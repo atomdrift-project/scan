@@ -1,0 +1,234 @@
+{
+  "cv_folds": 5,
+  "cv_auc_mean": 0.9982149106569335,
+  "cv_auc_std": 0.0014330510428006682,
+  "cv_f1_mean": 0.9817895860885132,
+  "cv_f1_std": 0.011470655424344075,
+  "accuracy": 0.9917405934536555,
+  "precision": 0.9838274932614556,
+  "recall": 0.9798657718120806,
+  "f1": 0.9818426361802286,
+  "roc_auc": 0.9969942245716292,
+  "avg_precision": 0.9949017447192195,
+  "optimal_threshold": 0.5881474018096924,
+  "confusion_matrix": [
+    [
+      2512,
+      12
+    ],
+    [
+      15,
+      730
+    ]
+  ],
+  "class_distribution": {
+    "benign": 2524,
+    "malware": 745
+  },
+  "scale_pos_weight": 3.3879194630872482,
+  "shap": {
+    "top_features": [
+      {
+        "name": "ftype_python_script",
+        "importance": 1.5378472805023193
+      },
+      {
+        "name": "byte_09",
+        "importance": 1.1975394487380981
+      },
+      {
+        "name": "byte_3b",
+        "importance": 0.22464042901992798
+      },
+      {
+        "name": "byte_2a",
+        "importance": 0.1898554265499115
+      },
+      {
+        "name": "cat_fs_ratio",
+        "importance": 0.18385107815265656
+      },
+      {
+        "name": "ftype_unknown",
+        "importance": 0.1719948947429657
+      },
+      {
+        "name": "byte_anomaly_mean",
+        "importance": 0.15137632191181183
+      },
+      {
+        "name": "func_anonymous",
+        "importance": 0.14848226308822632
+      },
+      {
+        "name": "crit_suspicious_count",
+        "importance": 0.13694140315055847
+      },
+      {
+        "name": "crit_danger_ratio",
+        "importance": 0.12567880749702454
+      },
+      {
+        "name": "byte_2b",
+        "importance": 0.12380096316337585
+      },
+      {
+        "name": "byte_3a",
+        "importance": 0.12289690226316452
+      },
+      {
+        "name": "byte_0d",
+        "importance": 0.082120880484581
+      },
+      {
+        "name": "byte_21",
+        "importance": 0.06726519018411636
+      },
+      {
+        "name": "cat_anti_static_ratio",
+        "importance": 0.06092563644051552
+      },
+      {
+        "name": "conf_suspicious_sum",
+        "importance": 0.05302056297659874
+      },
+      {
+        "name": "crit_dangerous_ratio",
+        "importance": 0.04246007651090622
+      },
+      {
+        "name": "byte_66",
+        "importance": 0.04148339852690697
+      },
+      {
+        "name": "cat_evasion_ratio",
+        "importance": 0.04081737995147705
+      },
+      {
+        "name": "metric_trailing_whitespace_lines",
+        "importance": 0.030794164165854454
+      },
+      {
+        "name": "byte_47",
+        "importance": 0.030572909861803055
+      },
+      {
+        "name": "byte_79",
+        "importance": 0.029577480629086494
+      },
+      {
+        "name": "byte_2f",
+        "importance": 0.028496423736214638
+      },
+      {
+        "name": "byte_2c",
+        "importance": 0.02406361699104309
+      },
+      {
+        "name": "byte_4c",
+        "importance": 0.023792052641510963
+      },
+      {
+        "name": "xz_supply_chain_patterns",
+        "importance": 0.023624395951628685
+      },
+      {
+        "name": "ftype_shell_script",
+        "importance": 0.021794825792312622
+      },
+      {
+        "name": "comment_to_code_ratio",
+        "importance": 0.020813705399632454
+      },
+      {
+        "name": "metric_max_line_length",
+        "importance": 0.019667092710733414
+      },
+      {
+        "name": "ftype_javascript",
+        "importance": 0.018610861152410507
+      },
+      {
+        "name": "byte_5a",
+        "importance": 0.015972619876265526
+      },
+      {
+        "name": "crit_suspicious_ratio",
+        "importance": 0.01489751972258091
+      },
+      {
+        "name": "byte_overrep_count",
+        "importance": 0.014474662952125072
+      },
+      {
+        "name": "crit_inert_ratio",
+        "importance": 0.013789772056043148
+      },
+      {
+        "name": "byte_24",
+        "importance": 0.01374292466789484
+      },
+      {
+        "name": "cat_exec_ratio",
+        "importance": 0.013151093386113644
+      },
+      {
+        "name": "byte_23",
+        "importance": 0.013136109337210655
+      },
+      {
+        "name": "byte_6b",
+        "importance": 0.013017893768846989
+      },
+      {
+        "name": "byte_57",
+        "importance": 0.012858407571911812
+      },
+      {
+        "name": "conf_total",
+        "importance": 0.012310809455811977
+      },
+      {
+        "name": "conf_evidence_total",
+        "importance": 0.012177793309092522
+      },
+      {
+        "name": "ident_avg_entropy",
+        "importance": 0.011800712905824184
+      },
+      {
+        "name": "struct_file_size_log",
+        "importance": 0.011460929177701473
+      },
+      {
+        "name": "byte_46",
+        "importance": 0.011309592984616756
+      },
+      {
+        "name": "func_avg_nesting_depth",
+        "importance": 0.011286499910056591
+      },
+      {
+        "name": "byte_5f",
+        "importance": 0.011078791692852974
+      },
+      {
+        "name": "cat_impact_ratio",
+        "importance": 0.011000623926520348
+      },
+      {
+        "name": "byte_59",
+        "importance": 0.010940120555460453
+      },
+      {
+        "name": "func_nested_functions",
+        "importance": 0.010932366363704205
+      },
+      {
+        "name": "byte_65",
+        "importance": 0.010613524354994297
+      }
+    ],
+    "useless_feature_count": 5867
+  }
+}

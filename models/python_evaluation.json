@@ -1,0 +1,234 @@
+{
+  "cv_folds": 5,
+  "cv_auc_mean": 0.8743937361455985,
+  "cv_auc_std": 0.13539517495538753,
+  "cv_f1_mean": 0.36666666666666664,
+  "cv_f1_std": 0.3055050463303893,
+  "accuracy": 0.9952339688041595,
+  "precision": 0.8,
+  "recall": 0.2857142857142857,
+  "f1": 0.42105263157894735,
+  "roc_auc": 0.9082544526092913,
+  "avg_precision": 0.4119974196155794,
+  "optimal_threshold": 0.3198116421699524,
+  "confusion_matrix": [
+    [
+      2293,
+      1
+    ],
+    [
+      10,
+      4
+    ]
+  ],
+  "class_distribution": {
+    "benign": 2294,
+    "malware": 14
+  },
+  "scale_pos_weight": 163.85714285714286,
+  "shap": {
+    "top_features": [
+      {
+        "name": "byte_21",
+        "importance": 0.14177657663822174
+      },
+      {
+        "name": "cat_fs_ratio",
+        "importance": 0.09560266882181168
+      },
+      {
+        "name": "byte_59",
+        "importance": 0.08810295909643173
+      },
+      {
+        "name": "byte_40",
+        "importance": 0.07994716614484787
+      },
+      {
+        "name": "byte_55",
+        "importance": 0.06658972054719925
+      },
+      {
+        "name": "byte_4c",
+        "importance": 0.06230040267109871
+      },
+      {
+        "name": "crit_danger_ratio",
+        "importance": 0.05896684154868126
+      },
+      {
+        "name": "byte_anomaly_mean",
+        "importance": 0.04253382980823517
+      },
+      {
+        "name": "ident_double_underscore_count",
+        "importance": 0.041742488741874695
+      },
+      {
+        "name": "byte_20",
+        "importance": 0.04162467271089554
+      },
+      {
+        "name": "byte_5f",
+        "importance": 0.041016098111867905
+      },
+      {
+        "name": "byte_2c",
+        "importance": 0.039254192262887955
+      },
+      {
+        "name": "ident_high_entropy_ratio",
+        "importance": 0.03909013420343399
+      },
+      {
+        "name": "byte_4d",
+        "importance": 0.038727954030036926
+      },
+      {
+        "name": "byte_27",
+        "importance": 0.02648543380200863
+      },
+      {
+        "name": "byte_4b",
+        "importance": 0.02599935419857502
+      },
+      {
+        "name": "cat_comm_ratio",
+        "importance": 0.020938200876116753
+      },
+      {
+        "name": "conf_mean",
+        "importance": 0.020134704187512398
+      },
+      {
+        "name": "byte_73",
+        "importance": 0.01712999865412712
+      },
+      {
+        "name": "byte_71",
+        "importance": 0.016746994107961655
+      },
+      {
+        "name": "str_total",
+        "importance": 0.015971215441823006
+      },
+      {
+        "name": "byte_3b",
+        "importance": 0.004070937167853117
+      },
+      {
+        "name": "byte_29",
+        "importance": 0.003000567900016904
+      },
+      {
+        "name": "byte_anomaly_max",
+        "importance": 0.0015555997379124165
+      },
+      {
+        "name": "func_no_params_count",
+        "importance": 0.0
+      },
+      {
+        "name": "func_density_per_100_lines",
+        "importance": 0.0
+      },
+      {
+        "name": "func_nested_functions",
+        "importance": 0.0
+      },
+      {
+        "name": "func_max_nesting_depth",
+        "importance": 0.0
+      },
+      {
+        "name": "func_single_char_params",
+        "importance": 0.0
+      },
+      {
+        "name": "func_total",
+        "importance": 0.0
+      },
+      {
+        "name": "ident_all_uppercase_ratio",
+        "importance": 0.0
+      },
+      {
+        "name": "ident_avg_entropy",
+        "importance": 0.0
+      },
+      {
+        "name": "ident_avg_length",
+        "importance": 0.0
+      },
+      {
+        "name": "func_max_length_lines",
+        "importance": 0.0
+      },
+      {
+        "name": "ident_has_digit_ratio",
+        "importance": 0.0
+      },
+      {
+        "name": "func_one_liners",
+        "importance": 0.0
+      },
+      {
+        "name": "xz_truncated_section_names",
+        "importance": 0.0
+      },
+      {
+        "name": "func_code_in_functions_ratio",
+        "importance": 0.0
+      },
+      {
+        "name": "func_avg_params",
+        "importance": 0.0
+      },
+      {
+        "name": "cs_sc_dependency",
+        "importance": 0.0
+      },
+      {
+        "name": "cs_sc_install_script",
+        "importance": 0.0
+      },
+      {
+        "name": "cs_sc_typosquat",
+        "importance": 0.0
+      },
+      {
+        "name": "cs_supply_chain_score",
+        "importance": 0.0
+      },
+      {
+        "name": "ftype_elf",
+        "importance": 0.0
+      },
+      {
+        "name": "ftype_go",
+        "importance": 0.0
+      },
+      {
+        "name": "ftype_java_class",
+        "importance": 0.0
+      },
+      {
+        "name": "ftype_javascript",
+        "importance": 0.0
+      },
+      {
+        "name": "ftype_macho",
+        "importance": 0.0
+      },
+      {
+        "name": "ftype_pe",
+        "importance": 0.0
+      },
+      {
+        "name": "ftype_python_script",
+        "importance": 0.0
+      }
+    ],
+    "useless_feature_count": 5999
+  }
+}
