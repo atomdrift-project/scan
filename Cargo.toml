@@ -28,6 +28,40 @@ libc = "0.2"
 log = "0.4"
 env_logger = "0.11"
 
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_must_use = "deny"
+unused_imports = "deny"
+unused_mut = "deny"
+dead_code = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unimplemented = "deny"
+todo = "deny"
+unreachable = "deny"
+result_unit_err = "deny"
+result_large_err = "deny"
+missing_safety_doc = "warn"
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"
+unnecessary_wraps = "warn"
+match_same_arms = "warn"
+redundant_closure_for_method_calls = "warn"
+manual_let_else = "warn"
+
 [dev-dependencies]
 
 [lib]
