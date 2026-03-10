@@ -76,19 +76,28 @@ impl Model {
         let onnx_path = model_dir.join("model.onnx");
         let spec_path = model_dir.join("feature_spec.json");
 
+        tracing::debug!(path = %spec_path.display(), "loading feature spec");
         let spec = FeatureSpec::load(&spec_path)
             .with_context(|| format!("loading feature spec from {}", spec_path.display()))?;
+        tracing::debug!(features = spec.total_features, "feature spec loaded");
 
+        tracing::debug!("creating ORT session builder");
         let mut builder = ort::session::Session::builder()
             .map_err(|e| anyhow::anyhow!("creating ONNX session builder: {e}"))?;
+        tracing::debug!("ORT session builder created");
 
         builder = builder
             .with_intra_threads(1)
-            .map_err(|e| anyhow::anyhow!("setting intra threads: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("setting intra threads: {e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| anyhow::anyhow!("setting inter threads: {e}"))?;
+        tracing::debug!("ORT thread config set (intra=1, inter=1)");
 
+        tracing::debug!(path = %onnx_path.display(), "loading ONNX model");
         let session = builder
             .commit_from_file(&onnx_path)
             .map_err(|e| anyhow::anyhow!("loading ONNX model from {}: {e}", onnx_path.display()))?;
+        tracing::debug!("ONNX model committed");
 
         tracing::info!(
             features = spec.total_features,

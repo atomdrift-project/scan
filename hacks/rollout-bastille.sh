@@ -82,7 +82,7 @@ load_rc_config $name
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-c -f -P ${pidfile} -r -u litmus /usr/local/share/litmus/litmus serve --bind 0.0.0.0:8081"
+command_args="-c -f -P ${pidfile} -r -u litmus env ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so /usr/local/share/litmus/litmus serve --bind 0.0.0.0:8081"
 
 run_rc_command "$1"
 EOF
