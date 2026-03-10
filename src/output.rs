@@ -150,11 +150,11 @@ pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, verbose
     // Format PID list.
     let pid_str = if pids.len() <= 5 {
         pids.iter()
-            .map(|p| p.to_string())
+            .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     } else {
-        let first: Vec<String> = pids[..4].iter().map(|p| p.to_string()).collect();
+        let first: Vec<String> = pids[..4].iter().map(u32::to_string).collect();
         format!("{} +{} more", first.join(", "), pids.len() - 4)
     };
     let pid_display = fg(100, 100, 100, &format!("[pids: {pid_str}]"));

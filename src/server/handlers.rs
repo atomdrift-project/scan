@@ -26,16 +26,13 @@ pub(super) async fn health() -> Json<serde_json::Value> {
 /// Only one reload may run at a time; concurrent calls receive 409.
 pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
     // Prevent concurrent reloads — each load allocates significant memory.
-    let _guard = match state.reload_lock.try_lock() {
-        Ok(g) => g,
-        Err(_) => {
-            log::warn!("reload rejected: already in progress");
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "Reload already in progress"})),
-            )
-                .into_response();
-        }
+    let Ok(_guard) = state.reload_lock.try_lock() else {
+        log::warn!("reload rejected: already in progress");
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Reload already in progress"})),
+        )
+            .into_response();
     };
 
     let start = Instant::now();
@@ -388,7 +385,7 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = state;
-        return None;
+        None
     }
 
     #[cfg(target_os = "linux")]

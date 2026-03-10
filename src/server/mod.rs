@@ -63,24 +63,37 @@ impl Default for ServerConfig {
 }
 
 /// Loaded model resources; swapped atomically on /reload.
+#[derive(Debug)]
 pub struct ModelResources {
+    /// Loaded ONNX model.
     pub model: Model,
+    /// SHAP importance data for explanations.
     pub shap: Option<ShapImportance>,
+    /// Feature extraction context built from the model spec.
     pub ctx: ExtractContext,
 }
 
 /// Shared application state, held behind an `Arc`.
+#[derive(Debug)]
 pub struct AppState {
+    /// Per-request analysis timeout in seconds.
     pub timeout_secs: u64,
+    /// Maximum RSS before rejecting requests.
     pub max_rss_bytes: u64,
+    /// Directory containing model artifacts.
     pub model_dir: PathBuf,
+    /// Minimum probability to classify as suspicious.
     pub threshold_suspicious: f32,
+    /// Minimum probability to classify as hostile.
     pub threshold_hostile: f32,
+    /// Warn when a single cleave rule takes longer than this many milliseconds.
     pub slow_rule_ms: u64,
     /// Current model resources; wrapped in `Arc` so handlers can snapshot
     /// without holding the lock across `await` points.
     pub resources: RwLock<Arc<ModelResources>>,
+    /// Monotonically increasing request counter.
     pub next_request_id: AtomicU64,
+    /// Number of analysis tasks currently in flight.
     pub active_tasks: AtomicUsize,
     /// Serialises /reload — only one reload may run at a time.
     pub reload_lock: tokio::sync::Mutex<()>,

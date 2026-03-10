@@ -10,8 +10,11 @@ use crate::features::FeatureSpec;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Classification {
+    /// File shows no significant malicious indicators.
     Benign,
+    /// File has notable suspicious indicators.
     Suspicious,
+    /// File is likely malicious.
     Hostile,
 }
 
@@ -28,11 +31,15 @@ impl std::fmt::Display for Classification {
 /// Thresholds for classification.
 #[derive(Debug, Clone, Copy)]
 pub struct Thresholds {
+    /// Minimum probability to classify as suspicious.
     pub suspicious: f32,
+    /// Minimum probability to classify as hostile.
     pub hostile: f32,
 }
 
 impl Thresholds {
+    /// Classify a probability score into a [`Classification`].
+    #[must_use]
     pub fn classify(&self, probability: f32) -> Classification {
         if probability >= self.hostile {
             Classification::Hostile
@@ -48,8 +55,19 @@ impl Thresholds {
 /// Session::run requires &mut self, so we wrap in Mutex for thread safety.
 pub struct Model {
     session: Mutex<ort::session::Session>,
+    /// Feature specification used to build input vectors.
     pub spec: FeatureSpec,
+    /// Classification thresholds.
     pub thresholds: Thresholds,
+}
+
+impl std::fmt::Debug for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Model")
+            .field("spec", &self.spec)
+            .field("thresholds", &self.thresholds)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Model {

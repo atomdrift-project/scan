@@ -24,6 +24,7 @@ const STALENESS_DAYS: u64 = 30;
 ///
 /// Returns the base directory (not the versioned subdirectory).
 /// Call `model_dir()` to get the path suitable for `Model::load`.
+#[must_use]
 pub fn resolve_and_ensure() -> PathBuf {
     if let Ok(explicit) = std::env::var("LITMUS_MODELS_DIR") {
         let p = PathBuf::from(&explicit);
@@ -55,6 +56,7 @@ pub fn resolve_and_ensure() -> PathBuf {
 }
 
 /// Return the model directory suitable for `Model::load`.
+#[must_use]
 pub fn model_dir() -> PathBuf {
     resolve_and_ensure().join(CURRENT_VERSION).join(DEFAULT_MODEL)
 }
@@ -141,6 +143,7 @@ pub fn check_updates() -> Result<(), String> {
 }
 
 /// Get the short commit hash of the current models HEAD, if available.
+#[must_use]
 pub fn version() -> Option<String> {
     short_head(&current_models_dir())
 }

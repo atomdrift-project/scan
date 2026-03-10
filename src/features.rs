@@ -21,7 +21,6 @@ fn crit_ordinal(crit: &str) -> u32 {
     match crit {
         "filtered" => 0,
         "component" => 1,
-        "baseline" => 2,
         "notable" => 3,
         "suspicious" => 4,
         "hostile" => 5,
@@ -65,17 +64,24 @@ const KEY_METRICS: &[(&str, &str, bool)] = &[
 /// Feature specification loaded from feature_spec.json (v12).
 #[derive(Debug, Clone)]
 pub struct FeatureSpec {
+    /// Spec format version (expected: 12).
     pub version: u32,
     /// Entries like "objectives/evasion/process:hostile".
     pub path_vocab: Vec<String>,
+    /// File type vocabulary for one-hot encoding.
     pub filetype_vocab: Vec<String>,
+    /// Names of all features in the vector, in order.
     pub feature_names: Vec<String>,
+    /// Total number of features in the vector.
     pub total_features: usize,
+    /// Per-feature means for z-score standardization (from training).
     pub feature_means: Option<Vec<f32>>,
+    /// Per-feature standard deviations for z-score standardization (from training).
     pub feature_stds: Option<Vec<f32>>,
 }
 
 impl FeatureSpec {
+    /// Load feature specification from a JSON file.
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path).context("reading feature spec")?;
         let v: serde_json::Value = serde_json::from_str(&data).context("parsing feature spec")?;
@@ -103,10 +109,7 @@ impl FeatureSpec {
     /// Features that were constant during training (mean=0, std=1) are zeroed
     /// to prevent catastrophic misclassification from unseen raw values.
     pub fn standardize(&self, features: &mut [f32]) {
-        let (means, stds) = match (self.feature_means.as_ref(), self.feature_stds.as_ref()) {
-            (Some(m), Some(s)) => (m, s),
-            _ => return,
-        };
+        let (Some(means), Some(stds)) = (self.feature_means.as_ref(), self.feature_stds.as_ref()) else { return };
 
         for i in 0..features.len().min(means.len()) {
             let m = means[i];
@@ -133,16 +136,20 @@ fn json_f32_array(v: &serde_json::Value) -> Option<Vec<f32>> {
 }
 
 /// Pre-built lookup tables for fast repeated extraction against a spec.
+#[derive(Debug)]
 pub struct ExtractContext {
     /// Maps path string -> list of (feature_index_in_combo_block, tier_ordinal).
     path_tiers: HashMap<String, Vec<(usize, u32)>>,
     n_combos: usize,
     ft_lookup: HashMap<String, usize>,
     n_ft: usize,
+    /// Total number of features in the output vector.
     pub total_features: usize,
 }
 
 impl ExtractContext {
+    /// Build lookup tables from a feature specification.
+    #[must_use]
     pub fn new(spec: &FeatureSpec) -> Self {
         let mut path_tiers: HashMap<String, Vec<(usize, u32)>> = HashMap::new();
         for (i, combo) in spec.path_vocab.iter().enumerate() {
@@ -171,6 +178,7 @@ impl ExtractContext {
     }
 
     /// Extract features from a cleave AnalysisReport serialized as JSON.
+    #[must_use]
     pub fn extract(&self, report: &serde_json::Value) -> Vec<f32> {
         let mut vec = vec![0.0f32; self.total_features];
         self.extract_into(report, &mut vec);
@@ -310,7 +318,7 @@ impl ExtractContext {
             let val = metrics
                 .get(group)
                 .and_then(|g| g.get(fname))
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .unwrap_or(0.0) as f32;
             vec[offset] = if use_log { (val.abs() + 1.0).ln() } else { val };
             offset += 1;

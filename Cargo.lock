@@ -595,6 +595,7 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 [[package]]
 name = "cleave"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#6e4ba40e4a89eb256bf13fb61a35b9853598b09a"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -692,6 +693,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#6e4ba40e4a89eb256bf13fb61a35b9853598b09a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2299,6 +2301,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#6e4ba40e4a89eb256bf13fb61a35b9853598b09a"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -2962,6 +2965,7 @@ dependencies = [
 [[package]]
 name = "proclist"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/proclist.git#d03be5c18c4ff1c78c41f1e5a86c265d86acdd15"
 dependencies = [
  "libc",
  "log",
@@ -3471,6 +3475,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#6e4ba40e4a89eb256bf13fb61a35b9853598b09a"
 dependencies = [
  "thiserror 2.0.18",
 ]

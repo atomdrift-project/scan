@@ -18,12 +18,19 @@ use crate::scan::{DisplayFilter, ScanResult, ScanSummary};
 use crate::OutputFormat;
 
 /// Configuration for process scanning (mirrors ScanConfig fields).
+#[derive(Debug)]
 pub struct PsConfig {
+    /// Directory containing model.onnx and feature_spec.json.
     pub model_dir: PathBuf,
+    /// Output format.
     pub format: OutputFormat,
+    /// Minimum probability to classify as suspicious.
     pub threshold_suspicious: f32,
+    /// Minimum probability to classify as hostile.
     pub threshold_hostile: f32,
+    /// Which classifications to display.
     pub filter: DisplayFilter,
+    /// Print extra detail per file.
     pub verbose: bool,
     /// Warn when a single rule takes longer than this many milliseconds (default: 4000).
     pub slow_rule_ms: u64,
@@ -338,8 +345,9 @@ fn emit_result(
         }
         OutputFormat::Json => {
             if let Ok(line) = serde_json::to_string(r) {
-                let mut out = stdout.lock().unwrap();
-                let _ = writeln!(out, "{line}");
+                if let Ok(mut out) = stdout.lock() {
+                    let _ = writeln!(out, "{line}");
+                }
             }
         }
     }

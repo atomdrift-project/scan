@@ -13,9 +13,11 @@ pub use model::Classification;
 pub use scan::{ScanConfig, ScanResult, ScanSummary};
 
 /// Output format for scan results.
-#[derive(Clone, Copy, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
 pub enum OutputFormat {
+    /// Human-readable terminal output.
     #[default]
     Terminal,
+    /// Newline-delimited JSON, one object per file.
     Json,
 }

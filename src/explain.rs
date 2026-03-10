@@ -54,6 +54,7 @@ impl ShapImportance {
 
     /// Explain why a file was flagged by cross-referencing active features
     /// with global importance. Returns top N reasons.
+    #[must_use]
     pub fn explain(
         &self,
         feature_values: &[f32],

@@ -1,3 +1,5 @@
+//! litmus — ML-powered malware classification CLI.
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use litmus::scan::DisplayFilter;

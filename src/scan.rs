@@ -17,12 +17,17 @@ pub use crate::explain::Reason;
 /// Which classifications to display.
 #[derive(Debug, Clone)]
 pub struct DisplayFilter {
+    /// Show hostile files.
     pub hostile: bool,
+    /// Show suspicious files.
     pub suspicious: bool,
+    /// Show benign files.
     pub benign: bool,
 }
 
 impl DisplayFilter {
+    /// Returns true if the filter includes the given classification.
+    #[must_use]
     pub fn shows(&self, c: &Classification) -> bool {
         match c {
             Classification::Hostile => self.hostile,
@@ -39,12 +44,19 @@ impl Default for DisplayFilter {
 }
 
 /// Scan configuration.
+#[derive(Debug)]
 pub struct ScanConfig {
+    /// Directory containing model.onnx and feature_spec.json.
     pub model_dir: std::path::PathBuf,
+    /// Output format.
     pub format: OutputFormat,
+    /// Minimum probability to classify as suspicious.
     pub threshold_suspicious: f32,
+    /// Minimum probability to classify as hostile.
     pub threshold_hostile: f32,
+    /// Which classifications to display.
     pub filter: DisplayFilter,
+    /// Print extra detail per file.
     pub verbose: bool,
     /// Warn when a single rule takes longer than this many milliseconds (default: 4000).
     pub slow_rule_ms: u64,
@@ -53,55 +65,86 @@ pub struct ScanConfig {
 /// Summary of scan results.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanSummary {
+    /// Total number of files analyzed.
     pub total_files: u32,
+    /// Number of hostile files.
     pub hostile: u32,
+    /// Number of suspicious files.
     pub suspicious: u32,
+    /// Number of benign files.
     pub benign: u32,
+    /// Number of files that could not be analyzed.
     pub errors: u32,
+    /// Wall-clock duration of the scan in milliseconds.
     pub duration_ms: u64,
 }
 
 /// Finding counts by criticality level from cleave.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct FindingCounts {
+    /// Hostile-criticality findings.
     pub hostile: u32,
+    /// Suspicious-criticality findings.
     pub suspicious: u32,
+    /// Notable-criticality findings.
     pub notable: u32,
+    /// Baseline-criticality findings.
     pub baseline: u32,
 }
 
 /// Result for a single scanned file.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanResult {
+    /// Path to the analyzed file.
     pub path: String,
+    /// Model classification outcome.
     pub classification: Classification,
+    /// Raw malware probability from the model.
     pub probability: f32,
+    /// Thresholds used for classification.
     pub thresholds: Thresholds,
+    /// Breakdown of findings by criticality.
     pub finding_counts: FindingCounts,
+    /// Cleave formula string summarizing findings.
     pub formula: String,
+    /// Top SHAP-based reasons for the classification.
     pub reasons: Vec<Reason>,
+    /// Top findings from cleave at the relevant criticality level.
     pub top_findings: Vec<TopFinding>,
+    /// Detected file type (e.g. "pe", "elf", "sh").
     pub file_type: String,
+    /// File size in bytes.
     pub size_bytes: u64,
+    /// SHA-256 hex digest of the file.
     pub sha256: String,
+    /// Full cleave report (JSON mode only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleave: Option<serde_json::Value>,
+    /// PIDs running this binary (process scan only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pids: Option<Vec<u32>>,
+    /// Whether the binary was deleted from disk (process scan only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted: Option<bool>,
 }
 
+/// Classification thresholds serialized into scan results.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Thresholds {
+    /// Minimum probability to classify as hostile.
     pub hostile: f32,
+    /// Minimum probability to classify as suspicious.
     pub suspicious: f32,
 }
 
+/// A notable finding from cleave at the highest relevant criticality.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TopFinding {
+    /// Finding identifier (e.g. "objectives/evasion/process::injection").
     pub id: String,
+    /// Criticality level (e.g. "hostile", "suspicious").
     pub crit: String,
+    /// Human-readable description of the finding.
     pub desc: String,
 }
 
@@ -329,8 +372,9 @@ fn emit_result(r: &ScanResult, config: &ScanConfig, show_progress: bool, stdout:
         }
         OutputFormat::Json => {
             if let Ok(line) = serde_json::to_string(r) {
-                let mut out = stdout.lock().unwrap();
-                let _ = writeln!(out, "{line}");
+                if let Ok(mut out) = stdout.lock() {
+                    let _ = writeln!(out, "{line}");
+                }
             }
         }
     }
@@ -407,6 +451,7 @@ fn process_report(
 }
 
 /// Count cleave findings by criticality level.
+#[must_use]
 pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
     let findings = report["findings"]
         .as_array()
@@ -448,6 +493,7 @@ fn analyze_single(
 }
 
 /// Extract top findings at the highest criticality level present.
+#[must_use]
 pub fn extract_top_findings_from_json(
     report: &serde_json::Value,
     classification: &Classification,
@@ -511,7 +557,6 @@ fn crit_ordinal(crit: &str) -> u32 {
     match crit {
         "filtered" => 0,
         "component" => 1,
-        "baseline" => 2,
         "notable" => 3,
         "suspicious" => 4,
         "hostile" => 5,
