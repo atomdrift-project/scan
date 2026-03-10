@@ -2153,9 +2153,11 @@ name = "litmus"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "cleave",
  "colored 2.2.0",
+ "dirs",
  "env_logger",
  "libc",
  "log",
@@ -2165,6 +2167,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tower",
+ "tower-http",
 ]
 
 [[package]]
@@ -3829,7 +3834,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.0.0"
-source = "git+https://codeberg.org/atomdrift/stng?rev=7a62958ac54f29c156a0c62f142ad7e4b1051a64#7a62958ac54f29c156a0c62f142ad7e4b1051a64"
+source = "git+https://codeberg.org/atomdrift/stng?rev=1c043de8f98357bf2d8e0082da6f2581485ffc94#1c043de8f98357bf2d8e0082da6f2581485ffc94"
 dependencies = [
  "aho-corasick",
  "anyhow",

@@ -3,9 +3,11 @@
 pub mod explain;
 pub mod features;
 pub mod model;
+pub mod models_repo;
 pub mod output;
 pub mod ps;
 pub mod scan;
+pub mod server;
 
 pub use model::Classification;
 pub use scan::{ScanConfig, ScanResult, ScanSummary};

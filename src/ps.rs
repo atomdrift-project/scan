@@ -25,6 +25,8 @@ pub struct PsConfig {
     pub threshold_hostile: f32,
     pub filter: DisplayFilter,
     pub verbose: bool,
+    /// Warn when a single rule takes longer than this many milliseconds (default: 4000).
+    pub slow_rule_ms: u64,
 }
 
 /// A group of processes sharing the same executable binary (by SHA256).
@@ -187,7 +189,7 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
     )?;
     let shap = ShapImportance::load(&config.model_dir).ok();
     let ctx = ExtractContext::new(&model.spec);
-    let cleave_opts = cleave::AnalysisOptions::default();
+    let cleave_opts = cleave::AnalysisOptions { slow_rule_ms: config.slow_rule_ms, ..Default::default() };
     let stdout = Mutex::new(std::io::stdout());
 
     let mut hostile = 0u32;

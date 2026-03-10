@@ -46,6 +46,8 @@ pub struct ScanConfig {
     pub threshold_hostile: f32,
     pub filter: DisplayFilter,
     pub verbose: bool,
+    /// Warn when a single rule takes longer than this many milliseconds (default: 4000).
+    pub slow_rule_ms: u64,
 }
 
 /// Summary of scan results.
@@ -196,7 +198,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 
     let shap = ShapImportance::load(&config.model_dir).ok();
     let ctx = ExtractContext::new(&model.spec);
-    let cleave_opts = cleave::AnalysisOptions::default();
+    let cleave_opts = cleave::AnalysisOptions { slow_rule_ms: config.slow_rule_ms, ..Default::default() };
     let is_terminal = matches!(config.format, OutputFormat::Terminal);
     let scan_start = Instant::now();
 
