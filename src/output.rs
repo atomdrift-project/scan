@@ -1,264 +1,321 @@
-//! Output formatting for terminal and JSON.
+//! Terminal and JSON output formatting with litmus-colored confidence indicators.
 
-use crate::classifier::{Classification, ClassificationResult};
-use crate::diff::{DiffResult, RiskLevel, RiskSource};
-use crate::features::FeatureVector;
-use anyhow::Result;
 use colored::Colorize;
-use cleave::types::{AnalysisReport, Criticality};
-use std::path::Path;
 
-/// Print scan results to terminal
-pub fn print_scan_terminal(
-    path: &Path,
-    report: &AnalysisReport,
-    result: Option<&ClassificationResult>,
-) -> Result<()> {
-    println!("litmus v{}\n", env!("CARGO_PKG_VERSION"));
-    println!("File: {}", path.display());
-    println!("Type: {}", report.target.file_type);
-    println!("Size: {} bytes", report.target.size_bytes);
-    println!();
+use crate::model::Classification;
+use crate::scan::{ScanResult, ScanSummary};
 
-    // Classification result
-    if let Some(r) = result {
-        let class_str = match r.classification {
-            Classification::Hostile => "HOSTILE".red().bold(),
-            Classification::Suspicious => "SUSPICIOUS".yellow().bold(),
-            Classification::Benign => "BENIGN".green().bold(),
-        };
+const BLOCK: &str = "\u{2588}";
 
-        println!("Classification: {}", class_str);
-        println!(
-            "Probability: {:.2} (threshold: {:.2})",
-            r.probability, r.hostile_threshold
-        );
-        println!();
-    } else {
-        println!("Classification: {} (no model loaded)", "UNKNOWN".dimmed());
-        println!();
-    }
-
-    // Key capabilities from cleave
-    let hostile: Vec<_> = report
-        .findings
-        .iter()
-        .filter(|f| f.crit == Criticality::Hostile)
-        .collect();
-    let suspicious: Vec<_> = report
-        .findings
-        .iter()
-        .filter(|f| f.crit == Criticality::Suspicious)
-        .collect();
-    let notable: Vec<_> = report
-        .findings
-        .iter()
-        .filter(|f| f.crit == Criticality::Notable)
-        .collect();
-
-    if !hostile.is_empty() || !suspicious.is_empty() || !notable.is_empty() {
-        println!("Key Capabilities Detected:");
-
-        for f in hostile.iter().take(5) {
-            println!("  {} {}", "[HOSTILE]".red(), f.id);
-        }
-        for f in suspicious.iter().take(5) {
-            println!("  {} {}", "[Suspicious]".yellow(), f.id);
-        }
-        for f in notable.iter().take(5) {
-            println!("  {} {}", "[Notable]".blue(), f.id);
-        }
-
-        let total = hostile.len() + suspicious.len() + notable.len();
-        if total > 15 {
-            println!("  ... and {} more", total - 15);
-        }
-        println!();
-    }
-
-    if result.is_some() {
-        println!(
-            "{}",
-            "Run with --explain for detailed SHAP analysis (requires Python)".dimmed()
-        );
-    }
-
-    Ok(())
+/// Set truecolor foreground on text.
+fn fg(r: u8, g: u8, b: u8, text: &str) -> String {
+    format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
 }
 
-/// Print scan results as JSON
-pub fn print_scan_json(
-    path: &Path,
-    report: &AnalysisReport,
-    result: Option<&ClassificationResult>,
-    features: &FeatureVector,
-) -> Result<()> {
-    let output = serde_json::json!({
-        "path": path.display().to_string(),
-        "file_type": report.target.file_type,
-        "size_bytes": report.target.size_bytes,
-        "sha256": report.target.sha256,
-        "classification": result.map(|r| match r.classification {
-            Classification::Hostile => "hostile",
-            Classification::Suspicious => "suspicious",
-            Classification::Benign => "benign",
-        }),
-        "probability": result.map(|r| r.probability),
-        "hostile_threshold": result.map(|r| r.hostile_threshold),
-        "suspicious_threshold": result.map(|r| r.suspicious_threshold),
-        "findings": report.findings.iter().map(|f| {
-            serde_json::json!({
-                "id": f.id,
-                "crit": format!("{:?}", f.crit),
-                "desc": f.desc,
-            })
-        }).collect::<Vec<_>>(),
-        "feature_count": features.len(),
-        "cleave": report,
-    });
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
+/// Linear interpolation between two u8 values.
+fn lerp(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
 }
 
-/// Print diff results to terminal
-pub fn print_diff_terminal(old_path: &Path, new_path: &Path, result: &DiffResult) -> Result<()> {
-    println!("litmus diff - Supply Chain Analysis\n");
-    println!(
-        "Comparing: {} → {}",
-        old_path.display(),
-        new_path.display()
+/// Two-block litmus confidence indicator.
+///
+/// At maximum confidence both blocks are identical (pure saturated color).
+/// As confidence decreases within a classification band, the left block
+/// darkens and the right block lightens/desaturates, creating a visual
+/// "spread" that intuitively conveys uncertainty.
+fn confidence_blocks(probability: f32, classification: &Classification) -> String {
+    match classification {
+        Classification::Hostile => {
+            // Band: 0.85 .. 1.0 -> t: 0.0 .. 1.0
+            let t = ((probability - 0.85) / 0.15).clamp(0.0, 1.0);
+            // Left: dark red (#640000) -> bright red (#FF0000)
+            let l = fg(lerp(100, 255, t), 0, 0, BLOCK);
+            // Right: pink (#FF9696) -> bright red (#FF0000)
+            let r = fg(255, lerp(150, 0, t), lerp(150, 0, t), BLOCK);
+            format!("{l}{r}")
+        }
+        Classification::Suspicious => {
+            // Band: 0.75 .. 0.85 -> t: 0.0 .. 1.0
+            let t = ((probability - 0.75) / 0.10).clamp(0.0, 1.0);
+            // Left: muted amber (#B46400) -> bright amber (#FFA000)
+            let l = fg(lerp(180, 255, t), lerp(100, 160, t), 0, BLOCK);
+            // Right: pale orange (#FFB450) -> bright amber (#FF8C00)
+            let r = fg(255, lerp(180, 140, t), lerp(80, 0, t), BLOCK);
+            format!("{l}{r}")
+        }
+        Classification::Benign => {
+            let t = (probability / 0.75).clamp(0.0, 1.0);
+            let l = fg(0, lerp(100, 180, t), 0, BLOCK);
+            let r = fg(0, lerp(80, 160, t), 0, BLOCK);
+            format!("{l}{r}")
+        }
+    }
+}
+
+/// Color percentage text to match the classification band.
+fn colored_pct(probability: f32, classification: &Classification) -> String {
+    let pct = format!("{:>4}", format!("{:.0}%", probability * 100.0));
+    match classification {
+        Classification::Hostile => fg(255, 70, 70, &pct),
+        Classification::Suspicious => fg(255, 175, 55, &pct),
+        Classification::Benign => fg(80, 200, 80, &pct),
+    }
+}
+
+/// Print a single file result immediately, clearing progress line if active.
+pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, verbose: bool) {
+    if has_progress {
+        eprint!("\r\x1b[2K");
+    }
+
+    let blocks = confidence_blocks(result.probability, &result.classification);
+    let pct = colored_pct(result.probability, &result.classification);
+    let vt_link = format!(
+        "\x1b]8;;https://www.virustotal.com/gui/file/{sha}\x1b\\{sha}\x1b]8;;\x1b\\",
+        sha = result.sha256,
     );
-    println!();
-
-    // Classification change
-    if let (Some(old), Some(new)) = (&result.old_classification, &result.new_classification) {
-        let old_str = format_classification(old.classification, old.probability);
-        let new_str = format_classification(new.classification, new.probability);
-        println!("Classification Change: {} → {}", old_str, new_str);
+    let mut meta = format!(
+        "{} \u{00b7} {} \u{00b7} {}",
+        result.file_type,
+        format_size(result.size_bytes),
+        vt_link,
+    );
+    if !result.formula.is_empty() {
+        meta.push_str(&format!(" \u{00b7} {}", result.formula));
     }
 
-    // Risk level with source
-    let risk_str = match result.risk_level {
-        RiskLevel::Critical => "CRITICAL".red().bold(),
-        RiskLevel::High => "HIGH".red(),
-        RiskLevel::Medium => "MEDIUM".yellow(),
-        RiskLevel::Low => "LOW".green(),
+    eprintln!("  {blocks} {pct}  {}  {}", result.path.bold(), meta.bright_black());
+
+    if verbose {
+        let fc = &result.finding_counts;
+        let h = if fc.hostile > 0 {
+            fg(255, 80, 80, &format!("h:{}", fc.hostile))
+        } else {
+            fg(60, 60, 60, &format!("h:{}", fc.hostile))
+        };
+        let s = if fc.suspicious > 0 {
+            fg(255, 175, 55, &format!("s:{}", fc.suspicious))
+        } else {
+            fg(60, 60, 60, &format!("s:{}", fc.suspicious))
+        };
+        let n = if fc.notable > 0 {
+            fg(180, 180, 100, &format!("n:{}", fc.notable))
+        } else {
+            fg(60, 60, 60, &format!("n:{}", fc.notable))
+        };
+        let b = fg(60, 60, 60, &format!("b:{}", fc.baseline));
+        let dot = fg(50, 50, 50, "\u{00b7}");
+        let p = fg(100, 100, 100, &format!("p={:.4}", result.probability));
+        eprintln!("           {h}  {s}  {n}  {b}  {dot}  {p}");
+    }
+
+    if !result.top_findings.is_empty() {
+        let findings: Vec<String> = result
+            .top_findings
+            .iter()
+            .take(4)
+            .map(|f| short_finding_id(&f.id))
+            .collect();
+        let line = findings.join(&format!(" {} ", fg(80, 80, 80, "\u{00b7}")));
+        let colored = match result.classification {
+            Classification::Hostile => fg(255, 100, 100, &line),
+            Classification::Suspicious => fg(255, 190, 90, &line),
+            Classification::Benign => line,
+        };
+        eprintln!("           {colored}");
+    }
+
+    if !result.reasons.is_empty() {
+        let reason_strs: Vec<&str> = result
+            .reasons
+            .iter()
+            .take(3)
+            .map(|r| r.description.as_str())
+            .collect();
+        eprintln!(
+            "           {} {}",
+            fg(70, 70, 70, "\u{2191}"),
+            fg(100, 100, 100, &reason_strs.join(", ")),
+        );
+    }
+
+    eprintln!();
+}
+
+/// Print a process scan result with PID annotations.
+pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, verbose: bool) {
+    let blocks = confidence_blocks(result.probability, &result.classification);
+    let pct = colored_pct(result.probability, &result.classification);
+
+    // Format PID list.
+    let pid_str = if pids.len() <= 5 {
+        pids.iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        let first: Vec<String> = pids[..4].iter().map(|p| p.to_string()).collect();
+        format!("{} +{} more", first.join(", "), pids.len() - 4)
     };
-    let source_str = format_risk_source(&result.risk_source);
-    println!("Risk Level: {} ({})", risk_str, source_str);
-    println!();
+    let pid_display = fg(100, 100, 100, &format!("[pids: {pid_str}]"));
 
-    // New capabilities
-    if !result.new_capabilities.is_empty() {
-        println!("New Capabilities:");
-        for cap in &result.new_capabilities {
-            println!("  {} {}", "+".green(), cap);
-        }
-        println!();
-    }
-
-    // Removed capabilities
-    if !result.removed_capabilities.is_empty() {
-        println!("Removed Capabilities:");
-        for cap in &result.removed_capabilities {
-            println!("  {} {}", "-".red(), cap);
-        }
-        println!();
-    }
-
-    // Feature deltas
-    if !result.feature_deltas.is_empty() {
-        println!("Feature Delta (top changes):");
-        for (name, old_val, new_val) in &result.feature_deltas {
-            println!("  {}: {:.2} → {:.2}", name, old_val, new_val);
-        }
-        println!();
-    }
-
-    // Recommendation
-    match result.risk_level {
-        RiskLevel::Critical => {
-            println!(
-                "{}",
-                "Recommendation: DO NOT UPGRADE - Likely supply chain compromise"
-                    .red()
-                    .bold()
-            );
-        }
-        RiskLevel::High => {
-            println!(
-                "{}",
-                "Recommendation: Manual review required before upgrade"
-                    .yellow()
-                    .bold()
-            );
-        }
-        RiskLevel::Medium => {
-            println!(
-                "{}",
-                "Recommendation: Review new capabilities before upgrade".yellow()
-            );
-        }
-        RiskLevel::Low => {
-            println!("{}", "Recommendation: Changes appear safe".green());
-        }
-    }
-
-    Ok(())
-}
-
-/// Print diff results as JSON
-pub fn print_diff_json(old_path: &Path, new_path: &Path, result: &DiffResult) -> Result<()> {
-    let output = serde_json::json!({
-        "old_path": old_path.display().to_string(),
-        "new_path": new_path.display().to_string(),
-        "old_classification": result.old_classification.as_ref().map(|r| {
-            serde_json::json!({
-                "class": format!("{:?}", r.classification),
-                "probability": r.probability,
-            })
-        }),
-        "new_classification": result.new_classification.as_ref().map(|r| {
-            serde_json::json!({
-                "class": format!("{:?}", r.classification),
-                "probability": r.probability,
-            })
-        }),
-        "risk_level": format!("{:?}", result.risk_level),
-        "new_capabilities": result.new_capabilities,
-        "removed_capabilities": result.removed_capabilities,
-        "feature_deltas": result.feature_deltas.iter().map(|(name, old, new)| {
-            serde_json::json!({
-                "name": name,
-                "old_value": old,
-                "new_value": new,
-            })
-        }).collect::<Vec<_>>(),
-    });
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
-}
-
-/// Format classification with color
-fn format_classification(class: Classification, prob: f32) -> String {
-    let label = match class {
-        Classification::Hostile => "HOSTILE".red().to_string(),
-        Classification::Suspicious => "SUSPICIOUS".yellow().to_string(),
-        Classification::Benign => "BENIGN".green().to_string(),
+    let deleted_marker = if deleted {
+        format!(" {}", fg(255, 100, 100, "(deleted)"))
+    } else {
+        String::new()
     };
-    format!("{} ({:.2})", label, prob)
+
+    let vt_link = format!(
+        "\x1b]8;;https://www.virustotal.com/gui/file/{sha}\x1b\\{sha}\x1b]8;;\x1b\\",
+        sha = result.sha256,
+    );
+    let mut meta = format!(
+        "{} \u{00b7} {} \u{00b7} {}",
+        result.file_type,
+        format_size(result.size_bytes),
+        vt_link,
+    );
+    if !result.formula.is_empty() {
+        meta.push_str(&format!(" \u{00b7} {}", result.formula));
+    }
+
+    eprintln!(
+        "  {blocks} {pct}  {}{deleted_marker}  {pid_display}  {}",
+        result.path.bold(),
+        meta.bright_black(),
+    );
+
+    if verbose {
+        let fc = &result.finding_counts;
+        let h = if fc.hostile > 0 {
+            fg(255, 80, 80, &format!("h:{}", fc.hostile))
+        } else {
+            fg(60, 60, 60, &format!("h:{}", fc.hostile))
+        };
+        let s = if fc.suspicious > 0 {
+            fg(255, 175, 55, &format!("s:{}", fc.suspicious))
+        } else {
+            fg(60, 60, 60, &format!("s:{}", fc.suspicious))
+        };
+        let n = if fc.notable > 0 {
+            fg(180, 180, 100, &format!("n:{}", fc.notable))
+        } else {
+            fg(60, 60, 60, &format!("n:{}", fc.notable))
+        };
+        let b = fg(60, 60, 60, &format!("b:{}", fc.baseline));
+        let dot = fg(50, 50, 50, "\u{00b7}");
+        let p = fg(100, 100, 100, &format!("p={:.4}", result.probability));
+        eprintln!("           {h}  {s}  {n}  {b}  {dot}  {p}");
+    }
+
+    if !result.top_findings.is_empty() {
+        let findings: Vec<String> = result
+            .top_findings
+            .iter()
+            .take(4)
+            .map(|f| short_finding_id(&f.id))
+            .collect();
+        let line = findings.join(&format!(" {} ", fg(80, 80, 80, "\u{00b7}")));
+        let colored = match result.classification {
+            Classification::Hostile => fg(255, 100, 100, &line),
+            Classification::Suspicious => fg(255, 190, 90, &line),
+            Classification::Benign => line,
+        };
+        eprintln!("           {colored}");
+    }
+
+    if !result.reasons.is_empty() {
+        let reason_strs: Vec<&str> = result
+            .reasons
+            .iter()
+            .take(3)
+            .map(|r| r.description.as_str())
+            .collect();
+        eprintln!(
+            "           {} {}",
+            fg(70, 70, 70, "\u{2191}"),
+            fg(100, 100, 100, &reason_strs.join(", ")),
+        );
+    }
+
+    eprintln!();
 }
 
-/// Format risk source for display
-fn format_risk_source(source: &RiskSource) -> String {
-    match source {
-        RiskSource::FileClassification => "file ML classification".to_string(),
-        RiskSource::NewHostileFindings(n) => format!("{} new hostile findings", n),
-        RiskSource::NewSuspiciousFindings(n) => format!("{} new suspicious findings", n),
-        RiskSource::BinaryAnomaly(detail) => format!("binary anomaly: {}", detail),
-        RiskSource::DangerousCapabilities(n) => format!("{} dangerous capabilities", n),
-        RiskSource::None => "no significant changes".to_string(),
+/// Print the scan header.
+pub fn print_header(path: &std::path::Path, count: usize) {
+    eprintln!();
+    eprintln!(
+        "  {}  {} files in {}",
+        fg(120, 180, 255, "\u{25c6}"),
+        count,
+        fg(180, 180, 180, &path.display().to_string()),
+    );
+    eprintln!();
+}
+
+/// Print scan summary.
+pub fn print_summary(summary: &ScanSummary) {
+    if summary.total_files == 0 {
+        return;
+    }
+
+    let line = fg(50, 50, 50, &"\u{2500}".repeat(52));
+    eprintln!("  {line}");
+
+    if summary.hostile == 0 && summary.suspicious == 0 {
+        eprintln!(
+            "  {}  {} files scanned, all clean  {}",
+            fg(80, 220, 80, "\u{2713}"),
+            summary.total_files,
+            fg(80, 80, 80, &format_elapsed(summary.duration_ms)),
+        );
+        eprintln!();
+        return;
+    }
+
+    let mut parts = vec![format!("{} files", summary.total_files)];
+    if summary.hostile > 0 {
+        parts.push(fg(255, 70, 70, &format!("{} hostile", summary.hostile)));
+    }
+    if summary.suspicious > 0 {
+        parts.push(fg(255, 175, 55, &format!("{} suspicious", summary.suspicious)));
+    }
+    if summary.errors > 0 {
+        parts.push(fg(180, 180, 180, &format!("{} errors", summary.errors)));
+    }
+    parts.push(fg(80, 80, 80, &format!("{} clean", summary.benign)));
+    parts.push(fg(80, 80, 80, &format_elapsed(summary.duration_ms)));
+
+    let sep = format!("  {}  ", fg(50, 50, 50, "\u{00b7}"));
+    eprintln!("  {}", parts.join(&sep));
+    eprintln!();
+}
+
+/// Shorten finding IDs by stripping namespace prefixes and variants.
+fn short_finding_id(id: &str) -> String {
+    let base = id.split("::").next().unwrap_or(id);
+    base.strip_prefix("objectives/")
+        .or_else(|| base.strip_prefix("micro-behaviors/"))
+        .or_else(|| base.strip_prefix("well-known/"))
+        .or_else(|| base.strip_prefix("metadata/"))
+        .unwrap_or(base)
+        .to_string()
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn format_elapsed(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
     }
 }

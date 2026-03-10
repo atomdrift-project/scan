@@ -1,119 +1,165 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use litmus::scan::DisplayFilter;
+use litmus::OutputFormat;
 use std::path::PathBuf;
+use std::process;
 
-mod classifier;
-mod diff;
-mod extract;
-mod features;
-mod hybrid_model;
-mod multi_model;
-mod output;
-mod scan;
+/// Classification values accepted by `--show`.
+#[derive(Clone, clap::ValueEnum)]
+enum Show {
+    Hostile,
+    Sus,
+    Benign,
+    All,
+}
 
 #[derive(Parser)]
 #[command(name = "litmus")]
-#[command(author, version, about = "Malware classification using ML analysis")]
+#[command(version)]
+#[command(about = "Malware classification powered by ML + static analysis")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-
-    /// Output format
-    #[arg(short, long, global = true, default_value = "terminal")]
-    format: OutputFormat,
-
-    /// Custom hostile threshold (0.0-1.0)
-    #[arg(long, global = true)]
-    threshold: Option<f32>,
-}
-
-#[derive(Clone, Copy, Default, clap::ValueEnum)]
-enum OutputFormat {
-    #[default]
-    Terminal,
-    Json,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Classify a file or directory as benign/suspicious/hostile
+    /// Scan files or directories for hostile/suspicious content
     Scan {
         /// Path to file or directory to scan
         path: PathBuf,
 
-        /// Show SHAP explanations (requires Python)
-        #[arg(long)]
-        explain: bool,
+        /// Directory containing model files (model.onnx, feature_spec.json, etc.)
+        #[arg(long, default_value = "../collimator/out")]
+        model_dir: PathBuf,
 
-        /// Exit with error if highest criticality matches these levels (comma-separated: hostile,suspicious,notable,inert)
-        #[arg(long, value_delimiter = ',')]
-        error_if: Vec<String>,
+        /// Output format
+        #[arg(short, long, default_value = "terminal")]
+        format: OutputFormat,
+
+        /// Probability threshold for suspicious classification (0.0-1.0)
+        #[arg(long, default_value = "0.75")]
+        threshold_suspicious: f32,
+
+        /// Probability threshold for hostile classification (0.0-1.0)
+        #[arg(long, default_value = "0.85")]
+        threshold_hostile: f32,
+
+        /// Classifications to display: hostile, sus, benign, all (comma-separated)
+        #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
+        show: Vec<Show>,
+
+        /// Show cleave finding counts (h/s/n/b) and raw model score per file
+        #[arg(long, short)]
+        verbose: bool,
     },
 
-    /// Compare two versions for supply chain attack detection
-    Diff {
-        /// Path to old/baseline version
-        old: PathBuf,
+    /// Scan executables of all running processes
+    Ps {
+        /// Directory containing model files (model.onnx, feature_spec.json, etc.)
+        #[arg(long, default_value = "../collimator/out")]
+        model_dir: PathBuf,
 
-        /// Path to new/target version
-        new: PathBuf,
+        /// Output format
+        #[arg(short, long, default_value = "terminal")]
+        format: OutputFormat,
+
+        /// Probability threshold for suspicious classification (0.0-1.0)
+        #[arg(long, default_value = "0.75")]
+        threshold_suspicious: f32,
+
+        /// Probability threshold for hostile classification (0.0-1.0)
+        #[arg(long, default_value = "0.85")]
+        threshold_hostile: f32,
+
+        /// Classifications to display: hostile, sus, benign, all (comma-separated)
+        #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
+        show: Vec<Show>,
+
+        /// Show cleave finding counts (h/s/n/b) and raw model score per file
+        #[arg(long, short)]
+        verbose: bool,
     },
 
-    /// Extract features for training (fast batch mode)
-    Extract {
-        /// Directory containing samples, or file with list of paths
-        input: PathBuf,
-
-        /// Output file (JSON format)
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Label for all samples (0=benign, 1=malicious)
-        #[arg(short, long)]
-        label: u8,
-
-        /// Number of parallel workers
-        #[arg(short, long, default_value = "8")]
-        workers: usize,
-
-        /// Limit number of samples to process
-        #[arg(long)]
-        limit: Option<usize>,
-
-        /// Only include samples with suspicious/hostile traits (for malware training)
-        /// Also filters out files with "clean" in the path
-        #[arg(long)]
-        require_suspicious: bool,
-
-        /// Only include files with this extension (e.g., "js", "py", "exe")
-        #[arg(short = 'x', long)]
-        extension: Option<String>,
-    },
+    /// Print version information
+    Version,
 }
 
 fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .format_timestamp(None)
+        .init();
+
+    #[cfg(debug_assertions)]
+    log::warn!("DEBUG binary — litmus will be very slow; use `make release` for production builds");
+
     let cli = Cli::parse();
 
-    // Set custom threshold if provided
-    let threshold = cli.threshold.unwrap_or(0.80);
-
     match cli.command {
-        Commands::Scan { path, explain, error_if } => {
-            scan::run(&path, explain, threshold, cli.format, &error_if)?;
-        }
-        Commands::Diff { old, new } => {
-            diff::run(&old, &new, threshold, cli.format)?;
-        }
-        Commands::Extract {
-            input,
-            output,
-            label,
-            workers,
-            limit,
-            require_suspicious,
-            extension,
+        Commands::Scan {
+            path,
+            model_dir,
+            format,
+            threshold_suspicious,
+            threshold_hostile,
+            show,
+            verbose,
         } => {
-            extract::run(&input, &output, label, workers, limit, require_suspicious, extension.as_deref())?;
+            let all = show.iter().any(|s| matches!(s, Show::All));
+            let config = litmus::ScanConfig {
+                model_dir,
+                format,
+                threshold_suspicious,
+                threshold_hostile,
+                filter: DisplayFilter {
+                    hostile: all || show.iter().any(|s| matches!(s, Show::Hostile)),
+                    suspicious: all || show.iter().any(|s| matches!(s, Show::Sus)),
+                    benign: all || show.iter().any(|s| matches!(s, Show::Benign)),
+                },
+                verbose,
+            };
+            let result = litmus::scan::run(&path, &config)?;
+
+            if result.hostile > 0 {
+                process::exit(1);
+            }
+            if result.suspicious > 0 {
+                process::exit(2);
+            }
+        }
+        Commands::Ps {
+            model_dir,
+            format,
+            threshold_suspicious,
+            threshold_hostile,
+            show,
+            verbose,
+        } => {
+            let all = show.iter().any(|s| matches!(s, Show::All));
+            let config = litmus::ps::PsConfig {
+                model_dir,
+                format,
+                threshold_suspicious,
+                threshold_hostile,
+                filter: DisplayFilter {
+                    hostile: all || show.iter().any(|s| matches!(s, Show::Hostile)),
+                    suspicious: all || show.iter().any(|s| matches!(s, Show::Sus)),
+                    benign: all || show.iter().any(|s| matches!(s, Show::Benign)),
+                },
+                verbose,
+            };
+            let result = litmus::ps::run(&config)?;
+
+            if result.hostile > 0 {
+                process::exit(1);
+            }
+            if result.suspicious > 0 {
+                process::exit(2);
+            }
+        }
+        Commands::Version => {
+            println!("litmus {}", env!("CARGO_PKG_VERSION"));
         }
     }
 

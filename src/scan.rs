@@ -1,457 +1,518 @@
-//! Scan command implementation - classify files as benign/suspicious/hostile.
+//! Recursive directory scanning and file classification.
 
-use crate::classifier::{Classifier, ClassificationResult};
-use crate::features::FeatureExtractor;
-use crate::hybrid_model::HybridClassifier;
-use crate::multi_model::{ModelRegistry, detect_filetype};
-use crate::output;
-use crate::OutputFormat;
 use anyhow::{Context, Result};
-use cleave::types::{AnalysisReport, Criticality};
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
-/// Classify features using either hybrid, multi-model registry, or single model
-fn classify_features(path: &Path, features: &[f32], threshold: f32) -> Result<Option<ClassificationResult>> {
-    // Try hybrid classifier first (intelligently routes between per-type and single models)
-    match HybridClassifier::load_default() {
-        Ok(hybrid) => {
-            let mut hybrid = hybrid.with_hostile_threshold(threshold);
+use crate::explain::ShapImportance;
+use crate::features::ExtractContext;
+use crate::model::{Classification, Model};
+use crate::OutputFormat;
 
-            // Print stats if in verbose mode
-            if std::env::var("LITMUS_VERBOSE").is_ok() {
-                eprintln!("{}", hybrid.stats());
-            }
+pub use crate::explain::Reason;
 
-            match hybrid.classify(path, features) {
-                Ok(result) => return Ok(Some(result)),
-                Err(e) => {
-                    eprintln!("Warning: Hybrid classifier failed: {}", e);
-                    eprintln!("Trying fallback methods...");
+/// Which classifications to display.
+#[derive(Debug, Clone)]
+pub struct DisplayFilter {
+    pub hostile: bool,
+    pub suspicious: bool,
+    pub benign: bool,
+}
+
+impl DisplayFilter {
+    pub fn shows(&self, c: &Classification) -> bool {
+        match c {
+            Classification::Hostile => self.hostile,
+            Classification::Suspicious => self.suspicious,
+            Classification::Benign => self.benign,
+        }
+    }
+}
+
+impl Default for DisplayFilter {
+    fn default() -> Self {
+        Self { hostile: true, suspicious: true, benign: false }
+    }
+}
+
+/// Scan configuration.
+pub struct ScanConfig {
+    pub model_dir: std::path::PathBuf,
+    pub format: OutputFormat,
+    pub threshold_suspicious: f32,
+    pub threshold_hostile: f32,
+    pub filter: DisplayFilter,
+    pub verbose: bool,
+}
+
+/// Summary of scan results.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanSummary {
+    pub total_files: u32,
+    pub hostile: u32,
+    pub suspicious: u32,
+    pub benign: u32,
+    pub errors: u32,
+    pub duration_ms: u64,
+}
+
+/// Finding counts by criticality level from cleave.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct FindingCounts {
+    pub hostile: u32,
+    pub suspicious: u32,
+    pub notable: u32,
+    pub baseline: u32,
+}
+
+/// Result for a single scanned file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanResult {
+    pub path: String,
+    pub classification: Classification,
+    pub probability: f32,
+    pub thresholds: Thresholds,
+    pub finding_counts: FindingCounts,
+    pub formula: String,
+    pub reasons: Vec<Reason>,
+    pub top_findings: Vec<TopFinding>,
+    pub file_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleave: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pids: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Thresholds {
+    pub hostile: f32,
+    pub suspicious: f32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopFinding {
+    pub id: String,
+    pub crit: String,
+    pub desc: String,
+}
+
+const SPINNER: &[char] = &['\u{2800}', '\u{2801}', '\u{2809}', '\u{2819}', '\u{281B}', '\u{281E}', '\u{2816}', '\u{2812}', '\u{2810}', '\u{2800}'];
+
+/// Progress state shared between threads.
+struct Progress {
+    analyzed: AtomicU32,
+    total: u32,
+    start: Instant,
+}
+
+impl Progress {
+    fn new(total: u32) -> Self {
+        Self {
+            analyzed: AtomicU32::new(0),
+            total,
+            start: Instant::now(),
+        }
+    }
+
+    fn increment(&self) {
+        self.analyzed.fetch_add(1, Ordering::Relaxed);
+        self.draw();
+    }
+
+    /// Redraw progress line without incrementing (after printing a result).
+    fn redraw(&self) {
+        self.draw();
+    }
+
+    fn draw(&self) {
+        let done = self.analyzed.load(Ordering::Relaxed);
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let rate = done as f64 / elapsed.max(0.001);
+        let remaining = (self.total - done) as f64 / rate.max(0.001);
+
+        let frame = SPINNER[done as usize % SPINNER.len()];
+        let bar_w = 20;
+        let filled = (done as usize * bar_w / self.total.max(1) as usize).min(bar_w);
+        let bar: String = (0..bar_w)
+            .map(|i| {
+                if i < filled {
+                    '\u{2501}' // ━
+                } else if i == filled {
+                    '\u{2578}' // ╸
+                } else {
+                    '\u{2500}' // ─
                 }
-            }
-        }
-        Err(_) => {
-            // Hybrid not available, try older approaches
-        }
-    }
-
-    // Fall back to multi-model registry
-    match ModelRegistry::load_default() {
-        Ok(mut registry) => {
-            if registry.is_empty() {
-                // Registry exists but has no models, fall back to single model
-                return classify_with_single_model(features, threshold);
-            }
-
-            let file_type = detect_filetype(path);
-            match registry.classify(&file_type, features) {
-                Ok(result) => Ok(Some(result)),
-                Err(e) => {
-                    eprintln!("Warning: Multi-model classification failed: {}", e);
-                    eprintln!("Falling back to single model");
-                    classify_with_single_model(features, threshold)
-                }
-            }
-        }
-        Err(_) => {
-            // No registry found, use single model (backward compatibility)
-            classify_with_single_model(features, threshold)
-        }
-    }
-}
-
-/// Classify using single model (backward compatibility)
-fn classify_with_single_model(features: &[f32], threshold: f32) -> Result<Option<ClassificationResult>> {
-    match Classifier::load_default() {
-        Ok(classifier) => {
-            let classifier = classifier.with_hostile_threshold(threshold);
-            Ok(Some(classifier.classify(features)?))
-        }
-        Err(e) => {
-            eprintln!("Warning: Could not load ML model: {}", e);
-            eprintln!("Showing cleave analysis without ML classification.\n");
-            Ok(None)
-        }
-    }
-}
-
-/// Parse criticality level from string
-fn parse_criticality(s: &str) -> Result<Criticality> {
-    match s.to_lowercase().as_str() {
-        "hostile" => Ok(Criticality::Hostile),
-        "suspicious" => Ok(Criticality::Suspicious),
-        "notable" => Ok(Criticality::Notable),
-        "baseline" => Ok(Criticality::Baseline),
-        "component" => Ok(Criticality::Component),
-        "filtered" => Ok(Criticality::Filtered),
-        _ => anyhow::bail!("Invalid criticality level: {}. Valid values: hostile, suspicious, notable, baseline, component, filtered", s),
-    }
-}
-
-/// Get the highest criticality level from findings in this report
-fn report_criticality(report: &AnalysisReport) -> Option<Criticality> {
-    report.findings.iter().map(|f| &f.crit).max().copied()
-}
-
-/// Get the highest criticality level across all files in the report
-/// Uses v2 flat files array which includes archive contents
-fn highest_criticality(report: &AnalysisReport) -> Option<Criticality> {
-    // Check top-level findings
-    let mut max_crit = report_criticality(report);
-
-    // Check all files in v2 array (includes archive contents)
-    for file in &report.files {
-        if let Some(file_max) = file.findings.iter().map(|f| f.crit).max() {
-            max_crit = Some(match max_crit {
-                Some(current) => current.max(file_max),
-                None => file_max,
-            });
-        }
-    }
-
-    max_crit
-}
-
-/// Scan a single file and check error-if condition
-fn scan_single_file(
-    path: &Path,
-    options: &cleave::AnalysisOptions,
-    explain: bool,
-    threshold: f32,
-    format: OutputFormat,
-    error_crits: &[Criticality],
-) -> Result<bool> {
-    let report = cleave::analyze_file(path, options)
-        .context(format!("cleave analysis failed for {:?}", path))?;
-
-    // Extract features (pass path for byte histogram)
-    let extractor = FeatureExtractor::load_default().unwrap_or_else(|e| {
-        eprintln!("Warning: Could not load vocabulary: {}. Using defaults.", e);
-        FeatureExtractor::new()
-    });
-    let features = extractor.extract_with_path(&report, Some(path));
-
-    // Try to classify using either multi-model or single model
-    let result = classify_features(path, features.as_slice(), threshold)?;
-
-    // Output results
-    match format {
-        OutputFormat::Json => {
-            output::print_scan_json(path, &report, result.as_ref(), &features)?;
-        }
-        OutputFormat::Terminal => {
-            output::print_scan_terminal(path, &report, result.as_ref())?;
-        }
-    }
-
-    // Run SHAP explanation if requested
-    if explain {
-        if result.is_some() {
-            run_shap_explanation(&features)?;
-        } else {
-            eprintln!("\nCannot run SHAP explanation without loaded model.");
-        }
-    }
-
-    // Check if highest criticality matches error-if list
-    // This recursively checks sub_reports (files within archives)
-    if !error_crits.is_empty() {
-        if let Some(highest) = highest_criticality(&report) {
-            if error_crits.contains(&highest) {
-                return Ok(true); // Matches error condition
-            }
-        }
-    }
-
-    Ok(false) // Does not match error condition
-}
-
-/// Run the scan command
-pub fn run(path: &Path, explain: bool, threshold: f32, format: OutputFormat, error_if: &[String]) -> Result<()> {
-    if !path.exists() {
-        anyhow::bail!("Path does not exist: {:?}", path);
-    }
-
-    // Parse error-if criticality levels
-    let error_crits: Vec<Criticality> = error_if
-        .iter()
-        .map(|s| parse_criticality(s))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Analyze with cleave (handles archives recursively via sub_reports)
-    let options = cleave::AnalysisOptions {
-        disable_yara: false,
-        disable_radare2: true, // Skip radare2 for speed
-        disable_upx: false,
-        ..Default::default()
-    };
-
-    // Handle directories by walking recursively (like cleave scan does)
-    if path.is_dir() {
-        use walkdir::WalkDir;
-
-        let mut all_files = Vec::new();
-        for entry in WalkDir::new(path)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                let file_name = e.file_name().to_string_lossy();
-                !file_name.starts_with(".git")
             })
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file() {
-                all_files.push(entry.path().to_path_buf());
-            }
-        }
-
-        eprintln!("Found {} files to scan\n", all_files.len());
-
-        let mut error_files = Vec::new();
-        for file_path in all_files {
-            match scan_single_file(&file_path, &options, explain, threshold, format, &error_crits) {
-                Ok(true) => {
-                    error_files.push(file_path.display().to_string());
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    eprintln!("Error scanning {}: {}", file_path.display(), e);
-                }
-            }
-        }
-
-        // If any files matched error-if condition, exit with error
-        if !error_files.is_empty() {
-            let mut msg = format!("Error: {} file(s) match --error-if condition:\n", error_files.len());
-            for file in error_files.iter().take(10) {
-                msg.push_str(&format!("  - {}\n", file));
-            }
-            if error_files.len() > 10 {
-                msg.push_str(&format!("  ... and {} more files\n", error_files.len() - 10));
-            }
-            anyhow::bail!(msg);
-        }
-
-        return Ok(());
-    }
-
-    // Single file
-    let matches_error = scan_single_file(path, &options, explain, threshold, format, &error_crits)?;
-
-    if matches_error {
-        anyhow::bail!(
-            "Error: highest criticality level matches --error-if condition"
-        );
-    }
-
-    Ok(())
-}
-
-/// Find Python interpreter (prefer venv)
-fn find_python() -> String {
-    // Check for venv python in training directory
-    let venv_python = std::path::PathBuf::from("training/.venv/bin/python");
-    if venv_python.exists() {
-        return venv_python.display().to_string();
-    }
-    // Fall back to system python
-    "python3".to_string()
-}
-
-/// Shell out to Python for SHAP explanations
-fn run_shap_explanation(features: &crate::features::FeatureVector) -> Result<()> {
-    // Find explain.py
-    let explain_script = find_explain_script()?;
-
-    // Find model files
-    let model_path = find_model_path("litmus_v1.json")?; // XGBoost native format for SHAP
-    let feature_names_path = find_model_path("feature_names.json")?;
-
-    // Serialize features to JSON
-    let features_json = serde_json::to_string(&features.values)?;
-
-    // Run Python script with venv if available
-    let python = find_python();
-    let output = Command::new(&python)
-        .arg(&explain_script)
-        .arg(&features_json)
-        .arg(&model_path)
-        .arg(&feature_names_path)
-        .output()
-        .context("Failed to run SHAP explanation script. Is Python installed?")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("SHAP explanation failed: {}", stderr);
-    }
-
-    // Parse and display SHAP output
-    let shap_output: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("Failed to parse SHAP output")?;
-
-    println!("\nTop Contributing Features (SHAP):");
-    if let Some(top_features) = shap_output.get("top_features").and_then(|v| v.as_array()) {
-        for (i, feature) in top_features.iter().enumerate() {
-            let name = feature.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let value = feature.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let shap = feature.get("shap").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-            let sign = if shap >= 0.0 { "+" } else { "" };
-            println!(
-                "  {:2}. {:30} {}{:.3}  ({:.2})",
-                i + 1,
-                name,
-                sign,
-                shap,
-                value
-            );
-        }
-    }
-
-    if let Some(base) = shap_output.get("base_value").and_then(|v| v.as_f64()) {
-        println!("\nBase value: {:.3} (prior probability)", base);
-    }
-
-    Ok(())
-}
-
-/// Find the explain.py script
-fn find_explain_script() -> Result<std::path::PathBuf> {
-    // Check LITMUS_TRAINING_PATH
-    if let Ok(path) = std::env::var("LITMUS_TRAINING_PATH") {
-        let script = std::path::PathBuf::from(path).join("explain.py");
-        if script.exists() {
-            return Ok(script);
-        }
-    }
-
-    // Check ~/.litmus/training/explain.py
-    if let Some(home) = dirs::home_dir() {
-        let script = home.join(".litmus").join("training").join("explain.py");
-        if script.exists() {
-            return Ok(script);
-        }
-    }
-
-    // Check ./training/explain.py
-    let script = std::path::PathBuf::from("training/explain.py");
-    if script.exists() {
-        return Ok(script);
-    }
-
-    anyhow::bail!(
-        "Could not find explain.py. Set LITMUS_TRAINING_PATH or place in ~/.litmus/training/"
-    )
-}
-
-/// Find a model file
-fn find_model_path(filename: &str) -> Result<std::path::PathBuf> {
-    // Check LITMUS_MODEL_PATH directory
-    if let Ok(path) = std::env::var("LITMUS_MODEL_PATH") {
-        let model_dir = std::path::Path::new(&path).parent().unwrap_or(std::path::Path::new("."));
-        let file = model_dir.join(filename);
-        if file.exists() {
-            return Ok(file);
-        }
-    }
-
-    // Check ~/.litmus/models/
-    if let Some(home) = dirs::home_dir() {
-        let file = home.join(".litmus").join("models").join(filename);
-        if file.exists() {
-            return Ok(file);
-        }
-    }
-
-    // Check ./models/
-    let file = std::path::PathBuf::from("models").join(filename);
-    if file.exists() {
-        return Ok(file);
-    }
-
-    anyhow::bail!("Could not find model file: {}", filename)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cleave::types::{Finding, TargetInfo};
-
-    fn create_finding(crit: Criticality, id: &str) -> Finding {
-        Finding {
-            id: id.to_string(),
-            kind: cleave::types::FindingKind::Capability,
-            desc: "test finding".to_string(),
-            conf: 1.0,
-            crit,
-            mbc: None,
-            attack: None,
-            trait_refs: vec![],
-            evidence: vec![],
-            match_count: 0,
-            source_file: None,
-        }
-    }
-
-    fn create_test_report(findings: Vec<(Criticality, &str)>) -> AnalysisReport {
-        let mut report = AnalysisReport::new(TargetInfo {
-            path: "test.tar".to_string(),
-            file_type: "archive".to_string(),
-            size_bytes: 1024,
-            sha256: "test".to_string(),
-            architectures: None,
-        });
-
-        report.findings = findings
-            .into_iter()
-            .map(|(crit, id)| create_finding(crit, id))
             .collect();
 
-        report
+        let filled_str: String = bar.chars().take(filled + 1).collect();
+        let dim_str: String = bar.chars().skip(filled + 1).collect();
+
+        eprint!(
+            "\r  \x1b[38;2;100;180;255m{frame}\x1b[0m \x1b[38;2;80;160;220m{filled_str}\x1b[38;2;50;50;50m{dim_str}\x1b[0m  \x1b[38;2;160;160;160m{done}/{total}  {rate:.0}/s  {eta}\x1b[0m   ",
+            total = self.total,
+            eta = format_eta(remaining),
+        );
+        let _ = std::io::stderr().flush();
     }
 
-    #[test]
-    fn test_highest_criticality_no_findings() {
-        let report = create_test_report(vec![]);
-        assert_eq!(highest_criticality(&report), None);
+    fn finish(&self) {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let done = self.analyzed.load(Ordering::Relaxed);
+        let rate = done as f64 / elapsed.max(0.001);
+        eprint!(
+            "\r\x1b[2K  \x1b[38;2;80;220;80m\u{2713}\x1b[0m  \x1b[38;2;160;160;160m{done} files in {elapsed:.1}s ({rate:.0}/s)\x1b[0m\n",
+        );
+        let _ = std::io::stderr().flush();
+    }
+}
+
+fn format_eta(secs: f64) -> String {
+    if secs < 1.0 {
+        "<1s".to_string()
+    } else if secs < 60.0 {
+        format!("~{:.0}s", secs)
+    } else {
+        format!("~{}m{:.0}s", (secs / 60.0) as u32, secs % 60.0)
+    }
+}
+
+/// Run a scan against a path (file or directory).
+pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
+    let model = Model::load(
+        &config.model_dir,
+        crate::model::Thresholds {
+            suspicious: config.threshold_suspicious,
+            hostile: config.threshold_hostile,
+        },
+    )?;
+
+    let shap = ShapImportance::load(&config.model_dir).ok();
+    let ctx = ExtractContext::new(&model.spec);
+    let cleave_opts = cleave::AnalysisOptions::default();
+    let is_terminal = matches!(config.format, OutputFormat::Terminal);
+    let scan_start = Instant::now();
+
+    // Single-file path: handle directly without the directory streaming API.
+    if path.is_file() {
+        let result = analyze_single(path, &cleave_opts, &ctx, &model, shap.as_ref(), config);
+        let (mut hostile, mut suspicious, mut benign, mut errors) = (0u32, 0u32, 0u32, 0u32);
+        let stdout = Mutex::new(std::io::stdout());
+        match result {
+            Ok(r) => {
+                match r.classification {
+                    Classification::Hostile => hostile += 1,
+                    Classification::Suspicious => suspicious += 1,
+                    Classification::Benign => benign += 1,
+                }
+                if config.filter.shows(&r.classification) {
+                    emit_result(&r, config, false, &stdout);
+                }
+            }
+            Err(e) => {
+                log::warn!("error analyzing {}: {}", path.display(), e);
+                errors += 1;
+            }
+        }
+        let summary = ScanSummary {
+            total_files: 1,
+            hostile,
+            suspicious,
+            benign,
+            errors,
+            duration_ms: scan_start.elapsed().as_millis() as u64,
+        };
+        if is_terminal {
+            crate::output::print_summary(&summary);
+        }
+        return Ok(summary);
     }
 
-    #[test]
-    fn test_highest_criticality_single_finding() {
-        let report = create_test_report(vec![(Criticality::Suspicious, "test/suspicious")]);
-        assert_eq!(highest_criticality(&report), Some(Criticality::Suspicious));
+    if !path.is_dir() {
+        anyhow::bail!("path does not exist: {}", path.display());
     }
 
-    #[test]
-    fn test_highest_criticality_multiple_findings() {
-        let report = create_test_report(vec![
-            (Criticality::Notable, "test/notable"),
-            (Criticality::Hostile, "test/hostile"),
-            (Criticality::Suspicious, "test/suspicious"),
-        ]);
-        assert_eq!(highest_criticality(&report), Some(Criticality::Hostile));
+    // Directory scan: delegate walking and parallel analysis to cleave, which
+    // loads CapabilityMapper and YARA once and streams results via callback.
+    let total_files: OnceLock<u32> = OnceLock::new();
+    let hostile_count = AtomicU32::new(0);
+    let suspicious_count = AtomicU32::new(0);
+    let benign_count = AtomicU32::new(0);
+    let error_count = AtomicU32::new(0);
+    let stdout = Mutex::new(std::io::stdout());
+    let progress: OnceLock<Progress> = OnceLock::new();
+
+    cleave::scan_directory(path, &cleave_opts, |event| match event {
+        cleave::ScanEvent::Start { total } => {
+            let _ = total_files.set(total as u32);
+            if is_terminal && total > 1 {
+                crate::output::print_header(path, total);
+                let _ = progress.set(Progress::new(total as u32));
+            }
+        }
+        cleave::ScanEvent::File {
+            path: ref file_path,
+            result,
+        } => {
+            let scan_result =
+                result.and_then(|report| process_report(file_path, report, &ctx, &model, shap.as_ref(), config));
+            let prog = progress.get();
+            if let Some(p) = prog {
+                p.increment();
+            }
+            match scan_result {
+                Ok(r) => {
+                    match r.classification {
+                        Classification::Hostile => {
+                            hostile_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Classification::Suspicious => {
+                            suspicious_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Classification::Benign => {
+                            benign_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if config.filter.shows(&r.classification) {
+                        emit_result(&r, config, prog.is_some(), &stdout);
+                        if let Some(p) = prog {
+                            p.redraw();
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("error analyzing {}: {}", file_path.display(), e);
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    })?;
+
+    if let Some(p) = progress.get() {
+        p.finish();
     }
 
-    #[test]
-    fn test_highest_criticality_ordering() {
-        // Verify criticality ordering: Hostile > Suspicious > Notable > Baseline > Component > Filtered
-        assert!(Criticality::Hostile > Criticality::Suspicious);
-        assert!(Criticality::Suspicious > Criticality::Notable);
-        assert!(Criticality::Notable > Criticality::Baseline);
-        assert!(Criticality::Baseline > Criticality::Filtered);
+    let hostile = hostile_count.load(Ordering::Relaxed);
+    let suspicious = suspicious_count.load(Ordering::Relaxed);
+    let benign = benign_count.load(Ordering::Relaxed);
+    let errors = error_count.load(Ordering::Relaxed);
+    let summary = ScanSummary {
+        total_files: total_files.get().copied().unwrap_or(hostile + suspicious + benign + errors),
+        hostile,
+        suspicious,
+        benign,
+        errors,
+        duration_ms: scan_start.elapsed().as_millis() as u64,
+    };
+
+    if is_terminal {
+        crate::output::print_summary(&summary);
     }
 
-    #[test]
-    fn test_parse_criticality() {
-        assert_eq!(parse_criticality("hostile").unwrap(), Criticality::Hostile);
-        assert_eq!(parse_criticality("HOSTILE").unwrap(), Criticality::Hostile);
-        assert_eq!(parse_criticality("Suspicious").unwrap(), Criticality::Suspicious);
-        assert_eq!(parse_criticality("notable").unwrap(), Criticality::Notable);
-        assert_eq!(parse_criticality("baseline").unwrap(), Criticality::Baseline);
-        assert_eq!(parse_criticality("filtered").unwrap(), Criticality::Filtered);
+    Ok(summary)
+}
 
-        assert!(parse_criticality("invalid").is_err());
-        assert!(parse_criticality("").is_err());
+/// Emit a scan result to the appropriate output channel.
+fn emit_result(r: &ScanResult, config: &ScanConfig, show_progress: bool, stdout: &Mutex<std::io::Stdout>) {
+    match config.format {
+        OutputFormat::Terminal => {
+            crate::output::print_file_result_streaming(r, show_progress, config.verbose);
+        }
+        OutputFormat::Json => {
+            if let Ok(line) = serde_json::to_string(r) {
+                let mut out = stdout.lock().unwrap();
+                let _ = writeln!(out, "{line}");
+            }
+        }
+    }
+}
+
+/// Apply litmus model inference to a cleave report. Always returns a ScanResult
+/// (even for benign); the caller decides whether to display it.
+fn process_report(
+    path: &Path,
+    mut report: cleave::AnalysisReport,
+    ctx: &ExtractContext,
+    model: &Model,
+    shap: Option<&ShapImportance>,
+    config: &ScanConfig,
+) -> Result<ScanResult> {
+    // Compute formula before finalize (formula_from_report reads root-level findings).
+    let formula = cleave::formula_from_report(&report);
+
+    // Finalize moves all data into files[0], matching the structure the model was
+    // trained on (collimator processes finalized cleave output). Without this,
+    // primary_file() returns Null and the entire feature vector is zeros.
+    report.finalize();
+
+    let report_json = serde_json::to_value(&report).context("serializing cleave report")?;
+    let mut features = ctx.extract(&report_json);
+    model.spec.standardize(&mut features);
+    let (probability, classification) = model.predict(&features)?;
+
+    let finding_counts = count_findings_from_json(&report_json);
+
+    // Only compute expensive extras for non-benign files.
+    let (reasons, top_findings) = if classification != Classification::Benign {
+        let r = shap
+            .map(|s| s.explain(&features, &model.spec.feature_names, 5))
+            .unwrap_or_default();
+        let f = extract_top_findings_from_json(&report_json, &classification);
+        (r, f)
+    } else {
+        (vec![], vec![])
+    };
+
+    let pf = report_json["files"]
+        .as_array()
+        .and_then(|a| a.first())
+        .unwrap_or(&report_json);
+    let file_type = pf["file_type"].as_str().unwrap_or("unknown").to_string();
+    let size_bytes = pf["size"].as_u64().unwrap_or(0);
+    let sha256 = pf["sha256"].as_str().unwrap_or("").to_string();
+
+    let cleave_json = match config.format {
+        OutputFormat::Json => Some(report_json),
+        OutputFormat::Terminal => None,
+    };
+
+    Ok(ScanResult {
+        path: path.display().to_string(),
+        classification,
+        probability,
+        thresholds: Thresholds {
+            hostile: config.threshold_hostile,
+            suspicious: config.threshold_suspicious,
+        },
+        finding_counts,
+        formula,
+        reasons,
+        top_findings,
+        file_type,
+        size_bytes,
+        sha256,
+        cleave: cleave_json,
+        pids: None,
+        deleted: None,
+    })
+}
+
+/// Count cleave findings by criticality level.
+pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
+    let findings = report["findings"]
+        .as_array()
+        .or_else(|| {
+            report["files"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|f| f["findings"].as_array())
+        });
+
+    let Some(findings) = findings else {
+        return FindingCounts::default();
+    };
+
+    let mut counts = FindingCounts::default();
+    for f in findings {
+        match f["crit"].as_str().unwrap_or("baseline") {
+            "hostile" => counts.hostile += 1,
+            "suspicious" => counts.suspicious += 1,
+            "notable" => counts.notable += 1,
+            _ => counts.baseline += 1,
+        }
+    }
+    counts
+}
+
+/// Analyze a single file end-to-end (cleave + litmus model).
+fn analyze_single(
+    path: &Path,
+    cleave_opts: &cleave::AnalysisOptions,
+    ctx: &ExtractContext,
+    model: &Model,
+    shap: Option<&ShapImportance>,
+    config: &ScanConfig,
+) -> Result<ScanResult> {
+    let report = cleave::analyze_file(path, cleave_opts)
+        .with_context(|| format!("cleave analysis of {}", path.display()))?;
+    process_report(path, report, ctx, model, shap, config)
+}
+
+/// Extract top findings at the highest criticality level present.
+pub fn extract_top_findings_from_json(
+    report: &serde_json::Value,
+    classification: &Classification,
+) -> Vec<TopFinding> {
+    let findings = report["findings"]
+        .as_array()
+        .or_else(|| {
+            report["files"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|f| f["findings"].as_array())
+        })
+        .cloned()
+        .unwrap_or_default();
+
+    let min_crit = match classification {
+        Classification::Hostile => "hostile",
+        Classification::Suspicious => "suspicious",
+        Classification::Benign => "baseline",
+    };
+
+    let mut relevant: Vec<TopFinding> = findings
+        .iter()
+        .filter(|f| {
+            let crit = f["crit"].as_str().unwrap_or("baseline");
+            crit_ordinal(crit) >= crit_ordinal(min_crit)
+        })
+        .map(|f| TopFinding {
+            id: f["id"].as_str().unwrap_or("").to_string(),
+            crit: f["crit"].as_str().unwrap_or("baseline").to_string(),
+            desc: f["desc"].as_str().unwrap_or("").to_string(),
+        })
+        .collect();
+
+    // Fall back to suspicious if no hostile findings.
+    if relevant.is_empty() && min_crit == "hostile" {
+        relevant = findings
+            .iter()
+            .filter(|f| crit_ordinal(f["crit"].as_str().unwrap_or("baseline")) >= 4)
+            .map(|f| TopFinding {
+                id: f["id"].as_str().unwrap_or("").to_string(),
+                crit: f["crit"].as_str().unwrap_or("baseline").to_string(),
+                desc: f["desc"].as_str().unwrap_or("").to_string(),
+            })
+            .collect();
+    }
+
+    // Deduplicate by base ID.
+    let mut seen = std::collections::HashSet::new();
+    relevant.retain(|f| {
+        let base = f.id.split("::").next().unwrap_or(&f.id);
+        seen.insert(base.to_string())
+    });
+
+    relevant.sort_by(|a, b| crit_ordinal(&b.crit).cmp(&crit_ordinal(&a.crit)));
+    relevant.truncate(5);
+    relevant
+}
+
+fn crit_ordinal(crit: &str) -> u32 {
+    match crit {
+        "filtered" => 0,
+        "component" => 1,
+        "baseline" => 2,
+        "notable" => 3,
+        "suspicious" => 4,
+        "hostile" => 5,
+        _ => 2,
     }
 }
