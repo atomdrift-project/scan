@@ -32,11 +32,9 @@ log "Installing build dependencies"
 doas bastille pkg "$BUILD" install -y rust sccache git
 
 log "Copying source trees to build jail"
-doas bastille cmd "$BUILD" rm -rf /home/litmus/litmus /home/litmus/cleave /home/litmus/proclist
+doas bastille cmd "$BUILD" rm -rf /home/litmus/litmus
 doas bastille cp "$BUILD" . /home/litmus/litmus
-doas bastille cp "$BUILD" ../cleave /home/litmus/cleave
-doas bastille cp "$BUILD" ../proclist /home/litmus/proclist
-doas bastille cmd "$BUILD" chown -R litmus:litmus /home/litmus/litmus /home/litmus/cleave /home/litmus/proclist
+doas bastille cmd "$BUILD" chown -R litmus:litmus /home/litmus/litmus
 
 log "Building tarball"
 doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache make tarball"
