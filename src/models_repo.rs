@@ -29,7 +29,7 @@ pub fn resolve_and_ensure() -> PathBuf {
     if let Ok(explicit) = std::env::var("LITMUS_MODELS_DIR") {
         let p = PathBuf::from(&explicit);
         if p.is_dir() {
-            log::debug!("Using models from LITMUS_MODELS_DIR={}", p.display());
+            tracing::debug!("Using models from LITMUS_MODELS_DIR={}", p.display());
             return p;
         }
         eprintln!("Error: LITMUS_MODELS_DIR={explicit} does not exist");
@@ -38,7 +38,7 @@ pub fn resolve_and_ensure() -> PathBuf {
 
     let data_dir = default_models_dir();
     if has_models(&data_dir) {
-        log::debug!("Using models from {}", data_dir.display());
+        tracing::debug!("Using models from {}", data_dir.display());
         check_staleness(&data_dir);
         return data_dir;
     }

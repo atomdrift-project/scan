@@ -131,7 +131,7 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
                 match sha256_proc_exe(first_pid) {
                     Ok(h) => h,
                     Err(e) => {
-                        log::warn!("cannot hash deleted binary {} (pid {}): {e}", path.display(), first_pid);
+                        tracing::warn!("cannot hash deleted binary {} (pid {}): {e}", path.display(), first_pid);
                         hash_errors += 1;
                         continue;
                     }
@@ -139,7 +139,7 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                log::warn!("cannot hash deleted binary: {}", path.display());
+                tracing::warn!("cannot hash deleted binary: {}", path.display());
                 hash_errors += 1;
                 continue;
             }
@@ -147,7 +147,7 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
             match sha256_file(&path) {
                 Ok(h) => h,
                 Err(e) => {
-                    log::warn!("cannot hash {}: {e}", path.display());
+                    tracing::warn!("cannot hash {}: {e}", path.display());
                     hash_errors += 1;
                     continue;
                 }
@@ -213,7 +213,7 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                log::warn!(
+                tracing::warn!(
                     "deleted binary not scannable: {} (pids: {:?})",
                     group.path.display(),
                     group.pids
@@ -228,7 +228,7 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
         let report = match cleave::analyze_file(&scan_path, &cleave_opts) {
             Ok(r) => r,
             Err(e) => {
-                log::warn!("error analyzing {}: {e}", group.path.display());
+                tracing::warn!("error analyzing {}: {e}", group.path.display());
                 errors += 1;
                 continue;
             }
@@ -246,7 +246,7 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
                 }
             }
             Err(e) => {
-                log::warn!("error processing {}: {e}", group.path.display());
+                tracing::warn!("error processing {}: {e}", group.path.display());
                 errors += 1;
             }
         }

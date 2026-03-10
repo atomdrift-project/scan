@@ -20,13 +20,14 @@ colored = "2"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
 tower = { version = "0.5", features = ["limit"] }
-tower-http = { version = "0.6", features = ["limit"] }
+tower-http = { version = "0.6" }
 tempfile = "3"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-log = "0.4"
-env_logger = "0.11"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -88,7 +88,7 @@ impl FeatureSpec {
 
         let version = v["version"].as_u64().unwrap_or(12) as u32;
         if version < 12 {
-            log::warn!(
+            tracing::warn!(
                 "feature spec version {} (expected 12); models trained with older collimator are not compatible",
                 version,
             );

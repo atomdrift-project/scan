@@ -27,7 +27,7 @@ pub(super) async fn health() -> Json<serde_json::Value> {
 pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
     // Prevent concurrent reloads — each load allocates significant memory.
     let Ok(_guard) = state.reload_lock.try_lock() else {
-        log::warn!("reload rejected: already in progress");
+        tracing::warn!("reload rejected: already in progress");
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "Reload already in progress"})),
@@ -57,7 +57,7 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
             match state.resources.write() {
                 Ok(mut lock) => {
                     *lock = Arc::new(super::ModelResources { model, shap, ctx });
-                    log::info!("model reloaded in {elapsed_ms}ms");
+                    tracing::info!("model reloaded in {elapsed_ms}ms");
                     Json(serde_json::json!({
                         "status": "ok",
                         "elapsed_ms": elapsed_ms,
@@ -65,7 +65,7 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
                     .into_response()
                 }
                 Err(e) => {
-                    log::error!("write lock poisoned during reload: {e}");
+                    tracing::error!("write lock poisoned during reload: {e}");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": "Internal error"})),
@@ -76,7 +76,7 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
         }
         Ok(Err(e)) => {
             // Log internally but do not expose filesystem paths or model internals to callers.
-            log::warn!("reload failed (previous model retained) in {elapsed_ms}ms: {e}");
+            tracing::warn!("reload failed (previous model retained) in {elapsed_ms}ms: {e}");
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({
@@ -87,7 +87,7 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
                 .into_response()
         }
         Err(e) => {
-            log::warn!("reload task join error: {e}");
+            tracing::warn!("reload task join error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
@@ -105,7 +105,7 @@ pub(super) async fn analyze(
     let request_id = state.next_request_id();
     let request_start = Instant::now();
 
-    log::info!("--> POST /analyze  id={request_id}");
+    tracing::info!("--> POST /analyze  id={request_id}");
 
     if let Some(response) = check_memory_pressure(&state) {
         return response;
@@ -115,7 +115,7 @@ pub(super) async fn analyze(
     let mut field = match multipart.next_field().await {
         Ok(Some(f)) => f,
         Ok(None) => {
-            log::warn!("bad request: no file field  id={request_id}");
+            tracing::warn!("bad request: no file field  id={request_id}");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "No file field in request"})),
@@ -123,7 +123,7 @@ pub(super) async fn analyze(
                 .into_response();
         }
         Err(e) => {
-            log::warn!("failed to parse multipart: {e}  id={request_id}");
+            tracing::warn!("failed to parse multipart: {e}  id={request_id}");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "Invalid multipart data"})),
@@ -143,7 +143,7 @@ pub(super) async fn analyze(
     let temp_file = match tokio::task::spawn_blocking(NamedTempFile::new).await {
         Ok(Ok(f)) => f,
         Ok(Err(e)) => {
-            log::warn!("failed to create temp file: {e}  id={request_id}");
+            tracing::warn!("failed to create temp file: {e}  id={request_id}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
@@ -151,7 +151,7 @@ pub(super) async fn analyze(
                 .into_response();
         }
         Err(e) => {
-            log::warn!("temp file task join error: {e}  id={request_id}");
+            tracing::warn!("temp file task join error: {e}  id={request_id}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
@@ -165,7 +165,7 @@ pub(super) async fn analyze(
     let mut tokio_file = match tokio::fs::File::create(&path).await {
         Ok(f) => f,
         Err(e) => {
-            log::warn!("failed to open temp file for writing: {e}  id={request_id}");
+            tracing::warn!("failed to open temp file for writing: {e}  id={request_id}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
@@ -181,7 +181,7 @@ pub(super) async fn analyze(
                 file_size += chunk.len();
                 if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut tokio_file, &chunk).await
                 {
-                    log::warn!("failed to write chunk: {e}  id={request_id}");
+                    tracing::warn!("failed to write chunk: {e}  id={request_id}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": "Failed to save file data"})),
@@ -192,7 +192,7 @@ pub(super) async fn analyze(
             Ok(Some(_)) => continue,
             Ok(None) => break,
             Err(e) => {
-                log::warn!("error reading multipart chunk: {e}  id={request_id}");
+                tracing::warn!("error reading multipart chunk: {e}  id={request_id}");
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"error": "Error reading upload data"})),
@@ -203,7 +203,7 @@ pub(super) async fn analyze(
     }
 
     if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut tokio_file).await {
-        log::warn!("failed to flush temp file: {e}  id={request_id}");
+        tracing::warn!("failed to flush temp file: {e}  id={request_id}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "Failed to save file data"})),
@@ -213,7 +213,7 @@ pub(super) async fn analyze(
     drop(tokio_file);
 
     if file_size == 0 {
-        log::warn!("bad request: empty file  id={request_id}");
+        tracing::warn!("bad request: empty file  id={request_id}");
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Empty file"})),
@@ -221,13 +221,13 @@ pub(super) async fn analyze(
             .into_response();
     }
 
-    log::info!("starting analysis: filename={filename:?} size={file_size}  id={request_id}");
+    tracing::info!("starting analysis: filename={filename:?} size={file_size}  id={request_id}");
 
     // Snapshot the current model resources (Arc clone, no lock held during analysis).
     let resources = match state.resources.read() {
         Ok(lock) => Arc::clone(&*lock),
         Err(e) => {
-            log::error!("read lock poisoned: {e}");
+            tracing::error!("read lock poisoned: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
@@ -258,7 +258,7 @@ pub(super) async fn analyze(
 
             match join_result {
                 Ok(Ok(scan_result)) => {
-                    log::info!(
+                    tracing::info!(
                         "<-- 200 OK  id={request_id} filename={filename:?} size={file_size} \
                          elapsed_ms={elapsed_ms} classification={}",
                         scan_result.classification,
@@ -266,7 +266,7 @@ pub(super) async fn analyze(
                     Json(scan_result).into_response()
                 }
                 Ok(Err(e)) => {
-                    log::warn!(
+                    tracing::warn!(
                         "<-- 500 analysis failed  id={request_id} elapsed_ms={elapsed_ms}: {e}"
                     );
                     (
@@ -276,7 +276,7 @@ pub(super) async fn analyze(
                         .into_response()
                 }
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "<-- 500 task join error  id={request_id} elapsed_ms={elapsed_ms}: {e}"
                     );
                     (
@@ -291,7 +291,7 @@ pub(super) async fn analyze(
             // On timeout the blocking task keeps running; watch it to decrement the
             // counter and drop the temp file when it eventually finishes.
             let active = state.active_tasks.load(std::sync::atomic::Ordering::Relaxed);
-            log::warn!(
+            tracing::warn!(
                 "analysis timed out after {}s  id={request_id} filename={filename:?} active={active}",
                 state.timeout_secs,
             );
@@ -396,7 +396,7 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
             // Happy path: reset overload timer if set.
             if let Ok(mut overloaded) = state.overloaded_since.try_lock() {
                 if overloaded.is_some() {
-                    log::info!("memory recovered: rss={}MB", rss / 1024 / 1024);
+                    tracing::info!("memory recovered: rss={}MB", rss / 1024 / 1024);
                     *overloaded = None;
                 }
             }
@@ -409,14 +409,14 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
         let overloaded_secs = since.elapsed().as_secs();
 
         if overloaded_secs > 30 {
-            log::error!(
+            tracing::error!(
                 "memory overload persisted >30s (rss={}MB), terminating",
                 rss / 1024 / 1024
             );
             std::process::exit(1);
         }
 
-        log::warn!(
+        tracing::warn!(
             "server overloaded: rss={}MB max={}MB overloaded_secs={overloaded_secs}",
             rss / 1024 / 1024,
             state.max_rss_bytes / 1024 / 1024,

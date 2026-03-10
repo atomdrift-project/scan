@@ -22,6 +22,10 @@ enum Show {
 #[command(version)]
 #[command(about = "Malware classification powered by ML + static analysis")]
 struct Cli {
+    /// Enable debug logging for litmus and cleave
+    #[arg(long)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -144,14 +148,21 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format_timestamp(None)
+    let cli = Cli::parse();
+
+    let filter = if cli.verbose {
+        tracing_subscriber::EnvFilter::new("warn,litmus=debug,cleave=debug")
+    } else {
+        tracing_subscriber::EnvFilter::new("warn")
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .without_time()
         .init();
 
     #[cfg(debug_assertions)]
-    log::warn!("DEBUG binary — litmus will be very slow; use `make release` for production builds");
-
-    let cli = Cli::parse();
+    tracing::warn!("DEBUG binary — litmus will be very slow; use `make release` for production builds");
 
     match cli.command {
         Commands::Scan {
@@ -242,6 +253,7 @@ fn main() -> Result<()> {
                 threshold_hostile,
                 slow_rule_ms,
             };
+            eprintln!("Starting litmus server on http://{} ...", bind);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?

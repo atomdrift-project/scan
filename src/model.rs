@@ -90,11 +90,11 @@ impl Model {
             .commit_from_file(&onnx_path)
             .map_err(|e| anyhow::anyhow!("loading ONNX model from {}: {e}", onnx_path.display()))?;
 
-        log::info!(
-            "loaded model: {} features, thresholds: suspicious={}, hostile={}",
-            spec.total_features,
-            thresholds.suspicious,
-            thresholds.hostile,
+        tracing::info!(
+            features = spec.total_features,
+            threshold_suspicious = thresholds.suspicious,
+            threshold_hostile = thresholds.hostile,
+            "model loaded",
         );
 
         Ok(Self {

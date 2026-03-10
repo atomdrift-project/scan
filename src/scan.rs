@@ -262,7 +262,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                 }
             }
             Err(e) => {
-                log::warn!("error analyzing {}: {}", path.display(), e);
+                tracing::warn!("error analyzing {}: {}", path.display(), e);
                 errors += 1;
             }
         }
@@ -333,7 +333,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                     }
                 }
                 Err(e) => {
-                    log::warn!("error analyzing {}: {}", file_path.display(), e);
+                    tracing::warn!("error analyzing {}: {}", file_path.display(), e);
                     error_count.fetch_add(1, Ordering::Relaxed);
                 }
             }

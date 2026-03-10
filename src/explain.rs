@@ -48,7 +48,7 @@ impl ShapImportance {
             })
             .unwrap_or_default();
 
-        log::info!("loaded {} SHAP importance features", features.len());
+        tracing::info!("loaded {} SHAP importance features", features.len());
         Ok(Self { features })
     }
 

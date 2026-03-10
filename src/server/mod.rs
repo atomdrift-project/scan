@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::signal;
 use tower::limit::ConcurrencyLimitLayer;
-use tower_http::limit::RequestBodyLimitLayer;
+use axum::extract::DefaultBodyLimit;
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
@@ -109,27 +109,45 @@ impl AppState {
 
 /// Start the HTTP server. Blocks until SIGINT or SIGTERM.
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
-    eprintln!("Loading model from {}...", config.model_dir.display());
+    tracing::info!(model_dir = %config.model_dir.display(), "loading resources");
 
     let thresholds = Thresholds {
         suspicious: config.threshold_suspicious,
         hostile: config.threshold_hostile,
     };
 
-    let model = Model::load(&config.model_dir, thresholds)?;
-    let shap = ShapImportance::load(&config.model_dir).ok();
-    let ctx = ExtractContext::new(&model.spec);
-
-    // Warm up cleave's lazy-initialised YARA rules and capability mapper so
-    // the first real request doesn't pay the cold-start cost.
-    eprintln!("Warming up cleave (loading YARA rules and capability mapper)...");
+    // Load the ONNX model and warm up YARA/capability-mapper in parallel so
+    // startup is not serialised on the slower of the two.
+    let model_dir_for_model = config.model_dir.clone();
+    let model_dir_for_shap = config.model_dir.clone();
     let slow_rule_ms = config.slow_rule_ms;
-    tokio::task::spawn_blocking(move || {
+
+    let model_task = tokio::task::spawn_blocking(move || -> anyhow::Result<(Model, ExtractContext)> {
+        let t = Instant::now();
+        tracing::debug!("loading ONNX model and feature spec...");
+        let model = Model::load(&model_dir_for_model, thresholds)?;
+        let ctx = ExtractContext::new(&model.spec);
+        tracing::info!(elapsed_ms = t.elapsed().as_millis(), "ONNX model loaded");
+        Ok((model, ctx))
+    });
+
+    let warmup_task = tokio::task::spawn_blocking(move || {
+        let t = Instant::now();
+        tracing::debug!("warming up YARA rules and capability mapper...");
         let opts = cleave::AnalysisOptions { slow_rule_ms, ..Default::default() };
         let _ = cleave::analyze_file(std::path::Path::new("/dev/null"), &opts);
-    })
-    .await?;
-    eprintln!("Resources loaded");
+        tracing::info!(elapsed_ms = t.elapsed().as_millis(), "YARA warmup complete");
+    });
+
+    let shap_task = tokio::task::spawn_blocking(move || {
+        tracing::debug!("loading SHAP importance data...");
+        ShapImportance::load(&model_dir_for_shap).ok()
+    });
+
+    let (model_result, _, shap) = tokio::try_join!(model_task, warmup_task, shap_task)?;
+    let (model, ctx) = model_result?;
+
+    tracing::info!("all resources loaded");
 
     let state = Arc::new(AppState {
         timeout_secs: config.timeout_secs,
@@ -149,7 +167,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .map(std::num::NonZero::get)
         .unwrap_or(4)
         * 2;
-    eprintln!("Max concurrent analyses: {max_concurrent}");
+    tracing::debug!(max_concurrent, "concurrency limit set");
 
     let analysis_routes = Router::new()
         .route("/analyze", post(handlers::analyze))
@@ -159,30 +177,36 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .route("/health", get(handlers::health))
         .route("/reload", post(handlers::reload))
         .merge(analysis_routes)
-        .layer(RequestBodyLimitLayer::new(config.max_body_size))
+        .layer(DefaultBodyLimit::max(config.max_body_size))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     eprintln!(
-        "Listening on http://{} (timeout: {}s, max size: {} MB)",
+        "Listening on http://{} (timeout: {}s, max size: {} MB) — Press Ctrl+C to stop",
         config.bind,
         config.timeout_secs,
         config.max_body_size / 1024 / 1024,
     );
-    eprintln!("Press Ctrl+C to stop");
+    tracing::info!(
+        bind = %config.bind,
+        timeout_secs = config.timeout_secs,
+        max_body_mb = config.max_body_size / 1024 / 1024,
+        max_concurrent,
+        "server ready",
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    eprintln!("Server shut down");
+    tracing::info!("server shut down");
     Ok(())
 }
 
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = signal::ctrl_c().await {
-            log::warn!("failed to install Ctrl+C handler: {e}");
+            tracing::warn!("failed to install Ctrl+C handler: {e}");
             std::future::pending::<()>().await;
         }
     };
@@ -194,7 +218,7 @@ async fn shutdown_signal() {
                 sig.recv().await;
             }
             Err(e) => {
-                log::warn!("failed to install SIGTERM handler: {e}");
+                tracing::warn!("failed to install SIGTERM handler: {e}");
                 std::future::pending::<()>().await;
             }
         }
@@ -204,7 +228,7 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => log::info!("received SIGINT"),
-        _ = terminate => log::info!("received SIGTERM"),
+        _ = ctrl_c => tracing::info!("received SIGINT"),
+        _ = terminate => tracing::info!("received SIGTERM"),
     }
 }
