@@ -29,7 +29,7 @@ doas bastille cmd "$BUILD" id -u litmus >/dev/null 2>&1 || \
     doas bastille cmd "$BUILD" pw useradd litmus -m -s /bin/sh -c "Litmus Build"
 
 log "Installing build dependencies"
-doas bastille pkg "$BUILD" install -y rust sccache git
+doas bastille pkg "$BUILD" install -y rust sccache git pkgconf onnxruntime
 
 log "Syncing source to build jail (preserving target/)"
 doas bastille cmd "$BUILD" mkdir -p /home/litmus/litmus
@@ -84,7 +84,7 @@ load_rc_config $name
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-c -f -P ${pidfile} -r -o ${litmus_logfile} -u litmus env LD_PRELOAD=/usr/local/lib/libonnxruntime_providers_shared.so ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so /usr/local/share/litmus/litmus --verbose serve --bind 0.0.0.0:8081"
+command_args="-c -f -P ${pidfile} -r -o ${litmus_logfile} -u litmus /usr/local/share/litmus/litmus --verbose serve --bind 0.0.0.0:8081"
 
 run_rc_command "$1"
 EOF
