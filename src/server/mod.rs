@@ -62,6 +62,17 @@ impl Default for ServerConfig {
     }
 }
 
+/// Metadata for a request currently in the analysis pipeline.
+#[derive(Debug)]
+pub struct InFlightRequest {
+    /// Original upload filename.
+    pub name: String,
+    /// File size in bytes.
+    pub size_bytes: u64,
+    /// When analysis began (after upload completed).
+    pub started_at: Instant,
+}
+
 /// Loaded model resources; swapped atomically on /reload.
 #[derive(Debug)]
 pub struct ModelResources {
@@ -99,6 +110,8 @@ pub struct AppState {
     pub reload_lock: tokio::sync::Mutex<()>,
     /// Tracks when the server first entered a memory-overloaded state.
     pub overloaded_since: std::sync::Mutex<Option<Instant>>,
+    /// Currently in-flight analysis requests, keyed by request ID.
+    pub in_flight: dashmap::DashMap<u64, InFlightRequest>,
 }
 
 impl AppState {
@@ -161,6 +174,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         active_tasks: AtomicUsize::new(0),
         reload_lock: tokio::sync::Mutex::new(()),
         overloaded_since: std::sync::Mutex::new(None),
+        in_flight: dashmap::DashMap::new(),
     });
 
     let max_concurrent = std::thread::available_parallelism()
@@ -174,8 +188,11 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .layer(ConcurrencyLimitLayer::new(max_concurrent));
 
     let app = Router::new()
-        .route("/health", get(handlers::health))
-        .route("/reload", post(handlers::reload))
+        .route("/_/health", get(handlers::health))
+        .route("/_/reload", post(handlers::reload))
+        .route("/_/memory", get(handlers::memory_stats))
+        .route("/_/requests", get(handlers::requests))
+        .route("/_/threads", get(handlers::threads))
         .merge(analysis_routes)
         .layer(DefaultBodyLimit::max(config.max_body_size))
         .with_state(state);

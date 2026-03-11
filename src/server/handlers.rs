@@ -4,6 +4,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
@@ -16,9 +17,36 @@ use crate::scan::{
     Thresholds as ScanThresholds,
 };
 
-/// GET /health
-pub(super) async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok"}))
+/// GET /_/health — liveness check with memory and concurrency status.
+/// Returns 503 when RSS exceeds the configured limit.
+pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let rss_mb = cleave::memory_tracker::current_rss().map(|b| b / 1024 / 1024);
+    let active_tasks = state.active_tasks.load(std::sync::atomic::Ordering::Relaxed);
+    let overloaded = rss_mb
+        .map(|mb| mb * 1024 * 1024 > state.max_rss_bytes)
+        .unwrap_or(false);
+
+    if overloaded {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "degraded",
+                "reason": "memory_pressure",
+                "rss_mb": rss_mb,
+                "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
+                "active_tasks": active_tasks,
+                "rayon_threads": rayon::current_num_threads(),
+            })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "status": "ok",
+        "rss_mb": rss_mb,
+        "active_tasks": active_tasks,
+        "rayon_threads": rayon::current_num_threads(),
+    }))
+    .into_response()
 }
 
 /// POST /reload — reload model from disk, swap atomically.
@@ -238,6 +266,14 @@ pub(super) async fn analyze(
 
     let timeout_duration = Duration::from_secs(state.timeout_secs);
     state.active_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.in_flight.insert(
+        request_id,
+        super::InFlightRequest {
+            name: filename.clone(),
+            size_bytes: file_size as u64,
+            started_at: Instant::now(),
+        },
+    );
     let slow_rule_ms = state.slow_rule_ms;
     let filename_for_closure = filename.clone();
 
@@ -254,6 +290,7 @@ pub(super) async fn analyze(
     match result {
         Ok(join_result) => {
             state.active_tasks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            state.in_flight.remove(&request_id);
             drop(temp_file);
 
             match join_result {
@@ -301,6 +338,7 @@ pub(super) async fn analyze(
                 orphan_state
                     .active_tasks
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                orphan_state.in_flight.remove(&request_id);
                 drop(temp_file);
             });
             (
@@ -380,66 +418,238 @@ fn classify_file(
 }
 
 /// Check RSS memory pressure. Returns a 503 response if the server is overloaded,
-/// or `None` if memory is within limits. Linux-only; always returns `None` on other platforms.
+/// or `None` if memory is within limits or RSS is unavailable on this platform.
 fn check_memory_pressure(state: &AppState) -> Option<Response> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = state;
-        None
-    }
+    let rss = cleave::memory_tracker::current_rss()?;
 
-    #[cfg(target_os = "linux")]
-    {
-        let rss = current_rss_linux()?;
-
-        if rss <= state.max_rss_bytes {
-            // Happy path: reset overload timer if set.
-            if let Ok(mut overloaded) = state.overloaded_since.try_lock() {
-                if overloaded.is_some() {
-                    tracing::info!("memory recovered: rss={}MB", rss / 1024 / 1024);
-                    *overloaded = None;
-                }
+    if rss <= state.max_rss_bytes {
+        // Happy path: reset overload timer if set.
+        if let Ok(mut overloaded) = state.overloaded_since.try_lock() {
+            if overloaded.is_some() {
+                tracing::info!("memory recovered: rss={}MB", rss / 1024 / 1024);
+                *overloaded = None;
             }
-            return None;
         }
-
-        // Memory pressure: update overload timer.
-        let mut overloaded = state.overloaded_since.lock().ok()?;
-        let since = *overloaded.get_or_insert_with(Instant::now);
-        let overloaded_secs = since.elapsed().as_secs();
-
-        if overloaded_secs > 30 {
-            tracing::error!(
-                "memory overload persisted >30s (rss={}MB), terminating",
-                rss / 1024 / 1024
-            );
-            std::process::exit(1);
-        }
-
-        tracing::warn!(
-            "server overloaded: rss={}MB max={}MB overloaded_secs={overloaded_secs}",
-            rss / 1024 / 1024,
-            state.max_rss_bytes / 1024 / 1024,
-        );
-        Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Server overloaded (memory)"})),
-            )
-                .into_response(),
-        )
+        return None;
     }
+
+    // Memory pressure: update overload timer.
+    let mut overloaded = state.overloaded_since.lock().ok()?;
+    let since = *overloaded.get_or_insert_with(Instant::now);
+    let overloaded_secs = since.elapsed().as_secs();
+
+    if overloaded_secs > 30 {
+        tracing::error!(
+            "memory overload persisted >30s (rss={}MB), terminating",
+            rss / 1024 / 1024
+        );
+        std::process::exit(1);
+    }
+
+    tracing::warn!(
+        "server overloaded: rss={}MB max={}MB overloaded_secs={overloaded_secs}",
+        rss / 1024 / 1024,
+        state.max_rss_bytes / 1024 / 1024,
+    );
+    Some(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Server overloaded (memory)"})),
+        )
+            .into_response(),
+    )
+}
+
+/// GET /_/memory — memory diagnostics for all major structures.
+///
+/// `process.jemalloc` is null unless cleave was built with `--features jemalloc`.
+/// When available, `jemalloc.allocated_mb` is the most useful leak indicator:
+/// if it tracks RSS closely, you have a real leak; if RSS >> allocated, it's fragmentation.
+pub(super) async fn memory_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let rss_mb = cleave::memory_tracker::current_rss().map(|b| b / 1024 / 1024);
+
+    let jemalloc = cleave::memory_tracker::jemalloc_stats().map(|s| {
+        serde_json::json!({
+            "allocated_mb":     s.allocated / 1024 / 1024,
+            "active_mb":        s.active    / 1024 / 1024,
+            "metadata_mb":      s.metadata  / 1024 / 1024,
+            "resident_mb":      s.resident  / 1024 / 1024,
+            "retained_mb":      s.retained  / 1024 / 1024,
+            "fragmentation_mb": s.active.saturating_sub(s.allocated) / 1024 / 1024,
+        })
+    });
+
+    Json(serde_json::json!({
+        "process": {
+            "rss_mb": rss_mb,
+            "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
+            "jemalloc": jemalloc,
+        },
+        "server": {
+            "active_tasks": state.active_tasks.load(Ordering::Relaxed),
+            "requests_total": state.next_request_id.load(Ordering::Relaxed),
+        },
+        "thread_pools": {
+            "rayon_threads": rayon::current_num_threads(),
+        },
+    }))
+}
+
+/// GET /_/requests — all analyses currently in flight, sorted by elapsed time descending.
+pub(super) async fn requests(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let now = Instant::now();
+    let mut entries: Vec<serde_json::Value> = state
+        .in_flight
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "request_id": e.key(),
+                "name": e.name,
+                "size_bytes": e.size_bytes,
+                "elapsed_ms": now.duration_since(e.started_at).as_millis(),
+            })
+        })
+        .collect();
+
+    entries.sort_by(|a, b| b["elapsed_ms"].as_u64().cmp(&a["elapsed_ms"].as_u64()));
+
+    Json(serde_json::json!({
+        "count": entries.len(),
+        "requests": entries,
+    }))
+}
+
+/// GET /_/threads — OS-level thread info for every thread in this process.
+///
+/// On Linux: thread name, state, and `wchan` (kernel function blocked in).
+/// `wchan` values to watch for: `futex_wait*` = mutex deadlock, `do_epoll_wait` = healthy async.
+/// On FreeBSD: equivalent via sysctl + kinfo_proc (`ki_wmesg` instead of wchan).
+pub(super) async fn threads() -> Json<serde_json::Value> {
+    let info = tokio::task::spawn_blocking(read_thread_info).await;
+    let info = info.unwrap_or_else(|_| serde_json::json!({"error": "failed to read thread info"}));
+    Json(info)
+}
+
+fn read_thread_info() -> serde_json::Value {
+    #[cfg(target_os = "linux")]
+    return read_thread_info_linux();
+
+    #[cfg(target_os = "freebsd")]
+    return read_thread_info_freebsd();
+
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    serde_json::json!({
+        "note": "detailed thread info only available on Linux and FreeBSD",
+        "rayon_threads": rayon::current_num_threads(),
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn current_rss_linux() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            // Format: "VmRSS:      123456 kB"
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb * 1024);
-        }
+fn read_thread_info_linux() -> serde_json::Value {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return serde_json::json!({"error": "cannot read /proc/self/task"});
+    };
+
+    let mut threads: Vec<serde_json::Value> = tasks
+        .flatten()
+        .filter_map(|entry| {
+            let base = entry.path();
+            let tid: u32 = entry.file_name().to_string_lossy().parse().ok()?;
+
+            let name = std::fs::read_to_string(base.join("comm"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+
+            let wchan = std::fs::read_to_string(base.join("wchan"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+
+            let mut state_str = String::new();
+            let mut vol_switches: u64 = 0;
+            let mut nonvol_switches: u64 = 0;
+            if let Ok(status) = std::fs::read_to_string(base.join("status")) {
+                for line in status.lines() {
+                    if let Some(val) = line.strip_prefix("State:\t") {
+                        state_str = val.to_string();
+                    } else if let Some(val) = line.strip_prefix("voluntary_ctxt_switches:\t") {
+                        vol_switches = val.trim().parse().unwrap_or(0);
+                    } else if let Some(val) = line.strip_prefix("nonvoluntary_ctxt_switches:\t") {
+                        nonvol_switches = val.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+
+            Some(serde_json::json!({
+                "tid": tid,
+                "name": name,
+                "state": state_str,
+                "wchan": wchan,
+                "voluntary_context_switches": vol_switches,
+                "nonvoluntary_context_switches": nonvol_switches,
+            }))
+        })
+        .collect();
+
+    threads.sort_by_key(|t| t["tid"].as_u64().unwrap_or(0));
+    serde_json::json!({"count": threads.len(), "threads": threads})
+}
+
+#[cfg(target_os = "freebsd")]
+fn read_thread_info_freebsd() -> serde_json::Value {
+    use std::mem;
+
+    let pid = unsafe { libc::getpid() };
+    let mib: [libc::c_int; 4] = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID | libc::KERN_PROC_INC_THREAD,
+        pid,
+    ];
+
+    let mut len: libc::size_t = 0;
+    let ret = unsafe {
+        libc::sysctl(mib.as_ptr(), 4, std::ptr::null_mut(), &mut len,
+                     std::ptr::null_mut(), 0)
+    };
+    if ret != 0 {
+        return serde_json::json!({"error": "sysctl size query failed"});
     }
-    None
+
+    len += len / 4; // 25% slack for new threads between calls
+    let count = len / mem::size_of::<libc::kinfo_proc>();
+    let mut procs: Vec<libc::kinfo_proc> =
+        (0..count).map(|_| unsafe { mem::zeroed() }).collect();
+    let mut actual_len = len;
+
+    let ret = unsafe {
+        libc::sysctl(mib.as_ptr(), 4, procs.as_mut_ptr().cast(), &mut actual_len,
+                     std::ptr::null_mut(), 0)
+    };
+    if ret != 0 {
+        return serde_json::json!({"error": "sysctl data query failed"});
+    }
+
+    procs.truncate(actual_len / mem::size_of::<libc::kinfo_proc>());
+
+    let c_str = |buf: &[libc::c_char]| {
+        let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let state_str = |s: libc::c_char| match s as u8 {
+        1 => "idle", 2 => "running", 3 => "sleeping",
+        4 => "stopped", 5 => "zombie", 6 => "waiting", 7 => "locked", _ => "unknown",
+    };
+
+    let mut threads: Vec<serde_json::Value> = procs
+        .iter()
+        .map(|p| serde_json::json!({
+            "tid": p.ki_tid,
+            "name": c_str(&p.ki_tdname),
+            "state": state_str(p.ki_stat),
+            "wchan": c_str(&p.ki_wmesg),
+        }))
+        .collect();
+
+    threads.sort_by_key(|t| t["tid"].as_u64().unwrap_or(0));
+    serde_json::json!({"count": threads.len(), "threads": threads})
 }

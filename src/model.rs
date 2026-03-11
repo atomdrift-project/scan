@@ -1,8 +1,7 @@
-//! ONNX model loading and inference.
+//! Model loading and inference.
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::sync::Mutex;
 
 use crate::features::FeatureSpec;
 
@@ -52,28 +51,19 @@ impl Thresholds {
 }
 
 /// Loaded model ready for inference.
-/// Session::run requires &mut self, so we wrap in Mutex for thread safety.
+#[derive(Debug)]
 pub struct Model {
-    session: Mutex<ort::session::Session>,
+    inner: xgboost_native::Model,
     /// Feature specification used to build input vectors.
     pub spec: FeatureSpec,
     /// Classification thresholds.
     pub thresholds: Thresholds,
 }
 
-impl std::fmt::Debug for Model {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Model")
-            .field("spec", &self.spec)
-            .field("thresholds", &self.thresholds)
-            .finish_non_exhaustive()
-    }
-}
-
 impl Model {
-    /// Load model from a directory containing model.onnx and feature_spec.json.
+    /// Load model from a directory containing model.json and feature_spec.json.
     pub fn load(model_dir: &Path, thresholds: Thresholds) -> Result<Self> {
-        let onnx_path = model_dir.join("model.onnx");
+        let model_path = model_dir.join("model.json");
         let spec_path = model_dir.join("feature_spec.json");
 
         tracing::debug!(path = %spec_path.display(), "loading feature spec");
@@ -81,23 +71,10 @@ impl Model {
             .with_context(|| format!("loading feature spec from {}", spec_path.display()))?;
         tracing::debug!(features = spec.total_features, "feature spec loaded");
 
-        tracing::debug!("creating ORT session builder");
-        let mut builder = ort::session::Session::builder()
-            .map_err(|e| anyhow::anyhow!("creating ONNX session builder: {e}"))?;
-        tracing::debug!("ORT session builder created");
-
-        builder = builder
-            .with_intra_threads(1)
-            .map_err(|e| anyhow::anyhow!("setting intra threads: {e}"))?
-            .with_inter_threads(1)
-            .map_err(|e| anyhow::anyhow!("setting inter threads: {e}"))?;
-        tracing::debug!("ORT thread config set (intra=1, inter=1)");
-
-        tracing::debug!(path = %onnx_path.display(), "loading ONNX model");
-        let session = builder
-            .commit_from_file(&onnx_path)
-            .map_err(|e| anyhow::anyhow!("loading ONNX model from {}: {e}", onnx_path.display()))?;
-        tracing::debug!("ONNX model committed");
+        tracing::debug!(path = %model_path.display(), "loading model");
+        let inner = xgboost_native::Model::load(&model_path)
+            .with_context(|| format!("loading model from {}", model_path.display()))?;
+        tracing::debug!("model loaded");
 
         tracing::info!(
             features = spec.total_features,
@@ -107,7 +84,7 @@ impl Model {
         );
 
         Ok(Self {
-            session: Mutex::new(session),
+            inner,
             spec,
             thresholds,
         })
@@ -115,27 +92,7 @@ impl Model {
 
     /// Run inference on a feature vector. Returns (probability, classification).
     pub fn predict(&self, features: &[f32]) -> Result<(f32, Classification)> {
-        let input = ort::value::Tensor::from_array(([1, features.len()], features.to_vec()))
-            .map_err(|e| anyhow::anyhow!("creating input tensor: {e}"))?;
-
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|e| anyhow::anyhow!("locking session: {e}"))?;
-
-        let outputs = session
-            .run(ort::inputs![input])
-            .map_err(|e| anyhow::anyhow!("running inference: {e}"))?;
-
-        // XGBoost ONNX: outputs[0] = label(i64), outputs[1] = probabilities(f32, [batch, 2])
-        let (_shape, data) = outputs
-            .get("probabilities")
-            .ok_or_else(|| anyhow::anyhow!("model has no 'probabilities' output"))?
-            .try_extract_tensor::<f32>()
-            .map_err(|e| anyhow::anyhow!("extracting probabilities tensor: {e}"))?;
-        // Shape [1, 2]: [benign_prob, malware_prob] — take class 1.
-        let probability = data.get(1).copied().unwrap_or(0.0);
-
+        let probability = self.inner.predict(features);
         Ok((probability, self.thresholds.classify(probability)))
     }
 }

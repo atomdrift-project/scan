@@ -1,35 +1,7 @@
-[package]
-name = "litmus"
-version = "0.2.0"
-edition = "2021"
-authors = ["The Atomdrift Project"]
-description = "ML-powered malware classification using cleave static analysis"
-license = "Apache-2.0"
+[workspace]
+resolver = "2"
 
-[dependencies]
-cleave = { git = "https://codeberg.org/atomdrift/cleave.git" }
-proclist = { git = "https://codeberg.org/atomdrift/proclist.git" }
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-dirs = "6.0"
-ort = { git = "https://github.com/tstromberg/ort.git", features = ["pkg-config"] }
-sha2 = "0.10"
-colored = "2"
-axum = { version = "0.8", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
-tower = { version = "0.5", features = ["limit"] }
-tower-http = { version = "0.6" }
-tempfile = "3"
-
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
 unused_must_use = "deny"
@@ -40,7 +12,7 @@ unreachable_pub = "warn"
 missing_debug_implementations = "warn"
 missing_docs = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 correctness = { level = "deny", priority = -1 }
 suspicious = { level = "deny", priority = -1 }
@@ -63,7 +35,42 @@ match_same_arms = "warn"
 redundant_closure_for_method_calls = "warn"
 manual_let_else = "warn"
 
-[dev-dependencies]
+[package]
+name = "litmus"
+version = "0.2.0"
+edition = "2021"
+authors = ["The Atomdrift Project"]
+description = "ML-powered malware classification using cleave static analysis"
+license = "Apache-2.0"
+
+[dependencies]
+cleave = { git = "https://codeberg.org/atomdrift/cleave.git" }
+proclist = { git = "https://codeberg.org/atomdrift/proclist.git" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dirs = "6.0"
+xgboost-native = { git = "https://codeberg.org/atomdrift/xgboost-native" }
+sha2 = "0.10"
+colored = "2"
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6" }
+tempfile = "3"
+dashmap = "6"
+rayon = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true
+
 
 [lib]
 name = "litmus"
