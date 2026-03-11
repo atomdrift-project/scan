@@ -26,6 +26,10 @@ struct Cli {
     #[arg(long)]
     verbose: bool,
 
+    /// Update models and traits before running (failures are non-fatal)
+    #[arg(short = 'u', long)]
+    update: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -163,6 +167,21 @@ fn main() -> Result<()> {
 
     #[cfg(debug_assertions)]
     tracing::warn!("DEBUG binary — litmus will be very slow; use `make release` for production builds");
+
+    if cli.update {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                if let Err(e) = litmus::models_repo::update() {
+                    eprintln!("Warning: model update failed: {e}");
+                }
+            });
+            s.spawn(|| {
+                if let Err(e) = cleave::traits_repo::update(false) {
+                    eprintln!("Warning: traits update failed: {e}");
+                }
+            });
+        });
+    }
 
     match cli.command {
         Commands::Scan {

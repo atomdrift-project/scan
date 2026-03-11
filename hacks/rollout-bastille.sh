@@ -84,7 +84,7 @@ load_rc_config $name
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-c -f -P ${pidfile} -r -o ${litmus_logfile} -u litmus /usr/local/share/litmus/litmus --verbose serve --bind 0.0.0.0:8081"
+command_args="-c -f -P ${pidfile} -r -o ${litmus_logfile} -u litmus /usr/local/share/litmus/litmus --verbose -u serve --bind 0.0.0.0:8081"
 
 run_rc_command "$1"
 EOF
