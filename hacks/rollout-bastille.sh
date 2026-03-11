@@ -31,9 +31,10 @@ doas bastille cmd "$BUILD" id -u litmus >/dev/null 2>&1 || \
 log "Installing build dependencies"
 doas bastille pkg "$BUILD" install -y rust sccache git
 
-log "Copying source trees to build jail"
-doas bastille cmd "$BUILD" rm -rf /home/litmus/litmus
-doas bastille cp "$BUILD" . /home/litmus/litmus
+log "Syncing source to build jail (preserving target/)"
+doas bastille cmd "$BUILD" mkdir -p /home/litmus/litmus
+tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
+    | doas bastille cmd "$BUILD" tar -xf - -C /home/litmus/litmus
 doas bastille cmd "$BUILD" chown -R litmus:litmus /home/litmus/litmus
 
 log "Building tarball"
@@ -83,7 +84,7 @@ load_rc_config $name
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-c -f -P ${pidfile} -r -o ${litmus_logfile} -u litmus env ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so /usr/local/share/litmus/litmus serve --bind 0.0.0.0:8081 --verbose"
+command_args="-c -f -P ${pidfile} -r -o ${litmus_logfile} -u litmus env ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so /usr/local/share/litmus/litmus --verbose serve --bind 0.0.0.0:8081"
 
 run_rc_command "$1"
 EOF
