@@ -41,8 +41,8 @@ doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache
     || die "build failed in build jail"
 
 log "Upgrading rules"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && ./target/release/litmus upgrade-rules" \
-    || die "upgrade-rules failed in build jail"
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && ./target/release/litmus update-rules" \
+    || die "update-rules failed in build jail"
 
 log "Running tests"
 doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=lld' cargo test --release -- --nocapture" \
