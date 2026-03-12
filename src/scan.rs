@@ -390,6 +390,7 @@ fn process_report(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
+    let verbose = config.verbose;
     // Compute formula before finalize (formula_from_report reads root-level findings).
     let formula = cleave::formula_from_report(&report);
 
@@ -400,13 +401,28 @@ fn process_report(
 
     let report_json = serde_json::to_value(&report).context("serializing cleave report")?;
     let mut features = ctx.extract(&report_json);
+    let nonzero = features.iter().filter(|&&v| v != 0.0).count();
     model.spec.standardize(&mut features);
     let (probability, classification) = model.predict(&features)?;
 
     let finding_counts = count_findings_from_json(&report_json);
 
-    // Only compute expensive extras for non-benign files.
-    let (reasons, top_findings) = if classification != Classification::Benign {
+    tracing::debug!(
+        path = %path.display(),
+        classification = ?classification,
+        probability = format!("{:.4}", probability),
+        features_nonzero = nonzero,
+        features_total = features.len(),
+        findings_hostile = finding_counts.hostile,
+        findings_suspicious = finding_counts.suspicious,
+        findings_notable = finding_counts.notable,
+        findings_baseline = finding_counts.baseline,
+        formula = %formula,
+        "classified file",
+    );
+
+    // Compute SHAP reasons and top findings for flagged files (or all files in verbose mode).
+    let (reasons, top_findings) = if classification != Classification::Benign || verbose {
         let r = shap
             .map(|s| s.explain(&features, &model.spec.feature_names, 5))
             .unwrap_or_default();

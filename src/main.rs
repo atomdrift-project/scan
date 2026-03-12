@@ -154,7 +154,12 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let filter = if cli.verbose {
+    let subcommand_verbose = match &cli.command {
+        Commands::Scan { verbose, .. } | Commands::Ps { verbose, .. } => *verbose,
+        _ => false,
+    };
+    let debug_logging = cli.verbose || subcommand_verbose;
+    let filter = if debug_logging {
         tracing_subscriber::EnvFilter::new("warn,litmus=debug,cleave=debug")
     } else {
         tracing_subscriber::EnvFilter::new("warn")
@@ -195,7 +200,7 @@ fn main() -> Result<()> {
             slow_rule_ms,
         } => {
             let model_dir = model_dir.unwrap_or_else(litmus::models_repo::model_dir);
-            let all = show.iter().any(|s| matches!(s, Show::All));
+            let all = verbose || show.iter().any(|s| matches!(s, Show::All));
             let config = litmus::ScanConfig {
                 model_dir,
                 format,
@@ -228,7 +233,7 @@ fn main() -> Result<()> {
             slow_rule_ms,
         } => {
             let model_dir = model_dir.unwrap_or_else(litmus::models_repo::model_dir);
-            let all = show.iter().any(|s| matches!(s, Show::All));
+            let all = verbose || show.iter().any(|s| matches!(s, Show::All));
             let config = litmus::ps::PsConfig {
                 model_dir,
                 format,

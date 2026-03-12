@@ -1,20 +1,28 @@
 //! Feature extraction from cleave v3 AnalysisReport JSON.
 //!
-//! Mirrors the feature extraction in collimator/src/collimator/features.py (v12)
+//! Mirrors the feature extraction in collimator/src/collimator/features.py (v13)
 //! exactly, using the same feature_spec.json vocabulary to produce identical
 //! feature vectors.
 //!
-//! Feature groups:
-//!   1. Path × Tier: binary features for hierarchical paths × crit tiers
-//!   2. Path Aggregates: attack breadth, context breadth, ratios (8)
-//!   3. Third-Party / Well-Known Summary: aggregated match signals (6)
-//!   4. Key Metrics: curated binary/text/PE metrics (16)
-//!   5. File Type: one-hot
-//!   6. Structural: anomalies + finding count (4)
+//! Feature groups (v13):
+//!   1. Presence: binary (1.0 if path exists at crit ≥ baseline)
+//!   2. Max Criticality: ordinal (0–5) per path
+//!   3. Aggregates: breadth, concentration, escalation ratios (8)
+//!   4. Third-Party / Well-Known Summary (6)
+//!   5. Key Metrics: curated binary/text/PE metrics (16)
+//!   6. File Type: one-hot
+//!   7. Structural: anomalies + finding count (4)
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// Feature spec version this build was compiled against.
+/// Must match the version in the loaded feature_spec.json.
+pub const EXPECTED_SPEC_VERSION: u32 = 13;
+
+/// Minimum finding confidence for inclusion (matches collimator MIN_CONFIDENCE).
+const MIN_CONFIDENCE: f64 = 0.65;
 
 /// Criticality ordinals (must match collimator CRITICALITY_ORDINAL).
 fn crit_ordinal(crit: &str) -> u32 {
@@ -24,17 +32,9 @@ fn crit_ordinal(crit: &str) -> u32 {
         "notable" => 3,
         "suspicious" => 4,
         "hostile" => 5,
-        _ => 2,
+        _ => 2, // baseline and unknown
     }
 }
-
-/// Tier thresholds used for path×tier binary features (notable=3, suspicious=4, hostile=5).
-const TIERS: &[(&str, u32)] = &[("notable", 3), ("suspicious", 4), ("hostile", 5)];
-
-/// Top-level categories counted as "attack" paths for aggregate features.
-const ATTACK_TOPS: &[&str] = &["objectives"];
-/// Top-level categories counted as "context" (benign indicator) paths.
-const CONTEXT_TOPS: &[&str] = &["metadata"];
 
 /// Key metrics extracted from the report's `metrics` object.
 /// Each entry is (group, field, use_log1p).
@@ -61,13 +61,13 @@ const KEY_METRICS: &[(&str, &str, bool)] = &[
     ("pe", "rsrc_size", true),
 ];
 
-/// Feature specification loaded from feature_spec.json (v12).
+/// Feature specification loaded from feature_spec.json (v13).
 #[derive(Debug, Clone)]
 pub struct FeatureSpec {
-    /// Spec format version (expected: 12).
+    /// Spec format version (expected: 13).
     pub version: u32,
-    /// Entries like "objectives/evasion/process:hostile".
-    pub path_vocab: Vec<String>,
+    /// Path vocabulary for presence/maxcrit features.
+    pub presence_vocab: Vec<String>,
     /// File type vocabulary for one-hot encoding.
     pub filetype_vocab: Vec<String>,
     /// Names of all features in the vector, in order.
@@ -86,17 +86,17 @@ impl FeatureSpec {
         let data = std::fs::read_to_string(path).context("reading feature spec")?;
         let v: serde_json::Value = serde_json::from_str(&data).context("parsing feature spec")?;
 
-        let version = v["version"].as_u64().unwrap_or(12) as u32;
-        if version < 12 {
-            tracing::warn!(
-                "feature spec version {} (expected 12); models trained with older collimator are not compatible",
-                version,
+        let version = v["version"].as_u64().unwrap_or(0) as u32;
+        if version != EXPECTED_SPEC_VERSION {
+            anyhow::bail!(
+                "feature spec version mismatch: spec is v{version} but litmus requires v{EXPECTED_SPEC_VERSION} — \
+                 the model was trained with a different collimator version and cannot be used with this build",
             );
         }
 
         Ok(Self {
             version,
-            path_vocab: json_string_array(&v["path_vocab"]),
+            presence_vocab: json_string_array(&v["presence_vocab"]),
             filetype_vocab: json_string_array(&v["filetype_vocab"]),
             feature_names: json_string_array(&v["feature_names"]),
             total_features: v["total_features"].as_u64().unwrap_or(0) as usize,
@@ -109,7 +109,10 @@ impl FeatureSpec {
     /// Features that were constant during training (mean=0, std=1) are zeroed
     /// to prevent catastrophic misclassification from unseen raw values.
     pub fn standardize(&self, features: &mut [f32]) {
-        let (Some(means), Some(stds)) = (self.feature_means.as_ref(), self.feature_stds.as_ref()) else { return };
+        let (Some(means), Some(stds)) = (self.feature_means.as_ref(), self.feature_stds.as_ref())
+        else {
+            return;
+        };
 
         for i in 0..features.len().min(means.len()) {
             let m = means[i];
@@ -125,22 +128,25 @@ impl FeatureSpec {
 
 fn json_string_array(v: &serde_json::Value) -> Vec<String> {
     v.as_array()
-        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn json_f32_array(v: &serde_json::Value) -> Option<Vec<f32>> {
-    v.as_array().map(|arr| {
-        arr.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()
-    })
+    v.as_array()
+        .map(|arr| arr.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
 }
 
 /// Pre-built lookup tables for fast repeated extraction against a spec.
 #[derive(Debug)]
 pub struct ExtractContext {
-    /// Maps path string -> list of (feature_index_in_combo_block, tier_ordinal).
-    path_tiers: HashMap<String, Vec<(usize, u32)>>,
-    n_combos: usize,
+    /// Maps path string -> index in presence_vocab.
+    presence_lookup: HashMap<String, usize>,
+    n_presence: usize,
     ft_lookup: HashMap<String, usize>,
     n_ft: usize,
     /// Total number of features in the output vector.
@@ -151,15 +157,12 @@ impl ExtractContext {
     /// Build lookup tables from a feature specification.
     #[must_use]
     pub fn new(spec: &FeatureSpec) -> Self {
-        let mut path_tiers: HashMap<String, Vec<(usize, u32)>> = HashMap::new();
-        for (i, combo) in spec.path_vocab.iter().enumerate() {
-            // combo is "objectives/evasion/process:hostile"
-            if let Some((path, tier_name)) = combo.rsplit_once(':') {
-                if let Some(&tier_ord) = TIERS.iter().find(|&&(t, _)| t == tier_name).map(|(_, o)| o) {
-                    path_tiers.entry(path.to_string()).or_default().push((i, tier_ord));
-                }
-            }
-        }
+        let presence_lookup: HashMap<String, usize> = spec
+            .presence_vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
 
         let ft_lookup: HashMap<String, usize> = spec
             .filetype_vocab
@@ -169,8 +172,8 @@ impl ExtractContext {
             .collect();
 
         Self {
-            path_tiers,
-            n_combos: spec.path_vocab.len(),
+            presence_lookup,
+            n_presence: spec.presence_vocab.len(),
             ft_lookup,
             n_ft: spec.filetype_vocab.len(),
             total_features: spec.total_features,
@@ -191,13 +194,10 @@ impl ExtractContext {
         let mut offset = 0usize;
 
         // -------------------------------------------------------------------
-        // Group 1: Path × Tier binary features (n_combos)
+        // Build per-path max criticality from findings.
         // -------------------------------------------------------------------
-        let path_offset = offset;
-        offset += self.n_combos;
-
-        // Per-path max crit across all findings (at all hierarchy levels).
         let mut sample_paths: HashMap<&str, u32> = HashMap::new();
+        let mut filtered_finding_count = 0u32;
         let mut third_party_max_crit = 0u32;
         let mut third_party_count = 0u32;
         let mut well_known_max_crit = 0u32;
@@ -210,6 +210,14 @@ impl ExtractContext {
             if fid.is_empty() {
                 continue;
             }
+
+            // Skip low-confidence findings (matches collimator MIN_CONFIDENCE).
+            let conf = finding["conf"].as_f64().unwrap_or(1.0);
+            if conf < MIN_CONFIDENCE {
+                continue;
+            }
+            filtered_finding_count += 1;
+
             let crit_ord = crit_ordinal(finding["crit"].as_str().unwrap_or("baseline"));
 
             let top = fid.split('/').next().unwrap_or("");
@@ -238,32 +246,58 @@ impl ExtractContext {
             }
         }
 
-        // Set binary path×tier features.
+        // -------------------------------------------------------------------
+        // Group 1: Presence features (n_presence binary features)
+        // Set to 1.0 if path exists at criticality ≥ baseline (ordinal 2).
+        // -------------------------------------------------------------------
+        let presence_offset = offset;
+        offset += self.n_presence;
+
         for (path, &max_ord) in &sample_paths {
-            if let Some(entries) = self.path_tiers.get(*path) {
-                for &(feat_idx, tier_ord) in entries {
-                    if max_ord >= tier_ord {
-                        vec[path_offset + feat_idx] = 1.0;
-                    }
+            if max_ord >= 2 {
+                if let Some(&idx) = self.presence_lookup.get(*path) {
+                    vec[presence_offset + idx] = 1.0;
                 }
             }
         }
 
         // -------------------------------------------------------------------
-        // Group 2: Path Aggregates (8 features)
+        // Group 2: Max criticality features (n_presence ordinal features)
+        // Stores the max criticality ordinal (0–5) per path.
+        // -------------------------------------------------------------------
+        let maxcrit_offset = offset;
+        offset += self.n_presence;
+
+        for (path, &max_ord) in &sample_paths {
+            if let Some(&idx) = self.presence_lookup.get(*path) {
+                vec[maxcrit_offset + idx] = max_ord as f32;
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Group 3: Aggregates (8 features)
         // -------------------------------------------------------------------
         let agg_offset = offset;
         offset += 8;
 
-        let mut attack_breadth_notable = 0u32;
-        let mut attack_breadth_suspicious = 0u32;
-        let mut attack_max_crit = 0u32;
-        let mut micro_breadth_notable = 0u32;
-        let mut context_breadth = 0u32;
+        let mut max_crit = 0u32;
+        let mut categories: HashSet<&str> = HashSet::new();
+        let mut path_breadth_any = 0u32;
         let mut total_active = 0u32;
+        let mut breadth_notable = 0u32;
+        let mut breadth_suspicious = 0u32;
+        let mut breadth_hostile = 0u32;
+        let mut breadth_notable_only = 0u32;
 
         for (path, &max_ord) in &sample_paths {
-            // Only count 3-level paths (two '/' separators) to avoid double-counting.
+            if max_ord >= 2 {
+                let top = path.split('/').next().unwrap_or("");
+                categories.insert(top);
+                if path.chars().filter(|&c| c == '/').count() >= 2 {
+                    path_breadth_any += 1;
+                }
+            }
+
             if path.chars().filter(|&c| c == '/').count() < 2 {
                 continue;
             }
@@ -271,34 +305,31 @@ impl ExtractContext {
                 continue;
             }
             total_active += 1;
-            let top = path.split('/').next().unwrap_or("");
-            if ATTACK_TOPS.contains(&top) {
-                attack_breadth_notable += 1;
-                if max_ord >= 4 {
-                    attack_breadth_suspicious += 1;
-                }
-                if max_ord > attack_max_crit {
-                    attack_max_crit = max_ord;
-                }
-            } else if CONTEXT_TOPS.contains(&top) {
-                context_breadth += 1;
-            } else if top == "micro-behaviors" {
-                micro_breadth_notable += 1;
+            breadth_notable += 1;
+            if max_ord > max_crit {
+                max_crit = max_ord;
+            }
+            if max_ord >= 4 {
+                breadth_suspicious += 1;
+            }
+            if max_ord >= 5 {
+                breadth_hostile += 1;
+            } else if max_ord == 3 {
+                breadth_notable_only += 1;
             }
         }
 
-        vec[agg_offset] = attack_breadth_notable as f32;
-        vec[agg_offset + 1] = attack_breadth_suspicious as f32;
-        vec[agg_offset + 2] = attack_max_crit as f32;
-        vec[agg_offset + 3] = micro_breadth_notable as f32;
-        vec[agg_offset + 4] = context_breadth as f32;
-        vec[agg_offset + 5] = attack_breadth_notable as f32 / (context_breadth as f32 + 1.0);
-        vec[agg_offset + 6] = (total_active as f32 + 1.0).ln();
-        vec[agg_offset + 7] = attack_breadth_notable as f32
-            * (context_breadth as f32 / total_active.max(1) as f32);
+        vec[agg_offset] = max_crit as f32;
+        vec[agg_offset + 1] = categories.len() as f32;
+        vec[agg_offset + 2] = (path_breadth_any as f32 + 1.0).ln();
+        vec[agg_offset + 3] = (total_active as f32 + 1.0).ln();
+        vec[agg_offset + 4] = breadth_suspicious as f32 / path_breadth_any.max(1) as f32;
+        vec[agg_offset + 5] = breadth_hostile as f32 / path_breadth_any.max(1) as f32;
+        vec[agg_offset + 6] = breadth_suspicious as f32 / breadth_notable.max(1) as f32;
+        vec[agg_offset + 7] = breadth_notable_only as f32 / breadth_notable.max(1) as f32;
 
         // -------------------------------------------------------------------
-        // Group 3: Third-Party / Well-Known Summary (6 features)
+        // Group 4: Third-Party / Well-Known Summary (6 features)
         // -------------------------------------------------------------------
         let ext_offset = offset;
         offset += 6;
@@ -311,7 +342,7 @@ impl ExtractContext {
         vec[ext_offset + 5] = if has_yara { 1.0 } else { 0.0 };
 
         // -------------------------------------------------------------------
-        // Group 4: Key Metrics (16 features)
+        // Group 5: Key Metrics (16 features)
         // -------------------------------------------------------------------
         let metrics = pf.get("metrics").unwrap_or(&serde_json::Value::Null);
         for &(group, fname, use_log) in KEY_METRICS {
@@ -325,7 +356,7 @@ impl ExtractContext {
         }
 
         // -------------------------------------------------------------------
-        // Group 5: File Type one-hot
+        // Group 6: File Type one-hot
         // -------------------------------------------------------------------
         let file_type = pf["file_type"].as_str().unwrap_or("");
         if let Some(&idx) = self.ft_lookup.get(file_type) {
@@ -334,7 +365,7 @@ impl ExtractContext {
         offset += self.n_ft;
 
         // -------------------------------------------------------------------
-        // Group 6: Structural (4 features)
+        // Group 7: Structural (4 features)
         // -------------------------------------------------------------------
         let file_size = pf["size"].as_u64().unwrap_or(0);
         let is_binary = matches!(file_type, "pe" | "elf" | "macho");
@@ -342,8 +373,8 @@ impl ExtractContext {
 
         vec[offset] = if is_binary && file_size < 20_000 { 1.0 } else { 0.0 };
         vec[offset + 1] = if imports.is_empty() { 1.0 } else { 0.0 };
-        vec[offset + 2] = if findings.is_empty() { 1.0 } else { 0.0 };
-        vec[offset + 3] = (findings.len() as f32 + 1.0).ln();
+        vec[offset + 2] = if filtered_finding_count == 0 { 1.0 } else { 0.0 };
+        vec[offset + 3] = (filtered_finding_count as f32 + 1.0).ln();
     }
 }
 
@@ -357,7 +388,10 @@ fn primary_file(report: &serde_json::Value) -> &serde_json::Value {
 
 /// Get an array field as a slice of Value refs.
 fn pf_array<'a>(pf: &'a serde_json::Value, key: &str) -> Vec<&'a serde_json::Value> {
-    pf[key].as_array().map(|a| a.iter().collect()).unwrap_or_default()
+    pf[key]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default()
 }
 
 /// Extract hierarchical path prefixes (1, 2, up to 3 levels) from a finding ID.
@@ -384,7 +418,6 @@ fn finding_paths(finding_id: &str) -> impl Iterator<Item = &str> {
     }
     // Determine the end of the 3rd component (everything up to the 3rd slash, or end).
     let third_end = if n_slashes >= 3 {
-        // Find position of the 3rd slash.
         let mut count = 0;
         let mut pos = base.len();
         for (i, ch) in base.char_indices() {
@@ -425,12 +458,20 @@ impl<'a> Iterator for FindingPaths<'a> {
         let result = match self.step {
             // 1-component prefix: up to first slash (or full base if no slashes).
             0 => {
-                let end = if self.n_slashes >= 1 { self.slash_ends[0] } else { self.base.len() };
+                let end = if self.n_slashes >= 1 {
+                    self.slash_ends[0]
+                } else {
+                    self.base.len()
+                };
                 Some(&self.base[..end])
             }
             // 2-component prefix: up to second slash.
             1 if self.n_slashes >= 1 => {
-                let end = if self.n_slashes >= 2 { self.slash_ends[1] } else { self.base.len() };
+                let end = if self.n_slashes >= 2 {
+                    self.slash_ends[1]
+                } else {
+                    self.base.len()
+                };
                 Some(&self.base[..end])
             }
             // 3-component prefix: up to third slash (or end).
@@ -491,8 +532,8 @@ mod tests {
     #[test]
     fn test_standardize() {
         let spec = FeatureSpec {
-            version: 12,
-            path_vocab: vec![],
+            version: 13,
+            presence_vocab: vec![],
             filetype_vocab: vec![],
             feature_names: vec![],
             total_features: 3,
@@ -512,11 +553,12 @@ mod tests {
     #[test]
     fn test_extract_empty_report() {
         let spec = FeatureSpec {
-            version: 12,
-            path_vocab: vec!["objectives/evasion/process:hostile".to_string()],
+            version: 13,
+            presence_vocab: vec!["objectives/evasion/process".to_string()],
             filetype_vocab: vec!["sh".to_string()],
             feature_names: vec![],
-            total_features: 1 + 8 + 6 + 16 + 1 + 4,
+            // 1 presence + 1 maxcrit + 8 agg + 6 ext + 16 metrics + 1 filetype + 4 struct
+            total_features: 1 + 1 + 8 + 6 + 16 + 1 + 4,
             feature_means: None,
             feature_stds: None,
         };
@@ -524,13 +566,85 @@ mod tests {
         let report = serde_json::json!({"files": [{"file_type": "sh", "size": 100}]});
         let features = ctx.extract(&report);
         assert_eq!(features.len(), spec.total_features);
-        // path feature: 0 (no findings)
+        // presence feature: 0 (no findings)
         assert_eq!(features[0], 0.0);
-        // zero_findings structural feature
-        let struct_offset = 1 + 8 + 6 + 16 + 1;
-        assert_eq!(features[struct_offset + 2], 1.0); // zero_findings
+        // maxcrit feature: 0 (no findings)
+        assert_eq!(features[1], 0.0);
         // filetype sh one-hot
-        let ft_offset = 1 + 8 + 6 + 16;
+        let ft_offset = 1 + 1 + 8 + 6 + 16;
         assert_eq!(features[ft_offset], 1.0);
+        // zero_findings structural feature
+        let struct_offset = ft_offset + 1;
+        assert_eq!(features[struct_offset + 2], 1.0);
+    }
+
+    #[test]
+    fn test_extract_with_findings() {
+        let spec = FeatureSpec {
+            version: 13,
+            presence_vocab: vec![
+                "objectives".to_string(),
+                "objectives/evasion".to_string(),
+                "objectives/evasion/process".to_string(),
+            ],
+            filetype_vocab: vec!["php".to_string()],
+            feature_names: vec![],
+            total_features: 3 + 3 + 8 + 6 + 16 + 1 + 4,
+            feature_means: None,
+            feature_stds: None,
+        };
+        let ctx = ExtractContext::new(&spec);
+        let report = serde_json::json!({
+            "files": [{
+                "file_type": "php",
+                "size": 1000,
+                "findings": [
+                    {"id": "objectives/evasion/process/injection::test", "crit": "hostile", "conf": 0.9},
+                ],
+                "metrics": {},
+            }]
+        });
+        let features = ctx.extract(&report);
+
+        // All 3 presence features should be 1.0 (hostile ≥ baseline)
+        assert_eq!(features[0], 1.0); // present:objectives
+        assert_eq!(features[1], 1.0); // present:objectives/evasion
+        assert_eq!(features[2], 1.0); // present:objectives/evasion/process
+
+        // All 3 maxcrit features should be 5.0 (hostile)
+        assert_eq!(features[3], 5.0); // maxcrit:objectives
+        assert_eq!(features[4], 5.0); // maxcrit:objectives/evasion
+        assert_eq!(features[5], 5.0); // maxcrit:objectives/evasion/process
+
+        // agg:max_crit = 5.0
+        assert_eq!(features[6], 5.0);
+    }
+
+    #[test]
+    fn test_confidence_filtering() {
+        let spec = FeatureSpec {
+            version: 13,
+            presence_vocab: vec!["objectives".to_string()],
+            filetype_vocab: vec![],
+            feature_names: vec![],
+            total_features: 1 + 1 + 8 + 6 + 16 + 0 + 4,
+            feature_means: None,
+            feature_stds: None,
+        };
+        let ctx = ExtractContext::new(&spec);
+        let report = serde_json::json!({
+            "files": [{
+                "file_type": "sh",
+                "size": 100,
+                "findings": [
+                    {"id": "objectives/evasion::test", "crit": "hostile", "conf": 0.3},
+                ],
+                "metrics": {},
+            }]
+        });
+        let features = ctx.extract(&report);
+        // Low confidence finding should be skipped
+        assert_eq!(features[0], 0.0); // present:objectives
+        assert_eq!(features[1], 0.0); // maxcrit:objectives
     }
 }
