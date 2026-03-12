@@ -1,11 +1,11 @@
 #!/bin/sh
 # rollout-bastille.sh - Deploy litmus using separate build and run jails
-# Usage: ./rollout-bastille.sh <build-jail> <run-jail>
+# Usage: ./rollout-bastille.sh [build-jail] [run-jail]
 
 set -e
 
-BUILD="$1"
-RUN="$2"
+BUILD="${1:-build}"
+RUN="${2:-litmus}"
 
 die() {
     echo "error: $*" >&2
@@ -15,8 +15,6 @@ die() {
 log() {
     echo "==> $*"
 }
-
-[ -z "$BUILD" ] || [ -z "$RUN" ] && die "usage: $0 <build-jail> <run-jail>"
 
 # Verify jails are accessible
 doas bastille cmd "$BUILD" true || die "build jail '$BUILD' not accessible"
