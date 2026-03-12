@@ -36,12 +36,17 @@ doas bastille cmd "$BUILD" su -l litmus -c "mkdir -p ~/litmus"
 tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
     | doas bastille cmd "$BUILD" su -l litmus -c "tar -xf - -C ~/litmus"
 
+log "Building tarball"
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=lld' make tarball" \
+    || die "build failed in build jail"
+
+log "Upgrading rules"
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && ./target/release/litmus upgrade-rules" \
+    || die "upgrade-rules failed in build jail"
+
 log "Running tests"
 doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=lld' cargo test --release -- --nocapture" \
     || die "tests failed in build jail"
-
-log "Building tarball"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=lld' make tarball"
 
 # --- Transfer tarball via jail filesystem ---
 
