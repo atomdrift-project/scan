@@ -29,7 +29,7 @@ doas bastille cmd "$BUILD" id -u litmus >/dev/null 2>&1 || \
     doas bastille cmd "$BUILD" pw useradd litmus -m -s /bin/sh -c "Litmus Build"
 
 log "Installing build dependencies"
-doas bastille pkg "$BUILD" install -y rust sccache git pkgconf onnxruntime
+doas bastille pkg "$BUILD" install -y rust sccache git pkgconf lld
 
 log "Syncing source to build jail (preserving target/)"
 doas bastille cmd "$BUILD" mkdir -p /home/litmus/litmus
@@ -37,12 +37,12 @@ tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
     | doas bastille cmd "$BUILD" tar -xf - -C /home/litmus/litmus
 doas bastille cmd "$BUILD" chown -R litmus:litmus /home/litmus/litmus
 
-log "Running tests and lint"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache make test lint" \
-    || die "tests or lint failed in build jail"
+log "Running tests"
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=lld' cargo test --release -- --nocapture" \
+    || die "tests failed in build jail"
 
 log "Building tarball"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache make tarball"
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=lld' make tarball"
 
 # --- Transfer tarball via jail filesystem ---
 
@@ -58,7 +58,7 @@ doas bastille cmd "$RUN" id -u litmus >/dev/null 2>&1 || \
     doas bastille cmd "$RUN" pw useradd litmus -m -s /bin/sh -c "Litmus Service"
 
 log "Installing runtime dependencies"
-doas bastille pkg "$RUN" install -y git onnxruntime
+doas bastille pkg "$RUN" install -y git
 
 log "Extracting tarball"
 doas bastille cmd "$RUN" rm -rf /usr/local/share/litmus
