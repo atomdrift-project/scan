@@ -595,7 +595,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 [[package]]
 name = "cleave"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#85dbdcc0ad70c4de42d7a9e6891250f1086c095d"
+source = "git+https://codeberg.org/atomdrift/cleave.git#4ab43a1744fcb9732ec4140a131b7ad7fa55a2d1"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -694,7 +694,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#85dbdcc0ad70c4de42d7a9e6891250f1086c095d"
+source = "git+https://codeberg.org/atomdrift/cleave.git#4ab43a1744fcb9732ec4140a131b7ad7fa55a2d1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2221,7 +2221,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#85dbdcc0ad70c4de42d7a9e6891250f1086c095d"
+source = "git+https://codeberg.org/atomdrift/cleave.git#4ab43a1744fcb9732ec4140a131b7ad7fa55a2d1"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -3249,7 +3249,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#85dbdcc0ad70c4de42d7a9e6891250f1086c095d"
+source = "git+https://codeberg.org/atomdrift/cleave.git#4ab43a1744fcb9732ec4140a131b7ad7fa55a2d1"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3455,6 +3455,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -3579,7 +3589,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.0.0"
-source = "git+https://codeberg.org/atomdrift/stng?rev=1c043de8f98357bf2d8e0082da6f2581485ffc94#1c043de8f98357bf2d8e0082da6f2581485ffc94"
+source = "git+https://codeberg.org/atomdrift/stng.git#67e9aff64e7b6d24d163f0631d22653d88122480"
 dependencies = [
  "aho-corasick",
  "anyhow",
