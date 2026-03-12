@@ -5250,7 +5250,7 @@ dependencies = [
 [[package]]
 name = "xgboost-native"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/xgboost-native#9058619219944d4b827387272955ffd2a8e4b8aa"
+source = "git+https://codeberg.org/atomdrift/xgboost-native#b6ff534d19dc546ad56f9c10c732824afb5fcac7"
 dependencies = [
  "serde",
  "serde_json",
