@@ -1,7 +1,10 @@
 //! Model loading and inference.
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
+use std::process::Command;
 
 use crate::features::FeatureSpec;
 
@@ -28,7 +31,7 @@ impl std::fmt::Display for Classification {
 }
 
 /// Thresholds for classification.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct Thresholds {
     /// Minimum probability to classify as suspicious.
     pub suspicious: f32,
@@ -50,6 +53,18 @@ impl Thresholds {
     }
 }
 
+/// Metadata about the loaded model, computed once at startup.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelInfo {
+    /// Feature spec version (e.g. 13).
+    pub version: u32,
+    /// SHA-256 hex digest of the model file.
+    pub sha256: String,
+    /// Short git commit hash of the models repository, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
 /// Loaded model ready for inference.
 #[derive(Debug)]
 pub struct Model {
@@ -58,6 +73,8 @@ pub struct Model {
     pub spec: FeatureSpec,
     /// Classification thresholds.
     pub thresholds: Thresholds,
+    /// Model metadata (version, sha256, commit).
+    pub info: ModelInfo,
 }
 
 impl Model {
@@ -76,17 +93,47 @@ impl Model {
             .with_context(|| format!("loading model from {}", model_path.display()))?;
         tracing::debug!("model loaded");
 
+        let model_sha256 = {
+            let mut file = std::fs::File::open(&model_path)
+                .with_context(|| format!("opening {}", model_path.display()))?;
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 { break; }
+                hasher.update(&buf[..n]);
+            }
+            format!("{:x}", hasher.finalize())
+        };
+
+        let commit = Command::new("git")
+            .args(["-C", &model_dir.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
         tracing::info!(
             features = spec.total_features,
             threshold_suspicious = thresholds.suspicious,
             threshold_hostile = thresholds.hostile,
+            model_sha256 = %model_sha256,
+            model_commit = ?commit,
+            spec_version = spec.version,
             "model loaded",
         );
+
+        let info = ModelInfo {
+            version: spec.version,
+            sha256: model_sha256,
+            commit,
+        };
 
         Ok(Self {
             inner,
             spec,
             thresholds,
+            info,
         })
     }
 

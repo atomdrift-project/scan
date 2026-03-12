@@ -91,8 +91,8 @@ async fn analyze_encrypted_zip_returns_json() {
     assert!(json["classification"].is_string(), "missing classification");
     assert!(json["probability"].is_number(), "missing probability");
     assert!(json["thresholds"].is_object(), "missing thresholds");
-    assert!(json["finding_counts"].is_object(), "missing finding_counts");
     assert!(json["formula"].is_string(), "missing formula");
+    assert!(json["model"].is_object(), "missing model metadata");
     assert!(json["reasons"].is_array(), "missing reasons array");
     assert!(json["top_findings"].is_array(), "missing top_findings array");
     assert!(json["file_type"].is_string(), "missing file_type");

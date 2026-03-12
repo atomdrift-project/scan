@@ -12,10 +12,7 @@ use super::AppState;
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
-use crate::scan::{
-    count_findings_from_json, extract_top_findings_from_json, ScanResult,
-    Thresholds as ScanThresholds,
-};
+use crate::scan::{count_findings_from_json, extract_top_findings_from_json, ScanResult};
 
 /// GET /_/health — liveness check with memory and concurrency status.
 /// Returns 503 while resources are still loading or when RSS exceeds the configured limit.
@@ -455,10 +452,7 @@ fn classify_file(
         path: label.to_string(),
         classification,
         probability,
-        thresholds: ScanThresholds {
-            hostile: resources.model.thresholds.hostile,
-            suspicious: resources.model.thresholds.suspicious,
-        },
+        thresholds: resources.model.thresholds,
         finding_counts,
         formula,
         reasons,
@@ -466,6 +460,7 @@ fn classify_file(
         file_type,
         size_bytes,
         sha256,
+        model: Some(resources.model.info.clone()),
         cleave: Some(report_json),
         pids: None,
         deleted: None,

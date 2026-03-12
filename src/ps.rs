@@ -305,18 +305,15 @@ fn build_result(
     let file_type = pf["file_type"].as_str().unwrap_or("unknown").to_string();
     let size_bytes = pf["size"].as_u64().unwrap_or(0);
 
-    let cleave_json = match config.format {
-        OutputFormat::Json => Some(report_json),
-        OutputFormat::Terminal => None,
-    };
+    let is_json = matches!(config.format, OutputFormat::Json);
 
     Ok(ScanResult {
         path: display_path.display().to_string(),
         classification,
         probability,
-        thresholds: crate::scan::Thresholds {
-            hostile: config.threshold_hostile,
+        thresholds: crate::model::Thresholds {
             suspicious: config.threshold_suspicious,
+            hostile: config.threshold_hostile,
         },
         finding_counts,
         formula,
@@ -325,7 +322,8 @@ fn build_result(
         file_type,
         size_bytes,
         sha256: group.sha256.clone(),
-        cleave: cleave_json,
+        model: if is_json { Some(model.info.clone()) } else { None },
+        cleave: if is_json { Some(report_json) } else { None },
         pids: Some(group.pids.clone()),
         deleted: if group.deleted { Some(true) } else { None },
     })

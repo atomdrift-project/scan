@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
-use crate::model::{Classification, Model};
+use crate::model::{Classification, Model, ModelInfo, Thresholds};
 use crate::OutputFormat;
 
 pub use crate::explain::Reason;
@@ -103,7 +103,8 @@ pub struct ScanResult {
     pub probability: f32,
     /// Thresholds used for classification.
     pub thresholds: Thresholds,
-    /// Breakdown of findings by criticality.
+    /// Breakdown of findings by criticality (terminal display only).
+    #[serde(skip)]
     pub finding_counts: FindingCounts,
     /// Cleave formula string summarizing findings.
     pub formula: String,
@@ -117,6 +118,9 @@ pub struct ScanResult {
     pub size_bytes: u64,
     /// SHA-256 hex digest of the file.
     pub sha256: String,
+    /// Model metadata (JSON mode only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelInfo>,
     /// Full cleave report (JSON mode only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleave: Option<serde_json::Value>,
@@ -126,15 +130,6 @@ pub struct ScanResult {
     /// Whether the binary was deleted from disk (process scan only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted: Option<bool>,
-}
-
-/// Classification thresholds serialized into scan results.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Thresholds {
-    /// Minimum probability to classify as hostile.
-    pub hostile: f32,
-    /// Minimum probability to classify as suspicious.
-    pub suspicious: f32,
 }
 
 /// A notable finding from cleave at the highest relevant criticality.
@@ -440,18 +435,15 @@ fn process_report(
     let size_bytes = pf["size"].as_u64().unwrap_or(0);
     let sha256 = pf["sha256"].as_str().unwrap_or("").to_string();
 
-    let cleave_json = match config.format {
-        OutputFormat::Json => Some(report_json),
-        OutputFormat::Terminal => None,
-    };
+    let is_json = matches!(config.format, OutputFormat::Json);
 
     Ok(ScanResult {
         path: path.display().to_string(),
         classification,
         probability,
         thresholds: Thresholds {
-            hostile: config.threshold_hostile,
             suspicious: config.threshold_suspicious,
+            hostile: config.threshold_hostile,
         },
         finding_counts,
         formula,
@@ -460,7 +452,8 @@ fn process_report(
         file_type,
         size_bytes,
         sha256,
-        cleave: cleave_json,
+        model: if is_json { Some(model.info.clone()) } else { None },
+        cleave: if is_json { Some(report_json) } else { None },
         pids: None,
         deleted: None,
     })
