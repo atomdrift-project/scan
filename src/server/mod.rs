@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::signal;
@@ -101,9 +101,14 @@ pub struct AppState {
     pub threshold_hostile: f32,
     /// Warn when a single cleave rule takes longer than this many milliseconds.
     pub slow_rule_ms: u64,
+    /// True once model resources have been loaded and the server is ready to
+    /// serve analysis requests.  Set with `Release` ordering; read with
+    /// `Acquire` so the resources write is always visible before this flips.
+    pub ready: AtomicBool,
     /// Current model resources; wrapped in `Arc` so handlers can snapshot
-    /// without holding the lock across `await` points.
-    pub resources: RwLock<Arc<ModelResources>>,
+    /// without holding the lock across `await` points.  `None` while the
+    /// server is still initialising.
+    pub resources: RwLock<Option<Arc<ModelResources>>>,
     /// Monotonically increasing request counter.
     pub next_request_id: AtomicU64,
     /// Number of analysis tasks currently in flight.
@@ -122,47 +127,17 @@ impl AppState {
     }
 }
 
-/// Load model resources and build the axum [`Router`].
+/// Build the axum [`Router`] and start background resource loading.
+///
+/// The server is bound and begins accepting connections immediately.  Until
+/// model resources finish loading the health endpoint returns 503 and the
+/// analyze endpoint returns 503.  Resources load concurrently in a background
+/// task; YARA is warmed up in a separate fire-and-forget task so it does not
+/// delay readiness.
 ///
 /// Useful for integration tests that need the app without binding to a port.
 pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
-    tracing::info!(model_dir = %config.model_dir.display(), "loading resources");
-
-    let thresholds = Thresholds {
-        suspicious: config.threshold_suspicious,
-        hostile: config.threshold_hostile,
-    };
-
-    let model_dir_for_model = config.model_dir.clone();
-    let model_dir_for_shap = config.model_dir.clone();
-    let slow_rule_ms = config.slow_rule_ms;
-
-    let model_task = tokio::task::spawn_blocking(move || -> anyhow::Result<(Model, ExtractContext)> {
-        let t = Instant::now();
-        tracing::debug!("loading ONNX model and feature spec...");
-        let model = Model::load(&model_dir_for_model, thresholds)?;
-        let ctx = ExtractContext::new(&model.spec);
-        tracing::info!(elapsed_ms = t.elapsed().as_millis(), "ONNX model loaded");
-        Ok((model, ctx))
-    });
-
-    let warmup_task = tokio::task::spawn_blocking(move || {
-        let t = Instant::now();
-        tracing::debug!("warming up YARA rules and capability mapper...");
-        let opts = cleave::AnalysisOptions { slow_rule_ms, ..Default::default() };
-        let _ = cleave::analyze_file(std::path::Path::new("/dev/null"), &opts);
-        tracing::info!(elapsed_ms = t.elapsed().as_millis(), "YARA warmup complete");
-    });
-
-    let shap_task = tokio::task::spawn_blocking(move || {
-        tracing::debug!("loading SHAP importance data...");
-        ShapImportance::load(&model_dir_for_shap).ok()
-    });
-
-    let (model_result, _, shap) = tokio::try_join!(model_task, warmup_task, shap_task)?;
-    let (model, ctx) = model_result?;
-
-    tracing::info!("all resources loaded");
+    tracing::info!(model_dir = %config.model_dir.display(), "starting — resources loading in background");
 
     let state = Arc::new(AppState {
         timeout_secs: config.timeout_secs,
@@ -172,13 +147,105 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         threshold_suspicious: config.threshold_suspicious,
         threshold_hostile: config.threshold_hostile,
         slow_rule_ms: config.slow_rule_ms,
-        resources: RwLock::new(Arc::new(ModelResources { model, shap, ctx })),
+        ready: AtomicBool::new(false),
+        resources: RwLock::new(None),
         next_request_id: AtomicU64::new(1),
         active_tasks: AtomicUsize::new(0),
         reload_lock: tokio::sync::Mutex::new(()),
         overloaded_since: std::sync::Mutex::new(None),
         in_flight: dashmap::DashMap::new(),
     });
+
+    // Background task: load model + SHAP concurrently, then mark the server ready.
+    {
+        let bg = Arc::clone(&state);
+        let model_dir = config.model_dir.clone();
+        let model_dir_shap = config.model_dir.clone();
+        let thresholds = Thresholds {
+            suspicious: config.threshold_suspicious,
+            hostile: config.threshold_hostile,
+        };
+        tokio::spawn(async move {
+            let init_start = Instant::now();
+            tracing::info!("resource loader started (model + SHAP loading concurrently)");
+
+            // Capture spawn times in the async context so each blocking closure
+            // can report queue_ms (time waiting for a thread) separately from
+            // work_ms (time actually doing I/O and parsing).
+            let model_spawned_at = Instant::now();
+            let model_task = tokio::task::spawn_blocking(move || -> anyhow::Result<(Model, ExtractContext)> {
+                let queue_ms = model_spawned_at.elapsed().as_millis();
+                let t = Instant::now();
+                tracing::info!(queue_ms, "loading ONNX model and feature spec");
+                let model = Model::load(&model_dir, thresholds)?;
+                let ctx = ExtractContext::new(&model.spec);
+                tracing::info!(
+                    queue_ms,
+                    work_ms = t.elapsed().as_millis(),
+                    spec_version = model.spec.version,
+                    features = model.spec.total_features,
+                    "ONNX model loaded",
+                );
+                Ok((model, ctx))
+            });
+            let shap_spawned_at = Instant::now();
+            let shap_task = tokio::task::spawn_blocking(move || {
+                let queue_ms = shap_spawned_at.elapsed().as_millis();
+                let t = Instant::now();
+                tracing::info!(queue_ms, "loading SHAP importance data");
+                match ShapImportance::load(&model_dir_shap) {
+                    Ok(shap) => {
+                        tracing::info!(queue_ms, work_ms = t.elapsed().as_millis(), "SHAP data loaded");
+                        Some(shap)
+                    }
+                    Err(e) => {
+                        tracing::warn!(queue_ms, work_ms = t.elapsed().as_millis(), "SHAP data unavailable (explanations disabled): {e}");
+                        None
+                    }
+                }
+            });
+
+            match tokio::join!(model_task, shap_task) {
+                (Ok(Ok((model, ctx))), Ok(shap)) => {
+                    let spec_version = model.spec.version;
+                    let features = model.spec.total_features;
+                    let shap_loaded = shap.is_some();
+                    tracing::info!("all resources ready, installing into AppState");
+                    match bg.resources.write() {
+                        Ok(mut lock) => {
+                            *lock = Some(Arc::new(ModelResources { model, shap, ctx }));
+                            bg.ready.store(true, Ordering::Release);
+                            tracing::info!(
+                                total_ms = init_start.elapsed().as_millis(),
+                                spec_version,
+                                features,
+                                shap_loaded,
+                                "server ready",
+                            );
+                        }
+                        Err(e) => tracing::error!("resources lock poisoned during init: {e}"),
+                    }
+                }
+                (Ok(Err(e)), _) => tracing::error!("failed to load model: {e}"),
+                (Err(e), _) => tracing::error!("model load task panicked: {e}"),
+                (_, Err(e)) => tracing::error!("shap load task panicked: {e}"),
+            }
+        });
+    }
+
+    // Fire-and-forget YARA warmup — does not block readiness.  If it finishes
+    // before the first request arrives, great; otherwise the first request
+    // naturally warms the rules.
+    {
+        let slow_rule_ms = config.slow_rule_ms;
+        tokio::spawn(tokio::task::spawn_blocking(move || {
+            let t = Instant::now();
+            tracing::info!("YARA warmup started (non-blocking)");
+            let opts = cleave::AnalysisOptions { slow_rule_ms, ..Default::default() };
+            let _ = cleave::analyze_file(std::path::Path::new("/dev/null"), &opts);
+            tracing::info!(elapsed_ms = t.elapsed().as_millis(), "YARA warmup complete");
+        }));
+    }
 
     let max_concurrent = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
@@ -209,7 +276,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     eprintln!(
-        "Listening on http://{} (timeout: {}s, max size: {} MB) — Press Ctrl+C to stop",
+        "Listening on http://{} (timeout: {}s, max size: {} MB, starting up) — Press Ctrl+C to stop",
         config.bind,
         config.timeout_secs,
         config.max_body_size / 1024 / 1024,
@@ -218,7 +285,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         bind = %config.bind,
         timeout_secs = config.timeout_secs,
         max_body_mb = config.max_body_size / 1024 / 1024,
-        "server ready",
+        "listening (resources loading in background)",
     );
 
     axum::serve(listener, app)

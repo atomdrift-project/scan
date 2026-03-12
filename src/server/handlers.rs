@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Json, Response};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use tempfile::NamedTempFile;
+use tempfile::Builder as TempBuilder;
 
 use super::AppState;
 use crate::explain::ShapImportance;
@@ -18,8 +18,16 @@ use crate::scan::{
 };
 
 /// GET /_/health — liveness check with memory and concurrency status.
-/// Returns 503 when RSS exceeds the configured limit.
+/// Returns 503 while resources are still loading or when RSS exceeds the configured limit.
 pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
+    if !state.ready.load(std::sync::atomic::Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "starting"})),
+        )
+            .into_response();
+    }
+
     let rss_bytes = cleave::memory_tracker::current_rss();
     let rss_mb = rss_bytes.map(|b| b / 1024 / 1024);
     let active_tasks = state.active_tasks.load(std::sync::atomic::Ordering::Relaxed);
@@ -83,10 +91,19 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
 
     match result {
         Ok(Ok((model, shap, ctx))) => {
+            let spec_version = model.spec.version;
+            let features = model.spec.total_features;
+            let shap_loaded = shap.is_some();
+            let was_ready = state.ready.load(std::sync::atomic::Ordering::Relaxed);
             match state.resources.write() {
                 Ok(mut lock) => {
-                    *lock = Arc::new(super::ModelResources { model, shap, ctx });
-                    tracing::info!("model reloaded in {elapsed_ms}ms");
+                    *lock = Some(Arc::new(super::ModelResources { model, shap, ctx }));
+                    state.ready.store(true, std::sync::atomic::Ordering::Release);
+                    if was_ready {
+                        tracing::info!(elapsed_ms, spec_version, features, shap_loaded, "model reloaded");
+                    } else {
+                        tracing::info!(elapsed_ms, spec_version, features, shap_loaded, "model loaded via reload — server now ready");
+                    }
                     Json(serde_json::json!({
                         "status": "ok",
                         "elapsed_ms": elapsed_ms,
@@ -161,22 +178,36 @@ pub(super) async fn analyze(
         }
     };
 
-    // Sanitize the uploaded filename: strip control characters and path separators,
-    // collapse path traversal attempts, cap length. Used only as the `path` label in
-    // the result — never interpreted as a filesystem path.
-    let filename = field
-        .file_name()
-        .map(|s| {
-            s.chars()
-                .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
-                .take(255)
-                .collect::<String>()
-        })
-        .map(|s| s.replace("..", ""))
-        .unwrap_or_else(|| format!("upload-{request_id}"));
+    // Sanitize the uploaded filename: replace any character outside [A-Za-z0-9_.-] with _,
+    // collapse .. to prevent path traversal, and right-truncate to 63 characters so that
+    // the extension is preserved. Used as both the `path` label and the temp file suffix
+    // so that cleave can detect the file type from the extension.
+    let filename: String = {
+        let raw = field
+            .file_name()
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| format!("upload-{request_id}"));
+        let sanitized: String = raw
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' })
+            .collect::<String>()
+            .replace("..", "__");
+        if sanitized.len() > 63 {
+            // Right-truncate: preserve the tail (and thus the extension).
+            // All remaining chars are ASCII so byte indexing is safe.
+            sanitized[sanitized.len() - 63..].to_string()
+        } else {
+            sanitized
+        }
+    };
 
-    // Create temp file on the blocking thread pool.
-    let temp_file = match tokio::task::spawn_blocking(NamedTempFile::new).await {
+    // Create temp file with the sanitized filename as suffix so cleave detects the file type.
+    let suffix = format!("_{filename}");
+    let temp_file = match tokio::task::spawn_blocking(move || {
+        TempBuilder::new().suffix(&suffix).tempfile()
+    })
+    .await
+    {
         Ok(Ok(f)) => f,
         Ok(Err(e)) => {
             tracing::warn!("failed to create temp file: {e}  id={request_id}");
@@ -272,7 +303,17 @@ pub(super) async fn analyze(
 
     // Snapshot the current model resources (Arc clone, no lock held during analysis).
     let resources = match state.resources.read() {
-        Ok(lock) => Arc::clone(&*lock),
+        Ok(lock) => match lock.as_ref() {
+            Some(r) => Arc::clone(r),
+            None => {
+                tracing::debug!("analyze rejected: resources not yet loaded  id={request_id}");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "Server starting up"})),
+                )
+                    .into_response();
+            }
+        },
         Err(e) => {
             tracing::error!("read lock poisoned: {e}");
             return (
