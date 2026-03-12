@@ -29,7 +29,7 @@ doas bastille cmd "$BUILD" id -u litmus >/dev/null 2>&1 || \
     doas bastille cmd "$BUILD" pw useradd litmus -m -s /bin/sh -c "Litmus Build"
 
 log "Installing build dependencies"
-doas bastille pkg "$BUILD" install -y rust sccache git pkgconf lld
+doas bastille pkg "$BUILD" install -y rust sccache git pkgconf
 
 log "Syncing source to build jail (preserving target/)"
 doas bastille cmd "$BUILD" mkdir -p /home/litmus/litmus
