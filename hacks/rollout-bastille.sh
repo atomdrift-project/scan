@@ -32,10 +32,9 @@ log "Installing build dependencies"
 doas bastille pkg "$BUILD" install -y rust sccache git pkgconf
 
 log "Syncing source to build jail (preserving target/)"
-doas bastille cmd "$BUILD" mkdir -p /home/litmus/litmus
+doas bastille cmd "$BUILD" su -l litmus -c "mkdir -p ~/litmus"
 tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
-    | doas bastille cmd "$BUILD" tar -xf - -C /home/litmus/litmus
-doas bastille cmd "$BUILD" chown -R litmus:litmus /home/litmus/litmus
+    | doas bastille cmd "$BUILD" su -l litmus -c "tar -xf - -C ~/litmus"
 
 log "Running tests"
 doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=lld' cargo test --release -- --nocapture" \
