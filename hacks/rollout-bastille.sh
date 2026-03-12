@@ -37,6 +37,10 @@ tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
     | doas bastille cmd "$BUILD" tar -xf - -C /home/litmus/litmus
 doas bastille cmd "$BUILD" chown -R litmus:litmus /home/litmus/litmus
 
+log "Running tests and lint"
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache make test lint" \
+    || die "tests or lint failed in build jail"
+
 log "Building tarball"
 doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache make tarball"
 
