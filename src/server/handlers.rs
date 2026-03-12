@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 use super::AppState;
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
-use crate::model::{Classification, Model, Thresholds};
+use crate::model::{Model, Thresholds};
 use crate::scan::{
     count_findings_from_json, extract_top_findings_from_json, ScanResult,
     Thresholds as ScanThresholds,
@@ -20,10 +20,11 @@ use crate::scan::{
 /// GET /_/health — liveness check with memory and concurrency status.
 /// Returns 503 when RSS exceeds the configured limit.
 pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
-    let rss_mb = cleave::memory_tracker::current_rss().map(|b| b / 1024 / 1024);
+    let rss_bytes = cleave::memory_tracker::current_rss();
+    let rss_mb = rss_bytes.map(|b| b / 1024 / 1024);
     let active_tasks = state.active_tasks.load(std::sync::atomic::Ordering::Relaxed);
-    let overloaded = rss_mb
-        .map(|mb| mb * 1024 * 1024 > state.max_rss_bytes)
+    let overloaded = rss_bytes
+        .map(|b| b > state.max_rss_bytes)
         .unwrap_or(false);
 
     if overloaded {
@@ -160,11 +161,18 @@ pub(super) async fn analyze(
         }
     };
 
-    // Sanitize the uploaded filename: strip control characters, cap length.
-    // Used only as the `path` label in the result — never interpreted as a filesystem path.
+    // Sanitize the uploaded filename: strip control characters and path separators,
+    // collapse path traversal attempts, cap length. Used only as the `path` label in
+    // the result — never interpreted as a filesystem path.
     let filename = field
         .file_name()
-        .map(|s| s.chars().filter(|c| !c.is_control()).take(255).collect::<String>())
+        .map(|s| {
+            s.chars()
+                .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+                .take(255)
+                .collect::<String>()
+        })
+        .map(|s| s.replace("..", ""))
         .unwrap_or_else(|| format!("upload-{request_id}"));
 
     // Create temp file on the blocking thread pool.
@@ -202,11 +210,22 @@ pub(super) async fn analyze(
         }
     };
 
+    let max_upload = state.max_upload_bytes;
     let mut file_size = 0usize;
     loop {
         match field.chunk().await {
             Ok(Some(chunk)) if !chunk.is_empty() => {
                 file_size += chunk.len();
+                if file_size > max_upload {
+                    tracing::warn!(
+                        "upload exceeded size limit: {file_size} > {max_upload}  id={request_id}"
+                    );
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        Json(serde_json::json!({"error": "File too large"})),
+                    )
+                        .into_response();
+                }
                 if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut tokio_file, &chunk).await
                 {
                     tracing::warn!("failed to write chunk: {e}  id={request_id}");
@@ -376,17 +395,12 @@ fn classify_file(
 
     let finding_counts = count_findings_from_json(&report_json);
 
-    let (reasons, top_findings) = if classification != Classification::Benign {
-        let r = resources
-            .shap
-            .as_ref()
-            .map(|s| s.explain(&features, &resources.model.spec.feature_names, 5))
-            .unwrap_or_default();
-        let f = extract_top_findings_from_json(&report_json, &classification);
-        (r, f)
-    } else {
-        (vec![], vec![])
-    };
+    let reasons = resources
+        .shap
+        .as_ref()
+        .map(|s| s.explain(&features, &resources.model.spec.feature_names, 5))
+        .unwrap_or_default();
+    let top_findings = extract_top_findings_from_json(&report_json, &classification);
 
     let pf = report_json["files"]
         .as_array()

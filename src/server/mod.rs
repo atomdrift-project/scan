@@ -89,6 +89,8 @@ pub struct ModelResources {
 pub struct AppState {
     /// Per-request analysis timeout in seconds.
     pub timeout_secs: u64,
+    /// Maximum upload size in bytes (defense-in-depth, mirrors DefaultBodyLimit).
+    pub max_upload_bytes: usize,
     /// Maximum RSS before rejecting requests.
     pub max_rss_bytes: u64,
     /// Directory containing model artifacts.
@@ -120,8 +122,10 @@ impl AppState {
     }
 }
 
-/// Start the HTTP server. Blocks until SIGINT or SIGTERM.
-pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
+/// Load model resources and build the axum [`Router`].
+///
+/// Useful for integration tests that need the app without binding to a port.
+pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     tracing::info!(model_dir = %config.model_dir.display(), "loading resources");
 
     let thresholds = Thresholds {
@@ -129,8 +133,6 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         hostile: config.threshold_hostile,
     };
 
-    // Load the ONNX model and warm up YARA/capability-mapper in parallel so
-    // startup is not serialised on the slower of the two.
     let model_dir_for_model = config.model_dir.clone();
     let model_dir_for_shap = config.model_dir.clone();
     let slow_rule_ms = config.slow_rule_ms;
@@ -164,6 +166,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         timeout_secs: config.timeout_secs,
+        max_upload_bytes: config.max_body_size,
         max_rss_bytes: config.max_rss_bytes,
         model_dir: config.model_dir.clone(),
         threshold_suspicious: config.threshold_suspicious,
@@ -197,6 +200,13 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .layer(DefaultBodyLimit::max(config.max_body_size))
         .with_state(state);
 
+    Ok(app)
+}
+
+/// Start the HTTP server. Blocks until SIGINT or SIGTERM.
+pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
+    let app = build_app(&config).await?;
+
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     eprintln!(
         "Listening on http://{} (timeout: {}s, max size: {} MB) — Press Ctrl+C to stop",
@@ -208,7 +218,6 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         bind = %config.bind,
         timeout_secs = config.timeout_secs,
         max_body_mb = config.max_body_size / 1024 / 1024,
-        max_concurrent,
         "server ready",
     );
 
