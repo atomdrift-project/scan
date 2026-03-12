@@ -257,7 +257,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                     Classification::Suspicious => suspicious += 1,
                     Classification::Benign => benign += 1,
                 }
-                if config.filter.shows(&r.classification) {
+                if config.format == OutputFormat::Json || config.filter.shows(&r.classification) {
                     emit_result(&r, config, false, &stdout);
                 }
             }
@@ -325,7 +325,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                             benign_count.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    if config.filter.shows(&r.classification) {
+                    if config.format == OutputFormat::Json || config.filter.shows(&r.classification) {
                         emit_result(&r, config, prog.is_some(), &stdout);
                         if let Some(p) = prog {
                             p.redraw();

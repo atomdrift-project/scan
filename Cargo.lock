@@ -595,7 +595,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 [[package]]
 name = "cleave"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#63f7e40282ac62e8c09ddea540f7485814545fd2"
+source = "git+https://codeberg.org/atomdrift/cleave.git#5bf9c3107262c3dbb5f468dcb46c3f7fd8968c24"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -694,7 +694,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#63f7e40282ac62e8c09ddea540f7485814545fd2"
+source = "git+https://codeberg.org/atomdrift/cleave.git#5bf9c3107262c3dbb5f468dcb46c3f7fd8968c24"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2221,7 +2221,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#63f7e40282ac62e8c09ddea540f7485814545fd2"
+source = "git+https://codeberg.org/atomdrift/cleave.git#5bf9c3107262c3dbb5f468dcb46c3f7fd8968c24"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -2481,9 +2481,9 @@ dependencies = [
 
 [[package]]
 name = "once_cell"
-version = "1.21.3"
+version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "once_cell_polyfill"
@@ -3249,7 +3249,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#63f7e40282ac62e8c09ddea540f7485814545fd2"
+source = "git+https://codeberg.org/atomdrift/cleave.git#5bf9c3107262c3dbb5f468dcb46c3f7fd8968c24"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4212,9 +4212,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-scala"
-version = "0.24.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7516aeb3d1f40ede8e3045b163e86993b3434514dd06c34c0b75e782d9a0b251"
+checksum = "3b4f354028b5fcf1d0c77f1c6d84cd5a579f29a1e43cb61551ec6580e9a99229"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -13,7 +13,7 @@ pub use model::Classification;
 pub use scan::{ScanConfig, ScanResult, ScanSummary};
 
 /// Output format for scan results.
-#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, clap::ValueEnum)]
 pub enum OutputFormat {
     /// Human-readable terminal output.
     #[default]

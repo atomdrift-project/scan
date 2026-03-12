@@ -241,7 +241,7 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
                     Classification::Suspicious => suspicious += 1,
                     Classification::Benign => benign += 1,
                 }
-                if config.filter.shows(&result.classification) {
+                if config.format == OutputFormat::Json || config.filter.shows(&result.classification) {
                     emit_result(&result, config, &group.pids, group.deleted, &stdout);
                 }
             }
