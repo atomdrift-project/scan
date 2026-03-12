@@ -46,6 +46,25 @@ async fn analyze_encrypted_zip_returns_json() {
     };
     let app = build_app(&config).await.expect("failed to build app");
 
+    // Wait for background resource loading to complete before sending requests.
+    eprintln!("waiting for server readiness...");
+    for _ in 0..100 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::OK {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     let (content_type, body) = multipart_body(&file_bytes, "encrypted.zip");
 
     let response = app
