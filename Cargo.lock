@@ -595,7 +595,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 [[package]]
 name = "cleave"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4ab43a1744fcb9732ec4140a131b7ad7fa55a2d1"
+source = "git+https://codeberg.org/atomdrift/cleave.git#63f7e40282ac62e8c09ddea540f7485814545fd2"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -694,7 +694,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4ab43a1744fcb9732ec4140a131b7ad7fa55a2d1"
+source = "git+https://codeberg.org/atomdrift/cleave.git#63f7e40282ac62e8c09ddea540f7485814545fd2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2221,7 +2221,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4ab43a1744fcb9732ec4140a131b7ad7fa55a2d1"
+source = "git+https://codeberg.org/atomdrift/cleave.git#63f7e40282ac62e8c09ddea540f7485814545fd2"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -3249,7 +3249,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4ab43a1744fcb9732ec4140a131b7ad7fa55a2d1"
+source = "git+https://codeberg.org/atomdrift/cleave.git#63f7e40282ac62e8c09ddea540f7485814545fd2"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -5250,7 +5250,7 @@ dependencies = [
 [[package]]
 name = "xgboost-native"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/xgboost-native#eecc5e5d5b289f01c66f94bd760e746673c6441a"
+source = "git+https://codeberg.org/atomdrift/xgboost-native#9058619219944d4b827387272955ffd2a8e4b8aa"
 dependencies = [
  "serde",
  "serde_json",
