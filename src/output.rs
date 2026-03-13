@@ -255,12 +255,18 @@ pub fn print_header(path: &std::path::Path, count: usize) {
 
 /// Print scan summary.
 pub fn print_summary(summary: &ScanSummary) {
-    if summary.total_files == 0 {
-        return;
-    }
-
     let line = fg(50, 50, 50, &"\u{2500}".repeat(52));
     eprintln!("  {line}");
+
+    if summary.total_files == 0 {
+        eprintln!(
+            "  {}  no scannable files found  {}",
+            fg(180, 180, 60, "!"),
+            fg(80, 80, 80, &format_elapsed(summary.duration_ms)),
+        );
+        eprintln!();
+        return;
+    }
 
     if summary.hostile == 0 && summary.suspicious == 0 {
         eprintln!(
