@@ -182,7 +182,7 @@ pub(super) async fn analyze(
     let filename: String = {
         let raw = field
             .file_name()
-            .map(|s| s.to_owned())
+            .map(str::to_owned)
             .unwrap_or_else(|| format!("upload-{request_id}"));
         let sanitized: String = raw
             .chars()

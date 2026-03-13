@@ -30,6 +30,14 @@ struct Cli {
     #[arg(short = 'u', long)]
     update: bool,
 
+    /// Force light-background color theme
+    #[arg(long, conflicts_with = "dark")]
+    light: bool,
+
+    /// Force dark-background color theme
+    #[arg(long, conflicts_with = "light")]
+    dark: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -169,6 +177,15 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .without_time()
         .init();
+
+    // Initialize terminal theme before any output.
+    if cli.light {
+        litmus::output::set_theme(litmus::output::Theme::Light);
+    } else if cli.dark {
+        litmus::output::set_theme(litmus::output::Theme::Dark);
+    } else {
+        litmus::output::detect_theme();
+    }
 
     #[cfg(debug_assertions)]
     tracing::warn!("DEBUG binary — litmus will be very slow; use `make release` for production builds");

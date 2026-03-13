@@ -1,4 +1,7 @@
 //! Terminal and JSON output formatting with litmus-colored confidence indicators.
+//! Supports both dark and light terminal backgrounds via auto-detection.
+
+use std::sync::OnceLock;
 
 use colored::Colorize;
 
@@ -7,8 +10,147 @@ use crate::scan::{ScanResult, ScanSummary};
 
 const BLOCK: &str = "\u{2588}";
 
+/// RGB color tuple.
+#[derive(Debug, Clone, Copy)]
+struct Rgb(u8, u8, u8);
+
+/// Terminal background theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    /// Dark terminal background (default).
+    Dark,
+    /// Light/white terminal background.
+    Light,
+}
+
+/// Color palette tuned for a specific background theme.
+#[derive(Debug, Clone, Copy)]
+struct Palette {
+    // Classification colors — high-vis on both backgrounds.
+    hostile: Rgb,
+    hostile_finding: Rgb,
+    suspicious: Rgb,
+    suspicious_finding: Rgb,
+    benign: Rgb,
+
+    // Semantic accent colors.
+    filetype: Rgb,
+    formula: Rgb,
+
+    // UI chrome.
+    dot_sep: Rgb,
+    dim: Rgb,
+    very_dim: Rgb,
+    header_icon: Rgb,
+    header_path: Rgb,
+    summary_line: Rgb,
+    warning: Rgb,
+    arrow: Rgb,
+    reason: Rgb,
+
+    // Verbose counters — active vs inactive.
+    count_inactive: Rgb,
+    notable_active: Rgb,
+}
+
+impl Palette {
+    const fn dark() -> Self {
+        Self {
+            hostile: Rgb(255, 70, 70),
+            hostile_finding: Rgb(255, 100, 100),
+            suspicious: Rgb(255, 175, 55),
+            suspicious_finding: Rgb(255, 190, 90),
+            benign: Rgb(80, 200, 80),
+
+            filetype: Rgb(120, 160, 220),
+            formula: Rgb(80, 160, 140),
+
+            dot_sep: Rgb(50, 50, 50),
+            dim: Rgb(100, 100, 100),
+            very_dim: Rgb(80, 80, 80),
+            header_icon: Rgb(120, 180, 255),
+            header_path: Rgb(180, 180, 180),
+            summary_line: Rgb(50, 50, 50),
+            warning: Rgb(180, 180, 60),
+            arrow: Rgb(70, 70, 70),
+            reason: Rgb(100, 100, 100),
+
+            count_inactive: Rgb(60, 60, 60),
+            notable_active: Rgb(180, 180, 100),
+        }
+    }
+
+    const fn light() -> Self {
+        Self {
+            hostile: Rgb(200, 30, 30),
+            hostile_finding: Rgb(180, 40, 40),
+            suspicious: Rgb(180, 120, 0),
+            suspicious_finding: Rgb(160, 100, 0),
+            benign: Rgb(30, 140, 30),
+
+            filetype: Rgb(40, 90, 160),
+            formula: Rgb(30, 120, 100),
+
+            dot_sep: Rgb(180, 180, 180),
+            dim: Rgb(120, 120, 120),
+            very_dim: Rgb(150, 150, 150),
+            header_icon: Rgb(40, 100, 200),
+            header_path: Rgb(80, 80, 80),
+            summary_line: Rgb(190, 190, 190),
+            warning: Rgb(140, 140, 0),
+            arrow: Rgb(160, 160, 160),
+            reason: Rgb(100, 100, 100),
+
+            count_inactive: Rgb(180, 180, 180),
+            notable_active: Rgb(130, 120, 0),
+        }
+    }
+}
+
+/// Globally cached theme detection result.
+static THEME: OnceLock<Theme> = OnceLock::new();
+
+/// Detect the terminal theme, with env var override.
+///
+/// Priority: `LITMUS_THEME` env var > terminal query > default (dark).
+pub fn detect_theme() -> Theme {
+    *THEME.get_or_init(|| {
+        // Check env override first.
+        if let Ok(val) = std::env::var("LITMUS_THEME") {
+            return match val.to_ascii_lowercase().as_str() {
+                "light" | "white" => Theme::Light,
+                _ => Theme::Dark,
+            };
+        }
+
+        // Query terminal via OSC 11 + COLORFGBG fallback.
+        match terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default()) {
+            Ok(scheme) => match scheme {
+                terminal_colorsaurus::ColorScheme::Dark => Theme::Dark,
+                terminal_colorsaurus::ColorScheme::Light => Theme::Light,
+            },
+            Err(_) => Theme::Dark,
+        }
+    })
+}
+
+/// Override the theme (called from CLI flags before any output).
+pub fn set_theme(theme: Theme) {
+    let _ = THEME.set(theme);
+}
+
+fn palette() -> &'static Palette {
+    static DARK: Palette = Palette::dark();
+    static LIGHT: Palette = Palette::light();
+
+    match THEME.get().copied().unwrap_or(Theme::Dark) {
+        Theme::Dark => &DARK,
+        Theme::Light => &LIGHT,
+    }
+}
+
 /// Set truecolor foreground on text.
-fn fg(r: u8, g: u8, b: u8, text: &str) -> String {
+fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
     format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
 }
 
@@ -24,29 +166,36 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
 /// darkens and the right block lightens/desaturates, creating a visual
 /// "spread" that intuitively conveys uncertainty.
 fn confidence_blocks(probability: f32, classification: &Classification) -> String {
+    let p = palette();
     match classification {
         Classification::Hostile => {
-            // Band: 0.85 .. 1.0 -> t: 0.0 .. 1.0
             let t = ((probability - 0.85) / 0.15).clamp(0.0, 1.0);
-            // Left: dark red (#640000) -> bright red (#FF0000)
-            let l = fg(lerp(100, 255, t), 0, 0, BLOCK);
-            // Right: pink (#FF9696) -> bright red (#FF0000)
-            let r = fg(255, lerp(150, 0, t), lerp(150, 0, t), BLOCK);
+            let base = p.hostile;
+            let l = fg(Rgb(lerp(base.0 / 2, base.0, t), 0, 0), BLOCK);
+            let r = fg(
+                Rgb(base.0, lerp(150, 0, t), lerp(150, 0, t)),
+                BLOCK,
+            );
             format!("{l}{r}")
         }
         Classification::Suspicious => {
-            // Band: 0.75 .. 0.85 -> t: 0.0 .. 1.0
             let t = ((probability - 0.75) / 0.10).clamp(0.0, 1.0);
-            // Left: muted amber (#B46400) -> bright amber (#FFA000)
-            let l = fg(lerp(180, 255, t), lerp(100, 160, t), 0, BLOCK);
-            // Right: pale orange (#FFB450) -> bright amber (#FF8C00)
-            let r = fg(255, lerp(180, 140, t), lerp(80, 0, t), BLOCK);
+            let base = p.suspicious;
+            let l = fg(
+                Rgb(lerp(base.0 * 3 / 4, base.0, t), lerp(base.1 / 2, base.1, t), 0),
+                BLOCK,
+            );
+            let r = fg(
+                Rgb(base.0, lerp(base.1 + 30, base.1, t), lerp(80, 0, t)),
+                BLOCK,
+            );
             format!("{l}{r}")
         }
         Classification::Benign => {
             let t = (probability / 0.75).clamp(0.0, 1.0);
-            let l = fg(0, lerp(100, 180, t), 0, BLOCK);
-            let r = fg(0, lerp(80, 160, t), 0, BLOCK);
+            let base = p.benign;
+            let l = fg(Rgb(0, lerp(base.1 / 2, base.1, t), 0), BLOCK);
+            let r = fg(Rgb(0, lerp(base.1 / 3, base.1 * 4 / 5, t), 0), BLOCK);
             format!("{l}{r}")
         }
     }
@@ -54,11 +203,12 @@ fn confidence_blocks(probability: f32, classification: &Classification) -> Strin
 
 /// Color percentage text to match the classification band.
 fn colored_pct(probability: f32, classification: &Classification) -> String {
+    let p = palette();
     let pct = format!("{:>4}", format!("{:.0}%", probability * 100.0));
     match classification {
-        Classification::Hostile => fg(255, 70, 70, &pct),
-        Classification::Suspicious => fg(255, 175, 55, &pct),
-        Classification::Benign => fg(80, 200, 80, &pct),
+        Classification::Hostile => fg(p.hostile, &pct),
+        Classification::Suspicious => fg(p.suspicious, &pct),
+        Classification::Benign => fg(p.benign, &pct),
     }
 }
 
@@ -68,82 +218,24 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, verb
         eprint!("\r\x1b[2K");
     }
 
+    let p = palette();
     let blocks = confidence_blocks(result.probability, &result.classification);
     let pct = colored_pct(result.probability, &result.classification);
-    let vt_link = format!(
-        "\x1b]8;;https://www.virustotal.com/gui/file/{sha}\x1b\\{sha}\x1b]8;;\x1b\\",
-        sha = result.sha256,
-    );
-    let mut meta = format!(
-        "{} \u{00b7} {} \u{00b7} {}",
-        result.file_type,
-        format_size(result.size_bytes),
-        vt_link,
-    );
-    if !result.formula.is_empty() {
-        meta.push_str(&format!(" \u{00b7} {}", result.formula));
-    }
 
-    eprintln!("  {blocks} {pct}  {}  {}", result.path.bold(), meta.bright_black());
+    eprintln!("  {blocks} {pct}  {}", result.path.bold());
+    print_detail_lines(result, p);
 
     if verbose {
-        let fc = &result.finding_counts;
-        let h = if fc.hostile > 0 {
-            fg(255, 80, 80, &format!("h:{}", fc.hostile))
-        } else {
-            fg(60, 60, 60, &format!("h:{}", fc.hostile))
-        };
-        let s = if fc.suspicious > 0 {
-            fg(255, 175, 55, &format!("s:{}", fc.suspicious))
-        } else {
-            fg(60, 60, 60, &format!("s:{}", fc.suspicious))
-        };
-        let n = if fc.notable > 0 {
-            fg(180, 180, 100, &format!("n:{}", fc.notable))
-        } else {
-            fg(60, 60, 60, &format!("n:{}", fc.notable))
-        };
-        let b = fg(60, 60, 60, &format!("b:{}", fc.baseline));
-        let dot = fg(50, 50, 50, "\u{00b7}");
-        let p = fg(100, 100, 100, &format!("p={:.4}", result.probability));
-        eprintln!("           {h}  {s}  {n}  {b}  {dot}  {p}");
+        print_verbose_counts(&result.finding_counts, result.probability, p);
     }
 
-    if !result.top_findings.is_empty() {
-        let findings: Vec<String> = result
-            .top_findings
-            .iter()
-            .take(4)
-            .map(|f| short_finding_id(&f.id))
-            .collect();
-        let line = findings.join(&format!(" {} ", fg(80, 80, 80, "\u{00b7}")));
-        let colored = match result.classification {
-            Classification::Hostile => fg(255, 100, 100, &line),
-            Classification::Suspicious => fg(255, 190, 90, &line),
-            Classification::Benign => line,
-        };
-        eprintln!("           {colored}");
-    }
-
-    if !result.reasons.is_empty() {
-        let reason_strs: Vec<&str> = result
-            .reasons
-            .iter()
-            .take(3)
-            .map(|r| r.description.as_str())
-            .collect();
-        eprintln!(
-            "           {} {}",
-            fg(70, 70, 70, "\u{2191}"),
-            fg(100, 100, 100, &reason_strs.join(", ")),
-        );
-    }
-
+    print_reasons(result, p);
     eprintln!();
 }
 
 /// Print a process scan result with PID annotations.
 pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, verbose: bool) {
+    let p = palette();
     let blocks = confidence_blocks(result.probability, &result.classification);
     let pct = colored_pct(result.probability, &result.classification);
 
@@ -157,73 +249,62 @@ pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, verbose
         let first: Vec<String> = pids[..4].iter().map(u32::to_string).collect();
         format!("{} +{} more", first.join(", "), pids.len() - 4)
     };
-    let pid_display = fg(100, 100, 100, &format!("[pids: {pid_str}]"));
+    let pid_display = fg(p.dim, &format!("[pids: {pid_str}]"));
 
     let deleted_marker = if deleted {
-        format!(" {}", fg(255, 100, 100, "(deleted)"))
+        format!(" {}", fg(p.hostile_finding, "(deleted)"))
     } else {
         String::new()
     };
 
-    let vt_link = format!(
-        "\x1b]8;;https://www.virustotal.com/gui/file/{sha}\x1b\\{sha}\x1b]8;;\x1b\\",
-        sha = result.sha256,
-    );
-    let mut meta = format!(
-        "{} \u{00b7} {} \u{00b7} {}",
-        result.file_type,
-        format_size(result.size_bytes),
-        vt_link,
-    );
-    if !result.formula.is_empty() {
-        meta.push_str(&format!(" \u{00b7} {}", result.formula));
-    }
-
     eprintln!(
-        "  {blocks} {pct}  {}{deleted_marker}  {pid_display}  {}",
+        "  {blocks} {pct}  {}{deleted_marker}  {pid_display}",
         result.path.bold(),
-        meta.bright_black(),
     );
+
+    print_detail_lines(result, p);
 
     if verbose {
-        let fc = &result.finding_counts;
-        let h = if fc.hostile > 0 {
-            fg(255, 80, 80, &format!("h:{}", fc.hostile))
-        } else {
-            fg(60, 60, 60, &format!("h:{}", fc.hostile))
-        };
-        let s = if fc.suspicious > 0 {
-            fg(255, 175, 55, &format!("s:{}", fc.suspicious))
-        } else {
-            fg(60, 60, 60, &format!("s:{}", fc.suspicious))
-        };
-        let n = if fc.notable > 0 {
-            fg(180, 180, 100, &format!("n:{}", fc.notable))
-        } else {
-            fg(60, 60, 60, &format!("n:{}", fc.notable))
-        };
-        let b = fg(60, 60, 60, &format!("b:{}", fc.baseline));
-        let dot = fg(50, 50, 50, "\u{00b7}");
-        let p = fg(100, 100, 100, &format!("p={:.4}", result.probability));
-        eprintln!("           {h}  {s}  {n}  {b}  {dot}  {p}");
+        print_verbose_counts(&result.finding_counts, result.probability, p);
     }
 
+    print_reasons(result, p);
+    eprintln!();
+}
+
+/// Print metadata line (filetype + formula) and findings line.
+fn print_detail_lines(result: &ScanResult, p: &Palette) {
+    let dot = fg(p.dot_sep, "\u{00b7}");
+
+    // Line 2: filetype · formula
+    let mut meta: Vec<String> = Vec::new();
+    meta.push(fg(p.filetype, &result.file_type));
+    if !result.formula.is_empty() {
+        meta.push(fg(p.formula, &result.formula));
+    }
+    eprintln!("           {}", meta.join(&format!(" {dot} ")));
+
+    // Line 3: findings (classification-colored)
     if !result.top_findings.is_empty() {
         let findings: Vec<String> = result
             .top_findings
             .iter()
             .take(4)
-            .map(|f| short_finding_id(&f.id))
+            .map(|f| {
+                let name = short_finding_id(&f.id);
+                match result.classification {
+                    Classification::Hostile => fg(p.hostile_finding, &name),
+                    Classification::Suspicious => fg(p.suspicious_finding, &name),
+                    Classification::Benign => name,
+                }
+            })
             .collect();
-        let line = findings.join(&format!(" {} ", fg(80, 80, 80, "\u{00b7}")));
-        let colored = match result.classification {
-            Classification::Hostile => fg(255, 100, 100, &line),
-            Classification::Suspicious => fg(255, 190, 90, &line),
-            Classification::Benign => line,
-        };
-        eprintln!("           {colored}");
+        eprintln!("           {}", findings.join(&format!(" {dot} ")));
     }
+}
 
+/// Print SHAP reason line if present.
+fn print_reasons(result: &ScanResult, p: &Palette) {
     if !result.reasons.is_empty() {
         let reason_strs: Vec<&str> = result
             .reasons
@@ -233,36 +314,63 @@ pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, verbose
             .collect();
         eprintln!(
             "           {} {}",
-            fg(70, 70, 70, "\u{2191}"),
-            fg(100, 100, 100, &reason_strs.join(", ")),
+            fg(p.arrow, "\u{2191}"),
+            fg(p.reason, &reason_strs.join(", ")),
         );
     }
+}
 
-    eprintln!();
+/// Print verbose finding counts and raw probability.
+fn print_verbose_counts(
+    fc: &crate::scan::FindingCounts,
+    probability: f32,
+    p: &Palette,
+) {
+    let h = if fc.hostile > 0 {
+        fg(p.hostile, &format!("h:{}", fc.hostile))
+    } else {
+        fg(p.count_inactive, &format!("h:{}", fc.hostile))
+    };
+    let s = if fc.suspicious > 0 {
+        fg(p.suspicious, &format!("s:{}", fc.suspicious))
+    } else {
+        fg(p.count_inactive, &format!("s:{}", fc.suspicious))
+    };
+    let n = if fc.notable > 0 {
+        fg(p.notable_active, &format!("n:{}", fc.notable))
+    } else {
+        fg(p.count_inactive, &format!("n:{}", fc.notable))
+    };
+    let b = fg(p.count_inactive, &format!("b:{}", fc.baseline));
+    let vdot = fg(p.dot_sep, "\u{00b7}");
+    let prob = fg(p.dim, &format!("p={probability:.4}"));
+    eprintln!("           {h}  {s}  {n}  {b}  {vdot}  {prob}");
 }
 
 /// Print the scan header.
 pub fn print_header(path: &std::path::Path, count: usize) {
+    let p = palette();
     eprintln!();
     eprintln!(
         "  {}  {} files in {}",
-        fg(120, 180, 255, "\u{25c6}"),
+        fg(p.header_icon, "\u{25c6}"),
         count,
-        fg(180, 180, 180, &path.display().to_string()),
+        fg(p.header_path, &path.display().to_string()),
     );
     eprintln!();
 }
 
 /// Print scan summary.
 pub fn print_summary(summary: &ScanSummary) {
-    let line = fg(50, 50, 50, &"\u{2500}".repeat(52));
+    let p = palette();
+    let line = fg(p.summary_line, &"\u{2500}".repeat(52));
     eprintln!("  {line}");
 
     if summary.total_files == 0 {
         eprintln!(
             "  {}  no scannable files found  {}",
-            fg(180, 180, 60, "!"),
-            fg(80, 80, 80, &format_elapsed(summary.duration_ms)),
+            fg(p.warning, "!"),
+            fg(p.very_dim, &format_elapsed(summary.duration_ms)),
         );
         eprintln!();
         return;
@@ -271,9 +379,9 @@ pub fn print_summary(summary: &ScanSummary) {
     if summary.hostile == 0 && summary.suspicious == 0 {
         eprintln!(
             "  {}  {} files scanned, all clean  {}",
-            fg(80, 220, 80, "\u{2713}"),
+            fg(p.benign, "\u{2713}"),
             summary.total_files,
-            fg(80, 80, 80, &format_elapsed(summary.duration_ms)),
+            fg(p.very_dim, &format_elapsed(summary.duration_ms)),
         );
         eprintln!();
         return;
@@ -281,18 +389,21 @@ pub fn print_summary(summary: &ScanSummary) {
 
     let mut parts = vec![format!("{} files", summary.total_files)];
     if summary.hostile > 0 {
-        parts.push(fg(255, 70, 70, &format!("{} hostile", summary.hostile)));
+        parts.push(fg(p.hostile, &format!("{} hostile", summary.hostile)));
     }
     if summary.suspicious > 0 {
-        parts.push(fg(255, 175, 55, &format!("{} suspicious", summary.suspicious)));
+        parts.push(fg(
+            p.suspicious,
+            &format!("{} suspicious", summary.suspicious),
+        ));
     }
     if summary.errors > 0 {
-        parts.push(fg(180, 180, 180, &format!("{} errors", summary.errors)));
+        parts.push(fg(p.header_path, &format!("{} errors", summary.errors)));
     }
-    parts.push(fg(80, 80, 80, &format!("{} clean", summary.benign)));
-    parts.push(fg(80, 80, 80, &format_elapsed(summary.duration_ms)));
+    parts.push(fg(p.very_dim, &format!("{} clean", summary.benign)));
+    parts.push(fg(p.very_dim, &format_elapsed(summary.duration_ms)));
 
-    let sep = format!("  {}  ", fg(50, 50, 50, "\u{00b7}"));
+    let sep = format!("  {}  ", fg(p.dot_sep, "\u{00b7}"));
     eprintln!("  {}", parts.join(&sep));
     eprintln!();
 }
@@ -306,16 +417,6 @@ fn short_finding_id(id: &str) -> String {
         .or_else(|| base.strip_prefix("metadata/"))
         .unwrap_or(base)
         .to_string()
-}
-
-fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes}B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
-    }
 }
 
 fn format_elapsed(ms: u64) -> String {
