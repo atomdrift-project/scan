@@ -272,6 +272,11 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
 
 /// Start the HTTP server. Blocks until SIGINT or SIGTERM.
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
+    // Server mode processes many files over a long lifetime. Configure jemalloc
+    // to aggressively return freed pages to the OS, preventing multi-GB RSS
+    // growth from allocator fragmentation across thousands of analyses.
+    cleave::memory_tracker::configure_jemalloc_low_memory();
+
     let app = build_app(&config).await?;
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;

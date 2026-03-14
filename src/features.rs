@@ -78,6 +78,9 @@ pub struct FeatureSpec {
     pub feature_means: Option<Vec<f32>>,
     /// Per-feature standard deviations for z-score standardization (from training).
     pub feature_stds: Option<Vec<f32>>,
+    /// Whether the model was trained on standardized features. When false,
+    /// inference should use raw features directly (no z-score transform).
+    pub standardized: bool,
 }
 
 impl FeatureSpec {
@@ -102,13 +105,18 @@ impl FeatureSpec {
             total_features: v["total_features"].as_u64().unwrap_or(0) as usize,
             feature_means: json_f32_array(&v["feature_means"]),
             feature_stds: json_f32_array(&v["feature_stds"]),
+            standardized: v["standardized"].as_bool().unwrap_or(true),
         })
     }
 
     /// Apply z-score standardization using training statistics.
+    /// No-op if the model was trained on raw features (standardized=false).
     /// Features that were constant during training (mean=0, std=1) are zeroed
     /// to prevent catastrophic misclassification from unseen raw values.
     pub fn standardize(&self, features: &mut [f32]) {
+        if !self.standardized {
+            return;
+        }
         let (Some(means), Some(stds)) = (self.feature_means.as_ref(), self.feature_stds.as_ref())
         else {
             return;
@@ -539,6 +547,7 @@ mod tests {
             total_features: 3,
             feature_means: Some(vec![0.0, 1.0, 2.0]),
             feature_stds: Some(vec![1.0, 2.0, 0.5]),
+            standardized: true,
         };
         let mut features = vec![1.0, 3.0, 3.0];
         spec.standardize(&mut features);
@@ -561,6 +570,7 @@ mod tests {
             total_features: 1 + 1 + 8 + 6 + 16 + 1 + 4,
             feature_means: None,
             feature_stds: None,
+            standardized: false,
         };
         let ctx = ExtractContext::new(&spec);
         let report = serde_json::json!({"files": [{"file_type": "sh", "size": 100}]});
@@ -592,6 +602,7 @@ mod tests {
             total_features: 3 + 3 + 8 + 6 + 16 + 1 + 4,
             feature_means: None,
             feature_stds: None,
+            standardized: false,
         };
         let ctx = ExtractContext::new(&spec);
         let report = serde_json::json!({
@@ -630,6 +641,7 @@ mod tests {
             total_features: 1 + 1 + 8 + 6 + 16 + 0 + 4,
             feature_means: None,
             feature_stds: None,
+            standardized: false,
         };
         let ctx = ExtractContext::new(&spec);
         let report = serde_json::json!({
