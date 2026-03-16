@@ -39,7 +39,20 @@ pub struct Thresholds {
     pub hostile: f32,
 }
 
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            suspicious: Self::DEFAULT_SUSPICIOUS,
+            hostile: Self::DEFAULT_HOSTILE,
+        }
+    }
+}
+
 impl Thresholds {
+    /// Default suspicious threshold.
+    pub const DEFAULT_SUSPICIOUS: f32 = 0.97;
+    /// Default hostile threshold.
+    pub const DEFAULT_HOSTILE: f32 = 0.99;
     /// Classify a probability score into a [`Classification`].
     #[must_use]
     pub fn classify(&self, probability: f32) -> Classification {

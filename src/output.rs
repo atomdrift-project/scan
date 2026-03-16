@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use colored::Colorize;
 
-use crate::model::Classification;
+use crate::model::{Classification, Thresholds};
 use crate::scan::{ScanResult, ScanSummary};
 
 const BLOCK: &str = "\u{2588}";
@@ -47,10 +47,6 @@ struct Palette {
     warning: Rgb,
     arrow: Rgb,
     reason: Rgb,
-
-    // Verbose counters — active vs inactive.
-    count_inactive: Rgb,
-    notable_active: Rgb,
 }
 
 impl Palette {
@@ -74,9 +70,6 @@ impl Palette {
             warning: Rgb(180, 180, 60),
             arrow: Rgb(70, 70, 70),
             reason: Rgb(100, 100, 100),
-
-            count_inactive: Rgb(60, 60, 60),
-            notable_active: Rgb(180, 180, 100),
         }
     }
 
@@ -100,9 +93,6 @@ impl Palette {
             warning: Rgb(140, 140, 0),
             arrow: Rgb(160, 160, 160),
             reason: Rgb(100, 100, 100),
-
-            count_inactive: Rgb(180, 180, 180),
-            notable_active: Rgb(130, 120, 0),
         }
     }
 }
@@ -167,9 +157,12 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
 /// "spread" that intuitively conveys uncertainty.
 fn confidence_blocks(probability: f32, classification: &Classification) -> String {
     let p = palette();
+    let thresh = Thresholds::default();
+    let hostile_range = 1.0 - thresh.hostile;
+    let suspicious_range = thresh.hostile - thresh.suspicious;
     match classification {
         Classification::Hostile => {
-            let t = ((probability - 0.85) / 0.15).clamp(0.0, 1.0);
+            let t = ((probability - thresh.hostile) / hostile_range).clamp(0.0, 1.0);
             let base = p.hostile;
             let l = fg(Rgb(lerp(base.0 / 2, base.0, t), 0, 0), BLOCK);
             let r = fg(
@@ -179,10 +172,10 @@ fn confidence_blocks(probability: f32, classification: &Classification) -> Strin
             format!("{l}{r}")
         }
         Classification::Suspicious => {
-            let t = ((probability - 0.75) / 0.10).clamp(0.0, 1.0);
+            let t = ((probability - thresh.suspicious) / suspicious_range).clamp(0.0, 1.0);
             let base = p.suspicious;
             let l = fg(
-                Rgb(lerp(base.0 * 3 / 4, base.0, t), lerp(base.1 / 2, base.1, t), 0),
+                Rgb(lerp((base.0 as u16 * 3 / 4) as u8, base.0, t), lerp(base.1 / 2, base.1, t), 0),
                 BLOCK,
             );
             let r = fg(
@@ -192,10 +185,10 @@ fn confidence_blocks(probability: f32, classification: &Classification) -> Strin
             format!("{l}{r}")
         }
         Classification::Benign => {
-            let t = (probability / 0.75).clamp(0.0, 1.0);
+            let t = (probability / thresh.suspicious).clamp(0.0, 1.0);
             let base = p.benign;
             let l = fg(Rgb(0, lerp(base.1 / 2, base.1, t), 0), BLOCK);
-            let r = fg(Rgb(0, lerp(base.1 / 3, base.1 * 4 / 5, t), 0), BLOCK);
+            let r = fg(Rgb(0, lerp(base.1 / 3, (base.1 as u16 * 4 / 5) as u8, t), 0), BLOCK);
             format!("{l}{r}")
         }
     }
@@ -213,7 +206,7 @@ fn colored_pct(probability: f32, classification: &Classification) -> String {
 }
 
 /// Print a single file result immediately, clearing progress line if active.
-pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, verbose: bool) {
+pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool) {
     if has_progress {
         eprint!("\r\x1b[2K");
     }
@@ -224,17 +217,12 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, verb
 
     eprintln!("  {blocks} {pct}  {}", result.path.bold());
     print_detail_lines(result, p);
-
-    if verbose {
-        print_verbose_counts(&result.finding_counts, result.probability, p);
-    }
-
     print_reasons(result, p);
     eprintln!();
 }
 
 /// Print a process scan result with PID annotations.
-pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, verbose: bool) {
+pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool) {
     let p = palette();
     let blocks = confidence_blocks(result.probability, &result.classification);
     let pct = colored_pct(result.probability, &result.classification);
@@ -263,11 +251,6 @@ pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, verbose
     );
 
     print_detail_lines(result, p);
-
-    if verbose {
-        print_verbose_counts(&result.finding_counts, result.probability, p);
-    }
-
     print_reasons(result, p);
     eprintln!();
 }
@@ -318,33 +301,6 @@ fn print_reasons(result: &ScanResult, p: &Palette) {
             fg(p.reason, &reason_strs.join(", ")),
         );
     }
-}
-
-/// Print verbose finding counts and raw probability.
-fn print_verbose_counts(
-    fc: &crate::scan::FindingCounts,
-    probability: f32,
-    p: &Palette,
-) {
-    let h = if fc.hostile > 0 {
-        fg(p.hostile, &format!("h:{}", fc.hostile))
-    } else {
-        fg(p.count_inactive, &format!("h:{}", fc.hostile))
-    };
-    let s = if fc.suspicious > 0 {
-        fg(p.suspicious, &format!("s:{}", fc.suspicious))
-    } else {
-        fg(p.count_inactive, &format!("s:{}", fc.suspicious))
-    };
-    let n = if fc.notable > 0 {
-        fg(p.notable_active, &format!("n:{}", fc.notable))
-    } else {
-        fg(p.count_inactive, &format!("n:{}", fc.notable))
-    };
-    let b = fg(p.count_inactive, &format!("b:{}", fc.baseline));
-    let vdot = fg(p.dot_sep, "\u{00b7}");
-    let prob = fg(p.dim, &format!("p={probability:.4}"));
-    eprintln!("           {h}  {s}  {n}  {b}  {vdot}  {prob}");
 }
 
 /// Print the scan header.

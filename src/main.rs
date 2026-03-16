@@ -38,8 +38,35 @@ struct Cli {
     #[arg(long, conflicts_with = "light")]
     dark: bool,
 
+    /// Override model directory (default: auto-resolved from models repo)
+    #[arg(long)]
+    model_dir: Option<PathBuf>,
+
+    /// Output format
+    #[arg(short, long, default_value = "terminal")]
+    format: OutputFormat,
+
+    /// Probability threshold for suspicious classification (0.0-1.0)
+    #[arg(long, default_value_t = litmus::model::Thresholds::DEFAULT_SUSPICIOUS)]
+    threshold_suspicious: f32,
+
+    /// Probability threshold for hostile classification (0.0-1.0)
+    #[arg(long, default_value_t = litmus::model::Thresholds::DEFAULT_HOSTILE)]
+    threshold_hostile: f32,
+
+    /// Classifications to display: hostile, sus, benign, all (comma-separated)
+    #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
+    show: Vec<Show>,
+
+    /// Warn when a single rule takes longer than this many milliseconds
+    #[arg(long, default_value = "4000")]
+    slow_rule_ms: u64,
+
+    /// Path to file or directory to scan (shorthand for `litmus scan <path>`)
+    path: Option<PathBuf>,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -48,66 +75,10 @@ enum Commands {
     Scan {
         /// Path to file or directory to scan
         path: PathBuf,
-
-        /// Override model directory (default: auto-resolved from models repo)
-        #[arg(long)]
-        model_dir: Option<PathBuf>,
-
-        /// Output format
-        #[arg(short, long, default_value = "terminal")]
-        format: OutputFormat,
-
-        /// Probability threshold for suspicious classification (0.0-1.0)
-        #[arg(long, default_value = "0.75")]
-        threshold_suspicious: f32,
-
-        /// Probability threshold for hostile classification (0.0-1.0)
-        #[arg(long, default_value = "0.85")]
-        threshold_hostile: f32,
-
-        /// Classifications to display: hostile, sus, benign, all (comma-separated)
-        #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
-        show: Vec<Show>,
-
-        /// Show cleave finding counts (h/s/n/b) and raw model score per file
-        #[arg(long, short)]
-        verbose: bool,
-
-        /// Warn when a single rule takes longer than this many milliseconds
-        #[arg(long, default_value = "4000")]
-        slow_rule_ms: u64,
     },
 
     /// Scan executables of all running processes
-    Ps {
-        /// Override model directory (default: auto-resolved from models repo)
-        #[arg(long)]
-        model_dir: Option<PathBuf>,
-
-        /// Output format
-        #[arg(short, long, default_value = "terminal")]
-        format: OutputFormat,
-
-        /// Probability threshold for suspicious classification (0.0-1.0)
-        #[arg(long, default_value = "0.75")]
-        threshold_suspicious: f32,
-
-        /// Probability threshold for hostile classification (0.0-1.0)
-        #[arg(long, default_value = "0.85")]
-        threshold_hostile: f32,
-
-        /// Classifications to display: hostile, sus, benign, all (comma-separated)
-        #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
-        show: Vec<Show>,
-
-        /// Show cleave finding counts (h/s/n/b) and raw model score per file
-        #[arg(long, short)]
-        verbose: bool,
-
-        /// Warn when a single rule takes longer than this many milliseconds
-        #[arg(long, default_value = "4000")]
-        slow_rule_ms: u64,
-    },
+    Ps,
 
     /// Update models (and optionally cleave traits)
     UpdateRules {
@@ -122,10 +93,6 @@ enum Commands {
 
     /// Run as an HTTP classification server
     Serve {
-        /// Override model directory (default: auto-resolved from models repo)
-        #[arg(long)]
-        model_dir: Option<PathBuf>,
-
         /// Address to listen on
         #[arg(long, default_value = "127.0.0.1:8081")]
         bind: SocketAddr,
@@ -141,18 +108,6 @@ enum Commands {
         /// Maximum RSS in gigabytes before rejecting requests (Linux only)
         #[arg(long, default_value = "8")]
         max_rss_gb: u64,
-
-        /// Probability threshold for suspicious classification (0.0-1.0)
-        #[arg(long, default_value = "0.75")]
-        threshold_suspicious: f32,
-
-        /// Probability threshold for hostile classification (0.0-1.0)
-        #[arg(long, default_value = "0.85")]
-        threshold_hostile: f32,
-
-        /// Warn when a single rule takes longer than this many milliseconds
-        #[arg(long, default_value = "4000")]
-        slow_rule_ms: u64,
     },
 
     /// Print version information
@@ -162,12 +117,19 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let subcommand_verbose = match &cli.command {
-        Commands::Scan { verbose, .. } | Commands::Ps { verbose, .. } => *verbose,
-        _ => false,
+    // Default to Scan when a bare path is given without a subcommand.
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => match cli.path {
+            Some(ref path) => Commands::Scan { path: path.clone() },
+            None => {
+                Cli::parse_from(["litmus", "--help"]);
+                unreachable!()
+            }
+        },
     };
-    let debug_logging = cli.verbose || subcommand_verbose;
-    let filter = if debug_logging {
+
+    let filter = if cli.verbose {
         tracing_subscriber::EnvFilter::new("litmus=debug,cleave=debug,warn")
     } else {
         tracing_subscriber::EnvFilter::new("litmus=warn,cleave=warn")
@@ -205,31 +167,25 @@ fn main() -> Result<()> {
         });
     }
 
-    match cli.command {
-        Commands::Scan {
-            path,
-            model_dir,
-            format,
-            threshold_suspicious,
-            threshold_hostile,
-            show,
-            verbose,
-            slow_rule_ms,
-        } => {
-            let model_dir = model_dir.unwrap_or_else(litmus::models_repo::model_dir);
-            let all = verbose || show.iter().any(|s| matches!(s, Show::All));
+    let model_dir = cli
+        .model_dir
+        .unwrap_or_else(litmus::models_repo::model_dir);
+    let all = cli.show.iter().any(|s| matches!(s, Show::All));
+    let filter = DisplayFilter {
+        hostile: all || cli.show.iter().any(|s| matches!(s, Show::Hostile)),
+        suspicious: all || cli.show.iter().any(|s| matches!(s, Show::Sus)),
+        benign: all || cli.show.iter().any(|s| matches!(s, Show::Benign)),
+    };
+
+    match command {
+        Commands::Scan { path } => {
             let config = litmus::ScanConfig {
                 model_dir,
-                format,
-                threshold_suspicious,
-                threshold_hostile,
-                filter: DisplayFilter {
-                    hostile: all || show.iter().any(|s| matches!(s, Show::Hostile)),
-                    suspicious: all || show.iter().any(|s| matches!(s, Show::Sus)),
-                    benign: all || show.iter().any(|s| matches!(s, Show::Benign)),
-                },
-                verbose,
-                slow_rule_ms,
+                format: cli.format,
+                threshold_suspicious: cli.threshold_suspicious,
+                threshold_hostile: cli.threshold_hostile,
+                filter,
+                slow_rule_ms: cli.slow_rule_ms,
             };
             let result = litmus::scan::run(&path, &config)?;
 
@@ -240,29 +196,14 @@ fn main() -> Result<()> {
                 process::exit(2);
             }
         }
-        Commands::Ps {
-            model_dir,
-            format,
-            threshold_suspicious,
-            threshold_hostile,
-            show,
-            verbose,
-            slow_rule_ms,
-        } => {
-            let model_dir = model_dir.unwrap_or_else(litmus::models_repo::model_dir);
-            let all = verbose || show.iter().any(|s| matches!(s, Show::All));
+        Commands::Ps => {
             let config = litmus::ps::PsConfig {
                 model_dir,
-                format,
-                threshold_suspicious,
-                threshold_hostile,
-                filter: DisplayFilter {
-                    hostile: all || show.iter().any(|s| matches!(s, Show::Hostile)),
-                    suspicious: all || show.iter().any(|s| matches!(s, Show::Sus)),
-                    benign: all || show.iter().any(|s| matches!(s, Show::Benign)),
-                },
-                verbose,
-                slow_rule_ms,
+                format: cli.format,
+                threshold_suspicious: cli.threshold_suspicious,
+                threshold_hostile: cli.threshold_hostile,
+                filter,
+                slow_rule_ms: cli.slow_rule_ms,
             };
             let result = litmus::ps::run(&config)?;
 
@@ -274,25 +215,20 @@ fn main() -> Result<()> {
             }
         }
         Commands::Serve {
-            model_dir,
             bind,
             timeout_secs,
             max_size_mb,
             max_rss_gb,
-            threshold_suspicious,
-            threshold_hostile,
-            slow_rule_ms,
         } => {
-            let model_dir = model_dir.unwrap_or_else(litmus::models_repo::model_dir);
             let config = litmus::server::ServerConfig {
                 bind,
                 timeout_secs,
                 max_body_size: max_size_mb * 1024 * 1024,
                 max_rss_bytes: max_rss_gb * 1024 * 1024 * 1024,
                 model_dir,
-                threshold_suspicious,
-                threshold_hostile,
-                slow_rule_ms,
+                threshold_suspicious: cli.threshold_suspicious,
+                threshold_hostile: cli.threshold_hostile,
+                slow_rule_ms: cli.slow_rule_ms,
             };
             eprintln!("Starting litmus server on http://{} ...", bind);
             tokio::runtime::Builder::new_multi_thread()

@@ -56,8 +56,6 @@ pub struct ScanConfig {
     pub threshold_hostile: f32,
     /// Which classifications to display.
     pub filter: DisplayFilter,
-    /// Print extra detail per file.
-    pub verbose: bool,
     /// Warn when a single rule takes longer than this many milliseconds (default: 4000).
     pub slow_rule_ms: u64,
 }
@@ -363,7 +361,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 fn emit_result(r: &ScanResult, config: &ScanConfig, show_progress: bool, stdout: &Mutex<std::io::Stdout>) {
     match config.format {
         OutputFormat::Terminal => {
-            crate::output::print_file_result_streaming(r, show_progress, config.verbose);
+            crate::output::print_file_result_streaming(r, show_progress);
         }
         OutputFormat::Json => {
             if let Ok(line) = serde_json::to_string(r) {
@@ -385,7 +383,6 @@ fn process_report(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
-    let verbose = config.verbose;
     // Compute formula before finalize (formula_from_report reads root-level findings).
     let formula = cleave::formula_from_report(&report);
 
@@ -416,8 +413,8 @@ fn process_report(
         "classified file",
     );
 
-    // Compute SHAP reasons and top findings for flagged files (or all files in verbose mode).
-    let (reasons, top_findings) = if classification != Classification::Benign || verbose {
+    // Compute SHAP reasons and top findings for flagged files.
+    let (reasons, top_findings) = if classification != Classification::Benign {
         let r = shap
             .map(|s| s.explain(&features, &model.spec.feature_names, 5))
             .unwrap_or_default();

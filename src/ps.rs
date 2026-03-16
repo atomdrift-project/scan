@@ -30,8 +30,6 @@ pub struct PsConfig {
     pub threshold_hostile: f32,
     /// Which classifications to display.
     pub filter: DisplayFilter,
-    /// Print extra detail per file.
-    pub verbose: bool,
     /// Warn when a single rule takes longer than this many milliseconds (default: 4000).
     pub slow_rule_ms: u64,
 }
@@ -339,7 +337,7 @@ fn emit_result(
 ) {
     match config.format {
         OutputFormat::Terminal => {
-            output::print_ps_result(r, pids, deleted, config.verbose);
+            output::print_ps_result(r, pids, deleted);
         }
         OutputFormat::Json => {
             if let Ok(line) = serde_json::to_string(r) {

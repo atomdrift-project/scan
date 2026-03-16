@@ -55,8 +55,8 @@ impl Default for ServerConfig {
             max_body_size: 100 * 1024 * 1024,      // 100 MB
             max_rss_bytes: 8 * 1024 * 1024 * 1024, // 8 GB
             model_dir: PathBuf::new(),
-            threshold_suspicious: 0.75,
-            threshold_hostile: 0.85,
+            threshold_suspicious: Thresholds::DEFAULT_SUSPICIOUS,
+            threshold_hostile: Thresholds::DEFAULT_HOSTILE,
             slow_rule_ms: 4000,
         }
     }

@@ -606,7 +606,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
+source = "git+https://codeberg.org/atomdrift/cleave.git#1ef6a9a9cc04f58a3b1d0b575a1652e4c4f0e018"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -670,6 +670,8 @@ dependencies = [
  "tempfile",
  "terminal_size",
  "thiserror 2.0.18",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "tokio",
  "toml",
  "tower",
@@ -708,7 +710,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
+source = "git+https://codeberg.org/atomdrift/cleave.git#1ef6a9a9cc04f58a3b1d0b575a1652e4c4f0e018"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2244,7 +2246,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
+source = "git+https://codeberg.org/atomdrift/cleave.git#1ef6a9a9cc04f58a3b1d0b575a1652e4c4f0e018"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -2572,6 +2574,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pbkdf2"
@@ -3272,7 +3280,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
+source = "git+https://codeberg.org/atomdrift/cleave.git#1ef6a9a9cc04f58a3b1d0b575a1652e4c4f0e018"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3718,7 +3726,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
+source = "git+https://codeberg.org/atomdrift/cleave.git#1ef6a9a9cc04f58a3b1d0b575a1652e4c4f0e018"
 
 [[package]]
 name = "tap"
@@ -3854,6 +3862,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tikv-jemalloc-ctl"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c"
+dependencies = [
+ "libc",
+ "paste",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]
