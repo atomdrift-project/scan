@@ -523,6 +523,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfb"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8a4f8e55be323b378facfcf1f06aa97f6ec17cf4ac84fb17325093aaf62da41"
+dependencies = [
+ "byteorder",
+ "fnv",
+ "uuid",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -595,7 +606,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#0078689c1b3824749d8f2a292ecda0fda93654e4"
+source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -606,6 +617,7 @@ dependencies = [
  "base64",
  "bzip2 0.6.1",
  "cbc",
+ "cfb",
  "chrono",
  "clap",
  "cleave-macros",
@@ -623,6 +635,7 @@ dependencies = [
  "hex",
  "iced-x86",
  "indicatif",
+ "jpeg-decoder",
  "libc",
  "lnk",
  "lru",
@@ -652,6 +665,7 @@ dependencies = [
  "stng",
  "streaming-iterator",
  "strsim",
+ "sysmem",
  "tar",
  "tempfile",
  "terminal_size",
@@ -694,7 +708,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#0078689c1b3824749d8f2a292ecda0fda93654e4"
+source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1964,6 +1978,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.91"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2221,7 +2244,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#0078689c1b3824749d8f2a292ecda0fda93654e4"
+source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -3249,7 +3272,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#0078689c1b3824749d8f2a292ecda0fda93654e4"
+source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3589,7 +3612,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.0.0"
-source = "git+https://codeberg.org/atomdrift/stng.git#67e9aff64e7b6d24d163f0631d22653d88122480"
+source = "git+https://codeberg.org/atomdrift/stng.git#a56c67297392ad57d8d9c06449a43d2431a592d6"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3597,6 +3620,7 @@ dependencies = [
  "clap",
  "data-encoding",
  "dirs",
+ "flate2",
  "goblin",
  "hex",
  "iced-x86",
@@ -3690,6 +3714,11 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "sysmem"
+version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#6adf8ffed734eede1a8ae4baf53ca26d16a0b206"
 
 [[package]]
 name = "tap"
