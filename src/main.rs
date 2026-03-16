@@ -168,9 +168,9 @@ fn main() -> Result<()> {
     };
     let debug_logging = cli.verbose || subcommand_verbose;
     let filter = if debug_logging {
-        tracing_subscriber::EnvFilter::new("warn,litmus=debug,cleave=debug")
+        tracing_subscriber::EnvFilter::new("litmus=debug,cleave=debug,warn")
     } else {
-        tracing_subscriber::EnvFilter::new("warn")
+        tracing_subscriber::EnvFilter::new("litmus=warn,cleave=warn")
     };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
