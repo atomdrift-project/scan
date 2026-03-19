@@ -40,12 +40,18 @@ release: check-cargo $(OUT_DIR)
 	cp target/release/$(BINARY) $(OUT_DIR)/
 
 install: release
-	@if [ -w /usr/local/bin ]; then \
-		cp $(OUT_DIR)/$(BINARY) /usr/local/bin/$(BINARY); \
-		echo "✓ Installed to /usr/local/bin/$(BINARY)"; \
+	@if echo "$$PATH" | tr ':' '\n' | grep -qx "$$HOME/.cargo/bin" && [ -d "$$HOME/.cargo/bin" ]; then \
+		cp $(OUT_DIR)/$(BINARY) "$$HOME/.cargo/bin/$(BINARY)"; \
+		echo "✓ Installed to $$HOME/.cargo/bin/$(BINARY)"; \
 	elif [ -d "$$HOME/bin" ] && [ -w "$$HOME/bin" ]; then \
 		cp $(OUT_DIR)/$(BINARY) "$$HOME/bin/$(BINARY)"; \
 		echo "✓ Installed to $$HOME/bin/$(BINARY)"; \
+	elif [ -d "$$HOME/.local/bin" ] && [ -w "$$HOME/.local/bin" ]; then \
+		cp $(OUT_DIR)/$(BINARY) "$$HOME/.local/bin/$(BINARY)"; \
+		echo "✓ Installed to $$HOME/.local/bin/$(BINARY)"; \
+	elif [ -w /usr/local/bin ]; then \
+		cp $(OUT_DIR)/$(BINARY) /usr/local/bin/$(BINARY); \
+		echo "✓ Installed to /usr/local/bin/$(BINARY)"; \
 	else \
 		mkdir -p "$$HOME/.cargo/bin"; \
 		cp $(OUT_DIR)/$(BINARY) "$$HOME/.cargo/bin/$(BINARY)"; \
