@@ -50,9 +50,9 @@ impl Default for Thresholds {
 
 impl Thresholds {
     /// Default suspicious threshold.
-    pub const DEFAULT_SUSPICIOUS: f32 = 0.97;
+    pub const DEFAULT_SUSPICIOUS: f32 = 0.5;
     /// Default hostile threshold.
-    pub const DEFAULT_HOSTILE: f32 = 0.99;
+    pub const DEFAULT_HOSTILE: f32 = 0.990;
     /// Classify a probability score into a [`Classification`].
     #[must_use]
     pub fn classify(&self, probability: f32) -> Classification {
