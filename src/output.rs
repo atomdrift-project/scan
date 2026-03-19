@@ -222,7 +222,10 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool) {
 }
 
 /// Print a process scan result with PID annotations.
-pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool) {
+pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, has_progress: bool) {
+    if has_progress {
+        eprint!("\r\x1b[2K");
+    }
     let p = palette();
     let blocks = confidence_blocks(result.probability, &result.classification);
     let pct = colored_pct(result.probability, &result.classification);

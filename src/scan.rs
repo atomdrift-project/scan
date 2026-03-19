@@ -141,17 +141,17 @@ pub struct TopFinding {
     pub desc: String,
 }
 
-const SPINNER: &[char] = &['\u{2800}', '\u{2801}', '\u{2809}', '\u{2819}', '\u{281B}', '\u{281E}', '\u{2816}', '\u{2812}', '\u{2810}', '\u{2800}'];
+pub(crate) const SPINNER: &[char] = &['\u{2800}', '\u{2801}', '\u{2809}', '\u{2819}', '\u{281B}', '\u{281E}', '\u{2816}', '\u{2812}', '\u{2810}', '\u{2800}'];
 
 /// Progress state shared between threads.
-struct Progress {
+pub(crate) struct Progress {
     analyzed: AtomicU32,
     total: u32,
     start: Instant,
 }
 
 impl Progress {
-    fn new(total: u32) -> Self {
+    pub(crate) fn new(total: u32) -> Self {
         Self {
             analyzed: AtomicU32::new(0),
             total,
@@ -159,13 +159,13 @@ impl Progress {
         }
     }
 
-    fn increment(&self) {
+    pub(crate) fn increment(&self) {
         self.analyzed.fetch_add(1, Ordering::Relaxed);
         self.draw();
     }
 
     /// Redraw progress line without incrementing (after printing a result).
-    fn redraw(&self) {
+    pub(crate) fn redraw(&self) {
         self.draw();
     }
 
@@ -201,7 +201,7 @@ impl Progress {
         let _ = std::io::stderr().flush();
     }
 
-    fn finish(&self) {
+    pub(crate) fn finish(&self) {
         let elapsed = self.start.elapsed().as_secs_f64();
         let done = self.analyzed.load(Ordering::Relaxed);
         let rate = done as f64 / elapsed.max(0.001);

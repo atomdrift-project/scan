@@ -14,7 +14,7 @@ use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Classification, Model};
 use crate::output;
-use crate::scan::{DisplayFilter, ScanResult, ScanSummary};
+use crate::scan::{DisplayFilter, Progress, ScanResult, ScanSummary};
 use crate::OutputFormat;
 
 /// Configuration for process scanning (mirrors ScanConfig fields).
@@ -197,6 +197,12 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
     let cleave_opts = cleave::AnalysisOptions { slow_rule_ms: config.slow_rule_ms, ..Default::default() };
     let stdout = Mutex::new(std::io::stdout());
 
+    let progress = if is_terminal && total > 1 {
+        Some(Progress::new(total))
+    } else {
+        None
+    };
+
     let mut hostile = 0u32;
     let mut suspicious = 0u32;
     let mut benign = 0u32;
@@ -228,9 +234,16 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
             Err(e) => {
                 tracing::warn!("error analyzing {}: {e}", group.path.display());
                 errors += 1;
+                if let Some(p) = &progress {
+                    p.increment();
+                }
                 continue;
             }
         };
+
+        if let Some(p) = &progress {
+            p.increment();
+        }
 
         match build_result(&group.path, report, &ctx, &model, shap.as_ref(), config, group) {
             Ok(result) => {
@@ -240,7 +253,10 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
                     Classification::Benign => benign += 1,
                 }
                 if config.format == OutputFormat::Json || config.filter.shows(&result.classification) {
-                    emit_result(&result, config, &group.pids, group.deleted, &stdout);
+                    emit_result(&result, config, &group.pids, group.deleted, progress.is_some(), &stdout);
+                    if let Some(p) = &progress {
+                        p.redraw();
+                    }
                 }
             }
             Err(e) => {
@@ -248,6 +264,10 @@ pub fn run(config: &PsConfig) -> Result<ScanSummary> {
                 errors += 1;
             }
         }
+    }
+
+    if let Some(p) = &progress {
+        p.finish();
     }
 
     let summary = ScanSummary {
@@ -333,11 +353,12 @@ fn emit_result(
     config: &PsConfig,
     pids: &[u32],
     deleted: bool,
+    has_progress: bool,
     stdout: &Mutex<std::io::Stdout>,
 ) {
     match config.format {
         OutputFormat::Terminal => {
-            output::print_ps_result(r, pids, deleted);
+            output::print_ps_result(r, pids, deleted, has_progress);
         }
         OutputFormat::Json => {
             if let Ok(line) = serde_json::to_string(r) {
