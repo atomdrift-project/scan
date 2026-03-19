@@ -2,16 +2,55 @@ SHELL := /bin/bash
 BINARY = litmus
 OUT_DIR = out
 
-.PHONY: build release tarball rollout-bastille lint test clean
+.PHONY: build release install check-cargo tarball rollout-bastille lint test clean
 
 all: build
 
 build:
 	cargo build
 
-release: $(OUT_DIR)
+check-cargo:
+	@command -v cargo >/dev/null 2>&1 || { \
+		echo "Error: cargo not found. Install Rust via:"; \
+		case "$$(uname -s)" in \
+			Darwin)  echo "  brew install rust   # or: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" ;; \
+			FreeBSD) echo "  pkg install rust" ;; \
+			OpenBSD) echo "  pkg_add rust" ;; \
+			NetBSD)  echo "  pkgin install rust   # or: pkg_add rust" ;; \
+			SunOS)   echo "  pkgin install rust" ;; \
+			Linux) \
+				if command -v apt-get >/dev/null 2>&1; then \
+					echo "  apt-get install cargo   # or: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
+				elif command -v dnf >/dev/null 2>&1; then \
+					echo "  dnf install cargo   # or: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
+				elif command -v pacman >/dev/null 2>&1; then \
+					echo "  pacman -S rust   # or: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
+				elif command -v apk >/dev/null 2>&1; then \
+					echo "  apk add cargo   # or: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
+				else \
+					echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
+				fi ;; \
+			*) echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" ;; \
+		esac; \
+		exit 1; \
+	}
+
+release: check-cargo $(OUT_DIR)
 	cargo build --release
 	cp target/release/$(BINARY) $(OUT_DIR)/
+
+install: release
+	@if [ -w /usr/local/bin ]; then \
+		cp $(OUT_DIR)/$(BINARY) /usr/local/bin/$(BINARY); \
+		echo "✓ Installed to /usr/local/bin/$(BINARY)"; \
+	elif [ -d "$$HOME/bin" ] && [ -w "$$HOME/bin" ]; then \
+		cp $(OUT_DIR)/$(BINARY) "$$HOME/bin/$(BINARY)"; \
+		echo "✓ Installed to $$HOME/bin/$(BINARY)"; \
+	else \
+		mkdir -p "$$HOME/.cargo/bin"; \
+		cp $(OUT_DIR)/$(BINARY) "$$HOME/.cargo/bin/$(BINARY)"; \
+		echo "✓ Installed to $$HOME/.cargo/bin/$(BINARY)"; \
+	fi
 
 tarball: release
 	tar -czf $(OUT_DIR)/litmus.tgz -C $(OUT_DIR) litmus
