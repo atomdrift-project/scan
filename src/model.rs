@@ -50,7 +50,7 @@ impl Default for Thresholds {
 
 impl Thresholds {
     /// Default suspicious threshold.
-    pub const DEFAULT_SUSPICIOUS: f32 = 0.97;
+    pub const DEFAULT_SUSPICIOUS: f32 = 0.975;
     /// Default hostile threshold.
     pub const DEFAULT_HOSTILE: f32 = 0.99;
 

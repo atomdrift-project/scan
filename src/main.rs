@@ -62,19 +62,20 @@ struct Cli {
     #[arg(long, default_value = "4000")]
     slow_rule_ms: u64,
 
-    /// Path to file or directory to scan (shorthand for `litmus scan <path>`)
-    path: Option<PathBuf>,
+    /// Paths to files or directories to scan (shorthand for `litmus scan <paths...>`)
+    paths: Vec<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Commands {
     /// Scan files or directories for hostile/suspicious content
     Scan {
-        /// Path to file or directory to scan
-        path: PathBuf,
+        /// Paths to files or directories to scan
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
     },
 
     /// Scan executables of all running processes
@@ -117,16 +118,19 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Default to Scan when a bare path is given without a subcommand.
+    // Default to Scan when bare paths are given without a subcommand.
     let command = match cli.command {
         Some(cmd) => cmd,
-        None => match cli.path {
-            Some(ref path) => Commands::Scan { path: path.clone() },
-            None => {
+        None => {
+            if !cli.paths.is_empty() {
+                Commands::Scan {
+                    paths: cli.paths.clone(),
+                }
+            } else {
                 Cli::parse_from(["litmus", "--help"]);
                 std::process::exit(0);
             }
-        },
+        }
     };
 
     let filter = if cli.verbose {
@@ -182,7 +186,7 @@ fn main() -> Result<()> {
     };
 
     match command {
-        Commands::Scan { path } => {
+        Commands::Scan { paths } => {
             let config = litmus::ScanConfig {
                 model_dir,
                 format: cli.format,
@@ -191,7 +195,7 @@ fn main() -> Result<()> {
                 filter,
                 slow_rule_ms: cli.slow_rule_ms,
             };
-            let result = litmus::scan::run(&path, &config)?;
+            let result = run_scan_paths(&paths, &config)?;
 
             if result.hostile > 0 {
                 process::exit(1);
@@ -278,4 +282,60 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litmus::ScanSummary> {
+    let started = std::time::Instant::now();
+    let mut summary = litmus::ScanSummary {
+        total_files: 0,
+        hostile: 0,
+        suspicious: 0,
+        benign: 0,
+        errors: 0,
+        duration_ms: 0,
+    };
+
+    for path in paths {
+        let result = litmus::scan::run(path, config)?;
+        summary.total_files += result.total_files;
+        summary.hostile += result.hostile;
+        summary.suspicious += result.suspicious;
+        summary.benign += result.benign;
+        summary.errors += result.errors;
+    }
+
+    summary.duration_ms = started.elapsed().as_millis() as u64;
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn bare_paths_default_to_scan_shorthand() {
+        let cli = Cli::try_parse_from(["litmus", "/tmp/a", "/tmp/b"]).expect("parse should work");
+        assert_eq!(
+            cli.paths,
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn scan_subcommand_accepts_multiple_paths() {
+        let cli =
+            Cli::try_parse_from(["litmus", "scan", "/tmp/a", "/tmp/b"]).expect("parse should work");
+        match cli.command.expect("scan subcommand expected") {
+            Commands::Scan { paths } => {
+                assert_eq!(
+                    paths,
+                    vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }
