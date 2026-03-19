@@ -3,8 +3,8 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::Builder as TempBuilder;
 
@@ -12,7 +12,7 @@ use super::AppState;
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
-use crate::scan::{count_findings_from_json, extract_top_findings_from_json, ScanResult};
+use crate::scan::ScanResult;
 
 /// GET /_/health — liveness check with memory and concurrency status.
 /// Returns 503 while resources are still loading or when RSS exceeds the configured limit.
@@ -27,10 +27,10 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
 
     let rss_bytes = cleave::memory_tracker::current_rss();
     let rss_mb = rss_bytes.map(|b| b / 1024 / 1024);
-    let active_tasks = state.active_tasks.load(std::sync::atomic::Ordering::Relaxed);
-    let overloaded = rss_bytes
-        .map(|b| b > state.max_rss_bytes)
-        .unwrap_or(false);
+    let active_tasks = state
+        .active_tasks
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let overloaded = rss_bytes.map(|b| b > state.max_rss_bytes).unwrap_or(false);
 
     if overloaded {
         return (
@@ -95,11 +95,25 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
             match state.resources.write() {
                 Ok(mut lock) => {
                     *lock = Some(Arc::new(super::ModelResources { model, shap, ctx }));
-                    state.ready.store(true, std::sync::atomic::Ordering::Release);
+                    state
+                        .ready
+                        .store(true, std::sync::atomic::Ordering::Release);
                     if was_ready {
-                        tracing::info!(elapsed_ms, spec_version, features, shap_loaded, "model reloaded");
+                        tracing::info!(
+                            elapsed_ms,
+                            spec_version,
+                            features,
+                            shap_loaded,
+                            "model reloaded"
+                        );
                     } else {
-                        tracing::info!(elapsed_ms, spec_version, features, shap_loaded, "model loaded via reload — server now ready");
+                        tracing::info!(
+                            elapsed_ms,
+                            spec_version,
+                            features,
+                            shap_loaded,
+                            "model loaded via reload — server now ready"
+                        );
                     }
                     Json(serde_json::json!({
                         "status": "ok",
@@ -186,7 +200,13 @@ pub(super) async fn analyze(
             .unwrap_or_else(|| format!("upload-{request_id}"));
         let sanitized: String = raw
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>()
             .replace("..", "__");
         if sanitized.len() > 63 {
@@ -200,36 +220,35 @@ pub(super) async fn analyze(
 
     // Create temp file with the sanitized filename as suffix so cleave detects the file type.
     let suffix = format!("_{filename}");
-    let temp_file = match tokio::task::spawn_blocking(move || {
-        TempBuilder::new().suffix(&suffix).tempfile()
-    })
-    .await
-    {
-        Ok(Ok(f)) => f,
-        Ok(Err(e)) => {
-            tracing::warn!("failed to create temp file: {e}  id={request_id}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::warn!("temp file task join error: {e}  id={request_id}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response();
-        }
-    };
+    let temp_file =
+        match tokio::task::spawn_blocking(move || TempBuilder::new().suffix(&suffix).tempfile())
+            .await
+        {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                tracing::warn!("failed to create temp file: {e}  id={request_id}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Internal error"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::warn!("temp file task join error: {e}  id={request_id}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Internal error"})),
+                )
+                    .into_response();
+            }
+        };
 
     // Stream multipart field to the temp file.
     let path = temp_file.path().to_owned();
-    let mut tokio_file = match tokio::fs::File::create(&path).await {
-        Ok(f) => f,
+    let writer = match temp_file.reopen() {
+        Ok(file) => file,
         Err(e) => {
-            tracing::warn!("failed to open temp file for writing: {e}  id={request_id}");
+            tracing::warn!("failed to reopen temp file for writing: {e}  id={request_id}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
@@ -237,6 +256,7 @@ pub(super) async fn analyze(
                 .into_response();
         }
     };
+    let mut tokio_file = tokio::fs::File::from_std(writer);
 
     let max_upload = state.max_upload_bytes;
     let mut file_size = 0usize;
@@ -254,8 +274,7 @@ pub(super) async fn analyze(
                     )
                         .into_response();
                 }
-                if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut tokio_file, &chunk).await
-                {
+                if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut tokio_file, &chunk).await {
                     tracing::warn!("failed to write chunk: {e}  id={request_id}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -279,6 +298,14 @@ pub(super) async fn analyze(
 
     if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut tokio_file).await {
         tracing::warn!("failed to flush temp file: {e}  id={request_id}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Failed to save file data"})),
+        )
+            .into_response();
+    }
+    if let Err(e) = tokio_file.sync_all().await {
+        tracing::warn!("failed to sync temp file: {e}  id={request_id}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "Failed to save file data"})),
@@ -322,7 +349,9 @@ pub(super) async fn analyze(
     };
 
     let timeout_duration = Duration::from_secs(state.timeout_secs);
-    state.active_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .active_tasks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     state.in_flight.insert(
         request_id,
         super::InFlightRequest {
@@ -346,7 +375,9 @@ pub(super) async fn analyze(
 
     match result {
         Ok(join_result) => {
-            state.active_tasks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .active_tasks
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             state.in_flight.remove(&request_id);
             drop(temp_file);
 
@@ -384,7 +415,9 @@ pub(super) async fn analyze(
         Err(_elapsed) => {
             // On timeout the blocking task keeps running; watch it to decrement the
             // counter and drop the temp file when it eventually finishes.
-            let active = state.active_tasks.load(std::sync::atomic::Ordering::Relaxed);
+            let active = state
+                .active_tasks
+                .load(std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 "analysis timed out after {}s  id={request_id} filename={filename:?} active={active}",
                 state.timeout_secs,
@@ -419,49 +452,35 @@ fn classify_file(
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
-    let opts = cleave::AnalysisOptions { slow_rule_ms, ..Default::default() };
-    let mut report = cleave::analyze_file(path, &opts)
-        .with_context(|| format!("cleave analysis of {label}"))?;
+    let opts = cleave::AnalysisOptions {
+        slow_rule_ms,
+        ..Default::default()
+    };
+    let report =
+        cleave::analyze_file(path, &opts).with_context(|| format!("cleave analysis of {label}"))?;
 
-    let formula = cleave::formula_from_report(&report);
-    report.finalize();
-
-    let report_json = serde_json::to_value(&report).context("serializing cleave report")?;
-    let mut features = resources.ctx.extract(&report_json);
-    resources.model.spec.standardize(&mut features);
-    let (probability, classification) = resources.model.predict(&features)?;
-
-    let finding_counts = count_findings_from_json(&report_json);
-
-    let reasons = resources
-        .shap
-        .as_ref()
-        .map(|s| s.explain(&features, &resources.model.spec.feature_names, 5))
-        .unwrap_or_default();
-    let top_findings = extract_top_findings_from_json(&report_json, &classification);
-
-    let pf = report_json["files"]
-        .as_array()
-        .and_then(|a| a.first())
-        .unwrap_or(&report_json);
-    let file_type = pf["file_type"].as_str().unwrap_or("unknown").to_string();
-    let size_bytes = pf["size"].as_u64().unwrap_or(0);
-    let sha256 = pf["sha256"].as_str().unwrap_or("").to_string();
+    let cr = crate::scan::classify_report(
+        label,
+        report,
+        &resources.ctx,
+        &resources.model,
+        resources.shap.as_ref(),
+    )?;
 
     Ok(ScanResult {
         path: label.to_string(),
-        classification,
-        probability,
+        classification: cr.classification,
+        probability: cr.probability,
         thresholds: resources.model.thresholds,
-        finding_counts,
-        formula,
-        reasons,
-        top_findings,
-        file_type,
-        size_bytes,
-        sha256,
+        finding_counts: cr.finding_counts,
+        formula: cr.formula,
+        reasons: cr.reasons,
+        top_findings: cr.top_findings,
+        file_type: cr.file_type,
+        size_bytes: cr.size_bytes,
+        sha256: cr.sha256,
         model: Some(resources.model.info.clone()),
-        cleave: Some(report_json),
+        cleave: Some(cr.report_json),
         pids: None,
         deleted: None,
     })
@@ -490,10 +509,9 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
 
     if overloaded_secs > 30 {
         tracing::error!(
-            "memory overload persisted >30s (rss={}MB), terminating",
+            "memory overload persisted >30s (rss={}MB), continuing to reject requests",
             rss / 1024 / 1024
         );
-        std::process::exit(1);
     }
 
     tracing::warn!(
@@ -658,8 +676,14 @@ fn read_thread_info_freebsd() -> serde_json::Value {
 
     let mut len: libc::size_t = 0;
     let ret = unsafe {
-        libc::sysctl(mib.as_ptr(), 4, std::ptr::null_mut(), &mut len,
-                     std::ptr::null_mut(), 0)
+        libc::sysctl(
+            mib.as_ptr(),
+            4,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
     };
     if ret != 0 {
         return serde_json::json!({"error": "sysctl size query failed"});
@@ -667,13 +691,18 @@ fn read_thread_info_freebsd() -> serde_json::Value {
 
     len += len / 4; // 25% slack for new threads between calls
     let count = len / mem::size_of::<libc::kinfo_proc>();
-    let mut procs: Vec<libc::kinfo_proc> =
-        (0..count).map(|_| unsafe { mem::zeroed() }).collect();
+    let mut procs: Vec<libc::kinfo_proc> = (0..count).map(|_| unsafe { mem::zeroed() }).collect();
     let mut actual_len = len;
 
     let ret = unsafe {
-        libc::sysctl(mib.as_ptr(), 4, procs.as_mut_ptr().cast(), &mut actual_len,
-                     std::ptr::null_mut(), 0)
+        libc::sysctl(
+            mib.as_ptr(),
+            4,
+            procs.as_mut_ptr().cast(),
+            &mut actual_len,
+            std::ptr::null_mut(),
+            0,
+        )
     };
     if ret != 0 {
         return serde_json::json!({"error": "sysctl data query failed"});
@@ -682,22 +711,34 @@ fn read_thread_info_freebsd() -> serde_json::Value {
     procs.truncate(actual_len / mem::size_of::<libc::kinfo_proc>());
 
     let c_str = |buf: &[libc::c_char]| {
-        let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        let bytes: Vec<u8> = buf
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
         String::from_utf8_lossy(&bytes).into_owned()
     };
     let state_str = |s: libc::c_char| match s as u8 {
-        1 => "idle", 2 => "running", 3 => "sleeping",
-        4 => "stopped", 5 => "zombie", 6 => "waiting", 7 => "locked", _ => "unknown",
+        1 => "idle",
+        2 => "running",
+        3 => "sleeping",
+        4 => "stopped",
+        5 => "zombie",
+        6 => "waiting",
+        7 => "locked",
+        _ => "unknown",
     };
 
     let mut threads: Vec<serde_json::Value> = procs
         .iter()
-        .map(|p| serde_json::json!({
-            "tid": p.ki_tid,
-            "name": c_str(&p.ki_tdname),
-            "state": state_str(p.ki_stat),
-            "wchan": c_str(&p.ki_wmesg),
-        }))
+        .map(|p| {
+            serde_json::json!({
+                "tid": p.ki_tid,
+                "name": c_str(&p.ki_tdname),
+                "state": state_str(p.ki_stat),
+                "wchan": c_str(&p.ki_wmesg),
+            })
+        })
         .collect();
 
     threads.sort_by_key(|t| t["tid"].as_u64().unwrap_or(0));

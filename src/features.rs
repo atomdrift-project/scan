@@ -25,7 +25,7 @@ pub const EXPECTED_SPEC_VERSION: u32 = 13;
 const MIN_CONFIDENCE: f64 = 0.65;
 
 /// Criticality ordinals (must match collimator CRITICALITY_ORDINAL).
-fn crit_ordinal(crit: &str) -> u32 {
+pub(crate) fn crit_ordinal(crit: &str) -> u32 {
     match crit {
         "filtered" => 0,
         "component" => 1,
@@ -85,6 +85,7 @@ pub struct FeatureSpec {
 
 impl FeatureSpec {
     /// Load feature specification from a JSON file.
+    #[must_use]
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path).context("reading feature spec")?;
         let v: serde_json::Value = serde_json::from_str(&data).context("parsing feature spec")?;
@@ -125,7 +126,11 @@ impl FeatureSpec {
         for i in 0..features.len().min(means.len()) {
             let m = means[i];
             let s = stds[i];
-            if m == 0.0 && s == 1.0 {
+            if s.abs() <= f32::EPSILON
+                || (m.abs() <= f32::EPSILON && (s - 1.0).abs() <= f32::EPSILON)
+            {
+                // Dead feature: constant during training, or zero std.
+                // Zero it to prevent NaN/inf from propagating.
                 features[i] = 0.0;
             } else {
                 features[i] = (features[i] - m) / s;
@@ -145,8 +150,11 @@ fn json_string_array(v: &serde_json::Value) -> Vec<String> {
 }
 
 fn json_f32_array(v: &serde_json::Value) -> Option<Vec<f32>> {
-    v.as_array()
-        .map(|arr| arr.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
+    v.as_array().map(|arr| {
+        arr.iter()
+            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+            .collect()
+    })
 }
 
 /// Pre-built lookup tables for fast repeated extraction against a spec.
@@ -379,9 +387,17 @@ impl ExtractContext {
         let is_binary = matches!(file_type, "pe" | "elf" | "macho");
         let imports = pf_array(pf, "imports");
 
-        vec[offset] = if is_binary && file_size < 20_000 { 1.0 } else { 0.0 };
+        vec[offset] = if is_binary && file_size < 20_000 {
+            1.0
+        } else {
+            0.0
+        };
         vec[offset + 1] = if imports.is_empty() { 1.0 } else { 0.0 };
-        vec[offset + 2] = if filtered_finding_count == 0 { 1.0 } else { 0.0 };
+        vec[offset + 2] = if filtered_finding_count == 0 {
+            1.0
+        } else {
+            0.0
+        };
         vec[offset + 3] = (filtered_finding_count as f32 + 1.0).ln();
     }
 }
@@ -503,7 +519,11 @@ mod tests {
     fn test_finding_paths_deep() {
         assert_eq!(
             paths("objectives/evasion/process/injection::technique-x"),
-            vec!["objectives", "objectives/evasion", "objectives/evasion/process"],
+            vec![
+                "objectives",
+                "objectives/evasion",
+                "objectives/evasion/process"
+            ],
         );
     }
 
@@ -524,7 +544,11 @@ mod tests {
     fn test_finding_paths_exactly_three() {
         assert_eq!(
             paths("objectives/evasion/process::technique"),
-            vec!["objectives", "objectives/evasion", "objectives/evasion/process"],
+            vec![
+                "objectives",
+                "objectives/evasion",
+                "objectives/evasion/process"
+            ],
         );
     }
 

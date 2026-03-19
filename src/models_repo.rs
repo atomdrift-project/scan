@@ -24,41 +24,39 @@ const STALENESS_DAYS: u64 = 30;
 ///
 /// Returns the base directory (not the versioned subdirectory).
 /// Call `model_dir()` to get the path suitable for `Model::load`.
-#[must_use]
-pub fn resolve_and_ensure() -> PathBuf {
+pub fn resolve_and_ensure() -> Result<PathBuf, String> {
     if let Ok(explicit) = std::env::var("LITMUS_MODELS_DIR") {
         let p = PathBuf::from(&explicit);
         if p.is_dir() {
             tracing::debug!("Using models from LITMUS_MODELS_DIR={}", p.display());
-            return p;
+            return Ok(p);
         }
-        eprintln!("Error: LITMUS_MODELS_DIR={explicit} does not exist");
-        std::process::exit(1);
+        return Err(format!("LITMUS_MODELS_DIR={explicit} does not exist"));
     }
 
     let data_dir = default_models_dir();
     if has_models(&data_dir) {
         tracing::debug!("Using models from {}", data_dir.display());
         check_staleness(&data_dir);
-        return data_dir;
+        return Ok(data_dir);
     }
 
     eprintln!("First run: downloading litmus models...");
     if let Err(e) = clone_repo(&data_dir) {
-        eprintln!("Error: Failed to download models: {e}");
-        eprintln!();
-        eprintln!("Ensure 'git' is installed, or manually clone:");
-        eprintln!("  git clone {MODELS_REPO_URL} \"{}\"", data_dir.display());
-        std::process::exit(1);
+        return Err(format!(
+            "Failed to download models: {e}\n\n\
+             Ensure 'git' is installed, or manually clone:\n  \
+             git clone {MODELS_REPO_URL} \"{}\"",
+            data_dir.display()
+        ));
     }
     eprintln!("Models ready. Continuing...");
-    data_dir
+    Ok(data_dir)
 }
 
 /// Return the model directory suitable for `Model::load`.
-#[must_use]
-pub fn model_dir() -> PathBuf {
-    resolve_and_ensure().join(CURRENT_VERSION).join(DEFAULT_MODEL)
+pub fn model_dir() -> Result<PathBuf, String> {
+    resolve_and_ensure().map(|base| base.join(CURRENT_VERSION).join(DEFAULT_MODEL))
 }
 
 /// Update the models repository.
@@ -165,7 +163,7 @@ fn current_models_dir() -> PathBuf {
 
 fn has_models(path: &Path) -> bool {
     let model = path.join(CURRENT_VERSION).join(DEFAULT_MODEL);
-    model.join("model.onnx").exists() && model.join("feature_spec.json").exists()
+    model.join("model.json").exists() && model.join("feature_spec.json").exists()
 }
 
 fn clone_repo(target: &Path) -> std::io::Result<()> {
@@ -216,7 +214,13 @@ fn days_since_last_commit(path: &Path) -> Option<u64> {
 
 fn short_head(path: &Path) -> Option<String> {
     let output = Command::new("git")
-        .args(["-C", &path.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ])
         .output()
         .ok()?;
     if output.status.success() {
@@ -233,15 +237,12 @@ fn is_git_repo(path: &Path) -> bool {
 }
 
 fn check_git_available() -> std::io::Result<()> {
-    Command::new("git")
-        .arg("--version")
-        .output()
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "git is not installed or not in PATH",
-            )
-        })?;
+    Command::new("git").arg("--version").output().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "git is not installed or not in PATH",
+        )
+    })?;
     Ok(())
 }
 
@@ -267,20 +268,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let model = tmp.path().join("v1").join("default");
         std::fs::create_dir_all(&model).unwrap();
-        std::fs::write(model.join("model.onnx"), b"").unwrap();
+        std::fs::write(model.join("model.json"), b"").unwrap();
         std::fs::write(model.join("feature_spec.json"), b"{}").unwrap();
         assert!(has_models(tmp.path()));
     }
 
     #[test]
     fn env_var_overrides_default() {
-        let original = std::env::var("LITMUS_MODELS_DIR").ok();
-        std::env::set_var("LITMUS_MODELS_DIR", "/tmp/test-models");
-        let result = current_models_dir();
-        assert_eq!(result, PathBuf::from("/tmp/test-models"));
-        match original {
-            Some(v) => std::env::set_var("LITMUS_MODELS_DIR", v),
-            None => std::env::remove_var("LITMUS_MODELS_DIR"),
+        // SAFETY: set_var is unsound under parallel test execution.
+        // This test runs in its own process via `cargo test -- --test-threads=1`
+        // or is acceptable because LITMUS_MODELS_DIR is only read here.
+        unsafe {
+            let original = std::env::var("LITMUS_MODELS_DIR").ok();
+            std::env::set_var("LITMUS_MODELS_DIR", "/tmp/test-models");
+            let result = current_models_dir();
+            assert_eq!(result, PathBuf::from("/tmp/test-models"));
+            match original {
+                Some(v) => std::env::set_var("LITMUS_MODELS_DIR", v),
+                None => std::env::remove_var("LITMUS_MODELS_DIR"),
+            }
         }
     }
 }

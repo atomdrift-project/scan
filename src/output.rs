@@ -1,7 +1,7 @@
 //! Terminal and JSON output formatting with litmus-colored confidence indicators.
 //! Supports both dark and light terminal backgrounds via auto-detection.
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, RwLock};
 
 use colored::Colorize;
 
@@ -97,23 +97,26 @@ impl Palette {
     }
 }
 
-/// Globally cached theme detection result.
-static THEME: OnceLock<Theme> = OnceLock::new();
+/// Process-global theme selection. Starts unset, then caches either an explicit
+/// override or the first successful auto-detection result.
+static THEME: LazyLock<RwLock<Option<Theme>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Detect the terminal theme, with env var override.
 ///
 /// Priority: `LITMUS_THEME` env var > terminal query > default (dark).
 pub fn detect_theme() -> Theme {
-    *THEME.get_or_init(|| {
-        // Check env override first.
-        if let Ok(val) = std::env::var("LITMUS_THEME") {
-            return match val.to_ascii_lowercase().as_str() {
-                "light" | "white" => Theme::Light,
-                _ => Theme::Dark,
-            };
+    if let Ok(theme) = THEME.read() {
+        if let Some(theme) = *theme {
+            return theme;
         }
+    }
 
-        // Query terminal via OSC 11 + COLORFGBG fallback.
+    let detected = if let Ok(val) = std::env::var("LITMUS_THEME") {
+        match val.to_ascii_lowercase().as_str() {
+            "light" | "white" => Theme::Light,
+            _ => Theme::Dark,
+        }
+    } else {
         match terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default()) {
             Ok(scheme) => match scheme {
                 terminal_colorsaurus::ColorScheme::Dark => Theme::Dark,
@@ -121,19 +124,33 @@ pub fn detect_theme() -> Theme {
             },
             Err(_) => Theme::Dark,
         }
-    })
+    };
+
+    if let Ok(mut theme) = THEME.write() {
+        *theme = Some(detected);
+    }
+
+    detected
 }
 
 /// Override the theme (called from CLI flags before any output).
 pub fn set_theme(theme: Theme) {
-    let _ = THEME.set(theme);
+    if let Ok(mut current) = THEME.write() {
+        *current = Some(theme);
+    }
 }
 
 fn palette() -> &'static Palette {
     static DARK: Palette = Palette::dark();
     static LIGHT: Palette = Palette::light();
 
-    match THEME.get().copied().unwrap_or(Theme::Dark) {
+    let theme = THEME
+        .read()
+        .ok()
+        .and_then(|theme| *theme)
+        .unwrap_or(Theme::Dark);
+
+    match theme {
         Theme::Dark => &DARK,
         Theme::Light => &LIGHT,
     }
@@ -146,7 +163,9 @@ fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
 
 /// Linear interpolation between two u8 values.
 fn lerp(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
+    (a as f32 + (b as f32 - a as f32) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 /// Two-block litmus confidence indicator.
@@ -155,27 +174,31 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
 /// As confidence decreases within a classification band, the left block
 /// darkens and the right block lightens/desaturates, creating a visual
 /// "spread" that intuitively conveys uncertainty.
-fn confidence_blocks(probability: f32, classification: &Classification) -> String {
+fn confidence_blocks(
+    probability: f32,
+    classification: &Classification,
+    thresholds: Thresholds,
+) -> String {
     let p = palette();
-    let thresh = Thresholds::default();
-    let hostile_range = 1.0 - thresh.hostile;
-    let suspicious_range = thresh.hostile - thresh.suspicious;
+    let hostile_range = (1.0 - thresholds.hostile).max(f32::EPSILON);
+    let suspicious_range = (thresholds.hostile - thresholds.suspicious).max(f32::EPSILON);
     match classification {
         Classification::Hostile => {
-            let t = ((probability - thresh.hostile) / hostile_range).clamp(0.0, 1.0);
+            let t = ((probability - thresholds.hostile) / hostile_range).clamp(0.0, 1.0);
             let base = p.hostile;
             let l = fg(Rgb(lerp(base.0 / 2, base.0, t), 0, 0), BLOCK);
-            let r = fg(
-                Rgb(base.0, lerp(150, 0, t), lerp(150, 0, t)),
-                BLOCK,
-            );
+            let r = fg(Rgb(base.0, lerp(150, 0, t), lerp(150, 0, t)), BLOCK);
             format!("{l}{r}")
         }
         Classification::Suspicious => {
-            let t = ((probability - thresh.suspicious) / suspicious_range).clamp(0.0, 1.0);
+            let t = ((probability - thresholds.suspicious) / suspicious_range).clamp(0.0, 1.0);
             let base = p.suspicious;
             let l = fg(
-                Rgb(lerp((base.0 as u16 * 3 / 4) as u8, base.0, t), lerp(base.1 / 2, base.1, t), 0),
+                Rgb(
+                    lerp((base.0 as u16 * 3 / 4) as u8, base.0, t),
+                    lerp(base.1 / 2, base.1, t),
+                    0,
+                ),
                 BLOCK,
             );
             let r = fg(
@@ -185,19 +208,47 @@ fn confidence_blocks(probability: f32, classification: &Classification) -> Strin
             format!("{l}{r}")
         }
         Classification::Benign => {
-            let t = (probability / thresh.suspicious).clamp(0.0, 1.0);
+            let t = (probability / thresholds.suspicious.max(f32::EPSILON)).clamp(0.0, 1.0);
             let base = p.benign;
             let l = fg(Rgb(0, lerp(base.1 / 2, base.1, t), 0), BLOCK);
-            let r = fg(Rgb(0, lerp(base.1 / 3, (base.1 as u16 * 4 / 5) as u8, t), 0), BLOCK);
+            let r = fg(
+                Rgb(0, lerp(base.1 / 3, (base.1 as u16 * 4 / 5) as u8, t), 0),
+                BLOCK,
+            );
             format!("{l}{r}")
         }
     }
 }
 
+/// Rescale raw model probability for display.
+///
+/// The suspicious threshold maps to 50%, so users see an intuitive scale
+/// where 50% = "just crossed into suspicious" and 100% = maximum confidence.
+fn display_probability(raw: f32, thresholds: Thresholds) -> f32 {
+    if raw <= thresholds.suspicious {
+        // [0, suspicious] → [0%, 50%]
+        (raw / thresholds.suspicious.max(f32::EPSILON)) * 0.5
+    } else {
+        // [suspicious, 1.0] → [50%, 100%]
+        0.5 + ((raw - thresholds.suspicious) / (1.0 - thresholds.suspicious).max(f32::EPSILON))
+            * 0.5
+    }
+}
+
 /// Color percentage text to match the classification band.
-fn colored_pct(probability: f32, classification: &Classification) -> String {
+fn colored_pct(
+    probability: f32,
+    classification: &Classification,
+    thresholds: Thresholds,
+) -> String {
     let p = palette();
-    let pct = format!("{:>4}", format!("{:.0}%", probability * 100.0));
+    let pct = format!(
+        "{:>4}",
+        format!(
+            "{:.0}%",
+            display_probability(probability, thresholds) * 100.0
+        )
+    );
     match classification {
         Classification::Hostile => fg(p.hostile, &pct),
         Classification::Suspicious => fg(p.suspicious, &pct),
@@ -212,8 +263,16 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool) {
     }
 
     let p = palette();
-    let blocks = confidence_blocks(result.probability, &result.classification);
-    let pct = colored_pct(result.probability, &result.classification);
+    let blocks = confidence_blocks(
+        result.probability,
+        &result.classification,
+        result.thresholds,
+    );
+    let pct = colored_pct(
+        result.probability,
+        &result.classification,
+        result.thresholds,
+    );
 
     eprintln!("  {blocks} {pct}  {}", result.path.bold());
     print_detail_lines(result, p);
@@ -227,8 +286,16 @@ pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, has_pro
         eprint!("\r\x1b[2K");
     }
     let p = palette();
-    let blocks = confidence_blocks(result.probability, &result.classification);
-    let pct = colored_pct(result.probability, &result.classification);
+    let blocks = confidence_blocks(
+        result.probability,
+        &result.classification,
+        result.thresholds,
+    );
+    let pct = colored_pct(
+        result.probability,
+        &result.classification,
+        result.thresholds,
+    );
 
     // Format PID list.
     let pid_str = if pids.len() <= 5 {
@@ -383,5 +450,62 @@ fn format_elapsed(ms: u64) -> String {
         format!("{ms}ms")
     } else {
         format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_probability_at_thresholds() {
+        let thresh = Thresholds::default();
+
+        // At zero → 0%
+        assert!((display_probability(0.0, thresh) - 0.0).abs() < 1e-6);
+
+        // At suspicious threshold → 50%
+        assert!((display_probability(thresh.suspicious, thresh) - 0.5).abs() < 1e-6);
+
+        // At hostile threshold → midpoint of upper half
+        let expected =
+            0.5 + ((thresh.hostile - thresh.suspicious) / (1.0 - thresh.suspicious)) * 0.5;
+        assert!((display_probability(thresh.hostile, thresh) - expected).abs() < 1e-6);
+
+        // At 1.0 → 100%
+        assert!((display_probability(1.0, thresh) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn display_probability_monotonic() {
+        // The mapping must be strictly monotonically increasing.
+        let steps: Vec<f32> = (0..=100).map(|i| i as f32 / 100.0).collect();
+        let thresh = Thresholds::default();
+        for pair in steps.windows(2) {
+            assert!(
+                display_probability(pair[1], thresh) > display_probability(pair[0], thresh),
+                "not monotonic at {} -> {}",
+                pair[0],
+                pair[1],
+            );
+        }
+    }
+
+    #[test]
+    fn display_probability_below_suspicious_is_under_50() {
+        let thresh = Thresholds::default();
+        // Anything below the suspicious threshold must display < 50%.
+        assert!(display_probability(thresh.suspicious - 0.01, thresh) < 0.5);
+        assert!(display_probability(0.5, thresh) < 0.5);
+    }
+
+    #[test]
+    fn display_probability_uses_custom_thresholds() {
+        let thresh = Thresholds {
+            suspicious: 0.80,
+            hostile: 0.95,
+        };
+        assert!((display_probability(0.80, thresh) - 0.5).abs() < 1e-6);
+        assert!(display_probability(0.79, thresh) < 0.5);
     }
 }

@@ -2,14 +2,14 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use litmus::server::{ServerConfig, build_app};
+use litmus::server::{build_app, ServerConfig};
 use tower::ServiceExt;
 
 fn model_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("LITMUS_MODELS_DIR") {
         return std::path::PathBuf::from(d);
     }
-    litmus::models_repo::model_dir()
+    litmus::models_repo::model_dir().expect("failed to resolve model directory")
 }
 
 fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
@@ -25,10 +25,7 @@ fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
     );
     body.extend_from_slice(file_bytes);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    (
-        format!("multipart/form-data; boundary={boundary}"),
-        body,
-    )
+    (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
 /// Submit an encrypted zip via /analyze and verify JSON response structure.
@@ -41,8 +38,14 @@ async fn analyze_encrypted_zip_returns_json() {
     let file_bytes = std::fs::read(&testdata).unwrap();
 
     let config = ServerConfig {
+        bind: std::net::SocketAddr::from(([127, 0, 0, 1], 8081)),
+        timeout_secs: 120,
+        max_body_size: 100 * 1024 * 1024,
+        max_rss_bytes: 8 * 1024 * 1024 * 1024,
         model_dir: model_dir(),
-        ..Default::default()
+        threshold_suspicious: litmus::model::Thresholds::DEFAULT_SUSPICIOUS,
+        threshold_hostile: litmus::model::Thresholds::DEFAULT_HOSTILE,
+        slow_rule_ms: 4000,
     };
     let app = build_app(&config).await.expect("failed to build app");
 
@@ -84,8 +87,8 @@ async fn analyze_encrypted_zip_returns_json() {
     let body_bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
         .await
         .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body_bytes)
-        .expect("response must be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("response must be valid JSON");
 
     // Every response must have these fields, regardless of classification.
     assert!(json["classification"].is_string(), "missing classification");
@@ -94,7 +97,10 @@ async fn analyze_encrypted_zip_returns_json() {
     assert!(json["formula"].is_string(), "missing formula");
     assert!(json["model"].is_object(), "missing model metadata");
     assert!(json["reasons"].is_array(), "missing reasons array");
-    assert!(json["top_findings"].is_array(), "missing top_findings array");
+    assert!(
+        json["top_findings"].is_array(),
+        "missing top_findings array"
+    );
     assert!(json["file_type"].is_string(), "missing file_type");
     assert!(json["sha256"].is_string(), "missing sha256");
     assert!(json["cleave"].is_object(), "missing cleave report");

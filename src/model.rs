@@ -50,9 +50,33 @@ impl Default for Thresholds {
 
 impl Thresholds {
     /// Default suspicious threshold.
-    pub const DEFAULT_SUSPICIOUS: f32 = 0.5;
+    pub const DEFAULT_SUSPICIOUS: f32 = 0.97;
     /// Default hostile threshold.
-    pub const DEFAULT_HOSTILE: f32 = 0.990;
+    pub const DEFAULT_HOSTILE: f32 = 0.99;
+
+    /// Validate that thresholds are sane: both in [0.0, 1.0] and suspicious < hostile.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(0.0..=1.0).contains(&self.suspicious) {
+            return Err(format!(
+                "suspicious threshold {} is outside [0.0, 1.0]",
+                self.suspicious
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.hostile) {
+            return Err(format!(
+                "hostile threshold {} is outside [0.0, 1.0]",
+                self.hostile
+            ));
+        }
+        if self.suspicious >= self.hostile {
+            return Err(format!(
+                "suspicious threshold ({}) must be less than hostile threshold ({})",
+                self.suspicious, self.hostile
+            ));
+        }
+        Ok(())
+    }
+
     /// Classify a probability score into a [`Classification`].
     #[must_use]
     pub fn classify(&self, probability: f32) -> Classification {
@@ -92,7 +116,12 @@ pub struct Model {
 
 impl Model {
     /// Load model from a directory containing model.json and feature_spec.json.
+    #[must_use]
     pub fn load(model_dir: &Path, thresholds: Thresholds) -> Result<Self> {
+        thresholds
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid thresholds: {e}"))?;
+
         let model_path = model_dir.join("model.json");
         let spec_path = model_dir.join("feature_spec.json");
 
@@ -113,14 +142,22 @@ impl Model {
             let mut buf = [0u8; 65536];
             loop {
                 let n = file.read(&mut buf)?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 hasher.update(&buf[..n]);
             }
             format!("{:x}", hasher.finalize())
         };
 
         let commit = Command::new("git")
-            .args(["-C", &model_dir.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+            .args([
+                "-C",
+                &model_dir.to_string_lossy(),
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ])
             .output()
             .ok()
             .filter(|o| o.status.success())

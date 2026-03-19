@@ -8,15 +8,17 @@ fn model_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("LITMUS_MODELS_DIR") {
         return std::path::PathBuf::from(d);
     }
-    litmus::models_repo::model_dir()
+    litmus::models_repo::model_dir().expect("failed to resolve model directory")
 }
 
 #[test]
 fn spec_version_matches_expected() {
     let spec_path = model_dir().join("feature_spec.json");
     if !spec_path.exists() {
-        eprintln!("skipping: {} not found", spec_path.display());
-        return;
+        panic!(
+            "SKIPPED (would hide failures): {} not found — set LITMUS_MODELS_DIR or clone the models repo",
+            spec_path.display()
+        );
     }
 
     let spec = FeatureSpec::load(&spec_path)

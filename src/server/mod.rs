@@ -11,6 +11,7 @@
 
 mod handlers;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use std::net::SocketAddr;
@@ -20,7 +21,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::signal;
 use tower::limit::ConcurrencyLimitLayer;
-use axum::extract::DefaultBodyLimit;
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
@@ -45,21 +45,6 @@ pub struct ServerConfig {
     pub threshold_hostile: f32,
     /// Warn when a single cleave rule takes longer than this many milliseconds.
     pub slow_rule_ms: u64,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            bind: SocketAddr::from(([127, 0, 0, 1], 8081)),
-            timeout_secs: 120,
-            max_body_size: 100 * 1024 * 1024,      // 100 MB
-            max_rss_bytes: 8 * 1024 * 1024 * 1024, // 8 GB
-            model_dir: PathBuf::new(),
-            threshold_suspicious: Thresholds::DEFAULT_SUSPICIOUS,
-            threshold_hostile: Thresholds::DEFAULT_HOSTILE,
-            slow_rule_ms: 4000,
-        }
-    }
 }
 
 /// Metadata for a request currently in the analysis pipeline.
@@ -173,21 +158,22 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
             // can report queue_ms (time waiting for a thread) separately from
             // work_ms (time actually doing I/O and parsing).
             let model_spawned_at = Instant::now();
-            let model_task = tokio::task::spawn_blocking(move || -> anyhow::Result<(Model, ExtractContext)> {
-                let queue_ms = model_spawned_at.elapsed().as_millis();
-                let t = Instant::now();
-                tracing::info!(queue_ms, "loading ONNX model and feature spec");
-                let model = Model::load(&model_dir, thresholds)?;
-                let ctx = ExtractContext::new(&model.spec);
-                tracing::info!(
-                    queue_ms,
-                    work_ms = t.elapsed().as_millis(),
-                    spec_version = model.spec.version,
-                    features = model.spec.total_features,
-                    "ONNX model loaded",
-                );
-                Ok((model, ctx))
-            });
+            let model_task =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<(Model, ExtractContext)> {
+                    let queue_ms = model_spawned_at.elapsed().as_millis();
+                    let t = Instant::now();
+                    tracing::info!(queue_ms, "loading ONNX model and feature spec");
+                    let model = Model::load(&model_dir, thresholds)?;
+                    let ctx = ExtractContext::new(&model.spec);
+                    tracing::info!(
+                        queue_ms,
+                        work_ms = t.elapsed().as_millis(),
+                        spec_version = model.spec.version,
+                        features = model.spec.total_features,
+                        "ONNX model loaded",
+                    );
+                    Ok((model, ctx))
+                });
             let shap_spawned_at = Instant::now();
             let shap_task = tokio::task::spawn_blocking(move || {
                 let queue_ms = shap_spawned_at.elapsed().as_millis();
@@ -195,11 +181,19 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                 tracing::info!(queue_ms, "loading SHAP importance data");
                 match ShapImportance::load(&model_dir_shap) {
                     Ok(shap) => {
-                        tracing::info!(queue_ms, work_ms = t.elapsed().as_millis(), "SHAP data loaded");
+                        tracing::info!(
+                            queue_ms,
+                            work_ms = t.elapsed().as_millis(),
+                            "SHAP data loaded"
+                        );
                         Some(shap)
                     }
                     Err(e) => {
-                        tracing::warn!(queue_ms, work_ms = t.elapsed().as_millis(), "SHAP data unavailable (explanations disabled): {e}");
+                        tracing::warn!(
+                            queue_ms,
+                            work_ms = t.elapsed().as_millis(),
+                            "SHAP data unavailable (explanations disabled): {e}"
+                        );
                         None
                     }
                 }
@@ -241,7 +235,10 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         tokio::spawn(tokio::task::spawn_blocking(move || {
             let t = Instant::now();
             tracing::info!("YARA warmup started (non-blocking)");
-            let opts = cleave::AnalysisOptions { slow_rule_ms, ..Default::default() };
+            let opts = cleave::AnalysisOptions {
+                slow_rule_ms,
+                ..Default::default()
+            };
             let _ = cleave::analyze_file(std::path::Path::new("/dev/null"), &opts);
             tracing::info!(elapsed_ms = t.elapsed().as_millis(), "YARA warmup complete");
         }));

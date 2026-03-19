@@ -124,15 +124,15 @@ fn main() -> Result<()> {
             Some(ref path) => Commands::Scan { path: path.clone() },
             None => {
                 Cli::parse_from(["litmus", "--help"]);
-                unreachable!()
+                std::process::exit(0);
             }
         },
     };
 
     let filter = if cli.verbose {
-        tracing_subscriber::EnvFilter::new("litmus=debug,cleave=debug,warn")
+        tracing_subscriber::EnvFilter::new("litmus=debug,cleave=debug")
     } else {
-        tracing_subscriber::EnvFilter::new("litmus=warn,cleave=warn")
+        tracing_subscriber::EnvFilter::new("litmus=warn,cleave=error")
     };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -150,7 +150,9 @@ fn main() -> Result<()> {
     }
 
     #[cfg(debug_assertions)]
-    tracing::warn!("DEBUG binary — litmus will be very slow; use `make release` for production builds");
+    tracing::warn!(
+        "DEBUG binary — litmus will be very slow; use `make release` for production builds"
+    );
 
     if cli.update {
         std::thread::scope(|s| {
@@ -167,9 +169,11 @@ fn main() -> Result<()> {
         });
     }
 
-    let model_dir = cli
-        .model_dir
-        .unwrap_or_else(litmus::models_repo::model_dir);
+    let model_dir = match cli.model_dir {
+        Some(model_dir) => model_dir,
+        None => litmus::models_repo::model_dir()
+            .map_err(|e| anyhow::anyhow!("failed to resolve model directory: {e}"))?,
+    };
     let all = cli.show.iter().any(|s| matches!(s, Show::All));
     let filter = DisplayFilter {
         hostile: all || cli.show.iter().any(|s| matches!(s, Show::Hostile)),
@@ -197,7 +201,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Ps => {
-            let config = litmus::ps::PsConfig {
+            let config = litmus::ScanConfig {
                 model_dir,
                 format: cli.format,
                 threshold_suspicious: cli.threshold_suspicious,
@@ -223,8 +227,8 @@ fn main() -> Result<()> {
             let config = litmus::server::ServerConfig {
                 bind,
                 timeout_secs,
-                max_body_size: max_size_mb * 1024 * 1024,
-                max_rss_bytes: max_rss_gb * 1024 * 1024 * 1024,
+                max_body_size: max_size_mb.saturating_mul(1024 * 1024),
+                max_rss_bytes: max_rss_gb.saturating_mul(1024 * 1024 * 1024),
                 model_dir,
                 threshold_suspicious: cli.threshold_suspicious,
                 threshold_hostile: cli.threshold_hostile,
@@ -237,10 +241,7 @@ fn main() -> Result<()> {
                 .block_on(litmus::server::run(config))?;
         }
 
-        Commands::UpdateRules {
-            models_only,
-            check,
-        } => {
+        Commands::UpdateRules { models_only, check } => {
             if check {
                 if let Err(e) = litmus::models_repo::check_updates() {
                     eprintln!("Error checking model updates: {e}");

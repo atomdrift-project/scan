@@ -39,7 +39,11 @@ impl DisplayFilter {
 
 impl Default for DisplayFilter {
     fn default() -> Self {
-        Self { hostile: true, suspicious: true, benign: false }
+        Self {
+            hostile: true,
+            suspicious: true,
+            benign: false,
+        }
     }
 }
 
@@ -141,7 +145,10 @@ pub struct TopFinding {
     pub desc: String,
 }
 
-pub(crate) const SPINNER: &[char] = &['\u{2800}', '\u{2801}', '\u{2809}', '\u{2819}', '\u{281B}', '\u{281E}', '\u{2816}', '\u{2812}', '\u{2810}', '\u{2800}'];
+pub(crate) const SPINNER: &[char] = &[
+    '\u{2800}', '\u{2801}', '\u{2809}', '\u{2819}', '\u{281B}', '\u{281E}', '\u{2816}', '\u{2812}',
+    '\u{2810}', '\u{2800}',
+];
 
 /// Progress state shared between threads.
 pub(crate) struct Progress {
@@ -234,7 +241,10 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 
     let shap = ShapImportance::load(&config.model_dir).ok();
     let ctx = ExtractContext::new(&model.spec);
-    let cleave_opts = cleave::AnalysisOptions { slow_rule_ms: config.slow_rule_ms, ..Default::default() };
+    let cleave_opts = cleave::AnalysisOptions {
+        slow_rule_ms: config.slow_rule_ms,
+        ..Default::default()
+    };
     let is_terminal = matches!(config.format, OutputFormat::Terminal);
     let scan_start = Instant::now();
 
@@ -299,8 +309,9 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             path: ref file_path,
             result,
         } => {
-            let scan_result =
-                result.and_then(|report| process_report(file_path, report, &ctx, &model, shap.as_ref(), config));
+            let scan_result = result.and_then(|report| {
+                process_report(file_path, report, &ctx, &model, shap.as_ref(), config)
+            });
             let prog = progress.get();
             if let Some(p) = prog {
                 p.increment();
@@ -318,7 +329,8 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                             benign_count.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    if config.format == OutputFormat::Json || config.filter.shows(&r.classification) {
+                    if config.format == OutputFormat::Json || config.filter.shows(&r.classification)
+                    {
                         emit_result(&r, config, prog.is_some(), &stdout);
                         if let Some(p) = prog {
                             p.redraw();
@@ -342,7 +354,10 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     let benign = benign_count.load(Ordering::Relaxed);
     let errors = error_count.load(Ordering::Relaxed);
     let summary = ScanSummary {
-        total_files: total_files.get().copied().unwrap_or(hostile + suspicious + benign + errors),
+        total_files: total_files
+            .get()
+            .copied()
+            .unwrap_or(hostile + suspicious + benign + errors),
         hostile,
         suspicious,
         benign,
@@ -358,37 +373,54 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 }
 
 /// Emit a scan result to the appropriate output channel.
-fn emit_result(r: &ScanResult, config: &ScanConfig, show_progress: bool, stdout: &Mutex<std::io::Stdout>) {
+fn emit_result(
+    r: &ScanResult,
+    config: &ScanConfig,
+    show_progress: bool,
+    stdout: &Mutex<std::io::Stdout>,
+) {
     match config.format {
         OutputFormat::Terminal => {
             crate::output::print_file_result_streaming(r, show_progress);
         }
-        OutputFormat::Json => {
-            if let Ok(line) = serde_json::to_string(r) {
+        OutputFormat::Json => match serde_json::to_string(r) {
+            Ok(line) => {
                 if let Ok(mut out) = stdout.lock() {
                     let _ = writeln!(out, "{line}");
                 }
             }
-        }
+            Err(e) => {
+                tracing::error!(path = %r.path, "failed to serialize scan result: {e}");
+            }
+        },
     }
 }
 
-/// Apply litmus model inference to a cleave report. Always returns a ScanResult
-/// (even for benign); the caller decides whether to display it.
-fn process_report(
-    path: &Path,
+/// Intermediate classification result from the model pipeline.
+/// Produced by `classify_report`, consumed when building a `ScanResult`.
+pub(crate) struct ClassifiedReport {
+    pub(crate) classification: Classification,
+    pub(crate) probability: f32,
+    pub(crate) finding_counts: FindingCounts,
+    pub(crate) formula: String,
+    pub(crate) reasons: Vec<Reason>,
+    pub(crate) top_findings: Vec<TopFinding>,
+    pub(crate) file_type: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
+    pub(crate) report_json: serde_json::Value,
+}
+
+/// Run the full cleave-finalize + model inference pipeline on a report.
+/// This is the single authoritative inference path used by scan, ps, and the server.
+pub(crate) fn classify_report(
+    label: &str,
     mut report: cleave::AnalysisReport,
     ctx: &ExtractContext,
     model: &Model,
     shap: Option<&ShapImportance>,
-    config: &ScanConfig,
-) -> Result<ScanResult> {
-    // Compute formula before finalize (formula_from_report reads root-level findings).
+) -> Result<ClassifiedReport> {
     let formula = cleave::formula_from_report(&report);
-
-    // Finalize moves all data into files[0], matching the structure the model was
-    // trained on (collimator processes finalized cleave output). Without this,
-    // primary_file() returns Null and the entire feature vector is zeros.
     report.finalize();
 
     let report_json = serde_json::to_value(&report).context("serializing cleave report")?;
@@ -400,7 +432,7 @@ fn process_report(
     let finding_counts = count_findings_from_json(&report_json);
 
     tracing::debug!(
-        path = %path.display(),
+        path = %label,
         classification = ?classification,
         probability = format!("{:.4}", probability),
         features_nonzero = nonzero,
@@ -413,7 +445,6 @@ fn process_report(
         "classified file",
     );
 
-    // Compute SHAP reasons and top findings for flagged files.
     let (reasons, top_findings) = if classification != Classification::Benign {
         let r = shap
             .map(|s| s.explain(&features, &model.spec.feature_names, 5))
@@ -432,16 +463,9 @@ fn process_report(
     let size_bytes = pf["size"].as_u64().unwrap_or(0);
     let sha256 = pf["sha256"].as_str().unwrap_or("").to_string();
 
-    let is_json = matches!(config.format, OutputFormat::Json);
-
-    Ok(ScanResult {
-        path: path.display().to_string(),
+    Ok(ClassifiedReport {
         classification,
         probability,
-        thresholds: Thresholds {
-            suspicious: config.threshold_suspicious,
-            hostile: config.threshold_hostile,
-        },
         finding_counts,
         formula,
         reasons,
@@ -449,8 +473,44 @@ fn process_report(
         file_type,
         size_bytes,
         sha256,
-        model: if is_json { Some(model.info.clone()) } else { None },
-        cleave: if is_json { Some(report_json) } else { None },
+        report_json,
+    })
+}
+
+/// Apply litmus model inference to a cleave report. Always returns a ScanResult
+/// (even for benign); the caller decides whether to display it.
+fn process_report(
+    path: &Path,
+    report: cleave::AnalysisReport,
+    ctx: &ExtractContext,
+    model: &Model,
+    shap: Option<&ShapImportance>,
+    config: &ScanConfig,
+) -> Result<ScanResult> {
+    let cr = classify_report(&path.display().to_string(), report, ctx, model, shap)?;
+    let is_json = matches!(config.format, OutputFormat::Json);
+
+    Ok(ScanResult {
+        path: path.display().to_string(),
+        classification: cr.classification,
+        probability: cr.probability,
+        thresholds: Thresholds {
+            suspicious: config.threshold_suspicious,
+            hostile: config.threshold_hostile,
+        },
+        finding_counts: cr.finding_counts,
+        formula: cr.formula,
+        reasons: cr.reasons,
+        top_findings: cr.top_findings,
+        file_type: cr.file_type,
+        size_bytes: cr.size_bytes,
+        sha256: cr.sha256,
+        model: if is_json {
+            Some(model.info.clone())
+        } else {
+            None
+        },
+        cleave: if is_json { Some(cr.report_json) } else { None },
         pids: None,
         deleted: None,
     })
@@ -459,14 +519,12 @@ fn process_report(
 /// Count cleave findings by criticality level.
 #[must_use]
 pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
-    let findings = report["findings"]
-        .as_array()
-        .or_else(|| {
-            report["files"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|f| f["findings"].as_array())
-        });
+    let findings = report["findings"].as_array().or_else(|| {
+        report["files"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|f| f["findings"].as_array())
+    });
 
     let Some(findings) = findings else {
         return FindingCounts::default();
@@ -560,12 +618,5 @@ pub fn extract_top_findings_from_json(
 }
 
 fn crit_ordinal(crit: &str) -> u32 {
-    match crit {
-        "filtered" => 0,
-        "component" => 1,
-        "notable" => 3,
-        "suspicious" => 4,
-        "hostile" => 5,
-        _ => 2,
-    }
+    crate::features::crit_ordinal(crit)
 }
