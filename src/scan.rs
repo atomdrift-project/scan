@@ -420,8 +420,12 @@ pub(crate) fn classify_report(
     model: &Model,
     shap: Option<&ShapImportance>,
 ) -> Result<ClassifiedReport> {
-    let formula = cleave::formula_from_report(&report);
     report.finalize();
+    let formula = report
+        .files
+        .first()
+        .and_then(|file| file.formula.clone())
+        .unwrap_or_default();
 
     let report_json = serde_json::to_value(&report).context("serializing cleave report")?;
     let mut features = ctx.extract(&report_json);
