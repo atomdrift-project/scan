@@ -1,4 +1,28 @@
-//! litmus - ML-powered malware classification using cleave static analysis.
+//! `litmus` classifies files as benign, suspicious, or hostile using
+//! `cleave` static analysis plus an XGBoost model.
+//!
+//! The crate exposes a small public API centered around:
+//! - [`ScanConfig`] for validated scan settings
+//! - [`scan::run`] for recursive file and directory scans
+//! - [`ps::run`] for process scans
+//! - [`Classification`] and [`Thresholds`] for interpreting model output
+//!
+//! # Example
+//! ```no_run
+//! use litmus::{DisplayFilter, OutputFormat, ScanConfig, Thresholds};
+//!
+//! let config = ScanConfig::new(
+//!     "/path/to/models",
+//!     OutputFormat::Json,
+//!     Thresholds::default(),
+//!     DisplayFilter::all(),
+//!     4_000,
+//! )?;
+//!
+//! let summary = litmus::scan::run(std::path::Path::new("/tmp/sample.exe"), &config)?;
+//! println!("scanned {} file(s)", summary.total_files);
+//! # Ok::<(), anyhow::Error>(())
+//! ```
 
 pub mod explain;
 pub mod features;
@@ -10,7 +34,8 @@ pub mod scan;
 pub mod server;
 
 pub use model::Classification;
-pub use scan::{ScanConfig, ScanResult, ScanSummary};
+pub use model::Thresholds;
+pub use scan::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
 
 /// Output format for scan results.
 #[derive(Debug, Clone, Copy, Default, PartialEq, clap::ValueEnum)]

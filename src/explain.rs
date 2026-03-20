@@ -34,7 +34,6 @@ pub struct Reason {
 
 impl ShapImportance {
     /// Load from shap_importance.json in model directory.
-    #[must_use]
     pub fn load(model_dir: &Path) -> Result<Self> {
         let path = model_dir.join("shap_importance.json");
         let data = std::fs::read_to_string(&path)

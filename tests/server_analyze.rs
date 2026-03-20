@@ -1,15 +1,16 @@
 //! Integration tests for the /analyze endpoint.
 
+use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use litmus::server::{build_app, ServerConfig};
 use tower::ServiceExt;
 
-fn model_dir() -> std::path::PathBuf {
+fn model_dir() -> Result<std::path::PathBuf> {
     if let Ok(d) = std::env::var("LITMUS_MODELS_DIR") {
-        return std::path::PathBuf::from(d);
+        return Ok(std::path::PathBuf::from(d));
     }
-    litmus::models_repo::model_dir().expect("failed to resolve model directory")
+    litmus::models_repo::model_dir().context("failed to resolve model directory")
 }
 
 fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
@@ -30,24 +31,24 @@ fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
 
 /// Submit an encrypted zip via /analyze and verify JSON response structure.
 #[tokio::test]
-async fn analyze_encrypted_zip_returns_json() {
+async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/encrypted.zip");
-    if !testdata.exists() {
-        panic!("testdata/encrypted.zip not found — copy a test sample there");
-    }
-    let file_bytes = std::fs::read(&testdata).unwrap();
+    assert!(
+        testdata.exists(),
+        "testdata/encrypted.zip not found — copy a test sample there"
+    );
+    let file_bytes = std::fs::read(&testdata).context("failed to read test archive")?;
 
-    let config = ServerConfig {
-        bind: std::net::SocketAddr::from(([127, 0, 0, 1], 8081)),
-        timeout_secs: 120,
-        max_body_size: 100 * 1024 * 1024,
-        max_rss_bytes: 8 * 1024 * 1024 * 1024,
-        model_dir: model_dir(),
-        threshold_suspicious: litmus::model::Thresholds::DEFAULT_SUSPICIOUS,
-        threshold_hostile: litmus::model::Thresholds::DEFAULT_HOSTILE,
-        slow_rule_ms: 4000,
-    };
-    let app = build_app(&config).await.expect("failed to build app");
+    let config = ServerConfig::new(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 8081)),
+        120,
+        100 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        model_dir()?,
+        litmus::model::Thresholds::default(),
+        4000,
+    )?;
+    let app = build_app(&config).await.context("failed to build app")?;
 
     // Wait for background resource loading to complete before sending requests.
     eprintln!("waiting for server readiness...");
@@ -58,10 +59,10 @@ async fn analyze_encrypted_zip_returns_json() {
                 Request::builder()
                     .uri("/_/health")
                     .body(Body::empty())
-                    .unwrap(),
+                    .context("failed to build health request")?,
             )
             .await
-            .unwrap();
+            .context("health request failed")?;
         if resp.status() == StatusCode::OK {
             break;
         }
@@ -77,18 +78,18 @@ async fn analyze_encrypted_zip_returns_json() {
                 .uri("/analyze")
                 .header("content-type", content_type)
                 .body(Body::from(body))
-                .unwrap(),
+                .context("failed to build analyze request")?,
         )
         .await
-        .unwrap();
+        .context("analyze request failed")?;
 
     assert_eq!(response.status(), StatusCode::OK);
 
     let body_bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
         .await
-        .unwrap();
+        .context("failed to read response body")?;
     let json: serde_json::Value =
-        serde_json::from_slice(&body_bytes).expect("response must be valid JSON");
+        serde_json::from_slice(&body_bytes).context("response must be valid JSON")?;
 
     // Every response must have these fields, regardless of classification.
     assert!(json["classification"].is_string(), "missing classification");
@@ -105,9 +106,12 @@ async fn analyze_encrypted_zip_returns_json() {
     assert!(json["sha256"].is_string(), "missing sha256");
     assert!(json["cleave"].is_object(), "missing cleave report");
 
-    let classification = json["classification"].as_str().unwrap();
+    let classification = json["classification"]
+        .as_str()
+        .context("classification must be a string")?;
     assert!(
         ["benign", "suspicious", "hostile"].contains(&classification),
         "unexpected classification: {classification}"
     );
+    Ok(())
 }

@@ -8,6 +8,10 @@
 //!   GET  /health   — liveness check
 //!   POST /analyze  — upload a file, receive full classification JSON
 //!   POST /reload   — hot-reload model from disk
+//!
+//! [`ServerConfig`] keeps the public server surface intentionally small:
+//! validated thresholds are supplied up front, and callers use accessors
+//! rather than mutating fields after construction.
 
 mod handlers;
 
@@ -26,84 +30,162 @@ use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
 
-/// Server configuration.
+/// Immutable configuration for the HTTP API server.
+///
+/// Construct with [`ServerConfig::new`] so thresholds are validated before the
+/// listener starts and background resource loading begins.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Address to bind to (default: 127.0.0.1:8081).
-    pub bind: SocketAddr,
+    bind: SocketAddr,
+    timeout_secs: u64,
+    max_body_size: usize,
+    max_rss_bytes: u64,
+    model_dir: PathBuf,
+    thresholds: Thresholds,
+    slow_rule_ms: u64,
+}
+
+impl ServerConfig {
+    /// Create a validated server configuration.
+    ///
+    /// `max_body_size` and `max_rss_bytes` are byte counts.
+    ///
+    /// # Example
+    /// ```
+    /// use litmus::{server::ServerConfig, Thresholds};
+    ///
+    /// let config = ServerConfig::new(
+    ///     "127.0.0.1:8081".parse()?,
+    ///     120,
+    ///     100 * 1024 * 1024,
+    ///     8 * 1024 * 1024 * 1024,
+    ///     "/path/to/models",
+    ///     Thresholds::default(),
+    ///     4_000,
+    /// )?;
+    ///
+    /// assert_eq!(config.timeout_secs(), 120);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn new(
+        bind: SocketAddr,
+        timeout_secs: u64,
+        max_body_size: usize,
+        max_rss_bytes: u64,
+        model_dir: impl Into<PathBuf>,
+        thresholds: Thresholds,
+        slow_rule_ms: u64,
+    ) -> anyhow::Result<Self> {
+        thresholds
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
+        Ok(Self {
+            bind,
+            timeout_secs,
+            max_body_size,
+            max_rss_bytes,
+            model_dir: model_dir.into(),
+            thresholds,
+            slow_rule_ms,
+        })
+    }
+
+    /// Address the HTTP server binds to.
+    #[must_use]
+    pub const fn bind(&self) -> SocketAddr {
+        self.bind
+    }
+
     /// Per-request analysis timeout in seconds.
-    pub timeout_secs: u64,
+    #[must_use]
+    pub const fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+
     /// Maximum request body size in bytes.
-    pub max_body_size: usize,
-    /// Maximum RSS before rejecting requests (Linux only).
-    pub max_rss_bytes: u64,
-    /// Directory containing model.onnx, feature_spec.json, shap_importance.json.
-    pub model_dir: PathBuf,
-    /// Probability threshold for suspicious classification.
-    pub threshold_suspicious: f32,
-    /// Probability threshold for hostile classification.
-    pub threshold_hostile: f32,
-    /// Warn when a single cleave rule takes longer than this many milliseconds.
-    pub slow_rule_ms: u64,
-}
+    #[must_use]
+    pub const fn max_body_size(&self) -> usize {
+        self.max_body_size
+    }
 
-/// Metadata for a request currently in the analysis pipeline.
-#[derive(Debug)]
-pub struct InFlightRequest {
-    /// Original upload filename.
-    pub name: String,
-    /// File size in bytes.
-    pub size_bytes: u64,
-    /// When analysis began (after upload completed).
-    pub started_at: Instant,
-}
-
-/// Loaded model resources; swapped atomically on /reload.
-#[derive(Debug)]
-pub struct ModelResources {
-    /// Loaded ONNX model.
-    pub model: Model,
-    /// SHAP importance data for explanations.
-    pub shap: Option<ShapImportance>,
-    /// Feature extraction context built from the model spec.
-    pub ctx: ExtractContext,
-}
-
-/// Shared application state, held behind an `Arc`.
-#[derive(Debug)]
-pub struct AppState {
-    /// Per-request analysis timeout in seconds.
-    pub timeout_secs: u64,
-    /// Maximum upload size in bytes (defense-in-depth, mirrors DefaultBodyLimit).
-    pub max_upload_bytes: usize,
     /// Maximum RSS before rejecting requests.
-    pub max_rss_bytes: u64,
+    #[must_use]
+    pub const fn max_rss_bytes(&self) -> u64 {
+        self.max_rss_bytes
+    }
+
     /// Directory containing model artifacts.
-    pub model_dir: PathBuf,
-    /// Minimum probability to classify as suspicious.
-    pub threshold_suspicious: f32,
-    /// Minimum probability to classify as hostile.
-    pub threshold_hostile: f32,
-    /// Warn when a single cleave rule takes longer than this many milliseconds.
-    pub slow_rule_ms: u64,
-    /// True once model resources have been loaded and the server is ready to
-    /// serve analysis requests.  Set with `Release` ordering; read with
-    /// `Acquire` so the resources write is always visible before this flips.
-    pub ready: AtomicBool,
-    /// Current model resources; wrapped in `Arc` so handlers can snapshot
-    /// without holding the lock across `await` points.  `None` while the
-    /// server is still initialising.
-    pub resources: RwLock<Option<Arc<ModelResources>>>,
-    /// Monotonically increasing request counter.
-    pub next_request_id: AtomicU64,
-    /// Number of analysis tasks currently in flight.
-    pub active_tasks: AtomicUsize,
-    /// Serialises /reload — only one reload may run at a time.
-    pub reload_lock: tokio::sync::Mutex<()>,
-    /// Tracks when the server first entered a memory-overloaded state.
-    pub overloaded_since: std::sync::Mutex<Option<Instant>>,
-    /// Currently in-flight analysis requests, keyed by request ID.
-    pub in_flight: dashmap::DashMap<u64, InFlightRequest>,
+    #[must_use]
+    pub fn model_dir(&self) -> &std::path::Path {
+        &self.model_dir
+    }
+
+    /// Classification thresholds used by the model.
+    #[must_use]
+    pub const fn thresholds(&self) -> Thresholds {
+        self.thresholds
+    }
+
+    /// Warn when a single cleave rule exceeds this duration in milliseconds.
+    #[must_use]
+    pub const fn slow_rule_ms(&self) -> u64 {
+        self.slow_rule_ms
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn server_config_rejects_invalid_thresholds() {
+        let result = ServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], 8081)),
+            120,
+            100 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+            "/tmp/models",
+            Thresholds {
+                suspicious: -0.1,
+                hostile: 0.9,
+            },
+            4_000,
+        );
+
+        assert!(result.is_err());
+    }
+}
+
+#[derive(Debug)]
+struct InFlightRequest {
+    name: String,
+    size_bytes: u64,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct ModelResources {
+    model: Model,
+    shap: Option<ShapImportance>,
+    ctx: ExtractContext,
+}
+
+#[derive(Debug)]
+struct AppState {
+    timeout_secs: u64,
+    max_upload_bytes: usize,
+    max_rss_bytes: u64,
+    model_dir: PathBuf,
+    threshold_suspicious: f32,
+    threshold_hostile: f32,
+    slow_rule_ms: u64,
+    ready: AtomicBool,
+    resources: RwLock<Option<Arc<ModelResources>>>,
+    next_request_id: AtomicU64,
+    active_tasks: AtomicUsize,
+    reload_lock: tokio::sync::Mutex<()>,
+    overloaded_since: std::sync::Mutex<Option<Instant>>,
+    in_flight: dashmap::DashMap<u64, InFlightRequest>,
 }
 
 impl AppState {
@@ -121,17 +203,21 @@ impl AppState {
 /// delay readiness.
 ///
 /// Useful for integration tests that need the app without binding to a port.
+///
+/// # Errors
+/// Returns an error if the router cannot be assembled or background resource
+/// initialization cannot be scheduled.
 pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
-    tracing::info!(model_dir = %config.model_dir.display(), "starting — resources loading in background");
+    tracing::info!(model_dir = %config.model_dir().display(), "starting — resources loading in background");
 
     let state = Arc::new(AppState {
-        timeout_secs: config.timeout_secs,
-        max_upload_bytes: config.max_body_size,
-        max_rss_bytes: config.max_rss_bytes,
-        model_dir: config.model_dir.clone(),
-        threshold_suspicious: config.threshold_suspicious,
-        threshold_hostile: config.threshold_hostile,
-        slow_rule_ms: config.slow_rule_ms,
+        timeout_secs: config.timeout_secs(),
+        max_upload_bytes: config.max_body_size(),
+        max_rss_bytes: config.max_rss_bytes(),
+        model_dir: config.model_dir().to_path_buf(),
+        threshold_suspicious: config.thresholds().suspicious,
+        threshold_hostile: config.thresholds().hostile,
+        slow_rule_ms: config.slow_rule_ms(),
         ready: AtomicBool::new(false),
         resources: RwLock::new(None),
         next_request_id: AtomicU64::new(1),
@@ -144,12 +230,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     // Background task: load model + SHAP concurrently, then mark the server ready.
     {
         let bg = Arc::clone(&state);
-        let model_dir = config.model_dir.clone();
-        let model_dir_shap = config.model_dir.clone();
-        let thresholds = Thresholds {
-            suspicious: config.threshold_suspicious,
-            hostile: config.threshold_hostile,
-        };
+        let model_dir = config.model_dir().to_path_buf();
+        let model_dir_shap = config.model_dir().to_path_buf();
+        let thresholds = config.thresholds();
         tokio::spawn(async move {
             let init_start = Instant::now();
             tracing::info!("resource loader started (model + SHAP loading concurrently)");
@@ -164,12 +247,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     let t = Instant::now();
                     tracing::info!(queue_ms, "loading ONNX model and feature spec");
                     let model = Model::load(&model_dir, thresholds)?;
-                    let ctx = ExtractContext::new(&model.spec);
+                    let ctx = ExtractContext::new(model.spec());
                     tracing::info!(
                         queue_ms,
                         work_ms = t.elapsed().as_millis(),
-                        spec_version = model.spec.version,
-                        features = model.spec.total_features,
+                        spec_version = model.spec().version(),
+                        features = model.spec().total_features(),
                         "ONNX model loaded",
                     );
                     Ok((model, ctx))
@@ -201,8 +284,8 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
 
             match tokio::join!(model_task, shap_task) {
                 (Ok(Ok((model, ctx))), Ok(shap)) => {
-                    let spec_version = model.spec.version;
-                    let features = model.spec.total_features;
+                    let spec_version = model.spec().version();
+                    let features = model.spec().total_features();
                     let shap_loaded = shap.is_some();
                     tracing::info!("all resources ready, installing into AppState");
                     match bg.resources.write() {
@@ -231,7 +314,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     // before the first request arrives, great; otherwise the first request
     // naturally warms the rules.
     {
-        let slow_rule_ms = config.slow_rule_ms;
+        let slow_rule_ms = config.slow_rule_ms();
         tokio::spawn(tokio::task::spawn_blocking(move || {
             let t = Instant::now();
             tracing::info!("YARA warmup started (non-blocking)");
@@ -261,13 +344,20 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         .route("/_/requests", get(handlers::requests))
         .route("/_/threads", get(handlers::threads))
         .merge(analysis_routes)
-        .layer(DefaultBodyLimit::max(config.max_body_size))
+        .layer(DefaultBodyLimit::max(config.max_body_size()))
         .with_state(state);
 
     Ok(app)
 }
 
-/// Start the HTTP server. Blocks until SIGINT or SIGTERM.
+/// Start the HTTP server and block until shutdown.
+///
+/// This binds the configured socket address, starts background resource
+/// loading, and serves requests until `SIGINT` or `SIGTERM`.
+///
+/// # Errors
+/// Returns an error if the listening socket cannot be bound or the server
+/// fails while serving requests.
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // Server mode processes many files over a long lifetime. Configure jemalloc
     // to aggressively return freed pages to the OS, preventing multi-GB RSS
@@ -276,17 +366,17 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     let app = build_app(&config).await?;
 
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let listener = tokio::net::TcpListener::bind(config.bind()).await?;
     eprintln!(
         "Listening on http://{} (timeout: {}s, max size: {} MB, starting up) — Press Ctrl+C to stop",
-        config.bind,
-        config.timeout_secs,
-        config.max_body_size / 1024 / 1024,
+        config.bind(),
+        config.timeout_secs(),
+        config.max_body_size() / 1024 / 1024,
     );
     tracing::info!(
-        bind = %config.bind,
-        timeout_secs = config.timeout_secs,
-        max_body_mb = config.max_body_size / 1024 / 1024,
+        bind = %config.bind(),
+        timeout_secs = config.timeout_secs(),
+        max_body_mb = config.max_body_size() / 1024 / 1024,
         "listening (resources loading in background)",
     );
 

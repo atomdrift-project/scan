@@ -65,27 +65,26 @@ const KEY_METRICS: &[(&str, &str, bool)] = &[
 #[derive(Debug, Clone)]
 pub struct FeatureSpec {
     /// Spec format version (expected: 13).
-    pub version: u32,
+    version: u32,
     /// Path vocabulary for presence/maxcrit features.
-    pub presence_vocab: Vec<String>,
+    presence_vocab: Vec<String>,
     /// File type vocabulary for one-hot encoding.
-    pub filetype_vocab: Vec<String>,
+    filetype_vocab: Vec<String>,
     /// Names of all features in the vector, in order.
-    pub feature_names: Vec<String>,
+    feature_names: Vec<String>,
     /// Total number of features in the vector.
-    pub total_features: usize,
+    total_features: usize,
     /// Per-feature means for z-score standardization (from training).
-    pub feature_means: Option<Vec<f32>>,
+    feature_means: Option<Vec<f32>>,
     /// Per-feature standard deviations for z-score standardization (from training).
-    pub feature_stds: Option<Vec<f32>>,
+    feature_stds: Option<Vec<f32>>,
     /// Whether the model was trained on standardized features. When false,
     /// inference should use raw features directly (no z-score transform).
-    pub standardized: bool,
+    standardized: bool,
 }
 
 impl FeatureSpec {
     /// Load feature specification from a JSON file.
-    #[must_use]
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path).context("reading feature spec")?;
         let v: serde_json::Value = serde_json::from_str(&data).context("parsing feature spec")?;
@@ -108,6 +107,36 @@ impl FeatureSpec {
             feature_stds: json_f32_array(&v["feature_stds"]),
             standardized: v["standardized"].as_bool().unwrap_or(true),
         })
+    }
+
+    /// Spec format version.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Path vocabulary for presence and max-criticality features.
+    #[must_use]
+    pub fn presence_vocab(&self) -> &[String] {
+        &self.presence_vocab
+    }
+
+    /// Names of all features in model input order.
+    #[must_use]
+    pub fn feature_names(&self) -> &[String] {
+        &self.feature_names
+    }
+
+    /// Total feature count expected by the model.
+    #[must_use]
+    pub const fn total_features(&self) -> usize {
+        self.total_features
+    }
+
+    /// Whether raw features should be standardized before inference.
+    #[must_use]
+    pub const fn is_standardized(&self) -> bool {
+        self.standardized
     }
 
     /// Apply z-score standardization using training statistics.
@@ -159,20 +188,20 @@ fn json_f32_array(v: &serde_json::Value) -> Option<Vec<f32>> {
 
 /// Pre-built lookup tables for fast repeated extraction against a spec.
 #[derive(Debug)]
-pub struct ExtractContext {
+pub(crate) struct ExtractContext {
     /// Maps path string -> index in presence_vocab.
     presence_lookup: HashMap<String, usize>,
     n_presence: usize,
     ft_lookup: HashMap<String, usize>,
     n_ft: usize,
     /// Total number of features in the output vector.
-    pub total_features: usize,
+    total_features: usize,
 }
 
 impl ExtractContext {
     /// Build lookup tables from a feature specification.
     #[must_use]
-    pub fn new(spec: &FeatureSpec) -> Self {
+    pub(crate) fn new(spec: &FeatureSpec) -> Self {
         let presence_lookup: HashMap<String, usize> = spec
             .presence_vocab
             .iter()
@@ -198,7 +227,7 @@ impl ExtractContext {
 
     /// Extract features from a cleave AnalysisReport serialized as JSON.
     #[must_use]
-    pub fn extract(&self, report: &serde_json::Value) -> Vec<f32> {
+    pub(crate) fn extract(&self, report: &serde_json::Value) -> Vec<f32> {
         let mut vec = vec![0.0f32; self.total_features];
         self.extract_into(report, &mut vec);
         vec
@@ -207,178 +236,47 @@ impl ExtractContext {
     fn extract_into(&self, report: &serde_json::Value, vec: &mut [f32]) {
         let pf = primary_file(report);
         let findings = pf_array(pf, "findings");
-        let mut offset = 0usize;
-
-        // -------------------------------------------------------------------
-        // Build per-path max criticality from findings.
-        // -------------------------------------------------------------------
-        let mut sample_paths: HashMap<&str, u32> = HashMap::new();
-        let mut filtered_finding_count = 0u32;
-        let mut third_party_max_crit = 0u32;
-        let mut third_party_count = 0u32;
-        let mut well_known_max_crit = 0u32;
-        let mut well_known_hostile = 0u32;
-        let mut well_known_suspicious = 0u32;
-        let mut has_yara = false;
-
-        for finding in &findings {
-            let fid = finding["id"].as_str().unwrap_or("");
-            if fid.is_empty() {
-                continue;
-            }
-
-            // Skip low-confidence findings (matches collimator MIN_CONFIDENCE).
-            let conf = finding["conf"].as_f64().unwrap_or(1.0);
-            if conf < MIN_CONFIDENCE {
-                continue;
-            }
-            filtered_finding_count += 1;
-
-            let crit_ord = crit_ordinal(finding["crit"].as_str().unwrap_or("baseline"));
-
-            let top = fid.split('/').next().unwrap_or("");
-            if top == "third_party" {
-                third_party_count += 1;
-                if crit_ord > third_party_max_crit {
-                    third_party_max_crit = crit_ord;
-                }
-                has_yara = true;
-            } else if top == "well-known" {
-                if crit_ord > well_known_max_crit {
-                    well_known_max_crit = crit_ord;
-                }
-                if crit_ord >= 5 {
-                    well_known_hostile += 1;
-                } else if crit_ord >= 4 {
-                    well_known_suspicious += 1;
-                }
-            }
-
-            for path in finding_paths(fid) {
-                let entry = sample_paths.entry(path).or_insert(0);
-                if crit_ord > *entry {
-                    *entry = crit_ord;
-                }
-            }
-        }
+        let mut offsets = FeatureCursor::default();
+        let finding_summary = summarize_findings(&findings);
 
         // -------------------------------------------------------------------
         // Group 1: Presence features (n_presence binary features)
         // Set to 1.0 if path exists at criticality ≥ baseline (ordinal 2).
         // -------------------------------------------------------------------
-        let presence_offset = offset;
-        offset += self.n_presence;
-
-        for (path, &max_ord) in &sample_paths {
-            if max_ord >= 2 {
-                if let Some(&idx) = self.presence_lookup.get(*path) {
-                    vec[presence_offset + idx] = 1.0;
-                }
-            }
-        }
+        let presence_offset = offsets.take(self.n_presence);
+        self.write_presence_features(&finding_summary.sample_paths, vec, presence_offset);
 
         // -------------------------------------------------------------------
         // Group 2: Max criticality features (n_presence ordinal features)
         // Stores the max criticality ordinal (0–5) per path.
         // -------------------------------------------------------------------
-        let maxcrit_offset = offset;
-        offset += self.n_presence;
-
-        for (path, &max_ord) in &sample_paths {
-            if let Some(&idx) = self.presence_lookup.get(*path) {
-                vec[maxcrit_offset + idx] = max_ord as f32;
-            }
-        }
+        let maxcrit_offset = offsets.take(self.n_presence);
+        self.write_max_crit_features(&finding_summary.sample_paths, vec, maxcrit_offset);
 
         // -------------------------------------------------------------------
         // Group 3: Aggregates (8 features)
         // -------------------------------------------------------------------
-        let agg_offset = offset;
-        offset += 8;
-
-        let mut max_crit = 0u32;
-        let mut categories: HashSet<&str> = HashSet::new();
-        let mut path_breadth_any = 0u32;
-        let mut total_active = 0u32;
-        let mut breadth_notable = 0u32;
-        let mut breadth_suspicious = 0u32;
-        let mut breadth_hostile = 0u32;
-        let mut breadth_notable_only = 0u32;
-
-        for (path, &max_ord) in &sample_paths {
-            if max_ord >= 2 {
-                let top = path.split('/').next().unwrap_or("");
-                categories.insert(top);
-                if path.chars().filter(|&c| c == '/').count() >= 2 {
-                    path_breadth_any += 1;
-                }
-            }
-
-            if path.chars().filter(|&c| c == '/').count() < 2 {
-                continue;
-            }
-            if max_ord < 3 {
-                continue;
-            }
-            total_active += 1;
-            breadth_notable += 1;
-            if max_ord > max_crit {
-                max_crit = max_ord;
-            }
-            if max_ord >= 4 {
-                breadth_suspicious += 1;
-            }
-            if max_ord >= 5 {
-                breadth_hostile += 1;
-            } else if max_ord == 3 {
-                breadth_notable_only += 1;
-            }
-        }
-
-        vec[agg_offset] = max_crit as f32;
-        vec[agg_offset + 1] = categories.len() as f32;
-        vec[agg_offset + 2] = (path_breadth_any as f32 + 1.0).ln();
-        vec[agg_offset + 3] = (total_active as f32 + 1.0).ln();
-        vec[agg_offset + 4] = breadth_suspicious as f32 / path_breadth_any.max(1) as f32;
-        vec[agg_offset + 5] = breadth_hostile as f32 / path_breadth_any.max(1) as f32;
-        vec[agg_offset + 6] = breadth_suspicious as f32 / breadth_notable.max(1) as f32;
-        vec[agg_offset + 7] = breadth_notable_only as f32 / breadth_notable.max(1) as f32;
+        let agg_offset = offsets.take(8);
+        write_aggregate_features(&finding_summary.sample_paths, vec, agg_offset);
 
         // -------------------------------------------------------------------
         // Group 4: Third-Party / Well-Known Summary (6 features)
         // -------------------------------------------------------------------
-        let ext_offset = offset;
-        offset += 6;
-
-        vec[ext_offset] = third_party_max_crit as f32;
-        vec[ext_offset + 1] = (third_party_count as f32 + 1.0).ln();
-        vec[ext_offset + 2] = well_known_max_crit as f32;
-        vec[ext_offset + 3] = well_known_hostile as f32;
-        vec[ext_offset + 4] = well_known_suspicious as f32;
-        vec[ext_offset + 5] = if has_yara { 1.0 } else { 0.0 };
+        let ext_offset = offsets.take(6);
+        write_external_summary_features(&finding_summary, vec, ext_offset);
 
         // -------------------------------------------------------------------
         // Group 5: Key Metrics (16 features)
         // -------------------------------------------------------------------
-        let metrics = pf.get("metrics").unwrap_or(&serde_json::Value::Null);
-        for &(group, fname, use_log) in KEY_METRICS {
-            let val = metrics
-                .get(group)
-                .and_then(|g| g.get(fname))
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0) as f32;
-            vec[offset] = if use_log { (val.abs() + 1.0).ln() } else { val };
-            offset += 1;
-        }
+        let metrics_offset = offsets.take(KEY_METRICS.len());
+        write_metric_features(pf, vec, metrics_offset);
 
         // -------------------------------------------------------------------
         // Group 6: File Type one-hot
         // -------------------------------------------------------------------
         let file_type = pf["file_type"].as_str().unwrap_or("");
-        if let Some(&idx) = self.ft_lookup.get(file_type) {
-            vec[offset + idx] = 1.0;
-        }
-        offset += self.n_ft;
+        let file_type_offset = offsets.take(self.n_ft);
+        self.write_file_type_features(file_type, vec, file_type_offset);
 
         // -------------------------------------------------------------------
         // Group 7: Structural (4 features)
@@ -386,20 +284,213 @@ impl ExtractContext {
         let file_size = pf["size"].as_u64().unwrap_or(0);
         let is_binary = matches!(file_type, "pe" | "elf" | "macho");
         let imports = pf_array(pf, "imports");
-
-        vec[offset] = if is_binary && file_size < 20_000 {
-            1.0
-        } else {
-            0.0
-        };
-        vec[offset + 1] = if imports.is_empty() { 1.0 } else { 0.0 };
-        vec[offset + 2] = if filtered_finding_count == 0 {
-            1.0
-        } else {
-            0.0
-        };
-        vec[offset + 3] = (filtered_finding_count as f32 + 1.0).ln();
+        let structural_offset = offsets.take(4);
+        write_structural_features(
+            vec,
+            structural_offset,
+            is_binary,
+            file_size,
+            imports.is_empty(),
+            finding_summary.filtered_finding_count,
+        );
     }
+
+    fn write_presence_features(
+        &self,
+        sample_paths: &HashMap<&str, u32>,
+        vec: &mut [f32],
+        offset: usize,
+    ) {
+        for (path, &max_ord) in sample_paths {
+            if max_ord >= 2 {
+                if let Some(&idx) = self.presence_lookup.get(*path) {
+                    vec[offset + idx] = 1.0;
+                }
+            }
+        }
+    }
+
+    fn write_max_crit_features(
+        &self,
+        sample_paths: &HashMap<&str, u32>,
+        vec: &mut [f32],
+        offset: usize,
+    ) {
+        for (path, &max_ord) in sample_paths {
+            if let Some(&idx) = self.presence_lookup.get(*path) {
+                vec[offset + idx] = max_ord as f32;
+            }
+        }
+    }
+
+    fn write_file_type_features(&self, file_type: &str, vec: &mut [f32], offset: usize) {
+        if let Some(&idx) = self.ft_lookup.get(file_type) {
+            vec[offset + idx] = 1.0;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FeatureCursor {
+    offset: usize,
+}
+
+impl FeatureCursor {
+    fn take(&mut self, width: usize) -> usize {
+        let start = self.offset;
+        self.offset += width;
+        start
+    }
+}
+
+#[derive(Debug, Default)]
+struct FindingSummary<'a> {
+    sample_paths: HashMap<&'a str, u32>,
+    filtered_finding_count: u32,
+    third_party_max_crit: u32,
+    third_party_count: u32,
+    well_known_max_crit: u32,
+    well_known_hostile: u32,
+    well_known_suspicious: u32,
+    has_yara: bool,
+}
+
+fn summarize_findings<'a>(findings: &[&'a serde_json::Value]) -> FindingSummary<'a> {
+    let mut summary = FindingSummary::default();
+
+    for finding in findings {
+        let fid = finding["id"].as_str().unwrap_or("");
+        if fid.is_empty() {
+            continue;
+        }
+
+        let conf = finding["conf"].as_f64().unwrap_or(1.0);
+        if conf < MIN_CONFIDENCE {
+            continue;
+        }
+        summary.filtered_finding_count += 1;
+
+        let crit_ord = crit_ordinal(finding["crit"].as_str().unwrap_or("baseline"));
+        let top = fid.split('/').next().unwrap_or("");
+
+        match top {
+            "third_party" => {
+                summary.third_party_count += 1;
+                summary.third_party_max_crit = summary.third_party_max_crit.max(crit_ord);
+                summary.has_yara = true;
+            }
+            "well-known" => {
+                summary.well_known_max_crit = summary.well_known_max_crit.max(crit_ord);
+                if crit_ord >= 5 {
+                    summary.well_known_hostile += 1;
+                } else if crit_ord >= 4 {
+                    summary.well_known_suspicious += 1;
+                }
+            }
+            _ => {}
+        }
+
+        for path in finding_paths(fid) {
+            let entry = summary.sample_paths.entry(path).or_insert(0);
+            *entry = (*entry).max(crit_ord);
+        }
+    }
+
+    summary
+}
+
+fn write_aggregate_features(sample_paths: &HashMap<&str, u32>, vec: &mut [f32], offset: usize) {
+    let mut max_crit = 0u32;
+    let mut categories: HashSet<&str> = HashSet::new();
+    let mut path_breadth_any = 0u32;
+    let mut total_active = 0u32;
+    let mut breadth_notable = 0u32;
+    let mut breadth_suspicious = 0u32;
+    let mut breadth_hostile = 0u32;
+    let mut breadth_notable_only = 0u32;
+
+    for (path, &max_ord) in sample_paths {
+        let path_depth = path.chars().filter(|&c| c == '/').count();
+        if max_ord >= 2 {
+            let top = path.split('/').next().unwrap_or("");
+            categories.insert(top);
+            if path_depth >= 2 {
+                path_breadth_any += 1;
+            }
+        }
+
+        if path_depth < 2 || max_ord < 3 {
+            continue;
+        }
+        total_active += 1;
+        breadth_notable += 1;
+        max_crit = max_crit.max(max_ord);
+        if max_ord >= 4 {
+            breadth_suspicious += 1;
+        }
+        if max_ord >= 5 {
+            breadth_hostile += 1;
+        } else if max_ord == 3 {
+            breadth_notable_only += 1;
+        }
+    }
+
+    vec[offset] = max_crit as f32;
+    vec[offset + 1] = categories.len() as f32;
+    vec[offset + 2] = (path_breadth_any as f32 + 1.0).ln();
+    vec[offset + 3] = (total_active as f32 + 1.0).ln();
+    vec[offset + 4] = breadth_suspicious as f32 / path_breadth_any.max(1) as f32;
+    vec[offset + 5] = breadth_hostile as f32 / path_breadth_any.max(1) as f32;
+    vec[offset + 6] = breadth_suspicious as f32 / breadth_notable.max(1) as f32;
+    vec[offset + 7] = breadth_notable_only as f32 / breadth_notable.max(1) as f32;
+}
+
+fn write_external_summary_features(summary: &FindingSummary<'_>, vec: &mut [f32], offset: usize) {
+    vec[offset] = summary.third_party_max_crit as f32;
+    vec[offset + 1] = (summary.third_party_count as f32 + 1.0).ln();
+    vec[offset + 2] = summary.well_known_max_crit as f32;
+    vec[offset + 3] = summary.well_known_hostile as f32;
+    vec[offset + 4] = summary.well_known_suspicious as f32;
+    vec[offset + 5] = if summary.has_yara { 1.0 } else { 0.0 };
+}
+
+fn write_metric_features(pf: &serde_json::Value, vec: &mut [f32], mut offset: usize) {
+    let metrics = pf.get("metrics").unwrap_or(&serde_json::Value::Null);
+    for &(group, field_name, use_log) in KEY_METRICS {
+        let value = metrics
+            .get(group)
+            .and_then(|group_metrics| group_metrics.get(field_name))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        vec[offset] = if use_log {
+            (value.abs() + 1.0).ln()
+        } else {
+            value
+        };
+        offset += 1;
+    }
+}
+
+fn write_structural_features(
+    vec: &mut [f32],
+    offset: usize,
+    is_binary: bool,
+    file_size: u64,
+    imports_empty: bool,
+    filtered_finding_count: u32,
+) {
+    vec[offset] = if is_binary && file_size < 20_000 {
+        1.0
+    } else {
+        0.0
+    };
+    vec[offset + 1] = if imports_empty { 1.0 } else { 0.0 };
+    vec[offset + 2] = if filtered_finding_count == 0 {
+        1.0
+    } else {
+        0.0
+    };
+    vec[offset + 3] = (filtered_finding_count as f32 + 1.0).ln();
 }
 
 /// Return the primary (first) file entry from a v3 report.
@@ -662,7 +753,7 @@ mod tests {
             presence_vocab: vec!["objectives".to_string()],
             filetype_vocab: vec![],
             feature_names: vec![],
-            total_features: 1 + 1 + 8 + 6 + 16 + 0 + 4,
+            total_features: 1 + 1 + 8 + 6 + 16 + 4,
             feature_means: None,
             feature_stds: None,
             standardized: false,

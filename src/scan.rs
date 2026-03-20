@@ -1,8 +1,8 @@
-//! Recursive directory scanning and file classification.
+//! Recursive file-system scanning and classification.
 
 use anyhow::{Context, Result};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -14,18 +14,40 @@ use crate::OutputFormat;
 
 pub use crate::explain::Reason;
 
-/// Which classifications to display.
-#[derive(Debug, Clone)]
+/// Terminal display policy for scan results.
+///
+/// This affects human-readable output only. JSON output still emits every
+/// scanned file so downstream consumers receive a complete event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayFilter {
-    /// Show hostile files.
-    pub hostile: bool,
-    /// Show suspicious files.
-    pub suspicious: bool,
-    /// Show benign files.
-    pub benign: bool,
+    hostile: bool,
+    suspicious: bool,
+    benign: bool,
 }
 
 impl DisplayFilter {
+    /// Create a filter with explicit inclusion flags for each classification.
+    #[must_use]
+    pub const fn new(hostile: bool, suspicious: bool, benign: bool) -> Self {
+        Self {
+            hostile,
+            suspicious,
+            benign,
+        }
+    }
+
+    /// Include only hostile and suspicious files.
+    #[must_use]
+    pub const fn alerts_only() -> Self {
+        Self::new(true, true, false)
+    }
+
+    /// Include every classification.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self::new(true, true, true)
+    }
+
     /// Returns true if the filter includes the given classification.
     #[must_use]
     pub fn shows(&self, c: &Classification) -> bool {
@@ -35,36 +57,138 @@ impl DisplayFilter {
             Classification::Benign => self.benign,
         }
     }
+
+    /// Returns whether hostile files are included.
+    #[must_use]
+    pub const fn shows_hostile(&self) -> bool {
+        self.hostile
+    }
+
+    /// Returns whether suspicious files are included.
+    #[must_use]
+    pub const fn shows_suspicious(&self) -> bool {
+        self.suspicious
+    }
+
+    /// Returns whether benign files are included.
+    #[must_use]
+    pub const fn shows_benign(&self) -> bool {
+        self.benign
+    }
 }
 
 impl Default for DisplayFilter {
     fn default() -> Self {
-        Self {
-            hostile: true,
-            suspicious: true,
-            benign: false,
-        }
+        Self::alerts_only()
     }
 }
 
-/// Scan configuration.
+/// Immutable configuration for file-system and process scans.
+///
+/// Use [`ScanConfig::new`] so threshold invariants are validated before work
+/// begins. After construction the value is read-only and can be shared freely.
 #[derive(Debug)]
 pub struct ScanConfig {
-    /// Directory containing model.onnx and feature_spec.json.
-    pub model_dir: std::path::PathBuf,
-    /// Output format.
-    pub format: OutputFormat,
-    /// Minimum probability to classify as suspicious.
-    pub threshold_suspicious: f32,
-    /// Minimum probability to classify as hostile.
-    pub threshold_hostile: f32,
-    /// Which classifications to display.
-    pub filter: DisplayFilter,
-    /// Warn when a single rule takes longer than this many milliseconds (default: 4000).
-    pub slow_rule_ms: u64,
+    model_dir: PathBuf,
+    format: OutputFormat,
+    thresholds: Thresholds,
+    filter: DisplayFilter,
+    slow_rule_ms: u64,
 }
 
-/// Summary of scan results.
+impl ScanConfig {
+    /// Create a validated scan configuration.
+    ///
+    /// `slow_rule_ms` is advisory logging only; it does not cancel analysis.
+    ///
+    /// # Example
+    /// ```
+    /// use litmus::{DisplayFilter, OutputFormat, ScanConfig, Thresholds};
+    ///
+    /// let config = ScanConfig::new(
+    ///     "/path/to/models",
+    ///     OutputFormat::Terminal,
+    ///     Thresholds::default(),
+    ///     DisplayFilter::alerts_only(),
+    ///     4_000,
+    /// )?;
+    ///
+    /// assert_eq!(config.format(), OutputFormat::Terminal);
+    /// assert!(config.filter().shows_hostile());
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn new(
+        model_dir: impl Into<PathBuf>,
+        format: OutputFormat,
+        thresholds: Thresholds,
+        filter: DisplayFilter,
+        slow_rule_ms: u64,
+    ) -> Result<Self> {
+        thresholds
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
+        Ok(Self {
+            model_dir: model_dir.into(),
+            format,
+            thresholds,
+            filter,
+            slow_rule_ms,
+        })
+    }
+
+    /// Directory containing `model.json` and `feature_spec.json`.
+    #[must_use]
+    pub fn model_dir(&self) -> &Path {
+        &self.model_dir
+    }
+
+    /// Output format for emitted results.
+    #[must_use]
+    pub const fn format(&self) -> OutputFormat {
+        self.format
+    }
+
+    /// Classification thresholds used during inference.
+    #[must_use]
+    pub const fn thresholds(&self) -> Thresholds {
+        self.thresholds
+    }
+
+    /// Filter controlling which classifications are printed in terminal mode.
+    #[must_use]
+    pub const fn filter(&self) -> DisplayFilter {
+        self.filter
+    }
+
+    /// Warn when a single rule exceeds this duration in milliseconds.
+    #[must_use]
+    pub const fn slow_rule_ms(&self) -> u64 {
+        self.slow_rule_ms
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn scan_config_rejects_invalid_thresholds() {
+        let result = ScanConfig::new(
+            "/tmp/models",
+            OutputFormat::Terminal,
+            Thresholds {
+                suspicious: 0.99,
+                hostile: 0.50,
+            },
+            DisplayFilter::alerts_only(),
+            4_000,
+        );
+
+        assert!(result.is_err());
+    }
+}
+
+/// Aggregate counters for a completed scan.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanSummary {
     /// Total number of files analyzed.
@@ -94,7 +218,10 @@ pub struct FindingCounts {
     pub baseline: u32,
 }
 
-/// Result for a single scanned file.
+/// Classification result for a single analyzed file or executable.
+///
+/// In terminal mode only a subset of results may be shown, but in JSON mode
+/// every scanned item is emitted as a `ScanResult`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanResult {
     /// Path to the analyzed file.
@@ -134,7 +261,7 @@ pub struct ScanResult {
     pub deleted: Option<bool>,
 }
 
-/// A notable finding from cleave at the highest relevant criticality.
+/// A representative cleave finding surfaced alongside a classification.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TopFinding {
     /// Finding identifier (e.g. "objectives/evasion/process::injection").
@@ -229,23 +356,24 @@ fn format_eta(secs: f64) -> String {
     }
 }
 
-/// Run a scan against a path (file or directory).
+/// Run a scan against a file or directory tree.
+///
+/// A file path is analyzed directly. A directory path is walked recursively via
+/// `cleave`, with results streamed as they complete.
+///
+/// # Errors
+/// Returns an error if the target path does not exist, model artifacts cannot
+/// be loaded, or `cleave` analysis fails for the overall scan operation.
 pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
-    let model = Model::load(
-        &config.model_dir,
-        crate::model::Thresholds {
-            suspicious: config.threshold_suspicious,
-            hostile: config.threshold_hostile,
-        },
-    )?;
+    let model = Model::load(config.model_dir(), config.thresholds())?;
 
-    let shap = ShapImportance::load(&config.model_dir).ok();
-    let ctx = ExtractContext::new(&model.spec);
+    let shap = ShapImportance::load(config.model_dir()).ok();
+    let ctx = ExtractContext::new(model.spec());
     let cleave_opts = cleave::AnalysisOptions {
-        slow_rule_ms: config.slow_rule_ms,
+        slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
     };
-    let is_terminal = matches!(config.format, OutputFormat::Terminal);
+    let is_terminal = matches!(config.format(), OutputFormat::Terminal);
     let scan_start = Instant::now();
 
     // Single-file path: handle directly without the directory streaming API.
@@ -260,7 +388,9 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                     Classification::Suspicious => suspicious += 1,
                     Classification::Benign => benign += 1,
                 }
-                if config.format == OutputFormat::Json || config.filter.shows(&r.classification) {
+                if config.format() == OutputFormat::Json
+                    || config.filter().shows(&r.classification)
+                {
                     emit_result(&r, config, false, &stdout);
                 }
             }
@@ -329,7 +459,8 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                             benign_count.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    if config.format == OutputFormat::Json || config.filter.shows(&r.classification)
+                    if config.format() == OutputFormat::Json
+                        || config.filter().shows(&r.classification)
                     {
                         emit_result(&r, config, prog.is_some(), &stdout);
                         if let Some(p) = prog {
@@ -379,7 +510,7 @@ fn emit_result(
     show_progress: bool,
     stdout: &Mutex<std::io::Stdout>,
 ) {
-    match config.format {
+    match config.format() {
         OutputFormat::Terminal => {
             crate::output::print_file_result_streaming(r, show_progress);
         }
@@ -430,7 +561,7 @@ pub(crate) fn classify_report(
     let report_json = serde_json::to_value(&report).context("serializing cleave report")?;
     let mut features = ctx.extract(&report_json);
     let nonzero = features.iter().filter(|&&v| v != 0.0).count();
-    model.spec.standardize(&mut features);
+    model.spec().standardize(&mut features);
     let (probability, classification) = model.predict(&features)?;
 
     let finding_counts = count_findings_from_json(&report_json);
@@ -451,7 +582,7 @@ pub(crate) fn classify_report(
 
     let (reasons, top_findings) = if classification != Classification::Benign {
         let r = shap
-            .map(|s| s.explain(&features, &model.spec.feature_names, 5))
+            .map(|s| s.explain(&features, model.spec().feature_names(), 5))
             .unwrap_or_default();
         let f = extract_top_findings_from_json(&report_json, &classification);
         (r, f)
@@ -492,16 +623,13 @@ fn process_report(
     config: &ScanConfig,
 ) -> Result<ScanResult> {
     let cr = classify_report(&path.display().to_string(), report, ctx, model, shap)?;
-    let is_json = matches!(config.format, OutputFormat::Json);
+    let is_json = matches!(config.format(), OutputFormat::Json);
 
     Ok(ScanResult {
         path: path.display().to_string(),
         classification: cr.classification,
         probability: cr.probability,
-        thresholds: Thresholds {
-            suspicious: config.threshold_suspicious,
-            hostile: config.threshold_hostile,
-        },
+        thresholds: config.thresholds(),
         finding_counts: cr.finding_counts,
         formula: cr.formula,
         reasons: cr.reasons,
@@ -510,7 +638,7 @@ fn process_report(
         size_bytes: cr.size_bytes,
         sha256: cr.sha256,
         model: if is_json {
-            Some(model.info.clone())
+            Some(model.info().clone())
         } else {
             None
         },
@@ -520,7 +648,8 @@ fn process_report(
     })
 }
 
-/// Count cleave findings by criticality level.
+/// Count cleave findings by criticality level from either a top-level report or
+/// the primary file entry inside that report.
 #[must_use]
 pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
     let findings = report["findings"].as_array().or_else(|| {
@@ -560,7 +689,7 @@ fn analyze_single(
     process_report(path, report, ctx, model, shap, config)
 }
 
-/// Extract top findings at the highest criticality level present.
+/// Extract a small set of human-facing findings relevant to the classification.
 #[must_use]
 pub fn extract_top_findings_from_json(
     report: &serde_json::Value,

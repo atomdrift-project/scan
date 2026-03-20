@@ -161,6 +161,11 @@ fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
     format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
 }
 
+/// Linear interpolation between two RGB colors.
+fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    Rgb(lerp(a.0, b.0, t), lerp(a.1, b.1, t), lerp(a.2, b.2, t))
+}
+
 /// Linear interpolation between two u8 values.
 fn lerp(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t)
@@ -168,56 +173,85 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
+/// Normalized progress within the current classification band.
+fn band_progress(probability: f32, classification: &Classification, thresholds: Thresholds) -> f32 {
+    match classification {
+        Classification::Hostile => {
+            ((probability - thresholds.hostile) / (1.0 - thresholds.hostile).max(f32::EPSILON))
+                .clamp(0.0, 1.0)
+        }
+        Classification::Suspicious => ((probability - thresholds.suspicious)
+            / (thresholds.hostile - thresholds.suspicious).max(f32::EPSILON))
+        .clamp(0.0, 1.0),
+        Classification::Benign => {
+            (probability / thresholds.suspicious.max(f32::EPSILON)).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Litmus-style color progression within each classification band.
+fn indicator_colors(
+    probability: f32,
+    classification: &Classification,
+    thresholds: Thresholds,
+) -> (Rgb, Rgb, Rgb) {
+    let t = band_progress(probability, classification, thresholds);
+    let theme = THEME
+        .read()
+        .ok()
+        .and_then(|theme| *theme)
+        .unwrap_or(Theme::Dark);
+
+    match (theme, classification) {
+        // Benign shifts from strong green toward yellow-green near the suspicious boundary.
+        (Theme::Dark, Classification::Benign) => (
+            mix_rgb(Rgb(25, 170, 120), Rgb(120, 190, 40), t),
+            mix_rgb(Rgb(70, 215, 135), Rgb(195, 210, 60), t),
+            mix_rgb(Rgb(45, 195, 105), Rgb(160, 205, 50), t),
+        ),
+        (Theme::Light, Classification::Benign) => (
+            mix_rgb(Rgb(20, 130, 95), Rgb(120, 135, 20), t),
+            mix_rgb(Rgb(35, 155, 100), Rgb(150, 150, 25), t),
+            mix_rgb(Rgb(25, 145, 95), Rgb(135, 145, 20), t),
+        ),
+
+        // Suspicious starts at greenish-yellow, moves through yellow, and ends orange.
+        (Theme::Dark, Classification::Suspicious) => (
+            mix_rgb(Rgb(170, 190, 45), Rgb(255, 180, 40), t),
+            mix_rgb(Rgb(235, 220, 65), Rgb(255, 125, 20), t),
+            mix_rgb(Rgb(210, 205, 55), Rgb(255, 150, 30), t),
+        ),
+        (Theme::Light, Classification::Suspicious) => (
+            mix_rgb(Rgb(125, 145, 20), Rgb(205, 135, 0), t),
+            mix_rgb(Rgb(165, 150, 20), Rgb(175, 100, 0), t),
+            mix_rgb(Rgb(145, 145, 15), Rgb(185, 115, 0), t),
+        ),
+
+        // Hostile starts orange-red at the boundary and deepens to saturated red.
+        (Theme::Dark, Classification::Hostile) => (
+            mix_rgb(Rgb(255, 135, 40), Rgb(255, 50, 65), t),
+            mix_rgb(Rgb(255, 95, 35), Rgb(255, 35, 35), t),
+            mix_rgb(Rgb(255, 120, 40), Rgb(255, 45, 50), t),
+        ),
+        (Theme::Light, Classification::Hostile) => (
+            mix_rgb(Rgb(190, 85, 10), Rgb(200, 30, 30), t),
+            mix_rgb(Rgb(170, 65, 10), Rgb(175, 25, 25), t),
+            mix_rgb(Rgb(185, 75, 10), Rgb(190, 30, 30), t),
+        ),
+    }
+}
+
 /// Two-block litmus confidence indicator.
 ///
-/// At maximum confidence both blocks are identical (pure saturated color).
-/// As confidence decreases within a classification band, the left block
-/// darkens and the right block lightens/desaturates, creating a visual
-/// "spread" that intuitively conveys uncertainty.
+/// The colors shift across the band itself, so threshold-adjacent results
+/// stay visually distinct from high-confidence results in the same class.
 fn confidence_blocks(
     probability: f32,
     classification: &Classification,
     thresholds: Thresholds,
 ) -> String {
-    let p = palette();
-    let hostile_range = (1.0 - thresholds.hostile).max(f32::EPSILON);
-    let suspicious_range = (thresholds.hostile - thresholds.suspicious).max(f32::EPSILON);
-    match classification {
-        Classification::Hostile => {
-            let t = ((probability - thresholds.hostile) / hostile_range).clamp(0.0, 1.0);
-            let base = p.hostile;
-            let l = fg(Rgb(lerp(base.0 / 2, base.0, t), 0, 0), BLOCK);
-            let r = fg(Rgb(base.0, lerp(150, 0, t), lerp(150, 0, t)), BLOCK);
-            format!("{l}{r}")
-        }
-        Classification::Suspicious => {
-            let t = ((probability - thresholds.suspicious) / suspicious_range).clamp(0.0, 1.0);
-            let base = p.suspicious;
-            let l = fg(
-                Rgb(
-                    lerp((base.0 as u16 * 3 / 4) as u8, base.0, t),
-                    lerp(base.1 / 2, base.1, t),
-                    0,
-                ),
-                BLOCK,
-            );
-            let r = fg(
-                Rgb(base.0, lerp(base.1 + 30, base.1, t), lerp(80, 0, t)),
-                BLOCK,
-            );
-            format!("{l}{r}")
-        }
-        Classification::Benign => {
-            let t = (probability / thresholds.suspicious.max(f32::EPSILON)).clamp(0.0, 1.0);
-            let base = p.benign;
-            let l = fg(Rgb(0, lerp(base.1 / 2, base.1, t), 0), BLOCK);
-            let r = fg(
-                Rgb(0, lerp(base.1 / 3, (base.1 as u16 * 4 / 5) as u8, t), 0),
-                BLOCK,
-            );
-            format!("{l}{r}")
-        }
-    }
+    let (left, right, _) = indicator_colors(probability, classification, thresholds);
+    format!("{}{}", fg(left, BLOCK), fg(right, BLOCK))
 }
 
 /// Rescale raw model probability for display.
@@ -241,7 +275,6 @@ fn colored_pct(
     classification: &Classification,
     thresholds: Thresholds,
 ) -> String {
-    let p = palette();
     let pct = format!(
         "{:>4}",
         format!(
@@ -249,11 +282,8 @@ fn colored_pct(
             display_probability(probability, thresholds) * 100.0
         )
     );
-    match classification {
-        Classification::Hostile => fg(p.hostile, &pct),
-        Classification::Suspicious => fg(p.suspicious, &pct),
-        Classification::Benign => fg(p.benign, &pct),
-    }
+    let (_, _, accent) = indicator_colors(probability, classification, thresholds);
+    fg(accent, &pct)
 }
 
 /// Print a single file result immediately, clearing progress line if active.

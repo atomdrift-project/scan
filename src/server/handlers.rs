@@ -79,7 +79,7 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let model = Model::load(&model_dir, thresholds)?;
         let shap = ShapImportance::load(&model_dir).ok();
-        let ctx = ExtractContext::new(&model.spec);
+        let ctx = ExtractContext::new(model.spec());
         Ok::<_, anyhow::Error>((model, shap, ctx))
     })
     .await;
@@ -88,8 +88,8 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
 
     match result {
         Ok(Ok((model, shap, ctx))) => {
-            let spec_version = model.spec.version;
-            let features = model.spec.total_features;
+            let spec_version = model.spec().version();
+            let features = model.spec().total_features();
             let shap_loaded = shap.is_some();
             let was_ready = state.ready.load(std::sync::atomic::Ordering::Relaxed);
             match state.resources.write() {
@@ -471,7 +471,7 @@ fn classify_file(
         path: label.to_string(),
         classification: cr.classification,
         probability: cr.probability,
-        thresholds: resources.model.thresholds,
+        thresholds: resources.model.thresholds(),
         finding_counts: cr.finding_counts,
         formula: cr.formula,
         reasons: cr.reasons,
@@ -479,7 +479,7 @@ fn classify_file(
         file_type: cr.file_type,
         size_bytes: cr.size_bytes,
         sha256: cr.sha256,
-        model: Some(resources.model.info.clone()),
+        model: Some(resources.model.info().clone()),
         cleave: Some(cr.report_json),
         pids: None,
         deleted: None,

@@ -55,7 +55,7 @@ fn sha256_proc_exe(pid: u32) -> Result<String> {
 /// Run a process scan: enumerate, deduplicate, classify.
 pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let scan_start = Instant::now();
-    let is_terminal = matches!(config.format, OutputFormat::Terminal);
+    let is_terminal = matches!(config.format(), OutputFormat::Terminal);
 
     // Enumerate processes.
     let proc_result = proclist::enumerate().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -171,17 +171,11 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     }
 
     // Load model and scan each unique binary.
-    let model = Model::load(
-        &config.model_dir,
-        crate::model::Thresholds {
-            suspicious: config.threshold_suspicious,
-            hostile: config.threshold_hostile,
-        },
-    )?;
-    let shap = ShapImportance::load(&config.model_dir).ok();
-    let ctx = ExtractContext::new(&model.spec);
+    let model = Model::load(config.model_dir(), config.thresholds())?;
+    let shap = ShapImportance::load(config.model_dir()).ok();
+    let ctx = ExtractContext::new(model.spec());
     let cleave_opts = cleave::AnalysisOptions {
-        slow_rule_ms: config.slow_rule_ms,
+        slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
     };
     let stdout = Mutex::new(std::io::stdout());
@@ -249,8 +243,8 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                     Classification::Suspicious => suspicious += 1,
                     Classification::Benign => benign += 1,
                 }
-                if config.format == OutputFormat::Json
-                    || config.filter.shows(&result.classification)
+                if config.format() == OutputFormat::Json
+                    || config.filter().shows(&result.classification)
                 {
                     emit_result(
                         &result,
@@ -309,16 +303,13 @@ fn build_result(
         model,
         shap,
     )?;
-    let is_json = matches!(config.format, OutputFormat::Json);
+    let is_json = matches!(config.format(), OutputFormat::Json);
 
     Ok(ScanResult {
         path: display_path.display().to_string(),
         classification: cr.classification,
         probability: cr.probability,
-        thresholds: crate::model::Thresholds {
-            suspicious: config.threshold_suspicious,
-            hostile: config.threshold_hostile,
-        },
+        thresholds: config.thresholds(),
         finding_counts: cr.finding_counts,
         formula: cr.formula,
         reasons: cr.reasons,
@@ -327,7 +318,7 @@ fn build_result(
         size_bytes: cr.size_bytes,
         sha256: group.sha256.clone(),
         model: if is_json {
-            Some(model.info.clone())
+            Some(model.info().clone())
         } else {
             None
         },
@@ -346,7 +337,7 @@ fn emit_result(
     has_progress: bool,
     stdout: &Mutex<std::io::Stdout>,
 ) {
-    match config.format {
+    match config.format() {
         OutputFormat::Terminal => {
             output::print_ps_result(r, pids, deleted, has_progress);
         }

@@ -179,22 +179,20 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to resolve model directory: {e}"))?,
     };
     let all = cli.show.iter().any(|s| matches!(s, Show::All));
-    let filter = DisplayFilter {
-        hostile: all || cli.show.iter().any(|s| matches!(s, Show::Hostile)),
-        suspicious: all || cli.show.iter().any(|s| matches!(s, Show::Sus)),
-        benign: all || cli.show.iter().any(|s| matches!(s, Show::Benign)),
+    let filter = DisplayFilter::new(
+        all || cli.show.iter().any(|s| matches!(s, Show::Hostile)),
+        all || cli.show.iter().any(|s| matches!(s, Show::Sus)),
+        all || cli.show.iter().any(|s| matches!(s, Show::Benign)),
+    );
+    let thresholds = litmus::model::Thresholds {
+        suspicious: cli.threshold_suspicious,
+        hostile: cli.threshold_hostile,
     };
 
     match command {
         Commands::Scan { paths } => {
-            let config = litmus::ScanConfig {
-                model_dir,
-                format: cli.format,
-                threshold_suspicious: cli.threshold_suspicious,
-                threshold_hostile: cli.threshold_hostile,
-                filter,
-                slow_rule_ms: cli.slow_rule_ms,
-            };
+            let config =
+                litmus::ScanConfig::new(model_dir, cli.format, thresholds, filter, cli.slow_rule_ms)?;
             let result = run_scan_paths(&paths, &config)?;
 
             if result.hostile > 0 {
@@ -205,14 +203,8 @@ fn main() -> Result<()> {
             }
         }
         Commands::Ps => {
-            let config = litmus::ScanConfig {
-                model_dir,
-                format: cli.format,
-                threshold_suspicious: cli.threshold_suspicious,
-                threshold_hostile: cli.threshold_hostile,
-                filter,
-                slow_rule_ms: cli.slow_rule_ms,
-            };
+            let config =
+                litmus::ScanConfig::new(model_dir, cli.format, thresholds, filter, cli.slow_rule_ms)?;
             let result = litmus::ps::run(&config)?;
 
             if result.hostile > 0 {
@@ -228,16 +220,15 @@ fn main() -> Result<()> {
             max_size_mb,
             max_rss_gb,
         } => {
-            let config = litmus::server::ServerConfig {
+            let config = litmus::server::ServerConfig::new(
                 bind,
                 timeout_secs,
-                max_body_size: max_size_mb.saturating_mul(1024 * 1024),
-                max_rss_bytes: max_rss_gb.saturating_mul(1024 * 1024 * 1024),
+                max_size_mb.saturating_mul(1024 * 1024),
+                max_rss_gb.saturating_mul(1024 * 1024 * 1024),
                 model_dir,
-                threshold_suspicious: cli.threshold_suspicious,
-                threshold_hostile: cli.threshold_hostile,
-                slow_rule_ms: cli.slow_rule_ms,
-            };
+                thresholds,
+                cli.slow_rule_ms,
+            )?;
             eprintln!("Starting litmus server on http://{} ...", bind);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -310,32 +301,36 @@ fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litm
 
 #[cfg(test)]
 mod tests {
+    use anyhow::{Context, Result};
     use super::{Cli, Commands};
     use clap::Parser;
     use std::path::PathBuf;
 
     #[test]
-    fn bare_paths_default_to_scan_shorthand() {
-        let cli = Cli::try_parse_from(["litmus", "/tmp/a", "/tmp/b"]).expect("parse should work");
+    fn bare_paths_default_to_scan_shorthand() -> Result<()> {
+        let cli = Cli::try_parse_from(["litmus", "/tmp/a", "/tmp/b"])
+            .context("parse should work")?;
         assert_eq!(
             cli.paths,
             vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
         );
         assert!(cli.command.is_none());
+        Ok(())
     }
 
     #[test]
-    fn scan_subcommand_accepts_multiple_paths() {
-        let cli =
-            Cli::try_parse_from(["litmus", "scan", "/tmp/a", "/tmp/b"]).expect("parse should work");
-        match cli.command.expect("scan subcommand expected") {
+    fn scan_subcommand_accepts_multiple_paths() -> Result<()> {
+        let cli = Cli::try_parse_from(["litmus", "scan", "/tmp/a", "/tmp/b"])
+            .context("parse should work")?;
+        match cli.command.context("scan subcommand expected")? {
             Commands::Scan { paths } => {
                 assert_eq!(
                     paths,
                     vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
                 );
             }
-            other => panic!("unexpected command: {other:?}"),
+            other => anyhow::bail!("unexpected command: {other:?}"),
         }
+        Ok(())
     }
 }

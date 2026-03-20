@@ -12,6 +12,7 @@
 //!   ln -sfn ~/dev/atomdrift/litmus-models \
 //!     ~/Library/Application\ Support/litmus/models
 
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,14 +25,14 @@ const STALENESS_DAYS: u64 = 30;
 ///
 /// Returns the base directory (not the versioned subdirectory).
 /// Call `model_dir()` to get the path suitable for `Model::load`.
-pub fn resolve_and_ensure() -> Result<PathBuf, String> {
+pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
     if let Ok(explicit) = std::env::var("LITMUS_MODELS_DIR") {
         let p = PathBuf::from(&explicit);
         if p.is_dir() {
             tracing::debug!("Using models from LITMUS_MODELS_DIR={}", p.display());
             return Ok(p);
         }
-        return Err(format!("LITMUS_MODELS_DIR={explicit} does not exist"));
+        anyhow::bail!("LITMUS_MODELS_DIR={explicit} does not exist");
     }
 
     let data_dir = default_models_dir();
@@ -42,32 +43,30 @@ pub fn resolve_and_ensure() -> Result<PathBuf, String> {
     }
 
     eprintln!("First run: downloading litmus models...");
-    if let Err(e) = clone_repo(&data_dir) {
-        return Err(format!(
-            "Failed to download models: {e}\n\n\
-             Ensure 'git' is installed, or manually clone:\n  \
-             git clone {MODELS_REPO_URL} \"{}\"",
+    clone_repo(&data_dir).with_context(|| {
+        format!(
+            "failed to download models\n\nEnsure 'git' is installed, or manually clone:\n  git clone {MODELS_REPO_URL} \"{}\"",
             data_dir.display()
-        ));
-    }
+        )
+    })?;
     eprintln!("Models ready. Continuing...");
     Ok(data_dir)
 }
 
 /// Return the model directory suitable for `Model::load`.
-pub fn model_dir() -> Result<PathBuf, String> {
+pub fn model_dir() -> Result<PathBuf> {
     resolve_and_ensure().map(|base| base.join(CURRENT_VERSION).join(DEFAULT_MODEL))
 }
 
 /// Update the models repository.
-pub fn update() -> Result<(), String> {
+pub fn update() -> Result<()> {
     let base = current_models_dir();
     if !is_git_repo(&base) {
-        return Err(format!(
+        anyhow::bail!(
             "Models directory is not a git repository: {}\n\
              (if using a symlink, ensure the target is a git repo)",
             base.display()
-        ));
+        );
     }
 
     let before = short_head(&base).unwrap_or_default();
@@ -76,13 +75,10 @@ pub fn update() -> Result<(), String> {
     let output = Command::new("git")
         .args(["-C", &base.to_string_lossy(), "pull", "--ff-only"])
         .output()
-        .map_err(|e| format!("git pull failed: {e}"))?;
+        .context("git pull failed")?;
 
     if !output.status.success() {
-        return Err(format!(
-            "Update failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        anyhow::bail!("update failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     let after = short_head(&base).unwrap_or_default();
@@ -112,19 +108,16 @@ pub fn update() -> Result<(), String> {
 }
 
 /// Check for updates without applying them.
-pub fn check_updates() -> Result<(), String> {
+pub fn check_updates() -> Result<()> {
     let base = current_models_dir();
     if !is_git_repo(&base) {
-        return Err(format!(
-            "Models directory is not a git repository: {}",
-            base.display()
-        ));
+        anyhow::bail!("Models directory is not a git repository: {}", base.display());
     }
 
     let fetch = Command::new("git")
         .args(["-C", &base.to_string_lossy(), "fetch", "--dry-run"])
         .output()
-        .map_err(|e| format!("git fetch failed: {e}"))?;
+        .context("git fetch failed")?;
 
     let local = short_head(&base).unwrap_or_default();
     let stderr = String::from_utf8_lossy(&fetch.stderr);
