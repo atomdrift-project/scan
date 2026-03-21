@@ -483,6 +483,7 @@ fn classify_file(
         cleave: Some(cr.report_json),
         pids: None,
         deleted: None,
+        embedded_files: cr.embedded_files,
     })
 }
 

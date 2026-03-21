@@ -325,6 +325,7 @@ fn build_result(
         cleave: if is_json { Some(cr.report_json) } else { None },
         pids: Some(group.pids.clone()),
         deleted: if group.deleted { Some(true) } else { None },
+        embedded_files: cr.embedded_files,
     })
 }
 

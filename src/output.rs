@@ -6,7 +6,7 @@ use std::sync::{LazyLock, RwLock};
 use colored::Colorize;
 
 use crate::model::{Classification, Thresholds};
-use crate::scan::{ScanResult, ScanSummary};
+use crate::scan::{EmbeddedFile, ScanResult, ScanSummary};
 
 const BLOCK: &str = "\u{2588}";
 
@@ -307,6 +307,7 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool) {
     eprintln!("  {blocks} {pct}  {}", result.path.bold());
     print_detail_lines(result, p);
     print_reasons(result, p);
+    print_embedded_files(&result.embedded_files, result.thresholds, p);
     eprintln!();
 }
 
@@ -352,6 +353,7 @@ pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, has_pro
 
     print_detail_lines(result, p);
     print_reasons(result, p);
+    print_embedded_files(&result.embedded_files, result.thresholds, p);
     eprintln!();
 }
 
@@ -375,10 +377,10 @@ fn print_detail_lines(result: &ScanResult, p: &Palette) {
             .take(4)
             .map(|f| {
                 let name = short_finding_id(&f.id);
-                match result.classification {
-                    Classification::Hostile => fg(p.hostile_finding, &name),
-                    Classification::Suspicious => fg(p.suspicious_finding, &name),
-                    Classification::Benign => name,
+                match f.crit.as_str() {
+                    "hostile" => fg(p.hostile_finding, &name),
+                    "suspicious" => fg(p.suspicious_finding, &name),
+                    _ => name,
                 }
             })
             .collect();
@@ -400,6 +402,39 @@ fn print_reasons(result: &ScanResult, p: &Palette) {
             fg(p.arrow, "\u{2191}"),
             fg(p.reason, &reason_strs.join(", ")),
         );
+    }
+}
+
+/// Print embedded files (icon + type + path + formula + findings on one line each).
+fn print_embedded_files(files: &[EmbeddedFile], thresholds: Thresholds, p: &Palette) {
+    if files.is_empty() {
+        return;
+    }
+    let dot = fg(p.dot_sep, "\u{00b7}");
+    for ef in files.iter().filter(|ef| ef.file_type != "unknown") {
+        let blocks = confidence_blocks(ef.probability, &ef.classification, thresholds);
+        let ftype = fg(p.filetype, &ef.file_type);
+        let mut header = vec![ftype, ef.path.clone()];
+        if !ef.formula.is_empty() {
+            header.push(fg(p.formula, &ef.formula));
+        }
+        eprintln!("           {blocks} {}", header.join(&format!(" {dot} ")));
+        if !ef.top_findings.is_empty() {
+            let findings: Vec<String> = ef
+                .top_findings
+                .iter()
+                .take(3)
+                .map(|f| {
+                    let name = short_finding_id(&f.id);
+                    match f.crit.as_str() {
+                        "hostile" => fg(p.hostile_finding, &name),
+                        "suspicious" => fg(p.suspicious_finding, &name),
+                        _ => name,
+                    }
+                })
+                .collect();
+            eprintln!("              {}", findings.join(&format!(" {dot} ")));
+        }
     }
 }
 

@@ -259,6 +259,9 @@ pub struct ScanResult {
     /// Whether the binary was deleted from disk (process scan only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted: Option<bool>,
+    /// Flagged files embedded within archives (hostile/suspicious only).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub embedded_files: Vec<EmbeddedFile>,
 }
 
 /// A representative cleave finding surfaced alongside a classification.
@@ -270,6 +273,24 @@ pub struct TopFinding {
     pub crit: String,
     /// Human-readable description of the finding.
     pub desc: String,
+}
+
+/// A file embedded within an archive or self-extracting executable.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmbeddedFile {
+    /// Relative path within the archive (portion after "!!" delimiter).
+    pub path: String,
+    /// Detected file type.
+    pub file_type: String,
+    /// Model classification for this embedded file.
+    pub classification: Classification,
+    /// Raw model probability for this embedded file.
+    pub probability: f32,
+    /// Molecular formula for this embedded file.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub formula: String,
+    /// Top findings for this embedded file.
+    pub top_findings: Vec<TopFinding>,
 }
 
 pub(crate) const SPINNER: &[char] = &[
@@ -539,6 +560,7 @@ pub(crate) struct ClassifiedReport {
     pub(crate) file_type: String,
     pub(crate) size_bytes: u64,
     pub(crate) sha256: String,
+    pub(crate) embedded_files: Vec<EmbeddedFile>,
     pub(crate) report_json: serde_json::Value,
 }
 
@@ -559,8 +581,9 @@ pub(crate) fn classify_report(
         .unwrap_or_default();
 
     let report_json = serde_json::to_value(&report).context("serializing cleave report")?;
-    let mut features = ctx.extract(&report_json);
-    let nonzero = features.iter().filter(|&&v| v != 0.0).count();
+    let raw_features = ctx.extract(&report_json);
+    let nonzero = raw_features.iter().filter(|&&v| v != 0.0).count();
+    let mut features = raw_features.clone();
     model.spec().standardize(&mut features);
     let (probability, classification) = model.predict(&features)?;
 
@@ -580,16 +603,6 @@ pub(crate) fn classify_report(
         "classified file",
     );
 
-    let (reasons, top_findings) = if classification != Classification::Benign {
-        let r = shap
-            .map(|s| s.explain(&features, model.spec().feature_names(), 5))
-            .unwrap_or_default();
-        let f = extract_top_findings_from_json(&report_json, &classification);
-        (r, f)
-    } else {
-        (vec![], vec![])
-    };
-
     let pf = report_json["files"]
         .as_array()
         .and_then(|a| a.first())
@@ -597,6 +610,91 @@ pub(crate) fn classify_report(
     let file_type = pf["file_type"].as_str().unwrap_or("unknown").to_string();
     let size_bytes = pf["size"].as_u64().unwrap_or(0);
     let sha256 = pf["sha256"].as_str().unwrap_or("").to_string();
+
+    // Extract embedded files (archive members at depth > 0), run each through
+    // the model individually, and elevate the parent if any embedded file scores higher.
+    let embedded_entries: Vec<&serde_json::Value> = report_json["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["depth"].as_u64().unwrap_or(0) > 0)
+        .collect();
+
+    let mut embedded_files: Vec<EmbeddedFile> = Vec::with_capacity(embedded_entries.len());
+    let mut max_probability = probability;
+    let mut max_classification = classification;
+
+    for ef in &embedded_entries {
+        // Construct a synthetic single-file report for model inference.
+        let synthetic = serde_json::json!({ "files": [ef], "version": "3" });
+        let mut ef_features = ctx.extract(&synthetic);
+        model.spec().standardize(&mut ef_features);
+        let (ef_prob, ef_class) = model.predict(&ef_features).unwrap_or((0.0, Classification::Benign));
+
+        let full_path = ef["path"].as_str().unwrap_or("");
+        let rel_path = full_path
+            .rsplit_once("!!")
+            .map(|(_, r)| r)
+            .unwrap_or(full_path)
+            .to_string();
+
+        let ef_top_findings: Vec<TopFinding> = ef["findings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|ff| crit_ordinal(ff["crit"].as_str().unwrap_or("baseline")) >= 4)
+            .take(3)
+            .map(|ff| TopFinding {
+                id: ff["id"].as_str().unwrap_or("").to_string(),
+                crit: ff["crit"].as_str().unwrap_or("baseline").to_string(),
+                desc: ff["desc"].as_str().unwrap_or("").to_string(),
+            })
+            .collect();
+
+        tracing::debug!(
+            parent = %label,
+            embedded_path = %rel_path,
+            probability = format!("{:.4}", ef_prob),
+            classification = ?ef_class,
+            "classified embedded file",
+        );
+
+        if ef_prob > max_probability {
+            max_probability = ef_prob;
+            max_classification = ef_class;
+        }
+
+        embedded_files.push(EmbeddedFile {
+            path: rel_path,
+            file_type: ef["file_type"].as_str().unwrap_or("unknown").to_string(),
+            classification: ef_class,
+            probability: ef_prob,
+            formula: ef["formula"].as_str().unwrap_or("").to_string(),
+            top_findings: ef_top_findings,
+        });
+    }
+
+    embedded_files.sort_by(|a, b| b.probability.partial_cmp(&a.probability).unwrap_or(std::cmp::Ordering::Equal));
+    embedded_files.truncate(10);
+
+    // If an embedded file scored higher, elevate the parent classification.
+    let (classification, probability) = if max_probability > probability {
+        tracing::info!(
+            path = %label,
+            original_probability = format!("{:.4}", probability),
+            elevated_probability = format!("{:.4}", max_probability),
+            elevated_classification = ?max_classification,
+            "elevated archive classification due to embedded file",
+        );
+        (max_classification, max_probability)
+    } else {
+        (classification, probability)
+    };
+
+    let reasons = shap
+        .map(|s| s.explain(&raw_features, model.spec().feature_names(), 5))
+        .unwrap_or_default();
+    let top_findings = extract_top_findings_from_json(&report_json, &classification);
 
     Ok(ClassifiedReport {
         classification,
@@ -608,6 +706,7 @@ pub(crate) fn classify_report(
         file_type,
         size_bytes,
         sha256,
+        embedded_files,
         report_json,
     })
 }
@@ -645,6 +744,7 @@ fn process_report(
         cleave: if is_json { Some(cr.report_json) } else { None },
         pids: None,
         deleted: None,
+        embedded_files: cr.embedded_files,
     })
 }
 
@@ -708,8 +808,7 @@ pub fn extract_top_findings_from_json(
 
     let min_crit = match classification {
         Classification::Hostile => "hostile",
-        Classification::Suspicious => "suspicious",
-        Classification::Benign => "baseline",
+        Classification::Suspicious | Classification::Benign => "suspicious",
     };
 
     let mut relevant: Vec<TopFinding> = findings
