@@ -1,5 +1,9 @@
 //! litmus — ML-powered malware classification CLI.
 
+#[cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly"))))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use litmus::scan::DisplayFilter;
