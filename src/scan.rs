@@ -674,7 +674,7 @@ pub(crate) fn classify_report(
         });
     }
 
-    embedded_files.sort_by(|a, b| b.probability.partial_cmp(&a.probability).unwrap_or(std::cmp::Ordering::Equal));
+    embedded_files.sort_by(|a, b| b.probability.total_cmp(&a.probability));
     embedded_files.truncate(10);
 
     // If an embedded file scored higher, elevate the parent classification.
@@ -849,6 +849,4 @@ pub fn extract_top_findings_from_json(
     relevant
 }
 
-fn crit_ordinal(crit: &str) -> u32 {
-    crate::features::crit_ordinal(crit)
-}
+use crate::features::crit_ordinal;

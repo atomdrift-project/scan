@@ -152,17 +152,15 @@ impl FeatureSpec {
             return;
         };
 
-        for i in 0..features.len().min(means.len()) {
-            let m = means[i];
-            let s = stds[i];
+        for (feature, (&m, &s)) in features.iter_mut().zip(means.iter().zip(stds.iter())) {
             if s.abs() <= f32::EPSILON
                 || (m.abs() <= f32::EPSILON && (s - 1.0).abs() <= f32::EPSILON)
             {
                 // Dead feature: constant during training, or zero std.
                 // Zero it to prevent NaN/inf from propagating.
-                features[i] = 0.0;
+                *feature = 0.0;
             } else {
-                features[i] = (features[i] - m) / s;
+                *feature = (*feature - m) / s;
             }
         }
     }

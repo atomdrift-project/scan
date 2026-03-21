@@ -85,11 +85,7 @@ impl ShapImportance {
             })
             .collect();
 
-        reasons.sort_by(|a, b| {
-            b.importance
-                .partial_cmp(&a.importance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        reasons.sort_by(|a, b| b.importance.total_cmp(&a.importance));
         reasons.truncate(max_reasons);
         reasons
     }

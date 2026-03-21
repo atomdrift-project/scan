@@ -39,9 +39,13 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     );
     let file_bytes = std::fs::read(&testdata).context("failed to read test archive")?;
 
+    // Debug builds are ~10x slower than release; use a generous timeout so
+    // YARA warmup + encrypted-zip analysis can finish without a 504.
+    let timeout_secs = if cfg!(debug_assertions) { 600 } else { 120 };
+
     let config = ServerConfig::new(
         std::net::SocketAddr::from(([127, 0, 0, 1], 8081)),
-        120,
+        timeout_secs,
         100 * 1024 * 1024,
         8 * 1024 * 1024 * 1024,
         model_dir()?,
