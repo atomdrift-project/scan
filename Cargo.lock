@@ -618,7 +618,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "0.3.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#237eba5e77e16f7629f6de710c6dd16663180e87"
+source = "git+https://codeberg.org/atomdrift/cleave.git#e8850922dddc737bf0846a1305e2bb532756af23"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -723,7 +723,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#237eba5e77e16f7629f6de710c6dd16663180e87"
+source = "git+https://codeberg.org/atomdrift/cleave.git#e8850922dddc737bf0846a1305e2bb532756af23"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2131,6 +2131,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "terminal-colorsaurus",
+ "tikv-jemallocator",
  "tokio",
  "tower",
  "tower-http",
@@ -2266,7 +2267,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#237eba5e77e16f7629f6de710c6dd16663180e87"
+source = "git+https://codeberg.org/atomdrift/cleave.git#e8850922dddc737bf0846a1305e2bb532756af23"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -3309,7 +3310,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#237eba5e77e16f7629f6de710c6dd16663180e87"
+source = "git+https://codeberg.org/atomdrift/cleave.git#e8850922dddc737bf0846a1305e2bb532756af23"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3755,7 +3756,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#237eba5e77e16f7629f6de710c6dd16663180e87"
+source = "git+https://codeberg.org/atomdrift/cleave.git#e8850922dddc737bf0846a1305e2bb532756af23"
 
 [[package]]
 name = "tap"
