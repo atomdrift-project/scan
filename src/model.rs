@@ -71,9 +71,9 @@ impl Default for Thresholds {
 
 impl Thresholds {
     /// Default suspicious threshold.
-    pub const DEFAULT_SUSPICIOUS: f32 = 0.87;
+    pub const DEFAULT_SUSPICIOUS: f32 = 0.65;
     /// Default hostile threshold.
-    pub const DEFAULT_HOSTILE: f32 = 0.979;
+    pub const DEFAULT_HOSTILE: f32 = 0.887;
 
     /// Validate the threshold invariants.
     ///
