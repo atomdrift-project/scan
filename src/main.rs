@@ -66,6 +66,10 @@ struct Cli {
     #[arg(long, default_value = "4000")]
     slow_rule_ms: u64,
 
+    /// Show raw probability and SHAP feature values in terminal output
+    #[arg(long, hide = true)]
+    extra: bool,
+
     /// Paths to files or directories to scan (shorthand for `litmus scan <paths...>`)
     paths: Vec<PathBuf>,
 
@@ -196,7 +200,7 @@ fn main() -> Result<()> {
     match command {
         Commands::Scan { paths } => {
             let config =
-                litmus::ScanConfig::new(model_dir, cli.format, thresholds, filter, cli.slow_rule_ms)?;
+                litmus::ScanConfig::new(model_dir, cli.format, thresholds, filter, cli.slow_rule_ms, cli.extra)?;
             let result = run_scan_paths(&paths, &config)?;
 
             if result.hostile > 0 {
@@ -208,7 +212,7 @@ fn main() -> Result<()> {
         }
         Commands::Ps => {
             let config =
-                litmus::ScanConfig::new(model_dir, cli.format, thresholds, filter, cli.slow_rule_ms)?;
+                litmus::ScanConfig::new(model_dir, cli.format, thresholds, filter, cli.slow_rule_ms, cli.extra)?;
             let result = litmus::ps::run(&config)?;
 
             if result.hostile > 0 {

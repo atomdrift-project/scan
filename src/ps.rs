@@ -333,7 +333,7 @@ fn emit_result(
 ) {
     match config.format() {
         OutputFormat::Terminal => {
-            output::print_ps_result(r, pids, deleted, has_progress);
+            output::print_ps_result(r, pids, deleted, has_progress, config.extra());
         }
         OutputFormat::Json => match serde_json::to_string(r) {
             Ok(line) => {

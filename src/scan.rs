@@ -94,6 +94,7 @@ pub struct ScanConfig {
     thresholds: Thresholds,
     filter: DisplayFilter,
     slow_rule_ms: u64,
+    extra: bool,
 }
 
 impl ScanConfig {
@@ -111,6 +112,7 @@ impl ScanConfig {
     ///     Thresholds::default(),
     ///     DisplayFilter::alerts_only(),
     ///     4_000,
+    ///     false,
     /// )?;
     ///
     /// assert_eq!(config.format(), OutputFormat::Terminal);
@@ -123,6 +125,7 @@ impl ScanConfig {
         thresholds: Thresholds,
         filter: DisplayFilter,
         slow_rule_ms: u64,
+        extra: bool,
     ) -> Result<Self> {
         thresholds
             .validate()
@@ -133,6 +136,7 @@ impl ScanConfig {
             thresholds,
             filter,
             slow_rule_ms,
+            extra,
         })
     }
 
@@ -165,6 +169,12 @@ impl ScanConfig {
     pub const fn slow_rule_ms(&self) -> u64 {
         self.slow_rule_ms
     }
+
+    /// Whether to show extra debug info (raw probability, SHAP values) in terminal output.
+    #[must_use]
+    pub const fn extra(&self) -> bool {
+        self.extra
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +192,7 @@ mod config_tests {
             },
             DisplayFilter::alerts_only(),
             4_000,
+            false,
         );
 
         assert!(result.is_err());
@@ -533,7 +544,7 @@ fn emit_result(
 ) {
     match config.format() {
         OutputFormat::Terminal => {
-            crate::output::print_file_result_streaming(r, show_progress);
+            crate::output::print_file_result_streaming(r, show_progress, config.extra());
         }
         OutputFormat::Json => match serde_json::to_string(r) {
             Ok(line) => {

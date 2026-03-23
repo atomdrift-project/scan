@@ -17,6 +17,7 @@
 //!     Thresholds::default(),
 //!     DisplayFilter::all(),
 //!     4_000,
+//!     false,
 //! )?;
 //!
 //! let summary = litmus::scan::run(std::path::Path::new("/tmp/sample.exe"), &config)?;

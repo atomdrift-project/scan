@@ -286,8 +286,17 @@ fn colored_pct(
     fg(accent, &pct)
 }
 
+/// Classification label colored to match the band.
+fn colored_label(classification: &Classification, p: &Palette) -> String {
+    match classification {
+        Classification::Hostile => fg(p.hostile, "hostile"),
+        Classification::Suspicious => fg(p.suspicious, "suspicious"),
+        Classification::Benign => fg(p.benign, "benign"),
+    }
+}
+
 /// Print a single file result immediately, clearing progress line if active.
-pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool) {
+pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extra: bool) {
     if has_progress {
         eprint!("\r\x1b[2K");
     }
@@ -303,16 +312,20 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool) {
         &result.classification,
         result.thresholds,
     );
+    let label = colored_label(&result.classification, p);
 
-    eprintln!("  {blocks} {pct}  {}", result.path.bold());
+    eprintln!("  {blocks} {pct} {label}  {}", result.path.bold());
     print_detail_lines(result, p);
     print_reasons(result, p);
+    if extra {
+        print_extra(result, p);
+    }
     print_embedded_files(&result.embedded_files, result.thresholds, p);
     eprintln!();
 }
 
 /// Print a process scan result with PID annotations.
-pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, has_progress: bool) {
+pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, has_progress: bool, extra: bool) {
     if has_progress {
         eprint!("\r\x1b[2K");
     }
@@ -339,6 +352,7 @@ pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, has_pro
         format!("{} +{} more", first.join(", "), pids.len() - 4)
     };
     let pid_display = fg(p.dim, &format!("[pids: {pid_str}]"));
+    let label = colored_label(&result.classification, p);
 
     let deleted_marker = if deleted {
         format!(" {}", fg(p.hostile_finding, "(deleted)"))
@@ -347,12 +361,15 @@ pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, has_pro
     };
 
     eprintln!(
-        "  {blocks} {pct}  {}{deleted_marker}  {pid_display}",
+        "  {blocks} {pct} {label}  {}{deleted_marker}  {pid_display}",
         result.path.bold(),
     );
 
     print_detail_lines(result, p);
     print_reasons(result, p);
+    if extra {
+        print_extra(result, p);
+    }
     print_embedded_files(&result.embedded_files, result.thresholds, p);
     eprintln!();
 }
@@ -402,6 +419,26 @@ fn print_reasons(result: &ScanResult, p: &Palette) {
             fg(p.arrow, "\u{2191}"),
             fg(p.reason, &reason_strs.join(", ")),
         );
+    }
+}
+
+/// Print raw probability and SHAP feature values (hidden --extra mode).
+fn print_extra(result: &ScanResult, p: &Palette) {
+    eprintln!(
+        "           {} {}",
+        fg(p.dim, "prob:"),
+        fg(p.dim, &format!("{:.6}", result.probability)),
+    );
+    if !result.reasons.is_empty() {
+        eprintln!("           {}", fg(p.dim, "shap:"));
+        for r in &result.reasons {
+            eprintln!(
+                "             {} {} {}",
+                fg(p.dim, &format!("{:>8.4}", r.importance)),
+                fg(p.dim, &format!("val={:<8.2}", r.value)),
+                fg(p.very_dim, &r.feature),
+            );
+        }
     }
 }
 
