@@ -17,8 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/litmus-models.git";
-const CURRENT_VERSION: &str = "v1";
-const DEFAULT_MODEL: &str = "default";
+const CURRENT_MODEL: &str = "scan-v14";
 const STALENESS_DAYS: u64 = 30;
 
 /// Resolve the models base directory, auto-cloning if necessary.
@@ -55,7 +54,7 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
 
 /// Return the model directory suitable for `Model::load`.
 pub fn model_dir() -> Result<PathBuf> {
-    resolve_and_ensure().map(|base| base.join(CURRENT_VERSION).join(DEFAULT_MODEL))
+    resolve_and_ensure().map(|base| base.join(CURRENT_MODEL))
 }
 
 /// Update the models repository.
@@ -155,7 +154,7 @@ fn current_models_dir() -> PathBuf {
 }
 
 fn has_models(path: &Path) -> bool {
-    let model = path.join(CURRENT_VERSION).join(DEFAULT_MODEL);
+    let model = path.join(CURRENT_MODEL);
     model.join("model.json").exists() && model.join("feature_spec.json").exists()
 }
 
@@ -257,9 +256,9 @@ mod tests {
     }
 
     #[test]
-    fn has_models_with_v1_default_artifacts() {
+    fn has_models_with_scan_v14_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
-        let model = tmp.path().join("v1").join("default");
+        let model = tmp.path().join("scan-v14");
         std::fs::create_dir_all(&model).unwrap();
         std::fs::write(model.join("model.json"), b"").unwrap();
         std::fs::write(model.join("feature_spec.json"), b"{}").unwrap();
