@@ -615,7 +615,10 @@ fn merge_metric_values(files: &[&serde_json::Value]) -> serde_json::Value {
             Some(m) if m.is_object() => m,
             _ => continue,
         };
-        for (group, fields) in metrics.as_object().unwrap() {
+        let Some(metrics_obj) = metrics.as_object() else {
+            continue;
+        };
+        for (group, fields) in metrics_obj {
             let Some(fields_obj) = fields.as_object() else {
                 continue;
             };
@@ -669,7 +672,7 @@ fn write_structural_features(
             import_candidates += 1;
             let imports_empty = file_entry["imports"]
                 .as_array()
-                .map_or(true, |a| a.is_empty());
+                .is_none_or(Vec::is_empty);
             if imports_empty {
                 importless_candidates += 1;
             }

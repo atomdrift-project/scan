@@ -141,16 +141,22 @@ fn main() -> Result<()> {
         }
     };
 
+    let is_serve = matches!(command, Commands::Serve { .. });
     let filter = if cli.verbose {
         tracing_subscriber::EnvFilter::new("litmus=debug,cleave=debug")
+    } else if is_serve {
+        tracing_subscriber::EnvFilter::new("litmus=info,cleave=warn")
     } else {
         tracing_subscriber::EnvFilter::new("litmus=warn,cleave=error")
     };
-    tracing_subscriber::fmt()
+    let fmt = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .without_time()
-        .init();
+        .with_writer(std::io::stderr);
+    if is_serve {
+        fmt.init();
+    } else {
+        fmt.without_time().init();
+    }
 
     // Initialize terminal theme before any output.
     if cli.light {

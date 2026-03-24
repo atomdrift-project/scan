@@ -18,6 +18,7 @@ use crate::scan::ScanResult;
 /// Returns 503 while resources are still loading or when RSS exceeds the configured limit.
 pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
     if !state.ready.load(std::sync::atomic::Ordering::Acquire) {
+        tracing::debug!("GET /_/health -> 503 (starting)");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"status": "starting"})),
@@ -33,6 +34,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
     let overloaded = rss_bytes.map(|b| b > state.max_rss_bytes).unwrap_or(false);
 
     if overloaded {
+        tracing::warn!("GET /_/health -> 503 (degraded, rss={rss_mb:?}MB)");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -46,6 +48,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     }
+    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, active={active_tasks})");
     Json(serde_json::json!({
         "status": "ok",
         "rss_mb": rss_mb,
@@ -59,6 +62,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
 ///
 /// Only one reload may run at a time; concurrent calls receive 409.
 pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
+    tracing::info!("POST /_/reload");
     // Prevent concurrent reloads — each load allocates significant memory.
     let Ok(_guard) = state.reload_lock.try_lock() else {
         tracing::warn!("reload rejected: already in progress");
@@ -162,7 +166,7 @@ pub(super) async fn analyze(
     let request_id = state.next_request_id();
     let request_start = Instant::now();
 
-    tracing::info!("--> POST /analyze  id={request_id}");
+    tracing::info!(id = request_id, "--> POST /analyze");
 
     if let Some(response) = check_memory_pressure(&state) {
         return response;
@@ -323,7 +327,13 @@ pub(super) async fn analyze(
             .into_response();
     }
 
-    tracing::info!("starting analysis: filename={filename:?} size={file_size}  id={request_id}");
+    tracing::info!(
+        id = request_id,
+        filename = %filename,
+        size_bytes = file_size,
+        upload_ms = request_start.elapsed().as_millis() as u64,
+        "received file, starting analysis",
+    );
 
     // Snapshot the current model resources (Arc clone, no lock held during analysis).
     let resources = match state.resources.read() {
@@ -384,15 +394,22 @@ pub(super) async fn analyze(
             match join_result {
                 Ok(Ok(scan_result)) => {
                     tracing::info!(
-                        "<-- 200 OK  id={request_id} filename={filename:?} size={file_size} \
-                         elapsed_ms={elapsed_ms} classification={}",
-                        scan_result.classification,
+                        id = request_id,
+                        filename = %filename,
+                        size_bytes = file_size,
+                        elapsed_ms = elapsed_ms as u64,
+                        classification = %scan_result.classification,
+                        probability = scan_result.probability,
+                        "<-- 200 OK",
                     );
                     Json(scan_result).into_response()
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(
-                        "<-- 500 analysis failed  id={request_id} elapsed_ms={elapsed_ms}: {e}"
+                        id = request_id,
+                        elapsed_ms = elapsed_ms as u64,
+                        error = %e,
+                        "<-- 500 analysis failed",
                     );
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -402,7 +419,10 @@ pub(super) async fn analyze(
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "<-- 500 task join error  id={request_id} elapsed_ms={elapsed_ms}: {e}"
+                        id = request_id,
+                        elapsed_ms = elapsed_ms as u64,
+                        error = %e,
+                        "<-- 500 task join error",
                     );
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
