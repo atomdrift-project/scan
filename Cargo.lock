@@ -618,7 +618,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "0.3.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#7a74537662fc33b49ecb60848d102eb95d60ab37"
+source = "git+https://codeberg.org/atomdrift/cleave.git#a15a5966f08243c09819ed193ab0aaad80eb0ce8"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -723,7 +723,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#7a74537662fc33b49ecb60848d102eb95d60ab37"
+source = "git+https://codeberg.org/atomdrift/cleave.git#a15a5966f08243c09819ed193ab0aaad80eb0ce8"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2267,7 +2267,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#7a74537662fc33b49ecb60848d102eb95d60ab37"
+source = "git+https://codeberg.org/atomdrift/cleave.git#a15a5966f08243c09819ed193ab0aaad80eb0ce8"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -3310,7 +3310,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#7a74537662fc33b49ecb60848d102eb95d60ab37"
+source = "git+https://codeberg.org/atomdrift/cleave.git#a15a5966f08243c09819ed193ab0aaad80eb0ce8"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3756,7 +3756,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#7a74537662fc33b49ecb60848d102eb95d60ab37"
+source = "git+https://codeberg.org/atomdrift/cleave.git#a15a5966f08243c09819ed193ab0aaad80eb0ce8"
 
 [[package]]
 name = "tap"
@@ -4033,9 +4033,9 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.7+spec-1.1.0"
+version = "0.25.8+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d15b06e6c39068c203e7c1d0bc3944796d867449e7668ef7fa5ea43727cb846e"
+checksum = "16bff38f1d86c47f9ff0647e6838d7bb362522bdf44006c7068c2b1e606f1f3c"
 dependencies = [
  "indexmap",
  "toml_datetime",
