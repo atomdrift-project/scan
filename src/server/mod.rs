@@ -227,15 +227,16 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         in_flight: dashmap::DashMap::new(),
     });
 
-    // Background task: load model + SHAP concurrently, then mark the server ready.
+    // Background task: load model + SHAP + YARA concurrently, then mark ready.
     {
         let bg = Arc::clone(&state);
         let model_dir = config.model_dir().to_path_buf();
         let model_dir_shap = config.model_dir().to_path_buf();
         let thresholds = config.thresholds();
+        let slow_rule_ms = config.slow_rule_ms();
         tokio::spawn(async move {
             let init_start = Instant::now();
-            tracing::info!("resource loader started (model + SHAP loading concurrently)");
+            tracing::info!("resource loader started (model + SHAP + YARA loading concurrently)");
 
             // Capture spawn times in the async context so each blocking closure
             // can report queue_ms (time waiting for a thread) separately from
@@ -281,9 +282,25 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     }
                 }
             });
+            let yara_spawned_at = Instant::now();
+            let yara_task = tokio::task::spawn_blocking(move || {
+                let queue_ms = yara_spawned_at.elapsed().as_millis();
+                let t = Instant::now();
+                tracing::info!(queue_ms, "YARA warmup started");
+                let opts = cleave::AnalysisOptions {
+                    slow_rule_ms,
+                    ..Default::default()
+                };
+                let _ = cleave::analyze_file(std::path::Path::new("/dev/null"), &opts);
+                tracing::info!(
+                    queue_ms,
+                    work_ms = t.elapsed().as_millis(),
+                    "YARA warmup complete",
+                );
+            });
 
-            match tokio::join!(model_task, shap_task) {
-                (Ok(Ok((model, ctx))), Ok(shap)) => {
+            match tokio::join!(model_task, shap_task, yara_task) {
+                (Ok(Ok((model, ctx))), Ok(shap), Ok(())) => {
                     let spec_version = model.spec().version();
                     let features = model.spec().total_features();
                     let shap_loaded = shap.is_some();
@@ -303,28 +320,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                         Err(e) => tracing::error!("resources lock poisoned during init: {e}"),
                     }
                 }
-                (Ok(Err(e)), _) => tracing::error!("failed to load model: {e}"),
-                (Err(e), _) => tracing::error!("model load task panicked: {e}"),
-                (_, Err(e)) => tracing::error!("shap load task panicked: {e}"),
+                (Ok(Err(e)), _, _) => tracing::error!("failed to load model: {e}"),
+                (Err(e), _, _) => tracing::error!("model load task panicked: {e}"),
+                (_, Err(e), _) => tracing::error!("shap load task panicked: {e}"),
+                (_, _, Err(e)) => tracing::error!("yara warmup task panicked: {e}"),
             }
         });
-    }
-
-    // Fire-and-forget YARA warmup — does not block readiness.  If it finishes
-    // before the first request arrives, great; otherwise the first request
-    // naturally warms the rules.
-    {
-        let slow_rule_ms = config.slow_rule_ms();
-        tokio::spawn(tokio::task::spawn_blocking(move || {
-            let t = Instant::now();
-            tracing::info!("YARA warmup started (non-blocking)");
-            let opts = cleave::AnalysisOptions {
-                slow_rule_ms,
-                ..Default::default()
-            };
-            let _ = cleave::analyze_file(std::path::Path::new("/dev/null"), &opts);
-            tracing::info!(elapsed_ms = t.elapsed().as_millis(), "YARA warmup complete");
-        }));
     }
 
     let max_concurrent = std::thread::available_parallelism()

@@ -5,6 +5,18 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use litmus::server::{build_app, ServerConfig};
 use tower::ServiceExt;
+use tracing_subscriber::EnvFilter;
+
+/// Install a tracing subscriber so server logs are visible on test failure.
+/// Silently ignored if another test in the process already installed one.
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+}
 
 fn model_dir() -> Result<std::path::PathBuf> {
     if let Ok(d) = std::env::var("LITMUS_MODELS_DIR") {
@@ -32,6 +44,7 @@ fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
 /// Submit an encrypted zip via /analyze and verify JSON response structure.
 #[tokio::test]
 async fn analyze_encrypted_zip_returns_json() -> Result<()> {
+    init_tracing();
     let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/encrypted.zip");
     assert!(
         testdata.exists(),
@@ -87,11 +100,18 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
         .await
         .context("analyze request failed")?;
 
-    assert_eq!(response.status(), StatusCode::OK);
-
+    let status = response.status();
     let body_bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
         .await
         .context("failed to read response body")?;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 but got {status}: {}",
+        String::from_utf8_lossy(&body_bytes),
+    );
+
     let json: serde_json::Value =
         serde_json::from_slice(&body_bytes).context("response must be valid JSON")?;
 
