@@ -1,32 +1,28 @@
 # litmus
 
-**Experimental ML-powered malware classifier using [cleave](https://github.com/chainguard-dev/cleave) static analysis.**
+ML-powered malware classifier for supply-chain security. Uses [cleave](https://codeberg.org/atomdrift/cleave) static analysis to extract capabilities, then classifies threat level — built for security engineers and automated pipelines alike.
 
-> **Warning:** This is alpha software. It will produce false positives and false negatives. Do not use for production security decisions. May kill kittens.
+> **Note:** Alpha software. Expect false positives and false negatives.
 
-## Features
+## What It Does
 
-- Train and consume custom ML models tailored to your threat model
-- Scan files, directories, and archives for malicious indicators
-- Compare package versions to detect supply chain attacks
+- **Scan** files, directories, and archives — evaluates them against a local [ML model](https://codeberg.org/atomdrift/litmus-models/)
 
 ## Usage
 
 ```bash
-# Build (requires cleave at ../cleave)
-cargo build --release
+# macOS (Homebrew)
+brew tap atomdrift/tap https://codeberg.org/atomdrift/homebrew-tap.git
+brew install atomdrift/tap/litmus
 
-# Scan a file
-./target/release/litmus scan /path/to/file
-
-# Compare package versions
-./target/release/litmus diff old.tar.gz new.tar.gz
+# From source
+make install
 ```
 
-## Training
-
-See [TRAINING_GUIDE.md](TRAINING_GUIDE.md) to train your own model.
+```bash
+litmus scan /path/to/file
+```
 
 ## License
 
-Apache 2.0
+Apache-2.0
