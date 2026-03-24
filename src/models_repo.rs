@@ -57,15 +57,11 @@ pub fn model_dir() -> Result<PathBuf> {
     resolve_and_ensure().map(|base| base.join(CURRENT_MODEL))
 }
 
-/// Update the models repository.
+/// Update the models repository, cloning it first if necessary.
 pub fn update() -> Result<()> {
     let base = current_models_dir();
-    if !is_git_repo(&base) {
-        anyhow::bail!(
-            "Models directory is not a git repository: {}\n\
-             (if using a symlink, ensure the target is a git repo)",
-            base.display()
-        );
+    if ensure_repo(&base)? {
+        return Ok(());
     }
 
     let before = short_head(&base).unwrap_or_default();
@@ -109,8 +105,8 @@ pub fn update() -> Result<()> {
 /// Check for updates without applying them.
 pub fn check_updates() -> Result<()> {
     let base = current_models_dir();
-    if !is_git_repo(&base) {
-        anyhow::bail!("Models directory is not a git repository: {}", base.display());
+    if ensure_repo(&base)? {
+        return Ok(());
     }
 
     let fetch = Command::new("git")
@@ -151,6 +147,23 @@ fn current_models_dir() -> PathBuf {
         return PathBuf::from(explicit);
     }
     default_models_dir()
+}
+
+/// Ensure the models repo exists at `base`, cloning if necessary.
+/// Returns `Ok(true)` if a fresh clone was performed.
+fn ensure_repo(base: &Path) -> Result<bool> {
+    if is_git_repo(base) {
+        return Ok(false);
+    }
+    eprintln!("Models not found — cloning...");
+    clone_repo(base).with_context(|| {
+        format!(
+            "failed to clone models\n\nEnsure 'git' is installed, or manually clone:\n  git clone {MODELS_REPO_URL} \"{}\"",
+            base.display()
+        )
+    })?;
+    eprintln!("Models ready ({}).", short_head(base).unwrap_or_default());
+    Ok(true)
 }
 
 fn has_models(path: &Path) -> bool {

@@ -187,10 +187,14 @@ fn main() -> Result<()> {
         });
     }
 
-    let model_dir = match cli.model_dir {
-        Some(model_dir) => model_dir,
-        None => litmus::models_repo::model_dir()
-            .map_err(|e| anyhow::anyhow!("failed to resolve model directory: {e}"))?,
+    // Resolve model directory lazily — update-rules and version don't need it,
+    // and eagerly resolving triggers auto-clone before those commands can run.
+    let resolve_model_dir = || -> Result<PathBuf> {
+        match &cli.model_dir {
+            Some(d) => Ok(d.clone()),
+            None => litmus::models_repo::model_dir()
+                .map_err(|e| anyhow::anyhow!("failed to resolve model directory: {e}")),
+        }
     };
     let all = cli.show.iter().any(|s| matches!(s, Show::All));
     let filter = DisplayFilter::new(
@@ -206,7 +210,7 @@ fn main() -> Result<()> {
     match command {
         Commands::Scan { paths } => {
             let config =
-                litmus::ScanConfig::new(model_dir, cli.format, thresholds, filter, cli.slow_rule_ms, cli.extra)?;
+                litmus::ScanConfig::new(resolve_model_dir()?, cli.format, thresholds, filter, cli.slow_rule_ms, cli.extra)?;
             let result = run_scan_paths(&paths, &config)?;
 
             if result.hostile > 0 {
@@ -218,7 +222,7 @@ fn main() -> Result<()> {
         }
         Commands::Ps => {
             let config =
-                litmus::ScanConfig::new(model_dir, cli.format, thresholds, filter, cli.slow_rule_ms, cli.extra)?;
+                litmus::ScanConfig::new(resolve_model_dir()?, cli.format, thresholds, filter, cli.slow_rule_ms, cli.extra)?;
             let result = litmus::ps::run(&config)?;
 
             if result.hostile > 0 {
@@ -239,7 +243,7 @@ fn main() -> Result<()> {
                 timeout_secs,
                 max_size_mb.saturating_mul(1024 * 1024),
                 max_rss_gb.saturating_mul(1024 * 1024 * 1024),
-                model_dir,
+                resolve_model_dir()?,
                 thresholds,
                 cli.slow_rule_ms,
             )?;
