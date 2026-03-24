@@ -68,8 +68,11 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     let app = build_app(&config).await.context("failed to build app")?;
 
     // Wait for background resource loading to complete before sending requests.
-    eprintln!("waiting for server readiness...");
-    for _ in 0..100 {
+    // YARA warmup can take ~15s in release and longer in debug builds.
+    let max_health_polls: u32 = if cfg!(debug_assertions) { 1800 } else { 600 };
+    eprintln!("waiting for server readiness (up to {}s)...", max_health_polls / 10);
+    let mut ready = false;
+    for _ in 0..max_health_polls {
         let resp = app
             .clone()
             .oneshot(
@@ -81,10 +84,12 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
             .await
             .context("health request failed")?;
         if resp.status() == StatusCode::OK {
+            ready = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    assert!(ready, "server did not become ready within {}s", max_health_polls / 10);
 
     let (content_type, body) = multipart_body(&file_bytes, "encrypted.zip");
 
