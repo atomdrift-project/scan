@@ -133,7 +133,7 @@ impl std::fmt::Display for Classification {
 /// assert_eq!(thresholds.classify(0.99), Classification::Hostile);
 /// # Ok::<(), litmus::model::ThresholdValidationError>(())
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Thresholds {
     /// Minimum probability to classify as suspicious.
     pub suspicious: f32,
