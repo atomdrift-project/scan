@@ -302,7 +302,7 @@ fn build_result(
         path: display_path.display().to_string(),
         classification: cr.classification,
         probability: cr.probability,
-        thresholds: config.thresholds(),
+        thresholds: model.thresholds(),
         finding_counts: cr.finding_counts,
         formula: cr.formula,
         reasons: cr.reasons,

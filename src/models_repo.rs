@@ -41,14 +41,19 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
         return Ok(data_dir);
     }
 
-    eprintln!("First run: downloading litmus models...");
+    if is_git_repo(&data_dir) {
+        eprintln!("Models exist at {} but missing expected artifacts — re-cloning...", data_dir.display());
+        std::fs::remove_dir_all(&data_dir).ok();
+    } else {
+        eprintln!("First run: downloading litmus models...");
+    }
     clone_repo(&data_dir).with_context(|| {
         format!(
             "failed to download models\n\nEnsure 'git' is installed, or manually clone:\n  git clone {MODELS_REPO_URL} \"{}\"",
             data_dir.display()
         )
     })?;
-    eprintln!("Models ready. Continuing...");
+    eprintln!("Models ready ({})", data_dir.join(CURRENT_MODEL).display());
     Ok(data_dir)
 }
 

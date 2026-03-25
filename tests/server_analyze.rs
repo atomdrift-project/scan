@@ -62,7 +62,7 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
         100 * 1024 * 1024,
         8 * 1024 * 1024 * 1024,
         model_dir()?,
-        litmus::model::Thresholds::default(),
+        None,
         4000,
     )?;
     let app = build_app(&config).await.context("failed to build app")?;

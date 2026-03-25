@@ -50,13 +50,13 @@ struct Cli {
     #[arg(short, long, default_value = "terminal")]
     format: OutputFormat,
 
-    /// Probability threshold for suspicious classification (0.0-1.0)
-    #[arg(long, default_value_t = litmus::model::Thresholds::DEFAULT_SUSPICIOUS)]
-    threshold_suspicious: f32,
+    /// Override suspicious threshold (0.0-1.0); omit to use model's recommendation
+    #[arg(long)]
+    threshold_suspicious: Option<f32>,
 
-    /// Probability threshold for hostile classification (0.0-1.0)
-    #[arg(long, default_value_t = litmus::model::Thresholds::DEFAULT_HOSTILE)]
-    threshold_hostile: f32,
+    /// Override hostile threshold (0.0-1.0); omit to use model's recommendation
+    #[arg(long)]
+    threshold_hostile: Option<f32>,
 
     /// Classifications to display: hostile, sus, benign, all (comma-separated)
     #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
@@ -202,9 +202,14 @@ fn main() -> Result<()> {
         all || cli.show.iter().any(|s| matches!(s, Show::Sus)),
         all || cli.show.iter().any(|s| matches!(s, Show::Benign)),
     );
-    let thresholds = litmus::model::Thresholds {
-        suspicious: cli.threshold_suspicious,
-        hostile: cli.threshold_hostile,
+    // Only construct explicit thresholds if at least one CLI flag was provided.
+    // When both are omitted, pass None so Model::load uses evaluation.json.
+    let thresholds = match (cli.threshold_suspicious, cli.threshold_hostile) {
+        (None, None) => None,
+        (sus, hos) => Some(litmus::model::Thresholds {
+            suspicious: sus.unwrap_or(litmus::model::Thresholds::FALLBACK_SUSPICIOUS),
+            hostile: hos.unwrap_or(litmus::model::Thresholds::FALLBACK_HOSTILE),
+        }),
     };
 
     match command {

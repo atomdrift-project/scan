@@ -11,7 +11,7 @@ use tempfile::Builder as TempBuilder;
 use super::AppState;
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
-use crate::model::{Model, Thresholds};
+use crate::model::Model;
 use crate::scan::ScanResult;
 
 /// GET /_/health — liveness check with memory and concurrency status.
@@ -75,10 +75,7 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
 
     let start = Instant::now();
     let model_dir = state.model_dir.clone();
-    let thresholds = Thresholds {
-        suspicious: state.threshold_suspicious,
-        hostile: state.threshold_hostile,
-    };
+    let thresholds = state.threshold_overrides;
 
     let result = tokio::task::spawn_blocking(move || {
         let model = Model::load(&model_dir, thresholds)?;

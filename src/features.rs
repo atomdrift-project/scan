@@ -189,7 +189,7 @@ fn json_f32_array(v: &serde_json::Value) -> Option<Vec<f32>> {
 
 /// Pre-built lookup tables for fast repeated extraction against a spec.
 #[derive(Debug)]
-pub(crate) struct ExtractContext {
+pub struct ExtractContext {
     /// Maps path string -> index in presence_vocab.
     presence_lookup: HashMap<String, usize>,
     n_presence: usize,
@@ -202,7 +202,8 @@ pub(crate) struct ExtractContext {
 impl ExtractContext {
     /// Build lookup tables from a feature specification.
     #[must_use]
-    pub(crate) fn new(spec: &FeatureSpec) -> Self {
+    /// Build lookup tables from a feature specification.
+    pub fn new(spec: &FeatureSpec) -> Self {
         let presence_lookup: HashMap<String, usize> = spec
             .presence_vocab
             .iter()
@@ -228,14 +229,23 @@ impl ExtractContext {
 
     /// Extract features from a cleave AnalysisReport serialized as JSON.
     #[must_use]
-    pub(crate) fn extract(&self, report: &serde_json::Value) -> Vec<f32> {
+    /// Extract features from a cleave AnalysisReport serialized as JSON.
+    pub fn extract(&self, report: &serde_json::Value) -> Vec<f32> {
         let mut vec = vec![0.0f32; self.total_features];
         self.extract_into(report, &mut vec);
         vec
     }
 
     fn extract_into(&self, report: &serde_json::Value, vec: &mut [f32]) {
-        let files = report_files(report);
+        let empty_obj = serde_json::Value::Object(serde_json::Map::new());
+        let raw_files = report_files(report);
+        // Match Python: if no files, substitute a single empty object so
+        // structural features always have at least one file entry.
+        let files: Vec<&serde_json::Value> = if raw_files.is_empty() {
+            vec![&empty_obj]
+        } else {
+            raw_files
+        };
         let summary = summarize_report_files(&files);
         let merged_metrics = merge_metric_values(&files);
         let mut offsets = FeatureCursor::default();
@@ -279,9 +289,9 @@ impl ExtractContext {
         self.write_file_type_features(&files, vec, file_type_offset);
 
         // -------------------------------------------------------------------
-        // Group 7: Structural (6 features)
+        // Group 7: Structural (7 features)
         // -------------------------------------------------------------------
-        let structural_offset = offsets.take(6);
+        let structural_offset = offsets.take(7);
         write_structural_features(vec, structural_offset, &files, summary.filtered_finding_count);
     }
 
@@ -661,6 +671,7 @@ fn write_structural_features(
     let mut any_tiny_binary = false;
     let mut import_candidates = 0u32;
     let mut importless_candidates = 0u32;
+    let mut max_entropy: f64 = 0.0;
 
     for file_entry in files {
         let ft = file_entry["file_type"].as_str().unwrap_or("");
@@ -676,6 +687,16 @@ fn write_structural_features(
             if imports_empty {
                 importless_candidates += 1;
             }
+        }
+        // Track max binary entropy for stealth_potential.
+        let entropy = file_entry
+            .get("metrics")
+            .and_then(|m| m.get("binary"))
+            .and_then(|b| b.get("overall_entropy"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        if entropy > max_entropy {
+            max_entropy = entropy;
         }
     }
 
@@ -694,6 +715,12 @@ fn write_structural_features(
     let file_count = files.len() as f32;
     vec[offset + 4] = (file_count + 1.0).ln();
     vec[offset + 5] = ((file_count - 1.0).max(0.0) + 1.0).ln();
+    // stealth_potential: high entropy (packed/encrypted) with very few findings.
+    vec[offset + 6] = if filtered_finding_count < 5 && max_entropy > 6.5 {
+        1.0
+    } else {
+        0.0
+    };
 }
 
 /// Return all file entries from a v3 report.

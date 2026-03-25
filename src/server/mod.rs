@@ -41,18 +41,21 @@ pub struct ServerConfig {
     max_body_size: usize,
     max_rss_bytes: u64,
     model_dir: PathBuf,
-    thresholds: Thresholds,
+    thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
 }
 
 impl ServerConfig {
-    /// Create a validated server configuration.
+    /// Create a server configuration.
+    ///
+    /// `thresholds` may be `None` to use the model's recommended thresholds
+    /// from `evaluation.json`, or `Some(t)` to override with explicit values.
     ///
     /// `max_body_size` and `max_rss_bytes` are byte counts.
     ///
     /// # Example
     /// ```
-    /// use litmus::{server::ServerConfig, Thresholds};
+    /// use litmus::server::ServerConfig;
     ///
     /// let config = ServerConfig::new(
     ///     "127.0.0.1:8081".parse()?,
@@ -60,7 +63,7 @@ impl ServerConfig {
     ///     100 * 1024 * 1024,
     ///     8 * 1024 * 1024 * 1024,
     ///     "/path/to/models",
-    ///     Thresholds::default(),
+    ///     None,
     ///     4_000,
     /// )?;
     ///
@@ -73,12 +76,13 @@ impl ServerConfig {
         max_body_size: usize,
         max_rss_bytes: u64,
         model_dir: impl Into<PathBuf>,
-        thresholds: Thresholds,
+        thresholds: Option<Thresholds>,
         slow_rule_ms: u64,
     ) -> anyhow::Result<Self> {
-        thresholds
-            .validate()
-            .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
+        if let Some(ref t) = thresholds {
+            t.validate()
+                .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
+        }
         Ok(Self {
             bind,
             timeout_secs,
@@ -120,9 +124,9 @@ impl ServerConfig {
         &self.model_dir
     }
 
-    /// Classification thresholds used by the model.
+    /// Explicit threshold overrides, if any. `None` means use model defaults.
     #[must_use]
-    pub const fn thresholds(&self) -> Thresholds {
+    pub const fn thresholds(&self) -> Option<Thresholds> {
         self.thresholds
     }
 
@@ -145,14 +149,29 @@ mod config_tests {
             100 * 1024 * 1024,
             8 * 1024 * 1024 * 1024,
             "/tmp/models",
-            Thresholds {
+            Some(Thresholds {
                 suspicious: -0.1,
                 hostile: 0.9,
-            },
+            }),
             4_000,
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn server_config_accepts_none_thresholds() {
+        let result = ServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], 8081)),
+            120,
+            100 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+            "/tmp/models",
+            None,
+            4_000,
+        );
+
+        assert!(result.is_ok());
     }
 }
 
@@ -176,8 +195,7 @@ struct AppState {
     max_upload_bytes: usize,
     max_rss_bytes: u64,
     model_dir: PathBuf,
-    threshold_suspicious: f32,
-    threshold_hostile: f32,
+    threshold_overrides: Option<Thresholds>,
     slow_rule_ms: u64,
     ready: AtomicBool,
     resources: RwLock<Option<Arc<ModelResources>>>,
@@ -215,8 +233,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         max_upload_bytes: config.max_body_size(),
         max_rss_bytes: config.max_rss_bytes(),
         model_dir: config.model_dir().to_path_buf(),
-        threshold_suspicious: config.thresholds().suspicious,
-        threshold_hostile: config.thresholds().hostile,
+        threshold_overrides: config.thresholds(),
         slow_rule_ms: config.slow_rule_ms(),
         ready: AtomicBool::new(false),
         resources: RwLock::new(None),

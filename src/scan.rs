@@ -91,14 +91,17 @@ impl Default for DisplayFilter {
 pub struct ScanConfig {
     model_dir: PathBuf,
     format: OutputFormat,
-    thresholds: Thresholds,
+    thresholds: Option<Thresholds>,
     filter: DisplayFilter,
     slow_rule_ms: u64,
     extra: bool,
 }
 
 impl ScanConfig {
-    /// Create a validated scan configuration.
+    /// Create a scan configuration.
+    ///
+    /// `thresholds` may be `None` to use the model's recommended thresholds
+    /// from `evaluation.json`, or `Some(t)` to override with explicit values.
     ///
     /// `slow_rule_ms` is advisory logging only; it does not cancel analysis.
     ///
@@ -109,7 +112,7 @@ impl ScanConfig {
     /// let config = ScanConfig::new(
     ///     "/path/to/models",
     ///     OutputFormat::Terminal,
-    ///     Thresholds::default(),
+    ///     None,
     ///     DisplayFilter::alerts_only(),
     ///     4_000,
     ///     false,
@@ -122,14 +125,15 @@ impl ScanConfig {
     pub fn new(
         model_dir: impl Into<PathBuf>,
         format: OutputFormat,
-        thresholds: Thresholds,
+        thresholds: Option<Thresholds>,
         filter: DisplayFilter,
         slow_rule_ms: u64,
         extra: bool,
     ) -> Result<Self> {
-        thresholds
-            .validate()
-            .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
+        if let Some(ref t) = thresholds {
+            t.validate()
+                .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
+        }
         Ok(Self {
             model_dir: model_dir.into(),
             format,
@@ -152,9 +156,9 @@ impl ScanConfig {
         self.format
     }
 
-    /// Classification thresholds used during inference.
+    /// Explicit threshold overrides, if any. `None` means use model defaults.
     #[must_use]
-    pub const fn thresholds(&self) -> Thresholds {
+    pub const fn thresholds(&self) -> Option<Thresholds> {
         self.thresholds
     }
 
@@ -186,10 +190,10 @@ mod config_tests {
         let result = ScanConfig::new(
             "/tmp/models",
             OutputFormat::Terminal,
-            Thresholds {
+            Some(Thresholds {
                 suspicious: 0.99,
                 hostile: 0.50,
-            },
+            }),
             DisplayFilter::alerts_only(),
             4_000,
             false,
@@ -739,7 +743,7 @@ fn process_report(
         path: path.display().to_string(),
         classification: cr.classification,
         probability: cr.probability,
-        thresholds: config.thresholds(),
+        thresholds: model.thresholds(),
         finding_counts: cr.finding_counts,
         formula: cr.formula,
         reasons: cr.reasons,
