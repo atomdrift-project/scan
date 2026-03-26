@@ -1,13 +1,13 @@
 //! Feature extraction from cleave v3 AnalysisReport JSON.
 //!
-//! Mirrors the feature extraction in collimator/src/collimator/features.py (v14)
+//! Mirrors the feature extraction in collimator/src/collimator/features.py (v15)
 //! exactly, using the same feature_spec.json vocabulary to produce identical
 //! feature vectors.
 //!
-//! Feature groups (v14):
+//! Feature groups (v15):
 //!   1. Presence: binary (1.0 if path exists at crit >= baseline)
 //!   2. Max Criticality: ordinal (0-5) per path
-//!   3. Aggregates: breadth, concentration, finding-density signals (20)
+//!   3. Aggregates: breadth, concentration, finding-density, hostile-escalation signals (25)
 //!   4. Third-Party / Well-Known Summary (6)
 //!   5. Key Metrics: curated binary/text/PE metrics (16)
 //!   6. File Type: multi-hot across all files
@@ -19,7 +19,7 @@ use std::path::Path;
 
 /// Feature spec version this build was compiled against.
 /// Must match the version in the loaded feature_spec.json.
-pub const EXPECTED_SPEC_VERSION: u32 = 14;
+pub const EXPECTED_SPEC_VERSION: u32 = 15;
 /// Stable model ABI version shared with collimator.
 /// Keep this in sync with EXPECTED_SPEC_VERSION for a single compatibility number.
 pub const EXPECTED_MODEL_ABI_VERSION: u32 = EXPECTED_SPEC_VERSION;
@@ -67,10 +67,10 @@ const KEY_METRICS: &[(&str, &str, bool)] = &[
     ("pe", "rsrc_size", true),
 ];
 
-/// Feature specification loaded from feature_spec.json (v14).
+/// Feature specification loaded from feature_spec.json (v15).
 #[derive(Debug, Clone)]
 pub struct FeatureSpec {
-    /// Spec format version (expected: 14).
+    /// Spec format version (expected: 15).
     version: u32,
     /// Stable preprocessing/inference ABI version.
     abi_version: u32,
@@ -272,7 +272,7 @@ fn build_expected_feature_names(
     filetype_vocab: &[String],
 ) -> Vec<String> {
     let mut feature_names = Vec::with_capacity(
-        presence_vocab.len() * 2 + 20 + 6 + KEY_METRICS.len() + filetype_vocab.len() + 7,
+        presence_vocab.len() * 2 + 25 + 6 + KEY_METRICS.len() + filetype_vocab.len() + 7,
     );
 
     for path in presence_vocab {
@@ -304,6 +304,11 @@ fn build_expected_feature_names(
         format!("agg:top{TOP_K_RISK_FILES}_file_hostile_ratio_sum"),
         format!("agg:top{TOP_K_RISK_FILES}_file_suspicious_findings_log"),
         format!("agg:top{TOP_K_RISK_FILES}_file_hostile_findings_log"),
+        "agg:hostile_escalation_rate".to_string(),
+        "agg:hostile_share_of_suspicious".to_string(),
+        "agg:suspicious_finding_escalation_rate".to_string(),
+        "agg:hostile_finding_escalation_rate".to_string(),
+        "agg:hostile_share_of_suspicious_findings".to_string(),
     ]);
 
     feature_names.extend([
@@ -414,9 +419,9 @@ impl ExtractContext {
         self.write_max_crit_features(&summary.sample_paths, vec, maxcrit_offset);
 
         // -------------------------------------------------------------------
-        // Group 3: Aggregates (20 features)
+        // Group 3: Aggregates (25 features)
         // -------------------------------------------------------------------
-        let agg_offset = offsets.take(20);
+        let agg_offset = offsets.take(25);
         write_aggregate_features(&summary, &files, vec, agg_offset);
 
         // -------------------------------------------------------------------
@@ -585,7 +590,7 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
     summary
 }
 
-/// Aggregate findings across every file in the report (v14 multi-file aggregation).
+/// Aggregate findings across every file in the report (v15 default aggregation).
 fn summarize_report_files(files: &[&serde_json::Value]) -> FindingSummary {
     let mut combined = FindingSummary::default();
     let mut all_suspicious_ids: HashSet<String> = HashSet::new();
@@ -774,7 +779,7 @@ fn write_aggregate_features(
     vec[offset + 6] = breadth_suspicious as f32 / breadth_notable.max(1) as f32;
     vec[offset + 7] = breadth_notable_only as f32 / breadth_notable.max(1) as f32;
 
-    // v14 finding-density features (12 new).
+    // Base aggregate features.
     vec[offset + 8] = (summary.notable_finding_count as f32 + 1.0).ln();
     vec[offset + 9] = (summary.suspicious_finding_count as f32 + 1.0).ln();
     vec[offset + 10] = (summary.hostile_finding_count as f32 + 1.0).ln();
@@ -789,6 +794,11 @@ fn write_aggregate_features(
     vec[offset + 17] = host_ratio;
     vec[offset + 18] = susp_log;
     vec[offset + 19] = host_log;
+    vec[offset + 20] = breadth_hostile as f32 / breadth_notable.max(1) as f32;
+    vec[offset + 21] = breadth_hostile as f32 / breadth_suspicious.max(1) as f32;
+    vec[offset + 22] = summary.suspicious_finding_count as f32 / summary.notable_finding_count.max(1) as f32;
+    vec[offset + 23] = summary.hostile_finding_count as f32 / summary.notable_finding_count.max(1) as f32;
+    vec[offset + 24] = summary.hostile_finding_count as f32 / summary.suspicious_finding_count.max(1) as f32;
 }
 
 fn write_external_summary_features(summary: &FindingSummary, vec: &mut [f32], offset: usize) {
@@ -1067,8 +1077,8 @@ mod tests {
     #[test]
     fn test_standardize() {
         let spec = FeatureSpec {
-            version: 14,
-            abi_version: 14,
+            version: 15,
+            abi_version: 15,
             presence_vocab: vec![],
             filetype_vocab: vec![],
             feature_names: vec![],
@@ -1090,13 +1100,13 @@ mod tests {
     #[test]
     fn test_extract_empty_report() {
         let spec = FeatureSpec {
-            version: 14,
-            abi_version: 14,
+            version: 15,
+            abi_version: 15,
             presence_vocab: vec!["objectives/evasion/process".to_string()],
             filetype_vocab: vec!["sh".to_string()],
             feature_names: vec![],
-            // 1 presence + 1 maxcrit + 20 agg + 6 ext + 16 metrics + 1 filetype + 7 struct
-            total_features: 1 + 1 + 20 + 6 + 16 + 1 + 7,
+            // 1 presence + 1 maxcrit + 25 agg + 6 ext + 16 metrics + 1 filetype + 7 struct
+            total_features: 1 + 1 + 25 + 6 + 16 + 1 + 7,
             feature_means: None,
             feature_stds: None,
             standardized: false,
@@ -1110,7 +1120,7 @@ mod tests {
         // maxcrit feature: 0 (no findings)
         assert_eq!(features[1], 0.0);
         // filetype sh one-hot
-        let ft_offset = 1 + 1 + 20 + 6 + 16;
+        let ft_offset = 1 + 1 + 25 + 6 + 16;
         assert_eq!(features[ft_offset], 1.0);
         // zero_findings structural feature
         let struct_offset = ft_offset + 1;
@@ -1124,8 +1134,8 @@ mod tests {
     #[test]
     fn test_extract_with_findings() {
         let spec = FeatureSpec {
-            version: 14,
-            abi_version: 14,
+            version: 15,
+            abi_version: 15,
             presence_vocab: vec![
                 "objectives".to_string(),
                 "objectives/evasion".to_string(),
@@ -1133,7 +1143,7 @@ mod tests {
             ],
             filetype_vocab: vec!["php".to_string()],
             feature_names: vec![],
-            total_features: 3 + 3 + 20 + 6 + 16 + 1 + 7,
+            total_features: 3 + 3 + 25 + 6 + 16 + 1 + 7,
             feature_means: None,
             feature_stds: None,
             standardized: false,
@@ -1173,12 +1183,12 @@ mod tests {
     #[test]
     fn test_confidence_filtering() {
         let spec = FeatureSpec {
-            version: 14,
-            abi_version: 14,
+            version: 15,
+            abi_version: 15,
             presence_vocab: vec!["objectives".to_string()],
             filetype_vocab: vec![],
             feature_names: vec![],
-            total_features: 1 + 1 + 20 + 6 + 16 + 7,
+            total_features: 1 + 1 + 25 + 6 + 16 + 7,
             feature_means: None,
             feature_stds: None,
             standardized: false,
@@ -1203,8 +1213,8 @@ mod tests {
     #[test]
     fn test_multi_file_aggregation() {
         let spec = FeatureSpec {
-            version: 14,
-            abi_version: 14,
+            version: 15,
+            abi_version: 15,
             presence_vocab: vec![
                 "objectives".to_string(),
                 "objectives/evasion".to_string(),
@@ -1213,7 +1223,7 @@ mod tests {
             ],
             filetype_vocab: vec!["pe".to_string(), "sh".to_string()],
             feature_names: vec![],
-            total_features: 4 + 4 + 20 + 6 + 16 + 2 + 7,
+            total_features: 4 + 4 + 25 + 6 + 16 + 2 + 7,
             feature_means: None,
             feature_stds: None,
             standardized: false,
@@ -1242,7 +1252,7 @@ mod tests {
         let features = ctx.extract(&report);
 
         // Both file types should be set (multi-hot)
-        let ft_offset = 4 + 4 + 20 + 6 + 16;
+        let ft_offset = 4 + 4 + 25 + 6 + 16;
         assert_eq!(features[ft_offset], 1.0); // pe
         assert_eq!(features[ft_offset + 1], 1.0); // sh
 
@@ -1253,7 +1263,7 @@ mod tests {
         assert_eq!(features[3], 1.0); // present:metadata/format (from file 2)
 
         // Metrics should take max: binary.overall_entropy = max(7.5, 3.0) = 7.5
-        let metrics_offset = 4 + 4 + 20 + 6;
+        let metrics_offset = 4 + 4 + 25 + 6;
         assert!((features[metrics_offset] - 7.5).abs() < 1e-6);
 
         // file_count_log = log1p(2)
@@ -1266,12 +1276,12 @@ mod tests {
     #[test]
     fn test_has_yara_only_for_yara_prefix() {
         let spec = FeatureSpec {
-            version: 14,
-            abi_version: 14,
+            version: 15,
+            abi_version: 15,
             presence_vocab: vec!["third_party".to_string()],
             filetype_vocab: vec![],
             feature_names: vec![],
-            total_features: 1 + 1 + 20 + 6 + 16 + 7,
+            total_features: 1 + 1 + 25 + 6 + 16 + 7,
             feature_means: None,
             feature_stds: None,
             standardized: false,
@@ -1290,7 +1300,7 @@ mod tests {
             }]
         });
         let features = ctx.extract(&report);
-        let ext_offset = 1 + 1 + 20;
+        let ext_offset = 1 + 1 + 25;
         assert_eq!(features[ext_offset + 5], 0.0); // has_yara = false
 
         // third_party/yara -> has_yara should be true
@@ -1313,7 +1323,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new()?;
         writeln!(
             file,
-            "{{\"version\":14,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"total_features\":46,\"standardized\":false}}"
+            "{{\"version\":15,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"total_features\":51,\"standardized\":false}}"
         )?;
 
         let Err(err) = FeatureSpec::load(file.path()) else {
@@ -1333,7 +1343,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new()?;
         writeln!(
             file,
-            "{{\"version\":14,\"abi_version\":14,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"feature_names\":[{}],\"total_features\":{},\"standardized\":false}}",
+            "{{\"version\":15,\"abi_version\":15,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"feature_names\":[{}],\"total_features\":{},\"standardized\":false}}",
             feature_names
                 .into_iter()
                 .map(|name| format!("\"{name}\""))
@@ -1345,7 +1355,7 @@ mod tests {
         let Err(err) = FeatureSpec::load(file.path()) else {
             anyhow::bail!("unexpected feature layout should be rejected");
         };
-        assert!(err.to_string().contains("expected v14 layout"));
+        assert!(err.to_string().contains("expected v15 layout"));
         Ok(())
     }
 
@@ -1358,7 +1368,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new()?;
         writeln!(
             file,
-            "{{\"version\":14,\"abi_version\":14,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"feature_names\":[{}],\"total_features\":{},\"feature_means\":[0.0],\"feature_stds\":[1.0],\"standardized\":true}}",
+            "{{\"version\":15,\"abi_version\":15,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"feature_names\":[{}],\"total_features\":{},\"feature_means\":[0.0],\"feature_stds\":[1.0],\"standardized\":true}}",
             feature_names,
             total_features
         )?;
