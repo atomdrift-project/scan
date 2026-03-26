@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::Path;
 use std::process::Command;
 
-use crate::features::FeatureSpec;
+use crate::features::{FeatureSpec, EXPECTED_MODEL_ABI_VERSION};
 
 /// Recommended thresholds loaded from collimator's `evaluation.json`.
 ///
@@ -21,10 +21,16 @@ struct EvaluationThresholds {
 /// Thresholds block within evaluation.json.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct EvaluationJson {
+    #[serde(default = "default_model_abi_version")]
+    model_abi_version: u32,
     #[serde(default)]
     recommended_thresholds: Option<EvaluationThresholds>,
     #[serde(default)]
     optimal_threshold: Option<f64>,
+}
+
+const fn default_model_abi_version() -> u32 {
+    EXPECTED_MODEL_ABI_VERSION
 }
 
 /// Try to load thresholds from config.json in the model directory.
@@ -59,6 +65,14 @@ fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
     let path = model_dir.join("evaluation.json");
     let data = std::fs::read_to_string(&path).ok()?;
     let eval: EvaluationJson = serde_json::from_str(&data).ok()?;
+    if eval.model_abi_version != EXPECTED_MODEL_ABI_VERSION {
+        tracing::warn!(
+            found = eval.model_abi_version,
+            expected = EXPECTED_MODEL_ABI_VERSION,
+            "evaluation.json ABI version mismatch, ignoring thresholds"
+        );
+        return None;
+    }
 
     if let Some(rec) = eval.recommended_thresholds {
         let suspicious = rec.suspicious? as f32;
@@ -267,6 +281,8 @@ impl std::error::Error for ThresholdValidationError {}
 pub struct ModelInfo {
     /// Feature spec version (e.g. 13).
     pub version: u32,
+    /// Stable preprocessing/inference ABI version.
+    pub abi_version: u32,
     /// SHA-256 hex digest of the model file.
     pub sha256: String,
     /// Short git commit hash of the models repository, if available.
@@ -377,6 +393,7 @@ impl Model {
 
         tracing::info!(
             features = spec.total_features(),
+            model_abi_version = spec.abi_version(),
             threshold_suspicious = effective_thresholds.suspicious,
             threshold_hostile = effective_thresholds.hostile,
             threshold_source = if thresholds.is_some() { "explicit" }
@@ -391,6 +408,7 @@ impl Model {
 
         let info = ModelInfo {
             version: spec.version(),
+            abi_version: spec.abi_version(),
             sha256: model_sha256,
             commit,
         };

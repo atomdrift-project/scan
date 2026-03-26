@@ -3,7 +3,7 @@
 //! Catches model/code version drift at CI time rather than in production.
 
 use anyhow::{Context, Result};
-use litmus::features::{FeatureSpec, EXPECTED_SPEC_VERSION};
+use litmus::features::{FeatureSpec, EXPECTED_MODEL_ABI_VERSION, EXPECTED_SPEC_VERSION};
 
 fn model_dir() -> Result<std::path::PathBuf> {
     std::env::var("LITMUS_MODELS_DIR")
@@ -33,6 +33,12 @@ fn spec_version_matches_expected() -> Result<()> {
         "feature_spec.json is v{} but litmus expects v{EXPECTED_SPEC_VERSION} — \
          update litmus feature extraction or retrain the model",
         spec.version(),
+    );
+    assert_eq!(
+        spec.abi_version(),
+        EXPECTED_MODEL_ABI_VERSION,
+        "feature_spec.json ABI is v{} but litmus expects ABI v{EXPECTED_MODEL_ABI_VERSION}",
+        spec.abi_version(),
     );
     assert!(
         spec.total_features() > 0,
