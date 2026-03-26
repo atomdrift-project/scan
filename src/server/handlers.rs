@@ -17,6 +17,20 @@ use crate::scan::ScanResult;
 /// GET /_/health — liveness check with memory and concurrency status.
 /// Returns 503 while resources are still loading or when RSS exceeds the configured limit.
 pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
+    if let Ok(init_error) = state.init_error.read() {
+        if let Some(message) = init_error.as_ref() {
+            tracing::error!("GET /_/health -> 503 (failed: {message})");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "reason": "initialization_failed",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     if !state.ready.load(std::sync::atomic::Ordering::Acquire) {
         tracing::debug!("GET /_/health -> 503 (starting)");
         return (
@@ -96,6 +110,9 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
             match state.resources.write() {
                 Ok(mut lock) => {
                     *lock = Some(Arc::new(super::ModelResources { model, shap, ctx }));
+                    if let Ok(mut init_error) = state.init_error.write() {
+                        *init_error = None;
+                    }
                     state
                         .ready
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -164,6 +181,17 @@ pub(super) async fn analyze(
     let request_start = Instant::now();
 
     tracing::info!(id = request_id, "--> POST /analyze");
+
+    if let Ok(init_error) = state.init_error.read() {
+        if let Some(message) = init_error.as_ref() {
+            tracing::error!("analyze rejected: startup failed  id={request_id} error={message}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Server failed to initialize"})),
+            )
+                .into_response();
+        }
+    }
 
     if let Some(response) = check_memory_pressure(&state) {
         return response;
@@ -369,8 +397,20 @@ pub(super) async fn analyze(
     );
     let slow_rule_ms = state.slow_rule_ms;
     let filename_for_closure = filename.clone();
+    let permit = match Arc::clone(&state.analysis_slots).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => {
+            tracing::error!("failed to acquire analysis slot: {e}  id={request_id}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Internal error"})),
+            )
+                .into_response();
+        }
+    };
 
     let mut handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         classify_file(&path, &filename_for_closure, &resources, slow_rule_ms)
     });
 

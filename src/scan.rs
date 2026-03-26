@@ -424,8 +424,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                     Classification::Suspicious => suspicious += 1,
                     Classification::Benign => benign += 1,
                 }
-                if config.format() == OutputFormat::Json
-                    || config.filter().shows(&r.classification)
+                if config.format() == OutputFormat::Json || config.filter().shows(&r.classification)
                 {
                     emit_result(&r, config, false, &stdout);
                 }
@@ -644,7 +643,9 @@ pub(crate) fn classify_report(
         let synthetic = serde_json::json!({ "files": [ef], "version": "3" });
         let mut ef_features = ctx.extract(&synthetic);
         model.spec().standardize(&mut ef_features);
-        let (ef_prob, ef_class) = model.predict(&ef_features).unwrap_or((0.0, Classification::Benign));
+        let (ef_prob, ef_class) = model
+            .predict(&ef_features)
+            .unwrap_or((0.0, Classification::Benign));
 
         let full_path = ef["path"].as_str().unwrap_or("");
         let rel_path = full_path
@@ -707,7 +708,7 @@ pub(crate) fn classify_report(
     };
 
     let reasons = shap
-        .map(|s| s.explain(&raw_features, model.spec().feature_names(), 5))
+        .map(|s| s.explain(&raw_features, model.spec().feature_names()))
         .unwrap_or_default();
     let top_findings = extract_top_findings_from_json(&report_json, &classification);
 

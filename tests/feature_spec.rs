@@ -6,14 +6,18 @@ use anyhow::{Context, Result};
 use litmus::features::{FeatureSpec, EXPECTED_SPEC_VERSION};
 
 fn model_dir() -> Result<std::path::PathBuf> {
-    if let Ok(d) = std::env::var("LITMUS_MODELS_DIR") {
-        return Ok(std::path::PathBuf::from(d));
-    }
-    litmus::models_repo::model_dir().context("failed to resolve model directory")
+    std::env::var("LITMUS_MODELS_DIR")
+        .map(std::path::PathBuf::from)
+        .context("set LITMUS_MODELS_DIR to run integration tests against real model artifacts")
 }
 
 #[test]
 fn spec_version_matches_expected() -> Result<()> {
+    if std::env::var_os("LITMUS_MODELS_DIR").is_none() {
+        eprintln!("skipping: LITMUS_MODELS_DIR is not set");
+        return Ok(());
+    }
+
     let spec_path = model_dir()?.join("feature_spec.json");
     assert!(
         spec_path.exists(),
@@ -24,7 +28,8 @@ fn spec_version_matches_expected() -> Result<()> {
     let spec = FeatureSpec::load(&spec_path).context("failed to load feature spec")?;
 
     assert_eq!(
-        spec.version(), EXPECTED_SPEC_VERSION,
+        spec.version(),
+        EXPECTED_SPEC_VERSION,
         "feature_spec.json is v{} but litmus expects v{EXPECTED_SPEC_VERSION} — \
          update litmus feature extraction or retrain the model",
         spec.version(),

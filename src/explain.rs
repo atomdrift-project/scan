@@ -53,14 +53,9 @@ impl ShapImportance {
     }
 
     /// Explain why a file was flagged by cross-referencing active features
-    /// with global importance. Returns top N reasons.
+    /// with global importance, sorted by descending importance.
     #[must_use]
-    pub fn explain(
-        &self,
-        feature_values: &[f32],
-        feature_names: &[String],
-        max_reasons: usize,
-    ) -> Vec<Reason> {
+    pub fn explain(&self, feature_values: &[f32], feature_names: &[String]) -> Vec<Reason> {
         let name_to_idx: std::collections::HashMap<&str, usize> = feature_names
             .iter()
             .enumerate()
@@ -86,7 +81,6 @@ impl ShapImportance {
             .collect();
 
         reasons.sort_by(|a, b| b.importance.total_cmp(&a.importance));
-        reasons.truncate(max_reasons);
         reasons
     }
 }

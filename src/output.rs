@@ -176,10 +176,9 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
 /// Normalized progress within the current classification band.
 fn band_progress(probability: f32, classification: &Classification, thresholds: Thresholds) -> f32 {
     match classification {
-        Classification::Hostile => {
-            ((probability - thresholds.hostile) / (1.0 - thresholds.hostile).max(f32::EPSILON))
-                .clamp(0.0, 1.0)
-        }
+        Classification::Hostile => ((probability - thresholds.hostile)
+            / (1.0 - thresholds.hostile).max(f32::EPSILON))
+        .clamp(0.0, 1.0),
         Classification::Suspicious => ((probability - thresholds.suspicious)
             / (thresholds.hostile - thresholds.suspicious).max(f32::EPSILON))
         .clamp(0.0, 1.0),
@@ -325,7 +324,13 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extr
 }
 
 /// Print a process scan result with PID annotations.
-pub fn print_ps_result(result: &ScanResult, pids: &[u32], deleted: bool, has_progress: bool, extra: bool) {
+pub fn print_ps_result(
+    result: &ScanResult,
+    pids: &[u32],
+    deleted: bool,
+    has_progress: bool,
+    extra: bool,
+) {
     if has_progress {
         eprint!("\r\x1b[2K");
     }

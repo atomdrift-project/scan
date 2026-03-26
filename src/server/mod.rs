@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::signal;
+use tokio::sync::Semaphore;
 use tower::limit::ConcurrencyLimitLayer;
 
 use crate::explain::ShapImportance;
@@ -198,7 +199,9 @@ struct AppState {
     threshold_overrides: Option<Thresholds>,
     slow_rule_ms: u64,
     ready: AtomicBool,
+    init_error: RwLock<Option<String>>,
     resources: RwLock<Option<Arc<ModelResources>>>,
+    analysis_slots: Arc<Semaphore>,
     next_request_id: AtomicU64,
     active_tasks: AtomicUsize,
     reload_lock: tokio::sync::Mutex<()>,
@@ -228,6 +231,12 @@ impl AppState {
 pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     tracing::info!(model_dir = %config.model_dir().display(), "starting — resources loading in background");
 
+    let max_concurrent = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(4)
+        * 2;
+    tracing::debug!(max_concurrent, "concurrency limit set");
+
     let state = Arc::new(AppState {
         timeout_secs: config.timeout_secs(),
         max_upload_bytes: config.max_body_size(),
@@ -236,7 +245,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         threshold_overrides: config.thresholds(),
         slow_rule_ms: config.slow_rule_ms(),
         ready: AtomicBool::new(false),
+        init_error: RwLock::new(None),
         resources: RwLock::new(None),
+        analysis_slots: Arc::new(Semaphore::new(max_concurrent)),
         next_request_id: AtomicU64::new(1),
         active_tasks: AtomicUsize::new(0),
         reload_lock: tokio::sync::Mutex::new(()),
@@ -325,6 +336,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     match bg.resources.write() {
                         Ok(mut lock) => {
                             *lock = Some(Arc::new(ModelResources { model, shap, ctx }));
+                            if let Ok(mut init_error) = bg.init_error.write() {
+                                *init_error = None;
+                            }
                             bg.ready.store(true, Ordering::Release);
                             tracing::info!(
                                 total_ms = init_start.elapsed().as_millis(),
@@ -337,19 +351,21 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                         Err(e) => tracing::error!("resources lock poisoned during init: {e}"),
                     }
                 }
-                (Ok(Err(e)), _, _) => tracing::error!("failed to load model: {e}"),
-                (Err(e), _, _) => tracing::error!("model load task panicked: {e}"),
-                (_, Err(e), _) => tracing::error!("shap load task panicked: {e}"),
-                (_, _, Err(e)) => tracing::error!("yara warmup task panicked: {e}"),
+                (Ok(Err(e)), _, _) => {
+                    record_init_failure(&bg, &format!("failed to load model: {e}"))
+                }
+                (Err(e), _, _) => {
+                    record_init_failure(&bg, &format!("model load task panicked: {e}"))
+                }
+                (_, Err(e), _) => {
+                    record_init_failure(&bg, &format!("shap load task panicked: {e}"))
+                }
+                (_, _, Err(e)) => {
+                    record_init_failure(&bg, &format!("yara warmup task panicked: {e}"))
+                }
             }
         });
     }
-
-    let max_concurrent = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4)
-        * 2;
-    tracing::debug!(max_concurrent, "concurrency limit set");
 
     let analysis_routes = Router::new()
         .route("/analyze", post(handlers::analyze))
@@ -366,6 +382,14 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         .with_state(state);
 
     Ok(app)
+}
+
+fn record_init_failure(state: &AppState, message: &str) {
+    state.ready.store(false, Ordering::Release);
+    if let Ok(mut init_error) = state.init_error.write() {
+        *init_error = Some(message.to_string());
+    }
+    tracing::error!("{message}");
 }
 
 /// Start the HTTP server and block until shutdown.

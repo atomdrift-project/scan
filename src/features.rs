@@ -86,30 +86,54 @@ pub struct FeatureSpec {
     standardized: bool,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RawFeatureSpec {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    presence_vocab: Vec<String>,
+    #[serde(default)]
+    filetype_vocab: Vec<String>,
+    #[serde(default)]
+    feature_names: Vec<String>,
+    #[serde(default)]
+    total_features: usize,
+    feature_means: Option<Vec<f32>>,
+    feature_stds: Option<Vec<f32>>,
+    #[serde(default = "default_standardized")]
+    standardized: bool,
+}
+
+const fn default_standardized() -> bool {
+    true
+}
+
 impl FeatureSpec {
     /// Load feature specification from a JSON file.
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path).context("reading feature spec")?;
-        let v: serde_json::Value = serde_json::from_str(&data).context("parsing feature spec")?;
+        let raw: RawFeatureSpec = serde_json::from_str(&data).context("parsing feature spec")?;
 
-        let version = v["version"].as_u64().unwrap_or(0) as u32;
-        if version != EXPECTED_SPEC_VERSION {
+        if raw.version != EXPECTED_SPEC_VERSION {
             anyhow::bail!(
-                "feature spec version mismatch: spec is v{version} but litmus requires v{EXPECTED_SPEC_VERSION} — \
+                "feature spec version mismatch: spec is v{} but litmus requires v{EXPECTED_SPEC_VERSION} — \
                  the model was trained with a different collimator version and cannot be used with this build",
+                raw.version,
             );
         }
 
-        Ok(Self {
-            version,
-            presence_vocab: json_string_array(&v["presence_vocab"]),
-            filetype_vocab: json_string_array(&v["filetype_vocab"]),
-            feature_names: json_string_array(&v["feature_names"]),
-            total_features: v["total_features"].as_u64().unwrap_or(0) as usize,
-            feature_means: json_f32_array(&v["feature_means"]),
-            feature_stds: json_f32_array(&v["feature_stds"]),
-            standardized: v["standardized"].as_bool().unwrap_or(true),
-        })
+        let spec = Self {
+            version: raw.version,
+            presence_vocab: raw.presence_vocab,
+            filetype_vocab: raw.filetype_vocab,
+            feature_names: raw.feature_names,
+            total_features: raw.total_features,
+            feature_means: raw.feature_means,
+            feature_stds: raw.feature_stds,
+            standardized: raw.standardized,
+        };
+        spec.validate()?;
+        Ok(spec)
     }
 
     /// Spec format version.
@@ -167,24 +191,61 @@ impl FeatureSpec {
             }
         }
     }
-}
 
-fn json_string_array(v: &serde_json::Value) -> Vec<String> {
-    v.as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
+    fn validate(&self) -> Result<()> {
+        if self.presence_vocab.is_empty() {
+            anyhow::bail!("feature spec missing presence_vocab entries");
+        }
+        if self.feature_names.len() != self.total_features {
+            anyhow::bail!(
+                "feature spec feature_names length {} does not match total_features {}",
+                self.feature_names.len(),
+                self.total_features
+            );
+        }
 
-fn json_f32_array(v: &serde_json::Value) -> Option<Vec<f32>> {
-    v.as_array().map(|arr| {
-        arr.iter()
-            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-            .collect()
-    })
+        let expected_total = self.presence_vocab.len() * 2
+            + 20
+            + 6
+            + KEY_METRICS.len()
+            + self.filetype_vocab.len()
+            + 6;
+        if self.total_features != expected_total {
+            anyhow::bail!(
+                "feature spec total_features {} does not match derived feature count {}",
+                self.total_features,
+                expected_total
+            );
+        }
+
+        match (
+            self.feature_means.as_ref(),
+            self.feature_stds.as_ref(),
+            self.standardized,
+        ) {
+            (Some(means), Some(stds), _) => {
+                if means.len() != self.total_features || stds.len() != self.total_features {
+                    anyhow::bail!(
+                        "feature spec standardization stats must each have {} entries (got means={}, stds={})",
+                        self.total_features,
+                        means.len(),
+                        stds.len()
+                    );
+                }
+            }
+            (None, None, false) => {}
+            (None, None, true) => {
+                anyhow::bail!("feature spec is marked standardized but feature_means/feature_stds are missing");
+            }
+            (Some(_), None, _) | (None, Some(_), _) => {
+                anyhow::bail!(
+                    "feature spec must include both feature_means and feature_stds together"
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Pre-built lookup tables for fast repeated extraction against a spec.
@@ -292,7 +353,12 @@ impl ExtractContext {
         // Group 7: Structural (7 features)
         // -------------------------------------------------------------------
         let structural_offset = offsets.take(7);
-        write_structural_features(vec, structural_offset, &files, summary.filtered_finding_count);
+        write_structural_features(
+            vec,
+            structural_offset,
+            &files,
+            summary.filtered_finding_count,
+        );
     }
 
     fn write_presence_features(
@@ -451,10 +517,12 @@ fn summarize_report_files(files: &[&serde_json::Value]) -> FindingSummary {
         combined.third_party_count += file_summary.third_party_count;
         combined.well_known_hostile += file_summary.well_known_hostile;
         combined.well_known_suspicious += file_summary.well_known_suspicious;
-        combined.third_party_max_crit =
-            combined.third_party_max_crit.max(file_summary.third_party_max_crit);
-        combined.well_known_max_crit =
-            combined.well_known_max_crit.max(file_summary.well_known_max_crit);
+        combined.third_party_max_crit = combined
+            .third_party_max_crit
+            .max(file_summary.third_party_max_crit);
+        combined.well_known_max_crit = combined
+            .well_known_max_crit
+            .max(file_summary.well_known_max_crit);
         combined.has_yara = combined.has_yara || file_summary.has_yara;
 
         for (path, max_ord) in &file_summary.sample_paths {
@@ -518,25 +586,52 @@ fn topk_file_risk_features(files: &[&serde_json::Value]) -> (f32, f32, f32, f32)
 
     // Top by suspicious ratio.
     stats.sort_by(|a, b| {
-        (b.suspicious_ratio, b.suspicious_findings, b.hostile_ratio, b.hostile_findings)
-            .partial_cmp(&(a.suspicious_ratio, a.suspicious_findings, a.hostile_ratio, a.hostile_findings))
+        (
+            b.suspicious_ratio,
+            b.suspicious_findings,
+            b.hostile_ratio,
+            b.hostile_findings,
+        )
+            .partial_cmp(&(
+                a.suspicious_ratio,
+                a.suspicious_findings,
+                a.hostile_ratio,
+                a.hostile_findings,
+            ))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let top_susp: Vec<&FileRiskStats> = stats.iter().take(TOP_K_RISK_FILES).collect();
     let susp_ratio_sum: f32 = top_susp.iter().map(|s| s.suspicious_ratio).sum();
-    let susp_findings_log = (top_susp.iter().map(|s| s.suspicious_findings).sum::<u32>() as f32 + 1.0).ln();
+    let susp_findings_log =
+        (top_susp.iter().map(|s| s.suspicious_findings).sum::<u32>() as f32 + 1.0).ln();
 
     // Top by hostile ratio.
     stats.sort_by(|a, b| {
-        (b.hostile_ratio, b.hostile_findings, b.suspicious_ratio, b.suspicious_findings)
-            .partial_cmp(&(a.hostile_ratio, a.hostile_findings, a.suspicious_ratio, a.suspicious_findings))
+        (
+            b.hostile_ratio,
+            b.hostile_findings,
+            b.suspicious_ratio,
+            b.suspicious_findings,
+        )
+            .partial_cmp(&(
+                a.hostile_ratio,
+                a.hostile_findings,
+                a.suspicious_ratio,
+                a.suspicious_findings,
+            ))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let top_host: Vec<&FileRiskStats> = stats.iter().take(TOP_K_RISK_FILES).collect();
     let host_ratio_sum: f32 = top_host.iter().map(|s| s.hostile_ratio).sum();
-    let host_findings_log = (top_host.iter().map(|s| s.hostile_findings).sum::<u32>() as f32 + 1.0).ln();
+    let host_findings_log =
+        (top_host.iter().map(|s| s.hostile_findings).sum::<u32>() as f32 + 1.0).ln();
 
-    (susp_ratio_sum, host_ratio_sum, susp_findings_log, host_findings_log)
+    (
+        susp_ratio_sum,
+        host_ratio_sum,
+        susp_findings_log,
+        host_findings_log,
+    )
 }
 
 fn write_aggregate_features(
@@ -681,9 +776,7 @@ fn write_structural_features(
         }
         if file_entry.get("imports").is_some() {
             import_candidates += 1;
-            let imports_empty = file_entry["imports"]
-                .as_array()
-                .is_none_or(Vec::is_empty);
+            let imports_empty = file_entry["imports"].as_array().is_none_or(Vec::is_empty);
             if imports_empty {
                 importless_candidates += 1;
             }
@@ -823,6 +916,7 @@ impl<'a> Iterator for FindingPaths<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn paths(id: &str) -> Vec<&str> {
         finding_paths(id).collect()
@@ -1110,5 +1204,39 @@ mod tests {
         });
         let features = ctx.extract(&report);
         assert_eq!(features[ext_offset + 5], 1.0); // has_yara = true
+    }
+
+    #[test]
+    fn test_load_rejects_missing_feature_names() -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new()?;
+        writeln!(
+            file,
+            "{{\"version\":14,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"total_features\":45,\"standardized\":false}}"
+        )?;
+
+        let Err(err) = FeatureSpec::load(file.path()) else {
+            anyhow::bail!("missing feature_names should be rejected");
+        };
+        assert!(err.to_string().contains("feature_names length"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_rejects_mismatched_standardization_stats() -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new()?;
+        writeln!(
+            file,
+            "{{\"version\":14,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"feature_names\":[{}],\"total_features\":51,\"feature_means\":[0.0],\"feature_stds\":[1.0],\"standardized\":true}}",
+            (0..51)
+                .map(|i| format!("\"f{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        )?;
+
+        let Err(err) = FeatureSpec::load(file.path()) else {
+            anyhow::bail!("mismatched standardization stats should be rejected");
+        };
+        assert!(err.to_string().contains("standardization stats"));
+        Ok(())
     }
 }

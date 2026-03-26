@@ -19,10 +19,9 @@ fn init_tracing() {
 }
 
 fn model_dir() -> Result<std::path::PathBuf> {
-    if let Ok(d) = std::env::var("LITMUS_MODELS_DIR") {
-        return Ok(std::path::PathBuf::from(d));
-    }
-    litmus::models_repo::model_dir().context("failed to resolve model directory")
+    std::env::var("LITMUS_MODELS_DIR")
+        .map(std::path::PathBuf::from)
+        .context("set LITMUS_MODELS_DIR to run integration tests against real model artifacts")
 }
 
 fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
@@ -45,6 +44,11 @@ fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
 #[tokio::test]
 async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     init_tracing();
+    if std::env::var_os("LITMUS_MODELS_DIR").is_none() {
+        eprintln!("skipping: LITMUS_MODELS_DIR is not set");
+        return Ok(());
+    }
+
     let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/encrypted.zip");
     assert!(
         testdata.exists(),
@@ -70,7 +74,10 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     // Wait for background resource loading to complete before sending requests.
     // YARA warmup can take ~15s in release and longer in debug builds.
     let max_health_polls: u32 = if cfg!(debug_assertions) { 1800 } else { 600 };
-    eprintln!("waiting for server readiness (up to {}s)...", max_health_polls / 10);
+    eprintln!(
+        "waiting for server readiness (up to {}s)...",
+        max_health_polls / 10
+    );
     let mut ready = false;
     for _ in 0..max_health_polls {
         let resp = app
@@ -89,7 +96,11 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(ready, "server did not become ready within {}s", max_health_polls / 10);
+    assert!(
+        ready,
+        "server did not become ready within {}s",
+        max_health_polls / 10
+    );
 
     let (content_type, body) = multipart_body(&file_bytes, "encrypted.zip");
 

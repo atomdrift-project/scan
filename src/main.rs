@@ -214,8 +214,14 @@ fn main() -> Result<()> {
 
     match command {
         Commands::Scan { paths } => {
-            let config =
-                litmus::ScanConfig::new(resolve_model_dir()?, cli.format, thresholds, filter, cli.slow_rule_ms, cli.extra)?;
+            let config = litmus::ScanConfig::new(
+                resolve_model_dir()?,
+                cli.format,
+                thresholds,
+                filter,
+                cli.slow_rule_ms,
+                cli.extra,
+            )?;
             let result = run_scan_paths(&paths, &config)?;
 
             if result.hostile > 0 {
@@ -224,10 +230,19 @@ fn main() -> Result<()> {
             if result.suspicious > 0 {
                 process::exit(2);
             }
+            if result.errors > 0 {
+                process::exit(3);
+            }
         }
         Commands::Ps => {
-            let config =
-                litmus::ScanConfig::new(resolve_model_dir()?, cli.format, thresholds, filter, cli.slow_rule_ms, cli.extra)?;
+            let config = litmus::ScanConfig::new(
+                resolve_model_dir()?,
+                cli.format,
+                thresholds,
+                filter,
+                cli.slow_rule_ms,
+                cli.extra,
+            )?;
             let result = litmus::ps::run(&config)?;
 
             if result.hostile > 0 {
@@ -235,6 +250,9 @@ fn main() -> Result<()> {
             }
             if result.suspicious > 0 {
                 process::exit(2);
+            }
+            if result.errors > 0 {
+                process::exit(3);
             }
         }
         Commands::Serve {
@@ -324,15 +342,15 @@ fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litm
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{Context, Result};
     use super::{Cli, Commands};
+    use anyhow::{Context, Result};
     use clap::Parser;
     use std::path::PathBuf;
 
     #[test]
     fn bare_paths_default_to_scan_shorthand() -> Result<()> {
-        let cli = Cli::try_parse_from(["litmus", "/tmp/a", "/tmp/b"])
-            .context("parse should work")?;
+        let cli =
+            Cli::try_parse_from(["litmus", "/tmp/a", "/tmp/b"]).context("parse should work")?;
         assert_eq!(
             cli.paths,
             vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
