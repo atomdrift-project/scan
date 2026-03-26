@@ -1338,7 +1338,10 @@ mod tests {
         let presence_vocab = vec!["objectives".to_string()];
         let filetype_vocab = vec!["sh".to_string()];
         let mut feature_names = build_expected_feature_names(&presence_vocab, &filetype_vocab);
-        *feature_names.last_mut().expect("non-empty feature list") = "struct:wrong_name".to_string();
+        let Some(last_feature_name) = feature_names.last_mut() else {
+            anyhow::bail!("expected non-empty feature list");
+        };
+        *last_feature_name = "struct:wrong_name".to_string();
         let total_features = feature_names.len();
         let mut file = tempfile::NamedTempFile::new()?;
         writeln!(

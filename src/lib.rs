@@ -14,7 +14,7 @@
 //! let config = ScanConfig::new(
 //!     "/path/to/models",
 //!     OutputFormat::Json,
-//!     Thresholds::default(),
+//!     Some(Thresholds::default()),
 //!     DisplayFilter::all(),
 //!     4_000,
 //!     false,
