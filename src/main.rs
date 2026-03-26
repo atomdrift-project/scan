@@ -16,6 +16,7 @@ use std::process;
 #[derive(Clone, clap::ValueEnum)]
 enum Show {
     Hostile,
+    #[value(name = "sus", alias = "suspicious")]
     Sus,
     Benign,
     All,
@@ -58,7 +59,7 @@ struct Cli {
     #[arg(long)]
     threshold_hostile: Option<f32>,
 
-    /// Classifications to display: hostile, sus, benign, all (comma-separated)
+    /// Classifications to display: hostile, suspicious, sus, benign, all (comma-separated)
     #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
     show: Vec<Show>,
 

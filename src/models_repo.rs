@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/litmus-models.git";
-const CURRENT_MODEL: &str = "scan-v14";
+const CURRENT_MODEL: &str = "scan-v15";
 const STALENESS_DAYS: u64 = 30;
 
 /// Resolve the models base directory, auto-cloning if necessary.
@@ -274,9 +274,9 @@ mod tests {
     }
 
     #[test]
-    fn has_models_with_scan_v14_artifacts() {
+    fn has_models_with_current_model_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
-        let model = tmp.path().join("scan-v14");
+        let model = tmp.path().join(CURRENT_MODEL);
         std::fs::create_dir_all(&model).unwrap();
         std::fs::write(model.join("model.json"), b"").unwrap();
         std::fs::write(model.join("feature_spec.json"), b"{}").unwrap();

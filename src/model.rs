@@ -49,13 +49,14 @@ fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
     };
     if t.validate().is_ok() {
         tracing::info!(
+            path = %path.display(),
             suspicious = suspicious,
             hostile = hostile,
             "loaded thresholds from config.json"
         );
         Some(t)
     } else {
-        tracing::warn!("config.json thresholds are invalid, ignoring");
+        tracing::warn!(path = %path.display(), "config.json thresholds are invalid, ignoring");
         None
     }
 }
@@ -67,6 +68,7 @@ fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
     let eval: EvaluationJson = serde_json::from_str(&data).ok()?;
     if eval.model_abi_version != EXPECTED_MODEL_ABI_VERSION {
         tracing::warn!(
+            path = %path.display(),
             found = eval.model_abi_version,
             expected = EXPECTED_MODEL_ABI_VERSION,
             "evaluation.json ABI version mismatch, ignoring thresholds"
@@ -83,6 +85,7 @@ fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
         };
         if t.validate().is_ok() {
             tracing::info!(
+                path = %path.display(),
                 suspicious = suspicious,
                 hostile = hostile,
                 "loaded recommended thresholds from evaluation.json"
@@ -95,6 +98,7 @@ fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
     if let Some(threshold) = eval.optimal_threshold {
         let t = threshold as f32;
         tracing::debug!(
+            path = %path.display(),
             threshold = t,
             "evaluation.json has optimal_threshold but no recommended_thresholds"
         );
@@ -323,6 +327,19 @@ impl Model {
         let model_path = model_dir.join("model.json");
         let spec_path = model_dir.join("feature_spec.json");
 
+        if !spec_path.is_file() {
+            anyhow::bail!(
+                "model bundle is incomplete: missing {}. Run 'litmus update-rules' to refresh the installed models.",
+                spec_path.display(),
+            );
+        }
+        if !model_path.is_file() {
+            anyhow::bail!(
+                "model bundle is incomplete: missing {}. Run 'litmus update-rules' to refresh the installed models.",
+                model_path.display(),
+            );
+        }
+
         tracing::debug!(path = %spec_path.display(), "loading feature spec");
         let spec = FeatureSpec::load(&spec_path)
             .with_context(|| format!("loading feature spec from {}", spec_path.display()))?;
@@ -451,5 +468,25 @@ impl Model {
     #[must_use]
     pub fn info(&self) -> &ModelInfo {
         &self.info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+
+    #[test]
+    fn load_rejects_missing_feature_spec_with_update_guidance() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("model.json"), b"{}")?;
+
+        let Err(err) = Model::load(dir.path(), None) else {
+            anyhow::bail!("missing feature spec should be rejected");
+        };
+        let message = err.to_string();
+        assert!(message.contains("model bundle is incomplete"));
+        assert!(message.contains("Run 'litmus update-rules'"));
+        Ok(())
     }
 }

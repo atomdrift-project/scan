@@ -127,8 +127,8 @@ impl FeatureSpec {
 
         if raw.version != EXPECTED_SPEC_VERSION {
             anyhow::bail!(
-                "feature spec version mismatch: spec is v{} but litmus requires v{EXPECTED_SPEC_VERSION} — \
-                 the model was trained with a different collimator version and cannot be used with this build",
+                "feature spec version mismatch: this installed model uses spec v{}, but this litmus build requires v{EXPECTED_SPEC_VERSION}. \
+                 The model is incompatible with this build. Run 'litmus update-rules' to install a matching model bundle.",
                 raw.version,
             );
         }
@@ -1356,6 +1356,23 @@ mod tests {
             anyhow::bail!("unexpected feature layout should be rejected");
         };
         assert!(err.to_string().contains("expected v15 layout"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_rejects_mismatched_spec_version_with_update_guidance() -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new()?;
+        writeln!(
+            file,
+            "{{\"version\":14,\"abi_version\":14,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"feature_names\":[],\"total_features\":0,\"standardized\":false}}"
+        )?;
+
+        let Err(err) = FeatureSpec::load(file.path()) else {
+            anyhow::bail!("mismatched spec version should be rejected");
+        };
+        let message = err.to_string();
+        assert!(message.contains("feature spec version mismatch"));
+        assert!(message.contains("Run 'litmus update-rules'"));
         Ok(())
     }
 
