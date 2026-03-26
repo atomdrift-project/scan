@@ -618,7 +618,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "0.9.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#f2ecaa13e4e92cb7e6f0547ac7797f705da47cbf"
+source = "git+https://codeberg.org/atomdrift/cleave.git#c19bf76a86e2fffe1ec0d1a8616baff56120a6a3"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -723,7 +723,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#f2ecaa13e4e92cb7e6f0547ac7797f705da47cbf"
+source = "git+https://codeberg.org/atomdrift/cleave.git#c19bf76a86e2fffe1ec0d1a8616baff56120a6a3"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2267,7 +2267,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#f2ecaa13e4e92cb7e6f0547ac7797f705da47cbf"
+source = "git+https://codeberg.org/atomdrift/cleave.git#c19bf76a86e2fffe1ec0d1a8616baff56120a6a3"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -3310,7 +3310,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#f2ecaa13e4e92cb7e6f0547ac7797f705da47cbf"
+source = "git+https://codeberg.org/atomdrift/cleave.git#c19bf76a86e2fffe1ec0d1a8616baff56120a6a3"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3650,7 +3650,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.1.6"
-source = "git+https://codeberg.org/atomdrift/stng.git#e3e532bdf55b21d59f87a70517d6bdea9d532739"
+source = "git+https://codeberg.org/atomdrift/stng.git#fa71444481663aaef031fceee1955dbbcb29fa20"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3756,7 +3756,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#f2ecaa13e4e92cb7e6f0547ac7797f705da47cbf"
+source = "git+https://codeberg.org/atomdrift/cleave.git#c19bf76a86e2fffe1ec0d1a8616baff56120a6a3"
 
 [[package]]
 name = "tap"
