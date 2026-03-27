@@ -42,7 +42,13 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
     }
 
     if is_git_repo(&data_dir) {
-        eprintln!("Models exist at {} but missing expected artifacts — re-cloning...", data_dir.display());
+        let missing = missing_artifacts(&data_dir);
+        eprintln!(
+            "Models exist at {} but missing: {} — removing in 30s (Ctrl-C to abort)...",
+            data_dir.display(),
+            missing.join(", "),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(30));
         std::fs::remove_dir_all(&data_dir).ok();
     } else {
         eprintln!("First run: downloading litmus models...");
@@ -171,9 +177,20 @@ fn ensure_repo(base: &Path) -> Result<bool> {
     Ok(true)
 }
 
+const MODEL_ARTIFACTS: &[&str] = &["model.json", "feature_spec.json"];
+
 fn has_models(path: &Path) -> bool {
     let model = path.join(CURRENT_MODEL);
-    model.join("model.json").exists() && model.join("feature_spec.json").exists()
+    MODEL_ARTIFACTS.iter().all(|f| model.join(f).exists())
+}
+
+fn missing_artifacts(path: &Path) -> Vec<String> {
+    let model = path.join(CURRENT_MODEL);
+    MODEL_ARTIFACTS
+        .iter()
+        .filter(|f| !model.join(f).exists())
+        .map(|f| format!("{CURRENT_MODEL}/{f}"))
+        .collect()
 }
 
 fn clone_repo(target: &Path) -> std::io::Result<()> {
