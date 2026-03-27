@@ -524,9 +524,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.57"
+version = "1.2.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a0dd1ca384932ff3641c8718a02769f1698e7563dc6974ffd03346116310423"
+checksum = "e1e928d4b69e3077709075a938a05ffbedfa53a84c8f766efbf8220bb1ff60e1"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -618,7 +618,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "1.0.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#557990f0cce64ff6c42a6d5782cd6bdf7dbad42b"
+source = "git+https://codeberg.org/atomdrift/cleave.git#bc340f1d40c8843c1ad32d8f75ad528136b71f6e"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -723,7 +723,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#557990f0cce64ff6c42a6d5782cd6bdf7dbad42b"
+source = "git+https://codeberg.org/atomdrift/cleave.git#bc340f1d40c8843c1ad32d8f75ad528136b71f6e"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2267,7 +2267,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#557990f0cce64ff6c42a6d5782cd6bdf7dbad42b"
+source = "git+https://codeberg.org/atomdrift/cleave.git#bc340f1d40c8843c1ad32d8f75ad528136b71f6e"
 dependencies = [
  "rustc-hash 2.1.1",
  "serde",
@@ -2356,9 +2356,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.1.1"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
+checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
 dependencies = [
  "libc",
  "wasi",
@@ -3310,7 +3310,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#557990f0cce64ff6c42a6d5782cd6bdf7dbad42b"
+source = "git+https://codeberg.org/atomdrift/cleave.git#bc340f1d40c8843c1ad32d8f75ad528136b71f6e"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3565,9 +3565,9 @@ dependencies = [
 
 [[package]]
 name = "simd-adler32"
-version = "0.3.8"
+version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
+checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
 name = "simd-json"
@@ -3756,7 +3756,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#557990f0cce64ff6c42a6d5782cd6bdf7dbad42b"
+source = "git+https://codeberg.org/atomdrift/cleave.git#bc340f1d40c8843c1ad32d8f75ad528136b71f6e"
 
 [[package]]
 name = "tap"
@@ -4338,9 +4338,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-rust"
-version = "0.24.1"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f715f73a0687261ddb686f0d64a1e5af57bd199c4d12be5fdda6676ce1885bf9"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -4501,9 +4501,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.22.0"
+version = "1.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
+checksum = "5ac8b6f42ead25368cf5b098aeb3dc8a1a2c05a3eee8a9a1a68c640edbfc79d9"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -5314,8 +5314,8 @@ dependencies = [
 
 [[package]]
 name = "xgboost-native"
-version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/xgboost-native#01192c2f4e5f0133f924c4ba9b405ce97e3ac1c9"
+version = "1.0.0"
+source = "git+https://codeberg.org/atomdrift/xgboost-native#fd575dead809aa2c64ee7c6a55e7e7cfba74f8e2"
 dependencies = [
  "serde",
  "serde_json",
