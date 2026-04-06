@@ -399,9 +399,9 @@ fn print_detail_lines(result: &ScanResult, p: &Palette) {
             .take(4)
             .map(|f| {
                 let name = short_finding_id(&f.id);
-                match f.crit.as_str() {
-                    "hostile" => fg(p.hostile_finding, &name),
-                    "suspicious" => fg(p.suspicious_finding, &name),
+                match f.crit {
+                    5 => fg(p.hostile_finding, &name),
+                    4 => fg(p.suspicious_finding, &name),
                     _ => name,
                 }
             })
@@ -468,9 +468,9 @@ fn print_embedded_files(files: &[EmbeddedFile], thresholds: Thresholds, p: &Pale
                 .take(3)
                 .map(|f| {
                     let name = short_finding_id(&f.id);
-                    match f.crit.as_str() {
-                        "hostile" => fg(p.hostile_finding, &name),
-                        "suspicious" => fg(p.suspicious_finding, &name),
+                    match f.crit {
+                        5 => fg(p.hostile_finding, &name),
+                        4 => fg(p.suspicious_finding, &name),
                         _ => name,
                     }
                 })

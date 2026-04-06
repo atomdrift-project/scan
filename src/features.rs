@@ -30,16 +30,10 @@ const MIN_CONFIDENCE: f64 = 0.65;
 /// Number of riskiest files to summarize for top-k aggregate features.
 const TOP_K_RISK_FILES: usize = 1;
 
-/// Criticality ordinals (must match collimator CRITICALITY_ORDINAL).
-pub(crate) fn crit_ordinal(crit: &str) -> u32 {
-    match crit {
-        "filtered" => 0,
-        "component" => 1,
-        "notable" => 3,
-        "suspicious" => 4,
-        "hostile" => 5,
-        _ => 2, // baseline and unknown
-    }
+/// Read v4 criticality ordinal from a finding JSON value.
+/// v4 crit is already an integer: 0=filtered, 1=component, 2=baseline, 3=notable, 4=suspicious, 5=hostile.
+pub(crate) fn crit_ordinal(finding: &serde_json::Value) -> u32 {
+    finding["l"].as_u64().unwrap_or(0) as u32
 }
 
 /// Key metrics extracted from the report's `metrics` object.
@@ -489,7 +483,7 @@ impl ExtractContext {
         offset: usize,
     ) {
         for file_entry in files {
-            let ft = file_entry["file_type"].as_str().unwrap_or("");
+            let ft = file_entry["type"].as_str().unwrap_or("");
             if let Some(&idx) = self.ft_lookup.get(ft) {
                 vec[offset + idx] = 1.0;
             }
@@ -534,18 +528,18 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
     let mut hostile_ids: HashSet<&str> = HashSet::new();
 
     for finding in findings {
-        let fid = finding["id"].as_str().unwrap_or("");
+        let fid = finding["i"].as_str().unwrap_or("");
         if fid.is_empty() {
             continue;
         }
 
-        let conf = finding["conf"].as_f64().unwrap_or(1.0);
+        let conf = finding["c"].as_f64().unwrap_or(1.0);
         if conf < MIN_CONFIDENCE {
             continue;
         }
         summary.filtered_finding_count += 1;
 
-        let crit_ord = crit_ordinal(finding["crit"].as_str().unwrap_or("baseline"));
+        let crit_ord = crit_ordinal(finding);
 
         if crit_ord >= 3 {
             summary.notable_finding_count += 1;
@@ -597,7 +591,7 @@ fn summarize_report_files(files: &[&serde_json::Value]) -> FindingSummary {
     let mut all_hostile_ids: HashSet<String> = HashSet::new();
 
     for file_entry in files {
-        let findings: Vec<&serde_json::Value> = file_entry["findings"]
+        let findings: Vec<&serde_json::Value> = file_entry["ts"]
             .as_array()
             .map(|a| a.iter().collect())
             .unwrap_or_default();
@@ -625,15 +619,15 @@ fn summarize_report_files(files: &[&serde_json::Value]) -> FindingSummary {
 
         // Collect unique IDs across all files for dedup.
         for finding in &findings {
-            let fid = finding["id"].as_str().unwrap_or("");
+            let fid = finding["i"].as_str().unwrap_or("");
             if fid.is_empty() {
                 continue;
             }
-            let conf = finding["conf"].as_f64().unwrap_or(1.0);
+            let conf = finding["c"].as_f64().unwrap_or(1.0);
             if conf < MIN_CONFIDENCE {
                 continue;
             }
-            let crit_ord = crit_ordinal(finding["crit"].as_str().unwrap_or("baseline"));
+            let crit_ord = crit_ordinal(finding);
             if crit_ord >= 4 {
                 all_suspicious_ids.insert(fid.to_owned());
             }
@@ -657,7 +651,7 @@ struct FileRiskStats {
 }
 
 fn file_risk_stats(file_entry: &serde_json::Value) -> FileRiskStats {
-    let findings: Vec<&serde_json::Value> = file_entry["findings"]
+    let findings: Vec<&serde_json::Value> = file_entry["ts"]
         .as_array()
         .map(|a| a.iter().collect())
         .unwrap_or_default();
@@ -814,7 +808,7 @@ fn write_external_summary_features(summary: &FindingSummary, vec: &mut [f32], of
 fn merge_metric_values(files: &[&serde_json::Value]) -> serde_json::Value {
     let mut merged: HashMap<String, HashMap<String, f64>> = HashMap::new();
     for file_entry in files {
-        let metrics = match file_entry.get("metrics") {
+        let metrics = match file_entry.get("ms") {
             Some(m) if m.is_object() => m,
             _ => continue,
         };
@@ -867,21 +861,21 @@ fn write_structural_features(
     let mut max_entropy: f64 = 0.0;
 
     for file_entry in files {
-        let ft = file_entry["file_type"].as_str().unwrap_or("");
-        let size = file_entry["size"].as_u64().unwrap_or(0);
+        let ft = file_entry["type"].as_str().unwrap_or("");
+        let size = file_entry["sz"].as_u64().unwrap_or(0);
         if binary_like.contains(&ft) && size < 20_000 {
             any_tiny_binary = true;
         }
-        if file_entry.get("imports").is_some() {
+        if file_entry.get("is").is_some() {
             import_candidates += 1;
-            let imports_empty = file_entry["imports"].as_array().is_none_or(Vec::is_empty);
+            let imports_empty = file_entry["is"].as_array().is_none_or(Vec::is_empty);
             if imports_empty {
                 importless_candidates += 1;
             }
         }
         // Track max binary entropy for stealth_potential.
         let entropy = file_entry
-            .get("metrics")
+            .get("ms")
             .and_then(|m| m.get("binary"))
             .and_then(|b| b.get("overall_entropy"))
             .and_then(serde_json::Value::as_f64)
@@ -916,7 +910,7 @@ fn write_structural_features(
 
 /// Return all file entries from a v3 report.
 fn report_files(report: &serde_json::Value) -> Vec<&serde_json::Value> {
-    report["files"]
+    report["fs"]
         .as_array()
         .map(|a| a.iter().collect())
         .unwrap_or_default()
@@ -1067,11 +1061,12 @@ mod tests {
 
     #[test]
     fn test_crit_ordinal() {
-        assert_eq!(crit_ordinal("hostile"), 5);
-        assert_eq!(crit_ordinal("suspicious"), 4);
-        assert_eq!(crit_ordinal("notable"), 3);
-        assert_eq!(crit_ordinal("baseline"), 2);
-        assert_eq!(crit_ordinal("unknown"), 2);
+        assert_eq!(crit_ordinal(&serde_json::json!({"l":5})), 5); // hostile
+        assert_eq!(crit_ordinal(&serde_json::json!({"l":4})), 4); // suspicious
+        assert_eq!(crit_ordinal(&serde_json::json!({"l":3})), 3); // notable
+        assert_eq!(crit_ordinal(&serde_json::json!({"l":2})), 2); // baseline
+        assert_eq!(crit_ordinal(&serde_json::json!({"l":0})), 0); // filtered
+        assert_eq!(crit_ordinal(&serde_json::json!({})), 0);          // missing → 0
     }
 
     #[test]
@@ -1112,7 +1107,7 @@ mod tests {
             standardized: false,
         };
         let ctx = ExtractContext::new(&spec);
-        let report = serde_json::json!({"files": [{"file_type": "sh", "size": 100}]});
+        let report = serde_json::json!({"fs": [{"type": "sh", "sz": 100}]});
         let features = ctx.extract(&report);
         assert_eq!(features.len(), spec.total_features);
         // presence feature: 0 (no findings)
@@ -1150,13 +1145,13 @@ mod tests {
         };
         let ctx = ExtractContext::new(&spec);
         let report = serde_json::json!({
-            "files": [{
-                "file_type": "php",
-                "size": 1000,
-                "findings": [
-                    {"id": "objectives/evasion/process/injection::test", "crit": "hostile", "conf": 0.9},
+            "fs": [{
+                "type": "php",
+                "sz":1000,
+                "ts": [
+                    {"i": "objectives/evasion/process/injection::test", "l":5, "c":0.9},
                 ],
-                "metrics": {},
+                "ms": {},
             }]
         });
         let features = ctx.extract(&report);
@@ -1195,13 +1190,13 @@ mod tests {
         };
         let ctx = ExtractContext::new(&spec);
         let report = serde_json::json!({
-            "files": [{
-                "file_type": "sh",
-                "size": 100,
-                "findings": [
-                    {"id": "objectives/evasion::test", "crit": "hostile", "conf": 0.3},
+            "fs": [{
+                "type": "sh",
+                "sz":100,
+                "ts": [
+                    {"i": "objectives/evasion::test", "l":5, "c":0.3},
                 ],
-                "metrics": {},
+                "ms": {},
             }]
         });
         let features = ctx.extract(&report);
@@ -1230,22 +1225,22 @@ mod tests {
         };
         let ctx = ExtractContext::new(&spec);
         let report = serde_json::json!({
-            "files": [
+            "fs": [
                 {
-                    "file_type": "pe",
-                    "size": 1000,
-                    "findings": [
-                        {"id": "objectives/evasion/process::test", "crit": "hostile", "conf": 0.9},
+                    "type": "pe",
+                    "sz":1000,
+                    "ts": [
+                        {"i": "objectives/evasion/process::test", "l":5, "c":0.9},
                     ],
-                    "metrics": {"binary": {"overall_entropy": 7.5}},
+                    "ms": {"binary": {"overall_entropy": 7.5}},
                 },
                 {
-                    "file_type": "sh",
-                    "size": 200,
-                    "findings": [
-                        {"id": "metadata/format::no-functions", "crit": "notable", "conf": 0.8},
+                    "type": "sh",
+                    "sz":200,
+                    "ts": [
+                        {"i": "metadata/format::no-functions", "l":3, "c":0.8},
                     ],
-                    "metrics": {"binary": {"overall_entropy": 3.0}},
+                    "ms": {"binary": {"overall_entropy": 3.0}},
                 },
             ]
         });
@@ -1290,13 +1285,13 @@ mod tests {
 
         // third_party but not yara -> has_yara should be false
         let report = serde_json::json!({
-            "files": [{
-                "file_type": "pe",
-                "size": 100,
-                "findings": [
-                    {"id": "third_party/clamav::match", "crit": "hostile", "conf": 0.9},
+            "fs": [{
+                "type": "pe",
+                "sz":100,
+                "ts": [
+                    {"i": "third_party/clamav::match", "l":5, "c":0.9},
                 ],
-                "metrics": {},
+                "ms": {},
             }]
         });
         let features = ctx.extract(&report);
@@ -1305,13 +1300,13 @@ mod tests {
 
         // third_party/yara -> has_yara should be true
         let report = serde_json::json!({
-            "files": [{
-                "file_type": "pe",
-                "size": 100,
-                "findings": [
-                    {"id": "third_party/yara/rule::match", "crit": "hostile", "conf": 0.9},
+            "fs": [{
+                "type": "pe",
+                "sz":100,
+                "ts": [
+                    {"i": "third_party/yara/rule::match", "l":5, "c":0.9},
                 ],
-                "metrics": {},
+                "ms": {},
             }]
         });
         let features = ctx.extract(&report);

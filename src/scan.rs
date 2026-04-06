@@ -284,8 +284,8 @@ pub struct ScanResult {
 pub struct TopFinding {
     /// Finding identifier (e.g. "objectives/evasion/process::injection").
     pub id: String,
-    /// Criticality level (e.g. "hostile", "suspicious").
-    pub crit: String,
+    /// Criticality ordinal (0=filtered .. 5=hostile).
+    pub crit: u32,
     /// Human-readable description of the finding.
     pub desc: String,
 }
@@ -588,13 +588,14 @@ pub(crate) fn classify_report(
     shap: Option<&ShapImportance>,
 ) -> Result<ClassifiedReport> {
     report.finalize();
-    let formula = report
-        .files
+    let compact = cleave::types::compact::compact_from_files(&report.files);
+    let formula = compact
+        .fs
         .first()
-        .and_then(|file| file.formula.clone())
+        .and_then(|file| file.f.clone())
         .unwrap_or_default();
 
-    let report_json = serde_json::to_value(&report).context("serializing cleave report")?;
+    let report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
     let raw_features = ctx.extract(&report_json);
     let nonzero = raw_features.iter().filter(|&&v| v != 0.0).count();
     let mut features = raw_features.clone();
@@ -617,21 +618,21 @@ pub(crate) fn classify_report(
         "classified file",
     );
 
-    let pf = report_json["files"]
+    let pf = report_json["fs"]
         .as_array()
         .and_then(|a| a.first())
         .unwrap_or(&report_json);
-    let file_type = pf["file_type"].as_str().unwrap_or("unknown").to_string();
-    let size_bytes = pf["size"].as_u64().unwrap_or(0);
-    let sha256 = pf["sha256"].as_str().unwrap_or("").to_string();
+    let file_type = pf["type"].as_str().unwrap_or("unknown").to_string();
+    let size_bytes = pf["sz"].as_u64().unwrap_or(0);
+    let sha256 = pf["sha"].as_str().unwrap_or("").to_string();
 
     // Extract embedded files (archive members at depth > 0), run each through
     // the model individually, and elevate the parent if any embedded file scores higher.
-    let embedded_entries: Vec<&serde_json::Value> = report_json["files"]
+    let embedded_entries: Vec<&serde_json::Value> = report_json["fs"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|f| f["depth"].as_u64().unwrap_or(0) > 0)
+        .filter(|f| f["dp"].as_u64().unwrap_or(0) > 0)
         .collect();
 
     let mut embedded_files: Vec<EmbeddedFile> = Vec::with_capacity(embedded_entries.len());
@@ -640,7 +641,7 @@ pub(crate) fn classify_report(
 
     for ef in &embedded_entries {
         // Construct a synthetic single-file report for model inference.
-        let synthetic = serde_json::json!({ "files": [ef], "version": "3" });
+        let synthetic = serde_json::json!({ "fs": [ef], "v": "4" });
         let mut ef_features = ctx.extract(&synthetic);
         model.spec().standardize(&mut ef_features);
         let (ef_prob, ef_class) = model
@@ -654,16 +655,16 @@ pub(crate) fn classify_report(
             .unwrap_or(full_path)
             .to_string();
 
-        let ef_top_findings: Vec<TopFinding> = ef["findings"]
+        let ef_top_findings: Vec<TopFinding> = ef["ts"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|ff| crit_ordinal(ff["crit"].as_str().unwrap_or("baseline")) >= 4)
+            .filter(|ff| crit_ordinal(ff) >= 4)
             .take(3)
             .map(|ff| TopFinding {
-                id: ff["id"].as_str().unwrap_or("").to_string(),
-                crit: ff["crit"].as_str().unwrap_or("baseline").to_string(),
-                desc: ff["desc"].as_str().unwrap_or("").to_string(),
+                id: ff["i"].as_str().unwrap_or("").to_string(),
+                crit: ff["l"].as_u64().unwrap_or(0) as u32,
+                desc: ff["d"].as_str().unwrap_or("").to_string(),
             })
             .collect();
 
@@ -682,10 +683,10 @@ pub(crate) fn classify_report(
 
         embedded_files.push(EmbeddedFile {
             path: rel_path,
-            file_type: ef["file_type"].as_str().unwrap_or("unknown").to_string(),
+            file_type: ef["type"].as_str().unwrap_or("unknown").to_string(),
             classification: ef_class,
             probability: ef_prob,
-            formula: ef["formula"].as_str().unwrap_or("").to_string(),
+            formula: ef["f"].as_str().unwrap_or("").to_string(),
             top_findings: ef_top_findings,
         });
     }
@@ -768,11 +769,11 @@ fn process_report(
 /// the primary file entry inside that report.
 #[must_use]
 pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
-    let findings = report["findings"].as_array().or_else(|| {
-        report["files"]
+    let findings = report["ts"].as_array().or_else(|| {
+        report["fs"]
             .as_array()
             .and_then(|a| a.first())
-            .and_then(|f| f["findings"].as_array())
+            .and_then(|f| f["ts"].as_array())
     });
 
     let Some(findings) = findings else {
@@ -781,10 +782,10 @@ pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
 
     let mut counts = FindingCounts::default();
     for f in findings {
-        match f["crit"].as_str().unwrap_or("baseline") {
-            "hostile" => counts.hostile += 1,
-            "suspicious" => counts.suspicious += 1,
-            "notable" => counts.notable += 1,
+        match f["l"].as_u64().unwrap_or(0) {
+            5 => counts.hostile += 1,
+            4 => counts.suspicious += 1,
+            3 => counts.notable += 1,
             _ => counts.baseline += 1,
         }
     }
@@ -811,44 +812,41 @@ pub fn extract_top_findings_from_json(
     report: &serde_json::Value,
     classification: &Classification,
 ) -> Vec<TopFinding> {
-    let findings = report["findings"]
+    let findings = report["ts"]
         .as_array()
         .or_else(|| {
-            report["files"]
+            report["fs"]
                 .as_array()
                 .and_then(|a| a.first())
-                .and_then(|f| f["findings"].as_array())
+                .and_then(|f| f["ts"].as_array())
         })
         .cloned()
         .unwrap_or_default();
 
-    let min_crit = match classification {
-        Classification::Hostile => "hostile",
-        Classification::Suspicious | Classification::Benign => "suspicious",
+    let min_crit: u32 = match classification {
+        Classification::Hostile => 5,
+        Classification::Suspicious | Classification::Benign => 4,
     };
 
     let mut relevant: Vec<TopFinding> = findings
         .iter()
-        .filter(|f| {
-            let crit = f["crit"].as_str().unwrap_or("baseline");
-            crit_ordinal(crit) >= crit_ordinal(min_crit)
-        })
+        .filter(|f| crit_ordinal(f) >= min_crit)
         .map(|f| TopFinding {
-            id: f["id"].as_str().unwrap_or("").to_string(),
-            crit: f["crit"].as_str().unwrap_or("baseline").to_string(),
-            desc: f["desc"].as_str().unwrap_or("").to_string(),
+            id: f["i"].as_str().unwrap_or("").to_string(),
+            crit: f["l"].as_u64().unwrap_or(0) as u32,
+            desc: f["d"].as_str().unwrap_or("").to_string(),
         })
         .collect();
 
     // Fall back to suspicious if no hostile findings.
-    if relevant.is_empty() && min_crit == "hostile" {
+    if relevant.is_empty() && min_crit == 5 {
         relevant = findings
             .iter()
-            .filter(|f| crit_ordinal(f["crit"].as_str().unwrap_or("baseline")) >= 4)
+            .filter(|f| crit_ordinal(f) >= 4)
             .map(|f| TopFinding {
-                id: f["id"].as_str().unwrap_or("").to_string(),
-                crit: f["crit"].as_str().unwrap_or("baseline").to_string(),
-                desc: f["desc"].as_str().unwrap_or("").to_string(),
+                id: f["i"].as_str().unwrap_or("").to_string(),
+                crit: f["l"].as_u64().unwrap_or(0) as u32,
+                desc: f["d"].as_str().unwrap_or("").to_string(),
             })
             .collect();
     }
@@ -860,7 +858,7 @@ pub fn extract_top_findings_from_json(
         seen.insert(base.to_string())
     });
 
-    relevant.sort_by(|a, b| crit_ordinal(&b.crit).cmp(&crit_ordinal(&a.crit)));
+    relevant.sort_by(|a, b| b.crit.cmp(&a.crit));
     relevant.truncate(5);
     relevant
 }
