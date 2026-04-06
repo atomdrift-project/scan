@@ -44,6 +44,7 @@ pub struct ServerConfig {
     model_dir: PathBuf,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
+    allowed_dirs: Vec<PathBuf>,
 }
 
 impl ServerConfig {
@@ -66,6 +67,7 @@ impl ServerConfig {
     ///     "/path/to/models",
     ///     None,
     ///     4_000,
+    ///     vec![],
     /// )?;
     ///
     /// assert_eq!(config.timeout_secs(), 120);
@@ -79,6 +81,7 @@ impl ServerConfig {
         model_dir: impl Into<PathBuf>,
         thresholds: Option<Thresholds>,
         slow_rule_ms: u64,
+        allowed_dirs: Vec<PathBuf>,
     ) -> anyhow::Result<Self> {
         if let Some(ref t) = thresholds {
             t.validate()
@@ -92,6 +95,7 @@ impl ServerConfig {
             model_dir: model_dir.into(),
             thresholds,
             slow_rule_ms,
+            allowed_dirs,
         })
     }
 
@@ -136,6 +140,12 @@ impl ServerConfig {
     pub const fn slow_rule_ms(&self) -> u64 {
         self.slow_rule_ms
     }
+
+    /// Directories allowed for `/analyze-path` requests.
+    #[must_use]
+    pub fn allowed_dirs(&self) -> &[PathBuf] {
+        &self.allowed_dirs
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +165,7 @@ mod config_tests {
                 hostile: 0.9,
             }),
             4_000,
+            vec![],
         );
 
         assert!(result.is_err());
@@ -170,6 +181,7 @@ mod config_tests {
             "/tmp/models",
             None,
             4_000,
+            vec![],
         );
 
         assert!(result.is_ok());
@@ -198,6 +210,7 @@ struct AppState {
     model_dir: PathBuf,
     threshold_overrides: Option<Thresholds>,
     slow_rule_ms: u64,
+    allowed_dirs: Vec<PathBuf>,
     ready: AtomicBool,
     init_error: RwLock<Option<String>>,
     resources: RwLock<Option<Arc<ModelResources>>>,
@@ -244,6 +257,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         model_dir: config.model_dir().to_path_buf(),
         threshold_overrides: config.thresholds(),
         slow_rule_ms: config.slow_rule_ms(),
+        allowed_dirs: config.allowed_dirs().to_vec(),
         ready: AtomicBool::new(false),
         init_error: RwLock::new(None),
         resources: RwLock::new(None),
@@ -369,6 +383,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
 
     let analysis_routes = Router::new()
         .route("/analyze", post(handlers::analyze))
+        .route("/analyze-path", post(handlers::analyze_path))
         .layer(ConcurrencyLimitLayer::new(max_concurrent));
 
     let app = Router::new()

@@ -3,13 +3,13 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
-use crate::model::{Classification, Model, ModelInfo, Thresholds};
+use crate::model::{Classification, Model, Thresholds};
 use crate::OutputFormat;
 
 pub use crate::explain::Reason;
@@ -237,45 +237,43 @@ pub struct FindingCounts {
 ///
 /// In terminal mode only a subset of results may be shown, but in JSON mode
 /// every scanned item is emitted as a `ScanResult`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct ScanResult {
-    /// Path to the analyzed file.
-    pub path: String,
+    /// Schema version.
+    pub v: &'static str,
     /// Model classification outcome.
     pub classification: Classification,
     /// Raw malware probability from the model.
     pub probability: f32,
-    /// Thresholds used for classification.
+    /// Thresholds.
     pub thresholds: Thresholds,
-    /// Breakdown of findings by criticality (terminal display only).
-    #[serde(skip)]
+    /// Model version identifier (spec version, ABI version, model hash prefix).
+    pub version: String,
+    /// UTC timestamp of when this analysis was performed (RFC 3339).
+    pub analyzed_at: String,
+    /// Full cleave report (unmutated).
+    pub cleave: Option<serde_json::Value>,
+    /// PIDs running this binary (process scan only).
+    pub pids: Option<Vec<u32>>,
+    /// Whether the binary was deleted from disk (process scan only).
+    pub deleted: Option<bool>,
+    /// Display path (original filename or scanned path).
+    pub path: String,
+    /// Finding counts by severity level.
     pub finding_counts: FindingCounts,
-    /// Cleave formula string summarizing findings.
+    /// Molecular formula.
     pub formula: String,
-    /// Top SHAP-based reasons for the classification.
+    /// SHAP explanation reasons.
     pub reasons: Vec<Reason>,
-    /// Top findings from cleave at the relevant criticality level.
+    /// Top findings for display.
     pub top_findings: Vec<TopFinding>,
-    /// Detected file type (e.g. "pe", "elf", "sh").
+    /// Detected file type.
     pub file_type: String,
     /// File size in bytes.
     pub size_bytes: u64,
-    /// SHA-256 hex digest of the file.
+    /// SHA-256 hex digest.
     pub sha256: String,
-    /// Model metadata (JSON mode only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<ModelInfo>,
-    /// Full cleave report (JSON mode only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cleave: Option<serde_json::Value>,
-    /// PIDs running this binary (process scan only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pids: Option<Vec<u32>>,
-    /// Whether the binary was deleted from disk (process scan only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deleted: Option<bool>,
-    /// Flagged files embedded within archives (hostile/suspicious only).
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    /// Per-file ML evaluations for archive members.
     pub embedded_files: Vec<EmbeddedFile>,
 }
 
@@ -405,8 +403,19 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let ctrlc_flag = Arc::clone(&cancellation);
+    let _ = ctrlc::set_handler(move || {
+        if ctrlc_flag.load(Ordering::Relaxed) {
+            // Second ctrl-c: hard exit.
+            std::process::exit(130);
+        }
+        eprintln!("\nInterrupted — finishing current file…");
+        ctrlc_flag.store(true, Ordering::Relaxed);
+    });
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
+        cancellation: Some(Arc::clone(&cancellation)),
         ..Default::default()
     };
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
@@ -549,7 +558,7 @@ fn emit_result(
         OutputFormat::Terminal => {
             crate::output::print_file_result_streaming(r, show_progress, config.extra());
         }
-        OutputFormat::Json => match serde_json::to_string(r) {
+        OutputFormat::Json => match serde_json::to_string(&r.to_envelope()) {
             Ok(line) => {
                 if let Ok(mut out) = stdout.lock() {
                     let _ = writeln!(out, "{line}");
@@ -741,11 +750,26 @@ fn process_report(
     let cr = classify_report(&path.display().to_string(), report, ctx, model, shap)?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
+    // Include raw cleave report for JSON output (unmutated — ML scores go in the ml section).
+    let cleave = if is_json {
+        Some(cr.report_json)
+    } else {
+        None
+    };
+
+    let thresholds = model.thresholds();
+
     Ok(ScanResult {
-        path: path.display().to_string(),
+        v: "4",
         classification: cr.classification,
         probability: cr.probability,
-        thresholds: model.thresholds(),
+        thresholds,
+        version: model_version_string(model.info()),
+        analyzed_at: now_rfc3339(),
+        cleave,
+        pids: None,
+        deleted: None,
+        path: path.display().to_string(),
         finding_counts: cr.finding_counts,
         formula: cr.formula,
         reasons: cr.reasons,
@@ -753,14 +777,6 @@ fn process_report(
         file_type: cr.file_type,
         size_bytes: cr.size_bytes,
         sha256: cr.sha256,
-        model: if is_json {
-            Some(model.info().clone())
-        } else {
-            None
-        },
-        cleave: if is_json { Some(cr.report_json) } else { None },
-        pids: None,
-        deleted: None,
         embedded_files: cr.embedded_files,
     })
 }
@@ -864,3 +880,137 @@ pub fn extract_top_findings_from_json(
 }
 
 use crate::features::crit_ordinal;
+
+/// Build a compact model version string from ModelInfo.
+/// Format: "v{spec_version}.{abi_version}-{sha256_prefix}" or with commit if available.
+pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
+    let sha_prefix = if info.sha256.len() >= 8 {
+        &info.sha256[..8]
+    } else {
+        &info.sha256
+    };
+    match &info.commit {
+        Some(commit) => format!("v{}.{}-{}-{}", info.version, info.abi_version, sha_prefix, commit),
+        None => format!("v{}.{}-{}", info.version, info.abi_version, sha_prefix),
+    }
+}
+
+/// Return the current time as an RFC 3339 string in UTC.
+pub(crate) fn now_rfc3339() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    // Manual UTC breakdown — avoids external time crate dependency.
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let h = time_of_day / 3600;
+    let m = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+    // Civil date from day count (algorithm from Howard Hinnant).
+    let z = days as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Serialize Thresholds as [suspicious, hostile] array for v4 JSON.
+fn serialize_thresholds<S>(t: &Thresholds, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::Serialize;
+    [t.suspicious, t.hostile].serialize(serializer)
+}
+
+/// Build per-file ML classification entries for the `ml.fs` array.
+///
+/// Each entry contains `{id, class, prob}` keyed by the cleave `fs[].id` field.
+/// The root file (dp=0) gets the parent classification; embedded files get their
+/// individual scores matched by path suffix.
+fn build_ml_fs(
+    report_json: &serde_json::Value,
+    classification: &Classification,
+    probability: f32,
+    embedded_files: &[EmbeddedFile],
+) -> Vec<serde_json::Value> {
+    let Some(fs) = report_json.get("fs").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(fs.len());
+    for (idx, entry) in fs.iter().enumerate() {
+        let id = entry.get("id").and_then(|v| v.as_u64()).unwrap_or(idx as u64);
+        let depth = entry.get("dp").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        let (cls, prob) = if depth == 0 {
+            (classification, probability)
+        } else {
+            let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let suffix = path.rsplit_once("!!").map(|(_, r)| r).unwrap_or(path);
+            embedded_files
+                .iter()
+                .find(|ef| ef.path == suffix)
+                .map(|ef| (&ef.classification, ef.probability))
+                .unwrap_or((classification, probability))
+        };
+
+        out.push(serde_json::json!({"id": id, "class": cls, "prob": prob}));
+    }
+    out
+}
+
+/// Top-level JSON envelope: `{"ml": {...}, "raw": {...}}`.
+#[derive(Debug, serde::Serialize)]
+pub struct ScanResultEnvelope {
+    ml: MlSection,
+    raw: serde_json::Value,
+}
+
+/// The `ml` section of the response envelope.
+#[derive(Debug, serde::Serialize)]
+struct MlSection {
+    v: &'static str,
+    #[serde(rename = "class")]
+    classification: Classification,
+    #[serde(rename = "prob")]
+    probability: f32,
+    #[serde(serialize_with = "serialize_thresholds")]
+    thresholds: Thresholds,
+    version: String,
+    analyzed_at: String,
+    fs: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pids: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deleted: Option<bool>,
+}
+
+impl ScanResult {
+    /// Build the `{"ml": {...}, "raw": {...}}` envelope for JSON output.
+    pub fn to_envelope(&self) -> ScanResultEnvelope {
+        let raw = self.cleave.clone().unwrap_or(serde_json::json!({}));
+        let ml_fs = build_ml_fs(&raw, &self.classification, self.probability, &self.embedded_files);
+        ScanResultEnvelope {
+            ml: MlSection {
+                v: self.v,
+                classification: self.classification,
+                probability: self.probability,
+                thresholds: self.thresholds,
+                version: self.version.clone(),
+                analyzed_at: self.analyzed_at.clone(),
+                fs: ml_fs,
+                pids: self.pids.clone(),
+                deleted: self.deleted,
+            },
+            raw,
+        }
+    }
+}

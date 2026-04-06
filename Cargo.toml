@@ -62,6 +62,7 @@ tower-http = { version = "0.6" }
 tempfile = "3"
 dashmap = "6"
 rayon = "1"
+ctrlc = "3"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

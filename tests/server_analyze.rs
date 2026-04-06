@@ -68,6 +68,7 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
         model_dir()?,
         None,
         4000,
+        vec![],
     )?;
     let app = build_app(&config).await.context("failed to build app")?;
 

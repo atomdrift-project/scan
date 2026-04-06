@@ -118,6 +118,10 @@ enum Commands {
         /// Maximum RSS in gigabytes before rejecting requests (Linux only)
         #[arg(long, default_value = "8")]
         max_rss_gb: u64,
+
+        /// Comma-separated directories allowed for /analyze-path requests
+        #[arg(long)]
+        allowed_dirs: Option<String>,
     },
 
     /// Print version information
@@ -261,7 +265,14 @@ fn main() -> Result<()> {
             timeout_secs,
             max_size_mb,
             max_rss_gb,
+            allowed_dirs,
         } => {
+            let dirs: Vec<std::path::PathBuf> = allowed_dirs
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .collect();
             let config = litmus::server::ServerConfig::new(
                 bind,
                 timeout_secs,
@@ -270,6 +281,7 @@ fn main() -> Result<()> {
                 resolve_model_dir()?,
                 thresholds,
                 cli.slow_rule_ms,
+                dirs,
             )?;
             eprintln!("Starting litmus server on http://{} ...", bind);
             tokio::runtime::Builder::new_multi_thread()

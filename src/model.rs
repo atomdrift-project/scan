@@ -108,15 +108,23 @@ fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
 }
 
 /// Classification outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// Serializes as an integer: 0 = benign, 1 = suspicious, 2 = hostile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Classification {
     /// File shows no significant malicious indicators.
-    Benign,
+    Benign = 0,
     /// File has notable suspicious indicators.
-    Suspicious,
+    Suspicious = 1,
     /// File is likely malicious.
-    Hostile,
+    Hostile = 2,
+}
+
+impl serde::Serialize for Classification {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(*self as u8)
+    }
 }
 
 impl std::fmt::Display for Classification {

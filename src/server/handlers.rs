@@ -3,7 +3,7 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::Builder as TempBuilder;
@@ -397,6 +397,8 @@ pub(super) async fn analyze(
     );
     let slow_rule_ms = state.slow_rule_ms;
     let filename_for_closure = filename.clone();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancel_flag = Arc::clone(&cancellation);
     let permit = match Arc::clone(&state.analysis_slots).acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => {
@@ -411,7 +413,13 @@ pub(super) async fn analyze(
 
     let mut handle = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        classify_file(&path, &filename_for_closure, &resources, slow_rule_ms)
+        classify_file(
+            &path,
+            &filename_for_closure,
+            &resources,
+            slow_rule_ms,
+            Some(cancel_flag),
+        )
     });
 
     // Use timeout() rather than select! so a simultaneous completion + timeout
@@ -439,7 +447,7 @@ pub(super) async fn analyze(
                         probability = scan_result.probability,
                         "<-- 200 OK",
                     );
-                    Json(scan_result).into_response()
+                    Json(scan_result.to_envelope()).into_response()
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(
@@ -470,8 +478,11 @@ pub(super) async fn analyze(
             }
         }
         Err(_elapsed) => {
-            // On timeout the blocking task keeps running; watch it to decrement the
-            // counter and drop the temp file when it eventually finishes.
+            // Signal cleave to stop processing early.
+            cancellation.store(true, Ordering::Relaxed);
+
+            // The blocking task keeps running until cleave checks the flag;
+            // watch it to decrement the counter and drop the temp file.
             let active = state
                 .active_tasks
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -506,11 +517,13 @@ fn classify_file(
     label: &str,
     resources: &super::ModelResources,
     slow_rule_ms: u64,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
     let opts = cleave::AnalysisOptions {
         slow_rule_ms,
+        cancellation,
         ..Default::default()
     };
     let report =
@@ -525,10 +538,16 @@ fn classify_file(
     )?;
 
     Ok(ScanResult {
-        path: label.to_string(),
+        v: "4",
         classification: cr.classification,
         probability: cr.probability,
         thresholds: resources.model.thresholds(),
+        version: crate::scan::model_version_string(resources.model.info()),
+        analyzed_at: crate::scan::now_rfc3339(),
+        cleave: Some(cr.report_json),
+        pids: None,
+        deleted: None,
+        path: label.to_string(),
         finding_counts: cr.finding_counts,
         formula: cr.formula,
         reasons: cr.reasons,
@@ -536,15 +555,201 @@ fn classify_file(
         file_type: cr.file_type,
         size_bytes: cr.size_bytes,
         sha256: cr.sha256,
-        model: Some(resources.model.info().clone()),
-        cleave: Some(cr.report_json),
-        pids: None,
-        deleted: None,
         embedded_files: cr.embedded_files,
     })
 }
 
 /// Check RSS memory pressure. Returns a 503 response if the server is overloaded,
+// --- /analyze-path endpoint ---
+
+#[derive(serde::Deserialize)]
+pub(super) struct AnalyzePathRequest {
+    path: String,
+}
+
+/// POST /analyze-path — analyze a file by its on-disk path.
+///
+/// Accepts `{"path": "/full/path/to/file"}`. The path must be under one of
+/// the directories specified by `--allowed-dirs`. Returns the same
+/// `{"ml": {...}, "raw": {...}}` envelope as `/analyze`.
+pub(super) async fn analyze_path(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AnalyzePathRequest>,
+) -> Response {
+    let request_id = state.next_request_id();
+    let request_start = Instant::now();
+
+    let path = std::path::PathBuf::from(&req.path);
+
+    // Validate the path is under an allowed directory.
+    if state.allowed_dirs.is_empty()
+        || !state
+            .allowed_dirs
+            .iter()
+            .any(|dir| path.starts_with(dir))
+    {
+        tracing::warn!(id = request_id, path = %req.path, "analyze-path rejected: not under allowed dirs");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Path not under allowed directories"})),
+        )
+            .into_response();
+    }
+
+    if !path.is_file() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "File not found"})),
+        )
+            .into_response();
+    }
+
+    // Check memory pressure.
+    if let Some(resp) = check_memory_pressure(&state) {
+        return resp;
+    }
+
+    // Ensure resources are loaded.
+    let resources = {
+        let guard = match state.resources.read() {
+            Ok(g) => g,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Internal error"})),
+                )
+                    .into_response();
+            }
+        };
+        match guard.as_ref() {
+            Some(r) => Arc::clone(r),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "Server starting up"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let slow_rule_ms = state.slow_rule_ms;
+    let timeout_duration = Duration::from_secs(state.timeout_secs);
+    let filename = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
+
+    tracing::info!(
+        id = request_id,
+        path = %req.path,
+        size_bytes = file_size,
+        "--> POST /analyze-path",
+    );
+
+    let permit = match Arc::clone(&state.analysis_slots).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => {
+            tracing::error!("failed to acquire analysis slot: {e}  id={request_id}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Internal error"})),
+            )
+                .into_response();
+        }
+    };
+
+    state
+        .active_tasks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.in_flight.insert(
+        request_id,
+        super::InFlightRequest {
+            name: filename.clone(),
+            size_bytes: file_size,
+            started_at: request_start,
+        },
+    );
+
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancel_flag = Arc::clone(&cancellation);
+    let analyze_path = path.clone();
+    let mut handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        classify_file(
+            &analyze_path,
+            &filename,
+            &resources,
+            slow_rule_ms,
+            Some(cancel_flag),
+        )
+    });
+
+    let result = tokio::time::timeout(timeout_duration, &mut handle).await;
+    let elapsed_ms = request_start.elapsed().as_millis();
+
+    state
+        .active_tasks
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    state.in_flight.remove(&request_id);
+
+    match result {
+        Ok(Ok(Ok(scan_result))) => {
+            tracing::info!(
+                id = request_id,
+                path = %req.path,
+                elapsed_ms = elapsed_ms as u64,
+                classification = %scan_result.classification,
+                probability = scan_result.probability,
+                "<-- 200 OK",
+            );
+            Json(scan_result.to_envelope()).into_response()
+        }
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(
+                id = request_id,
+                elapsed_ms = elapsed_ms as u64,
+                error = %e,
+                "<-- 500 analysis failed",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Analysis failed"})),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                id = request_id,
+                elapsed_ms = elapsed_ms as u64,
+                error = %e,
+                "<-- 500 task panicked",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            cancellation.store(true, Ordering::Relaxed);
+            handle.abort();
+            tracing::warn!(
+                id = request_id,
+                elapsed_ms = elapsed_ms as u64,
+                "<-- 504 timeout",
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({"error": "Analysis timed out"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// or `None` if memory is within limits or RSS is unavailable on this platform.
 fn check_memory_pressure(state: &AppState) -> Option<Response> {
     let rss = cleave::memory_tracker::current_rss()?;

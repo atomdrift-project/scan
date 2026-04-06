@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -167,8 +168,18 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let model = Model::load(config.model_dir(), config.thresholds())?;
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let ctrlc_flag = Arc::clone(&cancellation);
+    let _ = ctrlc::set_handler(move || {
+        if ctrlc_flag.load(Ordering::Relaxed) {
+            std::process::exit(130);
+        }
+        eprintln!("\nInterrupted — finishing current process…");
+        ctrlc_flag.store(true, Ordering::Relaxed);
+    });
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
+        cancellation: Some(Arc::clone(&cancellation)),
         ..Default::default()
     };
     let stdout = Mutex::new(std::io::stdout());
@@ -185,6 +196,9 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let mut errors = hash_errors;
 
     for group in &groups {
+        if cancellation.load(Ordering::Relaxed) {
+            break;
+        }
         let scan_path = if group.deleted && !group.path.exists() {
             // On Linux, try scanning via /proc/pid/exe.
             #[cfg(target_os = "linux")]
@@ -298,11 +312,24 @@ fn build_result(
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
+    let cleave = if is_json {
+        Some(cr.report_json)
+    } else {
+        None
+    };
+    let thresholds = model.thresholds();
+
     Ok(ScanResult {
-        path: display_path.display().to_string(),
+        v: "4",
         classification: cr.classification,
         probability: cr.probability,
-        thresholds: model.thresholds(),
+        thresholds,
+        version: crate::scan::model_version_string(model.info()),
+        analyzed_at: crate::scan::now_rfc3339(),
+        cleave,
+        pids: Some(group.pids.clone()),
+        deleted: if group.deleted { Some(true) } else { None },
+        path: display_path.display().to_string(),
         finding_counts: cr.finding_counts,
         formula: cr.formula,
         reasons: cr.reasons,
@@ -310,14 +337,6 @@ fn build_result(
         file_type: cr.file_type,
         size_bytes: cr.size_bytes,
         sha256: group.sha256.clone(),
-        model: if is_json {
-            Some(model.info().clone())
-        } else {
-            None
-        },
-        cleave: if is_json { Some(cr.report_json) } else { None },
-        pids: Some(group.pids.clone()),
-        deleted: if group.deleted { Some(true) } else { None },
         embedded_files: cr.embedded_files,
     })
 }
@@ -335,7 +354,7 @@ fn emit_result(
         OutputFormat::Terminal => {
             output::print_ps_result(r, pids, deleted, has_progress, config.extra());
         }
-        OutputFormat::Json => match serde_json::to_string(r) {
+        OutputFormat::Json => match serde_json::to_string(&r.to_envelope()) {
             Ok(line) => {
                 if let Ok(mut out) = stdout.lock() {
                     let _ = writeln!(out, "{line}");
