@@ -484,7 +484,15 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             result,
         } => {
             let scan_result = result.and_then(|report| {
-                process_report(file_path, report, &ctx, &model, shap.as_ref(), config)
+                process_report(
+                    file_path,
+                    report,
+                    &ctx,
+                    &model,
+                    shap.as_ref(),
+                    config,
+                    cleave_opts.cancellation.clone(),
+                )
             });
             let prog = progress.get();
             if let Some(p) = prog {
@@ -595,6 +603,7 @@ pub(crate) fn classify_report(
     ctx: &ExtractContext,
     model: &Model,
     shap: Option<&ShapImportance>,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<ClassifiedReport> {
     report.finalize();
     let compact = cleave::types::compact::compact_from_files(&report.files);
@@ -637,11 +646,13 @@ pub(crate) fn classify_report(
 
     // Extract embedded files (archive members at depth > 0), run each through
     // the model individually, and elevate the parent if any embedded file scores higher.
+    // Limit to top 100 embedded entries to prevent resource exhaustion.
     let embedded_entries: Vec<&serde_json::Value> = report_json["fs"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|f| f["dp"].as_u64().unwrap_or(0) > 0)
+        .take(100)
         .collect();
 
     let mut embedded_files: Vec<EmbeddedFile> = Vec::with_capacity(embedded_entries.len());
@@ -649,6 +660,12 @@ pub(crate) fn classify_report(
     let mut max_classification = classification;
 
     for ef in &embedded_entries {
+        if let Some(ref c) = cancellation {
+            if c.load(Ordering::Relaxed) {
+                anyhow::bail!("analysis cancelled during embedded file processing");
+            }
+        }
+
         // Construct a synthetic single-file report for model inference.
         let synthetic = serde_json::json!({ "fs": [ef], "v": "4" });
         let mut ef_features = ctx.extract(&synthetic);
@@ -746,8 +763,16 @@ fn process_report(
     model: &Model,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
-    let cr = classify_report(&path.display().to_string(), report, ctx, model, shap)?;
+    let cr = classify_report(
+        &path.display().to_string(),
+        report,
+        ctx,
+        model,
+        shap,
+        cancellation,
+    )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
     // Include raw cleave report for JSON output (unmutated — ML scores go in the ml section).
@@ -819,7 +844,15 @@ fn analyze_single(
 ) -> Result<ScanResult> {
     let report = cleave::analyze_file(path, cleave_opts)
         .with_context(|| format!("cleave analysis of {}", path.display()))?;
-    process_report(path, report, ctx, model, shap, config)
+    process_report(
+        path,
+        report,
+        ctx,
+        model,
+        shap,
+        config,
+        cleave_opts.cancellation.clone(),
+    )
 }
 
 /// Extract a small set of human-facing findings relevant to the classification.

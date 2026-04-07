@@ -243,6 +243,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
             shap.as_ref(),
             config,
             group,
+            Some(Arc::clone(&cancellation)),
         ) {
             Ok(result) => {
                 match result.classification {
@@ -302,6 +303,7 @@ fn build_result(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
     group: &ProcessGroup,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
     let cr = crate::scan::classify_report(
         &display_path.display().to_string(),
@@ -309,6 +311,7 @@ fn build_result(
         ctx,
         model,
         shap,
+        cancellation,
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

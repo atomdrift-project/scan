@@ -63,7 +63,28 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             .into_response();
     }
     if active_tasks >= state.max_concurrent_tasks {
-        tracing::warn!("GET /_/health -> 503 (thread pool saturated, active={active_tasks})");
+        let orphaned_tasks = state
+            .in_flight
+            .iter()
+            .filter(|e| e.timed_out.load(std::sync::atomic::Ordering::Relaxed))
+            .count();
+        let live_tasks = active_tasks.saturating_sub(orphaned_tasks);
+
+        // Find the oldest task for diagnostic purposes.
+        let oldest = state
+            .in_flight
+            .iter()
+            .min_by_key(|e| e.started_at)
+            .map(|e| (e.name.clone(), e.started_at.elapsed().as_secs()));
+
+        tracing::warn!(
+            active_tasks,
+            live_tasks,
+            orphaned_tasks,
+            max_concurrent_tasks = state.max_concurrent_tasks,
+            oldest_task = ?oldest,
+            "GET /_/health -> 503 (thread pool saturated)"
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -71,7 +92,10 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
                 "reason": "thread_pool_saturated",
                 "rss_mb": rss_mb,
                 "active_tasks": active_tasks,
+                "live_tasks": live_tasks,
+                "orphaned_tasks": orphaned_tasks,
                 "max_concurrent_tasks": state.max_concurrent_tasks,
+                "oldest_task": oldest.map(|(name, secs)| serde_json::json!({"name": name, "elapsed_secs": secs})),
                 "rayon_threads": rayon::current_num_threads(),
             })),
         )
@@ -203,6 +227,54 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// RAII guard to ensure active_tasks and in_flight entries are cleaned up.
+struct TaskGuard {
+    state: Arc<AppState>,
+    request_id: u64,
+    start_time: Instant,
+}
+
+impl TaskGuard {
+    fn new(state: Arc<AppState>, request_id: u64, name: String, size_bytes: u64) -> Self {
+        state.active_tasks.fetch_add(1, Ordering::SeqCst);
+        state.in_flight.insert(
+            request_id,
+            super::InFlightRequest {
+                name,
+                size_bytes,
+                started_at: Instant::now(),
+                timed_out: AtomicBool::new(false),
+            },
+        );
+        Self {
+            state,
+            request_id,
+            start_time: Instant::now(),
+        }
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        let was_orphaned = if let Some(req) = self.state.in_flight.get(&self.request_id) {
+            req.timed_out.load(Ordering::Relaxed)
+        } else {
+            false
+        };
+
+        self.state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+        self.state.in_flight.remove(&self.request_id);
+
+        if was_orphaned {
+            tracing::info!(
+                id = self.request_id,
+                duration_ms = self.start_time.elapsed().as_millis() as u64,
+                "orphaned task finally finished and released slot"
+            );
+        }
+    }
+}
+
 /// POST /analyze — accept multipart file upload, classify, return full JSON result.
 pub(super) async fn analyze(
     State(state): State<Arc<AppState>>,
@@ -294,7 +366,7 @@ pub(super) async fn analyze(
                     .into_response();
             }
             Err(e) => {
-                tracing::warn!("temp file task join error: {e}  id={request_id}");
+                tracing::warn!("temp file task join error (panic?): {e}  id={request_id}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": "Internal error"})),
@@ -421,6 +493,8 @@ pub(super) async fn analyze(
     if active >= state.max_concurrent_tasks {
         tracing::warn!(
             id = request_id,
+            filename = %filename,
+            size_bytes = file_size,
             active_tasks = active,
             max = state.max_concurrent_tasks,
             "rejecting: at capacity"
@@ -435,26 +509,20 @@ pub(super) async fn analyze(
     let slow_rule_ms = state.slow_rule_ms;
     let timeout_duration = Duration::from_secs(state.timeout_secs);
 
-    // Claim a slot. The blocking closure releases it on exit.
-    state
-        .active_tasks
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state.in_flight.insert(
+    // Claim a slot using the RAII guard.
+    let guard = TaskGuard::new(
+        Arc::clone(&state),
         request_id,
-        super::InFlightRequest {
-            name: filename.clone(),
-            size_bytes: file_size as u64,
-            started_at: Instant::now(),
-            timed_out: AtomicBool::new(false),
-        },
+        filename.clone(),
+        file_size as u64,
     );
 
     let filename_for_closure = filename.clone();
     let should_clear_caches = request_id.is_multiple_of(50);
     let cancellation = Arc::new(AtomicBool::new(false));
     let cancel_flag = Arc::clone(&cancellation);
-    let cleanup_state = Arc::clone(&state);
     let mut handle = tokio::task::spawn_blocking(move || {
+        let _moved_guard = guard;
         let result = classify_file(
             &path,
             &filename_for_closure,
@@ -465,11 +533,6 @@ pub(super) async fn analyze(
         if should_clear_caches {
             cleave::clear_all_thread_caches();
         }
-        // Always release slot and clean up, even if timed out on the async side.
-        cleanup_state
-            .active_tasks
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        cleanup_state.in_flight.remove(&request_id);
         drop(temp_file);
         result
     });
@@ -512,7 +575,7 @@ pub(super) async fn analyze(
                 .into_response()
         }
         Some(Err(e)) => {
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error");
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error (panic?)");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
@@ -545,7 +608,7 @@ fn classify_file(
 
     let opts = cleave::AnalysisOptions {
         slow_rule_ms,
-        cancellation,
+        cancellation: cancellation.clone(),
         ..Default::default()
     };
     let report =
@@ -557,6 +620,7 @@ fn classify_file(
         &resources.ctx,
         &resources.model,
         resources.shap.as_ref(),
+        cancellation,
     )?;
 
     Ok(ScanResult {
@@ -676,6 +740,8 @@ pub(super) async fn analyze_path(
     if active >= state.max_concurrent_tasks {
         tracing::warn!(
             id = request_id,
+            filename = %filename,
+            size_bytes = file_size,
             active_tasks = active,
             max = state.max_concurrent_tasks,
             "rejecting: at capacity"
@@ -690,37 +756,23 @@ pub(super) async fn analyze_path(
     let slow_rule_ms = state.slow_rule_ms;
     let timeout_duration = Duration::from_secs(state.timeout_secs);
 
-    // Claim a slot. The blocking closure is responsible for releasing it
-    // when it finishes — whether normally, on error, or after cancellation.
-    state
-        .active_tasks
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state.in_flight.insert(
+    // Claim a slot using the RAII guard.
+    let guard = TaskGuard::new(
+        Arc::clone(&state),
         request_id,
-        super::InFlightRequest {
-            name: req.path.clone(),
-            size_bytes: file_size,
-            started_at: request_start,
-            timed_out: AtomicBool::new(false),
-        },
+        req.path.clone(),
+        file_size,
     );
 
     let should_clear_caches = request_id.is_multiple_of(50);
     let cancellation = Arc::new(AtomicBool::new(false));
     let cancel_flag = Arc::clone(&cancellation);
-    let cleanup_state = Arc::clone(&state);
     let mut handle = tokio::task::spawn_blocking(move || {
+        let _moved_guard = guard;
         let result = classify_file(&path, &filename, &resources, slow_rule_ms, Some(cancel_flag));
         if should_clear_caches {
             cleave::clear_all_thread_caches();
         }
-        // The blocking task always releases its slot, even if the HTTP
-        // response already returned a 504 timeout. This ensures active_tasks
-        // accurately reflects running work — orphans don't leak slots.
-        cleanup_state
-            .active_tasks
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        cleanup_state.in_flight.remove(&request_id);
         result
     });
 
@@ -760,7 +812,7 @@ pub(super) async fn analyze_path(
                 .into_response()
         }
         Some(Err(e)) => {
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task panicked");
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error (panic?)");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
