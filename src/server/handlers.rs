@@ -147,6 +147,14 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
     let thresholds = state.threshold_overrides;
 
     let result = tokio::task::spawn_blocking(move || {
+        // Reload cleave traits first so the new model runs against fresh rules.
+        if let Err(e) = cleave::reload_capability_mapper() {
+            tracing::warn!("cleave trait reload failed (previous traits retained): {e}");
+        } else {
+            tracing::info!("cleave traits reloaded");
+        }
+        cleave::clear_all_thread_caches();
+
         let model = Model::load(&model_dir, thresholds)?;
         let shap = ShapImportance::load(&model_dir).ok();
         let ctx = ExtractContext::new(model.spec());
