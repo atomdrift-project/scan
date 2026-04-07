@@ -24,8 +24,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::signal;
-use tokio::sync::Semaphore;
-use tower::limit::ConcurrencyLimitLayer;
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
@@ -193,6 +191,8 @@ struct InFlightRequest {
     name: String,
     size_bytes: u64,
     started_at: Instant,
+    /// Set to true when the HTTP side returns 504 but the blocking task is still running.
+    timed_out: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -214,9 +214,12 @@ struct AppState {
     ready: AtomicBool,
     init_error: RwLock<Option<String>>,
     resources: RwLock<Option<Arc<ModelResources>>>,
-    analysis_slots: Arc<Semaphore>,
     next_request_id: AtomicU64,
     active_tasks: AtomicUsize,
+    /// Hard cap on concurrent analysis tasks. Requests are rejected with 503
+    /// when active_tasks >= this value, preventing orphaned blocking tasks
+    /// from piling up and consuming unbounded memory.
+    max_concurrent_tasks: usize,
     reload_lock: tokio::sync::Mutex<()>,
     overloaded_since: std::sync::Mutex<Option<Instant>>,
     in_flight: dashmap::DashMap<u64, InFlightRequest>,
@@ -244,11 +247,11 @@ impl AppState {
 pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     tracing::info!(model_dir = %config.model_dir().display(), "starting — resources loading in background");
 
+    // CPU-bound analysis: match available cores, not 2x.
     let max_concurrent = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
-        .unwrap_or(4)
-        * 2;
-    tracing::debug!(max_concurrent, "concurrency limit set");
+        .unwrap_or(4);
+    tracing::info!(max_concurrent, "concurrency limit set (1 per core)");
 
     let state = Arc::new(AppState {
         timeout_secs: config.timeout_secs(),
@@ -261,9 +264,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         ready: AtomicBool::new(false),
         init_error: RwLock::new(None),
         resources: RwLock::new(None),
-        analysis_slots: Arc::new(Semaphore::new(max_concurrent)),
         next_request_id: AtomicU64::new(1),
         active_tasks: AtomicUsize::new(0),
+        max_concurrent_tasks: max_concurrent,
         reload_lock: tokio::sync::Mutex::new(()),
         overloaded_since: std::sync::Mutex::new(None),
         in_flight: dashmap::DashMap::new(),
@@ -381,18 +384,17 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         });
     }
 
-    let analysis_routes = Router::new()
-        .route("/analyze", post(handlers::analyze))
-        .route("/analyze-path", post(handlers::analyze_path))
-        .layer(ConcurrencyLimitLayer::new(max_concurrent));
-
+    // No ConcurrencyLimitLayer — the hard gate (active_tasks >= max_concurrent_tasks)
+    // in each handler rejects immediately with 503. No silent queuing.
+    // Hopper controls send rate via litmus-workers; litmus accepts or rejects.
     let app = Router::new()
         .route("/_/health", get(handlers::health))
         .route("/_/reload", post(handlers::reload))
         .route("/_/memory", get(handlers::memory_stats))
         .route("/_/requests", get(handlers::requests))
         .route("/_/threads", get(handlers::threads))
-        .merge(analysis_routes)
+        .route("/analyze", post(handlers::analyze))
+        .route("/analyze-path", post(handlers::analyze_path))
         .layer(DefaultBodyLimit::max(config.max_body_size()))
         .with_state(state);
 

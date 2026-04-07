@@ -62,11 +62,42 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     }
-    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, active={active_tasks})");
+    if active_tasks >= state.max_concurrent_tasks {
+        tracing::warn!("GET /_/health -> 503 (thread pool saturated, active={active_tasks})");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "degraded",
+                "reason": "thread_pool_saturated",
+                "rss_mb": rss_mb,
+                "active_tasks": active_tasks,
+                "max_concurrent_tasks": state.max_concurrent_tasks,
+                "rayon_threads": rayon::current_num_threads(),
+            })),
+        )
+            .into_response();
+    }
+    let max_tasks = state.max_concurrent_tasks;
+    let orphaned_tasks = state
+        .in_flight
+        .iter()
+        .filter(|e| e.timed_out.load(std::sync::atomic::Ordering::Relaxed))
+        .count();
+    let live_tasks = active_tasks.saturating_sub(orphaned_tasks);
+    let load = if max_tasks > 0 {
+        live_tasks as f64 / max_tasks as f64
+    } else {
+        0.0
+    };
+    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, live={live_tasks}, orphaned={orphaned_tasks}, load={load:.2})");
     Json(serde_json::json!({
         "status": "ok",
         "rss_mb": rss_mb,
         "active_tasks": active_tasks,
+        "live_tasks": live_tasks,
+        "orphaned_tasks": orphaned_tasks,
+        "max_concurrent_tasks": max_tasks,
+        "load": load,
         "rayon_threads": rayon::current_num_threads(),
     }))
     .into_response()
@@ -383,7 +414,28 @@ pub(super) async fn analyze(
         }
     };
 
+    // Hard gate: reject immediately if at capacity.
+    let active = state
+        .active_tasks
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if active >= state.max_concurrent_tasks {
+        tracing::warn!(
+            id = request_id,
+            active_tasks = active,
+            max = state.max_concurrent_tasks,
+            "rejecting: at capacity"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
+        )
+            .into_response();
+    }
+
+    let slow_rule_ms = state.slow_rule_ms;
     let timeout_duration = Duration::from_secs(state.timeout_secs);
+
+    // Claim a slot. The blocking closure releases it on exit.
     state
         .active_tasks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -393,112 +445,82 @@ pub(super) async fn analyze(
             name: filename.clone(),
             size_bytes: file_size as u64,
             started_at: Instant::now(),
+            timed_out: AtomicBool::new(false),
         },
     );
-    let slow_rule_ms = state.slow_rule_ms;
+
     let filename_for_closure = filename.clone();
+    let should_clear_caches = request_id.is_multiple_of(50);
     let cancellation = Arc::new(AtomicBool::new(false));
     let cancel_flag = Arc::clone(&cancellation);
-    let permit = match Arc::clone(&state.analysis_slots).acquire_owned().await {
-        Ok(permit) => permit,
-        Err(e) => {
-            tracing::error!("failed to acquire analysis slot: {e}  id={request_id}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response();
-        }
-    };
-
+    let cleanup_state = Arc::clone(&state);
     let mut handle = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        classify_file(
+        let result = classify_file(
             &path,
             &filename_for_closure,
             &resources,
             slow_rule_ms,
             Some(cancel_flag),
-        )
+        );
+        if should_clear_caches {
+            cleave::clear_all_thread_caches();
+        }
+        // Always release slot and clean up, even if timed out on the async side.
+        cleanup_state
+            .active_tasks
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        cleanup_state.in_flight.remove(&request_id);
+        drop(temp_file);
+        result
     });
 
-    // Use timeout() rather than select! so a simultaneous completion + timeout
-    // always prefers the completed result (no spurious 504s).
-    let result = tokio::time::timeout(timeout_duration, &mut handle).await;
+    let result = tokio::select! {
+        res = &mut handle => Some(res),
+        _ = tokio::time::sleep(timeout_duration) => {
+            cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(req) = state.in_flight.get(&request_id) {
+                req.timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            None
+        }
+    };
 
     let elapsed_ms = request_start.elapsed().as_millis();
 
     match result {
-        Ok(join_result) => {
-            state
-                .active_tasks
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            state.in_flight.remove(&request_id);
-            drop(temp_file);
-
-            match join_result {
-                Ok(Ok(scan_result)) => {
-                    tracing::info!(
-                        id = request_id,
-                        filename = %filename,
-                        size_bytes = file_size,
-                        elapsed_ms = elapsed_ms as u64,
-                        classification = %scan_result.classification,
-                        probability = scan_result.probability,
-                        "<-- 200 OK",
-                    );
-                    Json(scan_result.to_envelope()).into_response()
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        id = request_id,
-                        elapsed_ms = elapsed_ms as u64,
-                        error = %e,
-                        "<-- 500 analysis failed",
-                    );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "Analysis failed"})),
-                    )
-                        .into_response()
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        id = request_id,
-                        elapsed_ms = elapsed_ms as u64,
-                        error = %e,
-                        "<-- 500 task join error",
-                    );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "Internal error"})),
-                    )
-                        .into_response()
-                }
-            }
-        }
-        Err(_elapsed) => {
-            // Signal cleave to stop processing early.
-            cancellation.store(true, Ordering::Relaxed);
-
-            // The blocking task keeps running until cleave checks the flag;
-            // watch it to decrement the counter and drop the temp file.
-            let active = state
-                .active_tasks
-                .load(std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
-                "analysis timed out after {}s  id={request_id} filename={filename:?} active={active}",
-                state.timeout_secs,
+        Some(Ok(Ok(scan_result))) => {
+            tracing::info!(
+                id = request_id,
+                filename = %filename,
+                size_bytes = file_size,
+                elapsed_ms = elapsed_ms as u64,
+                classification = %scan_result.classification,
+                probability = scan_result.probability,
+                "<-- 200 OK",
             );
-            let orphan_state = Arc::clone(&state);
-            tokio::spawn(async move {
-                let _ = handle.await;
-                orphan_state
-                    .active_tasks
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                orphan_state.in_flight.remove(&request_id);
-                drop(temp_file);
-            });
+            let mut resp = Json(scan_result.to_envelope()).into_response();
+            resp.headers_mut()
+                .insert("X-Total-Ms", (elapsed_ms as u64).into());
+            resp
+        }
+        Some(Ok(Err(e))) => {
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 analysis failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Analysis failed"})),
+            )
+                .into_response()
+        }
+        Some(Err(e)) => {
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+        None => {
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, "<-- 504 timeout after {}s", state.timeout_secs);
             (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(serde_json::json!({"error": "Analysis timed out"})),
@@ -633,14 +655,12 @@ pub(super) async fn analyze_path(
         }
     };
 
-    let slow_rule_ms = state.slow_rule_ms;
-    let timeout_duration = Duration::from_secs(state.timeout_secs);
+    let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
     let filename = path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
 
     tracing::info!(
         id = request_id,
@@ -649,98 +669,106 @@ pub(super) async fn analyze_path(
         "--> POST /analyze-path",
     );
 
-    let permit = match Arc::clone(&state.analysis_slots).acquire_owned().await {
-        Ok(permit) => permit,
-        Err(e) => {
-            tracing::error!("failed to acquire analysis slot: {e}  id={request_id}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response();
-        }
-    };
+    // Hard gate: reject immediately if at capacity (including orphaned tasks).
+    let active = state
+        .active_tasks
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if active >= state.max_concurrent_tasks {
+        tracing::warn!(
+            id = request_id,
+            active_tasks = active,
+            max = state.max_concurrent_tasks,
+            "rejecting: at capacity"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
+        )
+            .into_response();
+    }
 
+    let slow_rule_ms = state.slow_rule_ms;
+    let timeout_duration = Duration::from_secs(state.timeout_secs);
+
+    // Claim a slot. The blocking closure is responsible for releasing it
+    // when it finishes — whether normally, on error, or after cancellation.
     state
         .active_tasks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     state.in_flight.insert(
         request_id,
         super::InFlightRequest {
-            name: filename.clone(),
+            name: req.path.clone(),
             size_bytes: file_size,
             started_at: request_start,
+            timed_out: AtomicBool::new(false),
         },
     );
 
+    let should_clear_caches = request_id.is_multiple_of(50);
     let cancellation = Arc::new(AtomicBool::new(false));
     let cancel_flag = Arc::clone(&cancellation);
-    let analyze_path = path.clone();
+    let cleanup_state = Arc::clone(&state);
     let mut handle = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        classify_file(
-            &analyze_path,
-            &filename,
-            &resources,
-            slow_rule_ms,
-            Some(cancel_flag),
-        )
+        let result = classify_file(&path, &filename, &resources, slow_rule_ms, Some(cancel_flag));
+        if should_clear_caches {
+            cleave::clear_all_thread_caches();
+        }
+        // The blocking task always releases its slot, even if the HTTP
+        // response already returned a 504 timeout. This ensures active_tasks
+        // accurately reflects running work — orphans don't leak slots.
+        cleanup_state
+            .active_tasks
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        cleanup_state.in_flight.remove(&request_id);
+        result
     });
 
-    let result = tokio::time::timeout(timeout_duration, &mut handle).await;
+    let result = tokio::select! {
+        res = &mut handle => Some(res),
+        _ = tokio::time::sleep(timeout_duration) => {
+            cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(req) = state.in_flight.get(&request_id) {
+                req.timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            None
+        }
+    };
+
     let elapsed_ms = request_start.elapsed().as_millis();
 
-    state
-        .active_tasks
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    state.in_flight.remove(&request_id);
-
     match result {
-        Ok(Ok(Ok(scan_result))) => {
+        Some(Ok(Ok(scan_result))) => {
             tracing::info!(
                 id = request_id,
-                path = %req.path,
                 elapsed_ms = elapsed_ms as u64,
                 classification = %scan_result.classification,
                 probability = scan_result.probability,
                 "<-- 200 OK",
             );
-            Json(scan_result.to_envelope()).into_response()
+            let mut resp = Json(scan_result.to_envelope()).into_response();
+            resp.headers_mut()
+                .insert("X-Total-Ms", (elapsed_ms as u64).into());
+            resp
         }
-        Ok(Ok(Err(e))) => {
-            tracing::warn!(
-                id = request_id,
-                elapsed_ms = elapsed_ms as u64,
-                error = %e,
-                "<-- 500 analysis failed",
-            );
+        Some(Ok(Err(e))) => {
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 analysis failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Analysis failed"})),
             )
                 .into_response()
         }
-        Ok(Err(e)) => {
-            tracing::warn!(
-                id = request_id,
-                elapsed_ms = elapsed_ms as u64,
-                error = %e,
-                "<-- 500 task panicked",
-            );
+        Some(Err(e)) => {
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task panicked");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
             )
                 .into_response()
         }
-        Err(_) => {
-            cancellation.store(true, Ordering::Relaxed);
-            handle.abort();
-            tracing::warn!(
-                id = request_id,
-                elapsed_ms = elapsed_ms as u64,
-                "<-- 504 timeout",
-            );
+        None => {
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, "<-- 504 timeout after {}s", state.timeout_secs);
             (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(serde_json::json!({"error": "Analysis timed out"})),
@@ -750,7 +778,10 @@ pub(super) async fn analyze_path(
     }
 }
 
-/// or `None` if memory is within limits or RSS is unavailable on this platform.
+/// Check RSS memory pressure and attempt recovery before rejecting requests.
+///
+/// Returns `Some(Response)` if the request should be rejected due to memory pressure,
+/// or `None` if the server has enough memory to proceed.
 fn check_memory_pressure(state: &AppState) -> Option<Response> {
     let rss = cleave::memory_tracker::current_rss()?;
 
@@ -758,29 +789,53 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
         // Happy path: reset overload timer if set.
         if let Ok(mut overloaded) = state.overloaded_since.try_lock() {
             if overloaded.is_some() {
-                tracing::info!("memory recovered: rss={}MB", rss / 1024 / 1024);
+                tracing::info!(rss_mb = rss / 1024 / 1024, "memory recovered below threshold");
                 *overloaded = None;
             }
         }
         return None;
     }
 
-    // Memory pressure: update overload timer.
+    // Memory pressure detected — try to reclaim by clearing thread-local caches.
+    tracing::info!(
+        rss_mb = rss / 1024 / 1024,
+        "memory pressure detected, clearing thread-local caches"
+    );
+    tokio::task::block_in_place(cleave::clear_all_thread_caches);
+
+    // Re-check after clearing caches.
+    let rss_after = cleave::memory_tracker::current_rss()?;
+    if rss_after <= state.max_rss_bytes {
+        if let Ok(mut overloaded) = state.overloaded_since.try_lock() {
+            *overloaded = None;
+        }
+        tracing::info!(
+            rss_before_mb = rss / 1024 / 1024,
+            rss_after_mb = rss_after / 1024 / 1024,
+            "cache clear freed memory, accepting request"
+        );
+        return None;
+    }
+
+    // Still overloaded — track duration and potentially terminate.
     let mut overloaded = state.overloaded_since.lock().ok()?;
     let since = *overloaded.get_or_insert_with(Instant::now);
     let overloaded_secs = since.elapsed().as_secs();
 
     if overloaded_secs > 30 {
         tracing::error!(
-            "memory overload persisted >30s (rss={}MB), continuing to reject requests",
-            rss / 1024 / 1024
+            rss_mb = rss_after / 1024 / 1024,
+            overloaded_secs,
+            "memory overload persisted >30s after cache clears, terminating"
         );
+        std::process::exit(1);
     }
 
     tracing::warn!(
-        "server overloaded: rss={}MB max={}MB overloaded_secs={overloaded_secs}",
-        rss / 1024 / 1024,
-        state.max_rss_bytes / 1024 / 1024,
+        rss_mb = rss_after / 1024 / 1024,
+        max_rss_mb = state.max_rss_bytes / 1024 / 1024,
+        overloaded_secs,
+        "server overloaded: high memory usage (even after cache clear)"
     );
     Some(
         (
@@ -818,7 +873,9 @@ pub(super) async fn memory_stats(State(state): State<Arc<AppState>>) -> Json<ser
         },
         "server": {
             "active_tasks": state.active_tasks.load(Ordering::Relaxed),
+            "max_concurrent_tasks": state.max_concurrent_tasks,
             "requests_total": state.next_request_id.load(Ordering::Relaxed),
+            "timeout_secs": state.timeout_secs,
         },
         "thread_pools": {
             "rayon_threads": rayon::current_num_threads(),
@@ -838,6 +895,7 @@ pub(super) async fn requests(State(state): State<Arc<AppState>>) -> Json<serde_j
                 "name": e.name,
                 "size_bytes": e.size_bytes,
                 "elapsed_ms": now.duration_since(e.started_at).as_millis(),
+                "timed_out": e.timed_out.load(std::sync::atomic::Ordering::Relaxed),
             })
         })
         .collect();

@@ -108,7 +108,7 @@ enum Commands {
         bind: SocketAddr,
 
         /// Per-request analysis timeout in seconds
-        #[arg(long, default_value = "120")]
+        #[arg(long, default_value = "600")]
         timeout_secs: u64,
 
         /// Maximum upload size in megabytes
