@@ -122,6 +122,10 @@ enum Commands {
         /// Comma-separated directories allowed for /analyze-path requests
         #[arg(long)]
         allowed_dirs: Option<String>,
+
+        /// Directory for extracting archive members (passed to cleave)
+        #[arg(long)]
+        extract_dir: Option<String>,
     },
 
     /// Print version information
@@ -266,6 +270,7 @@ fn main() -> Result<()> {
             max_size_mb,
             max_rss_gb,
             allowed_dirs,
+            extract_dir,
         } => {
             let dirs: Vec<std::path::PathBuf> = allowed_dirs
                 .unwrap_or_default()
@@ -282,6 +287,7 @@ fn main() -> Result<()> {
                 thresholds,
                 cli.slow_rule_ms,
                 dirs,
+                extract_dir.map(std::path::PathBuf::from),
             )?;
             eprintln!("Starting litmus server on http://{} ...", bind);
             tokio::runtime::Builder::new_multi_thread()

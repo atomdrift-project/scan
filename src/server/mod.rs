@@ -43,6 +43,7 @@ pub struct ServerConfig {
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
     allowed_dirs: Vec<PathBuf>,
+    extract_dir: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -66,6 +67,7 @@ impl ServerConfig {
     ///     None,
     ///     4_000,
     ///     vec![],
+    ///     None,
     /// )?;
     ///
     /// assert_eq!(config.timeout_secs(), 120);
@@ -80,6 +82,7 @@ impl ServerConfig {
         thresholds: Option<Thresholds>,
         slow_rule_ms: u64,
         allowed_dirs: Vec<PathBuf>,
+        extract_dir: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         if let Some(ref t) = thresholds {
             t.validate()
@@ -94,7 +97,14 @@ impl ServerConfig {
             thresholds,
             slow_rule_ms,
             allowed_dirs,
+            extract_dir,
         })
+    }
+
+    /// Directory for extracting archive members.
+    #[must_use]
+    pub fn extract_dir(&self) -> Option<&std::path::Path> {
+        self.extract_dir.as_deref()
     }
 
     /// Address the HTTP server binds to.
@@ -164,6 +174,7 @@ mod config_tests {
             }),
             4_000,
             vec![],
+            None,
         );
 
         assert!(result.is_err());
@@ -180,6 +191,7 @@ mod config_tests {
             None,
             4_000,
             vec![],
+            None,
         );
 
         assert!(result.is_ok());
@@ -211,6 +223,7 @@ struct AppState {
     threshold_overrides: Option<Thresholds>,
     slow_rule_ms: u64,
     allowed_dirs: Vec<PathBuf>,
+    extract_dir: Option<PathBuf>,
     ready: AtomicBool,
     init_error: RwLock<Option<String>>,
     resources: RwLock<Option<Arc<ModelResources>>>,
@@ -261,6 +274,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         threshold_overrides: config.thresholds(),
         slow_rule_ms: config.slow_rule_ms(),
         allowed_dirs: config.allowed_dirs().to_vec(),
+        extract_dir: config.extract_dir().map(PathBuf::from),
         ready: AtomicBool::new(false),
         init_error: RwLock::new(None),
         resources: RwLock::new(None),

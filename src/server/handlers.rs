@@ -536,6 +536,7 @@ pub(super) async fn analyze(
             &filename_for_closure,
             &resources,
             slow_rule_ms,
+            None,
             Some(cancel_flag),
         );
         if should_clear_caches {
@@ -610,12 +611,15 @@ fn classify_file(
     label: &str,
     resources: &super::ModelResources,
     slow_rule_ms: u64,
+    extract_dir: Option<&std::path::Path>,
     cancellation: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
+    let sample_extraction = extract_dir.map(|d| cleave::SampleExtractionConfig::new(d.to_path_buf()));
     let opts = cleave::AnalysisOptions {
         slow_rule_ms,
+        sample_extraction,
         cancellation: cancellation.clone(),
         ..Default::default()
     };
@@ -773,11 +777,12 @@ pub(super) async fn analyze_path(
     );
 
     let should_clear_caches = request_id.is_multiple_of(50);
+    let extract_dir = state.extract_dir.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
     let cancel_flag = Arc::clone(&cancellation);
     let mut handle = tokio::task::spawn_blocking(move || {
         let _moved_guard = guard;
-        let result = classify_file(&path, &filename, &resources, slow_rule_ms, Some(cancel_flag));
+        let result = classify_file(&path, &filename, &resources, slow_rule_ms, extract_dir.as_deref(), Some(cancel_flag));
         if should_clear_caches {
             cleave::clear_all_thread_caches();
         }
@@ -798,7 +803,24 @@ pub(super) async fn analyze_path(
     let elapsed_ms = request_start.elapsed().as_millis();
 
     match result {
-        Some(Ok(Ok(scan_result))) => {
+        Some(Ok(Ok(mut scan_result))) => {
+            // Inject extracted_path into the raw cleave JSON so cyclotron
+            // knows where archive members were extracted on disk.
+            if let (Some(ref extract_dir), Some(ref mut raw)) = (&state.extract_dir, &mut scan_result.cleave) {
+                if let Some(fs) = raw.get("fs").and_then(|f| f.as_array()) {
+                    if let Some(first) = fs.first().and_then(|f| f.get("sha")).and_then(|s| s.as_str()) {
+                        let short = &first[..first.len().min(6)];
+                        let dir = extract_dir.join(short);
+                        if dir.is_dir() {
+                            raw.as_object_mut().map(|o| o.insert(
+                                "extracted_path".to_string(),
+                                serde_json::Value::String(dir.to_string_lossy().into_owned()),
+                            ));
+                        }
+                    }
+                }
+            }
+
             tracing::info!(
                 id = request_id,
                 elapsed_ms = elapsed_ms as u64,
