@@ -315,11 +315,7 @@ fn build_result(
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
-    let cleave = if is_json {
-        Some(cr.report_json)
-    } else {
-        None
-    };
+    let cleave = if is_json { Some(cr.report_json) } else { None };
     let thresholds = model.thresholds();
 
     Ok(ScanResult {

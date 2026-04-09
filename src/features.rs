@@ -790,9 +790,12 @@ fn write_aggregate_features(
     vec[offset + 19] = host_log;
     vec[offset + 20] = breadth_hostile as f32 / breadth_notable.max(1) as f32;
     vec[offset + 21] = breadth_hostile as f32 / breadth_suspicious.max(1) as f32;
-    vec[offset + 22] = summary.suspicious_finding_count as f32 / summary.notable_finding_count.max(1) as f32;
-    vec[offset + 23] = summary.hostile_finding_count as f32 / summary.notable_finding_count.max(1) as f32;
-    vec[offset + 24] = summary.hostile_finding_count as f32 / summary.suspicious_finding_count.max(1) as f32;
+    vec[offset + 22] =
+        summary.suspicious_finding_count as f32 / summary.notable_finding_count.max(1) as f32;
+    vec[offset + 23] =
+        summary.hostile_finding_count as f32 / summary.notable_finding_count.max(1) as f32;
+    vec[offset + 24] =
+        summary.hostile_finding_count as f32 / summary.suspicious_finding_count.max(1) as f32;
 }
 
 fn write_external_summary_features(summary: &FindingSummary, vec: &mut [f32], offset: usize) {
@@ -1066,7 +1069,7 @@ mod tests {
         assert_eq!(crit_ordinal(&serde_json::json!({"l":3})), 3); // notable
         assert_eq!(crit_ordinal(&serde_json::json!({"l":2})), 2); // baseline
         assert_eq!(crit_ordinal(&serde_json::json!({"l":0})), 0); // filtered
-        assert_eq!(crit_ordinal(&serde_json::json!({})), 0);          // missing → 0
+        assert_eq!(crit_ordinal(&serde_json::json!({})), 0); // missing → 0
     }
 
     #[test]

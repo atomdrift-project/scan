@@ -776,11 +776,7 @@ fn process_report(
     let is_json = matches!(config.format(), OutputFormat::Json);
 
     // Include raw cleave report for JSON output (unmutated — ML scores go in the ml section).
-    let cleave = if is_json {
-        Some(cr.report_json)
-    } else {
-        None
-    };
+    let cleave = if is_json { Some(cr.report_json) } else { None };
 
     let thresholds = model.thresholds();
 
@@ -923,7 +919,10 @@ pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
         &info.sha256
     };
     match &info.commit {
-        Some(commit) => format!("v{}.{}-{}-{}", info.version, info.abi_version, sha_prefix, commit),
+        Some(commit) => format!(
+            "v{}.{}-{}-{}",
+            info.version, info.abi_version, sha_prefix, commit
+        ),
         None => format!("v{}.{}-{}", info.version, info.abi_version, sha_prefix),
     }
 }
@@ -980,7 +979,10 @@ fn build_ml_fs(
 
     let mut out = Vec::with_capacity(fs.len());
     for (idx, entry) in fs.iter().enumerate() {
-        let id = entry.get("id").and_then(|v| v.as_u64()).unwrap_or(idx as u64);
+        let id = entry
+            .get("id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(idx as u64);
         let depth = entry.get("dp").and_then(|v| v.as_u64()).unwrap_or(0);
 
         let (cls, prob) = if depth == 0 {
@@ -1030,7 +1032,12 @@ impl ScanResult {
     /// Build the `{"ml": {...}, "raw": {...}}` envelope for JSON output.
     pub fn to_envelope(&self) -> ScanResultEnvelope {
         let raw = self.cleave.clone().unwrap_or(serde_json::json!({}));
-        let ml_fs = build_ml_fs(&raw, &self.classification, self.probability, &self.embedded_files);
+        let ml_fs = build_ml_fs(
+            &raw,
+            &self.classification,
+            self.probability,
+            &self.embedded_files,
+        );
         ScanResultEnvelope {
             ml: MlSection {
                 v: self.v,

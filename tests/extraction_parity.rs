@@ -131,7 +131,9 @@ fn full_pipeline_matches_collimator() {
         .first()
         .is_some_and(|s| s.expected_probability.is_some());
     if !has_e2e {
-        eprintln!("SKIPPED: extraction_fixture.json has no end-to-end data (regenerate with model)");
+        eprintln!(
+            "SKIPPED: extraction_fixture.json has no end-to-end data (regenerate with model)"
+        );
         return;
     }
 

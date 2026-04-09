@@ -9,6 +9,53 @@ use std::time::{Duration, Instant};
 use tempfile::Builder as TempBuilder;
 
 use super::AppState;
+
+fn analysis_error_response(error: &anyhow::Error) -> Response {
+    let (status, message) = classify_analysis_error(error.root_cause().to_string().as_str());
+    let detail = format!("{error:#}");
+
+    (
+        status,
+        Json(if detail == message {
+            serde_json::json!({ "error": message })
+        } else {
+            serde_json::json!({ "error": message, "detail": detail })
+        }),
+    )
+        .into_response()
+}
+
+fn classify_analysis_error(message: &str) -> (StatusCode, String) {
+    let normalized = message.to_ascii_lowercase();
+
+    let status = if normalized.contains("unsupported file type")
+        || normalized.contains("unsupported archive type")
+        || normalized.contains("unsupported compression")
+    {
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    } else if normalized.contains("archive is encrypted but no passwords configured")
+        || normalized.contains("invalid ")
+        || normalized.contains("not a valid ")
+        || normalized.contains("truncated")
+        || normalized.contains("too small")
+        || normalized.contains("out of bounds")
+        || normalized.contains("empty package.json")
+        || normalized.contains("maximum archive depth")
+        || normalized.contains("maximum decode depth")
+        || normalized.contains("exceeded maximum")
+        || normalized.contains("file count limit exceeded")
+    {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+
+    (status, message.to_string())
+}
+
+fn analysis_error_status(error: &anyhow::Error) -> StatusCode {
+    classify_analysis_error(error.root_cause().to_string().as_str()).0
+}
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::Model;
@@ -576,12 +623,9 @@ pub(super) async fn analyze(
             resp
         }
         Some(Ok(Err(e))) => {
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 analysis failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Analysis failed"})),
-            )
-                .into_response()
+            let status = analysis_error_status(&e);
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, status = status.as_u16(), error = %e, "analysis failed");
+            analysis_error_response(&e)
         }
         Some(Err(e)) => {
             tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error (panic?)");
@@ -592,7 +636,12 @@ pub(super) async fn analyze(
                 .into_response()
         }
         None => {
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, "<-- 504 timeout after {}s", state.timeout_secs);
+            tracing::warn!(
+                id = request_id,
+                elapsed_ms = elapsed_ms as u64,
+                "<-- 504 timeout after {}s",
+                state.timeout_secs
+            );
             (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(serde_json::json!({"error": "Analysis timed out"})),
@@ -616,7 +665,8 @@ fn classify_file(
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
-    let sample_extraction = extract_dir.map(|d| cleave::SampleExtractionConfig::new(d.to_path_buf()));
+    let sample_extraction =
+        extract_dir.map(|d| cleave::SampleExtractionConfig::new(d.to_path_buf()));
     let opts = cleave::AnalysisOptions {
         slow_rule_ms,
         sample_extraction,
@@ -680,11 +730,7 @@ pub(super) async fn analyze_path(
     let path = std::path::PathBuf::from(&req.path);
 
     // Validate the path is under an allowed directory.
-    if state.allowed_dirs.is_empty()
-        || !state
-            .allowed_dirs
-            .iter()
-            .any(|dir| path.starts_with(dir))
+    if state.allowed_dirs.is_empty() || !state.allowed_dirs.iter().any(|dir| path.starts_with(dir))
     {
         tracing::warn!(id = request_id, path = %req.path, "analyze-path rejected: not under allowed dirs");
         return (
@@ -769,12 +815,7 @@ pub(super) async fn analyze_path(
     let timeout_duration = Duration::from_secs(state.timeout_secs);
 
     // Claim a slot using the RAII guard.
-    let guard = TaskGuard::new(
-        Arc::clone(&state),
-        request_id,
-        req.path.clone(),
-        file_size,
-    );
+    let guard = TaskGuard::new(Arc::clone(&state), request_id, req.path.clone(), file_size);
 
     let should_clear_caches = request_id.is_multiple_of(50);
     let extract_dir = state.extract_dir.clone();
@@ -782,7 +823,14 @@ pub(super) async fn analyze_path(
     let cancel_flag = Arc::clone(&cancellation);
     let mut handle = tokio::task::spawn_blocking(move || {
         let _moved_guard = guard;
-        let result = classify_file(&path, &filename, &resources, slow_rule_ms, extract_dir.as_deref(), Some(cancel_flag));
+        let result = classify_file(
+            &path,
+            &filename,
+            &resources,
+            slow_rule_ms,
+            extract_dir.as_deref(),
+            Some(cancel_flag),
+        );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
         }
@@ -806,16 +854,24 @@ pub(super) async fn analyze_path(
         Some(Ok(Ok(mut scan_result))) => {
             // Inject extracted_path into the raw cleave JSON so cyclotron
             // knows where archive members were extracted on disk.
-            if let (Some(ref extract_dir), Some(ref mut raw)) = (&state.extract_dir, &mut scan_result.cleave) {
+            if let (Some(ref extract_dir), Some(ref mut raw)) =
+                (&state.extract_dir, &mut scan_result.cleave)
+            {
                 if let Some(fs) = raw.get("fs").and_then(|f| f.as_array()) {
-                    if let Some(first) = fs.first().and_then(|f| f.get("sha")).and_then(|s| s.as_str()) {
+                    if let Some(first) = fs
+                        .first()
+                        .and_then(|f| f.get("sha"))
+                        .and_then(|s| s.as_str())
+                    {
                         let short = &first[..first.len().min(6)];
                         let dir = extract_dir.join(short);
                         if dir.is_dir() {
-                            raw.as_object_mut().map(|o| o.insert(
-                                "extracted_path".to_string(),
-                                serde_json::Value::String(dir.to_string_lossy().into_owned()),
-                            ));
+                            raw.as_object_mut().map(|o| {
+                                o.insert(
+                                    "extracted_path".to_string(),
+                                    serde_json::Value::String(dir.to_string_lossy().into_owned()),
+                                )
+                            });
                         }
                     }
                 }
@@ -834,12 +890,9 @@ pub(super) async fn analyze_path(
             resp
         }
         Some(Ok(Err(e))) => {
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 analysis failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Analysis failed"})),
-            )
-                .into_response()
+            let status = analysis_error_status(&e);
+            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, status = status.as_u16(), error = %e, "analysis failed");
+            analysis_error_response(&e)
         }
         Some(Err(e)) => {
             tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error (panic?)");
@@ -850,7 +903,12 @@ pub(super) async fn analyze_path(
                 .into_response()
         }
         None => {
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, "<-- 504 timeout after {}s", state.timeout_secs);
+            tracing::warn!(
+                id = request_id,
+                elapsed_ms = elapsed_ms as u64,
+                "<-- 504 timeout after {}s",
+                state.timeout_secs
+            );
             (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(serde_json::json!({"error": "Analysis timed out"})),
@@ -871,7 +929,10 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
         // Happy path: reset overload timer if set.
         if let Ok(mut overloaded) = state.overloaded_since.try_lock() {
             if overloaded.is_some() {
-                tracing::info!(rss_mb = rss / 1024 / 1024, "memory recovered below threshold");
+                tracing::info!(
+                    rss_mb = rss / 1024 / 1024,
+                    "memory recovered below threshold"
+                );
                 *overloaded = None;
             }
         }
@@ -926,6 +987,33 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
         )
             .into_response(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_analysis_error;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn classify_unsupported_file_type_as_415() {
+        let (status, message) = classify_analysis_error("Unsupported file type: Unknown");
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(message, "Unsupported file type: Unknown");
+    }
+
+    #[test]
+    fn classify_invalid_archive_as_422() {
+        let (status, message) =
+            classify_analysis_error("Archive is encrypted but no passwords configured");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, "Archive is encrypted but no passwords configured");
+    }
+
+    #[test]
+    fn classify_unexpected_failure_as_500() {
+        let (status, _) = classify_analysis_error("model evaluation failed");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
 
 /// GET /_/memory — memory diagnostics for all major structures.
