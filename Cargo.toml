@@ -37,7 +37,7 @@ manual_let_else = "warn"
 
 [package]
 name = "litmus"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["The Atomdrift Project"]
 description = "ML-powered malware classification using cleave static analysis"
