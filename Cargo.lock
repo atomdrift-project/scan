@@ -633,7 +633,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "1.0.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4e9076f5f95fdac5cb98a935ad19cdb68e7589de"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72e57b4a70dd39bcfb1429e1e1391dbf60befa13"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -739,7 +739,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4e9076f5f95fdac5cb98a935ad19cdb68e7589de"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72e57b4a70dd39bcfb1429e1e1391dbf60befa13"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1370,7 +1370,7 @@ dependencies = [
 [[package]]
 name = "fileid"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4e9076f5f95fdac5cb98a935ad19cdb68e7589de"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72e57b4a70dd39bcfb1429e1e1391dbf60befa13"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -2317,7 +2317,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4e9076f5f95fdac5cb98a935ad19cdb68e7589de"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72e57b4a70dd39bcfb1429e1e1391dbf60befa13"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -3381,7 +3381,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4e9076f5f95fdac5cb98a935ad19cdb68e7589de"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72e57b4a70dd39bcfb1429e1e1391dbf60befa13"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3827,7 +3827,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#4e9076f5f95fdac5cb98a935ad19cdb68e7589de"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72e57b4a70dd39bcfb1429e1e1391dbf60befa13"
 
 [[package]]
 name = "tap"
