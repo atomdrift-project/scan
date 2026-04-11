@@ -40,23 +40,21 @@ release: check-cargo $(OUT_DIR)
 	cp target/release/$(BINARY) $(OUT_DIR)/
 
 install: release
-	@if echo "$$PATH" | tr ':' '\n' | grep -qx "$$HOME/.cargo/bin" && [ -d "$$HOME/.cargo/bin" ]; then \
-		cp $(OUT_DIR)/$(BINARY) "$$HOME/.cargo/bin/$(BINARY)"; \
-		echo "✓ Installed to $$HOME/.cargo/bin/$(BINARY)"; \
+	@set -e; \
+	if echo "$$PATH" | tr ':' '\n' | grep -qx "$$HOME/.cargo/bin" && [ -d "$$HOME/.cargo/bin" ]; then \
+		dest="$$HOME/.cargo/bin/$(BINARY)"; \
 	elif [ -d "$$HOME/bin" ] && [ -w "$$HOME/bin" ]; then \
-		cp $(OUT_DIR)/$(BINARY) "$$HOME/bin/$(BINARY)"; \
-		echo "✓ Installed to $$HOME/bin/$(BINARY)"; \
+		dest="$$HOME/bin/$(BINARY)"; \
 	elif [ -d "$$HOME/.local/bin" ] && [ -w "$$HOME/.local/bin" ]; then \
-		cp $(OUT_DIR)/$(BINARY) "$$HOME/.local/bin/$(BINARY)"; \
-		echo "✓ Installed to $$HOME/.local/bin/$(BINARY)"; \
+		dest="$$HOME/.local/bin/$(BINARY)"; \
 	elif [ -w /usr/local/bin ]; then \
-		cp $(OUT_DIR)/$(BINARY) /usr/local/bin/$(BINARY); \
-		echo "✓ Installed to /usr/local/bin/$(BINARY)"; \
+		dest="/usr/local/bin/$(BINARY)"; \
 	else \
 		mkdir -p "$$HOME/.cargo/bin"; \
-		cp $(OUT_DIR)/$(BINARY) "$$HOME/.cargo/bin/$(BINARY)"; \
-		echo "✓ Installed to $$HOME/.cargo/bin/$(BINARY)"; \
-	fi
+		dest="$$HOME/.cargo/bin/$(BINARY)"; \
+	fi; \
+	install -m 755 $(OUT_DIR)/$(BINARY) "$$dest.new" && mv -f "$$dest.new" "$$dest"; \
+	echo "✓ Installed to $$dest"
 
 tarball: release
 	tar -czf $(OUT_DIR)/litmus.tgz -C $(OUT_DIR) litmus

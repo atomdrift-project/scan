@@ -168,6 +168,20 @@ fn main() -> Result<()> {
         fmt.without_time().init();
     }
 
+    // Configure the global rayon pool BEFORE any cleave work runs. Cleave's
+    // archive + YARA-X + composite-rule evaluation paths recurse deeply enough
+    // to exhaust rayon's default 2 MB worker stack, producing an unnamed
+    // `thread '<unknown>' has overflowed its stack` abort. Cleave's CLI does
+    // this in `cli_bootstrap`, but litmus uses cleave as a library and never
+    // calls that, so we have to install the global pool ourselves.
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .stack_size(16 * 1024 * 1024)
+        .thread_name(|i| format!("rayon-{i}"))
+        .build_global()
+    {
+        tracing::warn!(error = %e, "failed to install global rayon pool; using default");
+    }
+
     // Initialize terminal theme before any output.
     if cli.light {
         litmus::output::set_theme(litmus::output::Theme::Light);
