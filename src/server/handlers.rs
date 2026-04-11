@@ -62,7 +62,9 @@ use crate::model::Model;
 use crate::scan::ScanResult;
 
 /// GET /_/health — liveness check with memory and concurrency status.
-/// Returns 503 while resources are still loading or when RSS exceeds the configured limit.
+/// Returns 503 while resources are still loading or when RSS exceeds the
+/// configured limit. A fully-utilised worker pool returns 200 with
+/// `status: "saturated"` — that's the target steady state, not a fault.
 ///
 /// Every response carries `uptime_secs` (seconds since the server started)
 /// so clients can detect restarts without polling a separate endpoint.
@@ -119,46 +121,6 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     }
-    if active_tasks >= state.max_concurrent_tasks {
-        let orphaned_tasks = state
-            .in_flight
-            .iter()
-            .filter(|e| e.timed_out.load(std::sync::atomic::Ordering::Relaxed))
-            .count();
-        let live_tasks = active_tasks.saturating_sub(orphaned_tasks);
-
-        // Find the oldest task for diagnostic purposes.
-        let oldest = state
-            .in_flight
-            .iter()
-            .min_by_key(|e| e.started_at)
-            .map(|e| (e.name.clone(), e.started_at.elapsed().as_secs()));
-
-        tracing::warn!(
-            active_tasks,
-            live_tasks,
-            orphaned_tasks,
-            max_concurrent_tasks = state.max_concurrent_tasks,
-            oldest_task = ?oldest,
-            "GET /_/health -> 503 (thread pool saturated)"
-        );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "status": "degraded",
-                "reason": "thread_pool_saturated",
-                "rss_mb": rss_mb,
-                "active_tasks": active_tasks,
-                "live_tasks": live_tasks,
-                "orphaned_tasks": orphaned_tasks,
-                "max_concurrent_tasks": state.max_concurrent_tasks,
-                "oldest_task": oldest.map(|(name, secs)| serde_json::json!({"name": name, "elapsed_secs": secs})),
-                "uptime_secs": uptime_secs,
-                "rayon_threads": rayon::current_num_threads(),
-            })),
-        )
-            .into_response();
-    }
     let max_tasks = state.max_concurrent_tasks;
     let orphaned_tasks = state
         .in_flight
@@ -171,6 +133,41 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
     } else {
         0.0
     };
+    // A fully-utilised worker pool is the *target* steady state, not a fault.
+    // Report it as "saturated" with HTTP 200 so monitors can distinguish "all
+    // slots busy" from real failures (memory pressure, stuck workers). The
+    // /analyze endpoint still rejects with 503 when active >= max, so clients
+    // back off correctly without /_/health pretending the server is unhealthy.
+    let saturated = active_tasks >= max_tasks;
+    if saturated {
+        let oldest = state
+            .in_flight
+            .iter()
+            .min_by_key(|e| e.started_at)
+            .map(|e| (e.name.clone(), e.started_at.elapsed().as_secs()));
+        tracing::debug!(
+            active_tasks,
+            live_tasks,
+            orphaned_tasks,
+            max_concurrent_tasks = max_tasks,
+            oldest_task = ?oldest,
+            "GET /_/health -> 200 (saturated)"
+        );
+        return Json(serde_json::json!({
+            "status": "saturated",
+            "reason": "thread_pool_saturated",
+            "rss_mb": rss_mb,
+            "active_tasks": active_tasks,
+            "live_tasks": live_tasks,
+            "orphaned_tasks": orphaned_tasks,
+            "max_concurrent_tasks": max_tasks,
+            "oldest_task": oldest.map(|(name, secs)| serde_json::json!({"name": name, "elapsed_secs": secs})),
+            "load": load,
+            "uptime_secs": uptime_secs,
+            "rayon_threads": rayon::current_num_threads(),
+        }))
+            .into_response();
+    }
     tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, live={live_tasks}, orphaned={orphaned_tasks}, load={load:.2})");
     Json(serde_json::json!({
         "status": "ok",
@@ -189,8 +186,9 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
 /// GET /_/info — static server capacity and version info.
 ///
 /// Returned by litmus on startup so clients (e.g. hopper) can size their
-/// per-node worker pools without hand-configuring slot counts. Always 200,
-/// independent of readiness — readiness is reported by /_/health.
+/// per-node worker pools without hand-configuring slot counts, and so they
+/// can compare model/traits commits across nodes for drift detection.
+/// Always 200, independent of readiness — readiness is reported by /_/health.
 pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
     let cpus = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
@@ -201,25 +199,23 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
         "cpus": cpus,
         "max_upload_mb": state.max_upload_bytes / 1024 / 1024,
         "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
+        "model_commit": crate::models_repo::version(),
+        "traits_commit": cleave::traits_repo::version(),
     }))
     .into_response()
 }
 
-/// POST /reload — reload model from disk, swap atomically.
-///
-/// Only one reload may run at a time; concurrent calls receive 409.
-pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
-    tracing::info!("POST /_/reload");
-    // Prevent concurrent reloads — each load allocates significant memory.
-    let Ok(_guard) = state.reload_lock.try_lock() else {
-        tracing::warn!("reload rejected: already in progress");
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Reload already in progress"})),
-        )
-            .into_response();
-    };
+/// Outcome of [`do_model_reload`] — caller maps this to an HTTP response.
+struct ReloadOutcome {
+    elapsed_ms: u128,
+}
 
+/// Perform the cleave-traits reload + model load + atomic swap. Caller is
+/// responsible for holding `state.reload_lock`. Shared by /_/reload and
+/// /_/update so the load+swap dance lives in exactly one place.
+async fn do_model_reload(
+    state: &Arc<AppState>,
+) -> Result<ReloadOutcome, (StatusCode, &'static str)> {
     let start = Instant::now();
     let model_dir = state.model_dir.clone();
     let thresholds = state.threshold_overrides;
@@ -242,74 +238,158 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
 
     let elapsed_ms = start.elapsed().as_millis();
 
-    match result {
-        Ok(Ok((model, shap, ctx))) => {
-            let spec_version = model.spec().version();
-            let features = model.spec().total_features();
-            let shap_loaded = shap.is_some();
-            let was_ready = state.ready.load(std::sync::atomic::Ordering::Relaxed);
-            match state.resources.write() {
-                Ok(mut lock) => {
-                    *lock = Some(Arc::new(super::ModelResources { model, shap, ctx }));
-                    if let Ok(mut init_error) = state.init_error.write() {
-                        *init_error = None;
-                    }
-                    state
-                        .ready
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    if was_ready {
-                        tracing::info!(
-                            elapsed_ms,
-                            spec_version,
-                            features,
-                            shap_loaded,
-                            "model reloaded"
-                        );
-                    } else {
-                        tracing::info!(
-                            elapsed_ms,
-                            spec_version,
-                            features,
-                            shap_loaded,
-                            "model loaded via reload — server now ready"
-                        );
-                    }
-                    Json(serde_json::json!({
-                        "status": "ok",
-                        "elapsed_ms": elapsed_ms,
-                    }))
-                    .into_response()
-                }
-                Err(e) => {
-                    tracing::error!("write lock poisoned during reload: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "Internal error"})),
-                    )
-                        .into_response()
-                }
-            }
-        }
+    let (model, shap, ctx) = match result {
+        Ok(Ok(t)) => t,
         Ok(Err(e)) => {
             // Log internally but do not expose filesystem paths or model internals to callers.
             tracing::warn!("reload failed (previous model retained) in {elapsed_ms}ms: {e}");
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "error": "Failed to load model",
-                    "elapsed_ms": elapsed_ms,
-                })),
-            )
-                .into_response()
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "Failed to load model"));
         }
         Err(e) => {
             tracing::warn!("reload task join error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response()
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal error"));
         }
+    };
+
+    let spec_version = model.spec().version();
+    let features = model.spec().total_features();
+    let shap_loaded = shap.is_some();
+    let was_ready = state.ready.load(std::sync::atomic::Ordering::Relaxed);
+
+    match state.resources.write() {
+        Ok(mut lock) => {
+            *lock = Some(Arc::new(super::ModelResources { model, shap, ctx }));
+            if let Ok(mut init_error) = state.init_error.write() {
+                *init_error = None;
+            }
+            state
+                .ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            if was_ready {
+                tracing::info!(
+                    elapsed_ms,
+                    spec_version,
+                    features,
+                    shap_loaded,
+                    "model reloaded"
+                );
+            } else {
+                tracing::info!(
+                    elapsed_ms,
+                    spec_version,
+                    features,
+                    shap_loaded,
+                    "model loaded via reload — server now ready"
+                );
+            }
+            Ok(ReloadOutcome { elapsed_ms })
+        }
+        Err(e) => {
+            tracing::error!("write lock poisoned during reload: {e}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))
+        }
+    }
+}
+
+/// POST /reload — reload model from disk, swap atomically.
+///
+/// Only one reload may run at a time; concurrent calls receive 409.
+pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
+    tracing::info!("POST /_/reload");
+    // Prevent concurrent reloads — each load allocates significant memory.
+    let Ok(_guard) = state.reload_lock.try_lock() else {
+        tracing::warn!("reload rejected: already in progress");
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Reload already in progress"})),
+        )
+            .into_response();
+    };
+
+    match do_model_reload(&state).await {
+        Ok(outcome) => Json(serde_json::json!({
+            "status": "ok",
+            "elapsed_ms": outcome.elapsed_ms,
+        }))
+        .into_response(),
+        Err((status, msg)) => (status, Json(serde_json::json!({ "error": msg }))).into_response(),
+    }
+}
+
+/// POST /_/update — pull latest models + traits from their git repos, then
+/// reload. Both pulls are non-fatal: if either fails, the response reports
+/// it but the reload still runs against whatever is currently on disk so
+/// the operator gets the most-recent-good state. Shares the reload_lock
+/// with /_/reload so concurrent calls receive 409.
+pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
+    tracing::info!("POST /_/update");
+    let Ok(_guard) = state.reload_lock.try_lock() else {
+        tracing::warn!("update rejected: reload already in progress");
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Reload already in progress"})),
+        )
+            .into_response();
+    };
+
+    // Run the two repo pulls on a blocking thread; they're synchronous git
+    // and filesystem work. Both are non-fatal — log on failure and proceed
+    // to the reload step regardless so we still pick up any partial state.
+    let pulls = tokio::task::spawn_blocking(|| {
+        let models_err = match crate::models_repo::update() {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::warn!("models update failed: {e}");
+                Some(format!("{e}"))
+            }
+        };
+        let traits_err = match cleave::traits_repo::update(false) {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::warn!("traits update failed: {e}");
+                Some(format!("{e}"))
+            }
+        };
+        (models_err, traits_err)
+    })
+    .await;
+
+    let (models_err, traits_err) = match pulls {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("update pull task join error: {e}");
+            (
+                Some("task join failed".to_string()),
+                Some("task join failed".to_string()),
+            )
+        }
+    };
+
+    match do_model_reload(&state).await {
+        Ok(outcome) => Json(serde_json::json!({
+            "status": "ok",
+            "elapsed_ms": outcome.elapsed_ms,
+            "models_updated": models_err.is_none(),
+            "traits_updated": traits_err.is_none(),
+            "models_error": models_err,
+            "traits_error": traits_err,
+            "version": env!("CARGO_PKG_VERSION"),
+            "model_commit": crate::models_repo::version(),
+            "traits_commit": cleave::traits_repo::version(),
+        }))
+        .into_response(),
+        Err((status, msg)) => (
+            status,
+            Json(serde_json::json!({
+                "status": "reload_failed",
+                "error": msg,
+                "models_updated": models_err.is_none(),
+                "traits_updated": traits_err.is_none(),
+                "models_error": models_err,
+                "traits_error": traits_err,
+            })),
+        )
+            .into_response(),
     }
 }
 

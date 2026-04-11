@@ -127,7 +127,7 @@ enum Commands {
         #[arg(long)]
         extract_dir: Option<String>,
 
-        /// Maximum concurrent analyses (defaults to max(1, num_cpus / 4))
+        /// Maximum concurrent analyses (defaults to max(1, num_cpus / 2))
         #[arg(long)]
         workers: Option<usize>,
 
@@ -310,7 +310,7 @@ fn main() -> Result<()> {
                 let cores = std::thread::available_parallelism()
                     .map(std::num::NonZero::get)
                     .unwrap_or(4);
-                std::cmp::max(1, cores / 4)
+                std::cmp::max(1, cores / 2)
             });
             let allow_cidrs = match allow_cidr {
                 Some(s) => litmus::server::parse_cidr_list(&s)

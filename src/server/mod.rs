@@ -322,7 +322,7 @@ impl AppState {
 pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     tracing::info!(model_dir = %config.model_dir().display(), "starting — resources loading in background");
 
-    // Concurrency limit comes from --workers (defaults to cores/4 in main.rs).
+    // Concurrency limit comes from --workers (defaults to cores/2 in main.rs).
     // CPU-bound cleave + ONNX work overlaps poorly across many threads, so a
     // smaller pool typically delivers higher aggregate throughput than 1/core.
     let max_concurrent = config.workers();
@@ -472,6 +472,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         .route("/_/health", get(handlers::health))
         .route("/_/info", get(handlers::info))
         .route("/_/reload", post(handlers::reload))
+        .route("/_/update", post(handlers::update))
         .route("/_/memory", get(handlers::memory_stats))
         .route("/_/requests", get(handlers::requests))
         .route("/_/threads", get(handlers::threads))
