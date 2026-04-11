@@ -86,7 +86,7 @@ rssh "doas tee /etc/rc.d/litmus >/dev/null" <<'EOF'
 # litmus - Litmus server
 
 daemon="/usr/local/share/litmus/litmus"
-daemon_flags="--verbose -u serve --bind 0.0.0.0:8880"
+daemon_flags="--verbose -u serve --bind 0.0.0.0:49999"
 daemon_user="_litmus"
 daemon_logger="daemon.info"
 
