@@ -60,8 +60,9 @@ tarball: release
 	tar -czf $(OUT_DIR)/litmus.tgz -C $(OUT_DIR) litmus
 	@echo "Tarball: $(OUT_DIR)/litmus.tgz"
 
+rollout-bastille: BUILD ?= build
+rollout-bastille: RUN ?= litmus
 rollout-bastille:
-	@[ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || { echo "Usage: make rollout-bastille BUILD=<build-jail> RUN=<run-jail>"; exit 1; }
 	./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)"
 
 rollout-debian:
