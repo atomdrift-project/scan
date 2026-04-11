@@ -1,4 +1,4 @@
-SHELL := /bin/bash
+SHELL := /bin/sh
 BINARY = litmus
 OUT_DIR = out
 
