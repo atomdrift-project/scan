@@ -63,7 +63,12 @@ use crate::scan::ScanResult;
 
 /// GET /_/health — liveness check with memory and concurrency status.
 /// Returns 503 while resources are still loading or when RSS exceeds the configured limit.
+///
+/// Every response carries `uptime_secs` (seconds since the server started)
+/// so clients can detect restarts without polling a separate endpoint.
 pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let uptime_secs = state.started_at.elapsed().as_secs();
+
     if let Ok(init_error) = state.init_error.read() {
         if let Some(message) = init_error.as_ref() {
             tracing::error!("GET /_/health -> 503 (failed: {message})");
@@ -72,6 +77,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
                 Json(serde_json::json!({
                     "status": "failed",
                     "reason": "initialization_failed",
+                    "uptime_secs": uptime_secs,
                 })),
             )
                 .into_response();
@@ -82,7 +88,10 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         tracing::debug!("GET /_/health -> 503 (starting)");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"status": "starting"})),
+            Json(serde_json::json!({
+                "status": "starting",
+                "uptime_secs": uptime_secs,
+            })),
         )
             .into_response();
     }
@@ -104,6 +113,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
                 "rss_mb": rss_mb,
                 "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
                 "active_tasks": active_tasks,
+                "uptime_secs": uptime_secs,
                 "rayon_threads": rayon::current_num_threads(),
             })),
         )
@@ -143,6 +153,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
                 "orphaned_tasks": orphaned_tasks,
                 "max_concurrent_tasks": state.max_concurrent_tasks,
                 "oldest_task": oldest.map(|(name, secs)| serde_json::json!({"name": name, "elapsed_secs": secs})),
+                "uptime_secs": uptime_secs,
                 "rayon_threads": rayon::current_num_threads(),
             })),
         )
@@ -169,7 +180,27 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         "orphaned_tasks": orphaned_tasks,
         "max_concurrent_tasks": max_tasks,
         "load": load,
+        "uptime_secs": uptime_secs,
         "rayon_threads": rayon::current_num_threads(),
+    }))
+    .into_response()
+}
+
+/// GET /_/info — static server capacity and version info.
+///
+/// Returned by litmus on startup so clients (e.g. hopper) can size their
+/// per-node worker pools without hand-configuring slot counts. Always 200,
+/// independent of readiness — readiness is reported by /_/health.
+pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
+    let cpus = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(0);
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "slots": state.max_concurrent_tasks,
+        "cpus": cpus,
+        "max_upload_mb": state.max_upload_bytes / 1024 / 1024,
+        "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
     }))
     .into_response()
 }

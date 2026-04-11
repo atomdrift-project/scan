@@ -2,10 +2,22 @@
 
 use anyhow::{Context, Result};
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use litmus::server::{build_app, ServerConfig};
+use std::net::SocketAddr;
 use tower::ServiceExt;
 use tracing_subscriber::EnvFilter;
+
+/// Inject a loopback ConnectInfo on a request so the ACL middleware sees a
+/// peer address. axum's `into_make_service_with_connect_info` runs only when
+/// the server is started via `axum::serve`; tests using `oneshot` must add
+/// it manually or every request 403s.
+fn loopback<B>(mut req: Request<B>) -> Request<B> {
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+    req
+}
 
 /// Install a tracing subscriber so server logs are visible on test failure.
 /// Silently ignored if another test in the process already installed one.
@@ -61,13 +73,16 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     let timeout_secs = if cfg!(debug_assertions) { 600 } else { 120 };
 
     let config = ServerConfig::new(
-        std::net::SocketAddr::from(([127, 0, 0, 1], 8081)),
+        SocketAddr::from(([127, 0, 0, 1], 8081)),
         timeout_secs,
         100 * 1024 * 1024,
         8 * 1024 * 1024 * 1024,
         model_dir()?,
         None,
         4000,
+        vec![],
+        None,
+        2,
         vec![],
     )?;
     let app = build_app(&config).await.context("failed to build app")?;
@@ -83,12 +98,12 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     for _ in 0..max_health_polls {
         let resp = app
             .clone()
-            .oneshot(
+            .oneshot(loopback(
                 Request::builder()
                     .uri("/_/health")
                     .body(Body::empty())
                     .context("failed to build health request")?,
-            )
+            ))
             .await
             .context("health request failed")?;
         if resp.status() == StatusCode::OK {
@@ -106,14 +121,14 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     let (content_type, body) = multipart_body(&file_bytes, "encrypted.zip");
 
     let response = app
-        .oneshot(
+        .oneshot(loopback(
             Request::builder()
                 .method("POST")
                 .uri("/analyze")
                 .header("content-type", content_type)
                 .body(Body::from(body))
                 .context("failed to build analyze request")?,
-        )
+        ))
         .await
         .context("analyze request failed")?;
 

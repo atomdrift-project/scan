@@ -104,7 +104,7 @@ enum Commands {
     /// Run as an HTTP classification server
     Serve {
         /// Address to listen on
-        #[arg(long, default_value = "127.0.0.1:8081")]
+        #[arg(long, default_value = "127.0.0.1:49999")]
         bind: SocketAddr,
 
         /// Per-request analysis timeout in seconds
@@ -126,6 +126,17 @@ enum Commands {
         /// Directory for extracting archive members (passed to cleave)
         #[arg(long)]
         extract_dir: Option<String>,
+
+        /// Maximum concurrent analyses (defaults to max(1, num_cpus / 4))
+        #[arg(long)]
+        workers: Option<usize>,
+
+        /// Comma-separated CIDR networks (in addition to loopback) allowed to
+        /// reach the server. /analyze-path is always restricted to loopback
+        /// regardless of this list. Pair with --bind 0.0.0.0:PORT to actually
+        /// accept remote connections.
+        #[arg(long)]
+        allow_cidr: Option<String>,
     },
 
     /// Print version information
@@ -286,6 +297,8 @@ fn main() -> Result<()> {
             max_rss_gb,
             allowed_dirs,
             extract_dir,
+            workers,
+            allow_cidr,
         } => {
             let dirs: Vec<std::path::PathBuf> = allowed_dirs
                 .unwrap_or_default()
@@ -293,6 +306,17 @@ fn main() -> Result<()> {
                 .filter(|s| !s.is_empty())
                 .map(std::path::PathBuf::from)
                 .collect();
+            let workers = workers.unwrap_or_else(|| {
+                let cores = std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4);
+                std::cmp::max(1, cores / 4)
+            });
+            let allow_cidrs = match allow_cidr {
+                Some(s) => litmus::server::parse_cidr_list(&s)
+                    .map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?,
+                None => Vec::new(),
+            };
             let config = litmus::server::ServerConfig::new(
                 bind,
                 timeout_secs,
@@ -303,6 +327,8 @@ fn main() -> Result<()> {
                 cli.slow_rule_ms,
                 dirs,
                 extract_dir.map(std::path::PathBuf::from),
+                workers,
+                allow_cidrs,
             )?;
             eprintln!("Starting litmus server on http://{} ...", bind);
             tokio::runtime::Builder::new_multi_thread()

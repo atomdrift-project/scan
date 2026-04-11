@@ -13,9 +13,13 @@
 //! validated thresholds are supplied up front, and callers use accessors
 //! rather than mutating fields after construction.
 
+mod acl;
 mod handlers;
 
+pub use acl::{parse_cidr_list, Cidr};
+
 use axum::extract::DefaultBodyLimit;
+use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use std::net::SocketAddr;
@@ -44,6 +48,8 @@ pub struct ServerConfig {
     slow_rule_ms: u64,
     allowed_dirs: Vec<PathBuf>,
     extract_dir: Option<PathBuf>,
+    workers: usize,
+    allow_cidrs: Vec<Cidr>,
 }
 
 impl ServerConfig {
@@ -54,12 +60,19 @@ impl ServerConfig {
     ///
     /// `max_body_size` and `max_rss_bytes` are byte counts.
     ///
+    /// `workers` is the maximum number of concurrent analyses; requests beyond
+    /// this are rejected with 503 by the per-handler hard gate.
+    ///
+    /// `allow_cidrs` lists peer networks (in addition to loopback) that may
+    /// reach the server. The `/analyze-path` endpoint is always restricted
+    /// to loopback regardless of this list.
+    ///
     /// # Example
     /// ```
     /// use litmus::server::ServerConfig;
     ///
     /// let config = ServerConfig::new(
-    ///     "127.0.0.1:8081".parse()?,
+    ///     "127.0.0.1:49999".parse()?,
     ///     120,
     ///     100 * 1024 * 1024,
     ///     8 * 1024 * 1024 * 1024,
@@ -68,6 +81,8 @@ impl ServerConfig {
     ///     4_000,
     ///     vec![],
     ///     None,
+    ///     2,
+    ///     vec![],
     /// )?;
     ///
     /// assert_eq!(config.timeout_secs(), 120);
@@ -83,10 +98,15 @@ impl ServerConfig {
         slow_rule_ms: u64,
         allowed_dirs: Vec<PathBuf>,
         extract_dir: Option<PathBuf>,
+        workers: usize,
+        allow_cidrs: Vec<Cidr>,
     ) -> anyhow::Result<Self> {
         if let Some(ref t) = thresholds {
             t.validate()
                 .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
+        }
+        if workers == 0 {
+            return Err(anyhow::anyhow!("workers must be >= 1"));
         }
         Ok(Self {
             bind,
@@ -98,6 +118,8 @@ impl ServerConfig {
             slow_rule_ms,
             allowed_dirs,
             extract_dir,
+            workers,
+            allow_cidrs,
         })
     }
 
@@ -154,6 +176,19 @@ impl ServerConfig {
     pub fn allowed_dirs(&self) -> &[PathBuf] {
         &self.allowed_dirs
     }
+
+    /// Maximum number of concurrent analyses.
+    #[must_use]
+    pub const fn workers(&self) -> usize {
+        self.workers
+    }
+
+    /// Networks (in addition to loopback) allowed to connect to the server.
+    /// `/analyze-path` is always restricted to loopback regardless.
+    #[must_use]
+    pub fn allow_cidrs(&self) -> &[Cidr] {
+        &self.allow_cidrs
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +210,8 @@ mod config_tests {
             4_000,
             vec![],
             None,
+            2,
+            vec![],
         );
 
         assert!(result.is_err());
@@ -192,9 +229,30 @@ mod config_tests {
             4_000,
             vec![],
             None,
+            2,
+            vec![],
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn server_config_rejects_zero_workers() {
+        let result = ServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], 8081)),
+            120,
+            100 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+            "/tmp/models",
+            None,
+            4_000,
+            vec![],
+            None,
+            0,
+            vec![],
+        );
+
+        assert!(result.is_err());
     }
 }
 
@@ -224,6 +282,10 @@ struct AppState {
     slow_rule_ms: u64,
     allowed_dirs: Vec<PathBuf>,
     extract_dir: Option<PathBuf>,
+    allow_cidrs: Vec<Cidr>,
+    /// Process uptime anchor — captured when build_app runs, very close to
+    /// process start. /_/health reports `now - started_at` as uptime_secs.
+    started_at: Instant,
     ready: AtomicBool,
     init_error: RwLock<Option<String>>,
     resources: RwLock<Option<Arc<ModelResources>>>,
@@ -260,11 +322,11 @@ impl AppState {
 pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     tracing::info!(model_dir = %config.model_dir().display(), "starting — resources loading in background");
 
-    // CPU-bound analysis: match available cores, not 2x.
-    let max_concurrent = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4);
-    tracing::info!(max_concurrent, "concurrency limit set (1 per core)");
+    // Concurrency limit comes from --workers (defaults to cores/4 in main.rs).
+    // CPU-bound cleave + ONNX work overlaps poorly across many threads, so a
+    // smaller pool typically delivers higher aggregate throughput than 1/core.
+    let max_concurrent = config.workers();
+    tracing::info!(max_concurrent, "concurrency limit set");
 
     let state = Arc::new(AppState {
         timeout_secs: config.timeout_secs(),
@@ -275,6 +337,8 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         slow_rule_ms: config.slow_rule_ms(),
         allowed_dirs: config.allowed_dirs().to_vec(),
         extract_dir: config.extract_dir().map(PathBuf::from),
+        allow_cidrs: config.allow_cidrs().to_vec(),
+        started_at: Instant::now(),
         ready: AtomicBool::new(false),
         init_error: RwLock::new(None),
         resources: RwLock::new(None),
@@ -401,8 +465,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     // No ConcurrencyLimitLayer — the hard gate (active_tasks >= max_concurrent_tasks)
     // in each handler rejects immediately with 503. No silent queuing.
     // Hopper controls send rate via litmus-workers; litmus accepts or rejects.
+    // Middleware order: layers are applied bottom-up, so the last `.layer()`
+    // call wraps everything else and runs first per request. ACL runs before
+    // the body limit so rejected peers don't get to upload bytes.
     let app = Router::new()
         .route("/_/health", get(handlers::health))
+        .route("/_/info", get(handlers::info))
         .route("/_/reload", post(handlers::reload))
         .route("/_/memory", get(handlers::memory_stats))
         .route("/_/requests", get(handlers::requests))
@@ -410,6 +478,10 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         .route("/analyze", post(handlers::analyze))
         .route("/analyze-path", post(handlers::analyze_path))
         .layer(DefaultBodyLimit::max(config.max_body_size()))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            acl::acl,
+        ))
         .with_state(state);
 
     Ok(app)
@@ -450,12 +522,28 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         bind = %config.bind(),
         timeout_secs = config.timeout_secs(),
         max_body_mb = config.max_body_size() / 1024 / 1024,
+        allow_cidrs = config.allow_cidrs().len(),
         "listening (resources loading in background)",
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Operator footgun: setting --allow-cidr while bound to loopback means
+    // the CIDR list can never match (no remote peers can connect). Warn so
+    // the operator notices before debugging "why is everyone getting 403?".
+    if !config.allow_cidrs().is_empty() && config.bind().ip().is_loopback() {
+        tracing::warn!(
+            bind = %config.bind(),
+            "--allow-cidr is set but bind address is loopback; remote clients cannot connect (use --bind 0.0.0.0:PORT)",
+        );
+    }
+
+    // ConnectInfo<SocketAddr> is required by the ACL middleware so it can
+    // see the peer IP. Tests inject ConnectInfo manually on each Request.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("server shut down");
     Ok(())
