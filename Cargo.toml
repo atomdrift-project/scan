@@ -76,9 +76,6 @@ libc = "0.2"
 [target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly"))))'.dependencies]
 tikv-jemallocator = "0.6"
 
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
-
 [lints]
 workspace = true
 
