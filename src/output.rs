@@ -6,7 +6,7 @@ use std::sync::{LazyLock, RwLock};
 use colored::Colorize;
 
 use crate::model::{Classification, Thresholds};
-use crate::scan::{EmbeddedFile, ScanResult, ScanSummary};
+use crate::scan::{ScanResult, ScanSummary};
 
 const BLOCK: &str = "\u{2588}";
 
@@ -319,7 +319,6 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extr
     if extra {
         print_extra(result, p);
     }
-    print_embedded_files(&result.embedded_files, result.thresholds, p);
     eprintln!();
 }
 
@@ -375,7 +374,6 @@ pub fn print_ps_result(
     if extra {
         print_extra(result, p);
     }
-    print_embedded_files(&result.embedded_files, result.thresholds, p);
     eprintln!();
 }
 
@@ -443,39 +441,6 @@ fn print_extra(result: &ScanResult, p: &Palette) {
                 fg(p.dim, &format!("val={:<8.2}", r.value)),
                 fg(p.very_dim, &r.feature),
             );
-        }
-    }
-}
-
-/// Print embedded files (icon + type + path + formula + findings on one line each).
-fn print_embedded_files(files: &[EmbeddedFile], thresholds: Thresholds, p: &Palette) {
-    if files.is_empty() {
-        return;
-    }
-    let dot = fg(p.dot_sep, "\u{00b7}");
-    for ef in files.iter().filter(|ef| ef.file_type != "unknown") {
-        let blocks = confidence_blocks(ef.probability, &ef.classification, thresholds);
-        let ftype = fg(p.filetype, &ef.file_type);
-        let mut header = vec![ftype, ef.path.clone()];
-        if !ef.formula.is_empty() {
-            header.push(fg(p.formula, &ef.formula));
-        }
-        eprintln!("           {blocks} {}", header.join(&format!(" {dot} ")));
-        if !ef.top_findings.is_empty() {
-            let findings: Vec<String> = ef
-                .top_findings
-                .iter()
-                .take(3)
-                .map(|f| {
-                    let name = short_finding_id(&f.id);
-                    match f.crit {
-                        5 => fg(p.hostile_finding, &name),
-                        4 => fg(p.suspicious_finding, &name),
-                        _ => name,
-                    }
-                })
-                .collect();
-            eprintln!("              {}", findings.join(&format!(" {dot} ")));
         }
     }
 }

@@ -160,6 +160,7 @@ fn main() -> Result<()> {
     };
     let fmt = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_thread_names(true)
         .with_writer(std::io::stderr);
     if is_serve {
         fmt.init();

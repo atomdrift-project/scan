@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/litmus-models.git";
-const CURRENT_MODEL: &str = "scan-v15";
+const CURRENT_MODEL: &str = "scan-v16";
 const STALENESS_DAYS: u64 = 30;
 
 /// Resolve the models base directory, auto-cloning if necessary.
