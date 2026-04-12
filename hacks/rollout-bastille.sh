@@ -60,7 +60,7 @@ doas bastille cmd "$RUN" id -u litmus >/dev/null 2>&1 || \
     doas bastille cmd "$RUN" pw useradd litmus -m -s /bin/sh -c "Litmus Service"
 
 log "Installing runtime dependencies"
-doas bastille pkg "$RUN" install -y git
+doas bastille pkg "$RUN" install -y git p7zip upx rizin innoextract
 
 log "Extracting tarball"
 doas bastille cmd "$RUN" rm -rf /usr/local/share/litmus

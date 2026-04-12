@@ -70,7 +70,7 @@ rssh "id -u _litmus >/dev/null 2>&1 || \
       doas useradd -d /var/empty -s /sbin/nologin -c 'Litmus Service' _litmus"
 
 log "Installing runtime dependencies on $RUN"
-rssh "doas pkg_add -I git || true"
+rssh "doas pkg_add -I git p7zip upx rizin innoextract || true"
 
 log "Extracting tarball on $RUN"
 rssh "doas rm -rf /usr/local/share/litmus && \

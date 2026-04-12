@@ -23,7 +23,7 @@ log() { echo "==> $*"; }
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un)}"
 
 log "Installing build dependencies"
-sudo -u "$REAL_USER" brew install rust sccache
+sudo -u "$REAL_USER" brew install rust sccache p7zip upx rizin innoextract
 
 log "Building release binary"
 sudo -u "$REAL_USER" env RUSTC_WRAPPER=sccache make release || die "build failed"
@@ -32,6 +32,7 @@ log "Upgrading rules"
 sudo -u "$REAL_USER" out/litmus update-rules || die "update-rules failed"
 
 REAL_HOME=$(dscl . -read "/Users/$REAL_USER" NFSHomeDirectory | sed 's/NFSHomeDirectory: //')
+BREW_PREFIX=$(sudo -u "$REAL_USER" brew --prefix)
 MODELS_SRC="$REAL_HOME/Library/Application Support/litmus/models"
 TRAITS_SRC="$REAL_HOME/Library/Application Support/cleave/traits"
 [ -d "$MODELS_SRC" ] || die "models not found at '$MODELS_SRC' after update-rules"
@@ -94,6 +95,8 @@ cat > "$PLIST" <<EOF
         <string>$INSTALL_DIR/models</string>
         <key>CLEAVE_TRAITS_DIR</key>
         <string>$INSTALL_DIR/traits</string>
+        <key>PATH</key>
+        <string>$BREW_PREFIX/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>UserName</key>
     <string>$SERVICE_USER</string>
