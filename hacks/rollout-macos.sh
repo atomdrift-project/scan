@@ -31,6 +31,12 @@ sudo -u "$REAL_USER" env RUSTC_WRAPPER=sccache make tarball || die "build failed
 log "Upgrading rules"
 sudo -u "$REAL_USER" out/litmus update-rules || die "update-rules failed"
 
+REAL_HOME=$(dscl . -read "/Users/$REAL_USER" NFSHomeDirectory | sed 's/NFSHomeDirectory: //')
+MODELS_SRC="$REAL_HOME/Library/Application Support/litmus/models"
+TRAITS_SRC="$REAL_HOME/Library/Application Support/cleave/traits"
+[ -d "$MODELS_SRC" ] || die "models not found at '$MODELS_SRC' after update-rules"
+[ -d "$TRAITS_SRC" ] || die "traits not found at '$TRAITS_SRC' after update-rules"
+
 log "Ensuring service user '$SERVICE_USER' exists"
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     uid=300
@@ -47,11 +53,16 @@ fi
 
 log "Installing binary"
 rm -rf "$INSTALL_DIR"
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR" /usr/local/bin
 tar -xzf out/litmus.tgz -C "$INSTALL_DIR"
 chown root:wheel "$INSTALL_DIR/$BINARY"
 chmod 755 "$INSTALL_DIR/$BINARY"
 ln -sf "$INSTALL_DIR/$BINARY" "$BIN_LINK"
+
+log "Installing models and traits"
+cp -R "$MODELS_SRC" "$INSTALL_DIR/models"
+cp -R "$TRAITS_SRC" "$INSTALL_DIR/traits"
+chown -R "$SERVICE_USER" "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
 
 log "Preparing log file"
 touch "$LOG"
@@ -77,6 +88,13 @@ cat > "$PLIST" <<EOF
         <string>--allow-cidr</string>
         <string>$ALLOW_CIDR</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LITMUS_MODELS_DIR</key>
+        <string>$INSTALL_DIR/models</string>
+        <key>CLEAVE_TRAITS_DIR</key>
+        <string>$INSTALL_DIR/traits</string>
+    </dict>
     <key>UserName</key>
     <string>$SERVICE_USER</string>
     <key>RunAtLoad</key>
