@@ -99,6 +99,7 @@ doas bastille cmd "$RUN" chmod 755 /usr/local/etc/rc.d/litmus
 
 log "Enabling and restarting litmus service"
 doas bastille sysrc "$RUN" litmus_enable=YES
+doas bastille cmd "$RUN" pkill -9 -x litmus 2>/dev/null || true
 doas bastille service "$RUN" litmus stop 2>/dev/null || true
 doas bastille service "$RUN" litmus start
 
