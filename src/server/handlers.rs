@@ -122,12 +122,18 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             .into_response();
     }
     let max_tasks = state.max_concurrent_tasks;
-    let orphaned_tasks = state
+    // In-grace-period orphans: timed out but slot not yet released (counted in active_tasks).
+    let grace_orphans = state
         .in_flight
         .iter()
         .filter(|e| e.timed_out.load(std::sync::atomic::Ordering::Relaxed))
         .count();
-    let live_tasks = active_tasks.saturating_sub(orphaned_tasks);
+    // Post-grace-period orphans: slot recycled, thread still running in background.
+    let recycled_orphans = state
+        .recycled_orphans
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let orphaned_tasks = grace_orphans + recycled_orphans;
+    let live_tasks = active_tasks.saturating_sub(grace_orphans);
     let load = if max_tasks > 0 {
         live_tasks as f64 / max_tasks as f64
     } else {
@@ -138,8 +144,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
     // slots busy" from real failures (memory pressure, stuck workers). The
     // /analyze endpoint still rejects with 503 when active >= max, so clients
     // back off correctly without /_/health pretending the server is unhealthy.
-    let saturated = active_tasks >= max_tasks;
-    if saturated {
+    if active_tasks >= max_tasks {
         let oldest = state
             .in_flight
             .iter()
@@ -148,7 +153,8 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         tracing::debug!(
             active_tasks,
             live_tasks,
-            orphaned_tasks,
+            grace_orphans,
+            recycled_orphans,
             max_concurrent_tasks = max_tasks,
             oldest_task = ?oldest,
             "GET /_/health -> 200 (saturated)"
@@ -168,7 +174,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         }))
             .into_response();
     }
-    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, live={live_tasks}, orphaned={orphaned_tasks}, load={load:.2})");
+    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, live={live_tasks}, grace_orphans={grace_orphans}, recycled_orphans={recycled_orphans}, load={load:.2})");
     Json(serde_json::json!({
         "status": "ok",
         "rss_mb": rss_mb,
@@ -393,53 +399,6 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-/// RAII guard to ensure active_tasks and in_flight entries are cleaned up.
-struct TaskGuard {
-    state: Arc<AppState>,
-    request_id: u64,
-    start_time: Instant,
-}
-
-impl TaskGuard {
-    fn new(state: Arc<AppState>, request_id: u64, name: String, size_bytes: u64) -> Self {
-        state.active_tasks.fetch_add(1, Ordering::SeqCst);
-        state.in_flight.insert(
-            request_id,
-            super::InFlightRequest {
-                name,
-                size_bytes,
-                started_at: Instant::now(),
-                timed_out: AtomicBool::new(false),
-            },
-        );
-        Self {
-            state,
-            request_id,
-            start_time: Instant::now(),
-        }
-    }
-}
-
-impl Drop for TaskGuard {
-    fn drop(&mut self) {
-        let was_orphaned = if let Some(req) = self.state.in_flight.get(&self.request_id) {
-            req.timed_out.load(Ordering::Relaxed)
-        } else {
-            false
-        };
-
-        self.state.active_tasks.fetch_sub(1, Ordering::SeqCst);
-        self.state.in_flight.remove(&self.request_id);
-
-        if was_orphaned {
-            tracing::info!(
-                id = self.request_id,
-                duration_ms = self.start_time.elapsed().as_millis() as u64,
-                "orphaned task finally finished and released slot"
-            );
-        }
-    }
-}
 
 /// POST /analyze — accept multipart file upload, classify, return full JSON result.
 pub(super) async fn analyze(
@@ -675,27 +634,32 @@ pub(super) async fn analyze(
     let slow_rule_ms = state.slow_rule_ms;
     let timeout_duration = Duration::from_secs(state.timeout_secs);
 
-    // Claim a slot using the RAII guard.
-    let guard = TaskGuard::new(
-        Arc::clone(&state),
-        request_id,
-        filename.clone(),
-        file_size as u64,
-    );
-
     let filename_for_closure = filename.clone();
     let should_clear_caches = request_id.is_multiple_of(50);
     let cancellation = Arc::new(AtomicBool::new(false));
+
+    // Register the slot before spawning so the count is accurate.
+    state.active_tasks.fetch_add(1, Ordering::SeqCst);
+    state.in_flight.insert(
+        request_id,
+        super::InFlightRequest {
+            name: filename.clone(),
+            size_bytes: file_size as u64,
+            started_at: Instant::now(),
+            timed_out: AtomicBool::new(false),
+            cancellation: Arc::clone(&cancellation),
+        },
+    );
+
     let cancel_flag = Arc::clone(&cancellation);
     let mut handle = tokio::task::spawn_blocking(move || {
-        let _moved_guard = guard;
         let result = classify_file(
             &path,
             &filename_for_closure,
             &resources,
             slow_rule_ms,
             None,
-            Some(cancel_flag),
+            Some(&cancel_flag),
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -707,13 +671,54 @@ pub(super) async fn analyze(
     let result = tokio::select! {
         res = &mut handle => Some(res),
         _ = tokio::time::sleep(timeout_duration) => {
-            cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancellation.store(true, Ordering::Relaxed);
             if let Some(req) = state.in_flight.get(&request_id) {
-                req.timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                req.timed_out.store(true, Ordering::Relaxed);
             }
             None
         }
     };
+
+    if result.is_some() {
+        // Task completed normally — release the slot immediately.
+        state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+        state.in_flight.remove(&request_id);
+    } else {
+        // Timed out. The blocking thread is still running (dropping the JoinHandle
+        // does not cancel it). Spawn a background task that gives it a 1800s grace
+        // period to finish cooperatively, then forcibly recycles the slot.
+        let active = state.active_tasks.load(Ordering::Relaxed);
+        tracing::warn!(
+            id = request_id,
+            filename = %filename,
+            active_tasks = active,
+            timeout_secs = state.timeout_secs,
+            "analysis timed out; background cleanup task started",
+        );
+        let orphan_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            // Phase 1: wait up to 1800s for the thread to finish on its own.
+            let grace = tokio::time::timeout(Duration::from_secs(1800), &mut handle).await;
+            orphan_state.in_flight.remove(&request_id);
+            orphan_state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+            if grace.is_ok() {
+                tracing::info!(request_id, "orphaned task completed within grace period");
+                return;
+            }
+            // Phase 2: grace period exhausted — recycle the slot and keep waiting so
+            // the thread is eventually joined and its resources are reclaimed.
+            let recycled =
+                orphan_state.recycled_orphans.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::error!(
+                request_id,
+                recycled_orphans = recycled,
+                "orphaned task exceeded grace period; slot recycled — still awaiting thread join",
+            );
+            let _ = handle.await;
+            orphan_state.recycled_orphans.fetch_sub(1, Ordering::Relaxed);
+            tracing::info!(request_id, "detached orphan finally completed and was joined");
+        });
+    }
 
     let elapsed_ms = request_start.elapsed().as_millis();
 
@@ -772,7 +777,7 @@ fn classify_file(
     resources: &super::ModelResources,
     slow_rule_ms: u64,
     extract_dir: Option<&std::path::Path>,
-    cancellation: Option<Arc<AtomicBool>>,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
@@ -781,7 +786,7 @@ fn classify_file(
     let opts = cleave::AnalysisOptions {
         slow_rule_ms,
         sample_extraction,
-        cancellation: cancellation.clone(),
+        cancellation: cancellation.cloned(),
         ..Default::default()
     };
     let report =
@@ -922,22 +927,32 @@ pub(super) async fn analyze_path(
     let slow_rule_ms = state.slow_rule_ms;
     let timeout_duration = Duration::from_secs(state.timeout_secs);
 
-    // Claim a slot using the RAII guard.
-    let guard = TaskGuard::new(Arc::clone(&state), request_id, req.path.clone(), file_size);
-
     let should_clear_caches = request_id.is_multiple_of(50);
     let extract_dir = state.extract_dir.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
+
+    // Register the slot before spawning so the count is accurate.
+    state.active_tasks.fetch_add(1, Ordering::SeqCst);
+    state.in_flight.insert(
+        request_id,
+        super::InFlightRequest {
+            name: req.path.clone(),
+            size_bytes: file_size,
+            started_at: Instant::now(),
+            timed_out: AtomicBool::new(false),
+            cancellation: Arc::clone(&cancellation),
+        },
+    );
+
     let cancel_flag = Arc::clone(&cancellation);
     let mut handle = tokio::task::spawn_blocking(move || {
-        let _moved_guard = guard;
         let result = classify_file(
             &path,
             &filename,
             &resources,
             slow_rule_ms,
             extract_dir.as_deref(),
-            Some(cancel_flag),
+            Some(&cancel_flag),
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -948,13 +963,47 @@ pub(super) async fn analyze_path(
     let result = tokio::select! {
         res = &mut handle => Some(res),
         _ = tokio::time::sleep(timeout_duration) => {
-            cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancellation.store(true, Ordering::Relaxed);
             if let Some(req) = state.in_flight.get(&request_id) {
-                req.timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                req.timed_out.store(true, Ordering::Relaxed);
             }
             None
         }
     };
+
+    if result.is_some() {
+        state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+        state.in_flight.remove(&request_id);
+    } else {
+        let active = state.active_tasks.load(Ordering::Relaxed);
+        tracing::warn!(
+            id = request_id,
+            path = %req.path,
+            active_tasks = active,
+            timeout_secs = state.timeout_secs,
+            "analyze-path timed out; background cleanup task started",
+        );
+        let orphan_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let grace = tokio::time::timeout(Duration::from_secs(1800), &mut handle).await;
+            orphan_state.in_flight.remove(&request_id);
+            orphan_state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+            if grace.is_ok() {
+                tracing::info!(request_id, "orphaned task completed within grace period");
+                return;
+            }
+            let recycled =
+                orphan_state.recycled_orphans.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::error!(
+                request_id,
+                recycled_orphans = recycled,
+                "orphaned task exceeded grace period; slot recycled — still awaiting thread join",
+            );
+            let _ = handle.await;
+            orphan_state.recycled_orphans.fetch_sub(1, Ordering::Relaxed);
+            tracing::info!(request_id, "detached orphan finally completed and was joined");
+        });
+    }
 
     let elapsed_ms = request_start.elapsed().as_millis();
 

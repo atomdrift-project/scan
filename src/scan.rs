@@ -491,7 +491,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                     &model,
                     shap.as_ref(),
                     config,
-                    cleave_opts.cancellation.clone(),
+                    cleave_opts.cancellation.as_ref(),
                 )
             });
             let prog = progress.get();
@@ -604,7 +604,7 @@ pub(crate) fn classify_report(
     ctx: &ExtractContext,
     model: &Model,
     shap: Option<&ShapImportance>,
-    cancellation: Option<Arc<AtomicBool>>,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<ClassifiedReport> {
     report.finalize();
     let compact = cleave::types::compact::compact_from_files(&report.files);
@@ -661,7 +661,7 @@ pub(crate) fn classify_report(
     let mut max_classification = classification;
 
     for ef in &embedded_entries {
-        if let Some(ref c) = cancellation {
+        if let Some(c) = cancellation {
             if c.load(Ordering::Relaxed) {
                 anyhow::bail!("analysis cancelled during embedded file processing");
             }
@@ -764,7 +764,7 @@ fn process_report(
     model: &Model,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
-    cancellation: Option<Arc<AtomicBool>>,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
     let cr = classify_report(
         &path.display().to_string(),
@@ -848,7 +848,7 @@ fn analyze_single(
         model,
         shap,
         config,
-        cleave_opts.cancellation.clone(),
+        cleave_opts.cancellation.as_ref(),
     )
 }
 

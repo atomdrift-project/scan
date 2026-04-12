@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::signal;
 
 use crate::explain::ShapImportance;
@@ -264,6 +264,8 @@ struct InFlightRequest {
     started_at: Instant,
     /// Set to true when the HTTP side returns 504 but the blocking task is still running.
     timed_out: AtomicBool,
+    /// Shared with the blocking task; set to true to request cooperative cancellation.
+    cancellation: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -292,12 +294,19 @@ struct AppState {
     resources: RwLock<Option<Arc<ModelResources>>>,
     next_request_id: AtomicU64,
     active_tasks: AtomicUsize,
+    /// Tasks that timed out, exceeded the 1800s grace period, and had their slot
+    /// forcibly recycled. Their threads are still running in the background.
+    /// A non-zero value means something is seriously wrong.
+    recycled_orphans: AtomicUsize,
     /// Hard cap on concurrent analysis tasks. Requests are rejected with 503
     /// when active_tasks >= this value, preventing orphaned blocking tasks
     /// from piling up and consuming unbounded memory.
     max_concurrent_tasks: usize,
     reload_lock: tokio::sync::Mutex<()>,
     overloaded_since: std::sync::Mutex<Option<Instant>>,
+    /// When all slots first became occupied exclusively by orphaned tasks.
+    /// Reset to None when any live task is present or load drops below max.
+    saturated_since: std::sync::Mutex<Option<Instant>>,
     in_flight: dashmap::DashMap<u64, InFlightRequest>,
 }
 
@@ -345,9 +354,11 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         resources: RwLock::new(None),
         next_request_id: AtomicU64::new(1),
         active_tasks: AtomicUsize::new(0),
+        recycled_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
         reload_lock: tokio::sync::Mutex::new(()),
         overloaded_since: std::sync::Mutex::new(None),
+        saturated_since: std::sync::Mutex::new(None),
         in_flight: dashmap::DashMap::new(),
     });
 
@@ -459,6 +470,67 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                 (_, _, Err(e)) => {
                     record_init_failure(&bg, &format!("yara warmup task panicked: {e}"))
                 }
+            }
+        });
+    }
+
+    // Watchdog: if every slot has been occupied solely by orphaned (timed-out) tasks
+    // for 600 seconds, something is irreparably stuck. Force-cancel all in-flight tasks,
+    // wait 30 s for cooperative shutdown, then exit so the process manager restarts us.
+    {
+        let watchdog = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let active = watchdog.active_tasks.load(Ordering::Relaxed);
+                let is_full = active >= watchdog.max_concurrent_tasks;
+                let timed_out_count = watchdog
+                    .in_flight
+                    .iter()
+                    .filter(|e| e.timed_out.load(Ordering::Relaxed))
+                    .count();
+                let live = active.saturating_sub(timed_out_count);
+
+                if !is_full || live > 0 {
+                    // Healthy or recovering — reset the clock.
+                    if let Ok(mut s) = watchdog.saturated_since.lock() {
+                        *s = None;
+                    }
+                    continue;
+                }
+
+                // All slots consumed by orphaned tasks.
+                let elapsed = match watchdog.saturated_since.lock() {
+                    Ok(mut s) => s.get_or_insert_with(Instant::now).elapsed(),
+                    Err(_) => continue,
+                };
+
+                if elapsed.as_secs() < 600 {
+                    tracing::warn!(
+                        active_tasks = active,
+                        max_concurrent_tasks = watchdog.max_concurrent_tasks,
+                        elapsed_secs = elapsed.as_secs(),
+                        "watchdog: all slots orphaned — will force-cancel in {}s if not recovered",
+                        600u64.saturating_sub(elapsed.as_secs()),
+                    );
+                    continue;
+                }
+
+                // 600 s elapsed — force-cancel every in-flight task, then restart.
+                tracing::error!(
+                    active_tasks = active,
+                    max_concurrent_tasks = watchdog.max_concurrent_tasks,
+                    elapsed_secs = elapsed.as_secs(),
+                    "watchdog: all slots orphaned for 600s — force-cancelling all tasks",
+                );
+                for entry in watchdog.in_flight.iter() {
+                    entry.cancellation.store(true, Ordering::Relaxed);
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                tracing::error!("watchdog: restarting after forced-cancellation grace period");
+                std::process::exit(1);
             }
         });
     }

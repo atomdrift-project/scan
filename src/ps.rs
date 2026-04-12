@@ -243,7 +243,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
             shap.as_ref(),
             config,
             group,
-            Some(Arc::clone(&cancellation)),
+            Some(&cancellation),
         ) {
             Ok(result) => {
                 match result.classification {
@@ -304,7 +304,7 @@ fn build_result(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
     group: &ProcessGroup,
-    cancellation: Option<Arc<AtomicBool>>,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
     let cr = crate::scan::classify_report(
         &display_path.display().to_string(),
