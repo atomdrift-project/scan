@@ -266,6 +266,11 @@ struct InFlightRequest {
     timed_out: AtomicBool,
     /// Shared with the blocking task; set to true to request cooperative cancellation.
     cancellation: Arc<AtomicBool>,
+    /// Tracks the current analysis phase inside cleave/litmus. Updated at each
+    /// major stage so `/_/requests` can report what a stuck request is doing.
+    phase: cleave::PhaseTracker,
+    /// OS thread ID of the blocking thread servicing this request (0 until started).
+    thread_id: AtomicU64,
 }
 
 #[derive(Debug)]

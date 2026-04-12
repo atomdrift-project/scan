@@ -3,12 +3,44 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::Builder as TempBuilder;
 
 use super::AppState;
+
+/// Return a platform-appropriate thread ID for the calling thread.
+/// On Linux this is the TID (matches /proc/self/task/), on macOS/FreeBSD
+/// it's the pthread ID, and elsewhere falls back to 0.
+fn current_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut tid: u64 = 0;
+        // pthread_threadid_np gives a stable, unique-per-process thread ID on macOS.
+        unsafe { libc::pthread_threadid_np(0, &mut tid) };
+        tid
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        // thr_self writes the lwpid into the provided pointer.
+        let mut tid: libc::c_long = 0;
+        unsafe { libc::thr_self(&mut tid) };
+        tid as u64
+    }
+    #[cfg(target_os = "openbsd")]
+    {
+        unsafe { libc::getthrid() as u64 }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
+    {
+        0
+    }
+}
 
 fn analysis_error_response(error: &anyhow::Error) -> Response {
     let (status, message) = classify_analysis_error(error.root_cause().to_string().as_str());
@@ -643,6 +675,8 @@ pub(super) async fn analyze(
             started_at: Instant::now(),
             timed_out: AtomicBool::new(false),
             cancellation: Arc::clone(&cancellation),
+            phase: cleave::PhaseTracker::new(),
+            thread_id: AtomicU64::new(0),
         },
     );
 
@@ -651,7 +685,13 @@ pub(super) async fn analyze(
     let temp_dir_path = temp_dir.path().to_path_buf();
 
     let cancel_flag = Arc::clone(&cancellation);
+    let phase_state = Arc::clone(&state);
+    let phase_tracker = phase_state.in_flight.get(&request_id).map(|r| r.phase.clone());
     let mut handle = tokio::task::spawn_blocking(move || {
+        // Record the OS thread servicing this request.
+        if let Some(req) = phase_state.in_flight.get(&request_id) {
+            req.thread_id.store(current_thread_id(), Ordering::Relaxed);
+        }
         let result = classify_file(
             &path,
             &filename_for_closure,
@@ -659,6 +699,7 @@ pub(super) async fn analyze(
             slow_rule_ms,
             None,
             Some(&cancel_flag),
+            phase_tracker.as_ref(),
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -779,15 +820,20 @@ fn classify_file(
     slow_rule_ms: u64,
     extract_dir: Option<&std::path::Path>,
     cancellation: Option<&Arc<AtomicBool>>,
+    phase: Option<&cleave::PhaseTracker>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
+    if let Some(p) = phase {
+        p.set("cleave:init");
+    }
     let sample_extraction =
         extract_dir.map(|d| cleave::SampleExtractionConfig::new(d.to_path_buf()));
     let opts = cleave::AnalysisOptions {
         slow_rule_ms,
         sample_extraction,
         cancellation: cancellation.cloned(),
+        phase: phase.cloned(),
         ..Default::default()
     };
     let report =
@@ -800,6 +846,9 @@ fn classify_file(
         anyhow::bail!("analysis cancelled");
     }
 
+    if let Some(p) = phase {
+        p.set("features+model");
+    }
     let cr = crate::scan::classify_report(
         label,
         report,
@@ -952,11 +1001,18 @@ pub(super) async fn analyze_path(
             started_at: Instant::now(),
             timed_out: AtomicBool::new(false),
             cancellation: Arc::clone(&cancellation),
+            phase: cleave::PhaseTracker::new(),
+            thread_id: AtomicU64::new(0),
         },
     );
 
     let cancel_flag = Arc::clone(&cancellation);
+    let phase_state = Arc::clone(&state);
+    let phase_tracker = phase_state.in_flight.get(&request_id).map(|r| r.phase.clone());
     let mut handle = tokio::task::spawn_blocking(move || {
+        if let Some(req) = phase_state.in_flight.get(&request_id) {
+            req.thread_id.store(current_thread_id(), Ordering::Relaxed);
+        }
         let result = classify_file(
             &path,
             &filename,
@@ -964,6 +1020,7 @@ pub(super) async fn analyze_path(
             slow_rule_ms,
             extract_dir.as_deref(),
             Some(&cancel_flag),
+            phase_tracker.as_ref(),
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -1199,12 +1256,16 @@ pub(super) async fn requests(State(state): State<Arc<AppState>>) -> Json<serde_j
         .in_flight
         .iter()
         .map(|e| {
+            let phase = e.phase.get();
+            let tid = e.thread_id.load(std::sync::atomic::Ordering::Relaxed);
             serde_json::json!({
                 "request_id": e.key(),
                 "name": e.name,
                 "size_bytes": e.size_bytes,
                 "elapsed_ms": now.duration_since(e.started_at).as_millis(),
                 "timed_out": e.timed_out.load(std::sync::atomic::Ordering::Relaxed),
+                "phase": phase,
+                "thread_id": if tid > 0 { Some(tid) } else { None },
             })
         })
         .collect();
