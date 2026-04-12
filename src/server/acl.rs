@@ -53,6 +53,7 @@ impl Cidr {
     }
 
     /// Returns true if `ip` lies inside this network.
+    #[must_use]
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.network, ip) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => v4_match(net, ip, self.prefix_len),
@@ -156,6 +157,7 @@ pub(super) async fn acl(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests intentionally unwrap parse results to assert success
 mod tests {
     use super::*;
 

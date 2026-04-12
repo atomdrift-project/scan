@@ -88,6 +88,7 @@ impl ServerConfig {
     /// assert_eq!(config.timeout_secs(), 120);
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    #[allow(clippy::too_many_arguments)] // ServerConfig is plumbed once at startup; a builder would add ceremony for no real benefit.
     pub fn new(
         bind: SocketAddr,
         timeout_secs: u64,

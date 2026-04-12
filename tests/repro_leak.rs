@@ -1,4 +1,5 @@
 //! Regression test for active_tasks leak on panic.
+#![allow(clippy::panic)] // the whole point of this test is to trigger a panic and assert no leak
 
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

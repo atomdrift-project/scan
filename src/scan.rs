@@ -597,6 +597,7 @@ pub(crate) struct ClassifiedReport {
 
 /// Run the full cleave-finalize + model inference pipeline on a report.
 /// This is the single authoritative inference path used by scan, ps, and the server.
+#[allow(clippy::needless_pass_by_value)] // Arc clones at call sites are negligible; ownership simplifies callers.
 pub(crate) fn classify_report(
     label: &str,
     mut report: cleave::AnalysisReport,
@@ -981,9 +982,9 @@ fn build_ml_fs(
     for (idx, entry) in fs.iter().enumerate() {
         let id = entry
             .get("id")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(idx as u64);
-        let depth = entry.get("dp").and_then(|v| v.as_u64()).unwrap_or(0);
+        let depth = entry.get("dp").and_then(serde_json::Value::as_u64).unwrap_or(0);
 
         let (cls, prob) = if depth == 0 {
             (classification, probability)
@@ -1030,6 +1031,7 @@ struct MlSection {
 
 impl ScanResult {
     /// Build the `{"ml": {...}, "raw": {...}}` envelope for JSON output.
+    #[must_use]
     pub fn to_envelope(&self) -> ScanResultEnvelope {
         let raw = self.cleave.clone().unwrap_or(serde_json::json!({}));
         let ml_fs = build_ml_fs(

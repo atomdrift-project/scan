@@ -295,6 +295,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 }
 
 /// Build a ScanResult from a cleave report, injecting pids and deleted state.
+#[allow(clippy::too_many_arguments)]
 fn build_result(
     display_path: &std::path::Path,
     report: cleave::AnalysisReport,

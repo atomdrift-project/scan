@@ -340,14 +340,14 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
             Ok(()) => None,
             Err(e) => {
                 tracing::warn!("models update failed: {e}");
-                Some(format!("{e}"))
+                Some(e.to_string())
             }
         };
         let traits_err = match cleave::traits_repo::update(false) {
             Ok(()) => None,
             Err(e) => {
                 tracing::warn!("traits update failed: {e}");
-                Some(format!("{e}"))
+                Some(e.to_string())
             }
         };
         (models_err, traits_err)
@@ -866,15 +866,12 @@ pub(super) async fn analyze_path(
 
     // Ensure resources are loaded.
     let resources = {
-        let guard = match state.resources.read() {
-            Ok(g) => g,
-            Err(_) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Internal error"})),
-                )
-                    .into_response();
-            }
+        let Ok(guard) = state.resources.read() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Internal error"})),
+            )
+                .into_response();
         };
         match guard.as_ref() {
             Some(r) => Arc::clone(r),
@@ -1100,33 +1097,6 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::classify_analysis_error;
-    use axum::http::StatusCode;
-
-    #[test]
-    fn classify_unsupported_file_type_as_415() {
-        let (status, message) = classify_analysis_error("Unsupported file type: Unknown");
-        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        assert_eq!(message, "Unsupported file type: Unknown");
-    }
-
-    #[test]
-    fn classify_invalid_archive_as_422() {
-        let (status, message) =
-            classify_analysis_error("Archive is encrypted but no passwords configured");
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(message, "Archive is encrypted but no passwords configured");
-    }
-
-    #[test]
-    fn classify_unexpected_failure_as_500() {
-        let (status, _) = classify_analysis_error("model evaluation failed");
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-}
-
 /// GET /_/memory — memory diagnostics for all major structures.
 ///
 /// `process.jemalloc` is null unless cleave was built with `--features jemalloc`.
@@ -1345,4 +1315,31 @@ fn read_thread_info_freebsd() -> serde_json::Value {
 
     threads.sort_by_key(|t| t["tid"].as_u64().unwrap_or(0));
     serde_json::json!({"count": threads.len(), "threads": threads})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_analysis_error;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn classify_unsupported_file_type_as_415() {
+        let (status, message) = classify_analysis_error("Unsupported file type: Unknown");
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(message, "Unsupported file type: Unknown");
+    }
+
+    #[test]
+    fn classify_invalid_archive_as_422() {
+        let (status, message) =
+            classify_analysis_error("Archive is encrypted but no passwords configured");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, "Archive is encrypted but no passwords configured");
+    }
+
+    #[test]
+    fn classify_unexpected_failure_as_500() {
+        let (status, _) = classify_analysis_error("model evaluation failed");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

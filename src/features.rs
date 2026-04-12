@@ -1752,12 +1752,11 @@ fn write_structural_extensions(
 /// Extract (formula, elements, score) from a cleave report's depth-0 file.
 /// Mirrors hopper.parseCleaveFile and collimator's canonical_fields_from_report.
 fn canonical_fields_from_report(report: &serde_json::Value) -> (String, String, i64) {
-    let files = match report.get("fs").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return (String::new(), String::new(), 0),
+    let Some(files) = report.get("fs").and_then(serde_json::Value::as_array) else {
+        return (String::new(), String::new(), 0);
     };
     for f in files {
-        let depth = f.get("dp").and_then(|v| v.as_i64()).unwrap_or(0);
+        let depth = f.get("dp").and_then(serde_json::Value::as_i64).unwrap_or(0);
         if depth == 0 {
             let formula = f.get("f").and_then(|v| v.as_str()).unwrap_or("").to_string();
             // Strip Unicode subscript digits ₀-₉ (U+2080..U+2089).
@@ -1765,7 +1764,7 @@ fn canonical_fields_from_report(report: &serde_json::Value) -> (String, String, 
                 .chars()
                 .filter(|c| !('\u{2080}'..='\u{2089}').contains(c))
                 .collect();
-            let score = f.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+            let score = f.get("x").and_then(serde_json::Value::as_i64).unwrap_or(0);
             return (formula, elements, score);
         }
     }
