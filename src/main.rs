@@ -305,7 +305,12 @@ fn main() -> Result<()> {
                 .unwrap_or_default()
                 .split(',')
                 .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from)
+                .map(|s| {
+                    let p = std::path::PathBuf::from(s);
+                    // Canonicalize allowed dirs at startup so symlink-resolved
+                    // request paths match correctly in starts_with checks.
+                    p.canonicalize().unwrap_or(p)
+                })
                 .collect();
             let workers = workers.unwrap_or_else(|| {
                 let cores = std::thread::available_parallelism()
