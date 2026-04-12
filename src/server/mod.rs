@@ -526,10 +526,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     "watchdog: all slots orphaned for 60s — force-cancelling all tasks",
                 );
                 for entry in watchdog.in_flight.iter() {
-                    entry.cancellation.store(true, Ordering::Relaxed);
+                    entry.cancellation.store(true, Ordering::Release);
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 tracing::error!("watchdog: restarting after forced-cancellation grace period");
+                // Flush stderr so the final log lines are visible before exit.
+                let _ = std::io::Write::flush(&mut std::io::stderr());
                 std::process::exit(1);
             }
         });

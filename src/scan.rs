@@ -617,6 +617,14 @@ pub(crate) fn classify_report(
     let report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
     let raw_features = ctx.extract(&report_json);
     let nonzero = raw_features.iter().filter(|&&v| v != 0.0).count();
+    let expected = model.spec().total_features();
+    if raw_features.len() != expected {
+        anyhow::bail!(
+            "feature vector length mismatch: got {} expected {} — model/feature_spec out of sync",
+            raw_features.len(),
+            expected,
+        );
+    }
     let mut features = raw_features.clone();
     model.spec().standardize(&mut features);
     let (probability, classification) = model.predict(&features)?;

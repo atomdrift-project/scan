@@ -653,6 +653,10 @@ pub(super) async fn analyze(
         },
     );
 
+    // Save the temp dir path so we can clean it up if the task is orphaned
+    // and the blocking thread never completes its drop(temp_dir).
+    let temp_dir_path = temp_dir.path().to_path_buf();
+
     let cancel_flag = Arc::clone(&cancellation);
     let mut handle = tokio::task::spawn_blocking(move || {
         let result = classify_file(
@@ -673,7 +677,7 @@ pub(super) async fn analyze(
     let result = tokio::select! {
         res = &mut handle => Some(res),
         _ = tokio::time::sleep(timeout_duration) => {
-            cancellation.store(true, Ordering::Relaxed);
+            cancellation.store(true, Ordering::Release);
             if let Some(req) = state.in_flight.get(&request_id) {
                 req.timed_out.store(true, Ordering::Relaxed);
             }
@@ -698,10 +702,11 @@ pub(super) async fn analyze(
             "analysis timed out; background cleanup task started",
         );
         let orphan_state = Arc::clone(&state);
+        let orphan_temp_path = temp_dir_path.clone();
         tokio::spawn(async move {
             // Phase 1: wait up to 120s for the thread to finish cooperatively.
             // If a rayon thread hasn't completed 2 minutes after timeout, it's
-            // deadlocked, not slow — the previous 120s grace was far too generous.
+            // deadlocked, not slow.
             let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
             // Release the slot BEFORE removing from in_flight — if a panic
             // occurs between these two operations, a leaked slot (counter too
@@ -724,6 +729,12 @@ pub(super) async fn analyze(
                 recycled_orphans = recycled,
                 "orphaned task exceeded 120s grace period; slot recycled, thread detached",
             );
+            // Clean up the temp directory that the orphaned blocking task will
+            // never drop. Best-effort — the directory may already be gone if
+            // the task raced to completion.
+            if let Err(e) = tokio::fs::remove_dir_all(&orphan_temp_path).await {
+                tracing::debug!(request_id, error = %e, "orphan temp dir cleanup (may already be gone)");
+            }
         });
     }
 
@@ -850,12 +861,25 @@ pub(super) async fn analyze_path(
     let request_id = state.next_request_id();
     let request_start = Instant::now();
 
-    let path = std::path::PathBuf::from(&req.path);
+    let raw_path = std::path::PathBuf::from(&req.path);
 
-    // Validate the path is under an allowed directory.
+    // Resolve symlinks and canonicalize BEFORE the allowed-dirs check to
+    // prevent symlink-based path traversal (e.g., /allowed/link → /etc/shadow).
+    let path = match raw_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "File not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate the canonical (symlink-resolved) path is under an allowed directory.
     if state.allowed_dirs.is_empty() || !state.allowed_dirs.iter().any(|dir| path.starts_with(dir))
     {
-        tracing::warn!(id = request_id, path = %req.path, "analyze-path rejected: not under allowed dirs");
+        tracing::warn!(id = request_id, path = %req.path, canonical = %path.display(), "analyze-path rejected: not under allowed dirs");
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "Path not under allowed directories"})),
@@ -970,7 +994,7 @@ pub(super) async fn analyze_path(
     let result = tokio::select! {
         res = &mut handle => Some(res),
         _ = tokio::time::sleep(timeout_duration) => {
-            cancellation.store(true, Ordering::Relaxed);
+            cancellation.store(true, Ordering::Release);
             if let Some(req) = state.in_flight.get(&request_id) {
                 req.timed_out.store(true, Ordering::Relaxed);
             }
