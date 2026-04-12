@@ -507,23 +507,23 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     Err(_) => continue,
                 };
 
-                if elapsed.as_secs() < 600 {
+                if elapsed.as_secs() < 60 {
                     tracing::warn!(
                         active_tasks = active,
                         max_concurrent_tasks = watchdog.max_concurrent_tasks,
                         elapsed_secs = elapsed.as_secs(),
                         "watchdog: all slots orphaned — will force-cancel in {}s if not recovered",
-                        600u64.saturating_sub(elapsed.as_secs()),
+                        60u64.saturating_sub(elapsed.as_secs()),
                     );
                     continue;
                 }
 
-                // 600 s elapsed — force-cancel every in-flight task, then restart.
+                // 60s elapsed — force-cancel every in-flight task, then restart.
                 tracing::error!(
                     active_tasks = active,
                     max_concurrent_tasks = watchdog.max_concurrent_tasks,
                     elapsed_secs = elapsed.as_secs(),
-                    "watchdog: all slots orphaned for 600s — force-cancelling all tasks",
+                    "watchdog: all slots orphaned for 60s — force-cancelling all tasks",
                 );
                 for entry in watchdog.in_flight.iter() {
                     entry.cancellation.store(true, Ordering::Relaxed);

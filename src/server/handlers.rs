@@ -699,26 +699,29 @@ pub(super) async fn analyze(
         );
         let orphan_state = Arc::clone(&state);
         tokio::spawn(async move {
-            // Phase 1: wait up to 1800s for the thread to finish on its own.
-            let grace = tokio::time::timeout(Duration::from_secs(1800), &mut handle).await;
+            // Phase 1: wait up to 120s for the thread to finish cooperatively.
+            // If a rayon thread hasn't completed 2 minutes after timeout, it's
+            // deadlocked, not slow — the previous 1800s grace was far too generous.
+            let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
             orphan_state.in_flight.remove(&request_id);
             orphan_state.active_tasks.fetch_sub(1, Ordering::SeqCst);
             if grace.is_ok() {
                 tracing::info!(request_id, "orphaned task completed within grace period");
                 return;
             }
-            // Phase 2: grace period exhausted — recycle the slot and keep waiting so
-            // the thread is eventually joined and its resources are reclaimed.
+            // Phase 2: grace period exhausted — recycle the slot. Detach the
+            // handle instead of awaiting indefinitely to avoid accumulating
+            // zombie futures that hold rayon thread resources.
             let recycled =
                 orphan_state.recycled_orphans.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::error!(
                 request_id,
                 recycled_orphans = recycled,
-                "orphaned task exceeded grace period; slot recycled — still awaiting thread join",
+                "orphaned task exceeded 120s grace period; slot recycled, thread detached",
             );
-            let _ = handle.await;
-            orphan_state.recycled_orphans.fetch_sub(1, Ordering::Relaxed);
-            tracing::info!(request_id, "detached orphan finally completed and was joined");
+            // Don't await the handle — if the rayon pool is deadlocked, this
+            // future would block forever. The watchdog will kill the process
+            // if recovery doesn't happen.
         });
     }
 
@@ -987,7 +990,7 @@ pub(super) async fn analyze_path(
         );
         let orphan_state = Arc::clone(&state);
         tokio::spawn(async move {
-            let grace = tokio::time::timeout(Duration::from_secs(1800), &mut handle).await;
+            let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
             orphan_state.in_flight.remove(&request_id);
             orphan_state.active_tasks.fetch_sub(1, Ordering::SeqCst);
             if grace.is_ok() {
@@ -999,11 +1002,8 @@ pub(super) async fn analyze_path(
             tracing::error!(
                 request_id,
                 recycled_orphans = recycled,
-                "orphaned task exceeded grace period; slot recycled — still awaiting thread join",
+                "orphaned task exceeded 120s grace period; slot recycled, thread detached",
             );
-            let _ = handle.await;
-            orphan_state.recycled_orphans.fetch_sub(1, Ordering::Relaxed);
-            tracing::info!(request_id, "detached orphan finally completed and was joined");
         });
     }
 
