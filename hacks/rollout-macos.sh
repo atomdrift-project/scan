@@ -21,6 +21,13 @@ ALLOW_CIDR="${ALLOW_CIDR:-10.0.0.0/8}"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
+# Non-login SSH shells don't source profile, so brew may not be in PATH.
+# Try the standard install locations for Intel and Apple Silicon.
+for brew_candidate in /usr/local/bin/brew /opt/homebrew/bin/brew; do
+    [ -x "$brew_candidate" ] && eval "$("$brew_candidate" shellenv)" && break
+done
+command -v brew >/dev/null 2>&1 || die "brew not found"
+
 BREW_PREFIX=$(brew --prefix)
 MODELS_SRC="$HOME/Library/Application Support/litmus/models"
 TRAITS_SRC="$HOME/Library/Application Support/cleave/traits"
