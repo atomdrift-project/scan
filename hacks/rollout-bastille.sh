@@ -34,6 +34,9 @@ doas bastille cmd "$BUILD" su -l litmus -c "mkdir -p ~/litmus"
 tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
     | doas bastille cmd "$BUILD" su -l litmus -c "tar -xf - -C ~/litmus"
 
+log "Killing any stale cargo processes in build jail"
+doas bastille cmd "$BUILD" su -l litmus -c "killall cargo 2>/dev/null || true"
+
 log "Building tarball"
 doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=mold' make tarball" \
     || die "build failed in build jail"
