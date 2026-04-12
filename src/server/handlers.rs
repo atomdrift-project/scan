@@ -687,6 +687,7 @@ pub(super) async fn analyze(
     let cancel_flag = Arc::clone(&cancellation);
     let phase_state = Arc::clone(&state);
     let phase_tracker = phase_state.in_flight.get(&request_id).map(|r| r.phase.clone());
+    let orphan_phase = phase_tracker.clone();
     let mut handle = tokio::task::spawn_blocking(move || {
         // Record the OS thread servicing this request.
         if let Some(req) = phase_state.in_flight.get(&request_id) {
@@ -734,15 +735,22 @@ pub(super) async fn analyze(
         );
         let orphan_state = Arc::clone(&state);
         let orphan_temp_path = temp_dir_path.clone();
+        let orphan_filename = filename.clone();
         tokio::spawn(async move {
             // Phase 1: wait up to 120s for the thread to finish cooperatively.
             let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
+            let phase = orphan_phase.as_ref().map(|p| p.get()).unwrap_or_default();
+            let tid = orphan_state
+                .in_flight
+                .get(&request_id)
+                .map(|r| r.thread_id.load(Ordering::Relaxed))
+                .unwrap_or(0);
             // Drop the permit here — RAII ensures this always runs, even if the
             // future is cancelled during runtime shutdown.
             drop(permit);
             orphan_state.in_flight.remove(&request_id);
             if grace.is_ok() {
-                tracing::info!(request_id, "orphaned task completed within grace period");
+                tracing::info!(request_id, filename = %orphan_filename, phase, thread_id = tid, "orphaned task completed within grace period");
                 return;
             }
             // Phase 2: grace period exhausted — thread is detached.
@@ -750,6 +758,9 @@ pub(super) async fn analyze(
                 orphan_state.recycled_orphans.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::error!(
                 request_id,
+                filename = %orphan_filename,
+                phase,
+                thread_id = tid,
                 recycled_orphans = recycled,
                 "orphaned task exceeded 120s grace period; slot recycled, thread detached",
             );
@@ -1009,6 +1020,7 @@ pub(super) async fn analyze_path(
     let cancel_flag = Arc::clone(&cancellation);
     let phase_state = Arc::clone(&state);
     let phase_tracker = phase_state.in_flight.get(&request_id).map(|r| r.phase.clone());
+    let orphan_phase = phase_tracker.clone();
     let mut handle = tokio::task::spawn_blocking(move || {
         if let Some(req) = phase_state.in_flight.get(&request_id) {
             req.thread_id.store(current_thread_id(), Ordering::Relaxed);
@@ -1050,18 +1062,28 @@ pub(super) async fn analyze_path(
             "analyze-path timed out; background cleanup task started",
         );
         let orphan_state = Arc::clone(&state);
+        let orphan_path = req.path.clone();
         tokio::spawn(async move {
             let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
+            let phase = orphan_phase.as_ref().map(|p| p.get()).unwrap_or_default();
+            let tid = orphan_state
+                .in_flight
+                .get(&request_id)
+                .map(|r| r.thread_id.load(Ordering::Relaxed))
+                .unwrap_or(0);
             drop(permit);
             orphan_state.in_flight.remove(&request_id);
             if grace.is_ok() {
-                tracing::info!(request_id, "orphaned task completed within grace period");
+                tracing::info!(request_id, path = %orphan_path, phase, thread_id = tid, "orphaned task completed within grace period");
                 return;
             }
             let recycled =
                 orphan_state.recycled_orphans.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::error!(
                 request_id,
+                path = %orphan_path,
+                phase,
+                thread_id = tid,
                 recycled_orphans = recycled,
                 "orphaned task exceeded 120s grace period; slot recycled, thread detached",
             );
