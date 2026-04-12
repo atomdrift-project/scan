@@ -25,8 +25,8 @@ REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un)}"
 log "Installing build dependencies"
 sudo -u "$REAL_USER" brew install rust sccache
 
-log "Building release tarball"
-sudo -u "$REAL_USER" env RUSTC_WRAPPER=sccache make tarball || die "build failed"
+log "Building release binary"
+sudo -u "$REAL_USER" env RUSTC_WRAPPER=sccache make release || die "build failed"
 
 log "Upgrading rules"
 sudo -u "$REAL_USER" out/litmus update-rules || die "update-rules failed"
@@ -54,7 +54,7 @@ fi
 log "Installing binary"
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR" /usr/local/bin
-tar -xzf out/litmus.tgz -C "$INSTALL_DIR"
+install -m 755 out/litmus "$INSTALL_DIR/$BINARY"
 chown root:wheel "$INSTALL_DIR/$BINARY"
 chmod 755 "$INSTALL_DIR/$BINARY"
 ln -sf "$INSTALL_DIR/$BINARY" "$BIN_LINK"
