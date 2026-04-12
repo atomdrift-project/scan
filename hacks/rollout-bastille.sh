@@ -90,7 +90,7 @@ load_rc_config $name
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-c -f -P ${pidfile} -r -o ${litmus_logfile} -u litmus /usr/local/share/litmus/litmus --verbose -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8"
+command_args="-c -f -P ${pidfile} -r -o ${litmus_logfile} -u litmus /usr/local/share/litmus/litmus -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8"
 
 run_rc_command "$1"
 EOF

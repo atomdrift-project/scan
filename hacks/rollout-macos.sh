@@ -81,7 +81,6 @@ cat > "$PLIST" <<EOF
     <key>ProgramArguments</key>
     <array>
         <string>$INSTALL_DIR/$BINARY</string>
-        <string>--verbose</string>
         <string>-u</string>
         <string>serve</string>
         <string>--bind</string>
