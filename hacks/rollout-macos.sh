@@ -74,7 +74,7 @@ fi
 
 # Install models and traits owned by service user so git pull works at runtime
 log "Installing models and traits"
-rm -rf "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
+sudo rm -rf "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
 cp -R "$MODELS_SRC" "$INSTALL_DIR/models"
 cp -R "$TRAITS_SRC" "$INSTALL_DIR/traits"
 sudo chown -R "$SERVICE_USER" "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
