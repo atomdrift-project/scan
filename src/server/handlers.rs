@@ -614,22 +614,19 @@ pub(super) async fn analyze(
 
     // Claim a slot. OwnedSemaphorePermit is RAII: the slot is released when the
     // permit is dropped, even on panic or runtime shutdown — no manual fetch_sub needed.
-    let permit = match Arc::clone(&state.slots).try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            tracing::warn!(
-                id = request_id,
-                filename = %filename,
-                size_bytes = file_size,
-                max = state.max_concurrent_tasks,
-                "rejecting: at capacity"
-            );
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
-            )
-                .into_response();
-        }
+    let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
+        tracing::warn!(
+            id = request_id,
+            filename = %filename,
+            size_bytes = file_size,
+            max = state.max_concurrent_tasks,
+            "rejecting: at capacity"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
+        )
+            .into_response();
     };
 
     let slow_rule_ms = state.slow_rule_ms;
@@ -799,7 +796,7 @@ fn classify_file(
     // If the timeout fired while cleave was running, bail now rather than
     // burning CPU on feature extraction and model inference for a result
     // nobody is waiting for.
-    if cancellation.map_or(false, |c| c.load(Ordering::Relaxed)) {
+    if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
         anyhow::bail!("analysis cancelled");
     }
 
@@ -858,15 +855,12 @@ pub(super) async fn analyze_path(
 
     // Resolve symlinks and canonicalize BEFORE the allowed-dirs check to
     // prevent symlink-based path traversal (e.g., /allowed/link → /etc/shadow).
-    let path = match raw_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "File not found"})),
-            )
-                .into_response();
-        }
+    let Ok(path) = raw_path.canonicalize() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "File not found"})),
+        )
+            .into_response();
     };
 
     // Validate the canonical (symlink-resolved) path is under an allowed directory.
@@ -929,22 +923,19 @@ pub(super) async fn analyze_path(
     );
 
     // Claim a slot — same RAII semaphore pattern as /analyze.
-    let permit = match Arc::clone(&state.slots).try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            tracing::warn!(
-                id = request_id,
-                filename = %filename,
-                size_bytes = file_size,
-                max = state.max_concurrent_tasks,
-                "rejecting: at capacity"
-            );
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
-            )
-                .into_response();
-        }
+    let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
+        tracing::warn!(
+            id = request_id,
+            filename = %filename,
+            size_bytes = file_size,
+            max = state.max_concurrent_tasks,
+            "rejecting: at capacity"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
+        )
+            .into_response();
     };
 
     let slow_rule_ms = state.slow_rule_ms;
