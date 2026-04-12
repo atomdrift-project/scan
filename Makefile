@@ -2,7 +2,7 @@ SHELL := /bin/sh
 BINARY = litmus
 OUT_DIR = out
 
-.PHONY: build release install check-cargo tarball rollout-bastille rollout-debian rollout-openbsd lint test clean
+.PHONY: build release install check-cargo tarball deploy rollout-bastille rollout-debian rollout-openbsd rollout-macos lint test clean
 
 all: build
 
@@ -60,10 +60,26 @@ tarball: release
 	tar -czf $(OUT_DIR)/litmus.tgz -C $(OUT_DIR) litmus
 	@echo "Tarball: $(OUT_DIR)/litmus.tgz"
 
+deploy:
+	@case "$$(uname -s)" in \
+		Darwin)  ./hacks/rollout-macos.sh ;; \
+		FreeBSD) ./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)" ;; \
+		Linux)   [ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || \
+		           { echo "Usage: make deploy BUILD=<build-host> RUN=<run-host>"; exit 1; }; \
+		         ./hacks/rollout-debian.sh "$(BUILD)" "$(RUN)" ;; \
+		OpenBSD) [ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || \
+		           { echo "Usage: make deploy BUILD=<build-host> RUN=<run-host>"; exit 1; }; \
+		         ./hacks/rollout-openbsd.sh "$(BUILD)" "$(RUN)" ;; \
+		*) echo "error: no deploy target for $$(uname -s)"; exit 1 ;; \
+	esac
+
 rollout-bastille: BUILD ?= build
 rollout-bastille: RUN ?= litmus
 rollout-bastille:
 	./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)"
+
+rollout-macos:
+	./hacks/rollout-macos.sh
 
 rollout-debian:
 	@[ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || { echo "Usage: make rollout-debian BUILD=<build-host> RUN=<run-host>"; exit 1; }
