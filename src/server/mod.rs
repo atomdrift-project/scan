@@ -294,7 +294,7 @@ struct AppState {
     resources: RwLock<Option<Arc<ModelResources>>>,
     next_request_id: AtomicU64,
     active_tasks: AtomicUsize,
-    /// Tasks that timed out, exceeded the 1800s grace period, and had their slot
+    /// Tasks that timed out, exceeded the 120s grace period, and had their slot
     /// forcibly recycled. Their threads are still running in the background.
     /// A non-zero value means something is seriously wrong.
     recycled_orphans: AtomicUsize,

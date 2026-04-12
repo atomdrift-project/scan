@@ -687,7 +687,7 @@ pub(super) async fn analyze(
         state.in_flight.remove(&request_id);
     } else {
         // Timed out. The blocking thread is still running (dropping the JoinHandle
-        // does not cancel it). Spawn a background task that gives it a 1800s grace
+        // does not cancel it). Spawn a background task that gives it a 120s grace
         // period to finish cooperatively, then forcibly recycles the slot.
         let active = state.active_tasks.load(Ordering::Relaxed);
         tracing::warn!(
@@ -701,10 +701,15 @@ pub(super) async fn analyze(
         tokio::spawn(async move {
             // Phase 1: wait up to 120s for the thread to finish cooperatively.
             // If a rayon thread hasn't completed 2 minutes after timeout, it's
-            // deadlocked, not slow — the previous 1800s grace was far too generous.
+            // deadlocked, not slow — the previous 120s grace was far too generous.
             let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
-            orphan_state.in_flight.remove(&request_id);
+            // Release the slot BEFORE removing from in_flight — if a panic
+            // occurs between these two operations, a leaked slot (counter too
+            // low) self-heals on the next request, while a leaked in_flight
+            // entry is harmless. The reverse order risked permanently losing a
+            // slot.
             orphan_state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+            orphan_state.in_flight.remove(&request_id);
             if grace.is_ok() {
                 tracing::info!(request_id, "orphaned task completed within grace period");
                 return;
@@ -719,9 +724,6 @@ pub(super) async fn analyze(
                 recycled_orphans = recycled,
                 "orphaned task exceeded 120s grace period; slot recycled, thread detached",
             );
-            // Don't await the handle — if the rayon pool is deadlocked, this
-            // future would block forever. The watchdog will kill the process
-            // if recovery doesn't happen.
         });
     }
 
@@ -991,8 +993,8 @@ pub(super) async fn analyze_path(
         let orphan_state = Arc::clone(&state);
         tokio::spawn(async move {
             let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
-            orphan_state.in_flight.remove(&request_id);
             orphan_state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+            orphan_state.in_flight.remove(&request_id);
             if grace.is_ok() {
                 tracing::info!(request_id, "orphaned task completed within grace period");
                 return;
