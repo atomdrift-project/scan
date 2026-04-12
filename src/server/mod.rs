@@ -293,14 +293,18 @@ struct AppState {
     init_error: RwLock<Option<String>>,
     resources: RwLock<Option<Arc<ModelResources>>>,
     next_request_id: AtomicU64,
-    active_tasks: AtomicUsize,
+    /// Semaphore with max_concurrent_tasks permits. Each analysis handler acquires
+    /// one OwnedSemaphorePermit before starting work; the permit is dropped when
+    /// the analysis completes or when the orphan-cleanup task gives up. RAII
+    /// semantics mean the slot is always released — even on panic or runtime shutdown.
+    slots: Arc<tokio::sync::Semaphore>,
     /// Tasks that timed out, exceeded the 120s grace period, and had their slot
     /// forcibly recycled. Their threads are still running in the background.
     /// A non-zero value means something is seriously wrong.
     recycled_orphans: AtomicUsize,
-    /// Hard cap on concurrent analysis tasks. Requests are rejected with 503
-    /// when active_tasks >= this value, preventing orphaned blocking tasks
-    /// from piling up and consuming unbounded memory.
+    /// Capacity of the slots semaphore. Requests are rejected with 503 when no
+    /// permits are available, preventing orphaned blocking tasks from piling up
+    /// and consuming unbounded memory.
     max_concurrent_tasks: usize,
     reload_lock: tokio::sync::Mutex<()>,
     overloaded_since: std::sync::Mutex<Option<Instant>>,
@@ -353,7 +357,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         init_error: RwLock::new(None),
         resources: RwLock::new(None),
         next_request_id: AtomicU64::new(1),
-        active_tasks: AtomicUsize::new(0),
+        slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         recycled_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
         reload_lock: tokio::sync::Mutex::new(()),
@@ -484,8 +488,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let active = watchdog.active_tasks.load(Ordering::Relaxed);
-                let is_full = active >= watchdog.max_concurrent_tasks;
+                let available = watchdog.slots.available_permits();
+                let active = watchdog.max_concurrent_tasks.saturating_sub(available);
+                let is_full = available == 0;
                 let timed_out_count = watchdog
                     .in_flight
                     .iter()
@@ -507,23 +512,26 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     Err(_) => continue,
                 };
 
-                if elapsed.as_secs() < 60 {
+                // Grace period for orphaned tasks is 120s. Wait 150s before
+                // firing so the grace-period cleanup tasks can release slots
+                // naturally before we resort to a forced restart.
+                if elapsed.as_secs() < 150 {
                     tracing::warn!(
                         active_tasks = active,
                         max_concurrent_tasks = watchdog.max_concurrent_tasks,
                         elapsed_secs = elapsed.as_secs(),
                         "watchdog: all slots orphaned — will force-cancel in {}s if not recovered",
-                        60u64.saturating_sub(elapsed.as_secs()),
+                        150u64.saturating_sub(elapsed.as_secs()),
                     );
                     continue;
                 }
 
-                // 60s elapsed — force-cancel every in-flight task, then restart.
+                // 150s elapsed — grace periods have expired; force-cancel and restart.
                 tracing::error!(
                     active_tasks = active,
                     max_concurrent_tasks = watchdog.max_concurrent_tasks,
                     elapsed_secs = elapsed.as_secs(),
-                    "watchdog: all slots orphaned for 60s — force-cancelling all tasks",
+                    "watchdog: all slots orphaned for 150s — force-cancelling all tasks",
                 );
                 for entry in watchdog.in_flight.iter() {
                     entry.cancellation.store(true, Ordering::Release);

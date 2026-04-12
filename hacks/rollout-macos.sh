@@ -72,12 +72,12 @@ if [ ! -L "$BIN_LINK" ] || [ "$(readlink "$BIN_LINK")" != "$INSTALL_DIR/$BINARY"
     sudo ln -sf "$INSTALL_DIR/$BINARY" "$BIN_LINK"
 fi
 
-# Install models and traits world-readable so _litmus can read without chown
+# Install models and traits owned by service user so git pull works at runtime
 log "Installing models and traits"
 rm -rf "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
 cp -R "$MODELS_SRC" "$INSTALL_DIR/models"
 cp -R "$TRAITS_SRC" "$INSTALL_DIR/traits"
-chmod -R a+rX "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
+sudo chown -R "$SERVICE_USER" "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
 
 # First-run only: prepare log file owned by service user
 if [ ! -f "$LOG" ]; then

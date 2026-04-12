@@ -100,9 +100,8 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
 
     let rss_bytes = cleave::memory_tracker::current_rss();
     let rss_mb = rss_bytes.map(|b| b / 1024 / 1024);
-    let active_tasks = state
-        .active_tasks
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let active_tasks = state.max_concurrent_tasks
+        .saturating_sub(state.slots.available_permits());
     let overloaded = rss_bytes.map(|b| b > state.max_rss_bytes).unwrap_or(false);
 
     if overloaded {
@@ -613,25 +612,25 @@ pub(super) async fn analyze(
         }
     };
 
-    // Hard gate: reject immediately if at capacity.
-    let active = state
-        .active_tasks
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if active >= state.max_concurrent_tasks {
-        tracing::warn!(
-            id = request_id,
-            filename = %filename,
-            size_bytes = file_size,
-            active_tasks = active,
-            max = state.max_concurrent_tasks,
-            "rejecting: at capacity"
-        );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
-        )
-            .into_response();
-    }
+    // Claim a slot. OwnedSemaphorePermit is RAII: the slot is released when the
+    // permit is dropped, even on panic or runtime shutdown — no manual fetch_sub needed.
+    let permit = match Arc::clone(&state.slots).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                id = request_id,
+                filename = %filename,
+                size_bytes = file_size,
+                max = state.max_concurrent_tasks,
+                "rejecting: at capacity"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
+            )
+                .into_response();
+        }
+    };
 
     let slow_rule_ms = state.slow_rule_ms;
     let timeout_duration = Duration::from_secs(state.timeout_secs);
@@ -639,9 +638,6 @@ pub(super) async fn analyze(
     let filename_for_closure = filename.clone();
     let should_clear_caches = request_id.is_multiple_of(50);
     let cancellation = Arc::new(AtomicBool::new(false));
-
-    // Register the slot before spawning so the count is accurate.
-    state.active_tasks.fetch_add(1, Ordering::SeqCst);
     state.in_flight.insert(
         request_id,
         super::InFlightRequest {
@@ -686,18 +682,15 @@ pub(super) async fn analyze(
     };
 
     if result.is_some() {
-        // Task completed normally — release the slot immediately.
-        state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+        drop(permit);
         state.in_flight.remove(&request_id);
     } else {
         // Timed out. The blocking thread is still running (dropping the JoinHandle
-        // does not cancel it). Spawn a background task that gives it a 120s grace
-        // period to finish cooperatively, then forcibly recycles the slot.
-        let active = state.active_tasks.load(Ordering::Relaxed);
+        // does not cancel it). Move the permit into a background task that gives
+        // the thread a 120s grace period; dropping the permit there releases the slot.
         tracing::warn!(
             id = request_id,
             filename = %filename,
-            active_tasks = active,
             timeout_secs = state.timeout_secs,
             "analysis timed out; background cleanup task started",
         );
@@ -705,23 +698,16 @@ pub(super) async fn analyze(
         let orphan_temp_path = temp_dir_path.clone();
         tokio::spawn(async move {
             // Phase 1: wait up to 120s for the thread to finish cooperatively.
-            // If a rayon thread hasn't completed 2 minutes after timeout, it's
-            // deadlocked, not slow.
             let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
-            // Release the slot BEFORE removing from in_flight — if a panic
-            // occurs between these two operations, a leaked slot (counter too
-            // low) self-heals on the next request, while a leaked in_flight
-            // entry is harmless. The reverse order risked permanently losing a
-            // slot.
-            orphan_state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+            // Drop the permit here — RAII ensures this always runs, even if the
+            // future is cancelled during runtime shutdown.
+            drop(permit);
             orphan_state.in_flight.remove(&request_id);
             if grace.is_ok() {
                 tracing::info!(request_id, "orphaned task completed within grace period");
                 return;
             }
-            // Phase 2: grace period exhausted — recycle the slot. Detach the
-            // handle instead of awaiting indefinitely to avoid accumulating
-            // zombie futures that hold rayon thread resources.
+            // Phase 2: grace period exhausted — thread is detached.
             let recycled =
                 orphan_state.recycled_orphans.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::error!(
@@ -809,6 +795,13 @@ fn classify_file(
     };
     let report =
         cleave::analyze_file(path, &opts).with_context(|| format!("cleave analysis of {label}"))?;
+
+    // If the timeout fired while cleave was running, bail now rather than
+    // burning CPU on feature extraction and model inference for a result
+    // nobody is waiting for.
+    if cancellation.map_or(false, |c| c.load(Ordering::Relaxed)) {
+        anyhow::bail!("analysis cancelled");
+    }
 
     let cr = crate::scan::classify_report(
         label,
@@ -935,25 +928,24 @@ pub(super) async fn analyze_path(
         "--> POST /analyze-path",
     );
 
-    // Hard gate: reject immediately if at capacity (including orphaned tasks).
-    let active = state
-        .active_tasks
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if active >= state.max_concurrent_tasks {
-        tracing::warn!(
-            id = request_id,
-            filename = %filename,
-            size_bytes = file_size,
-            active_tasks = active,
-            max = state.max_concurrent_tasks,
-            "rejecting: at capacity"
-        );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
-        )
-            .into_response();
-    }
+    // Claim a slot — same RAII semaphore pattern as /analyze.
+    let permit = match Arc::clone(&state.slots).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                id = request_id,
+                filename = %filename,
+                size_bytes = file_size,
+                max = state.max_concurrent_tasks,
+                "rejecting: at capacity"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
+            )
+                .into_response();
+        }
+    };
 
     let slow_rule_ms = state.slow_rule_ms;
     let timeout_duration = Duration::from_secs(state.timeout_secs);
@@ -961,9 +953,6 @@ pub(super) async fn analyze_path(
     let should_clear_caches = request_id.is_multiple_of(50);
     let extract_dir = state.extract_dir.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
-
-    // Register the slot before spawning so the count is accurate.
-    state.active_tasks.fetch_add(1, Ordering::SeqCst);
     state.in_flight.insert(
         request_id,
         super::InFlightRequest {
@@ -1003,21 +992,19 @@ pub(super) async fn analyze_path(
     };
 
     if result.is_some() {
-        state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+        drop(permit);
         state.in_flight.remove(&request_id);
     } else {
-        let active = state.active_tasks.load(Ordering::Relaxed);
         tracing::warn!(
             id = request_id,
             path = %req.path,
-            active_tasks = active,
             timeout_secs = state.timeout_secs,
             "analyze-path timed out; background cleanup task started",
         );
         let orphan_state = Arc::clone(&state);
         tokio::spawn(async move {
             let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
-            orphan_state.active_tasks.fetch_sub(1, Ordering::SeqCst);
+            drop(permit);
             orphan_state.in_flight.remove(&request_id);
             if grace.is_ok() {
                 tracing::info!(request_id, "orphaned task completed within grace period");
@@ -1146,7 +1133,10 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
     }
 
     // Still overloaded — track duration and potentially terminate.
-    let mut overloaded = state.overloaded_since.lock().ok()?;
+    // Use try_lock: if a concurrent request holds the lock it is already recording
+    // the overload timestamp, so it is safe to pass through rather than block a
+    // tokio worker on a std::sync::Mutex.
+    let mut overloaded = state.overloaded_since.try_lock().ok()?;
     let since = *overloaded.get_or_insert_with(Instant::now);
     let overloaded_secs = since.elapsed().as_secs();
 
@@ -1200,7 +1190,7 @@ pub(super) async fn memory_stats(State(state): State<Arc<AppState>>) -> Json<ser
             "jemalloc": jemalloc,
         },
         "server": {
-            "active_tasks": state.active_tasks.load(Ordering::Relaxed),
+            "active_tasks": state.max_concurrent_tasks.saturating_sub(state.slots.available_permits()),
             "max_concurrent_tasks": state.max_concurrent_tasks,
             "requests_total": state.next_request_id.load(Ordering::Relaxed),
             "timeout_secs": state.timeout_secs,
