@@ -2,8 +2,11 @@
 # rollout-macos.sh - Deploy litmus on macOS using launchd
 # Runs entirely on the local machine. Re-run to update.
 # Must be invoked from the repository root.
+#
+# Requires sudo on every run only for launchctl (system LaunchDaemon management).
+# All other sudo calls are first-run-only, guarded by existence/ownership checks.
 
-set -e
+set -ex
 
 BINARY=litmus
 INSTALL_DIR=/usr/local/share/litmus
@@ -18,59 +21,67 @@ ALLOW_CIDR="${ALLOW_CIDR:-10.0.0.0/8}"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
-[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
-
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un)}"
+BREW_PREFIX=$(brew --prefix)
+MODELS_SRC="$HOME/Library/Application Support/litmus/models"
+TRAITS_SRC="$HOME/Library/Application Support/cleave/traits"
 
 log "Installing build dependencies"
-sudo -u "$REAL_USER" brew install rust sccache p7zip upx rizin innoextract
+brew install rust sccache p7zip upx rizin innoextract
 
 log "Building release binary"
-sudo -u "$REAL_USER" env RUSTC_WRAPPER=sccache make release || die "build failed"
+RUSTC_WRAPPER=sccache make release || die "build failed"
 
 log "Upgrading rules"
-sudo -u "$REAL_USER" out/litmus update-rules || die "update-rules failed"
+out/litmus update-rules || die "update-rules failed"
 
-REAL_HOME=$(dscl . -read "/Users/$REAL_USER" NFSHomeDirectory | sed 's/NFSHomeDirectory: //')
-BREW_PREFIX=$(sudo -u "$REAL_USER" brew --prefix)
-MODELS_SRC="$REAL_HOME/Library/Application Support/litmus/models"
-TRAITS_SRC="$REAL_HOME/Library/Application Support/cleave/traits"
 [ -d "$MODELS_SRC" ] || die "models not found at '$MODELS_SRC' after update-rules"
 [ -d "$TRAITS_SRC" ] || die "traits not found at '$TRAITS_SRC' after update-rules"
 
+# First-run only: create service user
 log "Ensuring service user '$SERVICE_USER' exists"
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     uid=300
     while dscl . -list /Users UniqueID | awk '{print $2}' | grep -qx "$uid"; do
         uid=$((uid + 1))
     done
-    dscl . -create "/Users/$SERVICE_USER"
-    dscl . -create "/Users/$SERVICE_USER" UserShell /usr/bin/false
-    dscl . -create "/Users/$SERVICE_USER" RealName "Litmus Service"
-    dscl . -create "/Users/$SERVICE_USER" UniqueID "$uid"
-    dscl . -create "/Users/$SERVICE_USER" PrimaryGroupID 1
-    dscl . -create "/Users/$SERVICE_USER" NFSHomeDirectory /var/empty
+    sudo dscl . -create "/Users/$SERVICE_USER"
+    sudo dscl . -create "/Users/$SERVICE_USER" UserShell /usr/bin/false
+    sudo dscl . -create "/Users/$SERVICE_USER" RealName "Litmus Service"
+    sudo dscl . -create "/Users/$SERVICE_USER" UniqueID "$uid"
+    sudo dscl . -create "/Users/$SERVICE_USER" PrimaryGroupID 1
+    sudo dscl . -create "/Users/$SERVICE_USER" NFSHomeDirectory /var/empty
 fi
 
+# First-run only: create install dir owned by current user
 log "Installing binary"
-rm -rf "$INSTALL_DIR"
-mkdir -p "$INSTALL_DIR" /usr/local/bin
+if [ ! -d "$INSTALL_DIR" ] || [ ! -w "$INSTALL_DIR" ]; then
+    sudo mkdir -p "$INSTALL_DIR"
+    sudo chown "$(id -un)" "$INSTALL_DIR"
+fi
 install -m 755 out/litmus "$INSTALL_DIR/$BINARY"
-chown root:wheel "$INSTALL_DIR/$BINARY"
-chmod 755 "$INSTALL_DIR/$BINARY"
-ln -sf "$INSTALL_DIR/$BINARY" "$BIN_LINK"
 
+# First-run only: create symlink
+if [ ! -L "$BIN_LINK" ] || [ "$(readlink "$BIN_LINK")" != "$INSTALL_DIR/$BINARY" ]; then
+    sudo ln -sf "$INSTALL_DIR/$BINARY" "$BIN_LINK"
+fi
+
+# Install models and traits world-readable so _litmus can read without chown
 log "Installing models and traits"
+rm -rf "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
 cp -R "$MODELS_SRC" "$INSTALL_DIR/models"
 cp -R "$TRAITS_SRC" "$INSTALL_DIR/traits"
-chown -R "$SERVICE_USER" "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
+chmod -R a+rX "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
 
-log "Preparing log file"
-touch "$LOG"
-chown "$SERVICE_USER" "$LOG"
+# First-run only: prepare log file owned by service user
+if [ ! -f "$LOG" ]; then
+    sudo touch "$LOG"
+    sudo chown "$SERVICE_USER" "$LOG"
+fi
 
+# Write plist only if content has changed
 log "Installing launchd plist"
-cat > "$PLIST" <<EOF
+new_plist=$(mktemp)
+cat > "$new_plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -110,16 +121,21 @@ cat > "$PLIST" <<EOF
 </dict>
 </plist>
 EOF
-chown root:wheel "$PLIST"
-chmod 644 "$PLIST"
+if [ ! -f "$PLIST" ] || ! cmp -s "$new_plist" "$PLIST"; then
+    sudo cp "$new_plist" "$PLIST"
+    sudo chown root:wheel "$PLIST"
+    sudo chmod 644 "$PLIST"
+fi
+rm -f "$new_plist"
 
+# Always required: launchctl runs as root for system LaunchDaemon management
 log "Loading launchd service"
-launchctl bootout "system/$LABEL" 2>/dev/null || true
-launchctl bootout system "$PLIST" 2>/dev/null || true
-pkill -9 -x "$BINARY" 2>/dev/null || true
-launchctl bootstrap system "$PLIST"
+sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
+sudo launchctl bootout system "$PLIST" 2>/dev/null || true
+sudo pkill -9 -x "$BINARY" 2>/dev/null || true
+sudo launchctl bootstrap system "$PLIST"
 
 log "Service status:"
-launchctl print "system/$LABEL" || true
+sudo launchctl print "system/$LABEL" || true
 
 log "Deployment complete"

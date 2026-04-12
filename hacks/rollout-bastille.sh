@@ -2,7 +2,7 @@
 # rollout-bastille.sh - Deploy litmus using separate build and run jails
 # Usage: ./rollout-bastille.sh [build-jail] [run-jail]
 
-set -e
+set -ex
 
 BUILD="${1:-build}"
 RUN="${2:-litmus}"

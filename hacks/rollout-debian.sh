@@ -5,7 +5,7 @@
 # build-host / run-host are SSH targets (e.g. "user@host" or an ssh_config alias).
 # The same host may be passed for both. Remote user must have passwordless sudo.
 
-set -e
+set -ex
 
 BUILD="${1:-build}"
 RUN="${2:-litmus}"
