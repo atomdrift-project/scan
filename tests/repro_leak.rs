@@ -19,6 +19,7 @@ struct InFlightRequest {
     size_bytes: u64,
     #[allow(dead_code)]
     started_at: Instant,
+    #[allow(dead_code)]
     timed_out: AtomicBool,
 }
 

@@ -475,15 +475,17 @@ pub(super) async fn analyze(
         }
     };
 
-    // Create temp file with the sanitized filename as suffix so cleave detects the file type.
-    let suffix = format!("_{filename}");
-    let temp_file =
-        match tokio::task::spawn_blocking(move || TempBuilder::new().suffix(&suffix).tempfile())
+    // Create a temp directory containing a file with the original filename so that
+    // cleave's filename-based type detection works correctly (e.g. "package.json"
+    // is recognized as PackageJson, not Unknown).
+    let fname_for_temp = filename.clone();
+    let temp_dir =
+        match tokio::task::spawn_blocking(move || TempBuilder::new().prefix("litmus-").tempdir())
             .await
         {
-            Ok(Ok(f)) => f,
+            Ok(Ok(d)) => d,
             Ok(Err(e)) => {
-                tracing::warn!("failed to create temp file: {e}  id={request_id}");
+                tracing::warn!("failed to create temp dir: {e}  id={request_id}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": "Internal error"})),
@@ -491,7 +493,7 @@ pub(super) async fn analyze(
                     .into_response();
             }
             Err(e) => {
-                tracing::warn!("temp file task join error (panic?): {e}  id={request_id}");
+                tracing::warn!("temp dir task join error (panic?): {e}  id={request_id}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": "Internal error"})),
@@ -500,9 +502,9 @@ pub(super) async fn analyze(
             }
         };
 
-    // Stream multipart field to the temp file.
-    let path = temp_file.path().to_owned();
-    let writer = match temp_file.reopen() {
+    // Stream multipart field to a file with the original name inside the temp dir.
+    let path = temp_dir.path().join(&fname_for_temp);
+    let writer = match std::fs::File::create(&path) {
         Ok(file) => file,
         Err(e) => {
             tracing::warn!("failed to reopen temp file for writing: {e}  id={request_id}");
@@ -664,7 +666,7 @@ pub(super) async fn analyze(
         if should_clear_caches {
             cleave::clear_all_thread_caches();
         }
-        drop(temp_file);
+        drop(temp_dir);
         result
     });
 
