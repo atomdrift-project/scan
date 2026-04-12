@@ -116,6 +116,8 @@ chmod 644 "$PLIST"
 
 log "Loading launchd service"
 launchctl bootout "system/$LABEL" 2>/dev/null || true
+launchctl bootout system "$PLIST" 2>/dev/null || true
+pkill -9 -x "$BINARY" 2>/dev/null || true
 launchctl bootstrap system "$PLIST"
 
 log "Service status:"
