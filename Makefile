@@ -61,6 +61,7 @@ tarball: release
 	@echo "Tarball: $(OUT_DIR)/litmus.tgz"
 
 deploy:
+	git pull
 	@case "$$(uname -s)" in \
 		Darwin)  ./hacks/rollout-macos.sh ;; \
 		FreeBSD) ./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)" ;; \
