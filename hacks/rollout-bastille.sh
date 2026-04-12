@@ -27,7 +27,7 @@ doas bastille cmd "$BUILD" id -u litmus >/dev/null 2>&1 || \
     doas bastille cmd "$BUILD" pw useradd litmus -m -s /bin/sh -c "Litmus Build"
 
 log "Installing build dependencies"
-doas bastille pkg "$BUILD" install -y rust sccache git pkgconf
+doas bastille pkg "$BUILD" install -y rust sccache git pkgconf mold
 
 log "Syncing source to build jail (preserving target/)"
 doas bastille cmd "$BUILD" su -l litmus -c "mkdir -p ~/litmus"
@@ -35,7 +35,7 @@ tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
     | doas bastille cmd "$BUILD" su -l litmus -c "tar -xf - -C ~/litmus"
 
 log "Building tarball"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=lld' make tarball" \
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=mold' make tarball" \
     || die "build failed in build jail"
 
 log "Upgrading rules"
@@ -43,7 +43,7 @@ doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && ./target/release/litm
     || die "update-rules failed in build jail"
 
 log "Running tests"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=lld' cargo test --release -- --nocapture" \
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=mold' cargo test --release -- --nocapture" \
     || die "tests failed in build jail"
 
 # --- Transfer tarball via jail filesystem ---
