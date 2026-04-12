@@ -3,8 +3,9 @@
 # Runs entirely on the local machine. Re-run to update.
 # Must be invoked from the repository root.
 #
-# Requires sudo on every run only for launchctl (system LaunchDaemon management).
+# sudo is required on every run only for launchctl (system LaunchDaemon management).
 # All other sudo calls are first-run-only, guarded by existence/ownership checks.
+# Models and traits are cloned once; the service handles git pull at runtime.
 
 set -ex
 
@@ -29,7 +30,6 @@ done
 command -v brew >/dev/null 2>&1 || die "brew not found"
 
 BREW_PREFIX=$(brew --prefix)
-MODELS_SRC="$HOME/Library/Application Support/litmus/models"
 TRAITS_SRC="$HOME/Library/Application Support/cleave/traits"
 
 log "Installing build dependencies"
@@ -37,12 +37,6 @@ brew install rust sccache p7zip upx rizin innoextract
 
 log "Building release binary"
 RUSTC_WRAPPER=sccache make release || die "build failed"
-
-log "Upgrading rules"
-out/litmus update-rules || die "update-rules failed"
-
-[ -d "$MODELS_SRC" ] || die "models not found at '$MODELS_SRC' after update-rules"
-[ -d "$TRAITS_SRC" ] || die "traits not found at '$TRAITS_SRC' after update-rules"
 
 # First-run only: create service user
 log "Ensuring service user '$SERVICE_USER' exists"
@@ -60,24 +54,37 @@ if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 
 # First-run only: create install dir owned by current user
-log "Installing binary"
 if [ ! -d "$INSTALL_DIR" ] || [ ! -w "$INSTALL_DIR" ]; then
     sudo mkdir -p "$INSTALL_DIR"
     sudo chown "$(id -un)" "$INSTALL_DIR"
 fi
-install -m 755 out/litmus "$INSTALL_DIR/$BINARY"
+
+log "Installing binary"
+restart_needed=0
+if ! cmp -s "out/litmus" "$INSTALL_DIR/$BINARY" 2>/dev/null; then
+    install -m 755 out/litmus "$INSTALL_DIR/$BINARY"
+    restart_needed=1
+fi
 
 # First-run only: create symlink
 if [ ! -L "$BIN_LINK" ] || [ "$(readlink "$BIN_LINK")" != "$INSTALL_DIR/$BINARY" ]; then
     sudo ln -sf "$INSTALL_DIR/$BINARY" "$BIN_LINK"
 fi
 
-# Install models and traits owned by service user so git pull works at runtime
-log "Installing models and traits"
-sudo rm -rf "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
-cp -R "$MODELS_SRC" "$INSTALL_DIR/models"
-cp -R "$TRAITS_SRC" "$INSTALL_DIR/traits"
-sudo chown -R "$SERVICE_USER" "$INSTALL_DIR/models" "$INSTALL_DIR/traits"
+# Clone models and traits on first run; the service handles git pull at runtime
+log "Ensuring models repo"
+if [ ! -d "$INSTALL_DIR/models/.git" ]; then
+    sudo git clone https://codeberg.org/atomdrift/litmus-models.git "$INSTALL_DIR/models"
+    sudo chown -R "$SERVICE_USER" "$INSTALL_DIR/models"
+fi
+
+log "Ensuring traits repo"
+if [ ! -d "$INSTALL_DIR/traits/.git" ]; then
+    [ -d "$TRAITS_SRC" ] || die "traits not found at '$TRAITS_SRC'; run 'litmus update-rules' first"
+    traits_remote=$(git -C "$TRAITS_SRC" remote get-url origin 2>/dev/null) || die "'$TRAITS_SRC' is not a git repo"
+    sudo git clone "$traits_remote" "$INSTALL_DIR/traits"
+    sudo chown -R "$SERVICE_USER" "$INSTALL_DIR/traits"
+fi
 
 # First-run only: prepare log file owned by service user
 if [ ! -f "$LOG" ]; then
@@ -132,15 +139,19 @@ if [ ! -f "$PLIST" ] || ! cmp -s "$new_plist" "$PLIST"; then
     sudo cp "$new_plist" "$PLIST"
     sudo chown root:wheel "$PLIST"
     sudo chmod 644 "$PLIST"
+    restart_needed=1
 fi
 rm -f "$new_plist"
 
-# Always required: launchctl runs as root for system LaunchDaemon management
-log "Loading launchd service"
-sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
-sudo launchctl bootout system "$PLIST" 2>/dev/null || true
-sudo pkill -9 -x "$BINARY" 2>/dev/null || true
-sudo launchctl bootstrap system "$PLIST"
+# Only restart if binary or plist changed - avoid disrupting a healthy service
+if [ "$restart_needed" -eq 1 ]; then
+    log "Restarting launchd service"
+    sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
+    sudo pkill -9 -x "$BINARY" 2>/dev/null || true
+    sudo launchctl bootstrap system "$PLIST"
+else
+    log "Binary and plist unchanged, skipping service restart"
+fi
 
 log "Service status:"
 sudo launchctl print "system/$LABEL" || true
