@@ -583,6 +583,15 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // growth from allocator fragmentation across thousands of analyses.
     cleave::memory_tracker::configure_jemalloc_low_memory();
 
+    // Watchdog thread: enforces the same RSS limit as check_memory_pressure on
+    // wall-clock time, independent of request traffic. This catches memory
+    // growth that happens between requests (e.g. jemalloc fragmentation or
+    // background YARA work).
+    let _watchdog = cleave::memory_tracker::start_periodic_logging(
+        std::time::Duration::from_secs(10),
+        config.max_rss_bytes(),
+    );
+
     let app = build_app(&config).await?;
 
     let listener = tokio::net::TcpListener::bind(config.bind()).await?;

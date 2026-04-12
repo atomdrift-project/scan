@@ -115,8 +115,9 @@ enum Commands {
         #[arg(long, default_value = "100")]
         max_size_mb: usize,
 
-        /// Maximum RSS in gigabytes before rejecting requests (Linux only)
-        #[arg(long, default_value = "8")]
+        /// Maximum RSS in gigabytes before rejecting requests.
+        /// Defaults to 0, which means auto: min(50% RAM, 32 GiB).
+        #[arg(long, default_value = "0")]
         max_rss_gb: u64,
 
         /// Comma-separated directories allowed for /analyze-path requests
@@ -317,11 +318,16 @@ fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?,
                 None => Vec::new(),
             };
+            let max_rss_bytes = if max_rss_gb == 0 {
+                cleave::memory_tracker::memory_limit()
+            } else {
+                max_rss_gb.saturating_mul(1024 * 1024 * 1024)
+            };
             let config = litmus::server::ServerConfig::new(
                 bind,
                 timeout_secs,
                 max_size_mb.saturating_mul(1024 * 1024),
-                max_rss_gb.saturating_mul(1024 * 1024 * 1024),
+                max_rss_bytes,
                 resolve_model_dir()?,
                 thresholds,
                 cli.slow_rule_ms,
