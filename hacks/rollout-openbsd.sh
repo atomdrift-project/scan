@@ -41,7 +41,7 @@ if ! cmp -s "target/release/$BINARY" "$BIN_DIR/$BINARY" 2>/dev/null; then
 fi
 
 log "Installing cron entry"
-cron_cmd="* * * * * pgrep -x $BINARY >/dev/null 2>&1 || nohup $BIN_DIR/$BINARY -u serve --bind $BIND --allow-cidr $ALLOW_CIDR >> $LOG 2>&1 &"
+cron_cmd="* * * * * pgrep -x $BINARY >/dev/null 2>&1 || { ulimit -d \$(ulimit -Hd); nohup $BIN_DIR/$BINARY -u serve --bind $BIND --allow-cidr $ALLOW_CIDR >> $LOG 2>&1 & }"
 (crontab -l 2>/dev/null | grep -v "litmus.*serve"; echo "$cron_cmd") | crontab -
 
 if [ "$restart_needed" -eq 1 ]; then
