@@ -16,8 +16,7 @@ use tokio::sync::Semaphore;
 use crate::model::{Model, Thresholds};
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
-use crate::server::classify_file;
-use crate::server::ModelResources;
+use crate::server::{classify_bytes, classify_file, ModelResources};
 
 /// Configuration for the worker mode.
 #[derive(Debug)]
@@ -232,58 +231,52 @@ async fn run_job(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| job.sha256.clone());
 
-    // Try to resolve the file locally: join relative path with data_dir,
-    // verify it exists and SHA256 matches. Fall back to HTTP download.
+    // Try local file first; fall back to downloading bytes from hopper.
     let local_path = data_dir.map(|d| d.join(&job.path));
-    let (path, _temp) = match local_path {
-        Some(ref p) if p.exists() => {
-            match verify_sha256(p, &job.sha256) {
-                Ok(true) => {
-                    tracing::info!(sha256 = %job.sha256, path = %p.display(), file_type = %job.file_type, size = job.size_bytes, "analyzing local file");
-                    (p.clone(), None)
-                }
-                Ok(false) => {
-                    tracing::info!(sha256 = %job.sha256, path = %p.display(), "SHA256 mismatch, downloading from server");
-                    let tmp = download_file(client, base_url, &job.sha256, &label).await?;
-                    tracing::info!(sha256 = %job.sha256, tmp = %tmp.path().display(), size = tmp.path().metadata().map(|m| m.len()).unwrap_or(0), "downloaded to tempfile");
-                    let tp = tmp.path().to_path_buf();
-                    (tp, Some(tmp))
-                }
-                Err(e) => {
-                    tracing::info!(sha256 = %job.sha256, path = %p.display(), error = %e, "hash check failed, downloading from server");
-                    let tmp = download_file(client, base_url, &job.sha256, &label).await?;
-                    tracing::info!(sha256 = %job.sha256, tmp = %tmp.path().display(), size = tmp.path().metadata().map(|m| m.len()).unwrap_or(0), "downloaded to tempfile");
-                    let tp = tmp.path().to_path_buf();
-                    (tp, Some(tmp))
-                }
+    let use_local = match local_path {
+        Some(ref p) if p.exists() => match verify_sha256(p, &job.sha256) {
+            Ok(true) => {
+                tracing::info!(sha256 = %job.sha256, path = %p.display(), file_type = %job.file_type, size = job.size_bytes, "analyzing local file");
+                true
             }
-        }
-        _ => {
-            tracing::info!(sha256 = %job.sha256, file = %label, "no local file, downloading from server");
-            let tmp = download_file(client, base_url, &job.sha256, &label).await?;
-            tracing::info!(sha256 = %job.sha256, tmp = %tmp.path().display(), size = tmp.path().metadata().map(|m| m.len()).unwrap_or(0), "downloaded to tempfile");
-            let tp = tmp.path().to_path_buf();
-            (tp, Some(tmp))
-        }
+            Ok(false) => {
+                tracing::info!(sha256 = %job.sha256, path = %p.display(), "SHA256 mismatch, will download");
+                false
+            }
+            Err(e) => {
+                tracing::info!(sha256 = %job.sha256, path = %p.display(), error = %e, "hash check failed, will download");
+                false
+            }
+        },
+        _ => false,
+    };
+
+    // Download bytes if not using local file. analyze_bytes avoids writing to disk.
+    let downloaded: Option<Vec<u8>> = if use_local {
+        None
+    } else {
+        let bytes = download_bytes(client, base_url, &job.sha256, &label).await?;
+        tracing::info!(sha256 = %job.sha256, file = %label, size = bytes.len(), "downloaded for in-memory analysis");
+        Some(bytes)
     };
 
     let resources = Arc::clone(resources);
     let timeout = Duration::from_secs(timeout_secs);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = Arc::clone(&cancel);
+    let local = local_path.clone();
 
     // Run analysis on a blocking thread with a timeout.
     let start = Instant::now();
     let handle = tokio::task::spawn_blocking(move || {
-        classify_file(
-            &path,
-            &label,
-            &resources,
-            slow_rule_ms,
-            None, // extract_dir
-            Some(&cancel2),
-            None, // phase tracker
-        )
+        if let Some(data) = downloaded {
+            // In-memory analysis — no tempfile needed.
+            classify_bytes(&data, &label, &resources, slow_rule_ms, Some(&cancel2))
+        } else {
+            // Local file on disk.
+            let path = local.as_ref().expect("local path must be set");
+            classify_file(path, &label, &resources, slow_rule_ms, None, Some(&cancel2), None)
+        }
     });
 
     let result = tokio::time::timeout(timeout, handle).await;
@@ -303,7 +296,6 @@ async fn run_job(
             Err(format!("analysis timed out after {timeout_secs}s"))
         }
     }
-    // _temp is dropped here, deleting the tempfile if one was created.
 }
 
 /// Post the result back to hopper with retry on transient failures.
@@ -397,25 +389,20 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<bool, std::io::Error> {
     Ok(hash == expected)
 }
 
-/// Download a file from hopper's /api/file endpoint to a tempfile.
-async fn download_file(
+/// Download file bytes from hopper's /api/file endpoint.
+async fn download_bytes(
     client: &reqwest::Client,
     base_url: &str,
     sha256: &str,
     label: &str,
-) -> Result<tempfile::NamedTempFile, String> {
+) -> Result<Vec<u8>, String> {
     let url = format!("{}/api/file/{}", base_url, sha256);
     let resp = client.get(&url).send().await.map_err(|e| format!("download {label}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("download {label}: HTTP {}", resp.status()));
     }
     let bytes = resp.bytes().await.map_err(|e| format!("download {label}: read body: {e}"))?;
-
-    let mut tmp = tempfile::NamedTempFile::new()
-        .map_err(|e| format!("download {label}: create tempfile: {e}"))?;
-    std::io::Write::write_all(&mut tmp, &bytes)
-        .map_err(|e| format!("download {label}: write tempfile: {e}"))?;
-    Ok(tmp)
+    Ok(bytes.to_vec())
 }
 
 /// Exponential backoff with jitter, capped at 2 minutes.

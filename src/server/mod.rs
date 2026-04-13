@@ -18,6 +18,7 @@ mod handlers;
 
 pub use acl::{parse_cidr_list, Cidr};
 pub(crate) use handlers::classify_file;
+pub(crate) use handlers::classify_bytes;
 
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;

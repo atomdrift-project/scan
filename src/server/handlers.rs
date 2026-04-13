@@ -848,7 +848,51 @@ pub(crate) fn classify_file(
         cancellation,
     )?;
 
-    Ok(ScanResult {
+    Ok(scan_result_from(label, cr, resources))
+}
+
+/// Like [`classify_file`] but operates on in-memory data, avoiding disk I/O.
+/// Uses `cleave::analyze_bytes` so no tempfile is needed.
+pub(crate) fn classify_bytes(
+    data: &[u8],
+    label: &str,
+    resources: &super::ModelResources,
+    slow_rule_ms: u64,
+    cancellation: Option<&Arc<AtomicBool>>,
+) -> anyhow::Result<ScanResult> {
+    use anyhow::Context as _;
+
+    let opts = cleave::AnalysisOptions {
+        slow_rule_ms,
+        cancellation: cancellation.cloned(),
+        ..Default::default()
+    };
+    let report = cleave::analyze_bytes(data, label, &opts)
+        .with_context(|| format!("cleave analysis of {label}"))?;
+
+    if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        anyhow::bail!("analysis cancelled");
+    }
+
+    let cr = crate::scan::classify_report(
+        label,
+        report,
+        &resources.ctx,
+        &resources.model,
+        resources.shap.as_ref(),
+        cancellation,
+    )?;
+
+    Ok(scan_result_from(label, cr, resources))
+}
+
+/// Build a [`ScanResult`] from a classified report.
+fn scan_result_from(
+    label: &str,
+    cr: crate::scan::ClassifiedReport,
+    resources: &super::ModelResources,
+) -> ScanResult {
+    ScanResult {
         v: "4",
         classification: cr.classification,
         probability: cr.probability,
@@ -867,7 +911,7 @@ pub(crate) fn classify_file(
         size_bytes: cr.size_bytes,
         sha256: cr.sha256,
         embedded_files: cr.embedded_files,
-    })
+    }
 }
 
 /// Check RSS memory pressure. Returns a 503 response if the server is overloaded,
