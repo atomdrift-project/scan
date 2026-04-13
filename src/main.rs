@@ -140,6 +140,37 @@ enum Commands {
         allow_cidr: Option<String>,
     },
 
+    /// Run as a pull-based worker, polling a hopper instance for analysis jobs
+    Worker {
+        /// Hopper API base URL (e.g. http://hopper-host:8081)
+        #[arg(long)]
+        hopper_url: String,
+
+        /// Worker name (defaults to hostname)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Number of concurrent analysis slots
+        #[arg(long)]
+        workers: Option<usize>,
+
+        /// Poll interval in seconds when no work is available
+        #[arg(long, default_value = "2")]
+        poll_secs: u64,
+
+        /// Per-request analysis timeout in seconds
+        #[arg(long, default_value = "600")]
+        timeout_secs: u64,
+
+        /// Maximum RSS in gigabytes before pausing claims (0 = auto)
+        #[arg(long, default_value = "0")]
+        max_rss_gb: u64,
+
+        /// Rules/model update interval in minutes (0 = disabled)
+        #[arg(long, default_value = "60")]
+        update_interval_mins: u64,
+    },
+
     /// Print version information
     Version,
 }
@@ -162,7 +193,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let is_serve = matches!(command, Commands::Serve { .. });
+    let is_serve = matches!(command, Commands::Serve { .. } | Commands::Worker { .. });
     let filter = if cli.verbose {
         tracing_subscriber::EnvFilter::new("litmus=debug,cleave=debug")
     } else if is_serve {
@@ -372,6 +403,45 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        Commands::Worker {
+            hopper_url,
+            name,
+            workers,
+            poll_secs,
+            timeout_secs,
+            max_rss_gb,
+            update_interval_mins,
+        } => {
+            let model_dir = resolve_model_dir()?;
+            let workers = workers.unwrap_or_else(|| {
+                let cores = std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4);
+                std::cmp::max(1, cores / 2)
+            });
+            let name = name.unwrap_or_else(|| {
+                hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+            let config = litmus::worker::WorkerConfig {
+                hopper_url,
+                name,
+                workers,
+                poll_secs,
+                timeout_secs,
+                max_rss_gb,
+                update_interval_mins,
+                model_dir,
+                thresholds,
+                slow_rule_ms: cli.slow_rule_ms,
+            };
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(litmus::worker::run(config))?;
         }
         Commands::Version => {
             println!("litmus {}", env!("CARGO_PKG_VERSION"));

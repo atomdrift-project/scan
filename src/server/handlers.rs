@@ -803,7 +803,7 @@ pub(super) async fn analyze(
 ///
 /// Runs on a blocking thread. `label` is used as the `path` field in the result
 /// (the original upload filename, not the temp file path).
-fn classify_file(
+pub(crate) fn classify_file(
     path: &std::path::Path,
     label: &str,
     resources: &super::ModelResources,

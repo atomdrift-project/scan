@@ -1045,13 +1045,15 @@ fn build_ml_fs(
 /// Top-level JSON envelope: `{"ml": {...}, "raw": {...}}`.
 #[derive(Debug, serde::Serialize)]
 pub struct ScanResultEnvelope {
-    ml: MlSection,
-    raw: serde_json::Value,
+    /// ML classification section.
+    pub ml: MlSection,
+    /// Raw cleave analysis report.
+    pub raw: serde_json::Value,
 }
 
 /// The `ml` section of the response envelope.
 #[derive(Debug, serde::Serialize)]
-struct MlSection {
+pub struct MlSection {
     v: &'static str,
     #[serde(rename = "class")]
     classification: Classification,

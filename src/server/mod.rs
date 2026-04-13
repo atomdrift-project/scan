@@ -17,6 +17,7 @@ mod acl;
 mod handlers;
 
 pub use acl::{parse_cidr_list, Cidr};
+pub(crate) use handlers::classify_file;
 
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
@@ -292,10 +293,10 @@ impl Drop for RequestGuard {
 }
 
 #[derive(Debug)]
-struct ModelResources {
-    model: Model,
-    shap: Option<ShapImportance>,
-    ctx: ExtractContext,
+pub(crate) struct ModelResources {
+    pub(crate) model: Model,
+    pub(crate) shap: Option<ShapImportance>,
+    pub(crate) ctx: ExtractContext,
 }
 
 #[derive(Debug)]
