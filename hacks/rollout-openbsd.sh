@@ -21,7 +21,11 @@ die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
 log "Installing dependencies"
-doas pkg_add -I rust git p7zip rizin innoextract
+doas pkg_add -I rustup git p7zip rizin innoextract
+
+log "Updating Rust toolchain"
+rustup update stable 2>/dev/null || rustup install stable || die "rustup failed"
+. "$HOME/.cargo/env"
 
 log "Building"
 cargo build --release || die "build failed"

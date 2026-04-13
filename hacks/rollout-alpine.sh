@@ -26,7 +26,11 @@ grep -q 'edge/testing' /etc/apk/repositories 2>/dev/null || \
     echo 'https://dl-cdn.alpinelinux.org/alpine/edge/testing' | doas tee -a /etc/apk/repositories
 
 log "Installing dependencies"
-doas apk add --no-cache rust cargo sccache git 7zip upx rizin innoextract
+doas apk add --no-cache rustup sccache git 7zip upx rizin innoextract
+
+log "Updating Rust toolchain"
+rustup update stable 2>/dev/null || rustup install stable || die "rustup failed"
+. "$HOME/.cargo/env"
 
 log "Building"
 RUSTC_WRAPPER=sccache cargo build --release || die "build failed"
