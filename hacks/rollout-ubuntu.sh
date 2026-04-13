@@ -27,7 +27,7 @@ log() { echo "==> $*"; }
 command -v rizin >/dev/null 2>&1 || die "rizin not found — build and install it from https://rizin.re before running this script"
 
 pkgs_needed=""
-for pkg in cargo rustc git pkg-config build-essential clang lld ca-certificates \
+for pkg in git pkg-config build-essential clang lld ca-certificates \
            p7zip-full upx innoextract cron; do
     dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
         || pkgs_needed="$pkgs_needed $pkg"
@@ -42,6 +42,13 @@ if [ -n "$pkgs_needed" ]; then
 else
     log "All packages already installed"
 fi
+
+log "Ensuring Rust toolchain"
+if ! command -v cargo >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
+        || die "rustup install failed"
+fi
+. "$HOME/.cargo/env"
 
 log "Building"
 if command -v sccache >/dev/null 2>&1; then
