@@ -111,10 +111,6 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:49999")]
         bind: SocketAddr,
 
-        /// Per-request analysis timeout in seconds
-        #[arg(long, default_value = "600")]
-        timeout_secs: u64,
-
         /// Maximum upload size in megabytes
         #[arg(long, default_value = "100")]
         max_size_mb: usize,
@@ -299,7 +295,6 @@ fn main() -> Result<()> {
         }
         Commands::Serve {
             bind,
-            timeout_secs,
             max_size_mb,
             max_rss_gb,
             allowed_dirs,
@@ -336,7 +331,6 @@ fn main() -> Result<()> {
             };
             let config = litmus::server::ServerConfig::new(
                 bind,
-                timeout_secs,
                 max_size_mb.saturating_mul(1024 * 1024),
                 max_rss_bytes,
                 resolve_model_dir()?,

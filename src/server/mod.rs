@@ -40,7 +40,6 @@ use crate::model::{Model, Thresholds};
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     bind: SocketAddr,
-    timeout_secs: u64,
     max_body_size: usize,
     max_rss_bytes: u64,
     model_dir: PathBuf,
@@ -73,7 +72,6 @@ impl ServerConfig {
     ///
     /// let config = ServerConfig::new(
     ///     "127.0.0.1:49999".parse()?,
-    ///     120,
     ///     100 * 1024 * 1024,
     ///     8 * 1024 * 1024 * 1024,
     ///     "/path/to/models",
@@ -85,13 +83,12 @@ impl ServerConfig {
     ///     vec![],
     /// )?;
     ///
-    /// assert_eq!(config.timeout_secs(), 120);
+    /// assert_eq!(config.max_body_size(), 100 * 1024 * 1024);
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     #[allow(clippy::too_many_arguments)] // ServerConfig is plumbed once at startup; a builder would add ceremony for no real benefit.
     pub fn new(
         bind: SocketAddr,
-        timeout_secs: u64,
         max_body_size: usize,
         max_rss_bytes: u64,
         model_dir: impl Into<PathBuf>,
@@ -111,7 +108,6 @@ impl ServerConfig {
         }
         Ok(Self {
             bind,
-            timeout_secs,
             max_body_size,
             max_rss_bytes,
             model_dir: model_dir.into(),
@@ -134,12 +130,6 @@ impl ServerConfig {
     #[must_use]
     pub const fn bind(&self) -> SocketAddr {
         self.bind
-    }
-
-    /// Per-request analysis timeout in seconds.
-    #[must_use]
-    pub const fn timeout_secs(&self) -> u64 {
-        self.timeout_secs
     }
 
     /// Maximum request body size in bytes.
@@ -200,7 +190,6 @@ mod config_tests {
     fn server_config_rejects_invalid_thresholds() {
         let result = ServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], 8081)),
-            120,
             100 * 1024 * 1024,
             8 * 1024 * 1024 * 1024,
             "/tmp/models",
@@ -222,7 +211,6 @@ mod config_tests {
     fn server_config_accepts_none_thresholds() {
         let result = ServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], 8081)),
-            120,
             100 * 1024 * 1024,
             8 * 1024 * 1024 * 1024,
             "/tmp/models",
@@ -241,7 +229,6 @@ mod config_tests {
     fn server_config_rejects_zero_workers() {
         let result = ServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], 8081)),
-            120,
             100 * 1024 * 1024,
             8 * 1024 * 1024 * 1024,
             "/tmp/models",
@@ -262,8 +249,6 @@ struct InFlightRequest {
     name: String,
     size_bytes: u64,
     started_at: Instant,
-    /// Set to true when the HTTP side returns 504 but the blocking task is still running.
-    timed_out: AtomicBool,
     /// Shared with the blocking task; set to true to request cooperative cancellation.
     cancellation: Arc<AtomicBool>,
     /// Tracks the current analysis phase inside cleave/litmus. Updated at each
@@ -271,6 +256,39 @@ struct InFlightRequest {
     phase: cleave::PhaseTracker,
     /// OS thread ID of the blocking thread servicing this request (0 until started).
     thread_id: AtomicU64,
+}
+
+/// RAII guard that cleans up a request slot when the handler future completes or
+/// is dropped (e.g. on client disconnect). On drop it signals cooperative
+/// cancellation to the blocking thread and removes the in-flight entry, ensuring
+/// neither the semaphore slot nor the dashmap entry leaks even if axum cancels
+/// the handler mid-flight.
+pub(super) struct RequestGuard {
+    request_id: u64,
+    state: Arc<AppState>,
+    cancellation: Arc<AtomicBool>,
+    /// Held here so the semaphore permit is released when the guard drops.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl RequestGuard {
+    fn new(
+        request_id: u64,
+        state: Arc<AppState>,
+        cancellation: Arc<AtomicBool>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        Self { request_id, state, cancellation, _permit: permit }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        // Signal the blocking thread to stop cooperatively, then remove the
+        // in-flight entry. The permit is released automatically via _permit.
+        self.cancellation.store(true, Ordering::Release);
+        self.state.in_flight.remove(&self.request_id);
+    }
 }
 
 #[derive(Debug)]
@@ -282,7 +300,6 @@ struct ModelResources {
 
 #[derive(Debug)]
 struct AppState {
-    timeout_secs: u64,
     max_upload_bytes: usize,
     max_rss_bytes: u64,
     model_dir: PathBuf,
@@ -303,9 +320,8 @@ struct AppState {
     /// the analysis completes or when the orphan-cleanup task gives up. RAII
     /// semantics mean the slot is always released — even on panic or runtime shutdown.
     slots: Arc<tokio::sync::Semaphore>,
-    /// Tasks that timed out and exceeded the 120s grace period. They still
-    /// occupy a slot in the semaphore until they finish, and their presence
-    /// is what eventually triggers the watchdog restart.
+    /// Tasks stuck past the grace period — still occupying a slot until the
+    /// blocking thread finally returns. Tracked for observability only.
     stuck_orphans: AtomicUsize,
     /// Capacity of the slots semaphore. Requests are rejected with 503 when no
     /// permits are available, preventing orphaned blocking tasks from piling up
@@ -313,9 +329,6 @@ struct AppState {
     max_concurrent_tasks: usize,
     reload_lock: tokio::sync::Mutex<()>,
     overloaded_since: std::sync::Mutex<Option<Instant>>,
-    /// When all slots first became occupied exclusively by orphaned tasks.
-    /// Reset to None when any live task is present or load drops below max.
-    saturated_since: std::sync::Mutex<Option<Instant>>,
     in_flight: dashmap::DashMap<u64, InFlightRequest>,
 }
 
@@ -348,7 +361,6 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     tracing::info!(max_concurrent, "concurrency limit set");
 
     let state = Arc::new(AppState {
-        timeout_secs: config.timeout_secs(),
         max_upload_bytes: config.max_body_size(),
         max_rss_bytes: config.max_rss_bytes(),
         model_dir: config.model_dir().to_path_buf(),
@@ -367,7 +379,6 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         max_concurrent_tasks: max_concurrent,
         reload_lock: tokio::sync::Mutex::new(()),
         overloaded_since: std::sync::Mutex::new(None),
-        saturated_since: std::sync::Mutex::new(None),
         in_flight: dashmap::DashMap::new(),
     });
 
@@ -483,69 +494,57 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         });
     }
 
-    // Watchdog: if every slot has been occupied solely by orphaned (timed-out) tasks
-    // for 600 seconds, something is irreparably stuck. Force-cancel all in-flight tasks,
-    // wait 30 s for cooperative shutdown, then exit so the process manager restarts us.
+    // Watchdog: periodically log about stuck in-flight requests. Signals cooperative
+    // cancellation to tasks running longer than 10 minutes so cleave can bail out of
+    // slow YARA rules, but never terminates the process — that is left to the operator.
     {
         let watchdog = Arc::clone(&state);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let available = watchdog.slots.available_permits();
                 let active = watchdog.max_concurrent_tasks.saturating_sub(available);
-                let is_full = available == 0;
-                let timed_out_count = watchdog
-                    .in_flight
-                    .iter()
-                    .filter(|e| e.timed_out.load(Ordering::Relaxed))
-                    .count();
-                let live = active.saturating_sub(timed_out_count);
+                let stuck = watchdog.stuck_orphans.load(Ordering::Relaxed);
 
-                if !is_full || live > 0 {
-                    // Healthy or recovering — reset the clock.
-                    if let Ok(mut s) = watchdog.saturated_since.lock() {
-                        *s = None;
-                    }
+                if active == 0 {
                     continue;
                 }
 
-                // All slots consumed by orphaned tasks.
-                let elapsed = match watchdog.saturated_since.lock() {
-                    Ok(mut s) => s.get_or_insert_with(Instant::now).elapsed(),
-                    Err(_) => continue,
-                };
-
-                // Grace period for orphaned tasks is 120s. Wait 150s before
-                // firing so the grace-period cleanup tasks can release slots
-                // naturally before we resort to a forced restart.
-                if elapsed.as_secs() < 150 {
-                    tracing::warn!(
-                        active_tasks = active,
-                        max_concurrent_tasks = watchdog.max_concurrent_tasks,
-                        elapsed_secs = elapsed.as_secs(),
-                        "watchdog: all slots orphaned — will force-cancel in {}s if not recovered",
-                        150u64.saturating_sub(elapsed.as_secs()),
-                    );
-                    continue;
-                }
-
-                // 150s elapsed — grace periods have expired; force-cancel and restart.
-                tracing::error!(
-                    active_tasks = active,
-                    max_concurrent_tasks = watchdog.max_concurrent_tasks,
-                    elapsed_secs = elapsed.as_secs(),
-                    "watchdog: all slots orphaned for 150s — force-cancelling all tasks",
-                );
+                // Log details for every long-running in-flight request.
+                let now = Instant::now();
                 for entry in watchdog.in_flight.iter() {
-                    entry.cancellation.store(true, Ordering::Release);
+                    let elapsed_secs = now.duration_since(entry.started_at).as_secs();
+                    let phase = entry.phase.get();
+                    let tid = entry.thread_id.load(Ordering::Relaxed);
+                    if elapsed_secs >= 600 {
+                        // Signal cooperative cancellation for very long tasks so
+                        // cleave can exit slow YARA rules cleanly.
+                        entry.cancellation.store(true, Ordering::Release);
+                        tracing::error!(
+                            request_id = entry.key(),
+                            name = %entry.name,
+                            elapsed_secs,
+                            phase,
+                            thread_id = tid,
+                            stuck_orphans = stuck,
+                            active_tasks = active,
+                            "watchdog: task running ≥10 min — cancellation signalled",
+                        );
+                    } else if elapsed_secs >= 120 {
+                        tracing::warn!(
+                            request_id = entry.key(),
+                            name = %entry.name,
+                            elapsed_secs,
+                            phase,
+                            thread_id = tid,
+                            stuck_orphans = stuck,
+                            active_tasks = active,
+                            "watchdog: long-running task",
+                        );
+                    }
                 }
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                tracing::error!("watchdog: restarting after forced-cancellation grace period");
-                // Flush stderr so the final log lines are visible before exit.
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-                std::process::exit(1);
             }
         });
     }
@@ -611,14 +610,12 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(config.bind()).await?;
     eprintln!(
-        "Listening on http://{} (timeout: {}s, max size: {} MB, starting up) — Press Ctrl+C to stop",
+        "Listening on http://{} (max size: {} MB, starting up) — Press Ctrl+C to stop",
         config.bind(),
-        config.timeout_secs(),
         config.max_body_size() / 1024 / 1024,
     );
     tracing::info!(
         bind = %config.bind(),
-        timeout_secs = config.timeout_secs(),
         max_body_mb = config.max_body_size() / 1024 / 1024,
         allow_cidrs = config.allow_cidrs().len(),
         "listening (resources loading in background)",

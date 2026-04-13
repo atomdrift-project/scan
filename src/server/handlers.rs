@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tempfile::Builder as TempBuilder;
 
 use super::AppState;
@@ -173,22 +173,31 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             .into_response();
     }
     let max_tasks = state.max_concurrent_tasks;
-    // Total orphans: timed out but still running (either in grace period or stuck).
-    let total_orphans = state
+    let stuck_orphans = state.stuck_orphans.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Tasks running longer than 120s — visible in /_/requests with full phase detail.
+    let now = Instant::now();
+    let long_running: Vec<serde_json::Value> = state
         .in_flight
         .iter()
-        .filter(|e| e.timed_out.load(std::sync::atomic::Ordering::Relaxed))
-        .count();
-    // Stuck orphans: exceeded the 120s grace period and still running.
-    let stuck_orphans = state
-        .stuck_orphans
-        .load(std::sync::atomic::Ordering::Relaxed);
-    // Grace orphans: timed out but still within the 120s grace period.
-    let grace_orphans = total_orphans.saturating_sub(stuck_orphans);
+        .filter_map(|e| {
+            let elapsed_secs = now.duration_since(e.started_at).as_secs();
+            if elapsed_secs >= 120 {
+                Some(serde_json::json!({
+                    "request_id": e.key(),
+                    "name": e.name,
+                    "elapsed_secs": elapsed_secs,
+                    "phase": e.phase.get(),
+                    "thread_id": e.thread_id.load(std::sync::atomic::Ordering::Relaxed),
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
 
-    let live_tasks = active_tasks.saturating_sub(total_orphans);
     let load = if max_tasks > 0 {
-        live_tasks as f64 / max_tasks as f64
+        active_tasks as f64 / max_tasks as f64
     } else {
         0.0
     };
@@ -205,9 +214,8 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             .map(|e| (e.name.clone(), e.started_at.elapsed().as_secs()));
         tracing::debug!(
             active_tasks,
-            live_tasks,
-            grace_orphans,
             stuck_orphans,
+            long_running = long_running.len(),
             max_concurrent_tasks = max_tasks,
             oldest_task = ?oldest,
             "GET /_/health -> 200 (saturated)"
@@ -217,9 +225,8 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             "reason": "thread_pool_saturated",
             "rss_mb": rss_mb,
             "active_tasks": active_tasks,
-            "live_tasks": live_tasks,
-            "orphaned_tasks": total_orphans,
             "stuck_orphans": stuck_orphans,
+            "long_running_tasks": long_running,
             "max_concurrent_tasks": max_tasks,
             "oldest_task": oldest.map(|(name, secs)| serde_json::json!({"name": name, "elapsed_secs": secs})),
             "load": load,
@@ -229,14 +236,13 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         }))
             .into_response();
     }
-    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, live={live_tasks}, grace_orphans={grace_orphans}, stuck_orphans={stuck_orphans}, load={load:.2})");
+    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, active={active_tasks}, long_running={}, stuck_orphans={stuck_orphans}, load={load:.2})", long_running.len());
     Json(serde_json::json!({
         "status": "ok",
         "rss_mb": rss_mb,
         "active_tasks": active_tasks,
-        "live_tasks": live_tasks,
-        "orphaned_tasks": total_orphans,
         "stuck_orphans": stuck_orphans,
+        "long_running_tasks": long_running,
         "max_concurrent_tasks": max_tasks,
         "load": load,
         "load_avg": load_avg,
@@ -693,7 +699,6 @@ pub(super) async fn analyze(
     };
 
     let slow_rule_ms = state.slow_rule_ms;
-    let timeout_duration = Duration::from_secs(state.timeout_secs);
 
     let filename_for_closure = filename.clone();
     let should_clear_caches = request_id.is_multiple_of(50);
@@ -704,22 +709,29 @@ pub(super) async fn analyze(
             name: filename.clone(),
             size_bytes: file_size as u64,
             started_at: Instant::now(),
-            timed_out: AtomicBool::new(false),
             cancellation: Arc::clone(&cancellation),
             phase: cleave::PhaseTracker::new(),
             thread_id: AtomicU64::new(0),
         },
     );
 
-    // Save the temp dir path so we can clean it up if the task is orphaned
-    // and the blocking thread never completes its drop(temp_dir).
+    // RAII guard: if the client disconnects and axum drops this future, the guard's
+    // Drop impl signals cancellation to the blocking thread and removes the in-flight
+    // entry, so no slot or dashmap entry leaks.
+    let guard = super::RequestGuard::new(
+        request_id,
+        Arc::clone(&state),
+        Arc::clone(&cancellation),
+        permit,
+    );
+
+    // Save the temp dir path so we can clean it up after the blocking task finishes.
     let temp_dir_path = temp_dir.path().to_path_buf();
 
     let cancel_flag = Arc::clone(&cancellation);
     let phase_state = Arc::clone(&state);
     let phase_tracker = phase_state.in_flight.get(&request_id).map(|r| r.phase.clone());
-    let orphan_phase = phase_tracker.clone();
-    let mut handle = tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         // Record the OS thread servicing this request.
         if let Some(req) = phase_state.in_flight.get(&request_id) {
             req.thread_id.store(current_thread_id(), Ordering::Relaxed);
@@ -740,86 +752,23 @@ pub(super) async fn analyze(
         result
     });
 
-    let result = tokio::select! {
-        res = &mut handle => Some(res),
-        _ = tokio::time::sleep(timeout_duration) => {
-            cancellation.store(true, Ordering::Release);
-            if let Some(req) = state.in_flight.get(&request_id) {
-                req.timed_out.store(true, Ordering::Relaxed);
-            }
-            None
-        }
-    };
+    // Await to completion — no per-request timeout. If the client disconnects,
+    // axum drops this future; guard.drop() fires, signalling cancellation and
+    // releasing the slot.
+    let result = handle.await;
 
-    if result.is_some() {
-        drop(permit);
-        state.in_flight.remove(&request_id);
-    } else {
-        // Timed out. The blocking thread is still running (dropping the JoinHandle
-        // does not cancel it). We keep the permit and the in_flight entry until
-        // the thread actually finishes to prevent unbounded thread growth.
-        tracing::warn!(
-            id = request_id,
-            filename = %filename,
-            timeout_secs = state.timeout_secs,
-            "analysis timed out; background cleanup task started",
-        );
-        let orphan_state = Arc::clone(&state);
-        let orphan_temp_path = temp_dir_path.clone();
-        let orphan_filename = filename.clone();
-        tokio::spawn(async move {
-            // Phase 1: wait up to 120s for the thread to finish cooperatively.
-            let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
-            let phase = orphan_phase.as_ref().map(|p| p.get()).unwrap_or_default();
-            let tid = orphan_state
-                .in_flight
-                .get(&request_id)
-                .map(|r| r.thread_id.load(Ordering::Relaxed))
-                .unwrap_or(0);
+    // Normal completion: drop the guard explicitly so its log context is clear.
+    drop(guard);
 
-            if let Ok(_res) = grace {
-                // Thread finished within 120s grace period.
-                drop(permit);
-                orphan_state.in_flight.remove(&request_id);
-                tracing::info!(request_id, filename = %orphan_filename, phase, thread_id = tid, "orphaned task completed within grace period");
-                return;
-            }
-
-            // Phase 2: grace period exhausted — thread is seriously stuck.
-            // Increment the gauge. It will be decremented when the thread finally finishes.
-            orphan_state.stuck_orphans.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(
-                request_id,
-                filename = %orphan_filename,
-                phase,
-                thread_id = tid,
-                "orphaned task exceeded 120s grace period; thread is stuck in background",
-            );
-
-            // Wait forever for the thread to finish (or for the watchdog to restart the process).
-            let _ = handle.await;
-
-            orphan_state.stuck_orphans.fetch_sub(1, Ordering::Relaxed);
-            drop(permit);
-            orphan_state.in_flight.remove(&request_id);
-
-            tracing::info!(
-                request_id,
-                filename = %orphan_filename,
-                "stuck orphaned task finally completed",
-            );
-
-            // Clean up the temp directory.
-            if let Err(e) = tokio::fs::remove_dir_all(&orphan_temp_path).await {
-                tracing::debug!(request_id, error = %e, "orphan temp dir cleanup (may already be gone)");
-            }
-        });
+    // Clean up temp directory (handles the case where drop(temp_dir) above didn't run).
+    if let Err(e) = tokio::fs::remove_dir_all(&temp_dir_path).await {
+        tracing::debug!(request_id, error = %e, "temp dir cleanup (may already be gone)");
     }
 
     let elapsed_ms = request_start.elapsed().as_millis();
 
     match result {
-        Some(Ok(Ok(scan_result))) => {
+        Ok(Ok(scan_result)) => {
             tracing::info!(
                 id = request_id,
                 filename = %filename,
@@ -834,29 +783,16 @@ pub(super) async fn analyze(
                 .insert("X-Total-Ms", (elapsed_ms as u64).into());
             resp
         }
-        Some(Ok(Err(e))) => {
+        Ok(Err(e)) => {
             let status = analysis_error_status(&e);
             tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, status = status.as_u16(), error = %e, "analysis failed");
             analysis_error_response(&e)
         }
-        Some(Err(e)) => {
+        Err(e) => {
             tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error (panic?)");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response()
-        }
-        None => {
-            tracing::warn!(
-                id = request_id,
-                elapsed_ms = elapsed_ms as u64,
-                "<-- 504 timeout after {}s",
-                state.timeout_secs
-            );
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({"error": "Analysis timed out"})),
             )
                 .into_response()
         }
@@ -1043,7 +979,6 @@ pub(super) async fn analyze_path(
     };
 
     let slow_rule_ms = state.slow_rule_ms;
-    let timeout_duration = Duration::from_secs(state.timeout_secs);
 
     let should_clear_caches = request_id.is_multiple_of(50);
     let extract_dir = state.extract_dir.clone();
@@ -1054,18 +989,25 @@ pub(super) async fn analyze_path(
             name: req.path.clone(),
             size_bytes: file_size,
             started_at: Instant::now(),
-            timed_out: AtomicBool::new(false),
             cancellation: Arc::clone(&cancellation),
             phase: cleave::PhaseTracker::new(),
             thread_id: AtomicU64::new(0),
         },
     );
 
+    // RAII guard: signals cancellation and removes the in-flight entry on drop,
+    // covering both normal completion and client-disconnect cancellation.
+    let guard = super::RequestGuard::new(
+        request_id,
+        Arc::clone(&state),
+        Arc::clone(&cancellation),
+        permit,
+    );
+
     let cancel_flag = Arc::clone(&cancellation);
     let phase_state = Arc::clone(&state);
     let phase_tracker = phase_state.in_flight.get(&request_id).map(|r| r.phase.clone());
-    let orphan_phase = phase_tracker.clone();
-    let mut handle = tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         if let Some(req) = phase_state.in_flight.get(&request_id) {
             req.thread_id.store(current_thread_id(), Ordering::Relaxed);
         }
@@ -1084,75 +1026,15 @@ pub(super) async fn analyze_path(
         result
     });
 
-    let result = tokio::select! {
-        res = &mut handle => Some(res),
-        _ = tokio::time::sleep(timeout_duration) => {
-            cancellation.store(true, Ordering::Release);
-            if let Some(req) = state.in_flight.get(&request_id) {
-                req.timed_out.store(true, Ordering::Relaxed);
-            }
-            None
-        }
-    };
-
-    if result.is_some() {
-        drop(permit);
-        state.in_flight.remove(&request_id);
-    } else {
-        tracing::warn!(
-            id = request_id,
-            path = %req.path,
-            timeout_secs = state.timeout_secs,
-            "analyze-path timed out; background cleanup task started",
-        );
-        let orphan_state = Arc::clone(&state);
-        let orphan_path = req.path.clone();
-        tokio::spawn(async move {
-            let grace = tokio::time::timeout(Duration::from_secs(120), &mut handle).await;
-            let phase = orphan_phase.as_ref().map(|p| p.get()).unwrap_or_default();
-            let tid = orphan_state
-                .in_flight
-                .get(&request_id)
-                .map(|r| r.thread_id.load(Ordering::Relaxed))
-                .unwrap_or(0);
-
-            if let Ok(_res) = grace {
-                // Thread finished within 120s grace period.
-                drop(permit);
-                orphan_state.in_flight.remove(&request_id);
-                tracing::info!(request_id, path = %orphan_path, phase, thread_id = tid, "orphaned task completed within grace period");
-                return;
-            }
-
-            // Phase 2: grace period exhausted — thread is seriously stuck.
-            orphan_state.stuck_orphans.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(
-                request_id,
-                path = %orphan_path,
-                phase,
-                thread_id = tid,
-                "orphaned task exceeded 120s grace period; thread is stuck in background",
-            );
-
-            // Wait forever for the thread to finish (or for the watchdog to restart the process).
-            let _ = handle.await;
-
-            orphan_state.stuck_orphans.fetch_sub(1, Ordering::Relaxed);
-            drop(permit);
-            orphan_state.in_flight.remove(&request_id);
-
-            tracing::info!(
-                request_id,
-                path = %orphan_path,
-                "stuck orphaned task finally completed",
-            );
-        });
-    }
+    // Await to completion — no per-request timeout. Client disconnect drops this
+    // future; guard.drop() fires, signalling cancellation and releasing the slot.
+    let result = handle.await;
+    drop(guard);
 
     let elapsed_ms = request_start.elapsed().as_millis();
 
     match result {
-        Some(Ok(Ok(mut scan_result))) => {
+        Ok(Ok(mut scan_result)) => {
             // Inject extracted_path into the raw cleave JSON so cyclotron
             // knows where archive members were extracted on disk.
             if let (Some(ref extract_dir), Some(ref mut raw)) =
@@ -1190,29 +1072,16 @@ pub(super) async fn analyze_path(
                 .insert("X-Total-Ms", (elapsed_ms as u64).into());
             resp
         }
-        Some(Ok(Err(e))) => {
+        Ok(Err(e)) => {
             let status = analysis_error_status(&e);
             tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, status = status.as_u16(), error = %e, "analysis failed");
             analysis_error_response(&e)
         }
-        Some(Err(e)) => {
+        Err(e) => {
             tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error (panic?)");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response()
-        }
-        None => {
-            tracing::warn!(
-                id = request_id,
-                elapsed_ms = elapsed_ms as u64,
-                "<-- 504 timeout after {}s",
-                state.timeout_secs
-            );
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({"error": "Analysis timed out"})),
             )
                 .into_response()
         }
@@ -1261,22 +1130,15 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
         return None;
     }
 
-    // Still overloaded — track duration and potentially terminate.
+    // Still overloaded — track duration and log. Never terminate; let the operator
+    // decide when to restart. Requests continue to be rejected with 503 until
+    // memory drops below the threshold.
     // Use try_lock: if a concurrent request holds the lock it is already recording
     // the overload timestamp, so it is safe to pass through rather than block a
     // tokio worker on a std::sync::Mutex.
     let mut overloaded = state.overloaded_since.try_lock().ok()?;
     let since = *overloaded.get_or_insert_with(Instant::now);
     let overloaded_secs = since.elapsed().as_secs();
-
-    if overloaded_secs > 30 {
-        tracing::error!(
-            rss_mb = rss_after / 1024 / 1024,
-            overloaded_secs,
-            "memory overload persisted >30s after cache clears, terminating"
-        );
-        std::process::exit(1);
-    }
 
     tracing::warn!(
         rss_mb = rss_after / 1024 / 1024,
@@ -1323,7 +1185,6 @@ pub(super) async fn memory_stats(State(state): State<Arc<AppState>>) -> Json<ser
             "stuck_orphans": state.stuck_orphans.load(Ordering::Relaxed),
             "max_concurrent_tasks": state.max_concurrent_tasks,
             "requests_total": state.next_request_id.load(Ordering::Relaxed),
-            "timeout_secs": state.timeout_secs,
         },
         "thread_pools": {
             "rayon_threads": rayon::current_num_threads(),
@@ -1338,14 +1199,15 @@ pub(super) async fn requests(State(state): State<Arc<AppState>>) -> Json<serde_j
         .in_flight
         .iter()
         .map(|e| {
+            let elapsed_ms = now.duration_since(e.started_at).as_millis();
             let phase = e.phase.get();
             let tid = e.thread_id.load(std::sync::atomic::Ordering::Relaxed);
             serde_json::json!({
                 "request_id": e.key(),
                 "name": e.name,
                 "size_bytes": e.size_bytes,
-                "elapsed_ms": now.duration_since(e.started_at).as_millis(),
-                "timed_out": e.timed_out.load(std::sync::atomic::Ordering::Relaxed),
+                "elapsed_ms": elapsed_ms,
+                "long_running": elapsed_ms >= 120_000,
                 "phase": phase,
                 "thread_id": if tid > 0 { Some(tid) } else { None },
             })
