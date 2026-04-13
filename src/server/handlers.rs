@@ -677,16 +677,17 @@ pub(super) async fn analyze(
     // Claim a slot. OwnedSemaphorePermit is RAII: the slot is released when the
     // permit is dropped, even on panic or runtime shutdown — no manual fetch_sub needed.
     let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
+        let max = state.max_concurrent_tasks;
         tracing::warn!(
             id = request_id,
             filename = %filename,
             size_bytes = file_size,
-            max = state.max_concurrent_tasks,
+            max,
             "rejecting: at capacity"
         );
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": format!("At capacity ({max}/{max} active analyses)")})),
         )
             .into_response();
     };
@@ -1026,16 +1027,17 @@ pub(super) async fn analyze_path(
 
     // Claim a slot — same RAII semaphore pattern as /analyze.
     let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
+        let max = state.max_concurrent_tasks;
         tracing::warn!(
             id = request_id,
             filename = %filename,
             size_bytes = file_size,
-            max = state.max_concurrent_tasks,
+            max,
             "rejecting: at capacity"
         );
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Server overloaded (too many active analyses)"})),
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": format!("At capacity ({max}/{max} active analyses)")})),
         )
             .into_response();
     };
