@@ -21,10 +21,14 @@ die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
 log "Installing dependencies"
-doas pkg_add -I rust git p7zip rizin innoextract
+missing=""
+for p in rust git p7zip rizin innoextract; do
+    pkg_info -e "$p" >/dev/null 2>&1 || missing="$missing $p"
+done
+[ -n "$missing" ] && doas pkg_add -I $missing || true
 
 log "Building"
-cargo build --release || die "build failed"
+cargo build --release -j2 || die "build failed"
 
 mkdir -p "$BIN_DIR" "$(dirname "$LOG")"
 
