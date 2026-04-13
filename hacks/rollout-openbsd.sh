@@ -28,7 +28,7 @@ done
 [ -n "$missing" ] && doas pkg_add -I $missing || true
 
 log "Building"
-ulimit -Sd unlimited
+ulimit -d "$(ulimit -Hd)"
 cargo build --release || die "build failed"
 
 mkdir -p "$BIN_DIR" "$(dirname "$LOG")"
