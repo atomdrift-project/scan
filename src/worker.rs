@@ -57,8 +57,9 @@ struct ClaimResponse {
 struct ClaimJob {
     sha256: String,
     path: String,
-    #[allow(dead_code)]
     size_bytes: i64,
+    #[serde(default)]
+    file_type: String,
 }
 
 #[derive(Serialize)]
@@ -199,6 +200,15 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 let result = run_job(
                     &client, &url, data_dir.as_deref(), &job, &resources, slow_rule_ms, timeout_secs,
                 ).await;
+                if let Err(ref e) = result {
+                    tracing::warn!(
+                        sha256 = %job.sha256,
+                        file_type = %job.file_type,
+                        size = job.size_bytes,
+                        error = %e,
+                        "analysis failed",
+                    );
+                }
                 post_result(&client, &url, &name, &job.sha256, result).await;
                 drop(permit);
             });
@@ -227,25 +237,31 @@ async fn run_job(
     let local_path = data_dir.map(|d| d.join(&job.path));
     let (path, _temp) = match local_path {
         Some(ref p) if p.exists() => {
-            // Verify SHA256 to catch stale/replaced files.
             match verify_sha256(p, &job.sha256) {
-                Ok(true) => (p.clone(), None),
+                Ok(true) => {
+                    tracing::info!(sha256 = %job.sha256, path = %p.display(), file_type = %job.file_type, size = job.size_bytes, "analyzing local file");
+                    (p.clone(), None)
+                }
                 Ok(false) => {
-                    tracing::debug!(path = %p.display(), "SHA256 mismatch, downloading");
+                    tracing::info!(sha256 = %job.sha256, path = %p.display(), "SHA256 mismatch, downloading from server");
                     let tmp = download_file(client, base_url, &job.sha256, &label).await?;
+                    tracing::info!(sha256 = %job.sha256, tmp = %tmp.path().display(), size = tmp.path().metadata().map(|m| m.len()).unwrap_or(0), "downloaded to tempfile");
                     let tp = tmp.path().to_path_buf();
                     (tp, Some(tmp))
                 }
                 Err(e) => {
-                    tracing::debug!(path = %p.display(), error = %e, "hash check failed, downloading");
+                    tracing::info!(sha256 = %job.sha256, path = %p.display(), error = %e, "hash check failed, downloading from server");
                     let tmp = download_file(client, base_url, &job.sha256, &label).await?;
+                    tracing::info!(sha256 = %job.sha256, tmp = %tmp.path().display(), size = tmp.path().metadata().map(|m| m.len()).unwrap_or(0), "downloaded to tempfile");
                     let tp = tmp.path().to_path_buf();
                     (tp, Some(tmp))
                 }
             }
         }
         _ => {
+            tracing::info!(sha256 = %job.sha256, file = %label, "no local file, downloading from server");
             let tmp = download_file(client, base_url, &job.sha256, &label).await?;
+            tracing::info!(sha256 = %job.sha256, tmp = %tmp.path().display(), size = tmp.path().metadata().map(|m| m.len()).unwrap_or(0), "downloaded to tempfile");
             let tp = tmp.path().to_path_buf();
             (tp, Some(tmp))
         }
@@ -311,7 +327,6 @@ async fn post_result(
             }
         }
         Err(e) => {
-            tracing::warn!(sha256 = %sha256, error = %e, "analysis failed");
             ResultPayload {
                 sha256: sha256.to_string(),
                 worker: worker.to_string(),
