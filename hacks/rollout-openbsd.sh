@@ -21,10 +21,15 @@ die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
 log "Installing dependencies"
-doas pkg_add -I rustup git p7zip rizin innoextract
+doas pkg_add -I git p7zip rizin innoextract
 
 log "Updating Rust toolchain"
-rustup update stable 2>/dev/null || rustup install stable || die "rustup failed"
+if ! command -v rustup >/dev/null 2>&1; then
+    ftp -o /tmp/rustup-init.sh https://sh.rustup.rs || die "failed to fetch rustup"
+    sh /tmp/rustup-init.sh -y --no-modify-path || die "rustup install failed"
+    rm -f /tmp/rustup-init.sh
+fi
+rustup update stable || die "rustup update failed"
 . "$HOME/.cargo/env"
 
 log "Building"
