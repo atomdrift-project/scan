@@ -26,7 +26,16 @@ grep -q 'edge/testing' /etc/apk/repositories 2>/dev/null || \
     echo 'https://dl-cdn.alpinelinux.org/alpine/edge/testing' | doas tee -a /etc/apk/repositories
 
 log "Installing dependencies"
-doas apk add --no-cache rustup git 7zip upx rizin innoextract gcc g++ musl-dev
+pkgs_needed=""
+for pkg in rustup git 7zip upx rizin innoextract gcc g++ musl-dev; do
+    apk info -e "$pkg" >/dev/null 2>&1 || pkgs_needed="$pkgs_needed $pkg"
+done
+if [ -n "$pkgs_needed" ]; then
+    # shellcheck disable=SC2086
+    doas apk add --no-cache $pkgs_needed
+else
+    log "All packages already installed"
+fi
 
 log "Updating Rust toolchain"
 doas apk del rust cargo 2>/dev/null || true
