@@ -26,7 +26,7 @@ grep -q 'edge/testing' /etc/apk/repositories 2>/dev/null || \
     echo 'https://dl-cdn.alpinelinux.org/alpine/edge/testing' | doas tee -a /etc/apk/repositories
 
 log "Installing dependencies"
-doas apk add --no-cache rustup sccache git 7zip upx rizin innoextract gcc musl-dev
+doas apk add --no-cache rustup git 7zip upx rizin innoextract gcc g++ musl-dev
 
 log "Updating Rust toolchain"
 doas apk del rust cargo 2>/dev/null || true
@@ -37,7 +37,7 @@ fi
 . "$HOME/.cargo/env"
 
 log "Building"
-RUSTC_WRAPPER=sccache cargo build --release || die "build failed"
+cargo build --release || die "build failed"
 
 mkdir -p "$BIN_DIR" "$(dirname "$LOG")"
 
