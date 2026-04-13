@@ -859,12 +859,17 @@ pub(crate) fn classify_bytes(
     resources: &super::ModelResources,
     slow_rule_ms: u64,
     cancellation: Option<&Arc<AtomicBool>>,
+    phase: Option<&cleave::PhaseTracker>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
+    if let Some(p) = phase {
+        p.set("cleave:init");
+    }
     let opts = cleave::AnalysisOptions {
         slow_rule_ms,
         cancellation: cancellation.cloned(),
+        phase: phase.cloned(),
         ..Default::default()
     };
     let report = cleave::analyze_bytes(data, label, &opts)
@@ -874,6 +879,9 @@ pub(crate) fn classify_bytes(
         anyhow::bail!("analysis cancelled");
     }
 
+    if let Some(p) = phase {
+        p.set("features+model");
+    }
     let cr = crate::scan::classify_report(
         label,
         report,

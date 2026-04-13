@@ -78,9 +78,11 @@ struct ResultPayload {
 pub async fn run(config: WorkerConfig) -> Result<()> {
     let name = config.name.clone();
     let slots = config.workers;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs + 120))
-        .build()?;
+    let mut client_builder = reqwest::Client::builder();
+    if config.timeout_secs > 0 {
+        client_builder = client_builder.timeout(Duration::from_secs(config.timeout_secs + 120));
+    }
+    let client = client_builder.build()?;
     let semaphore = Arc::new(Semaphore::new(slots));
 
     // Load model resources once at startup.
@@ -261,40 +263,83 @@ async fn run_job(
     };
 
     let resources = Arc::clone(resources);
-    let timeout = Duration::from_secs(timeout_secs);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = Arc::clone(&cancel);
     let local = local_path.clone();
 
-    // Run analysis on a blocking thread with a timeout.
+    // Run analysis on a blocking thread with phase logging.
     let start = Instant::now();
-    let handle = tokio::task::spawn_blocking(move || {
-        if let Some(data) = downloaded {
-            // In-memory analysis — no tempfile needed.
-            classify_bytes(&data, &label, &resources, slow_rule_ms, Some(&cancel2))
-        } else {
-            // Local file on disk.
-            let path = local.as_ref().expect("local path must be set");
-            classify_file(path, &label, &resources, slow_rule_ms, None, Some(&cancel2), None)
+    let phase = cleave::PhaseTracker::new();
+    let phase2 = phase.clone();
+    let label2 = label.clone();
+    let sha_short = job.sha256[..12].to_string();
+
+    // Background phase watcher — logs transitions with timing.
+    let cancel_watcher = cancel.clone();
+    std::thread::spawn(move || {
+        let mut last_phase = String::new();
+        let mut phase_start = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if cancel_watcher.load(Ordering::Relaxed) {
+                break;
+            }
+            let current = phase2.get();
+            if current.is_empty() {
+                continue;
+            }
+            if current != last_phase {
+                if !last_phase.is_empty() {
+                    tracing::info!(
+                        sha256 = %sha_short,
+                        file = %label2,
+                        phase = %last_phase,
+                        elapsed_ms = phase_start.elapsed().as_millis() as u64,
+                        "phase complete",
+                    );
+                }
+                last_phase = current;
+                phase_start = Instant::now();
+                if last_phase == "done" {
+                    break;
+                }
+            }
         }
     });
 
-    let result = tokio::time::timeout(timeout, handle).await;
+    let handle = tokio::task::spawn_blocking(move || {
+        if let Some(data) = downloaded {
+            classify_bytes(&data, &label, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
+        } else {
+            let path = local.as_ref().expect("local path must be set");
+            classify_file(path, &label, &resources, slow_rule_ms, None, Some(&cancel2), Some(&phase))
+        }
+    });
+
+    let result = if timeout_secs == 0 {
+        // No timeout — let analysis run as long as it needs.
+        handle.await
+    } else {
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await {
+            Ok(r) => r,
+            Err(_) => {
+                cancel.store(true, Ordering::Relaxed);
+                let elapsed_ms = start.elapsed().as_millis() as i64;
+                return Err(format!("analysis timed out after {timeout_secs}s ({elapsed_ms}ms)"));
+            }
+        }
+    };
     let elapsed_ms = start.elapsed().as_millis() as i64;
 
     match result {
-        Ok(Ok(Ok(scan_result))) => {
+        Ok(Ok(scan_result)) => {
             let envelope = scan_result.to_envelope();
             let ml = serde_json::to_value(&envelope.ml).map_err(|e| e.to_string())?;
             let raw = envelope.raw;
             Ok((ml, raw, elapsed_ms))
         }
-        Ok(Ok(Err(e))) => Err(format!("{e:#}")),
-        Ok(Err(e)) => Err(format!("task join error: {e}")),
-        Err(_) => {
-            cancel.store(true, Ordering::Relaxed);
-            Err(format!("analysis timed out after {timeout_secs}s"))
-        }
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(e) => Err(format!("task join error: {e}")),
     }
 }
 
@@ -308,7 +353,7 @@ async fn post_result(
 ) {
     let payload = match result {
         Ok((ml, raw, duration_ms)) => {
-            tracing::debug!(sha256 = %sha256, duration_ms = duration_ms, "analysis complete");
+            tracing::info!(sha256 = %sha256, duration_ms = duration_ms, "analysis complete");
             ResultPayload {
                 sha256: sha256.to_string(),
                 worker: worker.to_string(),
