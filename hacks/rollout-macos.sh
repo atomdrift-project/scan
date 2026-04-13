@@ -143,38 +143,50 @@ if [ ! -f "$PLIST" ] || ! cmp -s "$new_plist" "$PLIST"; then
 fi
 rm -f "$new_plist"
 
-# Only restart if binary or plist changed - avoid disrupting a healthy service
-if [ "$restart_needed" -eq 1 ]; then
+service_loaded() {
+    sudo launchctl print "system/$LABEL" >/dev/null 2>&1
+}
+
+# Restart if files changed OR if the service isn't loaded (never assume it's running)
+if [ "$restart_needed" -eq 1 ] || ! service_loaded; then
     log "Restarting launchd service"
-    sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
 
-    # Wait for launchd to fully unregister the service before bootstrapping.
-    # Attempting bootstrap while launchd is still cleaning up yields error 5.
-    i=0
-    while sudo launchctl print "system/$LABEL" >/dev/null 2>&1; do
-        sleep 1
-        i=$((i + 1))
-        [ "$i" -ge 10 ] && break
-    done
+    # Only bootout if the service is actually registered - avoids "Bad request" error
+    if service_loaded; then
+        sudo launchctl bootout "system/$LABEL"
 
-    # Ensure the process itself has exited.
+        # Wait for launchd to fully unregister before bootstrapping.
+        # Bootstrapping while launchd is still cleaning up yields error 5.
+        i=0
+        while service_loaded; do
+            sleep 1
+            i=$((i + 1))
+            if [ "$i" -ge 10 ]; then
+                log "Timed out waiting for service to unregister"
+                break
+            fi
+        done
+    fi
+
+    # Ensure the process itself has exited before bootstrapping again.
     i=0
     while sudo pgrep -x "$BINARY" >/dev/null 2>&1; do
         sleep 1
         i=$((i + 1))
         if [ "$i" -ge 10 ]; then
+            log "Process did not exit cleanly; sending SIGKILL"
             sudo pkill -9 -x "$BINARY" 2>/dev/null || true
             sleep 1
             break
         fi
     done
 
-    sudo launchctl bootstrap system "$PLIST"
+    sudo launchctl bootstrap system "$PLIST" || die "launchctl bootstrap failed"
 else
-    log "Binary and plist unchanged, skipping service restart"
+    log "Binary and plist unchanged, service already running, skipping restart"
 fi
 
 log "Service status:"
-sudo launchctl print "system/$LABEL" || true
+sudo launchctl print "system/$LABEL" || die "service failed to start"
 
 log "Deployment complete"
