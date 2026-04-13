@@ -144,7 +144,7 @@ enum Commands {
     Worker {
         /// Hopper API base URL (e.g. http://hopper-host:8081)
         #[arg(long)]
-        hopper_url: String,
+        url: String,
 
         /// Worker name (defaults to hostname)
         #[arg(long)]
@@ -169,6 +169,12 @@ enum Commands {
         /// Rules/model update interval in minutes (0 = disabled)
         #[arg(long, default_value = "60")]
         update_interval_mins: u64,
+
+        /// Local data directory. Hopper returns relative paths; the worker
+        /// joins them with this root to find files locally instead of
+        /// downloading. SHA256 is verified before using a local file.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Print version information
@@ -405,13 +411,14 @@ fn main() -> Result<()> {
             }
         }
         Commands::Worker {
-            hopper_url,
+            url,
             name,
             workers,
             poll_secs,
             timeout_secs,
             max_rss_gb,
             update_interval_mins,
+            data_dir,
         } => {
             let model_dir = resolve_model_dir()?;
             let workers = workers.unwrap_or_else(|| {
@@ -427,13 +434,14 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| "unknown".to_string())
             });
             let config = litmus::worker::WorkerConfig {
-                hopper_url,
+                hopper_url: url,
                 name,
                 workers,
                 poll_secs,
                 timeout_secs,
                 max_rss_gb,
                 update_interval_mins,
+                data_dir,
                 model_dir,
                 thresholds,
                 slow_rule_ms: cli.slow_rule_ms,

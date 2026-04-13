@@ -40,6 +40,10 @@ pub struct WorkerConfig {
     pub model_dir: PathBuf,
     /// Optional threshold overrides.
     pub thresholds: Option<Thresholds>,
+    /// Local data directory. Paths from hopper are joined with this root.
+    /// If the file exists locally and SHA256 matches, it is analyzed in place
+    /// instead of downloading from hopper.
+    pub data_dir: Option<PathBuf>,
     /// Slow rule warning threshold in ms.
     pub slow_rule_ms: u64,
 }
@@ -108,7 +112,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         });
     }
 
-    let hopper_url = config.hopper_url.clone();
+    let base_url = config.hopper_url.clone();
+    let data_dir = config.data_dir.clone();
     let poll_secs = config.poll_secs;
     let slow_rule_ms = config.slow_rule_ms;
     let timeout_secs = config.timeout_secs;
@@ -125,11 +130,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let free = semaphore.available_permits() + 1;
 
         // Poll for work.
-        let url = format!(
+        let poll_url = format!(
             "{}/api/next?worker={}&count={}&slots={}",
-            hopper_url, encoded_name, free, slots
+            base_url, encoded_name, free, slots
         );
-        let resp = match client.get(&url).send().await {
+        let resp = match client.get(&poll_url).send().await {
             Ok(r) => r,
             Err(e) => {
                 drop(gate);
@@ -182,14 +187,15 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 .context("semaphore closed")?;
             let client = client.clone();
             let resources = Arc::clone(&resources);
-            let hopper_url = hopper_url.clone();
+            let url = base_url.clone();
             let name = name.clone();
+            let data_dir = data_dir.clone();
 
             tokio::spawn(async move {
                 let result = run_job(
-                    &job, &resources, slow_rule_ms, timeout_secs,
+                    &client, &url, data_dir.as_deref(), &job, &resources, slow_rule_ms, timeout_secs,
                 ).await;
-                post_result(&client, &hopper_url, &name, &job.sha256, result).await;
+                post_result(&client, &url, &name, &job.sha256, result).await;
                 drop(permit);
             });
         }
@@ -197,16 +203,50 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 }
 
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
+/// Resolves the relative path against data_dir if provided. If the file
+/// isn't accessible locally (or SHA256 doesn't match), downloads from hopper.
 async fn run_job(
+    client: &reqwest::Client,
+    base_url: &str,
+    data_dir: Option<&Path>,
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
     timeout_secs: u64,
 ) -> Result<(serde_json::Value, serde_json::Value, i64), String> {
-    let path = PathBuf::from(&job.path);
-    let label = path.file_name()
+    let label = Path::new(&job.path).file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| job.sha256.clone());
+
+    // Try to resolve the file locally: join relative path with data_dir,
+    // verify it exists and SHA256 matches. Fall back to HTTP download.
+    let local_path = data_dir.map(|d| d.join(&job.path));
+    let (path, _temp) = match local_path {
+        Some(ref p) if p.exists() => {
+            // Verify SHA256 to catch stale/replaced files.
+            match verify_sha256(p, &job.sha256) {
+                Ok(true) => (p.clone(), None),
+                Ok(false) => {
+                    tracing::debug!(path = %p.display(), "SHA256 mismatch, downloading");
+                    let tmp = download_file(client, base_url, &job.sha256, &label).await?;
+                    let tp = tmp.path().to_path_buf();
+                    (tp, Some(tmp))
+                }
+                Err(e) => {
+                    tracing::debug!(path = %p.display(), error = %e, "hash check failed, downloading");
+                    let tmp = download_file(client, base_url, &job.sha256, &label).await?;
+                    let tp = tmp.path().to_path_buf();
+                    (tp, Some(tmp))
+                }
+            }
+        }
+        _ => {
+            let tmp = download_file(client, base_url, &job.sha256, &label).await?;
+            let tp = tmp.path().to_path_buf();
+            (tp, Some(tmp))
+        }
+    };
+
     let resources = Arc::clone(resources);
     let timeout = Duration::from_secs(timeout_secs);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -243,12 +283,13 @@ async fn run_job(
             Err(format!("analysis timed out after {timeout_secs}s"))
         }
     }
+    // _temp is dropped here, deleting the tempfile if one was created.
 }
 
 /// Post the result back to hopper with retry on transient failures.
 async fn post_result(
     client: &reqwest::Client,
-    hopper_url: &str,
+    url: &str,
     worker: &str,
     sha256: &str,
     result: Result<(serde_json::Value, serde_json::Value, i64), String>,
@@ -278,7 +319,7 @@ async fn post_result(
         }
     };
 
-    let url = format!("{}/api/result", hopper_url);
+    let url = format!("{}/api/result", url);
     for attempt in 0..3u32 {
         if attempt > 0 {
             let delay = Duration::from_secs(1 << attempt);
@@ -325,6 +366,37 @@ async fn periodic_update(
         // are reloaded above. To pick up a new model, restart the worker.
         tracing::info!("rules updated; restart worker to pick up new model weights");
     }
+}
+
+/// Verify that a file's SHA256 matches the expected value.
+fn verify_sha256(path: &Path, expected: &str) -> Result<bool, std::io::Error> {
+    use sha2::{Sha256, Digest};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    let hash = format!("{:x}", hasher.finalize());
+    Ok(hash == expected)
+}
+
+/// Download a file from hopper's /api/file endpoint to a tempfile.
+async fn download_file(
+    client: &reqwest::Client,
+    base_url: &str,
+    sha256: &str,
+    label: &str,
+) -> Result<tempfile::NamedTempFile, String> {
+    let url = format!("{}/api/file/{}", base_url, sha256);
+    let resp = client.get(&url).send().await.map_err(|e| format!("download {label}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download {label}: HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| format!("download {label}: read body: {e}"))?;
+
+    let mut tmp = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("download {label}: create tempfile: {e}"))?;
+    std::io::Write::write_all(&mut tmp, &bytes)
+        .map_err(|e| format!("download {label}: write tempfile: {e}"))?;
+    Ok(tmp)
 }
 
 /// Exponential backoff with jitter, capped at 2 minutes.
