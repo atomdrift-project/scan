@@ -1,111 +1,51 @@
 #!/bin/sh
-# rollout-openbsd.sh - Deploy litmus to OpenBSD nodes using separate build and run hosts
-# Usage: ./rollout-openbsd.sh [build-host] [run-host]
+# rollout-openbsd.sh - Deploy litmus on OpenBSD
+# Runs on the local machine. Re-run to update.
+# Must be invoked from the repository root.
 #
-# build-host / run-host are SSH targets (e.g. "user@host" or an ssh_config alias).
-# The same host may be passed for both. Remote user must have passwordless doas.
+# doas is required only for package installation. Add to /etc/doas.conf:
+#   permit nopass <youruser> as root cmd pkg_add
+#
+# The service runs as the current user, kept alive by a cron watchdog (restarts within 1 min of a crash).
+# Models and traits are cloned automatically by litmus on first start.
 
 set -ex
 
-BUILD="${1:-build}"
-RUN="${2:-litmus}"
+BINARY=litmus
+BIN_DIR="$HOME/bin"
+LOG="$HOME/.local/share/litmus/litmus.log"
+BIND="${BIND:-0.0.0.0:49999}"
+ALLOW_CIDR="${ALLOW_CIDR:-10.0.0.0/8}"
 
-die() {
-    echo "error: $*" >&2
-    exit 1
-}
+die() { echo "error: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
 
-log() {
-    echo "==> $*"
-}
+log "Installing dependencies"
+doas pkg_add -I rust sccache git p7zip upx rizin innoextract
 
-bssh() {
-    ssh -o BatchMode=yes "$BUILD" "$@"
-}
+log "Building"
+RUSTC_WRAPPER=sccache cargo build --release || die "build failed"
 
-rssh() {
-    ssh -o BatchMode=yes "$RUN" "$@"
-}
+mkdir -p "$BIN_DIR" "$(dirname "$LOG")"
 
-# Verify hosts are reachable
-bssh true || die "build host '$BUILD' not accessible"
-rssh true || die "run host '$RUN' not accessible"
+log "Installing binary"
+restart_needed=0
+if ! cmp -s "target/release/$BINARY" "$BIN_DIR/$BINARY" 2>/dev/null; then
+    install -m 755 "target/release/$BINARY" "$BIN_DIR/$BINARY"
+    restart_needed=1
+fi
 
-# --- Build host setup ---
+log "Installing cron entry"
+cron_cmd="* * * * * pgrep -x $BINARY >/dev/null 2>&1 || nohup $BIN_DIR/$BINARY -u serve --bind $BIND --allow-cidr $ALLOW_CIDR >> $LOG 2>&1 &"
+(crontab -l 2>/dev/null | grep -v "litmus.*serve"; echo "$cron_cmd") | crontab -
 
-log "Installing build dependencies on $BUILD"
-bssh "doas pkg_add -I rust git sccache-- || true"
-
-log "Ensuring build user exists on $BUILD"
-bssh "id -u _litmusbld >/dev/null 2>&1 || \
-      doas useradd -m -d /home/_litmusbld -s /bin/ksh -c 'Litmus Build' _litmusbld"
-
-log "Syncing source to build host (excluding target/, out/, .git)"
-bssh "doas install -d -o _litmusbld -g _litmusbld /home/_litmusbld/litmus"
-tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
-    | bssh "doas -u _litmusbld tar -xf - -C /home/_litmusbld/litmus"
-
-log "Building tarball on $BUILD"
-bssh "doas -u _litmusbld ksh -c 'cd ~/litmus && RUSTC_WRAPPER=sccache gmake tarball || make tarball'" \
-    || die "build failed on build host"
-
-log "Upgrading rules on $BUILD"
-bssh "doas -u _litmusbld ksh -c 'cd ~/litmus && ./target/release/litmus update-rules'" \
-    || die "update-rules failed on build host"
-
-log "Running tests on $BUILD"
-bssh "doas -u _litmusbld ksh -c 'cd ~/litmus && RUSTC_WRAPPER=sccache cargo test --release -- --nocapture'" \
-    || die "tests failed on build host"
-
-# --- Transfer tarball via SSH pipe ---
-
-log "Transferring tarball from $BUILD to $RUN"
-bssh "doas cat /home/_litmusbld/litmus/out/litmus.tgz" \
-    | rssh "doas tee /tmp/litmus.tgz >/dev/null"
-
-# --- Run host setup ---
-
-log "Ensuring service user exists on $RUN"
-rssh "id -u _litmus >/dev/null 2>&1 || \
-      doas useradd -d /var/empty -s /sbin/nologin -c 'Litmus Service' _litmus"
-
-log "Installing runtime dependencies on $RUN"
-rssh "doas pkg_add -I git p7zip upx rizin innoextract || true"
-
-log "Extracting tarball on $RUN"
-rssh "doas rm -rf /usr/local/share/litmus && \
-      doas mkdir -p /usr/local/share/litmus && \
-      doas tar -xzf /tmp/litmus.tgz -C /usr/local/share/litmus && \
-      doas rm -f /tmp/litmus.tgz && \
-      doas ln -sf /usr/local/share/litmus/litmus /usr/local/bin/litmus"
-
-log "Installing rc.d script on $RUN"
-rssh "doas tee /etc/rc.d/litmus >/dev/null" <<'EOF'
-#!/bin/ksh
-#
-# litmus - Litmus server
-
-daemon="/usr/local/share/litmus/litmus"
-daemon_flags="-u serve --bind 0.0.0.0:49999"
-daemon_user="_litmus"
-daemon_logger="daemon.info"
-
-. /etc/rc.d/rc.subr
-
-rc_bg=YES
-rc_reload=NO
-
-rc_cmd $1
-EOF
-
-rssh "doas chmod 555 /etc/rc.d/litmus"
-
-log "Enabling and restarting litmus service on $RUN"
-rssh "doas rcctl enable litmus && \
-      doas rcctl set litmus status on && \
-      doas rcctl restart litmus"
-
-log "Service status:"
-rssh "doas rcctl check litmus" || true
+if [ "$restart_needed" -eq 1 ]; then
+    log "Restarting litmus"
+    pkill -x "$BINARY" 2>/dev/null || true
+    sleep 1
+    nohup "$BIN_DIR/$BINARY" -u serve --bind "$BIND" --allow-cidr "$ALLOW_CIDR" >> "$LOG" 2>&1 &
+else
+    log "Binary unchanged, skipping restart"
+fi
 
 log "Deployment complete"
