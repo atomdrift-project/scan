@@ -4,7 +4,7 @@ OUT_DIR = out
 BUILD ?= build
 RUN   ?= litmus
 
-.PHONY: build release install check-cargo tarball deploy rollout-bastille rollout-debian rollout-openbsd rollout-macos lint test clean
+.PHONY: build release install check-cargo tarball deploy rollout-bastille rollout-debian rollout-openbsd rollout-alpine rollout-macos lint test clean
 
 all: build
 
@@ -67,9 +67,13 @@ deploy:
 	@case "$$(uname -s)" in \
 		Darwin)  ./hacks/rollout-macos.sh ;; \
 		FreeBSD) ./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)" ;; \
-		Linux)   [ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || \
-		           { echo "Usage: make deploy BUILD=<build-host> RUN=<run-host>"; exit 1; }; \
-		         ./hacks/rollout-debian.sh "$(BUILD)" "$(RUN)" ;; \
+		Linux)   if [ -f /etc/alpine-release ]; then \
+		           ./hacks/rollout-alpine.sh; \
+		         else \
+		           [ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || \
+		             { echo "Usage: make deploy BUILD=<build-host> RUN=<run-host>"; exit 1; }; \
+		           ./hacks/rollout-debian.sh "$(BUILD)" "$(RUN)"; \
+		         fi ;; \
 		OpenBSD) ./hacks/rollout-openbsd.sh ;; \
 		*) echo "error: no deploy target for $$(uname -s)"; exit 1 ;; \
 	esac
@@ -86,6 +90,9 @@ rollout-debian:
 
 rollout-openbsd:
 	./hacks/rollout-openbsd.sh
+
+rollout-alpine:
+	./hacks/rollout-alpine.sh
 
 lint:
 	cargo clippy -- -D warnings

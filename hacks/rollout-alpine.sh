@@ -1,10 +1,11 @@
 #!/bin/sh
-# rollout-openbsd.sh - Deploy litmus on OpenBSD
+# rollout-alpine.sh - Deploy litmus on Alpine Linux
 # Runs on the local machine. Re-run to update.
 # Must be invoked from the repository root.
 #
-# doas is required only for package installation. Add to /etc/doas.conf:
-#   permit nopass <youruser> as root cmd pkg_add
+# doas is required only for package management. Add to /etc/doas.conf:
+#   permit nopass <youruser> as root cmd apk
+#   permit nopass <youruser> as root cmd tee
 #
 # The service runs as the current user, kept alive by a cron watchdog (restarts within 1 min of a crash).
 # Models and traits are cloned automatically by litmus on first start.
@@ -20,11 +21,15 @@ ALLOW_CIDR="${ALLOW_CIDR:-10.0.0.0/8}"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
+log "Enabling testing repository"
+grep -q 'edge/testing' /etc/apk/repositories 2>/dev/null || \
+    echo 'https://dl-cdn.alpinelinux.org/alpine/edge/testing' | doas tee -a /etc/apk/repositories
+
 log "Installing dependencies"
-doas pkg_add -I rust git p7zip rizin innoextract
+doas apk add --no-cache rust cargo sccache git 7zip upx rizin innoextract
 
 log "Building"
-cargo build --release || die "build failed"
+RUSTC_WRAPPER=sccache cargo build --release || die "build failed"
 
 mkdir -p "$BIN_DIR" "$(dirname "$LOG")"
 
