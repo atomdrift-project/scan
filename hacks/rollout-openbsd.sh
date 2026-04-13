@@ -21,8 +21,7 @@ die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
 log "Installing dependencies"
-doas pkg_add -Dsnap rust || doas pkg_add rust || die "rust install failed"
-doas pkg_add -I git p7zip rizin innoextract
+doas pkg_add -I rust git p7zip rizin innoextract
 
 log "Building"
 cargo build --release || die "build failed"

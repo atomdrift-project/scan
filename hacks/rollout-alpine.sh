@@ -26,7 +26,7 @@ grep -q 'edge/testing' /etc/apk/repositories 2>/dev/null || \
     echo 'https://dl-cdn.alpinelinux.org/alpine/edge/testing' | doas tee -a /etc/apk/repositories
 
 log "Installing dependencies"
-doas apk add --no-cache rustup sccache git 7zip upx rizin innoextract
+doas apk add --no-cache rustup sccache git 7zip upx rizin innoextract gcc musl-dev
 
 log "Updating Rust toolchain"
 doas apk del rust cargo 2>/dev/null || true
