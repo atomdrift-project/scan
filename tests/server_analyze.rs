@@ -171,3 +171,107 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     );
     Ok(())
 }
+
+/// Regression test for orphaned thread management.
+/// Verifies that when a request times out, the concurrency slot is NOT recycled
+/// until the blocking thread actually finishes.
+#[tokio::test]
+async fn analyze_timeout_holds_slot() -> Result<()> {
+    init_tracing();
+    if std::env::var_os("LITMUS_MODELS_DIR").is_none() {
+        return Ok(());
+    }
+
+    let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/encrypted.zip");
+    let file_bytes = std::fs::read(&testdata).context("failed to read test archive")?;
+
+    // Use a very short timeout of 1 second and a single worker.
+    let timeout_secs = 1;
+    let max_concurrent = 1;
+
+    let config = ServerConfig::new(
+        SocketAddr::from(([127, 0, 0, 1], 8082)), // different port
+        timeout_secs,
+        100 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        model_dir()?,
+        None,
+        4000,
+        vec![],
+        None,
+        max_concurrent,
+        vec![],
+    )?;
+    let app = build_app(&config).await.context("failed to build app")?;
+
+    // Wait for server readiness.
+    let max_health_polls = 1000;
+    let mut ready = false;
+    for _ in 0..max_health_polls {
+        let resp = app
+            .clone()
+            .oneshot(loopback(
+                Request::builder()
+                    .uri("/_/health")
+                    .body(Body::empty())?,
+            ))
+            .await?;
+        if resp.status() == StatusCode::OK {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "server did not become ready");
+
+    let (content_type, body) = multipart_body(&file_bytes, "encrypted.zip");
+
+    // First request: expected to time out.
+    let response = app
+        .clone()
+        .oneshot(loopback(
+            Request::builder()
+                .method("POST")
+                .uri("/analyze")
+                .header("content-type", content_type.clone())
+                .body(Body::from(body.clone()))?,
+        ))
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+    // Second request: expected to be rejected because the slot is still held by the orphan.
+    let response2 = app
+        .clone()
+        .oneshot(loopback(
+            Request::builder()
+                .method("POST")
+                .uri("/analyze")
+                .header("content-type", content_type)
+                .body(Body::from(body))?,
+        ))
+        .await?;
+
+    assert_eq!(
+        response2.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Expected 503 because slot should be held by orphan"
+    );
+
+    // Verify /_/health reports it as an orphan.
+    let health_resp = app
+        .oneshot(loopback(
+            Request::builder()
+                .uri("/_/health")
+                .body(Body::empty())?,
+        ))
+        .await?;
+    
+    let body_bytes = axum::body::to_bytes(health_resp.into_body(), 1024).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes)?;
+    
+    assert_eq!(json["active_tasks"], 1);
+    assert_eq!(json["orphaned_tasks"], 1);
+
+    Ok(())
+}

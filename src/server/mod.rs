@@ -303,10 +303,10 @@ struct AppState {
     /// the analysis completes or when the orphan-cleanup task gives up. RAII
     /// semantics mean the slot is always released — even on panic or runtime shutdown.
     slots: Arc<tokio::sync::Semaphore>,
-    /// Tasks that timed out, exceeded the 120s grace period, and had their slot
-    /// forcibly recycled. Their threads are still running in the background.
-    /// A non-zero value means something is seriously wrong.
-    recycled_orphans: AtomicUsize,
+    /// Tasks that timed out and exceeded the 120s grace period. They still
+    /// occupy a slot in the semaphore until they finish, and their presence
+    /// is what eventually triggers the watchdog restart.
+    stuck_orphans: AtomicUsize,
     /// Capacity of the slots semaphore. Requests are rejected with 503 when no
     /// permits are available, preventing orphaned blocking tasks from piling up
     /// and consuming unbounded memory.
@@ -363,7 +363,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         resources: RwLock::new(None),
         next_request_id: AtomicU64::new(1),
         slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
-        recycled_orphans: AtomicUsize::new(0),
+        stuck_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
         reload_lock: tokio::sync::Mutex::new(()),
         overloaded_since: std::sync::Mutex::new(None),

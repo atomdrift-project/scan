@@ -153,18 +153,20 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             .into_response();
     }
     let max_tasks = state.max_concurrent_tasks;
-    // In-grace-period orphans: timed out but slot not yet released (counted in active_tasks).
-    let grace_orphans = state
+    // Total orphans: timed out but still running (either in grace period or stuck).
+    let total_orphans = state
         .in_flight
         .iter()
         .filter(|e| e.timed_out.load(std::sync::atomic::Ordering::Relaxed))
         .count();
-    // Post-grace-period orphans: slot recycled, thread still running in background.
-    let recycled_orphans = state
-        .recycled_orphans
+    // Stuck orphans: exceeded the 120s grace period and still running.
+    let stuck_orphans = state
+        .stuck_orphans
         .load(std::sync::atomic::Ordering::Relaxed);
-    let orphaned_tasks = grace_orphans + recycled_orphans;
-    let live_tasks = active_tasks.saturating_sub(grace_orphans);
+    // Grace orphans: timed out but still within the 120s grace period.
+    let grace_orphans = total_orphans.saturating_sub(stuck_orphans);
+
+    let live_tasks = active_tasks.saturating_sub(total_orphans);
     let load = if max_tasks > 0 {
         live_tasks as f64 / max_tasks as f64
     } else {
@@ -185,7 +187,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             active_tasks,
             live_tasks,
             grace_orphans,
-            recycled_orphans,
+            stuck_orphans,
             max_concurrent_tasks = max_tasks,
             oldest_task = ?oldest,
             "GET /_/health -> 200 (saturated)"
@@ -196,7 +198,8 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             "rss_mb": rss_mb,
             "active_tasks": active_tasks,
             "live_tasks": live_tasks,
-            "orphaned_tasks": orphaned_tasks,
+            "orphaned_tasks": total_orphans,
+            "stuck_orphans": stuck_orphans,
             "max_concurrent_tasks": max_tasks,
             "oldest_task": oldest.map(|(name, secs)| serde_json::json!({"name": name, "elapsed_secs": secs})),
             "load": load,
@@ -205,13 +208,14 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         }))
             .into_response();
     }
-    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, live={live_tasks}, grace_orphans={grace_orphans}, recycled_orphans={recycled_orphans}, load={load:.2})");
+    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, live={live_tasks}, grace_orphans={grace_orphans}, stuck_orphans={stuck_orphans}, load={load:.2})");
     Json(serde_json::json!({
         "status": "ok",
         "rss_mb": rss_mb,
         "active_tasks": active_tasks,
         "live_tasks": live_tasks,
-        "orphaned_tasks": orphaned_tasks,
+        "orphaned_tasks": total_orphans,
+        "stuck_orphans": stuck_orphans,
         "max_concurrent_tasks": max_tasks,
         "load": load,
         "uptime_secs": uptime_secs,
@@ -725,8 +729,8 @@ pub(super) async fn analyze(
         state.in_flight.remove(&request_id);
     } else {
         // Timed out. The blocking thread is still running (dropping the JoinHandle
-        // does not cancel it). Move the permit into a background task that gives
-        // the thread a 120s grace period; dropping the permit there releases the slot.
+        // does not cancel it). We keep the permit and the in_flight entry until
+        // the thread actually finishes to prevent unbounded thread growth.
         tracing::warn!(
             id = request_id,
             filename = %filename,
@@ -745,28 +749,40 @@ pub(super) async fn analyze(
                 .get(&request_id)
                 .map(|r| r.thread_id.load(Ordering::Relaxed))
                 .unwrap_or(0);
-            // Drop the permit here — RAII ensures this always runs, even if the
-            // future is cancelled during runtime shutdown.
-            drop(permit);
-            orphan_state.in_flight.remove(&request_id);
-            if grace.is_ok() {
+
+            if let Ok(_res) = grace {
+                // Thread finished within 120s grace period.
+                drop(permit);
+                orphan_state.in_flight.remove(&request_id);
                 tracing::info!(request_id, filename = %orphan_filename, phase, thread_id = tid, "orphaned task completed within grace period");
                 return;
             }
-            // Phase 2: grace period exhausted — thread is detached.
-            let recycled =
-                orphan_state.recycled_orphans.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Phase 2: grace period exhausted — thread is seriously stuck.
+            // Increment the gauge. It will be decremented when the thread finally finishes.
+            orphan_state.stuck_orphans.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 request_id,
                 filename = %orphan_filename,
                 phase,
                 thread_id = tid,
-                recycled_orphans = recycled,
-                "orphaned task exceeded 120s grace period; slot recycled, thread detached",
+                "orphaned task exceeded 120s grace period; thread is stuck in background",
             );
-            // Clean up the temp directory that the orphaned blocking task will
-            // never drop. Best-effort — the directory may already be gone if
-            // the task raced to completion.
+
+            // Wait forever for the thread to finish (or for the watchdog to restart the process).
+            let _ = handle.await;
+
+            orphan_state.stuck_orphans.fetch_sub(1, Ordering::Relaxed);
+            drop(permit);
+            orphan_state.in_flight.remove(&request_id);
+
+            tracing::info!(
+                request_id,
+                filename = %orphan_filename,
+                "stuck orphaned task finally completed",
+            );
+
+            // Clean up the temp directory.
             if let Err(e) = tokio::fs::remove_dir_all(&orphan_temp_path).await {
                 tracing::debug!(request_id, error = %e, "orphan temp dir cleanup (may already be gone)");
             }
@@ -1071,21 +1087,36 @@ pub(super) async fn analyze_path(
                 .get(&request_id)
                 .map(|r| r.thread_id.load(Ordering::Relaxed))
                 .unwrap_or(0);
-            drop(permit);
-            orphan_state.in_flight.remove(&request_id);
-            if grace.is_ok() {
+
+            if let Ok(_res) = grace {
+                // Thread finished within 120s grace period.
+                drop(permit);
+                orphan_state.in_flight.remove(&request_id);
                 tracing::info!(request_id, path = %orphan_path, phase, thread_id = tid, "orphaned task completed within grace period");
                 return;
             }
-            let recycled =
-                orphan_state.recycled_orphans.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Phase 2: grace period exhausted — thread is seriously stuck.
+            orphan_state.stuck_orphans.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 request_id,
                 path = %orphan_path,
                 phase,
                 thread_id = tid,
-                recycled_orphans = recycled,
-                "orphaned task exceeded 120s grace period; slot recycled, thread detached",
+                "orphaned task exceeded 120s grace period; thread is stuck in background",
+            );
+
+            // Wait forever for the thread to finish (or for the watchdog to restart the process).
+            let _ = handle.await;
+
+            orphan_state.stuck_orphans.fetch_sub(1, Ordering::Relaxed);
+            drop(permit);
+            orphan_state.in_flight.remove(&request_id);
+
+            tracing::info!(
+                request_id,
+                path = %orphan_path,
+                "stuck orphaned task finally completed",
             );
         });
     }
@@ -1261,6 +1292,7 @@ pub(super) async fn memory_stats(State(state): State<Arc<AppState>>) -> Json<ser
         },
         "server": {
             "active_tasks": state.max_concurrent_tasks.saturating_sub(state.slots.available_permits()),
+            "stuck_orphans": state.stuck_orphans.load(Ordering::Relaxed),
             "max_concurrent_tasks": state.max_concurrent_tasks,
             "requests_total": state.next_request_id.load(Ordering::Relaxed),
             "timeout_secs": state.timeout_secs,

@@ -147,7 +147,17 @@ rm -f "$new_plist"
 if [ "$restart_needed" -eq 1 ]; then
     log "Restarting launchd service"
     sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
-    sudo pkill -x "$BINARY" 2>/dev/null || true
+
+    # Wait for launchd to fully unregister the service before bootstrapping.
+    # Attempting bootstrap while launchd is still cleaning up yields error 5.
+    i=0
+    while sudo launchctl print "system/$LABEL" >/dev/null 2>&1; do
+        sleep 1
+        i=$((i + 1))
+        [ "$i" -ge 10 ] && break
+    done
+
+    # Ensure the process itself has exited.
     i=0
     while sudo pgrep -x "$BINARY" >/dev/null 2>&1; do
         sleep 1
@@ -158,6 +168,7 @@ if [ "$restart_needed" -eq 1 ]; then
             break
         fi
     done
+
     sudo launchctl bootstrap system "$PLIST"
 else
     log "Binary and plist unchanged, skipping service restart"
