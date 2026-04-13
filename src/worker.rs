@@ -166,12 +166,16 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
         consecutive_errors = 0;
 
-        let claim: ClaimResponse = match resp.json().await {
+        let resp_body = resp.text().await.unwrap_or_default();
+        let claim: ClaimResponse = match serde_json::from_str(&resp_body) {
             Ok(c) => c,
             Err(e) => {
                 drop(gate);
-                tracing::warn!(error = %e, "failed to parse claim response");
-                tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+                consecutive_errors += 1;
+                let backoff = backoff_duration(poll_secs, consecutive_errors);
+                let preview = if resp_body.len() > 200 { &resp_body[..200] } else { &resp_body };
+                tracing::warn!(error = %e, body = %preview, backoff_secs = backoff.as_secs(), "failed to parse claim response");
+                tokio::time::sleep(backoff).await;
                 continue;
             }
         };
