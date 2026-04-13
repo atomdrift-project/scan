@@ -256,12 +256,16 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
     let cpus = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(0);
+    let total_mem_mb = cleave::memory_tracker::total_memory()
+        .map(|bytes| bytes / 1024 / 1024)
+        .unwrap_or(0);
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "slots": state.max_concurrent_tasks,
         "cpus": cpus,
         "max_upload_mb": state.max_upload_bytes / 1024 / 1024,
         "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
+        "total_mem_mb": total_mem_mb,
         "model_commit": crate::models_repo::version(),
         "traits_commit": cleave::traits_repo::version(),
     }))
