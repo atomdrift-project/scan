@@ -67,6 +67,10 @@ struct Cli {
     #[arg(long, default_value = "4000")]
     slow_rule_ms: u64,
 
+    /// Number of parallel cleave scan workers for directory/archive-heavy scans
+    #[arg(long)]
+    scan_threads: Option<usize>,
+
     /// Show raw probability and SHAP feature values in terminal output
     #[arg(long, hide = true)]
     extra: bool,
@@ -256,6 +260,7 @@ fn main() -> Result<()> {
                 thresholds,
                 filter,
                 cli.slow_rule_ms,
+                cli.scan_threads,
                 cli.extra,
             )?;
             let result = run_scan_paths(&paths, &config)?;
@@ -277,6 +282,7 @@ fn main() -> Result<()> {
                 thresholds,
                 filter,
                 cli.slow_rule_ms,
+                cli.scan_threads,
                 cli.extra,
             )?;
             let result = litmus::ps::run(&config)?;

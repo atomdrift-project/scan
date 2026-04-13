@@ -3,8 +3,13 @@ BINARY = litmus
 OUT_DIR = out
 BUILD ?= build
 RUN   ?= litmus
+DATASET ?= slow
+BENCHMARK_ROOT ?= /Users/t/data/benchmark
+BENCHMARK_PATH ?= $(BENCHMARK_ROOT)/$(DATASET)
+SCAN_THREADS ?=
+SLOW_RULE_MS ?= 200
 
-.PHONY: build release install check-cargo tarball deploy rollout-bastille rollout-debian rollout-openbsd rollout-alpine rollout-macos lint test clean
+.PHONY: build release install check-cargo tarball deploy rollout-bastille rollout-debian rollout-ubuntu rollout-openbsd rollout-alpine rollout-macos benchmark profile-slow lint test clean
 
 all: build
 
@@ -69,6 +74,8 @@ deploy:
 		FreeBSD) ./hacks/rollout-bastille.sh "$(BUILD)" "$(RUN)" ;; \
 		Linux)   if [ -f /etc/alpine-release ]; then \
 		           ./hacks/rollout-alpine.sh; \
+		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
+		           ./hacks/rollout-ubuntu.sh; \
 		         else \
 		           [ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || \
 		             { echo "Usage: make deploy BUILD=<build-host> RUN=<run-host>"; exit 1; }; \
@@ -88,11 +95,24 @@ rollout-debian:
 	@[ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || { echo "Usage: make rollout-debian BUILD=<build-host> RUN=<run-host>"; exit 1; }
 	./hacks/rollout-debian.sh "$(BUILD)" "$(RUN)"
 
+rollout-ubuntu:
+	@grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null || { echo "error: rollout-ubuntu requires Ubuntu"; exit 1; }
+	./hacks/rollout-ubuntu.sh
+
 rollout-openbsd:
 	./hacks/rollout-openbsd.sh
 
 rollout-alpine:
 	./hacks/rollout-alpine.sh
+
+benchmark: release
+	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
+	CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./out/$(BINARY) --slow-rule-ms "$(SLOW_RULE_MS)" -f json "$(BENCHMARK_PATH)" >/dev/null
+
+profile-slow: release
+	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
+	samply record --save-only --duration 20 -o /tmp/litmus-$(DATASET)-profile.json.gz -- \
+		env CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./out/$(BINARY) --slow-rule-ms "$(SLOW_RULE_MS)" -f json "$(BENCHMARK_PATH)"
 
 lint:
 	cargo clippy -- -D warnings

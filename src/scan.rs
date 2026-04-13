@@ -94,6 +94,7 @@ pub struct ScanConfig {
     thresholds: Option<Thresholds>,
     filter: DisplayFilter,
     slow_rule_ms: u64,
+    scan_threads: Option<usize>,
     extra: bool,
 }
 
@@ -115,6 +116,7 @@ impl ScanConfig {
     ///     None,
     ///     DisplayFilter::alerts_only(),
     ///     4_000,
+    ///     None,
     ///     false,
     /// )?;
     ///
@@ -128,6 +130,7 @@ impl ScanConfig {
         thresholds: Option<Thresholds>,
         filter: DisplayFilter,
         slow_rule_ms: u64,
+        scan_threads: Option<usize>,
         extra: bool,
     ) -> Result<Self> {
         if let Some(ref t) = thresholds {
@@ -140,6 +143,7 @@ impl ScanConfig {
             thresholds,
             filter,
             slow_rule_ms,
+            scan_threads,
             extra,
         })
     }
@@ -174,6 +178,12 @@ impl ScanConfig {
         self.slow_rule_ms
     }
 
+    /// Number of parallel cleave scan workers to use for directory scans.
+    #[must_use]
+    pub const fn scan_threads(&self) -> Option<usize> {
+        self.scan_threads
+    }
+
     /// Whether to show extra debug info (raw probability, SHAP values) in terminal output.
     #[must_use]
     pub const fn extra(&self) -> bool {
@@ -196,6 +206,7 @@ mod config_tests {
             }),
             DisplayFilter::alerts_only(),
             4_000,
+            None,
             false,
         );
 
@@ -415,6 +426,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     });
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
+        scan_threads: config.scan_threads().unwrap_or(0),
         cancellation: Some(Arc::clone(&cancellation)),
         ..Default::default()
     };
