@@ -605,14 +605,40 @@ impl ExtractContext {
     #[must_use]
     pub fn extract(&self, report: &serde_json::Value) -> Vec<f32> {
         let mut vec = vec![0.0f32; self.total_features];
-        self.extract_into(report, &mut vec);
+        self.extract_report_into(report, &mut vec);
         vec
     }
 
-    fn extract_into(&self, report: &serde_json::Value, vec: &mut [f32]) {
+    /// Extract features for a single compact file entry.
+    #[must_use]
+    pub fn extract_file(&self, file: &serde_json::Value) -> Vec<f32> {
+        let mut vec = vec![0.0f32; self.total_features];
+        self.extract_files_into(std::slice::from_ref(&file), Some(file), &mut vec);
+        vec
+    }
+
+    fn extract_report_into(&self, report: &serde_json::Value, vec: &mut [f32]) {
         let raw_files = report_files(report);
-        // Parallel summarization of each file.
-        let file_summaries: Vec<FileSummary> = raw_files.par_iter().map(|&f| FileSummary::new(f)).collect();
+        let primary_file = primary_file(report);
+        self.extract_files_into(&raw_files, primary_file, vec);
+    }
+
+    fn extract_files_into(
+        &self,
+        raw_files: &[&serde_json::Value],
+        primary_file: Option<&serde_json::Value>,
+        vec: &mut [f32],
+    ) {
+        // Small warm-cache reports are cheaper to summarize serially than to
+        // fan out into rayon jobs.
+        let file_summaries: Vec<FileSummary> = if raw_files.len() < 8 {
+            raw_files.iter().map(|&f| FileSummary::new(f)).collect()
+        } else {
+            raw_files
+                .par_iter()
+                .map(|&f| FileSummary::new(f))
+                .collect()
+        };
 
         // If no files, we need at least one empty summary for structural logic.
         let summaries = if file_summaries.is_empty() {
@@ -625,7 +651,8 @@ impl ExtractContext {
         let merged_metrics = merge_metric_summaries(&summaries);
         let mut offsets = FeatureCursor::default();
 
-        let (formula_str, elements_str, sample_score) = canonical_fields_from_report(report);
+        let (formula_str, elements_str, sample_score) =
+            canonical_fields_from_primary_file(primary_file);
         let score_weight: f32 = if sample_score > 0 {
             (sample_score as f32).ln_1p()
         } else {
@@ -1345,18 +1372,35 @@ fn write_structural_extensions_from_summaries(summaries: &[FileSummary], combine
     if total_loc > 0 { vec[offset + 12] = (hostile_files as f32 * 1000.0) / total_loc as f32; }
 }
 
-fn canonical_fields_from_report(report: &serde_json::Value) -> (String, String, i64) {
-    if let Some(files) = report.get("fs").and_then(serde_json::Value::as_array) {
-        for f in files {
-            if f.get("dp").and_then(serde_json::Value::as_i64).unwrap_or(0) == 0 {
-                let formula = f.get("f").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let elements: String = formula.chars().filter(|c| !('\u{2080}'..='\u{2089}').contains(c)).collect();
-                let score = f.get("x").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                return (formula, elements, score);
-            }
-        }
-    }
-    (String::new(), String::new(), 0)
+fn canonical_fields_from_primary_file(file: Option<&serde_json::Value>) -> (String, String, i64) {
+    let Some(file) = file else {
+        return (String::new(), String::new(), 0);
+    };
+    let formula = file
+        .get("f")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let elements: String = formula
+        .chars()
+        .filter(|c| !('\u{2080}'..='\u{2089}').contains(c))
+        .collect();
+    let score = file
+        .get("x")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    (formula, elements, score)
+}
+
+fn primary_file(report: &serde_json::Value) -> Option<&serde_json::Value> {
+    report
+        .get("fs")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|files| {
+            files
+                .iter()
+                .find(|file| file.get("dp").and_then(serde_json::Value::as_i64).unwrap_or(0) == 0)
+        })
 }
 
 fn write_logic_gap_features_from_summaries(summary: &FindingSummary, summaries: &[FileSummary], vec: &mut [f32], offset: usize) {

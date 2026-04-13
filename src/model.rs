@@ -1,10 +1,8 @@
 //! Model loading, thresholding, and inference.
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::Path;
-use std::process::Command;
 
 use crate::features::{FeatureSpec, EXPECTED_MODEL_ABI_VERSION};
 
@@ -295,9 +293,15 @@ pub struct ModelInfo {
     pub version: u32,
     /// Stable preprocessing/inference ABI version.
     pub abi_version: u32,
-    /// SHA-256 hex digest of the model file.
+    /// Optional SHA-256 hex digest of the model file.
+    ///
+    /// Litmus does not compute this for ordinary scan startup because hashing
+    /// the model artifact is avoidable hot-path work.
     pub sha256: String,
     /// Short git commit hash of the models repository, if available.
+    ///
+    /// This is optional because spawning `git` during every scan is likewise
+    /// avoidable startup work.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
 }
@@ -395,27 +399,6 @@ impl Model {
             }),
         };
 
-        let model_sha256 = {
-            let mut file = std::fs::File::open(&model_path)
-                .with_context(|| format!("opening {}", model_path.display()))?;
-            let mut hasher = Sha256::new();
-            std::io::copy(&mut file, &mut hasher)?;
-            format!("{:x}", hasher.finalize())
-        };
-
-        let commit = Command::new("git")
-            .args([
-                "-C",
-                &model_dir.to_string_lossy(),
-                "rev-parse",
-                "--short",
-                "HEAD",
-            ])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
         tracing::info!(
             features = spec.total_features(),
             model_abi_version = spec.abi_version(),
@@ -425,8 +408,6 @@ impl Model {
                                else if config_thresholds.is_some() { "config.json" }
                                else if recommended.is_some() { "evaluation.json" }
                                else { "fallback" },
-            model_sha256 = %model_sha256,
-            model_commit = ?commit,
             spec_version = spec.version(),
             "model loaded",
         );
@@ -434,8 +415,8 @@ impl Model {
         let info = ModelInfo {
             version: spec.version(),
             abi_version: spec.abi_version(),
-            sha256: model_sha256,
-            commit,
+            sha256: String::new(),
+            commit: None,
         };
 
         Ok(Self {

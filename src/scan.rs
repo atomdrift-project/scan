@@ -411,6 +411,7 @@ fn format_eta(secs: f64) -> String {
 /// be loaded, or `cleave` analysis fails for the overall scan operation.
 pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     let model = Model::load(config.model_dir(), config.thresholds())?;
+    let model_version = model_version_string(model.info());
 
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
@@ -435,7 +436,15 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 
     // Single-file path: handle directly without the directory streaming API.
     if path.is_file() {
-        let result = analyze_single(path, &cleave_opts, &ctx, &model, shap.as_ref(), config);
+        let result = analyze_single(
+            path,
+            &cleave_opts,
+            &ctx,
+            &model,
+            &model_version,
+            shap.as_ref(),
+            config,
+        );
         let (mut hostile, mut suspicious, mut benign, mut errors) = (0u32, 0u32, 0u32, 0u32);
         let stdout = Mutex::new(std::io::stdout());
         match result {
@@ -501,6 +510,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                     report,
                     &ctx,
                     &model,
+                    &model_version,
                     shap.as_ref(),
                     config,
                     cleave_opts.cancellation.as_ref(),
@@ -627,7 +637,7 @@ pub(crate) fn classify_report(
         .unwrap_or_default();
 
     let report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
-    let raw_features = ctx.extract(&report_json);
+    let mut raw_features = ctx.extract(&report_json);
     let nonzero = raw_features.iter().filter(|&&v| v != 0.0).count();
     let expected = model.spec().total_features();
     if raw_features.len() != expected {
@@ -637,9 +647,17 @@ pub(crate) fn classify_report(
             expected,
         );
     }
-    let mut features = raw_features.clone();
-    model.spec().standardize(&mut features);
-    let (probability, classification) = model.predict(&features)?;
+    let (probability, classification, reasons) = if let Some(shap) = shap {
+        let mut features = raw_features.clone();
+        model.spec().standardize(&mut features);
+        let (probability, classification) = model.predict(&features)?;
+        let reasons = shap.explain(&raw_features, model.spec().feature_names());
+        (probability, classification, reasons)
+    } else {
+        model.spec().standardize(&mut raw_features);
+        let (probability, classification) = model.predict(&raw_features)?;
+        (probability, classification, Vec::new())
+    };
 
     let finding_counts = count_findings_from_json(&report_json);
 
@@ -648,7 +666,7 @@ pub(crate) fn classify_report(
         classification = ?classification,
         probability = format!("{:.4}", probability),
         features_nonzero = nonzero,
-        features_total = features.len(),
+        features_total = expected,
         findings_hostile = finding_counts.hostile,
         findings_suspicious = finding_counts.suspicious,
         findings_notable = finding_counts.notable,
@@ -687,9 +705,7 @@ pub(crate) fn classify_report(
             }
         }
 
-        // Construct a synthetic single-file report for model inference.
-        let synthetic = serde_json::json!({ "fs": [ef], "v": "4" });
-        let mut ef_features = ctx.extract(&synthetic);
+        let mut ef_features = ctx.extract_file(ef);
         model.spec().standardize(&mut ef_features);
         let (ef_prob, ef_class) = model
             .predict(&ef_features)
@@ -755,9 +771,6 @@ pub(crate) fn classify_report(
         (classification, probability)
     };
 
-    let reasons = shap
-        .map(|s| s.explain(&raw_features, model.spec().feature_names()))
-        .unwrap_or_default();
     let top_findings = extract_top_findings_from_json(&report_json, &classification);
 
     Ok(ClassifiedReport {
@@ -782,6 +795,7 @@ fn process_report(
     report: cleave::AnalysisReport,
     ctx: &ExtractContext,
     model: &Model,
+    model_version: &str,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
     cancellation: Option<&Arc<AtomicBool>>,
@@ -806,7 +820,7 @@ fn process_report(
         classification: cr.classification,
         probability: cr.probability,
         thresholds,
-        version: model_version_string(model.info()),
+        version: model_version.to_string(),
         analyzed_at: now_rfc3339(),
         cleave,
         pids: None,
@@ -856,6 +870,7 @@ fn analyze_single(
     cleave_opts: &cleave::AnalysisOptions,
     ctx: &ExtractContext,
     model: &Model,
+    model_version: &str,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
@@ -866,6 +881,7 @@ fn analyze_single(
         report,
         ctx,
         model,
+        model_version,
         shap,
         config,
         cleave_opts.cancellation.as_ref(),
@@ -934,6 +950,9 @@ use crate::features::crit_ordinal;
 /// Build a compact model version string from ModelInfo.
 /// Format: "v{spec_version}.{abi_version}-{sha256_prefix}" or with commit if available.
 pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
+    if info.sha256.is_empty() {
+        return format!("v{}.{}", info.version, info.abi_version);
+    }
     let sha_prefix = if info.sha256.len() >= 8 {
         &info.sha256[..8]
     } else {
