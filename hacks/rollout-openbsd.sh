@@ -23,7 +23,7 @@ log() { echo "==> $*"; }
 log "Installing dependencies"
 missing=""
 for p in rust git p7zip rizin innoextract; do
-    pkg_info -e "$p" >/dev/null 2>&1 || missing="$missing $p"
+    pkg_info -q | grep -q "^${p}-" || missing="$missing $p"
 done
 [ -n "$missing" ] && doas pkg_add -I $missing || true
 
