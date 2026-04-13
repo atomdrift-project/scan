@@ -93,6 +93,24 @@ use crate::features::ExtractContext;
 use crate::model::Model;
 use crate::scan::ScanResult;
 
+/// Returns the 1-minute system load average, or None on unsupported platforms.
+fn system_load_avg() -> Option<f64> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+    {
+        let mut avg: [libc::c_double; 1] = [0.0];
+        let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
+        if ret == 1 {
+            Some(avg[0])
+        } else {
+            None
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
+    {
+        None
+    }
+}
+
 /// GET /_/health — liveness check with memory and concurrency status.
 /// Returns 503 while resources are still loading or when RSS exceeds the
 /// configured limit. A fully-utilised worker pool returns 200 with
@@ -102,6 +120,7 @@ use crate::scan::ScanResult;
 /// so clients can detect restarts without polling a separate endpoint.
 pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
     let uptime_secs = state.started_at.elapsed().as_secs();
+    let load_avg = system_load_avg();
 
     if let Ok(init_error) = state.init_error.read() {
         if let Some(message) = init_error.as_ref() {
@@ -146,6 +165,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
                 "rss_mb": rss_mb,
                 "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
                 "active_tasks": active_tasks,
+                "load_avg": load_avg,
                 "uptime_secs": uptime_secs,
                 "rayon_threads": rayon::current_num_threads(),
             })),
@@ -203,6 +223,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             "max_concurrent_tasks": max_tasks,
             "oldest_task": oldest.map(|(name, secs)| serde_json::json!({"name": name, "elapsed_secs": secs})),
             "load": load,
+            "load_avg": load_avg,
             "uptime_secs": uptime_secs,
             "rayon_threads": rayon::current_num_threads(),
         }))
@@ -218,6 +239,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         "stuck_orphans": stuck_orphans,
         "max_concurrent_tasks": max_tasks,
         "load": load,
+        "load_avg": load_avg,
         "uptime_secs": uptime_secs,
         "rayon_threads": rayon::current_num_threads(),
     }))
