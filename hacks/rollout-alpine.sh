@@ -29,7 +29,11 @@ log "Installing dependencies"
 doas apk add --no-cache rustup sccache git 7zip upx rizin innoextract
 
 log "Updating Rust toolchain"
-rustup update stable 2>/dev/null || rustup install stable || die "rustup failed"
+doas apk del rust cargo 2>/dev/null || true
+if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+    /usr/bin/rustup-init -y --no-modify-path || die "rustup-init failed"
+fi
+"$HOME/.cargo/bin/rustup" update stable || die "rustup update failed"
 . "$HOME/.cargo/env"
 
 log "Building"
