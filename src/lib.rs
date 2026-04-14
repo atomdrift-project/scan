@@ -34,6 +34,7 @@ pub mod output;
 pub mod ps;
 pub mod scan;
 pub mod server;
+pub mod tools;
 pub mod worker;
 
 pub use model::Classification;

@@ -21,8 +21,11 @@ log() { echo "==> $*"; }
 . /etc/os-release
 [ "${ID:-}" = "ubuntu" ] || die "this rollout is for Ubuntu"
 
+command -v rizin >/dev/null 2>&1 || die "rizin not found — build and install it from https://rizin.re before running this script"
+
 pkgs_needed=""
-for pkg in git pkg-config build-essential clang lld ca-certificates cron; do
+for pkg in git pkg-config build-essential clang lld ca-certificates \
+           p7zip-full upx-ucl innoextract unrar cron; do
     dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
         || pkgs_needed="$pkgs_needed $pkg"
 done

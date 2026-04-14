@@ -49,6 +49,11 @@ bssh "sudo cat /home/litmus/litmus/out/litmus.tgz" \
 log "Ensuring run user exists on $RUN"
 rssh "id -u litmus >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -d /nonexistent -c 'Litmus Worker' litmus"
 
+log "Installing runtime dependencies on $RUN"
+rssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        git ca-certificates p7zip-full upx rizin innoextract unrar"
+
 log "Extracting tarball on $RUN"
 rssh "sudo rm -rf /usr/local/share/litmus && \
       sudo mkdir -p /usr/local/share/litmus && \

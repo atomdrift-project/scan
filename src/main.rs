@@ -263,6 +263,14 @@ fn main() -> Result<()> {
         "DEBUG binary — litmus will be very slow; use `make release` for production builds"
     );
 
+    // Warn about missing analysis tools for commands that will run cleave.
+    if matches!(
+        command,
+        Commands::Scan { .. } | Commands::Ps | Commands::Serve { .. } | Commands::Worker { .. }
+    ) {
+        litmus::tools::warn_missing();
+    }
+
     if cli.update {
         std::thread::scope(|s| {
             s.spawn(|| {

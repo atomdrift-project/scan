@@ -29,8 +29,8 @@ command -v brew >/dev/null 2>&1 || die "brew not found"
 
 BREW_PREFIX=$(brew --prefix)
 
-log "Installing build dependencies"
-brew install rust sccache
+log "Installing dependencies"
+brew install rust sccache p7zip upx rizin innoextract unrar
 
 log "Building release binary"
 RUSTC_WRAPPER=sccache make release || die "build failed"

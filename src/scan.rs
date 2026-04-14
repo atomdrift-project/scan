@@ -460,7 +460,9 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                 }
             }
             Err(e) => {
-                tracing::warn!("error analyzing {}: {}", path.display(), e);
+                let msg = crate::tools::enrich_error(&e)
+                    .unwrap_or_else(|| format!("{e:#}"));
+                tracing::warn!("error analyzing {}: {}", path.display(), msg);
                 errors += 1;
             }
         }
@@ -543,7 +545,9 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("error analyzing {}: {}", file_path.display(), e);
+                    let msg = crate::tools::enrich_error(&e)
+                        .unwrap_or_else(|| format!("{e:#}"));
+                    tracing::warn!("error analyzing {}: {}", file_path.display(), msg);
                     error_count.fetch_add(1, Ordering::Relaxed);
                 }
             }

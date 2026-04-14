@@ -47,6 +47,9 @@ log "Ensuring run user exists"
 doas bastille cmd "$RUN" id -u litmus >/dev/null 2>&1 || \
     doas bastille cmd "$RUN" pw useradd litmus -m -s /bin/sh -c "Litmus Worker"
 
+log "Installing runtime dependencies"
+doas bastille pkg "$RUN" install -y git 7-zip upx rizin innoextract unrar
+
 log "Extracting tarball"
 doas bastille cmd "$RUN" rm -rf /usr/local/share/litmus
 doas bastille cmd "$RUN" mkdir -p /usr/local/share/litmus

@@ -20,9 +20,13 @@ LOG="$HOME/.local/share/litmus/litmus-worker.log"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
+log "Enabling testing repository"
+grep -q 'edge/testing' /etc/apk/repositories 2>/dev/null || \
+    echo 'https://dl-cdn.alpinelinux.org/alpine/edge/testing' | doas tee -a /etc/apk/repositories
+
 log "Installing dependencies"
 pkgs_needed=""
-for pkg in rustup git gcc g++ musl-dev; do
+for pkg in rustup git 7zip upx rizin innoextract unrar gcc g++ musl-dev; do
     apk info -e "$pkg" >/dev/null 2>&1 || pkgs_needed="$pkgs_needed $pkg"
 done
 if [ -n "$pkgs_needed" ]; then
