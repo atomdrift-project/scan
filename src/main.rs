@@ -241,7 +241,19 @@ fn main() -> Result<()> {
     // `thread '<unknown>' has overflowed its stack` abort. Cleave's CLI does
     // this in `cli_bootstrap`, but litmus uses cleave as a library and never
     // calls that, so we have to install the global pool ourselves.
+    //
+    // Thread count: rayon defaults to num_cpus threads, but that's far too few
+    // when multiple worker slots run concurrent analyses with deeply nested
+    // rayon::join calls (struct+YARA → embedded PE → rayon::join → YARA par_iter).
+    // With num_cpus threads and N worker slots, nested tasks starve waiting for
+    // threads held by other files — a 0.4s ELF can wait 1178s. Using 64× the CPU
+    // count provides enough headroom for nested parallelism without starvation.
+    let rayon_threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(4)
+        * 64;
     if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads)
         .stack_size(16 * 1024 * 1024)
         .thread_name(|i| format!("rayon-{i}"))
         .build_global()
