@@ -116,7 +116,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         });
     }
 
-    let base_url = config.hopper_url.clone();
+    let base_url = config.hopper_url.trim_end_matches('/').to_string();
     let data_dir = config.data_dir.clone();
     let poll_secs = config.poll_secs;
     let slow_rule_ms = config.slow_rule_ms;
