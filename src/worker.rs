@@ -109,19 +109,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // Both are initialized lazily; the first analysis blocks until they're ready.
     // Doing this at startup avoids a multi-second latency spike on the first real job.
     // A minimal PE stub triggers full parallel initialization via cleave's rayon::join.
-    tracing::info!("pre-warming cleave resources");
-    let warm_start = Instant::now();
-    tokio::task::spawn_blocking(|| {
-        let _ = cleave::analyze_bytes(
-            b"\x4d\x5a\x90\x00\x03\x00\x00\x00",
-            "warmup.exe",
-            &cleave::AnalysisOptions::default(),
-        );
-    })
-    .await
-    .ok();
-    tracing::info!(elapsed_ms = warm_start.elapsed().as_millis() as u64, "cleave resources ready");
-
     // Background: periodic rules update.
     if config.update_interval_mins > 0 {
         let interval = Duration::from_secs(config.update_interval_mins * 60);
@@ -186,13 +173,15 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             "{}/api/next?worker={}&count={}&slots={}",
             base_url, encoded_name, free, slots
         );
+        tracing::info!(url = %poll_url, free_slots = free, "polling for work");
+        let poll_start = Instant::now();
         let resp = match client.get(&poll_url).send().await {
             Ok(r) => r,
             Err(e) => {
                 drop(gate);
                 consecutive_errors += 1;
                 let backoff = backoff_duration(poll_secs, consecutive_errors);
-                tracing::warn!(error = %e, backoff_secs = backoff.as_secs(), "poll failed");
+                tracing::warn!(error = %e, elapsed_ms = poll_start.elapsed().as_millis() as u64, backoff_secs = backoff.as_secs(), "poll failed");
                 tokio::time::sleep(backoff).await;
                 continue;
             }
@@ -201,6 +190,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         if resp.status() == reqwest::StatusCode::NO_CONTENT {
             drop(gate);
             consecutive_errors = 0;
+            tracing::debug!(elapsed_ms = poll_start.elapsed().as_millis() as u64, poll_secs, "no work available, sleeping");
             tokio::time::sleep(Duration::from_secs(poll_secs)).await;
             continue;
         }
@@ -211,7 +201,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             drop(gate);
             consecutive_errors += 1;
             let backoff = backoff_duration(poll_secs, consecutive_errors);
-            tracing::warn!(%status, body = %body, backoff_secs = backoff.as_secs(), "unexpected response from /api/next");
+            tracing::warn!(%status, body = %body, elapsed_ms = poll_start.elapsed().as_millis() as u64, backoff_secs = backoff.as_secs(), "unexpected response from /api/next");
             tokio::time::sleep(backoff).await;
             continue;
         }
@@ -226,11 +216,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 consecutive_errors += 1;
                 let backoff = backoff_duration(poll_secs, consecutive_errors);
                 let preview = if resp_body.len() > 200 { &resp_body[..200] } else { &resp_body };
-                tracing::warn!(error = %e, body = %preview, backoff_secs = backoff.as_secs(), "failed to parse claim response");
+                tracing::warn!(error = %e, body = %preview, elapsed_ms = poll_start.elapsed().as_millis() as u64, backoff_secs = backoff.as_secs(), "failed to parse claim response");
                 tokio::time::sleep(backoff).await;
                 continue;
             }
         };
+
+        tracing::info!(
+            jobs = claim.jobs.len(),
+            elapsed_ms = poll_start.elapsed().as_millis() as u64,
+            "claimed work from server",
+        );
 
         // Release the gate permit — each job gets its own permit below.
         drop(gate);
@@ -498,14 +494,19 @@ async fn post_result(
             let delay = Duration::from_secs(1 << attempt);
             tokio::time::sleep(delay).await;
         }
+        tracing::debug!(sha256 = %sha256, attempt, "posting result to server");
+        let post_start = Instant::now();
         match client.post(&url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => return,
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!(sha256 = %sha256, elapsed_ms = post_start.elapsed().as_millis() as u64, "result posted");
+                return;
+            }
             Ok(resp) => {
                 let status = resp.status();
-                tracing::warn!(sha256 = %sha256, %status, attempt, "post result: non-success response");
+                tracing::warn!(sha256 = %sha256, %status, elapsed_ms = post_start.elapsed().as_millis() as u64, attempt, "post result: non-success response");
             }
             Err(e) => {
-                tracing::warn!(sha256 = %sha256, error = %e, attempt, "post result: send failed");
+                tracing::warn!(sha256 = %sha256, error = %e, elapsed_ms = post_start.elapsed().as_millis() as u64, attempt, "post result: send failed");
             }
         }
     }
@@ -549,11 +550,20 @@ async fn download_bytes(
     label: &str,
 ) -> Result<Vec<u8>, String> {
     let url = format!("{}/api/file/{}", base_url, sha256);
+    tracing::debug!(sha256 = %sha256, file = %label, "downloading from server");
+    let start = Instant::now();
     let resp = client.get(&url).send().await.map_err(|e| format!("download {label}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("download {label}: HTTP {}", resp.status()));
     }
     let bytes = resp.bytes().await.map_err(|e| format!("download {label}: read body: {e}"))?;
+    tracing::info!(
+        sha256 = %sha256,
+        file = %label,
+        bytes = bytes.len(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "download complete",
+    );
     Ok(bytes.to_vec())
 }
 
