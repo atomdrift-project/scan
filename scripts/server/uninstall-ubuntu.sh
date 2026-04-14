@@ -11,6 +11,6 @@ log "Removing cron entry"
 (crontab -l 2>/dev/null | grep -v "litmus.*serve" || true) | crontab -
 
 log "Killing any remaining processes"
-pkill -f "$BINARY.*serve" 2>/dev/null || true
+pkill -x "$BINARY" 2>/dev/null || true
 
 log "Uninstall complete"

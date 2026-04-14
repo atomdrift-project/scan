@@ -9,6 +9,6 @@ log "Removing cron entry"
 (crontab -l 2>/dev/null | grep -v "litmus worker" || true) | crontab -
 
 log "Killing any remaining processes"
-pkill -f "litmus worker" 2>/dev/null || true
+pkill -x litmus 2>/dev/null || true
 
 log "Uninstall complete"
