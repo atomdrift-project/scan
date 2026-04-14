@@ -249,12 +249,16 @@ fn main() -> Result<()> {
         tracing::warn!(error = %e, "failed to install global rayon pool; using default");
     }
 
-    // Initialize terminal theme before any output.
+    // Terminal theme detection is only needed for scan/ps with terminal output.
+    // The OSC color-scheme query blocks on a TTY response and hangs in any
+    // environment that doesn't reply (SSH, some tmux configs, worker daemons).
+    let needs_terminal_theme = cli.format == litmus::OutputFormat::Terminal
+        && matches!(command, Commands::Scan { .. } | Commands::Ps);
     if cli.light {
         litmus::output::set_theme(litmus::output::Theme::Light);
     } else if cli.dark {
         litmus::output::set_theme(litmus::output::Theme::Dark);
-    } else {
+    } else if needs_terminal_theme {
         litmus::output::detect_theme();
     }
 
