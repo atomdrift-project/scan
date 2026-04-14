@@ -89,6 +89,7 @@ deploy-server:
 
 deploy-worker:
 	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker URL=<url> [BUILD=<host>] [RUN=<host>]"; exit 1; }
+	git stash
 	git pull
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/worker/worker-macos.sh "$(URL)" ;; \

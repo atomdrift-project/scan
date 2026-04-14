@@ -17,6 +17,12 @@ for node in "$@"; do
     printf "==> [%s] deploying ...\n" "$node"
     start=$(date +%s)
 
+    if ! ping -c1 -W2 "$node" >/dev/null 2>&1; then
+        results="$results $node:UNREACHABLE:0s"
+        printf "==> [%s] UNREACHABLE (ping failed)\n\n" "$node"
+        continue
+    fi
+
     ssh -t "$node" "uname -a && uptime && cd litmus && make deploy"
     exit_code=$?
 
@@ -45,6 +51,6 @@ done
 # Exit non-zero if any node failed
 for entry in $results; do
     case "$entry" in
-        *:FAILED:*) exit 1 ;;
+        *:FAILED:*|*:UNREACHABLE:*) exit 1 ;;
     esac
 done
