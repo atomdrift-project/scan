@@ -1,25 +1,19 @@
 #!/bin/sh
-# update-nodes.sh - Deploy litmus worker to remote nodes via SSH in serial
-# Usage: ./update-nodes.sh <url> <node> [node ...]
+# uninstall-nodes.sh - Remove litmus worker persistence from remote nodes via SSH
+# Usage: ./uninstall-nodes.sh <node> [node ...]
 
-if [ $# -lt 2 ]; then
-    echo "usage: $0 <url> <node> [node ...]" >&2
+if [ $# -eq 0 ]; then
+    echo "usage: $0 <node> [node ...]" >&2
     exit 1
 fi
-
-URL="$1"
-shift
-
-git pull
-git push
 
 results=""
 
 for node in "$@"; do
-    printf "==> [%s] deploying ...\n" "$node"
+    printf "==> [%s] uninstalling ...\n" "$node"
     start=$(date +%s)
 
-    ssh -t "$node" "uname -a && uptime && cd litmus && git pull && make deploy-worker URL=$URL"
+    ssh -t "$node" "uname -a && cd litmus && git pull && make uninstall-worker"
     exit_code=$?
 
     elapsed=$(( $(date +%s) - start ))

@@ -9,7 +9,7 @@ BENCHMARK_PATH ?= $(BENCHMARK_ROOT)/$(DATASET)
 SCAN_THREADS ?=
 SLOW_RULE_MS ?= 200
 
-.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes rollout-bastille rollout-debian rollout-ubuntu rollout-openbsd rollout-alpine rollout-macos benchmark profile-slow lint test clean
+.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille rollout-debian rollout-ubuntu rollout-openbsd rollout-alpine rollout-macos benchmark profile-slow lint test clean
 
 all: build
 
@@ -104,10 +104,50 @@ deploy-worker:
 		*) echo "error: no deploy-worker target for $$(uname -s)"; exit 1 ;; \
 	esac
 
+uninstall-server:
+	@case "$$(uname -s)" in \
+		Darwin)  ./scripts/server/uninstall-macos.sh ;; \
+		FreeBSD) ./scripts/server/uninstall-bastille.sh "$(RUN)" ;; \
+		Linux)   if [ -f /etc/alpine-release ]; then \
+		           ./scripts/server/uninstall-alpine.sh; \
+		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
+		           ./scripts/server/uninstall-ubuntu.sh; \
+		         else \
+		           [ -n "$(RUN)" ] || { echo "Usage: make uninstall-server RUN=<run-host>"; exit 1; }; \
+		           ./scripts/server/uninstall-debian.sh "$(RUN)"; \
+		         fi ;; \
+		OpenBSD) ./scripts/server/uninstall-openbsd.sh ;; \
+		*) echo "error: no uninstall-server target for $$(uname -s)"; exit 1 ;; \
+	esac
+
+uninstall-worker:
+	@case "$$(uname -s)" in \
+		Darwin)  ./scripts/worker/uninstall-macos.sh ;; \
+		FreeBSD) ./scripts/worker/uninstall-bastille.sh "$(RUN)" ;; \
+		Linux)   if [ -f /etc/alpine-release ]; then \
+		           ./scripts/worker/uninstall-alpine.sh; \
+		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
+		           ./scripts/worker/uninstall-ubuntu.sh; \
+		         else \
+		           [ -n "$(RUN)" ] || { echo "Usage: make uninstall-worker RUN=<run-host>"; exit 1; }; \
+		           ./scripts/worker/uninstall-debian.sh "$(RUN)"; \
+		         fi ;; \
+		OpenBSD) ./scripts/worker/uninstall-openbsd.sh ;; \
+		*) echo "error: no uninstall-worker target for $$(uname -s)"; exit 1 ;; \
+	esac
+
 deploy-worker-nodes:
 	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker-nodes URL=<url> NODES=\"node1 node2\""; exit 1; }
 	@[ -n "$(NODES)" ] || { echo "Usage: make deploy-worker-nodes URL=<url> NODES=\"node1 node2\""; exit 1; }
 	./scripts/worker/update-nodes.sh "$(URL)" $(NODES)
+
+uninstall-server-nodes:
+	@[ -n "$(NODES)" ] || { echo "Usage: make uninstall-server-nodes NODES=\"node1 node2\""; exit 1; }
+	./scripts/server/uninstall-nodes.sh $(NODES)
+
+uninstall-worker-nodes:
+	@[ -n "$(NODES)" ] || { echo "Usage: make uninstall-worker-nodes NODES=\"node1 node2\""; exit 1; }
+	./scripts/worker/uninstall-nodes.sh $(NODES)
 
 rollout-bastille:
 	./scripts/server/rollout-bastille.sh "$(BUILD)" "$(RUN)"
