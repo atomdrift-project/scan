@@ -454,7 +454,12 @@ async fn post_result(
 ) {
     let payload = match result {
         Ok((ml, raw, duration_ms)) => {
-            let classification = ml.get("class").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let classification = match ml.get("class").and_then(|v| v.as_u64()) {
+                Some(0) => "benign",
+                Some(1) => "suspicious",
+                Some(2) => "hostile",
+                _ => "unknown",
+            };
             tracing::info!(sha256 = %sha256, duration_ms, classification, "analysis complete");
             ResultPayload {
                 sha256: sha256.to_string(),

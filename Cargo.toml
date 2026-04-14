@@ -87,9 +87,6 @@ inherits = "release"
 strip = "none"
 debug = 1
 
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
-
 [lints]
 workspace = true
 
