@@ -45,6 +45,8 @@ pub struct WorkerConfig {
     pub data_dir: Option<PathBuf>,
     /// Slow rule warning threshold in ms.
     pub slow_rule_ms: u64,
+    /// Exit after this many jobs have been analyzed (None = run forever).
+    pub max_jobs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -119,11 +121,23 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let poll_secs = config.poll_secs;
     let slow_rule_ms = config.slow_rule_ms;
     let timeout_secs = config.timeout_secs;
+    let max_jobs = config.max_jobs;
     let encoded_name: String = url_encode(&name);
     let mut consecutive_errors: u32 = 0;
+    let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     loop {
+        if let Some(max) = max_jobs {
+            if completed.load(Ordering::Acquire) >= max {
+                tracing::info!(max_jobs = max, "job limit reached, draining in-flight work");
+                break;
+            }
+        }
         // Wait for at least one free slot.
+        let available = semaphore.available_permits();
+        if available == 0 {
+            tracing::debug!(slots, "all slots occupied — waiting for a job to complete");
+        }
         let gate = semaphore
             .clone()
             .acquire_owned()
@@ -196,6 +210,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             let url = base_url.clone();
             let name = name.clone();
             let data_dir = data_dir.clone();
+            let completed = Arc::clone(&completed);
 
             tokio::spawn(async move {
                 let result = run_job(
@@ -211,10 +226,16 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     );
                 }
                 post_result(&client, &url, &name, &job.sha256, result).await;
+                completed.fetch_add(1, Ordering::Release);
                 drop(permit);
             });
         }
     }
+
+    // Drain any in-flight work before exiting.
+    let _ = semaphore.acquire_many(slots as u32).await;
+    tracing::info!("all in-flight jobs finished, exiting");
+    Ok(())
 }
 
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
@@ -274,11 +295,13 @@ async fn run_job(
     let label2 = label.clone();
     let sha_short = job.sha256[..12].to_string();
 
-    // Background phase watcher — logs transitions with timing.
+    // Background phase watcher — logs transitions with timing, and emits a
+    // heartbeat every 30 s so a stuck phase is visible in logs.
     let cancel_watcher = cancel.clone();
     std::thread::spawn(move || {
         let mut last_phase = String::new();
         let mut phase_start = Instant::now();
+        let mut last_heartbeat = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(100));
             if cancel_watcher.load(Ordering::Relaxed) {
@@ -286,6 +309,16 @@ async fn run_job(
             }
             let current = phase2.get();
             if current.is_empty() {
+                // Phase tracker not yet updated — log if this persists.
+                if last_heartbeat.elapsed().as_secs() >= 30 {
+                    tracing::warn!(
+                        sha256 = %sha_short,
+                        file = %label2,
+                        elapsed_ms = phase_start.elapsed().as_millis() as u64,
+                        "analysis running but phase tracker has not been updated",
+                    );
+                    last_heartbeat = Instant::now();
+                }
                 continue;
             }
             if current != last_phase {
@@ -300,14 +333,42 @@ async fn run_job(
                 }
                 last_phase = current;
                 phase_start = Instant::now();
+                last_heartbeat = Instant::now();
+                tracing::info!(
+                    sha256 = %sha_short,
+                    file = %label2,
+                    phase = %last_phase,
+                    "phase started",
+                );
                 if last_phase == "done" {
                     break;
                 }
+            } else if last_heartbeat.elapsed().as_secs() >= 30 {
+                tracing::warn!(
+                    sha256 = %sha_short,
+                    file = %label2,
+                    phase = %last_phase,
+                    elapsed_ms = phase_start.elapsed().as_millis() as u64,
+                    "phase still running",
+                );
+                last_heartbeat = Instant::now();
             }
         }
     });
 
+    tracing::info!(
+        sha256 = %&job.sha256[..12],
+        file = %label,
+        size = downloaded.as_ref().map(|b| b.len()).unwrap_or(0),
+        "analysis starting",
+    );
+    let sha_short2 = job.sha256[..12].to_string();
     let handle = tokio::task::spawn_blocking(move || {
+        tracing::info!(
+            sha256 = %sha_short2,
+            thread_id = os_thread_id(),
+            "analysis thread started",
+        );
         if let Some(data) = downloaded {
             classify_bytes(&data, &label, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
         } else {
@@ -329,6 +390,11 @@ async fn run_job(
             }
         }
     };
+
+    // Always signal the phase watcher to stop. Without this, if cleave returns
+    // an error before setting phase="done", the watcher thread leaks indefinitely.
+    cancel.store(true, Ordering::Relaxed);
+
     let elapsed_ms = start.elapsed().as_millis() as i64;
 
     match result {
@@ -458,6 +524,43 @@ fn backoff_duration(base_secs: u64, consecutive_errors: u32) -> Duration {
     // Simple jitter: ±25% using a cheap hash of the error count.
     let jitter = (consecutive_errors as u64 * 7 + 3) % (capped / 4 + 1);
     Duration::from_secs(capped.saturating_add(jitter))
+}
+
+/// Returns the OS-level thread ID for the calling thread.
+///
+/// The returned value matches what `lldb`'s `thread list`, `sample`, and
+/// `/proc/self/task/` show, making it possible to correlate log lines with
+/// debugger or profiler output when diagnosing stuck analyses.
+fn os_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut tid: u64 = 0;
+        unsafe { libc::pthread_threadid_np(0, &mut tid) };
+        tid
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let mut tid: libc::c_long = 0;
+        unsafe { libc::thr_self(&mut tid) };
+        tid as u64
+    }
+    #[cfg(target_os = "openbsd")]
+    {
+        unsafe { libc::getthrid() as u64 }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )))]
+    {
+        0
+    }
 }
 
 /// Percent-encode a string for use in URL query parameters.

@@ -8,8 +8,10 @@ BENCHMARK_ROOT ?= /Users/t/data/benchmark
 BENCHMARK_PATH ?= $(BENCHMARK_ROOT)/$(DATASET)
 SCAN_THREADS ?=
 SLOW_RULE_MS ?= 200
+MAX_JOBS ?= 25
+WORKERS  ?=
 
-.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille rollout-debian rollout-ubuntu rollout-openbsd rollout-alpine rollout-macos benchmark profile-slow lint test clean
+.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille rollout-debian rollout-ubuntu rollout-openbsd rollout-alpine rollout-macos benchmark benchmark-worker profile-slow lint test clean
 
 all: build
 
@@ -172,6 +174,13 @@ rollout-alpine:
 benchmark: release
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
 	CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./out/$(BINARY) --slow-rule-ms "$(SLOW_RULE_MS)" -f json "$(BENCHMARK_PATH)" >/dev/null
+
+benchmark-worker: release
+	@[ -n "$(URL)" ] || { echo "Usage: make benchmark-worker URL=<hopper-url>"; exit 1; }
+	samply record -o /tmp/litmus-worker-profile.json.gz -- \
+		./out/$(BINARY) --verbose worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
+		$(if $(WORKERS),--workers $(WORKERS),) \
+		2>&1 | tee /tmp/litmus-worker-benchmark.log
 
 profile-slow: release
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }

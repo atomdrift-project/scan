@@ -183,6 +183,10 @@ enum Commands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
 
+        /// Exit after this many jobs have been analyzed (default: run forever)
+        #[arg(long)]
+        max_jobs: Option<u64>,
+
         /// Path to a writable cleave traits directory (overrides CLEAVE_TRAITS_DIR).
         /// Use when running as a restricted user whose $HOME is not writable
         /// (e.g. macOS system accounts where $HOME=/var/empty). Traits are
@@ -437,6 +441,7 @@ fn main() -> Result<()> {
             max_rss_gb,
             update_interval_mins,
             data_dir,
+            max_jobs,
             traits_dir,
         } => {
             if let Some(ref p) = traits_dir {
@@ -464,6 +469,7 @@ fn main() -> Result<()> {
                 max_rss_gb,
                 update_interval_mins,
                 data_dir,
+                max_jobs,
                 model_dir,
                 thresholds,
                 slow_rule_ms: cli.slow_rule_ms,
