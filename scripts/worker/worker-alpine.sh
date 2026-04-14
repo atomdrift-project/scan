@@ -37,7 +37,6 @@ else
 fi
 
 log "Updating Rust toolchain"
-doas apk del rust cargo 2>/dev/null || true
 if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
     /usr/bin/rustup-init -y --no-modify-path || die "rustup-init failed"
 fi
