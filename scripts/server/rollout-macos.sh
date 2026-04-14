@@ -33,7 +33,7 @@ BREW_PREFIX=$(brew --prefix)
 TRAITS_SRC="$HOME/Library/Application Support/cleave/traits"
 
 log "Installing build dependencies"
-brew install rust sccache p7zip upx rizin innoextract unrar
+brew install rust sccache p7zip upx rizin innoextract
 
 log "Building release binary"
 RUSTC_WRAPPER=sccache make release || die "build failed"
