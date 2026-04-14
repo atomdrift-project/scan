@@ -26,7 +26,7 @@ grep -q 'edge/testing' /etc/apk/repositories 2>/dev/null || \
 
 log "Installing dependencies"
 pkgs_needed=""
-for pkg in rustup git 7zip upx rizin innoextract unrar gcc g++ musl-dev; do
+for pkg in rustup git 7zip upx rizin innoextract gcc g++ musl-dev; do
     apk info -e "$pkg" >/dev/null 2>&1 || pkgs_needed="$pkgs_needed $pkg"
 done
 if [ -n "$pkgs_needed" ]; then

@@ -72,7 +72,7 @@ rssh "id -u litmus >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -d /n
 log "Installing runtime dependencies on $RUN"
 rssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        git ca-certificates p7zip-full upx rizin innoextract unrar"
+        git ca-certificates p7zip-full upx rizin innoextract"
 
 log "Extracting tarball on $RUN"
 rssh "sudo rm -rf /usr/local/share/litmus && \
