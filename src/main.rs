@@ -138,6 +138,13 @@ enum Commands {
         /// accept remote connections.
         #[arg(long)]
         allow_cidr: Option<String>,
+
+        /// Path to a writable cleave traits directory (overrides CLEAVE_TRAITS_DIR).
+        /// Use when running as a restricted user whose $HOME is not writable
+        /// (e.g. macOS system accounts where $HOME=/var/empty). Traits are
+        /// cloned automatically if the directory does not yet exist.
+        #[arg(long)]
+        traits_dir: Option<PathBuf>,
     },
 
     /// Run as a pull-based worker, polling a hopper instance for analysis jobs
@@ -175,6 +182,13 @@ enum Commands {
         /// downloading. SHA256 is verified before using a local file.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+
+        /// Path to a writable cleave traits directory (overrides CLEAVE_TRAITS_DIR).
+        /// Use when running as a restricted user whose $HOME is not writable
+        /// (e.g. macOS system accounts where $HOME=/var/empty). Traits are
+        /// cloned automatically if the directory does not yet exist.
+        #[arg(long)]
+        traits_dir: Option<PathBuf>,
     },
 
     /// Print version information
@@ -338,7 +352,11 @@ fn main() -> Result<()> {
             extract_dir,
             workers,
             allow_cidr,
+            traits_dir,
         } => {
+            if let Some(ref p) = traits_dir {
+                std::env::set_var("CLEAVE_TRAITS_DIR", p);
+            }
             let dirs: Vec<std::path::PathBuf> = allowed_dirs
                 .unwrap_or_default()
                 .split(',')
@@ -419,7 +437,11 @@ fn main() -> Result<()> {
             max_rss_gb,
             update_interval_mins,
             data_dir,
+            traits_dir,
         } => {
+            if let Some(ref p) = traits_dir {
+                std::env::set_var("CLEAVE_TRAITS_DIR", p);
+            }
             let model_dir = resolve_model_dir()?;
             let workers = workers.unwrap_or_else(|| {
                 let cores = std::thread::available_parallelism()

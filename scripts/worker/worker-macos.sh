@@ -12,6 +12,7 @@ URL="$1"
 BINARY=litmus
 INSTALL_DIR=/usr/local/share/litmus
 MODELS_DIR=/usr/local/share/litmus/models
+TRAITS_DIR=/usr/local/share/litmus/traits
 BIN_LINK=/usr/local/bin/litmus
 PLIST=/Library/LaunchDaemons/com.atomdrift.litmus-worker.plist
 LABEL=com.atomdrift.litmus-worker
@@ -53,10 +54,14 @@ if [ ! -d "$INSTALL_DIR" ] || [ ! -w "$INSTALL_DIR" ]; then
     sudo chown "$(id -un)" "$INSTALL_DIR"
 fi
 
-# Models directory is owned by the service user so it can auto-clone/update.
+# Models and traits directories are owned by the service user so it can auto-clone/update.
 if [ ! -d "$MODELS_DIR" ]; then
     sudo mkdir -p "$MODELS_DIR"
     sudo chown "$SERVICE_USER" "$MODELS_DIR"
+fi
+if [ ! -d "$TRAITS_DIR" ]; then
+    sudo mkdir -p "$TRAITS_DIR"
+    sudo chown "$SERVICE_USER" "$TRAITS_DIR"
 fi
 
 log "Installing binary"
@@ -91,6 +96,8 @@ cat > "$new_plist" <<EOF
         <string>worker</string>
         <string>--url</string>
         <string>$URL</string>
+        <string>--traits-dir</string>
+        <string>$TRAITS_DIR</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
