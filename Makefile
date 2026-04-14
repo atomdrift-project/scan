@@ -190,10 +190,11 @@ profile-worker:
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		2>&1 | tee /tmp/litmus-worker-benchmark.log
 
-profile-slow: release
+profile-slow:
+	cargo build --profile profiling
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
 	samply record --save-only --duration 20 -o /tmp/litmus-$(DATASET)-profile.json.gz -- \
-		env CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./out/$(BINARY) --slow-rule-ms "$(SLOW_RULE_MS)" -f json "$(BENCHMARK_PATH)"
+		env CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./target/profiling/$(BINARY) --slow-rule-ms "$(SLOW_RULE_MS)" -f json "$(BENCHMARK_PATH)"
 
 lint:
 	cargo clippy -- -D warnings

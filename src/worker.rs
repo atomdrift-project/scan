@@ -88,7 +88,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(slots));
 
     // Load model resources once at startup.
-    let model = Model::load(&config.model_dir, config.thresholds.clone())
+    let model = Model::load(&config.model_dir, config.thresholds)
         .context("loading model")?;
     let shap = ShapImportance::load(&config.model_dir).ok();
     let ctx = ExtractContext::new(model.spec());
@@ -104,6 +104,23 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         hopper = %config.hopper_url,
         "worker starting"
     );
+
+    // Pre-warm YARA compiler and capability mapper before claiming work.
+    // Both are initialized lazily; the first analysis blocks until they're ready.
+    // Doing this at startup avoids a multi-second latency spike on the first real job.
+    // A minimal PE stub triggers full parallel initialization via cleave's rayon::join.
+    tracing::info!("pre-warming cleave resources");
+    let warm_start = Instant::now();
+    tokio::task::spawn_blocking(|| {
+        let _ = cleave::analyze_bytes(
+            b"\x4d\x5a\x90\x00\x03\x00\x00\x00",
+            "warmup.exe",
+            &cleave::AnalysisOptions::default(),
+        );
+    })
+    .await
+    .ok();
+    tracing::info!(elapsed_ms = warm_start.elapsed().as_millis() as u64, "cleave resources ready");
 
     // Background: periodic rules update.
     if config.update_interval_mins > 0 {
@@ -275,22 +292,14 @@ async fn run_job(
         .unwrap_or_else(|| job.sha256.clone());
 
     // Try local file first; fall back to downloading bytes from hopper.
+    // Trust hopper's SHA256 — re-hashing would read the file twice and block
+    // the tokio executor with blocking I/O.
     let local_path = data_dir.map(|d| d.join(&job.path));
     let use_local = match local_path {
-        Some(ref p) if p.exists() => match verify_sha256(p, &job.sha256) {
-            Ok(true) => {
-                tracing::info!(sha256 = %job.sha256, path = %p.display(), file_type = %job.file_type, size = job.size_bytes, "analyzing local file");
-                true
-            }
-            Ok(false) => {
-                tracing::info!(sha256 = %job.sha256, path = %p.display(), "SHA256 mismatch, will download");
-                false
-            }
-            Err(e) => {
-                tracing::info!(sha256 = %job.sha256, path = %p.display(), error = %e, "hash check failed, will download");
-                false
-            }
-        },
+        Some(ref p) if p.exists() => {
+            tracing::info!(sha256 = %job.sha256, path = %p.display(), file_type = %job.file_type, size = job.size_bytes, "analyzing local file");
+            true
+        }
         _ => false,
     };
 
@@ -318,13 +327,14 @@ async fn run_job(
 
     // Background phase watcher — logs transitions with timing, and emits a
     // heartbeat every 30 s so a stuck phase is visible in logs.
+    // Uses a tokio task instead of an OS thread to avoid one thread-per-job overhead.
     let cancel_watcher = cancel.clone();
-    std::thread::spawn(move || {
+    tokio::task::spawn(async move {
         let mut last_phase = String::new();
         let mut phase_start = Instant::now();
         let mut last_heartbeat = Instant::now();
         loop {
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
             if cancel_watcher.load(Ordering::Relaxed) {
                 // Log completion of the final phase so elapsed time is never lost.
                 if !last_phase.is_empty() && last_phase != "done" {
@@ -390,7 +400,7 @@ async fn run_job(
     tracing::info!(
         sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
         file = %label,
-        size = downloaded.as_ref().map(|b| b.len()).unwrap_or(0),
+        size = downloaded.as_ref().map_or(0, Vec::len),
         "analysis starting",
     );
     let sha_short2 = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
@@ -454,7 +464,7 @@ async fn post_result(
 ) {
     let payload = match result {
         Ok((ml, raw, duration_ms)) => {
-            let classification = match ml.get("class").and_then(|v| v.as_u64()) {
+            let classification = match ml.get("class").and_then(serde_json::Value::as_u64) {
                 Some(0) => "benign",
                 Some(1) => "suspicious",
                 Some(2) => "hostile",
@@ -529,16 +539,6 @@ async fn periodic_update(
         // are reloaded above. To pick up a new model, restart the worker.
         tracing::info!("rules updated; restart worker to pick up new model weights");
     }
-}
-
-/// Verify that a file's SHA256 matches the expected value.
-fn verify_sha256(path: &Path, expected: &str) -> Result<bool, std::io::Error> {
-    use sha2::{Sha256, Digest};
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
-    let hash = format!("{:x}", hasher.finalize());
-    Ok(hash == expected)
 }
 
 /// Download file bytes from hopper's /api/file endpoint.

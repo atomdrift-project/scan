@@ -411,7 +411,6 @@ fn format_eta(secs: f64) -> String {
 /// be loaded, or `cleave` analysis fails for the overall scan operation.
 pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     let model = Model::load(config.model_dir(), config.thresholds())?;
-    let model_version = model_version_string(model.info());
 
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
@@ -441,7 +440,6 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             &cleave_opts,
             &ctx,
             &model,
-            &model_version,
             shap.as_ref(),
             config,
         );
@@ -512,7 +510,6 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                     report,
                     &ctx,
                     &model,
-                    &model_version,
                     shap.as_ref(),
                     config,
                     cleave_opts.cancellation.as_ref(),
@@ -799,7 +796,6 @@ fn process_report(
     report: cleave::AnalysisReport,
     ctx: &ExtractContext,
     model: &Model,
-    model_version: &str,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
     cancellation: Option<&Arc<AtomicBool>>,
@@ -824,7 +820,7 @@ fn process_report(
         classification: cr.classification,
         probability: cr.probability,
         thresholds,
-        version: model_version.to_string(),
+        version: model_version_string(model.info()),
         analyzed_at: now_rfc3339(),
         cleave,
         pids: None,
@@ -874,7 +870,6 @@ fn analyze_single(
     cleave_opts: &cleave::AnalysisOptions,
     ctx: &ExtractContext,
     model: &Model,
-    model_version: &str,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
@@ -885,7 +880,6 @@ fn analyze_single(
         report,
         ctx,
         model,
-        model_version,
         shap,
         config,
         cleave_opts.cancellation.as_ref(),
