@@ -11,7 +11,7 @@ SLOW_RULE_MS ?= 200
 MAX_JOBS ?= 25
 WORKERS  ?=
 
-.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille rollout-debian rollout-ubuntu rollout-openbsd rollout-alpine rollout-macos benchmark benchmark-worker profile-slow lint test clean
+.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille rollout-debian rollout-ubuntu rollout-openbsd rollout-alpine rollout-macos benchmark benchmark-worker profile-worker profile-slow lint test clean
 
 all: build
 
@@ -177,8 +177,15 @@ benchmark: release
 
 benchmark-worker: release
 	@[ -n "$(URL)" ] || { echo "Usage: make benchmark-worker URL=<hopper-url>"; exit 1; }
+	./out/$(BINARY) --verbose worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
+		$(if $(WORKERS),--workers $(WORKERS),) \
+		2>&1 | tee /tmp/litmus-worker-benchmark.log
+
+profile-worker:
+	cargo build --profile profiling
+	@[ -n "$(URL)" ] || { echo "Usage: make profile-worker URL=<hopper-url>"; exit 1; }
 	samply record -o /tmp/litmus-worker-profile.json.gz -- \
-		./out/$(BINARY) --verbose worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
+		./target/profiling/$(BINARY) --verbose worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		2>&1 | tee /tmp/litmus-worker-benchmark.log
 

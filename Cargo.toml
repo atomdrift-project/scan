@@ -82,6 +82,14 @@ tikv-jemallocator = "0.6"
 [profile.release]
 strip = "debuginfo"
 
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = 1
+
+[patch."https://codeberg.org/atomdrift/cleave.git"]
+cleave = { path = "../cleave" }
+
 [lints]
 workspace = true
 
