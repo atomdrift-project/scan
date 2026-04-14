@@ -354,7 +354,7 @@ fn main() -> Result<()> {
                 let cores = std::thread::available_parallelism()
                     .map(std::num::NonZero::get)
                     .unwrap_or(4);
-                std::cmp::max(1, cores / 2)
+                std::cmp::max(2, cores / 2)
             });
             let allow_cidrs = match allow_cidr {
                 Some(s) => litmus::server::parse_cidr_list(&s)
@@ -425,7 +425,7 @@ fn main() -> Result<()> {
                 let cores = std::thread::available_parallelism()
                     .map(std::num::NonZero::get)
                     .unwrap_or(4);
-                std::cmp::max(2, cores / 4)
+                std::cmp::max(2, cores / 2)
             });
             let name = name.unwrap_or_else(|| {
                 hostname::get()

@@ -84,8 +84,8 @@ doas bastille cmd "$RUN" chmod 755 /usr/local/etc/rc.d/litmus-worker
 
 log "Enabling and restarting litmus-worker service"
 doas bastille sysrc "$RUN" litmus_worker_enable=YES
-doas bastille cmd "$RUN" pkill -9 -x litmus 2>/dev/null || true
 doas bastille service "$RUN" litmus-worker stop 2>/dev/null || true
+doas bastille cmd "$RUN" pkill -9 -F /var/run/litmus_worker.pid 2>/dev/null || true
 doas bastille service "$RUN" litmus-worker start
 
 log "Deployment complete"
