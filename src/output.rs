@@ -101,6 +101,15 @@ impl Palette {
 /// override or the first successful auto-detection result.
 static THEME: LazyLock<RwLock<Option<Theme>>> = LazyLock::new(|| RwLock::new(None));
 
+/// Returns true if stderr is connected to a real TTY.
+///
+/// Terminal queries (color scheme detection) must only be attempted when a TTY
+/// is present. Without one, the read blocks indefinitely or the kernel sends
+/// SIGTTIN, suspending the process.
+fn stderr_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDERR_FILENO) == 1 }
+}
+
 /// Detect the terminal theme, with env var override.
 ///
 /// Priority: `LITMUS_THEME` env var > terminal query > default (dark).
@@ -116,6 +125,8 @@ pub fn detect_theme() -> Theme {
             "light" | "white" => Theme::Light,
             _ => Theme::Dark,
         }
+    } else if !stderr_is_tty() {
+        Theme::Dark
     } else {
         match terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default()) {
             Ok(scheme) => match scheme {

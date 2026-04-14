@@ -221,7 +221,7 @@ fn main() -> Result<()> {
     let filter = if cli.verbose {
         tracing_subscriber::EnvFilter::new("litmus=debug,cleave=debug")
     } else if is_serve {
-        tracing_subscriber::EnvFilter::new("litmus=info,cleave=warn")
+        tracing_subscriber::EnvFilter::new("litmus=info,cleave=info")
     } else {
         tracing_subscriber::EnvFilter::new("litmus=warn,cleave=error")
     };

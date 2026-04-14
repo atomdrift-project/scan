@@ -122,6 +122,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let slow_rule_ms = config.slow_rule_ms;
     let timeout_secs = config.timeout_secs;
     let max_jobs = config.max_jobs;
+    let max_rss_gb = config.max_rss_gb;
     let encoded_name: String = url_encode(&name);
     let mut consecutive_errors: u32 = 0;
     let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -133,6 +134,24 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 break;
             }
         }
+
+        // Enforce memory limit before claiming more work.
+        if max_rss_gb > 0 {
+            let max_bytes = max_rss_gb.saturating_mul(1024 * 1024 * 1024);
+            if let Some(rss) = cleave::memory_tracker::current_rss() {
+                if rss > max_bytes {
+                    tracing::warn!(
+                        rss_mb = rss / 1024 / 1024,
+                        max_rss_mb = max_bytes / 1024 / 1024,
+                        "memory pressure: pausing before claiming new work",
+                    );
+                    cleave::clear_all_thread_caches();
+                    tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+                    continue;
+                }
+            }
+        }
+
         // Wait for at least one free slot.
         let available = semaphore.available_permits();
         if available == 0 {
@@ -219,6 +238,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 if let Err(ref e) = result {
                     tracing::warn!(
                         sha256 = %job.sha256,
+                        file = %job.path,
                         file_type = %job.file_type,
                         size = job.size_bytes,
                         error = %e,
@@ -292,8 +312,9 @@ async fn run_job(
     let start = Instant::now();
     let phase = cleave::PhaseTracker::new();
     let phase2 = phase.clone();
+    let phase_timeout = phase.clone();
     let label2 = label.clone();
-    let sha_short = job.sha256[..12].to_string();
+    let sha_short = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
 
     // Background phase watcher — logs transitions with timing, and emits a
     // heartbeat every 30 s so a stuck phase is visible in logs.
@@ -305,6 +326,16 @@ async fn run_job(
         loop {
             std::thread::sleep(Duration::from_millis(100));
             if cancel_watcher.load(Ordering::Relaxed) {
+                // Log completion of the final phase so elapsed time is never lost.
+                if !last_phase.is_empty() && last_phase != "done" {
+                    tracing::info!(
+                        sha256 = %sha_short,
+                        file = %label2,
+                        phase = %last_phase,
+                        elapsed_ms = phase_start.elapsed().as_millis() as u64,
+                        "phase complete",
+                    );
+                }
                 break;
             }
             let current = phase2.get();
@@ -357,12 +388,12 @@ async fn run_job(
     });
 
     tracing::info!(
-        sha256 = %&job.sha256[..12],
+        sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
         file = %label,
         size = downloaded.as_ref().map(|b| b.len()).unwrap_or(0),
         "analysis starting",
     );
-    let sha_short2 = job.sha256[..12].to_string();
+    let sha_short2 = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
     let handle = tokio::task::spawn_blocking(move || {
         tracing::info!(
             sha256 = %sha_short2,
@@ -371,9 +402,10 @@ async fn run_job(
         );
         if let Some(data) = downloaded {
             classify_bytes(&data, &label, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
-        } else {
-            let path = local.as_ref().expect("local path must be set");
+        } else if let Some(path) = local.as_ref() {
             classify_file(path, &label, &resources, slow_rule_ms, None, Some(&cancel2), Some(&phase))
+        } else {
+            Err(anyhow::anyhow!("no downloaded bytes and no local path for {label}"))
         }
     });
 
@@ -384,9 +416,12 @@ async fn run_job(
         match tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await {
             Ok(r) => r,
             Err(_) => {
+                let stuck_phase = phase_timeout.get();
                 cancel.store(true, Ordering::Relaxed);
                 let elapsed_ms = start.elapsed().as_millis() as i64;
-                return Err(format!("analysis timed out after {timeout_secs}s ({elapsed_ms}ms)"));
+                return Err(format!(
+                    "analysis timed out after {timeout_secs}s ({elapsed_ms}ms) in phase={stuck_phase}"
+                ));
             }
         }
     };
@@ -419,7 +454,8 @@ async fn post_result(
 ) {
     let payload = match result {
         Ok((ml, raw, duration_ms)) => {
-            tracing::info!(sha256 = %sha256, duration_ms = duration_ms, "analysis complete");
+            let classification = ml.get("classification").and_then(|v| v.as_str()).unwrap_or("unknown");
+            tracing::info!(sha256 = %sha256, duration_ms, classification, "analysis complete");
             ResultPayload {
                 sha256: sha256.to_string(),
                 worker: worker.to_string(),
