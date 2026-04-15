@@ -246,12 +246,13 @@ fn main() -> Result<()> {
     // when multiple worker slots run concurrent analyses with deeply nested
     // rayon::join calls (struct+YARA → embedded PE → rayon::join → YARA par_iter).
     // With num_cpus threads and N worker slots, nested tasks starve waiting for
-    // threads held by other files — a 0.4s ELF can wait 1178s. Using 64× the CPU
-    // count provides enough headroom for nested parallelism without starvation.
+    // threads held by other files — a 0.4s ELF can wait 1178s. Using 32× the CPU
+    // count provides enough headroom for nested parallelism without starvation
+    // while keeping thread stack memory (32× × 16 MB) within reasonable bounds.
     let rayon_threads = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(4)
-        * 64;
+        * 32;
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
         .stack_size(16 * 1024 * 1024)
