@@ -886,6 +886,8 @@ struct FileSummary {
     risk: FileRiskStats,
     unique_3level_paths: Vec<String>,
     imports: HashSet<String>,
+    /// (finding_id, confidence, crit_ordinal) for cross-file unique ID dedup.
+    raw_findings: Vec<serde_json::Value>,
 }
 
 impl FileSummary {
@@ -910,11 +912,15 @@ impl FileSummary {
             max_crit,
         };
 
+        // N-gram paths: full base path (depth=0), filtered by min_crit=2
+        // (baseline+). Must match Python's _ngram_paths_for_file behavior.
         let mut unique_3level_paths: Vec<String> = findings_raw
             .iter()
             .filter_map(|f| {
                 let fid = f["i"].as_str()?;
-                (f["c"].as_f64().unwrap_or(1.0) >= MIN_CONFIDENCE)
+                let conf = f["c"].as_f64().unwrap_or(1.0);
+                let crit = crit_ordinal(f);
+                (conf >= MIN_CONFIDENCE && crit >= 2)
                     .then(|| fid.split("::").next().unwrap_or(fid).to_string())
             })
             .collect::<HashSet<_>>()
@@ -953,6 +959,8 @@ impl FileSummary {
             .map(str::to_string)
             .collect();
 
+        let raw_findings: Vec<serde_json::Value> = findings_raw.iter().map(|f| (*f).clone()).collect();
+
         Self {
             path: file_entry["path"].as_str().unwrap_or("").to_string(),
             parent: file_entry["p"].as_str().unwrap_or("").to_string(),
@@ -965,6 +973,7 @@ impl FileSummary {
             risk,
             unique_3level_paths,
             imports,
+            raw_findings,
         }
     }
 }
@@ -1061,6 +1070,12 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
 fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
     let mut combined = FindingSummary::default();
 
+    // Deduplicate unique IDs across all files (matching Python's second pass
+    // in _summarize_report_files which iterates all findings again).
+    let mut notable_ids: HashSet<String> = HashSet::new();
+    let mut suspicious_ids: HashSet<String> = HashSet::new();
+    let mut hostile_ids: HashSet<String> = HashSet::new();
+
     for s in summaries {
         let fs = &s.findings;
         combined.filtered_finding_count += fs.filtered_finding_count;
@@ -1083,8 +1098,24 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
             *e = f64::max(*e, conf);
         }
         combined.finding_confidences.extend(fs.finding_confidences.iter().copied());
+
+        // Re-scan raw findings to deduplicate unique IDs across files.
+        for finding in &s.raw_findings {
+            let fid = finding["i"].as_str().unwrap_or("");
+            if fid.is_empty() { continue; }
+            let conf = finding["c"].as_f64().unwrap_or(1.0);
+            if conf < MIN_CONFIDENCE { continue; }
+            let crit = crit_ordinal(finding);
+            if crit >= 3 { notable_ids.insert(fid.to_string()); }
+            if crit >= 4 { suspicious_ids.insert(fid.to_string()); }
+            if crit >= 5 { hostile_ids.insert(fid.to_string()); }
+        }
     }
-    
+
+    combined.unique_notable_ids = notable_ids.len();
+    combined.unique_suspicious_ids = suspicious_ids.len();
+    combined.unique_hostile_ids = hostile_ids.len();
+
     let mut susp_cats: HashSet<&str> = HashSet::new();
     let mut host_cats: HashSet<&str> = HashSet::new();
     for (path, &max_ord) in &combined.sample_paths {
