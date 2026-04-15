@@ -5,7 +5,7 @@
 set -ex
 
 BUILD="${1:-build}"
-RUN="${2:-litmus}"
+RUN="${2:-litmus-worker}"
 URL="$3"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
