@@ -387,6 +387,9 @@ fn build_expected_feature_names(
         "agg:file_suspicious_count_log".to_string(),
         "agg:file_notable_count_log".to_string(),
         "agg:hostile_depth_weight".to_string(),
+        "agg:suspicious_2level_breadth".to_string(),
+        "agg:hostile_2level_breadth".to_string(),
+        "agg:objectives_breadth".to_string(),
     ]);
 
     // Group 4: ext (6)
@@ -1208,7 +1211,24 @@ fn write_aggregate_features_from_summaries(summary: &FindingSummary, summaries: 
     vec[offset + 46] = hostile_files.ln_1p();
     vec[offset + 47] = suspicious_files.ln_1p();
     vec[offset + 48] = notable_files.ln_1p();
-    vec[offset + 49] = 0.0;
+    vec[offset + 49] = 0.0; // hostile_depth_weight (computed elsewhere or zero)
+
+    // 2-level breadth features: count distinct 2-level paths at each tier.
+    let mut suspicious_2level: HashSet<String> = HashSet::new();
+    let mut hostile_2level: HashSet<String> = HashSet::new();
+    let mut objectives_2level: HashSet<String> = HashSet::new();
+    for (path, &max_ord) in &summary.sample_paths {
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() >= 2 {
+            let two_level = format!("{}/{}", parts[0], parts[1]);
+            if max_ord >= 4 { suspicious_2level.insert(two_level.clone()); }
+            if max_ord >= 5 { hostile_2level.insert(two_level.clone()); }
+            if parts[0] == "objectives" && max_ord >= 2 { objectives_2level.insert(two_level); }
+        }
+    }
+    vec[offset + 50] = suspicious_2level.len() as f32;
+    vec[offset + 51] = hostile_2level.len() as f32;
+    vec[offset + 52] = objectives_2level.len() as f32;
 }
 
 fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8] {
