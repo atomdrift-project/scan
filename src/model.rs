@@ -109,6 +109,7 @@ fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
 ///
 /// Serializes as an integer: 0 = benign, 1 = suspicious, 2 = hostile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[repr(u8)]
 pub enum Classification {
     /// File shows no significant malicious indicators.

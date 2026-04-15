@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::explain::ShapImportance;
-use crate::features::ExtractContext;
+use crate::features::{crit_ordinal, ExtractContext};
 use crate::model::{Classification, Model, Thresholds};
 use crate::OutputFormat;
 
@@ -297,6 +297,16 @@ pub struct TopFinding {
     pub crit: u32,
     /// Human-readable description of the finding.
     pub desc: String,
+}
+
+impl From<&serde_json::Value> for TopFinding {
+    fn from(f: &serde_json::Value) -> Self {
+        Self {
+            id: f["i"].as_str().unwrap_or("").to_string(),
+            crit: crit_ordinal(f),
+            desc: f["d"].as_str().unwrap_or("").to_string(),
+        }
+    }
 }
 
 /// A file embedded within an archive or self-extracting executable.
@@ -725,11 +735,7 @@ pub(crate) fn classify_report(
             .flatten()
             .filter(|ff| crit_ordinal(ff) >= 4)
             .take(3)
-            .map(|ff| TopFinding {
-                id: ff["i"].as_str().unwrap_or("").to_string(),
-                crit: ff["l"].as_u64().unwrap_or(0) as u32,
-                desc: ff["d"].as_str().unwrap_or("").to_string(),
-            })
+            .map(TopFinding::from)
             .collect();
 
         tracing::debug!(
@@ -911,23 +917,15 @@ pub fn extract_top_findings_from_json(
     let mut relevant: Vec<TopFinding> = findings
         .iter()
         .filter(|f| crit_ordinal(f) >= min_crit)
-        .map(|f| TopFinding {
-            id: f["i"].as_str().unwrap_or("").to_string(),
-            crit: f["l"].as_u64().unwrap_or(0) as u32,
-            desc: f["d"].as_str().unwrap_or("").to_string(),
-        })
+        .map(TopFinding::from)
         .collect();
 
-    // Fall back to suspicious if no hostile findings.
+    // Fall back to suspicious-level findings if no hostile-level findings.
     if relevant.is_empty() && min_crit == 5 {
         relevant = findings
             .iter()
             .filter(|f| crit_ordinal(f) >= 4)
-            .map(|f| TopFinding {
-                id: f["i"].as_str().unwrap_or("").to_string(),
-                crit: f["l"].as_u64().unwrap_or(0) as u32,
-                desc: f["d"].as_str().unwrap_or("").to_string(),
-            })
+            .map(TopFinding::from)
             .collect();
     }
 
@@ -942,8 +940,6 @@ pub fn extract_top_findings_from_json(
     relevant.truncate(5);
     relevant
 }
-
-use crate::features::crit_ordinal;
 
 /// Build a compact model version string from ModelInfo.
 /// Format: "v{spec_version}.{abi_version}-{sha256_prefix}" or with commit if available.
