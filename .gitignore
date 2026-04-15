@@ -2,3 +2,4 @@
 **/*.rs.bk
 *.pdb
 **/mutants.out*/
+out/

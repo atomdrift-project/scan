@@ -888,6 +888,8 @@ struct FileSummary {
     imports: HashSet<String>,
     /// (finding_id, confidence, crit_ordinal) for cross-file unique ID dedup.
     raw_findings: Vec<serde_json::Value>,
+    /// Whether the "is" key exists in the cleave JSON (even if empty).
+    has_imports_key: bool,
 }
 
 impl FileSummary {
@@ -960,6 +962,7 @@ impl FileSummary {
             .collect();
 
         let raw_findings: Vec<serde_json::Value> = findings_raw.iter().map(|f| (*f).clone()).collect();
+        let has_imports_key = file_entry.get("is").is_some();
 
         Self {
             path: file_entry["path"].as_str().unwrap_or("").to_string(),
@@ -974,6 +977,7 @@ impl FileSummary {
             unique_3level_paths,
             imports,
             raw_findings,
+            has_imports_key,
         }
     }
 }
@@ -1556,7 +1560,7 @@ fn write_structural_features_from_summaries(vec: &mut [f32], offset: usize, summ
 
     for s in summaries {
         if binary_like.contains(&s.file_type.as_str()) && s.size_bytes < 20_000.0 { any_tiny_binary = true; }
-        if !s.imports.is_empty() || s.file_type == "pe" || s.file_type == "elf" { // approximation of import candidates
+        if s.has_imports_key { // matches Python: 'if "is" in file_entry'
             import_candidates += 1;
             if s.imports.is_empty() { importless_candidates += 1; }
         }

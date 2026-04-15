@@ -4,6 +4,7 @@
 //! When a slot is free, it claims work from hopper's `/api/next` endpoint,
 //! analyzes the file, and posts the result back to `/api/result`.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -76,6 +77,13 @@ struct ResultPayload {
     duration_ms: i64,
 }
 
+/// A job with its file data pre-downloaded (or marked for local access).
+struct PrefetchedJob {
+    job: ClaimJob,
+    /// `Ok(None)` = use local file, `Ok(Some(bytes))` = downloaded, `Err` = download failed.
+    data: std::result::Result<Option<Vec<u8>>, String>,
+}
+
 /// Run the worker loop. Blocks until cancelled.
 pub async fn run(config: WorkerConfig) -> Result<()> {
     let name = config.name.clone();
@@ -128,6 +136,14 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let mut consecutive_errors: u32 = 0;
     let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    let mut buffer: VecDeque<PrefetchedJob> = VecDeque::new();
+    // With local data, there's no download latency to hide — just claim
+    // what we can run immediately. Without local data, prefetch 3x slots
+    // so downloads overlap with analysis.
+    let has_local_data = data_dir.is_some();
+    let prefetch_count = if has_local_data { slots } else { (slots * 3).min(32) };
+    let mut last_empty_poll = Instant::now() - Duration::from_secs(poll_secs + 1);
+
     loop {
         if let Some(max) = max_jobs {
             if completed.load(Ordering::Acquire) >= max {
@@ -153,131 +169,157 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             }
         }
 
-        // Wait for at least one free slot.
-        let available = semaphore.available_permits();
-        if available == 0 {
-            tracing::debug!(slots, "all slots occupied — waiting for a job to complete");
+        // Refill the prefetch buffer when it's running low. Rate-limit polls
+        // so we don't hammer hopper when it has no work.
+        let should_poll = buffer.len() < slots
+            && last_empty_poll.elapsed() >= Duration::from_secs(poll_secs);
+        if should_poll {
+            let poll_url = format!(
+                "{}/api/next?worker={}&count={}&slots={}",
+                base_url, encoded_name, prefetch_count, slots
+            );
+            tracing::info!(url = %poll_url, buffer = buffer.len(), "polling for work");
+            let poll_start = Instant::now();
+
+            match claim_and_prefetch(&client, &poll_url, &base_url, data_dir.as_deref()).await {
+                Ok(None) => {
+                    consecutive_errors = 0;
+                    last_empty_poll = Instant::now();
+                    if buffer.is_empty() {
+                        tracing::debug!(elapsed_ms = crate::duration_ms(poll_start.elapsed()), poll_secs, "no work available, sleeping");
+                        tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+                        continue;
+                    }
+                    // Buffer has work — keep dispatching.
+                }
+                Ok(Some(jobs)) => {
+                    consecutive_errors = 0;
+                    tracing::info!(
+                        jobs = jobs.len(),
+                        elapsed_ms = crate::duration_ms(poll_start.elapsed()),
+                        "claimed and prefetched",
+                    );
+                    buffer.extend(jobs);
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    let backoff = backoff_duration(poll_secs, consecutive_errors);
+                    tracing::warn!(error = %e, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "poll/prefetch failed");
+                    if buffer.is_empty() {
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    // Buffer has work — keep dispatching despite poll failure.
+                }
+            }
         }
-        let gate = semaphore
+
+        // Dispatch the next prefetched job when a slot is free.
+        let pj = match buffer.pop_front() {
+            Some(pj) => pj,
+            None => {
+                // Buffer empty and poll rate-limited — wait before retrying.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        // Wait for a free analysis slot.
+        let permit = semaphore
             .clone()
             .acquire_owned()
             .await
             .context("semaphore closed")?;
-        let free = semaphore.available_permits() + 1;
 
-        // Poll for work.
-        let poll_url = format!(
-            "{}/api/next?worker={}&count={}&slots={}",
-            base_url, encoded_name, free, slots
-        );
-        tracing::info!(url = %poll_url, free_slots = free, "polling for work");
-        let poll_start = Instant::now();
-        let resp = match client.get(&poll_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                drop(gate);
-                consecutive_errors += 1;
-                let backoff = backoff_duration(poll_secs, consecutive_errors);
-                tracing::warn!(error = %e, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "poll failed");
-                tokio::time::sleep(backoff).await;
-                continue;
+        let client = client.clone();
+        let resources = Arc::clone(&resources);
+        let url = base_url.clone();
+        let name = name.clone();
+        let data_dir = data_dir.clone();
+        let completed = Arc::clone(&completed);
+
+        tokio::spawn(async move {
+            let result = run_job(
+                &client, &url, data_dir.as_deref(), &pj.job, &resources,
+                slow_rule_ms, timeout_secs, pj.data,
+            ).await;
+            if let Err(ref e) = result {
+                tracing::warn!(
+                    sha256 = %pj.job.sha256,
+                    file = %pj.job.path,
+                    file_type = %pj.job.file_type,
+                    size = pj.job.size_bytes,
+                    error = %e,
+                    "analysis failed",
+                );
             }
-        };
-
-        if resp.status() == reqwest::StatusCode::NO_CONTENT {
-            drop(gate);
-            consecutive_errors = 0;
-            tracing::debug!(elapsed_ms = crate::duration_ms(poll_start.elapsed()), poll_secs, "no work available, sleeping");
-            tokio::time::sleep(Duration::from_secs(poll_secs)).await;
-            continue;
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            drop(gate);
-            consecutive_errors += 1;
-            let backoff = backoff_duration(poll_secs, consecutive_errors);
-            tracing::warn!(%status, body = %body, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "unexpected response from /api/next");
-            tokio::time::sleep(backoff).await;
-            continue;
-        }
-
-        consecutive_errors = 0;
-
-        let resp_body = match resp.text().await {
-            Ok(b) => b,
-            Err(e) => {
-                drop(gate);
-                consecutive_errors += 1;
-                let backoff = backoff_duration(poll_secs, consecutive_errors);
-                tracing::warn!(error = %e, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "failed to read claim response body");
-                tokio::time::sleep(backoff).await;
-                continue;
-            }
-        };
-        let claim: ClaimResponse = match serde_json::from_str(&resp_body) {
-            Ok(c) => c,
-            Err(e) => {
-                drop(gate);
-                consecutive_errors += 1;
-                let backoff = backoff_duration(poll_secs, consecutive_errors);
-                // floor_char_boundary guarantees a valid UTF-8 boundary.
-                #[allow(clippy::string_slice)]
-                let preview = &resp_body[..resp_body.floor_char_boundary(200)];
-                tracing::warn!(error = %e, body = %preview, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "failed to parse claim response");
-                tokio::time::sleep(backoff).await;
-                continue;
-            }
-        };
-
-        tracing::info!(
-            jobs = claim.jobs.len(),
-            elapsed_ms = crate::duration_ms(poll_start.elapsed()),
-            "claimed work from server",
-        );
-
-        // Release the gate permit — each job gets its own permit below.
-        drop(gate);
-
-        for job in claim.jobs {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .context("semaphore closed")?;
-            let client = client.clone();
-            let resources = Arc::clone(&resources);
-            let url = base_url.clone();
-            let name = name.clone();
-            let data_dir = data_dir.clone();
-            let completed = Arc::clone(&completed);
-
-            tokio::spawn(async move {
-                let result = run_job(
-                    &client, &url, data_dir.as_deref(), &job, &resources, slow_rule_ms, timeout_secs,
-                ).await;
-                if let Err(ref e) = result {
-                    tracing::warn!(
-                        sha256 = %job.sha256,
-                        file = %job.path,
-                        file_type = %job.file_type,
-                        size = job.size_bytes,
-                        error = %e,
-                        "analysis failed",
-                    );
-                }
-                post_result(&client, &url, &name, &job.sha256, result).await;
-                completed.fetch_add(1, Ordering::Release);
-                drop(permit);
-            });
-        }
+            post_result(&client, &url, &name, &pj.job.sha256, result).await;
+            completed.fetch_add(1, Ordering::Release);
+            drop(permit);
+        });
     }
 
     // Drain any in-flight work before exiting.
     let _ = semaphore.acquire_many(u32::try_from(slots).unwrap_or(u32::MAX)).await;
     tracing::info!("all in-flight jobs finished, exiting");
     Ok(())
+}
+
+/// Claim jobs from hopper and prefetch file data for all of them concurrently.
+/// Returns `Ok(None)` if no work is available (HTTP 204).
+async fn claim_and_prefetch(
+    client: &reqwest::Client,
+    poll_url: &str,
+    base_url: &str,
+    data_dir: Option<&Path>,
+) -> Result<Option<Vec<PrefetchedJob>>> {
+    let resp = client.get(poll_url).send().await.context("poll request")?;
+
+    if resp.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("unexpected response from /api/next: {status} {body}");
+    }
+
+    let resp_body = resp.text().await.context("read claim body")?;
+    let claim: ClaimResponse = serde_json::from_str(&resp_body).context("parse claim response")?;
+
+    if claim.jobs.is_empty() {
+        return Ok(None);
+    }
+
+    // Prefetch all files concurrently.
+    let mut set = tokio::task::JoinSet::new();
+    for job in claim.jobs {
+        let client = client.clone();
+        let base_url = base_url.to_string();
+        let data_dir = data_dir.map(Path::to_path_buf);
+        set.spawn(async move {
+            let local_path = data_dir.as_deref().map(|d| d.join(&job.path));
+            let use_local = matches!(local_path, Some(ref p) if p.exists());
+            let data = if use_local {
+                Ok(None)
+            } else {
+                match download_bytes(&client, &base_url, &job.sha256, &job.path).await {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(e) => Err(e),
+                }
+            };
+            PrefetchedJob { job, data }
+        });
+    }
+
+    let mut prefetched = Vec::with_capacity(set.len());
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok(pj) => prefetched.push(pj),
+            Err(e) => tracing::warn!(error = %e, "prefetch task panicked"),
+        }
+    }
+    Ok(Some(prefetched))
 }
 
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
@@ -291,14 +333,12 @@ async fn run_job(
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
     timeout_secs: u64,
+    prefetched: std::result::Result<Option<Vec<u8>>, String>,
 ) -> Result<(serde_json::Value, serde_json::Value, i64), String> {
     let label = Path::new(&job.path).file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| job.sha256.clone());
 
-    // Try local file first; fall back to downloading bytes from hopper.
-    // Trust hopper's SHA256 — re-hashing would read the file twice and block
-    // the tokio executor with blocking I/O.
     let local_path = data_dir.map(|d| d.join(&job.path));
     let use_local = match local_path {
         Some(ref p) if p.exists() => {
@@ -308,13 +348,22 @@ async fn run_job(
         _ => false,
     };
 
-    // Download bytes if not using local file. analyze_bytes avoids writing to disk.
+    // Use prefetched bytes, or fall back to downloading if prefetch failed.
     let downloaded: Option<Vec<u8>> = if use_local {
         None
     } else {
-        let bytes = download_bytes(client, base_url, &job.sha256, &label).await?;
-        tracing::info!(sha256 = %job.sha256, file = %label, size = bytes.len(), "downloaded for in-memory analysis");
-        Some(bytes)
+        match prefetched {
+            Ok(Some(bytes)) => {
+                tracing::info!(sha256 = %job.sha256, file = %label, size = bytes.len(), "using prefetched data");
+                Some(bytes)
+            }
+            Ok(None) => None, // shouldn't happen for remote jobs, but handle gracefully
+            Err(e) => {
+                tracing::warn!(sha256 = %job.sha256, file = %label, error = %e, "prefetch failed, downloading directly");
+                let bytes = download_bytes(client, base_url, &job.sha256, &job.path).await?;
+                Some(bytes)
+            }
+        }
     };
 
     let resources = Arc::clone(resources);
@@ -591,24 +640,43 @@ async fn periodic_update(interval: Duration) {
     }
 }
 
-/// Download file bytes from hopper's /api/file endpoint.
+/// Download file bytes from hopper. Tries the fast `/data/{path}` endpoint
+/// first (static file serving, no DB query). Falls back to `/api/file/{sha256}`
+/// for backward compatibility with older hopper versions.
 async fn download_bytes(
     client: &reqwest::Client,
     base_url: &str,
     sha256: &str,
-    label: &str,
+    path: &str,
 ) -> Result<Vec<u8>, String> {
-    let url = format!("{}/api/file/{}", base_url, sha256);
-    tracing::debug!(sha256 = %sha256, file = %label, "downloading from server");
     let start = Instant::now();
-    let resp = client.get(&url).send().await.map_err(|e| format!("download {label}: {e}"))?;
+
+    // Try path-based endpoint first (no DB lookup on hopper side).
+    // Encode each path segment to handle filenames with spaces or special chars.
+    let encoded_path: String = path.split('/')
+        .map(|seg| url_encode(seg))
+        .collect::<Vec<_>>()
+        .join("/");
+    let data_url = format!("{}/data/{}", base_url, encoded_path);
+    tracing::debug!(sha256 = %sha256, url = %data_url, "downloading via /data/");
+    let resp = client.get(&data_url).send().await.map_err(|e| format!("download {path}: {e}"))?;
+
+    let resp = if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // Fall back to legacy SHA256-based endpoint.
+        let file_url = format!("{}/api/file/{}", base_url, sha256);
+        tracing::debug!(sha256 = %sha256, url = %file_url, "falling back to /api/file/");
+        client.get(&file_url).send().await.map_err(|e| format!("download {path}: {e}"))?
+    } else {
+        resp
+    };
+
     if !resp.status().is_success() {
-        return Err(format!("download {label}: HTTP {}", resp.status()));
+        return Err(format!("download {path}: HTTP {}", resp.status()));
     }
-    let bytes = resp.bytes().await.map_err(|e| format!("download {label}: read body: {e}"))?;
+    let bytes = resp.bytes().await.map_err(|e| format!("download {path}: read body: {e}"))?;
     tracing::info!(
         sha256 = %sha256,
-        file = %label,
+        file = %path,
         bytes = bytes.len(),
         elapsed_ms = crate::duration_ms(start.elapsed()),
         "download complete",

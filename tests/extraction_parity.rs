@@ -25,6 +25,8 @@ fn model_dir() -> std::path::PathBuf {
 #[derive(serde::Deserialize)]
 struct ExtractionFixture {
     n_features: usize,
+    #[serde(default)]
+    feature_names: Vec<String>,
     samples: Vec<ExtractionSample>,
 }
 
@@ -82,6 +84,22 @@ fn feature_extraction_matches_collimator() {
         fixture.n_features,
     );
 
+    // Verify feature name ordering matches between litmus and Python.
+    // This catches offset bugs (e.g., adding features to agg without
+    // updating litmus offsets) with a clear error message.
+    if !fixture.feature_names.is_empty() {
+        let rust_names = spec.feature_names();
+        let n = rust_names.len().min(fixture.feature_names.len());
+        for j in 0..n {
+            assert_eq!(
+                rust_names[j], fixture.feature_names[j],
+                "feature name mismatch at index {j}: \
+                 rust={:?} python={:?} — likely an offset bug in litmus",
+                rust_names[j], fixture.feature_names[j],
+            );
+        }
+    }
+
     let ctx = ExtractContext::new(&spec);
 
     for (i, sample) in fixture.samples.iter().enumerate() {
@@ -93,27 +111,37 @@ fn feature_extraction_matches_collimator() {
             "sample {i}: feature vector length mismatch"
         );
 
-        let mut max_diff: f32 = 0.0;
-        let mut worst_idx: usize = 0;
+        // Collect ALL diverging features, not just the worst one.
+        let mut divergences: Vec<(usize, f32, f32, f32)> = Vec::new();
         for (j, (&rust_val, &python_val)) in rust_features
             .iter()
             .zip(sample.expected_features.iter())
             .enumerate()
         {
             let diff = (rust_val - python_val).abs();
-            if diff > max_diff {
-                max_diff = diff;
-                worst_idx = j;
+            if diff > 1e-5 {
+                divergences.push((j, rust_val, python_val, diff));
             }
         }
 
-        assert!(
-            max_diff < 1e-5,
-            "sample {i}: feature extraction diverges — max diff {max_diff:.2e} \
-             at feature index {worst_idx} (rust={:.8}, python={:.8})",
-            rust_features[worst_idx],
-            sample.expected_features[worst_idx],
-        );
+        if !divergences.is_empty() {
+            divergences.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+            let mut msg = format!(
+                "sample {i}: {n} features diverge (showing up to 10):\n",
+                n = divergences.len()
+            );
+            for &(j, rust_val, python_val, diff) in divergences.iter().take(10) {
+                let name = if j < fixture.feature_names.len() {
+                    fixture.feature_names[j].as_str()
+                } else {
+                    "?"
+                };
+                msg.push_str(&format!(
+                    "  [{j}] {name}: rust={rust_val:.6} python={python_val:.6} diff={diff:.2e}\n"
+                ));
+            }
+            panic!("{msg}");
+        }
     }
 }
 
@@ -154,24 +182,29 @@ fn full_pipeline_matches_collimator() {
 
         // Verify standardized features match Python.
         if let Some(ref expected_std) = sample.expected_standardized {
-            let mut max_diff: f32 = 0.0;
-            let mut worst_idx: usize = 0;
+            let mut divergences: Vec<(usize, f32, f32, f32)> = Vec::new();
             for (j, (&rust_val, &python_val)) in
                 features.iter().zip(expected_std.iter()).enumerate()
             {
                 let diff = (rust_val - python_val).abs();
-                if diff > max_diff {
-                    max_diff = diff;
-                    worst_idx = j;
+                if diff > 1e-4 {
+                    divergences.push((j, rust_val, python_val, diff));
                 }
             }
-            assert!(
-                max_diff < 1e-4,
-                "sample {i}: standardization diverges — max diff {max_diff:.2e} \
-                 at feature index {worst_idx} (rust={:.8}, python={:.8})",
-                features[worst_idx],
-                expected_std[worst_idx],
-            );
+            if !divergences.is_empty() {
+                divergences.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+                let mut msg = format!(
+                    "sample {i}: standardization — {n} features diverge:\n",
+                    n = divergences.len()
+                );
+                for &(j, rv, pv, diff) in divergences.iter().take(10) {
+                    let name = fixture.feature_names.get(j).map(|s| s.as_str()).unwrap_or("?");
+                    msg.push_str(&format!(
+                        "  [{j}] {name}: rust={rv:.6} python={pv:.6} diff={diff:.2e}\n"
+                    ));
+                }
+                panic!("{msg}");
+            }
         }
 
         // Step 3: predict.
