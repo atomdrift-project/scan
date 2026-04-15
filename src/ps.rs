@@ -124,25 +124,14 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
             }
         };
 
-        match by_sha.get_mut(&hash) {
-            Some(group) => {
-                group.pids.extend(pids);
-                if deleted {
-                    group.deleted = true;
-                }
-            }
-            None => {
-                by_sha.insert(
-                    hash.clone(),
-                    ProcessGroup {
-                        path,
-                        pids,
-                        deleted,
-                        sha256: hash,
-                    },
-                );
-            }
-        }
+        let group = by_sha.entry(hash.clone()).or_insert_with(|| ProcessGroup {
+            path,
+            pids: Vec::new(),
+            deleted: false,
+            sha256: hash,
+        });
+        group.pids.extend(pids);
+        group.deleted |= deleted;
     }
 
     let groups: Vec<ProcessGroup> = by_sha.into_values().collect();
@@ -320,7 +309,7 @@ fn build_result(
         analyzed_at: crate::scan::now_rfc3339(),
         cleave,
         pids: Some(group.pids.clone()),
-        deleted: if group.deleted { Some(true) } else { None },
+        deleted: group.deleted.then_some(true),
         path: display_path.display().to_string(),
         finding_counts: cr.finding_counts,
         formula: cr.formula,

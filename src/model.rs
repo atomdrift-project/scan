@@ -326,7 +326,6 @@ impl Model {
     /// # Errors
     /// Returns an error if thresholds are invalid, required model artifacts are
     /// missing, or the loaded feature spec does not match this build.
-    /// Load model artifacts from a directory.
     ///
     /// Threshold resolution order:
     /// 1. Explicit `thresholds` argument (from CLI flags)

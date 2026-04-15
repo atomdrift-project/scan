@@ -90,7 +90,13 @@ fn describe_feature(name: &str) -> String {
     // v12 path×tier binary features: "path:objectives/evasion/process:hostile"
     if let Some(rest) = name.strip_prefix("path:") {
         if let Some((path, tier)) = rest.rsplit_once(':') {
-            let short = humanize_path(path);
+            let short = path
+                .strip_prefix("objectives/")
+                .or_else(|| path.strip_prefix("micro-behaviors/"))
+                .or_else(|| path.strip_prefix("well-known/"))
+                .or_else(|| path.strip_prefix("metadata/"))
+                .unwrap_or(path)
+                .replace('/', " > ");
             return format!("{short} [{tier}]");
         }
         return format!("path: {}", rest.replace('/', " > "));
@@ -111,15 +117,4 @@ fn describe_feature(name: &str) -> String {
         return format!("structural: {}", rest.replace('_', " "));
     }
     name.to_string()
-}
-
-/// Shorten hierarchical paths to human-readable form.
-fn humanize_path(path: &str) -> String {
-    let short = path
-        .strip_prefix("objectives/")
-        .or_else(|| path.strip_prefix("micro-behaviors/"))
-        .or_else(|| path.strip_prefix("well-known/"))
-        .or_else(|| path.strip_prefix("metadata/"))
-        .unwrap_or(path);
-    short.replace('/', " > ")
 }

@@ -28,13 +28,11 @@ impl fmt::Display for MissingTool {
 /// An empty vec means the environment is fully equipped.
 #[must_use]
 pub fn missing() -> Vec<MissingTool> {
-    let mut absent = Vec::new();
-
-    for &(name, purpose, install) in TOOLS {
-        if !bin_available(name) {
-            absent.push(MissingTool { name, purpose, install });
-        }
-    }
+    let mut absent: Vec<MissingTool> = TOOLS
+        .iter()
+        .filter(|&&(name, _, _)| !bin_available(name))
+        .map(|&(name, purpose, install)| MissingTool { name, purpose, install })
+        .collect();
 
     // 7-Zip ships under several binary names depending on the platform.
     if !["7z", "7za", "7zz", "7zr"].iter().any(|&n| bin_available(n)) {

@@ -401,11 +401,17 @@ fn print_detail_lines(result: &ScanResult, p: &Palette) {
             .iter()
             .take(4)
             .map(|f| {
-                let name = short_finding_id(&f.id);
+                let base = f.id.split("::").next().unwrap_or(&f.id);
+                let name = base
+                    .strip_prefix("objectives/")
+                    .or_else(|| base.strip_prefix("micro-behaviors/"))
+                    .or_else(|| base.strip_prefix("well-known/"))
+                    .or_else(|| base.strip_prefix("metadata/"))
+                    .unwrap_or(base);
                 match f.crit {
-                    5 => fg(p.hostile_finding, &name),
-                    4 => fg(p.suspicious_finding, &name),
-                    _ => name,
+                    5 => fg(p.hostile_finding, name),
+                    4 => fg(p.suspicious_finding, name),
+                    _ => name.to_string(),
                 }
             })
             .collect();
@@ -511,16 +517,6 @@ pub fn print_summary(summary: &ScanSummary) {
     eprintln!();
 }
 
-/// Shorten finding IDs by stripping namespace prefixes and variants.
-fn short_finding_id(id: &str) -> String {
-    let base = id.split("::").next().unwrap_or(id);
-    base.strip_prefix("objectives/")
-        .or_else(|| base.strip_prefix("micro-behaviors/"))
-        .or_else(|| base.strip_prefix("well-known/"))
-        .or_else(|| base.strip_prefix("metadata/"))
-        .unwrap_or(base)
-        .to_string()
-}
 
 fn format_elapsed(ms: u64) -> String {
     if ms < 1000 {

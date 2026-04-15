@@ -537,12 +537,15 @@ impl ExtractContext {
     /// Build lookup tables from a feature specification.
     #[must_use]
     pub fn new(spec: &FeatureSpec) -> Self {
-        let presence_lookup: HashMap<String, usize> = spec.presence_vocab.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
-        let ft_lookup: HashMap<String, usize> = spec.filetype_vocab.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
-        let element_lookup: HashMap<String, usize> = spec.element_vocab.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
-        let ghost_lookup: HashMap<String, usize> = spec.ghost_vocab.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
-        let skeleton_lookup: HashMap<String, usize> = spec.skeleton_vocab.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
-        let rare_lookup: HashMap<String, usize> = spec.rare_element_vocab.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
+        let vocab_index = |v: &[String]| -> HashMap<String, usize> {
+            v.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect()
+        };
+        let presence_lookup = vocab_index(&spec.presence_vocab);
+        let ft_lookup = vocab_index(&spec.filetype_vocab);
+        let element_lookup = vocab_index(&spec.element_vocab);
+        let ghost_lookup = vocab_index(&spec.ghost_vocab);
+        let skeleton_lookup = vocab_index(&spec.skeleton_vocab);
+        let rare_lookup = vocab_index(&spec.rare_element_vocab);
 
         // Optimized bigram/trigram lookups
         let mut path_to_id = HashMap::new();
@@ -899,42 +902,48 @@ impl FileSummary {
             max_crit,
         };
 
-        let mut unique_3level_paths_set: HashSet<String> = HashSet::new();
-        for finding in findings_raw {
-            if let Some(fid) = finding["i"].as_str() {
-                if finding["c"].as_f64().unwrap_or(1.0) >= MIN_CONFIDENCE {
-                    unique_3level_paths_set.insert(fid.split("::").next().unwrap_or(fid).to_string());
-                }
-            }
-        }
-        let mut unique_3level_paths: Vec<String> = unique_3level_paths_set.into_iter().collect();
+        let mut unique_3level_paths: Vec<String> = findings_raw
+            .iter()
+            .filter_map(|f| {
+                let fid = f["i"].as_str()?;
+                (f["c"].as_f64().unwrap_or(1.0) >= MIN_CONFIDENCE)
+                    .then(|| fid.split("::").next().unwrap_or(fid).to_string())
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         unique_3level_paths.sort();
 
-        let mut metrics = HashMap::new();
-        if let Some(obj) = file_entry.get("ms").and_then(|v| v.as_object()) {
-            for (group, fields) in obj {
-                if let Some(f_obj) = fields.as_object() {
-                    let mut group_map = HashMap::new();
-                    for (k, v) in f_obj {
-                        group_map.insert(k.clone(), v.as_f64().unwrap_or(0.0));
-                    }
-                    metrics.insert(group.clone(), group_map);
-                }
-            }
-        }
+        let metrics: HashMap<String, HashMap<String, f64>> = file_entry
+            .get("ms")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(group, fields)| {
+                        let group_map = fields
+                            .as_object()?
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.as_f64().unwrap_or(0.0)))
+                            .collect();
+                        Some((group.clone(), group_map))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let overall_entropy = metrics.get("binary").and_then(|m| m.get("overall_entropy")).copied().unwrap_or(0.0);
 
-        let mut imports: HashSet<String> = HashSet::new();
-        if let Some(arr) = file_entry.get("is").and_then(|v| v.as_array()) {
-            for imp in arr {
-                if let Some(s) = imp.as_str() {
-                    imports.insert(s.to_string());
-                } else if let Some(n) = imp.get("n").and_then(|v| v.as_str()) {
-                    imports.insert(n.to_string());
-                }
-            }
-        }
+        let imports: HashSet<String> = file_entry
+            .get("is")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|imp| {
+                imp.as_str()
+                    .or_else(|| imp.get("n").and_then(|v| v.as_str()))
+            })
+            .map(str::to_string)
+            .collect();
 
         Self {
             path: file_entry["path"].as_str().unwrap_or("").to_string(),
@@ -1022,7 +1031,7 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
             let entry = summary.sample_paths.entry(path.to_owned()).or_insert(0);
             *entry = (*entry).max(crit_ord);
             let conf_entry = summary.path_confidences.entry(path.to_owned()).or_insert(0.0);
-            if conf > *conf_entry { *conf_entry = conf; }
+            *conf_entry = f64::max(*conf_entry, conf);
         }
     }
 
@@ -1055,15 +1064,15 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
         combined.well_known_suspicious += fs.well_known_suspicious;
         combined.third_party_max_crit = combined.third_party_max_crit.max(fs.third_party_max_crit);
         combined.well_known_max_crit = combined.well_known_max_crit.max(fs.well_known_max_crit);
-        combined.has_yara = combined.has_yara || fs.has_yara;
+        combined.has_yara |= fs.has_yara;
 
         for (path, max_ord) in &fs.sample_paths {
             let entry = combined.sample_paths.entry(path.clone()).or_insert(0);
             *entry = (*entry).max(*max_ord);
         }
         for (path, &conf) in &fs.path_confidences {
-            let entry = combined.path_confidences.entry(path.clone()).or_insert(0.0);
-            if conf > *entry { *entry = conf; }
+            let e = combined.path_confidences.entry(path.clone()).or_insert(0.0);
+            *e = f64::max(*e, conf);
         }
         combined.finding_confidences.extend(fs.finding_confidences.iter().copied());
     }
@@ -1284,7 +1293,7 @@ fn write_structural_extensions_from_summaries(summaries: &[FileSummary], combine
     let mut hostile_mtimes = Vec::new();
     let mut entropies = Vec::new();
     let mut code_entropies = Vec::new();
-    let mut max_entropy = 0.0;
+    let mut max_entropy = 0.0_f64;
     let mut hostile_files = 0;
     let mut hostile_files_with_parent = 0;
     let mut inner_file_count = 0;
@@ -1321,7 +1330,7 @@ fn write_structural_extensions_from_summaries(summaries: &[FileSummary], combine
 
         if let Some(t) = s.mtime { mtimes.push(t); }
         if s.overall_entropy > 0.0 { entropies.push(s.overall_entropy); }
-        if s.overall_entropy > max_entropy { max_entropy = s.overall_entropy; }
+        max_entropy = max_entropy.max(s.overall_entropy);
 
         if s.findings.hostile_finding_count > 0 {
             hostile_files += 1;
@@ -1353,7 +1362,7 @@ fn write_structural_extensions_from_summaries(summaries: &[FileSummary], combine
         let mx = entropies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         vec[offset + 6] = (mx - mean) as f32;
     }
-    vec[offset + 7] = if hostile_files > 0 && hostile_files_with_parent == 0 { 1.0 } else { 0.0 };
+    vec[offset + 7] = f32::from(hostile_files > 0 && hostile_files_with_parent == 0);
     if !mtimes.is_empty() && !hostile_mtimes.is_empty() {
         let mut sorted = mtimes.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1367,7 +1376,7 @@ fn write_structural_extensions_from_summaries(summaries: &[FileSummary], combine
         let max_code_ent = code_entropies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         vec[offset + 9] = (max_code_ent - avg_ent) as f32;
     }
-    vec[offset + 10] = if has_foreign_binaries { 1.0 } else { 0.0 };
+    vec[offset + 10] = f32::from(has_foreign_binaries);
     vec[offset + 11] = extension_mismatches as f32;
     if total_loc > 0 { vec[offset + 12] = (hostile_files as f32 * 1000.0) / total_loc as f32; }
 }
@@ -1455,7 +1464,7 @@ fn write_external_summary_features_from_combined(summary: &FindingSummary, vec: 
     vec[offset + 2] = summary.well_known_max_crit as f32;
     vec[offset + 3] = summary.well_known_hostile as f32;
     vec[offset + 4] = summary.well_known_suspicious as f32;
-    vec[offset + 5] = if summary.has_yara { 1.0 } else { 0.0 };
+    vec[offset + 5] = f32::from(summary.has_yara);
 }
 
 fn merge_metric_summaries(summaries: &[FileSummary]) -> serde_json::Value {
@@ -1464,8 +1473,8 @@ fn merge_metric_summaries(summaries: &[FileSummary]) -> serde_json::Value {
         for (group, fields) in &s.metrics {
             let group_map = merged.entry(group.clone()).or_default();
             for (fname, &val) in fields {
-                let entry = group_map.entry(fname.clone()).or_insert(f64::NEG_INFINITY);
-                if val > *entry { *entry = val; }
+                let e = group_map.entry(fname.clone()).or_insert(f64::NEG_INFINITY);
+                *e = f64::max(*e, val);
             }
         }
     }
@@ -1485,7 +1494,7 @@ fn write_structural_features_from_summaries(vec: &mut [f32], offset: usize, summ
     let mut any_tiny_binary = false;
     let mut import_candidates = 0;
     let mut importless_candidates = 0;
-    let mut max_entropy = 0.0;
+    let mut max_entropy = 0.0_f64;
     let mut suspicious_files = 0;
     let mut hostile_files = 0;
 
@@ -1495,19 +1504,19 @@ fn write_structural_features_from_summaries(vec: &mut [f32], offset: usize, summ
             import_candidates += 1;
             if s.imports.is_empty() { importless_candidates += 1; }
         }
-        if s.overall_entropy > max_entropy { max_entropy = s.overall_entropy; }
+        max_entropy = max_entropy.max(s.overall_entropy);
         if s.findings.suspicious_finding_count > 0 { suspicious_files += 1; }
         if s.findings.hostile_finding_count > 0 { hostile_files += 1; }
     }
 
-    vec[offset] = if any_tiny_binary { 1.0 } else { 0.0 };
-    vec[offset + 1] = if import_candidates > 0 && importless_candidates == import_candidates { 1.0 } else { 0.0 };
-    vec[offset + 2] = if filtered_finding_count == 0 { 1.0 } else { 0.0 };
+    vec[offset] = f32::from(any_tiny_binary);
+    vec[offset + 1] = f32::from(import_candidates > 0 && importless_candidates == import_candidates);
+    vec[offset + 2] = f32::from(filtered_finding_count == 0);
     vec[offset + 3] = (filtered_finding_count as f32 + 1.0).ln();
     let file_count = summaries.len() as f32;
     vec[offset + 4] = (file_count + 1.0).ln();
     vec[offset + 5] = ((file_count - 1.0).max(0.0) + 1.0).ln();
-    vec[offset + 6] = if filtered_finding_count < 5 && max_entropy > 6.5 { 1.0 } else { 0.0 };
+    vec[offset + 6] = f32::from(filtered_finding_count < 5 && max_entropy > 6.5);
     let denom = summaries.len().max(1) as f32;
     vec[offset + 7] = suspicious_files as f32 / denom;
     vec[offset + 8] = hostile_files as f32 / denom;

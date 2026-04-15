@@ -42,7 +42,12 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
     }
 
     if is_git_repo(&data_dir) {
-        let missing = missing_artifacts(&data_dir);
+        let model_path = data_dir.join(CURRENT_MODEL);
+        let missing: Vec<String> = MODEL_ARTIFACTS
+            .iter()
+            .filter(|f| !model_path.join(f).exists())
+            .map(|f| format!("{CURRENT_MODEL}/{f}"))
+            .collect();
         eprintln!(
             "Models exist at {} but missing: {} — removing in 30s (Ctrl-C to abort)...",
             data_dir.display(),
@@ -184,14 +189,6 @@ fn has_models(path: &Path) -> bool {
     MODEL_ARTIFACTS.iter().all(|f| model.join(f).exists())
 }
 
-fn missing_artifacts(path: &Path) -> Vec<String> {
-    let model = path.join(CURRENT_MODEL);
-    MODEL_ARTIFACTS
-        .iter()
-        .filter(|f| !model.join(f).exists())
-        .map(|f| format!("{CURRENT_MODEL}/{f}"))
-        .collect()
-}
 
 fn clone_repo(target: &Path) -> std::io::Result<()> {
     check_git_available()?;

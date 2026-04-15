@@ -338,17 +338,7 @@ fn main() -> Result<()> {
                 cli.scan_threads,
                 cli.extra,
             )?;
-            let result = run_scan_paths(&paths, &config)?;
-
-            if result.hostile > 0 {
-                process::exit(1);
-            }
-            if result.suspicious > 0 {
-                process::exit(2);
-            }
-            if result.errors > 0 {
-                process::exit(3);
-            }
+            exit_for_summary(&run_scan_paths(&paths, &config)?);
         }
         Commands::Ps => {
             let config = litmus::ScanConfig::new(
@@ -360,17 +350,7 @@ fn main() -> Result<()> {
                 cli.scan_threads,
                 cli.extra,
             )?;
-            let result = litmus::ps::run(&config)?;
-
-            if result.hostile > 0 {
-                process::exit(1);
-            }
-            if result.suspicious > 0 {
-                process::exit(2);
-            }
-            if result.errors > 0 {
-                process::exit(3);
-            }
+            exit_for_summary(&litmus::ps::run(&config)?);
         }
         Commands::Serve {
             bind,
@@ -396,12 +376,7 @@ fn main() -> Result<()> {
                     p.canonicalize().unwrap_or(p)
                 })
                 .collect();
-            let workers = workers.unwrap_or_else(|| {
-                let cores = std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4);
-                std::cmp::max(2, cores / 2)
-            });
+            let workers = workers.unwrap_or_else(default_workers);
             let allow_cidrs = match allow_cidr {
                 Some(s) => litmus::server::parse_cidr_list(&s)
                     .map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?,
@@ -472,12 +447,7 @@ fn main() -> Result<()> {
                 std::env::set_var("CLEAVE_TRAITS_DIR", p);
             }
             let model_dir = resolve_model_dir()?;
-            let workers = workers.unwrap_or_else(|| {
-                let cores = std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4);
-                std::cmp::max(2, cores / 2)
-            });
+            let workers = workers.unwrap_or_else(default_workers);
             let name = name.unwrap_or_else(|| {
                 hostname::get()
                     .ok()
@@ -515,6 +485,27 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Default worker count: at least 2, and half the available CPU cores.
+fn default_workers() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(4);
+    std::cmp::max(2, cores / 2)
+}
+
+/// Exit with the appropriate code based on scan summary counters.
+fn exit_for_summary(summary: &litmus::ScanSummary) {
+    if summary.hostile > 0 {
+        process::exit(1);
+    }
+    if summary.suspicious > 0 {
+        process::exit(2);
+    }
+    if summary.errors > 0 {
+        process::exit(3);
+    }
 }
 
 fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litmus::ScanSummary> {

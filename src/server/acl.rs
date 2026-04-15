@@ -10,7 +10,7 @@
 //! CIDR matching is hand-rolled (no extra crate dependency) and supports
 //! both IPv4 and IPv6.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -56,27 +56,19 @@ impl Cidr {
     #[must_use]
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.network, ip) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => v4_match(net, ip, self.prefix_len),
-            (IpAddr::V6(net), IpAddr::V6(ip)) => v6_match(net, ip, self.prefix_len),
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                if self.prefix_len == 0 { return true; }
+                let mask: u32 = u32::MAX << (32 - self.prefix_len);
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                if self.prefix_len == 0 { return true; }
+                let mask: u128 = u128::MAX << (128 - self.prefix_len);
+                (u128::from(net) & mask) == (u128::from(ip) & mask)
+            }
             _ => false,
         }
     }
-}
-
-fn v4_match(net: Ipv4Addr, ip: Ipv4Addr, prefix: u8) -> bool {
-    if prefix == 0 {
-        return true;
-    }
-    let mask: u32 = u32::MAX << (32 - prefix);
-    (u32::from(net) & mask) == (u32::from(ip) & mask)
-}
-
-fn v6_match(net: Ipv6Addr, ip: Ipv6Addr, prefix: u8) -> bool {
-    if prefix == 0 {
-        return true;
-    }
-    let mask: u128 = u128::MAX << (128 - prefix);
-    (u128::from(net) & mask) == (u128::from(ip) & mask)
 }
 
 /// Parse a comma-separated list of CIDRs. Whitespace is trimmed; empty
