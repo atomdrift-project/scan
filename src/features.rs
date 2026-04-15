@@ -679,7 +679,7 @@ impl ExtractContext {
         self.write_max_crit_features_v16(&combined, vec, maxcrit_offset, score_weight);
 
         // G3: Aggregates
-        let agg_offset = offsets.take(50);
+        let agg_offset = offsets.take(53);
         write_aggregate_features_from_summaries(&combined, &summaries, vec, agg_offset);
 
         // G4: External
@@ -723,7 +723,7 @@ impl ExtractContext {
         let total_size_bytes: f64 = summaries.iter().map(|s| s.size_bytes).sum();
         vec[score_offset] = sample_score as f32;
         vec[score_offset + 1] = if total_size_bytes > 0.0 {
-            sample_score as f32 / (total_size_bytes as f32 / 1024.0).ln_1p()
+            sample_score as f32 / (total_size_bytes as f32).ln_1p()
         } else {
             0.0
         };
