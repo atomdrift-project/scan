@@ -4,7 +4,8 @@
 //! When a slot is free, it claims work from hopper's `/api/next` endpoint,
 //! analyzes the file, and posts the result back to `/api/result`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,12 +13,220 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use crate::model::{Model, Thresholds};
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::server::{classify_bytes, classify_file, ModelResources};
+
+#[derive(Debug, Clone)]
+struct IndexedLocalFile {
+    path: PathBuf,
+    size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LocalNameKey {
+    parent_name: String,
+    basename: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedFileHash {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    sha256: String,
+}
+
+#[derive(Debug)]
+struct LocalFileIndex {
+    root: PathBuf,
+    by_name: HashMap<LocalNameKey, Vec<IndexedLocalFile>>,
+    verified_by_sha256: dashmap::DashMap<String, PathBuf>,
+    hash_cache: dashmap::DashMap<PathBuf, CachedFileHash>,
+}
+
+impl LocalFileIndex {
+    fn build(root: PathBuf) -> Result<Self> {
+        let mut by_name: HashMap<LocalNameKey, Vec<IndexedLocalFile>> = HashMap::new();
+        let mut stack = vec![root.clone()];
+        let mut indexed_files = 0u64;
+
+        while let Some(dir) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    tracing::warn!(path = %dir.display(), error = %e, "failed to read local data directory entry");
+                    continue;
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        tracing::warn!(path = %dir.display(), error = %e, "failed to enumerate local data directory entry");
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                let file_type = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "failed to read local file type");
+                        continue;
+                    }
+                };
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                let size = match entry.metadata() {
+                    Ok(meta) => meta.len(),
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "failed to read local file metadata");
+                        continue;
+                    }
+                };
+                let Some(basename) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let parent_name = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                by_name
+                    .entry(LocalNameKey {
+                        parent_name,
+                        basename: basename.to_string(),
+                    })
+                    .or_default()
+                    .push(IndexedLocalFile { path, size });
+                indexed_files += 1;
+            }
+        }
+
+        let distinct_names = by_name.len();
+        tracing::info!(
+            root = %root.display(),
+            indexed_files,
+            distinct_names,
+            "built local sample index"
+        );
+
+        Ok(Self {
+            root,
+            by_name,
+            verified_by_sha256: dashmap::DashMap::new(),
+            hash_cache: dashmap::DashMap::new(),
+        })
+    }
+
+    fn resolve(&self, requested_path: &str, sha256: &str, size_bytes: i64) -> Result<Option<PathBuf>> {
+        if let Some(found) = self.verified_by_sha256.get(sha256) {
+            let path = found.value().clone();
+            if path.exists() && self.path_matches_sha256(&path, sha256)? {
+                tracing::debug!(
+                    sha256,
+                    path = %path.display(),
+                    "using cached local path for sha256"
+                );
+                return Ok(Some(path));
+            }
+            self.verified_by_sha256.remove(sha256);
+        }
+
+        let mut candidates = Vec::new();
+        let requested = Path::new(requested_path);
+        if requested.is_relative() {
+            let direct = self.root.join(requested);
+            if direct.exists() {
+                candidates.push(direct);
+            }
+        }
+
+        let basename = requested.file_name().and_then(|n| n.to_str()).unwrap_or(requested_path);
+        let parent_name = requested
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let key = LocalNameKey {
+            parent_name: parent_name.to_string(),
+            basename: basename.to_string(),
+        };
+        if let Some(indexed) = self.by_name.get(&key) {
+            let expected_size = u64::try_from(size_bytes).ok();
+            candidates.extend(
+                indexed
+                    .iter()
+                    .filter(|entry| expected_size.is_none_or(|size| entry.size == size))
+                    .map(|entry| entry.path.clone()),
+            );
+        }
+
+        candidates.sort();
+        candidates.dedup();
+
+        for candidate in candidates {
+            if self.path_matches_sha256(&candidate, sha256)? {
+                self.verified_by_sha256
+                    .insert(sha256.to_string(), candidate.clone());
+                return Ok(Some(candidate));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn path_matches_sha256(&self, path: &Path, expected_sha256: &str) -> Result<bool> {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("reading metadata for {}", path.display()))?;
+        let modified = metadata.modified().ok();
+        if let Some(cached) = self.hash_cache.get(path) {
+            if cached.size == metadata.len() && cached.modified == modified {
+                return Ok(cached.sha256 == expected_sha256);
+            }
+        }
+
+        let digest = sha256_file(path)?;
+        self.hash_cache.insert(
+            path.to_path_buf(),
+            CachedFileHash {
+                size: metadata.len(),
+                modified,
+                sha256: digest.clone(),
+            },
+        );
+        Ok(digest == expected_sha256)
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+
+    let mut file =
+        fs::File::open(path).with_context(|| format!("opening local file {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("reading local file {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
 
 /// Configuration for the worker mode.
 #[derive(Debug)]
@@ -127,6 +336,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
     let base_url = config.hopper_url.trim_end_matches('/').to_string();
     let data_dir = config.data_dir.clone();
+    let local_index = data_dir
+        .clone()
+        .map(LocalFileIndex::build)
+        .transpose()
+        .context("building local data index")?
+        .map(Arc::new);
     let poll_secs = config.poll_secs;
     let slow_rule_ms = config.slow_rule_ms;
     let timeout_secs = config.timeout_secs;
@@ -235,12 +450,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let resources = Arc::clone(&resources);
         let url = base_url.clone();
         let name = name.clone();
-        let data_dir = data_dir.clone();
+        let local_index = local_index.clone();
         let completed = Arc::clone(&completed);
 
         tokio::spawn(async move {
             let result = run_job(
-                &client, &url, data_dir.as_deref(), &pj.job, &resources,
+                &client, &url, local_index.as_deref(), &pj.job, &resources,
                 slow_rule_ms, timeout_secs, pj.data,
             ).await;
             if let Err(ref e) = result {
@@ -323,12 +538,12 @@ async fn claim_and_prefetch(
 }
 
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
-/// Resolves the relative path against data_dir if provided. If the file
+/// Resolves the job against the local data index if provided. If the file
 /// isn't accessible locally (or SHA256 doesn't match), downloads from hopper.
 async fn run_job(
     client: &reqwest::Client,
     base_url: &str,
-    data_dir: Option<&Path>,
+    local_index: Option<&LocalFileIndex>,
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
@@ -339,13 +554,44 @@ async fn run_job(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| job.sha256.clone());
 
-    let local_path = data_dir.map(|d| d.join(&job.path));
-    let use_local = match local_path {
-        Some(ref p) if p.exists() => {
-            tracing::info!(sha256 = %job.sha256, path = %p.display(), file_type = %job.file_type, size = job.size_bytes, "analyzing local file");
+    // Try local file first; fall back to downloading bytes from hopper.
+    // Exact-path hits are attempted first, then final-dir+basename+size lookup.
+    let local_path = match local_index {
+        Some(index) => index
+            .resolve(&job.path, &job.sha256, job.size_bytes)
+            .map_err(|e| e.to_string())?,
+        None => None,
+    };
+    let use_local = match (local_index, local_path.as_ref()) {
+        (_, Some(p)) => {
+            tracing::info!(
+                sha256 = %job.sha256,
+                path = %p.display(),
+                file_type = %job.file_type,
+                size = job.size_bytes,
+                "analyzing local file"
+            );
             true
         }
-        _ => false,
+        (Some(index), None) => {
+            let parent = Path::new(&job.path)
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            tracing::warn!(
+                sha256 = %job.sha256,
+                requested_path = %job.path,
+                data_root = %index.root.display(),
+                parent_dir = %parent,
+                basename = %label,
+                file_type = %job.file_type,
+                size = job.size_bytes,
+                "local file not found under --data after exact-path and final-dir+basename+size lookup; downloading from hopper"
+            );
+            false
+        }
+        (None, None) => false,
     };
 
     // Use prefetched bytes, or fall back to downloading if prefetch failed.
@@ -378,6 +624,12 @@ async fn run_job(
     let phase_timeout = phase.clone();
     let label2 = label.clone();
     let sha_short = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
+    let input_source = if use_local { "local" } else { "downloaded" };
+    let input_size = if use_local {
+        u64::try_from(job.size_bytes).unwrap_or(0)
+    } else {
+        downloaded.as_ref().map_or(0, |bytes| bytes.len() as u64)
+    };
 
     // Background phase watcher — logs transitions with timing, and emits a
     // heartbeat every 30 s so a stuck phase is visible in logs.
@@ -454,7 +706,8 @@ async fn run_job(
     tracing::info!(
         sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
         file = %label,
-        size = downloaded.as_ref().map_or(0, Vec::len),
+        source = input_source,
+        size = input_size,
         "analysis starting",
     );
     let sha_short2 = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
@@ -749,3 +1002,99 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_file(path: &Path, data: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        let mut file = fs::File::create(path).expect("create file");
+        file.write_all(data).expect("write file");
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn local_index_resolves_exact_relative_path() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let rel = Path::new("good/repos/sample.bin");
+        let bytes = b"sample-a";
+        write_file(&root.path().join(rel), bytes);
+
+        let index = LocalFileIndex::build(root.path().to_path_buf()).expect("build index");
+        let resolved = index
+            .resolve(
+                rel.to_str().expect("utf8 rel path"),
+                &sha256_hex(bytes),
+                i64::try_from(bytes.len()).expect("len fits"),
+            )
+            .expect("resolve path");
+
+        assert_eq!(resolved.as_deref(), Some(root.path().join(rel).as_path()));
+    }
+
+    #[test]
+    fn local_index_resolves_by_final_dir_basename_and_size_for_absolute_requested_path() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let stored = root.path().join("bad/harvest/vxug/sample.bin");
+        let bytes = b"sample-b";
+        write_file(&stored, bytes);
+
+        let index = LocalFileIndex::build(root.path().to_path_buf()).expect("build index");
+        let resolved = index
+            .resolve(
+                "/srv/home/t/data/bad/harvest/vxug/sample.bin",
+                &sha256_hex(bytes),
+                i64::try_from(bytes.len()).expect("len fits"),
+            )
+            .expect("resolve path");
+
+        assert_eq!(resolved.as_deref(), Some(stored.as_path()));
+    }
+
+    #[test]
+    fn local_index_does_not_fallback_to_basename_only_when_final_dir_differs() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let stored = root.path().join("good/repos/sample.txt");
+        let bytes = b"12345678";
+        write_file(&stored, bytes);
+
+        let index = LocalFileIndex::build(root.path().to_path_buf()).expect("build index");
+        let resolved = index
+            .resolve(
+                "/srv/home/t/data/other/place/sample.txt",
+                &sha256_hex(bytes),
+                i64::try_from(bytes.len()).expect("len fits"),
+            )
+            .expect("resolve path");
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn local_index_rejects_sha_mismatch_even_when_final_dir_name_and_size_match() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let stored = root.path().join("good/repos/sample.txt");
+        let bytes = b"12345678";
+        write_file(&stored, bytes);
+
+        let index = LocalFileIndex::build(root.path().to_path_buf()).expect("build index");
+        let resolved = index
+            .resolve(
+                "/srv/home/t/data/good/repos/sample.txt",
+                &sha256_hex(b"87654321"),
+                i64::try_from(bytes.len()).expect("len fits"),
+            )
+            .expect("resolve path");
+
+        assert!(resolved.is_none());
+    }
+}
