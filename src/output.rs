@@ -101,15 +101,6 @@ impl Palette {
 /// override or the first successful auto-detection result.
 static THEME: LazyLock<RwLock<Option<Theme>>> = LazyLock::new(|| RwLock::new(None));
 
-/// Returns true if stderr is connected to a real TTY.
-///
-/// Terminal queries (color scheme detection) must only be attempted when a TTY
-/// is present. Without one, the read blocks indefinitely or the kernel sends
-/// SIGTTIN, suspending the process.
-fn stderr_is_tty() -> bool {
-    unsafe { libc::isatty(libc::STDERR_FILENO) == 1 }
-}
-
 /// Detect the terminal theme, with env var override.
 ///
 /// Priority: `LITMUS_THEME` env var > terminal query > default (dark).
@@ -125,7 +116,12 @@ pub fn detect_theme() -> Theme {
             "light" | "white" => Theme::Light,
             _ => Theme::Dark,
         }
-    } else if !stderr_is_tty() {
+    } else if
+        // Terminal queries must only be attempted on a real TTY. Without one,
+        // the read blocks indefinitely or the kernel sends SIGTTIN.
+        // SAFETY: isatty() is a trivial syscall with no preconditions.
+        unsafe { libc::isatty(libc::STDERR_FILENO) != 1 }
+    {
         Theme::Dark
     } else {
         match terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default()) {
@@ -174,14 +170,12 @@ fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
 
 /// Linear interpolation between two RGB colors.
 fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
-    Rgb(lerp(a.0, b.0, t), lerp(a.1, b.1, t), lerp(a.2, b.2, t))
-}
-
-/// Linear interpolation between two u8 values.
-fn lerp(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t)
-        .round()
-        .clamp(0.0, 255.0) as u8
+    let ch = |x: u8, y: u8| -> u8 {
+        (x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Rgb(ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
 }
 
 /// Normalized progress within the current classification band.

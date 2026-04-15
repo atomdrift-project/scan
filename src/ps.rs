@@ -39,13 +39,6 @@ fn sha256_file(path: &std::path::Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// SHA256 a file via /proc/pid/exe (Linux only — for deleted binaries).
-#[cfg(target_os = "linux")]
-fn sha256_proc_exe(pid: u32) -> Result<String> {
-    let proc_path = format!("/proc/{pid}/exe");
-    sha256_file(std::path::Path::new(&proc_path))
-}
-
 /// Run a process scan: enumerate, deduplicate, classify.
 pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let scan_start = Instant::now();
@@ -101,14 +94,13 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
             // Try reading via /proc on Linux.
             #[cfg(target_os = "linux")]
             {
-                let first_pid = pids[0];
-                match sha256_proc_exe(first_pid) {
+                match sha256_file(std::path::Path::new(&format!("/proc/{}/exe", pids[0]))) {
                     Ok(h) => h,
                     Err(e) => {
                         tracing::warn!(
                             "cannot hash deleted binary {} (pid {}): {e}",
                             path.display(),
-                            first_pid
+                            pids[0],
                         );
                         hash_errors += 1;
                         continue;
