@@ -169,6 +169,9 @@ fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
 }
 
 /// Linear interpolation between two RGB colors.
+// The .clamp(0.0, 255.0) bounds the value before the u8 cast; sign-loss is
+// impossible because clamp ensures non-negative output.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let ch = |x: u8, y: u8| -> u8 {
         (x as f32 + (y as f32 - x as f32) * t)

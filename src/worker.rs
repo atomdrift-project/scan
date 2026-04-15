@@ -112,11 +112,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // Background: periodic rules update.
     if config.update_interval_mins > 0 {
         let interval = Duration::from_secs(config.update_interval_mins * 60);
-        let model_dir = config.model_dir.clone();
-        let thresholds = config.thresholds;
-        let resources_ref = Arc::clone(&resources);
         tokio::spawn(async move {
-            periodic_update(interval, &model_dir, thresholds.as_ref(), &resources_ref).await;
+            periodic_update(interval).await;
         });
     }
 
@@ -149,7 +146,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         max_rss_mb = max_bytes / 1024 / 1024,
                         "memory pressure: pausing before claiming new work",
                     );
-                    cleave::clear_all_thread_caches();
+                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
                     tokio::time::sleep(Duration::from_secs(poll_secs)).await;
                     continue;
                 }
@@ -181,7 +178,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 drop(gate);
                 consecutive_errors += 1;
                 let backoff = backoff_duration(poll_secs, consecutive_errors);
-                tracing::warn!(error = %e, elapsed_ms = poll_start.elapsed().as_millis() as u64, backoff_secs = backoff.as_secs(), "poll failed");
+                tracing::warn!(error = %e, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "poll failed");
                 tokio::time::sleep(backoff).await;
                 continue;
             }
@@ -190,7 +187,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         if resp.status() == reqwest::StatusCode::NO_CONTENT {
             drop(gate);
             consecutive_errors = 0;
-            tracing::debug!(elapsed_ms = poll_start.elapsed().as_millis() as u64, poll_secs, "no work available, sleeping");
+            tracing::debug!(elapsed_ms = crate::duration_ms(poll_start.elapsed()), poll_secs, "no work available, sleeping");
             tokio::time::sleep(Duration::from_secs(poll_secs)).await;
             continue;
         }
@@ -201,22 +198,34 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             drop(gate);
             consecutive_errors += 1;
             let backoff = backoff_duration(poll_secs, consecutive_errors);
-            tracing::warn!(%status, body = %body, elapsed_ms = poll_start.elapsed().as_millis() as u64, backoff_secs = backoff.as_secs(), "unexpected response from /api/next");
+            tracing::warn!(%status, body = %body, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "unexpected response from /api/next");
             tokio::time::sleep(backoff).await;
             continue;
         }
 
         consecutive_errors = 0;
 
-        let resp_body = resp.text().await.unwrap_or_default();
+        let resp_body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                drop(gate);
+                consecutive_errors += 1;
+                let backoff = backoff_duration(poll_secs, consecutive_errors);
+                tracing::warn!(error = %e, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "failed to read claim response body");
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+        };
         let claim: ClaimResponse = match serde_json::from_str(&resp_body) {
             Ok(c) => c,
             Err(e) => {
                 drop(gate);
                 consecutive_errors += 1;
                 let backoff = backoff_duration(poll_secs, consecutive_errors);
-                let preview = if resp_body.len() > 200 { &resp_body[..200] } else { &resp_body };
-                tracing::warn!(error = %e, body = %preview, elapsed_ms = poll_start.elapsed().as_millis() as u64, backoff_secs = backoff.as_secs(), "failed to parse claim response");
+                // floor_char_boundary guarantees a valid UTF-8 boundary.
+                #[allow(clippy::string_slice)]
+                let preview = &resp_body[..resp_body.floor_char_boundary(200)];
+                tracing::warn!(error = %e, body = %preview, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "failed to parse claim response");
                 tokio::time::sleep(backoff).await;
                 continue;
             }
@@ -224,7 +233,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
         tracing::info!(
             jobs = claim.jobs.len(),
-            elapsed_ms = poll_start.elapsed().as_millis() as u64,
+            elapsed_ms = crate::duration_ms(poll_start.elapsed()),
             "claimed work from server",
         );
 
@@ -266,7 +275,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     }
 
     // Drain any in-flight work before exiting.
-    let _ = semaphore.acquire_many(slots as u32).await;
+    let _ = semaphore.acquire_many(u32::try_from(slots).unwrap_or(u32::MAX)).await;
     tracing::info!("all in-flight jobs finished, exiting");
     Ok(())
 }
@@ -338,7 +347,7 @@ async fn run_job(
                         sha256 = %sha_short,
                         file = %label2,
                         phase = %last_phase,
-                        elapsed_ms = phase_start.elapsed().as_millis() as u64,
+                        elapsed_ms = crate::duration_ms(phase_start.elapsed()),
                         "phase complete",
                     );
                 }
@@ -351,7 +360,7 @@ async fn run_job(
                     tracing::warn!(
                         sha256 = %sha_short,
                         file = %label2,
-                        elapsed_ms = phase_start.elapsed().as_millis() as u64,
+                        elapsed_ms = crate::duration_ms(phase_start.elapsed()),
                         "analysis running but phase tracker has not been updated",
                     );
                     last_heartbeat = Instant::now();
@@ -364,7 +373,7 @@ async fn run_job(
                         sha256 = %sha_short,
                         file = %label2,
                         phase = %last_phase,
-                        elapsed_ms = phase_start.elapsed().as_millis() as u64,
+                        elapsed_ms = crate::duration_ms(phase_start.elapsed()),
                         "phase complete",
                     );
                 }
@@ -385,7 +394,7 @@ async fn run_job(
                     sha256 = %sha_short,
                     file = %label2,
                     phase = %last_phase,
-                    elapsed_ms = phase_start.elapsed().as_millis() as u64,
+                    elapsed_ms = crate::duration_ms(phase_start.elapsed()),
                     "phase still running",
                 );
                 last_heartbeat = Instant::now();
@@ -424,7 +433,8 @@ async fn run_job(
             Err(_) => {
                 let stuck_phase = phase_timeout.get();
                 cancel.store(true, Ordering::Relaxed);
-                let elapsed_ms = start.elapsed().as_millis() as i64;
+                #[allow(clippy::cast_sign_loss)]
+                let elapsed_ms = crate::duration_ms(start.elapsed()) as i64;
                 return Err(format!(
                     "analysis timed out after {timeout_secs}s ({elapsed_ms}ms) in phase={stuck_phase}"
                 ));
@@ -436,7 +446,8 @@ async fn run_job(
     // an error before setting phase="done", the watcher thread leaks indefinitely.
     cancel.store(true, Ordering::Relaxed);
 
-    let elapsed_ms = start.elapsed().as_millis() as i64;
+    #[allow(clippy::cast_sign_loss)]
+    let elapsed_ms = crate::duration_ms(start.elapsed()) as i64;
 
     match result {
         Ok(Ok(scan_result)) => {
@@ -489,56 +500,94 @@ async fn post_result(
     };
 
     let url = format!("{}/api/result", url);
-    for attempt in 0..3u32 {
+    // Reuse the same exponential-backoff-with-jitter logic as poll failures.
+    // base=2s gives delays of 2s, 4s, 8s, 16s, 32s across 6 attempts (~90s total).
+    const MAX_ATTEMPTS: u32 = 6;
+    for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            let delay = Duration::from_secs(1 << attempt);
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(backoff_duration(2, attempt)).await;
         }
         tracing::debug!(sha256 = %sha256, attempt, "posting result to server");
         let post_start = Instant::now();
         match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(sha256 = %sha256, elapsed_ms = post_start.elapsed().as_millis() as u64, "result posted");
+                tracing::debug!(sha256 = %sha256, elapsed_ms = crate::duration_ms(post_start.elapsed()), "result posted");
                 return;
             }
             Ok(resp) => {
                 let status = resp.status();
-                tracing::warn!(sha256 = %sha256, %status, elapsed_ms = post_start.elapsed().as_millis() as u64, attempt, "post result: non-success response");
+                tracing::warn!(sha256 = %sha256, %status, elapsed_ms = crate::duration_ms(post_start.elapsed()), attempt, "post result: non-success response");
             }
             Err(e) => {
-                tracing::warn!(sha256 = %sha256, error = %e, elapsed_ms = post_start.elapsed().as_millis() as u64, attempt, "post result: send failed");
+                tracing::warn!(sha256 = %sha256, error = %e, elapsed_ms = crate::duration_ms(post_start.elapsed()), attempt, "post result: send failed");
             }
         }
     }
-    tracing::error!(sha256 = %sha256, "post result: giving up after 3 attempts");
+    tracing::error!(sha256 = %sha256, "post result: giving up after {MAX_ATTEMPTS} attempts");
 }
 
-async fn periodic_update(
-    interval: Duration,
-    _model_dir: &Path,
-    _thresholds: Option<&Thresholds>,
-    _resources: &Arc<ModelResources>,
-) {
+async fn periodic_update(interval: Duration) {
     loop {
         tokio::time::sleep(interval).await;
         tracing::info!("updating rules and models");
 
-        // Pull latest models and traits.
-        if let Err(e) = crate::models_repo::update() {
-            tracing::warn!(error = %e, "model update failed");
-        }
-        if let Err(e) = cleave::traits_repo::update(false) {
-            tracing::warn!(error = %e, "traits update failed");
-        }
+        // All update work runs on a single blocking thread under a hard timeout.
+        // This ensures:
+        //   - git and filesystem calls never block the async runtime
+        //   - reload_capability_mapper / clear_all_thread_caches (which may
+        //     contend with in-flight analysis tasks for internal cleave locks)
+        //     are bounded and cannot deadlock the worker loop
+        //   - rollback, if needed, is also on the same blocking thread so all
+        //     git ops stay together
+        //
+        // If the timeout fires, the blocking thread is abandoned and the loop
+        // continues; a future iteration will retry.
+        const UPDATE_TIMEOUT: Duration = Duration::from_secs(150);
+        match tokio::time::timeout(
+            UPDATE_TIMEOUT,
+            tokio::task::spawn_blocking(|| {
+                let prev = match crate::models_repo::update() {
+                    Ok(prev) => prev,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "model update failed");
+                        None
+                    }
+                };
+                let traits_ok = match cleave::traits_repo::update(false) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "traits update failed");
+                        false
+                    }
+                };
 
-        // Reload capabilities after traits update.
-        let _ = cleave::reload_capability_mapper();
-        cleave::clear_all_thread_caches();
-
-        // Note: model binary (xgboost weights) cannot be hot-swapped without
-        // interior mutability on ModelResources. Traits and capability rules
-        // are reloaded above. To pick up a new model, restart the worker.
-        tracing::info!("rules updated; restart worker to pick up new model weights");
+                if traits_ok {
+                    if let Err(e) = cleave::reload_capability_mapper() {
+                        tracing::warn!(error = %e, "capability mapper reload failed");
+                    }
+                    cleave::clear_all_thread_caches();
+                } else if let Some(ref rev) = prev {
+                    tracing::error!(rev, "traits update failed after models pull; rolling back models repo to previous commit");
+                    if let Err(e) = crate::models_repo::rollback(rev) {
+                        tracing::error!(error = %e, "models rollback failed");
+                    }
+                }
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                // Note: model binary (xgboost weights) cannot be hot-swapped in
+                // worker mode. Traits and capability rules are reloaded above.
+                // To pick up a new model, restart the worker.
+                tracing::info!("rules updated; restart worker to pick up new model weights");
+            }
+            Ok(Err(e)) => tracing::warn!(error = %e, "update task panicked"),
+            Err(_) => tracing::warn!(
+                "update timed out after {}s; continuing to serve requests",
+                UPDATE_TIMEOUT.as_secs()
+            ),
+        }
     }
 }
 
@@ -561,7 +610,7 @@ async fn download_bytes(
         sha256 = %sha256,
         file = %label,
         bytes = bytes.len(),
-        elapsed_ms = start.elapsed().as_millis() as u64,
+        elapsed_ms = crate::duration_ms(start.elapsed()),
         "download complete",
     );
     Ok(bytes.to_vec())
@@ -569,9 +618,9 @@ async fn download_bytes(
 
 /// Exponential backoff with jitter, capped at 2 minutes.
 fn backoff_duration(base_secs: u64, consecutive_errors: u32) -> Duration {
-    let exp = std::cmp::min(consecutive_errors, 7); // cap at 2^7 = 128s
+    let exp = consecutive_errors.min(7); // cap at 2^7 = 128s
     let secs = base_secs.saturating_mul(1 << exp);
-    let capped = std::cmp::min(secs, 120);
+    let capped = secs.min(120);
     // Simple jitter: ±25% using a cheap hash of the error count.
     let jitter = (consecutive_errors as u64 * 7 + 3) % (capped / 4 + 1);
     Duration::from_secs(capped.saturating_add(jitter))

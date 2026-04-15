@@ -14,11 +14,13 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/litmus-models.git";
 const CURRENT_MODEL: &str = "scan-v16";
 const STALENESS_DAYS: u64 = 30;
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Resolve the models base directory, auto-cloning if necessary.
 ///
@@ -37,7 +39,13 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
     let data_dir = default_models_dir();
     if has_models(&data_dir) {
         tracing::debug!("Using models from {}", data_dir.display());
-        check_staleness(&data_dir);
+        if let Some(days) = days_since_last_commit(&data_dir) {
+            if days > STALENESS_DAYS {
+                eprintln!(
+                    "Note: Models last updated {days} days ago. Run 'litmus update-rules' to refresh."
+                );
+            }
+        }
         return Ok(data_dir);
     }
 
@@ -54,7 +62,8 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
             missing.join(", "),
         );
         std::thread::sleep(std::time::Duration::from_secs(30));
-        std::fs::remove_dir_all(&data_dir).ok();
+        std::fs::remove_dir_all(&data_dir)
+            .with_context(|| format!("failed to remove incomplete models at {}", data_dir.display()))?;
     } else {
         eprintln!("First run: downloading litmus models...");
     }
@@ -73,40 +82,70 @@ pub fn model_dir() -> Result<PathBuf> {
     resolve_and_ensure().map(|base| base.join(CURRENT_MODEL))
 }
 
+/// Run a git command with a hard timeout, killing the child process if it exceeds it.
+///
+/// Uses `try_wait` polling so the calling thread is not blocked past the deadline.
+/// Returns the captured stdout/stderr output on success.
+fn run_git_with_timeout(args: &[&str]) -> Result<std::process::Output> {
+    let mut child = Command::new("git")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Prevent git from blocking on credential or hardware-key prompts.
+        // GIT_TERMINAL_PROMPT=0 disables all terminal prompts; BatchMode=yes
+        // makes SSH fail immediately instead of waiting for a PIN or passphrase.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+        .spawn()
+        .context("failed to start git")?;
+
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    loop {
+        match child.try_wait().context("failed to poll git process")? {
+            Some(_) => return child.wait_with_output().context("failed to read git output"),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                anyhow::bail!("git timed out after {}s", GIT_TIMEOUT.as_secs());
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
 /// Update the models repository, cloning it first if necessary.
-pub fn update() -> Result<()> {
+///
+/// Returns the pre-update HEAD commit so the caller can roll back if the new
+/// models turn out to be broken.  The returned value is `None` when the repo
+/// was freshly cloned (nothing to roll back to) or when HEAD could not be read.
+pub fn update() -> Result<Option<String>> {
     let base = current_models_dir();
     if ensure_repo(&base)? {
-        return Ok(());
+        return Ok(None);
     }
 
-    let before = short_head(&base).unwrap_or_default();
+    let before = short_head(&base);
     eprintln!("Updating models...");
 
-    let output = Command::new("git")
-        .args(["-C", &base.to_string_lossy(), "pull", "--ff-only"])
-        .output()
-        .context("git pull failed")?;
+    let base_str = base.to_string_lossy();
+    let output = run_git_with_timeout(&["-C", &base_str, "pull", "--ff-only"])?;
 
     if !output.status.success() {
         anyhow::bail!("update failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     let after = short_head(&base).unwrap_or_default();
-    if before == after {
+    let before_str = before.as_deref().unwrap_or_default();
+    if before_str == after {
         eprintln!("Already up to date ({after}).");
     } else {
-        eprintln!("Updated: {before} -> {after}");
-        if let Ok(diff) = Command::new("git")
-            .args([
-                "-C",
-                &base.to_string_lossy(),
-                "diff",
-                "--stat",
-                &format!("{before}..{after}"),
-            ])
-            .output()
-        {
+        eprintln!("Updated: {before_str} -> {after}");
+        if let Ok(diff) = run_git_with_timeout(&[
+            "-C",
+            &base_str,
+            "diff",
+            "--stat",
+            &format!("{before_str}..{after}"),
+        ]) {
             if diff.status.success() {
                 let summary = String::from_utf8_lossy(&diff.stdout);
                 if !summary.is_empty() {
@@ -115,6 +154,26 @@ pub fn update() -> Result<()> {
             }
         }
     }
+    Ok(before)
+}
+
+/// Roll back the models repository to a previously recorded commit.
+///
+/// Called when a pulled update fails to load so the disk is returned to the
+/// last-known-good state for future reloads.
+pub fn rollback(rev: &str) -> Result<()> {
+    let base = current_models_dir();
+    let broken = short_head(&base).unwrap_or_else(|| "unknown".to_string());
+    tracing::error!(broken_commit = %broken, rollback_to = %rev, "rolling back models repo");
+    let base_str = base.to_string_lossy();
+    let output = run_git_with_timeout(&["-C", &base_str, "reset", "--hard", rev])?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "rollback to {rev} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    tracing::info!(broken_commit = %broken, rolled_back_to = %rev, "models repo rolled back");
     Ok(())
 }
 
@@ -125,9 +184,8 @@ pub fn check_updates() -> Result<()> {
         return Ok(());
     }
 
-    let fetch = Command::new("git")
-        .args(["-C", &base.to_string_lossy(), "fetch", "--dry-run"])
-        .output()
+    let base_str = base.to_string_lossy();
+    let fetch = run_git_with_timeout(&["-C", &base_str, "fetch", "--dry-run"])
         .context("git fetch failed")?;
 
     let local = short_head(&base).unwrap_or_default();
@@ -189,9 +247,10 @@ fn has_models(path: &Path) -> bool {
     MODEL_ARTIFACTS.iter().all(|f| model.join(f).exists())
 }
 
-
 fn clone_repo(target: &Path) -> std::io::Result<()> {
-    check_git_available()?;
+    Command::new("git").arg("--version").output().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, format!("git is not installed or not in PATH: {e}"))
+    })?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -205,16 +264,6 @@ fn clone_repo(target: &Path) -> std::io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn check_staleness(path: &Path) {
-    if let Some(days) = days_since_last_commit(path) {
-        if days > STALENESS_DAYS {
-            eprintln!(
-                "Note: Models last updated {days} days ago. Run 'litmus update-rules' to refresh."
-            );
-        }
-    }
 }
 
 fn days_since_last_commit(path: &Path) -> Option<u64> {
@@ -233,7 +282,7 @@ fn days_since_last_commit(path: &Path) -> Option<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs() as i64;
-    Some(((now - timestamp) / 86400).max(0) as u64)
+    Some(((now - timestamp) / 86400).max(0).cast_unsigned())
 }
 
 fn short_head(path: &Path) -> Option<String> {
@@ -260,15 +309,6 @@ fn is_git_repo(path: &Path) -> bool {
     resolved.join(".git").exists()
 }
 
-fn check_git_available() -> std::io::Result<()> {
-    Command::new("git").arg("--version").output().map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "git is not installed or not in PATH",
-        )
-    })?;
-    Ok(())
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

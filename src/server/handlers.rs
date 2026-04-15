@@ -293,34 +293,45 @@ async fn do_model_reload(
     let model_dir = state.model_dir.clone();
     let thresholds = state.threshold_overrides;
 
-    let result = tokio::task::spawn_blocking(move || {
-        // Reload cleave traits first so the new model runs against fresh rules.
-        if let Err(e) = cleave::reload_capability_mapper() {
-            tracing::warn!("cleave trait reload failed (previous traits retained): {e}");
-        } else {
-            tracing::info!("cleave traits reloaded");
-        }
-        cleave::clear_all_thread_caches();
+    const RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    let result = tokio::time::timeout(
+        RELOAD_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            // Reload cleave traits first so the new model runs against fresh rules.
+            if let Err(e) = cleave::reload_capability_mapper() {
+                tracing::warn!("cleave trait reload failed (previous traits retained): {e}");
+            } else {
+                tracing::info!("cleave traits reloaded");
+            }
+            cleave::clear_all_thread_caches();
 
-        let model = Model::load(&model_dir, thresholds)?;
-        let shap = ShapImportance::load(&model_dir).ok();
-        let ctx = ExtractContext::new(model.spec());
-        Ok::<_, anyhow::Error>((model, shap, ctx))
-    })
+            let model = Model::load(&model_dir, thresholds)?;
+            let shap = ShapImportance::load(&model_dir).ok();
+            let ctx = ExtractContext::new(model.spec());
+            Ok::<_, anyhow::Error>((model, shap, ctx))
+        }),
+    )
     .await;
 
     let elapsed_ms = start.elapsed().as_millis();
 
     let (model, shap, ctx) = match result {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
+        Ok(Ok(Ok(t))) => t,
+        Ok(Ok(Err(e))) => {
             // Log internally but do not expose filesystem paths or model internals to callers.
             tracing::warn!("reload failed (previous model retained) in {elapsed_ms}ms: {e}");
             return Err((StatusCode::UNPROCESSABLE_ENTITY, "Failed to load model"));
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!("reload task join error: {e}");
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal error"));
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "reload timed out after {}s (previous model retained)",
+                RELOAD_TIMEOUT.as_secs()
+            );
+            return Err((StatusCode::GATEWAY_TIMEOUT, "Reload timed out"));
         }
     };
 
@@ -408,33 +419,53 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
     // Run the two repo pulls on a blocking thread; they're synchronous git
     // and filesystem work. Both are non-fatal — log on failure and proceed
     // to the reload step regardless so we still pick up any partial state.
-    let pulls = tokio::task::spawn_blocking(|| {
-        let models_err = match crate::models_repo::update() {
-            Ok(()) => None,
-            Err(e) => {
-                tracing::warn!("models update failed: {e}");
-                Some(e.to_string())
-            }
-        };
-        let traits_err = match cleave::traits_repo::update(false) {
-            Ok(()) => None,
-            Err(e) => {
-                tracing::warn!("traits update failed: {e}");
-                Some(e.to_string())
-            }
-        };
-        (models_err, traits_err)
-    })
+    //
+    // A 150s outer timeout guards against git hanging indefinitely (each pull
+    // already enforces a 60s limit internally, so this is a belt-and-suspenders
+    // backstop that ensures the reload_lock is always released promptly).
+    // A 150s outer timeout guards against git hanging indefinitely (each pull
+    // already enforces a 60s limit internally, so this is a belt-and-suspenders
+    // backstop that ensures the reload_lock is always released promptly).
+    //
+    // `prev_models_head` captures the commit before the pull so we can roll back
+    // the models repo on disk if the new model fails to load.
+    const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
+    let pull_result = tokio::time::timeout(
+        PULL_TIMEOUT,
+        tokio::task::spawn_blocking(|| {
+            let (models_err, prev_models_head) = match crate::models_repo::update() {
+                Ok(prev) => (None, prev),
+                Err(e) => {
+                    tracing::warn!("models update failed: {e}");
+                    (Some(e.to_string()), None)
+                }
+            };
+            let traits_err = match cleave::traits_repo::update(false) {
+                Ok(()) => None,
+                Err(e) => {
+                    tracing::warn!("traits update failed: {e}");
+                    Some(e.to_string())
+                }
+            };
+            (models_err, prev_models_head, traits_err)
+        }),
+    )
     .await;
 
-    let (models_err, traits_err) = match pulls {
-        Ok(t) => t,
-        Err(e) => {
+    let (models_err, prev_models_head, traits_err) = match pull_result {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
             tracing::warn!("update pull task join error: {e}");
-            (
-                Some("task join failed".to_string()),
-                Some("task join failed".to_string()),
-            )
+            let msg = "task join failed".to_string();
+            (Some(msg.clone()), None, Some(msg))
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "update pull timed out after {}s",
+                PULL_TIMEOUT.as_secs()
+            );
+            let msg = format!("git pull timed out after {}s", PULL_TIMEOUT.as_secs());
+            (Some(msg.clone()), None, Some(msg))
         }
     };
 
@@ -451,18 +482,31 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
             "traits_commit": cleave::traits_repo::version(),
         }))
         .into_response(),
-        Err((status, msg)) => (
-            status,
-            Json(serde_json::json!({
-                "status": "reload_failed",
-                "error": msg,
-                "models_updated": models_err.is_none(),
-                "traits_updated": traits_err.is_none(),
-                "models_error": models_err,
-                "traits_error": traits_err,
-            })),
-        )
-            .into_response(),
+        Err((status, msg)) => {
+            // The in-memory model was not swapped, so requests continue against
+            // the previous model. Roll the models repo back on disk too so future
+            // reloads don't re-encounter the broken state.
+            if let Some(rev) = prev_models_head {
+                tracing::error!(rev, "model reload failed after pull; rolling back models repo to previous commit");
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::models_repo::rollback(&rev) {
+                        tracing::error!("models rollback failed: {e}");
+                    }
+                });
+            }
+            (
+                status,
+                Json(serde_json::json!({
+                    "status": "reload_failed",
+                    "error": msg,
+                    "models_updated": models_err.is_none(),
+                    "traits_updated": traits_err.is_none(),
+                    "models_error": models_err,
+                    "traits_error": traits_err,
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -535,8 +579,10 @@ pub(super) async fn analyze(
             .replace("..", "__");
         if sanitized.len() > 63 {
             // Right-truncate: preserve the tail (and thus the extension).
-            // All remaining chars are ASCII so byte indexing is safe.
-            sanitized[sanitized.len() - 63..].to_string()
+            // All remaining chars are ASCII (filter above) so byte indexing is safe.
+            #[allow(clippy::string_slice)]
+            let s = sanitized[sanitized.len() - 63..].to_string();
+            s
         } else {
             sanitized
         }
@@ -653,7 +699,7 @@ pub(super) async fn analyze(
         id = request_id,
         filename = %filename,
         size_bytes = file_size,
-        upload_ms = request_start.elapsed().as_millis() as u64,
+        upload_ms = crate::duration_ms(request_start.elapsed()),
         "received file, starting analysis",
     );
 
@@ -701,7 +747,7 @@ pub(super) async fn analyze(
     let slow_rule_ms = state.slow_rule_ms;
 
     let filename_for_closure = filename.clone();
-    let should_clear_caches = request_id.is_multiple_of(50);
+    let should_clear_caches = request_id.is_multiple_of(100);
     let cancellation = Arc::new(AtomicBool::new(false));
     state.in_flight.insert(
         request_id,
@@ -765,7 +811,7 @@ pub(super) async fn analyze(
         tracing::debug!(request_id, error = %e, "temp dir cleanup (may already be gone)");
     }
 
-    let elapsed_ms = request_start.elapsed().as_millis();
+    let elapsed_ms = crate::duration_ms(request_start.elapsed());
 
     match result {
         Ok(Ok(scan_result)) => {
@@ -773,23 +819,23 @@ pub(super) async fn analyze(
                 id = request_id,
                 filename = %filename,
                 size_bytes = file_size,
-                elapsed_ms = elapsed_ms as u64,
+                elapsed_ms,
                 classification = %scan_result.classification,
                 probability = scan_result.probability,
                 "<-- 200 OK",
             );
             let mut resp = Json(scan_result.to_envelope()).into_response();
             resp.headers_mut()
-                .insert("X-Total-Ms", (elapsed_ms as u64).into());
+                .insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
         Ok(Err(e)) => {
             let status = analysis_error_status(&e);
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, status = status.as_u16(), error = %e, "analysis failed");
+            tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analysis failed");
             analysis_error_response(&e)
         }
         Err(e) => {
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error (panic?)");
+            tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
@@ -1032,7 +1078,7 @@ pub(super) async fn analyze_path(
 
     let slow_rule_ms = state.slow_rule_ms;
 
-    let should_clear_caches = request_id.is_multiple_of(50);
+    let should_clear_caches = request_id.is_multiple_of(100);
     let extract_dir = state.extract_dir.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
     state.in_flight.insert(
@@ -1083,7 +1129,7 @@ pub(super) async fn analyze_path(
     let result = handle.await;
     drop(guard);
 
-    let elapsed_ms = request_start.elapsed().as_millis();
+    let elapsed_ms = crate::duration_ms(request_start.elapsed());
 
     match result {
         Ok(Ok(mut scan_result)) => {
@@ -1098,7 +1144,8 @@ pub(super) async fn analyze_path(
                         .and_then(|f| f.get("sha"))
                         .and_then(|s| s.as_str())
                     {
-                        let short = &first[..first.len().min(6)];
+                        // SHA hex is ASCII; byte slice is always a valid UTF-8 boundary.
+                        let short = first.get(..first.len().min(6)).unwrap_or(first);
                         let dir = extract_dir.join(short);
                         if dir.is_dir() {
                             raw.as_object_mut().map(|o| {
@@ -1114,23 +1161,23 @@ pub(super) async fn analyze_path(
 
             tracing::info!(
                 id = request_id,
-                elapsed_ms = elapsed_ms as u64,
+                elapsed_ms,
                 classification = %scan_result.classification,
                 probability = scan_result.probability,
                 "<-- 200 OK",
             );
             let mut resp = Json(scan_result.to_envelope()).into_response();
             resp.headers_mut()
-                .insert("X-Total-Ms", (elapsed_ms as u64).into());
+                .insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
         Ok(Err(e)) => {
             let status = analysis_error_status(&e);
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, status = status.as_u16(), error = %e, "analysis failed");
+            tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analysis failed");
             analysis_error_response(&e)
         }
         Err(e) => {
-            tracing::warn!(id = request_id, elapsed_ms = elapsed_ms as u64, error = %e, "<-- 500 task join error (panic?)");
+            tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
@@ -1166,7 +1213,10 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
         rss_mb = rss / 1024 / 1024,
         "memory pressure detected, clearing thread-local caches"
     );
-    tokio::task::block_in_place(cleave::clear_all_thread_caches);
+    // Fire-and-forget: cache clearing is best-effort. We don't await here because
+    // check_memory_pressure is sync; the clear runs on a blocking thread and we
+    // re-check RSS immediately with whatever has been freed by then.
+    drop(tokio::task::spawn_blocking(cleave::clear_all_thread_caches));
 
     // Re-check after clearing caches.
     let rss_after = cleave::memory_tracker::current_rss()?;
@@ -1188,8 +1238,7 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
     // Use try_lock: if a concurrent request holds the lock it is already recording
     // the overload timestamp, so it is safe to pass through rather than block a
     // tokio worker on a std::sync::Mutex.
-    let mut overloaded = state.overloaded_since.try_lock().ok()?;
-    let since = *overloaded.get_or_insert_with(Instant::now);
+    let since = *state.overloaded_since.try_lock().ok()?.get_or_insert_with(Instant::now);
     let overloaded_secs = since.elapsed().as_secs();
 
     tracing::warn!(

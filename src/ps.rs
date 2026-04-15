@@ -64,7 +64,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
             suspicious: 0,
             benign: 0,
             errors: 0,
-            duration_ms: scan_start.elapsed().as_millis() as u64,
+            duration_ms: crate::duration_ms(scan_start.elapsed()),
         };
         if is_terminal {
             output::print_summary(&summary);
@@ -135,7 +135,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     }
 
     let groups: Vec<ProcessGroup> = by_sha.into_values().collect();
-    let total = groups.len() as u32;
+    let total = u32::try_from(groups.len()).unwrap_or(u32::MAX);
 
     if is_terminal {
         eprintln!(
@@ -265,7 +265,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         suspicious,
         benign,
         errors,
-        duration_ms: scan_start.elapsed().as_millis() as u64,
+        duration_ms: crate::duration_ms(scan_start.elapsed()),
     };
 
     if is_terminal {

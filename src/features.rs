@@ -4,6 +4,11 @@
 //! exactly, using the same feature_spec.json vocabulary to produce identical
 //! feature vectors.
 
+// All feature vectors use f32 to match the model's input dtype. The f64→f32
+// narrowing throughout this file is intentional and safe: feature values are
+// counts, ratios, or scores that fit well within f32 range.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -1560,6 +1565,9 @@ struct FindingPaths<'a> {
 
 impl<'a> Iterator for FindingPaths<'a> {
     type Item = &'a str;
+    // slash_ends and third_end are byte offsets of ASCII '/' characters, which are
+    // always single-byte UTF-8 codepoints — so these slices are valid UTF-8 boundaries.
+    #[allow(clippy::string_slice)]
     fn next(&mut self) -> Option<Self::Item> {
         let result = match self.step {
             0 => Some(if self.n_slashes >= 1 { &self.base[..self.slash_ends[0]] } else { self.base }),

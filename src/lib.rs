@@ -41,6 +41,17 @@ pub use model::Classification;
 pub use model::Thresholds;
 pub use scan::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
 
+/// Convert a [`std::time::Duration`] to milliseconds as `u64`, saturating at [`u64::MAX`].
+///
+/// Avoids the `u128 as u64` truncating cast that `as_millis()` requires.
+/// In practice elapsed durations are always tiny (seconds to minutes), so
+/// saturation never fires — this is purely for lint-cleanliness.
+pub(crate) fn duration_ms(d: std::time::Duration) -> u64 {
+    d.as_secs()
+        .saturating_mul(1_000)
+        .saturating_add(u64::from(d.subsec_millis()))
+}
+
 /// Output format for scan results.
 #[derive(Debug, Clone, Copy, Default, PartialEq, clap::ValueEnum)]
 pub enum OutputFormat {

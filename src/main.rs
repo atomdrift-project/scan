@@ -528,7 +528,8 @@ fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litm
         summary.errors += result.errors;
     }
 
-    summary.duration_ms = started.elapsed().as_millis() as u64;
+    #[allow(clippy::cast_possible_truncation)]
+    { summary.duration_ms = started.elapsed().as_millis() as u64; }
     Ok(summary)
 }
 

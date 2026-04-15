@@ -35,6 +35,8 @@ const fn default_model_abi_version() -> u32 {
 ///
 /// config.json is the primary model-level configuration and takes precedence
 /// over evaluation.json recommendations.
+// Threshold values from JSON are in 0.0..1.0; narrowing to f32 is safe.
+#[allow(clippy::cast_possible_truncation)]
 fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
     let path = model_dir.join("config.json");
     let data = std::fs::read_to_string(&path).ok()?;
@@ -60,6 +62,7 @@ fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
 }
 
 /// Try to load recommended thresholds from evaluation.json.
+#[allow(clippy::cast_possible_truncation)]
 fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
     let path = model_dir.join("evaluation.json");
     let data = std::fs::read_to_string(&path).ok()?;

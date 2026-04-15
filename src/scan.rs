@@ -401,6 +401,9 @@ impl Progress {
     }
 }
 
+// secs is always positive finite (computed from elapsed/rate); the f64→u32 cast
+// is safe for any realistic scan duration.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn format_eta(secs: f64) -> String {
     if secs < 1.0 {
         "<1s".to_string()
@@ -480,7 +483,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             suspicious,
             benign,
             errors,
-            duration_ms: scan_start.elapsed().as_millis() as u64,
+            duration_ms: crate::duration_ms(scan_start.elapsed()),
         };
         if is_terminal {
             crate::output::print_summary(&summary);
@@ -504,10 +507,11 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 
     cleave::scan_directory(path, &cleave_opts, |event| match event {
         cleave::ScanEvent::Start { total } => {
-            let _ = total_files.set(total as u32);
+            let total32 = u32::try_from(total).unwrap_or(u32::MAX);
+            let _ = total_files.set(total32);
             if is_terminal && total > 1 {
                 crate::output::print_header(path, total);
-                let _ = progress.set(Progress::new(total as u32));
+                let _ = progress.set(Progress::new(total32));
             }
         }
         cleave::ScanEvent::File {
@@ -578,7 +582,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
         suspicious,
         benign,
         errors,
-        duration_ms: scan_start.elapsed().as_millis() as u64,
+        duration_ms: crate::duration_ms(scan_start.elapsed()),
     };
 
     if is_terminal {
@@ -948,7 +952,7 @@ pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
         return format!("v{}.{}", info.version, info.abi_version);
     }
     let sha_prefix = if info.sha256.len() >= 8 {
-        &info.sha256[..8]
+        info.sha256.get(..8).unwrap_or(&info.sha256)
     } else {
         &info.sha256
     };
