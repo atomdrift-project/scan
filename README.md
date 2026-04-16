@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="media/logo.svg" alt="litmus" width="240">
+</p>
+
 # litmus
 
 ML-powered malware classifier for supply-chain security. Uses [cleave](https://codeberg.org/atomdrift/cleave) static analysis to extract capabilities, then classifies threat level — built for security engineers and automated pipelines alike.
