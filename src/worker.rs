@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,16 @@ struct CachedFileHash {
     size: u64,
     modified: Option<std::time::SystemTime>,
     sha256: String,
+}
+
+static NEXT_ANALYSIS_ID: AtomicU64 = AtomicU64::new(1);
+static BLOCKING_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLOCKING_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn inflight_blocking_count() -> u64 {
+    BLOCKING_STARTED_TOTAL
+        .load(Ordering::Relaxed)
+        .saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed))
 }
 
 #[derive(Debug)]
@@ -371,8 +381,30 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let has_local_data = data_dir.is_some();
     let prefetch_count = if has_local_data { slots } else { (slots * 3).min(32) };
     let mut last_empty_poll = Instant::now() - Duration::from_secs(poll_secs + 1);
+    let mut last_summary = Instant::now();
 
     loop {
+        if last_summary.elapsed() >= Duration::from_secs(60) {
+            let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
+            let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
+            let inflight_blocking = started.saturating_sub(finished);
+            let available_slots = semaphore.available_permits();
+            let active_slots = slots.saturating_sub(available_slots);
+            tracing::info!(
+                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                queued_prefetch_jobs = buffer.len(),
+                prefetch_buffer_mb = buffer_bytes / (1024 * 1024),
+                active_slots,
+                available_slots,
+                blocking_started_total = started,
+                blocking_finished_total = finished,
+                inflight_blocking,
+                completed = completed.load(Ordering::Acquire),
+                "worker summary",
+            );
+            last_summary = Instant::now();
+        }
+
         if let Some(max) = max_jobs {
             if completed.load(Ordering::Acquire) >= max {
                 tracing::info!(max_jobs = max, "job limit reached, draining in-flight work");
@@ -597,6 +629,7 @@ async fn run_job(
     timeout_secs: u64,
     prefetched: std::result::Result<Option<Vec<u8>>, String>,
 ) -> Result<(serde_json::Value, serde_json::Value, i64), String> {
+    let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     let label = Path::new(&job.path).file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| job.sha256.clone());
@@ -662,6 +695,8 @@ async fn run_job(
     let resources = Arc::clone(resources);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = Arc::clone(&cancel);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let timed_out2 = Arc::clone(&timed_out);
     let local = local_path.clone();
 
     // Run analysis on a blocking thread with phase logging.
@@ -670,6 +705,7 @@ async fn run_job(
     let phase2 = phase.clone();
     let phase_timeout = phase.clone();
     let label2 = label.clone();
+    let label_for_blocking = label.clone();
     let sha_short = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
     let input_source = if use_local { "local" } else { "downloaded" };
     let input_size = if use_local {
@@ -706,8 +742,10 @@ async fn run_job(
                 // Phase tracker not yet updated — log if this persists.
                 if last_heartbeat.elapsed().as_secs() >= 30 {
                     tracing::warn!(
+                        analysis_id,
                         sha256 = %sha_short,
                         file = %label2,
+                        rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                         elapsed_ms = crate::duration_ms(phase_start.elapsed()),
                         "analysis running but phase tracker has not been updated",
                     );
@@ -718,6 +756,7 @@ async fn run_job(
             if current != last_phase {
                 if !last_phase.is_empty() {
                     tracing::info!(
+                        analysis_id,
                         sha256 = %sha_short,
                         file = %label2,
                         phase = %last_phase,
@@ -729,6 +768,7 @@ async fn run_job(
                 phase_start = Instant::now();
                 last_heartbeat = Instant::now();
                 tracing::info!(
+                    analysis_id,
                     sha256 = %sha_short,
                     file = %label2,
                     phase = %last_phase,
@@ -739,9 +779,11 @@ async fn run_job(
                 }
             } else if last_heartbeat.elapsed().as_secs() >= 30 {
                 tracing::warn!(
+                    analysis_id,
                     sha256 = %sha_short,
                     file = %label2,
                     phase = %last_phase,
+                    rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                     elapsed_ms = crate::duration_ms(phase_start.elapsed()),
                     "phase still running",
                 );
@@ -751,6 +793,7 @@ async fn run_job(
     });
 
     tracing::info!(
+        analysis_id,
         sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
         file = %label,
         source = input_source,
@@ -758,19 +801,42 @@ async fn run_job(
         "analysis starting",
     );
     let sha_short2 = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
-    let handle = tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
+        let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let thread_id = os_thread_id();
+        let inflight_blocking = started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
         tracing::info!(
+            analysis_id,
             sha256 = %sha_short2,
-            thread_id = os_thread_id(),
+            thread_id,
+            inflight_blocking,
+            started_total = started,
+            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
             "analysis thread started",
         );
-        if let Some(data) = downloaded {
-            classify_bytes(&data, &label, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
+        let result = if let Some(data) = downloaded {
+            classify_bytes(&data, &label_for_blocking, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
         } else if let Some(path) = local.as_ref() {
-            classify_file(path, &label, &resources, slow_rule_ms, None, Some(&cancel2), Some(&phase))
+            classify_file(path, &label_for_blocking, &resources, slow_rule_ms, None, Some(&cancel2), Some(&phase))
         } else {
-            Err(anyhow::anyhow!("no downloaded bytes and no local path for {label}"))
-        }
+            Err(anyhow::anyhow!("no downloaded bytes and no local path for {label_for_blocking}"))
+        };
+        let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let inflight_blocking = BLOCKING_STARTED_TOTAL
+            .load(Ordering::Relaxed)
+            .saturating_sub(finished);
+        tracing::info!(
+            analysis_id,
+            sha256 = %sha_short2,
+            thread_id,
+            timed_out = timed_out2.load(Ordering::Relaxed),
+            inflight_blocking,
+            finished_total = finished,
+            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+            elapsed_ms = crate::duration_ms(start.elapsed()),
+            "analysis thread finished",
+        );
+        result
     });
 
     let result = if timeout_secs == 0 {
@@ -781,9 +847,26 @@ async fn run_job(
             Ok(r) => r,
             Err(_) => {
                 let stuck_phase = phase_timeout.get();
+                timed_out.store(true, Ordering::Relaxed);
                 cancel.store(true, Ordering::Relaxed);
                 #[allow(clippy::cast_sign_loss)]
                 let elapsed_ms = crate::duration_ms(start.elapsed()) as i64;
+                let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
+                let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
+                let inflight_blocking = inflight_blocking_count();
+                tracing::warn!(
+                    analysis_id,
+                    sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
+                    file = %label,
+                    phase = %stuck_phase,
+                    elapsed_ms,
+                    timeout_secs,
+                    inflight_blocking,
+                    blocking_started_total = started,
+                    blocking_finished_total = finished,
+                    rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                    "analysis timeout fired; blocking task may still be running",
+                );
                 return Err(format!(
                     "analysis timed out after {timeout_secs}s ({elapsed_ms}ms) in phase={stuck_phase}"
                 ));
