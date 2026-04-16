@@ -322,10 +322,13 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         "worker starting"
     );
 
-    // Pre-warm YARA compiler and capability mapper before claiming work.
-    // Both are initialized lazily; the first analysis blocks until they're ready.
-    // Doing this at startup avoids a multi-second latency spike on the first real job.
-    // A minimal PE stub triggers full parallel initialization via cleave's rayon::join.
+    // Update rules and models before claiming any work. Non-fatal — if the
+    // update fails, we continue with whatever is already installed.
+    tracing::info!("updating rules and models before first poll");
+    if let Err(e) = tokio::task::spawn_blocking(update_rules_and_models).await {
+        tracing::warn!(error = %e, "initial rules update task failed");
+    }
+
     // Background: periodic rules update.
     if config.update_interval_mins > 0 {
         let interval = Duration::from_secs(config.update_interval_mins * 60);
@@ -846,53 +849,45 @@ async fn post_result(
     tracing::error!(sha256 = %sha256, "post result: giving up after {MAX_ATTEMPTS} attempts");
 }
 
+/// Pull latest rules and models. Non-fatal — logs warnings on failure.
+fn update_rules_and_models() {
+    let prev = match crate::models_repo::update() {
+        Ok(prev) => prev,
+        Err(e) => {
+            tracing::warn!(error = %e, "model update failed");
+            None
+        }
+    };
+    let traits_ok = match cleave::traits_repo::update(false) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "traits update failed");
+            false
+        }
+    };
+
+    if traits_ok {
+        if let Err(e) = cleave::reload_capability_mapper() {
+            tracing::warn!(error = %e, "capability mapper reload failed");
+        }
+        cleave::clear_all_thread_caches();
+    } else if let Some(ref rev) = prev {
+        tracing::error!(rev, "traits update failed after models pull; rolling back models repo to previous commit");
+        if let Err(e) = crate::models_repo::rollback(rev) {
+            tracing::error!(error = %e, "models rollback failed");
+        }
+    }
+}
+
 async fn periodic_update(interval: Duration) {
     loop {
         tokio::time::sleep(interval).await;
         tracing::info!("updating rules and models");
 
-        // All update work runs on a single blocking thread under a hard timeout.
-        // This ensures:
-        //   - git and filesystem calls never block the async runtime
-        //   - reload_capability_mapper / clear_all_thread_caches (which may
-        //     contend with in-flight analysis tasks for internal cleave locks)
-        //     are bounded and cannot deadlock the worker loop
-        //   - rollback, if needed, is also on the same blocking thread so all
-        //     git ops stay together
-        //
-        // If the timeout fires, the blocking thread is abandoned and the loop
-        // continues; a future iteration will retry.
         const UPDATE_TIMEOUT: Duration = Duration::from_secs(150);
         match tokio::time::timeout(
             UPDATE_TIMEOUT,
-            tokio::task::spawn_blocking(|| {
-                let prev = match crate::models_repo::update() {
-                    Ok(prev) => prev,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "model update failed");
-                        None
-                    }
-                };
-                let traits_ok = match cleave::traits_repo::update(false) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "traits update failed");
-                        false
-                    }
-                };
-
-                if traits_ok {
-                    if let Err(e) = cleave::reload_capability_mapper() {
-                        tracing::warn!(error = %e, "capability mapper reload failed");
-                    }
-                    cleave::clear_all_thread_caches();
-                } else if let Some(ref rev) = prev {
-                    tracing::error!(rev, "traits update failed after models pull; rolling back models repo to previous commit");
-                    if let Err(e) = crate::models_repo::rollback(rev) {
-                        tracing::error!(error = %e, "models rollback failed");
-                    }
-                }
-            }),
+            tokio::task::spawn_blocking(update_rules_and_models),
         )
         .await
         {
