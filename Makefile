@@ -12,7 +12,7 @@ SLOW_RULE_MS ?= 200
 MAX_JOBS ?= 25
 WORKERS  ?=
 
-.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille rollout-debian rollout-ubuntu rollout-openbsd rollout-alpine rollout-macos benchmark benchmark-worker profile-worker profile-slow lint test clean
+.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker profile-worker profile-slow lint test clean
 
 all: build
 
@@ -76,19 +76,8 @@ tarball: release
 deploy-server:
 	git pull
 	@case "$$(uname -s)" in \
-		Darwin)  ./scripts/server/rollout-macos.sh ;; \
 		FreeBSD) ./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)" ;; \
-		Linux)   if [ -f /etc/alpine-release ]; then \
-		           ./scripts/server/rollout-alpine.sh; \
-		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
-		           ./scripts/server/rollout-ubuntu.sh; \
-		         else \
-		           [ -n "$(BUILD)" ] && [ -n "$(SERVER_RUN)" ] || \
-		             { echo "Usage: make deploy-server BUILD=<build-host> SERVER_RUN=<run-host>"; exit 1; }; \
-		           ./scripts/server/rollout-debian.sh "$(BUILD)" "$(SERVER_RUN)"; \
-		         fi ;; \
-		OpenBSD) ./scripts/server/rollout-openbsd.sh ;; \
-		*) echo "error: no deploy-server target for $$(uname -s)"; exit 1 ;; \
+		*) echo "error: server deployments are bastille-only; run from a FreeBSD host"; exit 1 ;; \
 	esac
 
 deploy-worker:
@@ -113,18 +102,8 @@ deploy-worker:
 
 uninstall-server:
 	@case "$$(uname -s)" in \
-		Darwin)  ./scripts/server/uninstall-macos.sh ;; \
 		FreeBSD) ./scripts/server/uninstall-bastille.sh "$(SERVER_RUN)" ;; \
-		Linux)   if [ -f /etc/alpine-release ]; then \
-		           ./scripts/server/uninstall-alpine.sh; \
-		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
-		           ./scripts/server/uninstall-ubuntu.sh; \
-		         else \
-		           [ -n "$(SERVER_RUN)" ] || { echo "Usage: make uninstall-server SERVER_RUN=<run-host>"; exit 1; }; \
-		           ./scripts/server/uninstall-debian.sh "$(SERVER_RUN)"; \
-		         fi ;; \
-		OpenBSD) ./scripts/server/uninstall-openbsd.sh ;; \
-		*) echo "error: no uninstall-server target for $$(uname -s)"; exit 1 ;; \
+		*) echo "error: server deployments are bastille-only; run from a FreeBSD host"; exit 1 ;; \
 	esac
 
 uninstall-worker:
@@ -158,23 +137,6 @@ uninstall-worker-nodes:
 
 rollout-bastille:
 	./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)"
-
-rollout-macos:
-	./scripts/server/rollout-macos.sh
-
-rollout-debian:
-	@[ -n "$(BUILD)" ] && [ -n "$(SERVER_RUN)" ] || { echo "Usage: make rollout-debian BUILD=<build-host> SERVER_RUN=<run-host>"; exit 1; }
-	./scripts/server/rollout-debian.sh "$(BUILD)" "$(SERVER_RUN)"
-
-rollout-ubuntu:
-	@grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null || { echo "error: rollout-ubuntu requires Ubuntu"; exit 1; }
-	./scripts/server/rollout-ubuntu.sh
-
-rollout-openbsd:
-	./scripts/server/rollout-openbsd.sh
-
-rollout-alpine:
-	./scripts/server/rollout-alpine.sh
 
 benchmark: release
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }

@@ -127,6 +127,18 @@ if [ ! -f "$PLIST" ] || ! cmp -s "$new_plist" "$PLIST"; then
 fi
 rm -f "$new_plist"
 
+# Migrate hosts that ran under the legacy unsuffixed label (com.atomdrift.litmus,
+# pre-rename in commit 65440b1). The old label collided with the macOS server
+# service name; if a stale plist is still on disk, bootout and delete it so
+# launchd doesn't resurrect a mismatched daemon on next boot.
+LEGACY_LABEL=com.atomdrift.litmus
+LEGACY_PLIST=/Library/LaunchDaemons/com.atomdrift.litmus.plist
+if [ -f "$LEGACY_PLIST" ]; then
+    log "Removing legacy unsuffixed worker service ($LEGACY_LABEL)"
+    sudo launchctl bootout "system/$LEGACY_LABEL" 2>/dev/null || true
+    sudo rm -f "$LEGACY_PLIST"
+fi
+
 service_loaded() {
     sudo launchctl print "system/$LABEL" >/dev/null 2>&1
 }

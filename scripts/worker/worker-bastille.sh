@@ -1,13 +1,14 @@
 #!/bin/sh
 # worker-bastille.sh - Deploy litmus worker using separate build and run jails
-# Usage: ./worker-bastille.sh [build-jail] [run-jail] <url>
+# Usage: ./worker-bastille.sh [build-jail] [run-jail] <hopper-url>
 
 set -ex
+set -o pipefail
 
 BUILD="${1:-build}"
 RUN="${2:-litworker}"
 URL="$3"
-[ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
+[ -n "$URL" ] || { echo "error: hopper URL required as third argument" >&2; exit 1; }
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -57,6 +58,10 @@ doas bastille cmd "$RUN" tar -xzf /tmp/litmus.tgz -C /usr/local/share/litmus
 doas bastille cmd "$RUN" rm -f /tmp/litmus.tgz
 doas bastille cmd "$RUN" ln -sf /usr/local/share/litmus/litmus /usr/local/bin/litmus
 
+log "Refreshing models and traits in run jail"
+doas bastille cmd "$RUN" su -l litmus -c "litmus update-rules" \
+    || die "update-rules failed in run jail"
+
 log "Creating rc.d service"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
 doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/litmus-worker >/dev/null <<EOF
@@ -78,7 +83,13 @@ load_rc_config \$name
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-c -f -P \${pidfile} -r -o \${litmus_worker_logfile} -u litmus /usr/local/share/litmus/litmus worker --url $URL"
+# MALLOC_CONF tunes FreeBSD's jemalloc to return freed memory to the OS
+# promptly instead of holding dirty pages for 10s (the default). Critical
+# under bursty analysis workloads where RSS would otherwise drift upward.
+# Set via /usr/bin/env so it survives daemon(8)'s user switch and any
+# login.conf environment filtering.
+malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,abort_conf:true"
+command_args="-c -f -P \${pidfile} -r -o \${litmus_worker_logfile} -u litmus /usr/bin/env MALLOC_CONF=\${malloc_conf} /usr/local/share/litmus/litmus worker --url $URL"
 
 run_rc_command "\$1"
 EOF

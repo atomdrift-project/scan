@@ -3,6 +3,7 @@
 # Usage: ./rollout-bastille.sh [build-jail] [run-jail]
 
 set -ex
+set -o pipefail
 
 BUILD="${1:-build}"
 RUN="${2:-litmus}"
@@ -41,10 +42,6 @@ log "Building tarball"
 doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=mold' make tarball" \
     || die "build failed in build jail"
 
-log "Upgrading rules"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && ./target/release/litmus update-rules" \
-    || die "update-rules failed in build jail"
-
 log "Running tests"
 doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=mold' cargo test --release -- --nocapture" \
     || die "tests failed in build jail"
@@ -71,6 +68,10 @@ doas bastille cmd "$RUN" mkdir -p /usr/local/share/litmus
 doas bastille cmd "$RUN" tar -xzf /tmp/litmus.tgz -C /usr/local/share/litmus
 doas bastille cmd "$RUN" rm -f /tmp/litmus.tgz
 doas bastille cmd "$RUN" ln -sf /usr/local/share/litmus/litmus /usr/local/bin/litmus
+
+log "Refreshing models and traits in run jail"
+doas bastille cmd "$RUN" su -l litmus -c "litmus update-rules" \
+    || die "update-rules failed in run jail"
 
 log "Creating rc.d service"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
