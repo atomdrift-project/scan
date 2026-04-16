@@ -2,7 +2,8 @@ SHELL := /bin/sh
 BINARY = litmus
 OUT_DIR = out
 BUILD ?= build
-RUN   ?= litmus
+SERVER_RUN ?= litmus
+WORKER_RUN ?= litworker
 DATASET ?= slow
 BENCHMARK_ROOT ?= /Users/t/data/benchmark
 BENCHMARK_PATH ?= $(BENCHMARK_ROOT)/$(DATASET)
@@ -73,35 +74,35 @@ deploy-server:
 	git pull
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/server/rollout-macos.sh ;; \
-		FreeBSD) ./scripts/server/rollout-bastille.sh "$(BUILD)" "$(RUN)" ;; \
+		FreeBSD) ./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)" ;; \
 		Linux)   if [ -f /etc/alpine-release ]; then \
 		           ./scripts/server/rollout-alpine.sh; \
 		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
 		           ./scripts/server/rollout-ubuntu.sh; \
 		         else \
-		           [ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || \
-		             { echo "Usage: make deploy-server BUILD=<build-host> RUN=<run-host>"; exit 1; }; \
-		           ./scripts/server/rollout-debian.sh "$(BUILD)" "$(RUN)"; \
+		           [ -n "$(BUILD)" ] && [ -n "$(SERVER_RUN)" ] || \
+		             { echo "Usage: make deploy-server BUILD=<build-host> SERVER_RUN=<run-host>"; exit 1; }; \
+		           ./scripts/server/rollout-debian.sh "$(BUILD)" "$(SERVER_RUN)"; \
 		         fi ;; \
 		OpenBSD) ./scripts/server/rollout-openbsd.sh ;; \
 		*) echo "error: no deploy-server target for $$(uname -s)"; exit 1 ;; \
 	esac
 
 deploy-worker:
-	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker URL=<url> [BUILD=<host>] [RUN=<host>]"; exit 1; }
+	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker URL=<url> [BUILD=<host>] [WORKER_RUN=<host>]"; exit 1; }
 	git stash
 	git pull
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/worker/worker-macos.sh "$(URL)" ;; \
-		FreeBSD) ./scripts/worker/worker-bastille.sh "$(BUILD)" "$(RUN)" "$(URL)" ;; \
+		FreeBSD) ./scripts/worker/worker-bastille.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)" ;; \
 		Linux)   if [ -f /etc/alpine-release ]; then \
 		           ./scripts/worker/worker-alpine.sh "$(URL)"; \
 		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
 		           ./scripts/worker/worker-ubuntu.sh "$(URL)"; \
 		         else \
-		           [ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || \
-		             { echo "Usage: make deploy-worker BUILD=<build-host> RUN=<run-host> URL=<url>"; exit 1; }; \
-		           ./scripts/worker/worker-debian.sh "$(BUILD)" "$(RUN)" "$(URL)"; \
+		           [ -n "$(BUILD)" ] && [ -n "$(WORKER_RUN)" ] || \
+		             { echo "Usage: make deploy-worker BUILD=<build-host> WORKER_RUN=<run-host> URL=<url>"; exit 1; }; \
+		           ./scripts/worker/worker-debian.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)"; \
 		         fi ;; \
 		OpenBSD) ./scripts/worker/worker-openbsd.sh "$(URL)" ;; \
 		*) echo "error: no deploy-worker target for $$(uname -s)"; exit 1 ;; \
@@ -110,14 +111,14 @@ deploy-worker:
 uninstall-server:
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/server/uninstall-macos.sh ;; \
-		FreeBSD) ./scripts/server/uninstall-bastille.sh "$(RUN)" ;; \
+		FreeBSD) ./scripts/server/uninstall-bastille.sh "$(SERVER_RUN)" ;; \
 		Linux)   if [ -f /etc/alpine-release ]; then \
 		           ./scripts/server/uninstall-alpine.sh; \
 		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
 		           ./scripts/server/uninstall-ubuntu.sh; \
 		         else \
-		           [ -n "$(RUN)" ] || { echo "Usage: make uninstall-server RUN=<run-host>"; exit 1; }; \
-		           ./scripts/server/uninstall-debian.sh "$(RUN)"; \
+		           [ -n "$(SERVER_RUN)" ] || { echo "Usage: make uninstall-server SERVER_RUN=<run-host>"; exit 1; }; \
+		           ./scripts/server/uninstall-debian.sh "$(SERVER_RUN)"; \
 		         fi ;; \
 		OpenBSD) ./scripts/server/uninstall-openbsd.sh ;; \
 		*) echo "error: no uninstall-server target for $$(uname -s)"; exit 1 ;; \
@@ -126,14 +127,14 @@ uninstall-server:
 uninstall-worker:
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/worker/uninstall-macos.sh ;; \
-		FreeBSD) ./scripts/worker/uninstall-bastille.sh "$(RUN)" ;; \
+		FreeBSD) ./scripts/worker/uninstall-bastille.sh "$(WORKER_RUN)" ;; \
 		Linux)   if [ -f /etc/alpine-release ]; then \
 		           ./scripts/worker/uninstall-alpine.sh; \
 		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
 		           ./scripts/worker/uninstall-ubuntu.sh; \
 		         else \
-		           [ -n "$(RUN)" ] || { echo "Usage: make uninstall-worker RUN=<run-host>"; exit 1; }; \
-		           ./scripts/worker/uninstall-debian.sh "$(RUN)"; \
+		           [ -n "$(WORKER_RUN)" ] || { echo "Usage: make uninstall-worker WORKER_RUN=<run-host>"; exit 1; }; \
+		           ./scripts/worker/uninstall-debian.sh "$(WORKER_RUN)"; \
 		         fi ;; \
 		OpenBSD) ./scripts/worker/uninstall-openbsd.sh ;; \
 		*) echo "error: no uninstall-worker target for $$(uname -s)"; exit 1 ;; \
@@ -153,14 +154,14 @@ uninstall-worker-nodes:
 	./scripts/worker/uninstall-nodes.sh $(NODES)
 
 rollout-bastille:
-	./scripts/server/rollout-bastille.sh "$(BUILD)" "$(RUN)"
+	./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)"
 
 rollout-macos:
 	./scripts/server/rollout-macos.sh
 
 rollout-debian:
-	@[ -n "$(BUILD)" ] && [ -n "$(RUN)" ] || { echo "Usage: make rollout-debian BUILD=<build-host> RUN=<run-host>"; exit 1; }
-	./scripts/server/rollout-debian.sh "$(BUILD)" "$(RUN)"
+	@[ -n "$(BUILD)" ] && [ -n "$(SERVER_RUN)" ] || { echo "Usage: make rollout-debian BUILD=<build-host> SERVER_RUN=<run-host>"; exit 1; }
+	./scripts/server/rollout-debian.sh "$(BUILD)" "$(SERVER_RUN)"
 
 rollout-ubuntu:
 	@grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null || { echo "error: rollout-ubuntu requires Ubuntu"; exit 1; }
