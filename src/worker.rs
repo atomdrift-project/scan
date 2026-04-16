@@ -352,6 +352,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let mut buffer: VecDeque<PrefetchedJob> = VecDeque::new();
+    let mut buffer_bytes: usize = 0; // track memory held by prefetched data
+    let max_buffer_bytes: usize = if cleave::memory_tracker::total_memory().unwrap_or(0) >= 16 * 1024 * 1024 * 1024 {
+        1024 * 1024 * 1024 // 1 GiB on systems with >= 16 GiB RAM
+    } else {
+        512 * 1024 * 1024  // 512 MiB otherwise
+    };
     // With local data, there's no download latency to hide — just claim
     // what we can run immediately. Without local data, prefetch 3x slots
     // so downloads overlap with analysis.
@@ -387,6 +393,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         // Refill the prefetch buffer when it's running low. Rate-limit polls
         // so we don't hammer hopper when it has no work.
         let should_poll = buffer.len() < slots
+            && buffer_bytes < max_buffer_bytes
             && last_empty_poll.elapsed() >= Duration::from_secs(poll_secs);
         if should_poll {
             let poll_url = format!(
@@ -409,16 +416,21 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 }
                 Ok(Some(jobs)) => {
                     consecutive_errors = 0;
+                    let n = jobs.len();
+                    for pj in jobs {
+                        buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, |v| v.len()));
+                        buffer.push_back(pj);
+                    }
                     tracing::info!(
-                        jobs = jobs.len(),
+                        jobs = n,
+                        buffer_mb = buffer_bytes / (1024 * 1024),
                         elapsed_ms = crate::duration_ms(poll_start.elapsed()),
                         "claimed and prefetched",
                     );
-                    buffer.extend(jobs);
                 }
                 Err(e) => {
                     consecutive_errors += 1;
-                    let backoff = backoff_duration(poll_secs, consecutive_errors);
+                    let backoff = backoff_duration(consecutive_errors);
                     tracing::warn!(error = %e, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "poll/prefetch failed");
                     if buffer.is_empty() {
                         tokio::time::sleep(backoff).await;
@@ -431,7 +443,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
         // Dispatch the next prefetched job when a slot is free.
         let pj = match buffer.pop_front() {
-            Some(pj) => pj,
+            Some(pj) => {
+                buffer_bytes -= pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, |v| v.len()));
+                pj
+            }
             None => {
                 // Buffer empty and poll rate-limited — wait before retrying.
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -469,7 +484,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 );
             }
             post_result(&client, &url, &name, &pj.job.sha256, result).await;
-            completed.fetch_add(1, Ordering::Release);
+            let n = completed.fetch_add(1, Ordering::Release) + 1;
+            if n % 100 == 0 {
+                tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
+            }
             drop(permit);
         });
     }
@@ -807,7 +825,7 @@ async fn post_result(
     const MAX_ATTEMPTS: u32 = 6;
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(backoff_duration(2, attempt)).await;
+            tokio::time::sleep(backoff_duration(attempt)).await;
         }
         tracing::debug!(sha256 = %sha256, attempt, "posting result to server");
         let post_start = Instant::now();
@@ -938,11 +956,14 @@ async fn download_bytes(
 }
 
 /// Exponential backoff with jitter, capped at 2 minutes.
-fn backoff_duration(base_secs: u64, consecutive_errors: u32) -> Duration {
-    let exp = consecutive_errors.min(7); // cap at 2^7 = 128s
-    let secs = base_secs.saturating_mul(1 << exp);
-    let capped = secs.min(120);
-    // Simple jitter: ±25% using a cheap hash of the error count.
+/// Exponential backoff with jitter for hopper outage recovery.
+/// Starts at 1s, doubles each attempt, caps at 60s. Jitter prevents
+/// thundering herd when multiple workers reconnect simultaneously.
+fn backoff_duration(consecutive_errors: u32) -> Duration {
+    let exp = consecutive_errors.min(6); // cap at 2^6 = 64 → capped to 60
+    let secs = 1u64.saturating_mul(1 << exp);
+    let capped = secs.min(60);
+    // Jitter: ±25% using a cheap deterministic hash of the error count.
     let jitter = (consecutive_errors as u64 * 7 + 3) % (capped / 4 + 1);
     Duration::from_secs(capped.saturating_add(jitter))
 }
