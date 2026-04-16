@@ -44,12 +44,6 @@ static NEXT_ANALYSIS_ID: AtomicU64 = AtomicU64::new(1);
 static BLOCKING_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLOCKING_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-fn inflight_blocking_count() -> u64 {
-    BLOCKING_STARTED_TOTAL
-        .load(Ordering::Relaxed)
-        .saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed))
-}
-
 #[derive(Debug)]
 struct LocalFileIndex {
     root: PathBuf,
@@ -249,8 +243,6 @@ pub struct WorkerConfig {
     pub workers: usize,
     /// Seconds to sleep when no work is available.
     pub poll_secs: u64,
-    /// Per-file analysis timeout in seconds.
-    pub timeout_secs: u64,
     /// Maximum RSS in GB before pausing (0 = unlimited).
     pub max_rss_gb: u64,
     /// Minutes between rules/model updates (0 = disabled).
@@ -307,23 +299,8 @@ struct PrefetchedJob {
 pub async fn run(config: WorkerConfig) -> Result<()> {
     let name = config.name.clone();
     let slots = config.workers;
-    let mut client_builder = reqwest::Client::builder();
-    if config.timeout_secs > 0 {
-        client_builder = client_builder.timeout(Duration::from_secs(config.timeout_secs + 120));
-    }
-    let client = client_builder.build()?;
+    let client = reqwest::Client::builder().build()?;
     let semaphore = Arc::new(Semaphore::new(slots));
-
-    // Load model resources once at startup.
-    let model = Model::load(&config.model_dir, config.thresholds)
-        .context("loading model")?;
-    let shap = ShapImportance::load(&config.model_dir).ok();
-    let ctx = ExtractContext::new(model.spec());
-    let resources = Arc::new(ModelResources {
-        model,
-        shap,
-        ctx,
-    });
 
     tracing::info!(
         name = %name,
@@ -343,6 +320,18 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         tracing::warn!(error = %e, "initial rules update task failed");
     }
 
+    // Load model resources after the initial update so a stale or corrupted
+    // local checkout can be repaired before startup fails.
+    let model = Model::load(&config.model_dir, config.thresholds)
+        .context("loading model")?;
+    let shap = ShapImportance::load(&config.model_dir).ok();
+    let ctx = ExtractContext::new(model.spec());
+    let resources = Arc::new(ModelResources {
+        model,
+        shap,
+        ctx,
+    });
+
     // Background: periodic rules update.
     if config.update_interval_mins > 0 {
         let interval = Duration::from_secs(config.update_interval_mins * 60);
@@ -361,7 +350,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         .map(Arc::new);
     let poll_secs = config.poll_secs;
     let slow_rule_ms = config.slow_rule_ms;
-    let timeout_secs = config.timeout_secs;
     let max_jobs = config.max_jobs;
     let max_rss_gb = config.max_rss_gb;
     let encoded_name: String = url_encode(&name);
@@ -532,7 +520,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         tokio::spawn(async move {
             let result = run_job(
                 &client, &url, local_index.as_deref(), &pj.job, &resources,
-                slow_rule_ms, timeout_secs, pj.data,
+                slow_rule_ms, pj.data,
             ).await;
             if let Err(ref e) = result {
                 tracing::warn!(
@@ -626,7 +614,6 @@ async fn run_job(
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
-    timeout_secs: u64,
     prefetched: std::result::Result<Option<Vec<u8>>, String>,
 ) -> Result<(serde_json::Value, serde_json::Value, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
@@ -695,15 +682,12 @@ async fn run_job(
     let resources = Arc::clone(resources);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = Arc::clone(&cancel);
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let timed_out2 = Arc::clone(&timed_out);
     let local = local_path.clone();
 
     // Run analysis on a blocking thread with phase logging.
     let start = Instant::now();
     let phase = cleave::PhaseTracker::new();
     let phase2 = phase.clone();
-    let phase_timeout = phase.clone();
     let label2 = label.clone();
     let label_for_blocking = label.clone();
     let sha_short = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
@@ -829,7 +813,6 @@ async fn run_job(
             analysis_id,
             sha256 = %sha_short2,
             thread_id,
-            timed_out = timed_out2.load(Ordering::Relaxed),
             inflight_blocking,
             finished_total = finished,
             rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
@@ -839,40 +822,7 @@ async fn run_job(
         result
     });
 
-    let result = if timeout_secs == 0 {
-        // No timeout — let analysis run as long as it needs.
-        handle.await
-    } else {
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await {
-            Ok(r) => r,
-            Err(_) => {
-                let stuck_phase = phase_timeout.get();
-                timed_out.store(true, Ordering::Relaxed);
-                cancel.store(true, Ordering::Relaxed);
-                #[allow(clippy::cast_sign_loss)]
-                let elapsed_ms = crate::duration_ms(start.elapsed()) as i64;
-                let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
-                let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
-                let inflight_blocking = inflight_blocking_count();
-                tracing::warn!(
-                    analysis_id,
-                    sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
-                    file = %label,
-                    phase = %stuck_phase,
-                    elapsed_ms,
-                    timeout_secs,
-                    inflight_blocking,
-                    blocking_started_total = started,
-                    blocking_finished_total = finished,
-                    rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-                    "analysis timeout fired; blocking task may still be running",
-                );
-                return Err(format!(
-                    "analysis timed out after {timeout_secs}s ({elapsed_ms}ms) in phase={stuck_phase}"
-                ));
-            }
-        }
-    };
+    let result = handle.await;
 
     // Always signal the phase watcher to stop. Without this, if cleave returns
     // an error before setting phase="done", the watcher thread leaks indefinitely.

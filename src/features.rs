@@ -1587,10 +1587,6 @@ fn merge_metric_summaries(summaries: &[FileSummary]) -> serde_json::Value {
 }
 
 fn write_metric_features(metrics: &serde_json::Value, vec: &mut [f32], mut offset: usize, metric_vocab: &[String]) {
-    let base_keys: std::collections::HashSet<String> = KEY_METRICS.iter()
-        .map(|&(g, f, _)| format!("{g}_{f}"))
-        .collect();
-
     for &(group, field_name, use_log) in KEY_METRICS {
         let value = metrics.get(group).and_then(|g| g.get(field_name)).and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
         vec[offset] = if use_log { (value.abs() + 1.0).ln() } else { value };

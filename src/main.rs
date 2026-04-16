@@ -165,10 +165,6 @@ enum Commands {
         #[arg(long, default_value = "2")]
         poll_secs: u64,
 
-        /// Per-request analysis timeout in seconds (0 = no timeout)
-        #[arg(long, default_value = "0")]
-        timeout_secs: u64,
-
         /// Maximum RSS in gigabytes before pausing claims (0 = auto)
         #[arg(long, default_value = "0")]
         max_rss_gb: u64,
@@ -437,7 +433,6 @@ fn main() -> Result<()> {
             name,
             workers,
             poll_secs,
-            timeout_secs,
             max_rss_gb,
             update_interval_mins,
             data_dir,
@@ -460,7 +455,6 @@ fn main() -> Result<()> {
                 name,
                 workers,
                 poll_secs,
-                timeout_secs,
                 max_rss_gb,
                 update_interval_mins,
                 data_dir,
