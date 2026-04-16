@@ -1728,7 +1728,7 @@ mod tests {
     #[test]
     fn test_standardize() {
         let spec = FeatureSpec {
-            version: 16, abi_version: 16, presence_vocab: vec![], filetype_vocab: vec![], element_vocab: vec![], bigram_vocab: vec![], ghost_vocab: vec![], skeleton_vocab: vec![], rare_element_vocab: vec![], trigram_vocab: vec![], feature_names: vec![], total_features: 3,
+            version: 16, abi_version: 16, presence_vocab: vec![], filetype_vocab: vec![], element_vocab: vec![], bigram_vocab: vec![], ghost_vocab: vec![], skeleton_vocab: vec![], rare_element_vocab: vec![], trigram_vocab: vec![], metric_vocab: vec![], feature_names: vec![], total_features: 3,
             feature_means: Some(vec![0.0, 1.0, 2.0]), feature_stds: Some(vec![1.0, 2.0, 0.5]), standardized: true,
         };
         let mut features = vec![1.0, 3.0, 3.0];
