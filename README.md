@@ -4,20 +4,33 @@
 
 # litmus
 
-Malware classifier for the modern software supply chain. litmus turns [cleave](https://codeberg.org/atomdrift/cleave)'s capability analysis into a verdict — `hostile`, `suspicious`, or `benign` — using a local XGBoost model trained on millions of real packages. No cloud calls, no opaque signatures, no telemetry.
+Point litmus at a package, directory, or running process and it tells you whether it's `hostile`, `suspicious`, or `benign` — and exactly which behaviors drove that call. A local XGBoost model trained on millions of real packages runs the classification. No cloud calls, no opaque signatures, no telemetry.
 
 ## What It Does
 
-Every sample passes through cleave's AST-aware decomposition, which emits a vector of behaviors drawn from 47,000+ rules aligned to [MBC](https://github.com/MBCProject/mbc-markdown) and [ATT&CK](https://attack.mitre.org/). That vector feeds the classifier, which returns a probability and an exact TreeSHAP ranking of the capabilities that moved the score. You see not just *what* litmus decided, but *why*.
+Litmus looks for 47,000+ known malicious behaviors, cataloged against [MBC](https://github.com/MBCProject/mbc-markdown) and [MITRE ATT&CK](https://attack.mitre.org/), by running each sample through [cleave](https://codeberg.org/atomdrift/cleave). The model weighs what it finds and returns a score. Every flagged file comes with a ranked list of the capabilities that pushed it over the line — so when litmus flags something, you know *why*, not just *what*.
 
-The same binary runs four ways: a CLI at the desk, a JSON emitter in CI, an HTTP service under load, and a pull worker for fleets — handing the same model to a laptop, a build agent, or a jail analyzing a million packages a day.
+One binary, four modes: an interactive CLI, a JSON emitter for CI, an HTTP service, and a pull worker for distributed fleets. The same model runs on a laptop or a jail classifying a million packages a day.
 
 ## Quick Start
 
-```bash
-brew install atomdrift/tap/litmus            # macOS/Linux — first run: brew tap atomdrift/tap https://codeberg.org/atomdrift/homebrew-tap.git
-make install                                  # from source
+Install with Homebrew (macOS/Linux):
 
+```bash
+brew tap atomdrift/tap https://codeberg.org/atomdrift/homebrew-tap.git
+brew install litmus
+```
+
+Or build from source:
+
+```bash
+git clone https://codeberg.org/atomdrift/litmus.git
+cd litmus && make install
+```
+
+Then run:
+
+```bash
 litmus suspect.tgz                            # single sample
 litmus /srv/npm-mirror                        # recursive; archives unpacked
 litmus --format json --show all pkg/          # pipeline-friendly output
@@ -30,11 +43,11 @@ Optional: [rizin](https://github.com/rizinorg/rizin) for disassembly, [upx](http
 
 ## Why Security Engineers Use It
 
-- **Tunable paranoia** — `--threshold-hostile` and `--threshold-suspicious` move the goalposts at runtime; `--model-dir` swaps in your own weights when the stock model doesn't match your threat model.
-- **Explanations by default** — every flagged file ships with the capabilities that drove its score, computed via exact TreeSHAP against the production model. No post-hoc justification.
-- **Air-gap ready** — the model and trait repositories are plain git: fetch once, run forever. `--update` pulls new versions when you want them. No license servers, no sample upload.
-- **Pipeline-native** — JSONL output streams per-file verdicts with the full cleave report attached; progress lives on stderr so it never contaminates a pipe.
-- **Fleet-scale** — `litmus serve` exposes an HTTP API with loopback-default binding, CIDR allowlists, bounded concurrency, and an RSS ceiling that rejects requests before the box swaps. `litmus worker` pulls jobs from a [hopper](https://codeberg.org/atomdrift/hopper) queue with SHA256-verified local paths.
+- **Tune the sensitivity** — `--threshold-hostile` and `--threshold-suspicious` shift the verdict cutoffs at runtime. `--model-dir` swaps in your own model when the stock one doesn't match your threat profile.
+- **Every verdict is explained** — flagged files come with the exact capabilities that drove the score, computed via TreeSHAP on the live model. Not a post-hoc story.
+- **Works offline** — models and rules live in plain git repos: clone once, run forever. `--update` pulls new versions when you want them. No license servers, no sample upload.
+- **Built for pipelines** — JSONL output streams per-file verdicts with the full cleave report attached. Progress writes to stderr, so it stays out of your pipe.
+- **Scales to fleets** — `litmus serve` exposes an HTTP API with loopback-default binding, CIDR allowlists, bounded concurrency, and an RSS ceiling that rejects requests before the box starts swapping. `litmus worker` pulls jobs from a [hopper](https://codeberg.org/atomdrift/hopper) queue with SHA256-verified local paths.
 
 ## Related
 
