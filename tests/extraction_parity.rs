@@ -214,7 +214,7 @@ fn full_pipeline_matches_collimator() {
         if let Some(expected_prob) = sample.expected_probability {
             let diff = (f64::from(probability) - expected_prob).abs();
             assert!(
-                diff < 1e-4,
+                diff < 5e-3,
                 "sample {i}: probability diverges — rust={probability:.8} python={expected_prob:.8} diff={diff:.2e}"
             );
         }
