@@ -319,8 +319,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         name = %name,
         slots = slots,
         hopper = %config.hopper_url,
+        rayon_threads = rayon::current_num_threads(),
         "worker starting"
     );
+
+    // Start background rayon pool health monitoring.
+    cleave::start_rayon_diagnostics();
 
     // Update rules and models before claiming any work. Non-fatal — if the
     // update fails, we continue with whatever is already installed.
@@ -457,12 +461,34 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             }
         };
 
-        // Wait for a free analysis slot.
+        // Wait for a free analysis slot. Also check memory pressure after
+        // acquiring the permit — the RSS check at the top of the loop only
+        // runs before claiming, but memory can grow while waiting for a slot.
         let permit = semaphore
             .clone()
             .acquire_owned()
             .await
             .context("semaphore closed")?;
+
+        if max_rss_gb > 0 {
+            let max_bytes = max_rss_gb.saturating_mul(1024 * 1024 * 1024);
+            if let Some(rss) = cleave::memory_tracker::current_rss() {
+                if rss > max_bytes {
+                    tracing::warn!(
+                        rss_mb = rss / 1024 / 1024,
+                        max_rss_mb = max_bytes / 1024 / 1024,
+                        "memory pressure before dispatch: clearing caches and pausing",
+                    );
+                    drop(permit);
+                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
+                    tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+                    // Put the job back at the front of the buffer.
+                    buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, |v| v.len()));
+                    buffer.push_front(pj);
+                    continue;
+                }
+            }
+        }
 
         let client = client.clone();
         let resources = Arc::clone(&resources);

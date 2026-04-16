@@ -71,6 +71,7 @@ pub struct FeatureSpec {
     skeleton_vocab: Vec<String>,
     rare_element_vocab: Vec<String>,
     trigram_vocab: Vec<String>,
+    metric_vocab: Vec<String>,
     feature_names: Vec<String>,
     total_features: usize,
     feature_means: Option<Vec<f32>>,
@@ -100,6 +101,8 @@ struct RawFeatureSpec {
     rare_element_vocab: Vec<String>,
     #[serde(default)]
     trigram_vocab: Vec<String>,
+    #[serde(default)]
+    metric_vocab: Vec<String>,
     #[serde(default)]
     feature_names: Vec<String>,
     #[serde(default)]
@@ -143,6 +146,7 @@ impl FeatureSpec {
             skeleton_vocab: raw.skeleton_vocab,
             rare_element_vocab: raw.rare_element_vocab,
             trigram_vocab: raw.trigram_vocab,
+            metric_vocab: raw.metric_vocab,
             feature_names: raw.feature_names,
             total_features: raw.total_features,
             feature_means: raw.feature_means,
@@ -238,6 +242,7 @@ impl FeatureSpec {
             &self.skeleton_vocab,
             &self.rare_element_vocab,
             &self.trigram_vocab,
+            &self.metric_vocab,
         );
         if self.feature_names != expected_feature_names {
             let first_mismatch = self
@@ -322,6 +327,7 @@ fn build_expected_feature_names(
     skeleton_vocab: &[String],
     rare_element_vocab: &[String],
     trigram_vocab: &[String],
+    metric_vocab: &[String],
 ) -> Vec<String> {
     let mut feature_names = Vec::with_capacity(20000); // overestimate to avoid reallocs
 
@@ -390,6 +396,10 @@ fn build_expected_feature_names(
         "agg:suspicious_2level_breadth".to_string(),
         "agg:hostile_2level_breadth".to_string(),
         "agg:objectives_breadth".to_string(),
+        "agg:attack_technique_count".to_string(),
+        "agg:attack_tactic_count".to_string(),
+        "agg:mbc_behavior_count".to_string(),
+        "agg:has_attack_and_objective".to_string(),
     ]);
 
     // Group 4: ext (6)
@@ -402,9 +412,12 @@ fn build_expected_feature_names(
         "ext:has_yara_match".to_string(),
     ]);
 
-    // Group 5: metrics (16)
+    // Group 5: metrics (16 base + dynamic extended vocab)
     for &(group, field_name, _) in KEY_METRICS {
         feature_names.push(format!("metrics:{group}_{field_name}"));
+    }
+    for mk in metric_vocab {
+        feature_names.push(format!("metrics:{mk}"));
     }
 
     // Group 6: filetype
@@ -528,6 +541,8 @@ pub struct ExtractContext {
     n_skeleton: usize,
     n_rare: usize,
     n_trigram: usize,
+    n_ext_metrics: usize,
+    metric_vocab: Vec<String>,
     element_lookup: HashMap<String, usize>,
     ghost_lookup: HashMap<String, usize>,
     skeleton_lookup: HashMap<String, usize>,
@@ -600,6 +615,8 @@ impl ExtractContext {
             n_skeleton: spec.skeleton_vocab.len(),
             n_rare: spec.rare_element_vocab.len(),
             n_trigram: spec.trigram_vocab.len(),
+            n_ext_metrics: spec.metric_vocab.len(),
+            metric_vocab: spec.metric_vocab.clone(),
             element_lookup,
             ghost_lookup,
             skeleton_lookup,
@@ -679,16 +696,16 @@ impl ExtractContext {
         self.write_max_crit_features_v16(&combined, vec, maxcrit_offset, score_weight);
 
         // G3: Aggregates
-        let agg_offset = offsets.take(53);
+        let agg_offset = offsets.take(57);
         write_aggregate_features_from_summaries(&combined, &summaries, vec, agg_offset);
 
         // G4: External
         let ext_offset = offsets.take(6);
         write_external_summary_features_from_combined(&combined, vec, ext_offset);
 
-        // G5: Metrics
-        let metrics_offset = offsets.take(KEY_METRICS.len());
-        write_metric_features(&merged_metrics, vec, metrics_offset);
+        // G5: Metrics (base + extended vocab)
+        let metrics_offset = offsets.take(KEY_METRICS.len() + self.n_ext_metrics);
+        write_metric_features(&merged_metrics, vec, metrics_offset, &self.metric_vocab);
 
         // G6: Filetype (blindfolded in v16)
         let _file_type_offset = offsets.take(self.n_ft);
@@ -939,7 +956,12 @@ impl FileSummary {
                         let group_map = fields
                             .as_object()?
                             .iter()
-                            .map(|(k, v)| (k.clone(), v.as_f64().unwrap_or(0.0)))
+                            .filter_map(|(k, v)| {
+                                // Handle numbers, booleans (true→1.0), and skip strings/nulls.
+                                let val = v.as_f64()
+                                    .or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 }))?;
+                                Some((k.clone(), val))
+                            })
                             .collect();
                         Some((group.clone(), group_map))
                     })
@@ -1264,6 +1286,29 @@ fn write_aggregate_features_from_summaries(summary: &FindingSummary, summaries: 
     vec[offset + 50] = suspicious_2level.len() as f32;
     vec[offset + 51] = hostile_2level.len() as f32;
     vec[offset + 52] = objectives_2level.len() as f32;
+
+    // ATT&CK / MBC features from 'a' and 'm' fields in findings.
+    let mut attack_techniques: HashSet<String> = HashSet::new();
+    let mut mbc_behaviors: HashSet<String> = HashSet::new();
+    for s in summaries {
+        for finding in &s.raw_findings {
+            if let Some(a) = finding.get("a").and_then(|v| v.as_str()) {
+                attack_techniques.insert(a.to_string());
+            }
+            if let Some(m) = finding.get("m").and_then(|v| v.as_str()) {
+                mbc_behaviors.insert(m.to_string());
+            }
+        }
+    }
+    vec[offset + 53] = attack_techniques.len() as f32;
+    let tactic_prefixes: HashSet<&str> = attack_techniques.iter()
+        .filter(|t| t.starts_with('T') && t.len() >= 4)
+        .map(|t| &t[..4])
+        .collect();
+    vec[offset + 54] = tactic_prefixes.len() as f32;
+    vec[offset + 55] = mbc_behaviors.len() as f32;
+    let has_objectives = summary.sample_paths.keys().any(|p| p.starts_with("objectives/"));
+    vec[offset + 56] = if !attack_techniques.is_empty() && has_objectives { 1.0 } else { 0.0 };
 }
 
 fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8] {
@@ -1541,10 +1586,30 @@ fn merge_metric_summaries(summaries: &[FileSummary]) -> serde_json::Value {
     serde_json::to_value(&merged).unwrap_or(serde_json::Value::Null)
 }
 
-fn write_metric_features(metrics: &serde_json::Value, vec: &mut [f32], mut offset: usize) {
+fn write_metric_features(metrics: &serde_json::Value, vec: &mut [f32], mut offset: usize, metric_vocab: &[String]) {
+    let base_keys: std::collections::HashSet<String> = KEY_METRICS.iter()
+        .map(|&(g, f, _)| format!("{g}_{f}"))
+        .collect();
+
     for &(group, field_name, use_log) in KEY_METRICS {
         let value = metrics.get(group).and_then(|g| g.get(field_name)).and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
         vec[offset] = if use_log { (value.abs() + 1.0).ln() } else { value };
+        offset += 1;
+    }
+
+    // Extended metrics from dynamic vocab.
+    for mk in metric_vocab {
+        let parts: Vec<&str> = mk.splitn(2, '_').collect();
+        if parts.len() == 2 {
+            let value = metrics.get(parts[0])
+                .and_then(|g| g.get(parts[1]))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0) as f32;
+            let use_log = ["count", "size", "total", "bytes", "length"]
+                .iter()
+                .any(|w| parts[1].contains(w));
+            vec[offset] = if use_log { (value.abs() + 1.0).ln() } else { value };
+        }
         offset += 1;
     }
 }
