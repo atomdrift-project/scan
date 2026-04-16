@@ -889,7 +889,7 @@ async fn run_job(
             "analysis thread started",
         );
         let result = if let Some(data) = downloaded {
-            classify_bytes(&data, &label_for_blocking, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
+            classify_bytes(data, &label_for_blocking, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
         } else if let Some(path) = local.as_ref() {
             classify_file(path, &label_for_blocking, &resources, slow_rule_ms, None, Some(&cancel2), Some(&phase))
         } else {

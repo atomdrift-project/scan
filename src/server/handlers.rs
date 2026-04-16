@@ -898,9 +898,12 @@ pub(crate) fn classify_file(
 }
 
 /// Like [`classify_file`] but operates on in-memory data, avoiding disk I/O.
-/// Uses `cleave::analyze_bytes` so no tempfile is needed.
+///
+/// Takes ownership of `data` and hands it to `cleave::analyze_bytes_owned`,
+/// which moves the buffer into the analysis pipeline instead of copying it.
+/// At worker scale this eliminates one full-size memcpy per downloaded sample.
 pub(crate) fn classify_bytes(
-    data: &[u8],
+    data: Vec<u8>,
     label: &str,
     resources: &super::ModelResources,
     slow_rule_ms: u64,
@@ -918,7 +921,7 @@ pub(crate) fn classify_bytes(
         phase: phase.cloned(),
         ..Default::default()
     };
-    let report = cleave::analyze_bytes(data, label, &opts)
+    let report = cleave::analyze_bytes_owned(data, label, &opts)
         .with_context(|| format!("cleave analysis of {label}"))?;
 
     if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
