@@ -640,7 +640,7 @@ async fn run_job(
     };
     let use_local = match (local_index, local_path.as_ref()) {
         (_, Some(p)) => {
-            tracing::info!(
+            tracing::debug!(
                 sha256 = %job.sha256,
                 path = %p.display(),
                 file_type = %job.file_type,
@@ -676,7 +676,7 @@ async fn run_job(
     } else {
         match prefetched {
             Ok(Some(bytes)) => {
-                tracing::info!(sha256 = %job.sha256, file = %label, size = bytes.len(), "using prefetched data");
+                tracing::debug!(sha256 = %job.sha256, file = %label, size = bytes.len(), "using prefetched data");
                 Some(bytes)
             }
             Ok(None) => None, // shouldn't happen for remote jobs, but handle gracefully
@@ -785,7 +785,7 @@ async fn run_job(
         }
     });
 
-    tracing::info!(
+    tracing::debug!(
         analysis_id,
         sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
         file = %label,
@@ -798,7 +798,7 @@ async fn run_job(
         let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let thread_id = os_thread_id();
         let inflight_blocking = started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
-        tracing::info!(
+        tracing::debug!(
             analysis_id,
             sha256 = %sha_short2,
             thread_id,
@@ -818,7 +818,7 @@ async fn run_job(
         let inflight_blocking = BLOCKING_STARTED_TOTAL
             .load(Ordering::Relaxed)
             .saturating_sub(finished);
-        tracing::info!(
+        tracing::debug!(
             analysis_id,
             sha256 = %sha_short2,
             thread_id,
@@ -898,11 +898,11 @@ async fn post_result(
         if attempt > 0 {
             tokio::time::sleep(backoff_duration(attempt)).await;
         }
-        tracing::debug!(sha256 = %sha256, attempt, "posting result to server");
+        tracing::info!(sha256 = %sha256, attempt, "posting result to server");
         let post_start = Instant::now();
         match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(sha256 = %sha256, elapsed_ms = crate::duration_ms(post_start.elapsed()), "result posted");
+                tracing::info!(sha256 = %sha256, elapsed_ms = crate::duration_ms(post_start.elapsed()), "result posted");
                 return;
             }
             Ok(resp) => {
