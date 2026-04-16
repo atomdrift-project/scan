@@ -427,13 +427,14 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 "{}/api/next?worker={}&count={}&slots={}",
                 base_url, encoded_name, prefetch_count, slots
             );
-            if let Some(rss) = cleave::memory_tracker::current_rss() {
+            {
                 use std::fmt::Write;
-                let _ = write!(poll_url, "&rss_mb={}", rss / 1024 / 1024);
-            }
-            if let Some(load) = system_load_avg() {
-                use std::fmt::Write;
-                let _ = write!(poll_url, "&load1={:.2}", load);
+                if let Some(rss) = cleave::memory_tracker::current_rss() {
+                    let _ = write!(poll_url, "&rss_mb={}", rss / 1024 / 1024);
+                }
+                if let Some(load) = system_load_avg() {
+                    let _ = write!(poll_url, "&load1={:.2}", load);
+                }
             }
             tracing::info!(url = %poll_url, buffer = buffer.len(), "polling for work");
             let poll_start = Instant::now();
