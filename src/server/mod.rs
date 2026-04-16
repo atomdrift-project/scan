@@ -51,6 +51,7 @@ pub struct ServerConfig {
     extract_dir: Option<PathBuf>,
     workers: usize,
     allow_cidrs: Vec<Cidr>,
+    upgrade_heuristic: bool,
 }
 
 impl ServerConfig {
@@ -119,7 +120,21 @@ impl ServerConfig {
             extract_dir,
             workers,
             allow_cidrs,
+            upgrade_heuristic: true,
         })
+    }
+
+    /// Override the default finding-based upgrade heuristic (`--upgrade-heuristic=false`).
+    #[must_use]
+    pub const fn with_upgrade_heuristic(mut self, upgrade_heuristic: bool) -> Self {
+        self.upgrade_heuristic = upgrade_heuristic;
+        self
+    }
+
+    /// Whether the finding-based classification upgrade heuristic is enabled.
+    #[must_use]
+    pub const fn upgrade_heuristic(&self) -> bool {
+        self.upgrade_heuristic
     }
 
     /// Directory for extracting archive members.
@@ -244,6 +259,43 @@ mod config_tests {
 
         assert!(result.is_err());
     }
+
+    #[test]
+    fn server_config_upgrade_heuristic_defaults_to_true() {
+        let config = ServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], 8081)),
+            100 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+            "/tmp/models",
+            None,
+            4_000,
+            vec![],
+            None,
+            2,
+            vec![],
+        )
+        .expect("valid config");
+        assert!(config.upgrade_heuristic());
+    }
+
+    #[test]
+    fn server_config_with_upgrade_heuristic_false_disables() {
+        let config = ServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], 8081)),
+            100 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+            "/tmp/models",
+            None,
+            4_000,
+            vec![],
+            None,
+            2,
+            vec![],
+        )
+        .expect("valid config")
+        .with_upgrade_heuristic(false);
+        assert!(!config.upgrade_heuristic());
+    }
 }
 
 #[derive(Debug)]
@@ -298,6 +350,7 @@ pub(crate) struct ModelResources {
     pub(crate) model: Model,
     pub(crate) shap: Option<ShapImportance>,
     pub(crate) ctx: ExtractContext,
+    pub(crate) upgrade_heuristic: bool,
 }
 
 #[derive(Debug)]
@@ -307,6 +360,7 @@ struct AppState {
     model_dir: PathBuf,
     threshold_overrides: Option<Thresholds>,
     slow_rule_ms: u64,
+    upgrade_heuristic: bool,
     allowed_dirs: Vec<PathBuf>,
     extract_dir: Option<PathBuf>,
     allow_cidrs: Vec<Cidr>,
@@ -368,6 +422,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         model_dir: config.model_dir().to_path_buf(),
         threshold_overrides: config.thresholds(),
         slow_rule_ms: config.slow_rule_ms(),
+        upgrade_heuristic: config.upgrade_heuristic(),
         allowed_dirs: config.allowed_dirs().to_vec(),
         extract_dir: config.extract_dir().map(PathBuf::from),
         allow_cidrs: config.allow_cidrs().to_vec(),
@@ -464,7 +519,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     tracing::info!("all resources ready, installing into AppState");
                     match bg.resources.write() {
                         Ok(mut lock) => {
-                            *lock = Some(Arc::new(ModelResources { model, shap, ctx }));
+                            *lock = Some(Arc::new(ModelResources {
+                                model,
+                                shap,
+                                ctx,
+                                upgrade_heuristic: bg.upgrade_heuristic,
+                            }));
                             if let Ok(mut init_error) = bg.init_error.write() {
                                 *init_error = None;
                             }

@@ -342,7 +342,12 @@ async fn do_model_reload(
 
     match state.resources.write() {
         Ok(mut lock) => {
-            *lock = Some(Arc::new(super::ModelResources { model, shap, ctx }));
+            *lock = Some(Arc::new(super::ModelResources {
+                model,
+                shap,
+                ctx,
+                upgrade_heuristic: state.upgrade_heuristic,
+            }));
             if let Ok(mut init_error) = state.init_error.write() {
                 *init_error = None;
             }
@@ -892,6 +897,7 @@ pub(crate) fn classify_file(
         &resources.model,
         resources.shap.as_ref(),
         cancellation,
+        resources.upgrade_heuristic,
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -938,6 +944,7 @@ pub(crate) fn classify_bytes(
         &resources.model,
         resources.shap.as_ref(),
         cancellation,
+        resources.upgrade_heuristic,
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -953,6 +960,8 @@ fn scan_result_from(
         v: "4",
         classification: cr.classification,
         probability: cr.probability,
+        original_classification: cr.original_classification,
+        original_probability: cr.original_probability,
         thresholds: resources.model.thresholds(),
         version: crate::scan::model_version_string(resources.model.info()),
         analyzed_at: crate::scan::now_rfc3339(),

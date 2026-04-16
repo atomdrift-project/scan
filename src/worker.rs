@@ -275,6 +275,8 @@ pub struct WorkerConfig {
     pub slow_rule_ms: u64,
     /// Exit after this many jobs have been analyzed (None = run forever).
     pub max_jobs: Option<u64>,
+    /// Whether the finding-based classification upgrade heuristic is enabled.
+    pub upgrade_heuristic: bool,
 }
 
 #[derive(Deserialize)]
@@ -357,6 +359,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         model,
         shap,
         ctx,
+        upgrade_heuristic: config.upgrade_heuristic,
     });
 
     // Background: periodic rules update.

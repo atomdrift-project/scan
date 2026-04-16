@@ -294,6 +294,7 @@ fn build_result(
         model,
         shap,
         cancellation,
+        config.upgrade_heuristic(),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
@@ -304,6 +305,8 @@ fn build_result(
         v: "4",
         classification: cr.classification,
         probability: cr.probability,
+        original_classification: cr.original_classification,
+        original_probability: cr.original_probability,
         thresholds,
         version: crate::scan::model_version_string(model.info()),
         analyzed_at: crate::scan::now_rfc3339(),

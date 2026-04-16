@@ -96,6 +96,7 @@ pub struct ScanConfig {
     slow_rule_ms: u64,
     scan_threads: Option<usize>,
     extra: bool,
+    upgrade_heuristic: bool,
 }
 
 impl ScanConfig {
@@ -145,7 +146,19 @@ impl ScanConfig {
             slow_rule_ms,
             scan_threads,
             extra,
+            upgrade_heuristic: true,
         })
+    }
+
+    /// Override the default finding-based upgrade heuristic.
+    ///
+    /// The heuristic is enabled by default and upgrades ML classifications
+    /// when cleave findings clearly indicate a misclassification. Pass `false`
+    /// to disable it (exposed as the hidden `--upgrade-heuristic=false` flag).
+    #[must_use]
+    pub const fn with_upgrade_heuristic(mut self, upgrade_heuristic: bool) -> Self {
+        self.upgrade_heuristic = upgrade_heuristic;
+        self
     }
 
     /// Directory containing `model.json` and `feature_spec.json`.
@@ -189,6 +202,12 @@ impl ScanConfig {
     pub const fn extra(&self) -> bool {
         self.extra
     }
+
+    /// Whether the finding-based classification upgrade heuristic is enabled.
+    #[must_use]
+    pub const fn upgrade_heuristic(&self) -> bool {
+        self.upgrade_heuristic
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +230,236 @@ mod config_tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn scan_config_upgrade_heuristic_defaults_to_true() {
+        let config = ScanConfig::new(
+            "/tmp/models",
+            OutputFormat::Terminal,
+            None,
+            DisplayFilter::alerts_only(),
+            4_000,
+            None,
+            false,
+        )
+        .expect("valid config");
+        assert!(config.upgrade_heuristic());
+    }
+
+    #[test]
+    fn scan_config_with_upgrade_heuristic_false_disables() {
+        let config = ScanConfig::new(
+            "/tmp/models",
+            OutputFormat::Terminal,
+            None,
+            DisplayFilter::alerts_only(),
+            4_000,
+            None,
+            false,
+        )
+        .expect("valid config")
+        .with_upgrade_heuristic(false);
+        assert!(!config.upgrade_heuristic());
+    }
+}
+
+#[cfg(test)]
+mod finding_override_tests {
+    use super::*;
+
+    const T: Thresholds = Thresholds {
+        suspicious: 0.65,
+        hostile: 0.90,
+    };
+
+    fn counts(hostile: u32, suspicious: u32) -> FindingCounts {
+        FindingCounts {
+            hostile,
+            suspicious,
+            notable: 0,
+            baseline: 0,
+        }
+    }
+
+    #[test]
+    fn two_hostile_findings_upgrade_benign_to_hostile() {
+        let result = apply_finding_override(Classification::Benign, 0.10, &counts(2, 0), &T);
+        let Some((class, prob)) = result else {
+            panic!("expected upgrade, got None");
+        };
+        assert_eq!(class, Classification::Hostile);
+        assert!((prob - T.hostile).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn two_hostile_findings_upgrade_suspicious_to_hostile() {
+        let result = apply_finding_override(Classification::Suspicious, 0.70, &counts(2, 0), &T);
+        let Some((class, prob)) = result else {
+            panic!("expected upgrade, got None");
+        };
+        assert_eq!(class, Classification::Hostile);
+        assert!((prob - T.hostile).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn two_hostile_findings_noop_when_already_hostile_above_floor() {
+        let result = apply_finding_override(Classification::Hostile, 0.995, &counts(2, 0), &T);
+        assert!(
+            result.is_none(),
+            "must not re-stamp already-Hostile above threshold"
+        );
+    }
+
+    #[test]
+    fn two_hostile_findings_noop_when_already_hostile_at_floor() {
+        let result = apply_finding_override(Classification::Hostile, T.hostile, &counts(2, 0), &T);
+        assert!(result.is_none(), "must not fire when new_prob == current_prob");
+    }
+
+    #[test]
+    fn two_hostile_findings_upgrades_class_even_when_prob_already_above_hostile() {
+        // Defensive: Suspicious at prob > hostile is unusual but class still needs to rise.
+        let result = apply_finding_override(Classification::Suspicious, 0.95, &counts(2, 0), &T);
+        let Some((class, prob)) = result else {
+            panic!("expected class upgrade even with prob >= hostile floor");
+        };
+        assert_eq!(class, Classification::Hostile);
+        assert!((prob - 0.95).abs() < f32::EPSILON, "prob must not be downgraded");
+    }
+
+    #[test]
+    fn one_hostile_finding_upgrades_benign_to_suspicious() {
+        let result = apply_finding_override(Classification::Benign, 0.05, &counts(1, 0), &T);
+        let Some((class, prob)) = result else {
+            panic!("expected upgrade");
+        };
+        assert_eq!(class, Classification::Suspicious);
+        assert!((prob - T.suspicious).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn one_hostile_finding_leaves_suspicious_unchanged() {
+        let result = apply_finding_override(Classification::Suspicious, 0.70, &counts(1, 0), &T);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn one_hostile_finding_leaves_hostile_unchanged() {
+        let result = apply_finding_override(Classification::Hostile, 0.95, &counts(1, 0), &T);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn two_suspicious_findings_upgrade_benign_to_suspicious() {
+        let result = apply_finding_override(Classification::Benign, 0.20, &counts(0, 2), &T);
+        let Some((class, prob)) = result else {
+            panic!("expected upgrade");
+        };
+        assert_eq!(class, Classification::Suspicious);
+        assert!((prob - T.suspicious).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn one_suspicious_finding_leaves_benign_unchanged() {
+        let result = apply_finding_override(Classification::Benign, 0.20, &counts(0, 1), &T);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn two_suspicious_findings_leave_suspicious_unchanged() {
+        let result = apply_finding_override(Classification::Suspicious, 0.70, &counts(0, 2), &T);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn no_findings_noop_for_all_classes() {
+        for class in [
+            Classification::Benign,
+            Classification::Suspicious,
+            Classification::Hostile,
+        ] {
+            assert!(apply_finding_override(class, 0.5, &counts(0, 0), &T).is_none());
+        }
+    }
+
+    #[test]
+    fn override_never_downgrades_probability() {
+        // Benign at prob 0.99 (unusual — model should've classified higher) + 2 hostile
+        // findings. The hostile floor is 0.90; max(0.99, 0.90) = 0.99, preserving prob.
+        let result = apply_finding_override(Classification::Benign, 0.99, &counts(2, 0), &T);
+        let Some((_, prob)) = result else {
+            panic!("expected class upgrade");
+        };
+        assert!((prob - 0.99).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn hostile_findings_beat_suspicious_findings() {
+        // Both rules fire; hostile must win.
+        let result = apply_finding_override(Classification::Benign, 0.10, &counts(2, 5), &T);
+        let Some((class, _)) = result else {
+            panic!("expected upgrade");
+        };
+        assert_eq!(class, Classification::Hostile);
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    fn base_result() -> ScanResult {
+        ScanResult {
+            v: "4",
+            classification: Classification::Benign,
+            probability: 0.10,
+            original_classification: None,
+            original_probability: None,
+            thresholds: Thresholds {
+                suspicious: 0.65,
+                hostile: 0.90,
+            },
+            version: "test".to_string(),
+            analyzed_at: "2026-04-16T00:00:00Z".to_string(),
+            cleave: None,
+            pids: None,
+            deleted: None,
+            path: "/tmp/x".to_string(),
+            finding_counts: FindingCounts::default(),
+            formula: String::new(),
+            reasons: Vec::new(),
+            top_findings: Vec::new(),
+            file_type: "unknown".to_string(),
+            size_bytes: 0,
+            sha256: String::new(),
+            embedded_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn envelope_omits_originals_when_no_override() {
+        let r = base_result();
+        let envelope = r.to_envelope();
+        let json = serde_json::to_value(&envelope).expect("serialize");
+        assert!(json["ml"].get("oprob").is_none(), "oprob must be omitted");
+        assert!(json["ml"].get("oclass").is_none(), "oclass must be omitted");
+    }
+
+    #[test]
+    fn envelope_emits_originals_when_override_applied() {
+        let mut r = base_result();
+        r.classification = Classification::Hostile;
+        r.probability = 0.90;
+        r.original_classification = Some(Classification::Benign);
+        r.original_probability = Some(0.10);
+
+        let envelope = r.to_envelope();
+        let json = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(json["ml"]["class"].as_u64(), Some(2), "upgraded class");
+        assert_eq!(json["ml"]["oclass"].as_u64(), Some(0), "original was Benign");
+        let oprob = json["ml"]["oprob"].as_f64().expect("oprob number");
+        assert!((oprob - 0.10).abs() < 1e-6);
     }
 }
 
@@ -252,10 +501,14 @@ pub struct FindingCounts {
 pub struct ScanResult {
     /// Schema version.
     pub v: &'static str,
-    /// Model classification outcome.
+    /// Model classification outcome (may reflect a finding-based override).
     pub classification: Classification,
-    /// Raw malware probability from the model.
+    /// Malware probability used for display and exit-code logic.
     pub probability: f32,
+    /// Original model classification when an override upgraded the verdict.
+    pub original_classification: Option<Classification>,
+    /// Original model probability when an override upgraded the verdict.
+    pub original_probability: Option<f32>,
     /// Thresholds.
     pub thresholds: Thresholds,
     /// Model version identifier (spec version, ABI version, model hash prefix).
@@ -621,6 +874,8 @@ fn emit_result(
 pub(crate) struct ClassifiedReport {
     pub(crate) classification: Classification,
     pub(crate) probability: f32,
+    pub(crate) original_classification: Option<Classification>,
+    pub(crate) original_probability: Option<f32>,
     pub(crate) finding_counts: FindingCounts,
     pub(crate) formula: String,
     pub(crate) reasons: Vec<Reason>,
@@ -642,6 +897,7 @@ pub(crate) fn classify_report(
     model: &Model,
     shap: Option<&ShapImportance>,
     cancellation: Option<&Arc<AtomicBool>>,
+    upgrade_heuristic: bool,
 ) -> Result<ClassifiedReport> {
     report.finalize();
     let compact = cleave::types::compact::compact_from_files(&report.files);
@@ -779,11 +1035,43 @@ pub(crate) fn classify_report(
         (classification, probability)
     };
 
+    // Escape hatch: override the ML verdict when cleave findings clearly disagree.
+    // Disabled by the --upgrade-heuristic=false flag for debugging / raw-model evaluation.
+    let override_result = if upgrade_heuristic {
+        apply_finding_override(
+            classification,
+            probability,
+            &finding_counts,
+            &model.thresholds(),
+        )
+    } else {
+        None
+    };
+    let (classification, probability, original_classification, original_probability) =
+        match override_result {
+            Some((new_class, new_prob)) => {
+                tracing::warn!(
+                    path = %label,
+                    from = %classification,
+                    to = %new_class,
+                    prob = format!("{:.4}", probability),
+                    new_prob = format!("{:.4}", new_prob),
+                    hostile_findings = finding_counts.hostile,
+                    suspicious_findings = finding_counts.suspicious,
+                    "ML misclassification: upgrading {classification} to {new_class} using built-in heuristics",
+                );
+                (new_class, new_prob, Some(classification), Some(probability))
+            }
+            None => (classification, probability, None, None),
+        };
+
     let top_findings = extract_top_findings_from_json(&report_json, &classification);
 
     Ok(ClassifiedReport {
         classification,
         probability,
+        original_classification,
+        original_probability,
         finding_counts,
         formula,
         reasons,
@@ -814,6 +1102,7 @@ fn process_report(
         model,
         shap,
         cancellation,
+        config.upgrade_heuristic(),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
@@ -826,6 +1115,8 @@ fn process_report(
         v: "4",
         classification: cr.classification,
         probability: cr.probability,
+        original_classification: cr.original_classification,
+        original_probability: cr.original_probability,
         thresholds,
         version: model_version_string(model.info()),
         analyzed_at: now_rfc3339(),
@@ -842,6 +1133,53 @@ fn process_report(
         sha256: cr.sha256,
         embedded_files: cr.embedded_files,
     })
+}
+
+/// Escape-hatch override for ML classifications that appear to miss the signal
+/// visible in cleave findings.
+///
+/// Returns `Some((new_class, new_prob))` when findings warrant a class upgrade
+/// beyond what the model produced, or `None` when the model's output stands.
+/// Never downgrades class or probability.
+///
+/// Rules (most severe first):
+/// - `>= 2` hostile findings → Hostile, prob floored at `thresholds.hostile`
+/// - `== 1` hostile finding + currently Benign → Suspicious, prob floored at `thresholds.suspicious`
+/// - `>= 2` suspicious findings + currently Benign → Suspicious, prob floored at `thresholds.suspicious`
+#[must_use]
+pub fn apply_finding_override(
+    current_class: Classification,
+    current_prob: f32,
+    counts: &FindingCounts,
+    thresholds: &Thresholds,
+) -> Option<(Classification, f32)> {
+    let (new_class, new_prob) = if counts.hostile >= 2 {
+        (Classification::Hostile, current_prob.max(thresholds.hostile))
+    } else if current_class == Classification::Benign
+        && (counts.hostile == 1 || counts.suspicious >= 2)
+    {
+        (
+            Classification::Suspicious,
+            current_prob.max(thresholds.suspicious),
+        )
+    } else {
+        return None;
+    };
+
+    if new_class == current_class && new_prob <= current_prob {
+        return None;
+    }
+
+    debug_assert!(
+        new_class as u8 >= current_class as u8,
+        "override must not downgrade class",
+    );
+    debug_assert!(
+        new_prob >= current_prob,
+        "override must not downgrade probability",
+    );
+
+    Some((new_class, new_prob))
 }
 
 /// Count cleave findings by criticality level from either a top-level report or
@@ -1054,6 +1392,10 @@ pub struct MlSection {
     pub(crate) classification: Classification,
     #[serde(rename = "prob")]
     pub(crate) probability: f32,
+    #[serde(rename = "oclass", skip_serializing_if = "Option::is_none")]
+    pub(crate) original_classification: Option<Classification>,
+    #[serde(rename = "oprob", skip_serializing_if = "Option::is_none")]
+    pub(crate) original_probability: Option<f32>,
     #[serde(serialize_with = "serialize_thresholds")]
     pub(crate) thresholds: Thresholds,
     pub(crate) version: String,
@@ -1081,6 +1423,8 @@ impl ScanResult {
                 v: self.v,
                 classification: self.classification,
                 probability: self.probability,
+                original_classification: self.original_classification,
+                original_probability: self.original_probability,
                 thresholds: self.thresholds,
                 version: self.version.clone(),
                 analyzed_at: self.analyzed_at.clone(),
