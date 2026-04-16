@@ -4,13 +4,13 @@
 
 # litmus
 
-Malware classifier for the modern software supply chain. litmus turns [cleave](https://codeberg.org/atomdrift/cleave)'s capability analysis into a verdict — `hostile`, `suspicious`, or `benign` — using a local gradient-boosted model trained on millions of real packages. No cloud calls, no opaque signatures, no vendor lock-in.
+Malware classifier for the modern software supply chain. litmus turns [cleave](https://codeberg.org/atomdrift/cleave)'s capability analysis into a verdict — `hostile`, `suspicious`, or `benign` — using a local XGBoost model trained on millions of real packages. No cloud calls, no opaque signatures, no telemetry.
 
 ## What It Does
 
-litmus scans files, directories, archives, and running processes. Every sample passes through cleave's AST-aware decomposition, which emits a vector of behaviors drawn from 47,000+ rules aligned to [MBC](https://github.com/MBCProject/mbc-markdown) and [ATT&CK](https://attack.mitre.org/). That vector feeds the classifier, which returns a probability and a SHAP-ranked list of the capabilities that moved the score. You see not just *what* litmus decided, but *why*.
+Every sample passes through cleave's AST-aware decomposition, which emits a vector of behaviors drawn from 47,000+ rules aligned to [MBC](https://github.com/MBCProject/mbc-markdown) and [ATT&CK](https://attack.mitre.org/). That vector feeds the classifier, which returns a probability and an exact TreeSHAP ranking of the capabilities that moved the score. You see not just *what* litmus decided, but *why*.
 
-The same binary runs four ways. At the desk it's a CLI. In a pipeline it emits JSON and exits with a code your CI can branch on. Under load it runs as an HTTP service. Across a fleet it runs as a pull worker against a [hopper](https://codeberg.org/atomdrift/hopper) queue — handing the same model to a laptop, a build agent, or a jail full of FreeBSD boxes analyzing a million packages a day.
+The same binary runs four ways: a CLI at the desk, a JSON emitter in CI, an HTTP service under load, and a pull worker for fleets — handing the same model to a laptop, a build agent, or a jail analyzing a million packages a day.
 
 ## Quick Start
 
@@ -24,30 +24,17 @@ litmus --format json --show all pkg/          # pipeline-friendly output
 litmus ps                                     # classify every running process
 ```
 
-Exit codes are deliberate: `0` clean, `1` hostile present, `2` suspicious present, `3` analysis error. Wire them into CI directly.
+Exit codes: `0` clean, `1` hostile, `2` suspicious, `3` error. Wire them straight into CI.
 
-Optional: [rizin](https://github.com/rizinorg/rizin) for binary disassembly, [upx](https://github.com/upx/upx) for runtime unpacking. cleave drives both when present.
+Optional: [rizin](https://github.com/rizinorg/rizin) for disassembly, [upx](https://github.com/upx/upx) for runtime unpacking.
 
 ## Why Security Engineers Use It
 
-**Dial in your paranoia.** The model ships with thresholds chosen from a held-out evaluation set, but a SOC triaging npm publishes and an IR team sweeping for post-compromise artifacts have different tolerances for noise. `--threshold-hostile` and `--threshold-suspicious` move the goalposts at runtime. Bring your own model with `--model-dir` when the stock weights don't fit your threat model.
-
-**Explanations by default.** Every flagged file comes with the top capabilities that drove its score — credential theft, anti-debug, network exfiltration, whatever the sample actually did. This is SHAP against the production model, not a post-hoc justification. When a verdict is wrong you know immediately which feature to investigate.
-
-**Built for air-gapped defenders.** The model and trait repository are both plain git: fetch once, run forever. `litmus --update` pulls new versions when you want them. No telemetry, no license servers, no sample upload.
-
-**Pipeline-native.** JSONL output streams per-file verdicts with the full cleave report attached. Terminal output is concise by default — benign files are silent, hostile and suspicious render with context — and configurable with `--show`. Progress bars live on stderr so they never contaminate a pipe.
-
-**Scales past the laptop.** `litmus serve` exposes a classification HTTP API with loopback-by-default binding, CIDR allowlists for remote access, bounded concurrency, and an RSS ceiling that rejects requests before the machine starts swapping. `litmus worker` connects to a hopper queue and pulls jobs; SHA256-verified local paths avoid re-downloading when the worker shares storage with the orchestrator.
-
-**Honest about cost.** cleave does real work — disassembly, unpacking, YARA-X, AST walks — and litmus inherits that budget. In return you get a verdict backed by observed behavior, not a hash lookup that goes stale the moment an attacker recompiles.
-
-## How It Works
-
-1. **Extract** — cleave analyzes the sample against its rule corpus, emitting a report of matched traits and structural signals.
-2. **Featurize** — litmus compresses that report into a fixed-length numeric vector defined by [feature_spec.json](https://codeberg.org/atomdrift/litmus-models/). The spec is versioned; model and features move together.
-3. **Classify** — the vector is scored by an [XGBoost model](https://codeberg.org/atomdrift/litmus-models/) via [xgboost-native](https://codeberg.org/atomdrift/xgboost-native), with exact TreeSHAP producing per-feature attributions.
-4. **Arbitrate** — an optional heuristic layer upgrades verdicts when cleave reports capabilities that obviously disagree with a benign score (`--upgrade-heuristic=false` disables it for raw model output).
+- **Tunable paranoia** — `--threshold-hostile` and `--threshold-suspicious` move the goalposts at runtime; `--model-dir` swaps in your own weights when the stock model doesn't match your threat model.
+- **Explanations by default** — every flagged file ships with the capabilities that drove its score, computed via exact TreeSHAP against the production model. No post-hoc justification.
+- **Air-gap ready** — the model and trait repositories are plain git: fetch once, run forever. `--update` pulls new versions when you want them. No license servers, no sample upload.
+- **Pipeline-native** — JSONL output streams per-file verdicts with the full cleave report attached; progress lives on stderr so it never contaminates a pipe.
+- **Fleet-scale** — `litmus serve` exposes an HTTP API with loopback-default binding, CIDR allowlists, bounded concurrency, and an RSS ceiling that rejects requests before the box swaps. `litmus worker` pulls jobs from a [hopper](https://codeberg.org/atomdrift/hopper) queue with SHA256-verified local paths.
 
 ## Related
 
