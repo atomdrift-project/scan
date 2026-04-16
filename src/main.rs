@@ -177,7 +177,8 @@ enum Commands {
         #[arg(long, default_value = "2")]
         poll_secs: u64,
 
-        /// Maximum RSS in gigabytes before pausing claims (0 = auto)
+        /// Maximum RSS in gigabytes before pausing claims.
+        /// Defaults to 0, which means auto: 85% of total system RAM.
         #[arg(long, default_value = "0")]
         max_rss_gb: u64,
 
@@ -467,6 +468,16 @@ fn main() -> Result<()> {
                     .and_then(|h| h.into_string().ok())
                     .unwrap_or_else(|| "unknown".to_string())
             });
+            let max_rss_gb = if max_rss_gb == 0 {
+                let resolved = resolve_worker_max_rss_gb();
+                tracing::info!(
+                    max_rss_gb = resolved,
+                    "auto-resolved worker RSS ceiling (set --max-rss-gb to override)",
+                );
+                resolved
+            } else {
+                max_rss_gb
+            };
             let config = litmus::worker::WorkerConfig {
                 hopper_url: url,
                 name,
@@ -506,6 +517,17 @@ fn default_workers() -> usize {
         .map(std::num::NonZero::get)
         .unwrap_or(4);
     std::cmp::max(2, cores / 2)
+}
+
+/// Auto-resolve the worker RSS ceiling when the user hasn't set `--max-rss-gb`.
+///
+/// Worker processes typically own their jail, so we pick a single policy that
+/// scales with host size: 85% of total RAM. That leaves 15% for the kernel,
+/// ZFS ARC, other jail tenants, and transient spikes during analysis.
+fn resolve_worker_max_rss_gb() -> u64 {
+    const GB: u64 = 1024 * 1024 * 1024;
+    let total_bytes = cleave::memory_tracker::total_memory().unwrap_or(16 * GB);
+    std::cmp::max(1, (total_bytes * 85 / 100) / GB)
 }
 
 /// Exit with the appropriate code based on scan summary counters.
