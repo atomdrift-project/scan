@@ -423,10 +423,18 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             && buffer_bytes < max_buffer_bytes
             && last_empty_poll.elapsed() >= Duration::from_secs(poll_secs);
         if should_poll {
-            let poll_url = format!(
+            let mut poll_url = format!(
                 "{}/api/next?worker={}&count={}&slots={}",
                 base_url, encoded_name, prefetch_count, slots
             );
+            if let Some(rss) = cleave::memory_tracker::current_rss() {
+                use std::fmt::Write;
+                let _ = write!(poll_url, "&rss_mb={}", rss / 1024 / 1024);
+            }
+            if let Some(load) = system_load_avg() {
+                use std::fmt::Write;
+                let _ = write!(poll_url, "&load1={:.2}", load);
+            }
             tracing::info!(url = %poll_url, buffer = buffer.len(), "polling for work");
             let poll_start = Instant::now();
 
@@ -1056,6 +1064,24 @@ fn os_thread_id() -> u64 {
     )))]
     {
         0
+    }
+}
+
+/// Returns the 1-minute system load average, or None on unsupported platforms.
+fn system_load_avg() -> Option<f64> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+    {
+        let mut avg: [libc::c_double; 1] = [0.0];
+        let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
+        if ret == 1 {
+            Some(avg[0])
+        } else {
+            None
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
+    {
+        None
     }
 }
 
