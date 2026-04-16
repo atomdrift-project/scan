@@ -1301,6 +1301,9 @@ fn write_aggregate_features_from_summaries(summary: &FindingSummary, summaries: 
         }
     }
     vec[offset + 53] = attack_techniques.len() as f32;
+    // ATT&CK technique IDs ("T1059.001") are always ASCII, so a byte-slice at
+    // index 4 cannot fall in the middle of a UTF-8 character.
+    #[allow(clippy::string_slice)]
     let tactic_prefixes: HashSet<&str> = attack_techniques.iter()
         .filter(|t| t.starts_with('T') && t.len() >= 4)
         .map(|t| &t[..4])

@@ -53,6 +53,11 @@ struct LocalFileIndex {
 }
 
 impl LocalFileIndex {
+    // Returns Result for forward-compatibility: individual dir-entry failures
+    // are currently logged and skipped, but a future cap on I/O errors, a
+    // permission-denied signal, or a root-missing fail-fast policy would want
+    // to bubble up here.
+    #[allow(clippy::unnecessary_wraps)]
     fn build(root: PathBuf) -> Result<Self> {
         let mut by_name: HashMap<LocalNameKey, Vec<IndexedLocalFile>> = HashMap::new();
         let mut stack = vec![root.clone()];
@@ -320,6 +325,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         tracing::warn!(error = %e, "initial rules update task failed");
     }
 
+    // Warm the YARA engine and capability mapper in the background so the first
+    // job does not pay the 30-60 s cold-compile cost (and, more importantly, so
+    // the OnceLock behind them does not serialize every concurrent rayon worker
+    // waiting on first-use init).
+    cleave::prefetch_shared_resources(false);
+
     // Load model resources after the initial update so a stale or corrupted
     // local checkout can be repaired before startup fails.
     let model = Model::load(&config.model_dir, config.thresholds)
@@ -410,7 +421,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         max_rss_mb = max_bytes / 1024 / 1024,
                         "memory pressure: pausing before claiming new work",
                     );
-                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
+                    if let Err(e) =
+                        tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
+                    {
+                        tracing::warn!(error = %e, "cache-clear task failed");
+                    }
                     tokio::time::sleep(Duration::from_secs(poll_secs)).await;
                     continue;
                 }
@@ -454,7 +469,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     consecutive_errors = 0;
                     let n = jobs.len();
                     for pj in jobs {
-                        buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, |v| v.len()));
+                        buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, Vec::len));
                         buffer.push_back(pj);
                     }
                     tracing::debug!(
@@ -480,7 +495,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         // Dispatch the next prefetched job when a slot is free.
         let pj = match buffer.pop_front() {
             Some(pj) => {
-                buffer_bytes -= pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, |v| v.len()));
+                buffer_bytes -= pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, Vec::len));
                 pj
             }
             None => {
@@ -509,10 +524,14 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         "memory pressure before dispatch: clearing caches and pausing",
                     );
                     drop(permit);
-                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
+                    if let Err(e) =
+                        tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
+                    {
+                        tracing::warn!(error = %e, "cache-clear task failed");
+                    }
                     tokio::time::sleep(Duration::from_secs(poll_secs)).await;
                     // Put the job back at the front of the buffer.
-                    buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, |v| v.len()));
+                    buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, Vec::len));
                     buffer.push_front(pj);
                     continue;
                 }
@@ -543,7 +562,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             }
             post_result(&client, &url, &name, &pj.job.sha256, result).await;
             let n = completed.fetch_add(1, Ordering::Release) + 1;
-            if n % 100 == 0 {
+            if n.is_multiple_of(100) {
                 tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
             }
             drop(permit);
@@ -710,8 +729,10 @@ async fn run_job(
     // Background phase watcher — logs transitions with timing, and emits a
     // heartbeat every 30 s so a stuck phase is visible in logs.
     // Uses a tokio task instead of an OS thread to avoid one thread-per-job overhead.
+    // The returned JoinHandle is aborted via RAII guard below so the watcher cannot
+    // outlive this function even if the outer task is cancelled.
     let cancel_watcher = cancel.clone();
-    tokio::task::spawn(async move {
+    let watcher_handle = tokio::task::spawn(async move {
         let mut last_phase = String::new();
         let mut phase_start = Instant::now();
         let mut slow_logged = false;
@@ -812,6 +833,20 @@ async fn run_job(
             }
         }
     });
+
+    // RAII guard: aborts the watcher task whenever this function scope exits,
+    // even if the outer tokio task was cancelled. Without it, a watcher whose
+    // parent was dropped before the analysis returned would spin forever on its
+    // 100 ms sleep loop.
+    struct WatcherGuard(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for WatcherGuard {
+        fn drop(&mut self) {
+            if let Some(h) = self.0.take() {
+                h.abort();
+            }
+        }
+    }
+    let _watcher_guard = WatcherGuard(Some(watcher_handle));
 
     tracing::debug!(
         analysis_id,
@@ -1016,7 +1051,7 @@ async fn download_bytes(
     // Try path-based endpoint first (no DB lookup on hopper side).
     // Encode each path segment to handle filenames with spaces or special chars.
     let encoded_path: String = path.split('/')
-        .map(|seg| url_encode(seg))
+        .map(url_encode)
         .collect::<Vec<_>>()
         .join("/");
     let data_url = format!("{}/data/{}", base_url, encoded_path);

@@ -89,13 +89,15 @@ fn feature_extraction_matches_collimator() {
     // updating litmus offsets) with a clear error message.
     if !fixture.feature_names.is_empty() {
         let rust_names = spec.feature_names();
-        let n = rust_names.len().min(fixture.feature_names.len());
-        for j in 0..n {
+        for (j, (rust_name, python_name)) in rust_names
+            .iter()
+            .zip(fixture.feature_names.iter())
+            .enumerate()
+        {
             assert_eq!(
-                rust_names[j], fixture.feature_names[j],
+                rust_name, python_name,
                 "feature name mismatch at index {j}: \
-                 rust={:?} python={:?} — likely an offset bug in litmus",
-                rust_names[j], fixture.feature_names[j],
+                 rust={rust_name:?} python={python_name:?} — likely an offset bug in litmus",
             );
         }
     }
@@ -140,7 +142,7 @@ fn feature_extraction_matches_collimator() {
                     "  [{j}] {name}: rust={rust_val:.6} python={python_val:.6} diff={diff:.2e}\n"
                 ));
             }
-            panic!("{msg}");
+            assert!(divergences.is_empty(), "{msg}");
         }
     }
 }
@@ -198,12 +200,15 @@ fn full_pipeline_matches_collimator() {
                     n = divergences.len()
                 );
                 for &(j, rv, pv, diff) in divergences.iter().take(10) {
-                    let name = fixture.feature_names.get(j).map(|s| s.as_str()).unwrap_or("?");
+                    let name = fixture
+                        .feature_names
+                        .get(j)
+                        .map_or("?", String::as_str);
                     msg.push_str(&format!(
                         "  [{j}] {name}: rust={rv:.6} python={pv:.6} diff={diff:.2e}\n"
                     ));
                 }
-                panic!("{msg}");
+                assert!(divergences.is_empty(), "{msg}");
             }
         }
 

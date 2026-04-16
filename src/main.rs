@@ -233,25 +233,27 @@ fn main() -> Result<()> {
 
     // Configure the global rayon pool BEFORE any cleave work runs. Cleave's
     // archive + YARA-X + composite-rule evaluation paths recurse deeply enough
-    // to exhaust rayon's default 2 MB worker stack, producing an unnamed
-    // `thread '<unknown>' has overflowed its stack` abort. Cleave's CLI does
-    // this in `cli_bootstrap`, but litmus uses cleave as a library and never
-    // calls that, so we have to install the global pool ourselves.
+    // to exhaust rayon's default 2 MB worker stack, so we bump to 8 MB. Cleave's
+    // own CLI does this in `cli_bootstrap`, but litmus uses cleave as a library
+    // and never calls that, so the pool is installed here.
     //
-    // Thread count: rayon defaults to num_cpus threads, but that's far too few
-    // when multiple worker slots run concurrent analyses with deeply nested
-    // rayon::join calls (struct+YARA → embedded PE → rayon::join → YARA par_iter).
-    // With num_cpus threads and N worker slots, nested tasks starve waiting for
-    // threads held by other files — a 0.4s ELF can wait 1178s. Using 32× the CPU
-    // count provides enough headroom for nested parallelism without starvation
-    // while keeping thread stack memory (32× × 16 MB) within reasonable bounds.
-    let rayon_threads = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4)
-        * 32;
+    // Thread count: `available_parallelism()` (logical cores). Earlier versions
+    // used 32× the CPU count to paper over a nested-rayon starvation caused by
+    // a blocking semaphore inside cleave's archive analyzer; that deadlock has
+    // been removed, so the multiplier is no longer required. `CLEAVE_RAYON_THREADS`
+    // overrides this for tuning on unusual hardware.
+    let rayon_threads = std::env::var("CLEAVE_RAYON_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(4)
+        });
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .thread_name(|i| format!("rayon-{i}"))
         .build_global()
     {

@@ -532,7 +532,7 @@ pub(super) async fn analyze(
         }
     }
 
-    if let Some(response) = check_memory_pressure(&state) {
+    if let Some(response) = check_memory_pressure(&state).await {
         return response;
     }
 
@@ -1020,7 +1020,7 @@ pub(super) async fn analyze_path(
     }
 
     // Check memory pressure.
-    if let Some(resp) = check_memory_pressure(&state) {
+    if let Some(resp) = check_memory_pressure(&state).await {
         return resp;
     }
 
@@ -1191,7 +1191,7 @@ pub(super) async fn analyze_path(
 ///
 /// Returns `Some(Response)` if the request should be rejected due to memory pressure,
 /// or `None` if the server has enough memory to proceed.
-fn check_memory_pressure(state: &AppState) -> Option<Response> {
+async fn check_memory_pressure(state: &AppState) -> Option<Response> {
     let rss = cleave::memory_tracker::current_rss()?;
 
     if rss <= state.max_rss_bytes {
@@ -1213,10 +1213,14 @@ fn check_memory_pressure(state: &AppState) -> Option<Response> {
         rss_mb = rss / 1024 / 1024,
         "memory pressure detected, clearing thread-local caches"
     );
-    // Fire-and-forget: cache clearing is best-effort. We don't await here because
-    // check_memory_pressure is sync; the clear runs on a blocking thread and we
-    // re-check RSS immediately with whatever has been freed by then.
-    drop(tokio::task::spawn_blocking(cleave::clear_all_thread_caches));
+    // Await the clear before re-checking RSS. A prior version fired-and-forgot
+    // via `drop(spawn_blocking(...))`, then immediately re-read RSS on the next
+    // line — which produced a "cache clear freed memory" log before the clear
+    // had actually run, and let overloaded workers admit requests they could
+    // not service.
+    if let Err(e) = tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await {
+        tracing::warn!(error = %e, "cache-clear task failed");
+    }
 
     // Re-check after clearing caches.
     let rss_after = cleave::memory_tracker::current_rss()?;
