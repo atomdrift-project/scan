@@ -436,7 +436,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     let _ = write!(poll_url, "&load1={:.2}", load);
                 }
             }
-            tracing::info!(url = %poll_url, buffer = buffer.len(), "polling for work");
+            tracing::debug!(url = %poll_url, buffer = buffer.len(), "polling for work");
             let poll_start = Instant::now();
 
             match claim_and_prefetch(&client, &poll_url, &base_url, data_dir.as_deref()).await {
@@ -457,7 +457,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, |v| v.len()));
                         buffer.push_back(pj);
                     }
-                    tracing::info!(
+                    tracing::debug!(
                         jobs = n,
                         buffer_mb = buffer_bytes / (1024 * 1024),
                         elapsed_ms = crate::duration_ms(poll_start.elapsed()),
@@ -714,13 +714,14 @@ async fn run_job(
     tokio::task::spawn(async move {
         let mut last_phase = String::new();
         let mut phase_start = Instant::now();
-        let mut last_heartbeat = Instant::now();
+        let mut slow_logged = false;
+        let mut very_slow_logged = false;
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if cancel_watcher.load(Ordering::Relaxed) {
                 // Log completion of the final phase so elapsed time is never lost.
                 if !last_phase.is_empty() && last_phase != "done" {
-                    tracing::info!(
+                    tracing::debug!(
                         sha256 = %sha_short,
                         file = %label2,
                         phase = %last_phase,
@@ -732,23 +733,35 @@ async fn run_job(
             }
             let current = phase2.get();
             if current.is_empty() {
-                // Phase tracker not yet updated — log if this persists.
-                if last_heartbeat.elapsed().as_secs() >= 30 {
+                // Phase tracker not yet updated — only surface this once it is
+                // materially slow at the default log level.
+                let elapsed = phase_start.elapsed();
+                if elapsed.as_secs() >= 180 && !very_slow_logged {
                     tracing::warn!(
                         analysis_id,
                         sha256 = %sha_short,
                         file = %label2,
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-                        elapsed_ms = crate::duration_ms(phase_start.elapsed()),
-                        "analysis running but phase tracker has not been updated",
+                        elapsed_ms = crate::duration_ms(elapsed),
+                        "analysis running without phase updates for a very slow interval",
                     );
-                    last_heartbeat = Instant::now();
+                    very_slow_logged = true;
+                } else if elapsed.as_secs() >= 60 && !slow_logged {
+                    tracing::info!(
+                        analysis_id,
+                        sha256 = %sha_short,
+                        file = %label2,
+                        rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                        elapsed_ms = crate::duration_ms(elapsed),
+                        "analysis running without phase updates for a slow interval",
+                    );
+                    slow_logged = true;
                 }
                 continue;
             }
             if current != last_phase {
                 if !last_phase.is_empty() {
-                    tracing::info!(
+                    tracing::debug!(
                         analysis_id,
                         sha256 = %sha_short,
                         file = %label2,
@@ -759,8 +772,9 @@ async fn run_job(
                 }
                 last_phase = current;
                 phase_start = Instant::now();
-                last_heartbeat = Instant::now();
-                tracing::info!(
+                slow_logged = false;
+                very_slow_logged = false;
+                tracing::debug!(
                     analysis_id,
                     sha256 = %sha_short,
                     file = %label2,
@@ -770,17 +784,31 @@ async fn run_job(
                 if last_phase == "done" {
                     break;
                 }
-            } else if last_heartbeat.elapsed().as_secs() >= 30 {
-                tracing::warn!(
-                    analysis_id,
-                    sha256 = %sha_short,
-                    file = %label2,
-                    phase = %last_phase,
-                    rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-                    elapsed_ms = crate::duration_ms(phase_start.elapsed()),
-                    "phase still running",
-                );
-                last_heartbeat = Instant::now();
+            } else {
+                let elapsed = phase_start.elapsed();
+                if elapsed.as_secs() >= 180 && !very_slow_logged {
+                    tracing::warn!(
+                        analysis_id,
+                        sha256 = %sha_short,
+                        file = %label2,
+                        phase = %last_phase,
+                        rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                        elapsed_ms = crate::duration_ms(elapsed),
+                        "very slow phase",
+                    );
+                    very_slow_logged = true;
+                } else if elapsed.as_secs() >= 60 && !slow_logged {
+                    tracing::info!(
+                        analysis_id,
+                        sha256 = %sha_short,
+                        file = %label2,
+                        phase = %last_phase,
+                        rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                        elapsed_ms = crate::duration_ms(elapsed),
+                        "slow phase",
+                    );
+                    slow_logged = true;
+                }
             }
         }
     });
@@ -898,11 +926,11 @@ async fn post_result(
         if attempt > 0 {
             tokio::time::sleep(backoff_duration(attempt)).await;
         }
-        tracing::info!(sha256 = %sha256, attempt, "posting result to server");
+        tracing::debug!(sha256 = %sha256, attempt, "posting result to server");
         let post_start = Instant::now();
         match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::info!(sha256 = %sha256, elapsed_ms = crate::duration_ms(post_start.elapsed()), "result posted");
+                tracing::debug!(sha256 = %sha256, elapsed_ms = crate::duration_ms(post_start.elapsed()), "result posted");
                 return;
             }
             Ok(resp) => {
