@@ -141,7 +141,10 @@ impl LocalFileIndex {
     fn resolve(&self, requested_path: &str, sha256: &str, size_bytes: i64) -> Result<Option<PathBuf>> {
         if let Some(found) = self.verified_by_sha256.get(sha256) {
             let path = found.value().clone();
-            if path.exists() && self.path_matches_sha256(&path, sha256)? {
+            // One stat syscall instead of two: `path.exists()` + the later
+            // `fs::metadata` inside `path_matches_sha256` used to hit the
+            // filesystem twice for every local cache hit.
+            if self.path_matches_sha256(&path, sha256)? {
                 tracing::debug!(
                     sha256,
                     path = %path.display(),
@@ -196,8 +199,16 @@ impl LocalFileIndex {
     }
 
     fn path_matches_sha256(&self, path: &Path, expected_sha256: &str) -> Result<bool> {
-        let metadata = fs::metadata(path)
-            .with_context(|| format!("reading metadata for {}", path.display()))?;
+        // A missing file is not an error here — it means the cached entry is
+        // stale and the caller should fall through to the filename-index path.
+        let metadata = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("reading metadata for {}", path.display())));
+            }
+        };
         let modified = metadata.modified().ok();
         if let Some(cached) = self.hash_cache.get(path) {
             if cached.size == metadata.len() && cached.modified == modified {
@@ -284,8 +295,11 @@ struct ClaimJob {
 struct ResultPayload {
     sha256: String,
     worker: String,
+    // Typed `MlSection` instead of `serde_json::Value` so serialization walks the
+    // struct once into HTTP body bytes; the prior shape allocated an intermediate
+    // Value tree via `serde_json::to_value(&envelope.ml)` on every result post.
     #[serde(skip_serializing_if = "Option::is_none")]
-    ml: Option<serde_json::Value>,
+    ml: Option<crate::scan::MlSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     raw: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,7 +316,9 @@ struct PrefetchedJob {
 
 /// Run the worker loop. Blocks until cancelled.
 pub async fn run(config: WorkerConfig) -> Result<()> {
-    let name = config.name.clone();
+    // Arc<str> so every per-job dispatch clones an atomic refcount rather than
+    // reallocating the worker name for each `tokio::spawn`.
+    let name: Arc<str> = Arc::from(config.name.as_str());
     let slots = config.workers;
     let client = reqwest::Client::builder().build()?;
     let semaphore = Arc::new(Semaphore::new(slots));
@@ -351,7 +367,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         });
     }
 
-    let base_url = config.hopper_url.trim_end_matches('/').to_string();
+    // Arc<str> for the hopper URL — cloned per prefetched job and per dispatched
+    // analysis; an atomic bump is far cheaper than a String reallocation.
+    let base_url: Arc<str> = Arc::from(config.hopper_url.trim_end_matches('/'));
     let data_dir = config.data_dir.clone();
     let local_index = data_dir
         .clone()
@@ -540,8 +558,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
         let client = client.clone();
         let resources = Arc::clone(&resources);
-        let url = base_url.clone();
-        let name = name.clone();
+        let url = Arc::clone(&base_url);
+        let name = Arc::clone(&name);
         let local_index = local_index.clone();
         let completed = Arc::clone(&completed);
 
@@ -580,7 +598,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 async fn claim_and_prefetch(
     client: &reqwest::Client,
     poll_url: &str,
-    base_url: &str,
+    base_url: &Arc<str>,
     data_dir: Option<&Path>,
 ) -> Result<Option<Vec<PrefetchedJob>>> {
     let resp = client.get(poll_url).send().await.context("poll request")?;
@@ -605,7 +623,7 @@ async fn claim_and_prefetch(
     let mut set = tokio::task::JoinSet::new();
     for job in claim.jobs {
         let client = client.clone();
-        let base_url = base_url.to_string();
+        let base_url = Arc::clone(base_url);
         let data_dir = data_dir.map(Path::to_path_buf);
         set.spawn(async move {
             let local_path = data_dir.as_deref().map(|d| d.join(&job.path));
@@ -643,7 +661,7 @@ async fn run_job(
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
     prefetched: std::result::Result<Option<Vec<u8>>, String>,
-) -> Result<(serde_json::Value, serde_json::Value, i64), String> {
+) -> Result<(crate::scan::MlSection, serde_json::Value, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     let label = Path::new(&job.path).file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -906,9 +924,7 @@ async fn run_job(
     match result {
         Ok(Ok(scan_result)) => {
             let envelope = scan_result.to_envelope();
-            let ml = serde_json::to_value(&envelope.ml).map_err(|e| e.to_string())?;
-            let raw = envelope.raw;
-            Ok((ml, raw, elapsed_ms))
+            Ok((envelope.ml, envelope.raw, elapsed_ms))
         }
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(e) => Err(format!("task join error: {e}")),
@@ -921,15 +937,14 @@ async fn post_result(
     url: &str,
     worker: &str,
     sha256: &str,
-    result: Result<(serde_json::Value, serde_json::Value, i64), String>,
+    result: Result<(crate::scan::MlSection, serde_json::Value, i64), String>,
 ) {
     let payload = match result {
         Ok((ml, raw, duration_ms)) => {
-            let classification = match ml.get("class").and_then(serde_json::Value::as_u64) {
-                Some(0) => "benign",
-                Some(1) => "suspicious",
-                Some(2) => "hostile",
-                _ => "unknown",
+            let classification = match ml.classification {
+                crate::model::Classification::Benign => "benign",
+                crate::model::Classification::Suspicious => "suspicious",
+                crate::model::Classification::Hostile => "hostile",
             };
             tracing::info!(sha256 = %sha256, duration_ms, classification, "analysis complete");
             ResultPayload {

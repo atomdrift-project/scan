@@ -662,17 +662,14 @@ pub(crate) fn classify_report(
             expected,
         );
     }
-    let (probability, classification, reasons) = if let Some(shap) = shap {
-        let mut features = raw_features.clone();
-        model.spec().standardize(&mut features);
-        let (probability, classification) = model.predict(&features)?;
-        let reasons = shap.explain(&raw_features, model.spec().feature_names());
-        (probability, classification, reasons)
-    } else {
-        model.spec().standardize(&mut raw_features);
-        let (probability, classification) = model.predict(&raw_features)?;
-        (probability, classification, Vec::new())
-    };
+    // SHAP explanations use raw (unstandardized) values, so when SHAP is
+    // enabled we run `explain()` first, then standardize `raw_features` in place
+    // for `predict()`. Avoids cloning the whole feature vector.
+    let reasons = shap
+        .map(|s| s.explain(&raw_features, model.spec().feature_names()))
+        .unwrap_or_default();
+    model.spec().standardize(&mut raw_features);
+    let (probability, classification) = model.predict(&raw_features)?;
 
     let finding_counts = count_findings_from_json(&report_json);
 
@@ -1052,20 +1049,20 @@ pub struct ScanResultEnvelope {
 /// The `ml` section of the response envelope.
 #[derive(Debug, serde::Serialize)]
 pub struct MlSection {
-    v: &'static str,
+    pub(crate) v: &'static str,
     #[serde(rename = "class")]
-    classification: Classification,
+    pub(crate) classification: Classification,
     #[serde(rename = "prob")]
-    probability: f32,
+    pub(crate) probability: f32,
     #[serde(serialize_with = "serialize_thresholds")]
-    thresholds: Thresholds,
-    version: String,
-    analyzed_at: String,
-    fs: Vec<serde_json::Value>,
+    pub(crate) thresholds: Thresholds,
+    pub(crate) version: String,
+    pub(crate) analyzed_at: String,
+    pub(crate) fs: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pids: Option<Vec<u32>>,
+    pub(crate) pids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    deleted: Option<bool>,
+    pub(crate) deleted: Option<bool>,
 }
 
 impl ScanResult {
