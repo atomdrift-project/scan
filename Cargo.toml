@@ -66,7 +66,7 @@ sha2 = "0.10"
 colored = "2"
 terminal-colorsaurus = "0.4"
 axum = { version = "0.8", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal", "process"] }
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6" }
 tempfile = "3"

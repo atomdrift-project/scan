@@ -460,6 +460,15 @@ fn main() -> Result<()> {
             if let Some(ref p) = traits_dir {
                 std::env::set_var("CLEAVE_TRAITS_DIR", p);
             }
+            // Workers run unattended: ensure any git pull (models or cleave traits)
+            // fails fast rather than prompting for credentials / FIDO2 PINs / host-key
+            // confirmation. Children inherit these, so cleave's own `git` invocations
+            // pick them up without code changes there.
+            std::env::set_var("GIT_TERMINAL_PROMPT", "0");
+            std::env::set_var(
+                "GIT_SSH_COMMAND",
+                "ssh -o BatchMode=yes -o ConnectTimeout=15",
+            );
             let model_dir = resolve_model_dir()?;
             let workers = workers.unwrap_or_else(default_workers);
             let name = name.unwrap_or_else(|| {
