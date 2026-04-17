@@ -261,8 +261,6 @@ pub struct WorkerConfig {
     pub poll_secs: u64,
     /// Maximum RSS in GB before pausing (0 = unlimited).
     pub max_rss_gb: u64,
-    /// Minutes between rules/model updates (0 = disabled).
-    pub update_interval_mins: u64,
     /// Path to model directory.
     pub model_dir: PathBuf,
     /// Optional threshold overrides.
@@ -336,21 +334,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // Start background rayon pool health monitoring.
     cleave::start_rayon_diagnostics();
 
-    // Update rules and models before claiming any work. Non-fatal — if the
-    // update fails, we continue with whatever is already installed.
-    tracing::info!("updating rules and models before first poll");
-    if let Err(e) = tokio::task::spawn_blocking(update_rules_and_models).await {
-        tracing::warn!(error = %e, "initial rules update task failed");
-    }
-
     // Warm the YARA engine and capability mapper in the background so the first
     // job does not pay the 30-60 s cold-compile cost (and, more importantly, so
     // the OnceLock behind them does not serialize every concurrent rayon worker
     // waiting on first-use init).
     cleave::prefetch_shared_resources(false);
 
-    // Load model resources after the initial update so a stale or corrupted
-    // local checkout can be repaired before startup fails.
     let model = Model::load(&config.model_dir, config.thresholds)
         .context("loading model")?;
     let shap = ShapImportance::load(&config.model_dir).ok();
@@ -361,14 +350,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         ctx,
         upgrade_heuristic: config.upgrade_heuristic,
     });
-
-    // Background: periodic rules update.
-    if config.update_interval_mins > 0 {
-        let interval = Duration::from_secs(config.update_interval_mins * 60);
-        tokio::spawn(async move {
-            periodic_update(interval).await;
-        });
-    }
 
     // Arc<str> for the hopper URL — cloned per prefetched job and per dispatched
     // analysis; an atomic bump is far cheaper than a String reallocation.
@@ -996,70 +977,6 @@ async fn post_result(
         }
     }
     tracing::error!(sha256 = %sha256, "post result: giving up after {MAX_ATTEMPTS} attempts");
-}
-
-/// Pull latest rules and models. Non-fatal — logs warnings on failure.
-fn update_rules_and_models() {
-    let prev = match crate::models_repo::update() {
-        Ok(prev) => prev,
-        Err(e) => {
-            tracing::warn!(error = %e, "model update failed");
-            None
-        }
-    };
-    let traits_ok = match crate::traits_repo::update(false) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, "traits update failed");
-            false
-        }
-    };
-
-    if traits_ok {
-        if let Err(e) = cleave::reload_capability_mapper() {
-            tracing::warn!(error = %e, "capability mapper reload failed");
-        }
-        cleave::clear_all_thread_caches();
-    } else if let Some(ref rev) = prev {
-        tracing::error!(rev, "traits update failed after models pull; rolling back models repo to previous commit");
-        if let Err(e) = crate::models_repo::rollback(rev) {
-            tracing::error!(error = %e, "models rollback failed");
-        }
-    }
-}
-
-async fn periodic_update(interval: Duration) {
-    // Every git invocation inside `update_rules_and_models` is individually
-    // bounded by `git_cmd::run` (kills its own process group on timeout),
-    // so the blocking task is guaranteed to return in a bounded time.
-    // The outer timeout here is a safety net in case a future refactor
-    // introduces an unbounded call: if it ever fires, the blocking thread
-    // will still eventually return on its own.
-    const UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
-    loop {
-        tokio::time::sleep(interval).await;
-        tracing::info!("updating rules and models");
-
-        match tokio::time::timeout(
-            UPDATE_TIMEOUT,
-            tokio::task::spawn_blocking(update_rules_and_models),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                // Note: model binary (xgboost weights) cannot be hot-swapped in
-                // worker mode. Traits and capability rules are reloaded inside
-                // `update_rules_and_models`. To pick up new model weights,
-                // restart the worker.
-                tracing::info!("rules updated; restart worker to pick up new model weights");
-            }
-            Ok(Err(e)) => tracing::warn!(error = %e, "update task panicked"),
-            Err(_) => tracing::warn!(
-                "update timed out after {}s; continuing to serve requests",
-                UPDATE_TIMEOUT.as_secs()
-            ),
-        }
-    }
 }
 
 /// Download file bytes from hopper. Tries the fast `/data/{path}` endpoint

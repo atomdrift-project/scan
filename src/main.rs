@@ -182,10 +182,6 @@ enum Commands {
         #[arg(long, default_value = "0")]
         max_rss_gb: u64,
 
-        /// Rules/model update interval in minutes (0 = disabled)
-        #[arg(long, default_value = "60")]
-        update_interval_mins: u64,
-
         /// Local data directory. Hopper returns relative paths; the worker
         /// joins them with this root to find files locally instead of
         /// downloading. SHA256 is verified before using a local file.
@@ -452,7 +448,6 @@ fn main() -> Result<()> {
             workers,
             poll_secs,
             max_rss_gb,
-            update_interval_mins,
             data_dir,
             max_jobs,
             traits_dir,
@@ -484,7 +479,6 @@ fn main() -> Result<()> {
                 workers,
                 poll_secs,
                 max_rss_gb,
-                update_interval_mins,
                 data_dir,
                 max_jobs,
                 model_dir,
