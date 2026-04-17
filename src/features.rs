@@ -72,6 +72,13 @@ pub struct FeatureSpec {
     rare_element_vocab: Vec<String>,
     trigram_vocab: Vec<String>,
     metric_vocab: Vec<String>,
+    crit_unigram_vocab: Vec<String>,
+    crit_bigram_vocab: Vec<String>,
+    crit_trigram_vocab: Vec<String>,
+    attack_bigram_vocab: Vec<String>,
+    attack_trigram_vocab: Vec<String>,
+    mbc_bigram_vocab: Vec<String>,
+    mbc_trigram_vocab: Vec<String>,
     feature_names: Vec<String>,
     total_features: usize,
     feature_means: Option<Vec<f32>>,
@@ -103,6 +110,20 @@ struct RawFeatureSpec {
     trigram_vocab: Vec<String>,
     #[serde(default)]
     metric_vocab: Vec<String>,
+    #[serde(default)]
+    crit_unigram_vocab: Vec<String>,
+    #[serde(default)]
+    crit_bigram_vocab: Vec<String>,
+    #[serde(default)]
+    crit_trigram_vocab: Vec<String>,
+    #[serde(default)]
+    attack_bigram_vocab: Vec<String>,
+    #[serde(default)]
+    attack_trigram_vocab: Vec<String>,
+    #[serde(default)]
+    mbc_bigram_vocab: Vec<String>,
+    #[serde(default)]
+    mbc_trigram_vocab: Vec<String>,
     #[serde(default)]
     feature_names: Vec<String>,
     #[serde(default)]
@@ -147,6 +168,13 @@ impl FeatureSpec {
             rare_element_vocab: raw.rare_element_vocab,
             trigram_vocab: raw.trigram_vocab,
             metric_vocab: raw.metric_vocab,
+            crit_unigram_vocab: raw.crit_unigram_vocab,
+            crit_bigram_vocab: raw.crit_bigram_vocab,
+            crit_trigram_vocab: raw.crit_trigram_vocab,
+            attack_bigram_vocab: raw.attack_bigram_vocab,
+            attack_trigram_vocab: raw.attack_trigram_vocab,
+            mbc_bigram_vocab: raw.mbc_bigram_vocab,
+            mbc_trigram_vocab: raw.mbc_trigram_vocab,
             feature_names: raw.feature_names,
             total_features: raw.total_features,
             feature_means: raw.feature_means,
@@ -243,6 +271,13 @@ impl FeatureSpec {
             &self.rare_element_vocab,
             &self.trigram_vocab,
             &self.metric_vocab,
+            &self.crit_unigram_vocab,
+            &self.crit_bigram_vocab,
+            &self.crit_trigram_vocab,
+            &self.attack_bigram_vocab,
+            &self.attack_trigram_vocab,
+            &self.mbc_bigram_vocab,
+            &self.mbc_trigram_vocab,
         );
         if self.feature_names != expected_feature_names {
             let first_mismatch = self
@@ -328,6 +363,13 @@ fn build_expected_feature_names(
     rare_element_vocab: &[String],
     trigram_vocab: &[String],
     metric_vocab: &[String],
+    crit_unigram_vocab: &[String],
+    crit_bigram_vocab: &[String],
+    crit_trigram_vocab: &[String],
+    attack_bigram_vocab: &[String],
+    attack_trigram_vocab: &[String],
+    mbc_bigram_vocab: &[String],
+    mbc_trigram_vocab: &[String],
 ) -> Vec<String> {
     let mut feature_names = Vec::with_capacity(20000); // overestimate to avoid reallocs
 
@@ -401,6 +443,17 @@ fn build_expected_feature_names(
         "agg:mbc_behavior_count".to_string(),
         "agg:has_attack_and_objective".to_string(),
     ]);
+
+    // Crit-category n-grams (vocab-driven)
+    for cu in crit_unigram_vocab { feature_names.push(format!("crit:{cu}")); }
+    for cb in crit_bigram_vocab { feature_names.push(format!("critbi:{cb}")); }
+    for ct in crit_trigram_vocab { feature_names.push(format!("crittri:{ct}")); }
+
+    // ATT&CK/MBC code n-grams (vocab-driven)
+    for ab in attack_bigram_vocab { feature_names.push(format!("atkbi:{ab}")); }
+    for at in attack_trigram_vocab { feature_names.push(format!("atktri:{at}")); }
+    for mb in mbc_bigram_vocab { feature_names.push(format!("mbcbi:{mb}")); }
+    for mt in mbc_trigram_vocab { feature_names.push(format!("mbctri:{mt}")); }
 
     // Group 4: ext (6)
     feature_names.extend([
@@ -543,6 +596,15 @@ pub struct ExtractContext {
     n_trigram: usize,
     n_ext_metrics: usize,
     metric_vocab: Vec<String>,
+    n_crit_unigram: usize,
+    n_crit_bigram: usize,
+    n_crit_trigram: usize,
+    n_atk_bigram: usize,
+    n_atk_trigram: usize,
+    n_mbc_bigram: usize,
+    n_mbc_trigram: usize,
+    /// Global feature name → index lookup for vocab-based features.
+    absolute_lookup: HashMap<String, usize>,
     element_lookup: HashMap<String, usize>,
     ghost_lookup: HashMap<String, usize>,
     skeleton_lookup: HashMap<String, usize>,
@@ -617,6 +679,16 @@ impl ExtractContext {
             n_trigram: spec.trigram_vocab.len(),
             n_ext_metrics: spec.metric_vocab.len(),
             metric_vocab: spec.metric_vocab.clone(),
+            n_crit_unigram: spec.crit_unigram_vocab.len(),
+            n_crit_bigram: spec.crit_bigram_vocab.len(),
+            n_crit_trigram: spec.crit_trigram_vocab.len(),
+            n_atk_bigram: spec.attack_bigram_vocab.len(),
+            n_atk_trigram: spec.attack_trigram_vocab.len(),
+            n_mbc_bigram: spec.mbc_bigram_vocab.len(),
+            n_mbc_trigram: spec.mbc_trigram_vocab.len(),
+            absolute_lookup: spec.feature_names.iter().enumerate()
+                .map(|(i, n)| (n.clone(), i))
+                .collect(),
             element_lookup,
             ghost_lookup,
             skeleton_lookup,
@@ -696,8 +768,73 @@ impl ExtractContext {
         self.write_max_crit_features_v16(&combined, vec, maxcrit_offset, score_weight);
 
         // G3: Aggregates
-        let agg_offset = offsets.take(57);
+        let n_crit = self.n_crit_unigram + self.n_crit_bigram + self.n_crit_trigram;
+        let n_code_ngrams = self.n_atk_bigram + self.n_atk_trigram + self.n_mbc_bigram + self.n_mbc_trigram;
+        let agg_offset = offsets.take(57 + n_crit + n_code_ngrams);
         write_aggregate_features_from_summaries(&combined, &summaries, vec, agg_offset);
+
+        // Crit-category n-grams
+        {
+            let crit_categories: HashSet<&str> = [
+                "objectives", "well-known", "supply-chain", "anti-analysis", "anti-static",
+                "command-and-control", "evasion", "execution", "exfiltration",
+            ].into_iter().collect();
+            let crit_pfx = |c: u32| match c { 5 => "h", 4 => "s", _ => "n" };
+            let mut pmc: HashMap<String, u32> = HashMap::new();
+            for (path, &mo) in &combined.sample_paths {
+                if mo < 3 { continue; }
+                let parts: Vec<&str> = path.split('/').collect();
+                if !crit_categories.contains(parts[0]) { continue; }
+                let key = if parts.len() >= 2 { format!("{}/{}", parts[0], parts[1]) } else { parts[0].to_string() };
+                let e = pmc.entry(key).or_insert(0);
+                *e = (*e).max(mo);
+            }
+            let mut tokens: Vec<String> = pmc.iter().map(|(k, &c)| format!("{}:{k}", crit_pfx(c))).collect();
+            tokens.sort();
+            let lookup = &self.absolute_lookup;
+            for t in &tokens { if let Some(&i) = lookup.get(&format!("crit:{t}")) { vec[i] = 1.0; } }
+            for (i, t1) in tokens.iter().enumerate() {
+                for t2 in &tokens[i+1..] {
+                    if let Some(&idx) = lookup.get(&format!("critbi:{t1} + {t2}")) { vec[idx] = 1.0; }
+                }
+                for j in i+1..tokens.len() {
+                    for t3 in &tokens[j+1..] {
+                        if let Some(&idx) = lookup.get(&format!("crittri:{t1} + {} + {t3}", tokens[j])) { vec[idx] = 1.0; }
+                    }
+                }
+            }
+        }
+
+        // ATT&CK/MBC code n-grams
+        {
+            let mut attacks: HashSet<String> = HashSet::new();
+            let mut mbcs: HashSet<String> = HashSet::new();
+            for s in &summaries {
+                for f in &s.raw_findings {
+                    if let Some(a) = f.get("a").and_then(|v| v.as_str()) { attacks.insert(a.to_string()); }
+                    if let Some(m) = f.get("m").and_then(|v| v.as_str()) { mbcs.insert(m.to_string()); }
+                }
+            }
+            let lookup = &self.absolute_lookup;
+            let mut sa: Vec<_> = attacks.iter().collect(); sa.sort();
+            for (i, a1) in sa.iter().enumerate() {
+                for (j, a2) in sa[i+1..].iter().enumerate() {
+                    if let Some(&idx) = lookup.get(&format!("atkbi:{a1} + {a2}")) { vec[idx] = 1.0; }
+                    for a3 in &sa[i+1+j+1..] {
+                        if let Some(&idx) = lookup.get(&format!("atktri:{a1} + {a2} + {a3}")) { vec[idx] = 1.0; }
+                    }
+                }
+            }
+            let mut sm: Vec<_> = mbcs.iter().collect(); sm.sort();
+            for (i, m1) in sm.iter().enumerate() {
+                for (j, m2) in sm[i+1..].iter().enumerate() {
+                    if let Some(&idx) = lookup.get(&format!("mbcbi:{m1} + {m2}")) { vec[idx] = 1.0; }
+                    for m3 in &sm[i+1+j+1..] {
+                        if let Some(&idx) = lookup.get(&format!("mbctri:{m1} + {m2} + {m3}")) { vec[idx] = 1.0; }
+                    }
+                }
+            }
+        }
 
         // G4: External
         let ext_offset = offsets.take(6);
@@ -1312,6 +1449,10 @@ fn write_aggregate_features_from_summaries(summary: &FindingSummary, summaries: 
     vec[offset + 55] = mbc_behaviors.len() as f32;
     let has_objectives = summary.sample_paths.keys().any(|p| p.starts_with("objectives/"));
     vec[offset + 56] = if !attack_techniques.is_empty() && has_objectives { 1.0 } else { 0.0 };
+
+    // Crit-category and ATT&CK/MBC n-gram features are written by the caller
+    // (ExtractContext::extract) using absolute_lookup, since this function
+    // doesn't have access to the feature name→index mapping.
 }
 
 fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8] {
