@@ -76,6 +76,7 @@ fn classify_analysis_error(message: &str) -> (StatusCode, String) {
         || normalized.contains("maximum decode depth")
         || normalized.contains("exceeded maximum")
         || normalized.contains("file count limit exceeded")
+        || normalized.contains("file name too long")
     {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {
