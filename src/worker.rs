@@ -1071,9 +1071,13 @@ async fn download_bytes(
     sha256: &str,
     path: &str,
 ) -> Result<Vec<u8>, String> {
+    if path.is_empty() || path == "." {
+        return Err(format!("download {sha256}: empty path from hopper, cannot fetch"));
+    }
+
     let start = Instant::now();
 
-    // Try path-based endpoint first (no DB lookup on hopper side).
+    // Use path-based endpoint (static file serving, no DB query on hopper side).
     // Encode each path segment to handle filenames with spaces or special chars.
     let encoded_path: String = path.split('/')
         .map(url_encode)
@@ -1082,15 +1086,6 @@ async fn download_bytes(
     let data_url = format!("{}/data/{}", base_url, encoded_path);
     tracing::debug!(sha256 = %sha256, url = %data_url, "downloading via /data/");
     let resp = client.get(&data_url).send().await.map_err(|e| format!("download {path}: {e}"))?;
-
-    let resp = if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        // Fall back to legacy SHA256-based endpoint.
-        let file_url = format!("{}/api/file/{}", base_url, sha256);
-        tracing::debug!(sha256 = %sha256, url = %file_url, "falling back to /api/file/");
-        client.get(&file_url).send().await.map_err(|e| format!("download {path}: {e}"))?
-    } else {
-        resp
-    };
 
     if !resp.status().is_success() {
         return Err(format!("download {path}: HTTP {}", resp.status()));
