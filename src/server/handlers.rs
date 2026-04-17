@@ -445,7 +445,7 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
                     (Some(e.to_string()), None)
                 }
             };
-            let traits_err = match cleave::traits_repo::update(false) {
+            let traits_err = match crate::traits_repo::update(false) {
                 Ok(()) => None,
                 Err(e) => {
                     tracing::warn!("traits update failed: {e}");

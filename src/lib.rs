@@ -28,6 +28,7 @@
 
 pub mod explain;
 pub mod features;
+pub(crate) mod git_cmd;
 pub mod model;
 pub mod models_repo;
 pub mod output;
@@ -35,6 +36,7 @@ pub mod ps;
 pub mod scan;
 pub mod server;
 pub mod tools;
+pub mod traits_repo;
 pub mod worker;
 
 pub use model::Classification;

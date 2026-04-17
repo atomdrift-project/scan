@@ -1007,7 +1007,7 @@ fn update_rules_and_models() {
             None
         }
     };
-    let traits_ok = match cleave::traits_repo::update(false) {
+    let traits_ok = match crate::traits_repo::update(false) {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(error = %e, "traits update failed");
@@ -1029,101 +1029,35 @@ fn update_rules_and_models() {
 }
 
 async fn periodic_update(interval: Duration) {
-    const UPDATE_TIMEOUT: Duration = Duration::from_secs(150);
+    // Every git invocation inside `update_rules_and_models` is individually
+    // bounded by `git_cmd::run` (kills its own process group on timeout),
+    // so the blocking task is guaranteed to return in a bounded time.
+    // The outer timeout here is a safety net in case a future refactor
+    // introduces an unbounded call: if it ever fires, the blocking thread
+    // will still eventually return on its own.
+    const UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
     loop {
         tokio::time::sleep(interval).await;
         tracing::info!("updating rules and models");
 
-        // Snapshot the models HEAD before the update so we can roll back if the
-        // subprocess updates models but then dies before traits catch up.
-        let prev_models_rev = crate::models_repo::version();
-
-        match run_update_subprocess(UPDATE_TIMEOUT).await {
-            Ok(()) => {
-                if let Err(e) = cleave::reload_capability_mapper() {
-                    tracing::warn!(error = %e, "capability mapper reload failed");
-                }
-                cleave::clear_all_thread_caches();
+        match tokio::time::timeout(
+            UPDATE_TIMEOUT,
+            tokio::task::spawn_blocking(update_rules_and_models),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
                 // Note: model binary (xgboost weights) cannot be hot-swapped in
-                // worker mode. To pick up new model weights, restart the worker.
+                // worker mode. Traits and capability rules are reloaded inside
+                // `update_rules_and_models`. To pick up new model weights,
+                // restart the worker.
                 tracing::info!("rules updated; restart worker to pick up new model weights");
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "update failed");
-                // If models advanced but the subprocess failed (e.g. traits pull
-                // timed out), roll models back so a later restart doesn't load
-                // new weights against stale traits.
-                let current_rev = crate::models_repo::version();
-                if let (Some(prev), Some(curr)) =
-                    (prev_models_rev.as_deref(), current_rev.as_deref())
-                {
-                    if prev != curr {
-                        tracing::error!(
-                            rev = prev,
-                            "rolling back models repo after failed update"
-                        );
-                        if let Err(e) = crate::models_repo::rollback(prev) {
-                            tracing::error!(error = %e, "models rollback failed");
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Run the update in a child process we can actually kill on timeout.
-///
-/// `tokio::task::spawn_blocking` is uncancellable: if a `git pull` inside it
-/// hangs (FIDO2 PIN prompt, dead TCP connection, stuck git server) wrapping
-/// it in `tokio::time::timeout` only detaches the future — the blocking
-/// thread and its git/ssh children keep running for as long as they like.
-///
-/// A subprocess fixes that. We place it in a new session via `setsid(2)` so
-/// every descendant (git, ssh, ssh-askpass, etc.) shares a process group we
-/// can signal with `kill(-pgid, SIGKILL)`.
-async fn run_update_subprocess(timeout: Duration) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use tokio::process::Command;
-
-    let exe = std::env::current_exe().context("resolving current exe")?;
-    let mut cmd = Command::new(&exe);
-    cmd.arg("update-rules")
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true);
-
-    #[cfg(unix)]
-    // SAFETY: setsid is async-signal-safe and has no effect on the parent.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    let mut child = cmd.spawn().context("spawning update-rules subprocess")?;
-    let pid = child.id();
-
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => anyhow::bail!("update-rules exited with {status}"),
-        Ok(Err(e)) => Err(e).context("waiting on update-rules"),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                // setsid gave the child pgid == pid, so -pid signals the group.
-                // SAFETY: kill(2) with a signed pgid is a standard Unix API.
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = pid;
-            let _ = child.kill().await;
-            anyhow::bail!("update timed out after {}s; killed subprocess", timeout.as_secs());
+            Ok(Err(e)) => tracing::warn!(error = %e, "update task panicked"),
+            Err(_) => tracing::warn!(
+                "update timed out after {}s; continuing to serve requests",
+                UPDATE_TIMEOUT.as_secs()
+            ),
         }
     }
 }

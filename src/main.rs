@@ -307,7 +307,7 @@ fn main() -> Result<()> {
                 }
             });
             s.spawn(|| {
-                if let Err(e) = cleave::traits_repo::update(false) {
+                if let Err(e) = litmus::traits_repo::update(false) {
                     eprintln!("Warning: traits update failed: {e}");
                 }
             });
@@ -428,7 +428,7 @@ fn main() -> Result<()> {
                     process::exit(1);
                 }
                 if !models_only {
-                    if let Err(e) = cleave::traits_repo::check_updates() {
+                    if let Err(e) = litmus::traits_repo::check_updates() {
                         eprintln!("Error checking traits updates: {e}");
                         process::exit(1);
                     }
@@ -439,7 +439,7 @@ fn main() -> Result<()> {
                     process::exit(1);
                 }
                 if !models_only {
-                    if let Err(e) = cleave::traits_repo::update(false) {
+                    if let Err(e) = litmus::traits_repo::update(false) {
                         eprintln!("Error updating traits: {e}");
                         process::exit(1);
                     }
@@ -460,15 +460,6 @@ fn main() -> Result<()> {
             if let Some(ref p) = traits_dir {
                 std::env::set_var("CLEAVE_TRAITS_DIR", p);
             }
-            // Workers run unattended: ensure any git pull (models or cleave traits)
-            // fails fast rather than prompting for credentials / FIDO2 PINs / host-key
-            // confirmation. Children inherit these, so cleave's own `git` invocations
-            // pick them up without code changes there.
-            std::env::set_var("GIT_TERMINAL_PROMPT", "0");
-            std::env::set_var(
-                "GIT_SSH_COMMAND",
-                "ssh -o BatchMode=yes -o ConnectTimeout=15",
-            );
             let model_dir = resolve_model_dir()?;
             let workers = workers.unwrap_or_else(default_workers);
             let name = name.unwrap_or_else(|| {

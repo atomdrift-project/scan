@@ -12,10 +12,11 @@
 //!   ln -sfn ~/dev/atomdrift/litmus-models \
 //!     ~/Library/Application\ Support/litmus/models
 
+use crate::git_cmd;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 const MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/litmus-models.git";
 const CURRENT_MODEL: &str = "scan-v16";
@@ -82,36 +83,6 @@ pub fn model_dir() -> Result<PathBuf> {
     resolve_and_ensure().map(|base| base.join(CURRENT_MODEL))
 }
 
-/// Run a git command with a hard timeout, killing the child process if it exceeds it.
-///
-/// Uses `try_wait` polling so the calling thread is not blocked past the deadline.
-/// Returns the captured stdout/stderr output on success.
-fn run_git_with_timeout(args: &[&str]) -> Result<std::process::Output> {
-    let mut child = Command::new("git")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Prevent git from blocking on credential or hardware-key prompts.
-        // GIT_TERMINAL_PROMPT=0 disables all terminal prompts; BatchMode=yes
-        // makes SSH fail immediately instead of waiting for a PIN or passphrase.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
-        .spawn()
-        .context("failed to start git")?;
-
-    let deadline = Instant::now() + GIT_TIMEOUT;
-    loop {
-        match child.try_wait().context("failed to poll git process")? {
-            Some(_) => return child.wait_with_output().context("failed to read git output"),
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                anyhow::bail!("git timed out after {}s", GIT_TIMEOUT.as_secs());
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-}
-
 /// Update the models repository, cloning it first if necessary.
 ///
 /// Returns the pre-update HEAD commit so the caller can roll back if the new
@@ -123,29 +94,32 @@ pub fn update() -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let before = short_head(&base);
+    let before = git_cmd::short_head(&base);
     eprintln!("Updating models...");
 
     let base_str = base.to_string_lossy();
-    let output = run_git_with_timeout(&["-C", &base_str, "pull", "--ff-only"])?;
+    let output = git_cmd::run(&["-C", &base_str, "pull", "--ff-only"], GIT_TIMEOUT)?;
 
     if !output.status.success() {
         anyhow::bail!("update failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    let after = short_head(&base).unwrap_or_default();
+    let after = git_cmd::short_head(&base).unwrap_or_default();
     let before_str = before.as_deref().unwrap_or_default();
     if before_str == after {
         eprintln!("Already up to date ({after}).");
     } else {
         eprintln!("Updated: {before_str} -> {after}");
-        if let Ok(diff) = run_git_with_timeout(&[
-            "-C",
-            &base_str,
-            "diff",
-            "--stat",
-            &format!("{before_str}..{after}"),
-        ]) {
+        if let Ok(diff) = git_cmd::run(
+            &[
+                "-C",
+                &base_str,
+                "diff",
+                "--stat",
+                &format!("{before_str}..{after}"),
+            ],
+            GIT_TIMEOUT,
+        ) {
             if diff.status.success() {
                 let summary = String::from_utf8_lossy(&diff.stdout);
                 if !summary.is_empty() {
@@ -163,10 +137,10 @@ pub fn update() -> Result<Option<String>> {
 /// last-known-good state for future reloads.
 pub fn rollback(rev: &str) -> Result<()> {
     let base = current_models_dir();
-    let broken = short_head(&base).unwrap_or_else(|| "unknown".to_string());
+    let broken = git_cmd::short_head(&base).unwrap_or_else(|| "unknown".to_string());
     tracing::error!(broken_commit = %broken, rollback_to = %rev, "rolling back models repo");
     let base_str = base.to_string_lossy();
-    let output = run_git_with_timeout(&["-C", &base_str, "reset", "--hard", rev])?;
+    let output = git_cmd::run(&["-C", &base_str, "reset", "--hard", rev], GIT_TIMEOUT)?;
     if !output.status.success() {
         anyhow::bail!(
             "rollback to {rev} failed: {}",
@@ -185,10 +159,10 @@ pub fn check_updates() -> Result<()> {
     }
 
     let base_str = base.to_string_lossy();
-    let fetch = run_git_with_timeout(&["-C", &base_str, "fetch", "--dry-run"])
+    let fetch = git_cmd::run(&["-C", &base_str, "fetch", "--dry-run"], GIT_TIMEOUT)
         .context("git fetch failed")?;
 
-    let local = short_head(&base).unwrap_or_default();
+    let local = git_cmd::short_head(&base).unwrap_or_default();
     let stderr = String::from_utf8_lossy(&fetch.stderr);
     if fetch.status.success() && stderr.trim().is_empty() {
         eprintln!("Models are up to date ({local}).");
@@ -205,7 +179,7 @@ pub fn check_updates() -> Result<()> {
 /// Get the short commit hash of the current models HEAD, if available.
 #[must_use]
 pub fn version() -> Option<String> {
-    short_head(&current_models_dir())
+    git_cmd::short_head(&current_models_dir())
 }
 
 fn default_models_dir() -> PathBuf {
@@ -236,7 +210,7 @@ fn ensure_repo(base: &Path) -> Result<bool> {
             base.display()
         )
     })?;
-    eprintln!("Models ready ({}).", short_head(base).unwrap_or_default());
+    eprintln!("Models ready ({}).", git_cmd::short_head(base).unwrap_or_default());
     Ok(true)
 }
 
@@ -283,24 +257,6 @@ fn days_since_last_commit(path: &Path) -> Option<u64> {
         .ok()?
         .as_secs() as i64;
     Some(((now - timestamp) / 86400).max(0).cast_unsigned())
-}
-
-fn short_head(path: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            &path.to_string_lossy(),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
 }
 
 fn is_git_repo(path: &Path) -> bool {
