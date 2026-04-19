@@ -763,11 +763,13 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 
     cleave::scan_directory(path, &cleave_opts, |event| match event {
         cleave::ScanEvent::Start { total } => {
-            let total32 = u32::try_from(total).unwrap_or(u32::MAX);
-            let _ = total_files.set(total32);
-            if is_terminal && total > 1 {
-                crate::output::print_header(path, total);
-                let _ = progress.set(Progress::new(total32));
+            if let Some(total) = total {
+                let total32 = u32::try_from(total).unwrap_or(u32::MAX);
+                let _ = total_files.set(total32);
+                if is_terminal && total > 1 {
+                    crate::output::print_header(path, total);
+                    let _ = progress.set(Progress::new(total32));
+                }
             }
         }
         cleave::ScanEvent::File {
