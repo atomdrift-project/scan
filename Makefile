@@ -47,7 +47,7 @@ check-cargo:
 
 release: check-cargo $(OUT_DIR)
 	cargo build --release
-	cp target/release/$(BINARY) $(OUT_DIR)/
+	cp target/release/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
 	fi
