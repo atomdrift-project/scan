@@ -35,15 +35,6 @@ impl FeatureWriter<'_> {
             self.vec[idx] = value;
         }
     }
-
-    /// Set a feature using a pre-formatted owned String. Avoids double allocation
-    /// when the caller already built the name.
-    #[inline]
-    fn set_owned(&mut self, name: &String, value: f32) {
-        if let Some(&idx) = self.lookup.get(name.as_str()) {
-            self.vec[idx] = value;
-        }
-    }
 }
 
 /// Feature spec version this build was compiled against.
@@ -315,7 +306,7 @@ impl FeatureSpec {
             // Feature groups can be disabled during training (COLLIMATOR_DISABLE_FEATURE_GROUPS),
             // producing fewer features than the full layout. Verify that every feature in the
             // spec exists in the expected layout — if so, it's a valid subset.
-            let expected_set: std::collections::HashSet<&str> = expected_feature_names.iter().map(|s| s.as_str()).collect();
+            let expected_set: std::collections::HashSet<&str> = expected_feature_names.iter().map(String::as_str).collect();
             let all_known = self.feature_names.iter().all(|n| expected_set.contains(n.as_str()));
             if !all_known {
                 let first_unknown = self.feature_names.iter().find(|n| !expected_set.contains(n.as_str()));
@@ -627,7 +618,6 @@ fn build_expected_feature_names(
 pub struct ExtractContext {
     presence_lookup: HashMap<String, usize>,
     n_presence: usize,
-    ft_lookup: HashMap<String, usize>,
     n_ft: usize,
     n_element: usize,
     n_bigram: usize,
@@ -646,10 +636,6 @@ pub struct ExtractContext {
     n_mbc_trigram: usize,
     /// Global feature name → index lookup for vocab-based features.
     absolute_lookup: HashMap<String, usize>,
-    element_lookup: HashMap<String, usize>,
-    ghost_lookup: HashMap<String, usize>,
-    skeleton_lookup: HashMap<String, usize>,
-    rare_lookup: HashMap<String, usize>,
     ghost_vocab: Vec<String>,
     total_features: usize,
 
@@ -663,15 +649,12 @@ impl ExtractContext {
     /// Build lookup tables from a feature specification.
     #[must_use]
     pub fn new(spec: &FeatureSpec) -> Self {
-        let vocab_index = |v: &[String]| -> HashMap<String, usize> {
-            v.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect()
-        };
-        let presence_lookup = vocab_index(&spec.presence_vocab);
-        let ft_lookup = vocab_index(&spec.filetype_vocab);
-        let element_lookup = vocab_index(&spec.element_vocab);
-        let ghost_lookup = vocab_index(&spec.ghost_vocab);
-        let skeleton_lookup = vocab_index(&spec.skeleton_vocab);
-        let rare_lookup = vocab_index(&spec.rare_element_vocab);
+        let presence_lookup: HashMap<String, usize> = spec
+            .presence_vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
 
         // Optimized bigram/trigram lookups
         let mut path_to_id = HashMap::new();
@@ -710,7 +693,6 @@ impl ExtractContext {
         Self {
             presence_lookup,
             n_presence: spec.presence_vocab.len(),
-            ft_lookup,
             n_ft: spec.filetype_vocab.len(),
             n_element: spec.element_vocab.len(),
             n_bigram: spec.bigram_vocab.len(),
@@ -730,10 +712,6 @@ impl ExtractContext {
             absolute_lookup: spec.feature_names.iter().enumerate()
                 .map(|(i, n)| (n.clone(), i))
                 .collect(),
-            element_lookup,
-            ghost_lookup,
-            skeleton_lookup,
-            rare_lookup,
             ghost_vocab: spec.ghost_vocab.clone(),
             total_features: spec.total_features,
             path_to_id,
@@ -1240,11 +1218,20 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
             _ => {}
         }
 
+        // `entry(path.to_owned())` would allocate a fresh `String` on every
+        // call regardless of whether the key already exists. Most findings
+        // share path prefixes, so hitting an existing entry is the common
+        // case — `get_mut` + conditional `insert` pays for the allocation
+        // only on first insert.
         for path in finding_paths(fid) {
-            let entry = summary.sample_paths.entry(path.to_owned()).or_insert(0);
-            *entry = (*entry).max(crit_ord);
-            let conf_entry = summary.path_confidences.entry(path.to_owned()).or_insert(0.0);
-            *conf_entry = f64::max(*conf_entry, conf);
+            match summary.sample_paths.get_mut(path) {
+                Some(v) => *v = (*v).max(crit_ord),
+                None => { summary.sample_paths.insert(path.to_owned(), crit_ord); }
+            }
+            match summary.path_confidences.get_mut(path) {
+                Some(v) => *v = v.max(conf),
+                None => { summary.path_confidences.insert(path.to_owned(), conf); }
+            }
         }
     }
 
@@ -1267,10 +1254,14 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
     let mut combined = FindingSummary::default();
 
     // Deduplicate unique IDs across all files (matching Python's second pass
-    // in _summarize_report_files which iterates all findings again).
-    let mut notable_ids: HashSet<String> = HashSet::new();
-    let mut suspicious_ids: HashSet<String> = HashSet::new();
-    let mut hostile_ids: HashSet<String> = HashSet::new();
+    // in _summarize_report_files which iterates all findings again). The
+    // finding IDs borrow from `summaries` for the lifetime of this function,
+    // so the sets hold `&str` — matching `summarize_findings`'s shape — and
+    // avoid one `String` allocation per qualifying finding per criticality
+    // tier.
+    let mut notable_ids: HashSet<&str> = HashSet::new();
+    let mut suspicious_ids: HashSet<&str> = HashSet::new();
+    let mut hostile_ids: HashSet<&str> = HashSet::new();
 
     for s in summaries {
         let fs = &s.findings;
@@ -1285,13 +1276,19 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
         combined.well_known_max_crit = combined.well_known_max_crit.max(fs.well_known_max_crit);
         combined.has_yara |= fs.has_yara;
 
+        // Same motivation as `summarize_findings`: skip the `String` clone
+        // when the path already aggregates into `combined`.
         for (path, max_ord) in &fs.sample_paths {
-            let entry = combined.sample_paths.entry(path.clone()).or_insert(0);
-            *entry = (*entry).max(*max_ord);
+            match combined.sample_paths.get_mut(path) {
+                Some(v) => *v = (*v).max(*max_ord),
+                None => { combined.sample_paths.insert(path.clone(), *max_ord); }
+            }
         }
         for (path, &conf) in &fs.path_confidences {
-            let e = combined.path_confidences.entry(path.clone()).or_insert(0.0);
-            *e = f64::max(*e, conf);
+            match combined.path_confidences.get_mut(path) {
+                Some(v) => *v = v.max(conf),
+                None => { combined.path_confidences.insert(path.clone(), conf); }
+            }
         }
         combined.finding_confidences.extend(fs.finding_confidences.iter().copied());
 
@@ -1302,9 +1299,9 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
             let conf = finding["c"].as_f64().unwrap_or(1.0);
             if conf < MIN_CONFIDENCE { continue; }
             let crit = crit_ordinal(finding);
-            if crit >= 3 { notable_ids.insert(fid.to_string()); }
-            if crit >= 4 { suspicious_ids.insert(fid.to_string()); }
-            if crit >= 5 { hostile_ids.insert(fid.to_string()); }
+            if crit >= 3 { notable_ids.insert(fid); }
+            if crit >= 4 { suspicious_ids.insert(fid); }
+            if crit >= 5 { hostile_ids.insert(fid); }
         }
     }
 
@@ -1908,7 +1905,11 @@ mod tests {
     #[test]
     fn test_standardize() {
         let spec = FeatureSpec {
-            version: 16, abi_version: 16, presence_vocab: vec![], filetype_vocab: vec![], element_vocab: vec![], bigram_vocab: vec![], ghost_vocab: vec![], skeleton_vocab: vec![], rare_element_vocab: vec![], trigram_vocab: vec![], metric_vocab: vec![], feature_names: vec![], total_features: 3,
+            version: 16, abi_version: 16, presence_vocab: vec![], filetype_vocab: vec![], element_vocab: vec![], bigram_vocab: vec![], ghost_vocab: vec![], skeleton_vocab: vec![], rare_element_vocab: vec![], trigram_vocab: vec![], metric_vocab: vec![],
+            crit_unigram_vocab: vec![], crit_bigram_vocab: vec![], crit_trigram_vocab: vec![],
+            attack_bigram_vocab: vec![], attack_trigram_vocab: vec![],
+            mbc_bigram_vocab: vec![], mbc_trigram_vocab: vec![],
+            feature_names: vec![], total_features: 3,
             feature_means: Some(vec![0.0, 1.0, 2.0]), feature_stds: Some(vec![1.0, 2.0, 0.5]), standardized: true,
         };
         let mut features = vec![1.0, 3.0, 3.0];

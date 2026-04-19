@@ -6,9 +6,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -37,8 +38,34 @@ struct LocalNameKey {
 struct CachedFileHash {
     size: u64,
     modified: Option<std::time::SystemTime>,
-    sha256: String,
+    sha256: [u8; 32],
 }
+
+/// Stable handle into `LocalFileIndex::files`. `u32` supports 4 B indexed files,
+/// far beyond any plausible data dir; halving the index width vs. `usize` lets
+/// the secondary caches fit more per bucket.
+type FileId = u32;
+
+/// Identity hasher for SHA-256 digests. SHA-256 output is already uniformly
+/// distributed, so we can skip hashing entirely and use any 8 bytes of the
+/// digest as the hash code — dashmap shards and hashbrown buckets then spread
+/// keys just as well as a wyhash/foldhash pass would, at zero cost per lookup.
+#[derive(Default)]
+struct Sha256IdentityHasher(u64);
+
+impl Hasher for Sha256IdentityHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        if let Some(first8) = bytes.first_chunk::<8>() {
+            self.0 = u64::from_ne_bytes(*first8);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type Sha256IdentityBuildHasher = BuildHasherDefault<Sha256IdentityHasher>;
 
 static NEXT_ANALYSIS_ID: AtomicU64 = AtomicU64::new(1);
 static BLOCKING_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -47,9 +74,17 @@ static BLOCKING_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 struct LocalFileIndex {
     root: PathBuf,
-    by_name: HashMap<LocalNameKey, Vec<IndexedLocalFile>>,
-    verified_by_sha256: dashmap::DashMap<String, PathBuf>,
-    hash_cache: dashmap::DashMap<PathBuf, CachedFileHash>,
+    /// Every file found under `root` at startup — the single owner of each
+    /// `PathBuf`. Secondary indexes refer to entries by `FileId`.
+    files: Vec<IndexedLocalFile>,
+    by_name: HashMap<LocalNameKey, Vec<FileId>>,
+    /// SHA-256 → `FileId` for files whose content hash has been confirmed.
+    verified_by_sha256: dashmap::DashMap<[u8; 32], FileId, Sha256IdentityBuildHasher>,
+    /// Per-file lazily-populated hash cache, indexed by `FileId`. A boxed
+    /// slice of `OnceLock` gives lock-free reads and a bounded, preallocated
+    /// footprint (one slot per indexed file, regardless of how many are
+    /// eventually hashed).
+    hash_cache: Box<[OnceLock<CachedFileHash>]>,
 }
 
 impl LocalFileIndex {
@@ -59,9 +94,9 @@ impl LocalFileIndex {
     // to bubble up here.
     #[allow(clippy::unnecessary_wraps)]
     fn build(root: PathBuf) -> Result<Self> {
-        let mut by_name: HashMap<LocalNameKey, Vec<IndexedLocalFile>> = HashMap::new();
+        let mut files: Vec<IndexedLocalFile> = Vec::new();
+        let mut by_name: HashMap<LocalNameKey, Vec<FileId>> = HashMap::new();
         let mut stack = vec![root.clone()];
-        let mut indexed_files = 0u64;
 
         while let Some(dir) = stack.pop() {
             let entries = match fs::read_dir(&dir) {
@@ -111,17 +146,31 @@ impl LocalFileIndex {
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
                     .to_string();
+
+                // `FileId` is `u32`; bail out cleanly if a single data dir
+                // somehow exceeds 4 B files rather than silently truncating.
+                let Ok(file_id) = FileId::try_from(files.len()) else {
+                    tracing::warn!(
+                        root = %root.display(),
+                        limit = FileId::MAX,
+                        "local data index exceeds FileId capacity; ignoring remaining files",
+                    );
+                    break;
+                };
+
+                let basename = basename.to_string();
+                files.push(IndexedLocalFile { path, size });
                 by_name
                     .entry(LocalNameKey {
                         parent_name,
-                        basename: basename.to_string(),
+                        basename,
                     })
                     .or_default()
-                    .push(IndexedLocalFile { path, size });
-                indexed_files += 1;
+                    .push(file_id);
             }
         }
 
+        let indexed_files = files.len();
         let distinct_names = by_name.len();
         tracing::info!(
             root = %root.display(),
@@ -130,37 +179,57 @@ impl LocalFileIndex {
             "built local sample index"
         );
 
+        let hash_cache = (0..files.len())
+            .map(|_| OnceLock::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         Ok(Self {
             root,
+            files,
             by_name,
-            verified_by_sha256: dashmap::DashMap::new(),
-            hash_cache: dashmap::DashMap::new(),
+            verified_by_sha256: dashmap::DashMap::with_hasher(Sha256IdentityBuildHasher::default()),
+            hash_cache,
         })
     }
 
     fn resolve(&self, requested_path: &str, sha256: &str, size_bytes: i64) -> Result<Option<PathBuf>> {
-        if let Some(found) = self.verified_by_sha256.get(sha256) {
-            let path = found.value().clone();
-            // One stat syscall instead of two: `path.exists()` + the later
-            // `fs::metadata` inside `path_matches_sha256` used to hit the
-            // filesystem twice for every local cache hit.
-            if self.path_matches_sha256(&path, sha256)? {
-                tracing::debug!(
-                    sha256,
-                    path = %path.display(),
-                    "using cached local path for sha256"
-                );
-                return Ok(Some(path));
+        // Decode once at the boundary; all internal state is raw [u8; 32].
+        let Some(expected) = sha256_from_hex(sha256) else {
+            anyhow::bail!("expected 64-char hex sha256, got {:?}", sha256);
+        };
+
+        if let Some(found) = self.verified_by_sha256.get(&expected) {
+            let file_id = *found.value();
+            drop(found); // release the dashmap shard lock before any I/O
+            if let Some(entry) = self.files.get(file_id as usize) {
+                // One stat syscall instead of two: `path.exists()` + the later
+                // `fs::metadata` inside `file_matches_sha256` used to hit the
+                // filesystem twice for every local cache hit.
+                if self.file_matches_sha256(file_id, entry, &expected)? {
+                    tracing::debug!(
+                        sha256,
+                        path = %entry.path.display(),
+                        "using cached local path for sha256"
+                    );
+                    return Ok(Some(entry.path.clone()));
+                }
             }
-            self.verified_by_sha256.remove(sha256);
+            self.verified_by_sha256.remove(&expected);
         }
 
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<FileId> = Vec::new();
         let requested = Path::new(requested_path);
         if requested.is_relative() {
             let direct = self.root.join(requested);
+            // Exact-path hits are still resolved via the name index so that
+            // caches stay keyed by `FileId`. A disk-only match that isn't in
+            // `by_name` is treated as absent (the index is the source of truth
+            // for what this worker can analyze locally).
             if direct.exists() {
-                candidates.push(direct);
+                if let Some(id) = self.file_id_for_path(&direct) {
+                    candidates.push(id);
+                }
             }
         }
 
@@ -176,60 +245,117 @@ impl LocalFileIndex {
         };
         if let Some(indexed) = self.by_name.get(&key) {
             let expected_size = u64::try_from(size_bytes).ok();
-            candidates.extend(
-                indexed
-                    .iter()
-                    .filter(|entry| expected_size.is_none_or(|size| entry.size == size))
-                    .map(|entry| entry.path.clone()),
-            );
+            candidates.extend(indexed.iter().copied().filter(|id| {
+                self.files.get(*id as usize).is_some_and(|entry| {
+                    expected_size.is_none_or(|size| entry.size == size)
+                })
+            }));
         }
 
-        candidates.sort();
+        candidates.sort_unstable();
         candidates.dedup();
 
-        for candidate in candidates {
-            if self.path_matches_sha256(&candidate, sha256)? {
-                self.verified_by_sha256
-                    .insert(sha256.to_string(), candidate.clone());
-                return Ok(Some(candidate));
+        for file_id in candidates {
+            let Some(entry) = self.files.get(file_id as usize) else {
+                continue;
+            };
+            if self.file_matches_sha256(file_id, entry, &expected)? {
+                self.verified_by_sha256.insert(expected, file_id);
+                return Ok(Some(entry.path.clone()));
             }
         }
 
         Ok(None)
     }
 
-    fn path_matches_sha256(&self, path: &Path, expected_sha256: &str) -> Result<bool> {
+    fn file_id_for_path(&self, path: &Path) -> Option<FileId> {
+        let basename = path.file_name().and_then(|n| n.to_str())?.to_string();
+        let parent_name = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let key = LocalNameKey { parent_name, basename };
+        let candidates = self.by_name.get(&key)?;
+        candidates
+            .iter()
+            .copied()
+            .find(|id| self.files.get(*id as usize).is_some_and(|e| e.path == path))
+    }
+
+    fn file_matches_sha256(
+        &self,
+        file_id: FileId,
+        entry: &IndexedLocalFile,
+        expected: &[u8; 32],
+    ) -> Result<bool> {
         // A missing file is not an error here — it means the cached entry is
         // stale and the caller should fall through to the filename-index path.
-        let metadata = match fs::metadata(path) {
+        let metadata = match fs::metadata(&entry.path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => {
                 return Err(anyhow::Error::from(e)
-                    .context(format!("reading metadata for {}", path.display())));
+                    .context(format!("reading metadata for {}", entry.path.display())));
             }
         };
         let modified = metadata.modified().ok();
-        if let Some(cached) = self.hash_cache.get(path) {
-            if cached.size == metadata.len() && cached.modified == modified {
-                return Ok(cached.sha256 == expected_sha256);
+        let size = metadata.len();
+
+        if let Some(slot) = self.hash_cache.get(file_id as usize) {
+            if let Some(cached) = slot.get() {
+                if cached.size == size && cached.modified == modified {
+                    return Ok(&cached.sha256 == expected);
+                }
+                // Stale entry — `OnceLock` is write-once, so the next hash
+                // lookup for this file pays for a re-hash but no insert. In
+                // practice files under `--data` don't rewrite, so this is
+                // almost never taken.
             }
         }
 
-        let digest = sha256_file(path)?;
-        self.hash_cache.insert(
-            path.to_path_buf(),
-            CachedFileHash {
-                size: metadata.len(),
+        let digest = sha256_file(&entry.path)?;
+        if let Some(slot) = self.hash_cache.get(file_id as usize) {
+            // Ignore the Err case: another thread raced us and won; its value
+            // is equivalent (content-addressed), so drop ours silently.
+            let _ = slot.set(CachedFileHash {
+                size,
                 modified,
-                sha256: digest.clone(),
-            },
-        );
-        Ok(digest == expected_sha256)
+                sha256: digest,
+            });
+        }
+        Ok(&digest == expected)
     }
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+/// Decode a lowercase/uppercase hex SHA-256 string into raw bytes. Returns
+/// `None` for any non-hex byte or wrong length — callers treat that as an
+/// invalid job rather than propagating a structured error.
+fn sha256_from_hex(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<[u8; 32]> {
     use std::io::Read;
 
     let mut file =
@@ -245,7 +371,7 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher.finalize().into())
 }
 
 /// Configuration for the worker mode.
@@ -647,9 +773,12 @@ async fn run_job(
     prefetched: std::result::Result<Option<Vec<u8>>, String>,
 ) -> Result<(crate::scan::MlSection, serde_json::Value, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
-    let label = Path::new(&job.path).file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| job.sha256.clone());
+    // `Arc<str>` so the watcher and the blocking closure share the basename
+    // allocation instead of each cloning a fresh `String`.
+    let label: Arc<str> = Path::new(&job.path)
+        .file_name()
+        .map(|n| Arc::from(n.to_string_lossy().as_ref()))
+        .unwrap_or_else(|| Arc::from(job.sha256.as_str()));
 
     // Try local file first; fall back to downloading bytes from hopper.
     // Exact-path hits are attempted first, then final-dir+basename+size lookup.
@@ -718,9 +847,11 @@ async fn run_job(
     let start = Instant::now();
     let phase = cleave::PhaseTracker::new();
     let phase2 = phase.clone();
-    let label2 = label.clone();
-    let label_for_blocking = label.clone();
-    let sha_short = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
+    let label2 = Arc::clone(&label);
+    let label_for_blocking = Arc::clone(&label);
+    let sha_short: Arc<str> = Arc::from(job.sha256.get(..12).unwrap_or(&job.sha256));
+    // Pre-clone for the blocking closure before the watcher captures its copy.
+    let sha_short2 = Arc::clone(&sha_short);
     let input_source = if use_local { "local" } else { "downloaded" };
     let input_size = if use_local {
         u64::try_from(job.size_bytes).unwrap_or(0)
@@ -733,27 +864,16 @@ async fn run_job(
     // Uses a tokio task instead of an OS thread to avoid one thread-per-job overhead.
     // The returned JoinHandle is aborted via RAII guard below so the watcher cannot
     // outlive this function even if the outer task is cancelled.
-    let cancel_watcher = cancel.clone();
     let watcher_handle = tokio::task::spawn(async move {
         let mut last_phase = String::new();
         let mut phase_start = Instant::now();
         let mut slow_logged = false;
         let mut very_slow_logged = false;
+        // 500 ms polling is fine-grained enough for the 60 s / 180 s slow-phase
+        // thresholds below, and at 32 slots × 2 Hz the scheduler cost is a
+        // fifth of the old 10 Hz poll.
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if cancel_watcher.load(Ordering::Relaxed) {
-                // Log completion of the final phase so elapsed time is never lost.
-                if !last_phase.is_empty() && last_phase != "done" {
-                    tracing::debug!(
-                        sha256 = %sha_short,
-                        file = %label2,
-                        phase = %last_phase,
-                        elapsed_ms = crate::duration_ms(phase_start.elapsed()),
-                        "phase complete",
-                    );
-                }
-                break;
-            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
             let current = phase2.get();
             if current.is_empty() {
                 // Phase tracker not yet updated — only surface this once it is
@@ -858,8 +978,7 @@ async fn run_job(
         size = input_size,
         "analysis starting",
     );
-    let sha_short2 = job.sha256.get(..12).unwrap_or(&job.sha256).to_string();
-        let handle = tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let thread_id = os_thread_id();
         let inflight_blocking = started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
@@ -898,16 +1017,12 @@ async fn run_job(
 
     let result = handle.await;
 
-    // Always signal the phase watcher to stop. Without this, if cleave returns
-    // an error before setting phase="done", the watcher thread leaks indefinitely.
-    cancel.store(true, Ordering::Relaxed);
-
     #[allow(clippy::cast_sign_loss)]
     let elapsed_ms = crate::duration_ms(start.elapsed()) as i64;
 
     match result {
         Ok(Ok(scan_result)) => {
-            let envelope = scan_result.to_envelope();
+            let envelope = scan_result.into_envelope();
             Ok((envelope.ml, envelope.raw, elapsed_ms))
         }
         Ok(Err(e)) => Err(format!("{e:#}")),
@@ -996,11 +1111,19 @@ async fn download_bytes(
 
     // Use path-based endpoint (static file serving, no DB query on hopper side).
     // Encode each path segment to handle filenames with spaces or special chars.
-    let encoded_path: String = path.split('/')
-        .map(url_encode)
-        .collect::<Vec<_>>()
-        .join("/");
-    let data_url = format!("{}/data/{}", base_url, encoded_path);
+    // Build the URL in one pass — avoids the intermediate `Vec<String>` the
+    // previous `split().map().collect().join()` chain allocated per download.
+    let mut data_url = String::with_capacity(base_url.len() + 6 + path.len() * 2);
+    data_url.push_str(base_url);
+    data_url.push_str("/data/");
+    let mut first = true;
+    for segment in path.split('/') {
+        if !first {
+            data_url.push('/');
+        }
+        first = false;
+        url_encode_into(segment, &mut data_url);
+    }
     tracing::debug!(sha256 = %sha256, url = %data_url, "downloading via /data/");
     let resp = client.get(&data_url).send().await.map_err(|e| format!("download {path}: {e}"))?;
 
@@ -1089,6 +1212,14 @@ fn system_load_avg() -> Option<f64> {
 /// Percent-encode a string for use in URL query parameters.
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    url_encode_into(s, &mut out);
+    out
+}
+
+/// Append the percent-encoded form of `s` to `out`. Lets callers that build up
+/// a URL piece-by-piece skip the per-segment `String` allocations that
+/// `url_encode` would otherwise require.
+fn url_encode_into(s: &str, out: &mut String) {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -1101,7 +1232,6 @@ fn url_encode(s: &str) -> String {
             }
         }
     }
-    out
 }
 
 #[cfg(test)]

@@ -338,16 +338,17 @@ fn emit_result(
         OutputFormat::Terminal => {
             output::print_ps_result(r, pids, deleted, has_progress, config.extra());
         }
-        OutputFormat::Json => match serde_json::to_string(&r.to_envelope()) {
-            Ok(line) => {
-                if let Ok(mut out) = stdout.lock() {
-                    let _ = writeln!(out, "{line}");
-                }
-            }
-            Err(e) => {
+        OutputFormat::Json => {
+            let envelope = r.envelope_ref();
+            let Ok(mut out) = stdout.lock() else {
+                return;
+            };
+            if let Err(e) = serde_json::to_writer(&mut *out, &envelope) {
                 tracing::error!(path = %r.path, "failed to serialize scan result: {e}");
+                return;
             }
-        },
+            let _ = out.write_all(b"\n");
+        }
     }
 }
 

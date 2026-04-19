@@ -830,7 +830,7 @@ pub(super) async fn analyze(
                 probability = scan_result.probability,
                 "<-- 200 OK",
             );
-            let mut resp = Json(scan_result.to_envelope()).into_response();
+            let mut resp = Json(scan_result.into_envelope()).into_response();
             resp.headers_mut()
                 .insert("X-Total-Ms", elapsed_ms.into());
             resp
@@ -1179,7 +1179,7 @@ pub(super) async fn analyze_path(
                 probability = scan_result.probability,
                 "<-- 200 OK",
             );
-            let mut resp = Json(scan_result.to_envelope()).into_response();
+            let mut resp = Json(scan_result.into_envelope()).into_response();
             resp.headers_mut()
                 .insert("X-Total-Ms", elapsed_ms.into());
             resp

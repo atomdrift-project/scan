@@ -211,6 +211,7 @@ impl ScanConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod config_tests {
     use super::*;
 
@@ -265,6 +266,7 @@ mod config_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod finding_override_tests {
     use super::*;
 
@@ -406,6 +408,7 @@ mod finding_override_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod envelope_tests {
     use super::*;
 
@@ -856,16 +859,17 @@ fn emit_result(
         OutputFormat::Terminal => {
             crate::output::print_file_result_streaming(r, show_progress, config.extra());
         }
-        OutputFormat::Json => match serde_json::to_string(&r.to_envelope()) {
-            Ok(line) => {
-                if let Ok(mut out) = stdout.lock() {
-                    let _ = writeln!(out, "{line}");
-                }
-            }
-            Err(e) => {
+        OutputFormat::Json => {
+            let envelope = r.envelope_ref();
+            let Ok(mut out) = stdout.lock() else {
+                return;
+            };
+            if let Err(e) = serde_json::to_writer(&mut *out, &envelope) {
                 tracing::error!(path = %r.path, "failed to serialize scan result: {e}");
+                return;
             }
-        },
+            let _ = out.write_all(b"\n");
+        }
     }
 }
 
@@ -1095,8 +1099,9 @@ fn process_report(
     config: &ScanConfig,
     cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
+    let path_display = path.display().to_string();
     let cr = classify_report(
-        &path.display().to_string(),
+        &path_display,
         report,
         ctx,
         model,
@@ -1123,7 +1128,7 @@ fn process_report(
         cleave,
         pids: None,
         deleted: None,
-        path: path.display().to_string(),
+        path: path_display,
         finding_counts: cr.finding_counts,
         formula: cr.formula,
         reasons: cr.reasons,
@@ -1407,8 +1412,51 @@ pub struct MlSection {
     pub(crate) deleted: Option<bool>,
 }
 
+/// Zero-copy envelope view serialized directly from `&ScanResult`. Borrows the
+/// cleave JSON and the owned `String` fields, so the per-file JSON output path
+/// avoids cloning the cleave report (which can be hundreds of KB for archives).
+#[derive(Debug, serde::Serialize)]
+pub struct ScanResultEnvelopeRef<'a> {
+    /// ML classification section (borrowed).
+    pub ml: MlSectionRef<'a>,
+    /// Raw cleave analysis report (borrowed).
+    pub raw: &'a serde_json::Value,
+}
+
+/// Borrowed counterpart of [`MlSection`].
+#[derive(Debug, serde::Serialize)]
+pub struct MlSectionRef<'a> {
+    pub(crate) v: &'static str,
+    #[serde(rename = "class")]
+    pub(crate) classification: Classification,
+    #[serde(rename = "prob")]
+    pub(crate) probability: f32,
+    #[serde(rename = "oclass", skip_serializing_if = "Option::is_none")]
+    pub(crate) original_classification: Option<Classification>,
+    #[serde(rename = "oprob", skip_serializing_if = "Option::is_none")]
+    pub(crate) original_probability: Option<f32>,
+    #[serde(serialize_with = "serialize_thresholds")]
+    pub(crate) thresholds: Thresholds,
+    pub(crate) version: &'a str,
+    pub(crate) analyzed_at: &'a str,
+    pub(crate) fs: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pids: Option<&'a [u32]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) deleted: Option<bool>,
+}
+
+fn empty_raw() -> &'static serde_json::Value {
+    static EMPTY: OnceLock<serde_json::Value> = OnceLock::new();
+    EMPTY.get_or_init(|| serde_json::json!({}))
+}
+
 impl ScanResult {
     /// Build the `{"ml": {...}, "raw": {...}}` envelope for JSON output.
+    ///
+    /// Prefer [`Self::into_envelope`] when the caller owns the `ScanResult`.
+    /// `to_envelope` clones the full `cleave` report (potentially multi-MB
+    /// for archive analyses); the move variant avoids that entirely.
     #[must_use]
     pub fn to_envelope(&self) -> ScanResultEnvelope {
         let raw = self.cleave.clone().unwrap_or(serde_json::json!({}));
@@ -1430,6 +1478,71 @@ impl ScanResult {
                 analyzed_at: self.analyzed_at.clone(),
                 fs: ml_fs,
                 pids: self.pids.clone(),
+                deleted: self.deleted,
+            },
+            raw,
+        }
+    }
+
+    /// Build the envelope, consuming the `ScanResult`. Avoids cloning the
+    /// cleave report and owned string fields — the hot path for worker and
+    /// server handlers, which drop the result immediately after building the
+    /// envelope.
+    #[must_use]
+    pub fn into_envelope(self) -> ScanResultEnvelope {
+        let raw = self.cleave.unwrap_or(serde_json::json!({}));
+        let ml_fs = build_ml_fs(
+            &raw,
+            &self.classification,
+            self.probability,
+            &self.embedded_files,
+        );
+        ScanResultEnvelope {
+            ml: MlSection {
+                v: self.v,
+                classification: self.classification,
+                probability: self.probability,
+                original_classification: self.original_classification,
+                original_probability: self.original_probability,
+                thresholds: self.thresholds,
+                version: self.version,
+                analyzed_at: self.analyzed_at,
+                fs: ml_fs,
+                pids: self.pids,
+                deleted: self.deleted,
+            },
+            raw,
+        }
+    }
+
+    /// Zero-copy envelope view over `&self`. Use this on the JSON output hot
+    /// path (e.g. [`crate::scan`] and [`crate::ps`] `emit_result`) — it avoids
+    /// cloning the cleave report and all owned string fields. Prefer
+    /// [`Self::into_envelope`] when the caller can give up ownership.
+    #[must_use]
+    pub fn envelope_ref(&self) -> ScanResultEnvelopeRef<'_> {
+        let raw: &serde_json::Value = match &self.cleave {
+            Some(v) => v,
+            None => empty_raw(),
+        };
+        let ml_fs = build_ml_fs(
+            raw,
+            &self.classification,
+            self.probability,
+            &self.embedded_files,
+        );
+        ScanResultEnvelopeRef {
+            ml: MlSectionRef {
+                v: self.v,
+                classification: self.classification,
+                probability: self.probability,
+                original_classification: self.original_classification,
+                original_probability: self.original_probability,
+                thresholds: self.thresholds,
+                version: &self.version,
+                analyzed_at: &self.analyzed_at,
+                fs: ml_fs,
+                pids: self.pids.as_deref(),
                 deleted: self.deleted,
             },
             raw,
