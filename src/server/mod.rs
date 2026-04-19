@@ -679,6 +679,15 @@ fn record_init_failure(state: &AppState, message: &str) {
 /// Returns an error if the listening socket cannot be bound or the server
 /// fails while serving requests.
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
+    // Warm cleave's YARA engine + capability mapper off the rayon pool before
+    // the listener binds. The first request's analysis spawns rayon work; if
+    // one of those rayon workers is the first to hit `yara_engine()`, init's
+    // internal par_iter deadlocks against its peers parked on the OnceLock.
+    // Prefetching from a non-rayon thread here avoids the race entirely —
+    // `prefetch_shared_resources` returns immediately and does the work in a
+    // `std::thread::spawn`, so it doesn't delay startup.
+    cleave::prefetch_shared_resources(true);
+
     // Server mode processes many files over a long lifetime. Configure jemalloc
     // to aggressively return freed pages to the OS, preventing multi-GB RSS
     // growth from allocator fragmentation across thousands of analyses.

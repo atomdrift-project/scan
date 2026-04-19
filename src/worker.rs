@@ -542,11 +542,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // Start background rayon pool health monitoring.
     cleave::start_rayon_diagnostics();
 
-    // Warm the YARA engine and capability mapper in the background so the first
-    // job does not pay the 30-60 s cold-compile cost (and, more importantly, so
-    // the OnceLock behind them does not serialize every concurrent rayon worker
-    // waiting on first-use init).
-    cleave::prefetch_shared_resources(false);
+    // Warm YARA + capability mapper on a non-rayon thread before any job is
+    // dispatched. The variant (`true`) must match `AnalysisOptions::default()`
+    // — otherwise the prefetch warms an engine nobody uses and the first real
+    // analysis triggers a cold compile on a rayon worker, which deadlocks the
+    // pool. See cleave::shared_resources::yara_engine for the contract.
+    cleave::prefetch_shared_resources(true);
 
     let model = Model::load(&config.model_dir, config.thresholds)
         .context("loading model")?;

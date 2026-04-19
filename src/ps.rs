@@ -41,6 +41,10 @@ fn sha256_file(path: &std::path::Path) -> Result<String> {
 
 /// Run a process scan: enumerate, deduplicate, classify.
 pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
+    // Warm cleave's YARA engine + capability mapper off the rayon pool before
+    // any scan fires rayon work. See `run_scan_paths` for why this matters.
+    cleave::prefetch_shared_resources(true);
+
     let scan_start = Instant::now();
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
 

@@ -550,6 +550,13 @@ fn exit_for_summary(summary: &litmus::ScanSummary) {
 }
 
 fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litmus::ScanSummary> {
+    // Warm YARA + capability mapper off the rayon pool before any analysis
+    // spawns rayon work. Directory scans run on a dedicated rayon pool; if
+    // any of those workers is the first to hit `yara_engine()`, the init's
+    // internal par_iter deadlocks against its peers parked on the OnceLock.
+    // Prefetching from main (non-rayon) fills the OnceLock safely.
+    cleave::prefetch_shared_resources(true);
+
     let started = std::time::Instant::now();
     let mut summary = litmus::ScanSummary {
         total_files: 0,
