@@ -242,9 +242,12 @@ fn main() -> Result<()> {
 
     // Configure the global rayon pool BEFORE any cleave work runs. Cleave's
     // archive + YARA-X + composite-rule evaluation paths recurse deeply enough
-    // to exhaust rayon's default 2 MB worker stack, so we bump to 8 MB. Cleave's
-    // own CLI does this in `cli_bootstrap`, but litmus uses cleave as a library
-    // and never calls that, so the pool is installed here.
+    // to exhaust rayon's default 2 MB worker stack, so we bump to 16 MB. Cleave's
+    // nested-archive analyzer recurses in-place on rayon workers (see
+    // cleave::analyzers::archive::analyzers around the current_thread_index()
+    // branch) and documents 16 MB as the expected pool size. Cleave's own CLI
+    // does this in `cli_bootstrap`, but litmus uses cleave as a library and
+    // never calls that, so the pool is installed here.
     //
     // Thread count: `available_parallelism()` (logical cores). Earlier versions
     // used 32× the CPU count to paper over a nested-rayon starvation caused by
@@ -262,7 +265,7 @@ fn main() -> Result<()> {
         });
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(16 * 1024 * 1024)
         .thread_name(|i| format!("rayon-{i}"))
         .build_global()
     {
