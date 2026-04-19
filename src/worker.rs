@@ -987,11 +987,14 @@ async fn run_job(
 
     // Run analysis on a blocking thread with phase logging.
     let start = Instant::now();
-    let phase = cleave::PhaseTracker::new();
+    let sha_short: Arc<str> = Arc::from(job.sha256.get(..12).unwrap_or(&job.sha256));
+    // Register the tracker with a descriptive label so cleave's rayon-diag
+    // snapshot can name which analyses are in flight instead of just
+    // reporting a count.
+    let phase = cleave::PhaseTracker::with_label(format!("{sha_short} {label}"));
     let phase2 = phase.clone();
     let label2 = Arc::clone(&label);
     let label_for_blocking = Arc::clone(&label);
-    let sha_short: Arc<str> = Arc::from(job.sha256.get(..12).unwrap_or(&job.sha256));
     // Pre-clone for the blocking closure before the watcher captures its copy.
     let sha_short2 = Arc::clone(&sha_short);
     let input_source = if use_local { "local" } else { "downloaded" };

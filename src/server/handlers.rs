@@ -806,7 +806,7 @@ pub(super) async fn analyze(
             size_bytes: file_size as u64,
             started_at: Instant::now(),
             cancellation: Arc::clone(&cancellation),
-            phase: cleave::PhaseTracker::new(),
+            phase: cleave::PhaseTracker::with_label(format!("req#{request_id} {filename}")),
             thread_id: AtomicU64::new(0),
         },
     );
@@ -1172,7 +1172,7 @@ pub(super) async fn analyze_path(
             size_bytes: file_size,
             started_at: Instant::now(),
             cancellation: Arc::clone(&cancellation),
-            phase: cleave::PhaseTracker::new(),
+            phase: cleave::PhaseTracker::with_label(format!("req#{request_id} {}", req.path)),
             thread_id: AtomicU64::new(0),
         },
     );
