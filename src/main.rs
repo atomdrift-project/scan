@@ -285,6 +285,30 @@ fn main() -> Result<()> {
         litmus::output::detect_theme();
     }
 
+    // Dump all thread backtraces on SIGUSR1 (Linux equivalent of BSD SIGINFO / Ctrl-T).
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        std::thread::Builder::new()
+            .name("sigusr1".into())
+            .spawn(|| {
+                let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::sigemptyset(&mut mask);
+                    libc::sigaddset(&mut mask, libc::SIGUSR1);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+                }
+                loop {
+                    let mut sig: libc::c_int = 0;
+                    if unsafe { libc::sigwait(&mask, &mut sig) } == 0 {
+                        let bt = std::backtrace::Backtrace::force_capture();
+                        let _ = writeln!(std::io::stderr(), "\n--- SIGUSR1 backtrace ---\n{bt}\n--- end backtrace ---");
+                    }
+                }
+            })
+            .expect("failed to spawn sigusr1 thread");
+    }
+
     #[cfg(debug_assertions)]
     tracing::warn!(
         "DEBUG binary — litmus will be very slow; use `make release` for production builds"
