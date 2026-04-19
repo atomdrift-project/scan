@@ -251,7 +251,7 @@ fn main() -> Result<()> {
         });
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
-        .stack_size(32 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .thread_name(|i| format!("rayon-{i}"))
         .build_global()
     {
