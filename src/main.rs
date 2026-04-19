@@ -492,12 +492,21 @@ fn main() -> Result<()> {
             rt.block_on(litmus::worker::run(config))?;
         }
         Commands::Version => {
-            println!("litmus {}", env!("CARGO_PKG_VERSION"));
-            if let Some(v) = litmus::models_repo::version() {
-                println!("  models: {v}");
-            }
-            if let Some(v) = cleave::traits_repo::version() {
-                println!("  traits: {v}");
+            if cli.format == litmus::OutputFormat::Json {
+                let version = serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "models": litmus::models_repo::version(),
+                    "traits": cleave::traits_repo::version(),
+                });
+                println!("{version}");
+            } else {
+                println!("litmus {}", env!("CARGO_PKG_VERSION"));
+                if let Some(v) = litmus::models_repo::version() {
+                    println!("  models: {v}");
+                }
+                if let Some(v) = cleave::traits_repo::version() {
+                    println!("  traits: {v}");
+                }
             }
         }
     }
