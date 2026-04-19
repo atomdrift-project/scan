@@ -52,7 +52,14 @@ pub struct ServerConfig {
     workers: usize,
     allow_cidrs: Vec<Cidr>,
     upgrade_heuristic: bool,
+    /// Per-request analysis timeout in seconds. 0 disables.
+    analysis_timeout_secs: u64,
 }
+
+/// Default per-request analysis timeout: 5 minutes. Covers cold cleave scans
+/// of reasonable archives while preventing a pathological input from pinning
+/// a slot indefinitely. Override with [`ServerConfig::with_analysis_timeout`].
+pub const DEFAULT_ANALYSIS_TIMEOUT_SECS: u64 = 300;
 
 impl ServerConfig {
     /// Create a server configuration.
@@ -121,6 +128,7 @@ impl ServerConfig {
             workers,
             allow_cidrs,
             upgrade_heuristic: true,
+            analysis_timeout_secs: DEFAULT_ANALYSIS_TIMEOUT_SECS,
         })
     }
 
@@ -129,6 +137,19 @@ impl ServerConfig {
     pub const fn with_upgrade_heuristic(mut self, upgrade_heuristic: bool) -> Self {
         self.upgrade_heuristic = upgrade_heuristic;
         self
+    }
+
+    /// Override the default per-request analysis timeout. Pass `0` to disable.
+    #[must_use]
+    pub const fn with_analysis_timeout_secs(mut self, secs: u64) -> Self {
+        self.analysis_timeout_secs = secs;
+        self
+    }
+
+    /// Per-request analysis timeout in seconds. 0 = disabled.
+    #[must_use]
+    pub const fn analysis_timeout_secs(&self) -> u64 {
+        self.analysis_timeout_secs
     }
 
     /// Whether the finding-based classification upgrade heuristic is enabled.
@@ -384,6 +405,8 @@ struct AppState {
     /// permits are available, preventing orphaned blocking tasks from piling up
     /// and consuming unbounded memory.
     max_concurrent_tasks: usize,
+    /// Per-request analysis timeout. `0` disables the timeout entirely.
+    analysis_timeout_secs: u64,
     reload_lock: tokio::sync::Mutex<()>,
     overloaded_since: std::sync::Mutex<Option<Instant>>,
     in_flight: dashmap::DashMap<u64, InFlightRequest>,
@@ -435,6 +458,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         stuck_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
+        analysis_timeout_secs: config.analysis_timeout_secs(),
         reload_lock: tokio::sync::Mutex::new(()),
         overloaded_since: std::sync::Mutex::new(None),
         in_flight: dashmap::DashMap::new(),

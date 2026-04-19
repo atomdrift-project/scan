@@ -1446,11 +1446,6 @@ pub struct MlSectionRef<'a> {
     pub(crate) deleted: Option<bool>,
 }
 
-fn empty_raw() -> &'static serde_json::Value {
-    static EMPTY: OnceLock<serde_json::Value> = OnceLock::new();
-    EMPTY.get_or_init(|| serde_json::json!({}))
-}
-
 impl ScanResult {
     /// Build the `{"ml": {...}, "raw": {...}}` envelope for JSON output.
     ///
@@ -1521,9 +1516,10 @@ impl ScanResult {
     /// [`Self::into_envelope`] when the caller can give up ownership.
     #[must_use]
     pub fn envelope_ref(&self) -> ScanResultEnvelopeRef<'_> {
+        static EMPTY_RAW: OnceLock<serde_json::Value> = OnceLock::new();
         let raw: &serde_json::Value = match &self.cleave {
             Some(v) => v,
-            None => empty_raw(),
+            None => EMPTY_RAW.get_or_init(|| serde_json::json!({})),
         };
         let ml_fs = build_ml_fs(
             raw,

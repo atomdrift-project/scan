@@ -3,12 +3,56 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::Builder as TempBuilder;
 
 use super::AppState;
+
+/// Outcome of awaiting a `tokio::spawn_blocking` analysis task with a bound.
+///
+/// `Ok` boxes the `ScanResult` (≈376 B) so the idle-path variants — `Timeout`
+/// and `JoinError` — don't carry that much padding each.
+#[derive(Debug)]
+enum AnalysisOutcome {
+    /// Task completed (inner `Result` is the analyzer's result).
+    Ok(anyhow::Result<Box<crate::scan::ScanResult>>),
+    /// Task join failed (panic, runtime shutdown, etc.).
+    JoinError(tokio::task::JoinError),
+    /// Task exceeded the configured timeout. Slot is released; the blocking
+    /// thread keeps running until cleave observes the cancellation flag.
+    Timeout(u64),
+}
+
+/// Await a blocking analysis task with an optional per-request timeout.
+///
+/// On timeout, sets the cancellation flag (so cleave will exit at its next
+/// checkpoint), increments `stuck_orphans` for observability, and returns
+/// `Timeout`. The blocking task is **not** aborted — tokio can't force-stop
+/// a blocking thread — but the HTTP slot is released so new work can land.
+async fn await_with_timeout(
+    handle: tokio::task::JoinHandle<anyhow::Result<crate::scan::ScanResult>>,
+    timeout_secs: u64,
+    cancellation: &AtomicBool,
+    stuck_orphans: &AtomicUsize,
+) -> AnalysisOutcome {
+    if timeout_secs == 0 {
+        return match handle.await {
+            Ok(r) => AnalysisOutcome::Ok(r.map(Box::new)),
+            Err(e) => AnalysisOutcome::JoinError(e),
+        };
+    }
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await {
+        Ok(Ok(r)) => AnalysisOutcome::Ok(r.map(Box::new)),
+        Ok(Err(e)) => AnalysisOutcome::JoinError(e),
+        Err(_) => {
+            cancellation.store(true, Ordering::Release);
+            stuck_orphans.fetch_add(1, Ordering::Relaxed);
+            AnalysisOutcome::Timeout(timeout_secs)
+        }
+    }
+}
 
 /// Return a platform-appropriate thread ID for the calling thread.
 /// On Linux this is the TID (matches /proc/self/task/), on macOS/FreeBSD
@@ -804,10 +848,19 @@ pub(super) async fn analyze(
         result
     });
 
-    // Await to completion — no per-request timeout. If the client disconnects,
-    // axum drops this future; guard.drop() fires, signalling cancellation and
-    // releasing the slot.
-    let result = handle.await;
+    // Await to completion, bounded by the configured per-request timeout. If
+    // the client disconnects, axum drops this future and guard.drop() fires,
+    // signalling cancellation and releasing the slot. On timeout we signal
+    // cancellation and return 504 — the blocking thread continues until
+    // cleave notices the flag, but the slot is freed and `stuck_orphans` is
+    // incremented so an operator can see zombie work.
+    let result = await_with_timeout(
+        handle,
+        state.analysis_timeout_secs,
+        &cancellation,
+        &state.stuck_orphans,
+    )
+    .await;
 
     // Normal completion: drop the guard explicitly so its log context is clear.
     drop(guard);
@@ -820,7 +873,8 @@ pub(super) async fn analyze(
     let elapsed_ms = crate::duration_ms(request_start.elapsed());
 
     match result {
-        Ok(Ok(scan_result)) => {
+        AnalysisOutcome::Ok(Ok(scan_result)) => {
+            let scan_result = *scan_result;
             tracing::info!(
                 id = request_id,
                 filename = %filename,
@@ -835,16 +889,33 @@ pub(super) async fn analyze(
                 .insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
-        Ok(Err(e)) => {
+        AnalysisOutcome::Ok(Err(e)) => {
             let status = analysis_error_status(&e);
             tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analysis failed");
             analysis_error_response(&e)
         }
-        Err(e) => {
+        AnalysisOutcome::JoinError(e) => {
             tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+        AnalysisOutcome::Timeout(secs) => {
+            tracing::warn!(
+                id = request_id,
+                filename = %filename,
+                elapsed_ms,
+                timeout_secs = secs,
+                "<-- 504 analysis timeout",
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "analysis timeout",
+                    "timeout_secs": secs,
+                })),
             )
                 .into_response()
         }
@@ -1137,15 +1208,22 @@ pub(super) async fn analyze_path(
         result
     });
 
-    // Await to completion — no per-request timeout. Client disconnect drops this
-    // future; guard.drop() fires, signalling cancellation and releasing the slot.
-    let result = handle.await;
+    // Await to completion, bounded by the configured per-request timeout.
+    // See `analyze` for the timeout-drop-slot semantics.
+    let result = await_with_timeout(
+        handle,
+        state.analysis_timeout_secs,
+        &cancellation,
+        &state.stuck_orphans,
+    )
+    .await;
     drop(guard);
 
     let elapsed_ms = crate::duration_ms(request_start.elapsed());
 
     match result {
-        Ok(Ok(mut scan_result)) => {
+        AnalysisOutcome::Ok(Ok(scan_result)) => {
+            let mut scan_result = *scan_result;
             // Inject extracted_path into the raw cleave JSON so cyclotron
             // knows where archive members were extracted on disk.
             if let (Some(ref extract_dir), Some(ref mut raw)) =
@@ -1184,16 +1262,32 @@ pub(super) async fn analyze_path(
                 .insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
-        Ok(Err(e)) => {
+        AnalysisOutcome::Ok(Err(e)) => {
             let status = analysis_error_status(&e);
             tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analysis failed");
             analysis_error_response(&e)
         }
-        Err(e) => {
+        AnalysisOutcome::JoinError(e) => {
             tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Internal error"})),
+            )
+                .into_response()
+        }
+        AnalysisOutcome::Timeout(secs) => {
+            tracing::warn!(
+                id = request_id,
+                elapsed_ms,
+                timeout_secs = secs,
+                "<-- 504 analysis timeout",
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "analysis timeout",
+                    "timeout_secs": secs,
+                })),
             )
                 .into_response()
         }

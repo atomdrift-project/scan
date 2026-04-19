@@ -436,8 +436,83 @@ struct ResultPayload {
 /// A job with its file data pre-downloaded (or marked for local access).
 struct PrefetchedJob {
     job: ClaimJob,
-    /// `Ok(None)` = use local file, `Ok(Some(bytes))` = downloaded, `Err` = download failed.
-    data: std::result::Result<Option<Vec<u8>>, String>,
+    /// `Ok(None)` = use local file, `Ok(Some(bytes))` = downloaded,
+    /// `Err(Transient)` = download failed (fall back to direct download),
+    /// `Err(Skipped)` = job rejected without attempting download (e.g. oversized);
+    /// do not retry, post the error result directly.
+    data: std::result::Result<Option<Vec<u8>>, PrefetchError>,
+}
+
+/// Why a prefetch did not produce bytes.
+#[derive(Debug, Clone)]
+enum PrefetchError {
+    /// Download attempted and failed — `run_job` may retry via direct download.
+    Transient(String),
+    /// Download not attempted; treat as a permanent error for this worker.
+    Skipped(String),
+}
+
+impl std::fmt::Display for PrefetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(m) | Self::Skipped(m) => f.write_str(m),
+        }
+    }
+}
+
+/// Upper bound on how long `run` will wait for in-flight analyses to drain
+/// after a shutdown signal before exiting anyway. Cleave cancellation is
+/// cooperative; a stuck rayon unpack can refuse to exit, and the operator
+/// should not have to `kill -9` just because one file is wedged.
+const SHUTDOWN_DRAIN_SECS: u64 = 60;
+
+/// Poll the shutdown flag at ≤500 ms granularity so a signal interrupts any
+/// sleep the main loop is parked in (no-work backoff, memory-pressure pause,
+/// dispatch idle). Polling rather than `Notify` keeps the call sites simple
+/// and avoids plumbing an extra Arc through every branch.
+async fn interruptible_sleep(duration: Duration, shutdown: &AtomicBool) {
+    let deadline = Instant::now() + duration;
+    while !shutdown.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(500))).await;
+    }
+}
+
+/// Spawn a task that flips `shutdown` when SIGINT, SIGTERM (unix), or Ctrl-C
+/// (other platforms) arrive. Registration failures are logged, not fatal —
+/// better to run without graceful shutdown than to refuse to start.
+fn install_shutdown_handler(shutdown: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let sigterm = signal(SignalKind::terminate());
+            let sigint = signal(SignalKind::interrupt());
+            let (mut sigterm, mut sigint) = match (sigterm, sigint) {
+                (Ok(t), Ok(i)) => (t, i),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!(error = %e, "failed to install signal handler; graceful shutdown disabled");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("received SIGTERM, starting graceful shutdown"),
+                _ = sigint.recv()  => tracing::info!("received SIGINT, starting graceful shutdown"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::warn!(error = %e, "ctrl_c handler failed; graceful shutdown disabled");
+                return;
+            }
+            tracing::info!("received Ctrl-C, starting graceful shutdown");
+        }
+        shutdown.store(true, Ordering::Release);
+    });
 }
 
 /// Run the worker loop. Blocks until cancelled.
@@ -446,8 +521,15 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // reallocating the worker name for each `tokio::spawn`.
     let name: Arc<str> = Arc::from(config.name.as_str());
     let slots = config.workers;
-    let client = reqwest::Client::builder().build()?;
+    // 120 s per request is long enough for cold cleave scans yet short enough
+    // that a wedged hopper can't pin the worker indefinitely — without a
+    // timeout the default is "no timeout", which defeats graceful shutdown.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
     let semaphore = Arc::new(Semaphore::new(slots));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    install_shutdown_handler(Arc::clone(&shutdown));
 
     tracing::info!(
         name = %name,
@@ -511,6 +593,15 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let mut last_summary = Instant::now();
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!(
+                buffered_jobs = buffer.len(),
+                buffered_bytes = buffer_bytes,
+                "shutdown signalled, draining in-flight work",
+            );
+            break;
+        }
+
         if last_summary.elapsed() >= Duration::from_secs(60) {
             let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
             let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
@@ -554,7 +645,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     {
                         tracing::warn!(error = %e, "cache-clear task failed");
                     }
-                    tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+                    interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
                     continue;
                 }
             }
@@ -582,13 +673,19 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             tracing::debug!(url = %poll_url, buffer = buffer.len(), "polling for work");
             let poll_start = Instant::now();
 
-            match claim_and_prefetch(&client, &poll_url, &base_url, data_dir.as_deref()).await {
+            // Cap the per-job download size so a single outsized payload can't
+            // blow past the buffer budget. Pre-filtering on hopper's
+            // `size_bytes` lets us reject without touching the network; jobs
+            // without a size still download but are bounded by the client
+            // timeout and the outer `buffer_bytes` gate.
+            let max_single_bytes = max_buffer_bytes / 2;
+            match claim_and_prefetch(&client, &poll_url, &base_url, data_dir.as_deref(), max_single_bytes).await {
                 Ok(None) => {
                     consecutive_errors = 0;
                     last_empty_poll = Instant::now();
                     if buffer.is_empty() {
                         tracing::debug!(elapsed_ms = crate::duration_ms(poll_start.elapsed()), poll_secs, "no work available, sleeping");
-                        tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+                        interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
                         continue;
                     }
                     // Buffer has work — keep dispatching.
@@ -612,7 +709,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     let backoff = backoff_duration(consecutive_errors);
                     tracing::warn!(error = %e, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "poll/prefetch failed");
                     if buffer.is_empty() {
-                        tokio::time::sleep(backoff).await;
+                        interruptible_sleep(backoff, &shutdown).await;
                         continue;
                     }
                     // Buffer has work — keep dispatching despite poll failure.
@@ -628,7 +725,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             }
             None => {
                 // Buffer empty and poll rate-limited — wait before retrying.
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                interruptible_sleep(Duration::from_millis(100), &shutdown).await;
                 continue;
             }
         };
@@ -657,7 +754,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     {
                         tracing::warn!(error = %e, "cache-clear task failed");
                     }
-                    tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+                    interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
                     // Put the job back at the front of the buffer.
                     buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, Vec::len));
                     buffer.push_front(pj);
@@ -697,19 +794,39 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         });
     }
 
-    // Drain any in-flight work before exiting.
-    let _ = semaphore.acquire_many(u32::try_from(slots).unwrap_or(u32::MAX)).await;
-    tracing::info!("all in-flight jobs finished, exiting");
+    // Drain any in-flight work before exiting, but cap the wait so a stuck
+    // cleave unpack can't indefinitely block shutdown. Jobs that haven't
+    // finished by the timeout are still alive on the tokio blocking pool;
+    // they'll complete (or be killed with the process) at shutdown time.
+    let slot_count = u32::try_from(slots).unwrap_or(u32::MAX);
+    let drain = semaphore.acquire_many(slot_count);
+    match tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_SECS), drain).await {
+        Ok(_) => tracing::info!("all in-flight jobs finished, exiting"),
+        Err(_) => {
+            let still_running = slots.saturating_sub(semaphore.available_permits());
+            tracing::warn!(
+                still_running,
+                drain_secs = SHUTDOWN_DRAIN_SECS,
+                "drain timeout reached, exiting with in-flight analyses still running",
+            );
+        }
+    }
     Ok(())
 }
 
 /// Claim jobs from hopper and prefetch file data for all of them concurrently.
 /// Returns `Ok(None)` if no work is available (HTTP 204).
+///
+/// Jobs whose hopper-reported size exceeds `max_single_bytes` are not
+/// downloaded — they're returned with an oversize error so the result posts
+/// back to hopper immediately. This prevents a pathological single file from
+/// blowing past the worker's prefetch memory budget.
 async fn claim_and_prefetch(
     client: &reqwest::Client,
     poll_url: &str,
     base_url: &Arc<str>,
     data_dir: Option<&Path>,
+    max_single_bytes: usize,
 ) -> Result<Option<Vec<PrefetchedJob>>> {
     let resp = client.get(poll_url).send().await.context("poll request")?;
 
@@ -729,9 +846,27 @@ async fn claim_and_prefetch(
         return Ok(None);
     }
 
-    // Prefetch all files concurrently.
+    // Prefetch all files concurrently, but short-circuit any job whose reported
+    // size exceeds `max_single_bytes` — those are dispatched as error results
+    // rather than downloaded, so a 5 GiB outlier can't OOM the buffer.
     let mut set = tokio::task::JoinSet::new();
+    let mut oversized: Vec<PrefetchedJob> = Vec::new();
     for job in claim.jobs {
+        if u64::try_from(job.size_bytes).is_ok_and(|s| s > max_single_bytes as u64) {
+            tracing::warn!(
+                sha256 = %job.sha256,
+                path = %job.path,
+                size_bytes = job.size_bytes,
+                max_single_bytes,
+                "skipping oversized job; reporting error to hopper",
+            );
+            let err = PrefetchError::Skipped(format!(
+                "file size {} exceeds per-job prefetch cap of {} bytes",
+                job.size_bytes, max_single_bytes,
+            ));
+            oversized.push(PrefetchedJob { job, data: Err(err) });
+            continue;
+        }
         let client = client.clone();
         let base_url = Arc::clone(base_url);
         let data_dir = data_dir.map(Path::to_path_buf);
@@ -743,14 +878,15 @@ async fn claim_and_prefetch(
             } else {
                 match download_bytes(&client, &base_url, &job.sha256, &job.path).await {
                     Ok(bytes) => Ok(Some(bytes)),
-                    Err(e) => Err(e),
+                    Err(e) => Err(PrefetchError::Transient(e)),
                 }
             };
             PrefetchedJob { job, data }
         });
     }
 
-    let mut prefetched = Vec::with_capacity(set.len());
+    let mut prefetched = Vec::with_capacity(set.len() + oversized.len());
+    prefetched.append(&mut oversized);
     while let Some(result) = set.join_next().await {
         match result {
             Ok(pj) => prefetched.push(pj),
@@ -770,7 +906,7 @@ async fn run_job(
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
-    prefetched: std::result::Result<Option<Vec<u8>>, String>,
+    prefetched: std::result::Result<Option<Vec<u8>>, PrefetchError>,
 ) -> Result<(crate::scan::MlSection, serde_json::Value, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     // `Arc<str>` so the watcher and the blocking closure share the basename
@@ -830,7 +966,12 @@ async fn run_job(
                 Some(bytes)
             }
             Ok(None) => None, // shouldn't happen for remote jobs, but handle gracefully
-            Err(e) => {
+            Err(PrefetchError::Skipped(msg)) => {
+                // Prefetch layer decided not to download this job (e.g. oversized);
+                // fail the analysis immediately rather than retrying the fetch.
+                return Err(msg);
+            }
+            Err(PrefetchError::Transient(e)) => {
                 tracing::warn!(sha256 = %job.sha256, file = %label, error = %e, "prefetch failed, downloading directly");
                 let bytes = download_bytes(client, base_url, &job.sha256, &job.path).await?;
                 Some(bytes)
