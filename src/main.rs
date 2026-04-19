@@ -240,22 +240,6 @@ fn main() -> Result<()> {
         fmt.without_time().init();
     }
 
-    // Configure the global rayon pool BEFORE any cleave work runs. Cleave's
-    // archive + YARA-X + composite-rule evaluation paths recurse deeply enough
-    // to exhaust rayon's default 2 MB worker stack, so we bump to 32 MB. Cleave's
-    // nested-archive analyzer recurses in-place on rayon workers (see
-    // cleave::analyzers::archive::analyzers around the current_thread_index()
-    // branch), so up to max_depth levels of archive analysis stack on one
-    // worker, each carrying tree-sitter query cursors and YARA-X scanner state.
-    // 16 MB was observed to overflow on dense PHP archives; 32 MB gives headroom.
-    // Cleave's own CLI does this in `cli_bootstrap`, but litmus uses cleave as
-    // a library and never calls that, so the pool is installed here.
-    //
-    // Thread count: `available_parallelism()` (logical cores). Earlier versions
-    // used 32× the CPU count to paper over a nested-rayon starvation caused by
-    // a blocking semaphore inside cleave's archive analyzer; that deadlock has
-    // been removed, so the multiplier is no longer required. `CLEAVE_RAYON_THREADS`
-    // overrides this for tuning on unusual hardware.
     let rayon_threads = std::env::var("CLEAVE_RAYON_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
