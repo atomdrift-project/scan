@@ -77,7 +77,13 @@ rayon = "1"
 ctrlc = "3"
 
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Drop the `tracing-log` default feature: that bridge installs a global `log`
+# facade that funnels every upstream `log!()` through the tracing dispatcher
+# and env-filter. Goblin's ELF note parser warns per malformed note, and on
+# pathological inputs that turns into a CPU livelock spending 100% in
+# tracing's directive memcmp/TLS lookups. Without the bridge, those calls
+# are no-ops at the `log!` macro site.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi", "smallvec", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -416,7 +416,7 @@ pub struct WorkerConfig {
 /// analyses, so the free-list can never be starved in practice. The
 /// condvar is kept as a cheap safety net.
 pub(crate) struct WorkerPools {
-    free: Mutex<Vec<Arc<rayon::ThreadPool>>>,
+    free: Mutex<Vec<(usize, Arc<rayon::ThreadPool>)>>,
     available: Condvar,
 }
 
@@ -425,7 +425,7 @@ impl WorkerPools {
     pub(crate) fn new(slots: usize, threads_per_slot: usize) -> Arc<Self> {
         let slots = slots.max(1);
         let threads_per_slot = threads_per_slot.max(1);
-        let free: Vec<Arc<rayon::ThreadPool>> = (0..slots)
+        let free: Vec<(usize, Arc<rayon::ThreadPool>)> = (0..slots)
             .map(|i| {
                 let p = rayon::ThreadPoolBuilder::new()
                     .num_threads(threads_per_slot)
@@ -433,7 +433,7 @@ impl WorkerPools {
                     .stack_size(64 * 1024 * 1024)
                     .build()
                     .expect("build cleave worker pool");
-                Arc::new(p)
+                (i, Arc::new(p))
             })
             .collect();
         Arc::new(Self {
@@ -442,13 +442,15 @@ impl WorkerPools {
         })
     }
 
-    /// Run `f` on a pool from the free-list, returning the pool when done.
+    /// Run `f` on a pool from the free-list, passing the slot index so callers
+    /// can correlate logs with the `cleave-N-M` rayon thread names visible in
+    /// stack samples.
     pub(crate) fn install<T, F>(&self, f: F) -> T
     where
-        F: FnOnce() -> T + Send,
+        F: FnOnce(usize) -> T + Send,
         T: Send,
     {
-        let pool = {
+        let (slot, pool) = {
             let mut g = self.free.lock().expect("worker pool mutex poisoned");
             while g.is_empty() {
                 g = self
@@ -458,11 +460,11 @@ impl WorkerPools {
             }
             g.pop().expect("non-empty checked above")
         };
-        let result = pool.install(f);
+        let result = pool.install(|| f(slot));
         self.free
             .lock()
             .expect("worker pool mutex poisoned")
-            .push(pool);
+            .push((slot, pool));
         self.available.notify_one();
         result
     }
@@ -609,7 +611,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         threads_per_slot = threads_per_slot.max(1),
         hopper = %config.hopper_url,
         global_rayon_threads = rayon::current_num_threads(),
-        "worker starting"
+        pid = std::process::id(),
+        "worker starting; send `kill -USR1 <pid>` for an all-thread backtrace",
     );
 
     // Start background rayon pool health monitoring.
@@ -1106,7 +1109,9 @@ async fn run_job(
                         file = %label2,
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                         elapsed_ms = crate::duration_ms(elapsed),
-                        "analysis running without phase updates for a very slow interval",
+                        pid = std::process::id(),
+                        "analysis running without phase updates for a very slow interval; \
+                         send `kill -USR1 <pid>` for an all-thread backtrace",
                     );
                     very_slow_logged = true;
                 } else if elapsed.as_secs() >= 60 && !slow_logged {
@@ -1157,7 +1162,8 @@ async fn run_job(
                         phase = %last_phase,
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                         elapsed_ms = crate::duration_ms(elapsed),
-                        "very slow phase",
+                        pid = std::process::id(),
+                        "very slow phase; send `kill -USR1 <pid>` for an all-thread backtrace",
                     );
                     very_slow_logged = true;
                 } else if elapsed.as_secs() >= 60 && !slow_logged {
@@ -1200,45 +1206,52 @@ async fn run_job(
     );
     let pools_for_blocking = Arc::clone(pools);
     let handle = tokio::task::spawn_blocking(move || {
-        let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-        let thread_id = os_thread_id();
-        let inflight_blocking = started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
-        tracing::debug!(
-            analysis_id,
-            sha256 = %sha_short2,
-            thread_id,
-            inflight_blocking,
-            started_total = started,
-            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-            "analysis thread started",
-        );
         // Run the whole analysis inside this slot's dedicated rayon pool so
         // any `par_iter` fan-out stays local to this analysis and can't pile
-        // joins onto sibling workers' stacks.
-        let result = pools_for_blocking.install(|| {
-            if let Some(data) = downloaded {
+        // joins onto sibling workers' stacks. Lifecycle logs are emitted from
+        // INSIDE the install closure so the `thread_id` they report is the
+        // rayon worker (cleave-N-M), the thread an operator should sample to
+        // diagnose a wedged analysis. Sampling the outer tokio blocking
+        // thread would just show it parked in a rayon `LockLatch`.
+        pools_for_blocking.install(|slot| {
+            let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+            let thread_id = os_thread_id();
+            let inflight_blocking = started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
+            tracing::info!(
+                analysis_id,
+                sha256 = %sha_short2,
+                file = %label_for_blocking,
+                slot,
+                thread_id,
+                inflight_blocking,
+                started_total = started,
+                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                "analysis starting on rayon slot",
+            );
+            let result = if let Some(data) = downloaded {
                 classify_bytes(data, &label_for_blocking, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
             } else if let Some(path) = local.as_ref() {
                 classify_file(path, &label_for_blocking, &resources, slow_rule_ms, None, Some(&cancel2), Some(&phase))
             } else {
                 Err(anyhow::anyhow!("no downloaded bytes and no local path for {label_for_blocking}"))
-            }
-        });
-        let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-        let inflight_blocking = BLOCKING_STARTED_TOTAL
-            .load(Ordering::Relaxed)
-            .saturating_sub(finished);
-        tracing::debug!(
-            analysis_id,
-            sha256 = %sha_short2,
-            thread_id,
-            inflight_blocking,
-            finished_total = finished,
-            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-            elapsed_ms = crate::duration_ms(start.elapsed()),
-            "analysis thread finished",
-        );
-        result
+            };
+            let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+            let inflight_blocking = BLOCKING_STARTED_TOTAL
+                .load(Ordering::Relaxed)
+                .saturating_sub(finished);
+            tracing::debug!(
+                analysis_id,
+                sha256 = %sha_short2,
+                slot,
+                thread_id,
+                inflight_blocking,
+                finished_total = finished,
+                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                elapsed_ms = crate::duration_ms(start.elapsed()),
+                "analysis complete on rayon slot",
+            );
+            result
+        })
     });
 
     let result = handle.await;
