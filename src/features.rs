@@ -1034,7 +1034,7 @@ impl ExtractContext {
         for s in summaries {
             let ids: Vec<u32> = s.unique_3level_paths.iter().filter_map(|p| self.path_to_id.get(p).copied()).collect();
             let n = ids.len();
-            if n > 128 {
+            if n > 256 {
                 tracing::warn!(path = %s.path, tokens = n, "too many unique paths; skipping trigram generation for file");
                 continue;
             }
@@ -1108,15 +1108,15 @@ impl FileSummary {
             max_crit,
         };
 
-        // N-gram paths: full base path (depth=0), filtered by min_crit=2
-        // (baseline+). Must match Python's _ngram_paths_for_file behavior.
+        // N-gram paths: full base path (depth=0), filtered by min_crit=3
+        // (notable+). Must match Python's _ngram_paths_for_file behavior.
         let mut unique_3level_paths: Vec<String> = findings_raw
             .iter()
             .filter_map(|f| {
                 let fid = f["i"].as_str()?;
                 let conf = f["c"].as_f64().unwrap_or(1.0);
                 let crit = crit_ordinal(f);
-                (conf >= MIN_CONFIDENCE && crit >= 2)
+                (conf >= MIN_CONFIDENCE && crit >= 3)
                     .then(|| fid.split("::").next().unwrap_or(fid).to_string())
             })
             .collect::<HashSet<_>>()
