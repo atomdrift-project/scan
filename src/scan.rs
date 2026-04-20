@@ -216,7 +216,6 @@ mod config_tests {
             }),
             DisplayFilter::alerts_only(),
             4_000,
-            None,
             false,
         );
 
@@ -231,7 +230,6 @@ mod config_tests {
             None,
             DisplayFilter::alerts_only(),
             4_000,
-            None,
             false,
         )
         .expect("valid config");
@@ -246,7 +244,6 @@ mod config_tests {
             None,
             DisplayFilter::alerts_only(),
             4_000,
-            None,
             false,
         )
         .expect("valid config")

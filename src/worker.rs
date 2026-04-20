@@ -265,6 +265,42 @@ impl LocalFileIndex {
             }
         }
 
+        // Index miss — the file may have been added after the index was built
+        // (e.g. newly harvested). Try the direct path on disk, verifying by
+        // SHA-256 before trusting it. For absolute paths, also try
+        // canonicalize() in case the path uses a symlinked prefix.
+        let mut disk_candidates: Vec<PathBuf> = Vec::new();
+        if requested.is_relative() {
+            disk_candidates.push(self.root.join(requested));
+        } else if requested.is_absolute() {
+            disk_candidates.push(requested.to_path_buf());
+            if let Ok(resolved) = requested.canonicalize() {
+                if resolved != requested {
+                    disk_candidates.push(resolved);
+                }
+            }
+        }
+        let expected_size = u64::try_from(size_bytes).ok();
+        for candidate in &disk_candidates {
+            let meta = match fs::metadata(candidate) {
+                Ok(m) if m.is_file() => m,
+                _ => continue,
+            };
+            if expected_size.is_some_and(|sz| meta.len() != sz) {
+                continue;
+            }
+            if let Ok(digest) = sha256_file(candidate) {
+                if digest == expected {
+                    tracing::info!(
+                        sha256,
+                        path = %candidate.display(),
+                        "resolved file outside index by sha256 verification",
+                    );
+                    return Ok(Some(candidate.clone()));
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -1366,16 +1402,36 @@ async fn download_bytes(
     tracing::debug!(sha256 = %sha256, url = %data_url, "downloading via /data/");
     let resp = client.get(&data_url).send().await.map_err(|e| format!("download {path}: {e}"))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("download {path}: HTTP {}", resp.status()));
+    if resp.status().is_success() {
+        let bytes = resp.bytes().await.map_err(|e| format!("download {path}: read body: {e}"))?;
+        tracing::info!(
+            sha256 = %sha256,
+            file = %path,
+            bytes = bytes.len(),
+            elapsed_ms = crate::duration_ms(start.elapsed()),
+            "download complete via /data/",
+        );
+        return Ok(bytes.to_vec());
     }
-    let bytes = resp.bytes().await.map_err(|e| format!("download {path}: read body: {e}"))?;
+    let data_status = resp.status();
+
+    // /data/ failed — fall back to /api/file/{sha256} which does a DB lookup
+    // by hash, so it works even when the relative path doesn't match hopper's
+    // data root (e.g. different symlink resolution or data root migration).
+    let api_url = format!("{base_url}/api/file/{sha256}");
+    tracing::debug!(sha256 = %sha256, url = %api_url, "downloading via /api/file/ (fallback)");
+    let resp = client.get(&api_url).send().await.map_err(|e| format!("download {sha256}: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("download {path}: /data/ HTTP {data_status}, /api/file/ HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| format!("download {sha256}: read body: {e}"))?;
     tracing::info!(
         sha256 = %sha256,
         file = %path,
         bytes = bytes.len(),
         elapsed_ms = crate::duration_ms(start.elapsed()),
-        "download complete",
+        "download complete via /api/file/ (fallback)",
     );
     Ok(bytes.to_vec())
 }
@@ -1567,5 +1623,74 @@ mod tests {
             .expect("resolve path");
 
         assert!(resolved.is_none());
+    }
+
+    /// Files added after the index was built should still be found via the
+    /// disk fallback (relative path + SHA-256 verification).
+    #[test]
+    fn disk_fallback_resolves_file_added_after_index_build() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        // Build index with an empty root — no files indexed.
+        let index = LocalFileIndex::build(root.path().to_path_buf()).expect("build index");
+
+        // Now add a file after the index was built.
+        let rel = Path::new("unknown/harvest/new/crates/newpkg-1.0.crate");
+        let bytes = b"newly-harvested-crate";
+        write_file(&root.path().join(rel), bytes);
+
+        let resolved = index
+            .resolve(
+                rel.to_str().expect("utf8"),
+                &sha256_hex(bytes),
+                i64::try_from(bytes.len()).expect("len fits"),
+            )
+            .expect("resolve path");
+
+        assert_eq!(resolved.as_deref(), Some(root.path().join(rel).as_path()));
+    }
+
+    /// The disk fallback should reject a file whose SHA-256 doesn't match,
+    /// even when the path exists on disk.
+    #[test]
+    fn disk_fallback_rejects_sha_mismatch() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let index = LocalFileIndex::build(root.path().to_path_buf()).expect("build index");
+
+        let rel = Path::new("bad/malware/evil.bin");
+        write_file(&root.path().join(rel), b"actual-content");
+
+        let resolved = index
+            .resolve(
+                rel.to_str().expect("utf8"),
+                &sha256_hex(b"different-content"),
+                i64::try_from(14u64).expect("len fits"),
+            )
+            .expect("resolve path");
+
+        assert!(resolved.is_none());
+    }
+
+    /// Absolute paths from the DB that exist on disk should be resolved
+    /// via the disk fallback even when not in the index.
+    #[test]
+    fn disk_fallback_resolves_absolute_path_not_in_index() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let index = LocalFileIndex::build(root.path().to_path_buf()).expect("build index");
+
+        // Create a file outside the index root (simulates an absolute DB path).
+        let external = tempfile::tempdir().expect("create external dir");
+        let path = external.path().join("wolfi/pkg-1.0.apk");
+        let bytes = b"absolute-path-file";
+        write_file(&path, bytes);
+
+        let resolved = index
+            .resolve(
+                path.to_str().expect("utf8"),
+                &sha256_hex(bytes),
+                i64::try_from(bytes.len()).expect("len fits"),
+            )
+            .expect("resolve path");
+
+        assert_eq!(resolved.as_deref(), Some(path.as_path()));
     }
 }

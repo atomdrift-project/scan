@@ -326,6 +326,8 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
 /// Outcome of [`do_model_reload`] — caller maps this to an HTTP response.
 struct ReloadOutcome {
     elapsed_ms: u128,
+    /// If trait reload failed, the error message. `None` means traits loaded OK.
+    traits_reload_error: Option<String>,
 }
 
 /// Perform the cleave-traits reload + model load + atomic swap. Caller is
@@ -343,24 +345,29 @@ async fn do_model_reload(
         RELOAD_TIMEOUT,
         tokio::task::spawn_blocking(move || {
             // Reload cleave traits first so the new model runs against fresh rules.
-            if let Err(e) = cleave::reload_capability_mapper() {
-                tracing::warn!("cleave trait reload failed (previous traits retained): {e}");
-            } else {
-                tracing::info!("cleave traits reloaded");
-            }
+            let traits_reload_error = match cleave::reload_capability_mapper() {
+                Err(e) => {
+                    tracing::warn!("cleave trait reload failed (previous traits retained): {e}");
+                    Some(e)
+                }
+                Ok(_) => {
+                    tracing::info!("cleave traits reloaded");
+                    None
+                }
+            };
             cleave::clear_all_thread_caches();
 
             let model = Model::load(&model_dir, thresholds)?;
             let shap = ShapImportance::load(&model_dir).ok();
             let ctx = ExtractContext::new(model.spec());
-            Ok::<_, anyhow::Error>((model, shap, ctx))
+            Ok::<_, anyhow::Error>((model, shap, ctx, traits_reload_error))
         }),
     )
     .await;
 
     let elapsed_ms = start.elapsed().as_millis();
 
-    let (model, shap, ctx) = match result {
+    let (model, shap, ctx, traits_reload_error) = match result {
         Ok(Ok(Ok(t))) => t,
         Ok(Ok(Err(e))) => {
             // Log internally but do not expose filesystem paths or model internals to callers.
@@ -416,7 +423,7 @@ async fn do_model_reload(
                     "model loaded via reload — server now ready"
                 );
             }
-            Ok(ReloadOutcome { elapsed_ms })
+            Ok(ReloadOutcome { elapsed_ms, traits_reload_error })
         }
         Err(e) => {
             tracing::error!("write lock poisoned during reload: {e}");
@@ -441,11 +448,16 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
     };
 
     match do_model_reload(&state).await {
-        Ok(outcome) => Json(serde_json::json!({
-            "status": "ok",
-            "elapsed_ms": outcome.elapsed_ms,
-        }))
-        .into_response(),
+        Ok(outcome) => {
+            let mut body = serde_json::json!({
+                "status": "ok",
+                "elapsed_ms": outcome.elapsed_ms,
+            });
+            if let Some(err) = &outcome.traits_reload_error {
+                body["traits_reload_error"] = serde_json::json!(err);
+            }
+            Json(body).into_response()
+        }
         Err((status, msg)) => (status, Json(serde_json::json!({ "error": msg }))).into_response(),
     }
 }
@@ -520,18 +532,23 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
     };
 
     match do_model_reload(&state).await {
-        Ok(outcome) => Json(serde_json::json!({
-            "status": "ok",
-            "elapsed_ms": outcome.elapsed_ms,
-            "models_updated": models_err.is_none(),
-            "traits_updated": traits_err.is_none(),
-            "models_error": models_err,
-            "traits_error": traits_err,
-            "version": env!("CARGO_PKG_VERSION"),
-            "model_commit": crate::models_repo::version(),
-            "traits_commit": cleave::traits_repo::version(),
-        }))
-        .into_response(),
+        Ok(outcome) => {
+            let mut body = serde_json::json!({
+                "status": "ok",
+                "elapsed_ms": outcome.elapsed_ms,
+                "models_updated": models_err.is_none(),
+                "traits_updated": traits_err.is_none(),
+                "models_error": models_err,
+                "traits_error": traits_err,
+                "version": env!("CARGO_PKG_VERSION"),
+                "model_commit": crate::models_repo::version(),
+                "traits_commit": cleave::traits_repo::version(),
+            });
+            if let Some(err) = &outcome.traits_reload_error {
+                body["traits_reload_error"] = serde_json::json!(err);
+            }
+            Json(body).into_response()
+        }
         Err((status, msg)) => {
             // The in-memory model was not swapped, so requests continue against
             // the previous model. Roll the models repo back on disk too so future
