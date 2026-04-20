@@ -812,15 +812,23 @@ impl ExtractContext {
             tokens.sort();
             let lookup = &self.absolute_lookup;
             for t in &tokens { if let Some(&i) = lookup.get(&format!("crit:{t}")) { vec[i] = 1.0; } }
-            for (i, t1) in tokens.iter().enumerate() {
-                for t2 in &tokens[i+1..] {
-                    if let Some(&idx) = lookup.get(&format!("critbi:{t1} + {t2}")) { vec[idx] = 1.0; }
-                }
-                for j in i+1..tokens.len() {
-                    for t3 in &tokens[j+1..] {
-                        if let Some(&idx) = lookup.get(&format!("crittri:{t1} + {} + {t3}", tokens[j])) { vec[idx] = 1.0; }
+
+            // Safety: trigrams are O(N^3), bigrams O(N^2). Cap N to avoid complexity bombs on bloated reports.
+            if tokens.len() <= 512 {
+                for (i, t1) in tokens.iter().enumerate() {
+                    for t2 in &tokens[i+1..] {
+                        if let Some(&idx) = lookup.get(&format!("critbi:{t1} + {t2}")) { vec[idx] = 1.0; }
+                    }
+                    if tokens.len() <= 128 {
+                        for j in i+1..tokens.len() {
+                            for t3 in &tokens[j+1..] {
+                                if let Some(&idx) = lookup.get(&format!("crittri:{t1} + {} + {t3}", tokens[j])) { vec[idx] = 1.0; }
+                            }
+                        }
                     }
                 }
+            } else {
+                tracing::warn!(tokens = tokens.len(), "too many unique crit tokens; skipping n-gram generation");
             }
         }
 
@@ -836,22 +844,35 @@ impl ExtractContext {
             }
             let lookup = &self.absolute_lookup;
             let mut sa: Vec<_> = attacks.iter().collect(); sa.sort();
-            for (i, a1) in sa.iter().enumerate() {
-                for (j, a2) in sa[i+1..].iter().enumerate() {
-                    if let Some(&idx) = lookup.get(&format!("atkbi:{a1} + {a2}")) { vec[idx] = 1.0; }
-                    for a3 in &sa[i+1+j+1..] {
-                        if let Some(&idx) = lookup.get(&format!("atktri:{a1} + {a2} + {a3}")) { vec[idx] = 1.0; }
+            if sa.len() <= 512 {
+                for (i, a1) in sa.iter().enumerate() {
+                    for (j, a2) in sa[i+1..].iter().enumerate() {
+                        if let Some(&idx) = lookup.get(&format!("atkbi:{a1} + {a2}")) { vec[idx] = 1.0; }
+                        if sa.len() <= 128 {
+                            for a3 in &sa[i+1+j+1..] {
+                                if let Some(&idx) = lookup.get(&format!("atktri:{a1} + {a2} + {a3}")) { vec[idx] = 1.0; }
+                            }
+                        }
                     }
                 }
+            } else {
+                tracing::warn!(tokens = sa.len(), "too many unique ATT&CK tokens; skipping n-gram generation");
             }
+
             let mut sm: Vec<_> = mbcs.iter().collect(); sm.sort();
-            for (i, m1) in sm.iter().enumerate() {
-                for (j, m2) in sm[i+1..].iter().enumerate() {
-                    if let Some(&idx) = lookup.get(&format!("mbcbi:{m1} + {m2}")) { vec[idx] = 1.0; }
-                    for m3 in &sm[i+1+j+1..] {
-                        if let Some(&idx) = lookup.get(&format!("mbctri:{m1} + {m2} + {m3}")) { vec[idx] = 1.0; }
+            if sm.len() <= 512 {
+                for (i, m1) in sm.iter().enumerate() {
+                    for (j, m2) in sm[i+1..].iter().enumerate() {
+                        if let Some(&idx) = lookup.get(&format!("mbcbi:{m1} + {m2}")) { vec[idx] = 1.0; }
+                        if sm.len() <= 128 {
+                            for m3 in &sm[i+1+j+1..] {
+                                if let Some(&idx) = lookup.get(&format!("mbctri:{m1} + {m2} + {m3}")) { vec[idx] = 1.0; }
+                            }
+                        }
                     }
                 }
+            } else {
+                tracing::warn!(tokens = sm.len(), "too many unique MBC tokens; skipping n-gram generation");
             }
         }
 
@@ -994,6 +1015,10 @@ impl ExtractContext {
     fn write_bigram_features_optimized(&self, summaries: &[FileSummary], vec: &mut [f32], offset: usize) {
         for s in summaries {
             let ids: Vec<u32> = s.unique_3level_paths.iter().filter_map(|p| self.path_to_id.get(p).copied()).collect();
+            if ids.len() > 512 {
+                tracing::warn!(path = %s.path, tokens = ids.len(), "too many unique paths; skipping bigram generation for file");
+                continue;
+            }
             for i in 0..ids.len() {
                 for j in (i + 1)..ids.len() {
                     let key = (ids[i].min(ids[j]), ids[i].max(ids[j]));
@@ -1009,6 +1034,10 @@ impl ExtractContext {
         for s in summaries {
             let ids: Vec<u32> = s.unique_3level_paths.iter().filter_map(|p| self.path_to_id.get(p).copied()).collect();
             let n = ids.len();
+            if n > 128 {
+                tracing::warn!(path = %s.path, tokens = n, "too many unique paths; skipping trigram generation for file");
+                continue;
+            }
             for i in 0..n {
                 for j in (i + 1)..n {
                     for k in (j + 1)..n {

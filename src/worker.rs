@@ -9,7 +9,7 @@ use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -403,6 +403,71 @@ pub struct WorkerConfig {
     pub upgrade_heuristic: bool,
 }
 
+/// A fixed grid of dedicated rayon thread pools — one per worker slot.
+///
+/// With N concurrent analyses competing for a single rayon pool the work-
+/// stealing scheduler piles joins from unrelated analyses onto the same
+/// thread; each thread ends up holding a deep stack of half-completed jobs
+/// from every other caller and effective parallelism collapses. Giving each
+/// worker slot its own isolated pool eliminates that cross-contamination:
+/// an analysis's `par_iter` fan-out only ever touches its own pool.
+///
+/// The tokio semaphore already guarantees at most `slots` concurrent
+/// analyses, so the free-list can never be starved in practice. The
+/// condvar is kept as a cheap safety net.
+pub(crate) struct WorkerPools {
+    free: Mutex<Vec<Arc<rayon::ThreadPool>>>,
+    available: Condvar,
+}
+
+impl WorkerPools {
+    /// Build `slots` pools, each sized `threads_per_slot`.
+    pub(crate) fn new(slots: usize, threads_per_slot: usize) -> Arc<Self> {
+        let slots = slots.max(1);
+        let threads_per_slot = threads_per_slot.max(1);
+        let free: Vec<Arc<rayon::ThreadPool>> = (0..slots)
+            .map(|i| {
+                let p = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads_per_slot)
+                    .thread_name(move |j| format!("cleave-{i}-{j}"))
+                    .stack_size(64 * 1024 * 1024)
+                    .build()
+                    .expect("build cleave worker pool");
+                Arc::new(p)
+            })
+            .collect();
+        Arc::new(Self {
+            free: Mutex::new(free),
+            available: Condvar::new(),
+        })
+    }
+
+    /// Run `f` on a pool from the free-list, returning the pool when done.
+    pub(crate) fn install<T, F>(&self, f: F) -> T
+    where
+        F: FnOnce() -> T + Send,
+        T: Send,
+    {
+        let pool = {
+            let mut g = self.free.lock().expect("worker pool mutex poisoned");
+            while g.is_empty() {
+                g = self
+                    .available
+                    .wait(g)
+                    .expect("worker pool condvar poisoned");
+            }
+            g.pop().expect("non-empty checked above")
+        };
+        let result = pool.install(f);
+        self.free
+            .lock()
+            .expect("worker pool mutex poisoned")
+            .push(pool);
+        self.available.notify_one();
+        result
+    }
+}
+
 #[derive(Deserialize)]
 struct ClaimResponse {
     jobs: Vec<ClaimJob>,
@@ -531,11 +596,19 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(Arc::clone(&shutdown));
 
+    // One isolated rayon pool per worker slot. Each pool is sized so the grid
+    // as a whole uses roughly `num_cpus` threads; a single-archive analysis
+    // can still saturate its slot's threads without leaking par_iter fan-out
+    // onto other slots' pools.
+    let threads_per_slot = rayon::current_num_threads() / slots.max(1);
+    let pools = WorkerPools::new(slots, threads_per_slot);
+
     tracing::info!(
         name = %name,
         slots = slots,
+        threads_per_slot = threads_per_slot.max(1),
         hopper = %config.hopper_url,
-        rayon_threads = rayon::current_num_threads(),
+        global_rayon_threads = rayon::current_num_threads(),
         "worker starting"
     );
 
@@ -770,11 +843,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let name = Arc::clone(&name);
         let local_index = local_index.clone();
         let completed = Arc::clone(&completed);
+        let pools = Arc::clone(&pools);
 
         tokio::spawn(async move {
             let result = run_job(
                 &client, &url, local_index.as_deref(), &pj.job, &resources,
-                slow_rule_ms, pj.data,
+                slow_rule_ms, pj.data, &pools,
             ).await;
             if let Err(ref e) = result {
                 tracing::warn!(
@@ -908,6 +982,7 @@ async fn run_job(
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
     prefetched: std::result::Result<Option<Vec<u8>>, PrefetchError>,
+    pools: &Arc<WorkerPools>,
 ) -> Result<(crate::scan::MlSection, serde_json::Value, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     // `Arc<str>` so the watcher and the blocking closure share the basename
@@ -1123,6 +1198,7 @@ async fn run_job(
         size = input_size,
         "analysis starting",
     );
+    let pools_for_blocking = Arc::clone(pools);
     let handle = tokio::task::spawn_blocking(move || {
         let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let thread_id = os_thread_id();
@@ -1136,13 +1212,18 @@ async fn run_job(
             rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
             "analysis thread started",
         );
-        let result = if let Some(data) = downloaded {
-            classify_bytes(data, &label_for_blocking, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
-        } else if let Some(path) = local.as_ref() {
-            classify_file(path, &label_for_blocking, &resources, slow_rule_ms, None, Some(&cancel2), Some(&phase))
-        } else {
-            Err(anyhow::anyhow!("no downloaded bytes and no local path for {label_for_blocking}"))
-        };
+        // Run the whole analysis inside this slot's dedicated rayon pool so
+        // any `par_iter` fan-out stays local to this analysis and can't pile
+        // joins onto sibling workers' stacks.
+        let result = pools_for_blocking.install(|| {
+            if let Some(data) = downloaded {
+                classify_bytes(data, &label_for_blocking, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
+            } else if let Some(path) = local.as_ref() {
+                classify_file(path, &label_for_blocking, &resources, slow_rule_ms, None, Some(&cancel2), Some(&phase))
+            } else {
+                Err(anyhow::anyhow!("no downloaded bytes and no local path for {label_for_blocking}"))
+            }
+        });
         let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let inflight_blocking = BLOCKING_STARTED_TOTAL
             .load(Ordering::Relaxed)

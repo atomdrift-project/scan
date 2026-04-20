@@ -108,3 +108,4 @@ path = "src/lib.rs"
 [[bin]]
 name = "litmus"
 path = "src/main.rs"
+

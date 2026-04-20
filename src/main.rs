@@ -67,10 +67,6 @@ struct Cli {
     #[arg(long, default_value = "4000")]
     slow_rule_ms: u64,
 
-    /// Number of parallel cleave scan workers for directory/archive-heavy scans
-    #[arg(long)]
-    scan_threads: Option<usize>,
-
     /// Show raw probability and SHAP feature values in terminal output
     #[arg(long, hide = true)]
     extra: bool,
@@ -205,6 +201,21 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    // Block SIGUSR1 process-wide before spawning any threads so they all inherit
+    // the blocked mask; the dedicated sigusr1 thread below consumes it via sigwait.
+    #[cfg(unix)]
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+    }
+    // Allow a forked debugger to ptrace us under yama.ptrace_scope=1.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
+    }
+
     let cli = Cli::parse();
 
     // Default to Scan when bare paths are given without a subcommand.
@@ -257,6 +268,11 @@ fn main() -> Result<()> {
     {
         tracing::warn!(error = %e, "failed to install global rayon pool; using default");
     }
+    tracing::info!(
+        threads = rayon::current_num_threads(),
+        stack_mb = 64,
+        "rayon pool ready"
+    );
 
     // Terminal theme detection is only needed for scan/ps with terminal output.
     // The OSC color-scheme query blocks on a TTY response and hangs in any
@@ -272,28 +288,50 @@ fn main() -> Result<()> {
     }
 
     // Dump all thread backtraces on SIGUSR1 (Linux equivalent of BSD SIGINFO / Ctrl-T).
+    // Attaches lldb/gdb to ourselves so every thread is reported with symbols.
     #[cfg(unix)]
-    {
-        use std::io::Write;
-        std::thread::Builder::new()
-            .name("sigusr1".into())
-            .spawn(|| {
-                let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-                unsafe {
-                    libc::sigemptyset(&mut mask);
-                    libc::sigaddset(&mut mask, libc::SIGUSR1);
-                    libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+    std::thread::Builder::new()
+        .name("sigusr1".into())
+        .spawn(|| {
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+            let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut mask);
+                libc::sigaddset(&mut mask, libc::SIGUSR1);
+            }
+            loop {
+                let mut sig: libc::c_int = 0;
+                if unsafe { libc::sigwait(&mask, &mut sig) } != 0 {
+                    continue;
                 }
-                loop {
-                    let mut sig: libc::c_int = 0;
-                    if unsafe { libc::sigwait(&mask, &mut sig) } == 0 {
-                        let bt = std::backtrace::Backtrace::force_capture();
-                        let _ = writeln!(std::io::stderr(), "\n--- SIGUSR1 backtrace ---\n{bt}\n--- end backtrace ---");
-                    }
+                let pid = std::process::id().to_string();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "\n--- SIGUSR1 all-thread backtrace (pid {pid}) ---"
+                );
+                let lldb = Command::new("lldb")
+                    .args([
+                        "--batch", "-p", &pid, "-o", "thread backtrace all", "-o", "detach",
+                        "-o", "quit",
+                    ])
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status();
+                if !matches!(lldb, Ok(s) if s.success()) {
+                    let _ = Command::new("gdb")
+                        .args([
+                            "-batch", "-nx", "-p", &pid, "-ex", "thread apply all bt", "-ex",
+                            "detach", "-ex", "quit",
+                        ])
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .status();
                 }
-            })
-            .expect("failed to spawn sigusr1 thread");
-    }
+                let _ = writeln!(std::io::stderr(), "--- end backtrace ---\n");
+            }
+        })
+        .expect("failed to spawn sigusr1 thread");
 
     #[cfg(debug_assertions)]
     tracing::warn!(
@@ -356,7 +394,6 @@ fn main() -> Result<()> {
                 thresholds,
                 filter,
                 cli.slow_rule_ms,
-                cli.scan_threads,
                 cli.extra,
             )?
             .with_upgrade_heuristic(cli.upgrade_heuristic);
@@ -369,7 +406,6 @@ fn main() -> Result<()> {
                 thresholds,
                 filter,
                 cli.slow_rule_ms,
-                cli.scan_threads,
                 cli.extra,
             )?
             .with_upgrade_heuristic(cli.upgrade_heuristic);
