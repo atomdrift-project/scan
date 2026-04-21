@@ -634,11 +634,20 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(Arc::clone(&shutdown));
 
-    // One isolated rayon pool per worker slot. Each pool is sized so the grid
-    // as a whole uses roughly `num_cpus` threads; a single-archive analysis
-    // can still saturate its slot's threads without leaking par_iter fan-out
-    // onto other slots' pools.
-    let threads_per_slot = rayon::current_num_threads() / slots.max(1);
+    // Each slot's rayon pool must have enough threads to absorb cleave's
+    // nested archive `par_iter` without starvation. With only 2 threads,
+    // recursive tar→tar→member analysis commits both workers to depth-first
+    // joins and the outer join has no thread left to reap — a true deadlock
+    // that work-stealing cannot escape. 4 threads gives enough headroom for
+    // the nested-join chain to always have a stealable worker.
+    //
+    // This trades some throughput (pools × 4 can exceed `num_cpus`) for
+    // deadlock safety. The alternative — flattening cleave's archive
+    // recursion to a single top-level par_iter — is the durable fix but
+    // lives upstream.
+    const MIN_THREADS_PER_SLOT: usize = 4;
+    let threads_per_slot =
+        (rayon::current_num_threads() / slots.max(1)).max(MIN_THREADS_PER_SLOT);
     let pools = WorkerPools::new(slots, threads_per_slot);
 
     tracing::info!(
