@@ -95,6 +95,15 @@ libc = "0.2"
 [target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd"))))'.dependencies]
 tikv-jemallocator = "0.6"
 
+[features]
+# Enables jemalloc heap profiling. Build with:
+#   cargo build --profile profiling --features jemalloc-prof --bin litmus
+# Run with (note the `_RJEM_` prefix — tikv-jemalloc renames MALLOC_CONF):
+#   _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_interval:28,prof_prefix:out/heap/jeprof" \
+#     ./out/litmus.heap worker ...
+# Analyze with: jeprof --text ./out/litmus.heap out/heap/jeprof.*.heap
+jemalloc-prof = ["tikv-jemallocator/profiling"]
+
 [profile.release]
 strip = "debuginfo"
 
