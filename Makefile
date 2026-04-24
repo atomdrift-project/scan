@@ -73,6 +73,12 @@ tarball: release
 	tar -czf $(OUT_DIR)/litmus.tgz -C $(OUT_DIR) litmus
 	@echo "Tarball: $(OUT_DIR)/litmus.tgz"
 
+# Clear MAKEFLAGS for deploy recipes: GNU Make would otherwise inject the
+# outer invocation's `-j`/`--jobserver-*` flags plus command-line `URL=` into
+# the env, which tikv-jemalloc-sys's build.rs re-passes to its bundled `make`,
+# producing `*** No rule to make target '-j'` inside the jemalloc build.
+deploy-server deploy-worker deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
+
 deploy-server:
 	git pull
 	@case "$$(uname -s)" in \
