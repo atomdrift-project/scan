@@ -80,7 +80,12 @@ fn current_thread_id() -> u64 {
     {
         unsafe { libc::getthrid() as u64 }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )))]
     {
         0
     }
@@ -140,7 +145,12 @@ use crate::scan::ScanResult;
 
 /// Returns the 1-minute system load average, or None on unsupported platforms.
 fn system_load_avg() -> Option<f64> {
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    ))]
     {
         let mut avg: [libc::c_double; 1] = [0.0];
         let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
@@ -150,7 +160,12 @@ fn system_load_avg() -> Option<f64> {
             None
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )))]
     {
         None
     }
@@ -196,7 +211,8 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
 
     let rss_bytes = cleave::memory_tracker::current_rss();
     let rss_mb = rss_bytes.map(|b| b / 1024 / 1024);
-    let active_tasks = state.max_concurrent_tasks
+    let active_tasks = state
+        .max_concurrent_tasks
         .saturating_sub(state.slots.available_permits());
     let overloaded = rss_bytes.map(|b| b > state.max_rss_bytes).unwrap_or(false);
 
@@ -218,7 +234,9 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
             .into_response();
     }
     let max_tasks = state.max_concurrent_tasks;
-    let stuck_orphans = state.stuck_orphans.load(std::sync::atomic::Ordering::Relaxed);
+    let stuck_orphans = state
+        .stuck_orphans
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // Tasks running longer than 120s — visible in /_/requests with full phase detail.
     let now = Instant::now();
@@ -423,7 +441,10 @@ async fn do_model_reload(
                     "model loaded via reload — server now ready"
                 );
             }
-            Ok(ReloadOutcome { elapsed_ms, traits_reload_error })
+            Ok(ReloadOutcome {
+                elapsed_ms,
+                traits_reload_error,
+            })
         }
         Err(e) => {
             tracing::error!("write lock poisoned during reload: {e}");
@@ -522,10 +543,7 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
             (Some(msg.clone()), None, Some(msg))
         }
         Err(_elapsed) => {
-            tracing::warn!(
-                "update pull timed out after {}s",
-                PULL_TIMEOUT.as_secs()
-            );
+            tracing::warn!("update pull timed out after {}s", PULL_TIMEOUT.as_secs());
             let msg = format!("git pull timed out after {}s", PULL_TIMEOUT.as_secs());
             (Some(msg.clone()), None, Some(msg))
         }
@@ -554,7 +572,10 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
             // the previous model. Roll the models repo back on disk too so future
             // reloads don't re-encounter the broken state.
             if let Some(rev) = prev_models_head {
-                tracing::error!(rev, "model reload failed after pull; rolling back models repo to previous commit");
+                tracing::error!(
+                    rev,
+                    "model reload failed after pull; rolling back models repo to previous commit"
+                );
                 tokio::task::spawn_blocking(move || {
                     if let Err(e) = crate::models_repo::rollback(&rev) {
                         tracing::error!("models rollback failed: {e}");
@@ -576,7 +597,6 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
         }
     }
 }
-
 
 /// POST /analyze — accept multipart file upload, classify, return full JSON result.
 pub(super) async fn analyze(
@@ -806,7 +826,9 @@ pub(super) async fn analyze(
         );
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": format!("At capacity ({max}/{max} active analyses)")})),
+            Json(
+                serde_json::json!({"error": format!("At capacity ({max}/{max} active analyses)")}),
+            ),
         )
             .into_response();
     };
@@ -843,7 +865,10 @@ pub(super) async fn analyze(
 
     let cancel_flag = Arc::clone(&cancellation);
     let phase_state = Arc::clone(&state);
-    let phase_tracker = phase_state.in_flight.get(&request_id).map(|r| r.phase.clone());
+    let phase_tracker = phase_state
+        .in_flight
+        .get(&request_id)
+        .map(|r| r.phase.clone());
     let handle = tokio::task::spawn_blocking(move || {
         // Record the OS thread servicing this request.
         if let Some(req) = phase_state.in_flight.get(&request_id) {
@@ -902,8 +927,7 @@ pub(super) async fn analyze(
                 "<-- 200 OK",
             );
             let mut resp = Json(scan_result.into_envelope()).into_response();
-            resp.headers_mut()
-                .insert("X-Total-Ms", elapsed_ms.into());
+            resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
         AnalysisOutcome::Ok(Err(e)) => {
@@ -1172,7 +1196,9 @@ pub(super) async fn analyze_path(
         );
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": format!("At capacity ({max}/{max} active analyses)")})),
+            Json(
+                serde_json::json!({"error": format!("At capacity ({max}/{max} active analyses)")}),
+            ),
         )
             .into_response();
     };
@@ -1205,7 +1231,10 @@ pub(super) async fn analyze_path(
 
     let cancel_flag = Arc::clone(&cancellation);
     let phase_state = Arc::clone(&state);
-    let phase_tracker = phase_state.in_flight.get(&request_id).map(|r| r.phase.clone());
+    let phase_tracker = phase_state
+        .in_flight
+        .get(&request_id)
+        .map(|r| r.phase.clone());
     let handle = tokio::task::spawn_blocking(move || {
         if let Some(req) = phase_state.in_flight.get(&request_id) {
             req.thread_id.store(current_thread_id(), Ordering::Relaxed);
@@ -1275,8 +1304,7 @@ pub(super) async fn analyze_path(
                 "<-- 200 OK",
             );
             let mut resp = Json(scan_result.into_envelope()).into_response();
-            resp.headers_mut()
-                .insert("X-Total-Ms", elapsed_ms.into());
+            resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
         AnalysisOutcome::Ok(Err(e)) => {
@@ -1366,7 +1394,11 @@ async fn check_memory_pressure(state: &AppState) -> Option<Response> {
     // Use try_lock: if a concurrent request holds the lock it is already recording
     // the overload timestamp, so it is safe to pass through rather than block a
     // tokio worker on a std::sync::Mutex.
-    let since = *state.overloaded_since.try_lock().ok()?.get_or_insert_with(Instant::now);
+    let since = *state
+        .overloaded_since
+        .try_lock()
+        .ok()?
+        .get_or_insert_with(Instant::now);
     let overloaded_secs = since.elapsed().as_secs();
 
     tracing::warn!(

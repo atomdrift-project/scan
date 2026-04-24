@@ -91,8 +91,8 @@ pub fn update(force: bool) -> Result<()> {
 
 /// Check for updates without applying them, bounded by [`GIT_TIMEOUT`].
 pub fn check_updates() -> Result<()> {
-    let traits_dir: PathBuf = cleave::traits_repo::try_resolve()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let traits_dir: PathBuf =
+        cleave::traits_repo::try_resolve().map_err(|e| anyhow::anyhow!("{e}"))?;
     let path = traits_dir.to_string_lossy().into_owned();
 
     let fetch = git_cmd::run(&["-C", &path, "fetch", "--dry-run"], GIT_TIMEOUT)

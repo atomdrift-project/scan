@@ -407,10 +407,15 @@ impl Model {
             model_abi_version = spec.abi_version(),
             threshold_suspicious = effective_thresholds.suspicious,
             threshold_hostile = effective_thresholds.hostile,
-            threshold_source = if thresholds.is_some() { "explicit" }
-                               else if config_thresholds.is_some() { "config.json" }
-                               else if recommended.is_some() { "evaluation.json" }
-                               else { "fallback" },
+            threshold_source = if thresholds.is_some() {
+                "explicit"
+            } else if config_thresholds.is_some() {
+                "config.json"
+            } else if recommended.is_some() {
+                "evaluation.json"
+            } else {
+                "fallback"
+            },
             spec_version = spec.version(),
             "model loaded",
         );

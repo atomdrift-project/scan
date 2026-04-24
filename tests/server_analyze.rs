@@ -166,4 +166,3 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     );
     Ok(())
 }
-

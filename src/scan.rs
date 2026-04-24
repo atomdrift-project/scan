@@ -303,7 +303,10 @@ mod finding_override_tests {
     #[test]
     fn two_hostile_findings_noop_when_already_hostile_at_floor() {
         let result = apply_finding_override(Classification::Hostile, T.hostile, &counts(2, 0), &T);
-        assert!(result.is_none(), "must not fire when new_prob == current_prob");
+        assert!(
+            result.is_none(),
+            "must not fire when new_prob == current_prob"
+        );
     }
 
     #[test]
@@ -314,7 +317,10 @@ mod finding_override_tests {
             panic!("expected class upgrade even with prob >= hostile floor");
         };
         assert_eq!(class, Classification::Hostile);
-        assert!((prob - 0.95).abs() < f32::EPSILON, "prob must not be downgraded");
+        assert!(
+            (prob - 0.95).abs() < f32::EPSILON,
+            "prob must not be downgraded"
+        );
     }
 
     #[test]
@@ -447,7 +453,11 @@ mod envelope_tests {
         let envelope = r.to_envelope();
         let json = serde_json::to_value(&envelope).expect("serialize");
         assert_eq!(json["ml"]["class"].as_u64(), Some(2), "upgraded class");
-        assert_eq!(json["ml"]["oclass"].as_u64(), Some(0), "original was Benign");
+        assert_eq!(
+            json["ml"]["oclass"].as_u64(),
+            Some(0),
+            "original was Benign"
+        );
         let oprob = json["ml"]["oprob"].as_f64().expect("oprob number");
         assert!((oprob - 0.10).abs() < 1e-6);
     }
@@ -694,14 +704,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 
     // Single-file path: handle directly without the directory streaming API.
     if path.is_file() {
-        let result = analyze_single(
-            path,
-            &cleave_opts,
-            &ctx,
-            &model,
-            shap.as_ref(),
-            config,
-        );
+        let result = analyze_single(path, &cleave_opts, &ctx, &model, shap.as_ref(), config);
         let (mut hostile, mut suspicious, mut benign, mut errors) = (0u32, 0u32, 0u32, 0u32);
         let stdout = Mutex::new(std::io::stdout());
         match result {
@@ -717,8 +720,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                 }
             }
             Err(e) => {
-                let msg = crate::tools::enrich_error(&e)
-                    .unwrap_or_else(|| format!("{e:#}"));
+                let msg = crate::tools::enrich_error(&e).unwrap_or_else(|| format!("{e:#}"));
                 tracing::warn!("error analyzing {}: {}", path.display(), msg);
                 errors += 1;
             }
@@ -804,8 +806,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                     }
                 }
                 Err(e) => {
-                    let msg = crate::tools::enrich_error(&e)
-                        .unwrap_or_else(|| format!("{e:#}"));
+                    let msg = crate::tools::enrich_error(&e).unwrap_or_else(|| format!("{e:#}"));
                     tracing::warn!("error analyzing {}: {}", file_path.display(), msg);
                     error_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1151,7 +1152,10 @@ pub fn apply_finding_override(
     thresholds: &Thresholds,
 ) -> Option<(Classification, f32)> {
     let (new_class, new_prob) = if counts.hostile >= 2 {
-        (Classification::Hostile, current_prob.max(thresholds.hostile))
+        (
+            Classification::Hostile,
+            current_prob.max(thresholds.hostile),
+        )
     } else if current_class == Classification::Benign
         && (counts.hostile == 1 || counts.suspicious >= 2)
     {
@@ -1272,7 +1276,7 @@ pub fn extract_top_findings_from_json(
         seen.insert(base.to_string())
     });
 
-    relevant.sort_by(|a, b| b.crit.cmp(&a.crit));
+    relevant.sort_by_key(|f| std::cmp::Reverse(f.crit));
     relevant.truncate(5);
     relevant
 }
@@ -1353,7 +1357,10 @@ fn build_ml_fs(
             .get("id")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(idx as u64);
-        let depth = entry.get("dp").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let depth = entry
+            .get("dp")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
 
         let (cls, prob) = if depth == 0 {
             (classification, probability)

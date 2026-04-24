@@ -59,7 +59,11 @@ pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait().context("failed to poll git process")? {
-            Some(_) => return child.wait_with_output().context("failed to read git output"),
+            Some(_) => {
+                return child
+                    .wait_with_output()
+                    .context("failed to read git output")
+            }
             None if Instant::now() >= deadline => {
                 kill_group(pid);
                 let _ = child.kill();
@@ -75,7 +79,13 @@ pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output> {
 /// no timeout required.
 pub(crate) fn short_head(path: &Path) -> Option<String> {
     let output = Command::new("git")
-        .args(["-C", &path.to_string_lossy(), "rev-parse", "--short", "HEAD"])
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ])
         .output()
         .ok()?;
     if output.status.success() {

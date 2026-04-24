@@ -57,12 +57,16 @@ impl Cidr {
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.network, ip) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                if self.prefix_len == 0 { return true; }
+                if self.prefix_len == 0 {
+                    return true;
+                }
                 let mask: u32 = u32::MAX << (32 - self.prefix_len);
                 (u32::from(net) & mask) == (u32::from(ip) & mask)
             }
             (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                if self.prefix_len == 0 { return true; }
+                if self.prefix_len == 0 {
+                    return true;
+                }
                 let mask: u128 = u128::MAX << (128 - self.prefix_len);
                 (u128::from(net) & mask) == (u128::from(ip) & mask)
             }

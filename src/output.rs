@@ -117,11 +117,10 @@ pub fn detect_theme() -> Theme {
             _ => Theme::Dark,
         }
     } else if
-        // Terminal queries must only be attempted on a real TTY. Without one,
-        // the read blocks indefinitely or the kernel sends SIGTTIN.
-        // SAFETY: isatty() is a trivial syscall with no preconditions.
-        unsafe { libc::isatty(libc::STDERR_FILENO) != 1 }
-    {
+    // Terminal queries must only be attempted on a real TTY. Without one,
+    // the read blocks indefinitely or the kernel sends SIGTTIN.
+    // SAFETY: isatty() is a trivial syscall with no preconditions.
+    unsafe { libc::isatty(libc::STDERR_FILENO) != 1 } {
         Theme::Dark
     } else {
         match terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default()) {
@@ -519,7 +518,6 @@ pub fn print_summary(summary: &ScanSummary) {
     eprintln!("  {}", parts.join(&sep));
     eprintln!();
 }
-
 
 fn format_elapsed(ms: u64) -> String {
     if ms < 1000 {

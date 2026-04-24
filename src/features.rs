@@ -306,10 +306,17 @@ impl FeatureSpec {
             // Feature groups can be disabled during training (COLLIMATOR_DISABLE_FEATURE_GROUPS),
             // producing fewer features than the full layout. Verify that every feature in the
             // spec exists in the expected layout — if so, it's a valid subset.
-            let expected_set: std::collections::HashSet<&str> = expected_feature_names.iter().map(String::as_str).collect();
-            let all_known = self.feature_names.iter().all(|n| expected_set.contains(n.as_str()));
+            let expected_set: std::collections::HashSet<&str> =
+                expected_feature_names.iter().map(String::as_str).collect();
+            let all_known = self
+                .feature_names
+                .iter()
+                .all(|n| expected_set.contains(n.as_str()));
             if !all_known {
-                let first_unknown = self.feature_names.iter().find(|n| !expected_set.contains(n.as_str()));
+                let first_unknown = self
+                    .feature_names
+                    .iter()
+                    .find(|n| !expected_set.contains(n.as_str()));
                 anyhow::bail!(
                     "feature spec contains unknown feature {:?} not in the expected v{EXPECTED_SPEC_VERSION} layout \
                      (spec has {} features, expected max {})",
@@ -365,23 +372,32 @@ const INTENT_GAP_CATEGORIES: &[&str] = &["network", "filesystem", "execution", "
 
 /// Expected ghosts (v16 group 23).
 const EXPECTED_GHOSTS: &[(&str, &[&str])] = &[
-    ("elf", &[
-        "metadata/binary/layout",
-        "metadata/binary/metrics",
-        "metadata/binary/symbols",
-        "metadata/binary/linking",
-    ]),
-    ("javascript", &[
-        "micro-behaviors/javascript/async",
-        "metadata/package/versioning",
-    ]),
-    ("pe", &[
-        "metadata/binary/layout",
-        "metadata/binary/metrics",
-        "metadata/binary/resource",
-        "metadata/binary/symbols",
-        "metadata/binary/linking",
-    ]),
+    (
+        "elf",
+        &[
+            "metadata/binary/layout",
+            "metadata/binary/metrics",
+            "metadata/binary/symbols",
+            "metadata/binary/linking",
+        ],
+    ),
+    (
+        "javascript",
+        &[
+            "micro-behaviors/javascript/async",
+            "metadata/package/versioning",
+        ],
+    ),
+    (
+        "pe",
+        &[
+            "metadata/binary/layout",
+            "metadata/binary/metrics",
+            "metadata/binary/resource",
+            "metadata/binary/symbols",
+            "metadata/binary/linking",
+        ],
+    ),
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -477,15 +493,29 @@ fn build_expected_feature_names(
     ]);
 
     // Crit-category n-grams (vocab-driven)
-    for cu in crit_unigram_vocab { feature_names.push(format!("crit:{cu}")); }
-    for cb in crit_bigram_vocab { feature_names.push(format!("critbi:{cb}")); }
-    for ct in crit_trigram_vocab { feature_names.push(format!("crittri:{ct}")); }
+    for cu in crit_unigram_vocab {
+        feature_names.push(format!("crit:{cu}"));
+    }
+    for cb in crit_bigram_vocab {
+        feature_names.push(format!("critbi:{cb}"));
+    }
+    for ct in crit_trigram_vocab {
+        feature_names.push(format!("crittri:{ct}"));
+    }
 
     // ATT&CK/MBC code n-grams (vocab-driven)
-    for ab in attack_bigram_vocab { feature_names.push(format!("atkbi:{ab}")); }
-    for at in attack_trigram_vocab { feature_names.push(format!("atktri:{at}")); }
-    for mb in mbc_bigram_vocab { feature_names.push(format!("mbcbi:{mb}")); }
-    for mt in mbc_trigram_vocab { feature_names.push(format!("mbctri:{mt}")); }
+    for ab in attack_bigram_vocab {
+        feature_names.push(format!("atkbi:{ab}"));
+    }
+    for at in attack_trigram_vocab {
+        feature_names.push(format!("atktri:{at}"));
+    }
+    for mb in mbc_bigram_vocab {
+        feature_names.push(format!("mbcbi:{mb}"));
+    }
+    for mt in mbc_trigram_vocab {
+        feature_names.push(format!("mbctri:{mt}"));
+    }
 
     // Group 4: ext (6)
     feature_names.extend([
@@ -709,7 +739,10 @@ impl ExtractContext {
             n_atk_trigram: spec.attack_trigram_vocab.len(),
             n_mbc_bigram: spec.mbc_bigram_vocab.len(),
             n_mbc_trigram: spec.mbc_trigram_vocab.len(),
-            absolute_lookup: spec.feature_names.iter().enumerate()
+            absolute_lookup: spec
+                .feature_names
+                .iter()
+                .enumerate()
                 .map(|(i, n)| (n.clone(), i))
                 .collect(),
             ghost_vocab: spec.ghost_vocab.clone(),
@@ -753,10 +786,7 @@ impl ExtractContext {
         let file_summaries: Vec<FileSummary> = if raw_files.len() < 8 {
             raw_files.iter().map(|&f| FileSummary::new(f)).collect()
         } else {
-            raw_files
-                .par_iter()
-                .map(|&f| FileSummary::new(f))
-                .collect()
+            raw_files.par_iter().map(|&f| FileSummary::new(f)).collect()
         };
 
         // If no files, we need at least one empty summary for structural logic.
@@ -788,47 +818,92 @@ impl ExtractContext {
 
         // G3: Aggregates
         let n_crit = self.n_crit_unigram + self.n_crit_bigram + self.n_crit_trigram;
-        let n_code_ngrams = self.n_atk_bigram + self.n_atk_trigram + self.n_mbc_bigram + self.n_mbc_trigram;
+        let n_code_ngrams =
+            self.n_atk_bigram + self.n_atk_trigram + self.n_mbc_bigram + self.n_mbc_trigram;
         offsets.take(57 + n_crit + n_code_ngrams);
-        write_aggregate_features(&combined, &summaries, &mut FeatureWriter { vec, lookup: &self.absolute_lookup });
+        write_aggregate_features(
+            &combined,
+            &summaries,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+        );
 
         // Crit-category n-grams
         {
             let crit_categories: HashSet<&str> = [
-                "objectives", "well-known", "supply-chain", "anti-analysis", "anti-static",
-                "command-and-control", "evasion", "execution", "exfiltration",
-            ].into_iter().collect();
-            let crit_pfx = |c: u32| match c { 5 => "h", 4 => "s", _ => "n" };
+                "objectives",
+                "well-known",
+                "supply-chain",
+                "anti-analysis",
+                "anti-static",
+                "command-and-control",
+                "evasion",
+                "execution",
+                "exfiltration",
+            ]
+            .into_iter()
+            .collect();
+            let crit_pfx = |c: u32| match c {
+                5 => "h",
+                4 => "s",
+                _ => "n",
+            };
             let mut pmc: HashMap<String, u32> = HashMap::new();
             for (path, &mo) in &combined.sample_paths {
-                if mo < 3 { continue; }
+                if mo < 3 {
+                    continue;
+                }
                 let parts: Vec<&str> = path.split('/').collect();
-                if !crit_categories.contains(parts[0]) { continue; }
-                let key = if parts.len() >= 2 { format!("{}/{}", parts[0], parts[1]) } else { parts[0].to_string() };
+                if !crit_categories.contains(parts[0]) {
+                    continue;
+                }
+                let key = if parts.len() >= 2 {
+                    format!("{}/{}", parts[0], parts[1])
+                } else {
+                    parts[0].to_string()
+                };
                 let e = pmc.entry(key).or_insert(0);
                 *e = (*e).max(mo);
             }
-            let mut tokens: Vec<String> = pmc.iter().map(|(k, &c)| format!("{}:{k}", crit_pfx(c))).collect();
+            let mut tokens: Vec<String> = pmc
+                .iter()
+                .map(|(k, &c)| format!("{}:{k}", crit_pfx(c)))
+                .collect();
             tokens.sort();
             let lookup = &self.absolute_lookup;
-            for t in &tokens { if let Some(&i) = lookup.get(&format!("crit:{t}")) { vec[i] = 1.0; } }
+            for t in &tokens {
+                if let Some(&i) = lookup.get(&format!("crit:{t}")) {
+                    vec[i] = 1.0;
+                }
+            }
 
             // Safety: trigrams are O(N^3), bigrams O(N^2). Cap N to avoid complexity bombs on bloated reports.
             if tokens.len() <= 512 {
                 for (i, t1) in tokens.iter().enumerate() {
-                    for t2 in &tokens[i+1..] {
-                        if let Some(&idx) = lookup.get(&format!("critbi:{t1} + {t2}")) { vec[idx] = 1.0; }
+                    for t2 in &tokens[i + 1..] {
+                        if let Some(&idx) = lookup.get(&format!("critbi:{t1} + {t2}")) {
+                            vec[idx] = 1.0;
+                        }
                     }
                     if tokens.len() <= 128 {
-                        for j in i+1..tokens.len() {
-                            for t3 in &tokens[j+1..] {
-                                if let Some(&idx) = lookup.get(&format!("crittri:{t1} + {} + {t3}", tokens[j])) { vec[idx] = 1.0; }
+                        for j in i + 1..tokens.len() {
+                            for t3 in &tokens[j + 1..] {
+                                if let Some(&idx) =
+                                    lookup.get(&format!("crittri:{t1} + {} + {t3}", tokens[j]))
+                                {
+                                    vec[idx] = 1.0;
+                                }
                             }
                         }
                     }
                 }
             } else {
-                tracing::warn!(tokens = tokens.len(), "too many unique crit tokens; skipping n-gram generation");
+                tracing::warn!(
+                    tokens = tokens.len(),
+                    "too many unique crit tokens; skipping n-gram generation"
+                );
             }
         }
 
@@ -838,63 +913,110 @@ impl ExtractContext {
             let mut mbcs: HashSet<String> = HashSet::new();
             for s in &summaries {
                 for f in &s.raw_findings {
-                    if let Some(a) = f.get("a").and_then(|v| v.as_str()) { attacks.insert(a.to_string()); }
-                    if let Some(m) = f.get("m").and_then(|v| v.as_str()) { mbcs.insert(m.to_string()); }
+                    if let Some(a) = f.get("a").and_then(|v| v.as_str()) {
+                        attacks.insert(a.to_string());
+                    }
+                    if let Some(m) = f.get("m").and_then(|v| v.as_str()) {
+                        mbcs.insert(m.to_string());
+                    }
                 }
             }
             let lookup = &self.absolute_lookup;
-            let mut sa: Vec<_> = attacks.iter().collect(); sa.sort();
+            let mut sa: Vec<_> = attacks.iter().collect();
+            sa.sort();
             if sa.len() <= 512 {
                 for (i, a1) in sa.iter().enumerate() {
-                    for (j, a2) in sa[i+1..].iter().enumerate() {
-                        if let Some(&idx) = lookup.get(&format!("atkbi:{a1} + {a2}")) { vec[idx] = 1.0; }
+                    for (j, a2) in sa[i + 1..].iter().enumerate() {
+                        if let Some(&idx) = lookup.get(&format!("atkbi:{a1} + {a2}")) {
+                            vec[idx] = 1.0;
+                        }
                         if sa.len() <= 128 {
-                            for a3 in &sa[i+1+j+1..] {
-                                if let Some(&idx) = lookup.get(&format!("atktri:{a1} + {a2} + {a3}")) { vec[idx] = 1.0; }
+                            for a3 in &sa[i + 1 + j + 1..] {
+                                if let Some(&idx) =
+                                    lookup.get(&format!("atktri:{a1} + {a2} + {a3}"))
+                                {
+                                    vec[idx] = 1.0;
+                                }
                             }
                         }
                     }
                 }
             } else {
-                tracing::warn!(tokens = sa.len(), "too many unique ATT&CK tokens; skipping n-gram generation");
+                tracing::warn!(
+                    tokens = sa.len(),
+                    "too many unique ATT&CK tokens; skipping n-gram generation"
+                );
             }
 
-            let mut sm: Vec<_> = mbcs.iter().collect(); sm.sort();
+            let mut sm: Vec<_> = mbcs.iter().collect();
+            sm.sort();
             if sm.len() <= 512 {
                 for (i, m1) in sm.iter().enumerate() {
-                    for (j, m2) in sm[i+1..].iter().enumerate() {
-                        if let Some(&idx) = lookup.get(&format!("mbcbi:{m1} + {m2}")) { vec[idx] = 1.0; }
+                    for (j, m2) in sm[i + 1..].iter().enumerate() {
+                        if let Some(&idx) = lookup.get(&format!("mbcbi:{m1} + {m2}")) {
+                            vec[idx] = 1.0;
+                        }
                         if sm.len() <= 128 {
-                            for m3 in &sm[i+1+j+1..] {
-                                if let Some(&idx) = lookup.get(&format!("mbctri:{m1} + {m2} + {m3}")) { vec[idx] = 1.0; }
+                            for m3 in &sm[i + 1 + j + 1..] {
+                                if let Some(&idx) =
+                                    lookup.get(&format!("mbctri:{m1} + {m2} + {m3}"))
+                                {
+                                    vec[idx] = 1.0;
+                                }
                             }
                         }
                     }
                 }
             } else {
-                tracing::warn!(tokens = sm.len(), "too many unique MBC tokens; skipping n-gram generation");
+                tracing::warn!(
+                    tokens = sm.len(),
+                    "too many unique MBC tokens; skipping n-gram generation"
+                );
             }
         }
 
         // G4: External (name-based)
         offsets.take(6); // reserve space for offset tracking compatibility
-        write_external_summary_features(&combined, &mut FeatureWriter { vec, lookup: &self.absolute_lookup });
+        write_external_summary_features(
+            &combined,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+        );
 
         // G5: Metrics (base + extended vocab)
         offsets.take(KEY_METRICS.len() + self.n_ext_metrics);
-        write_metric_features(&merged_metrics, &mut FeatureWriter { vec, lookup: &self.absolute_lookup }, &self.metric_vocab);
+        write_metric_features(
+            &merged_metrics,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+            &self.metric_vocab,
+        );
 
         // G6: Filetype (blindfolded in v16)
         let _file_type_offset = offsets.take(self.n_ft);
 
         // G7: Structural
         offsets.take(11);
-        write_structural_features(&mut FeatureWriter { vec, lookup: &self.absolute_lookup }, &summaries, combined.filtered_finding_count);
+        write_structural_features(
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+            &summaries,
+            combined.filtered_finding_count,
+        );
 
         // G8: Elements
         offsets.take(self.n_element);
         {
-            let w = &mut FeatureWriter { vec, lookup: &self.absolute_lookup };
+            let w = &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            };
             if !elements_str.is_empty() {
                 for el in elements_str.split(',') {
                     let el = el.trim();
@@ -908,15 +1030,23 @@ impl ExtractContext {
             w.set("formula:skeleton_len", skeleton_str.chars().count() as f32);
             w.set("formula:unique_elements", unique_skel_chars.len() as f32);
             if combined.filtered_finding_count > 0 {
-                w.set("formula:complexity_ratio", formula_str.chars().count() as f32 / combined.filtered_finding_count as f32);
+                w.set(
+                    "formula:complexity_ratio",
+                    formula_str.chars().count() as f32 / combined.filtered_finding_count as f32,
+                );
             }
 
             // G10: Score
             let total_size_bytes: f64 = summaries.iter().map(|s| s.size_bytes).sum();
             w.set("score:hopper_score", sample_score as f32);
-            w.set("score:density", if total_size_bytes > 0.0 {
-                sample_score as f32 / (total_size_bytes as f32).ln_1p()
-            } else { 0.0 });
+            w.set(
+                "score:density",
+                if total_size_bytes > 0.0 {
+                    sample_score as f32 / (total_size_bytes as f32).ln_1p()
+                } else {
+                    0.0
+                },
+            );
             for s in &summaries {
                 w.set(&format!("inter:{}*score", s.file_type), sample_score as f32);
             }
@@ -964,7 +1094,14 @@ impl ExtractContext {
 
         // G15: Structural Extensions
         offsets.take(13);
-        write_structural_extensions(&summaries, &combined, &mut FeatureWriter { vec, lookup: &self.absolute_lookup });
+        write_structural_extensions(
+            &summaries,
+            &combined,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+        );
 
         // G16: Trigrams (optimized)
         let trigram_offset = offsets.take(self.n_trigram);
@@ -972,7 +1109,14 @@ impl ExtractContext {
 
         // G19: Logic Gaps
         offsets.take(LOGIC_GAP_CATEGORIES.len());
-        write_logic_gap_features(&combined, &summaries, &mut FeatureWriter { vec, lookup: &self.absolute_lookup });
+        write_logic_gap_features(
+            &combined,
+            &summaries,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+        );
 
         // G20: Signature Synergy
         let unsigned_bigram_offset = offsets.take(self.n_bigram);
@@ -982,17 +1126,36 @@ impl ExtractContext {
 
         // G22: Intent Gaps
         offsets.take(INTENT_GAP_CATEGORIES.len());
-        write_intent_gap_features(&combined, &mut FeatureWriter { vec, lookup: &self.absolute_lookup });
+        write_intent_gap_features(
+            &combined,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+        );
 
         // G23: Negative Space
         let missing_count: usize = EXPECTED_GHOSTS.iter().map(|(_, t)| t.len()).sum();
         offsets.take(missing_count);
-        write_negative_space_features(&combined, &summaries, &mut FeatureWriter { vec, lookup: &self.absolute_lookup });
+        write_negative_space_features(
+            &combined,
+            &summaries,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+        );
 
         debug_assert_eq!(offsets.offset, self.total_features);
     }
 
-    fn write_presence_features_v16(&self, summary: &FindingSummary, vec: &mut [f32], offset: usize, score_weight: f32) {
+    fn write_presence_features_v16(
+        &self,
+        summary: &FindingSummary,
+        vec: &mut [f32],
+        offset: usize,
+        score_weight: f32,
+    ) {
         for (path, &max_ord) in &summary.sample_paths {
             if max_ord >= 2 {
                 if let Some(&idx) = self.presence_lookup.get(path.as_str()) {
@@ -1003,7 +1166,13 @@ impl ExtractContext {
         }
     }
 
-    fn write_max_crit_features_v16(&self, summary: &FindingSummary, vec: &mut [f32], offset: usize, score_weight: f32) {
+    fn write_max_crit_features_v16(
+        &self,
+        summary: &FindingSummary,
+        vec: &mut [f32],
+        offset: usize,
+        score_weight: f32,
+    ) {
         for (path, &max_ord) in &summary.sample_paths {
             if let Some(&idx) = self.presence_lookup.get(path.as_str()) {
                 let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0) as f32;
@@ -1012,9 +1181,18 @@ impl ExtractContext {
         }
     }
 
-    fn write_bigram_features_optimized(&self, summaries: &[FileSummary], vec: &mut [f32], offset: usize) {
+    fn write_bigram_features_optimized(
+        &self,
+        summaries: &[FileSummary],
+        vec: &mut [f32],
+        offset: usize,
+    ) {
         for s in summaries {
-            let ids: Vec<u32> = s.unique_3level_paths.iter().filter_map(|p| self.path_to_id.get(p).copied()).collect();
+            let ids: Vec<u32> = s
+                .unique_3level_paths
+                .iter()
+                .filter_map(|p| self.path_to_id.get(p).copied())
+                .collect();
             if ids.len() > 512 {
                 tracing::warn!(path = %s.path, tokens = ids.len(), "too many unique paths; skipping bigram generation for file");
                 continue;
@@ -1030,9 +1208,18 @@ impl ExtractContext {
         }
     }
 
-    fn write_trigram_features_optimized(&self, summaries: &[FileSummary], vec: &mut [f32], offset: usize) {
+    fn write_trigram_features_optimized(
+        &self,
+        summaries: &[FileSummary],
+        vec: &mut [f32],
+        offset: usize,
+    ) {
         for s in summaries {
-            let ids: Vec<u32> = s.unique_3level_paths.iter().filter_map(|p| self.path_to_id.get(p).copied()).collect();
+            let ids: Vec<u32> = s
+                .unique_3level_paths
+                .iter()
+                .filter_map(|p| self.path_to_id.get(p).copied())
+                .collect();
             let n = ids.len();
             if n > 256 {
                 tracing::warn!(path = %s.path, tokens = n, "too many unique paths; skipping trigram generation for file");
@@ -1043,7 +1230,10 @@ impl ExtractContext {
                     for k in (j + 1)..n {
                         let mut sorted = [ids[i], ids[j], ids[k]];
                         sorted.sort();
-                        if let Some(&idx) = self.trigram_id_lookup.get(&(sorted[0], sorted[1], sorted[2])) {
+                        if let Some(&idx) = self
+                            .trigram_id_lookup
+                            .get(&(sorted[0], sorted[1], sorted[2]))
+                        {
                             vec[offset + idx] = 1.0;
                         }
                     }
@@ -1088,14 +1278,17 @@ struct FileSummary {
 
 impl FileSummary {
     fn new(file_entry: &serde_json::Value) -> Self {
-        let findings_raw: Vec<&serde_json::Value> = file_entry["ts"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+        let findings_raw: Vec<&serde_json::Value> = file_entry["ts"]
+            .as_array()
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
         let findings = summarize_findings(&findings_raw);
-        
+
         let size_bytes = file_entry["sz"].as_f64().unwrap_or(0.0);
         let size_kb = (size_bytes / 1024.0).max(1.0) as f32;
         let denom = findings.filtered_finding_count.max(1) as f32;
         let max_crit = findings.sample_paths.values().copied().max().unwrap_or(0);
-        
+
         let risk = FileRiskStats {
             suspicious_ratio: findings.suspicious_finding_count as f32 / denom,
             hostile_ratio: findings.hostile_finding_count as f32 / denom,
@@ -1135,7 +1328,8 @@ impl FileSummary {
                             .iter()
                             .filter_map(|(k, v)| {
                                 // Handle numbers, booleans (true→1.0), and skip strings/nulls.
-                                let val = v.as_f64()
+                                let val = v
+                                    .as_f64()
                                     .or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 }))?;
                                 Some((k.clone(), val))
                             })
@@ -1146,7 +1340,11 @@ impl FileSummary {
             })
             .unwrap_or_default();
 
-        let overall_entropy = metrics.get("binary").and_then(|m| m.get("overall_entropy")).copied().unwrap_or(0.0);
+        let overall_entropy = metrics
+            .get("binary")
+            .and_then(|m| m.get("overall_entropy"))
+            .copied()
+            .unwrap_or(0.0);
 
         let imports: HashSet<String> = file_entry
             .get("is")
@@ -1160,7 +1358,8 @@ impl FileSummary {
             .map(str::to_string)
             .collect();
 
-        let raw_findings: Vec<serde_json::Value> = findings_raw.iter().map(|f| (*f).clone()).collect();
+        let raw_findings: Vec<serde_json::Value> =
+            findings_raw.iter().map(|f| (*f).clone()).collect();
         let has_imports_key = file_entry.get("is").is_some();
 
         Self {
@@ -1211,10 +1410,14 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
 
     for finding in findings {
         let fid = finding["i"].as_str().unwrap_or("");
-        if fid.is_empty() { continue; }
+        if fid.is_empty() {
+            continue;
+        }
         let conf = finding["c"].as_f64().unwrap_or(1.0);
-        if conf < MIN_CONFIDENCE { continue; }
-        
+        if conf < MIN_CONFIDENCE {
+            continue;
+        }
+
         summary.filtered_finding_count += 1;
         summary.finding_confidences.push(conf);
         let crit_ord = crit_ordinal(finding);
@@ -1237,12 +1440,17 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
             "third_party" => {
                 summary.third_party_count += 1;
                 summary.third_party_max_crit = summary.third_party_max_crit.max(crit_ord);
-                if fid.starts_with("third_party/yara") { summary.has_yara = true; }
+                if fid.starts_with("third_party/yara") {
+                    summary.has_yara = true;
+                }
             }
             "well-known" => {
                 summary.well_known_max_crit = summary.well_known_max_crit.max(crit_ord);
-                if crit_ord >= 5 { summary.well_known_hostile += 1; }
-                else if crit_ord >= 4 { summary.well_known_suspicious += 1; }
+                if crit_ord >= 5 {
+                    summary.well_known_hostile += 1;
+                } else if crit_ord >= 4 {
+                    summary.well_known_suspicious += 1;
+                }
             }
             _ => {}
         }
@@ -1255,11 +1463,15 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
         for path in finding_paths(fid) {
             match summary.sample_paths.get_mut(path) {
                 Some(v) => *v = (*v).max(crit_ord),
-                None => { summary.sample_paths.insert(path.to_owned(), crit_ord); }
+                None => {
+                    summary.sample_paths.insert(path.to_owned(), crit_ord);
+                }
             }
             match summary.path_confidences.get_mut(path) {
                 Some(v) => *v = v.max(conf),
-                None => { summary.path_confidences.insert(path.to_owned(), conf); }
+                None => {
+                    summary.path_confidences.insert(path.to_owned(), conf);
+                }
             }
         }
     }
@@ -1271,8 +1483,12 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
     let mut susp_cats: HashSet<&str> = HashSet::new();
     let mut host_cats: HashSet<&str> = HashSet::new();
     for (path, &max_ord) in &summary.sample_paths {
-        if max_ord >= 4 { susp_cats.insert(path.split('/').next().unwrap_or("")); }
-        if max_ord >= 5 { host_cats.insert(path.split('/').next().unwrap_or("")); }
+        if max_ord >= 4 {
+            susp_cats.insert(path.split('/').next().unwrap_or(""));
+        }
+        if max_ord >= 5 {
+            host_cats.insert(path.split('/').next().unwrap_or(""));
+        }
     }
     summary.suspicious_category_breadth = susp_cats.len();
     summary.hostile_category_breadth = host_cats.len();
@@ -1310,27 +1526,43 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
         for (path, max_ord) in &fs.sample_paths {
             match combined.sample_paths.get_mut(path) {
                 Some(v) => *v = (*v).max(*max_ord),
-                None => { combined.sample_paths.insert(path.clone(), *max_ord); }
+                None => {
+                    combined.sample_paths.insert(path.clone(), *max_ord);
+                }
             }
         }
         for (path, &conf) in &fs.path_confidences {
             match combined.path_confidences.get_mut(path) {
                 Some(v) => *v = v.max(conf),
-                None => { combined.path_confidences.insert(path.clone(), conf); }
+                None => {
+                    combined.path_confidences.insert(path.clone(), conf);
+                }
             }
         }
-        combined.finding_confidences.extend(fs.finding_confidences.iter().copied());
+        combined
+            .finding_confidences
+            .extend(fs.finding_confidences.iter().copied());
 
         // Re-scan raw findings to deduplicate unique IDs across files.
         for finding in &s.raw_findings {
             let fid = finding["i"].as_str().unwrap_or("");
-            if fid.is_empty() { continue; }
+            if fid.is_empty() {
+                continue;
+            }
             let conf = finding["c"].as_f64().unwrap_or(1.0);
-            if conf < MIN_CONFIDENCE { continue; }
+            if conf < MIN_CONFIDENCE {
+                continue;
+            }
             let crit = crit_ordinal(finding);
-            if crit >= 3 { notable_ids.insert(fid); }
-            if crit >= 4 { suspicious_ids.insert(fid); }
-            if crit >= 5 { hostile_ids.insert(fid); }
+            if crit >= 3 {
+                notable_ids.insert(fid);
+            }
+            if crit >= 4 {
+                suspicious_ids.insert(fid);
+            }
+            if crit >= 5 {
+                hostile_ids.insert(fid);
+            }
         }
     }
 
@@ -1341,8 +1573,12 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
     let mut susp_cats: HashSet<&str> = HashSet::new();
     let mut host_cats: HashSet<&str> = HashSet::new();
     for (path, &max_ord) in &combined.sample_paths {
-        if max_ord >= 4 { susp_cats.insert(path.split('/').next().unwrap_or("")); }
-        if max_ord >= 5 { host_cats.insert(path.split('/').next().unwrap_or("")); }
+        if max_ord >= 4 {
+            susp_cats.insert(path.split('/').next().unwrap_or(""));
+        }
+        if max_ord >= 5 {
+            host_cats.insert(path.split('/').next().unwrap_or(""));
+        }
     }
     combined.suspicious_category_breadth = susp_cats.len();
     combined.hostile_category_breadth = host_cats.len();
@@ -1362,7 +1598,11 @@ struct FileRiskStats {
     max_crit: u32,
 }
 
-fn write_aggregate_features(summary: &FindingSummary, summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
+fn write_aggregate_features(
+    summary: &FindingSummary,
+    summaries: &[FileSummary],
+    w: &mut FeatureWriter<'_>,
+) {
     let mut max_crit = 0u32;
     let mut categories: HashSet<&str> = HashSet::new();
     let mut path_breadth_any = 0u32;
@@ -1376,15 +1616,24 @@ fn write_aggregate_features(summary: &FindingSummary, summaries: &[FileSummary],
         let path_depth = path.chars().filter(|&c| c == '/').count();
         if max_ord >= 2 {
             categories.insert(path.split('/').next().unwrap_or(""));
-            if path_depth >= 2 { path_breadth_any += 1; }
+            if path_depth >= 2 {
+                path_breadth_any += 1;
+            }
         }
-        if path_depth < 2 || max_ord < 3 { continue; }
+        if path_depth < 2 || max_ord < 3 {
+            continue;
+        }
         total_active += 1;
         breadth_notable += 1;
         max_crit = max_crit.max(max_ord);
-        if max_ord >= 4 { breadth_suspicious += 1; }
-        if max_ord >= 5 { breadth_hostile += 1; }
-        else if max_ord == 3 { breadth_notable_only += 1; }
+        if max_ord >= 4 {
+            breadth_suspicious += 1;
+        }
+        if max_ord >= 5 {
+            breadth_hostile += 1;
+        } else if max_ord == 3 {
+            breadth_notable_only += 1;
+        }
     }
 
     let total_size_bytes: f64 = summaries.iter().map(|s| s.size_bytes).sum();
@@ -1396,19 +1645,55 @@ fn write_aggregate_features(summary: &FindingSummary, summaries: &[FileSummary],
     w.set("agg:category_breadth", categories.len() as f32);
     w.set("agg:path_breadth_any", (path_breadth_any as f32).ln_1p());
     w.set("agg:total_active_paths", (total_active as f32).ln_1p());
-    w.set("agg:suspicious_concentration", breadth_suspicious as f32 / path_breadth_any.max(1) as f32);
-    w.set("agg:hostile_concentration", breadth_hostile as f32 / path_breadth_any.max(1) as f32);
-    w.set("agg:escalation_rate", breadth_suspicious as f32 / breadth_notable.max(1) as f32);
-    w.set("agg:notable_only_fraction", breadth_notable_only as f32 / breadth_notable.max(1) as f32);
-    w.set("agg:notable_findings_log", (summary.notable_finding_count as f32).ln_1p());
-    w.set("agg:suspicious_findings_log", (summary.suspicious_finding_count as f32).ln_1p());
-    w.set("agg:hostile_findings_log", (summary.hostile_finding_count as f32).ln_1p());
-    w.set("agg:notable_finding_ratio", summary.notable_finding_count as f32 / total_kb_p1);
-    w.set("agg:suspicious_finding_ratio", summary.suspicious_finding_count as f32 / total_kb_p1);
-    w.set("agg:hostile_finding_ratio", summary.hostile_finding_count as f32 / total_kb_p1);
+    w.set(
+        "agg:suspicious_concentration",
+        breadth_suspicious as f32 / path_breadth_any.max(1) as f32,
+    );
+    w.set(
+        "agg:hostile_concentration",
+        breadth_hostile as f32 / path_breadth_any.max(1) as f32,
+    );
+    w.set(
+        "agg:escalation_rate",
+        breadth_suspicious as f32 / breadth_notable.max(1) as f32,
+    );
+    w.set(
+        "agg:notable_only_fraction",
+        breadth_notable_only as f32 / breadth_notable.max(1) as f32,
+    );
+    w.set(
+        "agg:notable_findings_log",
+        (summary.notable_finding_count as f32).ln_1p(),
+    );
+    w.set(
+        "agg:suspicious_findings_log",
+        (summary.suspicious_finding_count as f32).ln_1p(),
+    );
+    w.set(
+        "agg:hostile_findings_log",
+        (summary.hostile_finding_count as f32).ln_1p(),
+    );
+    w.set(
+        "agg:notable_finding_ratio",
+        summary.notable_finding_count as f32 / total_kb_p1,
+    );
+    w.set(
+        "agg:suspicious_finding_ratio",
+        summary.suspicious_finding_count as f32 / total_kb_p1,
+    );
+    w.set(
+        "agg:hostile_finding_ratio",
+        summary.hostile_finding_count as f32 / total_kb_p1,
+    );
     let log_kb_p1 = total_kb_p1.ln_1p();
-    w.set("agg:unique_suspicious_ids_log", (summary.unique_suspicious_ids as f32).ln_1p() / log_kb_p1);
-    w.set("agg:unique_hostile_ids_log", (summary.unique_hostile_ids as f32).ln_1p() / log_kb_p1);
+    w.set(
+        "agg:unique_suspicious_ids_log",
+        (summary.unique_suspicious_ids as f32).ln_1p() / log_kb_p1,
+    );
+    w.set(
+        "agg:unique_hostile_ids_log",
+        (summary.unique_hostile_ids as f32).ln_1p() / log_kb_p1,
+    );
 
     let topk = topk_file_risk_features_from_summaries(summaries);
     w.set("agg:top1_file_suspicious_ratio_sum", topk[0]);
@@ -1417,42 +1702,111 @@ fn write_aggregate_features(summary: &FindingSummary, summaries: &[FileSummary],
     w.set("agg:top1_file_hostile_findings_log", topk[3]);
 
     let category_denom = categories.len().max(1) as f32;
-    w.set("agg:suspicious_category_breadth", summary.suspicious_category_breadth as f32);
-    w.set("agg:hostile_category_breadth", summary.hostile_category_breadth as f32);
-    w.set("agg:suspicious_category_density", summary.suspicious_category_breadth as f32 / category_denom);
-    w.set("agg:hostile_category_density", summary.hostile_category_breadth as f32 / category_denom);
-    w.set("agg:suspicious_findings_per_kb", summary.suspicious_finding_count as f32 / total_kb_1);
-    w.set("agg:hostile_findings_per_kb", summary.hostile_finding_count as f32 / total_kb_1);
-    w.set("agg:suspicious_categories_per_kb", summary.suspicious_category_breadth as f32 / total_kb_1);
-    w.set("agg:hostile_categories_per_kb", summary.hostile_category_breadth as f32 / total_kb_1);
+    w.set(
+        "agg:suspicious_category_breadth",
+        summary.suspicious_category_breadth as f32,
+    );
+    w.set(
+        "agg:hostile_category_breadth",
+        summary.hostile_category_breadth as f32,
+    );
+    w.set(
+        "agg:suspicious_category_density",
+        summary.suspicious_category_breadth as f32 / category_denom,
+    );
+    w.set(
+        "agg:hostile_category_density",
+        summary.hostile_category_breadth as f32 / category_denom,
+    );
+    w.set(
+        "agg:suspicious_findings_per_kb",
+        summary.suspicious_finding_count as f32 / total_kb_1,
+    );
+    w.set(
+        "agg:hostile_findings_per_kb",
+        summary.hostile_finding_count as f32 / total_kb_1,
+    );
+    w.set(
+        "agg:suspicious_categories_per_kb",
+        summary.suspicious_category_breadth as f32 / total_kb_1,
+    );
+    w.set(
+        "agg:hostile_categories_per_kb",
+        summary.hostile_category_breadth as f32 / total_kb_1,
+    );
     w.set("agg:top1_file_suspicious_density_sum", topk[4]);
     w.set("agg:top1_file_hostile_density_sum", topk[5]);
     w.set("agg:top1_file_suspicious_category_breadth_sum", topk[6]);
     w.set("agg:top1_file_hostile_category_breadth_sum", topk[7]);
 
-    w.set("agg:hostile_escalation_rate", breadth_hostile as f32 / breadth_notable.max(1) as f32);
-    w.set("agg:hostile_share_of_suspicious", breadth_hostile as f32 / breadth_suspicious.max(1) as f32);
-    w.set("agg:suspicious_finding_escalation_rate", summary.suspicious_finding_count as f32 / summary.notable_finding_count.max(1) as f32);
-    w.set("agg:hostile_finding_escalation_rate", summary.hostile_finding_count as f32 / summary.notable_finding_count.max(1) as f32);
-    w.set("agg:hostile_share_of_suspicious_findings", summary.hostile_finding_count as f32 / summary.suspicious_finding_count.max(1) as f32);
+    w.set(
+        "agg:hostile_escalation_rate",
+        breadth_hostile as f32 / breadth_notable.max(1) as f32,
+    );
+    w.set(
+        "agg:hostile_share_of_suspicious",
+        breadth_hostile as f32 / breadth_suspicious.max(1) as f32,
+    );
+    w.set(
+        "agg:suspicious_finding_escalation_rate",
+        summary.suspicious_finding_count as f32 / summary.notable_finding_count.max(1) as f32,
+    );
+    w.set(
+        "agg:hostile_finding_escalation_rate",
+        summary.hostile_finding_count as f32 / summary.notable_finding_count.max(1) as f32,
+    );
+    w.set(
+        "agg:hostile_share_of_suspicious_findings",
+        summary.hostile_finding_count as f32 / summary.suspicious_finding_count.max(1) as f32,
+    );
 
     let host_density_global = summary.hostile_finding_count as f32 / total_kb_1;
     let susp_density_global = summary.suspicious_finding_count as f32 / total_kb_1;
-    w.set("agg:hostile_weighted_density", host_density_global + 0.25 * susp_density_global);
+    w.set(
+        "agg:hostile_weighted_density",
+        host_density_global + 0.25 * susp_density_global,
+    );
 
     let mut stats: Vec<FileRiskStats> = summaries.iter().map(|s| s.risk.clone()).collect();
     stats.sort_by(|a, b| {
-        let ka = (a.hostile_density + 0.25 * a.suspicious_density, a.hostile_density, a.suspicious_density);
-        let kb = (b.hostile_density + 0.25 * b.suspicious_density, b.hostile_density, b.suspicious_density);
+        let ka = (
+            a.hostile_density + 0.25 * a.suspicious_density,
+            a.hostile_density,
+            a.suspicious_density,
+        );
+        let kb = (
+            b.hostile_density + 0.25 * b.suspicious_density,
+            b.hostile_density,
+            b.suspicious_density,
+        );
         kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
     });
-    let top_weighted: f32 = stats.iter().take(TOP_K_RISK_FILES).map(|s| s.hostile_density + 0.25 * s.suspicious_density).sum();
+    let top_weighted: f32 = stats
+        .iter()
+        .take(TOP_K_RISK_FILES)
+        .map(|s| s.hostile_density + 0.25 * s.suspicious_density)
+        .sum();
     w.set("agg:top1_file_hostile_weighted_density_sum", top_weighted);
 
-    w.set("agg:suspicious_id_repeat_ratio", 1.0 - (summary.unique_suspicious_ids as f32 / summary.suspicious_finding_count.max(1) as f32));
-    w.set("agg:hostile_id_repeat_ratio", 1.0 - (summary.unique_hostile_ids as f32 / summary.hostile_finding_count.max(1) as f32));
-    w.set("agg:suspicious_category_repeat_ratio", 1.0 - (summary.suspicious_category_breadth as f32 / summary.suspicious_finding_count.max(1) as f32));
-    w.set("agg:hostile_category_repeat_ratio", 1.0 - (summary.hostile_category_breadth as f32 / summary.hostile_finding_count.max(1) as f32));
+    w.set(
+        "agg:suspicious_id_repeat_ratio",
+        1.0 - (summary.unique_suspicious_ids as f32
+            / summary.suspicious_finding_count.max(1) as f32),
+    );
+    w.set(
+        "agg:hostile_id_repeat_ratio",
+        1.0 - (summary.unique_hostile_ids as f32 / summary.hostile_finding_count.max(1) as f32),
+    );
+    w.set(
+        "agg:suspicious_category_repeat_ratio",
+        1.0 - (summary.suspicious_category_breadth as f32
+            / summary.suspicious_finding_count.max(1) as f32),
+    );
+    w.set(
+        "agg:hostile_category_repeat_ratio",
+        1.0 - (summary.hostile_category_breadth as f32
+            / summary.hostile_finding_count.max(1) as f32),
+    );
 
     let n_files = summaries.len().max(1) as f32;
     let hostile_files = summaries.iter().filter(|s| s.risk.max_crit >= 5).count() as f32;
@@ -1474,12 +1828,21 @@ fn write_aggregate_features(summary: &FindingSummary, summaries: &[FileSummary],
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() >= 2 {
             let two_level = format!("{}/{}", parts[0], parts[1]);
-            if max_ord >= 4 { suspicious_2level.insert(two_level.clone()); }
-            if max_ord >= 5 { hostile_2level.insert(two_level.clone()); }
-            if parts[0] == "objectives" && max_ord >= 2 { objectives_2level.insert(two_level); }
+            if max_ord >= 4 {
+                suspicious_2level.insert(two_level.clone());
+            }
+            if max_ord >= 5 {
+                hostile_2level.insert(two_level.clone());
+            }
+            if parts[0] == "objectives" && max_ord >= 2 {
+                objectives_2level.insert(two_level);
+            }
         }
     }
-    w.set("agg:suspicious_2level_breadth", suspicious_2level.len() as f32);
+    w.set(
+        "agg:suspicious_2level_breadth",
+        suspicious_2level.len() as f32,
+    );
     w.set("agg:hostile_2level_breadth", hostile_2level.len() as f32);
     w.set("agg:objectives_breadth", objectives_2level.len() as f32);
 
@@ -1498,31 +1861,64 @@ fn write_aggregate_features(summary: &FindingSummary, summaries: &[FileSummary],
     }
     w.set("agg:attack_technique_count", attack_techniques.len() as f32);
     #[allow(clippy::string_slice)]
-    let tactic_prefixes: HashSet<&str> = attack_techniques.iter()
+    let tactic_prefixes: HashSet<&str> = attack_techniques
+        .iter()
         .filter(|t| t.starts_with('T') && t.len() >= 4)
         .map(|t| &t[..4])
         .collect();
     w.set("agg:attack_tactic_count", tactic_prefixes.len() as f32);
     w.set("agg:mbc_behavior_count", mbc_behaviors.len() as f32);
-    let has_objectives = summary.sample_paths.keys().any(|p| p.starts_with("objectives/"));
-    w.set("agg:has_attack_and_objective", if !attack_techniques.is_empty() && has_objectives { 1.0 } else { 0.0 });
+    let has_objectives = summary
+        .sample_paths
+        .keys()
+        .any(|p| p.starts_with("objectives/"));
+    w.set(
+        "agg:has_attack_and_objective",
+        if !attack_techniques.is_empty() && has_objectives {
+            1.0
+        } else {
+            0.0
+        },
+    );
 }
 
 fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8] {
-    if summaries.is_empty() || TOP_K_RISK_FILES == 0 { return [0.0; 8]; }
+    if summaries.is_empty() || TOP_K_RISK_FILES == 0 {
+        return [0.0; 8];
+    }
     let mut stats: Vec<FileRiskStats> = summaries.iter().map(|s| s.risk.clone()).collect();
-    
+
     let mut by_susp = stats.clone();
     by_susp.sort_by(|a, b| {
-        (b.suspicious_ratio, b.suspicious_findings, b.hostile_ratio, b.hostile_findings)
-            .partial_cmp(&(a.suspicious_ratio, a.suspicious_findings, a.hostile_ratio, a.hostile_findings))
+        (
+            b.suspicious_ratio,
+            b.suspicious_findings,
+            b.hostile_ratio,
+            b.hostile_findings,
+        )
+            .partial_cmp(&(
+                a.suspicious_ratio,
+                a.suspicious_findings,
+                a.hostile_ratio,
+                a.hostile_findings,
+            ))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let top_susp = &by_susp[..TOP_K_RISK_FILES.min(by_susp.len())];
 
     stats.sort_by(|a, b| {
-        (b.hostile_ratio, b.hostile_findings, b.suspicious_ratio, b.suspicious_findings)
-            .partial_cmp(&(a.hostile_ratio, a.hostile_findings, a.suspicious_ratio, a.suspicious_findings))
+        (
+            b.hostile_ratio,
+            b.hostile_findings,
+            b.suspicious_ratio,
+            b.suspicious_findings,
+        )
+            .partial_cmp(&(
+                a.hostile_ratio,
+                a.hostile_findings,
+                a.suspicious_ratio,
+                a.suspicious_findings,
+            ))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let top_host = &stats[..TOP_K_RISK_FILES.min(stats.len())];
@@ -1534,15 +1930,23 @@ fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8]
         (top_host.iter().map(|s| s.hostile_findings).sum::<u32>() as f32 + 1.0).ln(),
         top_susp.iter().map(|s| s.suspicious_density).sum(),
         top_host.iter().map(|s| s.hostile_density).sum(),
-        top_susp.iter().map(|s| s.suspicious_category_breadth as f32).sum(),
-        top_host.iter().map(|s| s.hostile_category_breadth as f32).sum(),
+        top_susp
+            .iter()
+            .map(|s| s.suspicious_category_breadth as f32)
+            .sum(),
+        top_host
+            .iter()
+            .map(|s| s.hostile_category_breadth as f32)
+            .sum(),
     ]
 }
 
 fn parse_iso8601(s: &str) -> Option<f64> {
     let s = s.trim().replace(' ', "T");
     let bytes = s.as_bytes();
-    if bytes.len() < 19 { return None; }
+    if bytes.len() < 19 {
+        return None;
+    }
     let year: i32 = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
     let month: u32 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
     let day: u32 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
@@ -1565,7 +1969,9 @@ fn parse_iso8601(s: &str) -> Option<f64> {
     if idx < bytes.len() && bytes[idx] == b'.' {
         idx += 1;
         let start = idx;
-        while idx < bytes.len() && bytes[idx].is_ascii_digit() { idx += 1; }
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
         if idx > start {
             let frac_str = std::str::from_utf8(&bytes[start..idx]).ok()?;
             frac = frac_str.parse::<f64>().ok()? / 10_f64.powi((idx - start) as i32);
@@ -1577,8 +1983,14 @@ fn parse_iso8601(s: &str) -> Option<f64> {
             let sign: i64 = if tz == b'+' { -1 } else { 1 };
             idx += 1;
             if idx + 5 <= bytes.len() && bytes[idx + 2] == b':' {
-                let oh: i64 = std::str::from_utf8(&bytes[idx..idx + 2]).ok()?.parse().ok()?;
-                let om: i64 = std::str::from_utf8(&bytes[idx + 3..idx + 5]).ok()?.parse().ok()?;
+                let oh: i64 = std::str::from_utf8(&bytes[idx..idx + 2])
+                    .ok()?
+                    .parse()
+                    .ok()?;
+                let om: i64 = std::str::from_utf8(&bytes[idx + 3..idx + 5])
+                    .ok()?
+                    .parse()
+                    .ok()?;
                 total += sign * (oh * 3600 + om * 60);
             }
         }
@@ -1586,7 +1998,11 @@ fn parse_iso8601(s: &str) -> Option<f64> {
     Some(total as f64 + frac)
 }
 
-fn write_structural_extensions(summaries: &[FileSummary], combined: &FindingSummary, w: &mut FeatureWriter<'_>) {
+fn write_structural_extensions(
+    summaries: &[FileSummary],
+    combined: &FindingSummary,
+    w: &mut FeatureWriter<'_>,
+) {
     let binary_like = ["pe", "elf", "macho"];
     let source_types = ["javascript", "python", "typescript", "ruby", "php"];
     let text_exts = ["txt", "md", "json", "png", "jpg"];
@@ -1606,8 +2022,9 @@ fn write_structural_extensions(summaries: &[FileSummary], combined: &FindingSumm
 
     let mut depths = HashMap::new();
     for s in summaries {
-        if s.parent.is_empty() { depths.insert(&s.path, 0); }
-        else {
+        if s.parent.is_empty() {
+            depths.insert(&s.path, 0);
+        } else {
             let pd = depths.get(&s.parent).copied().unwrap_or(0);
             depths.insert(&s.path, pd + 1);
         }
@@ -1615,29 +2032,50 @@ fn write_structural_extensions(summaries: &[FileSummary], combined: &FindingSumm
     let max_nesting_depth = depths.values().copied().max().unwrap_or(0);
 
     for s in summaries {
-        if !s.parent.is_empty() { inner_file_count += 1; }
-        if source_types.contains(&s.file_type.as_str()) { has_source_files = true; }
-        if binary_like.contains(&s.file_type.as_str()) && has_source_files { has_foreign_binaries = true; }
+        if !s.parent.is_empty() {
+            inner_file_count += 1;
+        }
+        if source_types.contains(&s.file_type.as_str()) {
+            has_source_files = true;
+        }
+        if binary_like.contains(&s.file_type.as_str()) && has_source_files {
+            has_foreign_binaries = true;
+        }
 
-        let lines = s.metrics.get("text").and_then(|t| t.get("total_lines")).copied().unwrap_or(0.0);
+        let lines = s
+            .metrics
+            .get("text")
+            .and_then(|t| t.get("total_lines"))
+            .copied()
+            .unwrap_or(0.0);
         total_loc += lines as u64;
 
         if !s.path.is_empty() && s.path.contains('.') {
             if let Some(ext) = s.path.rsplit('.').next() {
-                if binary_like.contains(&s.file_type.as_str()) && text_exts.contains(&ext.to_ascii_lowercase().as_str()) {
+                if binary_like.contains(&s.file_type.as_str())
+                    && text_exts.contains(&ext.to_ascii_lowercase().as_str())
+                {
                     extension_mismatches += 1;
                 }
             }
         }
 
-        if let Some(t) = s.mtime { mtimes.push(t); }
-        if s.overall_entropy > 0.0 { entropies.push(s.overall_entropy); }
+        if let Some(t) = s.mtime {
+            mtimes.push(t);
+        }
+        if s.overall_entropy > 0.0 {
+            entropies.push(s.overall_entropy);
+        }
         max_entropy = max_entropy.max(s.overall_entropy);
 
         if s.findings.hostile_finding_count > 0 {
             hostile_files += 1;
-            if let Some(t) = s.mtime { hostile_mtimes.push(t); }
-            if !s.parent.is_empty() { hostile_files_with_parent += 1; }
+            if let Some(t) = s.mtime {
+                hostile_mtimes.push(t);
+            }
+            if !s.parent.is_empty() {
+                hostile_files_with_parent += 1;
+            }
         }
 
         let code_types = ["javascript", "python", "pe", "elf", "macho"];
@@ -1646,7 +2084,10 @@ fn write_structural_extensions(summaries: &[FileSummary], combined: &FindingSumm
         }
     }
 
-    w.set("struct:packaged_capability", (combined.sample_paths.len() as f64 * max_entropy) as f32);
+    w.set(
+        "struct:packaged_capability",
+        (combined.sample_paths.len() as f64 * max_entropy) as f32,
+    );
     if mtimes.len() > 1 {
         let mn = mtimes.iter().cloned().fold(f64::INFINITY, f64::min);
         let mx = mtimes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -1655,32 +2096,69 @@ fn write_structural_extensions(summaries: &[FileSummary], combined: &FindingSumm
         let var = mtimes.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / mtimes.len() as f64;
         w.set("struct:mtime_stddev_hours", (var.sqrt() / 3600.0) as f32);
     }
-    w.set("struct:max_nesting_depth_log", (max_nesting_depth as f32).ln_1p());
-    w.set("struct:inner_file_ratio", inner_file_count as f32 / summaries.len().max(1) as f32);
+    w.set(
+        "struct:max_nesting_depth_log",
+        (max_nesting_depth as f32).ln_1p(),
+    );
+    w.set(
+        "struct:inner_file_ratio",
+        inner_file_count as f32 / summaries.len().max(1) as f32,
+    );
     if entropies.len() > 1 {
         let mean = entropies.iter().sum::<f64>() / entropies.len() as f64;
-        let var = entropies.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / entropies.len() as f64;
+        let var =
+            entropies.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / entropies.len() as f64;
         w.set("struct:entropy_std_dev", var.sqrt() as f32);
         let mx = entropies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         w.set("struct:entropy_max_diff", (mx - mean) as f32);
     }
-    w.set("struct:air_gap_signal", f32::from(hostile_files > 0 && hostile_files_with_parent == 0));
+    w.set(
+        "struct:air_gap_signal",
+        f32::from(hostile_files > 0 && hostile_files_with_parent == 0),
+    );
     if !mtimes.is_empty() && !hostile_mtimes.is_empty() {
         let mut sorted = mtimes.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = if sorted.len() % 2 == 1 { sorted[sorted.len() / 2] }
-                     else { (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0 };
-        let max_delta = hostile_mtimes.iter().map(|t| (t - median).abs()).fold(0.0, f64::max);
-        w.set("struct:anachronistic_injection", (max_delta / 3600.0) as f32);
+        let median = if sorted.len() % 2 == 1 {
+            sorted[sorted.len() / 2]
+        } else {
+            (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let max_delta = hostile_mtimes
+            .iter()
+            .map(|t| (t - median).abs())
+            .fold(0.0, f64::max);
+        w.set(
+            "struct:anachronistic_injection",
+            (max_delta / 3600.0) as f32,
+        );
     }
     if !code_entropies.is_empty() {
-        let avg_ent = if entropies.is_empty() { 0.0 } else { entropies.iter().sum::<f64>() / entropies.len() as f64 };
-        let max_code_ent = code_entropies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let avg_ent = if entropies.is_empty() {
+            0.0
+        } else {
+            entropies.iter().sum::<f64>() / entropies.len() as f64
+        };
+        let max_code_ent = code_entropies
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         w.set("struct:code_entropy_spike", (max_code_ent - avg_ent) as f32);
     }
-    w.set("struct:foreign_binary_signal", f32::from(has_foreign_binaries));
-    w.set("struct:extension_mismatch_signal", extension_mismatches as f32);
-    if total_loc > 0 { w.set("struct:hostile_finding_density", (hostile_files as f32 * 1000.0) / total_loc as f32); }
+    w.set(
+        "struct:foreign_binary_signal",
+        f32::from(has_foreign_binaries),
+    );
+    w.set(
+        "struct:extension_mismatch_signal",
+        extension_mismatches as f32,
+    );
+    if total_loc > 0 {
+        w.set(
+            "struct:hostile_finding_density",
+            (hostile_files as f32 * 1000.0) / total_loc as f32,
+        );
+    }
 }
 
 fn canonical_fields_from_primary_file(file: Option<&serde_json::Value>) -> (String, String, i64) {
@@ -1708,26 +2186,68 @@ fn primary_file(report: &serde_json::Value) -> Option<&serde_json::Value> {
         .get("fs")
         .and_then(serde_json::Value::as_array)
         .and_then(|files| {
-            files
-                .iter()
-                .find(|file| file.get("dp").and_then(serde_json::Value::as_i64).unwrap_or(0) == 0)
+            files.iter().find(|file| {
+                file.get("dp")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0)
+                    == 0
+            })
         })
 }
 
-fn write_logic_gap_features(summary: &FindingSummary, summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
+fn write_logic_gap_features(
+    summary: &FindingSummary,
+    summaries: &[FileSummary],
+    w: &mut FeatureWriter<'_>,
+) {
     let logic_gaps: &[(&str, &[&str], &[&str])] = &[
-        ("crypto", &["cryptography", "Crypto", "hashlib", "CryptAcquireContext", "BCryptOpenAlgorithmProvider"], &["micro-behaviors/crypto", "metadata/encoded-payload"]),
-        ("network", &["socket", "urllib", "requests", "http", "curl", "wininet", "winhttp"], &["micro-behaviors/network", "objectives/command-and-control"]),
-        ("process", &["subprocess", "os.spawn", "os.system", "CreateProcess", "ShellExecute", "posix_spawn"], &["micro-behaviors/process/create", "objectives/execution"]),
+        (
+            "crypto",
+            &[
+                "cryptography",
+                "Crypto",
+                "hashlib",
+                "CryptAcquireContext",
+                "BCryptOpenAlgorithmProvider",
+            ],
+            &["micro-behaviors/crypto", "metadata/encoded-payload"],
+        ),
+        (
+            "network",
+            &[
+                "socket", "urllib", "requests", "http", "curl", "wininet", "winhttp",
+            ],
+            &["micro-behaviors/network", "objectives/command-and-control"],
+        ),
+        (
+            "process",
+            &[
+                "subprocess",
+                "os.spawn",
+                "os.system",
+                "CreateProcess",
+                "ShellExecute",
+                "posix_spawn",
+            ],
+            &["micro-behaviors/process/create", "objectives/execution"],
+        ),
     ];
 
     let mut all_imports: HashSet<&str> = HashSet::new();
-    for s in summaries { for imp in &s.imports { all_imports.insert(imp.as_str()); } }
+    for s in summaries {
+        for imp in &s.imports {
+            all_imports.insert(imp.as_str());
+        }
+    }
 
     for target_cat in LOGIC_GAP_CATEGORIES {
-        if let Some((_, imports_set, traits_set)) = logic_gaps.iter().find(|(c, _, _)| c == target_cat) {
+        if let Some((_, imports_set, traits_set)) =
+            logic_gaps.iter().find(|(c, _, _)| c == target_cat)
+        {
             let has_import = imports_set.iter().any(|imp| all_imports.contains(*imp));
-            let has_behavior = summary.sample_paths.iter().any(|(path, &max_ord)| max_ord >= 3 && traits_set.iter().any(|t| path.starts_with(t)));
+            let has_behavior = summary.sample_paths.iter().any(|(path, &max_ord)| {
+                max_ord >= 3 && traits_set.iter().any(|t| path.starts_with(t))
+            });
             if has_import && !has_behavior {
                 w.set(&format!("gap:{target_cat}"), 1.0);
             }
@@ -1736,25 +2256,52 @@ fn write_logic_gap_features(summary: &FindingSummary, summaries: &[FileSummary],
 }
 
 fn write_intent_gap_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
-    let intent_signal = summary.sample_paths.contains_key("metadata/package/documentation") || summary.sample_paths.contains_key("metadata/package/help");
+    let intent_signal = summary
+        .sample_paths
+        .contains_key("metadata/package/documentation")
+        || summary.sample_paths.contains_key("metadata/package/help");
     let risky: &[(&str, &[&str])] = &[
-        ("network", &["objectives/network", "micro-behaviors/network"]),
-        ("filesystem", &["objectives/persistence", "micro-behaviors/filesystem"]),
-        ("execution", &["objectives/execution", "micro-behaviors/process/create"]),
+        (
+            "network",
+            &["objectives/network", "micro-behaviors/network"],
+        ),
+        (
+            "filesystem",
+            &["objectives/persistence", "micro-behaviors/filesystem"],
+        ),
+        (
+            "execution",
+            &["objectives/execution", "micro-behaviors/process/create"],
+        ),
         ("crypto", &["objectives/crypto", "micro-behaviors/crypto"]),
     ];
     for target_cat in INTENT_GAP_CATEGORIES {
-        let traits = risky.iter().find(|(c, _)| c == target_cat).map(|(_, t)| *t).unwrap_or(&[]);
-        let has_behavior = summary.sample_paths.iter().any(|(path, &max_ord)| max_ord >= 4 && traits.iter().any(|t| path.starts_with(t)));
+        let traits = risky
+            .iter()
+            .find(|(c, _)| c == target_cat)
+            .map(|(_, t)| *t)
+            .unwrap_or(&[]);
+        let has_behavior = summary
+            .sample_paths
+            .iter()
+            .any(|(path, &max_ord)| max_ord >= 4 && traits.iter().any(|t| path.starts_with(t)));
         if has_behavior && !intent_signal {
             w.set(&format!("intent_gap:{target_cat}"), 1.0);
         }
     }
 }
 
-fn write_negative_space_features(summary: &FindingSummary, summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
+fn write_negative_space_features(
+    summary: &FindingSummary,
+    summaries: &[FileSummary],
+    w: &mut FeatureWriter<'_>,
+) {
     let mut present_types: HashSet<&str> = HashSet::new();
-    for s in summaries { if !s.file_type.is_empty() { present_types.insert(s.file_type.as_str()); } }
+    for s in summaries {
+        if !s.file_type.is_empty() {
+            present_types.insert(s.file_type.as_str());
+        }
+    }
     for &(ftype, traits) in EXPECTED_GHOSTS {
         for trait_path in traits {
             if present_types.contains(ftype) && !summary.sample_paths.contains_key(*trait_path) {
@@ -1765,11 +2312,26 @@ fn write_negative_space_features(summary: &FindingSummary, summaries: &[FileSumm
 }
 
 fn write_external_summary_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
-    w.set("ext:third_party_max_crit", summary.third_party_max_crit as f32);
-    w.set("ext:third_party_count", (summary.third_party_count as f32 + 1.0).ln());
-    w.set("ext:well_known_max_crit", summary.well_known_max_crit as f32);
-    w.set("ext:well_known_hostile_count", summary.well_known_hostile as f32);
-    w.set("ext:well_known_suspicious_count", summary.well_known_suspicious as f32);
+    w.set(
+        "ext:third_party_max_crit",
+        summary.third_party_max_crit as f32,
+    );
+    w.set(
+        "ext:third_party_count",
+        (summary.third_party_count as f32 + 1.0).ln(),
+    );
+    w.set(
+        "ext:well_known_max_crit",
+        summary.well_known_max_crit as f32,
+    );
+    w.set(
+        "ext:well_known_hostile_count",
+        summary.well_known_hostile as f32,
+    );
+    w.set(
+        "ext:well_known_suspicious_count",
+        summary.well_known_suspicious as f32,
+    );
     w.set("ext:has_yara_match", f32::from(summary.has_yara));
 }
 
@@ -1787,15 +2349,28 @@ fn merge_metric_summaries(summaries: &[FileSummary]) -> serde_json::Value {
     serde_json::to_value(&merged).unwrap_or(serde_json::Value::Null)
 }
 
-fn write_metric_features(metrics: &serde_json::Value, w: &mut FeatureWriter<'_>, metric_vocab: &[String]) {
-    let base_keys: HashSet<String> = KEY_METRICS.iter()
+fn write_metric_features(
+    metrics: &serde_json::Value,
+    w: &mut FeatureWriter<'_>,
+    metric_vocab: &[String],
+) {
+    let base_keys: HashSet<String> = KEY_METRICS
+        .iter()
         .map(|&(g, f, _)| format!("{g}_{f}"))
         .collect();
 
     // Base KEY_METRICS with explicit log transforms.
     for &(group, field_name, use_log) in KEY_METRICS {
-        let value = metrics.get(group).and_then(|g| g.get(field_name)).and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
-        let val = if use_log { (value.abs() + 1.0).ln() } else { value };
+        let value = metrics
+            .get(group)
+            .and_then(|g| g.get(field_name))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        let val = if use_log {
+            (value.abs() + 1.0).ln()
+        } else {
+            value
+        };
         w.set(&format!("metrics:{group}_{field_name}"), val);
     }
 
@@ -1803,20 +2378,32 @@ fn write_metric_features(metrics: &serde_json::Value, w: &mut FeatureWriter<'_>,
     for mk in metric_vocab {
         let parts: Vec<&str> = mk.splitn(2, '_').collect();
         if parts.len() == 2 && !base_keys.contains(mk.as_str()) {
-            let value = metrics.get(parts[0])
+            let value = metrics
+                .get(parts[0])
                 .and_then(|g| g.get(parts[1]))
-                .and_then(|v| v.as_f64().or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 })))
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 }))
+                })
                 .unwrap_or(0.0) as f32;
             let use_log = ["count", "size", "total", "bytes", "length"]
                 .iter()
                 .any(|word| parts[1].contains(word));
-            let val = if use_log { (value.abs() + 1.0).ln() } else { value };
+            let val = if use_log {
+                (value.abs() + 1.0).ln()
+            } else {
+                value
+            };
             w.set(&format!("metrics:{mk}"), val);
         }
     }
 }
 
-fn write_structural_features(w: &mut FeatureWriter<'_>, summaries: &[FileSummary], filtered_finding_count: u32) {
+fn write_structural_features(
+    w: &mut FeatureWriter<'_>,
+    summaries: &[FileSummary],
+    filtered_finding_count: u32,
+) {
     let binary_like = ["pe", "elf", "macho"];
     let mut any_tiny_binary = false;
     let mut import_candidates = 0;
@@ -1826,33 +2413,65 @@ fn write_structural_features(w: &mut FeatureWriter<'_>, summaries: &[FileSummary
     let mut hostile_files = 0;
 
     for s in summaries {
-        if binary_like.contains(&s.file_type.as_str()) && s.size_bytes < 20_000.0 { any_tiny_binary = true; }
+        if binary_like.contains(&s.file_type.as_str()) && s.size_bytes < 20_000.0 {
+            any_tiny_binary = true;
+        }
         if s.has_imports_key {
             import_candidates += 1;
-            if s.imports.is_empty() { importless_candidates += 1; }
+            if s.imports.is_empty() {
+                importless_candidates += 1;
+            }
         }
         max_entropy = max_entropy.max(s.overall_entropy);
-        if s.findings.suspicious_finding_count > 0 { suspicious_files += 1; }
-        if s.findings.hostile_finding_count > 0 { hostile_files += 1; }
+        if s.findings.suspicious_finding_count > 0 {
+            suspicious_files += 1;
+        }
+        if s.findings.hostile_finding_count > 0 {
+            hostile_files += 1;
+        }
     }
 
     w.set("struct:tiny_executable", f32::from(any_tiny_binary));
-    w.set("struct:no_imports", f32::from(import_candidates > 0 && importless_candidates == import_candidates));
+    w.set(
+        "struct:no_imports",
+        f32::from(import_candidates > 0 && importless_candidates == import_candidates),
+    );
     w.set("struct:no_findings", f32::from(filtered_finding_count == 0));
-    w.set("struct:finding_count_log", (filtered_finding_count as f32 + 1.0).ln());
+    w.set(
+        "struct:finding_count_log",
+        (filtered_finding_count as f32 + 1.0).ln(),
+    );
     let file_count = summaries.len() as f32;
     w.set("struct:file_count_log", (file_count + 1.0).ln());
-    w.set("struct:inner_file_count_log", ((file_count - 1.0).max(0.0) + 1.0).ln());
-    w.set("struct:stealth_potential", f32::from(filtered_finding_count < 5 && max_entropy > 6.5));
+    w.set(
+        "struct:inner_file_count_log",
+        ((file_count - 1.0).max(0.0) + 1.0).ln(),
+    );
+    w.set(
+        "struct:stealth_potential",
+        f32::from(filtered_finding_count < 5 && max_entropy > 6.5),
+    );
     let denom = summaries.len().max(1) as f32;
-    w.set("struct:suspicious_file_fraction", suspicious_files as f32 / denom);
+    w.set(
+        "struct:suspicious_file_fraction",
+        suspicious_files as f32 / denom,
+    );
     w.set("struct:hostile_file_fraction", hostile_files as f32 / denom);
-    w.set("struct:suspicious_file_count_log", (suspicious_files as f32).ln_1p());
-    w.set("struct:hostile_file_count_log", (hostile_files as f32).ln_1p());
+    w.set(
+        "struct:suspicious_file_count_log",
+        (suspicious_files as f32).ln_1p(),
+    );
+    w.set(
+        "struct:hostile_file_count_log",
+        (hostile_files as f32).ln_1p(),
+    );
 }
 
 fn report_files(report: &serde_json::Value) -> Vec<&serde_json::Value> {
-    report["fs"].as_array().map(|a| a.iter().collect()).unwrap_or_default()
+    report["fs"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default()
 }
 
 fn finding_paths(finding_id: &str) -> FindingPaths<'_> {
@@ -1861,7 +2480,9 @@ fn finding_paths(finding_id: &str) -> FindingPaths<'_> {
     let mut n_slashes = 0;
     for (i, ch) in base.char_indices() {
         if ch == '/' {
-            if n_slashes < 2 { slash_ends[n_slashes] = i; }
+            if n_slashes < 2 {
+                slash_ends[n_slashes] = i;
+            }
             n_slashes += 1;
         }
     }
@@ -1869,12 +2490,26 @@ fn finding_paths(finding_id: &str) -> FindingPaths<'_> {
         let mut count = 0;
         let mut pos = base.len();
         for (i, ch) in base.char_indices() {
-            if ch == '/' { count += 1; if count == 3 { pos = i; break; } }
+            if ch == '/' {
+                count += 1;
+                if count == 3 {
+                    pos = i;
+                    break;
+                }
+            }
         }
         pos
-    } else { base.len() };
+    } else {
+        base.len()
+    };
 
-    FindingPaths { base, slash_ends, n_slashes: n_slashes.min(2), third_end, step: 0 }
+    FindingPaths {
+        base,
+        slash_ends,
+        n_slashes: n_slashes.min(2),
+        third_end,
+        step: 0,
+    }
 }
 
 struct FindingPaths<'a> {
@@ -1892,8 +2527,16 @@ impl<'a> Iterator for FindingPaths<'a> {
     #[allow(clippy::string_slice)]
     fn next(&mut self) -> Option<Self::Item> {
         let result = match self.step {
-            0 => Some(if self.n_slashes >= 1 { &self.base[..self.slash_ends[0]] } else { self.base }),
-            1 if self.n_slashes >= 1 => Some(if self.n_slashes >= 2 { &self.base[..self.slash_ends[1]] } else { self.base }),
+            0 => Some(if self.n_slashes >= 1 {
+                &self.base[..self.slash_ends[0]]
+            } else {
+                self.base
+            }),
+            1 if self.n_slashes >= 1 => Some(if self.n_slashes >= 2 {
+                &self.base[..self.slash_ends[1]]
+            } else {
+                self.base
+            }),
             2 if self.n_slashes >= 2 => Some(&self.base[..self.third_end]),
             _ => return None,
         };
@@ -1907,16 +2550,28 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn paths(id: &str) -> Vec<&str> { finding_paths(id).collect() }
+    fn paths(id: &str) -> Vec<&str> {
+        finding_paths(id).collect()
+    }
 
     #[test]
     fn test_finding_paths_deep() {
-        assert_eq!(paths("objectives/evasion/process/injection::technique-x"), vec!["objectives", "objectives/evasion", "objectives/evasion/process"]);
+        assert_eq!(
+            paths("objectives/evasion/process/injection::technique-x"),
+            vec![
+                "objectives",
+                "objectives/evasion",
+                "objectives/evasion/process"
+            ]
+        );
     }
 
     #[test]
     fn test_finding_paths_two_levels() {
-        assert_eq!(paths("metadata/format::no-functions"), vec!["metadata", "metadata/format"]);
+        assert_eq!(
+            paths("metadata/format::no-functions"),
+            vec!["metadata", "metadata/format"]
+        );
     }
 
     #[test]
@@ -1934,12 +2589,29 @@ mod tests {
     #[test]
     fn test_standardize() {
         let spec = FeatureSpec {
-            version: 16, abi_version: 16, presence_vocab: vec![], filetype_vocab: vec![], element_vocab: vec![], bigram_vocab: vec![], ghost_vocab: vec![], skeleton_vocab: vec![], rare_element_vocab: vec![], trigram_vocab: vec![], metric_vocab: vec![],
-            crit_unigram_vocab: vec![], crit_bigram_vocab: vec![], crit_trigram_vocab: vec![],
-            attack_bigram_vocab: vec![], attack_trigram_vocab: vec![],
-            mbc_bigram_vocab: vec![], mbc_trigram_vocab: vec![],
-            feature_names: vec![], total_features: 3,
-            feature_means: Some(vec![0.0, 1.0, 2.0]), feature_stds: Some(vec![1.0, 2.0, 0.5]), standardized: true,
+            version: 16,
+            abi_version: 16,
+            presence_vocab: vec![],
+            filetype_vocab: vec![],
+            element_vocab: vec![],
+            bigram_vocab: vec![],
+            ghost_vocab: vec![],
+            skeleton_vocab: vec![],
+            rare_element_vocab: vec![],
+            trigram_vocab: vec![],
+            metric_vocab: vec![],
+            crit_unigram_vocab: vec![],
+            crit_bigram_vocab: vec![],
+            crit_trigram_vocab: vec![],
+            attack_bigram_vocab: vec![],
+            attack_trigram_vocab: vec![],
+            mbc_bigram_vocab: vec![],
+            mbc_trigram_vocab: vec![],
+            feature_names: vec![],
+            total_features: 3,
+            feature_means: Some(vec![0.0, 1.0, 2.0]),
+            feature_stds: Some(vec![1.0, 2.0, 0.5]),
+            standardized: true,
         };
         let mut features = vec![1.0, 3.0, 3.0];
         spec.standardize(&mut features);
@@ -1952,7 +2624,9 @@ mod tests {
     fn test_load_rejects_missing_feature_names() -> Result<()> {
         let mut file = tempfile::NamedTempFile::new()?;
         writeln!(file, "{{\"version\":16,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"total_features\":51,\"standardized\":false}}")?;
-        let Err(err) = FeatureSpec::load(file.path()) else { anyhow::bail!("missing feature_names should be rejected"); };
+        let Err(err) = FeatureSpec::load(file.path()) else {
+            anyhow::bail!("missing feature_names should be rejected");
+        };
         assert!(err.to_string().contains("feature_names length"));
         Ok(())
     }

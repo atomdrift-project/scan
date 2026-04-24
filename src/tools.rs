@@ -19,7 +19,11 @@ pub struct MissingTool {
 
 impl fmt::Display for MissingTool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})\n  install: {}", self.name, self.purpose, self.install)
+        write!(
+            f,
+            "{} ({})\n  install: {}",
+            self.name, self.purpose, self.install
+        )
     }
 }
 
@@ -31,11 +35,18 @@ pub fn missing() -> Vec<MissingTool> {
     let mut absent: Vec<MissingTool> = TOOLS
         .iter()
         .filter(|&&(name, _, _)| !bin_available(name))
-        .map(|&(name, purpose, install)| MissingTool { name, purpose, install })
+        .map(|&(name, purpose, install)| MissingTool {
+            name,
+            purpose,
+            install,
+        })
         .collect();
 
     // 7-Zip ships under several binary names depending on the platform.
-    if !["7z", "7za", "7zz", "7zr"].iter().any(|&n| bin_available(n)) {
+    if !["7z", "7za", "7zz", "7zr"]
+        .iter()
+        .any(|&n| bin_available(n))
+    {
         absent.push(MissingTool {
             name: "7z",
             purpose: "7-Zip / CAB / tar archive extraction",
@@ -77,7 +88,9 @@ pub fn enrich_error(err: &anyhow::Error) -> Option<String> {
     }
     for &(name, _, install) in TOOLS {
         if msg.contains(name) {
-            return Some(format!("{msg}\n  hint: {name} is not installed — {install}"));
+            return Some(format!(
+                "{msg}\n  hint: {name} is not installed — {install}"
+            ));
         }
     }
     for variant in ["7z", "7za", "7zz", "7zr", "p7zip"] {
@@ -113,7 +126,9 @@ const TOOLS: &[(&str, &str, &str)] = &[
 /// Uses a PATH lookup rather than spawning the binary, so this never blocks
 /// even if the binary has a slow or hanging startup (e.g. rizin loading plugins).
 fn bin_available(name: &str) -> bool {
-    let Ok(path_var) = std::env::var("PATH") else { return false };
+    let Ok(path_var) = std::env::var("PATH") else {
+        return false;
+    };
     std::env::split_paths(&path_var).any(|dir| {
         let candidate = dir.join(name);
         candidate.is_file()

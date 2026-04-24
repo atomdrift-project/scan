@@ -1,6 +1,9 @@
 //! litmus — ML-powered malware classification CLI.
 
-#[cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd"))
+))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -289,8 +292,9 @@ fn main() -> Result<()> {
 
     // Dump all thread backtraces on SIGUSR1 (Linux equivalent of BSD SIGINFO / Ctrl-T).
     // Attaches lldb/gdb to ourselves so every thread is reported with symbols.
+    // Best-effort: if spawning fails we simply don't get backtraces on signal.
     #[cfg(unix)]
-    std::thread::Builder::new()
+    let _sigusr1_thread = std::thread::Builder::new()
         .name("sigusr1".into())
         .spawn(|| {
             use std::io::Write;
@@ -312,8 +316,15 @@ fn main() -> Result<()> {
                 );
                 let lldb = Command::new("lldb")
                     .args([
-                        "--batch", "-p", &pid, "-o", "thread backtrace all", "-o", "detach",
-                        "-o", "quit",
+                        "--batch",
+                        "-p",
+                        &pid,
+                        "-o",
+                        "thread backtrace all",
+                        "-o",
+                        "detach",
+                        "-o",
+                        "quit",
                     ])
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
@@ -321,8 +332,16 @@ fn main() -> Result<()> {
                 if !matches!(lldb, Ok(s) if s.success()) {
                     let _ = Command::new("gdb")
                         .args([
-                            "-batch", "-nx", "-p", &pid, "-ex", "thread apply all bt", "-ex",
-                            "detach", "-ex", "quit",
+                            "-batch",
+                            "-nx",
+                            "-p",
+                            &pid,
+                            "-ex",
+                            "thread apply all bt",
+                            "-ex",
+                            "detach",
+                            "-ex",
+                            "quit",
                         ])
                         .stdout(Stdio::inherit())
                         .stderr(Stdio::inherit())
@@ -330,8 +349,7 @@ fn main() -> Result<()> {
                 }
                 let _ = writeln!(std::io::stderr(), "--- end backtrace ---\n");
             }
-        })
-        .expect("failed to spawn sigusr1 thread");
+        });
 
     #[cfg(debug_assertions)]
     tracing::warn!(
@@ -638,7 +656,9 @@ fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litm
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    { summary.duration_ms = started.elapsed().as_millis() as u64; }
+    {
+        summary.duration_ms = started.elapsed().as_millis() as u64;
+    }
     Ok(summary)
 }
 

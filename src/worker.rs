@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use crate::model::{Model, Thresholds};
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
+use crate::model::{Model, Thresholds};
 use crate::server::{classify_bytes, classify_file, ModelResources};
 
 #[derive(Debug, Clone)]
@@ -193,7 +193,12 @@ impl LocalFileIndex {
         })
     }
 
-    fn resolve(&self, requested_path: &str, sha256: &str, size_bytes: i64) -> Result<Option<PathBuf>> {
+    fn resolve(
+        &self,
+        requested_path: &str,
+        sha256: &str,
+        size_bytes: i64,
+    ) -> Result<Option<PathBuf>> {
         // Decode once at the boundary; all internal state is raw [u8; 32].
         let Some(expected) = sha256_from_hex(sha256) else {
             anyhow::bail!("expected 64-char hex sha256, got {:?}", sha256);
@@ -233,7 +238,10 @@ impl LocalFileIndex {
             }
         }
 
-        let basename = requested.file_name().and_then(|n| n.to_str()).unwrap_or(requested_path);
+        let basename = requested
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(requested_path);
         let parent_name = requested
             .parent()
             .and_then(Path::file_name)
@@ -246,9 +254,9 @@ impl LocalFileIndex {
         if let Some(indexed) = self.by_name.get(&key) {
             let expected_size = u64::try_from(size_bytes).ok();
             candidates.extend(indexed.iter().copied().filter(|id| {
-                self.files.get(*id as usize).is_some_and(|entry| {
-                    expected_size.is_none_or(|size| entry.size == size)
-                })
+                self.files
+                    .get(*id as usize)
+                    .is_some_and(|entry| expected_size.is_none_or(|size| entry.size == size))
             }));
         }
 
@@ -312,7 +320,10 @@ impl LocalFileIndex {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        let key = LocalNameKey { parent_name, basename };
+        let key = LocalNameKey {
+            parent_name,
+            basename,
+        };
         let candidates = self.by_name.get(&key)?;
         candidates
             .iter()
@@ -458,6 +469,9 @@ pub(crate) struct WorkerPools {
 
 impl WorkerPools {
     /// Build `slots` pools, each sized `threads_per_slot`.
+    ///
+    /// Panics if rayon pool construction fails (OOM at startup).
+    #[allow(clippy::expect_used)]
     pub(crate) fn new(slots: usize, threads_per_slot: usize) -> Arc<Self> {
         let slots = slots.max(1);
         let threads_per_slot = threads_per_slot.max(1);
@@ -481,6 +495,10 @@ impl WorkerPools {
     /// Run `f` on a pool from the free-list, passing the slot index so callers
     /// can correlate logs with the `cleave-N-M` rayon thread names visible in
     /// stack samples.
+    ///
+    /// Panics if the pool mutex is poisoned (another worker panicked while
+    /// holding the lock) — in that case the process state is unrecoverable.
+    #[allow(clippy::expect_used)]
     pub(crate) fn install<T, F>(&self, f: F) -> T
     where
         F: FnOnce(usize) -> T + Send,
@@ -646,8 +664,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // recursion to a single top-level par_iter — is the durable fix but
     // lives upstream.
     const MIN_THREADS_PER_SLOT: usize = 4;
-    let threads_per_slot =
-        (rayon::current_num_threads() / slots.max(1)).max(MIN_THREADS_PER_SLOT);
+    let threads_per_slot = (rayon::current_num_threads() / slots.max(1)).max(MIN_THREADS_PER_SLOT);
     let pools = WorkerPools::new(slots, threads_per_slot);
 
     tracing::info!(
@@ -670,8 +687,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // pool. See cleave::shared_resources::yara_engine for the contract.
     cleave::prefetch_shared_resources(true);
 
-    let model = Model::load(&config.model_dir, config.thresholds)
-        .context("loading model")?;
+    let model = Model::load(&config.model_dir, config.thresholds).context("loading model")?;
     let shap = ShapImportance::load(&config.model_dir).ok();
     let ctx = ExtractContext::new(model.spec());
     let resources = Arc::new(ModelResources {
@@ -701,16 +717,21 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
     let mut buffer: VecDeque<PrefetchedJob> = VecDeque::new();
     let mut buffer_bytes: usize = 0; // track memory held by prefetched data
-    let max_buffer_bytes: usize = if cleave::memory_tracker::total_memory().unwrap_or(0) >= 16 * 1024 * 1024 * 1024 {
-        1024 * 1024 * 1024 // 1 GiB on systems with >= 16 GiB RAM
-    } else {
-        512 * 1024 * 1024  // 512 MiB otherwise
-    };
+    let max_buffer_bytes: usize =
+        if cleave::memory_tracker::total_memory().unwrap_or(0) >= 16 * 1024 * 1024 * 1024 {
+            1024 * 1024 * 1024 // 1 GiB on systems with >= 16 GiB RAM
+        } else {
+            512 * 1024 * 1024 // 512 MiB otherwise
+        };
     // With local data, there's no download latency to hide — just claim
     // what we can run immediately. Without local data, prefetch 3x slots
     // so downloads overlap with analysis.
     let has_local_data = data_dir.is_some();
-    let prefetch_count = if has_local_data { slots } else { (slots * 3).min(32) };
+    let prefetch_count = if has_local_data {
+        slots
+    } else {
+        (slots * 3).min(32)
+    };
     let mut last_empty_poll = Instant::now() - Duration::from_secs(poll_secs + 1);
     let mut last_summary = Instant::now();
 
@@ -801,12 +822,24 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             // without a size still download but are bounded by the client
             // timeout and the outer `buffer_bytes` gate.
             let max_single_bytes = max_buffer_bytes / 2;
-            match claim_and_prefetch(&client, &poll_url, &base_url, data_dir.as_deref(), max_single_bytes).await {
+            match claim_and_prefetch(
+                &client,
+                &poll_url,
+                &base_url,
+                data_dir.as_deref(),
+                max_single_bytes,
+            )
+            .await
+            {
                 Ok(None) => {
                     consecutive_errors = 0;
                     last_empty_poll = Instant::now();
                     if buffer.is_empty() {
-                        tracing::debug!(elapsed_ms = crate::duration_ms(poll_start.elapsed()), poll_secs, "no work available, sleeping");
+                        tracing::debug!(
+                            elapsed_ms = crate::duration_ms(poll_start.elapsed()),
+                            poll_secs,
+                            "no work available, sleeping"
+                        );
                         interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
                         continue;
                     }
@@ -816,7 +849,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     consecutive_errors = 0;
                     let n = jobs.len();
                     for pj in jobs {
-                        buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, Vec::len));
+                        buffer_bytes += pj
+                            .data
+                            .as_ref()
+                            .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
                         buffer.push_back(pj);
                     }
                     tracing::debug!(
@@ -842,7 +878,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         // Dispatch the next prefetched job when a slot is free.
         let pj = match buffer.pop_front() {
             Some(pj) => {
-                buffer_bytes -= pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, Vec::len));
+                buffer_bytes -= pj
+                    .data
+                    .as_ref()
+                    .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
                 pj
             }
             None => {
@@ -878,7 +917,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     }
                     interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
                     // Put the job back at the front of the buffer.
-                    buffer_bytes += pj.data.as_ref().map_or(0, |d| d.as_ref().map_or(0, Vec::len));
+                    buffer_bytes += pj
+                        .data
+                        .as_ref()
+                        .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
                     buffer.push_front(pj);
                     continue;
                 }
@@ -895,9 +937,16 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
         tokio::spawn(async move {
             let result = run_job(
-                &client, &url, local_index.as_deref(), &pj.job, &resources,
-                slow_rule_ms, pj.data, &pools,
-            ).await;
+                &client,
+                &url,
+                local_index.as_deref(),
+                &pj.job,
+                &resources,
+                slow_rule_ms,
+                pj.data,
+                &pools,
+            )
+            .await;
             if let Err(ref e) = result {
                 tracing::warn!(
                     sha256 = %pj.job.sha256,
@@ -987,7 +1036,10 @@ async fn claim_and_prefetch(
                 "file size {} exceeds per-job prefetch cap of {} bytes",
                 job.size_bytes, max_single_bytes,
             ));
-            oversized.push(PrefetchedJob { job, data: Err(err) });
+            oversized.push(PrefetchedJob {
+                job,
+                data: Err(err),
+            });
             continue;
         }
         let client = client.clone();
@@ -1022,6 +1074,7 @@ async fn claim_and_prefetch(
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
 /// Resolves the job against the local data index if provided. If the file
 /// isn't accessible locally (or SHA256 doesn't match), downloads from hopper.
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
     client: &reqwest::Client,
     base_url: &str,
@@ -1261,7 +1314,8 @@ async fn run_job(
         pools_for_blocking.install(|slot| {
             let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
             let thread_id = os_thread_id();
-            let inflight_blocking = started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
+            let inflight_blocking =
+                started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
             tracing::info!(
                 analysis_id,
                 sha256 = %sha_short2,
@@ -1274,11 +1328,28 @@ async fn run_job(
                 "analysis starting on rayon slot",
             );
             let result = if let Some(data) = downloaded {
-                classify_bytes(data, &label_for_blocking, &resources, slow_rule_ms, Some(&cancel2), Some(&phase))
+                classify_bytes(
+                    data,
+                    &label_for_blocking,
+                    &resources,
+                    slow_rule_ms,
+                    Some(&cancel2),
+                    Some(&phase),
+                )
             } else if let Some(path) = local.as_ref() {
-                classify_file(path, &label_for_blocking, &resources, slow_rule_ms, None, Some(&cancel2), Some(&phase))
+                classify_file(
+                    path,
+                    &label_for_blocking,
+                    &resources,
+                    slow_rule_ms,
+                    None,
+                    Some(&cancel2),
+                    Some(&phase),
+                )
             } else {
-                Err(anyhow::anyhow!("no downloaded bytes and no local path for {label_for_blocking}"))
+                Err(anyhow::anyhow!(
+                    "no downloaded bytes and no local path for {label_for_blocking}"
+                ))
             };
             let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
             let inflight_blocking = BLOCKING_STARTED_TOTAL
@@ -1339,16 +1410,14 @@ async fn post_result(
                 duration_ms,
             }
         }
-        Err(e) => {
-            ResultPayload {
-                sha256: sha256.to_string(),
-                worker: worker.to_string(),
-                ml: None,
-                raw: None,
-                error: Some(e),
-                duration_ms: 0,
-            }
-        }
+        Err(e) => ResultPayload {
+            sha256: sha256.to_string(),
+            worker: worker.to_string(),
+            ml: None,
+            raw: None,
+            error: Some(e),
+            duration_ms: 0,
+        },
     };
 
     let url = format!("{}/api/result", url);
@@ -1388,7 +1457,9 @@ async fn download_bytes(
     path: &str,
 ) -> Result<Vec<u8>, String> {
     if path.is_empty() || path == "." {
-        return Err(format!("download {sha256}: empty path from hopper, cannot fetch"));
+        return Err(format!(
+            "download {sha256}: empty path from hopper, cannot fetch"
+        ));
     }
 
     let start = Instant::now();
@@ -1409,10 +1480,17 @@ async fn download_bytes(
         url_encode_into(segment, &mut data_url);
     }
     tracing::debug!(sha256 = %sha256, url = %data_url, "downloading via /data/");
-    let resp = client.get(&data_url).send().await.map_err(|e| format!("download {path}: {e}"))?;
+    let resp = client
+        .get(&data_url)
+        .send()
+        .await
+        .map_err(|e| format!("download {path}: {e}"))?;
 
     if resp.status().is_success() {
-        let bytes = resp.bytes().await.map_err(|e| format!("download {path}: read body: {e}"))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("download {path}: read body: {e}"))?;
         tracing::info!(
             sha256 = %sha256,
             file = %path,
@@ -1429,12 +1507,22 @@ async fn download_bytes(
     // data root (e.g. different symlink resolution or data root migration).
     let api_url = format!("{base_url}/api/file/{sha256}");
     tracing::debug!(sha256 = %sha256, url = %api_url, "downloading via /api/file/ (fallback)");
-    let resp = client.get(&api_url).send().await.map_err(|e| format!("download {sha256}: {e}"))?;
+    let resp = client
+        .get(&api_url)
+        .send()
+        .await
+        .map_err(|e| format!("download {sha256}: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("download {path}: /data/ HTTP {data_status}, /api/file/ HTTP {}", resp.status()));
+        return Err(format!(
+            "download {path}: /data/ HTTP {data_status}, /api/file/ HTTP {}",
+            resp.status()
+        ));
     }
-    let bytes = resp.bytes().await.map_err(|e| format!("download {sha256}: read body: {e}"))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("download {sha256}: read body: {e}"))?;
     tracing::info!(
         sha256 = %sha256,
         file = %path,
@@ -1497,7 +1585,12 @@ fn os_thread_id() -> u64 {
 
 /// Returns the 1-minute system load average, or None on unsupported platforms.
 fn system_load_avg() -> Option<f64> {
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    ))]
     {
         let mut avg: [libc::c_double; 1] = [0.0];
         let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
@@ -1507,7 +1600,12 @@ fn system_load_avg() -> Option<f64> {
             None
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )))]
     {
         None
     }

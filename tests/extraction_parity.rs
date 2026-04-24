@@ -200,10 +200,7 @@ fn full_pipeline_matches_collimator() {
                     n = divergences.len()
                 );
                 for &(j, rv, pv, diff) in divergences.iter().take(10) {
-                    let name = fixture
-                        .feature_names
-                        .get(j)
-                        .map_or("?", String::as_str);
+                    let name = fixture.feature_names.get(j).map_or("?", String::as_str);
                     msg.push_str(&format!(
                         "  [{j}] {name}: rust={rv:.6} python={pv:.6} diff={diff:.2e}\n"
                     ));

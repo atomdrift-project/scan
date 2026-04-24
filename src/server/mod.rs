@@ -17,8 +17,8 @@ mod acl;
 mod handlers;
 
 pub use acl::{parse_cidr_list, Cidr};
-pub(crate) use handlers::classify_file;
 pub(crate) use handlers::classify_bytes;
+pub(crate) use handlers::classify_file;
 
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
@@ -354,7 +354,12 @@ impl RequestGuard {
         cancellation: Arc<AtomicBool>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
-        Self { request_id, state, cancellation, _permit: permit }
+        Self {
+            request_id,
+            state,
+            cancellation,
+            _permit: permit,
+        }
     }
 }
 
@@ -653,10 +658,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         .route("/analyze", post(handlers::analyze))
         .route("/analyze-path", post(handlers::analyze_path))
         .layer(DefaultBodyLimit::max(config.max_body_size()))
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            acl::acl,
-        ))
+        .layer(middleware::from_fn_with_state(Arc::clone(&state), acl::acl))
         .with_state(state);
 
     Ok(app)

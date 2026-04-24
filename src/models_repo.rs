@@ -63,8 +63,12 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
             missing.join(", "),
         );
         std::thread::sleep(std::time::Duration::from_secs(30));
-        std::fs::remove_dir_all(&data_dir)
-            .with_context(|| format!("failed to remove incomplete models at {}", data_dir.display()))?;
+        std::fs::remove_dir_all(&data_dir).with_context(|| {
+            format!(
+                "failed to remove incomplete models at {}",
+                data_dir.display()
+            )
+        })?;
     } else {
         eprintln!("First run: downloading litmus models...");
     }
@@ -210,7 +214,10 @@ fn ensure_repo(base: &Path) -> Result<bool> {
             base.display()
         )
     })?;
-    eprintln!("Models ready ({}).", git_cmd::short_head(base).unwrap_or_default());
+    eprintln!(
+        "Models ready ({}).",
+        git_cmd::short_head(base).unwrap_or_default()
+    );
     Ok(true)
 }
 
@@ -223,7 +230,10 @@ fn has_models(path: &Path) -> bool {
 
 fn clone_repo(target: &Path) -> std::io::Result<()> {
     Command::new("git").arg("--version").output().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, format!("git is not installed or not in PATH: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("git is not installed or not in PATH: {e}"),
+        )
     })?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -264,7 +274,6 @@ fn is_git_repo(path: &Path) -> bool {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     resolved.join(".git").exists()
 }
-
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
