@@ -17,7 +17,6 @@
 //!     Some(Thresholds::default()),
 //!     DisplayFilter::all(),
 //!     4_000,
-//!     None,
 //!     false,
 //! )?;
 //!

@@ -504,6 +504,21 @@ fn main() -> Result<()> {
             if let Some(ref p) = traits_dir {
                 std::env::set_var("CLEAVE_TRAITS_DIR", p);
             }
+            // Refresh models and traits at startup so long-lived workers pick up
+            // new rules on each restart. Failures are non-fatal — a worker in a
+            // disconnected environment must still start with whatever is on disk.
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    if let Err(e) = litmus::models_repo::update() {
+                        eprintln!("Warning: model update failed: {e}");
+                    }
+                });
+                s.spawn(|| {
+                    if let Err(e) = litmus::traits_repo::update(false) {
+                        eprintln!("Warning: traits update failed: {e}");
+                    }
+                });
+            });
             let model_dir = resolve_model_dir()?;
             let workers = workers.unwrap_or_else(default_workers);
             let name = name.unwrap_or_else(|| {
