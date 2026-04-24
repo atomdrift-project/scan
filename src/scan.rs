@@ -674,7 +674,11 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     let ctrlc_flag = Arc::clone(&cancellation);
     let _ = ctrlc::set_handler(move || {
         if ctrlc_flag.load(Ordering::Relaxed) {
-            // Second ctrl-c: hard exit.
+            // Second ctrl-c: reap rizin workers, then hard exit. Cleave runs
+            // each rizin in its own process group, so SIGINT on the terminal
+            // never reaches them — without an explicit SIGKILL here, every
+            // in-flight child would outlive us as an orphan.
+            cleave::kill_all_rizin_groups();
             std::process::exit(130);
         }
         eprintln!("\nInterrupted — finishing current file…");
