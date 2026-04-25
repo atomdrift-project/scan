@@ -78,8 +78,8 @@ if ! command -v cargo >/dev/null 2>&1; then
     log "Installing Rust toolchain"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
         || die "rustup install failed"
+    . "$HOME/.cargo/env"
 fi
-. "$HOME/.cargo/env"
 
 # --- Build (as the invoking user) ------------------------------------------
 
