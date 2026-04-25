@@ -497,9 +497,34 @@ fn main() -> Result<()> {
                     }
                 }
             } else {
-                if let Err(e) = litmus::models_repo::update() {
-                    eprintln!("Error updating models: {e}");
-                    process::exit(1);
+                // Pull models, then validate the new bundle by attempting to load it.
+                // If the load fails we roll the on-disk repo back to the prior commit
+                // so future invocations (and litmus workers that pull on startup)
+                // see the last-known-good state rather than the broken one.
+                let prev_models_head = match litmus::models_repo::update() {
+                    Ok(prev) => prev,
+                    Err(e) => {
+                        eprintln!("Error updating models: {e}");
+                        process::exit(1);
+                    }
+                };
+                if let Some(prev) = prev_models_head.as_deref() {
+                    match litmus::models_repo::model_dir() {
+                        Ok(dir) => {
+                            if let Err(load_err) = litmus::model::Model::load(&dir, None) {
+                                eprintln!("Pulled models failed to load: {load_err}");
+                                eprintln!("Rolling back to {prev}...");
+                                if let Err(rb) = litmus::models_repo::rollback(prev) {
+                                    eprintln!("Rollback to {prev} failed: {rb}");
+                                }
+                                process::exit(1);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error resolving model directory for validation: {e}");
+                            process::exit(1);
+                        }
+                    }
                 }
                 if !models_only {
                     if let Err(e) = litmus::traits_repo::update(false) {
