@@ -1,14 +1,3 @@
 #!/bin/sh
-# uninstall-ubuntu.sh - Remove litmus worker persistence on Ubuntu
-set -ex
-
-die() { echo "error: $*" >&2; exit 1; }
-log() { echo "==> $*"; }
-
-log "Removing cron entry"
-(crontab -l 2>/dev/null | grep -v "litmus worker" || true) | crontab -
-
-log "Killing any remaining processes"
-pkill -x litmus 2>/dev/null || true
-
-log "Uninstall complete"
+# Deprecated wrapper. Uninstall logic moved to uninstall-linux.sh.
+exec "$(dirname "$0")/uninstall-linux.sh" "$@"

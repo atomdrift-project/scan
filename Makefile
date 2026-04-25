@@ -5,6 +5,14 @@ BUILD ?= build
 SERVER_RUN ?= litmus
 WORKER_RUN ?= litworker
 DATASET ?= slow
+
+# Truthy ("1") iff the user explicitly passed BUILD or WORKER_RUN on the make
+# command line or via the environment, rather than inheriting the defaults
+# above. Used to opt into the SSH-orchestrated worker deploy on Linux; with no
+# override the Linux dispatch installs locally via systemd.
+WORKER_REMOTE := $(if $(strip \
+    $(filter command line environment,$(origin BUILD)) \
+    $(filter command line environment,$(origin WORKER_RUN))),1,)
 BENCHMARK_ROOT ?= /Users/t/data/benchmark
 BENCHMARK_PATH ?= $(BENCHMARK_ROOT)/$(DATASET)
 SCAN_THREADS ?=
@@ -93,14 +101,14 @@ deploy-worker:
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/worker/worker-macos.sh "$(URL)" ;; \
 		FreeBSD) ./scripts/worker/worker-bastille.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)" ;; \
-		Linux)   if [ -f /etc/alpine-release ]; then \
-		           ./scripts/worker/worker-alpine.sh "$(URL)"; \
-		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
-		           ./scripts/worker/worker-ubuntu.sh "$(URL)"; \
-		         else \
-		           [ -n "$(BUILD)" ] && [ -n "$(WORKER_RUN)" ] || \
-		             { echo "Usage: make deploy-worker BUILD=<build-host> WORKER_RUN=<run-host> URL=<url>"; exit 1; }; \
+		Linux)   if [ -n "$(WORKER_REMOTE)" ]; then \
 		           ./scripts/worker/worker-debian.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)"; \
+		         elif [ -f /etc/alpine-release ]; then \
+		           ./scripts/worker/worker-alpine.sh "$(URL)"; \
+		         elif command -v systemctl >/dev/null 2>&1; then \
+		           ./scripts/worker/worker-linux.sh "$(URL)"; \
+		         else \
+		           echo "error: unsupported Linux (no systemd; not Alpine; pass BUILD+WORKER_RUN for SSH deploy)"; exit 1; \
 		         fi ;; \
 		OpenBSD) ./scripts/worker/worker-openbsd.sh "$(URL)" ;; \
 		*) echo "error: no deploy-worker target for $$(uname -s)"; exit 1 ;; \
@@ -116,13 +124,14 @@ uninstall-worker:
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/worker/uninstall-macos.sh ;; \
 		FreeBSD) ./scripts/worker/uninstall-bastille.sh "$(WORKER_RUN)" ;; \
-		Linux)   if [ -f /etc/alpine-release ]; then \
-		           ./scripts/worker/uninstall-alpine.sh; \
-		         elif grep -q '^ID=ubuntu$$' /etc/os-release 2>/dev/null; then \
-		           ./scripts/worker/uninstall-ubuntu.sh; \
-		         else \
-		           [ -n "$(WORKER_RUN)" ] || { echo "Usage: make uninstall-worker WORKER_RUN=<run-host>"; exit 1; }; \
+		Linux)   if [ -n "$(WORKER_REMOTE)" ]; then \
 		           ./scripts/worker/uninstall-debian.sh "$(WORKER_RUN)"; \
+		         elif [ -f /etc/alpine-release ]; then \
+		           ./scripts/worker/uninstall-alpine.sh; \
+		         elif command -v systemctl >/dev/null 2>&1; then \
+		           ./scripts/worker/uninstall-linux.sh; \
+		         else \
+		           echo "error: unsupported Linux"; exit 1; \
 		         fi ;; \
 		OpenBSD) ./scripts/worker/uninstall-openbsd.sh ;; \
 		*) echo "error: no uninstall-worker target for $$(uname -s)"; exit 1 ;; \
