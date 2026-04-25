@@ -648,7 +648,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "1.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#adb6083140a60cf81e948bc4a90c718c0d8f475f"
+source = "git+https://codeberg.org/atomdrift/cleave.git#47822a98f9a99c61b7b83f435d424802c6101d53"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -756,7 +756,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#adb6083140a60cf81e948bc4a90c718c0d8f475f"
+source = "git+https://codeberg.org/atomdrift/cleave.git#47822a98f9a99c61b7b83f435d424802c6101d53"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1387,7 +1387,7 @@ dependencies = [
 [[package]]
 name = "fileid"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#adb6083140a60cf81e948bc4a90c718c0d8f475f"
+source = "git+https://codeberg.org/atomdrift/cleave.git#47822a98f9a99c61b7b83f435d424802c6101d53"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -2257,7 +2257,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "xgboost-native",
+ "xgboost-ars",
 ]
 
 [[package]]
@@ -2393,7 +2393,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#adb6083140a60cf81e948bc4a90c718c0d8f475f"
+source = "git+https://codeberg.org/atomdrift/cleave.git#47822a98f9a99c61b7b83f435d424802c6101d53"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -3037,9 +3037,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.204"
+version = "2.1.205"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "868e3200a2474f99d0ea576a7c76aabda7cdcc795cc27f2d93f30ab79867820d"
+checksum = "194b4aac978e4e46f782a95ecdb06bc69919c935e783984e5f5b817545881beb"
 dependencies = [
  "psl-types",
 ]
@@ -3603,7 +3603,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#adb6083140a60cf81e948bc4a90c718c0d8f475f"
+source = "git+https://codeberg.org/atomdrift/cleave.git#47822a98f9a99c61b7b83f435d424802c6101d53"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4052,7 +4052,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#adb6083140a60cf81e948bc4a90c718c0d8f475f"
+source = "git+https://codeberg.org/atomdrift/cleave.git#47822a98f9a99c61b7b83f435d424802c6101d53"
 
 [[package]]
 name = "tap"
@@ -5759,9 +5759,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "xgboost-native"
+name = "xgboost-ars"
 version = "1.0.0"
-source = "git+https://codeberg.org/atomdrift/xgboost-native#fd575dead809aa2c64ee7c6a55e7e7cfba74f8e2"
+source = "git+https://codeberg.org/atomdrift/xgboost-ars#bc4ff088b7ac0bc2bc4491962e56faa793012992"
 dependencies = [
  "serde",
  "serde_json",
@@ -5792,7 +5792,7 @@ dependencies = [
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#adb6083140a60cf81e948bc4a90c718c0d8f475f"
+source = "git+https://codeberg.org/atomdrift/cleave.git#47822a98f9a99c61b7b83f435d424802c6101d53"
 
 [[package]]
 name = "yara-x"

@@ -313,7 +313,7 @@ pub struct ModelInfo {
 /// Loaded model plus the feature spec and thresholds used for inference.
 #[derive(Debug)]
 pub struct Model {
-    inner: xgboost_native::Model,
+    inner: xgboost_ars::Model,
     spec: FeatureSpec,
     thresholds: Thresholds,
     info: ModelInfo,
@@ -361,7 +361,7 @@ impl Model {
         tracing::debug!(features = spec.total_features(), "feature spec loaded");
 
         tracing::debug!(path = %model_path.display(), "loading model");
-        let inner = xgboost_native::Model::load(&model_path)
+        let inner = xgboost_ars::Model::load(&model_path)
             .with_context(|| format!("loading model from {}", model_path.display()))?;
         tracing::debug!("model loaded");
 

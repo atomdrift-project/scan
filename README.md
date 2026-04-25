@@ -53,7 +53,7 @@ Optional: [rizin](https://github.com/rizinorg/rizin) for disassembly, [upx](http
 
 - [cleave](https://codeberg.org/atomdrift/cleave) — the capability analyzer litmus is built on
 - [hopper](https://codeberg.org/atomdrift/hopper) — work queue for distributed scanning fleets
-- [xgboost-native](https://codeberg.org/atomdrift/xgboost-native) — pure-Rust inference with exact TreeSHAP
+- [xgboost-ars](https://codeberg.org/atomdrift/xgboost-ars) — pure-Rust inference with exact TreeSHAP
 - [Atomdrift Lab](https://lab.atomdrift.org/) — submit samples for free analysis
 
 ## License
