@@ -110,7 +110,7 @@ strip = "debuginfo"
 [profile.profiling]
 inherits = "release"
 strip = "none"
-debug = 1
+debug = 2
 
 [lints]
 workspace = true
