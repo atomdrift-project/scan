@@ -199,6 +199,13 @@ enum Commands {
         /// cloned automatically if the directory does not yet exist.
         #[arg(long)]
         traits_dir: Option<PathBuf>,
+
+        /// Nice value applied to the worker process at startup. Default 10
+        /// keeps analysis bursts from starving other work on the host. Pass 0
+        /// to leave priority unchanged (e.g. when profiling). Unprivileged
+        /// processes can only raise the nice value.
+        #[arg(long, default_value = "10", allow_hyphen_values = true)]
+        nice: i32,
     },
 
     /// Print version information
@@ -545,6 +552,7 @@ fn main() -> Result<()> {
             data_dir,
             max_jobs,
             traits_dir,
+            nice,
         } => {
             if let Some(ref p) = traits_dir {
                 std::env::set_var("CLEAVE_TRAITS_DIR", p);
@@ -602,6 +610,7 @@ fn main() -> Result<()> {
                 thresholds,
                 slow_rule_ms: cli.slow_rule_ms,
                 upgrade_heuristic: cli.upgrade_heuristic,
+                nice,
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

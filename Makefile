@@ -20,7 +20,7 @@ SLOW_RULE_MS ?= 200
 MAX_JOBS ?= 25
 WORKERS  ?=
 
-.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker profile-worker profile-slow lint test clean
+.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker profile-worker profile-slow lint test clean
 
 all: build
 
@@ -162,6 +162,14 @@ benchmark-worker: release
 	./out/$(BINARY) --verbose worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		2>&1 | tee /tmp/litmus-worker-benchmark.log
+
+# Run a worker in the foreground for interactive use. The worker self-nices
+# to 10 by default; pass NICE=0 to disable.
+worker: release
+	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>]"; exit 1; }
+	./out/$(BINARY) --verbose worker --url "$(URL)" \
+		$(if $(WORKERS),--workers $(WORKERS),) \
+		$(if $(NICE),--nice $(NICE),)
 
 profile-worker:
 	cargo build --profile profiling

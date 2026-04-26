@@ -448,6 +448,8 @@ pub struct WorkerConfig {
     pub max_jobs: Option<u64>,
     /// Whether the finding-based classification upgrade heuristic is enabled.
     pub upgrade_heuristic: bool,
+    /// Nice value applied to the process at startup (0 = leave unchanged).
+    pub nice: i32,
 }
 
 /// A fixed grid of dedicated rayon thread pools — one per worker slot.
@@ -636,8 +638,28 @@ fn install_shutdown_handler(shutdown: Arc<AtomicBool>) {
     });
 }
 
+/// Apply a nice value to the current process. A no-op when `nice == 0`.
+/// `setpriority` failure is logged but never fatal — an unprivileged process
+/// cannot lower its nice value, and we'd rather run at the inherited priority
+/// than refuse to start.
+fn apply_nice(nice: i32) {
+    if nice == 0 {
+        return;
+    }
+    // SAFETY: setpriority(PRIO_PROCESS, 0, ...) targets the calling process
+    // and has no memory effects. PRIO_PROCESS is POSIX; pid 0 means "self".
+    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+    if rc == 0 {
+        tracing::info!(nice, "set worker process nice value");
+    } else {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(nice, error = %err, "setpriority failed; continuing at inherited priority");
+    }
+}
+
 /// Run the worker loop. Blocks until cancelled.
 pub async fn run(config: WorkerConfig) -> Result<()> {
+    apply_nice(config.nice);
     // Arc<str> so every per-job dispatch clones an atomic refcount rather than
     // reallocating the worker name for each `tokio::spawn`.
     let name: Arc<str> = Arc::from(config.name.as_str());
