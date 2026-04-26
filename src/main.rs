@@ -177,9 +177,11 @@ enum Commands {
         poll_secs: u64,
 
         /// Maximum RSS in gigabytes before pausing claims.
-        /// Defaults to 0, which means auto: 85% of total system RAM.
-        #[arg(long, default_value = "0")]
-        max_rss_gb: u64,
+        /// 0 (default) auto-resolves to 85% of total system RAM; -1 disables
+        /// in-process throttling entirely (use when an external supervisor
+        /// like systemd `MemoryMax=` already enforces a hard cap).
+        #[arg(long, default_value = "0", allow_hyphen_values = true)]
+        max_rss_gb: i64,
 
         /// Local data directory. Hopper returns relative paths; the worker
         /// joins them with this root to find files locally instead of
@@ -570,15 +572,23 @@ fn main() -> Result<()> {
                     .and_then(|h| h.into_string().ok())
                     .unwrap_or_else(|| "unknown".to_string())
             });
-            let max_rss_gb = if max_rss_gb == 0 {
-                let resolved = resolve_worker_max_rss_gb();
-                tracing::info!(
-                    max_rss_gb = resolved,
-                    "auto-resolved worker RSS ceiling (set --max-rss-gb to override)",
-                );
-                resolved
-            } else {
-                max_rss_gb
+            let max_rss_gb: u64 = match max_rss_gb {
+                n if n < 0 => {
+                    tracing::info!(
+                        "in-process RSS throttling disabled (--max-rss-gb=-1); \
+                         relying on external supervisor for OOM enforcement",
+                    );
+                    0
+                }
+                0 => {
+                    let resolved = resolve_worker_max_rss_gb();
+                    tracing::info!(
+                        max_rss_gb = resolved,
+                        "auto-resolved worker RSS ceiling (set --max-rss-gb to override, -1 to disable)",
+                    );
+                    resolved
+                }
+                n => n as u64,
             };
             let config = litmus::worker::WorkerConfig {
                 hopper_url: url,

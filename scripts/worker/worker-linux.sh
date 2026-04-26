@@ -11,7 +11,7 @@
 # Environment overrides:
 #   DATA_DIR    local sample dir shared with hopper           (default: unset → download)
 #   WORKERS     concurrency (--workers)                        (default: worker auto)
-#   MAX_RSS_GB  pause threshold (--max-rss-gb)                 (default: 0 = 85% of RAM)
+#   MAX_RSS_GB  pause threshold (--max-rss-gb)                 (default: -1 = off; systemd MemoryMax handles OOM)
 #   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, infinity)         (default: 32G)
 
 set -eu
@@ -28,7 +28,7 @@ UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
 DATA_DIR="${DATA_DIR:-}"
 WORKERS="${WORKERS:-}"
-MAX_RSS_GB="${MAX_RSS_GB:-0}"
+MAX_RSS_GB="${MAX_RSS_GB:--1}"
 MEMORY_MAX="${MEMORY_MAX:-32G}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -154,9 +154,11 @@ TimeoutStopSec=30s
 
 Environment=HOME=%S/litmus
 
-# Resource caps. The worker self-throttles via --max-rss-gb (default: 85% of
-# system RAM); MemoryMax is a systemd safety net (default: 32G; set to
-# 'infinity' to defer entirely to the worker's self-throttling).
+# Resource caps. Under systemd we disable the worker's in-process RSS
+# throttling (--max-rss-gb=-1) and let MemoryMax do the enforcement: a
+# stuck/leaking worker is killed and Restart=always brings it back, instead
+# of looping on "memory pressure: pausing" warnings. Override MAX_RSS_GB
+# at install time to re-enable in-process throttling.
 MemoryMax=${MEMORY_MAX}
 TasksMax=4096
 # A killed analysis subprocess (rizin OOM, etc.) must not bring the worker down.
