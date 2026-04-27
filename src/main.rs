@@ -592,6 +592,19 @@ fn main() -> Result<()> {
                 });
             });
             let model_dir = resolve_model_dir()?;
+            let validate_config = litmus::ScanConfig::new(
+                model_dir.clone(),
+                litmus::OutputFormat::Terminal,
+                thresholds,
+                DisplayFilter::alerts_only(),
+                cli.slow_rule_ms,
+                cli.extra,
+            )?
+            .with_upgrade_heuristic(cli.upgrade_heuristic);
+            if let Err(e) = litmus::validate::run(&validate_config) {
+                eprintln!("Worker startup validation failed: {e:#}");
+                process::exit(1);
+            }
             let workers = workers.unwrap_or_else(default_workers);
             let name = name.unwrap_or_else(|| {
                 hostname::get()
