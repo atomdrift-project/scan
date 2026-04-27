@@ -36,6 +36,7 @@ pub mod scan;
 pub mod server;
 pub mod tools;
 pub mod traits_repo;
+pub mod validate;
 pub mod worker;
 
 pub use model::Classification;

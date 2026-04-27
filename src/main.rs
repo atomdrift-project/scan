@@ -116,6 +116,9 @@ enum Commands {
         check: bool,
     },
 
+    /// Validate cleave traits, load the model, and ensure benign samples stay benign
+    Validate,
+
     /// Run as an HTTP classification server
     Serve {
         /// Address to listen on
@@ -368,7 +371,11 @@ fn main() -> Result<()> {
     // Warn about missing analysis tools for commands that will run cleave.
     if matches!(
         command,
-        Commands::Scan { .. } | Commands::Ps | Commands::Serve { .. } | Commands::Worker { .. }
+        Commands::Scan { .. }
+            | Commands::Ps
+            | Commands::Validate
+            | Commands::Serve { .. }
+            | Commands::Worker { .. }
     ) {
         litmus::tools::warn_missing();
     }
@@ -542,6 +549,18 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        Commands::Validate => {
+            let config = litmus::ScanConfig::new(
+                resolve_model_dir()?,
+                litmus::OutputFormat::Terminal,
+                thresholds,
+                DisplayFilter::alerts_only(),
+                cli.slow_rule_ms,
+                cli.extra,
+            )?
+            .with_upgrade_heuristic(cli.upgrade_heuristic);
+            litmus::validate::run(&config)?;
         }
         Commands::Worker {
             url,

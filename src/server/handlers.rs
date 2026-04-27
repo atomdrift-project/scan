@@ -1011,6 +1011,7 @@ pub(crate) fn classify_file(
         resources.shap.as_ref(),
         cancellation,
         resources.upgrade_heuristic,
+        Some(100),
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -1058,6 +1059,7 @@ pub(crate) fn classify_bytes(
         resources.shap.as_ref(),
         cancellation,
         resources.upgrade_heuristic,
+        Some(100),
     )?;
 
     Ok(scan_result_from(label, cr, resources))

@@ -304,6 +304,7 @@ fn build_result(
         shap,
         cancellation,
         config.upgrade_heuristic(),
+        Some(100),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

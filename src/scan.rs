@@ -895,6 +895,7 @@ pub(crate) fn classify_report(
     shap: Option<&ShapImportance>,
     cancellation: Option<&Arc<AtomicBool>>,
     upgrade_heuristic: bool,
+    embedded_file_limit: Option<usize>,
 ) -> Result<ClassifiedReport> {
     report.finalize();
     let compact = cleave::types::compact::compact_from_files(&report.files);
@@ -950,14 +951,17 @@ pub(crate) fn classify_report(
 
     // Extract embedded files (archive members at depth > 0), run each through
     // the model individually, and elevate the parent if any embedded file scores higher.
-    // Limit to top 100 embedded entries to prevent resource exhaustion.
-    let embedded_entries: Vec<&serde_json::Value> = report_json["fs"]
+    // Ordinary scans cap embedded work to prevent resource exhaustion; validation
+    // passes None so every Cleave-produced embedded file is checked.
+    let embedded_iter = report_json["fs"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|f| f["dp"].as_u64().unwrap_or(0) > 0)
-        .take(100)
-        .collect();
+        .filter(|f| f["dp"].as_u64().unwrap_or(0) > 0);
+    let embedded_entries: Vec<&serde_json::Value> = match embedded_file_limit {
+        Some(limit) => embedded_iter.take(limit).collect(),
+        None => embedded_iter.collect(),
+    };
 
     let mut embedded_files: Vec<EmbeddedFile> = Vec::with_capacity(embedded_entries.len());
     let mut max_probability = probability;
@@ -1016,7 +1020,9 @@ pub(crate) fn classify_report(
     }
 
     embedded_files.sort_by(|a, b| b.probability.total_cmp(&a.probability));
-    embedded_files.truncate(10);
+    if embedded_file_limit.is_some() {
+        embedded_files.truncate(10);
+    }
 
     // If an embedded file scored higher, elevate the parent classification.
     let (classification, probability) = if max_probability > probability {
@@ -1083,7 +1089,7 @@ pub(crate) fn classify_report(
 
 /// Apply litmus model inference to a cleave report. Always returns a ScanResult
 /// (even for benign); the caller decides whether to display it.
-fn process_report(
+pub(crate) fn process_report(
     path: &Path,
     report: cleave::AnalysisReport,
     ctx: &ExtractContext,
@@ -1101,6 +1107,7 @@ fn process_report(
         shap,
         cancellation,
         config.upgrade_heuristic(),
+        Some(100),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
