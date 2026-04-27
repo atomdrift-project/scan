@@ -7,12 +7,12 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use litmus::scan::DisplayFilter;
 use litmus::OutputFormat;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 /// Classification values accepted by `--show`.
@@ -29,6 +29,15 @@ enum Show {
 #[command(name = "litmus")]
 #[command(version)]
 #[command(about = "Malware classification powered by ML + static analysis")]
+#[command(group(
+    clap::ArgGroup::new("severity_level")
+        .args([
+            "level_1", "level_2", "level_3", "level_4", "level_5",
+            "level_6", "level_7", "level_8", "level_9",
+        ])
+        .multiple(false)
+        .conflicts_with_all(["threshold_suspicious", "threshold_hostile"])
+))]
 struct Cli {
     /// Enable debug logging for litmus and cleave
     #[arg(long)]
@@ -62,6 +71,42 @@ struct Cli {
     #[arg(long)]
     threshold_hostile: Option<f32>,
 
+    /// Use severity level 1: zero-FP targets; least noisy
+    #[arg(short = '1', long = "loose", global = true, action = clap::ArgAction::SetTrue)]
+    level_1: bool,
+
+    /// Use severity level 2
+    #[arg(short = '2', global = true, action = clap::ArgAction::SetTrue)]
+    level_2: bool,
+
+    /// Use severity level 3
+    #[arg(short = '3', global = true, action = clap::ArgAction::SetTrue)]
+    level_3: bool,
+
+    /// Use severity level 4
+    #[arg(short = '4', global = true, action = clap::ArgAction::SetTrue)]
+    level_4: bool,
+
+    /// Use severity level 5: default operating point
+    #[arg(short = '5', global = true, action = clap::ArgAction::SetTrue)]
+    level_5: bool,
+
+    /// Use severity level 6
+    #[arg(short = '6', global = true, action = clap::ArgAction::SetTrue)]
+    level_6: bool,
+
+    /// Use severity level 7
+    #[arg(short = '7', global = true, action = clap::ArgAction::SetTrue)]
+    level_7: bool,
+
+    /// Use severity level 8
+    #[arg(short = '8', global = true, action = clap::ArgAction::SetTrue)]
+    level_8: bool,
+
+    /// Use severity level 9: most sensitive
+    #[arg(short = '9', long = "paranoid", global = true, action = clap::ArgAction::SetTrue)]
+    level_9: bool,
+
     /// Classifications to display: hostile, suspicious, sus, benign, all (comma-separated)
     #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
     show: Vec<Show>,
@@ -91,6 +136,24 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+impl Cli {
+    fn selected_severity_level(&self) -> Option<u8> {
+        [
+            (self.level_1, 1),
+            (self.level_2, 2),
+            (self.level_3, 3),
+            (self.level_4, 4),
+            (self.level_5, 5),
+            (self.level_6, 6),
+            (self.level_7, 7),
+            (self.level_8, 8),
+            (self.level_9, 9),
+        ]
+        .into_iter()
+        .find_map(|(selected, level)| selected.then_some(level))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -215,6 +278,34 @@ enum Commands {
     Version,
 }
 
+fn threshold_overrides_for_model(
+    model_dir: &Path,
+    severity_level: Option<u8>,
+    threshold_suspicious: Option<f32>,
+    threshold_hostile: Option<f32>,
+) -> Result<Option<litmus::model::Thresholds>> {
+    if let Some(level) = severity_level {
+        let thresholds =
+            litmus::model::load_severity_thresholds(model_dir, level)?.with_context(|| {
+                format!(
+                    "model bundle does not contain severity level {level} thresholds; \
+                     run 'litmus update-rules' to refresh the installed models"
+                )
+            })?;
+        return Ok(Some(thresholds));
+    }
+
+    // Only construct explicit thresholds if at least one CLI flag was provided.
+    // When both are omitted, pass None so Model::load uses model metadata.
+    Ok(match (threshold_suspicious, threshold_hostile) {
+        (None, None) => None,
+        (sus, hos) => Some(litmus::model::Thresholds {
+            suspicious: sus.unwrap_or(litmus::model::Thresholds::FALLBACK_SUSPICIOUS),
+            hostile: hos.unwrap_or(litmus::model::Thresholds::FALLBACK_HOSTILE),
+        }),
+    })
+}
+
 fn main() -> Result<()> {
     // Block SIGUSR1 process-wide before spawning any threads so they all inherit
     // the blocked mask; the dedicated sigusr1 thread below consumes it via sigwait.
@@ -232,6 +323,9 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    let selected_severity_level = cli.selected_severity_level();
+    let threshold_suspicious = cli.threshold_suspicious;
+    let threshold_hostile = cli.threshold_hostile;
 
     // Default to Scan when bare paths are given without a subcommand.
     let command = match cli.command {
@@ -404,26 +498,27 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to resolve model directory: {e}")),
         }
     };
+    let threshold_overrides = |model_dir: &Path| -> Result<Option<litmus::model::Thresholds>> {
+        threshold_overrides_for_model(
+            model_dir,
+            selected_severity_level,
+            threshold_suspicious,
+            threshold_hostile,
+        )
+    };
     let all = cli.show.iter().any(|s| matches!(s, Show::All));
     let filter = DisplayFilter::new(
         all || cli.show.iter().any(|s| matches!(s, Show::Hostile)),
         all || cli.show.iter().any(|s| matches!(s, Show::Sus)),
         all || cli.show.iter().any(|s| matches!(s, Show::Benign)),
     );
-    // Only construct explicit thresholds if at least one CLI flag was provided.
-    // When both are omitted, pass None so Model::load uses evaluation.json.
-    let thresholds = match (cli.threshold_suspicious, cli.threshold_hostile) {
-        (None, None) => None,
-        (sus, hos) => Some(litmus::model::Thresholds {
-            suspicious: sus.unwrap_or(litmus::model::Thresholds::FALLBACK_SUSPICIOUS),
-            hostile: hos.unwrap_or(litmus::model::Thresholds::FALLBACK_HOSTILE),
-        }),
-    };
 
     match command {
         Commands::Scan { paths } => {
+            let model_dir = resolve_model_dir()?;
+            let thresholds = threshold_overrides(&model_dir)?;
             let config = litmus::ScanConfig::new(
-                resolve_model_dir()?,
+                model_dir,
                 cli.format,
                 thresholds,
                 filter,
@@ -434,8 +529,10 @@ fn main() -> Result<()> {
             exit_for_summary(&run_scan_paths(&paths, &config)?);
         }
         Commands::Ps => {
+            let model_dir = resolve_model_dir()?;
+            let thresholds = threshold_overrides(&model_dir)?;
             let config = litmus::ScanConfig::new(
-                resolve_model_dir()?,
+                model_dir,
                 cli.format,
                 thresholds,
                 filter,
@@ -480,11 +577,13 @@ fn main() -> Result<()> {
             } else {
                 max_rss_gb.saturating_mul(1024 * 1024 * 1024)
             };
+            let model_dir = resolve_model_dir()?;
+            let thresholds = threshold_overrides(&model_dir)?;
             let config = litmus::server::ServerConfig::new(
                 bind,
                 max_size_mb.saturating_mul(1024 * 1024),
                 max_rss_bytes,
-                resolve_model_dir()?,
+                model_dir,
                 thresholds,
                 cli.slow_rule_ms,
                 dirs,
@@ -551,8 +650,10 @@ fn main() -> Result<()> {
             }
         }
         Commands::Validate => {
+            let model_dir = resolve_model_dir()?;
+            let thresholds = threshold_overrides(&model_dir)?;
             let config = litmus::ScanConfig::new(
-                resolve_model_dir()?,
+                model_dir,
                 litmus::OutputFormat::Terminal,
                 thresholds,
                 DisplayFilter::alerts_only(),
@@ -592,6 +693,7 @@ fn main() -> Result<()> {
                 });
             });
             let model_dir = resolve_model_dir()?;
+            let thresholds = threshold_overrides(&model_dir)?;
             let validate_config = litmus::ScanConfig::new(
                 model_dir.clone(),
                 litmus::OutputFormat::Terminal,
@@ -802,6 +904,39 @@ mod tests {
         // This keeps parsing unambiguous when positional paths follow.
         let result = Cli::try_parse_from(["litmus", "--upgrade-heuristic", "/tmp/a"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn severity_level_flags_parse() -> Result<()> {
+        let cli = Cli::try_parse_from(["litmus", "-1", "/tmp/a"]).context("-1 should parse")?;
+        assert_eq!(cli.selected_severity_level(), Some(1));
+
+        let cli =
+            Cli::try_parse_from(["litmus", "--loose", "/tmp/a"]).context("--loose should parse")?;
+        assert_eq!(cli.selected_severity_level(), Some(1));
+
+        let cli = Cli::try_parse_from(["litmus", "--paranoid", "/tmp/a"])
+            .context("--paranoid should parse")?;
+        assert_eq!(cli.selected_severity_level(), Some(9));
+
+        let cli = Cli::try_parse_from(["litmus", "scan", "--paranoid", "/tmp/a"])
+            .context("global --paranoid should parse after scan")?;
+        assert_eq!(cli.selected_severity_level(), Some(9));
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_long_aliases_are_not_accepted() {
+        assert!(Cli::try_parse_from(["litmus", "--fast", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["litmus", "--best", "/tmp/a"]).is_err());
+    }
+
+    #[test]
+    fn severity_level_flags_conflict_with_each_other_and_manual_thresholds() {
+        assert!(Cli::try_parse_from(["litmus", "-1", "-9", "/tmp/a"]).is_err());
+        assert!(
+            Cli::try_parse_from(["litmus", "-9", "--threshold-hostile", "0.90", "/tmp/a"]).is_err()
+        );
     }
 
     #[test]

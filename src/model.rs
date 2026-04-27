@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::features::{FeatureSpec, EXPECTED_MODEL_ABI_VERSION};
 
-/// Recommended thresholds loaded from collimator's `evaluation.json`.
+/// Recommended thresholds loaded from collimator's model metadata.
 ///
 /// These are computed during training based on FPR targets and represent
 /// the empirically optimal operating points for the model.
@@ -14,6 +14,29 @@ use crate::features::{FeatureSpec, EXPECTED_MODEL_ABI_VERSION};
 struct EvaluationThresholds {
     suspicious: Option<f64>,
     hostile: Option<f64>,
+}
+
+/// Per-level threshold metrics emitted by collimator.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+struct SeverityThresholdMetric {
+    threshold: Option<f64>,
+}
+
+/// Gzip-style severity level thresholds emitted by collimator.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+struct SeverityLevel {
+    level: u8,
+    suspicious: Option<SeverityThresholdMetric>,
+    hostile: Option<SeverityThresholdMetric>,
+}
+
+/// config.json in the model directory.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ConfigJson {
+    suspicious: Option<f64>,
+    hostile: Option<f64>,
+    #[serde(default)]
+    severity_levels: Vec<SeverityLevel>,
 }
 
 /// Thresholds block within evaluation.json.
@@ -25,6 +48,8 @@ struct EvaluationJson {
     recommended_thresholds: Option<EvaluationThresholds>,
     #[serde(default)]
     optimal_threshold: Option<f64>,
+    #[serde(default)]
+    severity_levels: Vec<SeverityLevel>,
 }
 
 const fn default_model_abi_version() -> u32 {
@@ -40,7 +65,7 @@ const fn default_model_abi_version() -> u32 {
 fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
     let path = model_dir.join("config.json");
     let data = std::fs::read_to_string(&path).ok()?;
-    let cfg: EvaluationThresholds = serde_json::from_str(&data).ok()?;
+    let cfg: ConfigJson = serde_json::from_str(&data).ok()?;
     let suspicious = cfg.suspicious? as f32;
     let hostile = cfg.hostile? as f32;
     let t = Thresholds {
@@ -59,6 +84,74 @@ fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
         tracing::warn!(path = %path.display(), "config.json thresholds are invalid, ignoring");
         None
     }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn thresholds_from_severity_levels(levels: &[SeverityLevel], level: u8) -> Option<Thresholds> {
+    let entry = levels.iter().find(|entry| entry.level == level)?;
+    let suspicious = entry.suspicious?.threshold? as f32;
+    let hostile = entry.hostile?.threshold? as f32;
+    let thresholds = Thresholds {
+        suspicious,
+        hostile,
+    };
+    thresholds.validate().ok()?;
+    Some(thresholds)
+}
+
+fn load_config_severity_thresholds(model_dir: &Path, level: u8) -> Option<Thresholds> {
+    let path = model_dir.join("config.json");
+    let data = std::fs::read_to_string(&path).ok()?;
+    let cfg: ConfigJson = serde_json::from_str(&data).ok()?;
+    let thresholds = thresholds_from_severity_levels(&cfg.severity_levels, level)?;
+    tracing::info!(
+        path = %path.display(),
+        level = level,
+        suspicious = thresholds.suspicious,
+        hostile = thresholds.hostile,
+        "loaded severity thresholds from config.json"
+    );
+    Some(thresholds)
+}
+
+fn load_evaluation_severity_thresholds(model_dir: &Path, level: u8) -> Option<Thresholds> {
+    let path = model_dir.join("evaluation.json");
+    let data = std::fs::read_to_string(&path).ok()?;
+    let eval: EvaluationJson = serde_json::from_str(&data).ok()?;
+    if eval.model_abi_version != EXPECTED_MODEL_ABI_VERSION {
+        tracing::warn!(
+            path = %path.display(),
+            found = eval.model_abi_version,
+            expected = EXPECTED_MODEL_ABI_VERSION,
+            "evaluation.json ABI version mismatch, ignoring severity thresholds"
+        );
+        return None;
+    }
+    let thresholds = thresholds_from_severity_levels(&eval.severity_levels, level)?;
+    tracing::info!(
+        path = %path.display(),
+        level = level,
+        suspicious = thresholds.suspicious,
+        hostile = thresholds.hostile,
+        "loaded severity thresholds from evaluation.json"
+    );
+    Some(thresholds)
+}
+
+/// Load gzip-style severity thresholds from model metadata.
+///
+/// Resolution order matches normal threshold loading: `config.json` first, then
+/// `evaluation.json`. Returns `Ok(None)` when this model bundle predates
+/// severity metadata.
+///
+/// # Errors
+/// Returns an error if `level` is outside `1..=9`.
+pub fn load_severity_thresholds(model_dir: &Path, level: u8) -> Result<Option<Thresholds>> {
+    if !(1..=9).contains(&level) {
+        anyhow::bail!("severity level must be in 1..=9, got {level}");
+    }
+    Ok(load_config_severity_thresholds(model_dir, level)
+        .or_else(|| load_evaluation_severity_thresholds(model_dir, level)))
 }
 
 /// Try to load recommended thresholds from evaluation.json.
@@ -144,7 +237,7 @@ impl std::fmt::Display for Classification {
 /// Invariants:
 /// - `suspicious` must be within `0.0..=1.0`
 /// - `hostile` must be within `0.0..=1.0`
-/// - `suspicious < hostile`
+/// - `suspicious <= hostile`
 ///
 /// # Example
 /// ```
@@ -227,7 +320,7 @@ impl Thresholds {
                 value: self.hostile,
             });
         }
-        if self.suspicious >= self.hostile {
+        if self.suspicious > self.hostile {
             return Err(ThresholdValidationError::Misordered {
                 suspicious: self.suspicious,
                 hostile: self.hostile,
@@ -282,7 +375,7 @@ impl fmt::Display for ThresholdValidationError {
                 hostile,
             } => write!(
                 f,
-                "suspicious threshold ({suspicious}) must be less than hostile threshold ({hostile})"
+                "suspicious threshold ({suspicious}) must be less than or equal to hostile threshold ({hostile})"
             ),
         }
     }
@@ -484,6 +577,48 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("model bundle is incomplete"));
         assert!(message.contains("Run 'litmus update-rules'"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_severity_thresholds_reads_config_json_levels() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+              "suspicious": 0.65,
+              "hostile": 0.90,
+              "severity_levels": [
+                {
+                  "level": 1,
+                  "suspicious": {"threshold": 0.99},
+                  "hostile": {"threshold": 0.99}
+                },
+                {
+                  "level": 9,
+                  "suspicious": {"threshold": 0.50},
+                  "hostile": {"threshold": 0.80}
+                }
+              ]
+            }"#,
+        )?;
+
+        let level_1 = load_severity_thresholds(dir.path(), 1)?.context("level 1")?;
+        assert_eq!(level_1.suspicious, 0.99);
+        assert_eq!(level_1.hostile, 0.99);
+        assert_eq!(level_1.classify(0.99), Classification::Hostile);
+
+        let level_9 = load_severity_thresholds(dir.path(), 9)?.context("level 9")?;
+        assert_eq!(level_9.suspicious, 0.50);
+        assert_eq!(level_9.hostile, 0.80);
+        Ok(())
+    }
+
+    #[test]
+    fn load_severity_thresholds_rejects_invalid_level() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let err = load_severity_thresholds(dir.path(), 0).expect_err("level 0 is invalid");
+        assert!(err.to_string().contains("1..=9"));
         Ok(())
     }
 }
