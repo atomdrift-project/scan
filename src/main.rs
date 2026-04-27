@@ -360,6 +360,11 @@ fn main() -> Result<()> {
         fmt.without_time().init();
     }
 
+    // Stabilize cleave trait discovery before any cleave shared resources are
+    // initialized. This avoids clone-into-existing-directory failures when the
+    // default traits checkout was installed by cleave or another litmus run.
+    litmus::traits_repo::prepare_runtime_env();
+
     let rayon_threads = std::env::var("CLEAVE_RAYON_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
