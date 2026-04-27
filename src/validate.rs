@@ -75,7 +75,16 @@ pub fn run(config: &ScanConfig) -> Result<()> {
 fn collect_targets() -> Result<Vec<PathBuf>> {
     let mut targets = Vec::new();
 
-    for path in ["/bin/ls", "/bin/cp", "/bin/sh", "/usr/bin/curl"] {
+    for path in [
+        "/bin/ls",
+        "/bin/cp",
+        "/bin/sh",
+        "/usr/bin/curl",
+        "/bin/capsh",
+        "/bin/sulogin",
+        "/bin/gpgconf",
+        "/usr/lib/systemd/system/arptables.service",
+    ] {
         let p = PathBuf::from(path);
         if p.exists() {
             targets.push(p);

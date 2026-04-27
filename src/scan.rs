@@ -324,8 +324,14 @@ mod finding_override_tests {
     }
 
     #[test]
-    fn one_hostile_finding_upgrades_benign_to_suspicious() {
+    fn one_hostile_finding_leaves_benign_unchanged() {
         let result = apply_finding_override(Classification::Benign, 0.05, &counts(1, 0), &T);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn one_hostile_one_suspicious_upgrades_benign_to_suspicious() {
+        let result = apply_finding_override(Classification::Benign, 0.05, &counts(1, 1), &T);
         let Some((class, prob)) = result else {
             panic!("expected upgrade");
         };
@@ -1149,8 +1155,7 @@ pub(crate) fn process_report(
 ///
 /// Rules (most severe first):
 /// - `>= 2` hostile findings → Hostile, prob floored at `thresholds.hostile`
-/// - `== 1` hostile finding + currently Benign → Suspicious, prob floored at `thresholds.suspicious`
-/// - `>= 2` suspicious findings + currently Benign → Suspicious, prob floored at `thresholds.suspicious`
+/// - currently Benign + `>= 2` (hostile or suspicious) findings → Suspicious, prob floored at `thresholds.suspicious`
 #[must_use]
 pub fn apply_finding_override(
     current_class: Classification,
@@ -1164,7 +1169,7 @@ pub fn apply_finding_override(
             current_prob.max(thresholds.hostile),
         )
     } else if current_class == Classification::Benign
-        && (counts.hostile == 1 || counts.suspicious >= 2)
+        && (counts.hostile + counts.suspicious >= 2)
     {
         (
             Classification::Suspicious,
