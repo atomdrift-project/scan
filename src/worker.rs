@@ -9,7 +9,7 @@ use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -70,6 +70,9 @@ type Sha256IdentityBuildHasher = BuildHasherDefault<Sha256IdentityHasher>;
 static NEXT_ANALYSIS_ID: AtomicU64 = AtomicU64::new(1);
 static BLOCKING_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLOCKING_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
+
+type ResourceHandle = Arc<RwLock<Arc<ModelResources>>>;
 
 #[derive(Debug)]
 struct LocalFileIndex {
@@ -452,6 +455,153 @@ pub struct WorkerConfig {
     pub nice: i32,
 }
 
+fn load_model_resources(
+    model_dir: &Path,
+    thresholds: Option<Thresholds>,
+    upgrade_heuristic: bool,
+) -> Result<Arc<ModelResources>> {
+    let model = Model::load(model_dir, thresholds).context("loading model")?;
+    let shap = ShapImportance::load(model_dir).ok();
+    let ctx = ExtractContext::new(model.spec());
+    Ok(Arc::new(ModelResources {
+        model,
+        shap,
+        ctx,
+        upgrade_heuristic,
+    }))
+}
+
+fn validate_and_load_resources(
+    model_dir: &Path,
+    thresholds: Option<Thresholds>,
+    slow_rule_ms: u64,
+    upgrade_heuristic: bool,
+) -> Result<Arc<ModelResources>> {
+    let validate_config = crate::ScanConfig::new(
+        model_dir,
+        crate::OutputFormat::Terminal,
+        thresholds,
+        crate::DisplayFilter::alerts_only(),
+        slow_rule_ms,
+        false,
+    )?
+    .with_upgrade_heuristic(upgrade_heuristic);
+    crate::validate::run(&validate_config)?;
+    load_model_resources(model_dir, thresholds, upgrade_heuristic)
+}
+
+fn renew_resources_once(
+    model_dir: &Path,
+    thresholds: Option<Thresholds>,
+    slow_rule_ms: u64,
+    upgrade_heuristic: bool,
+) -> Result<Arc<ModelResources>> {
+    let prev_models_head = match crate::models_repo::update() {
+        Ok(prev) => prev,
+        Err(error) => {
+            tracing::warn!(error = %error, "model renewal update failed; validating current models");
+            None
+        }
+    };
+    if let Err(error) = crate::traits_repo::update(false) {
+        tracing::warn!(error = %error, "traits renewal update failed; validating current traits");
+    }
+
+    let resources = match validate_and_load_resources(
+        model_dir,
+        thresholds,
+        slow_rule_ms,
+        upgrade_heuristic,
+    ) {
+        Ok(resources) => resources,
+        Err(error) => {
+            if let Some(prev) = prev_models_head.as_deref() {
+                tracing::error!(rollback_to = %prev, "renewed models failed validation; rolling back");
+                if let Err(rollback_error) = crate::models_repo::rollback(prev) {
+                    tracing::error!(error = %rollback_error, "model rollback after failed renewal failed");
+                }
+            }
+            return Err(error);
+        }
+    };
+
+    match cleave::reload_capability_mapper() {
+        Ok((traits, composites)) => {
+            tracing::info!(traits, composites, "cleave capability mapper renewed");
+        }
+        Err(error) => {
+            if let Some(prev) = prev_models_head.as_deref() {
+                tracing::error!(rollback_to = %prev, "capability mapper reload failed after renewal; rolling back models");
+                if let Err(rollback_error) = crate::models_repo::rollback(prev) {
+                    tracing::error!(error = %rollback_error, "model rollback after mapper reload failure failed");
+                }
+            }
+            anyhow::bail!("reload cleave capability mapper: {error}");
+        }
+    }
+
+    Ok(resources)
+}
+
+fn current_resources(handle: &ResourceHandle) -> Result<Arc<ModelResources>> {
+    let guard = handle
+        .read()
+        .map_err(|error| anyhow::anyhow!("worker resources lock poisoned: {error}"))?;
+    Ok(Arc::clone(&guard))
+}
+
+fn spawn_resource_renewal_task(
+    handle: ResourceHandle,
+    model_dir: PathBuf,
+    thresholds: Option<Thresholds>,
+    slow_rule_ms: u64,
+    upgrade_heuristic: bool,
+    shutdown: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            interruptible_sleep(RESOURCE_RENEWAL_INTERVAL, &shutdown).await;
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            tracing::info!(
+                interval_secs = RESOURCE_RENEWAL_INTERVAL.as_secs(),
+                "worker resource renewal starting",
+            );
+            let model_dir = model_dir.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                renew_resources_once(&model_dir, thresholds, slow_rule_ms, upgrade_heuristic)
+            })
+            .await;
+
+            let new_resources = match result {
+                Ok(Ok(resources)) => resources,
+                Ok(Err(error)) => {
+                    tracing::error!(error = %error, "worker resource renewal failed; keeping last-known-good resources");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "worker resource renewal task panicked; keeping last-known-good resources");
+                    continue;
+                }
+            };
+
+            let spec_version = new_resources.model.spec().version();
+            let features = new_resources.model.spec().total_features();
+            match handle.write() {
+                Ok(mut guard) => {
+                    *guard = new_resources;
+                    tracing::info!(spec_version, features, "worker resources renewed");
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "worker resources lock poisoned; renewal discarded");
+                }
+            }
+        }
+    });
+}
+
 /// A fixed grid of dedicated rayon thread pools — one per worker slot.
 ///
 /// With N concurrent analyses competing for a single rayon pool the work-
@@ -709,15 +859,20 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // pool. See cleave::shared_resources::yara_engine for the contract.
     cleave::prefetch_shared_resources(true);
 
-    let model = Model::load(&config.model_dir, config.thresholds).context("loading model")?;
-    let shap = ShapImportance::load(&config.model_dir).ok();
-    let ctx = ExtractContext::new(model.spec());
-    let resources = Arc::new(ModelResources {
-        model,
-        shap,
-        ctx,
-        upgrade_heuristic: config.upgrade_heuristic,
-    });
+    let resources = load_model_resources(
+        &config.model_dir,
+        config.thresholds,
+        config.upgrade_heuristic,
+    )?;
+    let resources: ResourceHandle = Arc::new(RwLock::new(resources));
+    spawn_resource_renewal_task(
+        Arc::clone(&resources),
+        config.model_dir.clone(),
+        config.thresholds,
+        config.slow_rule_ms,
+        config.upgrade_heuristic,
+        Arc::clone(&shutdown),
+    );
 
     // Arc<str> for the hopper URL — cloned per prefetched job and per dispatched
     // analysis; an atomic bump is far cheaper than a String reallocation.
@@ -950,7 +1105,20 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         }
 
         let client = client.clone();
-        let resources = Arc::clone(&resources);
+        let resources = match current_resources(&resources) {
+            Ok(resources) => resources,
+            Err(error) => {
+                tracing::error!(error = %error, "cannot snapshot worker resources; pausing");
+                drop(permit);
+                buffer_bytes += pj
+                    .data
+                    .as_ref()
+                    .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
+                buffer.push_front(pj);
+                interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
+                continue;
+            }
+        };
         let url = Arc::clone(&base_url);
         let name = Arc::clone(&name);
         let local_index = local_index.clone();
