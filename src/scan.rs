@@ -1059,7 +1059,7 @@ pub(crate) fn classify_report(
     let (classification, probability, original_classification, original_probability) =
         match override_result {
             Some((new_class, new_prob)) => {
-                tracing::warn!(
+                tracing::info!(
                     path = %label,
                     from = %classification,
                     to = %new_class,

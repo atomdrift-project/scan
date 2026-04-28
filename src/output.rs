@@ -3,8 +3,6 @@
 
 use std::sync::{LazyLock, RwLock};
 
-use colored::Colorize;
-
 use crate::model::{Classification, Thresholds};
 use crate::scan::{ScanResult, ScanSummary};
 
@@ -41,6 +39,7 @@ struct Palette {
     dot_sep: Rgb,
     dim: Rgb,
     very_dim: Rgb,
+    path_name: Rgb,
     header_icon: Rgb,
     header_path: Rgb,
     summary_line: Rgb,
@@ -58,13 +57,14 @@ impl Palette {
             suspicious_finding: Rgb(255, 190, 90),
             benign: Rgb(80, 200, 80),
 
-            filetype: Rgb(120, 160, 220),
-            formula: Rgb(80, 160, 140),
+            filetype: Rgb(110, 110, 110),
+            formula: Rgb(110, 110, 110),
 
             dot_sep: Rgb(50, 50, 50),
             dim: Rgb(100, 100, 100),
             very_dim: Rgb(80, 80, 80),
-            header_icon: Rgb(120, 180, 255),
+            path_name: Rgb(230, 230, 230),
+            header_icon: Rgb(160, 160, 160),
             header_path: Rgb(180, 180, 180),
             summary_line: Rgb(50, 50, 50),
             warning: Rgb(180, 180, 60),
@@ -81,13 +81,14 @@ impl Palette {
             suspicious_finding: Rgb(160, 100, 0),
             benign: Rgb(30, 140, 30),
 
-            filetype: Rgb(40, 90, 160),
-            formula: Rgb(30, 120, 100),
+            filetype: Rgb(130, 130, 130),
+            formula: Rgb(130, 130, 130),
 
             dot_sep: Rgb(180, 180, 180),
             dim: Rgb(120, 120, 120),
             very_dim: Rgb(150, 150, 150),
-            header_icon: Rgb(40, 100, 200),
+            path_name: Rgb(30, 30, 30),
+            header_icon: Rgb(110, 110, 110),
             header_path: Rgb(80, 80, 80),
             summary_line: Rgb(190, 190, 190),
             warning: Rgb(140, 140, 0),
@@ -165,6 +166,11 @@ fn palette() -> &'static Palette {
 /// Set truecolor foreground on text.
 fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
     format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
+}
+
+/// Set truecolor foreground + bold on text.
+fn fg_bold(Rgb(r, g, b): Rgb, text: &str) -> String {
+    format!("\x1b[1;38;2;{r};{g};{b}m{text}\x1b[0m")
 }
 
 /// Linear interpolation between two RGB colors.
@@ -320,7 +326,10 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extr
     );
     let label = colored_label(&result.classification, p);
 
-    eprintln!("  {blocks} {pct} {label}  {}", result.path.bold());
+    eprintln!(
+        "  {blocks} {pct} {label}  {}",
+        fg_bold(p.path_name, &result.path),
+    );
     print_detail_lines(result, p);
     print_reasons(result, p);
     if extra {
@@ -373,7 +382,7 @@ pub fn print_ps_result(
 
     eprintln!(
         "  {blocks} {pct} {label}  {}{deleted_marker}  {pid_display}",
-        result.path.bold(),
+        fg_bold(p.path_name, &result.path),
     );
 
     print_detail_lines(result, p);
