@@ -824,8 +824,30 @@ fn log_worker_startup_diagnostics(d: WorkerStartupDiagnostics<'_>) {
     let total_memory_mb = cleave::memory_tracker::total_memory().map(|b| b / MIB);
     let memory_limit_mb = cleave::memory_tracker::memory_limit() / MIB;
     let current_rss_mb = cleave::memory_tracker::current_rss().map(|b| b / MIB);
-    let proc_memtotal_mb = proc_memtotal_mb();
+    let proc_memtotal = proc_memtotal_mb();
+    let (proc_memtotal_mb, proc_memtotal_error) = match proc_memtotal {
+        Ok(mb) => (Some(mb), None),
+        Err(e) => (None, Some(e)),
+    };
     let cgroup = cgroup_memory_diagnostics();
+    let memory_basis = worker_memory_basis();
+
+    if total_memory_mb.is_none() {
+        if memory_basis.source == "cgroup_limit" {
+            tracing::warn!(
+                proc_memtotal_error = ?proc_memtotal_error,
+                cgroup_memory_high = ?cgroup.memory_high,
+                cgroup_memory_max = ?cgroup.memory_max,
+                auto_memory_basis_mb = memory_basis.bytes / MIB,
+                "physical memory unavailable; using cgroup memory limit for worker RSS auto-resolution",
+            );
+        } else if memory_basis.source == "fallback_16g" {
+            tracing::warn!(
+                proc_memtotal_error = ?proc_memtotal_error,
+                "physical memory and cgroup memory limit unavailable; using 16 GiB fallback for worker RSS auto-resolution",
+            );
+        }
+    }
 
     tracing::info!(
         argv = ?d.argv,
@@ -845,6 +867,9 @@ fn log_worker_startup_diagnostics(d: WorkerStartupDiagnostics<'_>) {
         cleave_memory_limit_mb = memory_limit_mb,
         current_rss_mb = ?current_rss_mb,
         proc_memtotal_mb = ?proc_memtotal_mb,
+        proc_memtotal_error = ?proc_memtotal_error,
+        auto_memory_basis_source = memory_basis.source,
+        auto_memory_basis_mb = memory_basis.bytes / MIB,
         cgroup_path = ?cgroup.path,
         cgroup_memory_current = ?cgroup.memory_current,
         cgroup_memory_current_mb = ?cgroup.memory_current_mb,
@@ -856,15 +881,22 @@ fn log_worker_startup_diagnostics(d: WorkerStartupDiagnostics<'_>) {
     );
 }
 
-fn proc_memtotal_mb() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+fn proc_memtotal_mb() -> Result<u64, String> {
+    let meminfo =
+        std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("read /proc/meminfo: {e}"))?;
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb / 1024);
+            let raw = rest
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| "parse /proc/meminfo MemTotal: missing value".to_string())?;
+            let kb: u64 = raw
+                .parse()
+                .map_err(|e| format!("parse /proc/meminfo MemTotal value {raw:?}: {e}"))?;
+            return Ok(kb / 1024);
         }
     }
-    None
+    Err("parse /proc/meminfo: MemTotal not found".to_string())
 }
 
 #[derive(Default)]
@@ -876,6 +908,16 @@ struct CgroupMemoryDiagnostics {
     memory_high_mb: Option<u64>,
     memory_max: Option<String>,
     memory_max_mb: Option<u64>,
+}
+
+impl CgroupMemoryDiagnostics {
+    fn effective_limit_bytes(&self) -> Option<u64> {
+        [self.memory_high.as_deref(), self.memory_max.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|v| memory_value_bytes(Some(v)))
+            .min()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -932,20 +974,55 @@ fn read_trimmed(path: PathBuf) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn memory_value_mb(value: Option<&str>) -> Option<u64> {
+    memory_value_bytes(value).map(|b| b / MIB)
+}
+
+fn memory_value_bytes(value: Option<&str>) -> Option<u64> {
     let value = value?;
     if value == "max" {
         return None;
     }
-    value.parse::<u64>().ok().map(|b| b / MIB)
+    value.parse::<u64>().ok()
+}
+
+struct WorkerMemoryBasis {
+    bytes: u64,
+    source: &'static str,
+}
+
+fn worker_memory_basis() -> WorkerMemoryBasis {
+    let physical = cleave::memory_tracker::total_memory();
+    let cgroup_limit = cgroup_memory_diagnostics().effective_limit_bytes();
+    match (physical, cgroup_limit) {
+        (Some(p), Some(c)) => WorkerMemoryBasis {
+            bytes: p.min(c),
+            source: if c < p {
+                "physical_and_cgroup_min"
+            } else {
+                "physical"
+            },
+        },
+        (Some(p), None) => WorkerMemoryBasis {
+            bytes: p,
+            source: "physical",
+        },
+        (None, Some(c)) => WorkerMemoryBasis {
+            bytes: c,
+            source: "cgroup_limit",
+        },
+        (None, None) => WorkerMemoryBasis {
+            bytes: 16 * GIB,
+            source: "fallback_16g",
+        },
+    }
 }
 
 /// Auto-resolve the worker RSS ceiling when the user hasn't set `--max-rss-gb`.
 ///
-/// Worker processes typically own their jail, so we pick a single policy that
-/// scales with host size: 85% of total RAM. That leaves 15% for the kernel,
-/// ZFS ARC, other jail tenants, and transient spikes during analysis.
+/// Pick 85% of the effective memory basis: the smaller of physical RAM and
+/// the cgroup/systemd memory limit when one is visible.
 fn resolve_worker_max_rss_gb() -> u64 {
-    let total_bytes = cleave::memory_tracker::total_memory().unwrap_or(16 * GIB);
+    let total_bytes = worker_memory_basis().bytes;
     std::cmp::max(1, (total_bytes * 85 / 100) / GIB)
 }
 
