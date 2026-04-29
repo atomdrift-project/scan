@@ -65,8 +65,11 @@ pub fn run(config: &ScanConfig) -> Result<()> {
     let traits_ver = cleave::traits_repo::version()
         .map(|v| format!(" traits: {v}"))
         .unwrap_or_default();
+    let traits_dir = cleave::traits_repo::try_resolve()
+        .map(|p| format!(" traits_dir: {}", p.display()))
+        .unwrap_or_default();
     eprintln!(
-        "validate:{models_ver}{traits_ver} cleave traits + model benign corpus ({}/{})",
+        "validate:{models_ver}{traits_ver}{traits_dir} cleave traits + model benign corpus ({}/{})",
         passed, total,
     );
     Ok(())
