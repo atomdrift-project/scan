@@ -832,14 +832,16 @@ fn log_worker_startup_diagnostics(d: WorkerStartupDiagnostics<'_>) {
     let cgroup = cgroup_memory_diagnostics();
     let memory_basis = worker_memory_basis();
 
-    if total_memory_mb.is_none() {
-        if memory_basis.source == "cgroup_limit" {
+    if proc_memtotal_error.is_some() {
+        if let Some(limit) = cgroup.effective_limit_bytes() {
             tracing::warn!(
                 proc_memtotal_error = ?proc_memtotal_error,
                 cgroup_memory_high = ?cgroup.memory_high,
                 cgroup_memory_max = ?cgroup.memory_max,
+                cgroup_effective_limit_mb = limit / MIB,
+                auto_memory_basis_source = memory_basis.source,
                 auto_memory_basis_mb = memory_basis.bytes / MIB,
-                "physical memory unavailable; using cgroup memory limit for worker RSS auto-resolution",
+                "proc meminfo unavailable; using shared memory detector for worker RSS auto-resolution",
             );
         } else if memory_basis.source == "fallback_16g" {
             tracing::warn!(
@@ -991,36 +993,22 @@ struct WorkerMemoryBasis {
 }
 
 fn worker_memory_basis() -> WorkerMemoryBasis {
-    let physical = cleave::memory_tracker::total_memory();
-    let cgroup_limit = cgroup_memory_diagnostics().effective_limit_bytes();
-    match (physical, cgroup_limit) {
-        (Some(p), Some(c)) => WorkerMemoryBasis {
-            bytes: p.min(c),
-            source: if c < p {
-                "physical_and_cgroup_min"
-            } else {
-                "physical"
-            },
-        },
-        (Some(p), None) => WorkerMemoryBasis {
-            bytes: p,
-            source: "physical",
-        },
-        (None, Some(c)) => WorkerMemoryBasis {
-            bytes: c,
-            source: "cgroup_limit",
-        },
-        (None, None) => WorkerMemoryBasis {
-            bytes: 16 * GIB,
-            source: "fallback_16g",
-        },
+    if let Some(bytes) = cleave::memory_tracker::total_memory() {
+        return WorkerMemoryBasis {
+            bytes,
+            source: "cleave_total_memory",
+        };
+    }
+    WorkerMemoryBasis {
+        bytes: 16 * GIB,
+        source: "fallback_16g",
     }
 }
 
 /// Auto-resolve the worker RSS ceiling when the user hasn't set `--max-rss-gb`.
 ///
-/// Pick 85% of the effective memory basis: the smaller of physical RAM and
-/// the cgroup/systemd memory limit when one is visible.
+/// Pick 85% of cleave's shared memory detector, which is cgroup-aware on
+/// Linux and falls back to 16 GiB only when no memory signal is available.
 fn resolve_worker_max_rss_gb() -> u64 {
     let total_bytes = worker_memory_basis().bytes;
     std::cmp::max(1, (total_bytes * 85 / 100) / GIB)
