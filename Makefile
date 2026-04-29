@@ -167,7 +167,7 @@ benchmark-worker: release
 # to 10 by default; pass NICE=0 to disable.
 worker: release
 	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>]"; exit 1; }
-	./out/$(BINARY) --verbose worker --url "$(URL)" \
+	./out/$(BINARY) worker --url "$(URL)" \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		$(if $(NICE),--nice $(NICE),)
 
