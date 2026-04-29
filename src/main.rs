@@ -15,6 +15,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
 
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
 /// Classification values accepted by `--show`.
 #[derive(Clone, clap::ValueEnum)]
 enum Show {
@@ -682,6 +685,32 @@ fn main() -> Result<()> {
             if let Some(ref p) = traits_dir {
                 std::env::set_var("CLEAVE_TRAITS_DIR", p);
             }
+            let workers = workers.unwrap_or_else(default_workers);
+            let name = name.unwrap_or_else(|| {
+                hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+            let raw_max_rss_gb = max_rss_gb;
+            let max_rss_gb: u64 = match raw_max_rss_gb {
+                n if n < 0 => 0,
+                0 => resolve_worker_max_rss_gb(),
+                n => n as u64,
+            };
+            log_worker_startup_diagnostics(WorkerStartupDiagnostics {
+                argv: std::env::args().collect(),
+                hopper_url: &url,
+                name: &name,
+                workers,
+                poll_secs,
+                raw_max_rss_gb,
+                resolved_max_rss_gb: max_rss_gb,
+                data_dir: data_dir.as_deref(),
+                max_jobs,
+                traits_dir: traits_dir.as_deref(),
+                nice,
+            });
             // Refresh models and traits at startup so long-lived workers pick up
             // new rules on each restart. Failures are non-fatal — a worker in a
             // disconnected environment must still start with whatever is on disk.
@@ -712,31 +741,21 @@ fn main() -> Result<()> {
                 eprintln!("Worker startup validation failed: {e:#}");
                 process::exit(1);
             }
-            let workers = workers.unwrap_or_else(default_workers);
-            let name = name.unwrap_or_else(|| {
-                hostname::get()
-                    .ok()
-                    .and_then(|h| h.into_string().ok())
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
-            let max_rss_gb: u64 = match max_rss_gb {
+            match raw_max_rss_gb {
                 n if n < 0 => {
                     tracing::info!(
                         "in-process RSS throttling disabled (--max-rss-gb=-1); \
                          relying on external supervisor for OOM enforcement",
                     );
-                    0
                 }
                 0 => {
-                    let resolved = resolve_worker_max_rss_gb();
                     tracing::info!(
-                        max_rss_gb = resolved,
+                        max_rss_gb,
                         "auto-resolved worker RSS ceiling (set --max-rss-gb to override, -1 to disable)",
                     );
-                    resolved
                 }
-                n => n as u64,
-            };
+                _ => {}
+            }
             let config = litmus::worker::WorkerConfig {
                 hopper_url: url,
                 name,
@@ -787,15 +806,147 @@ fn default_workers() -> usize {
     std::cmp::max(2, cores / 2)
 }
 
+struct WorkerStartupDiagnostics<'a> {
+    argv: Vec<String>,
+    hopper_url: &'a str,
+    name: &'a str,
+    workers: usize,
+    poll_secs: u64,
+    raw_max_rss_gb: i64,
+    resolved_max_rss_gb: u64,
+    data_dir: Option<&'a Path>,
+    max_jobs: Option<u64>,
+    traits_dir: Option<&'a Path>,
+    nice: i32,
+}
+
+fn log_worker_startup_diagnostics(d: WorkerStartupDiagnostics<'_>) {
+    let total_memory_mb = cleave::memory_tracker::total_memory().map(|b| b / MIB);
+    let memory_limit_mb = cleave::memory_tracker::memory_limit() / MIB;
+    let current_rss_mb = cleave::memory_tracker::current_rss().map(|b| b / MIB);
+    let proc_memtotal_mb = proc_memtotal_mb();
+    let cgroup = cgroup_memory_diagnostics();
+
+    tracing::info!(
+        argv = ?d.argv,
+        hopper_url = d.hopper_url,
+        worker_name = d.name,
+        workers = d.workers,
+        poll_secs = d.poll_secs,
+        raw_max_rss_gb = d.raw_max_rss_gb,
+        resolved_max_rss_gb = d.resolved_max_rss_gb,
+        resolved_max_rss_mb = d.resolved_max_rss_gb.saturating_mul(1024),
+        rss_throttling_enabled = d.resolved_max_rss_gb > 0,
+        data_dir = ?d.data_dir,
+        max_jobs = ?d.max_jobs,
+        traits_dir = ?d.traits_dir,
+        nice = d.nice,
+        total_memory_mb = ?total_memory_mb,
+        cleave_memory_limit_mb = memory_limit_mb,
+        current_rss_mb = ?current_rss_mb,
+        proc_memtotal_mb = ?proc_memtotal_mb,
+        cgroup_path = ?cgroup.path,
+        cgroup_memory_current = ?cgroup.memory_current,
+        cgroup_memory_current_mb = ?cgroup.memory_current_mb,
+        cgroup_memory_high = ?cgroup.memory_high,
+        cgroup_memory_high_mb = ?cgroup.memory_high_mb,
+        cgroup_memory_max = ?cgroup.memory_max,
+        cgroup_memory_max_mb = ?cgroup.memory_max_mb,
+        "worker startup diagnostics",
+    );
+}
+
+fn proc_memtotal_mb() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct CgroupMemoryDiagnostics {
+    path: Option<String>,
+    memory_current: Option<String>,
+    memory_current_mb: Option<u64>,
+    memory_high: Option<String>,
+    memory_high_mb: Option<u64>,
+    memory_max: Option<String>,
+    memory_max_mb: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_diagnostics() -> CgroupMemoryDiagnostics {
+    let Some(path) = cgroup_v2_path() else {
+        return CgroupMemoryDiagnostics::default();
+    };
+    let memory_current = read_trimmed(path.join("memory.current"));
+    let memory_high = read_trimmed(path.join("memory.high"));
+    let memory_max = read_trimmed(path.join("memory.max"));
+    CgroupMemoryDiagnostics {
+        path: Some(path.display().to_string()),
+        memory_current_mb: memory_value_mb(memory_current.as_deref()),
+        memory_high_mb: memory_value_mb(memory_high.as_deref()),
+        memory_max_mb: memory_value_mb(memory_max.as_deref()),
+        memory_current,
+        memory_high,
+        memory_max,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_diagnostics() -> CgroupMemoryDiagnostics {
+    CgroupMemoryDiagnostics::default()
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_path() -> Option<PathBuf> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    for line in cgroup.lines() {
+        let mut parts = line.splitn(3, ':');
+        let hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let rel = parts.next()?;
+        if hierarchy == "0" && controllers.is_empty() {
+            let rel = rel.trim_start_matches('/');
+            return Some(if rel.is_empty() {
+                PathBuf::from("/sys/fs/cgroup")
+            } else {
+                PathBuf::from("/sys/fs/cgroup").join(rel)
+            });
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_trimmed(path: PathBuf) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn memory_value_mb(value: Option<&str>) -> Option<u64> {
+    let value = value?;
+    if value == "max" {
+        return None;
+    }
+    value.parse::<u64>().ok().map(|b| b / MIB)
+}
+
 /// Auto-resolve the worker RSS ceiling when the user hasn't set `--max-rss-gb`.
 ///
 /// Worker processes typically own their jail, so we pick a single policy that
 /// scales with host size: 85% of total RAM. That leaves 15% for the kernel,
 /// ZFS ARC, other jail tenants, and transient spikes during analysis.
 fn resolve_worker_max_rss_gb() -> u64 {
-    const GB: u64 = 1024 * 1024 * 1024;
-    let total_bytes = cleave::memory_tracker::total_memory().unwrap_or(16 * GB);
-    std::cmp::max(1, (total_bytes * 85 / 100) / GB)
+    let total_bytes = cleave::memory_tracker::total_memory().unwrap_or(16 * GIB);
+    std::cmp::max(1, (total_bytes * 85 / 100) / GIB)
 }
 
 /// Exit with the appropriate code based on scan summary counters.
