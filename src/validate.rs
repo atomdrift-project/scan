@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::features::ExtractContext;
-use crate::model::{Classification, Model};
+use crate::model::{Classification, Model, Thresholds};
 use crate::scan::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 
 /// Run full validation: cleave trait validation, model loading, and benign-corpus inference.
@@ -34,6 +34,7 @@ pub fn run(config: &ScanConfig) -> Result<()> {
     )?);
 
     let model = Model::load(config.model_dir(), config.thresholds())?;
+    let thresholds = model.thresholds();
     let ctx = ExtractContext::new(model.spec());
 
     let results: Vec<(PathBuf, Result<ClassifiedReport>)> = targets
@@ -57,7 +58,7 @@ pub fn run(config: &ScanConfig) -> Result<()> {
         })
         .collect();
 
-    let (passed, total) = evaluate(results)?;
+    let (passed, total, warnings) = evaluate(results, thresholds)?;
 
     let models_ver = crate::models_repo::version()
         .map(|v| format!(" models: {v}"))
@@ -69,8 +70,8 @@ pub fn run(config: &ScanConfig) -> Result<()> {
         .map(|p| format!(" traits_dir: {}", p.display()))
         .unwrap_or_default();
     eprintln!(
-        "validate:{models_ver}{traits_ver}{traits_dir} cleave traits + model benign corpus ({}/{})",
-        passed, total,
+        "validate:{models_ver}{traits_ver}{traits_dir} cleave traits + model benign corpus ({}/{}, warnings={})",
+        passed, total, warnings,
     );
     Ok(())
 }
@@ -123,58 +124,68 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn evaluate(results: Vec<(PathBuf, Result<ClassifiedReport>)>) -> Result<(usize, usize)> {
+fn evaluate(
+    results: Vec<(PathBuf, Result<ClassifiedReport>)>,
+    thresholds: Thresholds,
+) -> Result<(usize, usize, usize)> {
     let mut passed = 0usize;
     let mut total = 0usize;
-    let mut failed = 0usize;
+    let mut analysis_failed = 0usize;
+    let mut warnings = 0usize;
 
     for (path, result) in results {
         total += 1;
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                failed += 1;
+                analysis_failed += 1;
                 eprintln!("FAILED {}: analysis failed: {error:#}", path.display());
                 continue;
             }
         };
 
-        let mut file_failed = false;
+        let mut file_warned = false;
         if result.classification != Classification::Benign {
-            file_failed = true;
+            file_warned = true;
             eprintln!(
-                "FAILED {}: {} p={:.4}",
+                "WARN {}: grade={} probability={:.4} thresholds suspicious={:.4} hostile={:.4}",
                 path.display(),
                 result.classification,
                 result.probability,
+                thresholds.suspicious,
+                thresholds.hostile,
             );
             print_top_findings(&result.top_findings, "  ");
         }
         for embedded in &result.embedded_files {
             if embedded.classification != Classification::Benign {
-                file_failed = true;
+                file_warned = true;
                 eprintln!(
-                    "FAILED {}!!{}: {} p={:.4}",
+                    "WARN {}!!{}: grade={} probability={:.4} thresholds suspicious={:.4} hostile={:.4}",
                     path.display(),
                     embedded.path,
                     embedded.classification,
                     embedded.probability,
+                    thresholds.suspicious,
+                    thresholds.hostile,
                 );
                 print_embedded_findings(embedded, "  ");
             }
         }
 
-        if file_failed {
-            failed += 1;
+        if file_warned {
+            warnings += 1;
         } else {
             passed += 1;
         }
     }
 
-    if failed > 0 {
-        anyhow::bail!("{failed} validation check(s) failed ({passed}/{total} targets benign)");
+    if analysis_failed > 0 {
+        anyhow::bail!(
+            "{analysis_failed} validation check(s) failed during analysis ({passed}/{total} targets benign, {warnings} warning(s))"
+        );
     }
-    Ok((passed, total))
+    Ok((passed, total, warnings))
 }
 
 fn print_top_findings(findings: &[scan::TopFinding], indent: &str) {

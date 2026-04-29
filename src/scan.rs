@@ -1168,9 +1168,7 @@ pub fn apply_finding_override(
             Classification::Hostile,
             current_prob.max(thresholds.hostile),
         )
-    } else if current_class == Classification::Benign
-        && (counts.hostile + counts.suspicious >= 2)
-    {
+    } else if current_class == Classification::Benign && (counts.hostile + counts.suspicious >= 2) {
         (
             Classification::Suspicious,
             current_prob.max(thresholds.suspicious),
