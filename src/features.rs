@@ -802,8 +802,8 @@ impl ExtractContext {
 
         let (formula_str, elements_str, sample_score) =
             canonical_fields_from_primary_file(primary_file);
-        let score_weight: f32 = if sample_score > 0 {
-            (sample_score as f32).ln_1p()
+        let score_weight: f64 = if sample_score > 0 {
+            (sample_score as f64).ln_1p()
         } else {
             1.0
         };
@@ -1154,13 +1154,13 @@ impl ExtractContext {
         summary: &FindingSummary,
         vec: &mut [f32],
         offset: usize,
-        score_weight: f32,
+        score_weight: f64,
     ) {
         for (path, &max_ord) in &summary.sample_paths {
             if max_ord >= 2 {
                 if let Some(&idx) = self.presence_lookup.get(path.as_str()) {
-                    let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0) as f32;
-                    vec[offset + idx] = score_weight * conf;
+                    let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0);
+                    vec[offset + idx] = (score_weight * conf) as f32;
                 }
             }
         }
@@ -1171,12 +1171,12 @@ impl ExtractContext {
         summary: &FindingSummary,
         vec: &mut [f32],
         offset: usize,
-        score_weight: f32,
+        score_weight: f64,
     ) {
         for (path, &max_ord) in &summary.sample_paths {
             if let Some(&idx) = self.presence_lookup.get(path.as_str()) {
-                let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0) as f32;
-                vec[offset + idx] = max_ord as f32 * score_weight * conf;
+                let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0);
+                vec[offset + idx] = (f64::from(max_ord) * score_weight * conf) as f32;
             }
         }
     }
