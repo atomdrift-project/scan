@@ -13,6 +13,18 @@ URL="$3"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
+install_missing_build_packages() {
+    missing=""
+    for pkg in rust sccache git pkgconf mold gmake; do
+        if ! doas bastille cmd "$BUILD" pkg info -e "$pkg" >/dev/null 2>&1; then
+            missing="$missing $pkg"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        doas bastille pkg "$BUILD" install -y $missing
+    fi
+}
+
 doas bastille cmd "$BUILD" true || die "build jail '$BUILD' not accessible"
 doas bastille cmd "$RUN" true || die "run jail '$RUN' not accessible"
 
@@ -21,7 +33,7 @@ doas bastille cmd "$BUILD" id -u litmus >/dev/null 2>&1 || \
     doas bastille cmd "$BUILD" pw useradd litmus -m -s /bin/sh -c "Litmus Build"
 
 log "Installing build dependencies"
-doas bastille pkg "$BUILD" install -y rust sccache git pkgconf mold
+install_missing_build_packages
 
 log "Syncing source to build jail (preserving target/)"
 doas bastille cmd "$BUILD" su -l litmus -c "mkdir -p ~/litmus"
@@ -32,7 +44,7 @@ log "Killing any stale cargo processes in build jail"
 doas bastille cmd "$BUILD" su -l litmus -c "killall cargo 2>/dev/null || true"
 
 log "Building tarball"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=mold' make tarball" \
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=mold' gmake tarball" \
     || die "build failed in build jail"
 
 log "Running tests"

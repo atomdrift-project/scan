@@ -20,7 +20,7 @@ SLOW_RULE_MS ?= 200
 MAX_JOBS ?= 25
 WORKERS  ?=
 
-.PHONY: build release install check-cargo tarball deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker profile-worker profile-slow lint test clean
+.PHONY: build release install check-cargo tarball deploy deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker profile-worker profile-slow lint test clean
 
 all: build
 
@@ -86,6 +86,8 @@ tarball: release
 # the env, which tikv-jemalloc-sys's build.rs re-passes to its bundled `make`,
 # producing `*** No rule to make target '-j'` inside the jemalloc build.
 deploy-server deploy-worker deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
+
+deploy: deploy-server
 
 deploy-server:
 	git pull
