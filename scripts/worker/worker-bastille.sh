@@ -15,7 +15,7 @@ log() { echo "==> $*"; }
 
 install_missing_build_packages() {
     missing=""
-    for pkg in rust sccache git pkgconf mold gmake; do
+    for pkg in rust git pkgconf mold gmake; do
         if ! doas bastille cmd "$BUILD" pkg info -e "$pkg" >/dev/null 2>&1; then
             missing="$missing $pkg"
         fi
@@ -44,11 +44,11 @@ log "Killing any stale cargo processes in build jail"
 doas bastille cmd "$BUILD" su -l litmus -c "killall cargo 2>/dev/null || true"
 
 log "Building tarball"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=mold' gmake tarball" \
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTFLAGS='-C link-arg=-fuse-ld=mold' gmake tarball" \
     || die "build failed in build jail"
 
 log "Running tests"
-doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS='-C link-arg=-fuse-ld=mold' cargo test --release -- --nocapture" \
+doas bastille cmd "$BUILD" su -l litmus -c "cd ~/litmus && RUSTFLAGS='-C link-arg=-fuse-ld=mold' cargo test --release -- --nocapture" \
     || die "tests failed in build jail"
 
 log "Transferring tarball to run jail"
