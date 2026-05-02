@@ -62,6 +62,7 @@ serde_json = "1"
 anyhow = "1"
 dirs = "6.0"
 xgboost-ars = { git = "https://codeberg.org/atomdrift/xgboost-ars" }
+lightgbm-ars = { git = "https://codeberg.org/atomdrift/lightgbm-ars" }
 sha2 = "0.10"
 terminal-colorsaurus = "0.4"
 axum = { version = "0.8", features = ["multipart"] }

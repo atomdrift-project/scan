@@ -454,6 +454,30 @@ fn print_extra(result: &ScanResult, p: &Palette) {
         fg(p.dim, "prob:"),
         fg(p.dim, &format!("{:.6}", result.probability)),
     );
+    if !result.model_scores.is_empty() {
+        let models: Vec<String> = result
+            .model_scores
+            .iter()
+            .map(|s| format!("{}={:.6}", s.model, s.probability))
+            .collect();
+        eprintln!(
+            "           {} {}",
+            fg(p.dim, "models:"),
+            fg(p.dim, &models.join(" "))
+        );
+    }
+    if !result.skipped_models.is_empty() {
+        let skipped: Vec<String> = result
+            .skipped_models
+            .iter()
+            .map(|s| format!("{}:{}", s.model, s.reason))
+            .collect();
+        eprintln!(
+            "           {} {}",
+            fg(p.dim, "skipped:"),
+            fg(p.dim, &skipped.join(" "))
+        );
+    }
     if !result.reasons.is_empty() {
         eprintln!("           {}", fg(p.dim, "shap:"));
         for r in &result.reasons {

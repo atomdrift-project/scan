@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::explain::ShapImportance;
 use crate::features::{crit_ordinal, ExtractContext};
-use crate::model::{Classification, Model, Thresholds};
+use crate::model::{Classification, Model, RouteScore, SkippedRoute, Thresholds};
 use crate::OutputFormat;
 
 pub use crate::explain::Reason;
@@ -432,6 +432,8 @@ mod envelope_tests {
             formula: String::new(),
             reasons: Vec::new(),
             top_findings: Vec::new(),
+            model_scores: Vec::new(),
+            skipped_models: Vec::new(),
             file_type: "unknown".to_string(),
             size_bytes: 0,
             sha256: String::new(),
@@ -545,6 +547,10 @@ pub struct ScanResult {
     pub sha256: String,
     /// Per-file ML evaluations for archive members.
     pub embedded_files: Vec<EmbeddedFile>,
+    /// Per-model route scores from the routed ensemble.
+    pub model_scores: Vec<RouteScore>,
+    /// Applicable model routes skipped by the routed ensemble.
+    pub skipped_models: Vec<SkippedRoute>,
 }
 
 /// A representative cleave finding surfaced alongside a classification.
@@ -579,6 +585,12 @@ pub struct EmbeddedFile {
     pub classification: Classification,
     /// Raw model probability for this embedded file.
     pub probability: f32,
+    /// Per-model route scores for this embedded file.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_scores: Vec<RouteScore>,
+    /// Applicable model routes skipped for this embedded file.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_models: Vec<SkippedRoute>,
     /// Molecular formula for this embedded file.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub formula: String,
@@ -883,6 +895,8 @@ pub(crate) struct ClassifiedReport {
     pub(crate) formula: String,
     pub(crate) reasons: Vec<Reason>,
     pub(crate) top_findings: Vec<TopFinding>,
+    pub(crate) model_scores: Vec<RouteScore>,
+    pub(crate) skipped_models: Vec<SkippedRoute>,
     pub(crate) file_type: String,
     pub(crate) size_bytes: u64,
     pub(crate) sha256: String,
@@ -929,12 +943,26 @@ pub(crate) fn classify_report(
         .map(|s| s.explain(&raw_features, model.spec().feature_names()))
         .unwrap_or_default();
     model.spec().standardize(&mut raw_features);
-    let (probability, classification) = model.predict(&raw_features)?;
+
+    // The cleave file_type drives ensemble routing; pull it from the top-level
+    // file in the report. Single-bundle deployments ignore it via predict_for's
+    // fast path.
+    let pf = report_json["fs"]
+        .as_array()
+        .and_then(|a| a.first())
+        .unwrap_or(&report_json);
+    let file_type = pf["type"].as_str().unwrap_or("unknown").to_string();
+    let size_bytes = pf["sz"].as_u64().unwrap_or(0);
+    let sha256 = pf["sha"].as_str().unwrap_or("").to_string();
+
+    let (probability, classification, model_scores, skipped_models) =
+        model.predict_for_report_detailed(&file_type, &raw_features, &report_json)?;
 
     let finding_counts = count_findings_from_json(&report_json);
 
     tracing::debug!(
         path = %label,
+        file_type = %file_type,
         classification = ?classification,
         probability = format!("{:.4}", probability),
         features_nonzero = nonzero,
@@ -946,14 +974,6 @@ pub(crate) fn classify_report(
         formula = %formula,
         "classified file",
     );
-
-    let pf = report_json["fs"]
-        .as_array()
-        .and_then(|a| a.first())
-        .unwrap_or(&report_json);
-    let file_type = pf["type"].as_str().unwrap_or("unknown").to_string();
-    let size_bytes = pf["sz"].as_u64().unwrap_or(0);
-    let sha256 = pf["sha"].as_str().unwrap_or("").to_string();
 
     // Extract embedded files (archive members at depth > 0), run each through
     // the model individually, and elevate the parent if any embedded file scores higher.
@@ -982,9 +1002,10 @@ pub(crate) fn classify_report(
 
         let mut ef_features = ctx.extract_file(ef);
         model.spec().standardize(&mut ef_features);
-        let (ef_prob, ef_class) = model
-            .predict(&ef_features)
-            .unwrap_or((0.0, Classification::Benign));
+        let ef_type = ef["type"].as_str().unwrap_or("unknown");
+        let (ef_prob, ef_class, ef_model_scores, ef_skipped_models) = model
+            .predict_for_file_detailed(ef_type, &ef_features, ef)
+            .unwrap_or((0.0, Classification::Benign, Vec::new(), Vec::new()));
 
         let full_path = ef["path"].as_str().unwrap_or("");
         let rel_path = full_path
@@ -1020,6 +1041,8 @@ pub(crate) fn classify_report(
             file_type: ef["type"].as_str().unwrap_or("unknown").to_string(),
             classification: ef_class,
             probability: ef_prob,
+            model_scores: ef_model_scores,
+            skipped_models: ef_skipped_models,
             formula: ef["f"].as_str().unwrap_or("").to_string(),
             top_findings: ef_top_findings,
         });
@@ -1085,6 +1108,8 @@ pub(crate) fn classify_report(
         formula,
         reasons,
         top_findings,
+        model_scores,
+        skipped_models,
         file_type,
         size_bytes,
         sha256,
@@ -1139,6 +1164,8 @@ pub(crate) fn process_report(
         formula: cr.formula,
         reasons: cr.reasons,
         top_findings: cr.top_findings,
+        model_scores: cr.model_scores,
+        skipped_models: cr.skipped_models,
         file_type: cr.file_type,
         size_bytes: cr.size_bytes,
         sha256: cr.sha256,
@@ -1346,6 +1373,14 @@ where
     [t.suspicious, t.hostile].serialize(serializer)
 }
 
+fn route_scores_empty(scores: &[crate::model::RouteScore]) -> bool {
+    scores.is_empty()
+}
+
+fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
+    routes.is_empty()
+}
+
 /// Build per-file ML classification entries for the `ml.fs` array.
 ///
 /// Each entry contains `{id, class, prob}` keyed by the cleave `fs[].id` field.
@@ -1412,6 +1447,10 @@ pub struct MlSection {
     pub(crate) original_probability: Option<f32>,
     #[serde(serialize_with = "serialize_thresholds")]
     pub(crate) thresholds: Thresholds,
+    #[serde(rename = "models", skip_serializing_if = "Vec::is_empty")]
+    pub(crate) model_scores: Vec<crate::model::RouteScore>,
+    #[serde(rename = "skip", skip_serializing_if = "Vec::is_empty")]
+    pub(crate) skipped_models: Vec<crate::model::SkippedRoute>,
     pub(crate) version: String,
     pub(crate) analyzed_at: String,
     pub(crate) fs: Vec<serde_json::Value>,
@@ -1446,6 +1485,10 @@ pub struct MlSectionRef<'a> {
     pub(crate) original_probability: Option<f32>,
     #[serde(serialize_with = "serialize_thresholds")]
     pub(crate) thresholds: Thresholds,
+    #[serde(rename = "models", skip_serializing_if = "route_scores_empty")]
+    pub(crate) model_scores: &'a [crate::model::RouteScore],
+    #[serde(rename = "skip", skip_serializing_if = "skipped_routes_empty")]
+    pub(crate) skipped_models: &'a [crate::model::SkippedRoute],
     pub(crate) version: &'a str,
     pub(crate) analyzed_at: &'a str,
     pub(crate) fs: Vec<serde_json::Value>,
@@ -1478,6 +1521,8 @@ impl ScanResult {
                 original_classification: self.original_classification,
                 original_probability: self.original_probability,
                 thresholds: self.thresholds,
+                model_scores: self.model_scores.clone(),
+                skipped_models: self.skipped_models.clone(),
                 version: self.version.clone(),
                 analyzed_at: self.analyzed_at.clone(),
                 fs: ml_fs,
@@ -1509,6 +1554,8 @@ impl ScanResult {
                 original_classification: self.original_classification,
                 original_probability: self.original_probability,
                 thresholds: self.thresholds,
+                model_scores: self.model_scores,
+                skipped_models: self.skipped_models,
                 version: self.version,
                 analyzed_at: self.analyzed_at,
                 fs: ml_fs,
@@ -1544,6 +1591,8 @@ impl ScanResult {
                 original_classification: self.original_classification,
                 original_probability: self.original_probability,
                 thresholds: self.thresholds,
+                model_scores: &self.model_scores,
+                skipped_models: &self.skipped_models,
                 version: &self.version,
                 analyzed_at: &self.analyzed_at,
                 fs: ml_fs,

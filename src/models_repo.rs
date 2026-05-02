@@ -1,16 +1,39 @@
 //! Manages the external models repository (clone, update, resolve).
 //!
-//! Models live in a separate git repository. This module handles locating,
-//! auto-cloning, and updating that repository so users don't need to manage
-//! it manually.
+//! Models live in a separate git repository whose checkout root *is* the
+//! model bundle: `feature_spec.json`, `config.json`, `evaluation.json`, and
+//! either `model.json` (XGBoost) or `model.txt` (LightGBM) sit at the top
+//! level. The model "version" is the git ref the checkout points at, not a
+//! subdirectory name.
+//!
+//! On-disk layout under `dirs::data_dir()/litmus/models/`:
+//!
+//! ```text
+//! models/
+//!   azoth/        ← default bundle, all file types
+//!   azoth-pe/     ← (future) PE-only specialist
+//!   azoth-elf/    ← (future) ELF-only specialist
+//!   …
+//! ```
+//!
+//! The directory name comes from the last path segment of the configured
+//! upstream URL (`.../azoth.git` → `azoth`), so swapping `LITMUS_MODELS_REPO`
+//! to a per-filetype variant gives it a sibling directory automatically.
 //!
 //! Resolution order:
-//! 1. `LITMUS_MODELS_DIR` env var
-//! 2. Platform data directory (auto-cloned from upstream)
+//! 1. `LITMUS_MODELS_DIR` env var (points at a ready-to-load bundle directory)
+//! 2. The bundle directory derived from the upstream URL, auto-cloned/updated
 //!
-//! For development, symlink the data directory to a local checkout:
-//!   ln -sfn ~/dev/atomdrift/litmus-models \
-//!     ~/Library/Application\ Support/litmus/models
+//! Configurable via env (or CLI flags that overwrite these vars at startup):
+//! - `LITMUS_MODELS_REPO`: upstream URL (default: codeberg.org/atomdrift/azoth.git).
+//!   May embed a ref via the `URL#ref` syntax (`...azoth.git#v1`); the
+//!   trailing fragment overrides `LITMUS_MODELS_REF`.
+//! - `LITMUS_MODELS_REF`:  branch or tag to track (default: the remote's
+//!   default branch). If the configured ref is missing on the remote we warn
+//!   and fall back to whatever branch `HEAD` points at.
+//!
+//! For development, symlink the bundle path to a local working tree:
+//!   ln -sfn ~/dev/atomdrift/azoth ~/.local/share/litmus/models/azoth
 
 use crate::git_cmd;
 use anyhow::{Context, Result};
@@ -18,16 +41,44 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/litmus-models.git";
-const CURRENT_MODEL: &str = "scan-v16";
+const DEFAULT_MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/azoth.git";
 const STALENESS_DAYS: u64 = 30;
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Resolve the models base directory, auto-cloning if necessary.
+/// Sentinel used internally when the user pinned no ref. The clone path
+/// translates this to "omit `--branch`" and the fetch path to "fetch
+/// whatever the remote's HEAD points at".
+const REMOTE_DEFAULT_REF: &str = "";
+
+/// Files that must be present in a complete bundle. The model file is checked
+/// separately because we accept either `model.json` or `model.txt`.
+const REQUIRED_ARTIFACTS: &[&str] = &["feature_spec.json"];
+const MODEL_FILES: &[&str] = &["model.json", "model.txt"];
+
+/// Resolve the configured upstream URL and ref.
 ///
-/// Returns the base directory (not the versioned subdirectory).
-/// Call `model_dir()` to get the path suitable for `Model::load`.
-pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
+/// Resolution order:
+/// 1. `LITMUS_MODELS_REPO=URL#ref` — the trailing fragment, if present, is the ref.
+/// 2. `LITMUS_MODELS_REF=...` — used only if no `#ref` is embedded in the URL.
+/// 3. Built-in default URL plus `REMOTE_DEFAULT_REF` (= "track the remote's
+///    default branch").
+fn configured_repo() -> (String, String) {
+    let raw =
+        std::env::var("LITMUS_MODELS_REPO").unwrap_or_else(|_| DEFAULT_MODELS_REPO_URL.to_owned());
+    let (url, embedded_ref) = match raw.rfind('#') {
+        Some(idx) => (raw[..idx].to_owned(), Some(raw[idx + 1..].to_owned())),
+        None => (raw, None),
+    };
+    let ref_name = embedded_ref
+        .or_else(|| std::env::var("LITMUS_MODELS_REF").ok())
+        .unwrap_or_else(|| REMOTE_DEFAULT_REF.to_owned());
+    (url, ref_name)
+}
+
+/// Resolve the models bundle directory, auto-cloning if necessary.
+///
+/// Returns the path suitable for [`crate::model::Model::load`].
+pub fn model_dir() -> Result<PathBuf> {
     if let Ok(explicit) = std::env::var("LITMUS_MODELS_DIR") {
         let p = PathBuf::from(&explicit);
         if p.is_dir() {
@@ -38,6 +89,31 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
     }
 
     let data_dir = default_models_dir();
+    let (repo_url, ref_name) = configured_repo();
+
+    // If a checkout exists but its remote no longer matches the configured
+    // upstream, we must reclone. This is the migration path off the old
+    // litmus-models layout (where the bundle was a `scan-v16/` subdir under a
+    // different remote).
+    if is_git_repo(&data_dir) {
+        if let Some(existing) = current_remote_url(&data_dir) {
+            if !urls_match(&existing, &repo_url) {
+                eprintln!(
+                    "Configured models repo ({repo_url}) differs from on-disk repo ({existing}) at {} — removing in 30s (Ctrl-C to abort)...",
+                    data_dir.display()
+                );
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                std::fs::remove_dir_all(&data_dir).with_context(|| {
+                    format!("failed to remove stale models at {}", data_dir.display())
+                })?;
+                clone_repo(&data_dir, &repo_url, &ref_name)
+                    .with_context(|| format!("failed to clone {repo_url}"))?;
+                eprintln!("Models ready ({})", data_dir.display());
+                return Ok(data_dir);
+            }
+        }
+    }
+
     if has_models(&data_dir) {
         tracing::debug!("Using models from {}", data_dir.display());
         if let Some(days) = days_since_last_commit(&data_dir) {
@@ -51,12 +127,7 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
     }
 
     if is_git_repo(&data_dir) {
-        let model_path = data_dir.join(CURRENT_MODEL);
-        let missing: Vec<String> = MODEL_ARTIFACTS
-            .iter()
-            .filter(|f| !model_path.join(f).exists())
-            .map(|f| format!("{CURRENT_MODEL}/{f}"))
-            .collect();
+        let missing = missing_artifacts(&data_dir);
         eprintln!(
             "Models exist at {} but missing: {} — removing in 30s (Ctrl-C to abort)...",
             data_dir.display(),
@@ -72,40 +143,62 @@ pub(crate) fn resolve_and_ensure() -> Result<PathBuf> {
     } else {
         eprintln!("First run: downloading litmus models...");
     }
-    clone_repo(&data_dir).with_context(|| {
+    clone_repo(&data_dir, &repo_url, &ref_name).with_context(|| {
         format!(
-            "failed to download models\n\nEnsure 'git' is installed, or manually clone:\n  git clone {MODELS_REPO_URL} \"{}\"",
+            "failed to download models\n\nEnsure 'git' is installed, or manually clone:\n  git clone {repo_url} \"{}\"",
             data_dir.display()
         )
     })?;
-    eprintln!("Models ready ({})", data_dir.join(CURRENT_MODEL).display());
+    eprintln!("Models ready ({})", data_dir.display());
     Ok(data_dir)
-}
-
-/// Return the model directory suitable for `Model::load`.
-pub fn model_dir() -> Result<PathBuf> {
-    resolve_and_ensure().map(|base| base.join(CURRENT_MODEL))
 }
 
 /// Update the models repository, cloning it first if necessary.
 ///
 /// Returns the pre-update HEAD commit so the caller can roll back if the new
-/// models turn out to be broken.  The returned value is `None` when the repo
+/// models turn out to be broken. The returned value is `None` when the repo
 /// was freshly cloned (nothing to roll back to) or when HEAD could not be read.
 pub fn update() -> Result<Option<String>> {
     let base = current_models_dir();
-    if ensure_repo(&base)? {
+    let (repo_url, ref_name) = configured_repo();
+
+    if ensure_repo(&base, &repo_url, &ref_name)? {
         return Ok(None);
     }
 
     let before = git_cmd::short_head(&base);
-    eprintln!("Updating models...");
+    let effective_ref = resolve_ref(&repo_url, &ref_name);
+    eprintln!(
+        "Updating models (ref={display})...",
+        display = display_ref(&effective_ref)
+    );
 
     let base_str = base.to_string_lossy();
-    let output = git_cmd::run(&["-C", &base_str, "pull", "--ff-only"], GIT_TIMEOUT)?;
+    let fetch_args: Vec<&str> = if effective_ref.is_empty() {
+        vec!["-C", &base_str, "fetch", "origin"]
+    } else {
+        vec!["-C", &base_str, "fetch", "origin", &effective_ref]
+    };
+    let fetch = git_cmd::run(&fetch_args, GIT_TIMEOUT)?;
+    if !fetch.status.success() {
+        anyhow::bail!("fetch failed: {}", String::from_utf8_lossy(&fetch.stderr));
+    }
 
-    if !output.status.success() {
-        anyhow::bail!("update failed: {}", String::from_utf8_lossy(&output.stderr));
+    // Force the working tree to the fetched ref. We use `reset --hard
+    // FETCH_HEAD` rather than `checkout`/`pull --ff-only` so the ref-name can
+    // refer to either a branch or a tag (or even an arbitrary commit) without
+    // needing a different command per case, and so a manually edited bundle
+    // gets discarded the same way a half-applied pull would have been.
+    let reset = git_cmd::run(
+        &["-C", &base_str, "reset", "--hard", "FETCH_HEAD"],
+        GIT_TIMEOUT,
+    )?;
+    if !reset.status.success() {
+        anyhow::bail!(
+            "reset to {} failed: {}",
+            display_ref(&effective_ref),
+            String::from_utf8_lossy(&reset.stderr)
+        );
     }
 
     let after = git_cmd::short_head(&base).unwrap_or_default();
@@ -136,9 +229,6 @@ pub fn update() -> Result<Option<String>> {
 }
 
 /// Roll back the models repository to a previously recorded commit.
-///
-/// Called when a pulled update fails to load so the disk is returned to the
-/// last-known-good state for future reloads.
 pub fn rollback(rev: &str) -> Result<()> {
     let base = current_models_dir();
     let broken = git_cmd::short_head(&base).unwrap_or_else(|| "unknown".to_string());
@@ -158,20 +248,26 @@ pub fn rollback(rev: &str) -> Result<()> {
 /// Check for updates without applying them.
 pub fn check_updates() -> Result<()> {
     let base = current_models_dir();
-    if ensure_repo(&base)? {
+    let (repo_url, ref_name) = configured_repo();
+    if ensure_repo(&base, &repo_url, &ref_name)? {
         return Ok(());
     }
 
+    let effective_ref = resolve_ref(&repo_url, &ref_name);
     let base_str = base.to_string_lossy();
-    let fetch = git_cmd::run(&["-C", &base_str, "fetch", "--dry-run"], GIT_TIMEOUT)
-        .context("git fetch failed")?;
+    let mut args: Vec<&str> = vec!["-C", &base_str, "fetch", "--dry-run", "origin"];
+    if !effective_ref.is_empty() {
+        args.push(&effective_ref);
+    }
+    let fetch = git_cmd::run(&args, GIT_TIMEOUT).context("git fetch failed")?;
 
     let local = git_cmd::short_head(&base).unwrap_or_default();
     let stderr = String::from_utf8_lossy(&fetch.stderr);
+    let display = display_ref(&effective_ref);
     if fetch.status.success() && stderr.trim().is_empty() {
-        eprintln!("Models are up to date ({local}).");
+        eprintln!("Models are up to date ({local}, ref={display}).");
     } else {
-        eprintln!("Updates available (current: {local}). Run 'litmus update-rules' to update.");
+        eprintln!("Updates available (current: {local}, ref={display}). Run 'litmus update-rules' to update.");
     }
 
     if let Some(days) = days_since_last_commit(&base) {
@@ -186,11 +282,42 @@ pub fn version() -> Option<String> {
     git_cmd::short_head(&current_models_dir())
 }
 
+/// Default on-disk path for the model bundle.
+///
+/// Layout: `<data_dir>/litmus/models/<bundle>` where `<bundle>` is derived
+/// from the last path segment of the configured upstream URL. This means a
+/// per-filetype variant (e.g. `…/azoth-pe.git`) lands at a sibling directory
+/// (`…/models/azoth-pe`) without any further configuration.
+///
+/// On a dev machine you can `ln -sfn /path/to/working/tree
+/// ~/.local/share/litmus/models/azoth` to share one tree between the
+/// trainer and the scanner without round-tripping through git.
 fn default_models_dir() -> PathBuf {
+    let (url, _) = configured_repo();
+    let bundle = bundle_name_from_url(&url).unwrap_or_else(|| "azoth".to_owned());
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("litmus")
         .join("models")
+        .join(bundle)
+}
+
+/// Extract the bundle directory name from a git URL: the last path segment
+/// with any trailing `.git` and `/` stripped.
+fn bundle_name_from_url(url: &str) -> Option<String> {
+    let stripped = url
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or_else(|| {
+            // Fall back to the unstripped trim if there's no `.git` suffix.
+            url.trim_end_matches('/')
+        });
+    let segment = stripped.rsplit(&['/', ':']).next()?;
+    if segment.is_empty() {
+        None
+    } else {
+        Some(segment.to_owned())
+    }
 }
 
 /// Resolve the models directory currently in use (without auto-cloning).
@@ -203,14 +330,14 @@ fn current_models_dir() -> PathBuf {
 
 /// Ensure the models repo exists at `base`, cloning if necessary.
 /// Returns `Ok(true)` if a fresh clone was performed.
-fn ensure_repo(base: &Path) -> Result<bool> {
+fn ensure_repo(base: &Path, repo_url: &str, ref_name: &str) -> Result<bool> {
     if is_git_repo(base) {
         return Ok(false);
     }
-    eprintln!("Models not found — cloning...");
-    clone_repo(base).with_context(|| {
+    eprintln!("Models not found — cloning {repo_url}...");
+    clone_repo(base, repo_url, ref_name).with_context(|| {
         format!(
-            "failed to clone models\n\nEnsure 'git' is installed, or manually clone:\n  git clone {MODELS_REPO_URL} \"{}\"",
+            "failed to clone models\n\nEnsure 'git' is installed, or manually clone:\n  git clone {repo_url} \"{}\"",
             base.display()
         )
     })?;
@@ -221,14 +348,43 @@ fn ensure_repo(base: &Path) -> Result<bool> {
     Ok(true)
 }
 
-const MODEL_ARTIFACTS: &[&str] = &["model.json", "feature_spec.json"];
-
-fn has_models(path: &Path) -> bool {
-    let model = path.join(CURRENT_MODEL);
-    MODEL_ARTIFACTS.iter().all(|f| model.join(f).exists())
+/// Find which required artifacts are missing from the bundle. Returned for
+/// human-readable warnings on incomplete checkouts.
+fn missing_artifacts(path: &Path) -> Vec<String> {
+    if has_ensemble_layout(path) {
+        return Vec::new();
+    }
+    let mut missing: Vec<String> = REQUIRED_ARTIFACTS
+        .iter()
+        .filter(|f| !path.join(f).exists())
+        .map(|f| (*f).to_owned())
+        .collect();
+    if !MODEL_FILES.iter().any(|f| path.join(f).exists()) {
+        missing.push(format!("one of [{}]", MODEL_FILES.join(", ")));
+    }
+    missing
 }
 
-fn clone_repo(target: &Path) -> std::io::Result<()> {
+/// True if the directory looks like a complete bundle litmus can load.
+///
+/// Two layouts are accepted: an ensemble bundle (`general/` subdirectory
+/// containing the required artifacts) or a legacy single-bundle (artifacts
+/// at the root). See `model.rs` for the loader-side details.
+fn has_models(path: &Path) -> bool {
+    has_ensemble_layout(path) || has_single_bundle_layout(path)
+}
+
+fn has_single_bundle_layout(path: &Path) -> bool {
+    REQUIRED_ARTIFACTS.iter().all(|f| path.join(f).exists())
+        && MODEL_FILES.iter().any(|f| path.join(f).exists())
+}
+
+fn has_ensemble_layout(path: &Path) -> bool {
+    let general = path.join("general");
+    general.is_dir() && has_single_bundle_layout(&general)
+}
+
+fn clone_repo(target: &Path, repo_url: &str, ref_name: &str) -> std::io::Result<()> {
     Command::new("git").arg("--version").output().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -238,16 +394,90 @@ fn clone_repo(target: &Path) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let output = Command::new("git")
-        .args(["clone", "--depth", "1", MODELS_REPO_URL])
-        .arg(target)
-        .output()?;
+    let effective_ref = resolve_ref(repo_url, ref_name);
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "--depth", "1"]);
+    if !effective_ref.is_empty() {
+        cmd.args(["--branch", &effective_ref]);
+    }
+    cmd.arg(repo_url).arg(target);
+    let output = cmd.output()?;
     if !output.status.success() {
         return Err(std::io::Error::other(
             String::from_utf8_lossy(&output.stderr).to_string(),
         ));
     }
     Ok(())
+}
+
+/// Pre-flight ref check: if the user pinned a ref that the remote doesn't
+/// expose, warn once and treat it as "default branch". Returning the empty
+/// string signals callers to omit `--branch` / fetch the remote's HEAD.
+fn resolve_ref(repo_url: &str, ref_name: &str) -> String {
+    if ref_name.is_empty() {
+        return String::new();
+    }
+    let output = Command::new("git")
+        .args(["ls-remote", "--exit-code", repo_url, ref_name])
+        .output();
+    let exists = matches!(output, Ok(o) if o.status.success());
+    if exists {
+        ref_name.to_owned()
+    } else {
+        eprintln!(
+            "Note: ref {ref_name:?} not found on {repo_url}; using the remote's default branch."
+        );
+        String::new()
+    }
+}
+
+/// Render a ref for human-readable log lines: empty → `<default>`.
+fn display_ref(ref_name: &str) -> &str {
+    if ref_name.is_empty() {
+        "<default>"
+    } else {
+        ref_name
+    }
+}
+
+fn current_remote_url(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", &path.to_string_lossy(), "remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Compare two git URLs that point at the same repository. Normalizes:
+///   - trailing `/` and `.git`
+///   - protocol prefix (`ssh://`, `https://`, `http://`, `git://`)
+///   - `user@` prefix on ssh URLs
+///   - `git@host:path` ↔ `ssh://git@host/path` (the `:` host/path separator
+///     is rewritten to `/` so both forms compare equal)
+///
+/// Anything left over after this is "host + path", which is what actually
+/// identifies the repo.
+fn urls_match(a: &str, b: &str) -> bool {
+    fn normalize(s: &str) -> String {
+        let s = s.trim().trim_end_matches('/');
+        let s = s.strip_suffix(".git").unwrap_or(s);
+        let s = s
+            .strip_prefix("ssh://")
+            .or_else(|| s.strip_prefix("https://"))
+            .or_else(|| s.strip_prefix("http://"))
+            .or_else(|| s.strip_prefix("git://"))
+            .unwrap_or(s);
+        let s = match s.find('@') {
+            Some(idx) => &s[idx + 1..],
+            None => s,
+        };
+        // `git@host:path` uses ':' as the host/path separator.
+        s.replacen(':', "/", 1)
+    }
+    normalize(a) == normalize(b)
 }
 
 fn days_since_last_commit(path: &Path) -> Option<u64> {
@@ -280,10 +510,30 @@ fn is_git_repo(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    // The path-derivation logic is covered by `bundle_name_from_url_handles_common_shapes`.
+    // A `default_models_dir()` test would also be desirable but it depends on
+    // ambient `LITMUS_MODELS_REPO` / `LITMUS_MODELS_REF` env vars, which other
+    // tests in this module mutate concurrently — leading to a flake under the
+    // default parallel test runner. Not worth a serial-test dep just for this.
+
     #[test]
-    fn default_models_dir_ends_with_litmus_models() {
-        let dir = default_models_dir();
-        assert!(dir.ends_with("litmus/models"));
+    fn bundle_name_from_url_handles_common_shapes() {
+        assert_eq!(
+            bundle_name_from_url("https://codeberg.org/atomdrift/azoth.git").as_deref(),
+            Some("azoth")
+        );
+        assert_eq!(
+            bundle_name_from_url("https://codeberg.org/atomdrift/azoth-pe.git/").as_deref(),
+            Some("azoth-pe")
+        );
+        assert_eq!(
+            bundle_name_from_url("git@codeberg.org:atomdrift/azoth-elf.git").as_deref(),
+            Some("azoth-elf")
+        );
+        assert_eq!(
+            bundle_name_from_url("https://example.com/foo").as_deref(),
+            Some("foo")
+        );
     }
 
     #[test]
@@ -293,13 +543,121 @@ mod tests {
     }
 
     #[test]
-    fn has_models_with_current_model_artifacts() {
+    fn has_models_accepts_xgboost_layout() {
         let tmp = tempfile::tempdir().unwrap();
-        let model = tmp.path().join(CURRENT_MODEL);
-        std::fs::create_dir_all(&model).unwrap();
-        std::fs::write(model.join("model.json"), b"").unwrap();
-        std::fs::write(model.join("feature_spec.json"), b"{}").unwrap();
+        std::fs::write(tmp.path().join("model.json"), b"").unwrap();
+        std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
         assert!(has_models(tmp.path()));
+    }
+
+    #[test]
+    fn has_models_accepts_ensemble_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let general = tmp.path().join("general");
+        std::fs::create_dir_all(&general).unwrap();
+        std::fs::write(general.join("model.txt"), b"").unwrap();
+        std::fs::write(general.join("feature_spec.json"), b"{}").unwrap();
+        // Top-level config.json is optional for the resolver's "is this a
+        // complete bundle?" check; the loader will read it if present.
+        assert!(has_models(tmp.path()));
+    }
+
+    #[test]
+    fn has_models_rejects_ensemble_with_empty_general() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("general")).unwrap();
+        // general/ exists but contains no artifacts → not a valid bundle.
+        assert!(!has_models(tmp.path()));
+    }
+
+    #[test]
+    fn has_models_accepts_lightgbm_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("model.txt"), b"").unwrap();
+        std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
+        assert!(has_models(tmp.path()));
+    }
+
+    #[test]
+    fn has_models_rejects_missing_model_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
+        assert!(!has_models(tmp.path()));
+    }
+
+    #[test]
+    fn urls_match_normalizes_dot_git_and_slash() {
+        assert!(urls_match(
+            "https://codeberg.org/atomdrift/azoth.git",
+            "https://codeberg.org/atomdrift/azoth"
+        ));
+        assert!(urls_match(
+            "https://codeberg.org/atomdrift/azoth/",
+            "https://codeberg.org/atomdrift/azoth.git"
+        ));
+        assert!(!urls_match(
+            "https://codeberg.org/atomdrift/azoth.git",
+            "https://codeberg.org/atomdrift/litmus-models.git"
+        ));
+    }
+
+    #[test]
+    fn urls_match_treats_ssh_and_https_as_equivalent() {
+        // The on-disk remote is often ssh:// (push-friendly) while the
+        // canonical default we ship is https:// (no key required). These
+        // forms point at the same repo and must compare equal so the
+        // url-mismatch reclone path doesn't fire spuriously.
+        assert!(urls_match(
+            "https://codeberg.org/atomdrift/azoth.git",
+            "ssh://git@codeberg.org/atomdrift/azoth.git",
+        ));
+        assert!(urls_match(
+            "https://codeberg.org/atomdrift/azoth.git",
+            "git@codeberg.org:atomdrift/azoth.git",
+        ));
+        assert!(!urls_match(
+            "https://codeberg.org/atomdrift/azoth.git",
+            "git@codeberg.org:atomdrift/azoth-pe.git",
+        ));
+    }
+
+    #[test]
+    fn configured_repo_splits_url_fragment() {
+        // SAFETY: env-var manipulation in tests; these vars are only read here.
+        unsafe {
+            let saved_repo = std::env::var("LITMUS_MODELS_REPO").ok();
+            let saved_ref = std::env::var("LITMUS_MODELS_REF").ok();
+
+            // URL#ref takes precedence over the separate REF env var.
+            std::env::set_var("LITMUS_MODELS_REPO", "https://example.com/foo.git#v3");
+            std::env::set_var("LITMUS_MODELS_REF", "v9");
+            let (url, r) = configured_repo();
+            assert_eq!(url, "https://example.com/foo.git");
+            assert_eq!(r, "v3");
+
+            // No fragment → REF env var wins.
+            std::env::set_var("LITMUS_MODELS_REPO", "https://example.com/bar.git");
+            std::env::set_var("LITMUS_MODELS_REF", "v9");
+            let (url, r) = configured_repo();
+            assert_eq!(url, "https://example.com/bar.git");
+            assert_eq!(r, "v9");
+
+            // Neither set → empty (= remote default branch).
+            std::env::remove_var("LITMUS_MODELS_REPO");
+            std::env::remove_var("LITMUS_MODELS_REF");
+            let (_, r) = configured_repo();
+            assert_eq!(r, "");
+
+            // Restore.
+            match saved_repo {
+                Some(v) => std::env::set_var("LITMUS_MODELS_REPO", v),
+                None => std::env::remove_var("LITMUS_MODELS_REPO"),
+            }
+            match saved_ref {
+                Some(v) => std::env::set_var("LITMUS_MODELS_REF", v),
+                None => std::env::remove_var("LITMUS_MODELS_REF"),
+            }
+        }
     }
 
     #[test]

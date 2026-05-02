@@ -18,7 +18,14 @@ fn spec_version_matches_expected() -> Result<()> {
         return Ok(());
     }
 
-    let spec_path = model_dir()?.join("feature_spec.json");
+    let dir = model_dir()?;
+    let root_spec = dir.join("feature_spec.json");
+    let ensemble_spec = dir.join("general").join("feature_spec.json");
+    let spec_path = if root_spec.exists() {
+        root_spec
+    } else {
+        ensemble_spec
+    };
     assert!(
         spec_path.exists(),
         "{} not found — set LITMUS_MODELS_DIR or clone the models repo",

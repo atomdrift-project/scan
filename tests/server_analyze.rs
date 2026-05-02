@@ -142,26 +142,21 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     let json: serde_json::Value =
         serde_json::from_slice(&body_bytes).context("response must be valid JSON")?;
 
-    // Every response must have these fields, regardless of classification.
-    assert!(json["classification"].is_string(), "missing classification");
-    assert!(json["probability"].is_number(), "missing probability");
-    assert!(json["thresholds"].is_object(), "missing thresholds");
-    assert!(json["formula"].is_string(), "missing formula");
-    assert!(json["model"].is_object(), "missing model metadata");
-    assert!(json["reasons"].is_array(), "missing reasons array");
-    assert!(
-        json["top_findings"].is_array(),
-        "missing top_findings array"
-    );
-    assert!(json["file_type"].is_string(), "missing file_type");
-    assert!(json["sha256"].is_string(), "missing sha256");
-    assert!(json["cleave"].is_object(), "missing cleave report");
+    // Every response must have the v4 envelope fields, regardless of classification.
+    let ml = json["ml"].as_object().context("missing ml section")?;
+    assert!(ml["class"].is_number(), "missing classification");
+    assert!(ml["prob"].is_number(), "missing probability");
+    assert!(ml["thresholds"].is_array(), "missing thresholds");
+    assert!(ml["version"].is_string(), "missing model version");
+    assert!(ml["fs"].is_array(), "missing per-file ML results");
+    assert!(json["raw"].is_object(), "missing raw cleave report");
+    assert!(json["raw"]["fs"].is_array(), "missing cleave files");
 
-    let classification = json["classification"]
-        .as_str()
-        .context("classification must be a string")?;
+    let classification = ml["class"]
+        .as_u64()
+        .context("classification must be numeric")?;
     assert!(
-        ["benign", "suspicious", "hostile"].contains(&classification),
+        classification <= 2,
         "unexpected classification: {classification}"
     );
     Ok(())

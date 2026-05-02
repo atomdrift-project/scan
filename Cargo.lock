@@ -2319,6 +2319,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightgbm-ars"
+version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/lightgbm-ars#691b45e24058b145f3a8f1a6cce8692b6351012e"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2349,6 +2357,7 @@ dependencies = [
  "dirs",
  "hostname",
  "libc",
+ "lightgbm-ars",
  "proclist",
  "rayon",
  "reqwest",

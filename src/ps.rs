@@ -328,6 +328,8 @@ fn build_result(
         formula: cr.formula,
         reasons: cr.reasons,
         top_findings: cr.top_findings,
+        model_scores: cr.model_scores,
+        skipped_models: cr.skipped_models,
         file_type: cr.file_type,
         size_bytes: cr.size_bytes,
         sha256: group.sha256.clone(),

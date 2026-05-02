@@ -62,6 +62,14 @@ struct Cli {
     #[arg(long)]
     model_dir: Option<PathBuf>,
 
+    /// Override the models repository URL (env: LITMUS_MODELS_REPO)
+    #[arg(long)]
+    models_repo: Option<String>,
+
+    /// Override the models repository ref — branch or tag (env: LITMUS_MODELS_REF)
+    #[arg(long)]
+    models_ref: Option<String>,
+
     /// Output format
     #[arg(short, long, default_value = "terminal")]
     format: OutputFormat,
@@ -367,6 +375,20 @@ fn main() -> Result<()> {
     // initialized. This avoids clone-into-existing-directory failures when the
     // default traits checkout was installed by cleave or another litmus run.
     litmus::traits_repo::prepare_runtime_env();
+
+    // Surface CLI overrides for the models repo to the resolver in
+    // `models_repo.rs`, which reads these env vars. Doing it here means worker
+    // restarts inherit the same configuration without threading flags through.
+    //
+    // SAFETY: set_var is technically unsound under concurrent access, but at
+    // this point the program is still single-threaded — rayon and tokio
+    // pools are constructed below.
+    if let Some(url) = cli.models_repo.as_deref() {
+        unsafe { std::env::set_var("LITMUS_MODELS_REPO", url) };
+    }
+    if let Some(reference) = cli.models_ref.as_deref() {
+        unsafe { std::env::set_var("LITMUS_MODELS_REF", reference) };
+    }
 
     let rayon_threads = std::env::var("CLEAVE_RAYON_THREADS")
         .ok()
