@@ -19,6 +19,7 @@
 //! ```text
 //! <model_dir>/
 //!   config.json                   ensemble-level config: route map + thresholds
+//!   route_policies.json           optional per-filetype decision policies
 //!   general/                      always required
 //!     model.txt | model.json
 //!     feature_spec.json
@@ -35,8 +36,10 @@
 //! ## Ensemble `config.json` schema (`azoth.routed_ensemble.v1`)
 //!
 //! Emitted by collimator's calibration pipeline. The top-level config is the
-//! single source of thresholds for every route; specialist subdirectories do
-//! not carry their own `config.json`.
+//! coarse compatibility source of thresholds for every route; specialist
+//! subdirectories do not carry their own `config.json`. When
+//! `route_policies.json` is present, it is the primary runtime decision
+//! artifact.
 //!
 //! ```text
 //! {
@@ -69,6 +72,40 @@
 //!
 //! Route names use slash-separated paths matching the on-disk layout:
 //! `"general"`, `"filegroups/<name>"`, `"filetypes/<name>"`.
+//!
+//! ## Ensemble `route_policies.json` schema (`azoth.route_policy_search.v1`)
+//!
+//! This optional artifact records the calibrated decision policy per filetype
+//! and level. Each severity has a `best.thresholds` map:
+//!
+//! ```text
+//! {
+//!   "routes": {
+//!     "filetypes/elf": {
+//!       "filetype": "elf",
+//!       "levels": [{
+//!         "level": 5,
+//!         "hostile": {
+//!           "best": {
+//!             "policy": "specialist_primary_with_escape",
+//!             "thresholds": {
+//!               "filetypes/elf": 0.995,
+//!               "general": 0.968
+//!             }
+//!           }
+//!         },
+//!         "suspicious": {"best": {"thresholds": {"filetypes/elf": 0.980}}}
+//!       }]
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! At runtime litmus scores the applicable loaded routes, then applies only
+//! the route thresholds named by the filetype policy. A route absent from the
+//! policy does not participate in that severity decision. If
+//! `route_policies.json` is absent or has no policy for a filetype, litmus
+//! falls back to the older OR over `config.json` route thresholds.
 //!
 //! ## Specialist feature-spec rule
 //!
@@ -580,6 +617,34 @@ struct EnsembleConfig {
     route_thresholds: HashMap<String, Thresholds>,
 }
 
+/// Per-filetype route policy loaded from `route_policies.json`.
+#[derive(Debug, Default)]
+struct RoutePolicies {
+    by_filetype: HashMap<String, RoutePolicy>,
+}
+
+impl RoutePolicies {
+    fn contains_route(&self, route: &str) -> bool {
+        self.by_filetype.values().any(|policy| {
+            policy.hostile.thresholds.contains_key(route)
+                || policy.suspicious.thresholds.contains_key(route)
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RoutePolicy {
+    suspicious: PolicySeverity,
+    hostile: PolicySeverity,
+}
+
+#[derive(Debug, Clone)]
+struct PolicySeverity {
+    /// Route-name → calibrated threshold. Routes absent from this map do not
+    /// participate in that severity decision.
+    thresholds: HashMap<String, f32>,
+}
+
 /// Wire-format view of `config.json`. Captures only the fields litmus reads;
 /// other keys (timestamp, score_table_hash, model_set_hash, models[], etc.)
 /// are accepted and ignored.
@@ -591,6 +656,37 @@ struct EnsembleConfigJson {
     required_routes: Vec<String>,
     #[serde(default)]
     levels: Vec<LevelEntryJson>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RoutePoliciesJson {
+    #[serde(default)]
+    routes: HashMap<String, RoutePolicyRouteJson>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RoutePolicyRouteJson {
+    filetype: String,
+    #[serde(default)]
+    levels: Vec<RoutePolicyLevelJson>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RoutePolicyLevelJson {
+    level: u8,
+    hostile: RoutePolicySeverityJson,
+    suspicious: RoutePolicySeverityJson,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RoutePolicySeverityJson {
+    best: Option<RoutePolicyBestJson>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RoutePolicyBestJson {
+    #[serde(default)]
+    thresholds: HashMap<String, f64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -623,6 +719,68 @@ fn load_ensemble_config(model_dir: &Path, level: u8) -> Option<EnsembleConfig> {
         required_routes: json.required_routes,
         route_thresholds,
     })
+}
+
+/// Load searched per-filetype decision policies. These are optional: older
+/// ensembles without `route_policies.json` keep the original OR semantics.
+fn load_route_policies(model_dir: &Path, level: u8) -> RoutePolicies {
+    let path = model_dir.join("route_policies.json");
+    let data = match std::fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RoutePolicies::default(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot read route policies");
+            return RoutePolicies::default();
+        }
+    };
+    let json: RoutePoliciesJson = match serde_json::from_str(&data) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot parse route policies");
+            return RoutePolicies::default();
+        }
+    };
+
+    let mut by_filetype = HashMap::new();
+    for (_route_name, route) in json.routes {
+        let Some(level_entry) = route.levels.iter().find(|entry| entry.level == level) else {
+            continue;
+        };
+        let Some(hostile) = policy_severity_from_json(&level_entry.hostile) else {
+            continue;
+        };
+        let Some(suspicious) = policy_severity_from_json(&level_entry.suspicious) else {
+            continue;
+        };
+        by_filetype.insert(
+            route.filetype,
+            RoutePolicy {
+                suspicious,
+                hostile,
+            },
+        );
+    }
+
+    tracing::info!(
+        path = %path.display(),
+        level = level,
+        routes = by_filetype.len(),
+        "loaded route policies",
+    );
+    RoutePolicies { by_filetype }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn policy_severity_from_json(json: &RoutePolicySeverityJson) -> Option<PolicySeverity> {
+    let best = json.best.as_ref()?;
+    let mut thresholds = HashMap::new();
+    for (route, &threshold) in &best.thresholds {
+        let threshold = threshold as f32;
+        if (0.0..=1.0).contains(&threshold) {
+            thresholds.insert(route.clone(), threshold);
+        }
+    }
+    (!thresholds.is_empty()).then_some(PolicySeverity { thresholds })
 }
 
 /// Pull per-route thresholds from `levels[]` at the requested level. Pairs up
@@ -798,6 +956,7 @@ fn load_bundle(
 fn load_specialists(
     parent: &Path,
     route_thresholds: &HashMap<String, Thresholds>,
+    route_policies: &RoutePolicies,
     category: &str,
     out: &mut HashMap<String, Route>,
     skipped: &mut HashSet<String>,
@@ -824,7 +983,8 @@ fn load_specialists(
         // Skip on-disk subdirectories that the deployment config doesn't list.
         // These are common as artifacts of experimentation; loading them with
         // fallback thresholds would put uncalibrated routes in the OR.
-        let Some(route_t) = route_thresholds.get(&route_name).copied() else {
+        let route_t = route_thresholds.get(&route_name).copied();
+        if route_t.is_none() && !route_policies.contains_route(&route_name) {
             tracing::debug!(
                 category = %category,
                 name = %name,
@@ -833,7 +993,7 @@ fn load_specialists(
             skipped.insert(name);
             continue;
         };
-        match load_specialist(&path, &name, Some(route_t)) {
+        match load_specialist(&path, &name, Some(route_t.unwrap_or_default())) {
             Ok(route) => {
                 out.insert(name, route);
             }
@@ -911,6 +1071,8 @@ struct RouteSet {
     /// Filetype → filegroup mapping from `config.json`. Used to translate a
     /// scanned file's `type` into the applicable filegroup specialist.
     filetype_to_filegroup: HashMap<String, String>,
+    /// Optional searched policies keyed by cleave file type.
+    policies: RoutePolicies,
 }
 
 impl RouteSet {
@@ -927,6 +1089,66 @@ const fn max_class(a: Classification, b: Classification) -> Classification {
         a
     } else {
         b
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RouteProbability {
+    route: String,
+    probability: f32,
+}
+
+fn compact_route_name(route: &str) -> String {
+    if route == "general" {
+        "az".to_string()
+    } else if let Some(name) = route.strip_prefix("filegroups/") {
+        format!("az/{name}")
+    } else if let Some(name) = route.strip_prefix("filetypes/") {
+        format!("az/{name}")
+    } else {
+        format!("az/{route}")
+    }
+}
+
+fn policy_classify(policy: &RoutePolicy, scores: &[RouteProbability]) -> Classification {
+    if scores.iter().any(|score| {
+        policy
+            .hostile
+            .thresholds
+            .get(&score.route)
+            .is_some_and(|&threshold| score.probability >= threshold)
+    }) {
+        Classification::Hostile
+    } else if scores.iter().any(|score| {
+        policy
+            .suspicious
+            .thresholds
+            .get(&score.route)
+            .is_some_and(|&threshold| score.probability >= threshold)
+    }) {
+        Classification::Suspicious
+    } else {
+        Classification::Benign
+    }
+}
+
+fn policy_route_class(policy: &RoutePolicy, route: &str, probability: f32) -> Classification {
+    if policy
+        .hostile
+        .thresholds
+        .get(route)
+        .is_some_and(|&threshold| probability >= threshold)
+    {
+        Classification::Hostile
+    } else if policy
+        .suspicious
+        .thresholds
+        .get(route)
+        .is_some_and(|&threshold| probability >= threshold)
+    {
+        Classification::Suspicious
+    } else {
+        Classification::Benign
     }
 }
 
@@ -1014,6 +1236,7 @@ impl Model {
         // pre-resolved thresholds and skips its own (nonexistent) config.json.
         let ensemble_cfg =
             load_ensemble_config(model_dir, DEFAULT_SEVERITY_LEVEL).unwrap_or_default();
+        let policies = load_route_policies(model_dir, DEFAULT_SEVERITY_LEVEL);
 
         let general_dir = model_dir.join("general");
         let general_thresholds =
@@ -1036,6 +1259,7 @@ impl Model {
         load_specialists(
             &model_dir.join("filegroups"),
             &ensemble_cfg.route_thresholds,
+            &policies,
             "filegroups",
             &mut filegroups,
             &mut skipped_filegroups,
@@ -1043,6 +1267,7 @@ impl Model {
         load_specialists(
             &model_dir.join("filetypes"),
             &ensemble_cfg.route_thresholds,
+            &policies,
             "filetypes",
             &mut filetypes,
             &mut skipped_filetypes,
@@ -1105,6 +1330,7 @@ impl Model {
                 skipped_filegroups,
                 skipped_filetypes,
                 filetype_to_filegroup: ensemble_cfg.filetype_to_filegroup,
+                policies,
             },
         })
     }
@@ -1233,10 +1459,18 @@ impl Model {
         general_features: &[f32],
         report: &serde_json::Value,
     ) -> Result<(f32, Classification, Vec<RouteScore>, Vec<SkippedRoute>)> {
+        let policy = self.routes.policies.by_filetype.get(file_type);
         let general_prob = self.inner.predict(general_features)?;
-        let general_class = self.thresholds.classify(general_prob);
+        let general_class = policy.map_or_else(
+            || self.thresholds.classify(general_prob),
+            |policy| policy_route_class(policy, "general", general_prob),
+        );
         let mut max_prob = general_prob;
         let mut classification = general_class;
+        let mut route_probs = vec![RouteProbability {
+            route: "general".to_string(),
+            probability: general_prob,
+        }];
         let mut scores = vec![RouteScore {
             model: "az".to_string(),
             probability: general_prob,
@@ -1250,16 +1484,26 @@ impl Model {
 
         if let Some(group_name) = self.routes.filetype_to_filegroup.get(file_type) {
             if let Some(route) = self.routes.filegroups.get(group_name) {
+                let route_name = format!("filegroups/{group_name}");
                 let (prob, class) = Self::score_route_report(route, report)?;
+                let class = policy.map_or(class, |policy| {
+                    policy_route_class(policy, &route_name, prob)
+                });
                 scores.push(RouteScore {
                     model: format!("az/{group_name}"),
                     probability: prob,
                     classification: class,
                 });
+                route_probs.push(RouteProbability {
+                    route: route_name,
+                    probability: prob,
+                });
                 if prob > max_prob {
                     max_prob = prob;
                 }
-                classification = max_class(classification, class);
+                if policy.is_none() {
+                    classification = max_class(classification, class);
+                }
             } else if self.routes.skipped_filegroups.contains(group_name) {
                 skipped.push(SkippedRoute {
                     model: format!("az/{group_name}"),
@@ -1269,21 +1513,48 @@ impl Model {
         }
 
         if let Some(route) = self.routes.filetypes.get(file_type) {
+            let route_name = format!("filetypes/{file_type}");
             let (prob, class) = Self::score_route_report(route, report)?;
+            let class = policy.map_or(class, |policy| {
+                policy_route_class(policy, &route_name, prob)
+            });
             scores.push(RouteScore {
                 model: format!("az/{file_type}"),
                 probability: prob,
                 classification: class,
             });
+            route_probs.push(RouteProbability {
+                route: route_name,
+                probability: prob,
+            });
             if prob > max_prob {
                 max_prob = prob;
             }
-            classification = max_class(classification, class);
+            if policy.is_none() {
+                classification = max_class(classification, class);
+            }
         } else if self.routes.skipped_filetypes.contains(file_type) {
             skipped.push(SkippedRoute {
                 model: format!("az/{file_type}"),
                 reason: "uncalibrated",
             });
+        }
+
+        if let Some(policy) = policy {
+            for route in policy
+                .hostile
+                .thresholds
+                .keys()
+                .chain(policy.suspicious.thresholds.keys())
+            {
+                if !route_probs.iter().any(|score| score.route == *route) {
+                    skipped.push(SkippedRoute {
+                        model: compact_route_name(route),
+                        reason: "unavailable",
+                    });
+                }
+            }
+            classification = policy_classify(policy, &route_probs);
         }
 
         Ok((max_prob, classification, scores, skipped))
@@ -1308,10 +1579,18 @@ impl Model {
         general_features: &[f32],
         file: &serde_json::Value,
     ) -> Result<(f32, Classification, Vec<RouteScore>, Vec<SkippedRoute>)> {
+        let policy = self.routes.policies.by_filetype.get(file_type);
         let general_prob = self.inner.predict(general_features)?;
-        let general_class = self.thresholds.classify(general_prob);
+        let general_class = policy.map_or_else(
+            || self.thresholds.classify(general_prob),
+            |policy| policy_route_class(policy, "general", general_prob),
+        );
         let mut max_prob = general_prob;
         let mut classification = general_class;
+        let mut route_probs = vec![RouteProbability {
+            route: "general".to_string(),
+            probability: general_prob,
+        }];
         let mut scores = vec![RouteScore {
             model: "az".to_string(),
             probability: general_prob,
@@ -1325,16 +1604,26 @@ impl Model {
 
         if let Some(group_name) = self.routes.filetype_to_filegroup.get(file_type) {
             if let Some(route) = self.routes.filegroups.get(group_name) {
+                let route_name = format!("filegroups/{group_name}");
                 let (prob, class) = Self::score_route_file(route, file)?;
+                let class = policy.map_or(class, |policy| {
+                    policy_route_class(policy, &route_name, prob)
+                });
                 scores.push(RouteScore {
                     model: format!("az/{group_name}"),
                     probability: prob,
                     classification: class,
                 });
+                route_probs.push(RouteProbability {
+                    route: route_name,
+                    probability: prob,
+                });
                 if prob > max_prob {
                     max_prob = prob;
                 }
-                classification = max_class(classification, class);
+                if policy.is_none() {
+                    classification = max_class(classification, class);
+                }
             } else if self.routes.skipped_filegroups.contains(group_name) {
                 skipped.push(SkippedRoute {
                     model: format!("az/{group_name}"),
@@ -1344,21 +1633,48 @@ impl Model {
         }
 
         if let Some(route) = self.routes.filetypes.get(file_type) {
+            let route_name = format!("filetypes/{file_type}");
             let (prob, class) = Self::score_route_file(route, file)?;
+            let class = policy.map_or(class, |policy| {
+                policy_route_class(policy, &route_name, prob)
+            });
             scores.push(RouteScore {
                 model: format!("az/{file_type}"),
                 probability: prob,
                 classification: class,
             });
+            route_probs.push(RouteProbability {
+                route: route_name,
+                probability: prob,
+            });
             if prob > max_prob {
                 max_prob = prob;
             }
-            classification = max_class(classification, class);
+            if policy.is_none() {
+                classification = max_class(classification, class);
+            }
         } else if self.routes.skipped_filetypes.contains(file_type) {
             skipped.push(SkippedRoute {
                 model: format!("az/{file_type}"),
                 reason: "uncalibrated",
             });
+        }
+
+        if let Some(policy) = policy {
+            for route in policy
+                .hostile
+                .thresholds
+                .keys()
+                .chain(policy.suspicious.thresholds.keys())
+            {
+                if !route_probs.iter().any(|score| score.route == *route) {
+                    skipped.push(SkippedRoute {
+                        model: compact_route_name(route),
+                        reason: "unavailable",
+                    });
+                }
+            }
+            classification = policy_classify(policy, &route_probs);
         }
 
         Ok((max_prob, classification, scores, skipped))
@@ -1512,6 +1828,110 @@ mod tests {
             (elf.suspicious - elf.hostile).abs() < 1e-6,
             "hostile-only routes classify only at the hostile threshold"
         );
+    }
+
+    #[test]
+    fn route_policy_classification_keeps_general_escape() {
+        let policy = RoutePolicy {
+            hostile: PolicySeverity {
+                thresholds: HashMap::from([
+                    ("filetypes/elf".to_string(), 0.99),
+                    ("general".to_string(), 0.95),
+                ]),
+            },
+            suspicious: PolicySeverity {
+                thresholds: HashMap::from([("filetypes/elf".to_string(), 0.90)]),
+            },
+        };
+
+        let general_escape = vec![
+            RouteProbability {
+                route: "general".to_string(),
+                probability: 0.96,
+            },
+            RouteProbability {
+                route: "filetypes/elf".to_string(),
+                probability: 0.10,
+            },
+        ];
+        assert_eq!(
+            policy_classify(&policy, &general_escape),
+            Classification::Hostile
+        );
+
+        let specialist_suspicious = vec![
+            RouteProbability {
+                route: "general".to_string(),
+                probability: 0.10,
+            },
+            RouteProbability {
+                route: "filetypes/elf".to_string(),
+                probability: 0.91,
+            },
+        ];
+        assert_eq!(
+            policy_classify(&policy, &specialist_suspicious),
+            Classification::Suspicious
+        );
+
+        let inactive_route = vec![RouteProbability {
+            route: "filegroups/native".to_string(),
+            probability: 1.0,
+        }];
+        assert_eq!(
+            policy_classify(&policy, &inactive_route),
+            Classification::Benign
+        );
+    }
+
+    #[test]
+    fn load_route_policies_reads_level_and_route_membership() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("route_policies.json"),
+            r#"{
+              "schema": "azoth.route_policy_search.v1",
+              "routes": {
+                "filetypes/elf": {
+                  "filetype": "elf",
+                  "levels": [
+                    {
+                      "level": 4,
+                      "hostile": {
+                        "best": {"thresholds": {"general": 0.99}}
+                      },
+                      "suspicious": {
+                        "best": {"thresholds": {"general": 0.90}}
+                      }
+                    },
+                    {
+                      "level": 5,
+                      "hostile": {
+                        "best": {"thresholds": {"filetypes/elf": 0.98, "general": 0.97}}
+                      },
+                      "suspicious": {
+                        "best": {"thresholds": {"filegroups/native": 0.80}}
+                      }
+                    }
+                  ]
+                }
+              }
+            }"#,
+        )?;
+
+        let policies = load_route_policies(dir.path(), 5);
+        assert!(policies.contains_route("general"));
+        assert!(policies.contains_route("filegroups/native"));
+        assert!(policies.contains_route("filetypes/elf"));
+        assert!(!policies.contains_route("filetypes/pe"));
+
+        let elf = policies.by_filetype.get("elf").expect("elf policy");
+        assert!(
+            (elf.hostile.thresholds["filetypes/elf"] - 0.98).abs() < 1e-6,
+            "must select the requested level"
+        );
+        assert!(!elf.suspicious.thresholds.contains_key("general"));
+        Ok(())
     }
 
     #[test]
