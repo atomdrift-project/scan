@@ -1042,7 +1042,16 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 Err(e) => {
                     consecutive_errors += 1;
                     let backoff = backoff_duration(consecutive_errors);
-                    tracing::warn!(error = %e, elapsed_ms = crate::duration_ms(poll_start.elapsed()), backoff_secs = backoff.as_secs(), "poll/prefetch failed");
+                    let error_chain = format!("{e:#}");
+                    tracing::warn!(
+                        url = %poll_url,
+                        error = %error_chain,
+                        error_debug = ?e,
+                        elapsed_ms = crate::duration_ms(poll_start.elapsed()),
+                        backoff_secs = backoff.as_secs(),
+                        consecutive_errors,
+                        "poll/prefetch failed",
+                    );
                     if buffer.is_empty() {
                         interruptible_sleep(backoff, &shutdown).await;
                         continue;
@@ -1190,7 +1199,11 @@ async fn claim_and_prefetch(
     data_dir: Option<&Path>,
     max_single_bytes: usize,
 ) -> Result<Option<Vec<PrefetchedJob>>> {
-    let resp = client.get(poll_url).send().await.context("poll request")?;
+    let resp = client
+        .get(poll_url)
+        .send()
+        .await
+        .with_context(|| format!("poll request failed: url={poll_url}"))?;
 
     if resp.status() == reqwest::StatusCode::NO_CONTENT {
         return Ok(None);
@@ -1198,11 +1211,22 @@ async fn claim_and_prefetch(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("unexpected response from /api/next: {status} {body}");
+        anyhow::bail!(
+            "poll request returned non-success: url={poll_url} status={status} body={}",
+            body_excerpt(&body),
+        );
     }
 
-    let resp_body = resp.text().await.context("read claim body")?;
-    let claim: ClaimResponse = serde_json::from_str(&resp_body).context("parse claim response")?;
+    let resp_body = resp
+        .text()
+        .await
+        .with_context(|| format!("read claim body: url={poll_url}"))?;
+    let claim: ClaimResponse = serde_json::from_str(&resp_body).with_context(|| {
+        format!(
+            "parse claim response: url={poll_url} body={}",
+            body_excerpt(&resp_body),
+        )
+    })?;
 
     if claim.jobs.is_empty() {
         return Ok(None);
@@ -1637,6 +1661,16 @@ async fn post_result(
     tracing::error!(sha256 = %sha256, "post result: giving up after {MAX_ATTEMPTS} attempts");
 }
 
+fn body_excerpt(body: &str) -> String {
+    const MAX: usize = 512;
+    let compact = body.replace(['\r', '\n', '\t'], " ");
+    let mut out: String = compact.chars().take(MAX).collect();
+    if compact.chars().count() > MAX {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Download file bytes from hopper. Tries the fast `/data/{path}` endpoint
 /// first (static file serving, no DB query). Falls back to `/api/file/{sha256}`
 /// for backward compatibility with older hopper versions.
@@ -1670,17 +1704,15 @@ async fn download_bytes(
         url_encode_into(segment, &mut data_url);
     }
     tracing::debug!(sha256 = %sha256, url = %data_url, "downloading via /data/");
-    let resp = client
-        .get(&data_url)
-        .send()
-        .await
-        .map_err(|e| format!("download {path}: {e}"))?;
+    let resp =
+        client.get(&data_url).send().await.map_err(|e| {
+            format!("download failed: path={path} sha256={sha256} url={data_url}: {e}")
+        })?;
 
     if resp.status().is_success() {
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("download {path}: read body: {e}"))?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            format!("download body failed: path={path} sha256={sha256} url={data_url}: {e}")
+        })?;
         tracing::info!(
             sha256 = %sha256,
             file = %path,
@@ -1691,28 +1723,35 @@ async fn download_bytes(
         return Ok(bytes.to_vec());
     }
     let data_status = resp.status();
+    let data_body = resp
+        .text()
+        .await
+        .map(|body| body_excerpt(&body))
+        .unwrap_or_else(|e| format!("failed to read error body: {e}"));
 
     // /data/ failed — fall back to /api/file/{sha256} which does a DB lookup
     // by hash, so it works even when the relative path doesn't match hopper's
     // data root (e.g. different symlink resolution or data root migration).
     let api_url = format!("{base_url}/api/file/{sha256}");
     tracing::debug!(sha256 = %sha256, url = %api_url, "downloading via /api/file/ (fallback)");
-    let resp = client
-        .get(&api_url)
-        .send()
-        .await
-        .map_err(|e| format!("download {sha256}: {e}"))?;
+    let resp = client.get(&api_url).send().await.map_err(|e| {
+        format!("download fallback failed: path={path} sha256={sha256} url={api_url}: {e}")
+    })?;
 
     if !resp.status().is_success() {
+        let api_status = resp.status();
+        let api_body = resp
+            .text()
+            .await
+            .map(|body| body_excerpt(&body))
+            .unwrap_or_else(|e| format!("failed to read error body: {e}"));
         return Err(format!(
-            "download {path}: /data/ HTTP {data_status}, /api/file/ HTTP {}",
-            resp.status()
+            "download failed: path={path} sha256={sha256}; /data/ url={data_url} status={data_status} body={data_body}; /api/file/ url={api_url} status={api_status} body={api_body}",
         ));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("download {sha256}: read body: {e}"))?;
+    let bytes = resp.bytes().await.map_err(|e| {
+        format!("download fallback body failed: path={path} sha256={sha256} url={api_url}: {e}")
+    })?;
     tracing::info!(
         sha256 = %sha256,
         file = %path,
