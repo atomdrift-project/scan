@@ -204,9 +204,11 @@ enum Commands {
         max_size_mb: usize,
 
         /// Maximum RSS in gigabytes before rejecting requests.
-        /// Defaults to 0, which means auto: min(50% RAM, 32 GiB).
-        #[arg(long, default_value = "0")]
-        max_rss_gb: u64,
+        /// 0 (default) auto-resolves to the process memory limit; -1 disables
+        /// in-process throttling entirely (use when an external supervisor
+        /// like systemd `MemoryMax=` already enforces a hard cap).
+        #[arg(long, default_value = "0", allow_hyphen_values = true)]
+        max_rss_gb: i64,
 
         /// Comma-separated directories allowed for /analyze-path requests
         #[arg(long)]
@@ -602,11 +604,23 @@ fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?,
                 None => Vec::new(),
             };
-            let max_rss_bytes = if max_rss_gb == 0 {
-                cleave::memory_tracker::memory_limit()
-            } else {
-                max_rss_gb.saturating_mul(1024 * 1024 * 1024)
-            };
+            let raw_max_rss_gb = max_rss_gb;
+            let max_rss_bytes = resolve_process_max_rss_bytes(raw_max_rss_gb);
+            match raw_max_rss_gb {
+                n if n < 0 => {
+                    tracing::info!(
+                        "in-process RSS throttling disabled (--max-rss-gb=-1); \
+                         relying on external supervisor for OOM enforcement",
+                    );
+                }
+                0 => {
+                    tracing::info!(
+                        max_rss_mb = max_rss_bytes / 1024 / 1024,
+                        "auto-resolved server RSS ceiling (set --max-rss-gb to override, -1 to disable)",
+                    );
+                }
+                _ => {}
+            }
             let model_dir = resolve_model_dir()?;
             let thresholds = threshold_overrides(&model_dir)?;
             let config = litmus::server::ServerConfig::new(
@@ -715,11 +729,7 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| "unknown".to_string())
             });
             let raw_max_rss_gb = max_rss_gb;
-            let max_rss_gb: u64 = match raw_max_rss_gb {
-                n if n < 0 => 0,
-                0 => resolve_worker_max_rss_gb(),
-                n => n as u64,
-            };
+            let max_rss_gb = resolve_worker_max_rss_gb(raw_max_rss_gb);
             log_worker_startup_diagnostics(WorkerStartupDiagnostics {
                 argv: std::env::args().collect(),
                 hopper_url: &url,
@@ -1031,7 +1041,23 @@ fn worker_memory_basis() -> WorkerMemoryBasis {
 ///
 /// Pick 85% of cleave's shared memory detector, which is cgroup-aware on
 /// Linux and falls back to 16 GiB only when no memory signal is available.
-fn resolve_worker_max_rss_gb() -> u64 {
+fn resolve_worker_max_rss_gb(raw_max_rss_gb: i64) -> u64 {
+    match raw_max_rss_gb {
+        n if n < 0 => 0,
+        0 => auto_worker_max_rss_gb(),
+        n => n as u64,
+    }
+}
+
+fn resolve_process_max_rss_bytes(raw_max_rss_gb: i64) -> u64 {
+    match raw_max_rss_gb {
+        n if n < 0 => 0,
+        0 => cleave::memory_tracker::memory_limit(),
+        n => (n as u64).saturating_mul(GIB),
+    }
+}
+
+fn auto_worker_max_rss_gb() -> u64 {
     let total_bytes = worker_memory_basis().bytes;
     std::cmp::max(1, (total_bytes * 85 / 100) / GIB)
 }
@@ -1085,9 +1111,10 @@ fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litm
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands};
+    use super::{resolve_process_max_rss_bytes, resolve_worker_max_rss_gb, Cli, Commands, GIB};
     use anyhow::{Context, Result};
     use clap::Parser;
+    use std::net::SocketAddr;
     use std::path::PathBuf;
 
     #[test]
@@ -1116,6 +1143,55 @@ mod tests {
             other => anyhow::bail!("unexpected command: {other:?}"),
         }
         Ok(())
+    }
+
+    #[test]
+    fn serve_and_worker_accept_negative_max_rss_disable() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "litmus",
+            "serve",
+            "--bind",
+            "127.0.0.1:49999",
+            "--max-rss-gb",
+            "-1",
+        ])
+        .context("serve -1 should parse")?;
+        match cli.command.context("serve subcommand expected")? {
+            Commands::Serve {
+                bind, max_rss_gb, ..
+            } => {
+                assert_eq!(bind, "127.0.0.1:49999".parse::<SocketAddr>()?);
+                assert_eq!(max_rss_gb, -1);
+            }
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "litmus",
+            "worker",
+            "--url",
+            "http://127.0.0.1:8081",
+            "--max-rss-gb",
+            "-1",
+        ])
+        .context("worker -1 should parse")?;
+        match cli.command.context("worker subcommand expected")? {
+            Commands::Worker { max_rss_gb, .. } => assert_eq!(max_rss_gb, -1),
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn max_rss_semantics_match_for_disabled_and_explicit_values() {
+        assert_eq!(resolve_process_max_rss_bytes(-1), 0);
+        assert_eq!(resolve_worker_max_rss_gb(-1), 0);
+
+        assert_eq!(resolve_process_max_rss_bytes(3), 3 * GIB);
+        assert_eq!(resolve_worker_max_rss_gb(3), 3);
+
+        assert!(resolve_process_max_rss_bytes(0) > 0);
+        assert!(resolve_worker_max_rss_gb(0) > 0);
     }
 
     #[test]
