@@ -102,6 +102,8 @@ pub struct FeatureSpec {
     attack_trigram_vocab: Vec<String>,
     mbc_bigram_vocab: Vec<String>,
     mbc_trigram_vocab: Vec<String>,
+    tiered_bigram_vocab: Vec<String>,
+    tiered_trigram_vocab: Vec<String>,
     feature_names: Vec<String>,
     total_features: usize,
     feature_means: Option<Vec<f32>>,
@@ -147,6 +149,10 @@ struct RawFeatureSpec {
     mbc_bigram_vocab: Vec<String>,
     #[serde(default)]
     mbc_trigram_vocab: Vec<String>,
+    #[serde(default)]
+    tiered_bigram_vocab: Vec<String>,
+    #[serde(default)]
+    tiered_trigram_vocab: Vec<String>,
     #[serde(default)]
     feature_names: Vec<String>,
     #[serde(default)]
@@ -198,6 +204,8 @@ impl FeatureSpec {
             attack_trigram_vocab: raw.attack_trigram_vocab,
             mbc_bigram_vocab: raw.mbc_bigram_vocab,
             mbc_trigram_vocab: raw.mbc_trigram_vocab,
+            tiered_bigram_vocab: raw.tiered_bigram_vocab,
+            tiered_trigram_vocab: raw.tiered_trigram_vocab,
             feature_names: raw.feature_names,
             total_features: raw.total_features,
             feature_means: raw.feature_means,
@@ -301,6 +309,8 @@ impl FeatureSpec {
             &self.attack_trigram_vocab,
             &self.mbc_bigram_vocab,
             &self.mbc_trigram_vocab,
+            &self.tiered_bigram_vocab,
+            &self.tiered_trigram_vocab,
         );
         if self.feature_names != expected_feature_names {
             // Feature groups can be disabled during training (COLLIMATOR_DISABLE_FEATURE_GROUPS),
@@ -418,6 +428,8 @@ fn build_expected_feature_names(
     attack_trigram_vocab: &[String],
     mbc_bigram_vocab: &[String],
     mbc_trigram_vocab: &[String],
+    tiered_bigram_vocab: &[String],
+    tiered_trigram_vocab: &[String],
 ) -> Vec<String> {
     let mut feature_names = Vec::with_capacity(20000); // overestimate to avoid reallocs
 
@@ -581,6 +593,16 @@ fn build_expected_feature_names(
         feature_names.push(format!("bigrams:{bi}"));
     }
 
+    // Group 11b: report-level severity-prefixed trait bigrams
+    for bi in tiered_bigram_vocab {
+        feature_names.push(format!("tierbi:{bi}"));
+    }
+
+    // Group 11c: report-level severity-prefixed trait trigrams
+    for tri in tiered_trigram_vocab {
+        feature_names.push(format!("tiertri:{tri}"));
+    }
+
     // Group 12: ghost
     for gh in ghost_vocab {
         feature_names.push(format!("ghost:{gh}"));
@@ -664,6 +686,8 @@ pub struct ExtractContext {
     n_atk_trigram: usize,
     n_mbc_bigram: usize,
     n_mbc_trigram: usize,
+    n_tiered_bigram: usize,
+    n_tiered_trigram: usize,
     /// Global feature name → index lookup for vocab-based features.
     absolute_lookup: HashMap<String, usize>,
     ghost_vocab: Vec<String>,
@@ -739,6 +763,8 @@ impl ExtractContext {
             n_atk_trigram: spec.attack_trigram_vocab.len(),
             n_mbc_bigram: spec.mbc_bigram_vocab.len(),
             n_mbc_trigram: spec.mbc_trigram_vocab.len(),
+            n_tiered_bigram: spec.tiered_bigram_vocab.len(),
+            n_tiered_trigram: spec.tiered_trigram_vocab.len(),
             absolute_lookup: spec
                 .feature_names
                 .iter()
@@ -1087,6 +1113,24 @@ impl ExtractContext {
         // G11: Bigrams (optimized — still uses offset for performance)
         let bigrams_offset = offsets.take(self.n_bigram);
         self.write_bigram_features_optimized(&summaries, vec, bigrams_offset);
+
+        // G11b: Tiered report-level notable+ bigrams.
+        offsets.take(self.n_tiered_bigram);
+        write_tiered_bigram_features(
+            &combined,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+        );
+        offsets.take(self.n_tiered_trigram);
+        write_tiered_trigram_features(
+            &combined,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+        );
 
         offsets.take(self.n_ghost); // ghost (now name-based above)
         offsets.take(self.n_skeleton); // skeleton (now name-based above)
@@ -1882,6 +1926,84 @@ fn write_aggregate_features(
     );
 }
 
+fn tier_prefix(crit: u32) -> &'static str {
+    match crit {
+        5 => "h",
+        4 => "s",
+        _ => "n",
+    }
+}
+
+fn truncate_path_depth(path: &str, depth: usize) -> String {
+    if depth == 0 {
+        return path.to_string();
+    }
+    path.split('/').take(depth).collect::<Vec<_>>().join("/")
+}
+
+fn write_tiered_bigram_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
+    let mut token_max_crit: HashMap<String, u32> = HashMap::new();
+    for (path, &max_ord) in &summary.sample_paths {
+        if max_ord < 3 {
+            continue;
+        }
+        let key = truncate_path_depth(path, 3);
+        let entry = token_max_crit.entry(key).or_insert(0);
+        *entry = (*entry).max(max_ord);
+    }
+
+    let mut tokens: Vec<String> = token_max_crit
+        .into_iter()
+        .map(|(path, crit)| format!("{}:{path}", tier_prefix(crit)))
+        .collect();
+    tokens.sort();
+    if tokens.len() > 512 {
+        tracing::warn!(
+            tokens = tokens.len(),
+            "too many tiered bigram tokens; skipping generation"
+        );
+        return;
+    }
+    for (i, t1) in tokens.iter().enumerate() {
+        for t2 in &tokens[i + 1..] {
+            w.set(&format!("tierbi:{t1} + {t2}"), 1.0);
+        }
+    }
+}
+
+fn write_tiered_trigram_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
+    let mut token_max_crit: HashMap<String, u32> = HashMap::new();
+    for (path, &max_ord) in &summary.sample_paths {
+        if max_ord < 3 {
+            continue;
+        }
+        let key = truncate_path_depth(path, 3);
+        let entry = token_max_crit.entry(key).or_insert(0);
+        *entry = (*entry).max(max_ord);
+    }
+
+    let mut tokens: Vec<String> = token_max_crit
+        .into_iter()
+        .map(|(path, crit)| format!("{}:{path}", tier_prefix(crit)))
+        .collect();
+    tokens.sort();
+    if tokens.len() > 512 {
+        tracing::warn!(
+            tokens = tokens.len(),
+            "too many tiered trigram tokens; skipping generation"
+        );
+        return;
+    }
+    for (i, t1) in tokens.iter().enumerate() {
+        for j in i + 1..tokens.len() {
+            let t2 = &tokens[j];
+            for t3 in &tokens[j + 1..] {
+                w.set(&format!("tiertri:{t1} + {t2} + {t3}"), 1.0);
+            }
+        }
+    }
+}
+
 fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8] {
     if summaries.is_empty() || TOP_K_RISK_FILES == 0 {
         return [0.0; 8];
@@ -2607,6 +2729,8 @@ mod tests {
             attack_trigram_vocab: vec![],
             mbc_bigram_vocab: vec![],
             mbc_trigram_vocab: vec![],
+            tiered_bigram_vocab: vec![],
+            tiered_trigram_vocab: vec![],
             feature_names: vec![],
             total_features: 3,
             feature_means: Some(vec![0.0, 1.0, 2.0]),
