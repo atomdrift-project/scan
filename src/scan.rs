@@ -907,6 +907,7 @@ pub(crate) struct ClassifiedReport {
 /// Run the full cleave-finalize + model inference pipeline on a report.
 /// This is the single authoritative inference path used by scan, ps, and the server.
 #[allow(clippy::needless_pass_by_value)] // Arc clones at call sites are negligible; ownership simplifies callers.
+#[allow(clippy::too_many_arguments)] // Each parameter is independently meaningful at every call site; bundling them into a context struct would be noise without a natural grouping.
 pub(crate) fn classify_report(
     label: &str,
     mut report: cleave::AnalysisReport,

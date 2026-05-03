@@ -65,8 +65,8 @@ const MODEL_FILES: &[&str] = &["model.json", "model.txt"];
 fn configured_repo() -> (String, String) {
     let raw =
         std::env::var("LITMUS_MODELS_REPO").unwrap_or_else(|_| DEFAULT_MODELS_REPO_URL.to_owned());
-    let (url, embedded_ref) = match raw.rfind('#') {
-        Some(idx) => (raw[..idx].to_owned(), Some(raw[idx + 1..].to_owned())),
+    let (url, embedded_ref) = match raw.rsplit_once('#') {
+        Some((url, ref_name)) => (url.to_owned(), Some(ref_name.to_owned())),
         None => (raw, None),
     };
     let ref_name = embedded_ref
@@ -470,10 +470,7 @@ fn urls_match(a: &str, b: &str) -> bool {
             .or_else(|| s.strip_prefix("http://"))
             .or_else(|| s.strip_prefix("git://"))
             .unwrap_or(s);
-        let s = match s.find('@') {
-            Some(idx) => &s[idx + 1..],
-            None => s,
-        };
+        let s = s.split_once('@').map_or(s, |(_, after)| after);
         // `git@host:path` uses ':' as the host/path separator.
         s.replacen(':', "/", 1)
     }

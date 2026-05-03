@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use litmus::scan::DisplayFilter;
 use litmus::OutputFormat;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -604,23 +605,8 @@ fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?,
                 None => Vec::new(),
             };
-            let raw_max_rss_gb = max_rss_gb;
-            let max_rss_bytes = resolve_process_max_rss_bytes(raw_max_rss_gb);
-            match raw_max_rss_gb {
-                n if n < 0 => {
-                    tracing::info!(
-                        "in-process RSS throttling disabled (--max-rss-gb=-1); \
-                         relying on external supervisor for OOM enforcement",
-                    );
-                }
-                0 => {
-                    tracing::info!(
-                        max_rss_mb = max_rss_bytes / 1024 / 1024,
-                        "auto-resolved server RSS ceiling (set --max-rss-gb to override, -1 to disable)",
-                    );
-                }
-                _ => {}
-            }
+            let max_rss_bytes = resolve_process_max_rss_bytes(max_rss_gb);
+            log_max_rss_resolution("server", MaxRssPolicy::from_cli(max_rss_gb), max_rss_bytes);
             let model_dir = resolve_model_dir()?;
             let thresholds = threshold_overrides(&model_dir)?;
             let config = litmus::server::ServerConfig::new(
@@ -730,7 +716,7 @@ fn main() -> Result<()> {
             });
             let raw_max_rss_gb = max_rss_gb;
             let max_rss_gb = resolve_worker_max_rss_gb(raw_max_rss_gb);
-            log_worker_startup_diagnostics(WorkerStartupDiagnostics {
+            log_worker_startup_diagnostics(&WorkerStartupDiagnostics {
                 argv: std::env::args().collect(),
                 hopper_url: &url,
                 name: &name,
@@ -773,21 +759,11 @@ fn main() -> Result<()> {
                 eprintln!("Worker startup validation failed: {e:#}");
                 process::exit(1);
             }
-            match raw_max_rss_gb {
-                n if n < 0 => {
-                    tracing::info!(
-                        "in-process RSS throttling disabled (--max-rss-gb=-1); \
-                         relying on external supervisor for OOM enforcement",
-                    );
-                }
-                0 => {
-                    tracing::info!(
-                        max_rss_gb,
-                        "auto-resolved worker RSS ceiling (set --max-rss-gb to override, -1 to disable)",
-                    );
-                }
-                _ => {}
-            }
+            log_max_rss_resolution(
+                "worker",
+                MaxRssPolicy::from_cli(raw_max_rss_gb),
+                max_rss_gb.saturating_mul(GIB),
+            );
             let config = litmus::worker::WorkerConfig {
                 hopper_url: url,
                 name,
@@ -852,7 +828,7 @@ struct WorkerStartupDiagnostics<'a> {
     nice: i32,
 }
 
-fn log_worker_startup_diagnostics(d: WorkerStartupDiagnostics<'_>) {
+fn log_worker_startup_diagnostics(d: &WorkerStartupDiagnostics<'_>) {
     let total_memory_mb = cleave::memory_tracker::total_memory().map(|b| b / MIB);
     let memory_limit_mb = cleave::memory_tracker::memory_limit() / MIB;
     let current_rss_mb = cleave::memory_tracker::current_rss().map(|b| b / MIB);
@@ -1037,29 +1013,78 @@ fn worker_memory_basis() -> WorkerMemoryBasis {
     }
 }
 
-/// Auto-resolve the worker RSS ceiling when the user hasn't set `--max-rss-gb`.
+/// User-supplied resolution policy for `--max-rss-gb`.
 ///
-/// Pick 85% of cleave's shared memory detector, which is cgroup-aware on
-/// Linux and falls back to 16 GiB only when no memory signal is available.
+/// The CLI accepts an `i64` so a negative value can opt out, but the three
+/// possible behaviours are encoded in the type system from this point on so
+/// that downstream code cannot accidentally treat "disabled" as "ceiling = 0".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaxRssPolicy {
+    /// `--max-rss-gb=-1`: disable in-process RSS throttling entirely. Use when
+    /// an external supervisor (systemd `MemoryMax=`, jail rctl, etc.) already
+    /// enforces a hard memory cap.
+    Disabled,
+    /// `--max-rss-gb=0`: auto-resolve the ceiling from the platform's memory
+    /// signal (cgroup limits, /proc/meminfo, or a conservative fallback).
+    Auto,
+    /// `--max-rss-gb=N` (N > 0): explicit ceiling in gigabytes.
+    Explicit(NonZeroU64),
+}
+
+impl MaxRssPolicy {
+    fn from_cli(raw: i64) -> Self {
+        match raw {
+            n if n < 0 => Self::Disabled,
+            0 => Self::Auto,
+            // The previous arms exclude n <= 0, so `cast_unsigned` is
+            // value-preserving and `NonZeroU64::new` always returns `Some`.
+            // `unwrap_or(MIN)` documents that the fallback is unreachable.
+            n => Self::Explicit(NonZeroU64::new(n.cast_unsigned()).unwrap_or(NonZeroU64::MIN)),
+        }
+    }
+}
+
+/// Auto-resolve the worker RSS ceiling: 85% of cleave's shared memory detector,
+/// which is cgroup-aware on Linux and falls back to 16 GiB only when no memory
+/// signal is available.
+fn auto_worker_max_rss_gb() -> u64 {
+    let total_bytes = worker_memory_basis().bytes;
+    std::cmp::max(1, (total_bytes * 85 / 100) / GIB)
+}
+
 fn resolve_worker_max_rss_gb(raw_max_rss_gb: i64) -> u64 {
-    match raw_max_rss_gb {
-        n if n < 0 => 0,
-        0 => auto_worker_max_rss_gb(),
-        n => n as u64,
+    match MaxRssPolicy::from_cli(raw_max_rss_gb) {
+        MaxRssPolicy::Disabled => 0,
+        MaxRssPolicy::Auto => auto_worker_max_rss_gb(),
+        MaxRssPolicy::Explicit(gb) => gb.get(),
     }
 }
 
 fn resolve_process_max_rss_bytes(raw_max_rss_gb: i64) -> u64 {
-    match raw_max_rss_gb {
-        n if n < 0 => 0,
-        0 => cleave::memory_tracker::memory_limit(),
-        n => (n as u64).saturating_mul(GIB),
+    match MaxRssPolicy::from_cli(raw_max_rss_gb) {
+        MaxRssPolicy::Disabled => 0,
+        MaxRssPolicy::Auto => cleave::memory_tracker::memory_limit(),
+        MaxRssPolicy::Explicit(gb) => gb.get().saturating_mul(GIB),
     }
 }
 
-fn auto_worker_max_rss_gb() -> u64 {
-    let total_bytes = worker_memory_basis().bytes;
-    std::cmp::max(1, (total_bytes * 85 / 100) / GIB)
+/// Emit a startup log line describing how `--max-rss-gb` was resolved. The
+/// explicit case is intentionally silent: the user picked the number, so
+/// echoing it back adds no information.
+fn log_max_rss_resolution(role: &'static str, policy: MaxRssPolicy, resolved_bytes: u64) {
+    match policy {
+        MaxRssPolicy::Disabled => tracing::info!(
+            role,
+            "in-process RSS throttling disabled (--max-rss-gb=-1); \
+             relying on external supervisor for OOM enforcement",
+        ),
+        MaxRssPolicy::Auto => tracing::info!(
+            role,
+            resolved_max_rss_mb = resolved_bytes / MIB,
+            "auto-resolved RSS ceiling (set --max-rss-gb to override, -1 to disable)",
+        ),
+        MaxRssPolicy::Explicit(_) => {}
+    }
 }
 
 /// Exit with the appropriate code based on scan summary counters.
@@ -1110,8 +1135,12 @@ fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litm
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{resolve_process_max_rss_bytes, resolve_worker_max_rss_gb, Cli, Commands, GIB};
+    use super::{
+        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb, Cli, Commands, MaxRssPolicy, GIB,
+    };
+    use std::num::NonZeroU64;
     use anyhow::{Context, Result};
     use clap::Parser;
     use std::net::SocketAddr;
@@ -1192,6 +1221,54 @@ mod tests {
 
         assert!(resolve_process_max_rss_bytes(0) > 0);
         assert!(resolve_worker_max_rss_gb(0) > 0);
+    }
+
+    #[test]
+    fn max_rss_policy_classifies_cli_inputs() {
+        assert_eq!(MaxRssPolicy::from_cli(-1), MaxRssPolicy::Disabled);
+        assert_eq!(MaxRssPolicy::from_cli(i64::MIN), MaxRssPolicy::Disabled);
+        assert_eq!(MaxRssPolicy::from_cli(0), MaxRssPolicy::Auto);
+        assert_eq!(
+            MaxRssPolicy::from_cli(7),
+            MaxRssPolicy::Explicit(NonZeroU64::new(7).expect("non-zero"))
+        );
+    }
+
+    #[test]
+    fn server_config_treats_zero_max_rss_as_disabled() {
+        let cfg = litmus::server::ServerConfig::new(
+            "127.0.0.1:0".parse().expect("addr"),
+            1024 * 1024,
+            0,
+            "/tmp/models",
+            None,
+            0,
+            vec![],
+            None,
+            1,
+            vec![],
+        )
+        .expect("valid config");
+        assert!(cfg.max_rss_bytes().is_none(), "0 must mean disabled");
+
+        let cfg = litmus::server::ServerConfig::new(
+            "127.0.0.1:0".parse().expect("addr"),
+            1024 * 1024,
+            8 * GIB,
+            "/tmp/models",
+            None,
+            0,
+            vec![],
+            None,
+            1,
+            vec![],
+        )
+        .expect("valid config");
+        assert_eq!(
+            cfg.max_rss_bytes().map(NonZeroU64::get),
+            Some(8 * GIB),
+            "explicit limit must round-trip through accessor"
+        );
     }
 
     #[test]

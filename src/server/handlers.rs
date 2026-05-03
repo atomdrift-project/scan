@@ -211,10 +211,14 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
 
     let rss_bytes = cleave::memory_tracker::current_rss();
     let rss_mb = rss_bytes.map(|b| b / 1024 / 1024);
+    let max_rss_mb = state.max_rss_bytes.map(|n| n.get() / 1024 / 1024);
     let active_tasks = state
         .max_concurrent_tasks
         .saturating_sub(state.slots.available_permits());
-    let overloaded = rss_bytes.map(|b| b > state.max_rss_bytes).unwrap_or(false);
+    let overloaded = match (rss_bytes, state.max_rss_bytes) {
+        (Some(rss), Some(limit)) => rss > limit.get(),
+        _ => false,
+    };
 
     if overloaded {
         tracing::warn!("GET /_/health -> 503 (degraded, rss={rss_mb:?}MB)");
@@ -224,7 +228,7 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
                 "status": "degraded",
                 "reason": "memory_pressure",
                 "rss_mb": rss_mb,
-                "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
+                "max_rss_mb": max_rss_mb,
                 "active_tasks": active_tasks,
                 "load_avg": load_avg,
                 "uptime_secs": uptime_secs,
@@ -333,7 +337,7 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
         "slots": state.max_concurrent_tasks,
         "cpus": cpus,
         "max_upload_mb": state.max_upload_bytes / 1024 / 1024,
-        "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
+        "max_rss_mb": state.max_rss_bytes.map(|n| n.get() / 1024 / 1024),
         "total_mem_mb": total_mem_mb,
         "model_commit": crate::models_repo::version(),
         "traits_commit": cleave::traits_repo::version(),
@@ -1348,9 +1352,12 @@ pub(super) async fn analyze_path(
 /// Returns `Some(Response)` if the request should be rejected due to memory pressure,
 /// or `None` if the server has enough memory to proceed.
 async fn check_memory_pressure(state: &AppState) -> Option<Response> {
+    // Throttling disabled: never reject on memory pressure. The operator has
+    // delegated OOM enforcement to an external supervisor.
+    let max_rss_bytes = state.max_rss_bytes?.get();
     let rss = cleave::memory_tracker::current_rss()?;
 
-    if rss <= state.max_rss_bytes {
+    if rss <= max_rss_bytes {
         // Happy path: reset overload timer if set.
         if let Ok(mut overloaded) = state.overloaded_since.try_lock() {
             if overloaded.is_some() {
@@ -1380,7 +1387,7 @@ async fn check_memory_pressure(state: &AppState) -> Option<Response> {
 
     // Re-check after clearing caches.
     let rss_after = cleave::memory_tracker::current_rss()?;
-    if rss_after <= state.max_rss_bytes {
+    if rss_after <= max_rss_bytes {
         if let Ok(mut overloaded) = state.overloaded_since.try_lock() {
             *overloaded = None;
         }
@@ -1407,7 +1414,7 @@ async fn check_memory_pressure(state: &AppState) -> Option<Response> {
 
     tracing::warn!(
         rss_mb = rss_after / 1024 / 1024,
-        max_rss_mb = state.max_rss_bytes / 1024 / 1024,
+        max_rss_mb = max_rss_bytes / 1024 / 1024,
         overloaded_secs,
         "server overloaded: high memory usage (even after cache clear)"
     );
@@ -1442,7 +1449,7 @@ pub(super) async fn memory_stats(State(state): State<Arc<AppState>>) -> Json<ser
     Json(serde_json::json!({
         "process": {
             "rss_mb": rss_mb,
-            "max_rss_mb": state.max_rss_bytes / 1024 / 1024,
+            "max_rss_mb": state.max_rss_bytes.map(|n| n.get() / 1024 / 1024),
             "jemalloc": jemalloc,
         },
         "server": {

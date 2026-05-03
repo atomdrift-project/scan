@@ -25,6 +25,7 @@ use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -43,7 +44,7 @@ use crate::model::{Model, Thresholds};
 pub struct ServerConfig {
     bind: SocketAddr,
     max_body_size: usize,
-    max_rss_bytes: u64,
+    max_rss_bytes: Option<NonZeroU64>,
     model_dir: PathBuf,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
@@ -67,7 +68,10 @@ impl ServerConfig {
     /// `thresholds` may be `None` to use the model's recommended thresholds
     /// from `evaluation.json`, or `Some(t)` to override with explicit values.
     ///
-    /// `max_body_size` and `max_rss_bytes` are byte counts.
+    /// `max_body_size` and `max_rss_bytes` are byte counts. A `max_rss_bytes`
+    /// of `0` disables in-process RSS throttling — the server will not reject
+    /// requests on memory pressure (use this when an external supervisor like
+    /// systemd `MemoryMax=` already enforces a hard cap).
     ///
     /// `workers` is the maximum number of concurrent analyses; requests beyond
     /// this are rejected with 503 by the per-handler hard gate.
@@ -119,7 +123,7 @@ impl ServerConfig {
         Ok(Self {
             bind,
             max_body_size,
-            max_rss_bytes,
+            max_rss_bytes: NonZeroU64::new(max_rss_bytes),
             model_dir: model_dir.into(),
             thresholds,
             slow_rule_ms,
@@ -176,9 +180,10 @@ impl ServerConfig {
         self.max_body_size
     }
 
-    /// Maximum RSS before rejecting requests.
+    /// Maximum RSS before rejecting requests, or `None` when in-process RSS
+    /// throttling is disabled (constructed with `0`).
     #[must_use]
-    pub const fn max_rss_bytes(&self) -> u64 {
+    pub const fn max_rss_bytes(&self) -> Option<NonZeroU64> {
         self.max_rss_bytes
     }
 
@@ -383,7 +388,8 @@ pub(crate) struct ModelResources {
 #[derive(Debug)]
 struct AppState {
     max_upload_bytes: usize,
-    max_rss_bytes: u64,
+    /// Maximum RSS before rejecting requests; `None` disables throttling.
+    max_rss_bytes: Option<NonZeroU64>,
     model_dir: PathBuf,
     threshold_overrides: Option<Thresholds>,
     slow_rule_ms: u64,
@@ -698,11 +704,13 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // Watchdog thread: enforces the same RSS limit as check_memory_pressure on
     // wall-clock time, independent of request traffic. This catches memory
     // growth that happens between requests (e.g. jemalloc fragmentation or
-    // background YARA work).
-    let _watchdog = cleave::memory_tracker::start_periodic_logging(
-        std::time::Duration::from_secs(10),
-        config.max_rss_bytes(),
-    );
+    // background YARA work). Skipped when throttling is disabled.
+    let _watchdog = config.max_rss_bytes().map(|limit| {
+        cleave::memory_tracker::start_periodic_logging(
+            std::time::Duration::from_secs(10),
+            limit.get(),
+        )
+    });
 
     let app = build_app(&config).await?;
 
