@@ -679,7 +679,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "1.2.1"
-source = "git+https://codeberg.org/atomdrift/cleave.git#11aaa74bee46676446e8b6eb45e215c6c1c2b137"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72d78ad0dff6a7758b6ad643f4d82a35dbd5b332"
 dependencies = [
  "aes 0.8.4",
  "aho-corasick",
@@ -697,6 +697,7 @@ dependencies = [
  "cleave-macros",
  "colored",
  "cpio",
+ "crc32fast",
  "crossbeam-channel",
  "cu-bincode",
  "dashmap",
@@ -706,6 +707,7 @@ dependencies = [
  "flate2",
  "futures-core",
  "futures-util",
+ "gimli",
  "goblin",
  "hex",
  "iced-x86",
@@ -735,6 +737,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sevenz-rust",
+ "sha1 0.10.6",
  "sha2",
  "simd-json",
  "smallvec",
@@ -779,6 +782,7 @@ dependencies = [
  "ts-parser-perl",
  "unrar",
  "walkdir",
+ "x509-parser",
  "xz2",
  "yara-classify",
  "yara-x",
@@ -789,7 +793,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#11aaa74bee46676446e8b6eb45e215c6c1c2b137"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72d78ad0dff6a7758b6ad643f4d82a35dbd5b332"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1273,9 +1277,9 @@ dependencies = [
 
 [[package]]
 name = "digest"
-version = "0.11.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4850db49bf08e663084f7fb5c87d202ef91a3907271aff24a94eb97ff039153c"
+checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.0",
  "const-oid 0.10.2",
@@ -1468,7 +1472,7 @@ dependencies = [
 [[package]]
 name = "fileid"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#11aaa74bee46676446e8b6eb45e215c6c1c2b137"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72d78ad0dff6a7758b6ad643f4d82a35dbd5b332"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -1829,7 +1833,7 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
- "digest 0.11.2",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -2509,7 +2513,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#11aaa74bee46676446e8b6eb45e215c6c1c2b137"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72d78ad0dff6a7758b6ad643f4d82a35dbd5b332"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -2879,7 +2883,7 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
 dependencies = [
- "digest 0.11.2",
+ "digest 0.11.3",
  "hmac 0.13.0",
 ]
 
@@ -3719,7 +3723,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#11aaa74bee46676446e8b6eb45e215c6c1c2b137"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72d78ad0dff6a7758b6ad643f4d82a35dbd5b332"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3924,7 +3928,7 @@ checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
- "digest 0.11.2",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -4179,7 +4183,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#11aaa74bee46676446e8b6eb45e215c6c1c2b137"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72d78ad0dff6a7758b6ad643f4d82a35dbd5b332"
 
 [[package]]
 name = "tap"
@@ -5929,7 +5933,7 @@ dependencies = [
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#11aaa74bee46676446e8b6eb45e215c6c1c2b137"
+source = "git+https://codeberg.org/atomdrift/cleave.git#72d78ad0dff6a7758b6ad643f4d82a35dbd5b332"
 
 [[package]]
 name = "yara-x"
