@@ -91,7 +91,7 @@ struct Cli {
     #[arg(short = '2', global = true, action = clap::ArgAction::SetTrue)]
     level_2: bool,
 
-    /// Use severity level 3
+    /// Use severity level 3: default operating point
     #[arg(short = '3', global = true, action = clap::ArgAction::SetTrue)]
     level_3: bool,
 
@@ -99,7 +99,7 @@ struct Cli {
     #[arg(short = '4', global = true, action = clap::ArgAction::SetTrue)]
     level_4: bool,
 
-    /// Use severity level 5: default operating point
+    /// Use severity level 5
     #[arg(short = '5', global = true, action = clap::ArgAction::SetTrue)]
     level_5: bool,
 
@@ -1140,10 +1140,10 @@ mod tests {
     use super::{
         resolve_process_max_rss_bytes, resolve_worker_max_rss_gb, Cli, Commands, MaxRssPolicy, GIB,
     };
-    use std::num::NonZeroU64;
     use anyhow::{Context, Result};
     use clap::Parser;
     use std::net::SocketAddr;
+    use std::num::NonZeroU64;
     use std::path::PathBuf;
 
     #[test]
