@@ -68,7 +68,6 @@ terminal-colorsaurus = "0.4"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
 tower = { version = "0.5", features = ["limit"] }
-tower-http = { version = "0.6" }
 tempfile = "3"
 dashmap = "6"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
