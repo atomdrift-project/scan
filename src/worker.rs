@@ -1203,7 +1203,12 @@ async fn claim_and_prefetch(
         .get(poll_url)
         .send()
         .await
-        .with_context(|| format!("poll request failed: url={poll_url}"))?;
+        .map_err(|e| {
+            let error_text = e.to_string();
+            let is_connect = e.is_connect();
+            anyhow::Error::new(e)
+                .context(poll_request_context(poll_url, &error_text, is_connect))
+        })?;
 
     if resp.status() == reqwest::StatusCode::NO_CONTENT {
         return Ok(None);
@@ -1865,6 +1870,19 @@ fn url_encode_into(s: &str, out: &mut String) {
     }
 }
 
+fn poll_request_context(url: &str, error_text: &str, is_connect: bool) -> String {
+    let mut context = format!("poll request failed: url={url}");
+    if is_connect
+        && url.starts_with("https://")
+        && error_text.contains("InvalidContentType")
+    {
+        context.push_str(
+            " (HTTPS requested, but the peer did not speak TLS; hopper may be serving plain HTTP on this port. Try http://)",
+        );
+    }
+    context
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -2028,5 +2046,26 @@ mod tests {
             .expect("resolve path");
 
         assert_eq!(resolved.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn poll_request_context_hints_for_https_to_http_mismatch() {
+        let context = poll_request_context(
+            "https://10.9.8.5:8081/api/next",
+            "client error (Connect): received corrupt message of type InvalidContentType",
+            true,
+        );
+        assert!(context.contains("peer did not speak TLS"));
+        assert!(context.contains("Try http://"));
+    }
+
+    #[test]
+    fn poll_request_context_avoids_hint_for_other_errors() {
+        let context = poll_request_context(
+            "https://10.9.8.5:8081/api/next",
+            "dns error: failed to lookup address information",
+            true,
+        );
+        assert!(!context.contains("Try http://"));
     }
 }

@@ -80,10 +80,7 @@ pub fn update(force: bool) -> Result<()> {
         let fetch = git_cmd::run(&["-C", &path, "fetch", "origin"], GIT_TIMEOUT)
             .context("git fetch failed")?;
         if !fetch.status.success() {
-            anyhow::bail!(
-                "git fetch failed: {}",
-                String::from_utf8_lossy(&fetch.stderr)
-            );
+            anyhow::bail!("git fetch failed: {}", git_cmd::format_failure(&fetch));
         }
         let reset = git_cmd::run(
             &["-C", &path, "reset", "--hard", "origin/HEAD"],
@@ -91,20 +88,14 @@ pub fn update(force: bool) -> Result<()> {
         )
         .context("git reset failed")?;
         if !reset.status.success() {
-            anyhow::bail!(
-                "git reset failed: {}",
-                String::from_utf8_lossy(&reset.stderr)
-            );
+            anyhow::bail!("git reset failed: {}", git_cmd::format_failure(&reset));
         }
     } else {
         eprintln!("Updating traits...");
         let pull = git_cmd::run(&["-C", &path, "pull", "--ff-only"], GIT_TIMEOUT)
             .context("git pull failed")?;
         if !pull.status.success() {
-            anyhow::bail!(
-                "traits update failed: {}",
-                String::from_utf8_lossy(&pull.stderr)
-            );
+            anyhow::bail!("traits update failed: {}", git_cmd::format_failure(&pull));
         }
     }
 

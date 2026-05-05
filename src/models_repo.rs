@@ -181,7 +181,7 @@ pub fn update() -> Result<Option<String>> {
     };
     let fetch = git_cmd::run(&fetch_args, GIT_TIMEOUT)?;
     if !fetch.status.success() {
-        anyhow::bail!("fetch failed: {}", String::from_utf8_lossy(&fetch.stderr));
+        anyhow::bail!("fetch failed: {}", git_cmd::format_failure(&fetch));
     }
 
     // Force the working tree to the fetched ref. We use `reset --hard
@@ -197,7 +197,7 @@ pub fn update() -> Result<Option<String>> {
         anyhow::bail!(
             "reset to {} failed: {}",
             display_ref(&effective_ref),
-            String::from_utf8_lossy(&reset.stderr)
+            git_cmd::format_failure(&reset)
         );
     }
 
@@ -236,10 +236,7 @@ pub fn rollback(rev: &str) -> Result<()> {
     let base_str = base.to_string_lossy();
     let output = git_cmd::run(&["-C", &base_str, "reset", "--hard", rev], GIT_TIMEOUT)?;
     if !output.status.success() {
-        anyhow::bail!(
-            "rollback to {rev} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        anyhow::bail!("rollback to {rev} failed: {}", git_cmd::format_failure(&output));
     }
     tracing::info!(broken_commit = %broken, rolled_back_to = %rev, "models repo rolled back");
     Ok(())

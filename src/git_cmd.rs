@@ -75,6 +75,28 @@ pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output> {
     }
 }
 
+/// Format the most useful human-readable message from a completed git process.
+///
+/// Git often writes failures to stderr, but some commands and transports emit
+/// useful context on stdout instead. Prefer stderr, then stdout, then the exit
+/// status if neither stream contained anything.
+pub(crate) fn format_failure(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+
+    match output.status.code() {
+        Some(code) => format!("git exited with status {code}"),
+        None => "git terminated by signal".to_string(),
+    }
+}
+
 /// `git rev-parse --short HEAD` for a local repo. Local-only, no network,
 /// no timeout required.
 pub(crate) fn short_head(path: &Path) -> Option<String> {
@@ -114,11 +136,32 @@ fn kill_group(_pid: u32) {}
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn run_returns_output_for_fast_command() {
         let out = run(&["--version"], Duration::from_secs(10)).unwrap();
         assert!(out.status.success());
         assert!(String::from_utf8_lossy(&out.stdout).starts_with("git version"));
+    }
+
+    #[test]
+    fn format_failure_prefers_stderr() {
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: b"stdout details\n".to_vec(),
+            stderr: b"stderr details\n".to_vec(),
+        };
+        assert_eq!(format_failure(&output), "stderr details");
+    }
+
+    #[test]
+    fn format_failure_falls_back_to_stdout() {
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: b"stdout details\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(format_failure(&output), "stdout details");
     }
 }
