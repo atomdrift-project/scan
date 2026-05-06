@@ -16,14 +16,17 @@ use crate::scan::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 pub fn run(config: &ScanConfig) -> Result<()> {
     let targets = collect_targets()?;
 
-    cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal)
+    let cleave_output = cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal)
         .context("cleave validate")?;
+    print!("{cleave_output}");
 
-    // Keep model validation aligned with `cleave validate`: no YARA, one mapper
-    // shared by all target analyses, and the same benign corpus.
+    // Keep model validation aligned with `cleave validate`: no YARA/radare2/UPX,
+    // one mapper shared by all target analyses, and the same benign corpus.
     std::env::set_var("CLEAVE_SKIP_CACHE", "1");
     let options = cleave::AnalysisOptions {
         disable_yara: true,
+        disable_radare2: true,
+        disable_upx: true,
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
     };
@@ -62,16 +65,10 @@ pub fn run(config: &ScanConfig) -> Result<()> {
     let (passed, total, warnings) = evaluate(results, thresholds)?;
 
     let models_ver = crate::models_repo::version()
-        .map(|v| format!(" models: {v}"))
-        .unwrap_or_default();
-    let traits_ver = cleave::traits_repo::version()
-        .map(|v| format!(" traits: {v}"))
-        .unwrap_or_default();
-    let traits_dir = cleave::traits_repo::try_resolve()
-        .map(|p| format!(" traits_dir: {}", p.display()))
+        .map(|v| format!("  models: {v}"))
         .unwrap_or_default();
     eprintln!(
-        "validate:{models_ver}{traits_ver}{traits_dir} cleave traits + model benign corpus ({}/{}, warnings={})",
+        "validate ok:{models_ver}  benign corpus {}/{}  warnings={}",
         passed, total, warnings,
     );
     Ok(())
