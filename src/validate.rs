@@ -16,7 +16,7 @@ use crate::scan::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 pub fn run(config: &ScanConfig) -> Result<()> {
     let targets = collect_targets()?;
 
-    let cleave_output = cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal)
+    let cleave_output = cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None)
         .context("cleave validate")?;
     print!("{cleave_output}");
 
