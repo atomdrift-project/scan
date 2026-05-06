@@ -236,7 +236,10 @@ pub fn rollback(rev: &str) -> Result<()> {
     let base_str = base.to_string_lossy();
     let output = git_cmd::run(&["-C", &base_str, "reset", "--hard", rev], GIT_TIMEOUT)?;
     if !output.status.success() {
-        anyhow::bail!("rollback to {rev} failed: {}", git_cmd::format_failure(&output));
+        anyhow::bail!(
+            "rollback to {rev} failed: {}",
+            git_cmd::format_failure(&output)
+        );
     }
     tracing::info!(broken_commit = %broken, rolled_back_to = %rev, "models repo rolled back");
     Ok(())

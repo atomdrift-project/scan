@@ -1199,16 +1199,11 @@ async fn claim_and_prefetch(
     data_dir: Option<&Path>,
     max_single_bytes: usize,
 ) -> Result<Option<Vec<PrefetchedJob>>> {
-    let resp = client
-        .get(poll_url)
-        .send()
-        .await
-        .map_err(|e| {
-            let error_text = e.to_string();
-            let is_connect = e.is_connect();
-            anyhow::Error::new(e)
-                .context(poll_request_context(poll_url, &error_text, is_connect))
-        })?;
+    let resp = client.get(poll_url).send().await.map_err(|e| {
+        let error_text = e.to_string();
+        let is_connect = e.is_connect();
+        anyhow::Error::new(e).context(poll_request_context(poll_url, &error_text, is_connect))
+    })?;
 
     if resp.status() == reqwest::StatusCode::NO_CONTENT {
         return Ok(None);
@@ -1872,10 +1867,7 @@ fn url_encode_into(s: &str, out: &mut String) {
 
 fn poll_request_context(url: &str, error_text: &str, is_connect: bool) -> String {
     let mut context = format!("poll request failed: url={url}");
-    if is_connect
-        && url.starts_with("https://")
-        && error_text.contains("InvalidContentType")
-    {
+    if is_connect && url.starts_with("https://") && error_text.contains("InvalidContentType") {
         context.push_str(
             " (HTTPS requested, but the peer did not speak TLS; hopper may be serving plain HTTP on this port. Try http://)",
         );

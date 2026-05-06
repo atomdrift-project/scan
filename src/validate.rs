@@ -16,7 +16,8 @@ use crate::scan::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 pub fn run(config: &ScanConfig) -> Result<()> {
     let targets = collect_targets()?;
 
-    cleave::commands::validate::run().context("cleave validate")?;
+    cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal)
+        .context("cleave validate")?;
 
     // Keep model validation aligned with `cleave validate`: no YARA, one mapper
     // shared by all target analyses, and the same benign corpus.
