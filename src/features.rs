@@ -380,6 +380,55 @@ const LOGIC_GAP_CATEGORIES: &[&str] = &["crypto", "network", "process"];
 /// Intent gap categories (v16 group 22).
 const INTENT_GAP_CATEGORIES: &[&str] = &["network", "filesystem", "execution", "crypto"];
 
+const FORMAT_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "script",
+        &[
+            "batch",
+            "javascript",
+            "lua",
+            "perl",
+            "php",
+            "powershell",
+            "python",
+            "ruby",
+            "shell",
+            "typescript",
+            "vbscript",
+        ],
+    ),
+    ("native_binary", &["elf", "macho", "pe"]),
+    (
+        "archive_package",
+        &[
+            "7z", "apk", "cab", "deb", "egg", "gz", "jar", "msi", "rar", "rpm", "tar", "tgz",
+            "vsix", "war", "whl", "xpi", "xz", "zip", "zst",
+        ],
+    ),
+    (
+        "document",
+        &[
+            "doc", "docx", "html", "pdf", "ppt", "pptx", "rtf", "xls", "xlsx",
+        ],
+    ),
+    (
+        "source_code",
+        &[
+            "c", "cpp", "csharp", "go", "java", "kotlin", "makefile", "rust", "scala", "swift",
+        ],
+    ),
+    (
+        "config_data",
+        &["ini", "json", "plist", "toml", "xml", "yaml", "yml"],
+    ),
+    (
+        "media",
+        &[
+            "bmp", "gif", "jpg", "jpeg", "mp3", "mp4", "png", "svg", "webp",
+        ],
+    ),
+];
+
 /// Expected ghosts (v16 group 23).
 const EXPECTED_GHOSTS: &[(&str, &[&str])] = &[
     (
@@ -498,6 +547,29 @@ fn build_expected_feature_names(
         "agg:suspicious_2level_breadth".to_string(),
         "agg:hostile_2level_breadth".to_string(),
         "agg:objectives_breadth".to_string(),
+        "agg:kill_chain_span".to_string(),
+        "agg:objective_micro_ratio".to_string(),
+        "agg:avg_finding_depth".to_string(),
+        "agg:objective_hostile_density".to_string(),
+        "agg:static_file_bytes_log".to_string(),
+        "agg:static_import_count_log".to_string(),
+        "agg:static_export_count_log".to_string(),
+        "agg:static_dependency_count_log".to_string(),
+        "agg:static_string_count_log".to_string(),
+        "agg:static_wide_string_ratio".to_string(),
+        "agg:static_max_string_length_log".to_string(),
+        "agg:static_string_entropy_max".to_string(),
+        "agg:static_text_lines_log".to_string(),
+        "agg:static_function_count_log".to_string(),
+        "agg:static_code_bytes_log".to_string(),
+        "agg:static_code_to_data_ratio_max".to_string(),
+        "agg:static_wx_units_log".to_string(),
+        "agg:static_writable_unit_ratio".to_string(),
+        "agg:static_executable_unit_ratio".to_string(),
+        "agg:static_nonstandard_unit_names_log".to_string(),
+        "agg:static_largest_unit_ratio_max".to_string(),
+        "agg:static_resource_ratio_max".to_string(),
+        "agg:static_signed_file_fraction".to_string(),
         "agg:attack_technique_count".to_string(),
         "agg:attack_tactic_count".to_string(),
         "agg:mbc_behavior_count".to_string(),
@@ -551,6 +623,22 @@ fn build_expected_feature_names(
     for filetype in filetype_vocab {
         feature_names.push(format!("filetype:{filetype}"));
     }
+
+    // Group 6b: Portable format-group hints derived only from cleave file types.
+    for &(group, _) in FORMAT_GROUPS {
+        feature_names.push(format!("format:{group}"));
+        feature_names.push(format!("format:{group}_file_fraction"));
+        feature_names.push(format!("format:{group}_inner_fraction"));
+        feature_names.push(format!("format:{group}_suspicious_fraction"));
+        feature_names.push(format!("format:{group}_hostile_fraction"));
+    }
+    feature_names.extend([
+        "format:group_count_log".to_string(),
+        "format:mixed_script_binary".to_string(),
+        "format:mixed_archive_script".to_string(),
+        "format:mixed_archive_binary".to_string(),
+        "format:unknown_file_fraction".to_string(),
+    ]);
 
     // Group 7: struct base 7 + extensions
     feature_names.extend([
@@ -671,6 +759,7 @@ pub struct ExtractContext {
     presence_lookup: HashMap<String, usize>,
     n_presence: usize,
     n_ft: usize,
+    n_format: usize,
     n_element: usize,
     n_bigram: usize,
     n_ghost: usize,
@@ -748,6 +837,11 @@ impl ExtractContext {
             presence_lookup,
             n_presence: spec.presence_vocab.len(),
             n_ft: spec.filetype_vocab.len(),
+            n_format: spec
+                .feature_names
+                .iter()
+                .filter(|name| name.starts_with("format:"))
+                .count(),
             n_element: spec.element_vocab.len(),
             n_bigram: spec.bigram_vocab.len(),
             n_ghost: spec.ghost_vocab.len(),
@@ -1024,6 +1118,16 @@ impl ExtractContext {
 
         // G6: Filetype (blindfolded in v16)
         let _file_type_offset = offsets.take(self.n_ft);
+
+        // G6b: Format hints
+        offsets.take(self.n_format);
+        write_format_hint_features(
+            &summaries,
+            &mut FeatureWriter {
+                vec,
+                lookup: &self.absolute_lookup,
+            },
+        );
 
         // G7: Structural
         offsets.take(11);
@@ -2118,6 +2222,98 @@ fn parse_iso8601(s: &str) -> Option<f64> {
         }
     }
     Some(total as f64 + frac)
+}
+
+fn format_groups_for_type(file_type: &str) -> Vec<&'static str> {
+    let normalized = file_type.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    FORMAT_GROUPS
+        .iter()
+        .filter_map(|&(group, types)| types.contains(&normalized.as_str()).then_some(group))
+        .collect()
+}
+
+fn write_format_hint_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
+    let total_files = summaries.len().max(1) as f32;
+    let inner_files = summaries
+        .iter()
+        .filter(|s| !s.parent.is_empty())
+        .count()
+        .max(1) as f32;
+    let mut known_files = 0usize;
+    let mut present_groups = HashSet::new();
+
+    for &(group, _) in FORMAT_GROUPS {
+        let mut group_count = 0usize;
+        let mut inner_count = 0usize;
+        let mut suspicious_count = 0usize;
+        let mut hostile_count = 0usize;
+
+        for s in summaries {
+            let groups = format_groups_for_type(&s.file_type);
+            if groups.is_empty() {
+                continue;
+            }
+            if groups.contains(&group) {
+                group_count += 1;
+                present_groups.insert(group);
+                if !s.parent.is_empty() {
+                    inner_count += 1;
+                }
+                if s.findings.suspicious_finding_count > 0 {
+                    suspicious_count += 1;
+                }
+                if s.findings.hostile_finding_count > 0 {
+                    hostile_count += 1;
+                }
+            }
+        }
+
+        known_files += group_count;
+        let group_denom = group_count.max(1) as f32;
+        w.set(&format!("format:{group}"), f32::from(group_count > 0));
+        w.set(
+            &format!("format:{group}_file_fraction"),
+            group_count as f32 / total_files,
+        );
+        w.set(
+            &format!("format:{group}_inner_fraction"),
+            inner_count as f32 / inner_files,
+        );
+        w.set(
+            &format!("format:{group}_suspicious_fraction"),
+            suspicious_count as f32 / group_denom,
+        );
+        w.set(
+            &format!("format:{group}_hostile_fraction"),
+            hostile_count as f32 / group_denom,
+        );
+    }
+
+    w.set(
+        "format:group_count_log",
+        (present_groups.len() as f32).ln_1p(),
+    );
+    w.set(
+        "format:mixed_script_binary",
+        f32::from(present_groups.contains("script") && present_groups.contains("native_binary")),
+    );
+    w.set(
+        "format:mixed_archive_script",
+        f32::from(present_groups.contains("archive_package") && present_groups.contains("script")),
+    );
+    w.set(
+        "format:mixed_archive_binary",
+        f32::from(
+            present_groups.contains("archive_package") && present_groups.contains("native_binary"),
+        ),
+    );
+    w.set(
+        "format:unknown_file_fraction",
+        (summaries.len().saturating_sub(known_files)) as f32 / total_files,
+    );
 }
 
 fn write_structural_extensions(

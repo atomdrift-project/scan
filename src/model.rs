@@ -1002,7 +1002,7 @@ fn load_specialists(
                 tracing::warn!(
                     category = %category,
                     name = %name,
-                    error = %e,
+                    error = ?e,
                     "dropping specialist; route will degrade to general or filegroup",
                 );
             }
