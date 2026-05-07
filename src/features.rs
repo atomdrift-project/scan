@@ -335,9 +335,11 @@ impl FeatureSpec {
                     expected_feature_names.len(),
                 );
             }
-            // Valid subset — some feature groups were disabled during training.
-            tracing::info!(
-                "feature spec has {} features (expected {} with all groups enabled) — {} groups disabled",
+            // Valid subset: this model was trained without some optional feature families
+            // that the current extractor knows how to produce. Extraction still follows
+            // the shipped spec exactly, so the runtime vector layout remains compatible.
+            tracing::debug!(
+                "feature spec has {} features (extractor knows {} optional-inclusive features) — {} optional features absent from this model",
                 self.feature_names.len(),
                 expected_feature_names.len(),
                 expected_feature_names.len() - self.feature_names.len(),
