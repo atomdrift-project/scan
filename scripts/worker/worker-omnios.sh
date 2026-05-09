@@ -34,6 +34,27 @@ export PATH
 [ "$(id -u)" -eq 0 ] || die "must be run as root inside the zone"
 [ -f Cargo.toml ] || die "must be invoked from the litmus repository root"
 command -v pkgin >/dev/null 2>&1 || die "pkgin not found; install pkgsrc bootstrap first"
+command -v pkg >/dev/null 2>&1   || die "IPS pkg(1) not found; not running on illumos?"
+
+###############################################################################
+# IPS system prerequisites: crt1.o, headers, ld, libc — needed by pkgsrc gcc
+# to link anything. Without build-essential the linker fails with
+# "ld: fatal: file crt1.o: open failed".
+###############################################################################
+
+# IPS pkg(1) returns 4 when nothing needs doing — treat that as success.
+ensure_ips() {
+    pkg install -q "$1" && return 0
+    rc=$?
+    [ "$rc" -eq 4 ] && return 0
+    return "$rc"
+}
+
+log "Ensuring IPS build prerequisites (headers, ld, crt files)"
+# build-essential pulls headers + ld; c-runtime supplies /usr/lib/{,amd64/}crt1.o
+# which build-essential does NOT pull in on r151058+, despite the name.
+ensure_ips build-essential        || die "failed to install IPS build-essential"
+ensure_ips system/library/c-runtime || die "failed to install IPS c-runtime"
 
 JOBS=$(psrinfo | wc -l | tr -d ' ')
 [ "$JOBS" -gt 0 ] 2>/dev/null || JOBS=2
@@ -115,9 +136,15 @@ build_innoextract() {
     rm -rf build
     mkdir build
     cd build
+    # Boost_NO_BOOST_CMAKE: pkgsrc boost-libs 1.90 ships only the top-level
+    # BoostConfig.cmake, not per-component boost_systemConfig.cmake etc.,
+    # so we force cmake to fall back to the legacy FindBoost module which
+    # locates components via .so files in $PKG_PREFIX/lib.
     cmake -DCMAKE_INSTALL_PREFIX="$SRC_PREFIX" \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_PREFIX_PATH="$PKG_PREFIX" \
+          -DBoost_NO_BOOST_CMAKE=ON \
+          -DBOOST_ROOT="$PKG_PREFIX" \
           ..
     gmake -j"$JOBS"
     gmake install
