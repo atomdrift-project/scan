@@ -273,6 +273,10 @@ cat > "$SMF_MANIFEST" <<EOF
       <method_environment>
         <envvar name="PATH" value="$PATH"/>
         <envvar name="HOME" value="$LITMUS_HOME"/>
+        <!-- illumos's ld.so.1 doesn't search /opt/litmus/lib by default;
+             set LD_LIBRARY_PATH so rizin can find librz_util.so.0.x and
+             friends, plus pkgsrc libs at /opt/local/lib for transitive deps. -->
+        <envvar name="LD_LIBRARY_PATH" value="$SRC_PREFIX/lib:$PKG_PREFIX/lib"/>
       </method_environment>
     </method_context>
     <exec_method type="method" name="start"
