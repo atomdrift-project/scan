@@ -132,18 +132,31 @@ build_from_git() {
 }
 
 build_innoextract() {
+    # Boost 1.90 finally removed boost_system as a library (header-only since
+    # 1.69). innoextract still lists `system` in find_package COMPONENTS, so
+    # we point cmake at a stub config that declares Boost::system as a
+    # header-only INTERFACE target. Other components (filesystem, iostreams,
+    # date_time, program_options) come from pkgsrc as normal.
+    stub=$PWD/.boost-system-stub
+    mkdir -p "$stub"
+    cat > "$stub/boost_system-config.cmake" <<'STUB'
+add_library(Boost::system INTERFACE IMPORTED)
+set(boost_system_FOUND TRUE)
+set(boost_system_VERSION 1.90.0)
+STUB
+    cat > "$stub/boost_system-config-version.cmake" <<'STUB'
+set(PACKAGE_VERSION "1.90.0")
+set(PACKAGE_VERSION_COMPATIBLE TRUE)
+set(PACKAGE_VERSION_EXACT TRUE)
+STUB
+
     rm -rf build
     mkdir build
     cd build
-    # Boost_NO_BOOST_CMAKE: pkgsrc boost-libs 1.90 ships only the top-level
-    # BoostConfig.cmake, not per-component boost_systemConfig.cmake etc.,
-    # so we force cmake to fall back to the legacy FindBoost module which
-    # locates components via .so files in $PKG_PREFIX/lib.
     cmake -DCMAKE_INSTALL_PREFIX="$SRC_PREFIX" \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_PREFIX_PATH="$PKG_PREFIX" \
-          -DBoost_NO_BOOST_CMAKE=ON \
-          -DBOOST_ROOT="$PKG_PREFIX" \
+          -Dboost_system_DIR="$stub" \
           ..
     gmake -j"$JOBS"
     gmake install
