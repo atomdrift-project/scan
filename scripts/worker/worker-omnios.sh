@@ -109,17 +109,17 @@ build_from_git() {
     dir=$SRC_DIR/$name
 
     if [ ! -d "$dir/.git" ]; then
-        log "Cloning $name"
-        git clone "$repo" "$dir"
+        log "Cloning $name @ $ref (shallow)"
+        case "$ref" in
+            HEAD) git clone --depth 1 "$repo" "$dir" ;;
+            *)    git clone --depth 1 --branch "$ref" "$repo" "$dir" ;;
+        esac
     fi
 
-    git -C "$dir" fetch --tags --prune origin
-    case "$ref" in
-        HEAD) target=origin/HEAD ;;
-        *)    target=$ref ;;
-    esac
-    git -C "$dir" reset --hard "$target"
-    git -C "$dir" submodule update --init --recursive
+    # Shallow-fetch just the requested ref so re-runs don't pull history.
+    git -C "$dir" fetch --depth 1 origin "$ref"
+    git -C "$dir" reset --hard FETCH_HEAD
+    git -C "$dir" submodule update --init --recursive --depth 1
 
     sha=$(git -C "$dir" rev-parse HEAD)
     marker=$dir/.installed-sha
@@ -179,6 +179,28 @@ build_upx() {
 build_rizin() {
     rm -rf build
     meson setup --prefix="$SRC_PREFIX" --buildtype=release build
+
+    # tree-sitter's portable/endian.h has no illumos branch and falls into a
+    # "platform not supported" #error. illumos provides the standard
+    # le16toh/be16toh names via <endian.h>, so wrap the #error in a guard
+    # that includes <endian.h> on __sun. Idempotent — skipped if already
+    # patched. Path globs the version since rizin can bump tree-sitter.
+    ts_endian=$(find subprojects -path '*tree-sitter*/portable/endian.h' 2>/dev/null | head -1)
+    if [ -n "$ts_endian" ] && ! grep -q '__sun' "$ts_endian"; then
+        log "Patching tree-sitter portable/endian.h for illumos"
+        awk '
+            /^#    error platform not supported$/ {
+                print "#  if defined(__sun) || defined(__illumos__)"
+                print "#    include <endian.h>"
+                print "#  else"
+                print "#    error platform not supported"
+                print "#  endif"
+                next
+            }
+            { print }
+        ' "$ts_endian" > "$ts_endian.tmp" && mv "$ts_endian.tmp" "$ts_endian"
+    fi
+
     meson compile -C build
     meson install -C build
 }
