@@ -2,7 +2,13 @@
 
 #[cfg(all(
     unix,
-    not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd"))
+    not(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))
 ))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
