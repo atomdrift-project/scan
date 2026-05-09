@@ -60,7 +60,7 @@ add_pkg meson
 add_pkg ninja-build
 add_pkg gmake
 add_pkg pkgconf
-add_pkg gcc12
+add_pkg gcc13
 add_pkg boost-headers
 add_pkg boost-libs
 add_pkg xz
