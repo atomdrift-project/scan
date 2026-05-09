@@ -222,7 +222,12 @@ mkdir -p "$LITMUS_HOME" "$LITMUS_LOG_DIR"
 chown "$LITMUS_USER:$LITMUS_GROUP" "$LITMUS_HOME" "$LITMUS_LOG_DIR"
 
 log "Building litmus from source tree"
-cargo build --release || die "litmus build failed"
+# unrar-sys builds the unrar library as C++ but doesn't emit a link-lib for
+# libstdc++, so the final link (with -nodefaultlibs) leaves operator new,
+# std::__cxx11 string symbols, and __gxx_personality_v0 unresolved on illumos.
+# Force rustc to append -lstdc++ to the link line.
+RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-lstdc++" cargo build --release \
+    || die "litmus build failed"
 
 log "Installing litmus binary to $LITMUS_BIN"
 install -m 755 target/release/litmus "$LITMUS_BIN"

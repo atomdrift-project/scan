@@ -34,6 +34,10 @@ cd litmus && make install
 
 Optional: [rizin](https://github.com/rizinorg/rizin) for disassembly, [upx](https://github.com/upx/upx) for unpacking.
 
+## Platforms
+
+Known to run awesomely on illumos, OpenBSD, FreeBSD, Linux, and macOS.
+
 ## Usage
 
 ```bash
