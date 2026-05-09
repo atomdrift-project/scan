@@ -167,7 +167,7 @@ build_rizin() {
     meson install -C build
 }
 
-build_from_git innoextract https://github.com/dscharrer/innoextract.git 1.9        build_innoextract
+build_from_git innoextract https://github.com/dscharrer/innoextract.git HEAD       build_innoextract
 build_from_git upx          https://github.com/upx/upx.git                v4.2.4   build_upx
 build_from_git rizin        https://github.com/rizinorg/rizin.git         HEAD     build_rizin
 
