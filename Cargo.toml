@@ -54,7 +54,11 @@ description = "ML-powered malware classification using cleave static analysis"
 license = "Apache-2.0"
 
 [dependencies]
-cleave = { git = "https://codeberg.org/atomdrift/cleave.git" }
+# default-features = false drops cleave's `jemalloc` default (its only default
+# feature), so cleave doesn't pull in tikv-jemalloc-{ctl,sys}. Litmus declares
+# its own #[global_allocator] in main.rs (cfg-gated to skip illumos/Solaris/the
+# BSDs that ship jemalloc natively), so we don't need cleave's copy.
+cleave = { git = "https://codeberg.org/atomdrift/cleave.git", default-features = false }
 proclist = { git = "https://codeberg.org/atomdrift/proclist.git" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
