@@ -266,11 +266,11 @@ cat > "$SMF_MANIFEST" <<EOF
       <service_fmri value="svc:/system/filesystem/local:default"/>
     </dependency>
     <method_context>
+      <method_credential user="$LITMUS_USER" group="$LITMUS_GROUP"/>
       <method_environment>
         <envvar name="PATH" value="$PATH"/>
         <envvar name="HOME" value="$LITMUS_HOME"/>
       </method_environment>
-      <method_credential user="$LITMUS_USER" group="$LITMUS_GROUP"/>
     </method_context>
     <exec_method type="method" name="start"
                  exec="$LITMUS_BIN worker --url $URL"
