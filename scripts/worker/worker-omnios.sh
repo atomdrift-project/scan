@@ -53,8 +53,8 @@ add_pkg() {
     pkg_info -qe "$1" 2>/dev/null || to_install="$to_install $1"
 }
 add_pkg rust
-add_pkg 7zip
-add_pkg scmgit-base
+add_pkg p7zip
+add_pkg git
 add_pkg cmake
 add_pkg meson
 add_pkg ninja-build

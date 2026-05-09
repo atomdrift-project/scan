@@ -118,6 +118,7 @@ deploy-worker:
 		           echo "error: unsupported Linux (no systemd; not Alpine; pass BUILD+WORKER_RUN for SSH deploy)"; exit 1; \
 		         fi ;; \
 		OpenBSD) ./scripts/worker/worker-openbsd.sh "$(URL)" ;; \
+		SunOS)   ./scripts/worker/worker-omnios.sh "$(URL)" ;; \
 		*) echo "error: no deploy-worker target for $$(uname -s)"; exit 1 ;; \
 	esac
 
