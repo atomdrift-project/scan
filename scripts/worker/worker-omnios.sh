@@ -248,10 +248,13 @@ su - "$LITMUS_USER" -c "PATH=$PATH $LITMUS_BIN update-rules" \
 log "Writing SMF manifest at $SMF_MANIFEST"
 mkdir -p "$(dirname "$SMF_MANIFEST")"
 
-# duration=contract + ignore_error=core,signal: SMF restarts the worker
-# whether it exits cleanly, dies on signal, or dumps core, instead of
-# parking the service in maintenance. exec is run via /bin/sh -c so the
-# pkgsrc PATH is in effect for child processes (rizin, 7z, upx, innoextract).
+# duration=child: litmus runs in the foreground (doesn't fork), so SMF must
+# treat the start method's process itself as the service. With contract mode
+# SMF would expect start to fork+exit and would kill the worker as a
+# "method exit timeout" after timeout_seconds. With child mode SMF tracks
+# the start process directly and restarts it when it exits.
+# ignore_error=core,signal: restart on crash/signal instead of going to
+# maintenance. timeout_seconds=0 on start: no timeout (run forever).
 cat > "$SMF_MANIFEST" <<EOF
 <?xml version="1.0"?>
 <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
@@ -274,10 +277,10 @@ cat > "$SMF_MANIFEST" <<EOF
     </method_context>
     <exec_method type="method" name="start"
                  exec="$LITMUS_BIN worker --url $URL"
-                 timeout_seconds="120"/>
+                 timeout_seconds="0"/>
     <exec_method type="method" name="stop" exec=":kill" timeout_seconds="60"/>
     <property_group name="startd" type="framework">
-      <propval name="duration" type="astring" value="contract"/>
+      <propval name="duration" type="astring" value="child"/>
       <propval name="ignore_error" type="astring" value="core,signal"/>
     </property_group>
     <stability value="Unstable"/>
