@@ -701,11 +701,47 @@ impl IsotonicCalibrator {
                 raw.y.len()
             );
         }
+        // Reject non-finite values up front: a single NaN or Inf in x or y
+        // would propagate through every `apply()` call (NaN poisoning) — and
+        // because thresholds are also calibrated at load time, every file
+        // scored against this route would silently classify as Benign.
+        for v in raw.x.iter().chain(raw.y.iter()) {
+            if !v.is_finite() {
+                anyhow::bail!(
+                    "calibrator at {} contains a non-finite value (NaN/Inf)",
+                    path.display(),
+                );
+            }
+        }
+        // Strict-ascending x: equal adjacent breakpoints would make the
+        // linear-interpolation denominator zero and produce NaN in apply().
         for w in raw.x.windows(2) {
+            if w[1] <= w[0] {
+                anyhow::bail!(
+                    "calibrator at {} is malformed: x is not strictly ascending ({} >= {})",
+                    path.display(),
+                    w[0], w[1],
+                );
+            }
+        }
+        // y must be monotone-non-decreasing (the contract the calibrator
+        // claims) AND in [0, 1] (a probability). If either fails, threshold
+        // calibration could swap suspicious > hostile or land outside
+        // valid-probability range — both are silent classifier corruption.
+        for w in raw.y.windows(2) {
             if w[1] < w[0] {
                 anyhow::bail!(
-                    "calibrator at {} is malformed: x is not sorted ascending",
-                    path.display()
+                    "calibrator at {} is malformed: y is not monotone non-decreasing ({} > {})",
+                    path.display(),
+                    w[0], w[1],
+                );
+            }
+        }
+        for &v in &raw.y {
+            if !(0.0..=1.0).contains(&v) {
+                anyhow::bail!(
+                    "calibrator at {} has y value {} outside [0, 1]",
+                    path.display(), v,
                 );
             }
         }
@@ -1234,10 +1270,21 @@ fn load_bundle(
     // via `calibrate_policy_thresholds`, after every specialist has been
     // loaded and its calibrator is available for lookup.
     let thresholds = if let Some(cal) = calibrator.as_ref() {
-        Thresholds {
+        let calibrated = Thresholds {
             suspicious: cal.apply(thresholds.suspicious),
             hostile: cal.apply(thresholds.hostile),
-        }
+        };
+        // Re-validate: a calibrator could in principle push hostile below
+        // suspicious (it shouldn't given monotonicity, but defense in depth)
+        // or out of [0,1]. We'd rather refuse to load than ship a bundle
+        // whose decision boundaries are nonsensical.
+        calibrated.validate().with_context(|| format!(
+            "calibrated thresholds for {} are invalid (suspicious={}, hostile={}); \
+             check the calibrator at {}/calibrator.json",
+            bundle_dir.display(), calibrated.suspicious, calibrated.hostile,
+            bundle_dir.display(),
+        ))?;
+        calibrated
     } else {
         thresholds
     };
@@ -2248,6 +2295,70 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let cal = IsotonicCalibrator::load_optional(dir.path())?;
         assert!(cal.is_none(), "missing calibrator must be a None, not an error");
+        Ok(())
+    }
+
+    #[test]
+    fn isotonic_rejects_duplicate_x_breakpoints() -> Result<()> {
+        // Equal adjacent breakpoints make linear interpolation divide by zero
+        // and produce NaN in apply() — silently turning every prediction into
+        // NaN and every classification into Benign. Reject at load time.
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("calibrator.json"),
+            br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,0.5,0.5,1.0],"y":[0.0,0.4,0.6,1.0]}"#,
+        )?;
+        let err = IsotonicCalibrator::load_optional(dir.path())
+            .expect_err("duplicate breakpoints must be rejected");
+        assert!(err.to_string().contains("strictly ascending"),
+                "error should mention strict ascending: {err}");
+        Ok(())
+    }
+
+    #[test]
+    fn isotonic_rejects_non_finite_values() -> Result<()> {
+        // NaN or Inf in x or y would propagate through every apply() call.
+        for body in [
+            br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,0.5,1.0],"y":[0.0,"NaN",1.0]}"# as &[u8],
+            br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,"Infinity",1.0],"y":[0.0,0.5,1.0]}"#,
+        ] {
+            let dir = tempfile::tempdir()?;
+            std::fs::write(dir.path().join("calibrator.json"), body)?;
+            let result = IsotonicCalibrator::load_optional(dir.path());
+            // serde may reject NaN/Inf at parse time (depending on parser
+            // strict-mode); either parse-rejection or our own check is fine
+            // — both prevent the bad calibrator from being installed.
+            assert!(result.is_err(),
+                    "non-finite calibrator must be rejected (got {result:?})");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn isotonic_rejects_y_out_of_unit_interval() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("calibrator.json"),
+            br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,0.5,1.0],"y":[0.0,0.5,1.5]}"#,
+        )?;
+        let err = IsotonicCalibrator::load_optional(dir.path())
+            .expect_err("y > 1 must be rejected");
+        assert!(err.to_string().contains("outside [0, 1]"),
+                "error should explain the bound: {err}");
+        Ok(())
+    }
+
+    #[test]
+    fn isotonic_rejects_non_monotone_y() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("calibrator.json"),
+            br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,0.4,0.8,1.0],"y":[0.0,0.6,0.3,1.0]}"#,
+        )?;
+        let err = IsotonicCalibrator::load_optional(dir.path())
+            .expect_err("non-monotone y must be rejected");
+        assert!(err.to_string().contains("monotone"),
+                "error should mention monotone: {err}");
         Ok(())
     }
 
