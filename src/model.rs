@@ -123,7 +123,7 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::features::{ExtractContext, FeatureSpec, EXPECTED_MODEL_ABI_VERSION};
 
@@ -549,19 +549,14 @@ pub struct ModelInfo {
     pub commit: Option<String>,
 }
 
-/// Inference backend powering a loaded [`Model`].
-///
-/// Selected at load time by probing the bundle directory for `model.json`
-/// (XGBoost) or `model.txt` (LightGBM). Both backends expose the same
-/// `predict` and `num_features` surface; everything outside this enum is
-/// backend-agnostic.
+/// One trained tree-boosting model, picked at load time by file extension.
 #[derive(Debug)]
-enum Backend {
+enum InnerModel {
     Xgboost(xgboost_ars::Model),
     Lightgbm(lightgbm_ars::Model),
 }
 
-impl Backend {
+impl InnerModel {
     fn num_features(&self) -> usize {
         match self {
             Self::Xgboost(m) => m.num_features(),
@@ -586,6 +581,168 @@ impl Backend {
     }
 }
 
+/// Inference backend powering a loaded [`Model`].
+///
+/// Holds one or more trained models for a route. Single-model bundles (the
+/// historical layout, `model.txt` or `model.json` directly under the bundle
+/// dir) load `models = [one_model]`. Multi-seed bundles store
+/// `models/seed_NN.txt` (or `.json`) and load all of them; `predict` returns
+/// the arithmetic mean of every member's score, which is the variance-reducing
+/// equivalent of training K seeds and ensembling them at inference time.
+///
+/// All members of `models` are required to have the same backend kind
+/// (XGBoost or LightGBM) and the same `num_features` — mixing is rejected at
+/// load time.
+#[derive(Debug)]
+struct Backend {
+    /// At least one model; up to K for multi-seed bundles. K=1 is the default
+    /// and is byte-equivalent to the pre-multi-seed predict path.
+    models: Vec<InnerModel>,
+}
+
+impl Backend {
+    fn num_features(&self) -> usize {
+        // Constructor enforces uniform num_features; pick member 0.
+        self.models[0].num_features()
+    }
+
+    fn predict(&self, features: &[f32]) -> Result<f32> {
+        // Average member predictions in f64 to keep the rounding noise-floor
+        // below f32 precision even for K up to a few dozen seeds. The K=1
+        // path is mathematically identical to a direct `models[0].predict`.
+        let mut sum = 0.0_f64;
+        for m in &self.models {
+            sum += f64::from(m.predict(features)?);
+        }
+        // Safety: `models` is non-empty by construction. The narrowing cast
+        // is intentional — every member emits f32 probabilities and our caller
+        // surface is f32, so the f64 accumulator only exists to keep summation
+        // numerically stable across K members.
+        #[allow(clippy::cast_possible_truncation)]
+        let avg = (sum / self.models.len() as f64) as f32;
+        Ok(avg)
+    }
+
+    fn kind(&self) -> &'static str {
+        self.models[0].kind()
+    }
+
+    /// Number of trained members (1 = legacy single-model bundle, ≥2 =
+    /// multi-seed). Exposed mainly so the load-time `tracing::info!` line
+    /// can advertise it.
+    fn n_members(&self) -> usize {
+        self.models.len()
+    }
+}
+
+/// Per-route isotonic calibrator persisted by collimator's
+/// `azoth_calibrate_ensemble.py` as `calibrator.json` next to `model.txt`.
+///
+/// Maps a route's raw model probability to a calibrated probability on
+/// `[0, 1]`. The calibrator is fit on the deployment-time calibration corpus
+/// so the deployed score matches the empirical malware fraction at any score
+/// quantile.
+///
+/// Storage format (`azoth.calibrator.isotonic.v1`):
+/// - `x`: ascending raw-probability breakpoints
+/// - `y`: monotone-non-decreasing calibrated probabilities at each breakpoint
+/// - `out_of_bounds`: `"clip"` — values outside `[x[0], x[-1]]` clamp to the
+///   closest endpoint's `y`.
+///
+/// Apply: linear interpolation between adjacent breakpoints. Linear interp on
+/// monotone breakpoints preserves the ranking, so AUC is unchanged — only the
+/// probability *scale* shifts to match the empirical observation.
+///
+/// Backward compat: when `calibrator.json` is absent, raw scores pass through
+/// unchanged. Bundles built before this change continue to load.
+#[derive(Debug, Clone)]
+struct IsotonicCalibrator {
+    /// Sorted-ascending raw probability breakpoints.
+    x: Vec<f32>,
+    /// Monotone-non-decreasing calibrated probabilities; `y[i]` is the value
+    /// at `x[i]`.
+    y: Vec<f32>,
+}
+
+impl IsotonicCalibrator {
+    /// Read `<bundle_dir>/calibrator.json` if it exists. Returns Ok(None) if
+    /// the file is missing (intentional — pre-calibrator bundles are still
+    /// loadable). Errors only when the file exists but is unparseable.
+    fn load_optional(bundle_dir: &Path) -> Result<Option<Self>> {
+        let path = bundle_dir.join("calibrator.json");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            schema: Option<String>,
+            x: Vec<f32>,
+            y: Vec<f32>,
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading calibrator at {}", path.display()))?;
+        let raw: Raw = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing calibrator at {}", path.display()))?;
+        if let Some(schema) = raw.schema.as_deref() {
+            // Hard-fail on unrecognized future versions to avoid silently
+            // applying a calibrator we don't understand.
+            if schema != "azoth.calibrator.isotonic.v1" {
+                anyhow::bail!(
+                    "calibrator at {} has unsupported schema {schema}; this litmus only supports azoth.calibrator.isotonic.v1",
+                    path.display()
+                );
+            }
+        }
+        if raw.x.len() != raw.y.len() || raw.x.is_empty() {
+            anyhow::bail!(
+                "calibrator at {} is malformed: x.len={}, y.len={}",
+                path.display(),
+                raw.x.len(),
+                raw.y.len()
+            );
+        }
+        for w in raw.x.windows(2) {
+            if w[1] < w[0] {
+                anyhow::bail!(
+                    "calibrator at {} is malformed: x is not sorted ascending",
+                    path.display()
+                );
+            }
+        }
+        Ok(Some(Self { x: raw.x, y: raw.y }))
+    }
+
+    /// Apply the calibrator to a single raw probability. Linear interpolation
+    /// between adjacent breakpoints; clip to endpoint `y` outside `[x[0], x[-1]]`.
+    fn apply(&self, raw: f32) -> f32 {
+        if raw.is_nan() {
+            return raw;
+        }
+        // Out-of-bounds clipping (matches sklearn IsotonicRegression(out_of_bounds="clip")).
+        if raw <= self.x[0] {
+            return self.y[0];
+        }
+        if raw >= self.x[self.x.len() - 1] {
+            return self.y[self.y.len() - 1];
+        }
+        // Binary search for the interval containing `raw`.
+        let i = match self
+            .x
+            .binary_search_by(|p| p.partial_cmp(&raw).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            Ok(idx) => return self.y[idx], // exact hit on a breakpoint
+            Err(idx) => idx,
+        };
+        // raw is in (x[i-1], x[i]); linear interpolation.
+        let x0 = self.x[i - 1];
+        let x1 = self.x[i];
+        let y0 = self.y[i - 1];
+        let y1 = self.y[i];
+        let t = (raw - x0) / (x1 - x0);
+        y0 + t * (y1 - y0)
+    }
+}
+
 /// Output of the per-bundle loader: backend, spec, resolved thresholds, plus
 /// telemetry about where the thresholds came from for the load-time log line.
 struct LoadedBundle {
@@ -593,6 +750,9 @@ struct LoadedBundle {
     spec: FeatureSpec,
     thresholds: Thresholds,
     threshold_source: &'static str,
+    /// Per-route isotonic calibrator from `calibrator.json`. Optional —
+    /// pre-calibrator bundles return `None` here and skip calibration.
+    calibrator: Option<IsotonicCalibrator>,
 }
 
 /// Default severity level used to pick thresholds out of the levels[] table
@@ -846,6 +1006,147 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u8) -> HashMap<String, 
     out
 }
 
+/// Load the inference backend for a bundle directory. Multi-seed bundles
+/// store every member at `models/seed_NN.{txt,json}` (one file per seed); the
+/// historical layout has a single `model.{txt,json}` directly under the
+/// bundle dir. Both layouts are accepted; the multi-seed layout is preferred
+/// when the `models/` subdirectory is present and non-empty.
+///
+/// Mixing `.json` (XGBoost) and `.txt` (LightGBM) members in the same `models/`
+/// directory is rejected — the deployed bundle uses a single backend kind per
+/// route. So is mixing legacy and multi-seed layouts in the same bundle.
+fn load_backend(bundle_dir: &Path) -> Result<Backend> {
+    let multi_dir = bundle_dir.join("models");
+    let multi = if multi_dir.is_dir() {
+        collect_multi_seed_paths(&multi_dir)?
+    } else {
+        Vec::new()
+    };
+
+    let single_xgb = bundle_dir.join("model.json");
+    let single_lgb = bundle_dir.join("model.txt");
+    let has_single = single_xgb.is_file() || single_lgb.is_file();
+
+    if !multi.is_empty() && has_single {
+        anyhow::bail!(
+            "model bundle is ambiguous: both `models/` (multi-seed) and a top-level model artifact \
+             exist in {}; remove one to disambiguate the layout",
+            bundle_dir.display(),
+        );
+    }
+
+    let model_paths: Vec<PathBuf> = if !multi.is_empty() {
+        multi
+    } else {
+        match (single_xgb.is_file(), single_lgb.is_file()) {
+            (true, false) => vec![single_xgb],
+            (false, true) => vec![single_lgb],
+            (true, true) => anyhow::bail!(
+                "model bundle is ambiguous: both {} and {} exist; remove one to disambiguate the backend",
+                single_xgb.display(),
+                single_lgb.display(),
+            ),
+            (false, false) => anyhow::bail!(
+                "model bundle is incomplete: missing model.json (XGBoost) or model.txt (LightGBM) \
+                 in {} (and no models/ directory either)",
+                bundle_dir.display(),
+            ),
+        }
+    };
+
+    let mut models = Vec::with_capacity(model_paths.len());
+    let mut first_kind: Option<&'static str> = None;
+    let mut first_n_features: Option<usize> = None;
+    for path in &model_paths {
+        let inner = load_inner_model(path)?;
+        // Refuse to mix backend kinds across members.
+        let kind = inner.kind();
+        if let Some(prev) = first_kind {
+            if prev != kind {
+                anyhow::bail!(
+                    "model bundle has mixed backends in {}: member {} is {kind} but earlier \
+                     members were {prev}; every member must share the same backend kind",
+                    bundle_dir.display(),
+                    path.display(),
+                );
+            }
+        } else {
+            first_kind = Some(kind);
+        }
+        // Refuse to mix feature counts — averaging across heterogeneous
+        // feature spaces would silently produce nonsense scores.
+        let n = inner.num_features();
+        if let Some(prev) = first_n_features {
+            if prev != n {
+                anyhow::bail!(
+                    "model bundle has mismatched feature counts in {}: member {} expects {n} \
+                     features but earlier members expected {prev}",
+                    bundle_dir.display(),
+                    path.display(),
+                );
+            }
+        } else {
+            first_n_features = Some(n);
+        }
+        models.push(inner);
+    }
+
+    Ok(Backend { models })
+}
+
+/// Pick up every `seed_*.{txt,json}` under a `models/` directory, sorted by
+/// filename so load order is deterministic across runs (and so the K=1
+/// path with a single `seed_NN.txt` behaves identically regardless of fs order).
+fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(multi_dir)
+        .with_context(|| format!("reading multi-seed models dir {}", multi_dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("reading entry under {}", multi_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("seed_") {
+            // Tolerate bystander files (READMEs, hashes) so future additions
+            // don't silently break loading.
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "txt" && ext != "json" {
+            continue;
+        }
+        found.push(path);
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Load one trained model from a path, picking the backend by extension.
+fn load_inner_model(path: &Path) -> Result<InnerModel> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "json" => {
+            let m = xgboost_ars::Model::load(path)
+                .with_context(|| format!("loading XGBoost model from {}", path.display()))?;
+            Ok(InnerModel::Xgboost(m))
+        }
+        "txt" => {
+            let m = lightgbm_ars::Model::load(path)
+                .with_context(|| format!("loading LightGBM model from {}", path.display()))?;
+            Ok(InnerModel::Lightgbm(m))
+        }
+        other => anyhow::bail!(
+            "unrecognized model extension {other:?} for {}; expected .txt (LightGBM) or .json (XGBoost)",
+            path.display(),
+        ),
+    }
+}
+
 /// Load one model bundle (model file + feature spec + thresholds).
 ///
 /// `is_general` controls how missing artifacts are reported: for the general
@@ -867,29 +1168,7 @@ fn load_bundle(
         anyhow::bail!("missing {}", spec_path.display());
     }
 
-    let xgb_path = bundle_dir.join("model.json");
-    let lgb_path = bundle_dir.join("model.txt");
-    let (backend, model_path) = match (xgb_path.is_file(), lgb_path.is_file()) {
-        (true, false) => {
-            let m = xgboost_ars::Model::load(&xgb_path)
-                .with_context(|| format!("loading XGBoost model from {}", xgb_path.display()))?;
-            (Backend::Xgboost(m), xgb_path)
-        }
-        (false, true) => {
-            let m = lightgbm_ars::Model::load(&lgb_path)
-                .with_context(|| format!("loading LightGBM model from {}", lgb_path.display()))?;
-            (Backend::Lightgbm(m), lgb_path)
-        }
-        (true, true) => anyhow::bail!(
-            "model bundle is ambiguous: both {} and {} exist; remove one to disambiguate the backend",
-            xgb_path.display(),
-            lgb_path.display(),
-        ),
-        (false, false) => anyhow::bail!(
-            "model bundle is incomplete: missing model.json (XGBoost) or model.txt (LightGBM) in {}",
-            bundle_dir.display(),
-        ),
-    };
+    let backend = load_backend(bundle_dir)?;
 
     tracing::debug!(path = %spec_path.display(), "loading feature spec");
     let spec = FeatureSpec::load(&spec_path)
@@ -897,10 +1176,9 @@ fn load_bundle(
 
     if spec.total_features() != backend.num_features() {
         anyhow::bail!(
-            "feature count mismatch: feature_spec.json has {} features but {} expects {} — \
+            "feature count mismatch: feature_spec.json has {} features but the model expects {} — \
              these artifacts are from different training runs",
             spec.total_features(),
-            model_path.display(),
             backend.num_features(),
         );
     }
@@ -939,11 +1217,44 @@ fn load_bundle(
         },
     };
 
+    let calibrator = IsotonicCalibrator::load_optional(bundle_dir).with_context(|| {
+        format!("loading optional calibrator from {}", bundle_dir.display())
+    })?;
+    // When a calibrator is present, push the bundle-level thresholds through
+    // it so threshold comparisons happen in the same (calibrated) probability
+    // space as `predict_calibrated`'s output.  Isotonic is monotone, so this
+    // is decision-equivalent to comparing raw_score >= raw_threshold — but
+    // every emitted probability is now on a meaningful [0,1] scale matching
+    // the empirical malware fraction we observed at training time.
+    //
+    // Per-route policy thresholds (in `route_policies.json`, used by the
+    // OR-of-routes deployment policies) live in a different on-disk file and
+    // can't be calibrated here — the per-route calibrators aren't all loaded
+    // yet at this point. They get a second pass in `Model::load_ensemble`
+    // via `calibrate_policy_thresholds`, after every specialist has been
+    // loaded and its calibrator is available for lookup.
+    let thresholds = if let Some(cal) = calibrator.as_ref() {
+        Thresholds {
+            suspicious: cal.apply(thresholds.suspicious),
+            hostile: cal.apply(thresholds.hostile),
+        }
+    } else {
+        thresholds
+    };
+    if let Some(cal) = calibrator.as_ref() {
+        tracing::debug!(
+            bundle = %bundle_dir.display(),
+            breakpoints = cal.x.len(),
+            "loaded isotonic calibrator (thresholds calibrated to match)"
+        );
+    }
+
     Ok(LoadedBundle {
         backend,
         spec,
         thresholds,
         threshold_source,
+        calibrator,
     })
 }
 
@@ -1040,6 +1351,7 @@ fn load_specialist(
         spec: bundle.spec,
         ctx,
         thresholds: bundle.thresholds,
+        calibrator: bundle.calibrator,
     })
 }
 
@@ -1053,6 +1365,26 @@ struct Route {
     spec: FeatureSpec,
     ctx: ExtractContext,
     thresholds: Thresholds,
+    /// Optional isotonic calibrator. When present, the route's raw
+    /// probability is mapped through this before any downstream consumer
+    /// (threshold check, OR aggregation, JSON output) sees it. Older
+    /// bundles without `calibrator.json` carry `None` and behave like
+    /// before — backward compatible.
+    calibrator: Option<IsotonicCalibrator>,
+}
+
+impl Route {
+    /// Score a feature vector with the route's backend, then apply the
+    /// route's calibrator if present. Single source of truth for "what does
+    /// this route output for this file" — used by every code path that
+    /// previously called `backend.predict` directly.
+    fn predict_calibrated(&self, features: &[f32]) -> Result<f32> {
+        let raw = self.backend.predict(features)?;
+        Ok(match &self.calibrator {
+            Some(cal) => cal.apply(raw),
+            None => raw,
+        })
+    }
 }
 
 /// Routing decision: which route to consult for a file of type `T` in group `G`.
@@ -1133,6 +1465,54 @@ fn policy_classify(policy: &RoutePolicy, scores: &[RouteProbability]) -> Classif
     }
 }
 
+/// Push each per-route threshold in `route_policies.json` through that route's
+/// isotonic calibrator. The scoring path emits calibrated probabilities, so
+/// the policy comparison must happen in calibrated space too. Routes without
+/// a calibrator (pre-calibrator bundles) are left untouched. Routes referenced
+/// by a policy but not loaded as a specialist are also left untouched —
+/// they'll never produce a `RouteProbability` entry, so the comparison never
+/// fires.
+fn calibrate_policy_thresholds_with<'a>(
+    policies: &mut RoutePolicies,
+    lookup: impl Fn(&str) -> Option<&'a IsotonicCalibrator>,
+) {
+    let mut adjusted = 0_usize;
+    for policy in policies.by_filetype.values_mut() {
+        for severity in [&mut policy.hostile, &mut policy.suspicious] {
+            for (route_name, threshold) in severity.thresholds.iter_mut() {
+                if let Some(cal) = lookup(route_name) {
+                    *threshold = cal.apply(*threshold);
+                    adjusted += 1;
+                }
+            }
+        }
+    }
+    if adjusted > 0 {
+        tracing::debug!(adjusted, "calibrated route_policies thresholds");
+    }
+}
+
+/// Production lookup for `calibrate_policy_thresholds_with`. Resolves a route
+/// name (`general`, `filegroups/X`, `filetypes/Y`) to its calibrator, if any.
+fn calibrate_policy_thresholds(
+    policies: &mut RoutePolicies,
+    general_calibrator: &Option<IsotonicCalibrator>,
+    filegroups: &HashMap<String, Route>,
+    filetypes: &HashMap<String, Route>,
+) {
+    calibrate_policy_thresholds_with(policies, |route_name| {
+        if route_name == "general" {
+            general_calibrator.as_ref()
+        } else if let Some(name) = route_name.strip_prefix("filegroups/") {
+            filegroups.get(name).and_then(|r| r.calibrator.as_ref())
+        } else if let Some(name) = route_name.strip_prefix("filetypes/") {
+            filetypes.get(name).and_then(|r| r.calibrator.as_ref())
+        } else {
+            None
+        }
+    });
+}
+
 fn policy_route_class(policy: &RoutePolicy, route: &str, probability: f32) -> Classification {
     if policy
         .hostile
@@ -1165,6 +1545,23 @@ pub struct Model {
     thresholds: Thresholds,
     info: ModelInfo,
     routes: RouteSet,
+    /// Optional isotonic calibrator for the general model. Applied after
+    /// `inner.predict` everywhere we score with the general route. Mirrors
+    /// the per-route calibrator on Route; backward compat = None.
+    general_calibrator: Option<IsotonicCalibrator>,
+}
+
+impl Model {
+    /// Score with the general model and apply its calibrator if present.
+    /// Single source of truth for the general path's calibrated output —
+    /// every previous direct `self.inner.predict` call now goes through here.
+    fn predict_general_calibrated(&self, features: &[f32]) -> Result<f32> {
+        let raw = self.inner.predict(features)?;
+        Ok(match &self.general_calibrator {
+            Some(cal) => cal.apply(raw),
+            None => raw,
+        })
+    }
 }
 
 impl Model {
@@ -1203,6 +1600,7 @@ impl Model {
         let bundle = load_bundle(model_dir, thresholds.as_ref(), /* is_general = */ true)?;
         tracing::info!(
             backend = bundle.backend.kind(),
+            n_members = bundle.backend.n_members(),
             features = bundle.spec.total_features(),
             model_abi_version = bundle.spec.abi_version(),
             threshold_suspicious = bundle.thresholds.suspicious,
@@ -1224,6 +1622,7 @@ impl Model {
             thresholds: bundle.thresholds,
             info,
             routes: RouteSet::default(),
+            general_calibrator: bundle.calibrator,
         })
     }
 
@@ -1300,8 +1699,18 @@ impl Model {
             }
         }
 
+        // The route_policies.json thresholds for the OR-of-routes decision
+        // path were loaded in raw-score space, but the route scorers now emit
+        // calibrated probabilities (see `load_bundle`). Push each per-route
+        // threshold through that route's calibrator so policy_classify
+        // compares like with like. Isotonic monotonicity preserves the
+        // decision; the comparison is now numerically consistent.
+        let mut policies = policies;
+        calibrate_policy_thresholds(&mut policies, &general.calibrator, &filegroups, &filetypes);
+
         tracing::info!(
             backend = general.backend.kind(),
+            n_members = general.backend.n_members(),
             features = general.spec.total_features(),
             model_abi_version = general.spec.abi_version(),
             threshold_suspicious = general.thresholds.suspicious,
@@ -1333,6 +1742,7 @@ impl Model {
                 filetype_to_filegroup: ensemble_cfg.filetype_to_filegroup,
                 policies,
             },
+            general_calibrator: general.calibrator,
         })
     }
 
@@ -1347,7 +1757,7 @@ impl Model {
     /// Returns an error if the underlying model backend fails to produce a
     /// prediction for the provided feature vector.
     pub fn predict(&self, features: &[f32]) -> Result<(f32, Classification)> {
-        let probability = self.inner.predict(features)?;
+        let probability = self.predict_general_calibrated(features)?;
         Ok((probability, self.thresholds.classify(probability)))
     }
 
@@ -1373,7 +1783,7 @@ impl Model {
         }
 
         // Score general first; it's always present and supplies the baseline.
-        let general_prob = self.inner.predict(features)?;
+        let general_prob = self.predict_general_calibrated(features)?;
         let mut max_prob = general_prob;
         let mut classification = self.thresholds.classify(general_prob);
 
@@ -1389,7 +1799,7 @@ impl Model {
                         "skipping routed feature-vector prediction; use predict_for_report for heterogeneous specialists",
                     );
                 } else {
-                    let prob = route.backend.predict(features)?;
+                    let prob = route.predict_calibrated(features)?;
                     if prob > max_prob {
                         max_prob = prob;
                     }
@@ -1408,7 +1818,7 @@ impl Model {
                     "skipping routed feature-vector prediction; use predict_for_report for heterogeneous specialists",
                 );
             } else {
-                let prob = route.backend.predict(features)?;
+                let prob = route.predict_calibrated(features)?;
                 if prob > max_prob {
                     max_prob = prob;
                 }
@@ -1425,14 +1835,14 @@ impl Model {
     ) -> Result<(f32, Classification)> {
         let mut features = route.ctx.extract(report);
         route.spec.standardize(&mut features);
-        let probability = route.backend.predict(&features)?;
+        let probability = route.predict_calibrated(&features)?;
         Ok((probability, route.thresholds.classify(probability)))
     }
 
     fn score_route_file(route: &Route, file: &serde_json::Value) -> Result<(f32, Classification)> {
         let mut features = route.ctx.extract_file(file);
         route.spec.standardize(&mut features);
-        let probability = route.backend.predict(&features)?;
+        let probability = route.predict_calibrated(&features)?;
         Ok((probability, route.thresholds.classify(probability)))
     }
 
@@ -1461,7 +1871,7 @@ impl Model {
         report: &serde_json::Value,
     ) -> Result<(f32, Classification, Vec<RouteScore>, Vec<SkippedRoute>)> {
         let policy = self.routes.policies.by_filetype.get(file_type);
-        let general_prob = self.inner.predict(general_features)?;
+        let general_prob = self.predict_general_calibrated(general_features)?;
         let general_class = policy.map_or_else(
             || self.thresholds.classify(general_prob),
             |policy| policy_route_class(policy, "general", general_prob),
@@ -1581,7 +1991,7 @@ impl Model {
         file: &serde_json::Value,
     ) -> Result<(f32, Classification, Vec<RouteScore>, Vec<SkippedRoute>)> {
         let policy = self.routes.policies.by_filetype.get(file_type);
-        let general_prob = self.inner.predict(general_features)?;
+        let general_prob = self.predict_general_calibrated(general_features)?;
         let general_class = policy.map_or_else(
             || self.thresholds.classify(general_prob),
             |policy| policy_route_class(policy, "general", general_prob),
@@ -1766,6 +2176,123 @@ mod tests {
         let err = load_severity_thresholds(dir.path(), 0).expect_err("level 0 is invalid");
         assert!(err.to_string().contains("1..=9"));
         Ok(())
+    }
+
+    #[test]
+    fn isotonic_calibrator_load_apply_and_endpoints() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("calibrator.json"),
+            br#"{"schema":"azoth.calibrator.isotonic.v1",
+                 "x":[0.0,0.25,0.5,0.75,1.0],
+                 "y":[0.0,0.10,0.40,0.85,1.0]}"#,
+        )?;
+        let cal = IsotonicCalibrator::load_optional(dir.path())?
+            .context("calibrator should load")?;
+
+        // Endpoint clipping.
+        assert!((cal.apply(-1.0) - 0.0).abs() < 1e-6);
+        assert!((cal.apply(2.0) - 1.0).abs() < 1e-6);
+        // Exact breakpoints pass through.
+        assert!((cal.apply(0.5) - 0.40).abs() < 1e-6);
+        // Linear interpolation between breakpoints.
+        // At raw=0.625 we sit halfway between (0.5,0.40) and (0.75,0.85) → 0.625.
+        assert!((cal.apply(0.625) - 0.625).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn isotonic_preserves_threshold_decisions() -> Result<()> {
+        // Decision-equivalence property: for any monotone calibrator,
+        // cal(p) >= cal(τ) iff p >= τ. This is the invariant that lets us
+        // calibrate thresholds at load time without changing decisions.
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("calibrator.json"),
+            br#"{"schema":"azoth.calibrator.isotonic.v1",
+                 "x":[0.0,0.1,0.3,0.6,0.9,1.0],
+                 "y":[0.0,0.02,0.15,0.55,0.92,1.0]}"#,
+        )?;
+        let cal = IsotonicCalibrator::load_optional(dir.path())?
+            .context("calibrator should load")?;
+
+        for &raw_t in &[0.05_f32, 0.2, 0.5, 0.7, 0.95] {
+            let cal_t = cal.apply(raw_t);
+            for &raw_p in &[0.0_f32, 0.05, 0.2, 0.5, 0.7, 0.95, 1.0] {
+                let cal_p = cal.apply(raw_p);
+                assert_eq!(
+                    raw_p >= raw_t,
+                    cal_p >= cal_t,
+                    "decision flipped for raw_p={raw_p} raw_t={raw_t}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn isotonic_rejects_unknown_schema() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("calibrator.json"),
+            br#"{"schema":"azoth.calibrator.spline.v2","x":[0.0,1.0],"y":[0.0,1.0]}"#,
+        )?;
+        let err = IsotonicCalibrator::load_optional(dir.path())
+            .expect_err("future schema should be rejected");
+        assert!(err.to_string().contains("unsupported schema"));
+        Ok(())
+    }
+
+    #[test]
+    fn isotonic_load_optional_returns_none_when_absent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cal = IsotonicCalibrator::load_optional(dir.path())?;
+        assert!(cal.is_none(), "missing calibrator must be a None, not an error");
+        Ok(())
+    }
+
+    #[test]
+    fn calibrate_policy_thresholds_pushes_each_route_through_its_calibrator() {
+        // Build two distinct calibrators so we can verify per-route routing.
+        let cal_general = IsotonicCalibrator {
+            x: vec![0.0, 0.5, 1.0],
+            y: vec![0.0, 0.10, 1.0],
+        };
+        let cal_elf = IsotonicCalibrator {
+            x: vec![0.0, 0.5, 1.0],
+            y: vec![0.0, 0.90, 1.0],
+        };
+        // RoutePolicy with thresholds for general, filetypes/elf (calibrated)
+        // and filegroups/missing (no calibrator — must remain untouched).
+        let mut hostile = HashMap::new();
+        hostile.insert("general".to_string(), 0.5);
+        hostile.insert("filetypes/elf".to_string(), 0.5);
+        hostile.insert("filegroups/missing".to_string(), 0.5);
+        let mut suspicious = HashMap::new();
+        suspicious.insert("general".to_string(), 0.5);
+        let policy = RoutePolicy {
+            hostile: PolicySeverity { thresholds: hostile },
+            suspicious: PolicySeverity { thresholds: suspicious },
+        };
+        let mut policies = RoutePolicies {
+            by_filetype: HashMap::from([("elf".to_string(), policy)]),
+        };
+
+        calibrate_policy_thresholds_with(&mut policies, |route| match route {
+            "general" => Some(&cal_general),
+            "filetypes/elf" => Some(&cal_elf),
+            _ => None,
+        });
+
+        let elf = policies.by_filetype.get("elf").expect("policy retained");
+        // general at raw=0.5 → 0.10
+        assert!((elf.hostile.thresholds["general"] - 0.10).abs() < 1e-6);
+        // filetypes/elf at raw=0.5 → 0.90
+        assert!((elf.hostile.thresholds["filetypes/elf"] - 0.90).abs() < 1e-6);
+        // No calibrator for filegroups/missing — left at raw 0.5.
+        assert!((elf.hostile.thresholds["filegroups/missing"] - 0.5).abs() < 1e-6);
+        // Suspicious side also calibrated.
+        assert!((elf.suspicious.thresholds["general"] - 0.10).abs() < 1e-6);
     }
 
     #[test]

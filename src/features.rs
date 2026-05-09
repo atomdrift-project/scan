@@ -576,6 +576,17 @@ fn build_expected_feature_names(
         "agg:attack_tactic_count".to_string(),
         "agg:mbc_behavior_count".to_string(),
         "agg:has_attack_and_objective".to_string(),
+        // ATT&CK / MBC co-occurrence aggregates (log1p of unordered combinations
+        // among distinct technique / behavior codes seen in raw_findings).
+        "agg:attack_bigram_count".to_string(),
+        "agg:attack_trigram_count".to_string(),
+        "agg:mbc_bigram_count".to_string(),
+        // Objective path co-occurrence aggregates (log1p of unordered combinations
+        // among distinct `objectives/*` and `well-known/*` paths seen in
+        // sample_paths). Trigram is bounded with a per-pair cap of 20 inner
+        // elements to avoid O(n^3) explosion on samples with many objectives.
+        "agg:objective_bigram_count".to_string(),
+        "agg:objective_trigram_count".to_string(),
     ]);
 
     // Crit-category n-grams (vocab-driven)
@@ -2018,6 +2029,22 @@ fn write_aggregate_features(
         .collect();
     w.set("agg:attack_tactic_count", tactic_prefixes.len() as f32);
     w.set("agg:mbc_behavior_count", mbc_behaviors.len() as f32);
+
+    // ATT&CK / MBC co-occurrence aggregates: log1p of the count of unordered
+    // pairs / triples among the distinct technique and behavior codes seen.
+    // Mirrors `agg:attack_bigram_count` and friends in the collimator extractor
+    // (features.py around line 2197).  Combinations are computed analytically
+    // (n choose k) — equivalent to enumerating but cheaper for large finding
+    // counts.  saturating_sub guards the n=0 / n=1 cases where the product
+    // would otherwise underflow on usize.
+    let n_atk = attack_techniques.len();
+    let atk_bi = (n_atk * n_atk.saturating_sub(1)) / 2;
+    let atk_tri = (n_atk * n_atk.saturating_sub(1) * n_atk.saturating_sub(2)) / 6;
+    w.set("agg:attack_bigram_count", (atk_bi as f32).ln_1p());
+    w.set("agg:attack_trigram_count", (atk_tri as f32).ln_1p());
+    let n_mbc = mbc_behaviors.len();
+    let mbc_bi = (n_mbc * n_mbc.saturating_sub(1)) / 2;
+    w.set("agg:mbc_bigram_count", (mbc_bi as f32).ln_1p());
     let has_objectives = summary
         .sample_paths
         .keys()
@@ -2030,6 +2057,31 @@ fn write_aggregate_features(
             0.0
         },
     );
+
+    // Objective-path co-occurrence aggregates.  Mirrors collimator's
+    // `agg:objective_bigram_count` / `agg:objective_trigram_count` (features.py
+    // around line 2155).  Counts unordered pairs and triples among the distinct
+    // `objectives/*` and `well-known/*` sample paths.  The trigram inner loop
+    // is capped at 20 per (i, j) pair to bound work on samples with many
+    // objective paths — the same cap collimator uses, so the values match.
+    let mut obj_paths: Vec<&str> = summary
+        .sample_paths
+        .keys()
+        .filter(|p| p.starts_with("objectives/") || p.starts_with("well-known/"))
+        .map(String::as_str)
+        .collect();
+    obj_paths.sort_unstable();
+    let n_obj = obj_paths.len();
+    let n_obj_bi = (n_obj * n_obj.saturating_sub(1)) / 2;
+    let mut n_obj_tri: usize = 0;
+    for i in 0..n_obj {
+        for j in (i + 1)..n_obj {
+            let k_end = (j + 20).min(n_obj);
+            n_obj_tri += k_end.saturating_sub(j + 1);
+        }
+    }
+    w.set("agg:objective_bigram_count", (n_obj_bi as f32).ln_1p());
+    w.set("agg:objective_trigram_count", (n_obj_tri as f32).ln_1p());
 }
 
 fn tier_prefix(crit: u32) -> &'static str {

@@ -130,3 +130,77 @@ fn bundle_with_spec_but_no_model_is_rejected() {
         "error should mention both filenames: {msg}"
     );
 }
+
+#[test]
+#[ignore = "needs LITMUS_LIGHTGBM_BUNDLE pointing at a model.txt+feature_spec.json bundle"]
+fn multi_seed_lightgbm_bundle_loads_and_predicts() {
+    // Two seed members loaded from the same source model.txt — averaging two
+    // identical models must produce a probability identical to either member's
+    // single prediction (within f32 noise). This confirms the K-member load
+    // path and predict path are wired correctly without needing two distinct
+    // trained models to compare against.
+    let Some(src) = lightgbm_bundle() else {
+        panic!("LITMUS_LIGHTGBM_BUNDLE not set or missing artifacts");
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::copy(src.join("feature_spec.json"), dir.path().join("feature_spec.json")).unwrap();
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir(&models_dir).unwrap();
+    std::fs::copy(src.join("model.txt"), models_dir.join("seed_42.txt")).unwrap();
+    std::fs::copy(src.join("model.txt"), models_dir.join("seed_43.txt")).unwrap();
+    // Bystander file — must be ignored, not loaded.
+    std::fs::write(models_dir.join("README.md"), b"hi").unwrap();
+
+    let model = Model::load(dir.path(), None).expect("load multi-seed bundle");
+    assert_eq!(model.backend_kind(), "lightgbm");
+    let zeros = vec![0.0f32; model.spec().total_features()];
+    let (prob, _class) = model.predict(&zeros).expect("predict zeros");
+    assert!(prob.is_finite() && (0.0..=1.0).contains(&prob));
+
+    // Compare to the single-model prediction — must match within f32 noise.
+    let single = copy_bundle(&src, &["model.txt", "feature_spec.json"]);
+    let single_model = Model::load(single.path(), None).expect("load single bundle");
+    let (single_prob, _) = single_model.predict(&zeros).expect("predict zeros");
+    assert!(
+        (prob - single_prob).abs() < 1e-6,
+        "K=2 (identical members) prediction {prob} != K=1 prediction {single_prob}"
+    );
+}
+
+#[test]
+#[ignore = "needs LITMUS_LIGHTGBM_BUNDLE pointing at a model.txt+feature_spec.json bundle"]
+fn ambiguous_legacy_plus_multi_seed_layout_is_rejected() {
+    // A bundle with BOTH `model.txt` and `models/seed_*.txt` is ambiguous —
+    // the deploy script should choose one layout. We refuse to silently pick.
+    let Some(src) = lightgbm_bundle() else {
+        panic!("LITMUS_LIGHTGBM_BUNDLE not set or missing artifacts");
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::copy(src.join("feature_spec.json"), dir.path().join("feature_spec.json")).unwrap();
+    std::fs::copy(src.join("model.txt"), dir.path().join("model.txt")).unwrap();
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir(&models_dir).unwrap();
+    std::fs::copy(src.join("model.txt"), models_dir.join("seed_42.txt")).unwrap();
+
+    let err = Model::load(dir.path(), None).expect_err("ambiguous layout must error");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("ambiguous"), "error should mention 'ambiguous': {msg}");
+}
+
+#[test]
+fn empty_models_dir_falls_through_to_incomplete_error() {
+    // A bundle with `models/` but no recognized seed files (and no legacy
+    // model.txt either) must error out with the same "incomplete" path so the
+    // operator gets a clear signal.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("feature_spec.json"), b"{}").unwrap();
+    std::fs::create_dir(dir.path().join("models")).unwrap();
+    std::fs::write(dir.path().join("models").join("README.md"), b"hi").unwrap();
+
+    let err = Model::load(dir.path(), None).expect_err("empty models dir must error");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("incomplete") || msg.contains("missing"),
+        "error should mention incomplete/missing: {msg}"
+    );
+}
