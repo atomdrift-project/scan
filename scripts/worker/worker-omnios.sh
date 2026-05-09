@@ -18,7 +18,10 @@ die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
 PKG_PREFIX=/opt/local
-SRC_PREFIX=/usr/local
+# Source builds and the litmus binary install under /opt/litmus rather than
+# /usr/local: in sparse zones /usr is a read-only lofs mount from the global,
+# so /usr/local is unwritable. /opt is writable per-zone.
+SRC_PREFIX=/opt/litmus
 SRC_DIR=/var/litmus/src
 LITMUS_USER=litmus
 LITMUS_GROUP=litmus
@@ -97,7 +100,7 @@ fi
 # Source builds: innoextract, upx, rizin (HEAD)
 ###############################################################################
 
-mkdir -p "$SRC_DIR"
+mkdir -p "$SRC_DIR" "$SRC_PREFIX/bin" "$SRC_PREFIX/lib" "$SRC_PREFIX/share"
 
 # build_from_git <name> <repo> <ref> <builder-fn>
 # Idempotent: skips the build when the resolved SHA matches the marker.
