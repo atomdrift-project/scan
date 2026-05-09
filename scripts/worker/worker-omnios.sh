@@ -230,7 +230,12 @@ RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-lstdc++" cargo build --release \
     || die "litmus build failed"
 
 log "Installing litmus binary to $LITMUS_BIN"
-install -m 755 target/release/litmus "$LITMUS_BIN"
+# illumos install(1) is the old SunOS variant with incompatible flags;
+# use cp+chmod for portability. Stage to .new then rename for atomicity
+# (replacing a running binary while the SMF service is up is otherwise racy).
+cp -f target/release/litmus "$LITMUS_BIN.new"
+chmod 755 "$LITMUS_BIN.new"
+mv -f "$LITMUS_BIN.new" "$LITMUS_BIN"
 
 log "Refreshing rules/models as $LITMUS_USER"
 su - "$LITMUS_USER" -c "PATH=$PATH $LITMUS_BIN update-rules" \
