@@ -20,12 +20,17 @@ SLOW_RULE_MS ?= 200
 MAX_JOBS ?= 25
 WORKERS  ?=
 
+# Scrub GNU make's jobserver from cargo's environment. Without this, build
+# scripts that spawn their own `make` (e.g. tikv-jemalloc-sys) inherit a
+# malformed MAKEFLAGS and fail with "No rule to make target '-j'".
+CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
+
 .PHONY: build release install check-cargo tarball deploy deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker profile-worker profile-slow lint test clean
 
 all: build
 
 build:
-	cargo build
+	$(CARGO) build
 
 check-cargo:
 	@command -v cargo >/dev/null 2>&1 || { \
@@ -54,7 +59,7 @@ check-cargo:
 	}
 
 release: check-cargo $(OUT_DIR)
-	cargo build --release
+	$(CARGO) build --release
 	cp target/release/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
@@ -174,7 +179,7 @@ worker: release
 		$(if $(NICE),--nice $(NICE),)
 
 profile-worker:
-	cargo build --profile profiling
+	$(CARGO) build --profile profiling
 	@[ -n "$(URL)" ] || { echo "Usage: make profile-worker URL=<hopper-url>"; exit 1; }
 	samply record -o /tmp/litmus-worker-profile.json.gz -- \
 		./target/profiling/$(BINARY) --verbose worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
@@ -182,19 +187,19 @@ profile-worker:
 		2>&1 | tee /tmp/litmus-worker-benchmark.log
 
 profile-slow:
-	cargo build --profile profiling
+	$(CARGO) build --profile profiling
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
 	samply record --save-only --duration 20 -o /tmp/litmus-$(DATASET)-profile.json.gz -- \
 		env CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./target/profiling/$(BINARY) --slow-rule-ms "$(SLOW_RULE_MS)" -f json "$(BENCHMARK_PATH)"
 
 lint:
-	cargo clippy -- -D warnings
+	$(CARGO) clippy -- -D warnings
 
 test:
-	cargo test
+	$(CARGO) test
 
 clean:
-	cargo clean
+	$(CARGO) clean
 	rm -rf $(OUT_DIR)
 
 $(OUT_DIR):
