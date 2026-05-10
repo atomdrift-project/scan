@@ -978,11 +978,22 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             && last_empty_poll.elapsed() >= Duration::from_secs(poll_secs);
         if should_poll {
             let mut poll_url = format!(
-                "{}/api/next?worker={}&count={}&slots={}",
-                base_url, encoded_name, prefetch_count, slots
+                "{}/api/next?worker={}&count={}&slots={}&version={}",
+                base_url,
+                encoded_name,
+                prefetch_count,
+                slots,
+                env!("CARGO_PKG_VERSION"),
             );
             {
                 use std::fmt::Write;
+                // 5-char prefix matches hopper's litmusTraitsVersion()
+                // truncation so the dashboard's stale-traits comparison
+                // can string-equal the two.
+                if let Some(traits) = cleave::traits_repo::version() {
+                    let prefix: String = traits.chars().take(5).collect();
+                    let _ = write!(poll_url, "&traits={}", prefix);
+                }
                 if let Some(rss) = cleave::memory_tracker::current_rss() {
                     let _ = write!(poll_url, "&rss_mb={}", rss / 1024 / 1024);
                 }
