@@ -70,7 +70,7 @@ type Sha256IdentityBuildHasher = BuildHasherDefault<Sha256IdentityHasher>;
 static NEXT_ANALYSIS_ID: AtomicU64 = AtomicU64::new(1);
 static BLOCKING_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLOCKING_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
-const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 type ResourceHandle = Arc<RwLock<Arc<ModelResources>>>;
 
