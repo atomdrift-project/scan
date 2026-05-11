@@ -91,25 +91,14 @@ pub fn model_dir() -> Result<PathBuf> {
     let data_dir = default_models_dir();
     let (repo_url, ref_name) = configured_repo();
 
-    // If a checkout exists but its remote no longer matches the configured
-    // upstream, we must reclone. This is the migration path off the old
-    // litmus-models layout (where the bundle was a `scan-v16/` subdir under a
-    // different remote).
     if is_git_repo(&data_dir) {
         if let Some(existing) = current_remote_url(&data_dir) {
             if !urls_match(&existing, &repo_url) {
-                eprintln!(
-                    "Configured models repo ({repo_url}) differs from on-disk repo ({existing}) at {} — removing in 30s (Ctrl-C to abort)...",
+                anyhow::bail!(
+                    "configured models repo ({repo_url}) differs from on-disk repo ({existing}) at {}; \
+                     run 'litmus update-rules' or set LITMUS_MODELS_REPO/LITMUS_MODELS_DIR explicitly",
                     data_dir.display()
                 );
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                std::fs::remove_dir_all(&data_dir).with_context(|| {
-                    format!("failed to remove stale models at {}", data_dir.display())
-                })?;
-                clone_repo(&data_dir, &repo_url, &ref_name)
-                    .with_context(|| format!("failed to clone {repo_url}"))?;
-                eprintln!("Models ready ({})", data_dir.display());
-                return Ok(data_dir);
             }
         }
     }
@@ -128,18 +117,12 @@ pub fn model_dir() -> Result<PathBuf> {
 
     if is_git_repo(&data_dir) {
         let missing = missing_artifacts(&data_dir);
-        eprintln!(
-            "Models exist at {} but missing: {} — removing in 30s (Ctrl-C to abort)...",
+        anyhow::bail!(
+            "models exist at {} but are incomplete: missing {}. \
+             Run 'litmus update-rules' to refresh, or set LITMUS_MODELS_DIR to a complete bundle.",
             data_dir.display(),
-            missing.join(", "),
+            missing.join(", ")
         );
-        std::thread::sleep(std::time::Duration::from_secs(30));
-        std::fs::remove_dir_all(&data_dir).with_context(|| {
-            format!(
-                "failed to remove incomplete models at {}",
-                data_dir.display()
-            )
-        })?;
     } else {
         eprintln!("First run: downloading litmus models...");
     }
@@ -375,8 +358,31 @@ fn has_models(path: &Path) -> bool {
 }
 
 fn has_single_bundle_layout(path: &Path) -> bool {
-    REQUIRED_ARTIFACTS.iter().all(|f| path.join(f).exists())
-        && MODEL_FILES.iter().any(|f| path.join(f).exists())
+    REQUIRED_ARTIFACTS.iter().all(|f| path.join(f).exists()) && has_model_artifact(path)
+}
+
+fn has_model_artifact(path: &Path) -> bool {
+    if MODEL_FILES.iter().any(|f| path.join(f).exists()) {
+        return true;
+    }
+    let models = path.join("models");
+    let Ok(entries) = std::fs::read_dir(models) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        if !path.is_file() {
+            return false;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        name.starts_with("seed_")
+            && matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("json" | "txt")
+            )
+    })
 }
 
 fn has_ensemble_layout(path: &Path) -> bool {
@@ -556,6 +562,16 @@ mod tests {
         std::fs::write(general.join("feature_spec.json"), b"{}").unwrap();
         // Top-level config.json is optional for the resolver's "is this a
         // complete bundle?" check; the loader will read it if present.
+        assert!(has_models(tmp.path()));
+    }
+
+    #[test]
+    fn has_models_accepts_multiseed_ensemble_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("general").join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(tmp.path().join("general").join("feature_spec.json"), b"{}").unwrap();
+        std::fs::write(models.join("seed_42.txt"), b"").unwrap();
         assert!(has_models(tmp.path()));
     }
 

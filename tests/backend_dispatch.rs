@@ -143,7 +143,11 @@ fn multi_seed_lightgbm_bundle_loads_and_predicts() {
         panic!("LITMUS_LIGHTGBM_BUNDLE not set or missing artifacts");
     };
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::copy(src.join("feature_spec.json"), dir.path().join("feature_spec.json")).unwrap();
+    std::fs::copy(
+        src.join("feature_spec.json"),
+        dir.path().join("feature_spec.json"),
+    )
+    .unwrap();
     let models_dir = dir.path().join("models");
     std::fs::create_dir(&models_dir).unwrap();
     std::fs::copy(src.join("model.txt"), models_dir.join("seed_42.txt")).unwrap();
@@ -176,7 +180,11 @@ fn ambiguous_legacy_plus_multi_seed_layout_is_rejected() {
         panic!("LITMUS_LIGHTGBM_BUNDLE not set or missing artifacts");
     };
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::copy(src.join("feature_spec.json"), dir.path().join("feature_spec.json")).unwrap();
+    std::fs::copy(
+        src.join("feature_spec.json"),
+        dir.path().join("feature_spec.json"),
+    )
+    .unwrap();
     std::fs::copy(src.join("model.txt"), dir.path().join("model.txt")).unwrap();
     let models_dir = dir.path().join("models");
     std::fs::create_dir(&models_dir).unwrap();
@@ -184,7 +192,10 @@ fn ambiguous_legacy_plus_multi_seed_layout_is_rejected() {
 
     let err = Model::load(dir.path(), None).expect_err("ambiguous layout must error");
     let msg = format!("{err:#}");
-    assert!(msg.contains("ambiguous"), "error should mention 'ambiguous': {msg}");
+    assert!(
+        msg.contains("ambiguous"),
+        "error should mention 'ambiguous': {msg}"
+    );
 }
 
 #[test]

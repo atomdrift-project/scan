@@ -720,7 +720,8 @@ impl IsotonicCalibrator {
                 anyhow::bail!(
                     "calibrator at {} is malformed: x is not strictly ascending ({} >= {})",
                     path.display(),
-                    w[0], w[1],
+                    w[0],
+                    w[1],
                 );
             }
         }
@@ -733,7 +734,8 @@ impl IsotonicCalibrator {
                 anyhow::bail!(
                     "calibrator at {} is malformed: y is not monotone non-decreasing ({} > {})",
                     path.display(),
-                    w[0], w[1],
+                    w[0],
+                    w[1],
                 );
             }
         }
@@ -741,7 +743,8 @@ impl IsotonicCalibrator {
             if !(0.0..=1.0).contains(&v) {
                 anyhow::bail!(
                     "calibrator at {} has y value {} outside [0, 1]",
-                    path.display(), v,
+                    path.display(),
+                    v,
                 );
             }
         }
@@ -1138,8 +1141,8 @@ fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in std::fs::read_dir(multi_dir)
         .with_context(|| format!("reading multi-seed models dir {}", multi_dir.display()))?
     {
-        let entry = entry
-            .with_context(|| format!("reading entry under {}", multi_dir.display()))?;
+        let entry =
+            entry.with_context(|| format!("reading entry under {}", multi_dir.display()))?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -1253,9 +1256,8 @@ fn load_bundle(
         },
     };
 
-    let calibrator = IsotonicCalibrator::load_optional(bundle_dir).with_context(|| {
-        format!("loading optional calibrator from {}", bundle_dir.display())
-    })?;
+    let calibrator = IsotonicCalibrator::load_optional(bundle_dir)
+        .with_context(|| format!("loading optional calibrator from {}", bundle_dir.display()))?;
     // When a calibrator is present, push the bundle-level thresholds through
     // it so threshold comparisons happen in the same (calibrated) probability
     // space as `predict_calibrated`'s output.  Isotonic is monotone, so this
@@ -1278,12 +1280,16 @@ fn load_bundle(
         // suspicious (it shouldn't given monotonicity, but defense in depth)
         // or out of [0,1]. We'd rather refuse to load than ship a bundle
         // whose decision boundaries are nonsensical.
-        calibrated.validate().with_context(|| format!(
-            "calibrated thresholds for {} are invalid (suspicious={}, hostile={}); \
+        calibrated.validate().with_context(|| {
+            format!(
+                "calibrated thresholds for {} are invalid (suspicious={}, hostile={}); \
              check the calibrator at {}/calibrator.json",
-            bundle_dir.display(), calibrated.suspicious, calibrated.hostile,
-            bundle_dir.display(),
-        ))?;
+                bundle_dir.display(),
+                calibrated.suspicious,
+                calibrated.hostile,
+                bundle_dir.display(),
+            )
+        })?;
         calibrated
     } else {
         thresholds
@@ -2234,8 +2240,8 @@ mod tests {
                  "x":[0.0,0.25,0.5,0.75,1.0],
                  "y":[0.0,0.10,0.40,0.85,1.0]}"#,
         )?;
-        let cal = IsotonicCalibrator::load_optional(dir.path())?
-            .context("calibrator should load")?;
+        let cal =
+            IsotonicCalibrator::load_optional(dir.path())?.context("calibrator should load")?;
 
         // Endpoint clipping.
         assert!((cal.apply(-1.0) - 0.0).abs() < 1e-6);
@@ -2260,8 +2266,8 @@ mod tests {
                  "x":[0.0,0.1,0.3,0.6,0.9,1.0],
                  "y":[0.0,0.02,0.15,0.55,0.92,1.0]}"#,
         )?;
-        let cal = IsotonicCalibrator::load_optional(dir.path())?
-            .context("calibrator should load")?;
+        let cal =
+            IsotonicCalibrator::load_optional(dir.path())?.context("calibrator should load")?;
 
         for &raw_t in &[0.05_f32, 0.2, 0.5, 0.7, 0.95] {
             let cal_t = cal.apply(raw_t);
@@ -2294,7 +2300,10 @@ mod tests {
     fn isotonic_load_optional_returns_none_when_absent() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let cal = IsotonicCalibrator::load_optional(dir.path())?;
-        assert!(cal.is_none(), "missing calibrator must be a None, not an error");
+        assert!(
+            cal.is_none(),
+            "missing calibrator must be a None, not an error"
+        );
         Ok(())
     }
 
@@ -2310,8 +2319,10 @@ mod tests {
         )?;
         let err = IsotonicCalibrator::load_optional(dir.path())
             .expect_err("duplicate breakpoints must be rejected");
-        assert!(err.to_string().contains("strictly ascending"),
-                "error should mention strict ascending: {err}");
+        assert!(
+            err.to_string().contains("strictly ascending"),
+            "error should mention strict ascending: {err}"
+        );
         Ok(())
     }
 
@@ -2341,10 +2352,12 @@ mod tests {
             dir.path().join("calibrator.json"),
             br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,0.5,1.0],"y":[0.0,0.5,1.5]}"#,
         )?;
-        let err = IsotonicCalibrator::load_optional(dir.path())
-            .expect_err("y > 1 must be rejected");
-        assert!(err.to_string().contains("outside [0, 1]"),
-                "error should explain the bound: {err}");
+        let err =
+            IsotonicCalibrator::load_optional(dir.path()).expect_err("y > 1 must be rejected");
+        assert!(
+            err.to_string().contains("outside [0, 1]"),
+            "error should explain the bound: {err}"
+        );
         Ok(())
     }
 
@@ -2357,8 +2370,10 @@ mod tests {
         )?;
         let err = IsotonicCalibrator::load_optional(dir.path())
             .expect_err("non-monotone y must be rejected");
-        assert!(err.to_string().contains("monotone"),
-                "error should mention monotone: {err}");
+        assert!(
+            err.to_string().contains("monotone"),
+            "error should mention monotone: {err}"
+        );
         Ok(())
     }
 
@@ -2382,8 +2397,12 @@ mod tests {
         let mut suspicious = HashMap::new();
         suspicious.insert("general".to_string(), 0.5);
         let policy = RoutePolicy {
-            hostile: PolicySeverity { thresholds: hostile },
-            suspicious: PolicySeverity { thresholds: suspicious },
+            hostile: PolicySeverity {
+                thresholds: hostile,
+            },
+            suspicious: PolicySeverity {
+                thresholds: suspicious,
+            },
         };
         let mut policies = RoutePolicies {
             by_filetype: HashMap::from([("elf".to_string(), policy)]),
