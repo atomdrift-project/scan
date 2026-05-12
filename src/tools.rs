@@ -57,6 +57,28 @@ pub fn missing() -> Vec<MissingTool> {
     absent
 }
 
+/// Returns the canonical names of available external analysis tools.
+///
+/// This is intentionally compact because workers send it on every `/api/next`
+/// poll. The names are part of Hopper's scheduling contract.
+#[must_use]
+pub fn available_names() -> Vec<&'static str> {
+    let mut available: Vec<&'static str> = TOOLS
+        .iter()
+        .filter(|&&(name, _, _)| bin_available(name))
+        .map(|&(name, _, _)| name)
+        .collect();
+
+    if ["7z", "7za", "7zz", "7zr"]
+        .iter()
+        .any(|&n| bin_available(n))
+    {
+        available.push("7z");
+    }
+
+    available
+}
+
 /// Emit a structured warning for each tool that is missing from PATH.
 ///
 /// Call this at service startup so operators see a clear diagnosis before

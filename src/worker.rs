@@ -889,6 +889,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let max_jobs = config.max_jobs;
     let max_rss_gb = config.max_rss_gb;
     let encoded_name: String = url_encode(&name);
+    let available_tools = crate::tools::available_names().join(",");
     let mut consecutive_errors: u32 = 0;
     let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -1000,6 +1001,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 if let Some(load) = system_load_avg() {
                     let _ = write!(poll_url, "&load1={:.2}", load);
                 }
+                let _ = write!(poll_url, "&tools=");
+                url_encode_into(&available_tools, &mut poll_url);
             }
             tracing::debug!(url = %poll_url, buffer = buffer.len(), "polling for work");
             let poll_start = Instant::now();
