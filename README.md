@@ -56,11 +56,18 @@ Exit codes: `0` clean, `1` hostile, `2` suspicious, `3` error.
 ## Modes
 
 - `litmus <path>` — CLI scan
-- `litmus --format json` — JSONL output, full cleave report attached
-- `litmus serve` — HTTP API; loopback default, CIDR allowlist, bounded concurrency, RSS ceiling that rejects before the box swaps
-- `litmus worker` — pulls jobs from a [hopper](https://codeberg.org/atomdrift/hopper) queue with SHA256-verified local paths
+- `litmus --format json` — JSONL output, full cleave report attached ([schema](docs/JSON_REPORT.md))
+- `litmus serve` — HTTP API; loopback default, CIDR allowlist, bounded concurrency, RSS ceiling that rejects before the box swaps ([API reference](docs/SERVER_API.md))
+- `litmus worker` — pulls jobs from a [hopper](https://codeberg.org/atomdrift/hopper) queue with SHA256-verified local paths ([worker guide](docs/WORKERS.md))
 
 Models and rules are plain git repos. `--update` pulls new versions on demand.
+
+## Documentation
+
+- [Integration guide](docs/INTEGRATION.md) — pick CLI, server, or worker for your volume
+- [JSON report schema](docs/JSON_REPORT.md) — envelope shared by every mode
+- [Server API](docs/SERVER_API.md) — `litmus serve` HTTP reference
+- [Workers](docs/WORKERS.md) — `litmus worker` with hopper
 
 ## Related
 
