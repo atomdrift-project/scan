@@ -286,11 +286,11 @@ enum Commands {
         #[arg(long)]
         traits_dir: Option<PathBuf>,
 
-        /// Nice value applied to the worker process at startup. Default 10
+        /// Nice value applied to the worker process at startup. Default 18
         /// keeps analysis bursts from starving other work on the host. Pass 0
         /// to leave priority unchanged (e.g. when profiling). Unprivileged
         /// processes can only raise the nice value.
-        #[arg(long, default_value = "10", allow_hyphen_values = true)]
+        #[arg(long, default_value = "18", allow_hyphen_values = true)]
         nice: i32,
     },
 
