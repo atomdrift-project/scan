@@ -10,7 +10,7 @@ Three paths in. Pick by volume.
 | Rust library| You are already in Rust and need direct access.        | source — `classify_file`, `classify_bytes`   |
 
 All four emit the same response envelope. Schema and field names:
-[JSON_REPORT.md](JSON_REPORT.md).
+[JSON.md](JSON.md).
 
 ## Notes
 

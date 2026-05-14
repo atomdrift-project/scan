@@ -9,7 +9,7 @@ same envelope:
       "raw": { ... full cleave report ... }
     }
 
-`ml` is litmus. `raw` is the cleave [AnalysisReport](../../cleave/docs/JSON_REPORT.md);
+`ml` is litmus. `raw` is the cleave [AnalysisReport](../../cleave/docs/JSON.md);
 the cleave repo owns its schema.
 
 ## Why the field names are short

@@ -6,7 +6,7 @@ instance for jobs, analyses each file, and posts the result back.
 
 The classifier, thresholds, and response shape are identical to the
 server. See [SERVER_API.md](SERVER_API.md) for the server, and
-[JSON_REPORT.md](JSON_REPORT.md) for the JSON envelope every worker
+[JSON.md](JSON.md) for the JSON envelope every worker
 result carries.
 
 ## Running a worker
@@ -41,7 +41,7 @@ The same environment variables apply as for the server:
    Mismatched SHA-256 fails the claim.
 3. **Analyse.** Same `classify_file` / `classify_bytes` path used by
    the server.
-4. **Report.** The worker posts the [response envelope](JSON_REPORT.md)
+4. **Report.** The worker posts the [response envelope](JSON.md)
    back to hopper. The shape is the same as the server's `/analyze`
    response.
 5. **Sleep.** If the queue was empty on the last claim, the worker

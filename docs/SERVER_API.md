@@ -6,7 +6,7 @@ it as a local service and put a reverse proxy in front of it if
 anything else needs to reach it.
 
 For the pull-based worker, see [WORKERS.md](WORKERS.md).
-For the response schema, see [JSON_REPORT.md](JSON_REPORT.md).
+For the response schema, see [JSON.md](JSON.md).
 
 ## Running the server
 
@@ -48,7 +48,7 @@ a private temp directory so cleave sees a plausible extension.
 
     curl -s -F file=@/bin/ls http://127.0.0.1:49999/analyze | jq .ml
 
-Returns 200 with the [response envelope](JSON_REPORT.md). 413 if the
+Returns 200 with the [response envelope](JSON.md). 413 if the
 body exceeds `--max-size-mb`, 415 for unsupported types, 422 for
 truncated or malformed input, 503 if the server is starting or
 saturated, 504 if analysis exceeds the watchdog deadline.
