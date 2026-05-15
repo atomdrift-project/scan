@@ -12,7 +12,7 @@
 #   DATA_DIR    local sample dir shared with hopper           (default: unset → download)
 #   WORKERS     concurrency (--workers)                        (default: worker auto)
 #   MAX_RSS_GB  pause threshold (--max-rss-gb)                 (default: -1 = off; systemd MemoryMax handles OOM)
-#   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, infinity)         (default: 32G)
+#   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, 80%, infinity)     (default: 80%)
 
 set -eu
 
@@ -29,7 +29,7 @@ UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 DATA_DIR="${DATA_DIR:-}"
 WORKERS="${WORKERS:-}"
 MAX_RSS_GB="${MAX_RSS_GB:--1}"
-MEMORY_MAX="${MEMORY_MAX:-32G}"
+MEMORY_MAX="${MEMORY_MAX:-80%}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
