@@ -28,5 +28,5 @@ Breaking changes between minor releases until 1.0. Pin a commit. The
 JSON envelope is stable within a major version regardless of path.
 
 **Operational requirements** for the library: install an 8 MB rayon
-stack in `main`, call `kill_all_rizin_groups()` at shutdown. See
-[cleave's API.md](../../cleave/docs/API.md#operational-notes).
+stack in `main`, call `kill_all_rizin_groups()` at shutdown.
+
