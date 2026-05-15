@@ -1270,6 +1270,48 @@ fn analyze_single(
     )
 }
 
+/// Classify a payload held entirely in memory.
+///
+/// This is the in-process analog of [`run`] for callers that already own the
+/// bytes (HTTP proxies, S3 fetchers, fuzz harnesses, etc.). It skips the
+/// filesystem round-trip used by the on-disk path and relies on cleave's
+/// SHA256-keyed analysis cache to short-circuit repeated payloads.
+///
+/// `filename` is advisory only — cleave uses the extension as a type hint and
+/// the value is echoed back in [`ScanResult::path`]. Pass something
+/// human-meaningful (e.g. the URL the bytes came from) for logging.
+///
+/// Unlike [`run`], no `ScanSummary` aggregation happens here; one call =
+/// one [`ScanResult`]. Callers that need bulk counters should aggregate.
+///
+/// # Errors
+/// Propagates cleave analysis failures, model inference errors, and feature
+/// spec mismatches.
+pub fn scan_bytes(
+    data: Vec<u8>,
+    filename: &str,
+    model: &Model,
+    ctx: &ExtractContext,
+    shap: Option<&ShapImportance>,
+    config: &ScanConfig,
+) -> Result<ScanResult> {
+    let cleave_opts = cleave::AnalysisOptions {
+        slow_rule_ms: config.slow_rule_ms(),
+        ..Default::default()
+    };
+    let report = cleave::analyze_bytes_owned(data, filename, &cleave_opts)
+        .with_context(|| format!("cleave analysis of {filename}"))?;
+    process_report(
+        std::path::Path::new(filename),
+        report,
+        ctx,
+        model,
+        shap,
+        config,
+        None,
+    )
+}
+
 /// Extract a small set of human-facing findings relevant to the classification.
 #[must_use]
 pub fn extract_top_findings_from_json(

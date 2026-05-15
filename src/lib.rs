@@ -25,6 +25,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod analyzer;
 pub mod explain;
 pub mod features;
 pub(crate) mod git_cmd;
@@ -39,6 +40,7 @@ pub mod traits_repo;
 pub mod validate;
 pub mod worker;
 
+pub use analyzer::Analyzer;
 pub use model::Classification;
 pub use model::Thresholds;
 pub use scan::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
