@@ -28,6 +28,10 @@ LITMUS_USER=litmus
 LITMUS_GROUP=litmus
 LITMUS_HOME=/var/litmus
 LITMUS_LOG_DIR=/var/log/litmus
+# Disk-backed scratch dir. /tmp on illumos is tmpfs (swap-backed); large
+# unpacks (innoextract, 7z, rizin) can exhaust swap and wedge the whole
+# zone — including /etc/svc/volatile, which then blocks svc.startd.
+LITMUS_TMP_DIR=/var/litmus/tmp
 LITMUS_BIN=$SRC_PREFIX/bin/litmus
 SMF_MANIFEST=/lib/svc/manifest/site/litmus-worker.xml
 SMF_FMRI=svc:/site/litmus-worker:default
@@ -280,8 +284,12 @@ getent group "$LITMUS_GROUP" >/dev/null 2>&1 || groupadd "$LITMUS_GROUP"
 id "$LITMUS_USER" >/dev/null 2>&1 || \
     useradd -m -d "$LITMUS_HOME" -g "$LITMUS_GROUP" -s /bin/sh \
             -c "Litmus Worker" "$LITMUS_USER"
-mkdir -p "$LITMUS_HOME" "$LITMUS_LOG_DIR"
-chown "$LITMUS_USER:$LITMUS_GROUP" "$LITMUS_HOME" "$LITMUS_LOG_DIR"
+mkdir -p "$LITMUS_HOME" "$LITMUS_LOG_DIR" "$LITMUS_TMP_DIR"
+chown "$LITMUS_USER:$LITMUS_GROUP" "$LITMUS_HOME" "$LITMUS_LOG_DIR" "$LITMUS_TMP_DIR"
+chmod 700 "$LITMUS_TMP_DIR"
+# Sweep leftovers from any prior wedged run so the dir doesn't grow unbounded
+# across restarts. Safe: only the worker writes here.
+find "$LITMUS_TMP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
 litmus_changed=0
 if [ "$litmus_build_needed" -eq 1 ]; then
@@ -360,6 +368,9 @@ cat > "$manifest_tmp" <<EOF
              set LD_LIBRARY_PATH so rizin can find librz_util.so.0.x and
              friends, plus pkgsrc libs at /opt/local/lib for transitive deps. -->
         <envvar name="LD_LIBRARY_PATH" value="$SRC_PREFIX/lib:$PKG_PREFIX/lib"/>
+        <envvar name="TMPDIR" value="$LITMUS_TMP_DIR"/>
+        <envvar name="TMP"    value="$LITMUS_TMP_DIR"/>
+        <envvar name="TEMP"   value="$LITMUS_TMP_DIR"/>
       </method_environment>
     </method_context>
     <exec_method type="method" name="start"
