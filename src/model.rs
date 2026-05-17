@@ -826,8 +826,7 @@ struct RoutePolicies {
 impl RoutePolicies {
     fn contains_route(&self, route: &str) -> bool {
         self.by_filetype.values().any(|policy| {
-            policy.hostile.thresholds.contains_key(route)
-                || policy.suspicious.thresholds.contains_key(route)
+            policy.hostile.references_route(route) || policy.suspicious.references_route(route)
         })
     }
 }
@@ -843,6 +842,82 @@ struct PolicySeverity {
     /// Route-name → calibrated threshold. Routes absent from this map do not
     /// participate in that severity decision.
     thresholds: HashMap<String, f32>,
+    /// Learned-blend policy. When set, ``thresholds`` is empty and this
+    /// severity is evaluated as ``sigmoid(intercept + sum(w_i * logit(p_i))) >=
+    /// threshold`` over the named routes. Mirrors what
+    /// ``azoth_route_policy_search._make_learned_blend_candidate_at_fp`` fits
+    /// — the weights live in the same calibrated probability space that
+    /// ``predict_calibrated`` emits, so no isotonic mapping is applied at
+    /// load time.
+    blend: Option<BlendPolicy>,
+}
+
+impl PolicySeverity {
+    /// True iff this severity could fire on a contribution from ``route``.
+    /// For OR-rule policies that's "route has a threshold"; for blend policies
+    /// it's "route is one of the blend inputs."
+    fn references_route(&self, route: &str) -> bool {
+        if self.thresholds.contains_key(route) {
+            return true;
+        }
+        if let Some(blend) = &self.blend {
+            return blend.routes.iter().any(|r| r == route);
+        }
+        false
+    }
+
+    /// True iff this severity fires given the per-route scores. Dispatches
+    /// to blend evaluation when ``blend`` is set, OR-rule otherwise.
+    fn fires(&self, scores: &[RouteProbability]) -> bool {
+        if let Some(blend) = &self.blend {
+            return blend.fires(scores);
+        }
+        scores.iter().any(|score| {
+            self.thresholds
+                .get(&score.route)
+                .is_some_and(|&threshold| score.probability >= threshold)
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BlendPolicy {
+    /// Routes consumed by the blend, in the order their weights are listed.
+    /// Both ``weights`` and the score lookup happen by index, so reordering
+    /// after load is forbidden.
+    routes: Vec<String>,
+    weights: Vec<f32>,
+    intercept: f32,
+    /// Calibrated-space threshold on the sigmoid output. Already in the
+    /// space the blend was fit in (post-isotonic, matching ``predict_calibrated``),
+    /// so the per-route isotonic mapping that ``calibrate_policy_thresholds``
+    /// applies to OR-rule thresholds is intentionally NOT applied here.
+    threshold: f32,
+}
+
+impl BlendPolicy {
+    /// Evaluate ``sigmoid(intercept + sum(w_i * logit(clip(p_i)))) >= threshold``
+    /// over the configured routes. Missing routes (specialist not loaded for
+    /// this filetype, scoring failure, etc.) fall back to "doesn't fire" —
+    /// the blend can't be honestly evaluated with incomplete inputs and
+    /// firing on a partial blend would be a calibration mismatch.
+    fn fires(&self, scores: &[RouteProbability]) -> bool {
+        // f64 math throughout — logit blows up near 0/1, and the cumulative
+        // weighted sum can drift if we stay in f32. The final compare against
+        // ``threshold`` is in f32 to match how the calibration step writes it.
+        const EPS: f64 = 1e-6;
+        let mut z: f64 = f64::from(self.intercept);
+        for (idx, route) in self.routes.iter().enumerate() {
+            let Some(score) = scores.iter().find(|s| &s.route == route) else {
+                return false;
+            };
+            let p = (f64::from(score.probability)).clamp(EPS, 1.0 - EPS);
+            let logit = (p / (1.0 - p)).ln();
+            z += f64::from(self.weights[idx]) * logit;
+        }
+        let sigmoid_z = 1.0 / (1.0 + (-z).exp());
+        (sigmoid_z as f32) >= self.threshold
+    }
 }
 
 /// Wire-format view of `config.json`. Captures only the fields litmus reads;
@@ -887,6 +962,29 @@ struct RoutePolicySeverityJson {
 struct RoutePolicyBestJson {
     #[serde(default)]
     thresholds: HashMap<String, f64>,
+    /// Optional learned-blend variant. When set, ``thresholds`` is typically
+    /// empty and the severity classifies via the blend's combined score.
+    /// Mirrors azoth_route_policy_search._make_learned_blend_candidate_at_fp.
+    #[serde(default)]
+    blend: Option<BlendPolicyJson>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BlendPolicyJson {
+    #[serde(default)]
+    routes: Vec<String>,
+    #[serde(default)]
+    weights: Vec<f64>,
+    #[serde(default)]
+    intercept: f64,
+    #[serde(default)]
+    threshold: f64,
+    /// Currently only ``"logit"`` is supported. Future blend variants
+    /// (e.g., raw-prob linear, monotonic GAM) would advertise themselves
+    /// here so deploy can refuse unknown shapes loudly rather than
+    /// silently misapplying the wrong transform.
+    #[serde(default)]
+    transform: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -973,6 +1071,10 @@ fn load_route_policies(model_dir: &Path, level: u8) -> RoutePolicies {
 #[allow(clippy::cast_possible_truncation)]
 fn policy_severity_from_json(json: &RoutePolicySeverityJson) -> Option<PolicySeverity> {
     let best = json.best.as_ref()?;
+    let blend = best
+        .blend
+        .as_ref()
+        .and_then(blend_policy_from_json);
     let mut thresholds = HashMap::new();
     for (route, &threshold) in &best.thresholds {
         let threshold = threshold as f32;
@@ -980,7 +1082,52 @@ fn policy_severity_from_json(json: &RoutePolicySeverityJson) -> Option<PolicySev
             thresholds.insert(route.clone(), threshold);
         }
     }
-    (!thresholds.is_empty()).then_some(PolicySeverity { thresholds })
+    // A severity is loadable if either the OR-rule has at least one
+    // threshold OR the blend is well-formed. The two coexist only in
+    // pathological writer output — current code emits one or the other.
+    if thresholds.is_empty() && blend.is_none() {
+        return None;
+    }
+    Some(PolicySeverity { thresholds, blend })
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn blend_policy_from_json(json: &BlendPolicyJson) -> Option<BlendPolicy> {
+    // Only the logit transform is currently supported. An unknown transform
+    // means the writer is ahead of this deploy binary — refuse loudly rather
+    // than silently misapplying.
+    match json.transform.as_deref() {
+        None | Some("logit") => {}
+        Some(other) => {
+            tracing::warn!(
+                transform = %other,
+                "unknown blend transform; ignoring blend policy",
+            );
+            return None;
+        }
+    }
+    if json.routes.len() != json.weights.len() {
+        tracing::warn!(
+            routes = json.routes.len(),
+            weights = json.weights.len(),
+            "blend routes/weights length mismatch; ignoring blend policy",
+        );
+        return None;
+    }
+    if json.routes.is_empty() {
+        return None;
+    }
+    let threshold = json.threshold as f32;
+    if !(0.0..=1.0).contains(&threshold) {
+        tracing::warn!(threshold, "blend threshold outside [0,1]; ignoring");
+        return None;
+    }
+    Some(BlendPolicy {
+        routes: json.routes.clone(),
+        weights: json.weights.iter().map(|&w| w as f32).collect(),
+        intercept: json.intercept as f32,
+        threshold,
+    })
 }
 
 /// Pull per-route thresholds from `levels[]` at the requested level. Pairs up
@@ -1497,21 +1644,11 @@ fn compact_route_name(route: &str) -> String {
 }
 
 fn policy_classify(policy: &RoutePolicy, scores: &[RouteProbability]) -> Classification {
-    if scores.iter().any(|score| {
-        policy
-            .hostile
-            .thresholds
-            .get(&score.route)
-            .is_some_and(|&threshold| score.probability >= threshold)
-    }) {
+    // Each severity decides via its own rule: OR-rule per-route thresholds or
+    // learned blend. Hostile takes precedence over suspicious, same as before.
+    if policy.hostile.fires(scores) {
         Classification::Hostile
-    } else if scores.iter().any(|score| {
-        policy
-            .suspicious
-            .thresholds
-            .get(&score.route)
-            .is_some_and(|&threshold| score.probability >= threshold)
-    }) {
+    } else if policy.suspicious.fires(scores) {
         Classification::Suspicious
     } else {
         Classification::Benign
@@ -1532,6 +1669,15 @@ fn calibrate_policy_thresholds_with<'a>(
     let mut adjusted = 0_usize;
     for policy in policies.by_filetype.values_mut() {
         for severity in [&mut policy.hostile, &mut policy.suspicious] {
+            // Blend severities are calibrated at fit time (the policy writer
+            // applies isotonic to the per-route inputs before fitting LR), so
+            // their threshold and weights are already in calibrated-prob
+            // space. Skipping the per-route mapping is intentional — the
+            // logistic combination doesn't decompose through isotonic the
+            // way per-route OR-rule thresholds do.
+            if severity.blend.is_some() {
+                continue;
+            }
             for (route_name, threshold) in severity.thresholds.iter_mut() {
                 if let Some(cal) = lookup(route_name) {
                     *threshold = cal.apply(*threshold);
@@ -1567,18 +1713,27 @@ fn calibrate_policy_thresholds(
 }
 
 fn policy_route_class(policy: &RoutePolicy, route: &str, probability: f32) -> Classification {
-    if policy
-        .hostile
-        .thresholds
-        .get(route)
-        .is_some_and(|&threshold| probability >= threshold)
+    // Per-route classification is well-defined only for OR-rule severities —
+    // a learned blend's verdict is a function of all its inputs jointly, so
+    // no single route can be labeled Hostile/Suspicious on its own. For
+    // blend severities we return Benign here; the final verdict still comes
+    // from policy_classify, which evaluates the blend over the full score
+    // vector. The diagnostic per-route classification just won't get an
+    // individual contribution for blend-driven filetypes.
+    if policy.hostile.blend.is_none()
+        && policy
+            .hostile
+            .thresholds
+            .get(route)
+            .is_some_and(|&threshold| probability >= threshold)
     {
         Classification::Hostile
-    } else if policy
-        .suspicious
-        .thresholds
-        .get(route)
-        .is_some_and(|&threshold| probability >= threshold)
+    } else if policy.suspicious.blend.is_none()
+        && policy
+            .suspicious
+            .thresholds
+            .get(route)
+            .is_some_and(|&threshold| probability >= threshold)
     {
         Classification::Suspicious
     } else {
@@ -2399,9 +2554,11 @@ mod tests {
         let policy = RoutePolicy {
             hostile: PolicySeverity {
                 thresholds: hostile,
+                blend: None,
             },
             suspicious: PolicySeverity {
                 thresholds: suspicious,
+                blend: None,
             },
         };
         let mut policies = RoutePolicies {
@@ -2497,9 +2654,11 @@ mod tests {
                     ("filetypes/elf".to_string(), 0.99),
                     ("general".to_string(), 0.95),
                 ]),
+                blend: None,
             },
             suspicious: PolicySeverity {
                 thresholds: HashMap::from([("filetypes/elf".to_string(), 0.90)]),
+                blend: None,
             },
         };
 
@@ -2540,6 +2699,139 @@ mod tests {
         assert_eq!(
             policy_classify(&policy, &inactive_route),
             Classification::Benign
+        );
+    }
+
+    #[test]
+    fn blend_policy_fires_on_hand_built_inputs() {
+        // Construct a blend that fires when general's prob is high enough on
+        // its own (weight 1.0 on general, 0 on specialist, intercept chosen
+        // so threshold=0.5 lines up with general prob ≈ 0.6).
+        // sigmoid(intercept + 1.0 * logit(0.6)) = 0.5
+        //   logit(0.6) ≈ 0.4054
+        //   intercept = -0.4054 gives sigmoid(0) = 0.5
+        let blend = BlendPolicy {
+            routes: vec!["general".to_string(), "filetypes/elf".to_string()],
+            weights: vec![1.0, 0.0],
+            intercept: -0.4054,
+            threshold: 0.5,
+        };
+        // general=0.6 → fires
+        let fires = blend.fires(&[
+            RouteProbability {
+                route: "general".to_string(),
+                probability: 0.6,
+            },
+            RouteProbability {
+                route: "filetypes/elf".to_string(),
+                probability: 0.0,
+            },
+        ]);
+        assert!(fires);
+        // general=0.5 → doesn't fire (logit(0.5)=0, intercept negative)
+        let no_fire = blend.fires(&[
+            RouteProbability {
+                route: "general".to_string(),
+                probability: 0.5,
+            },
+            RouteProbability {
+                route: "filetypes/elf".to_string(),
+                probability: 0.99,
+            },
+        ]);
+        assert!(!no_fire);
+        // Missing route → can't blend, doesn't fire.
+        let missing = blend.fires(&[RouteProbability {
+            route: "general".to_string(),
+            probability: 1.0,
+        }]);
+        assert!(!missing);
+    }
+
+    #[test]
+    fn load_route_policies_parses_blend_field() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("route_policies.json"),
+            r#"{
+              "schema": "azoth.route_policy_search.v1",
+              "routes": {
+                "filetypes/elf": {
+                  "filetype": "elf",
+                  "levels": [{
+                    "level": 5,
+                    "hostile": {"best": {
+                      "thresholds": {},
+                      "blend": {
+                        "routes": ["general", "filegroups/native", "filetypes/elf"],
+                        "weights": [0.5, 0.3, 1.2],
+                        "intercept": -1.5,
+                        "threshold": 0.8,
+                        "transform": "logit"
+                      }
+                    }},
+                    "suspicious": {"best": {"thresholds": {"general": 0.7}}}
+                  }]
+                }
+              }
+            }"#,
+        )?;
+        let policies = load_route_policies(dir.path(), 5);
+        let policy = policies
+            .by_filetype
+            .get("elf")
+            .expect("elf policy loaded");
+        let blend = policy.hostile.blend.as_ref().expect("blend loaded");
+        assert_eq!(blend.routes.len(), 3);
+        assert_eq!(blend.weights.len(), 3);
+        assert!((blend.intercept - -1.5).abs() < 1e-6);
+        assert!((blend.threshold - 0.8).abs() < 1e-6);
+        // contains_route should recognize blend routes too.
+        assert!(policies.contains_route("filegroups/native"));
+        assert!(policies.contains_route("filetypes/elf"));
+        Ok(())
+    }
+
+    #[test]
+    fn blend_policy_severity_isnt_isotonic_calibrated() {
+        // calibrate_policy_thresholds_with must leave blend severities alone —
+        // the blend's threshold is already in calibrated-prob space (its fit
+        // ran on isotonic-calibrated route probs at policy-search time).
+        // If we double-applied isotonic here it would shift the threshold off
+        // the calibrated distribution and deploy verdicts would silently drift.
+        let blend = BlendPolicy {
+            routes: vec!["general".to_string()],
+            weights: vec![1.0],
+            intercept: 0.0,
+            threshold: 0.42,
+        };
+        let policy = RoutePolicy {
+            hostile: PolicySeverity {
+                thresholds: HashMap::new(),
+                blend: Some(blend),
+            },
+            suspicious: PolicySeverity {
+                thresholds: HashMap::from([("general".to_string(), 0.5)]),
+                blend: None,
+            },
+        };
+        let mut policies = RoutePolicies {
+            by_filetype: HashMap::from([("elf".to_string(), policy)]),
+        };
+        // A calibrator that shifts every input by +0.1 (clamped to [0, 1]).
+        let cal = IsotonicCalibrator {
+            x: vec![0.0, 1.0],
+            y: vec![0.1, 1.0],
+        };
+        calibrate_policy_thresholds_with(&mut policies, |_route| Some(&cal));
+        let pol = policies.by_filetype.get("elf").unwrap();
+        // Hostile (blend) threshold stays at its original calibrated value.
+        let blend = pol.hostile.blend.as_ref().unwrap();
+        assert!((blend.threshold - 0.42).abs() < 1e-6);
+        // Suspicious (OR-rule) threshold did get mapped.
+        assert!(
+            (pol.suspicious.thresholds.get("general").copied().unwrap() - cal.apply(0.5)).abs()
+                < 1e-6
         );
     }
 
