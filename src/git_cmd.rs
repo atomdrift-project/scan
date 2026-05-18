@@ -30,6 +30,9 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// Default timeout for git operations that may touch the network.
+pub(crate) const NETWORK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Run `git` with the given args, killing the child (and its process group)
 /// if it exceeds `timeout`. Returns the captured output.
 pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output> {

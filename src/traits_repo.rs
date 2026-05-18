@@ -12,9 +12,6 @@
 use crate::git_cmd;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Make cleave use an already-installed traits directory instead of attempting
 /// an auto-clone during resource initialization.
@@ -61,7 +58,7 @@ fn looks_like_traits_dir(path: &Path) -> bool {
             || path.join("metadata").is_dir())
 }
 
-/// Pull (or force-reset) the traits repo, bounded by [`GIT_TIMEOUT`].
+/// Pull (or force-reset) the traits repo, bounded by [`git_cmd::NETWORK_TIMEOUT`].
 ///
 /// Falls back to `cleave::traits_repo::update` when no local checkout
 /// exists yet so the fresh-install clone path stays in one place.
@@ -77,14 +74,14 @@ pub fn update(force: bool) -> Result<()> {
 
     if force {
         eprintln!("Force-updating traits from upstream...");
-        let fetch = git_cmd::run(&["-C", &path, "fetch", "origin"], GIT_TIMEOUT)
+        let fetch = git_cmd::run(&["-C", &path, "fetch", "origin"], git_cmd::NETWORK_TIMEOUT)
             .context("git fetch failed")?;
         if !fetch.status.success() {
             anyhow::bail!("git fetch failed: {}", git_cmd::format_failure(&fetch));
         }
         let reset = git_cmd::run(
             &["-C", &path, "reset", "--hard", "origin/HEAD"],
-            GIT_TIMEOUT,
+            git_cmd::NETWORK_TIMEOUT,
         )
         .context("git reset failed")?;
         if !reset.status.success() {
@@ -92,7 +89,10 @@ pub fn update(force: bool) -> Result<()> {
         }
     } else {
         eprintln!("Updating traits...");
-        let pull = git_cmd::run(&["-C", &path, "pull", "--ff-only"], GIT_TIMEOUT)
+        let pull = git_cmd::run(
+            &["-C", &path, "pull", "--ff-only"],
+            git_cmd::NETWORK_TIMEOUT,
+        )
             .context("git pull failed")?;
         if !pull.status.success() {
             anyhow::bail!("traits update failed: {}", git_cmd::format_failure(&pull));
@@ -113,7 +113,7 @@ pub fn update(force: bool) -> Result<()> {
                 "--stat",
                 &format!("{before_str}..{after}"),
             ],
-            GIT_TIMEOUT,
+            git_cmd::NETWORK_TIMEOUT,
         ) {
             if diff.status.success() {
                 let summary = String::from_utf8_lossy(&diff.stdout);
@@ -126,15 +126,18 @@ pub fn update(force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Check for updates without applying them, bounded by [`GIT_TIMEOUT`].
+/// Check for updates without applying them, bounded by [`git_cmd::NETWORK_TIMEOUT`].
 pub fn check_updates() -> Result<()> {
     prepare_runtime_env();
     let traits_dir: PathBuf =
         cleave::traits_repo::try_resolve().map_err(|e| anyhow::anyhow!("{e}"))?;
     let path = traits_dir.to_string_lossy().into_owned();
 
-    let fetch = git_cmd::run(&["-C", &path, "fetch", "--dry-run"], GIT_TIMEOUT)
-        .context("git fetch failed")?;
+    let fetch = git_cmd::run(
+        &["-C", &path, "fetch", "--dry-run"],
+        git_cmd::NETWORK_TIMEOUT,
+    )
+    .context("git fetch failed")?;
 
     let local = git_cmd::short_head(&traits_dir).unwrap_or_default();
     let stderr = String::from_utf8_lossy(&fetch.stderr);

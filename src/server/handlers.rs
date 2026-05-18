@@ -507,16 +507,13 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
     // and filesystem work. Both are non-fatal — log on failure and proceed
     // to the reload step regardless so we still pick up any partial state.
     //
-    // A 150s outer timeout guards against git hanging indefinitely (each pull
-    // already enforces a 60s limit internally, so this is a belt-and-suspenders
-    // backstop that ensures the reload_lock is always released promptly).
-    // A 150s outer timeout guards against git hanging indefinitely (each pull
-    // already enforces a 60s limit internally, so this is a belt-and-suspenders
-    // backstop that ensures the reload_lock is always released promptly).
+    // The outer timeout is only a backstop around the sequential models +
+    // traits updates. Each git process already enforces its own 10-minute
+    // process-group timeout internally.
     //
     // `prev_models_head` captures the commit before the pull so we can roll back
     // the models repo on disk if the new model fails to load.
-    const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
+    const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(21 * 60);
     let pull_result = tokio::time::timeout(
         PULL_TIMEOUT,
         tokio::task::spawn_blocking(|| {

@@ -39,11 +39,9 @@ use crate::git_cmd;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 const DEFAULT_MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/azoth.git";
 const STALENESS_DAYS: u64 = 30;
-const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Sentinel used internally when the user pinned no ref. The clone path
 /// translates this to "omit `--branch`" and the fetch path to "fetch
@@ -150,7 +148,7 @@ pub fn update() -> Result<Option<String>> {
     }
 
     let before = git_cmd::short_head(&base);
-    let effective_ref = resolve_ref(&repo_url, &ref_name);
+    let effective_ref = resolve_ref(&repo_url, &ref_name)?;
     eprintln!(
         "Updating models (ref={display})...",
         display = display_ref(&effective_ref)
@@ -162,7 +160,7 @@ pub fn update() -> Result<Option<String>> {
     } else {
         vec!["-C", &base_str, "fetch", "origin", &effective_ref]
     };
-    let fetch = git_cmd::run(&fetch_args, GIT_TIMEOUT)?;
+    let fetch = git_cmd::run(&fetch_args, git_cmd::NETWORK_TIMEOUT)?;
     if !fetch.status.success() {
         anyhow::bail!("fetch failed: {}", git_cmd::format_failure(&fetch));
     }
@@ -174,7 +172,7 @@ pub fn update() -> Result<Option<String>> {
     // gets discarded the same way a half-applied pull would have been.
     let reset = git_cmd::run(
         &["-C", &base_str, "reset", "--hard", "FETCH_HEAD"],
-        GIT_TIMEOUT,
+        git_cmd::NETWORK_TIMEOUT,
     )?;
     if !reset.status.success() {
         anyhow::bail!(
@@ -198,7 +196,7 @@ pub fn update() -> Result<Option<String>> {
                 "--stat",
                 &format!("{before_str}..{after}"),
             ],
-            GIT_TIMEOUT,
+            git_cmd::NETWORK_TIMEOUT,
         ) {
             if diff.status.success() {
                 let summary = String::from_utf8_lossy(&diff.stdout);
@@ -217,7 +215,10 @@ pub fn rollback(rev: &str) -> Result<()> {
     let broken = git_cmd::short_head(&base).unwrap_or_else(|| "unknown".to_string());
     tracing::error!(broken_commit = %broken, rollback_to = %rev, "rolling back models repo");
     let base_str = base.to_string_lossy();
-    let output = git_cmd::run(&["-C", &base_str, "reset", "--hard", rev], GIT_TIMEOUT)?;
+    let output = git_cmd::run(
+        &["-C", &base_str, "reset", "--hard", rev],
+        git_cmd::NETWORK_TIMEOUT,
+    )?;
     if !output.status.success() {
         anyhow::bail!(
             "rollback to {rev} failed: {}",
@@ -236,13 +237,13 @@ pub fn check_updates() -> Result<()> {
         return Ok(());
     }
 
-    let effective_ref = resolve_ref(&repo_url, &ref_name);
+    let effective_ref = resolve_ref(&repo_url, &ref_name)?;
     let base_str = base.to_string_lossy();
     let mut args: Vec<&str> = vec!["-C", &base_str, "fetch", "--dry-run", "origin"];
     if !effective_ref.is_empty() {
         args.push(&effective_ref);
     }
-    let fetch = git_cmd::run(&args, GIT_TIMEOUT).context("git fetch failed")?;
+    let fetch = git_cmd::run(&args, git_cmd::NETWORK_TIMEOUT).context("git fetch failed")?;
 
     let local = git_cmd::short_head(&base).unwrap_or_default();
     let stderr = String::from_utf8_lossy(&fetch.stderr);
@@ -390,28 +391,25 @@ fn has_ensemble_layout(path: &Path) -> bool {
     general.is_dir() && has_single_bundle_layout(&general)
 }
 
-fn clone_repo(target: &Path, repo_url: &str, ref_name: &str) -> std::io::Result<()> {
-    Command::new("git").arg("--version").output().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("git is not installed or not in PATH: {e}"),
-        )
-    })?;
+fn clone_repo(target: &Path, repo_url: &str, ref_name: &str) -> Result<()> {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map_err(|e| anyhow::anyhow!("git is not installed or not in PATH: {e}"))?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let effective_ref = resolve_ref(repo_url, ref_name);
-    let mut cmd = Command::new("git");
-    cmd.args(["clone", "--depth", "1"]);
+    let effective_ref = resolve_ref(repo_url, ref_name)?;
+    let target_str = target.to_string_lossy();
+    let mut args = vec!["clone", "--depth", "1"];
     if !effective_ref.is_empty() {
-        cmd.args(["--branch", &effective_ref]);
+        args.extend(["--branch", &effective_ref]);
     }
-    cmd.arg(repo_url).arg(target);
-    let output = cmd.output()?;
+    args.push(repo_url);
+    args.push(&target_str);
+    let output = git_cmd::run(&args, git_cmd::NETWORK_TIMEOUT).context("git clone failed")?;
     if !output.status.success() {
-        return Err(std::io::Error::other(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
+        anyhow::bail!("git clone failed: {}", git_cmd::format_failure(&output));
     }
     Ok(())
 }
@@ -419,21 +417,23 @@ fn clone_repo(target: &Path, repo_url: &str, ref_name: &str) -> std::io::Result<
 /// Pre-flight ref check: if the user pinned a ref that the remote doesn't
 /// expose, warn once and treat it as "default branch". Returning the empty
 /// string signals callers to omit `--branch` / fetch the remote's HEAD.
-fn resolve_ref(repo_url: &str, ref_name: &str) -> String {
+fn resolve_ref(repo_url: &str, ref_name: &str) -> Result<String> {
     if ref_name.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
-    let output = Command::new("git")
-        .args(["ls-remote", "--exit-code", repo_url, ref_name])
-        .output();
-    let exists = matches!(output, Ok(o) if o.status.success());
+    let output = git_cmd::run(
+        &["ls-remote", "--exit-code", repo_url, ref_name],
+        git_cmd::NETWORK_TIMEOUT,
+    )
+    .context("checking remote models ref")?;
+    let exists = output.status.success();
     if exists {
-        ref_name.to_owned()
+        Ok(ref_name.to_owned())
     } else {
         eprintln!(
             "Note: ref {ref_name:?} not found on {repo_url}; using the remote's default branch."
         );
-        String::new()
+        Ok(String::new())
     }
 }
 
