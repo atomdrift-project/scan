@@ -202,7 +202,9 @@ fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
         );
         Some(t)
     } else {
-        tracing::warn!(path = %path.display(), "config.json thresholds are invalid, ignoring");
+        // Hard model-config anomaly: surface at error level so CI / deploy
+        // verify catches it instead of silently degrading to fallbacks.
+        tracing::error!(path = %path.display(), "config.json thresholds are invalid, ignoring");
         None
     }
 }
@@ -240,7 +242,7 @@ fn load_evaluation_severity_thresholds(model_dir: &Path, level: u8) -> Option<Th
     let data = std::fs::read_to_string(&path).ok()?;
     let eval: EvaluationJson = serde_json::from_str(&data).ok()?;
     if eval.model_abi_version != EXPECTED_MODEL_ABI_VERSION {
-        tracing::warn!(
+        tracing::error!(
             path = %path.display(),
             found = eval.model_abi_version,
             expected = EXPECTED_MODEL_ABI_VERSION,
@@ -282,7 +284,7 @@ fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
     let data = std::fs::read_to_string(&path).ok()?;
     let eval: EvaluationJson = serde_json::from_str(&data).ok()?;
     if eval.model_abi_version != EXPECTED_MODEL_ABI_VERSION {
-        tracing::warn!(
+        tracing::error!(
             path = %path.display(),
             found = eval.model_abi_version,
             expected = EXPECTED_MODEL_ABI_VERSION,
@@ -1099,7 +1101,7 @@ fn blend_policy_from_json(json: &BlendPolicyJson) -> Option<BlendPolicy> {
     match json.transform.as_deref() {
         None | Some("logit") => {}
         Some(other) => {
-            tracing::warn!(
+            tracing::error!(
                 transform = %other,
                 "unknown blend transform; ignoring blend policy",
             );
@@ -1107,7 +1109,7 @@ fn blend_policy_from_json(json: &BlendPolicyJson) -> Option<BlendPolicy> {
         }
     }
     if json.routes.len() != json.weights.len() {
-        tracing::warn!(
+        tracing::error!(
             routes = json.routes.len(),
             weights = json.weights.len(),
             "blend routes/weights length mismatch; ignoring blend policy",
@@ -1119,7 +1121,7 @@ fn blend_policy_from_json(json: &BlendPolicyJson) -> Option<BlendPolicy> {
     }
     let threshold = json.threshold as f32;
     if !(0.0..=1.0).contains(&threshold) {
-        tracing::warn!(threshold, "blend threshold outside [0,1]; ignoring");
+        tracing::error!(threshold, "blend threshold outside [0,1]; ignoring");
         return None;
     }
     Some(BlendPolicy {
@@ -1164,7 +1166,10 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u8) -> HashMap<String, 
         if t.validate().is_ok() {
             out.insert(route.clone(), t);
         } else {
-            tracing::warn!(
+            // Inverted hostile/suspicious thresholds for a single route.
+            // Litmus drops the route from this level entirely — meaningful
+            // recall loss that should not pass deploy verification silently.
+            tracing::error!(
                 route = %route, level = level,
                 suspicious = t.suspicious, hostile = t.hostile,
                 "ignoring invalid thresholds in ensemble config"
@@ -1182,7 +1187,7 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u8) -> HashMap<String, 
         if t.validate().is_ok() {
             out.insert(route.clone(), t);
         } else {
-            tracing::warn!(
+            tracing::error!(
                 route = %route, level = level,
                 suspicious = t.suspicious, hostile = t.hostile,
                 "ignoring invalid suspicious-only thresholds in ensemble config"
@@ -1391,7 +1396,7 @@ fn load_bundle(
                 },
             ),
             None => {
-                tracing::warn!(
+                tracing::error!(
                     bundle = %bundle_dir.display(),
                     "no config.json or evaluation.json thresholds found — using conservative \
                      fallback (suspicious={}, hostile={})",
