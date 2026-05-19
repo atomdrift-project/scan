@@ -39,7 +39,14 @@ impl FeatureWriter<'_> {
 
 /// Feature spec version this build was compiled against.
 /// Must match the version in the loaded feature_spec.json.
-pub const EXPECTED_SPEC_VERSION: u32 = 16;
+pub const EXPECTED_SPEC_VERSION: u32 = 17;
+
+/// Earliest spec version this build can still load. v16 specs are
+/// loadable too: v17 added the `cluster:*` feature family and new
+/// `agg:static_*` aggregates that the extractor doesn't yet produce,
+/// but the loader extracts known features and zeros out unknowns —
+/// v16 bundles still work end-to-end.
+pub const MIN_LOADABLE_SPEC_VERSION: u32 = 16;
 /// Stable model ABI version shared with collimator.
 /// Keep this in sync with EXPECTED_SPEC_VERSION for a single compatibility number.
 pub const EXPECTED_MODEL_ABI_VERSION: u32 = EXPECTED_SPEC_VERSION;
@@ -177,11 +184,18 @@ impl FeatureSpec {
         let data = std::fs::read_to_string(path).context("reading feature spec")?;
         let raw: RawFeatureSpec = serde_json::from_str(&data).context("parsing feature spec")?;
 
-        if raw.version != EXPECTED_SPEC_VERSION {
+        if raw.version < MIN_LOADABLE_SPEC_VERSION || raw.version > EXPECTED_SPEC_VERSION {
             anyhow::bail!(
-                "feature spec version mismatch: this installed model uses spec v{}, but this litmus build requires v{EXPECTED_SPEC_VERSION}. \
+                "feature spec version mismatch: this installed model uses spec v{}, but this litmus build accepts v{MIN_LOADABLE_SPEC_VERSION}..=v{EXPECTED_SPEC_VERSION}. \
                  The model is incompatible with this build. Run 'litmus update-rules' to install a matching model bundle.",
                 raw.version,
+            );
+        }
+        if raw.version < EXPECTED_SPEC_VERSION {
+            tracing::warn!(
+                version = raw.version,
+                expected = EXPECTED_SPEC_VERSION,
+                "loading older spec version; extractor produces newer-version features as zeros for forward compatibility, but consider retraining at v{EXPECTED_SPEC_VERSION}"
             );
         }
 
