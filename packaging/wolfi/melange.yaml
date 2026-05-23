@@ -1,0 +1,121 @@
+# Wolfi package definition for litmus (binary) and litmus-models (data).
+#
+# Status: LOCAL DEV ONLY. Two upstream blockers:
+#   (1) cleave depends on filefacts via a sibling path dep — same issue
+#       as cleave/packaging/wolfi/melange.yaml.
+#   (2) litmus depends on cleave via a git dep; this file fetches that
+#       tag. wolfi-dev/os would prefer the cleave apk it already
+#       hosts (once (1) is resolved and cleave is upstreamed).
+#
+# The local build (`make wolfi`) bypasses both by staging cleave + filefacts
+# alongside litmus and using a Cargo `[patch]` override.
+# See packaging/wolfi/README.md.
+
+package:
+  name: litmus
+  version: 1.2.1
+  epoch: 0
+  description: ML-powered malware classification using cleave static analysis
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      - ca-certificates-bundle
+      - cleave
+      - cleave-traits
+  resources:
+    cpu: 4
+    memory: 8Gi
+
+environment:
+  contents:
+    # wolfi-dev/os injects these in CI; standalone melange needs them.
+    repositories:
+      - https://packages.wolfi.dev/os
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    packages:
+      - build-base
+      - busybox
+      - ca-certificates-bundle
+      - cargo-auditable
+      - clang
+      - cmake
+      - git
+      - perl
+      - pkgconf
+      - rust
+      - wolfi-baselayout
+
+pipeline:
+  # LOCAL_BUILD_STRIP_BEGIN  — scripts/build.sh removes this step for
+  # local builds so melange's --source-dir wins. Upstream keeps it.
+  - uses: git-checkout
+    with:
+      repository: https://codeberg.org/atomdrift/litmus
+      tag: v${{package.version}}
+      expected-commit: b10074a9d13dc91e5134a8f6e9e79811e77285fc
+  # LOCAL_BUILD_STRIP_END
+
+  - name: Build litmus
+    runs: |
+      set -eu
+      # LOCAL_BUILD_CD_HERE  — scripts/build.sh replaces this with
+      # `cd litmus` for local builds (cleave is staged as a sibling).
+      cargo auditable build --release --locked --bin litmus
+      install -Dm755 target/release/litmus "${{targets.destdir}}/usr/bin/litmus"
+
+  - uses: strip
+
+subpackages:
+  - name: litmus-models
+    description: Azoth XGBoost models loaded by litmus at runtime
+    dependencies:
+      runtime:
+        - litmus
+    pipeline:
+      # LOCAL_BUILD_STRIP_BEGIN  — scripts/build.sh removes this step
+      # and replaces the marker below with a copy from the host-staged
+      # azoth sibling, so local builds don't depend on codeberg uptime.
+      - uses: git-checkout
+        with:
+          repository: https://codeberg.org/atomdrift/azoth
+          branch: main
+          expected-commit: 058e2d57e6d07fcb1363338c543354f13120fddd
+          destination: models-src
+      # LOCAL_BUILD_STRIP_END
+      - name: Install models
+        runs: |
+          set -eu
+          # LOCAL_BUILD_AZOTH_HERE  — for local builds, scripts/build.sh
+          # replaces this comment with `cp -a /home/build/azoth/. models-src/`.
+          # /src is a nerdctl host mount and isn't visible inside
+          # melange's bubblewrap chroot; the staged azoth tree IS
+          # visible because --source-dir copies it into /home/build.
+          # Force 0755 — melange's runs: shell inherits a restrictive
+          # umask, otherwise the dir lands 0700 and the nonroot runtime
+          # user (uid 65532 in apko.yaml) cannot traverse it.
+          install -d -m 0755 "${{targets.subpkgdir}}/usr/share/litmus/models/azoth"
+          cp -a models-src/. "${{targets.subpkgdir}}/usr/share/litmus/models/azoth/"
+          chmod -R a+rX "${{targets.subpkgdir}}/usr/share/litmus/models"
+          # Litmus loads via the bundle name (azoth). Sanity-check the
+          # presence of the manifest file before we ship.
+          test -f "${{targets.subpkgdir}}/usr/share/litmus/models/azoth/config.json" \
+            || { echo "ERROR: azoth config.json missing" >&2; exit 1; }
+
+test:
+  pipeline:
+    - name: Version reports correctly
+      runs: |
+        set -euo pipefail
+        litmus --version
+        litmus --version | grep -q '1\.2\.1'
+    - name: Help works
+      runs: |
+        set -euo pipefail
+        litmus --help >/dev/null
+
+update:
+  enabled: true
+  git:
+    strip-prefix: v
