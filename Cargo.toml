@@ -111,6 +111,8 @@ jemalloc-prof = ["tikv-jemallocator/profiling"]
 
 [profile.release]
 strip = "debuginfo"
+lto = "fat"
+codegen-units = 1
 
 [profile.profiling]
 inherits = "release"
