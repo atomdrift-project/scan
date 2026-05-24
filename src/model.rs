@@ -1,5 +1,26 @@
 //! Model loading, thresholding, and inference.
 //!
+//! ## Model file formats (since v1.3 / spec v18)
+//!
+//! Three backends are supported:
+//!
+//! - **`.onnx`** — portable inference graph emitted by collimator's
+//!   training pipeline (LightGBM via `onnxmltools.convert_lightgbm`)
+//!   or any other framework that exports to ONNX. Loaded via `tract`
+//!   (pure-Rust, no FFI). **Preferred when present** — ~50% smaller
+//!   than `.txt`, 3-5× faster to load, 5-11× faster to infer.
+//! - **`.txt`** — native LightGBM Booster format. The historical
+//!   default. Still emitted alongside `.onnx` during the transition
+//!   and used as the canonical artifact for constant-predictor
+//!   models that ONNX Runtime's TreeEnsembleClassifier can't load.
+//! - **`.json`** — native XGBoost JSON dump.
+//!
+//! When `.onnx` and `.txt` are present for the same model (transitional
+//! state during the v18 ONNX migration), `.onnx` wins. The legacy
+//! ambiguity rule (`.txt` + `.json` together is ambiguous because
+//! they're different backends) still applies — `.onnx` doesn't conflict
+//! with either since it can represent both backends' graphs.
+//!
 //! ## Bundle layouts
 //!
 //! Two on-disk shapes are supported:
@@ -8,7 +29,7 @@
 //!
 //! ```text
 //! <model_dir>/
-//!   model.txt | model.json
+//!   model.onnx | model.txt | model.json
 //!   feature_spec.json
 //!   config.json
 //!   evaluation.json
@@ -21,13 +42,13 @@
 //!   config.json                   ensemble-level config: route map + thresholds
 //!   route_policies.json           optional per-filetype decision policies
 //!   general/                      always required
-//!     model.txt | model.json
+//!     model.onnx | model.txt | model.json
 //!     feature_spec.json
 //!   filegroups/<group>/           optional, e.g. native, scripts, archive
-//!     model.txt | model.json
+//!     model.onnx | model.txt | model.json
 //!     feature_spec.json           may be absent → uses general's spec
 //!   filetypes/<type>/             optional, e.g. elf, pe
-//!     model.txt | model.json
+//!     model.onnx | model.txt | model.json
 //!     feature_spec.json           may be absent → uses general's spec
 //! ```
 //!
@@ -552,10 +573,127 @@ pub struct ModelInfo {
 }
 
 /// One trained tree-boosting model, picked at load time by file extension.
+/// Pure-Rust ONNX backend (tract). Loads a serialized ONNX graph and
+/// runs single-sample inference returning the positive-class
+/// probability. Used to read the .onnx artifacts collimator emits
+/// alongside .txt models — typically ~50% smaller and 3-5× faster
+/// to load and infer than the LightGBM .txt path.
+///
+/// The graph is `onnxmltools.convert_lightgbm`'s standard output:
+/// inputs `("input", float32, [N, n_features])`, outputs
+/// `[label (int64, [N]), probabilities (float32, [N, 2])]`. We
+/// ignore the label output and use column 1 of probabilities.
+struct OnnxBackend {
+    /// Pre-optimized tract plan. Stored as a runnable model so
+    /// `.run` calls don't re-optimize each prediction.
+    plan: tract_onnx::prelude::TypedRunnableModel<
+        tract_onnx::prelude::TypedModel,
+    >,
+    n_features: usize,
+}
+
+impl std::fmt::Debug for OnnxBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxBackend")
+            .field("n_features", &self.n_features)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OnnxBackend {
+    fn load(path: &Path) -> Result<Self> {
+        use tract_onnx::prelude::*;
+        // Parse the ONNX graph first to recover n_features from the
+        // (dynamic-batch) input fact.
+        let mut model = tract_onnx::onnx()
+            .model_for_path(path)
+            .with_context(|| format!("parsing ONNX model {}", path.display()))?;
+        let input_fact_dyn = model
+            .input_fact(0)
+            .with_context(|| format!("reading input fact from {}", path.display()))?
+            .clone();
+        // input fact's shape is a ShapeFactoid with per-dim factoids.
+        // batch dim is unknown (the converter set it dynamic); the
+        // feature dim is concrete (the converter pinned n_features
+        // explicitly). Resolve the concrete feature dim via the
+        // Factoid::concretize trait method, then to_usize.
+        use tract_onnx::tract_hir::infer::Factoid;
+        use tract_onnx::tract_hir::internal::DimLike;
+        let n_features = input_fact_dyn
+            .shape
+            .dim(1)
+            .ok_or_else(|| anyhow::anyhow!("ONNX input has no feature dimension in {}", path.display()))?
+            .concretize()
+            .ok_or_else(|| anyhow::anyhow!("non-concrete feature dim in {}", path.display()))?
+            .to_usize()
+            .with_context(|| format!("feature dim not usize in {}", path.display()))?;
+        // Pin batch dim to 1 so tract can optimize the graph.
+        // Litmus infers one file at a time at scan time; multi-seed
+        // ensembling averages across seed members, not across a
+        // batch dimension. If we ever want batched scoring, swap
+        // this for a symbolic dim via tract_pulse.
+        let pinned_fact = InferenceFact::dt_shape(f32::datum_type(), tvec!(1, n_features));
+        model = model
+            .with_input_fact(0, pinned_fact)
+            .with_context(|| format!("pinning batch dim for {}", path.display()))?;
+        let plan = model
+            .into_optimized()
+            .with_context(|| format!("optimizing ONNX model {}", path.display()))?
+            .into_runnable()
+            .with_context(|| format!("making ONNX model runnable {}", path.display()))?;
+        Ok(Self { plan, n_features })
+    }
+
+    fn predict(&self, features: &[f32]) -> Result<f32> {
+        use tract_onnx::prelude::*;
+        if features.len() != self.n_features {
+            anyhow::bail!(
+                "feature vector length {} != ONNX expected {}",
+                features.len(),
+                self.n_features
+            );
+        }
+        // Build a (1, n_features) f32 tensor. We copy because tract
+        // takes owned input. For single-sample inference at scan time
+        // this is a single allocation per call; perfectly cheap.
+        let input: Tensor = tract_ndarray::Array2::from_shape_vec(
+            (1, self.n_features),
+            features.to_vec(),
+        )
+        .context("building ONNX input tensor")?
+        .into();
+        let outputs = self
+            .plan
+            .run(tvec!(input.into()))
+            .context("ONNX inference run failed")?;
+        // onnxmltools' LightGBM classifier exports outputs in
+        // [label, probabilities] order. probabilities is (1, 2) where
+        // column 1 is the positive-class probability — matches the
+        // contract the rest of model.rs expects from .predict().
+        let probs = outputs
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("ONNX missing probabilities output"))?;
+        let view = probs
+            .to_array_view::<f32>()
+            .context("ONNX probabilities output not f32")?;
+        let probs_slice = view
+            .as_slice()
+            .ok_or_else(|| anyhow::anyhow!("ONNX probabilities not contiguous"))?;
+        if probs_slice.len() != 2 {
+            anyhow::bail!(
+                "ONNX probabilities length {} != 2 (expected binary [neg, pos])",
+                probs_slice.len()
+            );
+        }
+        Ok(probs_slice[1])
+    }
+}
+
 #[derive(Debug)]
 enum InnerModel {
     Xgboost(xgboost_ars::Model),
     Lightgbm(lightgbm_ars::Model),
+    Onnx(OnnxBackend),
 }
 
 impl InnerModel {
@@ -563,6 +701,7 @@ impl InnerModel {
         match self {
             Self::Xgboost(m) => m.num_features(),
             Self::Lightgbm(m) => m.num_features(),
+            Self::Onnx(m) => m.n_features,
         }
     }
 
@@ -572,6 +711,7 @@ impl InnerModel {
             Self::Lightgbm(m) => m
                 .predict(features)
                 .map_err(|e| anyhow::anyhow!("lightgbm predict failed: {e}")),
+            Self::Onnx(m) => m.predict(features),
         }
     }
 
@@ -579,6 +719,7 @@ impl InnerModel {
         match self {
             Self::Xgboost(_) => "xgboost",
             Self::Lightgbm(_) => "lightgbm",
+            Self::Onnx(_) => "onnx",
         }
     }
 }
@@ -1215,9 +1356,16 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
         Vec::new()
     };
 
+    // Legacy single-model layout: model.{onnx,txt,json} directly under
+    // bundle_dir. .onnx wins when present (load + infer faster). When
+    // both .txt and .json exist with no .onnx, the bundle is ambiguous
+    // because they're different backends (LightGBM vs XGBoost). .onnx
+    // + .txt for the same route is FINE — the .onnx is just the
+    // LightGBM model in a portable format.
+    let single_onnx = bundle_dir.join("model.onnx");
     let single_xgb = bundle_dir.join("model.json");
     let single_lgb = bundle_dir.join("model.txt");
-    let has_single = single_xgb.is_file() || single_lgb.is_file();
+    let has_single = single_onnx.is_file() || single_xgb.is_file() || single_lgb.is_file();
 
     if !multi.is_empty() && has_single {
         anyhow::bail!(
@@ -1229,6 +1377,8 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
 
     let model_paths: Vec<PathBuf> = if !multi.is_empty() {
         multi
+    } else if single_onnx.is_file() {
+        vec![single_onnx]
     } else {
         match (single_xgb.is_file(), single_lgb.is_file()) {
             (true, false) => vec![single_xgb],
@@ -1239,7 +1389,7 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
                 single_lgb.display(),
             ),
             (false, false) => anyhow::bail!(
-                "model bundle is incomplete: missing model.json (XGBoost) or model.txt (LightGBM) \
+                "model bundle is incomplete: missing model.onnx, model.json (XGBoost), or model.txt (LightGBM) \
                  in {} (and no models/ directory either)",
                 bundle_dir.display(),
             ),
@@ -1286,11 +1436,16 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
     Ok(Backend { models })
 }
 
-/// Pick up every `seed_*.{txt,json}` under a `models/` directory, sorted by
-/// filename so load order is deterministic across runs (and so the K=1
-/// path with a single `seed_NN.txt` behaves identically regardless of fs order).
+/// Pick up every `seed_*.{onnx,txt,json}` under a `models/` directory.
+/// When the same seed has both `.onnx` and `.txt` (transitional state
+/// while the deploy migrates ONNX in), the `.onnx` wins because it
+/// loads ~3× faster, infers 5-11× faster, and is ~50% smaller. Output
+/// is sorted by stem (so seed_42 lands before seed_43) and is
+/// deterministic across runs.
 fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut found = Vec::new();
+    use std::collections::BTreeMap;
+    // stem -> chosen path. BTreeMap keeps stems sorted for deterministic order.
+    let mut by_stem: BTreeMap<String, PathBuf> = BTreeMap::new();
     for entry in std::fs::read_dir(multi_dir)
         .with_context(|| format!("reading multi-seed models dir {}", multi_dir.display()))?
     {
@@ -1309,13 +1464,40 @@ fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if ext != "txt" && ext != "json" {
+        // Lower number = higher priority (matches collimator's bundle.py
+        // _EXT_PRIORITY).
+        let priority = match ext {
+            "onnx" => 0u8,
+            "txt" => 1,
+            "json" => 2,
+            _ => continue,
+        };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
+        };
+        let stem = stem.to_owned();
+        match by_stem.get(&stem) {
+            Some(existing) => {
+                let existing_ext = existing
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let existing_priority = match existing_ext {
+                    "onnx" => 0u8,
+                    "txt" => 1,
+                    "json" => 2,
+                    _ => 255,
+                };
+                if priority < existing_priority {
+                    by_stem.insert(stem, path);
+                }
+            }
+            None => {
+                by_stem.insert(stem, path);
+            }
         }
-        found.push(path);
     }
-    found.sort();
-    Ok(found)
+    Ok(by_stem.into_values().collect())
 }
 
 /// Load one trained model from a path, picking the backend by extension.
@@ -1332,8 +1514,12 @@ fn load_inner_model(path: &Path) -> Result<InnerModel> {
                 .with_context(|| format!("loading LightGBM model from {}", path.display()))?;
             Ok(InnerModel::Lightgbm(m))
         }
+        "onnx" => {
+            let m = OnnxBackend::load(path)?;
+            Ok(InnerModel::Onnx(m))
+        }
         other => anyhow::bail!(
-            "unrecognized model extension {other:?} for {}; expected .txt (LightGBM) or .json (XGBoost)",
+            "unrecognized model extension {other:?} for {}; expected .onnx, .txt (LightGBM), or .json (XGBoost)",
             path.display(),
         ),
     }

@@ -126,8 +126,66 @@ fn bundle_with_spec_but_no_model_is_rejected() {
     let err = Model::load(dir.path(), None).expect_err("spec-only must error");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("model.json") && msg.contains("model.txt"),
-        "error should mention both filenames: {msg}"
+        msg.contains("model.onnx") && msg.contains("model.txt") && msg.contains("model.json"),
+        "error should mention all three filenames: {msg}"
+    );
+}
+
+fn onnx_bundle() -> Option<PathBuf> {
+    let p = std::env::var("LITMUS_ONNX_BUNDLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/home/t/azoth/filetypes/pe"));
+    (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
+}
+
+#[test]
+#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle (default: /home/t/azoth/filetypes/pe)"]
+fn onnx_bundle_dispatches_to_onnx_backend() {
+    let Some(src) = onnx_bundle() else {
+        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
+    };
+    let dir = copy_bundle(&src, &["model.onnx", "feature_spec.json"]);
+    let model = Model::load(dir.path(), None).expect("load ONNX bundle");
+    assert_eq!(model.backend_kind(), "onnx");
+    assert!(model.spec().total_features() > 0);
+
+    let zeros = vec![0.0f32; model.spec().total_features()];
+    let (prob, _class) = model.predict(&zeros).expect("predict zeros");
+    assert!(prob.is_finite() && (0.0..=1.0).contains(&prob));
+}
+
+#[test]
+#[ignore = "needs both LITMUS_ONNX_BUNDLE and LITMUS_LIGHTGBM_BUNDLE pointing at the same trained route"]
+fn onnx_is_preferred_over_txt_when_both_present() {
+    // When a bundle ships both model.onnx and model.txt for the same
+    // trained route (transitional ONNX-migration state), the .onnx is
+    // loaded and the .txt is ignored. Compare predictions on a zero
+    // vector to a separate txt-only load: they should match within
+    // float32 noise (1e-5 is the bundle-wide parity bound the
+    // collimator-side convert script enforces).
+    let Some(onnx_src) = onnx_bundle() else {
+        panic!("LITMUS_ONNX_BUNDLE not set");
+    };
+    let lgb_src = onnx_src.clone(); // PE bundle ships both .onnx and .txt today.
+    if !lgb_src.join("model.txt").is_file() {
+        panic!("expected {} to ship both model.onnx and model.txt for this test", lgb_src.display());
+    }
+
+    let hybrid_dir = copy_bundle(&onnx_src, &["model.onnx", "model.txt", "feature_spec.json"]);
+    let hybrid = Model::load(hybrid_dir.path(), None).expect("hybrid bundle loads");
+    assert_eq!(hybrid.backend_kind(), "onnx", "hybrid bundle should prefer ONNX");
+
+    let txt_dir = copy_bundle(&lgb_src, &["model.txt", "feature_spec.json"]);
+    let txt = Model::load(txt_dir.path(), None).expect("txt-only bundle loads");
+    assert_eq!(txt.backend_kind(), "lightgbm");
+
+    let zeros = vec![0.0f32; hybrid.spec().total_features()];
+    let (p_onnx, _) = hybrid.predict(&zeros).expect("predict onnx");
+    let (p_txt, _) = txt.predict(&zeros).expect("predict txt");
+    let delta = (p_onnx - p_txt).abs();
+    assert!(
+        delta < 1e-5,
+        "ONNX/.txt parity broken on zero vector: onnx={p_onnx} txt={p_txt} delta={delta:.3e}",
     );
 }
 
