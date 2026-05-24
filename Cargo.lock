@@ -735,7 +735,6 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "2.0.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#c3c7445ef5c6b0391ade4bb5982f6c0173f88989"
 dependencies = [
  "aes 0.8.4",
  "aho-corasick",
@@ -809,28 +808,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-elixir",
- "tree-sitter-go",
- "tree-sitter-groovy",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-kotlin-sg",
- "tree-sitter-lua 0.4.1",
- "tree-sitter-make",
- "tree-sitter-objc",
- "tree-sitter-php",
- "tree-sitter-powershell",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-scala 0.24.1",
- "tree-sitter-swift",
- "tree-sitter-typescript",
- "tree-sitter-zig",
- "ts-parser-perl",
  "unrar",
  "walkdir",
  "x509-parser",
@@ -844,7 +821,6 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#c3c7445ef5c6b0391ade4bb5982f6c0173f88989"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1610,7 +1586,6 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "0.5.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#0f0849bc556878a8dab2c35da4769f9b6e42a9bf"
 dependencies = [
  "aho-corasick",
  "bincode 1.3.3",
@@ -1650,20 +1625,25 @@ dependencies = [
  "tree-sitter-bash",
  "tree-sitter-c",
  "tree-sitter-c-sharp",
+ "tree-sitter-elixir",
  "tree-sitter-go",
+ "tree-sitter-groovy",
  "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-kotlin-ng",
- "tree-sitter-lua 0.5.0",
+ "tree-sitter-lua",
+ "tree-sitter-make",
  "tree-sitter-objc",
  "tree-sitter-php",
  "tree-sitter-powershell",
  "tree-sitter-python",
  "tree-sitter-ruby",
  "tree-sitter-rust",
- "tree-sitter-scala 0.26.0",
+ "tree-sitter-scala",
  "tree-sitter-swift",
  "tree-sitter-typescript",
+ "tree-sitter-zig",
+ "ts-parser-perl",
  "uuid",
  "x509-cert",
  "zip 2.4.2",
@@ -1673,7 +1653,6 @@ dependencies = [
 [[package]]
 name = "fileid"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#c3c7445ef5c6b0391ade4bb5982f6c0173f88989"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -2792,7 +2771,6 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#c3c7445ef5c6b0391ade4bb5982f6c0173f88989"
 
 [[package]]
 name = "lzxd"
@@ -2812,7 +2790,6 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#c3c7445ef5c6b0391ade4bb5982f6c0173f88989"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -3638,7 +3615,6 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#c3c7445ef5c6b0391ade4bb5982f6c0173f88989"
 dependencies = [
  "flate2",
  "memchr",
@@ -4217,7 +4193,6 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#c3c7445ef5c6b0391ade4bb5982f6c0173f88989"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4721,7 +4696,6 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#c3c7445ef5c6b0391ade4bb5982f6c0173f88989"
 
 [[package]]
 name = "tap"
@@ -5460,30 +5434,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-kotlin-sg"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c06ec43ae3c12165d4ac08afe4e1f5fc6757ffe274fa7bd5af9007ef11ba4319"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
 name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
-
-[[package]]
-name = "tree-sitter-lua"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea992f4164d83f371ef1239ae178c4d4596c296c09055e9a48bb02a2760403af"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
 
 [[package]]
 name = "tree-sitter-lua"
@@ -5560,16 +5514,6 @@ name = "tree-sitter-rust"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-scala"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b4f354028b5fcf1d0c77f1c6d84cd5a579f29a1e43cb61551ec6580e9a99229"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -6772,7 +6716,6 @@ dependencies = [
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#c3c7445ef5c6b0391ade4bb5982f6c0173f88989"
 
 [[package]]
 name = "yara-x"
