@@ -4,9 +4,7 @@
 
 # litmus
 
-> **WARNING — do not use in production.** The default model (`scan-v16`) is beta quality at best: expect false positives, false negatives, and threshold churn. CLI surface and JSON schema may also change before 1.0.
-
-Classifies a file, directory, or running process as `hostile`, `suspicious`, or `benign`, and shows which behaviors drove the call.
+Context-free malware detection. Classifies a file, directory, or running process as `hostile`, `suspicious`, or `benign`, and shows which behaviors drove the call — no signatures, no reputation lookups, no network round-trips.
 
 <p align="center">
   <img src="media/screenshot.png" alt="litmus terminal output" width="760">
@@ -14,7 +12,7 @@ Classifies a file, directory, or running process as `hostile`, `suspicious`, or 
 
 ## How it works
 
-litmus runs each sample through [cleave](https://codeberg.org/atomdrift/cleave) to extract capabilities (50,000+ rules mapped to [MBC](https://github.com/MBCProject/mbc-markdown) and [ATT&CK](https://attack.mitre.org/)), then scores them with an XGBoost model from [litmus-models](https://codeberg.org/atomdrift/litmus-models). The verdict ships with a TreeSHAP-ranked list of the capabilities that drove the score — computed on the live model, not a post-hoc story.
+litmus runs each sample through [cleave](https://codeberg.org/atomdrift/cleave) to extract capabilities (50,000+ rules mapped to [MBC](https://github.com/MBCProject/mbc-markdown) and [ATT&CK](https://attack.mitre.org/)), then scores them with **azoth**, our XGBoost model trained for context-free malware detection. Every verdict ships with a TreeSHAP-ranked list of the capabilities that drove the score — computed on the live model, not a post-hoc story.
 
 CPU-only inference. No GPU, no network, no telemetry. Same weights on a laptop, CI runner, or fleet.
 
@@ -25,18 +23,9 @@ brew tap atomdrift/tap https://codeberg.org/atomdrift/homebrew-tap.git
 brew install litmus
 ```
 
-Or from source:
+Or from source: `git clone https://codeberg.org/atomdrift/litmus.git && cd litmus && make install`.
 
-```bash
-git clone https://codeberg.org/atomdrift/litmus.git
-cd litmus && make install
-```
-
-Optional: [rizin](https://github.com/rizinorg/rizin) for disassembly, [upx](https://github.com/upx/upx) for unpacking.
-
-## Platforms
-
-Known to run awesomely on illumos, OpenBSD, FreeBSD, Linux, and macOS.
+Optional: [rizin](https://github.com/rizinorg/rizin) for disassembly, [upx](https://github.com/upx/upx) for unpacking. Runs on illumos, OpenBSD, FreeBSD, Linux, and macOS.
 
 ## Usage
 
@@ -49,7 +38,7 @@ litmus -1 release.tgz                    # loose: zero-FP target
 litmus -9 release.tgz                    # paranoid: catch the long tail
 ```
 
-Sensitivity is gzip-style: `-1` through `-9`, default `-5`. For exact cutoffs use `--threshold-hostile` / `--threshold-suspicious`. `--model-dir` swaps in a custom model.
+Sensitivity is gzip-style: `-1` through `-9`, default `-5`. For exact cutoffs use `--threshold-hostile` / `--threshold-suspicious`. `--model-dir` swaps in a custom model bundle.
 
 Exit codes: `0` clean, `1` hostile, `2` suspicious, `3` error.
 
@@ -60,19 +49,17 @@ Exit codes: `0` clean, `1` hostile, `2` suspicious, `3` error.
 - `litmus serve` — HTTP API; loopback default, CIDR allowlist, bounded concurrency, RSS ceiling that rejects before the box swaps ([API reference](docs/SERVER_API.md))
 - `litmus worker` — pulls jobs from a [hopper](https://codeberg.org/atomdrift/hopper) queue with SHA256-verified local paths ([worker guide](docs/WORKERS.md))
 
-Models and rules are plain git repos. `--update` pulls new versions on demand.
+Models and rules are plain git repos; `--update` pulls new versions on demand.
 
 ## Documentation
 
 - [Integration guide](docs/INTEGRATION.md) — pick CLI, server, or worker for your volume
-- [JSON report schema](docs/JSON.md) — envelope shared by every mode
-- [Server API](docs/SERVER_API.md) — `litmus serve` HTTP reference
-- [Workers](docs/WORKERS.md) — `litmus worker` with hopper
+- [JSON report schema](docs/JSON.md) · [Server API](docs/SERVER_API.md) · [Workers](docs/WORKERS.md)
 
 ## Related
 
 - [cleave](https://codeberg.org/atomdrift/cleave) — the capability analyzer underneath
-- [litmus-models](https://codeberg.org/atomdrift/litmus-models) — current XGBoost model weights and thresholds
+- [azoth](https://codeberg.org/atomdrift/azoth) — model weights, thresholds, and feature spec
 - [hopper](https://codeberg.org/atomdrift/hopper) — distributed work queue
 - [xgboost-ars](https://codeberg.org/atomdrift/xgboost-ars) — pure-Rust inference with exact TreeSHAP
 - [Atomdrift Lab](https://lab.atomdrift.org/) — submit samples for free analysis
