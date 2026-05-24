@@ -903,6 +903,7 @@ impl BlendPolicy {
     /// this filetype, scoring failure, etc.) fall back to "doesn't fire" —
     /// the blend can't be honestly evaluated with incomplete inputs and
     /// firing on a partial blend would be a calibration mismatch.
+    #[allow(clippy::cast_possible_truncation)]
     fn fires(&self, scores: &[RouteProbability]) -> bool {
         // f64 math throughout — logit blows up near 0/1, and the cumulative
         // weighted sum can drift if we stay in f32. The final compare against
