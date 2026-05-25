@@ -734,7 +734,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cleave"
-version = "2.0.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "aes 0.8.4",
  "aho-corasick",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "filefacts"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aho-corasick",
  "bincode 1.3.3",
@@ -1904,9 +1904,9 @@ dependencies = [
 
 [[package]]
 name = "goblin"
-version = "0.10.5"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "983a6aafb3b12d4c41ea78d39e189af4298ce747353945ff5105b54a056e5cd9"
+checksum = "0d494b2004fbc8cf419a6d2115488df4e11140f6f4abd877519de1bbd90c5370"
 dependencies = [
  "log",
  "plain",
@@ -2362,9 +2362,9 @@ dependencies = [
 
 [[package]]
 name = "intaglio"
-version = "1.14.0"
+version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c37f733ee758fb92c8e280b9f2712e3469321447c41f72e60222d37e01fc1b38"
+checksum = "8eca9188c1b20836bb561bc09bb2f54e9ca99b271031b5f3ff183a00c08c98c8"
 
 [[package]]
 name = "inventory"
@@ -2614,7 +2614,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "litmus"
-version = "2.0.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2676,9 +2676,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.29"
+version = "0.4.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 
 [[package]]
 name = "logos"
