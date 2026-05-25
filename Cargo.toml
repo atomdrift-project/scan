@@ -127,16 +127,6 @@ debug = 2
 [lints]
 workspace = true
 
-
-# Local development override: point cleave/filefacts at sibling worktrees so
-# in-flight changes are picked up without a publish cycle. Remove once both
-# upstreams are tagged.
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
-
-[patch."https://codeberg.org/atomdrift/filefacts.git"]
-filefacts = { path = "../filefacts" }
-
 [lib]
 name = "litmus"
 path = "src/lib.rs"
