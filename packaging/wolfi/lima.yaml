@@ -13,10 +13,11 @@ images:
   - location: "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-arm64.img"
     arch: "aarch64"
 
-# Litmus's release profile uses lto="fat" + codegen-units=1, which
-# exhausts ~10GB during the final link step (cleave + filefacts compile
-# in via the [patch] override). 12GiB headroom matches the cleave-wolfi
-# VM and survives the link with room to spare.
+# The wolfi build uses litmus's `release-lto` profile (lto="fat" +
+# codegen-units=1), which exhausts ~10GB during the final link step
+# (cleave + filefacts compile in via the [patch] override). 12GiB
+# headroom matches the cleave-wolfi VM and survives the link with
+# room to spare.
 cpus: 4
 memory: "12GiB"
 disk: "30GiB"

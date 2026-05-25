@@ -114,8 +114,20 @@ tikv-jemallocator = "0.6"
 # Analyze with: jeprof --text ./out/litmus.heap out/heap/jeprof.*.heap
 jemalloc-prof = ["tikv-jemallocator/profiling"]
 
+# Thin LTO + cu=16 keeps most of fat LTO's runtime gain at roughly a
+# third of the link time — the right default for everyday `cargo build
+# --release`. Use the `release-lto` profile for container/distribution
+# builds where the extra link minutes are acceptable.
 [profile.release]
 strip = "debuginfo"
+lto = "thin"
+codegen-units = 16
+
+# Distribution profile: fat LTO + single codegen unit. Squeezes out the
+# last few percent of runtime at the cost of multi-minute link times.
+# Used by `make release-lto` and the wolfi container builds.
+[profile.release-lto]
+inherits = "release"
 lto = "fat"
 codegen-units = 1
 

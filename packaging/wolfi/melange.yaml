@@ -62,8 +62,8 @@ pipeline:
       set -eu
       # LOCAL_BUILD_CD_HERE  — scripts/build.sh replaces this with
       # `cd litmus` for local builds (cleave is staged as a sibling).
-      cargo auditable build --release --locked --bin litmus
-      install -Dm755 target/release/litmus "${{targets.destdir}}/usr/bin/litmus"
+      cargo auditable build --profile release-lto --locked --bin litmus
+      install -Dm755 target/release-lto/litmus "${{targets.destdir}}/usr/bin/litmus"
 
   - uses: strip
 

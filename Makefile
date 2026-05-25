@@ -25,7 +25,7 @@ WORKERS  ?=
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: build release install check-cargo tarball deploy deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -61,6 +61,15 @@ check-cargo:
 release: check-cargo $(OUT_DIR)
 	$(CARGO) build --release
 	cp target/release/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
+	fi
+
+# Fat LTO + single codegen unit. Multi-minute link, marginal runtime win
+# over the default release profile. Use for container/tarball builds.
+release-lto: check-cargo $(OUT_DIR)
+	$(CARGO) build --profile release-lto
+	cp target/release-lto/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
 	fi
