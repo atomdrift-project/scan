@@ -47,8 +47,8 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "litmus"
-version = "2.0.0-rc.1"
-edition = "2021"
+version = "2.0.0-rc.2"
+edition = "2024"
 authors = ["The Atomdrift Project"]
 description = "ML-powered malware classification using cleave static analysis"
 license = "Apache-2.0"

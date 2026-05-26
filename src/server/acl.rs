@@ -89,10 +89,10 @@ pub fn parse_cidr_list(s: &str) -> Result<Vec<Cidr>, String> {
 /// underlying IPv4 form so loopback / CIDR checks behave consistently
 /// regardless of the listening socket's address family.
 fn normalize(ip: IpAddr) -> IpAddr {
-    if let IpAddr::V6(v6) = ip {
-        if let Some(v4) = v6.to_ipv4_mapped() {
-            return IpAddr::V4(v4);
-        }
+    if let IpAddr::V6(v6) = ip
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        return IpAddr::V4(v4);
     }
     ip
 }

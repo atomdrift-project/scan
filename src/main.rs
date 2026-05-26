@@ -591,8 +591,8 @@ fn main() -> Result<()> {
             allow_cidr,
             traits_dir,
         } => {
-            if let Some(ref p) = traits_dir {
-                std::env::set_var("CLEAVE_TRAITS_DIR", p);
+            if let Some(p) = traits_dir.as_ref() {
+                cleave::traits_repo::set_override_dir(Some(p.into()));
             }
             let dirs: Vec<std::path::PathBuf> = allowed_dirs
                 .unwrap_or_default()
@@ -641,11 +641,11 @@ fn main() -> Result<()> {
                     eprintln!("Error checking model updates: {e}");
                     process::exit(1);
                 }
-                if !models_only {
-                    if let Err(e) = litmus::traits_repo::check_updates() {
-                        eprintln!("Error checking traits updates: {e}");
-                        process::exit(1);
-                    }
+                if !models_only
+                    && let Err(e) = litmus::traits_repo::check_updates()
+                {
+                    eprintln!("Error checking traits updates: {e}");
+                    process::exit(1);
                 }
             } else {
                 // Pull models, then validate the new bundle by attempting to load it.
@@ -677,11 +677,11 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                if !models_only {
-                    if let Err(e) = litmus::traits_repo::update(false) {
-                        eprintln!("Error updating traits: {e}");
-                        process::exit(1);
-                    }
+                if !models_only
+                    && let Err(e) = litmus::traits_repo::update(false)
+                {
+                    eprintln!("Error updating traits: {e}");
+                    process::exit(1);
                 }
             }
         }
@@ -710,8 +710,8 @@ fn main() -> Result<()> {
             traits_dir,
             nice,
         } => {
-            if let Some(ref p) = traits_dir {
-                std::env::set_var("CLEAVE_TRAITS_DIR", p);
+            if let Some(p) = traits_dir.as_ref() {
+                cleave::traits_repo::set_override_dir(Some(p.into()));
             }
             let workers = workers.unwrap_or_else(default_workers);
             let name = name.unwrap_or_else(|| {

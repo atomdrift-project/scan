@@ -182,19 +182,19 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
     let uptime_secs = state.started_at.elapsed().as_secs();
     let load_avg = system_load_avg();
 
-    if let Ok(init_error) = state.init_error.read() {
-        if let Some(message) = init_error.as_ref() {
-            tracing::error!("GET /_/health -> 503 (failed: {message})");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "status": "failed",
-                    "reason": "initialization_failed",
-                    "uptime_secs": uptime_secs,
-                })),
-            )
-                .into_response();
-        }
+    if let Ok(init_error) = state.init_error.read()
+        && let Some(message) = init_error.as_ref()
+    {
+        tracing::error!("GET /_/health -> 503 (failed: {message})");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "failed",
+                "reason": "initialization_failed",
+                "uptime_secs": uptime_secs,
+            })),
+        )
+            .into_response();
     }
 
     if !state.ready.load(std::sync::atomic::Ordering::Acquire) {
@@ -609,15 +609,15 @@ pub(super) async fn analyze(
 
     tracing::info!(id = request_id, "--> POST /analyze");
 
-    if let Ok(init_error) = state.init_error.read() {
-        if let Some(message) = init_error.as_ref() {
-            tracing::error!("analyze rejected: startup failed  id={request_id} error={message}");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Server failed to initialize"})),
-            )
-                .into_response();
-        }
+    if let Ok(init_error) = state.init_error.read()
+        && let Some(message) = init_error.as_ref()
+    {
+        tracing::error!("analyze rejected: startup failed  id={request_id} error={message}");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Server failed to initialize"})),
+        )
+            .into_response();
     }
 
     if let Some(response) = check_memory_pressure(&state).await {
@@ -1277,27 +1277,24 @@ pub(super) async fn analyze_path(
             let mut scan_result = *scan_result;
             // Inject extracted_path into the raw cleave JSON so cyclotron
             // knows where archive members were extracted on disk.
-            if let (Some(ref extract_dir), Some(ref mut raw)) =
+            if let (Some(extract_dir), Some(raw)) =
                 (&state.extract_dir, &mut scan_result.cleave)
+                && let Some(fs) = raw.get("fs").and_then(|f| f.as_array())
+                && let Some(first) = fs
+                    .first()
+                    .and_then(|f| f.get("sha"))
+                    .and_then(|s| s.as_str())
             {
-                if let Some(fs) = raw.get("fs").and_then(|f| f.as_array()) {
-                    if let Some(first) = fs
-                        .first()
-                        .and_then(|f| f.get("sha"))
-                        .and_then(|s| s.as_str())
-                    {
-                        // SHA hex is ASCII; byte slice is always a valid UTF-8 boundary.
-                        let short = first.get(..first.len().min(6)).unwrap_or(first);
-                        let dir = extract_dir.join(short);
-                        if dir.is_dir() {
-                            raw.as_object_mut().map(|o| {
-                                o.insert(
-                                    "extracted_path".to_string(),
-                                    serde_json::Value::String(dir.to_string_lossy().into_owned()),
-                                )
-                            });
-                        }
-                    }
+                // SHA hex is ASCII; byte slice is always a valid UTF-8 boundary.
+                let short = first.get(..first.len().min(6)).unwrap_or(first);
+                let dir = extract_dir.join(short);
+                if dir.is_dir()
+                    && let Some(o) = raw.as_object_mut()
+                {
+                    o.insert(
+                        "extracted_path".to_string(),
+                        serde_json::Value::String(dir.to_string_lossy().into_owned()),
+                    );
                 }
             }
 
@@ -1356,14 +1353,14 @@ async fn check_memory_pressure(state: &AppState) -> Option<Response> {
 
     if rss <= max_rss_bytes {
         // Happy path: reset overload timer if set.
-        if let Ok(mut overloaded) = state.overloaded_since.try_lock() {
-            if overloaded.is_some() {
-                tracing::info!(
-                    rss_mb = rss / 1024 / 1024,
-                    "memory recovered below threshold"
-                );
-                *overloaded = None;
-            }
+        if let Ok(mut overloaded) = state.overloaded_since.try_lock()
+            && overloaded.is_some()
+        {
+            tracing::info!(
+                rss_mb = rss / 1024 / 1024,
+                "memory recovered below threshold"
+            );
+            *overloaded = None;
         }
         return None;
     }

@@ -1011,10 +1011,10 @@ pub(crate) fn classify_report(
     let mut max_classification = classification;
 
     for ef in &embedded_entries {
-        if let Some(c) = cancellation {
-            if c.load(Ordering::Relaxed) {
-                anyhow::bail!("analysis cancelled during embedded file processing");
-            }
+        if let Some(c) = cancellation
+            && c.load(Ordering::Relaxed)
+        {
+            anyhow::bail!("analysis cancelled during embedded file processing");
         }
 
         let mut ef_features = ctx.extract_file(ef);

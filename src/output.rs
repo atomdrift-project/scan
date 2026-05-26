@@ -106,10 +106,10 @@ static THEME: LazyLock<RwLock<Option<Theme>>> = LazyLock::new(|| RwLock::new(Non
 ///
 /// Priority: `LITMUS_THEME` env var > terminal query > default (dark).
 pub fn detect_theme() -> Theme {
-    if let Ok(theme) = THEME.read() {
-        if let Some(theme) = *theme {
-            return theme;
-        }
+    if let Ok(theme) = THEME.read()
+        && let Some(theme) = *theme
+    {
+        return theme;
     }
 
     let detected = if let Ok(val) = std::env::var("LITMUS_THEME") {

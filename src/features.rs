@@ -1351,11 +1351,11 @@ impl ExtractContext {
         score_weight: f64,
     ) {
         for (path, &max_ord) in &summary.sample_paths {
-            if max_ord >= 2 {
-                if let Some(&idx) = self.presence_lookup.get(path.as_str()) {
-                    let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0);
-                    vec[offset + idx] = (score_weight * conf) as f32;
-                }
+            if max_ord >= 2
+                && let Some(&idx) = self.presence_lookup.get(path.as_str())
+            {
+                let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0);
+                vec[offset + idx] = (score_weight * conf) as f32;
             }
         }
     }
@@ -2455,14 +2455,13 @@ fn write_structural_extensions(
             .unwrap_or(0.0);
         total_loc += lines as u64;
 
-        if !s.path.is_empty() && s.path.contains('.') {
-            if let Some(ext) = s.path.rsplit('.').next() {
-                if binary_like.contains(&s.file_type.as_str())
-                    && text_exts.contains(&ext.to_ascii_lowercase().as_str())
-                {
-                    extension_mismatches += 1;
-                }
-            }
+        if !s.path.is_empty()
+            && s.path.contains('.')
+            && let Some(ext) = s.path.rsplit('.').next()
+            && binary_like.contains(&s.file_type.as_str())
+            && text_exts.contains(&ext.to_ascii_lowercase().as_str())
+        {
+            extension_mismatches += 1;
         }
 
         if let Some(t) = s.mtime {

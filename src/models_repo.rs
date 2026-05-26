@@ -89,26 +89,25 @@ pub fn model_dir() -> Result<PathBuf> {
     let data_dir = default_models_dir();
     let (repo_url, ref_name) = configured_repo();
 
-    if is_git_repo(&data_dir) {
-        if let Some(existing) = current_remote_url(&data_dir) {
-            if !urls_match(&existing, &repo_url) {
-                anyhow::bail!(
-                    "configured models repo ({repo_url}) differs from on-disk repo ({existing}) at {}; \
-                     run 'litmus update-rules' or set LITMUS_MODELS_REPO/LITMUS_MODELS_DIR explicitly",
-                    data_dir.display()
-                );
-            }
-        }
+    if is_git_repo(&data_dir)
+        && let Some(existing) = current_remote_url(&data_dir)
+        && !urls_match(&existing, &repo_url)
+    {
+        anyhow::bail!(
+            "configured models repo ({repo_url}) differs from on-disk repo ({existing}) at {}; \
+             run 'litmus update-rules' or set LITMUS_MODELS_REPO/LITMUS_MODELS_DIR explicitly",
+            data_dir.display()
+        );
     }
 
     if has_models(&data_dir) {
         tracing::debug!("Using models from {}", data_dir.display());
-        if let Some(days) = days_since_last_commit(&data_dir) {
-            if days > STALENESS_DAYS {
-                eprintln!(
-                    "Note: Models last updated {days} days ago. Run 'litmus update-rules' to refresh."
-                );
-            }
+        if let Some(days) = days_since_last_commit(&data_dir)
+            && days > STALENESS_DAYS
+        {
+            eprintln!(
+                "Note: Models last updated {days} days ago. Run 'litmus update-rules' to refresh."
+            );
         }
         return Ok(data_dir);
     }
@@ -197,12 +196,11 @@ pub fn update() -> Result<Option<String>> {
                 &format!("{before_str}..{after}"),
             ],
             git_cmd::NETWORK_TIMEOUT,
-        ) {
-            if diff.status.success() {
-                let summary = String::from_utf8_lossy(&diff.stdout);
-                if !summary.is_empty() {
-                    eprint!("{summary}");
-                }
+        ) && diff.status.success()
+        {
+            let summary = String::from_utf8_lossy(&diff.stdout);
+            if !summary.is_empty() {
+                eprint!("{summary}");
             }
         }
     }

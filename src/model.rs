@@ -693,7 +693,7 @@ impl OnnxBackend {
 enum InnerModel {
     Xgboost(xgboost_ars::Model),
     Lightgbm(lightgbm_ars::Model),
-    Onnx(OnnxBackend),
+    Onnx(Box<OnnxBackend>),
 }
 
 impl InnerModel {
@@ -1516,7 +1516,7 @@ fn load_inner_model(path: &Path) -> Result<InnerModel> {
         }
         "onnx" => {
             let m = OnnxBackend::load(path)?;
-            Ok(InnerModel::Onnx(m))
+            Ok(InnerModel::Onnx(Box::new(m)))
         }
         other => anyhow::bail!(
             "unrecognized model extension {other:?} for {}; expected .onnx, .txt (LightGBM), or .json (XGBoost)",
@@ -2189,22 +2189,22 @@ impl Model {
 
         // Optional filegroup specialist, looked up via the configured
         // filetype → filegroup map.
-        if let Some(group_name) = self.routes.filetype_to_filegroup.get(file_type) {
-            if let Some(route) = self.routes.filegroups.get(group_name) {
-                if route.spec.total_features() != features.len() {
-                    tracing::debug!(
-                        route = %group_name,
-                        expected = route.spec.total_features(),
-                        got = features.len(),
-                        "skipping routed feature-vector prediction; use predict_for_report for heterogeneous specialists",
-                    );
-                } else {
-                    let prob = route.predict_calibrated(features)?;
-                    if prob > max_prob {
-                        max_prob = prob;
-                    }
-                    classification = max_class(classification, route.thresholds.classify(prob));
+        if let Some(group_name) = self.routes.filetype_to_filegroup.get(file_type)
+            && let Some(route) = self.routes.filegroups.get(group_name)
+        {
+            if route.spec.total_features() != features.len() {
+                tracing::debug!(
+                    route = %group_name,
+                    expected = route.spec.total_features(),
+                    got = features.len(),
+                    "skipping routed feature-vector prediction; use predict_for_report for heterogeneous specialists",
+                );
+            } else {
+                let prob = route.predict_calibrated(features)?;
+                if prob > max_prob {
+                    max_prob = prob;
                 }
+                classification = max_class(classification, route.thresholds.classify(prob));
             }
         }
 

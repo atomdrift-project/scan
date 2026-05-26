@@ -234,10 +234,10 @@ impl LocalFileIndex {
             // caches stay keyed by `FileId`. A disk-only match that isn't in
             // `by_name` is treated as absent (the index is the source of truth
             // for what this worker can analyze locally).
-            if direct.exists() {
-                if let Some(id) = self.file_id_for_path(&direct) {
-                    candidates.push(id);
-                }
+            if direct.exists()
+                && let Some(id) = self.file_id_for_path(&direct)
+            {
+                candidates.push(id);
             }
         }
 
@@ -285,10 +285,10 @@ impl LocalFileIndex {
             disk_candidates.push(self.root.join(requested));
         } else if requested.is_absolute() {
             disk_candidates.push(requested.to_path_buf());
-            if let Ok(resolved) = requested.canonicalize() {
-                if resolved != requested {
-                    disk_candidates.push(resolved);
-                }
+            if let Ok(resolved) = requested.canonicalize()
+                && resolved != requested
+            {
+                disk_candidates.push(resolved);
             }
         }
         let expected_size = u64::try_from(size_bytes).ok();
@@ -300,15 +300,15 @@ impl LocalFileIndex {
             if expected_size.is_some_and(|sz| meta.len() != sz) {
                 continue;
             }
-            if let Ok(digest) = sha256_file(candidate) {
-                if digest == expected {
-                    tracing::info!(
-                        sha256,
-                        path = %candidate.display(),
-                        "resolved file outside index by sha256 verification",
-                    );
-                    return Ok(Some(candidate.clone()));
-                }
+            if let Ok(digest) = sha256_file(candidate)
+                && digest == expected
+            {
+                tracing::info!(
+                    sha256,
+                    path = %candidate.display(),
+                    "resolved file outside index by sha256 verification",
+                );
+                return Ok(Some(candidate.clone()));
             }
         }
 
@@ -353,16 +353,15 @@ impl LocalFileIndex {
         let modified = metadata.modified().ok();
         let size = metadata.len();
 
-        if let Some(slot) = self.hash_cache.get(file_id as usize) {
-            if let Some(cached) = slot.get() {
-                if cached.size == size && cached.modified == modified {
-                    return Ok(&cached.sha256 == expected);
-                }
-                // Stale entry — `OnceLock` is write-once, so the next hash
-                // lookup for this file pays for a re-hash but no insert. In
-                // practice files under `--data` don't rewrite, so this is
-                // almost never taken.
-            }
+        // Stale entries (size/modified mismatch) fall through to re-hash.
+        // `OnceLock` is write-once, so the re-hash pays no insert cost; in
+        // practice files under `--data` don't rewrite, so this is rare.
+        if let Some(slot) = self.hash_cache.get(file_id as usize)
+            && let Some(cached) = slot.get()
+            && cached.size == size
+            && cached.modified == modified
+        {
+            return Ok(&cached.sha256 == expected);
         }
 
         let digest = sha256_file(&entry.path)?;
@@ -944,31 +943,31 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             last_summary = Instant::now();
         }
 
-        if let Some(max) = max_jobs {
-            if completed.load(Ordering::Acquire) >= max {
-                tracing::info!(max_jobs = max, "job limit reached, draining in-flight work");
-                break;
-            }
+        if let Some(max) = max_jobs
+            && completed.load(Ordering::Acquire) >= max
+        {
+            tracing::info!(max_jobs = max, "job limit reached, draining in-flight work");
+            break;
         }
 
         // Enforce memory limit before claiming more work.
         if max_rss_gb > 0 {
             let max_bytes = max_rss_gb.saturating_mul(1024 * 1024 * 1024);
-            if let Some(rss) = cleave::memory_tracker::current_rss() {
-                if rss > max_bytes {
-                    tracing::warn!(
-                        rss_mb = rss / 1024 / 1024,
-                        max_rss_mb = max_bytes / 1024 / 1024,
-                        "memory pressure: pausing before claiming new work",
-                    );
-                    if let Err(e) =
-                        tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
-                    {
-                        tracing::warn!(error = %e, "cache-clear task failed");
-                    }
-                    interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
-                    continue;
+            if let Some(rss) = cleave::memory_tracker::current_rss()
+                && rss > max_bytes
+            {
+                tracing::warn!(
+                    rss_mb = rss / 1024 / 1024,
+                    max_rss_mb = max_bytes / 1024 / 1024,
+                    "memory pressure: pausing before claiming new work",
+                );
+                if let Err(e) =
+                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
+                {
+                    tracing::warn!(error = %e, "cache-clear task failed");
                 }
+                interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
+                continue;
             }
         }
 
@@ -1102,28 +1101,28 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
         if max_rss_gb > 0 {
             let max_bytes = max_rss_gb.saturating_mul(1024 * 1024 * 1024);
-            if let Some(rss) = cleave::memory_tracker::current_rss() {
-                if rss > max_bytes {
-                    tracing::warn!(
-                        rss_mb = rss / 1024 / 1024,
-                        max_rss_mb = max_bytes / 1024 / 1024,
-                        "memory pressure before dispatch: clearing caches and pausing",
-                    );
-                    drop(permit);
-                    if let Err(e) =
-                        tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
-                    {
-                        tracing::warn!(error = %e, "cache-clear task failed");
-                    }
-                    interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
-                    // Put the job back at the front of the buffer.
-                    buffer_bytes += pj
-                        .data
-                        .as_ref()
-                        .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
-                    buffer.push_front(pj);
-                    continue;
+            if let Some(rss) = cleave::memory_tracker::current_rss()
+                && rss > max_bytes
+            {
+                tracing::warn!(
+                    rss_mb = rss / 1024 / 1024,
+                    max_rss_mb = max_bytes / 1024 / 1024,
+                    "memory pressure before dispatch: clearing caches and pausing",
+                );
+                drop(permit);
+                if let Err(e) =
+                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
+                {
+                    tracing::warn!(error = %e, "cache-clear task failed");
                 }
+                interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
+                // Put the job back at the front of the buffer.
+                buffer_bytes += pj
+                    .data
+                    .as_ref()
+                    .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
+                buffer.push_front(pj);
+                continue;
             }
         }
 

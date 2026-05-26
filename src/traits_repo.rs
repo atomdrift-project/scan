@@ -17,18 +17,21 @@ use std::path::{Path, PathBuf};
 /// an auto-clone during resource initialization.
 ///
 /// This protects first-run litmus startup from a common race/failure mode:
-/// cleave sees no explicit `CLEAVE_TRAITS_DIR`, tries to clone into its default
-/// data directory, and git fails because that directory already exists and is
+/// cleave sees no explicit traits dir, tries to clone into its default data
+/// directory, and git fails because that directory already exists and is
 /// non-empty from a prior cleave/litmus invocation.
 pub fn prepare_runtime_env() {
-    if let Some(value) = std::env::var_os("CLEAVE_TRAITS_DIR") {
-        if !value.is_empty() {
-            return;
-        }
+    if cleave::traits_repo::override_dir().is_some() {
+        return;
+    }
+    if let Some(value) = std::env::var_os("CLEAVE_TRAITS_DIR")
+        && !value.is_empty()
+    {
+        return;
     }
     if let Some(path) = existing_traits_dir() {
         tracing::debug!(path = %path.display(), "using existing cleave traits directory");
-        std::env::set_var("CLEAVE_TRAITS_DIR", path);
+        cleave::traits_repo::set_override_dir(Some(path));
     }
 }
 
@@ -114,12 +117,11 @@ pub fn update(force: bool) -> Result<()> {
                 &format!("{before_str}..{after}"),
             ],
             git_cmd::NETWORK_TIMEOUT,
-        ) {
-            if diff.status.success() {
-                let summary = String::from_utf8_lossy(&diff.stdout);
-                if !summary.is_empty() {
-                    eprint!("{summary}");
-                }
+        ) && diff.status.success()
+        {
+            let summary = String::from_utf8_lossy(&diff.stdout);
+            if !summary.is_empty() {
+                eprint!("{summary}");
             }
         }
     }

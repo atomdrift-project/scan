@@ -22,7 +22,7 @@ pub fn run(config: &ScanConfig) -> Result<()> {
 
     // Keep model validation aligned with `cleave validate`: no YARA/radare2/UPX,
     // one mapper shared by all target analyses, and the same benign corpus.
-    std::env::set_var("CLEAVE_SKIP_CACHE", "1");
+    cleave::cache::set_skip_cache_override(Some(true));
     let options = cleave::AnalysisOptions {
         disable_yara: true,
         disable_radare2: true,
