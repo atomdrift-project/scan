@@ -3426,14 +3426,9 @@ fn collect_file_symbols(summary: &FileSummary) -> HashSet<String> {
         }
     }
 
-    // Filefacts AST symbol kinds: Call (ff.ct) and Member (ff.mc). Each
-    // is a plain string in cleave's compact serialization, so the
-    // candidate-extraction is trivial. The collimator side gates the
-    // *vocab build* behind `COLLIMATOR_FILEFACTS_AST_SYMBOLS=1`; here we
-    // emit unconditionally — only tokens present in the trained
-    // `symbol_vocab` survive the FeatureWriter lookup. Specs that didn't
-    // train with the gate on simply won't have these tokens in vocab,
-    // so the emit no-ops.
+    // Filefacts AST symbol kinds: Call (ff.ct) and Member (ff.mc).
+    // Older cleave reports don't carry these keys; the iterator is then
+    // empty and the loop is a no-op.
     for raw in summary
         .raw_call_targets
         .iter()
