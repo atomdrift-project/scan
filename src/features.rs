@@ -1683,6 +1683,14 @@ struct FileSummary {
     raw_exports: Vec<serde_json::Value>,
     /// Cleave function names (`ff.fn`) — second source for `symbol:`.
     raw_functions: Vec<serde_json::Value>,
+    /// Filefacts call targets (`ff.ct`) — dotted call paths
+    /// (`Symbol::Call.target`). Sourced from cleave's v5 compact AST
+    /// emission; flows into `symbol:` when the spec's symbol_vocab
+    /// contains the token.
+    raw_call_targets: Vec<serde_json::Value>,
+    /// Filefacts member chains (`ff.mc`) — dotted access chains
+    /// (`Symbol::Member.path`). Same flow as call targets.
+    raw_member_chains: Vec<serde_json::Value>,
     /// (finding_id, confidence, crit_ordinal) for cross-file unique ID dedup.
     raw_findings: Vec<serde_json::Value>,
     /// Whether the "is" key exists in the cleave JSON (even if empty).
@@ -1730,8 +1738,14 @@ impl FileSummary {
             .collect();
         unique_3level_paths.sort();
 
-        let metrics: HashMap<String, HashMap<String, f64>> = file_entry
-            .get("ms")
+        // Resolve metrics: prefer v5 `ff.m`, fall back to v4 top-level `ms`.
+        // Matches `file_metrics` in collimator/src/collimator/features.py.
+        let metrics_source = file_entry
+            .get("ff")
+            .and_then(|f| f.get("m"))
+            .filter(|v| v.is_object())
+            .or_else(|| file_entry.get("ms"));
+        let metrics: HashMap<String, HashMap<String, f64>> = metrics_source
             .and_then(|v| v.as_object())
             .map(|obj| {
                 obj.iter()
@@ -1759,9 +1773,13 @@ impl FileSummary {
             .copied()
             .unwrap_or(0.0);
 
-        let imports: HashSet<String> = file_entry
-            .get("is")
+        // Imports — v5 prefers `ff.i`, falls back to v4 `is`.
+        let imports_array = file_entry
+            .get("ff")
+            .and_then(|f| f.get("i"))
             .and_then(|v| v.as_array())
+            .or_else(|| file_entry.get("is").and_then(|v| v.as_array()));
+        let imports: HashSet<String> = imports_array
             .into_iter()
             .flatten()
             .filter_map(|imp| {
@@ -1773,7 +1791,11 @@ impl FileSummary {
 
         let raw_findings: Vec<serde_json::Value> =
             findings_raw.iter().map(|f| (*f).clone()).collect();
-        let has_imports_key = file_entry.get("is").is_some();
+        let has_imports_key = file_entry.get("is").is_some()
+            || file_entry
+                .get("ff")
+                .and_then(|f| f.get("i"))
+                .is_some();
 
         // Cleave v5 facts block `ff` carries `m` (metrics), `v` (flat values),
         // `s` (strings), `i` (imports), `x` (exports), `fn` (function names).
@@ -1819,6 +1841,14 @@ impl FileSummary {
             .get("fn")
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default();
+        let raw_call_targets = facts
+            .get("ct")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let raw_member_chains = facts
+            .get("mc")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
 
         Self {
             path: file_entry["path"].as_str().unwrap_or("").to_string(),
@@ -1838,6 +1868,8 @@ impl FileSummary {
             raw_imports,
             raw_exports,
             raw_functions,
+            raw_call_targets,
+            raw_member_chains,
             raw_findings,
             has_imports_key,
         }
@@ -3278,17 +3310,19 @@ fn char_entropy(value: &str) -> f64 {
 }
 
 /// `_looks_base64ish` — char-class heuristic.
+///
+/// Note: Python's `str.isalnum()` is Unicode-aware (e.g. accented letters,
+/// Cyrillic), so we use `is_alphanumeric()` not `is_ascii_alphanumeric()`.
+/// Using the ASCII-only variant under-counts on non-Latin strings and
+/// produces values smaller than Python's by a few thousandths.
 fn looks_base64ish(value: &str) -> bool {
-    if value.len() < 16 {
-        return false;
-    }
     let len = value.chars().count();
     if len < 16 {
         return false;
     }
     let approved = value
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-'))
+        .filter(|c| c.is_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-'))
         .count();
     let has_b64_punct = value.chars().any(|c| matches!(c, '+' | '/' | '='));
     (approved as f64) / (len.max(1) as f64) > 0.92 && has_b64_punct
@@ -3387,6 +3421,26 @@ fn collect_file_symbols(summary: &FileSummary) -> HashSet<String> {
             String::new()
         };
         let sym = normalize_vocab_token(&candidate, 96);
+        if !sym.is_empty() {
+            insert_if_long(&mut out, sym);
+        }
+    }
+
+    // Filefacts AST symbol kinds: Call (ff.ct) and Member (ff.mc). Each
+    // is a plain string in cleave's compact serialization, so the
+    // candidate-extraction is trivial. The collimator side gates the
+    // *vocab build* behind `COLLIMATOR_FILEFACTS_AST_SYMBOLS=1`; here we
+    // emit unconditionally — only tokens present in the trained
+    // `symbol_vocab` survive the FeatureWriter lookup. Specs that didn't
+    // train with the gate on simply won't have these tokens in vocab,
+    // so the emit no-ops.
+    for raw in summary
+        .raw_call_targets
+        .iter()
+        .chain(summary.raw_member_chains.iter())
+    {
+        let candidate = raw.as_str().unwrap_or("");
+        let sym = normalize_vocab_token(candidate, 96);
         if !sym.is_empty() {
             insert_if_long(&mut out, sym);
         }
@@ -3716,6 +3770,48 @@ mod tests {
         assert_eq!(crit_ordinal(&serde_json::json!({"l":5})), 5);
         assert_eq!(crit_ordinal(&serde_json::json!({"l":0})), 0);
         assert_eq!(crit_ordinal(&serde_json::json!({})), 0);
+    }
+
+    /// `collect_file_symbols` reads imports/exports/functions PLUS the
+    /// filefacts AST symbol kinds (`ff.ct` = call targets,
+    /// `ff.mc` = member chains). Tokens shorter than 2 chars are dropped to
+    /// match collimator's `_file_symbols` threshold.
+    #[test]
+    fn collect_file_symbols_picks_up_ff_ct_and_mc() {
+        let file = serde_json::json!({
+            "path": "lib.rs",
+            "type": "rust",
+            "sz": 1024,
+            "ff": {
+                "i": [["libc", "open"], ["libc", "x"]],   // "x" too short, skipped
+                "ct": ["client.get", "attempt.url().origin", "a"],
+                "mc": ["window.localStorage", "process.env.PATH"],
+                "x": [["exported_fn"]],
+                "fn": [["render"], ["x"]]                 // "x" too short, skipped
+            }
+        });
+        let summary = FileSummary::new(&file);
+        let syms = collect_file_symbols(&summary);
+
+        for expected in [
+            "open",                                       // import
+            "libc!open",                                  // composite import
+            "exported_fn",                                // export
+            "render",                                     // function
+            "client.get",                                 // ff.ct
+            "attempt.url().origin",                       // ff.ct
+            "window.localStorage",                        // ff.mc
+            "process.env.PATH",                           // ff.mc
+        ] {
+            assert!(
+                syms.contains(expected),
+                "expected {expected:?} in symbol set, got {syms:?}"
+            );
+        }
+        assert!(
+            !syms.contains("a") && !syms.contains("x"),
+            "1-char symbols should be filtered out"
+        );
     }
 
     #[test]
