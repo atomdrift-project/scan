@@ -65,6 +65,12 @@ pub(crate) fn crit_ordinal(finding: &serde_json::Value) -> u32 {
 
 /// Key metrics extracted from the report's `metrics` object.
 /// Each entry is (group, field, use_log1p).
+///
+/// `use_log1p` matches collimator's choice in `_TEXT_FULL_FIELDS` / `_BATCH1_OVERLAY`
+/// (count/size fields get log1p; ratios/entropies do not). These entries are
+/// always extracted regardless of `metric_vocab` because routes like
+/// filetypes/c and filetypes/go reference them in `feature_names` without
+/// listing them in the dynamic `metric_vocab` array.
 const KEY_METRICS: &[(&str, &str, bool)] = &[
     // Binary structure
     ("binary", "overall_entropy", false),
@@ -75,12 +81,40 @@ const KEY_METRICS: &[(&str, &str, bool)] = &[
     ("binary", "max_complexity", false),
     ("binary", "normalized_string_count", false),
     ("binary", "high_entropy_regions", false),
+    // Binary overlay (collimator `_BATCH1_OVERLAY`).
+    ("binary", "overlay_ratio", false),
+    ("binary", "overlay_entropy", false),
+    ("binary", "overlay_size", true),
+    ("binary", "has_overlay", false),
     // Text analysis
     ("text", "char_entropy", false),
     ("text", "unique_chars", true),
     ("text", "whitespace_ratio", false),
     ("text", "most_common_ratio", false),
     ("text", "total_lines", true),
+    // Text full-shape fields (collimator `_TEXT_FULL_FIELDS`).
+    ("text", "non_ascii_ratio", false),
+    ("text", "non_printable_ratio", false),
+    ("text", "null_byte_count", true),
+    ("text", "high_byte_ratio", false),
+    ("text", "avg_line_length", true),
+    ("text", "max_line_length", true),
+    ("text", "line_length_stddev", true),
+    ("text", "last_line_length", true),
+    ("text", "empty_line_ratio", false),
+    ("text", "tab_count", true),
+    ("text", "space_count", true),
+    ("text", "trailing_whitespace_lines", true),
+    ("text", "unusual_whitespace", true),
+    ("text", "max_inline_whitespace_run", true),
+    ("text", "unicode_escape_count", true),
+    ("text", "octal_escape_count", true),
+    ("text", "escape_density", false),
+    ("text", "invisible_chars", true),
+    ("text", "long_token_count", true),
+    ("text", "repeated_char_sequences", true),
+    ("text", "digit_ratio", false),
+    ("text", "mixed_indent", false),
     // String analysis
     ("strings", "avg_entropy", false),
     // PE-specific
@@ -111,6 +145,10 @@ pub struct FeatureSpec {
     mbc_trigram_vocab: Vec<String>,
     tiered_bigram_vocab: Vec<String>,
     tiered_trigram_vocab: Vec<String>,
+    kv_vocab: Vec<String>,
+    symbol_vocab: Vec<String>,
+    symbol_bigram_vocab: Vec<String>,
+    symbol_trigram_vocab: Vec<String>,
     feature_names: Vec<String>,
     total_features: usize,
     feature_means: Option<Vec<f32>>,
@@ -160,6 +198,14 @@ struct RawFeatureSpec {
     tiered_bigram_vocab: Vec<String>,
     #[serde(default)]
     tiered_trigram_vocab: Vec<String>,
+    #[serde(default)]
+    kv_vocab: Vec<String>,
+    #[serde(default)]
+    symbol_vocab: Vec<String>,
+    #[serde(default)]
+    symbol_bigram_vocab: Vec<String>,
+    #[serde(default)]
+    symbol_trigram_vocab: Vec<String>,
     #[serde(default)]
     feature_names: Vec<String>,
     #[serde(default)]
@@ -220,6 +266,10 @@ impl FeatureSpec {
             mbc_trigram_vocab: raw.mbc_trigram_vocab,
             tiered_bigram_vocab: raw.tiered_bigram_vocab,
             tiered_trigram_vocab: raw.tiered_trigram_vocab,
+            kv_vocab: raw.kv_vocab,
+            symbol_vocab: raw.symbol_vocab,
+            symbol_bigram_vocab: raw.symbol_bigram_vocab,
+            symbol_trigram_vocab: raw.symbol_trigram_vocab,
             feature_names: raw.feature_names,
             total_features: raw.total_features,
             feature_means: raw.feature_means,
@@ -325,6 +375,10 @@ impl FeatureSpec {
             &self.mbc_trigram_vocab,
             &self.tiered_bigram_vocab,
             &self.tiered_trigram_vocab,
+            &self.kv_vocab,
+            &self.symbol_vocab,
+            &self.symbol_bigram_vocab,
+            &self.symbol_trigram_vocab,
         );
         if self.feature_names != expected_feature_names {
             // The spec is allowed to be a SUBSET of what this extractor knows
@@ -514,6 +568,10 @@ fn build_expected_feature_names(
     mbc_trigram_vocab: &[String],
     tiered_bigram_vocab: &[String],
     tiered_trigram_vocab: &[String],
+    kv_vocab: &[String],
+    symbol_vocab: &[String],
+    symbol_bigram_vocab: &[String],
+    symbol_trigram_vocab: &[String],
 ) -> Vec<String> {
     let mut feature_names = Vec::with_capacity(20000); // overestimate to avoid reallocs
 
@@ -796,8 +854,60 @@ fn build_expected_feature_names(
         }
     }
 
+    // Additional aggregate-level co-occurrence counts. Only present in some
+    // route specs (e.g. filetypes/makefile) — registered here so they don't
+    // surface as "unknown to this extractor".
+    feature_names.push("agg:suspicious_bigram_count".to_string());
+    feature_names.push("agg:suspicious_trigram_count".to_string());
+
+    // Cross-metric derived ratios. Computed from binary metric fields in
+    // write_derived_metric_features.
+    feature_names.push("metrics:derived_string_per_function".to_string());
+    feature_names.push("metrics:derived_imports_per_dependency".to_string());
+    feature_names.push("metrics:derived_wide_string_ratio".to_string());
+
+    // Optional silent-packer-signal struct feature.
+    feature_names.push("struct:silent_packer_signal".to_string());
+
+    // Group 24: textenc — 12 fixed ratios over file_strings.
+    for name in TEXTENC_FEATURE_NAMES {
+        feature_names.push(format!("textenc:{name}"));
+    }
+
+    // Group 25: kv vocab — sparse one-hot tokens from cleave metrics+values.
+    for kv in kv_vocab {
+        feature_names.push(format!("kv:{kv}"));
+    }
+
+    // Group 26: symbol vocab — normalized imports/exports/functions.
+    for sym in symbol_vocab {
+        feature_names.push(format!("symbol:{sym}"));
+    }
+    for sb in symbol_bigram_vocab {
+        feature_names.push(format!("symbol_bi:{sb}"));
+    }
+    for st in symbol_trigram_vocab {
+        feature_names.push(format!("symbol_tri:{st}"));
+    }
+
     feature_names
 }
+
+/// Fixed textenc feature names; matches collimator's `_apply_text_encoding_features`.
+const TEXTENC_FEATURE_NAMES: &[&str] = &[
+    "string_count_log",
+    "avg_len_log",
+    "max_len_log",
+    "base64ish_ratio",
+    "hexish_ratio",
+    "urlish_ratio",
+    "pathish_ratio",
+    "unicode_escape_ratio",
+    "wide_ratio",
+    "high_entropy_ratio",
+    "long_token_ratio",
+    "short_junk_ratio",
+];
 
 /// Pre-built lookup tables for fast repeated extraction against a spec.
 #[derive(Debug)]
@@ -823,6 +933,14 @@ pub struct ExtractContext {
     n_mbc_trigram: usize,
     n_tiered_bigram: usize,
     n_tiered_trigram: usize,
+    n_kv: usize,
+    n_symbol: usize,
+    n_symbol_bi: usize,
+    n_symbol_tri: usize,
+    n_textenc: usize,
+    n_derived_metrics: usize,
+    n_silent_packer: usize,
+    n_extra_agg: usize,
     /// Global feature name → index lookup for vocab-based features.
     absolute_lookup: HashMap<String, usize>,
     ghost_vocab: Vec<String>,
@@ -905,6 +1023,49 @@ impl ExtractContext {
             n_mbc_trigram: spec.mbc_trigram_vocab.len(),
             n_tiered_bigram: spec.tiered_bigram_vocab.len(),
             n_tiered_trigram: spec.tiered_trigram_vocab.len(),
+            n_kv: spec
+                .feature_names
+                .iter()
+                .filter(|n| n.starts_with("kv:"))
+                .count(),
+            n_symbol: spec
+                .feature_names
+                .iter()
+                .filter(|n| n.starts_with("symbol:"))
+                .count(),
+            n_symbol_bi: spec
+                .feature_names
+                .iter()
+                .filter(|n| n.starts_with("symbol_bi:"))
+                .count(),
+            n_symbol_tri: spec
+                .feature_names
+                .iter()
+                .filter(|n| n.starts_with("symbol_tri:"))
+                .count(),
+            n_textenc: spec
+                .feature_names
+                .iter()
+                .filter(|n| n.starts_with("textenc:"))
+                .count(),
+            n_derived_metrics: spec
+                .feature_names
+                .iter()
+                .filter(|n| n.starts_with("metrics:derived_"))
+                .count(),
+            n_silent_packer: spec
+                .feature_names
+                .iter()
+                .filter(|n| n.as_str() == "struct:silent_packer_signal")
+                .count(),
+            n_extra_agg: spec
+                .feature_names
+                .iter()
+                .filter(|n| {
+                    n.as_str() == "agg:suspicious_bigram_count"
+                        || n.as_str() == "agg:suspicious_trigram_count"
+                })
+                .count(),
             absolute_lookup: spec
                 .feature_names
                 .iter()
@@ -1340,6 +1501,51 @@ impl ExtractContext {
             },
         );
 
+        // G24+: extras gated by per-route spec contents.
+        // Sparse one-hot families that resolve through absolute_lookup; the
+        // cursor bookkeeping below tracks how many of these slots actually
+        // exist in this spec so the final offset matches total_features.
+        let mut tail_writer = FeatureWriter {
+            vec,
+            lookup: &self.absolute_lookup,
+        };
+
+        if self.n_extra_agg > 0 {
+            offsets.take(self.n_extra_agg);
+            write_suspicious_ngram_counts(&combined, &mut tail_writer);
+        }
+        if self.n_derived_metrics > 0 {
+            offsets.take(self.n_derived_metrics);
+            write_derived_metric_features(&merged_metrics, &mut tail_writer);
+        }
+        if self.n_silent_packer > 0 {
+            offsets.take(self.n_silent_packer);
+            write_silent_packer_signal(
+                &summaries,
+                combined.filtered_finding_count,
+                &mut tail_writer,
+            );
+        }
+        if self.n_textenc > 0 {
+            offsets.take(self.n_textenc);
+            write_textenc_features(&summaries, &mut tail_writer);
+        }
+        if self.n_kv > 0 {
+            offsets.take(self.n_kv);
+            for s in &summaries {
+                write_kv_features(s, &mut tail_writer);
+            }
+        }
+        if self.n_symbol > 0 || self.n_symbol_bi > 0 || self.n_symbol_tri > 0 {
+            offsets.take(self.n_symbol + self.n_symbol_bi + self.n_symbol_tri);
+            write_symbol_features(
+                &summaries,
+                &mut tail_writer,
+                self.n_symbol_bi > 0,
+                self.n_symbol_tri > 0,
+            );
+        }
+
         debug_assert_eq!(offsets.offset, self.total_features);
     }
 
@@ -1460,10 +1666,23 @@ struct FileSummary {
     mtime: Option<f64>,
     overall_entropy: f64,
     metrics: HashMap<String, HashMap<String, f64>>,
+    /// Full raw cleave metrics JSON (preserves strings, lists, dicts that
+    /// the numeric `metrics` map drops). Used by kv: token extraction.
+    raw_metrics: serde_json::Value,
+    /// Flat structural values from `ff.v` or `k` (kv: source for v.* paths).
+    raw_values: serde_json::Value,
+    /// String tuples from `ff.s` or `ss` (textenc source).
+    raw_strings: Vec<serde_json::Value>,
     findings: FindingSummary,
     risk: FileRiskStats,
     unique_3level_paths: Vec<String>,
     imports: HashSet<String>,
+    /// Cleave imports array (preserves [lib, name, ...] tuples for symbol port).
+    raw_imports: Vec<serde_json::Value>,
+    /// Cleave exports (`ff.x`) — list of export entries; one source for `symbol:`.
+    raw_exports: Vec<serde_json::Value>,
+    /// Cleave function names (`ff.fn`) — second source for `symbol:`.
+    raw_functions: Vec<serde_json::Value>,
     /// (finding_id, confidence, crit_ordinal) for cross-file unique ID dedup.
     raw_findings: Vec<serde_json::Value>,
     /// Whether the "is" key exists in the cleave JSON (even if empty).
@@ -1556,6 +1775,51 @@ impl FileSummary {
             findings_raw.iter().map(|f| (*f).clone()).collect();
         let has_imports_key = file_entry.get("is").is_some();
 
+        // Cleave v5 facts block `ff` carries `m` (metrics), `v` (flat values),
+        // `s` (strings), `i` (imports), `x` (exports), `fn` (function names).
+        // v4 reports stash these at top-level keys: `ms`, `k`, `ss`, `is`.
+        // Mirror the resolution order Python uses (collimator/features.py
+        // file_metrics/file_values/file_strings/file_imports).
+        let facts = file_entry.get("ff").cloned().unwrap_or(serde_json::Value::Null);
+        let raw_metrics = facts
+            .get("m")
+            .filter(|v| v.is_object())
+            .cloned()
+            .or_else(|| file_entry.get("ms").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let raw_values = facts
+            .get("v")
+            .filter(|v| v.is_object())
+            .cloned()
+            .or_else(|| file_entry.get("k").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let raw_strings = facts
+            .get("s")
+            .and_then(|v| v.as_array().cloned())
+            .or_else(|| {
+                file_entry
+                    .get("ss")
+                    .and_then(|v| v.as_array().cloned())
+            })
+            .unwrap_or_default();
+        let raw_imports = facts
+            .get("i")
+            .and_then(|v| v.as_array().cloned())
+            .or_else(|| {
+                file_entry
+                    .get("is")
+                    .and_then(|v| v.as_array().cloned())
+            })
+            .unwrap_or_default();
+        let raw_exports = facts
+            .get("x")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let raw_functions = facts
+            .get("fn")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+
         Self {
             path: file_entry["path"].as_str().unwrap_or("").to_string(),
             parent: file_entry["p"].as_str().unwrap_or("").to_string(),
@@ -1564,10 +1828,16 @@ impl FileSummary {
             mtime: file_entry["mt"].as_str().and_then(parse_iso8601),
             overall_entropy,
             metrics,
+            raw_metrics,
+            raw_values,
+            raw_strings,
             findings,
             risk,
             unique_3level_paths,
             imports,
+            raw_imports,
+            raw_exports,
+            raw_functions,
             raw_findings,
             has_imports_key,
         }
@@ -2949,6 +3219,464 @@ impl<'a> Iterator for FindingPaths<'a> {
     }
 }
 
+// ============================================================================
+// kv: / symbol: / textenc: / derived metric helpers — ported from
+// collimator/src/collimator/features.py. Each helper mirrors the Python
+// behavior exactly so the feature vectors stay bit-identical with the
+// training-time extraction.
+// ============================================================================
+
+/// Normalize a value to a bounded vocab token (collapse whitespace, truncate).
+/// Mirrors `_normalize_vocab_token` in collimator.
+fn normalize_vocab_token(value: &str, max_len: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Collapse runs of whitespace to single spaces ("a   b\nc" → "a b c").
+    let mut out = String::with_capacity(trimmed.len());
+    let mut prev_ws = false;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    if out.chars().count() > max_len {
+        out = out.chars().take(max_len).collect();
+    }
+    out
+}
+
+/// Shannon entropy over characters. Matches `_char_entropy`.
+fn char_entropy(value: &str) -> f64 {
+    if value.is_empty() {
+        return 0.0;
+    }
+    let mut counts: HashMap<char, u32> = HashMap::new();
+    let mut n = 0u32;
+    for ch in value.chars() {
+        *counts.entry(ch).or_insert(0) += 1;
+        n += 1;
+    }
+    let n_f = f64::from(n);
+    counts
+        .values()
+        .map(|&c| {
+            let p = f64::from(c) / n_f;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// `_looks_base64ish` — char-class heuristic.
+fn looks_base64ish(value: &str) -> bool {
+    if value.len() < 16 {
+        return false;
+    }
+    let len = value.chars().count();
+    if len < 16 {
+        return false;
+    }
+    let approved = value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-'))
+        .count();
+    let has_b64_punct = value.chars().any(|c| matches!(c, '+' | '/' | '='));
+    (approved as f64) / (len.max(1) as f64) > 0.92 && has_b64_punct
+}
+
+/// `_looks_hexish` — fraction of hex digits after whitespace strip.
+fn looks_hexish(value: &str) -> bool {
+    let compact: String = value.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    let len = compact.chars().count();
+    if len < 16 {
+        return false;
+    }
+    let hex = compact
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .count();
+    (hex as f64) / (len as f64) > 0.95
+}
+
+/// Extract one string entry: `(value, is_wide)`. Matches `_string_values`.
+/// A cleave string row looks like `[offset, ..., "value"]` or
+/// `[offset, "wide", "value"]`; we pull the last element as value and check
+/// any non-first / non-last element for a wide-encoding marker.
+fn extract_string_entry(item: &serde_json::Value) -> Option<(String, bool)> {
+    let arr = item.as_array()?;
+    if arr.len() < 2 {
+        return None;
+    }
+    let value = arr.last()?.as_str()?.to_string();
+    if value.is_empty() {
+        return None;
+    }
+    let is_wide = arr[1..arr.len().saturating_sub(1)].iter().any(|part| {
+        part.as_str()
+            .map(|s| matches!(s.to_lowercase().as_str(), "wide" | "u16" | "utf16le" | "utf-16le"))
+            .unwrap_or(false)
+    });
+    Some((value, is_wide))
+}
+
+/// Collect normalized import + export + function symbols for a file.
+/// Mirrors `_file_symbols` in collimator: imports may be `[lib, name]`
+/// tuples (we record both the bare name and the `lib!name` form), dicts
+/// with `n`/`name`/`symbol`, or plain strings. Exports (`ff.x`) and
+/// function names (`ff.fn`) contribute their first tuple element.
+fn collect_file_symbols(summary: &FileSummary) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let insert_if_long = |out: &mut HashSet<String>, token: String| {
+        if token.chars().count() >= 2 {
+            out.insert(token);
+        }
+    };
+
+    for raw in &summary.raw_imports {
+        let mut composite: Option<String> = None;
+        if let Some(arr) = raw.as_array() {
+            let lib = arr.first().and_then(|v| v.as_str()).unwrap_or("");
+            let name = arr.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let name_sym = normalize_vocab_token(name, 96);
+            if !name_sym.is_empty() {
+                insert_if_long(&mut out, name_sym);
+            }
+            composite = match (lib.is_empty(), name.is_empty()) {
+                (false, false) => Some(format!("{lib}!{name}")),
+                (true, false) => Some(name.to_string()),
+                (false, true) => Some(lib.to_string()),
+                _ => None,
+            };
+        }
+        let raw_str = if let Some(s) = composite {
+            s
+        } else if let Some(s) = raw.as_str() {
+            s.to_string()
+        } else if let Some(obj) = raw.as_object() {
+            obj.get("n")
+                .or_else(|| obj.get("name"))
+                .or_else(|| obj.get("symbol"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
+        let sym = normalize_vocab_token(&raw_str, 96);
+        if !sym.is_empty() {
+            insert_if_long(&mut out, sym);
+        }
+    }
+
+    for raw in summary.raw_exports.iter().chain(summary.raw_functions.iter()) {
+        let candidate = if let Some(arr) = raw.as_array() {
+            arr.first().and_then(|v| v.as_str()).unwrap_or("").to_string()
+        } else if let Some(s) = raw.as_str() {
+            s.to_string()
+        } else {
+            String::new()
+        };
+        let sym = normalize_vocab_token(&candidate, 96);
+        if !sym.is_empty() {
+            insert_if_long(&mut out, sym);
+        }
+    }
+
+    out
+}
+
+/// Per-file caps from collimator (`_SYMBOL_BIGRAM_CAP`/`_SYMBOL_TRIGRAM_CAP`).
+const SYMBOL_BIGRAM_CAP: usize = 64;
+const SYMBOL_TRIGRAM_CAP: usize = 24;
+
+/// Emit sparse kv:* tokens for one file. Mirrors `_metric_kv_tokens`.
+///
+/// `include_shape` and `split_string_values` are gated by collimator's
+/// `FeatureConfig.include_kv_shape_features` / `include_kv_value_split`
+/// env knobs; runtime models keep both off by default, so we set them
+/// to `false`. Models that need shape/split features were trained with
+/// extra vocab entries that won't appear here — they extract as zeros
+/// (acceptable graceful degradation; matches existing policy).
+fn write_kv_features(summary: &FileSummary, w: &mut FeatureWriter<'_>) {
+    if let Some(obj) = summary.raw_metrics.as_object() {
+        for (group, fields) in obj {
+            let Some(field_map) = fields.as_object() else {
+                continue;
+            };
+            for (key, value) in field_map {
+                let base = format!("{group}.{key}");
+                emit_kv_value_tokens(&base, value, w);
+            }
+        }
+    }
+    if let Some(obj) = summary.raw_values.as_object() {
+        for (path, value) in obj {
+            let base = format!("v.{path}");
+            emit_kv_value_tokens(&base, value, w);
+        }
+    }
+}
+
+fn emit_kv_value_tokens(base: &str, value: &serde_json::Value, w: &mut FeatureWriter<'_>) {
+    // bool: emit "<base>=true|false". Numeric values are never directly
+    // tokenized — only their bucket form is, which is gated by shape mode
+    // (off by default), so we skip them entirely here.
+    match value {
+        serde_json::Value::Bool(b) => {
+            w.set(&format!("kv:{base}={}", if *b { "true" } else { "false" }), 1.0);
+        }
+        serde_json::Value::String(s) => {
+            let val = normalize_vocab_token(s, 80);
+            if !val.is_empty() {
+                w.set(&format!("kv:{base}={val}"), 1.0);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            // Python emits `<base>:item=<value>` for the first 32 items when
+            // shape mode is on. Shape mode is off in production, so skip.
+            // We still descend into nested objects below for the dict case.
+            let _ = items;
+        }
+        serde_json::Value::Object(map) => {
+            // Same: nested-dict tokens are shape-mode only.
+            let _ = map;
+        }
+        _ => {}
+    }
+}
+
+/// Emit symbol:*, symbol_bi:*, symbol_tri:* for a set of summaries.
+fn write_symbol_features(
+    summaries: &[FileSummary],
+    w: &mut FeatureWriter<'_>,
+    emit_bigrams: bool,
+    emit_trigrams: bool,
+) {
+    for s in summaries {
+        let symbols = collect_file_symbols(s);
+        for sym in &symbols {
+            w.set(&format!("symbol:{sym}"), 1.0);
+        }
+        if !emit_bigrams && !emit_trigrams {
+            continue;
+        }
+        let mut sorted: Vec<&String> = symbols.iter().collect();
+        sorted.sort();
+        if emit_bigrams {
+            let cap = sorted.len().min(SYMBOL_BIGRAM_CAP);
+            for i in 0..cap {
+                for j in (i + 1)..cap {
+                    w.set(&format!("symbol_bi:{}||{}", sorted[i], sorted[j]), 1.0);
+                }
+            }
+        }
+        if emit_trigrams {
+            let cap = sorted.len().min(SYMBOL_TRIGRAM_CAP);
+            for i in 0..cap {
+                for j in (i + 1)..cap {
+                    for k in (j + 1)..cap {
+                        w.set(
+                            &format!(
+                                "symbol_tri:{}||{}||{}",
+                                sorted[i], sorted[j], sorted[k]
+                            ),
+                            1.0,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Emit textenc:* — 12 fixed ratios over concatenated strings across files.
+/// Mirrors `_apply_text_encoding_features`.
+fn write_textenc_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
+    let mut strings: Vec<(String, bool)> = Vec::new();
+    for s in summaries {
+        for item in &s.raw_strings {
+            if let Some(entry) = extract_string_entry(item) {
+                strings.push(entry);
+            }
+        }
+    }
+    let n = strings.len();
+    if n == 0 {
+        return;
+    }
+
+    let mut sum_len: usize = 0;
+    let mut max_len: usize = 0;
+    let mut base64ish = 0u32;
+    let mut hexish = 0u32;
+    let mut urlish = 0u32;
+    let mut pathish = 0u32;
+    let mut unicode_escape = 0u32;
+    let mut wide_n = 0u32;
+    let mut high_entropy = 0u32;
+    let mut long_token = 0u32;
+    let mut short_junk = 0u32;
+
+    for (value, is_wide) in &strings {
+        let len = value.chars().count();
+        sum_len += len;
+        max_len = max_len.max(len);
+        let lower = value.to_lowercase();
+
+        if looks_base64ish(value) {
+            base64ish += 1;
+        }
+        if looks_hexish(value) {
+            hexish += 1;
+        }
+        if lower.contains("http://")
+            || lower.contains("https://")
+            || lower.contains("://")
+            || lower.contains("%2f")
+        {
+            urlish += 1;
+        }
+        if value.contains('/')
+            || value.contains('\\')
+            || lower.starts_with("c:")
+            || lower.starts_with("./")
+            || lower.starts_with("../")
+        {
+            pathish += 1;
+        }
+        if value.contains("\\x") || value.contains("\\u") || lower.contains("%u") {
+            unicode_escape += 1;
+        }
+        if *is_wide {
+            wide_n += 1;
+        }
+        if len >= 24 && char_entropy(value) >= 4.0 {
+            high_entropy += 1;
+        }
+        if len >= 80 {
+            long_token += 1;
+        }
+        if (4..=8).contains(&len) && char_entropy(value) >= 2.4 {
+            short_junk += 1;
+        }
+    }
+
+    let n_f = n as f64;
+    let denom = n_f.max(1.0);
+    let log1p = |x: f64| x.ln_1p();
+
+    w.set("textenc:string_count_log", log1p(n_f) as f32);
+    w.set("textenc:avg_len_log", log1p(sum_len as f64 / denom) as f32);
+    w.set("textenc:max_len_log", log1p(max_len as f64) as f32);
+    w.set("textenc:base64ish_ratio", (f64::from(base64ish) / denom) as f32);
+    w.set("textenc:hexish_ratio", (f64::from(hexish) / denom) as f32);
+    w.set("textenc:urlish_ratio", (f64::from(urlish) / denom) as f32);
+    w.set("textenc:pathish_ratio", (f64::from(pathish) / denom) as f32);
+    w.set(
+        "textenc:unicode_escape_ratio",
+        (f64::from(unicode_escape) / denom) as f32,
+    );
+    w.set("textenc:wide_ratio", (f64::from(wide_n) / denom) as f32);
+    w.set("textenc:high_entropy_ratio", (f64::from(high_entropy) / denom) as f32);
+    w.set("textenc:long_token_ratio", (f64::from(long_token) / denom) as f32);
+    w.set("textenc:short_junk_ratio", (f64::from(short_junk) / denom) as f32);
+}
+
+/// Cross-metric derived ratios. Mirrors collimator `_BATCH1_RATIOS`.
+fn write_derived_metric_features(
+    merged_metrics: &serde_json::Value,
+    w: &mut FeatureWriter<'_>,
+) {
+    let get = |group: &str, field: &str| -> f64 {
+        merged_metrics
+            .get(group)
+            .and_then(|g| g.get(field))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
+    let ratio = |num: f64, denom: f64| -> f64 {
+        if denom == 0.0 {
+            0.0
+        } else {
+            num / denom
+        }
+    };
+    let string_count = get("binary", "string_count");
+    let function_count = get("binary", "function_count");
+    let import_count = get("binary", "import_count");
+    let dependency_count = get("binary", "dependency_count");
+    let wide_string_count = get("binary", "wide_string_count");
+    w.set(
+        "metrics:derived_string_per_function",
+        ratio(string_count, function_count) as f32,
+    );
+    w.set(
+        "metrics:derived_imports_per_dependency",
+        ratio(import_count, dependency_count) as f32,
+    );
+    w.set(
+        "metrics:derived_wide_string_ratio",
+        ratio(wide_string_count, string_count) as f32,
+    );
+}
+
+/// `struct:silent_packer_signal` — large file size / few findings → packer.
+/// Mirrors collimator's gated computation (Exp 43).
+fn write_silent_packer_signal(
+    summaries: &[FileSummary],
+    filtered_finding_count: u32,
+    w: &mut FeatureWriter<'_>,
+) {
+    let total_size: f64 = summaries.iter().map(|s| s.size_bytes).sum();
+    let size_mb = total_size / (1024.0 * 1024.0);
+    let denom = f64::from(filtered_finding_count + 1);
+    w.set(
+        "struct:silent_packer_signal",
+        (size_mb.ln_1p() / denom) as f32,
+    );
+}
+
+/// Aggregate-level suspicious n-gram co-occurrence counts. Mirrors
+/// collimator's `include_suspicious_trigrams` branch.
+fn write_suspicious_ngram_counts(combined: &FindingSummary, w: &mut FeatureWriter<'_>) {
+    let mut sus_paths: Vec<&String> = combined
+        .sample_paths
+        .iter()
+        .filter(|&(_, &mo)| mo >= 4)
+        .map(|(p, _)| p)
+        .collect();
+    sus_paths.sort();
+    let n = sus_paths.len();
+    let mut n_bi: u64 = 0;
+    let mut n_tri: u64 = 0;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            n_bi += 1;
+            // Python caps the third-element span to 20 to bound O(n^3).
+            let k_end = n.min(j + 20);
+            n_tri += (k_end.saturating_sub(j + 1)) as u64;
+        }
+    }
+    w.set(
+        "agg:suspicious_bigram_count",
+        (n_bi as f64).ln_1p() as f32,
+    );
+    w.set(
+        "agg:suspicious_trigram_count",
+        (n_tri as f64).ln_1p() as f32,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3013,6 +3741,10 @@ mod tests {
             mbc_trigram_vocab: vec![],
             tiered_bigram_vocab: vec![],
             tiered_trigram_vocab: vec![],
+            kv_vocab: vec![],
+            symbol_vocab: vec![],
+            symbol_bigram_vocab: vec![],
+            symbol_trigram_vocab: vec![],
             feature_names: vec![],
             total_features: 3,
             feature_means: Some(vec![0.0, 1.0, 2.0]),
