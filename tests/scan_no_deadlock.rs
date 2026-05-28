@@ -59,7 +59,20 @@ fn scan_cli_completes_under_cold_yara_cache() {
 
     let bin = env!("CARGO_BIN_EXE_litmus");
 
+    // Capture the child's stderr to a FILE, not a pipe. An undrained pipe can
+    // fill its OS buffer (~64KB) and block the child on write — which would
+    // look exactly like the hang we're hunting (a false positive). A file has
+    // no such limit, and lets us dump everything the child logged if it wedges
+    // or exits badly. `--verbose` raises litmus to `litmus=debug,cleave=debug`
+    // (a plain `scan` logs at warn/error and prints almost nothing), so the
+    // capture actually shows how far init/analysis got before stalling.
+    let stderr_file = tempfile::NamedTempFile::new().expect("create stderr capture");
+    let stderr_path = stderr_file.path().to_path_buf();
+    let child_stderr = stderr_file.reopen().expect("reopen stderr capture");
+    let captured = || std::fs::read_to_string(&stderr_path).unwrap_or_default();
+
     let mut child = Command::new(bin)
+        .arg("--verbose")
         .arg("scan")
         .arg(&sample_path)
         // Force the cold-compile code path that used to deadlock. With the
@@ -68,10 +81,9 @@ fn scan_cli_completes_under_cold_yara_cache() {
         // the process hangs.
         .env("CLEAVE_SKIP_YARA_CACHE", "1")
         .env("LITMUS_MODELS_DIR", &models_dir)
-        // Silence scanning output — a regression test cares about exit
-        // status and wall-clock, not which verdicts were printed.
+        .env("RUST_BACKTRACE", "1")
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(child_stderr))
         .spawn()
         .expect("spawn litmus");
 
@@ -84,11 +96,12 @@ fn scan_cli_completes_under_cold_yara_cache() {
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!(
-                        "litmus scan did not exit within {:?} — \
-                         likely YARA-init deadlock (check that every entry \
-                         point calls cleave::prefetch_shared_resources before \
-                         any rayon analysis)",
+                        "litmus scan did not exit within {:?} — process wedged. \
+                         Captured child stderr (litmus=debug,cleave=debug) below; \
+                         if it ends mid-init the last line shows where it stalled.\
+                         \n=== captured child stderr ===\n{}\n=== end captured stderr ===",
                         SCAN_TIMEOUT,
+                        captured(),
                     );
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -102,7 +115,8 @@ fn scan_cli_completes_under_cold_yara_cache() {
         scan_ran_to_completion(code),
         "litmus scan exited with code {code} (expected 0/1/2 — any verdict \
          is fine, we only reject error code 3 or termination by signal); \
-         elapsed {:?}",
+         elapsed {:?}\n=== captured child stderr ===\n{}\n=== end captured stderr ===",
         start.elapsed(),
+        captured(),
     );
 }
