@@ -15,6 +15,11 @@ set -eu
 URL="${1:-}"
 [ -n "$URL" ] || { echo "error: hopper URL required as first argument" >&2; exit 1; }
 
+# Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
+WORKERS="${WORKERS:-}"
+worker_args="worker --url $URL"
+[ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
+
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
@@ -374,7 +379,7 @@ cat > "$manifest_tmp" <<EOF
       </method_environment>
     </method_context>
     <exec_method type="method" name="start"
-                 exec="$LITMUS_BIN worker --url $URL"
+                 exec="$LITMUS_BIN $worker_args"
                  timeout_seconds="0"/>
     <exec_method type="method" name="stop" exec=":kill" timeout_seconds="60"/>
     <property_group name="startd" type="framework">

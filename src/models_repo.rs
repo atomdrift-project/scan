@@ -138,7 +138,7 @@ pub fn model_dir() -> Result<PathBuf> {
 /// Returns the pre-update HEAD commit so the caller can roll back if the new
 /// models turn out to be broken. The returned value is `None` when the repo
 /// was freshly cloned (nothing to roll back to) or when HEAD could not be read.
-pub fn update() -> Result<Option<String>> {
+pub fn update(quiet: bool) -> Result<Option<String>> {
     let base = current_models_dir();
     let (repo_url, ref_name) = configured_repo();
 
@@ -148,10 +148,12 @@ pub fn update() -> Result<Option<String>> {
 
     let before = git_cmd::short_head(&base);
     let effective_ref = resolve_ref(&repo_url, &ref_name)?;
-    eprintln!(
-        "Updating models (ref={display})...",
-        display = display_ref(&effective_ref)
-    );
+    if !quiet {
+        eprintln!(
+            "Updating models (ref={display})...",
+            display = display_ref(&effective_ref)
+        );
+    }
 
     let base_str = base.to_string_lossy();
     let fetch_args: Vec<&str> = if effective_ref.is_empty() {
@@ -183,7 +185,9 @@ pub fn update() -> Result<Option<String>> {
 
     let after = git_cmd::short_head(&base).unwrap_or_default();
     let before_str = before.as_deref().unwrap_or_default();
-    if before_str == after {
+    if quiet {
+        // Background renewal: caller decides what to do with the change.
+    } else if before_str == after {
         eprintln!("Already up to date ({after}).");
     } else {
         eprintln!("Updated: {before_str} -> {after}");

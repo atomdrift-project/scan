@@ -243,7 +243,7 @@ enum Commands {
         name: Option<String>,
 
         /// Number of concurrent analysis slots
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         workers: Option<usize>,
 
         /// Poll interval in seconds when no work is available
@@ -504,12 +504,12 @@ fn main() -> Result<()> {
     if cli.update {
         std::thread::scope(|s| {
             s.spawn(|| {
-                if let Err(e) = litmus::models_repo::update() {
+                if let Err(e) = litmus::models_repo::update(false) {
                     eprintln!("Warning: model update failed: {e}");
                 }
             });
             s.spawn(|| {
-                if let Err(e) = litmus::traits_repo::update(false) {
+                if let Err(e) = litmus::traits_repo::update(false, false) {
                     eprintln!("Warning: traits update failed: {e}");
                 }
             });
@@ -652,7 +652,7 @@ fn main() -> Result<()> {
                 // If the load fails we roll the on-disk repo back to the prior commit
                 // so future invocations (and litmus workers that pull on startup)
                 // see the last-known-good state rather than the broken one.
-                let prev_models_head = match litmus::models_repo::update() {
+                let prev_models_head = match litmus::models_repo::update(false) {
                     Ok(prev) => prev,
                     Err(e) => {
                         eprintln!("Error updating models: {e}");
@@ -678,7 +678,7 @@ fn main() -> Result<()> {
                     }
                 }
                 if !models_only
-                    && let Err(e) = litmus::traits_repo::update(false)
+                    && let Err(e) = litmus::traits_repo::update(false, false)
                 {
                     eprintln!("Error updating traits: {e}");
                     process::exit(1);
@@ -740,12 +740,12 @@ fn main() -> Result<()> {
             // disconnected environment must still start with whatever is on disk.
             std::thread::scope(|s| {
                 s.spawn(|| {
-                    if let Err(e) = litmus::models_repo::update() {
+                    if let Err(e) = litmus::models_repo::update(false) {
                         eprintln!("Warning: model update failed: {e}");
                     }
                 });
                 s.spawn(|| {
-                    if let Err(e) = litmus::traits_repo::update(false) {
+                    if let Err(e) = litmus::traits_repo::update(false, false) {
                         eprintln!("Warning: traits update failed: {e}");
                     }
                 });

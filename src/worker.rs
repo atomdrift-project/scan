@@ -490,22 +490,46 @@ fn validate_and_load_resources(
     load_model_resources(model_dir, thresholds, level)
 }
 
+/// Pull upstream rules and, **only if something actually changed**, re-validate
+/// and reload the model bundle. Returns `Ok(None)` when both repos are already
+/// up to date — a silent no-op so the periodic renewal doesn't flood the log
+/// with a full validation pass every interval.
 fn renew_resources_once(
     model_dir: &Path,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
     level: Option<u8>,
-) -> Result<Arc<ModelResources>> {
-    let prev_models_head = match crate::models_repo::update() {
-        Ok(prev) => prev,
+) -> Result<Option<Arc<ModelResources>>> {
+    let (prev_models_head, models_after, models_changed) = match crate::models_repo::update(true) {
+        Ok(prev) => {
+            let after = crate::models_repo::version();
+            let changed = prev.as_deref() != after.as_deref();
+            (prev, after, changed)
+        }
         Err(error) => {
-            tracing::warn!(error = %error, "model renewal update failed; validating current models");
-            None
+            tracing::warn!(error = %error, "model renewal fetch failed; treating models as unchanged");
+            (None, None, false)
         }
     };
-    if let Err(error) = crate::traits_repo::update(false) {
-        tracing::warn!(error = %error, "traits renewal update failed; validating current traits");
+    let traits_changed = match crate::traits_repo::update(false, true) {
+        Ok(changed) => changed,
+        Err(error) => {
+            tracing::warn!(error = %error, "traits renewal fetch failed; treating traits as unchanged");
+            false
+        }
+    };
+
+    if !models_changed && !traits_changed {
+        return Ok(None);
     }
+
+    tracing::info!(
+        models_changed,
+        traits_changed,
+        models_from = prev_models_head.as_deref().unwrap_or("none"),
+        models_to = models_after.as_deref().unwrap_or("unknown"),
+        "rules changed; revalidating bundle",
+    );
 
     let resources = match validate_and_load_resources(
         model_dir,
@@ -540,7 +564,7 @@ fn renew_resources_once(
         }
     }
 
-    Ok(resources)
+    Ok(Some(resources))
 }
 
 fn current_resources(handle: &ResourceHandle) -> Result<Arc<ModelResources>> {
@@ -565,9 +589,9 @@ fn spawn_resource_renewal_task(
                 break;
             }
 
-            tracing::info!(
+            tracing::debug!(
                 interval_secs = RESOURCE_RENEWAL_INTERVAL.as_secs(),
-                "worker resource renewal starting",
+                "worker resource renewal check starting",
             );
             let model_dir = model_dir.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -576,7 +600,11 @@ fn spawn_resource_renewal_task(
             .await;
 
             let new_resources = match result {
-                Ok(Ok(resources)) => resources,
+                Ok(Ok(Some(resources))) => resources,
+                Ok(Ok(None)) => {
+                    // Nothing changed upstream — silent no-op.
+                    continue;
+                }
                 Ok(Err(error)) => {
                     tracing::error!(error = %error, "worker resource renewal failed; keeping last-known-good resources");
                     continue;

@@ -517,15 +517,15 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
     let pull_result = tokio::time::timeout(
         PULL_TIMEOUT,
         tokio::task::spawn_blocking(|| {
-            let (models_err, prev_models_head) = match crate::models_repo::update() {
+            let (models_err, prev_models_head) = match crate::models_repo::update(false) {
                 Ok(prev) => (None, prev),
                 Err(e) => {
                     tracing::warn!("models update failed: {e}");
                     (Some(e.to_string()), None)
                 }
             };
-            let traits_err = match crate::traits_repo::update(false) {
-                Ok(()) => None,
+            let traits_err = match crate::traits_repo::update(false, false) {
+                Ok(_) => None,
                 Err(e) => {
                     tracing::warn!("traits update failed: {e}");
                     Some(e.to_string())

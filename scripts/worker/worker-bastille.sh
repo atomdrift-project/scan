@@ -10,6 +10,11 @@ RUN="${2:-litworker}"
 URL="$3"
 [ -n "$URL" ] || { echo "error: hopper URL required as third argument" >&2; exit 1; }
 
+# Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
+WORKERS="${WORKERS:-}"
+worker_args="worker --url $URL"
+[ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
+
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
@@ -101,7 +106,7 @@ command="/usr/sbin/daemon"
 # Set via /usr/bin/env so it survives daemon(8)'s user switch and any
 # login.conf environment filtering.
 malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,abort_conf:true"
-command_args="-c -f -P \${pidfile} -r -o \${litmus_worker_logfile} -u litmus /usr/bin/env MALLOC_CONF=\${malloc_conf} /usr/local/share/litmus/litmus worker --url $URL"
+command_args="-c -f -P \${pidfile} -r -o \${litmus_worker_logfile} -u litmus /usr/bin/env MALLOC_CONF=\${malloc_conf} /usr/local/share/litmus/litmus $worker_args"
 
 run_rc_command "\$1"
 EOF

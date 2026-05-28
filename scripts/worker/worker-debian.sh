@@ -12,6 +12,11 @@ RUN="${2:-litmus}"
 URL="$3"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
+# Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
+WORKERS="${WORKERS:-}"
+worker_args="worker --url $URL"
+[ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
+
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
@@ -72,7 +77,7 @@ Wants=network-online.target
 Type=simple
 User=litmus
 Group=litmus
-ExecStart=/usr/local/share/litmus/litmus worker --url $URL
+ExecStart=/usr/local/share/litmus/litmus $worker_args
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:/var/log/litmus-worker.log

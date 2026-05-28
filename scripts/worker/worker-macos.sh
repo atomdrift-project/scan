@@ -9,6 +9,9 @@ set -ex
 URL="$1"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
+# Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
+WORKERS="${WORKERS:-}"
+
 BINARY=litmus
 INSTALL_DIR=/usr/local/share/litmus
 MODELS_DIR=/usr/local/share/litmus/models
@@ -81,6 +84,10 @@ if [ ! -f "$LOG" ]; then
 fi
 
 log "Installing launchd plist"
+workers_args=""
+[ -n "$WORKERS" ] && workers_args="        <string>--workers</string>
+        <string>$WORKERS</string>
+"
 new_plist=$(mktemp)
 cat > "$new_plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -98,7 +105,7 @@ cat > "$new_plist" <<EOF
         <string>$URL</string>
         <string>--traits-dir</string>
         <string>$TRAITS_DIR</string>
-    </array>
+${workers_args}    </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>

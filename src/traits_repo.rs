@@ -65,18 +65,23 @@ fn looks_like_traits_dir(path: &Path) -> bool {
 ///
 /// Falls back to `cleave::traits_repo::update` when no local checkout
 /// exists yet so the fresh-install clone path stays in one place.
-pub fn update(force: bool) -> Result<()> {
+/// Returns `true` when the local HEAD advanced (new traits were pulled).
+pub fn update(force: bool, quiet: bool) -> Result<bool> {
     prepare_runtime_env();
     let Ok(traits_dir) = cleave::traits_repo::try_resolve() else {
-        return cleave::traits_repo::update(force)
-            .map_err(|e| anyhow::anyhow!("traits update failed: {e}"));
+        // No local checkout yet: cleave clones a fresh tree, which is by
+        // definition a change.
+        cleave::traits_repo::update(force).map_err(|e| anyhow::anyhow!("traits update failed: {e}"))?;
+        return Ok(true);
     };
 
     let path = traits_dir.to_string_lossy().into_owned();
     let before = git_cmd::short_head(&traits_dir);
 
     if force {
-        eprintln!("Force-updating traits from upstream...");
+        if !quiet {
+            eprintln!("Force-updating traits from upstream...");
+        }
         let fetch = git_cmd::run(&["-C", &path, "fetch", "origin"], git_cmd::NETWORK_TIMEOUT)
             .context("git fetch failed")?;
         if !fetch.status.success() {
@@ -91,7 +96,9 @@ pub fn update(force: bool) -> Result<()> {
             anyhow::bail!("git reset failed: {}", git_cmd::format_failure(&reset));
         }
     } else {
-        eprintln!("Updating traits...");
+        if !quiet {
+            eprintln!("Updating traits...");
+        }
         let pull = git_cmd::run(
             &["-C", &path, "pull", "--ff-only"],
             git_cmd::NETWORK_TIMEOUT,
@@ -104,7 +111,10 @@ pub fn update(force: bool) -> Result<()> {
 
     let after = git_cmd::short_head(&traits_dir).unwrap_or_default();
     let before_str = before.as_deref().unwrap_or_default();
-    if before_str == after {
+    let changed = before_str != after;
+    if quiet {
+        // Background renewal: caller decides what to do with the change.
+    } else if !changed {
         eprintln!("Already up to date ({after}).");
     } else {
         eprintln!("Updated: {before_str} -> {after}");
@@ -125,7 +135,7 @@ pub fn update(force: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Check for updates without applying them, bounded by [`git_cmd::NETWORK_TIMEOUT`].

@@ -12,6 +12,11 @@ set -ex
 URL="$1"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
+# Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
+WORKERS="${WORKERS:-}"
+worker_args="worker --url $URL"
+[ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
+
 BINARY=litmus
 BIN_DIR="$HOME/bin"
 LOG="$HOME/.local/share/litmus/litmus-worker.log"
@@ -40,14 +45,14 @@ if ! cmp -s "target/release/$BINARY" "$BIN_DIR/$BINARY" 2>/dev/null; then
 fi
 
 log "Installing cron entry"
-cron_cmd="* * * * * pgrep -af 'litmus worker' >/dev/null 2>&1 || { ulimit -d \$(ulimit -Hd); nohup $BIN_DIR/$BINARY worker --url $URL < /dev/null >> $LOG 2>&1 & }"
+cron_cmd="* * * * * pgrep -af 'litmus worker' >/dev/null 2>&1 || { ulimit -d \$(ulimit -Hd); nohup $BIN_DIR/$BINARY $worker_args < /dev/null >> $LOG 2>&1 & }"
 (crontab -l 2>/dev/null | grep -v "litmus worker" || true; echo "$cron_cmd") | crontab -
 
 if [ "$restart_needed" -eq 1 ]; then
     log "Restarting litmus worker"
     pkill -f "litmus worker" 2>/dev/null || true
     sleep 1
-    nohup "$BIN_DIR/$BINARY" worker --url "$URL" < /dev/null >> "$LOG" 2>&1 &
+    nohup "$BIN_DIR/$BINARY" $worker_args < /dev/null >> "$LOG" 2>&1 &
 else
     log "Binary unchanged, skipping restart"
 fi
