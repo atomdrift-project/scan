@@ -420,7 +420,7 @@ async fn do_model_reload(
                 model,
                 shap,
                 ctx,
-                upgrade_heuristic: state.upgrade_heuristic,
+                level: state.level,
             }));
             if let Ok(mut init_error) = state.init_error.write() {
                 *init_error = None;
@@ -1011,7 +1011,6 @@ pub(crate) fn classify_file(
         &resources.model,
         resources.shap.as_ref(),
         cancellation,
-        resources.upgrade_heuristic,
         Some(100),
     )?;
 
@@ -1059,7 +1058,6 @@ pub(crate) fn classify_bytes(
         &resources.model,
         resources.shap.as_ref(),
         cancellation,
-        resources.upgrade_heuristic,
         Some(100),
     )?;
 
@@ -1073,12 +1071,11 @@ fn scan_result_from(
     resources: &super::ModelResources,
 ) -> ScanResult {
     ScanResult {
-        v: "4",
+        v: "5",
         classification: cr.classification,
         probability: cr.probability,
-        original_classification: cr.original_classification,
-        original_probability: cr.original_probability,
-        thresholds: resources.model.thresholds(),
+        threshold: cr.threshold,
+        level: resources.level,
         version: crate::scan::model_version_string(resources.model.info()),
         analyzed_at: crate::scan::now_rfc3339(),
         cleave: Some(cr.report_json),

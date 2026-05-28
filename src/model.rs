@@ -511,6 +511,53 @@ impl Thresholds {
             Classification::Benign
         }
     }
+
+    /// Decide a verdict from a probability, returning the (class, prob,
+    /// threshold) triple that the decision was made against.
+    ///
+    /// The reported `threshold` is the cutoff defining the verdict band:
+    /// - Hostile: `hostile` (the cutoff `prob` met or exceeded)
+    /// - Suspicious: `suspicious` (the cutoff `prob` met or exceeded)
+    /// - Benign: `suspicious` (the cutoff `prob` did not reach)
+    #[must_use]
+    pub fn decide(&self, probability: f32) -> Decision {
+        if probability >= self.hostile {
+            Decision {
+                class: Classification::Hostile,
+                probability,
+                threshold: self.hostile,
+            }
+        } else if probability >= self.suspicious {
+            Decision {
+                class: Classification::Suspicious,
+                probability,
+                threshold: self.suspicious,
+            }
+        } else {
+            Decision {
+                class: Classification::Benign,
+                probability,
+                threshold: self.suspicious,
+            }
+        }
+    }
+}
+
+/// The outcome of a routed/threshold decision, carrying the probability the
+/// verdict was based on and the threshold it was compared against.
+///
+/// Invariant: `class = Hostile` iff `probability >= threshold` for the Hostile
+/// cutoff; `class = Suspicious` iff `probability >= threshold` for the
+/// Suspicious cutoff; `class = Benign` iff `probability < threshold`, where
+/// `threshold` is the Suspicious cutoff the score did not reach.
+#[derive(Debug, Clone, Copy)]
+pub struct Decision {
+    /// Classification outcome.
+    pub class: Classification,
+    /// Probability the decision was made on.
+    pub probability: f32,
+    /// Cutoff defining the verdict band.
+    pub threshold: f32,
 }
 
 /// Validation error for [`Thresholds`].
@@ -940,7 +987,7 @@ struct LoadedBundle {
 /// Default severity level used to pick thresholds out of the levels[] table
 /// when the caller hasn't asked for a different one. Matches collimator's
 /// default deploy policy.
-const DEFAULT_SEVERITY_LEVEL: u8 = 3;
+pub const DEFAULT_SEVERITY_LEVEL: u8 = 3;
 
 /// Ensemble-level config parsed from the top-level `config.json`. Every field
 /// is optional — an ensemble bundle with only `general/` populated and no
@@ -1011,15 +1058,36 @@ impl PolicySeverity {
 
     /// True iff this severity fires given the per-route scores. Dispatches
     /// to blend evaluation when ``blend`` is set, OR-rule otherwise.
+    #[cfg(test)]
     fn fires(&self, scores: &[RouteProbability]) -> bool {
+        self.fire(scores).is_some()
+    }
+
+    /// If this severity fires, return the deciding `(probability, threshold)`
+    /// pair so callers can build a [`Decision`] whose `probability` and
+    /// `threshold` satisfy `probability >= threshold`.
+    ///
+    /// For OR-rule policies the deciding route is the one with the largest
+    /// margin (`probability - threshold`) so the published `prob`/`threshold`
+    /// pair best characterises why the verdict fired.
+    fn fire(&self, scores: &[RouteProbability]) -> Option<(f32, f32)> {
         if let Some(blend) = &self.blend {
-            return blend.fires(scores);
+            return blend.fire(scores);
         }
-        scores.iter().any(|score| {
-            self.thresholds
-                .get(&score.route)
-                .is_some_and(|&threshold| score.probability >= threshold)
-        })
+        let mut best: Option<(f32, f32)> = None;
+        for score in scores {
+            if let Some(&t) = self.thresholds.get(&score.route)
+                && score.probability >= t
+            {
+                let margin = score.probability - t;
+                let best_margin =
+                    best.map(|(p, bt)| p - bt).unwrap_or(f32::NEG_INFINITY);
+                if margin > best_margin {
+                    best = Some((score.probability, t));
+                }
+            }
+        }
+        best
     }
 }
 
@@ -1044,23 +1112,31 @@ impl BlendPolicy {
     /// this filetype, scoring failure, etc.) fall back to "doesn't fire" —
     /// the blend can't be honestly evaluated with incomplete inputs and
     /// firing on a partial blend would be a calibration mismatch.
+    #[cfg(test)]
     #[allow(clippy::cast_possible_truncation)]
     fn fires(&self, scores: &[RouteProbability]) -> bool {
+        self.fire(scores).is_some()
+    }
+
+    /// Compute the blend's sigmoid output and, if it crosses the threshold,
+    /// return `(sigmoid_output, threshold)`. Missing routes mean the blend
+    /// cannot be honestly evaluated; treat as "doesn't fire."
+    #[allow(clippy::cast_possible_truncation)]
+    fn fire(&self, scores: &[RouteProbability]) -> Option<(f32, f32)> {
         // f64 math throughout — logit blows up near 0/1, and the cumulative
         // weighted sum can drift if we stay in f32. The final compare against
         // ``threshold`` is in f32 to match how the calibration step writes it.
         const EPS: f64 = 1e-6;
         let mut z: f64 = f64::from(self.intercept);
         for (idx, route) in self.routes.iter().enumerate() {
-            let Some(score) = scores.iter().find(|s| &s.route == route) else {
-                return false;
-            };
+            let score = scores.iter().find(|s| &s.route == route)?;
             let p = (f64::from(score.probability)).clamp(EPS, 1.0 - EPS);
             let logit = (p / (1.0 - p)).ln();
             z += f64::from(self.weights[idx]) * logit;
         }
         let sigmoid_z = 1.0 / (1.0 + (-z).exp());
-        (sigmoid_z as f32) >= self.threshold
+        let sigmoid_z = sigmoid_z as f32;
+        (sigmoid_z >= self.threshold).then_some((sigmoid_z, self.threshold))
     }
 }
 
@@ -1835,6 +1911,7 @@ fn compact_route_name(route: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn policy_classify(policy: &RoutePolicy, scores: &[RouteProbability]) -> Classification {
     // Each severity decides via its own rule: OR-rule per-route thresholds or
     // learned blend. Hostile takes precedence over suspicious, same as before.
@@ -1845,6 +1922,28 @@ fn policy_classify(policy: &RoutePolicy, scores: &[RouteProbability]) -> Classif
     } else {
         Classification::Benign
     }
+}
+
+/// Run the policy against the route scores and return the deciding [`Decision`]
+/// for hostile/suspicious fires. Returns `None` when neither severity fires —
+/// the caller picks the Benign fallback (typically general's prob against the
+/// model's suspicious cutoff).
+fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -> Option<Decision> {
+    if let Some((p, t)) = policy.hostile.fire(scores) {
+        return Some(Decision {
+            class: Classification::Hostile,
+            probability: p,
+            threshold: t,
+        });
+    }
+    if let Some((p, t)) = policy.suspicious.fire(scores) {
+        return Some(Decision {
+            class: Classification::Suspicious,
+            probability: p,
+            threshold: t,
+        });
+    }
+    None
 }
 
 /// Push each per-route threshold in `route_policies.json` through that route's
@@ -2161,6 +2260,31 @@ impl Model {
         Ok((probability, self.thresholds.classify(probability)))
     }
 
+    /// Pick the strongest [`Decision`] across the route scores using only the
+    /// model's general thresholds (no per-filetype policy). Picks the highest
+    /// class; on ties, the highest probability. Benign fallback uses the
+    /// general route's prob against the suspicious cutoff.
+    fn decide_from_scores(&self, scores: &[RouteProbability]) -> Decision {
+        // General route is always first when scoring through predict_*_detailed.
+        let general_prob = scores
+            .iter()
+            .find(|s| s.route == "general")
+            .map_or_else(|| 0.0, |s| s.probability);
+        let mut best = self.thresholds.decide(general_prob);
+        for score in scores {
+            let candidate = self.thresholds.decide(score.probability);
+            let better = match (candidate.class as u8).cmp(&(best.class as u8)) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => candidate.probability > best.probability,
+                std::cmp::Ordering::Less => false,
+            };
+            if better {
+                best = candidate;
+            }
+        }
+        best
+    }
+
     /// Routed prediction for a file of type `file_type`.
     ///
     /// Consults general always; consults the filegroup specialist if a
@@ -2257,9 +2381,9 @@ impl Model {
         general_features: &[f32],
         report: &serde_json::Value,
     ) -> Result<(f32, Classification)> {
-        let (probability, classification, _, _) =
+        let (decision, _, _) =
             self.predict_for_report_detailed(file_type, general_features, report)?;
-        Ok((probability, classification))
+        Ok((decision.probability, decision.class))
     }
 
     /// Same as [`Self::predict_for_report`], with per-route scores retained
@@ -2269,106 +2393,14 @@ impl Model {
         file_type: &str,
         general_features: &[f32],
         report: &serde_json::Value,
-    ) -> Result<(f32, Classification, Vec<RouteScore>, Vec<SkippedRoute>)> {
-        let policy = self.routes.policies.by_filetype.get(file_type);
-        let general_prob = self.predict_general_calibrated(general_features)?;
-        let general_class = policy.map_or_else(
-            || self.thresholds.classify(general_prob),
-            |policy| policy_route_class(policy, "general", general_prob),
-        );
-        let mut max_prob = general_prob;
-        let mut classification = general_class;
-        let mut route_probs = vec![RouteProbability {
-            route: "general".to_string(),
-            probability: general_prob,
-        }];
-        let mut scores = vec![RouteScore {
-            model: "az".to_string(),
-            probability: general_prob,
-            classification: general_class,
-        }];
-        let mut skipped = Vec::new();
-
-        if self.routes.is_empty() {
-            return Ok((max_prob, classification, scores, skipped));
-        }
-
-        if let Some(group_name) = self.routes.filetype_to_filegroup.get(file_type) {
-            if let Some(route) = self.routes.filegroups.get(group_name) {
-                let route_name = format!("filegroups/{group_name}");
-                let (prob, class) = Self::score_route_report(route, report)?;
-                let class = policy.map_or(class, |policy| {
-                    policy_route_class(policy, &route_name, prob)
-                });
-                scores.push(RouteScore {
-                    model: format!("az/{group_name}"),
-                    probability: prob,
-                    classification: class,
-                });
-                route_probs.push(RouteProbability {
-                    route: route_name,
-                    probability: prob,
-                });
-                if prob > max_prob {
-                    max_prob = prob;
-                }
-                if policy.is_none() {
-                    classification = max_class(classification, class);
-                }
-            } else if self.routes.skipped_filegroups.contains(group_name) {
-                skipped.push(SkippedRoute {
-                    model: format!("az/{group_name}"),
-                    reason: "uncalibrated",
-                });
-            }
-        }
-
-        if let Some(route) = self.routes.filetypes.get(file_type) {
-            let route_name = format!("filetypes/{file_type}");
-            let (prob, class) = Self::score_route_report(route, report)?;
-            let class = policy.map_or(class, |policy| {
-                policy_route_class(policy, &route_name, prob)
-            });
-            scores.push(RouteScore {
-                model: format!("az/{file_type}"),
-                probability: prob,
-                classification: class,
-            });
-            route_probs.push(RouteProbability {
-                route: route_name,
-                probability: prob,
-            });
-            if prob > max_prob {
-                max_prob = prob;
-            }
-            if policy.is_none() {
-                classification = max_class(classification, class);
-            }
-        } else if self.routes.skipped_filetypes.contains(file_type) {
-            skipped.push(SkippedRoute {
-                model: format!("az/{file_type}"),
-                reason: "uncalibrated",
-            });
-        }
-
-        if let Some(policy) = policy {
-            for route in policy
-                .hostile
-                .thresholds
-                .keys()
-                .chain(policy.suspicious.thresholds.keys())
-            {
-                if !route_probs.iter().any(|score| score.route == *route) {
-                    skipped.push(SkippedRoute {
-                        model: compact_route_name(route),
-                        reason: "unavailable",
-                    });
-                }
-            }
-            classification = policy_classify(policy, &route_probs);
-        }
-
-        Ok((max_prob, classification, scores, skipped))
+    ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
+        let (route_probs, scores, mut skipped) = self.score_all_routes(
+            file_type,
+            general_features,
+            |route| Self::score_route_report(route, report),
+        )?;
+        let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
+        Ok((decision, scores, skipped))
     }
 
     /// Routed prediction for one embedded-file JSON object.
@@ -2378,9 +2410,9 @@ impl Model {
         general_features: &[f32],
         file: &serde_json::Value,
     ) -> Result<(f32, Classification)> {
-        let (probability, classification, _, _) =
+        let (decision, _, _) =
             self.predict_for_file_detailed(file_type, general_features, file)?;
-        Ok((probability, classification))
+        Ok((decision.probability, decision.class))
     }
 
     /// Same as [`Self::predict_for_file`], with per-route scores retained.
@@ -2389,15 +2421,36 @@ impl Model {
         file_type: &str,
         general_features: &[f32],
         file: &serde_json::Value,
-    ) -> Result<(f32, Classification, Vec<RouteScore>, Vec<SkippedRoute>)> {
+    ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
+        let (route_probs, scores, mut skipped) = self.score_all_routes(
+            file_type,
+            general_features,
+            |route| Self::score_route_file(route, file),
+        )?;
+        let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
+        Ok((decision, scores, skipped))
+    }
+
+    /// Score every applicable route for `file_type` and return the
+    /// `(probabilities, RouteScore list, SkippedRoute list)` triple. The
+    /// per-route `RouteScore.classification` uses the policy's per-route
+    /// classifier when available, mirroring the previous behaviour for the
+    /// diagnostic `models` array.
+    fn score_all_routes<F>(
+        &self,
+        file_type: &str,
+        general_features: &[f32],
+        mut score: F,
+    ) -> Result<(Vec<RouteProbability>, Vec<RouteScore>, Vec<SkippedRoute>)>
+    where
+        F: FnMut(&Route) -> Result<(f32, Classification)>,
+    {
         let policy = self.routes.policies.by_filetype.get(file_type);
         let general_prob = self.predict_general_calibrated(general_features)?;
         let general_class = policy.map_or_else(
             || self.thresholds.classify(general_prob),
             |policy| policy_route_class(policy, "general", general_prob),
         );
-        let mut max_prob = general_prob;
-        let mut classification = general_class;
         let mut route_probs = vec![RouteProbability {
             route: "general".to_string(),
             probability: general_prob,
@@ -2410,13 +2463,13 @@ impl Model {
         let mut skipped = Vec::new();
 
         if self.routes.is_empty() {
-            return Ok((max_prob, classification, scores, skipped));
+            return Ok((route_probs, scores, skipped));
         }
 
         if let Some(group_name) = self.routes.filetype_to_filegroup.get(file_type) {
             if let Some(route) = self.routes.filegroups.get(group_name) {
                 let route_name = format!("filegroups/{group_name}");
-                let (prob, class) = Self::score_route_file(route, file)?;
+                let (prob, class) = score(route)?;
                 let class = policy.map_or(class, |policy| {
                     policy_route_class(policy, &route_name, prob)
                 });
@@ -2429,12 +2482,6 @@ impl Model {
                     route: route_name,
                     probability: prob,
                 });
-                if prob > max_prob {
-                    max_prob = prob;
-                }
-                if policy.is_none() {
-                    classification = max_class(classification, class);
-                }
             } else if self.routes.skipped_filegroups.contains(group_name) {
                 skipped.push(SkippedRoute {
                     model: format!("az/{group_name}"),
@@ -2445,7 +2492,7 @@ impl Model {
 
         if let Some(route) = self.routes.filetypes.get(file_type) {
             let route_name = format!("filetypes/{file_type}");
-            let (prob, class) = Self::score_route_file(route, file)?;
+            let (prob, class) = score(route)?;
             let class = policy.map_or(class, |policy| {
                 policy_route_class(policy, &route_name, prob)
             });
@@ -2458,12 +2505,6 @@ impl Model {
                 route: route_name,
                 probability: prob,
             });
-            if prob > max_prob {
-                max_prob = prob;
-            }
-            if policy.is_none() {
-                classification = max_class(classification, class);
-            }
         } else if self.routes.skipped_filetypes.contains(file_type) {
             skipped.push(SkippedRoute {
                 model: format!("az/{file_type}"),
@@ -2471,24 +2512,47 @@ impl Model {
             });
         }
 
-        if let Some(policy) = policy {
-            for route in policy
-                .hostile
-                .thresholds
-                .keys()
-                .chain(policy.suspicious.thresholds.keys())
-            {
-                if !route_probs.iter().any(|score| score.route == *route) {
-                    skipped.push(SkippedRoute {
-                        model: compact_route_name(route),
-                        reason: "unavailable",
-                    });
-                }
-            }
-            classification = policy_classify(policy, &route_probs);
-        }
+        Ok((route_probs, scores, skipped))
+    }
 
-        Ok((max_prob, classification, scores, skipped))
+    /// Pick the final [`Decision`] from per-route scores, applying the
+    /// per-filetype policy when one is configured.
+    fn decide_from_routes(
+        &self,
+        file_type: &str,
+        route_probs: &[RouteProbability],
+        skipped: &mut Vec<SkippedRoute>,
+    ) -> Decision {
+        let policy = self.routes.policies.by_filetype.get(file_type);
+        let Some(policy) = policy else {
+            return self.decide_from_scores(route_probs);
+        };
+        for route in policy
+            .hostile
+            .thresholds
+            .keys()
+            .chain(policy.suspicious.thresholds.keys())
+        {
+            if !route_probs.iter().any(|score| score.route == *route) {
+                skipped.push(SkippedRoute {
+                    model: compact_route_name(route),
+                    reason: "unavailable",
+                });
+            }
+        }
+        policy_decide(policy, route_probs).unwrap_or_else(|| {
+            // Benign fallback: report general's prob against the model's
+            // suspicious cutoff. That's the cutoff the score didn't reach.
+            let general_prob = route_probs
+                .iter()
+                .find(|s| s.route == "general")
+                .map_or(0.0, |s| s.probability);
+            Decision {
+                class: Classification::Benign,
+                probability: general_prob,
+                threshold: self.thresholds.suspicious,
+            }
+        })
     }
 
     /// Inference backend identifier (`"xgboost"` or `"lightgbm"`).

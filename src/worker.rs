@@ -448,8 +448,9 @@ pub struct WorkerConfig {
     pub slow_rule_ms: u64,
     /// Exit after this many jobs have been analyzed (None = run forever).
     pub max_jobs: Option<u64>,
-    /// Whether the finding-based classification upgrade heuristic is enabled.
-    pub upgrade_heuristic: bool,
+    /// FPR severity level (1..=9) that produced the thresholds, or `None` when
+    /// manual thresholds were supplied. Surfaces as `ml.level` in the envelope.
+    pub level: Option<u8>,
     /// Nice value applied to the process at startup (0 = leave unchanged).
     pub nice: i32,
 }
@@ -457,7 +458,7 @@ pub struct WorkerConfig {
 fn load_model_resources(
     model_dir: &Path,
     thresholds: Option<Thresholds>,
-    upgrade_heuristic: bool,
+    level: Option<u8>,
 ) -> Result<Arc<ModelResources>> {
     let model = Model::load(model_dir, thresholds).context("loading model")?;
     let shap = ShapImportance::load(model_dir).ok();
@@ -466,7 +467,7 @@ fn load_model_resources(
         model,
         shap,
         ctx,
-        upgrade_heuristic,
+        level,
     }))
 }
 
@@ -474,7 +475,7 @@ fn validate_and_load_resources(
     model_dir: &Path,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
-    upgrade_heuristic: bool,
+    level: Option<u8>,
 ) -> Result<Arc<ModelResources>> {
     let validate_config = crate::ScanConfig::new(
         model_dir,
@@ -484,16 +485,16 @@ fn validate_and_load_resources(
         slow_rule_ms,
         false,
     )?
-    .with_upgrade_heuristic(upgrade_heuristic);
+    .with_level(level);
     crate::validate::run(&validate_config)?;
-    load_model_resources(model_dir, thresholds, upgrade_heuristic)
+    load_model_resources(model_dir, thresholds, level)
 }
 
 fn renew_resources_once(
     model_dir: &Path,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
-    upgrade_heuristic: bool,
+    level: Option<u8>,
 ) -> Result<Arc<ModelResources>> {
     let prev_models_head = match crate::models_repo::update() {
         Ok(prev) => prev,
@@ -510,7 +511,7 @@ fn renew_resources_once(
         model_dir,
         thresholds,
         slow_rule_ms,
-        upgrade_heuristic,
+        level,
     ) {
         Ok(resources) => resources,
         Err(error) => {
@@ -554,7 +555,7 @@ fn spawn_resource_renewal_task(
     model_dir: PathBuf,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
-    upgrade_heuristic: bool,
+    level: Option<u8>,
     shutdown: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
@@ -570,7 +571,7 @@ fn spawn_resource_renewal_task(
             );
             let model_dir = model_dir.clone();
             let result = tokio::task::spawn_blocking(move || {
-                renew_resources_once(&model_dir, thresholds, slow_rule_ms, upgrade_heuristic)
+                renew_resources_once(&model_dir, thresholds, slow_rule_ms, level)
             })
             .await;
 
@@ -861,7 +862,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let resources = load_model_resources(
         &config.model_dir,
         config.thresholds,
-        config.upgrade_heuristic,
+        config.level,
     )?;
     let resources: ResourceHandle = Arc::new(RwLock::new(resources));
     spawn_resource_renewal_task(
@@ -869,7 +870,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         config.model_dir.clone(),
         config.thresholds,
         config.slow_rule_ms,
-        config.upgrade_heuristic,
+        config.level,
         Arc::clone(&shutdown),
     );
 

@@ -3,7 +3,7 @@
 
 use std::sync::{LazyLock, RwLock};
 
-use crate::model::{Classification, Thresholds};
+use crate::model::Classification;
 use crate::scan::{ScanResult, ScanSummary};
 
 const BLOCK: &str = "\u{2588}";
@@ -187,17 +187,18 @@ fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
 }
 
 /// Normalized progress within the current classification band.
-fn band_progress(probability: f32, classification: &Classification, thresholds: Thresholds) -> f32 {
+///
+/// `threshold` is the cutoff that defined `classification` (the value `prob`
+/// was compared against). With the v5 envelope we no longer carry both
+/// suspicious and hostile cutoffs, so the suspicious band uses the same
+/// "distance to 1.0" formula as the hostile band — an acceptable approximation
+/// for the band-internal color ramp.
+fn band_progress(probability: f32, classification: &Classification, threshold: f32) -> f32 {
     match classification {
-        Classification::Hostile => ((probability - thresholds.hostile)
-            / (1.0 - thresholds.hostile).max(f32::EPSILON))
-        .clamp(0.0, 1.0),
-        Classification::Suspicious => ((probability - thresholds.suspicious)
-            / (thresholds.hostile - thresholds.suspicious).max(f32::EPSILON))
-        .clamp(0.0, 1.0),
-        Classification::Benign => {
-            (probability / thresholds.suspicious.max(f32::EPSILON)).clamp(0.0, 1.0)
+        Classification::Hostile | Classification::Suspicious => {
+            ((probability - threshold) / (1.0 - threshold).max(f32::EPSILON)).clamp(0.0, 1.0)
         }
+        Classification::Benign => (probability / threshold.max(f32::EPSILON)).clamp(0.0, 1.0),
     }
 }
 
@@ -205,9 +206,9 @@ fn band_progress(probability: f32, classification: &Classification, thresholds: 
 fn indicator_colors(
     probability: f32,
     classification: &Classification,
-    thresholds: Thresholds,
+    threshold: f32,
 ) -> (Rgb, Rgb, Rgb) {
-    let t = band_progress(probability, classification, thresholds);
+    let t = band_progress(probability, classification, threshold);
     let theme = THEME
         .read()
         .ok()
@@ -260,24 +261,23 @@ fn indicator_colors(
 fn confidence_blocks(
     probability: f32,
     classification: &Classification,
-    thresholds: Thresholds,
+    threshold: f32,
 ) -> String {
-    let (left, right, _) = indicator_colors(probability, classification, thresholds);
+    let (left, right, _) = indicator_colors(probability, classification, threshold);
     format!("{}{}", fg(left, BLOCK), fg(right, BLOCK))
 }
 
 /// Rescale raw model probability for display.
 ///
-/// The suspicious threshold maps to 50%, so users see an intuitive scale
-/// where 50% = "just crossed into suspicious" and 100% = maximum confidence.
-fn display_probability(raw: f32, thresholds: Thresholds) -> f32 {
-    if raw <= thresholds.suspicious {
-        // [0, suspicious] → [0%, 50%]
-        (raw / thresholds.suspicious.max(f32::EPSILON)) * 0.5
+/// `threshold` is the deciding cutoff (the value `raw` was compared against).
+/// Below the cutoff is mapped into the bottom 50%, above it into the top 50%.
+fn display_probability(raw: f32, threshold: f32) -> f32 {
+    if raw <= threshold {
+        // [0, threshold] → [0%, 50%]
+        (raw / threshold.max(f32::EPSILON)) * 0.5
     } else {
-        // [suspicious, 1.0] → [50%, 100%]
-        0.5 + ((raw - thresholds.suspicious) / (1.0 - thresholds.suspicious).max(f32::EPSILON))
-            * 0.5
+        // [threshold, 1.0] → [50%, 100%]
+        0.5 + ((raw - threshold) / (1.0 - threshold).max(f32::EPSILON)) * 0.5
     }
 }
 
@@ -285,16 +285,13 @@ fn display_probability(raw: f32, thresholds: Thresholds) -> f32 {
 fn colored_pct(
     probability: f32,
     classification: &Classification,
-    thresholds: Thresholds,
+    threshold: f32,
 ) -> String {
     let pct = format!(
         "{:>4}",
-        format!(
-            "{:.0}%",
-            display_probability(probability, thresholds) * 100.0
-        )
+        format!("{:.0}%", display_probability(probability, threshold) * 100.0)
     );
-    let (_, _, accent) = indicator_colors(probability, classification, thresholds);
+    let (_, _, accent) = indicator_colors(probability, classification, threshold);
     fg(accent, &pct)
 }
 
@@ -317,12 +314,12 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extr
     let blocks = confidence_blocks(
         result.probability,
         &result.classification,
-        result.thresholds,
+        result.threshold,
     );
     let pct = colored_pct(
         result.probability,
         &result.classification,
-        result.thresholds,
+        result.threshold,
     );
     let label = colored_label(&result.classification, p);
 
@@ -353,12 +350,12 @@ pub fn print_ps_result(
     let blocks = confidence_blocks(
         result.probability,
         &result.classification,
-        result.thresholds,
+        result.threshold,
     );
     let pct = colored_pct(
         result.probability,
         &result.classification,
-        result.thresholds,
+        result.threshold,
     );
 
     // Format PID list.
@@ -565,32 +562,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_probability_at_thresholds() {
-        let thresh = Thresholds::default();
-
+    fn display_probability_at_threshold() {
+        let thr = 0.65_f32;
         // At zero → 0%
-        assert!((display_probability(0.0, thresh) - 0.0).abs() < 1e-6);
-
-        // At suspicious threshold → 50%
-        assert!((display_probability(thresh.suspicious, thresh) - 0.5).abs() < 1e-6);
-
-        // At hostile threshold → midpoint of upper half
-        let expected =
-            0.5 + ((thresh.hostile - thresh.suspicious) / (1.0 - thresh.suspicious)) * 0.5;
-        assert!((display_probability(thresh.hostile, thresh) - expected).abs() < 1e-6);
-
+        assert!((display_probability(0.0, thr) - 0.0).abs() < 1e-6);
+        // At the deciding threshold → exactly 50%
+        assert!((display_probability(thr, thr) - 0.5).abs() < 1e-6);
         // At 1.0 → 100%
-        assert!((display_probability(1.0, thresh) - 1.0).abs() < 1e-6);
+        assert!((display_probability(1.0, thr) - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn display_probability_monotonic() {
-        // The mapping must be strictly monotonically increasing.
+        let thr = 0.65_f32;
         let steps: Vec<f32> = (0..=100).map(|i| i as f32 / 100.0).collect();
-        let thresh = Thresholds::default();
         for pair in steps.windows(2) {
             assert!(
-                display_probability(pair[1], thresh) > display_probability(pair[0], thresh),
+                display_probability(pair[1], thr) > display_probability(pair[0], thr),
                 "not monotonic at {} -> {}",
                 pair[0],
                 pair[1],
@@ -599,20 +587,16 @@ mod tests {
     }
 
     #[test]
-    fn display_probability_below_suspicious_is_under_50() {
-        let thresh = Thresholds::default();
-        // Anything below the suspicious threshold must display < 50%.
-        assert!(display_probability(thresh.suspicious - 0.01, thresh) < 0.5);
-        assert!(display_probability(0.5, thresh) < 0.5);
+    fn display_probability_below_threshold_is_under_50() {
+        let thr = 0.65_f32;
+        assert!(display_probability(thr - 0.01, thr) < 0.5);
+        assert!(display_probability(0.5, thr) < 0.5);
     }
 
     #[test]
-    fn display_probability_uses_custom_thresholds() {
-        let thresh = Thresholds {
-            suspicious: 0.80,
-            hostile: 0.95,
-        };
-        assert!((display_probability(0.80, thresh) - 0.5).abs() < 1e-6);
-        assert!(display_probability(0.79, thresh) < 0.5);
+    fn display_probability_uses_custom_threshold() {
+        let thr = 0.80_f32;
+        assert!((display_probability(thr, thr) - 0.5).abs() < 1e-6);
+        assert!(display_probability(0.79, thr) < 0.5);
     }
 }

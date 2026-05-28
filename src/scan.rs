@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::explain::ShapImportance;
 use crate::features::{crit_ordinal, ExtractContext};
-use crate::model::{Classification, Model, RouteScore, SkippedRoute, Thresholds};
+use crate::model::{Classification, Decision, Model, RouteScore, SkippedRoute, Thresholds};
 use crate::OutputFormat;
 
 pub use crate::explain::Reason;
@@ -95,7 +95,7 @@ pub struct ScanConfig {
     filter: DisplayFilter,
     slow_rule_ms: u64,
     extra: bool,
-    upgrade_heuristic: bool,
+    level: Option<u8>,
 }
 
 impl ScanConfig {
@@ -142,18 +142,19 @@ impl ScanConfig {
             filter,
             slow_rule_ms,
             extra,
-            upgrade_heuristic: true,
+            level: None,
         })
     }
 
-    /// Override the default finding-based upgrade heuristic.
+    /// Attach the severity level that produced the resolved thresholds.
     ///
-    /// The heuristic is enabled by default and upgrades ML classifications
-    /// when cleave findings clearly indicate a misclassification. Pass `false`
-    /// to disable it (exposed as the hidden `--upgrade-heuristic=false` flag).
+    /// `None` indicates manual thresholds (no level applies); `Some(n)` is the
+    /// 1..=9 level that was used to pick `thresholds` from the model's
+    /// `severity_levels[]` table. Emitted as `ml.level` in the JSON envelope so
+    /// downstream consumers can correlate verdicts with FPR severity.
     #[must_use]
-    pub const fn with_upgrade_heuristic(mut self, upgrade_heuristic: bool) -> Self {
-        self.upgrade_heuristic = upgrade_heuristic;
+    pub const fn with_level(mut self, level: Option<u8>) -> Self {
+        self.level = level;
         self
     }
 
@@ -193,10 +194,11 @@ impl ScanConfig {
         self.extra
     }
 
-    /// Whether the finding-based classification upgrade heuristic is enabled.
+    /// Severity level (1..=9) used to pick thresholds, or `None` when manual
+    /// thresholds were supplied via `--suspicious-threshold` / `--hostile-threshold`.
     #[must_use]
-    pub const fn upgrade_heuristic(&self) -> bool {
-        self.upgrade_heuristic
+    pub const fn level(&self) -> Option<u8> {
+        self.level
     }
 }
 
@@ -223,7 +225,7 @@ mod config_tests {
     }
 
     #[test]
-    fn scan_config_upgrade_heuristic_defaults_to_true() {
+    fn scan_config_level_defaults_to_none() {
         let config = ScanConfig::new(
             "/tmp/models",
             OutputFormat::Terminal,
@@ -233,11 +235,11 @@ mod config_tests {
             false,
         )
         .expect("valid config");
-        assert!(config.upgrade_heuristic());
+        assert!(config.level().is_none());
     }
 
     #[test]
-    fn scan_config_with_upgrade_heuristic_false_disables() {
+    fn scan_config_with_level_persists() {
         let config = ScanConfig::new(
             "/tmp/models",
             OutputFormat::Terminal,
@@ -247,162 +249,8 @@ mod config_tests {
             false,
         )
         .expect("valid config")
-        .with_upgrade_heuristic(false);
-        assert!(!config.upgrade_heuristic());
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod finding_override_tests {
-    use super::*;
-
-    const T: Thresholds = Thresholds {
-        suspicious: 0.65,
-        hostile: 0.90,
-    };
-
-    fn counts(hostile: u32, suspicious: u32) -> FindingCounts {
-        FindingCounts {
-            hostile,
-            suspicious,
-            notable: 0,
-            baseline: 0,
-        }
-    }
-
-    #[test]
-    fn two_hostile_findings_upgrade_benign_to_hostile() {
-        let result = apply_finding_override(Classification::Benign, 0.10, &counts(2, 0), &T);
-        let Some((class, prob)) = result else {
-            panic!("expected upgrade, got None");
-        };
-        assert_eq!(class, Classification::Hostile);
-        assert!((prob - T.hostile).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn two_hostile_findings_upgrade_suspicious_to_hostile() {
-        let result = apply_finding_override(Classification::Suspicious, 0.70, &counts(2, 0), &T);
-        let Some((class, prob)) = result else {
-            panic!("expected upgrade, got None");
-        };
-        assert_eq!(class, Classification::Hostile);
-        assert!((prob - T.hostile).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn two_hostile_findings_noop_when_already_hostile_above_floor() {
-        let result = apply_finding_override(Classification::Hostile, 0.995, &counts(2, 0), &T);
-        assert!(
-            result.is_none(),
-            "must not re-stamp already-Hostile above threshold"
-        );
-    }
-
-    #[test]
-    fn two_hostile_findings_noop_when_already_hostile_at_floor() {
-        let result = apply_finding_override(Classification::Hostile, T.hostile, &counts(2, 0), &T);
-        assert!(
-            result.is_none(),
-            "must not fire when new_prob == current_prob"
-        );
-    }
-
-    #[test]
-    fn two_hostile_findings_upgrades_class_even_when_prob_already_above_hostile() {
-        // Defensive: Suspicious at prob > hostile is unusual but class still needs to rise.
-        let result = apply_finding_override(Classification::Suspicious, 0.95, &counts(2, 0), &T);
-        let Some((class, prob)) = result else {
-            panic!("expected class upgrade even with prob >= hostile floor");
-        };
-        assert_eq!(class, Classification::Hostile);
-        assert!(
-            (prob - 0.95).abs() < f32::EPSILON,
-            "prob must not be downgraded"
-        );
-    }
-
-    #[test]
-    fn one_hostile_finding_leaves_benign_unchanged() {
-        let result = apply_finding_override(Classification::Benign, 0.05, &counts(1, 0), &T);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn one_hostile_one_suspicious_upgrades_benign_to_suspicious() {
-        let result = apply_finding_override(Classification::Benign, 0.05, &counts(1, 1), &T);
-        let Some((class, prob)) = result else {
-            panic!("expected upgrade");
-        };
-        assert_eq!(class, Classification::Suspicious);
-        assert!((prob - T.suspicious).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn one_hostile_finding_leaves_suspicious_unchanged() {
-        let result = apply_finding_override(Classification::Suspicious, 0.70, &counts(1, 0), &T);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn one_hostile_finding_leaves_hostile_unchanged() {
-        let result = apply_finding_override(Classification::Hostile, 0.95, &counts(1, 0), &T);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn two_suspicious_findings_upgrade_benign_to_suspicious() {
-        let result = apply_finding_override(Classification::Benign, 0.20, &counts(0, 2), &T);
-        let Some((class, prob)) = result else {
-            panic!("expected upgrade");
-        };
-        assert_eq!(class, Classification::Suspicious);
-        assert!((prob - T.suspicious).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn one_suspicious_finding_leaves_benign_unchanged() {
-        let result = apply_finding_override(Classification::Benign, 0.20, &counts(0, 1), &T);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn two_suspicious_findings_leave_suspicious_unchanged() {
-        let result = apply_finding_override(Classification::Suspicious, 0.70, &counts(0, 2), &T);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn no_findings_noop_for_all_classes() {
-        for class in [
-            Classification::Benign,
-            Classification::Suspicious,
-            Classification::Hostile,
-        ] {
-            assert!(apply_finding_override(class, 0.5, &counts(0, 0), &T).is_none());
-        }
-    }
-
-    #[test]
-    fn override_never_downgrades_probability() {
-        // Benign at prob 0.99 (unusual — model should've classified higher) + 2 hostile
-        // findings. The hostile floor is 0.90; max(0.99, 0.90) = 0.99, preserving prob.
-        let result = apply_finding_override(Classification::Benign, 0.99, &counts(2, 0), &T);
-        let Some((_, prob)) = result else {
-            panic!("expected class upgrade");
-        };
-        assert!((prob - 0.99).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn hostile_findings_beat_suspicious_findings() {
-        // Both rules fire; hostile must win.
-        let result = apply_finding_override(Classification::Benign, 0.10, &counts(2, 5), &T);
-        let Some((class, _)) = result else {
-            panic!("expected upgrade");
-        };
-        assert_eq!(class, Classification::Hostile);
+        .with_level(Some(7));
+        assert_eq!(config.level(), Some(7));
     }
 }
 
@@ -413,15 +261,11 @@ mod envelope_tests {
 
     fn base_result() -> ScanResult {
         ScanResult {
-            v: "4",
+            v: "5",
             classification: Classification::Benign,
             probability: 0.10,
-            original_classification: None,
-            original_probability: None,
-            thresholds: Thresholds {
-                suspicious: 0.65,
-                hostile: 0.90,
-            },
+            threshold: 0.65,
+            level: Some(3),
             version: "test".to_string(),
             analyzed_at: "2026-04-16T00:00:00Z".to_string(),
             cleave: None,
@@ -442,32 +286,40 @@ mod envelope_tests {
     }
 
     #[test]
-    fn envelope_omits_originals_when_no_override() {
+    fn envelope_emits_threshold_and_level() {
         let r = base_result();
         let envelope = r.to_envelope();
         let json = serde_json::to_value(&envelope).expect("serialize");
-        assert!(json["ml"].get("oprob").is_none(), "oprob must be omitted");
-        assert!(json["ml"].get("oclass").is_none(), "oclass must be omitted");
+        assert_eq!(json["ml"]["v"].as_str(), Some("5"));
+        assert!(
+            (json["ml"]["threshold"].as_f64().expect("threshold") - 0.65).abs() < 1e-6,
+            "threshold round-trips"
+        );
+        assert_eq!(json["ml"]["level"].as_u64(), Some(3));
+        assert!(
+            json["ml"].get("thresholds").is_none(),
+            "v4 pair must not be emitted"
+        );
+        assert!(
+            json["ml"].get("oclass").is_none(),
+            "oclass must not be emitted in v5"
+        );
+        assert!(
+            json["ml"].get("oprob").is_none(),
+            "oprob must not be emitted in v5"
+        );
     }
 
     #[test]
-    fn envelope_emits_originals_when_override_applied() {
+    fn envelope_emits_null_level_when_manual_thresholds() {
         let mut r = base_result();
-        r.classification = Classification::Hostile;
-        r.probability = 0.90;
-        r.original_classification = Some(Classification::Benign);
-        r.original_probability = Some(0.10);
-
+        r.level = None;
         let envelope = r.to_envelope();
         let json = serde_json::to_value(&envelope).expect("serialize");
-        assert_eq!(json["ml"]["class"].as_u64(), Some(2), "upgraded class");
-        assert_eq!(
-            json["ml"]["oclass"].as_u64(),
-            Some(0),
-            "original was Benign"
+        assert!(
+            json["ml"]["level"].is_null(),
+            "manual thresholds must serialize level as null"
         );
-        let oprob = json["ml"]["oprob"].as_f64().expect("oprob number");
-        assert!((oprob - 0.10).abs() < 1e-6);
     }
 }
 
@@ -509,16 +361,17 @@ pub struct FindingCounts {
 pub struct ScanResult {
     /// Schema version.
     pub v: &'static str,
-    /// Model classification outcome (may reflect a finding-based override).
+    /// Model classification outcome.
     pub classification: Classification,
-    /// Malware probability used for display and exit-code logic.
+    /// Probability the verdict was decided on.
     pub probability: f32,
-    /// Original model classification when an override upgraded the verdict.
-    pub original_classification: Option<Classification>,
-    /// Original model probability when an override upgraded the verdict.
-    pub original_probability: Option<f32>,
-    /// Thresholds.
-    pub thresholds: Thresholds,
+    /// Cutoff defining the verdict band — the same value `probability` was
+    /// compared against to produce `classification`.
+    pub threshold: f32,
+    /// Severity level (1..=9) that produced the thresholds, or `None` when
+    /// manual thresholds were supplied via `--suspicious-threshold` /
+    /// `--hostile-threshold`.
+    pub level: Option<u8>,
     /// Model version identifier (spec version, ABI version, model hash prefix).
     pub version: String,
     /// UTC timestamp of when this analysis was performed (RFC 3339).
@@ -601,6 +454,8 @@ pub struct EmbeddedFile {
     pub classification: Classification,
     /// Raw model probability for this embedded file.
     pub probability: f32,
+    /// Cutoff that defined this embedded file's verdict band.
+    pub threshold: f32,
     /// Per-model route scores for this embedded file.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_scores: Vec<RouteScore>,
@@ -905,8 +760,7 @@ fn emit_result(
 pub(crate) struct ClassifiedReport {
     pub(crate) classification: Classification,
     pub(crate) probability: f32,
-    pub(crate) original_classification: Option<Classification>,
-    pub(crate) original_probability: Option<f32>,
+    pub(crate) threshold: f32,
     pub(crate) finding_counts: FindingCounts,
     pub(crate) formula: String,
     pub(crate) reasons: Vec<Reason>,
@@ -923,7 +777,6 @@ pub(crate) struct ClassifiedReport {
 /// Run the full cleave-finalize + model inference pipeline on a report.
 /// This is the single authoritative inference path used by scan, ps, and the server.
 #[allow(clippy::needless_pass_by_value)] // Arc clones at call sites are negligible; ownership simplifies callers.
-#[allow(clippy::too_many_arguments)] // Each parameter is independently meaningful at every call site; bundling them into a context struct would be noise without a natural grouping.
 pub(crate) fn classify_report(
     label: &str,
     mut report: cleave::AnalysisReport,
@@ -931,7 +784,6 @@ pub(crate) fn classify_report(
     model: &Model,
     shap: Option<&ShapImportance>,
     cancellation: Option<&Arc<AtomicBool>>,
-    upgrade_heuristic: bool,
     embedded_file_limit: Option<usize>,
 ) -> Result<ClassifiedReport> {
     report.finalize();
@@ -972,7 +824,7 @@ pub(crate) fn classify_report(
     let size_bytes = pf["sz"].as_u64().unwrap_or(0);
     let sha256 = pf["sha"].as_str().unwrap_or("").to_string();
 
-    let (probability, classification, model_scores, skipped_models) =
+    let (decision, model_scores, skipped_models) =
         model.predict_for_report_detailed(&file_type, &raw_features, &report_json)?;
 
     let finding_counts = count_findings_from_json(&report_json);
@@ -980,8 +832,9 @@ pub(crate) fn classify_report(
     tracing::debug!(
         path = %label,
         file_type = %file_type,
-        classification = ?classification,
-        probability = format!("{:.4}", probability),
+        classification = ?decision.class,
+        probability = format!("{:.4}", decision.probability),
+        threshold = format!("{:.4}", decision.threshold),
         features_nonzero = nonzero,
         features_total = expected,
         findings_hostile = finding_counts.hostile,
@@ -993,9 +846,10 @@ pub(crate) fn classify_report(
     );
 
     // Extract embedded files (archive members at depth > 0), run each through
-    // the model individually, and elevate the parent if any embedded file scores higher.
-    // Ordinary scans cap embedded work to prevent resource exhaustion; validation
-    // passes None so every Cleave-produced embedded file is checked.
+    // the model individually, and elevate the parent if any embedded file's
+    // decision outranks it. Ordinary scans cap embedded work to prevent
+    // resource exhaustion; validation passes None so every Cleave-produced
+    // embedded file is checked.
     let embedded_iter = report_json["fs"]
         .as_array()
         .into_iter()
@@ -1007,8 +861,7 @@ pub(crate) fn classify_report(
     };
 
     let mut embedded_files: Vec<EmbeddedFile> = Vec::with_capacity(embedded_entries.len());
-    let mut max_probability = probability;
-    let mut max_classification = classification;
+    let mut max_decision: Decision = decision;
 
     for ef in &embedded_entries {
         if let Some(c) = cancellation
@@ -1020,9 +873,17 @@ pub(crate) fn classify_report(
         let mut ef_features = ctx.extract_file(ef);
         model.spec().standardize(&mut ef_features);
         let ef_type = ef["type"].as_str().unwrap_or("unknown");
-        let (ef_prob, ef_class, ef_model_scores, ef_skipped_models) = model
+        let (ef_decision, ef_model_scores, ef_skipped_models) = model
             .predict_for_file_detailed(ef_type, &ef_features, ef)
-            .unwrap_or((0.0, Classification::Benign, Vec::new(), Vec::new()));
+            .unwrap_or((
+                Decision {
+                    class: Classification::Benign,
+                    probability: 0.0,
+                    threshold: model.thresholds().suspicious,
+                },
+                Vec::new(),
+                Vec::new(),
+            ));
 
         let full_path = ef["path"].as_str().unwrap_or("");
         let rel_path = full_path
@@ -1043,21 +904,21 @@ pub(crate) fn classify_report(
         tracing::debug!(
             parent = %label,
             embedded_path = %rel_path,
-            probability = format!("{:.4}", ef_prob),
-            classification = ?ef_class,
+            probability = format!("{:.4}", ef_decision.probability),
+            classification = ?ef_decision.class,
             "classified embedded file",
         );
 
-        if ef_prob > max_probability {
-            max_probability = ef_prob;
-            max_classification = ef_class;
+        if decision_outranks(&ef_decision, &max_decision) {
+            max_decision = ef_decision;
         }
 
         embedded_files.push(EmbeddedFile {
             path: rel_path,
             file_type: ef["type"].as_str().unwrap_or("unknown").to_string(),
-            classification: ef_class,
-            probability: ef_prob,
+            classification: ef_decision.class,
+            probability: ef_decision.probability,
+            threshold: ef_decision.threshold,
             model_scores: ef_model_scores,
             skipped_models: ef_skipped_models,
             formula: ef["f"].as_str().unwrap_or("").to_string(),
@@ -1070,57 +931,27 @@ pub(crate) fn classify_report(
         embedded_files.truncate(10);
     }
 
-    // If an embedded file scored higher, elevate the parent classification.
-    let (classification, probability) = if max_probability > probability {
+    // If an embedded file's decision outranks the parent, elevate.
+    let final_decision = if decision_outranks(&max_decision, &decision) {
         tracing::info!(
             path = %label,
-            original_probability = format!("{:.4}", probability),
-            elevated_probability = format!("{:.4}", max_probability),
-            elevated_classification = ?max_classification,
+            original_probability = format!("{:.4}", decision.probability),
+            elevated_probability = format!("{:.4}", max_decision.probability),
+            elevated_classification = ?max_decision.class,
+            elevated_threshold = format!("{:.4}", max_decision.threshold),
             "elevated archive classification due to embedded file",
         );
-        (max_classification, max_probability)
+        max_decision
     } else {
-        (classification, probability)
+        decision
     };
 
-    // Escape hatch: override the ML verdict when cleave findings clearly disagree.
-    // Disabled by the --upgrade-heuristic=false flag for debugging / raw-model evaluation.
-    let override_result = if upgrade_heuristic {
-        apply_finding_override(
-            classification,
-            probability,
-            &finding_counts,
-            &model.thresholds(),
-        )
-    } else {
-        None
-    };
-    let (classification, probability, original_classification, original_probability) =
-        match override_result {
-            Some((new_class, new_prob)) => {
-                tracing::info!(
-                    path = %label,
-                    from = %classification,
-                    to = %new_class,
-                    prob = format!("{:.4}", probability),
-                    new_prob = format!("{:.4}", new_prob),
-                    hostile_findings = finding_counts.hostile,
-                    suspicious_findings = finding_counts.suspicious,
-                    "ML misclassification: upgrading {classification} to {new_class} using built-in heuristics",
-                );
-                (new_class, new_prob, Some(classification), Some(probability))
-            }
-            None => (classification, probability, None, None),
-        };
-
-    let top_findings = extract_top_findings_from_json(&report_json, &classification);
+    let top_findings = extract_top_findings_from_json(&report_json, &final_decision.class);
 
     Ok(ClassifiedReport {
-        classification,
-        probability,
-        original_classification,
-        original_probability,
+        classification: final_decision.class,
+        probability: final_decision.probability,
+        threshold: final_decision.threshold,
         finding_counts,
         formula,
         reasons,
@@ -1133,6 +964,16 @@ pub(crate) fn classify_report(
         embedded_files,
         report_json,
     })
+}
+
+/// Returns `true` when `candidate` should replace `current` as the dominant
+/// decision: higher class wins; on ties, higher probability wins.
+fn decision_outranks(candidate: &Decision, current: &Decision) -> bool {
+    match (candidate.class as u8).cmp(&(current.class as u8)) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => candidate.probability > current.probability,
+        std::cmp::Ordering::Less => false,
+    }
 }
 
 /// Apply litmus model inference to a cleave report. Always returns a ScanResult
@@ -1154,7 +995,6 @@ pub(crate) fn process_report(
         model,
         shap,
         cancellation,
-        config.upgrade_heuristic(),
         Some(100),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
@@ -1162,15 +1002,12 @@ pub(crate) fn process_report(
     // Include raw cleave report for JSON output (unmutated — ML scores go in the ml section).
     let cleave = if is_json { Some(cr.report_json) } else { None };
 
-    let thresholds = model.thresholds();
-
     Ok(ScanResult {
-        v: "4",
+        v: "5",
         classification: cr.classification,
         probability: cr.probability,
-        original_classification: cr.original_classification,
-        original_probability: cr.original_probability,
-        thresholds,
+        threshold: cr.threshold,
+        level: config.level(),
         version: model_version_string(model.info()),
         analyzed_at: now_rfc3339(),
         cleave,
@@ -1188,53 +1025,6 @@ pub(crate) fn process_report(
         sha256: cr.sha256,
         embedded_files: cr.embedded_files,
     })
-}
-
-/// Escape-hatch override for ML classifications that appear to miss the signal
-/// visible in cleave findings.
-///
-/// Returns `Some((new_class, new_prob))` when findings warrant a class upgrade
-/// beyond what the model produced, or `None` when the model's output stands.
-/// Never downgrades class or probability.
-///
-/// Rules (most severe first):
-/// - `>= 2` hostile findings → Hostile, prob floored at `thresholds.hostile`
-/// - currently Benign + `>= 2` (hostile or suspicious) findings → Suspicious, prob floored at `thresholds.suspicious`
-#[must_use]
-pub fn apply_finding_override(
-    current_class: Classification,
-    current_prob: f32,
-    counts: &FindingCounts,
-    thresholds: &Thresholds,
-) -> Option<(Classification, f32)> {
-    let (new_class, new_prob) = if counts.hostile >= 2 {
-        (
-            Classification::Hostile,
-            current_prob.max(thresholds.hostile),
-        )
-    } else if current_class == Classification::Benign && (counts.hostile + counts.suspicious >= 2) {
-        (
-            Classification::Suspicious,
-            current_prob.max(thresholds.suspicious),
-        )
-    } else {
-        return None;
-    };
-
-    if new_class == current_class && new_prob <= current_prob {
-        return None;
-    }
-
-    debug_assert!(
-        new_class as u8 >= current_class as u8,
-        "override must not downgrade class",
-    );
-    debug_assert!(
-        new_prob >= current_prob,
-        "override must not downgrade probability",
-    );
-
-    Some((new_class, new_prob))
 }
 
 /// Count cleave findings by criticality level from either a top-level report or
@@ -1472,15 +1262,6 @@ pub(crate) fn now_rfc3339() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-/// Serialize Thresholds as [suspicious, hostile] array for v4 JSON.
-fn serialize_thresholds<S>(t: &Thresholds, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::Serialize;
-    [t.suspicious, t.hostile].serialize(serializer)
-}
-
 fn route_scores_empty(scores: &[crate::model::RouteScore]) -> bool {
     scores.is_empty()
 }
@@ -1491,13 +1272,16 @@ fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
 
 /// Build per-file ML classification entries for the `ml.fs` array.
 ///
-/// Each entry contains `{id, class, prob}` keyed by the cleave `fs[].id` field.
-/// The root file (dp=0) gets the parent classification; embedded files get their
-/// individual scores matched by path suffix.
+/// Each entry contains `{id, class, prob, threshold}` keyed by the cleave
+/// `fs[].id` field. The root file (dp=0) gets the parent classification;
+/// embedded files get their individual scores matched by path suffix. Every
+/// entry carries the cutoff its `prob` was compared against so the v5
+/// invariant `class = bucket(prob, threshold)` holds per-row.
 fn build_ml_fs(
     report_json: &serde_json::Value,
     classification: &Classification,
     probability: f32,
+    threshold: f32,
     embedded_files: &[EmbeddedFile],
 ) -> Vec<serde_json::Value> {
     let Some(fs) = report_json.get("fs").and_then(|v| v.as_array()) else {
@@ -1515,19 +1299,24 @@ fn build_ml_fs(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
 
-        let (cls, prob) = if depth == 0 {
-            (classification, probability)
+        let (cls, prob, thr) = if depth == 0 {
+            (classification, probability, threshold)
         } else {
             let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let suffix = path.rsplit_once("!!").map(|(_, r)| r).unwrap_or(path);
             embedded_files
                 .iter()
                 .find(|ef| ef.path == suffix)
-                .map(|ef| (&ef.classification, ef.probability))
-                .unwrap_or((classification, probability))
+                .map(|ef| (&ef.classification, ef.probability, ef.threshold))
+                .unwrap_or((classification, probability, threshold))
         };
 
-        out.push(serde_json::json!({"id": id, "class": cls, "prob": prob}));
+        out.push(serde_json::json!({
+            "id": id,
+            "class": cls,
+            "prob": prob,
+            "threshold": thr,
+        }));
     }
     out
 }
@@ -1549,12 +1338,10 @@ pub struct MlSection {
     pub(crate) classification: Classification,
     #[serde(rename = "prob")]
     pub(crate) probability: f32,
-    #[serde(rename = "oclass", skip_serializing_if = "Option::is_none")]
-    pub(crate) original_classification: Option<Classification>,
-    #[serde(rename = "oprob", skip_serializing_if = "Option::is_none")]
-    pub(crate) original_probability: Option<f32>,
-    #[serde(serialize_with = "serialize_thresholds")]
-    pub(crate) thresholds: Thresholds,
+    pub(crate) threshold: f32,
+    /// Severity level (1..=9) that selected the deciding threshold, or `null`
+    /// when manual `--suspicious-threshold` / `--hostile-threshold` were used.
+    pub(crate) level: Option<u8>,
     #[serde(rename = "models", skip_serializing_if = "Vec::is_empty")]
     pub(crate) model_scores: Vec<crate::model::RouteScore>,
     #[serde(rename = "skip", skip_serializing_if = "Vec::is_empty")]
@@ -1587,12 +1374,10 @@ pub struct MlSectionRef<'a> {
     pub(crate) classification: Classification,
     #[serde(rename = "prob")]
     pub(crate) probability: f32,
-    #[serde(rename = "oclass", skip_serializing_if = "Option::is_none")]
-    pub(crate) original_classification: Option<Classification>,
-    #[serde(rename = "oprob", skip_serializing_if = "Option::is_none")]
-    pub(crate) original_probability: Option<f32>,
-    #[serde(serialize_with = "serialize_thresholds")]
-    pub(crate) thresholds: Thresholds,
+    pub(crate) threshold: f32,
+    /// Severity level (1..=9) that selected the deciding threshold, or `null`
+    /// when manual `--suspicious-threshold` / `--hostile-threshold` were used.
+    pub(crate) level: Option<u8>,
     #[serde(rename = "models", skip_serializing_if = "route_scores_empty")]
     pub(crate) model_scores: &'a [crate::model::RouteScore],
     #[serde(rename = "skip", skip_serializing_if = "skipped_routes_empty")]
@@ -1638,6 +1423,7 @@ impl ScanResult {
             &raw,
             &self.classification,
             self.probability,
+            self.threshold,
             &self.embedded_files,
         );
         ScanResultEnvelope {
@@ -1645,9 +1431,8 @@ impl ScanResult {
                 v: self.v,
                 classification: self.classification,
                 probability: self.probability,
-                original_classification: self.original_classification,
-                original_probability: self.original_probability,
-                thresholds: self.thresholds,
+                threshold: self.threshold,
+                level: self.level,
                 model_scores: self.model_scores.clone(),
                 skipped_models: self.skipped_models.clone(),
                 version: self.version.clone(),
@@ -1671,6 +1456,7 @@ impl ScanResult {
             &raw,
             &self.classification,
             self.probability,
+            self.threshold,
             &self.embedded_files,
         );
         ScanResultEnvelope {
@@ -1678,9 +1464,8 @@ impl ScanResult {
                 v: self.v,
                 classification: self.classification,
                 probability: self.probability,
-                original_classification: self.original_classification,
-                original_probability: self.original_probability,
-                thresholds: self.thresholds,
+                threshold: self.threshold,
+                level: self.level,
                 model_scores: self.model_scores,
                 skipped_models: self.skipped_models,
                 version: self.version,
@@ -1708,6 +1493,7 @@ impl ScanResult {
             raw,
             &self.classification,
             self.probability,
+            self.threshold,
             &self.embedded_files,
         );
         ScanResultEnvelopeRef {
@@ -1715,9 +1501,8 @@ impl ScanResult {
                 v: self.v,
                 classification: self.classification,
                 probability: self.probability,
-                original_classification: self.original_classification,
-                original_probability: self.original_probability,
-                thresholds: self.thresholds,
+                threshold: self.threshold,
+                level: self.level,
                 model_scores: &self.model_scores,
                 skipped_models: &self.skipped_models,
                 version: &self.version,

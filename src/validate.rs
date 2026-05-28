@@ -54,7 +54,6 @@ pub fn run(config: &ScanConfig) -> Result<()> {
                         &model,
                         None,
                         None,
-                        config.upgrade_heuristic(),
                         None,
                     )
                 });

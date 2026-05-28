@@ -152,11 +152,11 @@ Thresholds are baked in at server start. To change them: stop the
 server, or edit the bundle and `POST /_/reload`, or push new models
 and `POST /_/update`. There is no per-request override.
 
-The upgrade heuristic can bump a verdict after the threshold compare
-when cleave findings clearly disagree with the model. When it bumps,
-the pre-bump values appear as `oclass` and `oprob` in the response.
-The active thresholds for a request are always reported in the
-`thresholds` field, so the response is self-describing.
+The `ml.threshold` field reports the cutoff that produced the verdict
+and `ml.level` reports the severity level that selected it (`null`
+when manual thresholds were used). The pair is always consistent with
+`ml.class` and `ml.prob`, so the response is self-describing. See
+[JSON.md](JSON.md) for the full envelope.
 
 ## Security
 

@@ -3335,10 +3335,7 @@ fn looks_hexish(value: &str) -> bool {
     if len < 16 {
         return false;
     }
-    let hex = compact
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .count();
+    let hex = compact.chars().filter(char::is_ascii_hexdigit).count();
     (hex as f64) / (len as f64) > 0.95
 }
 

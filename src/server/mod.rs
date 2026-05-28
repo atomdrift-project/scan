@@ -52,7 +52,7 @@ pub struct ServerConfig {
     extract_dir: Option<PathBuf>,
     workers: usize,
     allow_cidrs: Vec<Cidr>,
-    upgrade_heuristic: bool,
+    level: Option<u8>,
     /// Per-request analysis timeout in seconds. 0 disables.
     analysis_timeout_secs: u64,
 }
@@ -131,15 +131,16 @@ impl ServerConfig {
             extract_dir,
             workers,
             allow_cidrs,
-            upgrade_heuristic: true,
+            level: None,
             analysis_timeout_secs: DEFAULT_ANALYSIS_TIMEOUT_SECS,
         })
     }
 
-    /// Override the default finding-based upgrade heuristic (`--upgrade-heuristic=false`).
+    /// Attach the FPR severity level (1..=9) that produced the resolved
+    /// thresholds. Surfaces as `ml.level` in the JSON envelope.
     #[must_use]
-    pub const fn with_upgrade_heuristic(mut self, upgrade_heuristic: bool) -> Self {
-        self.upgrade_heuristic = upgrade_heuristic;
+    pub const fn with_level(mut self, level: Option<u8>) -> Self {
+        self.level = level;
         self
     }
 
@@ -156,10 +157,11 @@ impl ServerConfig {
         self.analysis_timeout_secs
     }
 
-    /// Whether the finding-based classification upgrade heuristic is enabled.
+    /// Severity level (1..=9) used to pick thresholds, or `None` for manual
+    /// thresholds.
     #[must_use]
-    pub const fn upgrade_heuristic(&self) -> bool {
-        self.upgrade_heuristic
+    pub const fn level(&self) -> Option<u8> {
+        self.level
     }
 
     /// Directory for extracting archive members.
@@ -288,7 +290,7 @@ mod config_tests {
     }
 
     #[test]
-    fn server_config_upgrade_heuristic_defaults_to_true() {
+    fn server_config_level_defaults_to_none() {
         let config = ServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], 8081)),
             100 * 1024 * 1024,
@@ -302,11 +304,11 @@ mod config_tests {
             vec![],
         )
         .expect("valid config");
-        assert!(config.upgrade_heuristic());
+        assert!(config.level().is_none());
     }
 
     #[test]
-    fn server_config_with_upgrade_heuristic_false_disables() {
+    fn server_config_with_level_persists() {
         let config = ServerConfig::new(
             SocketAddr::from(([127, 0, 0, 1], 8081)),
             100 * 1024 * 1024,
@@ -320,8 +322,8 @@ mod config_tests {
             vec![],
         )
         .expect("valid config")
-        .with_upgrade_heuristic(false);
-        assert!(!config.upgrade_heuristic());
+        .with_level(Some(5));
+        assert_eq!(config.level(), Some(5));
     }
 }
 
@@ -382,7 +384,8 @@ pub(crate) struct ModelResources {
     pub(crate) model: Model,
     pub(crate) shap: Option<ShapImportance>,
     pub(crate) ctx: ExtractContext,
-    pub(crate) upgrade_heuristic: bool,
+    /// Severity level surfaced in the JSON envelope's `ml.level` field.
+    pub(crate) level: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -393,7 +396,7 @@ struct AppState {
     model_dir: PathBuf,
     threshold_overrides: Option<Thresholds>,
     slow_rule_ms: u64,
-    upgrade_heuristic: bool,
+    level: Option<u8>,
     allowed_dirs: Vec<PathBuf>,
     extract_dir: Option<PathBuf>,
     allow_cidrs: Vec<Cidr>,
@@ -457,7 +460,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         model_dir: config.model_dir().to_path_buf(),
         threshold_overrides: config.thresholds(),
         slow_rule_ms: config.slow_rule_ms(),
-        upgrade_heuristic: config.upgrade_heuristic(),
+        level: config.level(),
         allowed_dirs: config.allowed_dirs().to_vec(),
         extract_dir: config.extract_dir().map(PathBuf::from),
         allow_cidrs: config.allow_cidrs().to_vec(),
@@ -559,7 +562,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                                 model,
                                 shap,
                                 ctx,
-                                upgrade_heuristic: bg.upgrade_heuristic,
+                                level: bg.level,
                             }));
                             if let Ok(mut init_error) = bg.init_error.write() {
                                 *init_error = None;

@@ -142,11 +142,13 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     let json: serde_json::Value =
         serde_json::from_slice(&body_bytes).context("response must be valid JSON")?;
 
-    // Every response must have the v4 envelope fields, regardless of classification.
+    // Every response must have the v5 envelope fields, regardless of classification.
     let ml = json["ml"].as_object().context("missing ml section")?;
+    assert_eq!(ml["v"].as_str(), Some("5"), "envelope version must be v5");
     assert!(ml["class"].is_number(), "missing classification");
     assert!(ml["prob"].is_number(), "missing probability");
-    assert!(ml["thresholds"].is_array(), "missing thresholds");
+    assert!(ml["threshold"].is_number(), "missing threshold");
+    assert!(ml.contains_key("level"), "missing level field");
     assert!(ml["version"].is_string(), "missing model version");
     assert!(ml["fs"].is_array(), "missing per-file ML results");
     assert!(json["raw"].is_object(), "missing raw cleave report");

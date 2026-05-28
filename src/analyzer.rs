@@ -106,11 +106,12 @@ impl Analyzer {
         Ok(self)
     }
 
-    /// Disable the finding-based classification upgrade heuristic.
-    /// On by default; pass `false` to see raw model output.
+    /// Attach the FPR severity level (1..=9) that produced the resolved
+    /// thresholds. Surfaces as `ml.level` in the JSON envelope. Pass `None` to
+    /// indicate manual thresholds with no level metadata.
     #[must_use]
-    pub fn with_upgrade_heuristic(mut self, on: bool) -> Self {
-        self.config = self.config.with_upgrade_heuristic(on);
+    pub fn with_level(mut self, level: Option<u8>) -> Self {
+        self.config = self.config.with_level(level);
         self
     }
 
@@ -168,7 +169,7 @@ impl Analyzer {
             slow_rule_ms,
             self.config.extra(),
         )?
-        .with_upgrade_heuristic(self.config.upgrade_heuristic()))
+        .with_level(self.config.level()))
     }
 }
 

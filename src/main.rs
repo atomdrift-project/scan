@@ -137,18 +137,6 @@ struct Cli {
     #[arg(long, hide = true)]
     extra: bool,
 
-    /// Apply built-in heuristics that upgrade ML classifications when cleave
-    /// findings clearly disagree. Disable with --upgrade-heuristic=false to see
-    /// raw model output.
-    #[arg(
-        long,
-        hide = true,
-        action = clap::ArgAction::Set,
-        default_value_t = true,
-        require_equals = true,
-    )]
-    upgrade_heuristic: bool,
-
     /// Paths to files or directories to scan (shorthand for `litmus scan <paths...>`)
     paths: Vec<PathBuf>,
 
@@ -545,6 +533,18 @@ fn main() -> Result<()> {
             threshold_hostile,
         )
     };
+    // The envelope's `ml.level` reports the FPR severity that produced the
+    // resolved thresholds. Manual `--threshold-*` overrides bypass the levels
+    // table entirely, so we emit `null` for those runs.
+    let manual_thresholds = threshold_suspicious.is_some() || threshold_hostile.is_some();
+    let envelope_level: Option<u8> = if manual_thresholds {
+        None
+    } else {
+        Some(
+            selected_severity_level
+                .unwrap_or(litmus::model::DEFAULT_SEVERITY_LEVEL),
+        )
+    };
     let all = cli.show.iter().any(|s| matches!(s, Show::All));
     let filter = DisplayFilter::new(
         all || cli.show.iter().any(|s| matches!(s, Show::Hostile)),
@@ -564,7 +564,7 @@ fn main() -> Result<()> {
                 cli.slow_rule_ms,
                 cli.extra,
             )?
-            .with_upgrade_heuristic(cli.upgrade_heuristic);
+            .with_level(envelope_level);
             exit_for_summary(&run_scan_paths(&paths, &config)?);
         }
         Commands::Ps => {
@@ -578,7 +578,7 @@ fn main() -> Result<()> {
                 cli.slow_rule_ms,
                 cli.extra,
             )?
-            .with_upgrade_heuristic(cli.upgrade_heuristic);
+            .with_level(envelope_level);
             exit_for_summary(&litmus::ps::run(&config)?);
         }
         Commands::Serve {
@@ -627,7 +627,7 @@ fn main() -> Result<()> {
                 workers,
                 allow_cidrs,
             )?
-            .with_upgrade_heuristic(cli.upgrade_heuristic);
+            .with_level(envelope_level);
             eprintln!("Starting litmus server on http://{} ...", bind);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -696,7 +696,7 @@ fn main() -> Result<()> {
                 cli.slow_rule_ms,
                 cli.extra,
             )?
-            .with_upgrade_heuristic(cli.upgrade_heuristic);
+            .with_level(envelope_level);
             litmus::validate::run(&config)?;
         }
         Commands::Worker {
@@ -760,7 +760,7 @@ fn main() -> Result<()> {
                 cli.slow_rule_ms,
                 cli.extra,
             )?
-            .with_upgrade_heuristic(cli.upgrade_heuristic);
+            .with_level(envelope_level);
             if let Err(e) = litmus::validate::run(&validate_config) {
                 eprintln!("Worker startup validation failed: {e:#}");
                 process::exit(1);
@@ -781,7 +781,7 @@ fn main() -> Result<()> {
                 model_dir,
                 thresholds,
                 slow_rule_ms: cli.slow_rule_ms,
-                upgrade_heuristic: cli.upgrade_heuristic,
+                level: envelope_level,
                 nice,
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1278,37 +1278,6 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_heuristic_defaults_to_true() -> Result<()> {
-        let cli = Cli::try_parse_from(["litmus", "/tmp/a"]).context("parse should work")?;
-        assert!(cli.upgrade_heuristic);
-        Ok(())
-    }
-
-    #[test]
-    fn upgrade_heuristic_accepts_false() -> Result<()> {
-        let cli = Cli::try_parse_from(["litmus", "--upgrade-heuristic=false", "/tmp/a"])
-            .context("parse should work")?;
-        assert!(!cli.upgrade_heuristic);
-        Ok(())
-    }
-
-    #[test]
-    fn upgrade_heuristic_accepts_true_explicitly() -> Result<()> {
-        let cli = Cli::try_parse_from(["litmus", "--upgrade-heuristic=true", "/tmp/a"])
-            .context("parse should work")?;
-        assert!(cli.upgrade_heuristic);
-        Ok(())
-    }
-
-    #[test]
-    fn upgrade_heuristic_rejects_bare_form() {
-        // require_equals means --upgrade-heuristic without =value is a parse error.
-        // This keeps parsing unambiguous when positional paths follow.
-        let result = Cli::try_parse_from(["litmus", "--upgrade-heuristic", "/tmp/a"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn severity_level_flags_parse() -> Result<()> {
         let cli = Cli::try_parse_from(["litmus", "-1", "/tmp/a"]).context("-1 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(1));
@@ -1341,9 +1310,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn upgrade_heuristic_rejects_non_bool_value() {
-        let result = Cli::try_parse_from(["litmus", "--upgrade-heuristic=yes", "/tmp/a"]);
-        assert!(result.is_err());
-    }
 }

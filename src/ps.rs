@@ -303,21 +303,18 @@ fn build_result(
         model,
         shap,
         cancellation,
-        config.upgrade_heuristic(),
         Some(100),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
     let cleave = if is_json { Some(cr.report_json) } else { None };
-    let thresholds = model.thresholds();
 
     Ok(ScanResult {
-        v: "4",
+        v: "5",
         classification: cr.classification,
         probability: cr.probability,
-        original_classification: cr.original_classification,
-        original_probability: cr.original_probability,
-        thresholds,
+        threshold: cr.threshold,
+        level: config.level(),
         version: crate::scan::model_version_string(model.info()),
         analyzed_at: crate::scan::now_rfc3339(),
         cleave,
