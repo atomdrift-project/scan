@@ -73,6 +73,26 @@ fn configured_repo() -> (String, String) {
     (url, ref_name)
 }
 
+/// Like [`configured_repo`], but when no ref was pinned via env or CLI flag,
+/// consult the hosted `litmus.toml` manifest for the ref this release line
+/// should track.
+///
+/// Precedence: CLI flag / env (`LITMUS_MODELS_REF`, `URL#ref`) > manifest >
+/// remote default branch. Used by the apply/check paths (`update`,
+/// `check_updates`) so `update-rules` respects the manifest; the lazy
+/// `model_dir` resolver keeps using [`configured_repo`] so ordinary scans never
+/// touch the network.
+fn configured_repo_with_manifest() -> (String, String) {
+    let (url, ref_name) = configured_repo();
+    if !ref_name.is_empty() {
+        return (url, ref_name);
+    }
+    match crate::update_check::models_ref() {
+        Some(manifest_ref) => (url, manifest_ref),
+        None => (url, ref_name),
+    }
+}
+
 /// Resolve the models bundle directory, auto-cloning if necessary.
 ///
 /// Returns the path suitable for [`crate::model::Model::load`].
@@ -140,7 +160,7 @@ pub fn model_dir() -> Result<PathBuf> {
 /// was freshly cloned (nothing to roll back to) or when HEAD could not be read.
 pub fn update(quiet: bool) -> Result<Option<String>> {
     let base = current_models_dir();
-    let (repo_url, ref_name) = configured_repo();
+    let (repo_url, ref_name) = configured_repo_with_manifest();
 
     if ensure_repo(&base, &repo_url, &ref_name)? {
         return Ok(None);
@@ -234,7 +254,7 @@ pub fn rollback(rev: &str) -> Result<()> {
 /// Check for updates without applying them.
 pub fn check_updates() -> Result<()> {
     let base = current_models_dir();
-    let (repo_url, ref_name) = configured_repo();
+    let (repo_url, ref_name) = configured_repo_with_manifest();
     if ensure_repo(&base, &repo_url, &ref_name)? {
         return Ok(());
     }

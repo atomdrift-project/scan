@@ -37,6 +37,8 @@ pub mod scan;
 pub mod server;
 pub mod tools;
 pub mod traits_repo;
+pub mod update_check;
+pub mod update_manifest;
 pub mod validate;
 pub mod worker;
 

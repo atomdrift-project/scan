@@ -57,6 +57,10 @@ struct Cli {
     #[arg(short = 'u', long)]
     update: bool,
 
+    /// Disable the periodic update notice (also: LITMUS_NO_UPDATE_CHECK=1)
+    #[arg(long)]
+    no_update_check: bool,
+
     /// Force light-background color theme
     #[arg(long, conflicts_with = "dark")]
     light: bool,
@@ -511,6 +515,19 @@ fn main() -> Result<()> {
             | Commands::Worker { .. }
     ) {
         litmus::tools::warn_missing();
+    }
+
+    // Interactive commands get a once-a-day, zero-telemetry update notice. The
+    // long-running daemons (serve/worker) are excluded — they refresh on
+    // restart and shouldn't print transient notices into their logs.
+    if matches!(
+        command,
+        Commands::Scan { .. }
+            | Commands::Ps
+            | Commands::Version
+            | Commands::UpdateRules { .. }
+    ) {
+        litmus::update_check::maybe_notify(cli.no_update_check);
     }
 
     if cli.update {
