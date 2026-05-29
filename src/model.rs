@@ -1,25 +1,13 @@
 //! Model loading, thresholding, and inference.
 //!
-//! ## Model file formats (since v1.3 / spec v18)
+//! ## Model file format
 //!
-//! Three backends are supported:
-//!
-//! - **`.onnx`** — portable inference graph emitted by collimator's
-//!   training pipeline (LightGBM via `onnxmltools.convert_lightgbm`)
-//!   or any other framework that exports to ONNX. Loaded via `tract`
-//!   (pure-Rust, no FFI). **Preferred when present** — ~50% smaller
-//!   than `.txt`, 3-5× faster to load, 5-11× faster to infer.
-//! - **`.txt`** — native LightGBM Booster format. The historical
-//!   default. Still emitted alongside `.onnx` during the transition
-//!   and used as the canonical artifact for constant-predictor
-//!   models that ONNX Runtime's TreeEnsembleClassifier can't load.
-//! - **`.json`** — native XGBoost JSON dump.
-//!
-//! When `.onnx` and `.txt` are present for the same model (transitional
-//! state during the v18 ONNX migration), `.onnx` wins. The legacy
-//! ambiguity rule (`.txt` + `.json` together is ambiguous because
-//! they're different backends) still applies — `.onnx` doesn't conflict
-//! with either since it can represent both backends' graphs.
+//! Only **`.onnx`** is supported — a portable inference graph emitted by
+//! collimator's training pipeline (LightGBM via `onnxmltools.convert_lightgbm`)
+//! or any other framework that exports to ONNX. Loaded via `tract` (pure-Rust,
+//! no FFI). The native LightGBM (`.txt`) and XGBoost (`.json`) loaders were
+//! retired now that collimator deploys ONNX-only bundles; any non-ONNX model
+//! artifact is rejected at load time.
 //!
 //! ## Bundle layouts
 //!
@@ -29,7 +17,7 @@
 //!
 //! ```text
 //! <model_dir>/
-//!   model.onnx | model.txt | model.json
+//!   model.onnx
 //!   feature_spec.json
 //!   config.json
 //!   evaluation.json
@@ -42,13 +30,13 @@
 //!   config.json                   ensemble-level config: route map + thresholds
 //!   route_policies.json           optional per-filetype decision policies
 //!   general/                      always required
-//!     model.onnx | model.txt | model.json
+//!     model.onnx | models/seed_*.onnx
 //!     feature_spec.json
 //!   filegroups/<group>/           optional, e.g. native, scripts, archive
-//!     model.onnx | model.txt | model.json
+//!     model.onnx | models/seed_*.onnx
 //!     feature_spec.json           may be absent → uses general's spec
 //!   filetypes/<type>/             optional, e.g. elf, pe
-//!     model.onnx | model.txt | model.json
+//!     model.onnx | models/seed_*.onnx
 //!     feature_spec.json           may be absent → uses general's spec
 //! ```
 //!
@@ -738,34 +726,24 @@ impl OnnxBackend {
 
 #[derive(Debug)]
 enum InnerModel {
-    Xgboost(xgboost_ars::Model),
-    Lightgbm(lightgbm_ars::Model),
     Onnx(Box<OnnxBackend>),
 }
 
 impl InnerModel {
     fn num_features(&self) -> usize {
         match self {
-            Self::Xgboost(m) => m.num_features(),
-            Self::Lightgbm(m) => m.num_features(),
             Self::Onnx(m) => m.n_features,
         }
     }
 
     fn predict(&self, features: &[f32]) -> Result<f32> {
         match self {
-            Self::Xgboost(m) => Ok(m.predict(features)),
-            Self::Lightgbm(m) => m
-                .predict(features)
-                .map_err(|e| anyhow::anyhow!("lightgbm predict failed: {e}")),
             Self::Onnx(m) => m.predict(features),
         }
     }
 
     fn kind(&self) -> &'static str {
         match self {
-            Self::Xgboost(_) => "xgboost",
-            Self::Lightgbm(_) => "lightgbm",
             Self::Onnx(_) => "onnx",
         }
     }
@@ -1432,20 +1410,14 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
         Vec::new()
     };
 
-    // Legacy single-model layout: model.{onnx,txt,json} directly under
-    // bundle_dir. .onnx wins when present (load + infer faster). When
-    // both .txt and .json exist with no .onnx, the bundle is ambiguous
-    // because they're different backends (LightGBM vs XGBoost). .onnx
-    // + .txt for the same route is FINE — the .onnx is just the
-    // LightGBM model in a portable format.
+    // Single-model layout: model.onnx directly under bundle_dir. The native
+    // model.txt (LightGBM) / model.json (XGBoost) layouts were retired — the
+    // deploy ships ONNX-only.
     let single_onnx = bundle_dir.join("model.onnx");
-    let single_xgb = bundle_dir.join("model.json");
-    let single_lgb = bundle_dir.join("model.txt");
-    let has_single = single_onnx.is_file() || single_xgb.is_file() || single_lgb.is_file();
 
-    if !multi.is_empty() && has_single {
+    if !multi.is_empty() && single_onnx.is_file() {
         anyhow::bail!(
-            "model bundle is ambiguous: both `models/` (multi-seed) and a top-level model artifact \
+            "model bundle is ambiguous: both `models/` (multi-seed) and a top-level model.onnx \
              exist in {}; remove one to disambiguate the layout",
             bundle_dir.display(),
         );
@@ -1456,20 +1428,10 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
     } else if single_onnx.is_file() {
         vec![single_onnx]
     } else {
-        match (single_xgb.is_file(), single_lgb.is_file()) {
-            (true, false) => vec![single_xgb],
-            (false, true) => vec![single_lgb],
-            (true, true) => anyhow::bail!(
-                "model bundle is ambiguous: both {} and {} exist; remove one to disambiguate the backend",
-                single_xgb.display(),
-                single_lgb.display(),
-            ),
-            (false, false) => anyhow::bail!(
-                "model bundle is incomplete: missing model.onnx, model.json (XGBoost), or model.txt (LightGBM) \
-                 in {} (and no models/ directory either)",
-                bundle_dir.display(),
-            ),
-        }
+        anyhow::bail!(
+            "model bundle is incomplete: no model.onnx and no models/ directory in {}",
+            bundle_dir.display(),
+        )
     };
 
     let mut models = Vec::with_capacity(model_paths.len());
@@ -1512,16 +1474,13 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
     Ok(Backend { models })
 }
 
-/// Pick up every `seed_*.{onnx,txt,json}` under a `models/` directory.
-/// When the same seed has both `.onnx` and `.txt` (transitional state
-/// while the deploy migrates ONNX in), the `.onnx` wins because it
-/// loads ~3× faster, infers 5-11× faster, and is ~50% smaller. Output
-/// is sorted by stem (so seed_42 lands before seed_43) and is
-/// deterministic across runs.
+/// Pick up every `seed_*.onnx` under a `models/` directory. Native
+/// `.txt`/`.json` seeds are ignored — only ONNX is loadable. Output is
+/// sorted (so seed_42 lands before seed_43) and deterministic across runs.
 fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
-    use std::collections::BTreeMap;
-    // stem -> chosen path. BTreeMap keeps stems sorted for deterministic order.
-    let mut by_stem: BTreeMap<String, PathBuf> = BTreeMap::new();
+    use std::collections::BTreeSet;
+    // Sorted set keeps a deterministic load order for the averaged ensemble.
+    let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
     for entry in std::fs::read_dir(multi_dir)
         .with_context(|| format!("reading multi-seed models dir {}", multi_dir.display()))?
     {
@@ -1534,68 +1493,32 @@ fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        // Tolerate bystander files (READMEs, hashes) and retired native dumps
+        // so they don't break loading; only ONNX seeds are members.
         if !name.starts_with("seed_") {
-            // Tolerate bystander files (READMEs, hashes) so future additions
-            // don't silently break loading.
             continue;
         }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        // Lower number = higher priority (matches collimator's bundle.py
-        // _EXT_PRIORITY).
-        let priority = match ext {
-            "onnx" => 0u8,
-            "txt" => 1,
-            "json" => 2,
-            _ => continue,
-        };
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        if path.extension().and_then(|e| e.to_str()) != Some("onnx") {
             continue;
-        };
-        let stem = stem.to_owned();
-        match by_stem.get(&stem) {
-            Some(existing) => {
-                let existing_ext = existing
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                let existing_priority = match existing_ext {
-                    "onnx" => 0u8,
-                    "txt" => 1,
-                    "json" => 2,
-                    _ => 255,
-                };
-                if priority < existing_priority {
-                    by_stem.insert(stem, path);
-                }
-            }
-            None => {
-                by_stem.insert(stem, path);
-            }
         }
+        paths.insert(path);
     }
-    Ok(by_stem.into_values().collect())
+    Ok(paths.into_iter().collect())
 }
 
-/// Load one trained model from a path, picking the backend by extension.
+/// Load one trained model from a path. Only ONNX is supported — the native
+/// LightGBM (`.txt`) and XGBoost (`.json`) loaders were retired now that
+/// collimator deploys ONNX-only bundles.
 fn load_inner_model(path: &Path) -> Result<InnerModel> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
-        "json" => {
-            let m = xgboost_ars::Model::load(path)
-                .with_context(|| format!("loading XGBoost model from {}", path.display()))?;
-            Ok(InnerModel::Xgboost(m))
-        }
-        "txt" => {
-            let m = lightgbm_ars::Model::load(path)
-                .with_context(|| format!("loading LightGBM model from {}", path.display()))?;
-            Ok(InnerModel::Lightgbm(m))
-        }
         "onnx" => {
             let m = OnnxBackend::load(path)?;
             Ok(InnerModel::Onnx(Box::new(m)))
         }
         other => anyhow::bail!(
-            "unrecognized model extension {other:?} for {}; expected .onnx, .txt (LightGBM), or .json (XGBoost)",
+            "unsupported model extension {other:?} for {}; only .onnx is supported \
+             (the LightGBM/XGBoost loaders were removed)",
             path.display(),
         ),
     }

@@ -1,7 +1,7 @@
 //! Integration tests for ensemble routing in `litmus::model::Model`.
 //!
 //! Builds a temporary ensemble bundle (general/ + filegroups/native/ +
-//! filetypes/elf/) from a real LightGBM bundle and verifies:
+//! filetypes/elf/) from a real ONNX bundle and verifies:
 //!   * `predict_for(file_type, …)` consults the right specialists.
 //!   * Files whose type is unmapped route to general only.
 //!   * A specialist with the wrong number of features is dropped (warning,
@@ -12,7 +12,7 @@
 //! disk. Run with:
 //!
 //! ```sh
-//! LITMUS_LIGHTGBM_BUNDLE=/home/t/collimator/out/models/azoth-light-full-leaves96-cpu \
+//! LITMUS_ONNX_BUNDLE=/home/t/azoth/filetypes/pe \
 //!     cargo test --test ensemble_dispatch -- --ignored
 //! ```
 
@@ -22,13 +22,11 @@ use std::path::{Path, PathBuf};
 
 use litmus::model::Model;
 
-fn lightgbm_bundle() -> Option<PathBuf> {
-    let p = std::env::var("LITMUS_LIGHTGBM_BUNDLE")
+fn onnx_bundle() -> Option<PathBuf> {
+    let p = std::env::var("LITMUS_ONNX_BUNDLE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from("/home/t/collimator/out/models/azoth-light-full-leaves96-cpu")
-        });
-    (p.join("model.txt").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
+        .unwrap_or_else(|_| PathBuf::from("/home/t/azoth/filetypes/pe"));
+    (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
 }
 
 /// Stage `general/` plus optionally `filegroups/<group>` and
@@ -45,7 +43,7 @@ fn stage_ensemble(
 
     let copy_bundle_to = |dest: &Path| {
         std::fs::create_dir_all(dest).unwrap();
-        for f in &["model.txt", "feature_spec.json"] {
+        for f in &["model.onnx", "feature_spec.json"] {
             std::fs::copy(src.join(f), dest.join(f)).unwrap();
         }
     };
@@ -63,10 +61,10 @@ fn stage_ensemble(
 }
 
 #[test]
-#[ignore = "needs LITMUS_LIGHTGBM_BUNDLE pointing at a real LightGBM bundle"]
+#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_routes_to_filetype_specialist_when_present() {
-    let Some(src) = lightgbm_bundle() else {
-        panic!("LITMUS_LIGHTGBM_BUNDLE not set or missing artifacts");
+    let Some(src) = onnx_bundle() else {
+        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
     };
     let cfg = r#"{
       "filetype_to_filegroup": { "elf": "native", "pe": "native" }
@@ -93,10 +91,10 @@ fn ensemble_routes_to_filetype_specialist_when_present() {
 }
 
 #[test]
-#[ignore = "needs LITMUS_LIGHTGBM_BUNDLE pointing at a real LightGBM bundle"]
+#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_routes_to_filegroup_when_filetype_absent() {
-    let Some(src) = lightgbm_bundle() else {
-        panic!("LITMUS_LIGHTGBM_BUNDLE not set or missing artifacts");
+    let Some(src) = onnx_bundle() else {
+        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
     };
     let cfg = r#"{
       "filetype_to_filegroup": { "pe": "native" }
@@ -111,10 +109,10 @@ fn ensemble_routes_to_filegroup_when_filetype_absent() {
 }
 
 #[test]
-#[ignore = "needs LITMUS_LIGHTGBM_BUNDLE pointing at a real LightGBM bundle"]
+#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_with_only_general_falls_back_to_general() {
-    let Some(src) = lightgbm_bundle() else {
-        panic!("LITMUS_LIGHTGBM_BUNDLE not set or missing artifacts");
+    let Some(src) = onnx_bundle() else {
+        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
     };
     let cfg = r#"{}"#;
     let dir = stage_ensemble(&src, &[], &[], cfg);
@@ -128,10 +126,10 @@ fn ensemble_with_only_general_falls_back_to_general() {
 }
 
 #[test]
-#[ignore = "needs LITMUS_LIGHTGBM_BUNDLE pointing at a real LightGBM bundle"]
+#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_required_route_missing_is_fatal() {
-    let Some(src) = lightgbm_bundle() else {
-        panic!("LITMUS_LIGHTGBM_BUNDLE not set or missing artifacts");
+    let Some(src) = onnx_bundle() else {
+        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
     };
     let cfg = r#"{
       "filetype_to_filegroup": {},

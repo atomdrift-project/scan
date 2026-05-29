@@ -65,12 +65,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 dirs = "6.0"
-xgboost-ars = { git = "https://codeberg.org/atomdrift/xgboost-ars" }
-lightgbm-ars = { git = "https://codeberg.org/atomdrift/lightgbm-ars" }
-# Pure-Rust ONNX inference (no FFI). Used to load .onnx route models
-# emitted by collimator's training pipeline alongside the legacy .txt
-# artifacts. tract handles the TreeEnsembleClassifier op LightGBM
-# models compile down to with onnxmltools.
+# Pure-Rust ONNX inference (no FFI) — the only model backend. Loads the
+# .onnx route models emitted by collimator's training pipeline; tract
+# handles the TreeEnsembleClassifier op LightGBM models compile down to
+# with onnxmltools.
 tract-onnx = { version = "0.21", default-features = false }
 sha2 = "0.10"
 terminal-colorsaurus = "0.4"

@@ -2493,14 +2493,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightgbm-ars"
-version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/lightgbm-ars#691b45e24058b145f3a8f1a6cce8692b6351012e"
-dependencies = [
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2588,7 +2580,6 @@ dependencies = [
  "dirs",
  "hostname",
  "libc",
- "lightgbm-ars",
  "proclist",
  "rayon",
  "reqwest",
@@ -2603,7 +2594,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tract-onnx",
- "xgboost-ars",
 ]
 
 [[package]]
@@ -6600,16 +6590,6 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix 1.1.4",
-]
-
-[[package]]
-name = "xgboost-ars"
-version = "1.0.1"
-source = "git+https://codeberg.org/atomdrift/xgboost-ars#2f653ea78f0ff26f0d13cca694fddfdabf8203d9"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
