@@ -35,7 +35,7 @@ below are the key.
 | `class`       | `classification`          | u8 (0/1/2)             | Final classification.                                |
 | `prob`        | `probability`             | f32 in `[0, 1]`        | Probability the verdict was decided on.              |
 | `threshold`   | `threshold`               | f32 in `[0, 1]`        | Cutoff defining the verdict band. See **The invariant** below. |
-| `level`       | `level`                   | u8 (1..=9) or null     | Severity level that selected the threshold, or `null` when manual thresholds were used. |
+| `level`       | `level`                   | u8 (0..=19) or null    | Severity level that selected the threshold, or `null` when manual thresholds were used. |
 | `models`      | `model_scores`            | array of `RouteScore`  | Per-route ensemble scores. Omitted if empty.         |
 | `skip`        | `skipped_models`          | array of `SkippedRoute`| Routes that were applicable but unused.              |
 | `version`     | `version`                 | string                 | Model version: spec, ABI, hash prefix.               |
@@ -62,8 +62,8 @@ cutoff that value was compared against. The two are always
 self-consistent for the verdict.
 
 `level` answers "what false-positive level produced this threshold?"
-For level-driven thresholds (the default, or `-1`..`-9` / `--loose` /
-`--paranoid`), `level` is `1..=9`. When `--threshold-suspicious` or
+For level-driven thresholds (the default, or `-0`..`-9` / `-l <N>` /
+`--level <N>` / `--loose` / `--paranoid`), `level` is `0..=19`. When `--threshold-suspicious` or
 `--threshold-hostile` was supplied, `level` is `null` — the threshold
 came from the operator, not from the model's level table.
 

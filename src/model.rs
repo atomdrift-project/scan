@@ -289,10 +289,10 @@ fn load_evaluation_severity_thresholds(model_dir: &Path, level: u8) -> Option<Th
 /// severity metadata.
 ///
 /// # Errors
-/// Returns an error if `level` is outside `1..=9`.
+/// Returns an error if `level` is outside `0..=19`.
 pub fn load_severity_thresholds(model_dir: &Path, level: u8) -> Result<Option<Thresholds>> {
-    if !(1..=9).contains(&level) {
-        anyhow::bail!("severity level must be in 1..=9, got {level}");
+    if !(0..=19).contains(&level) {
+        anyhow::bail!("severity level must be in 0..=19, got {level}");
     }
     Ok(load_config_severity_thresholds(model_dir, level)
         .or_else(|| load_evaluation_severity_thresholds(model_dir, level)))
@@ -2637,8 +2637,8 @@ mod tests {
     #[test]
     fn load_severity_thresholds_rejects_invalid_level() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let err = load_severity_thresholds(dir.path(), 0).expect_err("level 0 is invalid");
-        assert!(err.to_string().contains("1..=9"));
+        let err = load_severity_thresholds(dir.path(), 20).expect_err("level 20 is invalid");
+        assert!(err.to_string().contains("0..=19"));
         Ok(())
     }
 

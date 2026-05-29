@@ -34,11 +34,13 @@ litmus suspect.tgz                       # one sample
 litmus /srv/npm-mirror                   # recursive; archives unpacked
 litmus --format json --show all pkg/     # JSONL for pipelines
 litmus ps                                # classify running processes
-litmus -1 release.tgz                    # loose: zero-FP target
+litmus -0 release.tgz                    # zero false positives; strictest
+litmus --loose release.tgz               # level 1: least noisy
 litmus -9 release.tgz                    # paranoid: catch the long tail
+litmus -l 14 release.tgz                 # any level 0-19 via -l/--level
 ```
 
-Sensitivity is gzip-style: `-1` through `-9`, default `-5`. For exact cutoffs use `--threshold-hostile` / `--threshold-suspicious`. `--model-dir` swaps in a custom model bundle.
+Sensitivity is gzip-style: `-0` through `-9` (or `-l <N>` / `--level <N>` for the full `0`-`19` range), default `-3`; higher levels are more sensitive and noisier. For exact cutoffs use `--threshold-hostile` / `--threshold-suspicious`. `--model-dir` swaps in a custom model bundle.
 
 Exit codes: `0` clean, `1` hostile, `2` suspicious, `3` error.
 

@@ -42,8 +42,8 @@ enum Show {
 #[command(group(
     clap::ArgGroup::new("severity_level")
         .args([
-            "level_1", "level_2", "level_3", "level_4", "level_5",
-            "level_6", "level_7", "level_8", "level_9",
+            "level", "level_0", "level_1", "level_2", "level_3", "level_4",
+            "level_5", "level_6", "level_7", "level_8", "level_9",
         ])
         .multiple(false)
         .conflicts_with_all(["threshold_suspicious", "threshold_hostile"])
@@ -89,7 +89,15 @@ struct Cli {
     #[arg(long)]
     threshold_hostile: Option<f32>,
 
-    /// Use severity level 1: zero-FP targets; least noisy
+    /// Tune thresholds for false-positive level N (0-19): higher = more sensitive, noisier
+    #[arg(short = 'l', long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=19), global = true)]
+    level: Option<u8>,
+
+    /// Use severity level 0: zero false positives; strictest
+    #[arg(short = '0', global = true, action = clap::ArgAction::SetTrue)]
+    level_0: bool,
+
+    /// Use severity level 1: least noisy
     #[arg(short = '1', long = "loose", global = true, action = clap::ArgAction::SetTrue)]
     level_1: bool,
 
@@ -146,7 +154,11 @@ struct Cli {
 
 impl Cli {
     fn selected_severity_level(&self) -> Option<u8> {
+        if let Some(level) = self.level {
+            return Some(level);
+        }
         [
+            (self.level_0, 0),
             (self.level_1, 1),
             (self.level_2, 2),
             (self.level_3, 3),
@@ -1293,6 +1305,21 @@ mod tests {
         let cli = Cli::try_parse_from(["litmus", "scan", "--paranoid", "/tmp/a"])
             .context("global --paranoid should parse after scan")?;
         assert_eq!(cli.selected_severity_level(), Some(9));
+
+        let cli = Cli::try_parse_from(["litmus", "-0", "/tmp/a"]).context("-0 should parse")?;
+        assert_eq!(cli.selected_severity_level(), Some(0));
+
+        let cli = Cli::try_parse_from(["litmus", "-l", "19", "/tmp/a"])
+            .context("-l 19 should parse")?;
+        assert_eq!(cli.selected_severity_level(), Some(19));
+
+        let cli = Cli::try_parse_from(["litmus", "--level", "12", "/tmp/a"])
+            .context("--level 12 should parse")?;
+        assert_eq!(cli.selected_severity_level(), Some(12));
+
+        // Out-of-range and conflicting selections are rejected.
+        assert!(Cli::try_parse_from(["litmus", "-l", "20", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["litmus", "-l", "3", "-5", "/tmp/a"]).is_err());
         Ok(())
     }
 

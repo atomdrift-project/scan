@@ -136,7 +136,7 @@ impl ServerConfig {
         })
     }
 
-    /// Attach the FPR severity level (1..=9) that produced the resolved
+    /// Attach the FPR severity level (0..=19) that produced the resolved
     /// thresholds. Surfaces as `ml.level` in the JSON envelope.
     #[must_use]
     pub const fn with_level(mut self, level: Option<u8>) -> Self {
@@ -157,7 +157,7 @@ impl ServerConfig {
         self.analysis_timeout_secs
     }
 
-    /// Severity level (1..=9) used to pick thresholds, or `None` for manual
+    /// Severity level (0..=19) used to pick thresholds, or `None` for manual
     /// thresholds.
     #[must_use]
     pub const fn level(&self) -> Option<u8> {
