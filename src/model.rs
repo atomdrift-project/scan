@@ -610,9 +610,8 @@ pub struct ModelInfo {
 /// One trained tree-boosting model, picked at load time by file extension.
 /// Pure-Rust ONNX backend (tract). Loads a serialized ONNX graph and
 /// runs single-sample inference returning the positive-class
-/// probability. Used to read the .onnx artifacts collimator emits
-/// alongside .txt models — typically ~50% smaller and 3-5× faster
-/// to load and infer than the LightGBM .txt path.
+/// probability. Reads the `.onnx` route artifacts collimator emits — the
+/// only model format litmus loads.
 ///
 /// The graph is `onnxmltools.convert_lightgbm`'s standard output:
 /// inputs `("input", float32, [N, n_features])`, outputs
@@ -752,15 +751,14 @@ impl InnerModel {
 /// Inference backend powering a loaded [`Model`].
 ///
 /// Holds one or more trained models for a route. Single-model bundles (the
-/// historical layout, `model.txt` or `model.json` directly under the bundle
-/// dir) load `models = [one_model]`. Multi-seed bundles store
-/// `models/seed_NN.txt` (or `.json`) and load all of them; `predict` returns
-/// the arithmetic mean of every member's score, which is the variance-reducing
-/// equivalent of training K seeds and ensembling them at inference time.
+/// single-bundle layout, `model.onnx` directly under the bundle dir) load
+/// `models = [one_model]`. Multi-seed bundles store `models/seed_NN.onnx` and
+/// load all of them; `predict` returns the arithmetic mean of every member's
+/// score, which is the variance-reducing equivalent of training K seeds and
+/// ensembling them at inference time.
 ///
-/// All members of `models` are required to have the same backend kind
-/// (XGBoost or LightGBM) and the same `num_features` — mixing is rejected at
-/// load time.
+/// All members of `models` are required to have the same `num_features` —
+/// mismatches are rejected at load time.
 #[derive(Debug)]
 struct Backend {
     /// At least one model; up to K for multi-seed bundles. K=1 is the default
@@ -1395,13 +1393,12 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u8) -> HashMap<String, 
 
 /// Load the inference backend for a bundle directory. Multi-seed bundles
 /// store every member at `models/seed_NN.{txt,json}` (one file per seed); the
-/// historical layout has a single `model.{txt,json}` directly under the
-/// bundle dir. Both layouts are accepted; the multi-seed layout is preferred
-/// when the `models/` subdirectory is present and non-empty.
+/// single-bundle layout has a single `model.onnx` directly under the bundle
+/// dir. Both layouts are accepted; the multi-seed layout is preferred when the
+/// `models/` subdirectory is present and non-empty.
 ///
-/// Mixing `.json` (XGBoost) and `.txt` (LightGBM) members in the same `models/`
-/// directory is rejected — the deployed bundle uses a single backend kind per
-/// route. So is mixing legacy and multi-seed layouts in the same bundle.
+/// Mixing the single-bundle and multi-seed layouts in the same bundle is
+/// rejected.
 fn load_backend(bundle_dir: &Path) -> Result<Backend> {
     let multi_dir = bundle_dir.join("models");
     let multi = if multi_dir.is_dir() {
@@ -1435,24 +1432,9 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
     };
 
     let mut models = Vec::with_capacity(model_paths.len());
-    let mut first_kind: Option<&'static str> = None;
     let mut first_n_features: Option<usize> = None;
     for path in &model_paths {
         let inner = load_inner_model(path)?;
-        // Refuse to mix backend kinds across members.
-        let kind = inner.kind();
-        if let Some(prev) = first_kind {
-            if prev != kind {
-                anyhow::bail!(
-                    "model bundle has mixed backends in {}: member {} is {kind} but earlier \
-                     members were {prev}; every member must share the same backend kind",
-                    bundle_dir.display(),
-                    path.display(),
-                );
-            }
-        } else {
-            first_kind = Some(kind);
-        }
         // Refuse to mix feature counts — averaging across heterogeneous
         // feature spaces would silently produce nonsense scores.
         let n = inner.num_features();
@@ -1988,7 +1970,7 @@ impl Model {
 
 impl Model {
     /// Load model artifacts from a directory containing `feature_spec.json`
-    /// and either `model.json` (XGBoost) or `model.txt` (LightGBM).
+    /// and `model.onnx` (or `models/seed_*.onnx`).
     ///
     /// The same directory may also contain optional metadata such as
     /// `shap_importance.json` and git history, but those are not required here.
@@ -2478,7 +2460,7 @@ impl Model {
         })
     }
 
-    /// Inference backend identifier (`"xgboost"` or `"lightgbm"`).
+    /// Inference backend identifier (always `"onnx"`).
     #[must_use]
     pub fn backend_kind(&self) -> &'static str {
         self.inner.kind()

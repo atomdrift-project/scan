@@ -1,5 +1,6 @@
 //! `litmus` classifies files as benign, suspicious, or hostile using
-//! `cleave` static analysis plus an XGBoost model.
+//! `cleave` static analysis plus a gradient-boosted tree model (loaded as
+//! ONNX via `tract`).
 //!
 //! The crate exposes a small public API centered around:
 //! - [`ScanConfig`] for validated scan settings

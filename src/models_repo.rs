@@ -2,9 +2,8 @@
 //!
 //! Models live in a separate git repository whose checkout root *is* the
 //! model bundle: `feature_spec.json`, `config.json`, `evaluation.json`, and
-//! either `model.json` (XGBoost) or `model.txt` (LightGBM) sit at the top
-//! level. The model "version" is the git ref the checkout points at, not a
-//! subdirectory name.
+//! `model.onnx` (or `models/seed_*.onnx`) sit at the top level. The model
+//! "version" is the git ref the checkout points at, not a subdirectory name.
 //!
 //! On-disk layout under `dirs::data_dir()/litmus/models/`:
 //!
@@ -49,9 +48,10 @@ const STALENESS_DAYS: u64 = 30;
 const REMOTE_DEFAULT_REF: &str = "";
 
 /// Files that must be present in a complete bundle. The model file is checked
-/// separately because we accept either `model.json` or `model.txt`.
+/// separately because it may live at the top level or under `models/`.
 const REQUIRED_ARTIFACTS: &[&str] = &["feature_spec.json"];
-const MODEL_FILES: &[&str] = &["model.json", "model.txt"];
+/// litmus is ONNX-only — the native LightGBM/XGBoost loaders were retired.
+const MODEL_FILES: &[&str] = &["model.onnx"];
 
 /// Resolve the configured upstream URL and ref.
 ///
@@ -365,8 +365,8 @@ fn missing_artifacts(path: &Path) -> Vec<String> {
         .filter(|f| !path.join(f).exists())
         .map(|f| (*f).to_owned())
         .collect();
-    if !MODEL_FILES.iter().any(|f| path.join(f).exists()) {
-        missing.push(format!("one of [{}]", MODEL_FILES.join(", ")));
+    if !has_model_artifact(path) {
+        missing.push("model.onnx (or models/seed_*.onnx)".to_owned());
     }
     missing
 }
@@ -401,10 +401,7 @@ fn has_model_artifact(path: &Path) -> bool {
             return false;
         };
         name.starts_with("seed_")
-            && matches!(
-                path.extension().and_then(|ext| ext.to_str()),
-                Some("json" | "txt")
-            )
+            && path.extension().and_then(|ext| ext.to_str()) == Some("onnx")
     })
 }
 
@@ -568,9 +565,9 @@ mod tests {
     }
 
     #[test]
-    fn has_models_accepts_xgboost_layout() {
+    fn has_models_accepts_onnx_single_layout() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("model.json"), b"").unwrap();
+        std::fs::write(tmp.path().join("model.onnx"), b"").unwrap();
         std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
         assert!(has_models(tmp.path()));
     }
@@ -580,7 +577,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let general = tmp.path().join("general");
         std::fs::create_dir_all(&general).unwrap();
-        std::fs::write(general.join("model.txt"), b"").unwrap();
+        std::fs::write(general.join("model.onnx"), b"").unwrap();
         std::fs::write(general.join("feature_spec.json"), b"{}").unwrap();
         // Top-level config.json is optional for the resolver's "is this a
         // complete bundle?" check; the loader will read it if present.
@@ -593,7 +590,7 @@ mod tests {
         let models = tmp.path().join("general").join("models");
         std::fs::create_dir_all(&models).unwrap();
         std::fs::write(tmp.path().join("general").join("feature_spec.json"), b"{}").unwrap();
-        std::fs::write(models.join("seed_42.txt"), b"").unwrap();
+        std::fs::write(models.join("seed_42.onnx"), b"").unwrap();
         assert!(has_models(tmp.path()));
     }
 
@@ -606,11 +603,15 @@ mod tests {
     }
 
     #[test]
-    fn has_models_accepts_lightgbm_layout() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("model.txt"), b"").unwrap();
-        std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
-        assert!(has_models(tmp.path()));
+    fn has_models_rejects_native_model_files() {
+        // litmus is ONNX-only: a .txt/.json bundle the loader can't read must
+        // not be reported as a complete bundle.
+        for native in ["model.txt", "model.json"] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(native), b"").unwrap();
+            std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
+            assert!(!has_models(tmp.path()), "{native} should be rejected");
+        }
     }
 
     #[test]

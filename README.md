@@ -12,7 +12,7 @@ Context-free malware detection. Classifies a file, directory, or running process
 
 ## How it works
 
-litmus runs each sample through [cleave](https://codeberg.org/atomdrift/cleave) to extract capabilities (50,000+ rules mapped to [MBC](https://github.com/MBCProject/mbc-markdown) and [ATT&CK](https://attack.mitre.org/)), then scores them with **azoth**, our XGBoost model trained for context-free malware detection. Every verdict ships with a TreeSHAP-ranked list of the capabilities that drove the score — computed on the live model, not a post-hoc story.
+litmus runs each sample through [cleave](https://codeberg.org/atomdrift/cleave) to extract capabilities (50,000+ rules mapped to [MBC](https://github.com/MBCProject/mbc-markdown) and [ATT&CK](https://attack.mitre.org/)), then scores them with **azoth**, our gradient-boosted tree model (trained with LightGBM, shipped as ONNX) for context-free malware detection. Every verdict ships with a SHAP-ranked list of the capabilities that drove the score.
 
 CPU-only inference. No GPU, no network, no telemetry. Same weights on a laptop, CI runner, or fleet.
 
@@ -63,7 +63,6 @@ Models and rules are plain git repos; `--update` pulls new versions on demand.
 - [cleave](https://codeberg.org/atomdrift/cleave) — the capability analyzer underneath
 - [azoth](https://codeberg.org/atomdrift/azoth) — model weights, thresholds, and feature spec
 - [hopper](https://codeberg.org/atomdrift/hopper) — distributed work queue
-- [xgboost-ars](https://codeberg.org/atomdrift/xgboost-ars) — pure-Rust inference with exact TreeSHAP
 - [Atomdrift Lab](https://lab.atomdrift.org/) — submit samples for free analysis
 
 ## License
