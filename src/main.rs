@@ -1143,30 +1143,9 @@ fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litm
     // Prefetching from main (non-rayon) fills the OnceLock safely.
     cleave::prefetch_shared_resources(true);
 
-    let started = std::time::Instant::now();
-    let mut summary = litmus::ScanSummary {
-        total_files: 0,
-        hostile: 0,
-        suspicious: 0,
-        benign: 0,
-        errors: 0,
-        duration_ms: 0,
-    };
-
-    for path in paths {
-        let result = litmus::scan::run(path, config)?;
-        summary.total_files += result.total_files;
-        summary.hostile += result.hostile;
-        summary.suspicious += result.suspicious;
-        summary.benign += result.benign;
-        summary.errors += result.errors;
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        summary.duration_ms = started.elapsed().as_millis() as u64;
-    }
-    Ok(summary)
+    // Explicit files are analyzed as one parallel batch and each directory is
+    // streamed; run_paths shares one model load and verdict tally across all.
+    litmus::scan::run_paths(paths, config)
 }
 
 #[cfg(test)]

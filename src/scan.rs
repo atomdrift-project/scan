@@ -730,6 +730,172 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     Ok(summary)
 }
 
+/// Aggregate verdict counters shared across the parallel scan workers.
+#[derive(Default)]
+struct Tally {
+    hostile: AtomicU32,
+    suspicious: AtomicU32,
+    benign: AtomicU32,
+    errors: AtomicU32,
+}
+
+impl Tally {
+    /// Record one classified file against the matching counter.
+    fn count(&self, classification: Classification) {
+        let counter = match classification {
+            Classification::Hostile => &self.hostile,
+            Classification::Suspicious => &self.suspicious,
+            Classification::Benign => &self.benign,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Assemble the final [`ScanSummary`]. Every analyzed file lands in exactly
+    /// one of the four counters, so their sum is the total file count.
+    fn summary(&self, scan_start: Instant) -> ScanSummary {
+        let hostile = self.hostile.load(Ordering::Relaxed);
+        let suspicious = self.suspicious.load(Ordering::Relaxed);
+        let benign = self.benign.load(Ordering::Relaxed);
+        let errors = self.errors.load(Ordering::Relaxed);
+        ScanSummary {
+            total_files: hostile + suspicious + benign + errors,
+            hostile,
+            suspicious,
+            benign,
+            errors,
+            duration_ms: crate::duration_ms(scan_start.elapsed()),
+        }
+    }
+}
+
+/// Run the ML pipeline on one cleave result and record the verdict.
+///
+/// Shared by the file-batch and per-directory streams in [`run_paths`]. Called
+/// from rayon worker threads, so every shared input is behind `&`/atomics.
+#[allow(clippy::too_many_arguments)]
+fn record_file_result(
+    file_path: &Path,
+    cleave_result: Result<cleave::AnalysisReport>,
+    ctx: &ExtractContext,
+    model: &Model,
+    shap: Option<&ShapImportance>,
+    config: &ScanConfig,
+    cancellation: Option<&Arc<AtomicBool>>,
+    tally: &Tally,
+    stdout: &Mutex<std::io::Stdout>,
+) {
+    let scan_result = cleave_result.and_then(|report| {
+        process_report(file_path, report, ctx, model, shap, config, cancellation)
+    });
+    match scan_result {
+        Ok(r) => {
+            tally.count(r.classification);
+            if config.format() == OutputFormat::Json || config.filter().shows(&r.classification) {
+                emit_result(&r, config, false, stdout);
+            }
+        }
+        Err(e) => {
+            let msg = crate::tools::enrich_error(&e).unwrap_or_else(|| format!("{e:#}"));
+            tracing::warn!("error analyzing {}: {}", file_path.display(), msg);
+            tally.errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Scan a set of file and directory paths, classifying every file.
+///
+/// Explicit files are analyzed together as one parallel batch (via
+/// [`cleave::scan_files`]); each directory argument is streamed through cleave's
+/// recursive walker. Both feed a single shared [`Tally`], so the returned
+/// [`ScanSummary`] aggregates across every path. Results print in completion
+/// order, not argument order.
+///
+/// A path that is neither a file nor a directory is logged and counted as an
+/// error; the remaining paths are still scanned.
+///
+/// # Errors
+/// Propagates model-load and cleave setup failures. Per-file analysis errors
+/// are recorded in the summary, not returned.
+pub fn run_paths(paths: &[PathBuf], config: &ScanConfig) -> Result<ScanSummary> {
+    let model = Model::load(config.model_dir(), config.thresholds())?;
+    let shap = ShapImportance::load(config.model_dir()).ok();
+    let ctx = ExtractContext::new(model.spec());
+
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let ctrlc_flag = Arc::clone(&cancellation);
+    let _ = ctrlc::set_handler(move || {
+        if ctrlc_flag.load(Ordering::Relaxed) {
+            // Second ctrl-c: reap rizin workers, then hard exit. See `run`.
+            cleave::kill_all_rizin_groups();
+            std::process::exit(130);
+        }
+        eprintln!("\nInterrupted — finishing current file…");
+        ctrlc_flag.store(true, Ordering::Relaxed);
+    });
+
+    let cleave_opts = cleave::AnalysisOptions {
+        slow_rule_ms: config.slow_rule_ms(),
+        cancellation: Some(Arc::clone(&cancellation)),
+        ..Default::default()
+    };
+    let is_terminal = matches!(config.format(), OutputFormat::Terminal);
+    let scan_start = Instant::now();
+
+    let tally = Tally::default();
+    let stdout = Mutex::new(std::io::stdout());
+
+    // Partition the requested paths: explicit files become one parallel batch,
+    // each directory is walked separately, and anything else is an error.
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for path in paths {
+        if path.is_file() {
+            files.push(path.clone());
+        } else if path.is_dir() {
+            dirs.push(path.clone());
+        } else {
+            tracing::warn!("path does not exist: {}", path.display());
+            tally.errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let record = |file_path: &Path, result: Result<cleave::AnalysisReport>| {
+        record_file_result(
+            file_path,
+            result,
+            &ctx,
+            &model,
+            shap.as_ref(),
+            config,
+            Some(&cancellation),
+            &tally,
+            &stdout,
+        );
+    };
+
+    if !files.is_empty() {
+        cleave::scan_files(&files, &cleave_opts, |event| {
+            if let cleave::ScanEvent::File { path, result } = event {
+                record(&path, *result);
+            }
+        })?;
+    }
+
+    for dir in &dirs {
+        cleave::scan_directory(dir, &cleave_opts, |event| {
+            if let cleave::ScanEvent::File { path, result } = event {
+                record(&path, *result);
+            }
+        })?;
+    }
+
+    let summary = tally.summary(scan_start);
+    if is_terminal {
+        crate::output::print_summary(&summary);
+    }
+    Ok(summary)
+}
+
 /// Emit a scan result to the appropriate output channel.
 fn emit_result(
     r: &ScanResult,
