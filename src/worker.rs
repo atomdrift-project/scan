@@ -2120,4 +2120,180 @@ mod tests {
         );
         assert!(!context.contains("Try http://"));
     }
+
+    // Minimal in-process hopper: serves `/api/next` (returning exactly the
+    // requested `count` of distinct jobs, an unlimited supply) and `/data/...`
+    // (a fixed payload). Zero extra dependencies — just tokio, already in tree.
+    async fn read_target(stream: &mut tokio::net::TcpStream) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if buf.len() > 16 * 1024 {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let line = text.lines().next()?;
+        line.split_whitespace().nth(1).map(str::to_string)
+    }
+
+    async fn respond(stream: &mut tokio::net::TcpStream, status: &str, body: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        );
+        let _ = stream.write_all(head.as_bytes()).await;
+        let _ = stream.write_all(body).await;
+        let _ = stream.flush().await;
+    }
+
+    fn parse_count(target: &str) -> usize {
+        target
+            .split(['?', '&'])
+            .find_map(|kv| kv.strip_prefix("count="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prefetcher_fills_to_target_backpressures_and_refills() {
+        const PAYLOAD: &[u8] = b"payload";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let api_calls = Arc::new(AtomicUsize::new(0));
+        let next_id = Arc::new(AtomicUsize::new(0));
+        {
+            let api_calls = Arc::clone(&api_calls);
+            let next_id = Arc::clone(&next_id);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let api_calls = Arc::clone(&api_calls);
+                    let next_id = Arc::clone(&next_id);
+                    tokio::spawn(async move {
+                        let Some(target) = read_target(&mut stream).await else {
+                            return;
+                        };
+                        if target.starts_with("/api/next") {
+                            api_calls.fetch_add(1, Ordering::Relaxed);
+                            let count = parse_count(&target);
+                            let jobs: Vec<_> = (0..count)
+                                .map(|_| {
+                                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                                    serde_json::json!({
+                                        "sha256": format!("{id:064x}"),
+                                        "path": format!("samples/s{id}.bin"),
+                                        "size_bytes": PAYLOAD.len(),
+                                        "file_type": "data",
+                                    })
+                                })
+                                .collect();
+                            let body = serde_json::json!({ "jobs": jobs }).to_string();
+                            respond(&mut stream, "200 OK", body.as_bytes()).await;
+                        } else if target.starts_with("/data/") {
+                            respond(&mut stream, "200 OK", PAYLOAD).await;
+                        } else {
+                            respond(&mut stream, "404 Not Found", b"").await;
+                        }
+                    });
+                }
+            });
+        }
+
+        let slots = 3usize;
+        let target_depth = slots * 3;
+        let (tx, mut rx) = mpsc::unbounded_channel::<PrefetchedJob>();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = tokio::spawn(
+            Prefetcher {
+                client: reqwest::Client::new(),
+                base_url: Arc::from(format!("http://127.0.0.1:{port}").as_str()),
+                data_dir: None,
+                encoded_name: "test".to_string(),
+                available_tools: String::new(),
+                slots,
+                max_single_bytes: 1 << 20,
+                max_buffer_bytes: 1 << 30,
+                poll_secs: 1,
+                target_depth,
+            }
+            .run(
+                tx,
+                Arc::clone(&queued_bytes),
+                Arc::clone(&outstanding),
+                Arc::clone(&shutdown),
+            ),
+        );
+
+        // 1. Fills to exactly target_depth — every staged sample lands in the
+        //    channel — and never overshoots the cap.
+        assert!(
+            wait_until(|| rx.len() == target_depth).await,
+            "prefetcher did not fill to target_depth; channel len {}",
+            rx.len(),
+        );
+        assert_eq!(outstanding.load(Ordering::Relaxed), target_depth);
+        assert!(outstanding.load(Ordering::Relaxed) <= target_depth);
+
+        // 2. Backpressure: once full it stops polling the hopper.
+        let calls_when_full = api_calls.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            api_calls.load(Ordering::Relaxed),
+            calls_when_full,
+            "prefetcher kept polling while the buffer was full",
+        );
+
+        // 3. Draining samples (as the dispatch loop would) frees room and it
+        //    refills back to target, polling the hopper again.
+        for _ in 0..slots {
+            let pj = rx.recv().await.unwrap();
+            assert_eq!(pj.data.unwrap(), Some(PAYLOAD.to_vec()), "payload mismatch");
+            queued_bytes.fetch_sub(PAYLOAD.len(), Ordering::Release);
+            outstanding.fetch_sub(1, Ordering::Release);
+        }
+        assert!(
+            wait_until(|| outstanding.load(Ordering::Relaxed) == target_depth).await,
+            "prefetcher did not refill after draining",
+        );
+        assert!(
+            api_calls.load(Ordering::Relaxed) > calls_when_full,
+            "prefetcher should have polled again to refill",
+        );
+
+        // 4. Shutdown stops the prefetcher and closes the channel.
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), handle).await.is_ok(),
+            "prefetcher did not exit on shutdown",
+        );
+        while rx.recv().await.is_some() {}
+    }
 }
