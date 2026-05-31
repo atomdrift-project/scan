@@ -131,7 +131,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -142,7 +142,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -862,7 +862,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -934,8 +934,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adc822414b18d1f5b1b33ce1441534e311e62fef86ebb5b9d382af857d0272c9"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cranelift-assembler-x64-meta",
 ]
@@ -943,8 +942,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64-meta"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c646808b06f4532478d8d6057d74f15c3322f10d995d9486e7dcea405bf521a"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cranelift-srcgen",
 ]
@@ -952,8 +950,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bforest"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5996f01a686b2349cdb379083ec5ad3e8cb8767fb2d495d3a4f2ee4163a18d"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cranelift-entity",
  "wasmtime-internal-core",
@@ -962,8 +959,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bitset"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "523fea83273f6a985520f57788809a4de2165794d9ab00fb1254fceb4f5aa00c"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "serde",
  "serde_derive",
@@ -973,8 +969,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d73d1e372730b5f64ed1a2bd9f01fe4686c8ec14a28034e3084e530c8d951878"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -1001,8 +996,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-meta"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0319c18165e93dc1ebf78946a8da0b1c341c95b4a39729a69574671639bdb5f"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cranelift-assembler-x64-meta",
  "cranelift-codegen-shared",
@@ -1014,14 +1008,12 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-shared"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9195cd8aeecb55e401aa96b2eaa55921636e8246c127ed7908f7ef7e0d40f270"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 
 [[package]]
 name = "cranelift-control"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8976c2154b74136322befc74222ab5c7249edd7e2604f8cbef2b94975541ffb9"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "arbitrary",
 ]
@@ -1029,8 +1021,7 @@ dependencies = [
 [[package]]
 name = "cranelift-entity"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6038b3147c7982f4951150d5f96c7c06c1e7214b99d4b4a98607aadf8ded89d1"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cranelift-bitset",
  "serde",
@@ -1041,8 +1032,7 @@ dependencies = [
 [[package]]
 name = "cranelift-frontend"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cbd294abe236e23cc3d907b0936226b6a8342db7636daa9c7c72be1e323420e"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cranelift-codegen",
  "log",
@@ -1053,14 +1043,12 @@ dependencies = [
 [[package]]
 name = "cranelift-isle"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5a90b6ed3aba84189352a87badeb93b2126d3724225a42dc67fdce53d1b139c"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 
 [[package]]
 name = "cranelift-native"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3ec0cc1a54e22925eacf4fc3dc815f907734d3b377899d19d52bec04863e853"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cranelift-codegen",
  "libc",
@@ -1070,8 +1058,7 @@ dependencies = [
 [[package]]
 name = "cranelift-srcgen"
 version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "948865622f87f30907bb46fbb081b235ae63c1896a99a83c26a003305c1fa82d"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 
 [[package]]
 name = "crc"
@@ -1375,7 +1362,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1516,7 +1503,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2952,7 +2939,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3562,8 +3549,7 @@ checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 [[package]]
 name = "pulley-interpreter"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec12fe19a9588315a49fe5704502a9c02d6a198303314b0c7c86123b06d29e5"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cranelift-bitset",
  "log",
@@ -3574,8 +3560,7 @@ dependencies = [
 [[package]]
 name = "pulley-macros"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36f7d5ef31ebf1b46cd7e722ffef934e670d7e462f49aa01cde07b9b76dca580"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4078,7 +4063,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4498,7 +4483,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4723,7 +4708,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4768,7 +4753,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5945,8 +5930,7 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efb1ed5899dde98357cfdcf647a4614498798719793898245b4b34e663addabf"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "addr2line 0.26.1",
  "async-trait",
@@ -5982,8 +5966,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-environ"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4172382dcc785c31d0e862c6780a18f5dd437914d22c4691351f965ef751c821"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "anyhow",
  "cranelift-bforest",
@@ -6009,8 +5992,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-core"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a3820b174f477d2a7083209d1ad5353fcdb11eaea434b2137b8681029460dd3"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "hashbrown 0.16.1",
  "libm",
@@ -6020,8 +6002,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-cranelift"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1679d205caf9766c6aa309d45bb3e7c634d7725e3164404df33824b9f7c4fb7"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cfg-if",
  "cranelift-codegen",
@@ -6047,8 +6028,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-fiber"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1e505254058be5b0df458d670ee42d9eafe2349d04c1296e9dc01071dc20a85"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cc",
  "cfg-if",
@@ -6062,8 +6042,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-debug"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c2e05b345f1773e59c20e6ad7298fd6857cdea245023d88bb659c96d8f0ea72"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cc",
  "wasmtime-internal-versioned-export-macros",
@@ -6072,8 +6051,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b86701b234a4643e3f111869aa792b3a05a06e02d486ee9cb6c04dae16b52dab"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cfg-if",
  "libc",
@@ -6084,8 +6062,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-unwinder"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f63558d801beb83dde9b336eb4ae049019aee26627926edb32cd119d7e4c83cd"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "cfg-if",
  "cranelift-codegen",
@@ -6097,8 +6074,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-versioned-export-macros"
 version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "737c4d956fc3a848541a064afb683dd2771132a6b125be5baaf95c4379aa47df"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=freebsd-aarch64-43.0.2#7ced4bed1bf2b50735331f246703c58a598b828d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6174,7 +6150,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

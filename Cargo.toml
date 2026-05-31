@@ -147,3 +147,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "litmus"
 path = "src/main.rs"
+
+# FreeBSD/aarch64 support for wasmtime's signal trap handler, pulled in
+# transitively via yara-x (cleave -> yara-x -> wasmtime 43.0.2). Upstream
+# 43.0.2 lacks the freebsd/aarch64 arm in store_handler_in_ucontext, so the
+# build fails with compile_error!("unsupported platform"). Remove once the
+# fix lands upstream (bytecodealliance/wasmtime#5499) and yara-x bumps past it.
+[patch.crates-io]
+wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
