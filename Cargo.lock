@@ -131,7 +131,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -142,7 +142,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -727,7 +727,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "2.0.0-rc.3"
-source = "git+https://codeberg.org/atomdrift/cleave.git#3aebe6992cb1dc10afa807aea03ee39ffe52f4fd"
+source = "git+https://codeberg.org/atomdrift/cleave.git#83eb455c105a2faaaa2a636f8e6ac87140e42079"
 dependencies = [
  "aes 0.8.4",
  "aho-corasick",
@@ -815,7 +815,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#3aebe6992cb1dc10afa807aea03ee39ffe52f4fd"
+source = "git+https://codeberg.org/atomdrift/cleave.git#83eb455c105a2faaaa2a636f8e6ac87140e42079"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -862,7 +862,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1186,9 +1186,9 @@ dependencies = [
 
 [[package]]
 name = "daachorse"
-version = "3.0.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d87f75bbe32ee10609201e09e818537df81c3acb436be2b78f47cc85d139475"
+checksum = "d90e4c4a7034cde152cbbac492a8d61c5d85b0fe9972afdf32737ff5fc17c9ff"
 
 [[package]]
 name = "darling"
@@ -1362,7 +1362,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1503,7 +1503,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1546,7 +1546,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "0.8.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#d2cacf76354419d0031af7453b9264679402453d"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#dfc43f7cecb6221fdd16404eed2ce8a11fb88e30"
 dependencies = [
  "aho-corasick",
  "bincode",
@@ -2705,9 +2705,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-rust2"
-version = "0.16.3"
+version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e9ceaec84b54518262de7cf06b8b43e83c808349960f1610b21b0bfc9640f20"
+checksum = "ce716bf1a316f47a280fc76295f6495b5bea4752bca01c3b3885e101b1c23c02"
 dependencies = [
  "sha2 0.11.0",
 ]
@@ -2726,7 +2726,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#3aebe6992cb1dc10afa807aea03ee39ffe52f4fd"
+source = "git+https://codeberg.org/atomdrift/cleave.git#83eb455c105a2faaaa2a636f8e6ac87140e42079"
 
 [[package]]
 name = "lzxd"
@@ -2746,7 +2746,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#3aebe6992cb1dc10afa807aea03ee39ffe52f4fd"
+source = "git+https://codeberg.org/atomdrift/cleave.git#83eb455c105a2faaaa2a636f8e6ac87140e42079"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -2939,7 +2939,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3570,7 +3570,7 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#3aebe6992cb1dc10afa807aea03ee39ffe52f4fd"
+source = "git+https://codeberg.org/atomdrift/cleave.git#83eb455c105a2faaaa2a636f8e6ac87140e42079"
 dependencies = [
  "flate2",
  "memchr",
@@ -4063,7 +4063,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4140,7 +4140,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#3aebe6992cb1dc10afa807aea03ee39ffe52f4fd"
+source = "git+https://codeberg.org/atomdrift/cleave.git#83eb455c105a2faaaa2a636f8e6ac87140e42079"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4483,7 +4483,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4673,7 +4673,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#3aebe6992cb1dc10afa807aea03ee39ffe52f4fd"
+source = "git+https://codeberg.org/atomdrift/cleave.git#83eb455c105a2faaaa2a636f8e6ac87140e42079"
 
 [[package]]
 name = "tap"
@@ -4708,7 +4708,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4753,7 +4753,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6150,7 +6150,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6609,7 +6609,7 @@ dependencies = [
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#3aebe6992cb1dc10afa807aea03ee39ffe52f4fd"
+source = "git+https://codeberg.org/atomdrift/cleave.git#83eb455c105a2faaaa2a636f8e6ac87140e42079"
 
 [[package]]
 name = "yara-x"
