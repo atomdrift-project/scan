@@ -4,18 +4,18 @@
 //! When a slot is free, it claims work from hopper's `/api/next` endpoint,
 //! analyzes the file, and posts the result back to `/api/result`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
@@ -918,68 +918,95 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let max_rss_gb = config.max_rss_gb;
     let encoded_name: String = url_encode(&name);
     let available_tools = crate::tools::available_names().join(",");
-    let mut consecutive_errors: u32 = 0;
     let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let mut buffer: VecDeque<PrefetchedJob> = VecDeque::new();
-    let mut buffer_bytes: usize = 0; // track memory held by prefetched data
     let max_buffer_bytes: usize =
         if cleave::memory_tracker::total_memory().unwrap_or(0) >= 16 * 1024 * 1024 * 1024 {
             1024 * 1024 * 1024 // 1 GiB on systems with >= 16 GiB RAM
         } else {
             512 * 1024 * 1024 // 512 MiB otherwise
         };
-    // With local data, there's no download latency to hide — just claim
-    // what we can run immediately. Without local data, prefetch 3x slots
-    // so downloads overlap with analysis.
-    let has_local_data = data_dir.is_some();
-    let prefetch_count = if has_local_data {
-        slots
-    } else {
-        (slots * 3).min(32)
-    };
-    let mut last_empty_poll = Instant::now() - Duration::from_secs(poll_secs + 1);
-    let mut last_summary = Instant::now();
+
+    // Background prefetch keeps `3 × slots` samples staged at all times so a
+    // free worker slot never waits on a download. The prefetcher polls and
+    // downloads on its own task, pushing each sample into `rx` the instant its
+    // download finishes; this loop only pulls ready samples and dispatches
+    // them. `outstanding` (staged + in-flight) bounds the depth; `queued_bytes`
+    // bounds staged payload memory against `max_buffer_bytes`.
+    let (tx, mut rx) = mpsc::unbounded_channel::<PrefetchedJob>();
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let outstanding = Arc::new(AtomicUsize::new(0));
+    let target_depth = slots.saturating_mul(3).max(1);
+
+    tokio::spawn(
+        Prefetcher {
+            client: client.clone(),
+            base_url: Arc::clone(&base_url),
+            data_dir: data_dir.clone(),
+            encoded_name,
+            available_tools,
+            slots,
+            max_single_bytes: max_buffer_bytes / 2,
+            max_buffer_bytes,
+            poll_secs,
+            target_depth,
+        }
+        .run(
+            tx,
+            Arc::clone(&queued_bytes),
+            Arc::clone(&outstanding),
+            Arc::clone(&shutdown),
+        ),
+    );
+
+    // The dispatch loop parks in `await`s, so emit the periodic summary from a
+    // dedicated ticker reading the shared counters.
+    {
+        let semaphore = Arc::clone(&semaphore);
+        let completed = Arc::clone(&completed);
+        let outstanding = Arc::clone(&outstanding);
+        let queued_bytes = Arc::clone(&queued_bytes);
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            while !shutdown.load(Ordering::Relaxed) {
+                interruptible_sleep(Duration::from_secs(60), &shutdown).await;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
+                let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
+                let available_slots = semaphore.available_permits();
+                tracing::info!(
+                    rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                    queued_prefetch_jobs = outstanding.load(Ordering::Relaxed),
+                    prefetch_buffer_mb = queued_bytes.load(Ordering::Relaxed) / (1024 * 1024),
+                    active_slots = slots.saturating_sub(available_slots),
+                    available_slots,
+                    blocking_started_total = started,
+                    blocking_finished_total = finished,
+                    inflight_blocking = started.saturating_sub(finished),
+                    completed = completed.load(Ordering::Acquire),
+                    "worker summary",
+                );
+            }
+        });
+    }
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            tracing::info!(
-                buffered_jobs = buffer.len(),
-                buffered_bytes = buffer_bytes,
-                "shutdown signalled, draining in-flight work",
-            );
+            tracing::info!("shutdown signalled, draining in-flight work");
             break;
-        }
-
-        if last_summary.elapsed() >= Duration::from_secs(60) {
-            let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
-            let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
-            let inflight_blocking = started.saturating_sub(finished);
-            let available_slots = semaphore.available_permits();
-            let active_slots = slots.saturating_sub(available_slots);
-            tracing::info!(
-                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-                queued_prefetch_jobs = buffer.len(),
-                prefetch_buffer_mb = buffer_bytes / (1024 * 1024),
-                active_slots,
-                available_slots,
-                blocking_started_total = started,
-                blocking_finished_total = finished,
-                inflight_blocking,
-                completed = completed.load(Ordering::Acquire),
-                "worker summary",
-            );
-            last_summary = Instant::now();
         }
 
         if let Some(max) = max_jobs
             && completed.load(Ordering::Acquire) >= max
         {
             tracing::info!(max_jobs = max, "job limit reached, draining in-flight work");
+            shutdown.store(true, Ordering::Relaxed);
             break;
         }
 
-        // Enforce memory limit before claiming more work.
+        // Pause dispatch under memory pressure; staged samples stay queued.
         if max_rss_gb > 0 {
             let max_bytes = max_rss_gb.saturating_mul(1024 * 1024 * 1024);
             if let Some(rss) = cleave::memory_tracker::current_rss()
@@ -988,7 +1015,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 tracing::warn!(
                     rss_mb = rss / 1024 / 1024,
                     max_rss_mb = max_bytes / 1024 / 1024,
-                    "memory pressure: pausing before claiming new work",
+                    "memory pressure: pausing dispatch",
                 );
                 if let Err(e) =
                     tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
@@ -1000,173 +1027,44 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             }
         }
 
-        // Refill the prefetch buffer when it's running low. Rate-limit polls
-        // so we don't hammer hopper when it has no work.
-        let should_poll = buffer.len() < slots
-            && buffer_bytes < max_buffer_bytes
-            && last_empty_poll.elapsed() >= Duration::from_secs(poll_secs);
-        if should_poll {
-            let mut poll_url = format!(
-                "{}/api/next?worker={}&count={}&slots={}&version={}",
-                base_url,
-                encoded_name,
-                prefetch_count,
-                slots,
-                env!("CARGO_PKG_VERSION"),
-            );
-            {
-                use std::fmt::Write;
-                // 5-char prefix matches hopper's litmusTraitsVersion()
-                // truncation so the dashboard's stale-traits comparison
-                // can string-equal the two.
-                if let Some(traits) = cleave::traits_repo::version() {
-                    let prefix: String = traits.chars().take(5).collect();
-                    let _ = write!(poll_url, "&traits={}", prefix);
-                }
-                if let Some(rss) = cleave::memory_tracker::current_rss() {
-                    let _ = write!(poll_url, "&rss_mb={}", rss / 1024 / 1024);
-                }
-                if let Some(load) = system_load_avg() {
-                    let _ = write!(poll_url, "&load1={:.2}", load);
-                }
-                let _ = write!(poll_url, "&tools=");
-                url_encode_into(&available_tools, &mut poll_url);
-            }
-            tracing::debug!(url = %poll_url, buffer = buffer.len(), "polling for work");
-            let poll_start = Instant::now();
-
-            // Cap the per-job download size so a single outsized payload can't
-            // blow past the buffer budget. Pre-filtering on hopper's
-            // `size_bytes` lets us reject without touching the network; jobs
-            // without a size still download but are bounded by the client
-            // timeout and the outer `buffer_bytes` gate.
-            let max_single_bytes = max_buffer_bytes / 2;
-            match claim_and_prefetch(
-                &client,
-                &poll_url,
-                &base_url,
-                data_dir.as_deref(),
-                max_single_bytes,
-            )
-            .await
-            {
-                Ok(None) => {
-                    consecutive_errors = 0;
-                    last_empty_poll = Instant::now();
-                    if buffer.is_empty() {
-                        tracing::debug!(
-                            elapsed_ms = crate::duration_ms(poll_start.elapsed()),
-                            poll_secs,
-                            "no work available, sleeping"
-                        );
-                        interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
-                        continue;
-                    }
-                    // Buffer has work — keep dispatching.
-                }
-                Ok(Some(jobs)) => {
-                    consecutive_errors = 0;
-                    let n = jobs.len();
-                    for pj in jobs {
-                        buffer_bytes += pj
-                            .data
-                            .as_ref()
-                            .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
-                        buffer.push_back(pj);
-                    }
-                    tracing::debug!(
-                        jobs = n,
-                        buffer_mb = buffer_bytes / (1024 * 1024),
-                        elapsed_ms = crate::duration_ms(poll_start.elapsed()),
-                        "claimed and prefetched",
-                    );
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    let backoff = backoff_duration(consecutive_errors);
-                    let error_chain = format!("{e:#}");
-                    tracing::warn!(
-                        url = %poll_url,
-                        error = %error_chain,
-                        error_debug = ?e,
-                        elapsed_ms = crate::duration_ms(poll_start.elapsed()),
-                        backoff_secs = backoff.as_secs(),
-                        consecutive_errors,
-                        "poll/prefetch failed",
-                    );
-                    if buffer.is_empty() {
-                        interruptible_sleep(backoff, &shutdown).await;
-                        continue;
-                    }
-                    // Buffer has work — keep dispatching despite poll failure.
-                }
-            }
-        }
-
-        // Dispatch the next prefetched job when a slot is free.
-        let pj = match buffer.pop_front() {
-            Some(pj) => {
-                buffer_bytes -= pj
-                    .data
-                    .as_ref()
-                    .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
-                pj
-            }
-            None => {
-                // Buffer empty and poll rate-limited — wait before retrying.
-                interruptible_sleep(Duration::from_millis(100), &shutdown).await;
-                continue;
-            }
-        };
-
-        // Wait for a free analysis slot. Also check memory pressure after
-        // acquiring the permit — the RSS check at the top of the loop only
-        // runs before claiming, but memory can grow while waiting for a slot.
+        // Claim a worker slot, then take the next staged sample: work begins as
+        // soon as both a free slot and a ready sample exist. An empty channel
+        // means the prefetcher has exited (shutdown) — drain and stop.
         let permit = semaphore
             .clone()
             .acquire_owned()
             .await
             .context("semaphore closed")?;
-
-        if max_rss_gb > 0 {
-            let max_bytes = max_rss_gb.saturating_mul(1024 * 1024 * 1024);
-            if let Some(rss) = cleave::memory_tracker::current_rss()
-                && rss > max_bytes
-            {
-                tracing::warn!(
-                    rss_mb = rss / 1024 / 1024,
-                    max_rss_mb = max_bytes / 1024 / 1024,
-                    "memory pressure before dispatch: clearing caches and pausing",
-                );
-                drop(permit);
-                if let Err(e) =
-                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
-                {
-                    tracing::warn!(error = %e, "cache-clear task failed");
-                }
-                interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
-                // Put the job back at the front of the buffer.
-                buffer_bytes += pj
-                    .data
-                    .as_ref()
-                    .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
-                buffer.push_front(pj);
-                continue;
-            }
-        }
+        let Some(pj) = rx.recv().await else {
+            drop(permit);
+            shutdown.store(true, Ordering::Relaxed);
+            break;
+        };
+        let staged_bytes = pj
+            .data
+            .as_ref()
+            .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
+        queued_bytes.fetch_sub(staged_bytes, Ordering::Release);
+        outstanding.fetch_sub(1, Ordering::Release);
 
         let client = client.clone();
         let resources = match current_resources(&resources) {
             Ok(resources) => resources,
             Err(error) => {
-                tracing::error!(error = %error, "cannot snapshot worker resources; pausing");
+                // Lock poisoned (a worker thread panicked). Report the job as
+                // failed so hopper reassigns it instead of waiting out the
+                // lease, then carry on.
+                tracing::error!(error = %error, "cannot snapshot worker resources; failing job");
                 drop(permit);
-                buffer_bytes += pj
-                    .data
-                    .as_ref()
-                    .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
-                buffer.push_front(pj);
-                interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
+                post_result(
+                    &client,
+                    &base_url,
+                    &name,
+                    &pj.job.sha256,
+                    Err(format!("worker resource snapshot failed: {error}")),
+                )
+                .await;
+                completed.fetch_add(1, Ordering::Release);
                 continue;
             }
         };
@@ -1234,13 +1132,146 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 /// downloaded — they're returned with an oversize error so the result posts
 /// back to hopper immediately. This prevents a pathological single file from
 /// blowing past the worker's prefetch memory budget.
-async fn claim_and_prefetch(
-    client: &reqwest::Client,
-    poll_url: &str,
-    base_url: &Arc<str>,
-    data_dir: Option<&Path>,
+/// Background prefetcher: owns the polling and download side of the worker.
+/// Keeps `target_depth` (`3 × slots`) samples staged in the dispatch channel,
+/// downloading payloads concurrently and emitting each the moment it lands so a
+/// free worker slot never blocks on the network.
+struct Prefetcher {
+    client: reqwest::Client,
+    base_url: Arc<str>,
+    data_dir: Option<PathBuf>,
+    encoded_name: String,
+    available_tools: String,
+    slots: usize,
+    /// Per-job download cap; oversized jobs are reported as errors rather than
+    /// downloaded, so one huge payload can't blow the buffer budget.
     max_single_bytes: usize,
-) -> Result<Option<Vec<PrefetchedJob>>> {
+    /// Soft cap on total staged payload bytes.
+    max_buffer_bytes: usize,
+    poll_secs: u64,
+    /// Staged + in-flight sample target (`3 × slots`).
+    target_depth: usize,
+}
+
+impl Prefetcher {
+    /// Build the `/api/next` URL, attaching the live signals hopper uses to
+    /// ration work: traits version, current RSS, 1-minute load, and tools.
+    fn poll_url(&self, count: usize) -> String {
+        use std::fmt::Write;
+        let mut url = format!(
+            "{}/api/next?worker={}&count={}&slots={}&version={}",
+            self.base_url,
+            self.encoded_name,
+            count,
+            self.slots,
+            env!("CARGO_PKG_VERSION"),
+        );
+        // 5-char prefix matches hopper's litmusTraitsVersion() truncation so the
+        // dashboard's stale-traits comparison can string-equal the two.
+        if let Some(traits) = cleave::traits_repo::version() {
+            let prefix: String = traits.chars().take(5).collect();
+            let _ = write!(url, "&traits={}", prefix);
+        }
+        if let Some(rss) = cleave::memory_tracker::current_rss() {
+            let _ = write!(url, "&rss_mb={}", rss / 1024 / 1024);
+        }
+        if let Some(load) = system_load_avg() {
+            let _ = write!(url, "&load1={:.2}", load);
+        }
+        let _ = write!(url, "&tools=");
+        url_encode_into(&self.available_tools, &mut url);
+        url
+    }
+
+    /// Run until shutdown or the dispatch channel closes. `outstanding` tracks
+    /// staged + in-flight samples to bound depth; `queued_bytes` tracks staged
+    /// payload memory against `max_buffer_bytes`.
+    async fn run(
+        self,
+        tx: mpsc::UnboundedSender<PrefetchedJob>,
+        queued_bytes: Arc<AtomicUsize>,
+        outstanding: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        let mut consecutive_errors: u32 = 0;
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
+            // Hold at the target depth and don't stage more bytes than the
+            // budget allows. Either "buffer full" state: wait briefly for the
+            // dispatch loop to drain, then re-evaluate.
+            let room = self
+                .target_depth
+                .saturating_sub(outstanding.load(Ordering::Acquire));
+            let over_budget = queued_bytes.load(Ordering::Acquire) >= self.max_buffer_bytes;
+            if room == 0 || over_budget {
+                interruptible_sleep(Duration::from_millis(100), &shutdown).await;
+                continue;
+            }
+
+            // Cap a single poll's burst to `slots` so concurrent downloads stay
+            // bounded; the depth fills over a few polls.
+            let count = room.min(self.slots);
+            let url = self.poll_url(count);
+            match claim_jobs(&self.client, &url).await {
+                Ok(None) => {
+                    consecutive_errors = 0;
+                    interruptible_sleep(Duration::from_secs(self.poll_secs), &shutdown).await;
+                }
+                Ok(Some(jobs)) => {
+                    consecutive_errors = 0;
+                    outstanding.fetch_add(jobs.len(), Ordering::Release);
+                    let mut set = tokio::task::JoinSet::new();
+                    for job in jobs {
+                        let client = self.client.clone();
+                        let base_url = Arc::clone(&self.base_url);
+                        let data_dir = self.data_dir.clone();
+                        let max_single_bytes = self.max_single_bytes;
+                        set.spawn(async move {
+                            prefetch_one(client, base_url, data_dir, max_single_bytes, job).await
+                        });
+                    }
+                    while let Some(res) = set.join_next().await {
+                        match res {
+                            Ok(pj) => {
+                                let bytes = pj
+                                    .data
+                                    .as_ref()
+                                    .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
+                                queued_bytes.fetch_add(bytes, Ordering::Release);
+                                if tx.send(pj).is_err() {
+                                    return; // dispatch loop gone
+                                }
+                            }
+                            Err(e) => {
+                                // Download task panicked; reclaim its depth slot.
+                                outstanding.fetch_sub(1, Ordering::Release);
+                                tracing::warn!(error = %e, "prefetch task panicked");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    let backoff = backoff_duration(consecutive_errors);
+                    tracing::warn!(
+                        url = %url,
+                        error = %format!("{e:#}"),
+                        backoff_secs = backoff.as_secs(),
+                        consecutive_errors,
+                        "poll/prefetch failed",
+                    );
+                    interruptible_sleep(backoff, &shutdown).await;
+                }
+            }
+        }
+    }
+}
+
+/// Poll hopper's `/api/next` once. `Ok(None)` means no work is available now.
+async fn claim_jobs(client: &reqwest::Client, poll_url: &str) -> Result<Option<Vec<ClaimJob>>> {
     let resp = client.get(poll_url).send().await.map_err(|e| {
         let error_text = e.to_string();
         let is_connect = e.is_connect();
@@ -1273,58 +1304,46 @@ async fn claim_and_prefetch(
     if claim.jobs.is_empty() {
         return Ok(None);
     }
+    Ok(Some(claim.jobs))
+}
 
-    // Prefetch all files concurrently, but short-circuit any job whose reported
-    // size exceeds `max_single_bytes` — those are dispatched as error results
-    // rather than downloaded, so a 5 GiB outlier can't OOM the buffer.
-    let mut set = tokio::task::JoinSet::new();
-    let mut oversized: Vec<PrefetchedJob> = Vec::new();
-    for job in claim.jobs {
-        if u64::try_from(job.size_bytes).is_ok_and(|s| s > max_single_bytes as u64) {
-            tracing::warn!(
-                sha256 = %job.sha256,
-                path = %job.path,
-                size_bytes = job.size_bytes,
-                max_single_bytes,
-                "skipping oversized job; reporting error to hopper",
-            );
-            let err = PrefetchError::Skipped(format!(
-                "file size {} exceeds per-job prefetch cap of {} bytes",
-                job.size_bytes, max_single_bytes,
-            ));
-            oversized.push(PrefetchedJob {
-                job,
-                data: Err(err),
-            });
-            continue;
-        }
-        let client = client.clone();
-        let base_url = Arc::clone(base_url);
-        let data_dir = data_dir.map(Path::to_path_buf);
-        set.spawn(async move {
-            let local_path = data_dir.as_deref().map(|d| d.join(&job.path));
-            let use_local = matches!(local_path, Some(ref p) if p.exists());
-            let data = if use_local {
-                Ok(None)
-            } else {
-                match download_bytes(&client, &base_url, &job.sha256, &job.path).await {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(e) => Err(PrefetchError::Transient(e)),
-                }
-            };
-            PrefetchedJob { job, data }
-        });
+/// Download one claimed job's payload (or mark it for local access / rejection).
+/// Oversized jobs are skipped without a download, local files are used in place,
+/// and transient download failures fall through to `run_job`'s direct-download
+/// retry.
+async fn prefetch_one(
+    client: reqwest::Client,
+    base_url: Arc<str>,
+    data_dir: Option<PathBuf>,
+    max_single_bytes: usize,
+    job: ClaimJob,
+) -> PrefetchedJob {
+    if u64::try_from(job.size_bytes).is_ok_and(|s| s > max_single_bytes as u64) {
+        tracing::warn!(
+            sha256 = %job.sha256,
+            path = %job.path,
+            size_bytes = job.size_bytes,
+            max_single_bytes,
+            "skipping oversized job; reporting error to hopper",
+        );
+        let err = PrefetchError::Skipped(format!(
+            "file size {} exceeds per-job prefetch cap of {} bytes",
+            job.size_bytes, max_single_bytes,
+        ));
+        return PrefetchedJob { job, data: Err(err) };
     }
 
-    let mut prefetched = Vec::with_capacity(set.len() + oversized.len());
-    prefetched.append(&mut oversized);
-    while let Some(result) = set.join_next().await {
-        match result {
-            Ok(pj) => prefetched.push(pj),
-            Err(e) => tracing::warn!(error = %e, "prefetch task panicked"),
+    let local_path = data_dir.as_deref().map(|d| d.join(&job.path));
+    let use_local = matches!(local_path, Some(ref p) if p.exists());
+    let data = if use_local {
+        Ok(None)
+    } else {
+        match download_bytes(&client, &base_url, &job.sha256, &job.path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) => Err(PrefetchError::Transient(e)),
         }
-    }
-    Ok(Some(prefetched))
+    };
+    PrefetchedJob { job, data }
 }
 
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
