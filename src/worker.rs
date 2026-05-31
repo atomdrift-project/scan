@@ -849,6 +849,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         .timeout(Duration::from_secs(120))
         .build()?;
     let semaphore = Arc::new(Semaphore::new(slots));
+    // Slot count bounds concurrency but not memory: a slot analysing a huge
+    // archive holds it (plus expanded members) resident while a slot analysing a
+    // 4 KB script holds nothing. This gate caps the aggregate estimated
+    // footprint of in-flight analyses to a fraction of RAM so a burst of large
+    // archives serialises instead of co-residing and exhausting memory.
+    let admission = crate::admission::MemoryAdmission::new();
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(Arc::clone(&shutdown));
 
@@ -1017,6 +1023,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     max_rss_mb = max_bytes / 1024 / 1024,
                     "memory pressure: pausing dispatch",
                 );
+                admission.log_inflight("reactive RSS pause: max_rss_gb exceeded");
                 if let Err(e) =
                     tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
                 {
@@ -1068,6 +1075,19 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 continue;
             }
         };
+        // Reserve this job's estimated memory footprint before it starts
+        // expanding the archive. Blocks while the in-flight budget is full, so a
+        // burst of large archives serialises rather than co-residing and
+        // exhausting RAM. Held only for the duration of the analysis.
+        let admission_guard = admission
+            .admit(
+                Arc::from(pj.job.sha256.as_str()),
+                Arc::from(pj.job.path.as_str()),
+                Arc::from(pj.job.file_type.as_str()),
+                pj.job.size_bytes,
+            )
+            .await;
+
         let url = Arc::clone(&base_url);
         let name = Arc::clone(&name);
         let local_index = local_index.clone();
@@ -1086,6 +1106,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 &pools,
             )
             .await;
+            // The archive and its expanded members are freed when `run_job`
+            // returns; release the memory reservation now so the budget reopens
+            // before the result round-trip to hopper, not after.
+            drop(admission_guard);
             if let Err(ref e) = result {
                 tracing::warn!(
                     sha256 = %pj.job.sha256,

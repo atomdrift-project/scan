@@ -26,6 +26,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod admission;
 pub mod analyzer;
 pub mod explain;
 pub mod features;
