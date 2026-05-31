@@ -19,11 +19,11 @@ designed to be stored — in object stores, in row-oriented databases,
 in append-only log streams — and replayed later. The cost of every
 field name is paid once per record, and there are a lot of records.
 
-`prob` instead of `probability` saves seven bytes per record. `class`
-instead of `classification` saves nine. `m`, `why`, `skip`, `fs` are
-the same trade. Over a billion analyses the storage difference is not
-academic, and the names map cleanly to obvious things. The tables
-below are the key.
+`prob` instead of `probability` saves seven bytes per record. `l`
+instead of spelling out the level/verdict is the same trade. `m`,
+`why`, `skip`, `fs` follow the same rule. Over a billion analyses the
+storage difference is not academic, and the names map cleanly to
+obvious things. The tables below are the key.
 
 ## `ml` — `MlSection`
 
@@ -31,11 +31,9 @@ below are the key.
 
 | JSON          | Rust                      | Type                   | Meaning                                              |
 | ------------- | ------------------------- | ---------------------- | ---------------------------------------------------- |
-| `v`           | `v`                       | string                 | Envelope schema version. Currently `"5"`.            |
-| `class`       | `classification`          | u8 (0/1/2)             | Final classification.                                |
+| `v`           | `v`                       | string                 | Envelope schema version. Currently `"6"`.            |
 | `prob`        | `probability`             | f32 in `[0, 1]`        | Probability the verdict was decided on.              |
-| `threshold`   | `threshold`               | f32 in `[0, 1]`        | Cutoff defining the verdict band. See **The invariant** below. |
-| `level`       | `level`                   | u8 (0..=100) or null   | Severity level that selected the threshold (per-100M-benigns scale), or `null` when manual thresholds were used. |
+| `l`           | `l`                       | i32 or null            | Verdict-and-level marker. See **The verdict encoding** below. |
 | `models`      | `model_scores`            | array of `RouteScore`  | Per-route ensemble scores. Omitted if empty.         |
 | `skip`        | `skipped_models`          | array of `SkippedRoute`| Routes that were applicable but unused.              |
 | `version`     | `version`                 | string                 | Model version: spec, ABI, hash prefix.               |
@@ -44,32 +42,37 @@ below are the key.
 | `pids`        | `pids`                    | array of u32           | Running PIDs. Present only on process scans.         |
 | `deleted`     | `deleted`                 | bool                   | Whether the on-disk binary was deleted (process scan). |
 
-Classification ints: `0 = benign`, `1 = suspicious`, `2 = hostile`.
+## The verdict encoding
 
-## The invariant
+The envelope no longer carries `class` or `threshold`. Both are
+collapsed into a single field — `l` — which a consumer reads as:
 
-`class = bucket(prob, threshold)`:
+- `l == -1` (sentinel) → the file is **benign**, regardless of how
+  thresholds were resolved.
+- `l` in `0..=100` → the file is **hostile**, and the integer is the
+  per-100M-benigns level that selected the firing threshold
+  (so `l=50` ≡ 0.5 FP/M).
+- `l == null` → the file is **hostile**, but manual
+  `--threshold-hostile` / `--threshold-suspicious` were supplied, so
+  no level table applies.
 
-- `class == Hostile` (2) iff `prob >= threshold` and `threshold` is the hostile cutoff that fired.
-- `class == Suspicious` (1) iff `prob >= threshold` and `threshold` is the suspicious cutoff that fired.
-- `class == Benign` (0) iff `prob < threshold`; `threshold` is the suspicious cutoff that `prob` did not reach.
+In short: `l == -1` iff benign; anything else (including `null`) iff
+hostile.
 
 `prob` is the value the decision was made on — the firing route's
 probability for OR-rule policies, the blend's sigmoid output for
 learned-blend policies, or the elevating embedded file's probability
-when an archive member outranked its parent. `threshold` is whichever
-cutoff that value was compared against. The two are always
-self-consistent for the verdict.
+when an archive member outranked its parent.
 
-`level` answers "what false-positive level produced this threshold?"
-For level-driven thresholds (the default, or `-0`..`-9` / `-l <N>` /
-`--level <N>` / `--loose` / `--paranoid`), `level` is `0..=100` on the
-per-100M-benigns scale (so `level=50` ≡ 0.5 FP/M). When `--threshold-suspicious`
-or `--threshold-hostile` was supplied, `level` is `null` — the threshold
-came from the operator, not from the model's level table.
+Suspicious is now consumer-side. Collimator no longer emits suspicious
+thresholds, and litmus does not classify into a suspicious band on the
+wire. A consumer that wants one derives it from `prob` against its own
+suspicious cutoff. As far as this envelope is concerned, a Suspicious
+result is encoded the same way as Hostile — `l` is the resolved level
+or `null`, never `-1`.
 
-Each `ml.fs[]` entry carries its own `prob`/`class`/`threshold`, so the
-invariant holds per-row too.
+Each `ml.fs[]` entry carries its own `prob` and `l`, following the
+same rules.
 
 ## `RouteScore`
 
@@ -128,13 +131,13 @@ The status code carries the category; see
 
 ## A complete example
 
+A hostile verdict produced at level 3:
+
     {
       "ml": {
-        "v": "5",
-        "class": 2,
+        "v": "6",
         "prob": 0.998,
-        "threshold": 0.95,
-        "level": 3,
+        "l": 3,
         "models": [
           { "m": "az/native", "prob": 0.998, "class": 2 },
           { "m": "az",        "prob": 0.71,  "class": 1 }
@@ -145,27 +148,50 @@ The status code carries the category; see
         "version": "spec=4 abi=1 hash=8f3a91",
         "analyzed_at": "2026-05-14T18:22:01Z",
         "fs": [
-          {
-            "path": "payload.bin",
-            "file_type": "elf",
-            "classification": 2,
-            "probability": 0.998,
-            "threshold": 0.95,
-            "top_findings": [
-              { "id": "objectives/evasion/process::injection",
-                "crit": 5,
-                "desc": "writes to another process's address space" }
-            ]
-          }
+          { "id": 0, "prob": 0.998, "l": 3 }
         ]
       },
       "raw": { "...": "full cleave AnalysisReport" }
     }
 
-The verdict is hostile because `prob` (0.998) crossed the hostile
-cutoff (0.95) at severity level 3. The `az/native` specialist route
-drove the decision; the general `az` route alone would have been
-suspicious.
+A benign verdict (sentinel `l = -1`):
+
+    {
+      "ml": {
+        "v": "6",
+        "prob": 0.04,
+        "l": -1,
+        "version": "spec=4 abi=1 hash=8f3a91",
+        "analyzed_at": "2026-05-14T18:22:01Z",
+        "fs": [
+          { "id": 0, "prob": 0.04, "l": -1 }
+        ]
+      },
+      "raw": { "...": "full cleave AnalysisReport" }
+    }
+
+The hostile envelope above fired because `prob` (0.998) crossed the
+level-3 hostile cutoff. The `az/native` specialist route drove the
+decision; the general `az` route alone would have been suspicious.
+
+## Migration from v=5
+
+`v=5` carried `class` (0/1/2), `threshold` (the firing cutoff), and a
+separate `level` (the per-100M-benigns level or `null`). The
+invariant — `class = bucket(prob, threshold)` — meant the same fact
+was on the wire three times.
+
+`v=6` collapses all three into `l`:
+
+- benign is `l = -1`,
+- hostile-with-known-level is `l = 0..=100`,
+- hostile-with-manual-threshold is `l = null`.
+
+The deciding cutoff itself is no longer transmitted. Consumers that
+want to derive a Suspicious band do so against their own threshold;
+the envelope does not commit to one. Members of `ml.fs[]` follow the
+same shape — `{id, prob, l}` — instead of the prior
+`{id, class, prob, threshold}`.
 
 ## Migration from v=4
 
@@ -174,10 +200,6 @@ global pair) plus optional `oclass`/`oprob` from a finding-based
 upgrade heuristic. Both were misleading: the global thresholds did not
 necessarily produce `class` (per-filetype policies and learned blends
 have their own cutoffs), and the upgrade heuristic mutated the model's
-output without surfacing which cutoff applied.
-
-`v=5` reports the actual deciding `(prob, threshold)` pair plus the
-`level` that selected it. The upgrade heuristic is gone; `oclass` and
-`oprob` no longer appear. The `thresholds` pair is replaced by a
-single `threshold` that is consistent with `class` and `prob` by
-construction.
+output without surfacing which cutoff applied. `v=5` removed the pair
+and the heuristic; `v=6` further collapses `class`/`threshold`/`level`
+into `l` as described above.

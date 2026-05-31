@@ -107,8 +107,9 @@ impl Analyzer {
     }
 
     /// Attach the FPR severity level (0..=100) that produced the resolved
-    /// thresholds. Surfaces as `ml.level` in the JSON envelope. Pass `None` to
-    /// indicate manual thresholds with no level metadata.
+    /// thresholds. Folded into the JSON envelope's `ml.l` field (alongside the
+    /// `-1` benign sentinel). Pass `None` to indicate manual thresholds with no
+    /// level metadata.
     #[must_use]
     pub fn with_level(mut self, level: Option<u8>) -> Self {
         self.config = self.config.with_level(level);

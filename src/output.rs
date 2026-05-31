@@ -189,10 +189,10 @@ fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
 /// Normalized progress within the current classification band.
 ///
 /// `threshold` is the cutoff that defined `classification` (the value `prob`
-/// was compared against). With the v5 envelope we no longer carry both
-/// suspicious and hostile cutoffs, so the suspicious band uses the same
-/// "distance to 1.0" formula as the hostile band — an acceptable approximation
-/// for the band-internal color ramp.
+/// was compared against). The envelope no longer carries both suspicious and
+/// hostile cutoffs, so the suspicious band uses the same "distance to 1.0"
+/// formula as the hostile band — an acceptable approximation for the
+/// band-internal color ramp.
 fn band_progress(probability: f32, classification: &Classification, threshold: f32) -> f32 {
     match classification {
         Classification::Hostile | Classification::Suspicious => {

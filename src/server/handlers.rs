@@ -1071,7 +1071,7 @@ fn scan_result_from(
     resources: &super::ModelResources,
 ) -> ScanResult {
     ScanResult {
-        v: "5",
+        v: "6",
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,

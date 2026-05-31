@@ -990,8 +990,9 @@ struct LoadedBundle {
 
 /// Default severity level used to pick thresholds out of the levels[] table
 /// when the caller hasn't asked for a different one. Matches collimator's
-/// default deploy policy.
-pub const DEFAULT_SEVERITY_LEVEL: u8 = 3;
+/// `DEFAULT_SEVERITY_LEVEL = 50` on the per-100M-benigns scale (= 50 FP per
+/// 100M ≡ 0.5 FP/M).
+pub const DEFAULT_SEVERITY_LEVEL: u8 = 50;
 
 /// Ensemble-level config parsed from the top-level `config.json`. Every field
 /// is optional — an ensemble bundle with only `general/` populated and no

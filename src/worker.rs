@@ -449,7 +449,7 @@ pub struct WorkerConfig {
     /// Exit after this many jobs have been analyzed (None = run forever).
     pub max_jobs: Option<u64>,
     /// FPR severity level (0..=100) that produced the thresholds, or `None` when
-    /// manual thresholds were supplied. Surfaces as `ml.level` in the envelope.
+    /// manual thresholds were supplied. Folded into `ml.l` in the envelope.
     pub level: Option<u8>,
     /// Nice value applied to the process at startup (0 = leave unchanged).
     pub nice: i32,
@@ -1670,12 +1670,11 @@ async fn post_result(
 ) {
     let payload = match result {
         Ok((ml, raw, duration_ms)) => {
-            let classification = match ml.classification {
-                crate::model::Classification::Benign => "benign",
-                crate::model::Classification::Suspicious => "suspicious",
-                crate::model::Classification::Hostile => "hostile",
-            };
-            tracing::info!(sha256 = %sha256, duration_ms, classification, "analysis complete");
+            // v6 envelope no longer carries `class` on the wire — the verdict
+            // is encoded in `l` (-1 = benign, anything else = hostile). The
+            // suspicious band is consumer-side and not visible here.
+            let verdict = if ml.l == Some(-1) { "benign" } else { "hostile" };
+            tracing::info!(sha256 = %sha256, duration_ms, verdict, "analysis complete");
             ResultPayload {
                 sha256: sha256.to_string(),
                 worker: worker.to_string(),

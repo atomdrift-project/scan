@@ -137,7 +137,7 @@ impl ServerConfig {
     }
 
     /// Attach the FPR severity level (0..=100) that produced the resolved
-    /// thresholds. Surfaces as `ml.level` in the JSON envelope.
+    /// thresholds. Folded into `ml.l` in the JSON envelope.
     #[must_use]
     pub const fn with_level(mut self, level: Option<u8>) -> Self {
         self.level = level;
@@ -384,7 +384,7 @@ pub(crate) struct ModelResources {
     pub(crate) model: Model,
     pub(crate) shap: Option<ShapImportance>,
     pub(crate) ctx: ExtractContext,
-    /// Severity level surfaced in the JSON envelope's `ml.level` field.
+    /// Severity level folded into the JSON envelope's `ml.l` field.
     pub(crate) level: Option<u8>,
 }
 

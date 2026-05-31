@@ -150,8 +150,9 @@ impl ScanConfig {
     ///
     /// `None` indicates manual thresholds (no level applies); `Some(n)` is the
     /// 0..=100 level that was used to pick `thresholds` from the model's
-    /// `severity_levels[]` table. Emitted as `ml.level` in the JSON envelope so
-    /// downstream consumers can correlate verdicts with FPR severity.
+    /// `severity_levels[]` table. Folded into `ml.l` in the JSON envelope (which
+    /// also encodes the benign verdict via the `-1` sentinel) so downstream
+    /// consumers can correlate verdicts with FPR severity.
     #[must_use]
     pub const fn with_level(mut self, level: Option<u8>) -> Self {
         self.level = level;
@@ -261,7 +262,7 @@ mod envelope_tests {
 
     fn base_result() -> ScanResult {
         ScanResult {
-            v: "5",
+            v: "6",
             classification: Classification::Benign,
             probability: 0.10,
             threshold: 0.65,
@@ -286,40 +287,74 @@ mod envelope_tests {
     }
 
     #[test]
-    fn envelope_emits_threshold_and_level() {
+    fn envelope_benign_emits_negative_one_sentinel() {
+        // Benign always serializes l=-1 regardless of how thresholds were
+        // resolved (level-driven or manual). The dropped `class`/`threshold`
+        // fields must not appear anywhere in the envelope.
         let r = base_result();
         let envelope = r.to_envelope();
         let json = serde_json::to_value(&envelope).expect("serialize");
-        assert_eq!(json["ml"]["v"].as_str(), Some("5"));
-        assert!(
-            (json["ml"]["threshold"].as_f64().expect("threshold") - 0.65).abs() < 1e-6,
-            "threshold round-trips"
-        );
-        assert_eq!(json["ml"]["level"].as_u64(), Some(3));
-        assert!(
-            json["ml"].get("thresholds").is_none(),
-            "v4 pair must not be emitted"
-        );
-        assert!(
-            json["ml"].get("oclass").is_none(),
-            "oclass must not be emitted in v5"
-        );
-        assert!(
-            json["ml"].get("oprob").is_none(),
-            "oprob must not be emitted in v5"
-        );
+        assert_eq!(json["ml"]["v"].as_str(), Some("6"));
+        assert_eq!(json["ml"]["l"].as_i64(), Some(-1));
+        for dropped in ["class", "threshold", "level", "thresholds", "oclass", "oprob"] {
+            assert!(
+                json["ml"].get(dropped).is_none(),
+                "v6 envelope must not emit `{dropped}`"
+            );
+        }
     }
 
     #[test]
-    fn envelope_emits_null_level_when_manual_thresholds() {
+    fn envelope_benign_with_manual_thresholds_still_emits_negative_one() {
         let mut r = base_result();
         r.level = None;
         let envelope = r.to_envelope();
         let json = serde_json::to_value(&envelope).expect("serialize");
-        assert!(
-            json["ml"]["level"].is_null(),
-            "manual thresholds must serialize level as null"
+        assert_eq!(
+            json["ml"]["l"].as_i64(),
+            Some(-1),
+            "benign overrides manual-threshold null and emits the sentinel"
         );
+    }
+
+    #[test]
+    fn envelope_hostile_with_level_emits_level() {
+        let mut r = base_result();
+        r.classification = Classification::Hostile;
+        r.probability = 0.99;
+        r.threshold = 0.80;
+        r.level = Some(7);
+        let envelope = r.to_envelope();
+        let json = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(json["ml"]["l"].as_i64(), Some(7));
+    }
+
+    #[test]
+    fn envelope_hostile_with_manual_thresholds_emits_null() {
+        let mut r = base_result();
+        r.classification = Classification::Hostile;
+        r.probability = 0.99;
+        r.threshold = 0.80;
+        r.level = None;
+        let envelope = r.to_envelope();
+        let json = serde_json::to_value(&envelope).expect("serialize");
+        assert!(
+            json["ml"]["l"].is_null(),
+            "hostile + manual thresholds must serialize l as null"
+        );
+    }
+
+    #[test]
+    fn envelope_suspicious_treated_as_hostile_for_l() {
+        // collimator no longer emits suspicious thresholds; litmus derives the
+        // band consumer-side. For envelope purposes Suspicious must behave like
+        // Hostile — `l` is the resolved level (or null), never the benign -1.
+        let mut r = base_result();
+        r.classification = Classification::Suspicious;
+        r.level = Some(50);
+        let envelope = r.to_envelope();
+        let json = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(json["ml"]["l"].as_i64(), Some(50));
     }
 }
 
@@ -1169,7 +1204,7 @@ pub(crate) fn process_report(
     let cleave = if is_json { Some(cr.report_json) } else { None };
 
     Ok(ScanResult {
-        v: "5",
+        v: "6",
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,
@@ -1436,19 +1471,35 @@ fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
     routes.is_empty()
 }
 
+/// Collapse a `(classification, level)` pair into the wire-format `l` value.
+///
+/// - Benign verdicts always serialize as `Some(-1)` regardless of how
+///   thresholds were resolved.
+/// - Hostile (and suspicious — consumer-side derived) verdicts preserve the
+///   per-100M-benigns level when it is known, or `None` (→ JSON `null`) when
+///   manual `--threshold-hostile` / `--threshold-suspicious` were supplied.
+#[must_use]
+pub(crate) fn envelope_l(classification: Classification, level: Option<u8>) -> Option<i32> {
+    match classification {
+        Classification::Benign => Some(-1),
+        _ => level.map(i32::from),
+    }
+}
+
 /// Build per-file ML classification entries for the `ml.fs` array.
 ///
-/// Each entry contains `{id, class, prob, threshold}` keyed by the cleave
-/// `fs[].id` field. The root file (dp=0) gets the parent classification;
-/// embedded files get their individual scores matched by path suffix. Every
-/// entry carries the cutoff its `prob` was compared against so the v5
-/// invariant `class = bucket(prob, threshold)` holds per-row.
+/// Each entry contains `{id, prob, l}` keyed by the cleave `fs[].id` field.
+/// The root file (`dp=0`) inherits the parent envelope's classification and
+/// probability; embedded archive members report their own probability matched
+/// by path suffix. Members do not carry their own level — they inherit the
+/// envelope-level `l` so a single hostile-with-known-level scan is consistent
+/// per-row.
 fn build_ml_fs(
     report_json: &serde_json::Value,
     classification: &Classification,
     probability: f32,
-    threshold: f32,
     embedded_files: &[EmbeddedFile],
+    parent_l: Option<i32>,
 ) -> Vec<serde_json::Value> {
     let Some(fs) = report_json.get("fs").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -1465,23 +1516,30 @@ fn build_ml_fs(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
 
-        let (cls, prob, thr) = if depth == 0 {
-            (classification, probability, threshold)
+        let (member_class, prob) = if depth == 0 {
+            (*classification, probability)
         } else {
             let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let suffix = path.rsplit_once("!!").map(|(_, r)| r).unwrap_or(path);
             embedded_files
                 .iter()
                 .find(|ef| ef.path == suffix)
-                .map(|ef| (&ef.classification, ef.probability, ef.threshold))
-                .unwrap_or((classification, probability, threshold))
+                .map(|ef| (ef.classification, ef.probability))
+                .unwrap_or((*classification, probability))
+        };
+
+        // Each row resolves its own `l` so benign embedded members inside a
+        // hostile archive (and vice-versa) report the correct sentinel,
+        // borrowing the envelope's manual-vs-level encoding from `parent_l`.
+        let row_l = match member_class {
+            Classification::Benign => Some(-1),
+            _ => parent_l.filter(|v| *v != -1),
         };
 
         out.push(serde_json::json!({
             "id": id,
-            "class": cls,
             "prob": prob,
-            "threshold": thr,
+            "l": row_l,
         }));
     }
     out
@@ -1500,14 +1558,16 @@ pub struct ScanResultEnvelope {
 #[derive(Debug, serde::Serialize)]
 pub struct MlSection {
     pub(crate) v: &'static str,
-    #[serde(rename = "class")]
-    pub(crate) classification: Classification,
     #[serde(rename = "prob")]
     pub(crate) probability: f32,
-    pub(crate) threshold: f32,
-    /// Severity level (0..=100) that selected the deciding threshold, or `null`
-    /// when manual `--suspicious-threshold` / `--hostile-threshold` were used.
-    pub(crate) level: Option<u8>,
+    /// Resolved verdict marker, always serialized (including as `null`):
+    /// - `Some(-1)` → benign.
+    /// - `Some(0..=100)` → hostile; the per-100M-benigns level that selected
+    ///   the firing threshold.
+    /// - `None` → hostile; manual `--threshold-hostile` / `--threshold-suspicious`
+    ///   were used and no level applies.
+    #[serde(rename = "l")]
+    pub(crate) l: Option<i32>,
     #[serde(rename = "models", skip_serializing_if = "Vec::is_empty")]
     pub(crate) model_scores: Vec<crate::model::RouteScore>,
     #[serde(rename = "skip", skip_serializing_if = "Vec::is_empty")]
@@ -1536,14 +1596,11 @@ pub struct ScanResultEnvelopeRef<'a> {
 #[derive(Debug, serde::Serialize)]
 pub struct MlSectionRef<'a> {
     pub(crate) v: &'static str,
-    #[serde(rename = "class")]
-    pub(crate) classification: Classification,
     #[serde(rename = "prob")]
     pub(crate) probability: f32,
-    pub(crate) threshold: f32,
-    /// Severity level (0..=100) that selected the deciding threshold, or `null`
-    /// when manual `--suspicious-threshold` / `--hostile-threshold` were used.
-    pub(crate) level: Option<u8>,
+    /// See [`MlSection::l`] for the encoding of this field.
+    #[serde(rename = "l")]
+    pub(crate) l: Option<i32>,
     #[serde(rename = "models", skip_serializing_if = "route_scores_empty")]
     pub(crate) model_scores: &'a [crate::model::RouteScore],
     #[serde(rename = "skip", skip_serializing_if = "skipped_routes_empty")]
@@ -1585,20 +1642,19 @@ impl ScanResult {
     #[must_use]
     pub fn to_envelope(&self) -> ScanResultEnvelope {
         let raw = self.cleave.clone().unwrap_or(serde_json::json!({}));
+        let l = envelope_l(self.classification, self.level);
         let ml_fs = build_ml_fs(
             &raw,
             &self.classification,
             self.probability,
-            self.threshold,
             &self.embedded_files,
+            l,
         );
         ScanResultEnvelope {
             ml: MlSection {
                 v: self.v,
-                classification: self.classification,
                 probability: self.probability,
-                threshold: self.threshold,
-                level: self.level,
+                l,
                 model_scores: self.model_scores.clone(),
                 skipped_models: self.skipped_models.clone(),
                 version: self.version.clone(),
@@ -1618,20 +1674,19 @@ impl ScanResult {
     #[must_use]
     pub fn into_envelope(self) -> ScanResultEnvelope {
         let raw = self.cleave.unwrap_or(serde_json::json!({}));
+        let l = envelope_l(self.classification, self.level);
         let ml_fs = build_ml_fs(
             &raw,
             &self.classification,
             self.probability,
-            self.threshold,
             &self.embedded_files,
+            l,
         );
         ScanResultEnvelope {
             ml: MlSection {
                 v: self.v,
-                classification: self.classification,
                 probability: self.probability,
-                threshold: self.threshold,
-                level: self.level,
+                l,
                 model_scores: self.model_scores,
                 skipped_models: self.skipped_models,
                 version: self.version,
@@ -1655,20 +1710,19 @@ impl ScanResult {
             Some(v) => v,
             None => EMPTY_RAW.get_or_init(|| serde_json::json!({})),
         };
+        let l = envelope_l(self.classification, self.level);
         let ml_fs = build_ml_fs(
             raw,
             &self.classification,
             self.probability,
-            self.threshold,
             &self.embedded_files,
+            l,
         );
         ScanResultEnvelopeRef {
             ml: MlSectionRef {
                 v: self.v,
-                classification: self.classification,
                 probability: self.probability,
-                threshold: self.threshold,
-                level: self.level,
+                l,
                 model_scores: &self.model_scores,
                 skipped_models: &self.skipped_models,
                 version: &self.version,

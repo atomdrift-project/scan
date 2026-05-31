@@ -310,7 +310,7 @@ fn build_result(
     let cleave = if is_json { Some(cr.report_json) } else { None };
 
     Ok(ScanResult {
-        v: "5",
+        v: "6",
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,

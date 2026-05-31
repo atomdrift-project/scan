@@ -562,9 +562,10 @@ fn main() -> Result<()> {
             threshold_hostile,
         )
     };
-    // The envelope's `ml.level` reports the FPR severity that produced the
-    // resolved thresholds. Manual `--threshold-*` overrides bypass the levels
-    // table entirely, so we emit `null` for those runs.
+    // The envelope's `ml.l` encodes the FPR severity that produced the
+    // resolved thresholds (or the `-1` benign sentinel — see scan::envelope_l).
+    // Manual `--threshold-*` overrides bypass the levels table entirely, so we
+    // pass `None` here; benign verdicts will still surface as `-1` regardless.
     let manual_thresholds = threshold_suspicious.is_some() || threshold_hostile.is_some();
     let envelope_level: Option<u8> = if manual_thresholds {
         None

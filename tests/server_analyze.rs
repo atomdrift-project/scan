@@ -142,24 +142,31 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     let json: serde_json::Value =
         serde_json::from_slice(&body_bytes).context("response must be valid JSON")?;
 
-    // Every response must have the v5 envelope fields, regardless of classification.
+    // Every response must have the v6 envelope fields, regardless of classification.
     let ml = json["ml"].as_object().context("missing ml section")?;
-    assert_eq!(ml["v"].as_str(), Some("5"), "envelope version must be v5");
-    assert!(ml["class"].is_number(), "missing classification");
+    assert_eq!(ml["v"].as_str(), Some("6"), "envelope version must be v6");
     assert!(ml["prob"].is_number(), "missing probability");
-    assert!(ml["threshold"].is_number(), "missing threshold");
-    assert!(ml.contains_key("level"), "missing level field");
+    assert!(ml.contains_key("l"), "missing l field");
     assert!(ml["version"].is_string(), "missing model version");
     assert!(ml["fs"].is_array(), "missing per-file ML results");
     assert!(json["raw"].is_object(), "missing raw cleave report");
     assert!(json["raw"]["fs"].is_array(), "missing cleave files");
 
-    let classification = ml["class"]
-        .as_u64()
-        .context("classification must be numeric")?;
-    assert!(
-        classification <= 2,
-        "unexpected classification: {classification}"
-    );
+    // v6 drops `class` and `threshold` from the envelope; consumers derive the
+    // verdict from `l` instead (-1 = benign; anything else = hostile).
+    for dropped in ["class", "threshold", "level"] {
+        assert!(
+            !ml.contains_key(dropped),
+            "v6 envelope must not emit `{dropped}`"
+        );
+    }
+
+    let l = ml["l"].as_i64();
+    if let Some(l) = l {
+        assert!(
+            l == -1 || (0..=100).contains(&l),
+            "unexpected l value: {l}"
+        );
+    } // null is also valid (manual thresholds on a hostile verdict)
     Ok(())
 }
