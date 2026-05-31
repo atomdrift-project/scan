@@ -448,7 +448,7 @@ pub struct WorkerConfig {
     pub slow_rule_ms: u64,
     /// Exit after this many jobs have been analyzed (None = run forever).
     pub max_jobs: Option<u64>,
-    /// FPR severity level (0..=19) that produced the thresholds, or `None` when
+    /// FPR severity level (0..=100) that produced the thresholds, or `None` when
     /// manual thresholds were supplied. Surfaces as `ml.level` in the envelope.
     pub level: Option<u8>,
     /// Nice value applied to the process at startup (0 = leave unchanged).

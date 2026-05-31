@@ -140,9 +140,11 @@ The numbers are resolved in this order, each step overriding the
 previous one:
 
 1. `evaluation.json` in the model bundle (`src/model.rs:270`).
-2. Severity level flags `-0` … `-9`, or `-l <N>` / `--level <N>` for
-   the full `0`-`19` range, pick a row from the bundle
-   (`src/main.rs:160`). Higher levels are more sensitive.
+2. Severity level flags `-0` … `-9` (round-decade shorthand: L0,
+   L10, ..., L90), or `-l <N>` / `--level <N>` for any integer in the
+   `0`-`100` range on the per-100M-benigns scale, pick a row from the
+   bundle (`src/main.rs:160`). Higher numbers are more sensitive (more
+   permitted FP per 100M benigns).
 3. `--threshold-suspicious` and `--threshold-hostile` override
    everything (`src/main.rs:301`).
 4. If the bundle carries no thresholds and no flag is passed, the

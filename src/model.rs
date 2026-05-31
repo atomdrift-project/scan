@@ -128,6 +128,17 @@
 //!
 //! - `general/` ABI mismatch: fatal. Refuse to start.
 //! - Specialist ABI mismatch: warn, drop that specialist, continue.
+//!
+//! ## Optional `suspicious` in collimator JSON
+//!
+//! Collimator no longer emits a `suspicious` field in any of the JSONs it
+//! writes (`config.json`, `evaluation.json`, `route_policies.json`). Litmus
+//! derives it consumer-side as a fixed 10-percentage-point band below the
+//! hostile threshold: `suspicious = (hostile - 0.10).clamp(0.0, hostile)`.
+//! This is intentionally conservative — it tags MORE files as Suspicious
+//! than as Hostile, which matches the softer-signal intent. The
+//! `Thresholds` struct, `Classification` enum, and CLI surface still carry
+//! the value explicitly; only JSON-input sites tolerate its absence.
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -186,6 +197,13 @@ const fn default_model_abi_version() -> u32 {
     EXPECTED_MODEL_ABI_VERSION
 }
 
+/// Derive a suspicious threshold from hostile when collimator omits it.
+/// 10 pp below hostile, clamped — see model.rs banner for design.
+#[must_use]
+pub(crate) fn derive_suspicious_from_hostile(hostile: f32) -> f32 {
+    (hostile - 0.10).clamp(0.0, hostile)
+}
+
 /// Try to load thresholds from config.json in the model directory.
 ///
 /// config.json is the primary model-level configuration and takes precedence
@@ -196,8 +214,11 @@ fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
     let path = model_dir.join("config.json");
     let data = std::fs::read_to_string(&path).ok()?;
     let cfg: ConfigJson = serde_json::from_str(&data).ok()?;
-    let suspicious = cfg.suspicious? as f32;
     let hostile = cfg.hostile? as f32;
+    let suspicious = cfg
+        .suspicious
+        .map(|s| s as f32)
+        .unwrap_or_else(|| derive_suspicious_from_hostile(hostile));
     let t = Thresholds {
         suspicious,
         hostile,
@@ -221,8 +242,12 @@ fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
 #[allow(clippy::cast_possible_truncation)]
 fn thresholds_from_severity_levels(levels: &[SeverityLevel], level: u8) -> Option<Thresholds> {
     let entry = levels.iter().find(|entry| entry.level == level)?;
-    let suspicious = entry.suspicious?.threshold? as f32;
     let hostile = entry.hostile?.threshold? as f32;
+    let suspicious = entry
+        .suspicious
+        .and_then(|s| s.threshold)
+        .map(|s| s as f32)
+        .unwrap_or_else(|| derive_suspicious_from_hostile(hostile));
     let thresholds = Thresholds {
         suspicious,
         hostile,
@@ -277,10 +302,10 @@ fn load_evaluation_severity_thresholds(model_dir: &Path, level: u8) -> Option<Th
 /// severity metadata.
 ///
 /// # Errors
-/// Returns an error if `level` is outside `0..=19`.
+/// Returns an error if `level` is outside `0..=100`.
 pub fn load_severity_thresholds(model_dir: &Path, level: u8) -> Result<Option<Thresholds>> {
-    if !(0..=19).contains(&level) {
-        anyhow::bail!("severity level must be in 0..=19, got {level}");
+    if !(0..=100).contains(&level) {
+        anyhow::bail!("severity level must be in 0..=100, got {level}");
     }
     Ok(load_config_severity_thresholds(model_dir, level)
         .or_else(|| load_evaluation_severity_thresholds(model_dir, level)))
@@ -303,8 +328,11 @@ fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
     }
 
     if let Some(rec) = eval.recommended_thresholds {
-        let suspicious = rec.suspicious? as f32;
         let hostile = rec.hostile? as f32;
+        let suspicious = rec
+            .suspicious
+            .map(|s| s as f32)
+            .unwrap_or_else(|| derive_suspicious_from_hostile(hostile));
         let t = Thresholds {
             suspicious,
             hostile,
@@ -1146,7 +1174,9 @@ struct RoutePolicyRouteJson {
 struct RoutePolicyLevelJson {
     level: u8,
     hostile: RoutePolicySeverityJson,
-    suspicious: RoutePolicySeverityJson,
+    // Collimator may omit `suspicious`; the loader derives it from `hostile`.
+    #[serde(default)]
+    suspicious: Option<RoutePolicySeverityJson>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1187,7 +1217,12 @@ struct BlendPolicyJson {
 struct LevelEntryJson {
     level: u8,
     hostile: SeverityEntryJson,
-    suspicious: SeverityEntryJson,
+    // Collimator may omit `suspicious`; per-route derivation happens in
+    // `thresholds_at_level`. An absent block is treated as an empty map,
+    // which yields hostile-only routes (the same shape used when only some
+    // routes have a calibrated suspicious threshold).
+    #[serde(default)]
+    suspicious: Option<SeverityEntryJson>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1241,11 +1276,18 @@ fn load_route_policies(model_dir: &Path, level: u8) -> RoutePolicies {
             continue;
         };
         let Some(hostile) = policy_severity_from_json(&level_entry.hostile) else {
+            // Hostile is primary; without it we can't safely synthesize a
+            // suspicious band, so skip the level entirely.
             continue;
         };
-        let Some(suspicious) = policy_severity_from_json(&level_entry.suspicious) else {
-            continue;
-        };
+        // Suspicious is derived from hostile when the JSON omits it (or when
+        // collimator's writer emits a `suspicious` block that doesn't parse
+        // into a usable severity, e.g. empty thresholds + no blend).
+        let suspicious = level_entry
+            .suspicious
+            .as_ref()
+            .and_then(policy_severity_from_json)
+            .unwrap_or_else(|| derive_suspicious_policy_from_hostile(&hostile));
         by_filetype.insert(
             route.filetype,
             RoutePolicy {
@@ -1262,6 +1304,26 @@ fn load_route_policies(model_dir: &Path, level: u8) -> RoutePolicies {
         "loaded route policies",
     );
     RoutePolicies { by_filetype }
+}
+
+/// Derive a suspicious `PolicySeverity` from the matching hostile severity by
+/// shifting every per-route threshold (and the blend threshold, if any) down
+/// by 10 percentage points, clamped to `[0.0, hostile_t]`. Used when
+/// collimator's `route_policies.json` omits the `suspicious` block — see the
+/// module-level banner for design.
+fn derive_suspicious_policy_from_hostile(hostile: &PolicySeverity) -> PolicySeverity {
+    let thresholds = hostile
+        .thresholds
+        .iter()
+        .map(|(route, &t)| (route.clone(), derive_suspicious_from_hostile(t)))
+        .collect();
+    let blend = hostile.blend.as_ref().map(|b| BlendPolicy {
+        routes: b.routes.clone(),
+        weights: b.weights.clone(),
+        intercept: b.intercept,
+        threshold: derive_suspicious_from_hostile(b.threshold),
+    });
+    PolicySeverity { thresholds, blend }
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -1343,19 +1405,25 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u8) -> HashMap<String, 
     };
 
     let mut out: HashMap<String, Thresholds> = HashMap::new();
+    let suspicious_block = entry.suspicious.as_ref();
     for (route, &hostile) in &entry.hostile.thresholds {
-        // Hostile policy is primary. Some calibrated specialists only earn a
-        // hostile threshold at a level; keep them active as hostile-only by
-        // setting suspicious equal to hostile.
-        let suspicious = entry
-            .suspicious
-            .thresholds
-            .get(route)
-            .copied()
-            .unwrap_or(hostile);
+        // Hostile policy is primary. When the JSON carries an explicit
+        // `suspicious` block but a specific route is absent from it, that
+        // route stays active as hostile-only (suspicious == hostile). When
+        // collimator omits the `suspicious` block entirely, derive the
+        // suspicious cutoff as a 10pp band below hostile.
+        let hostile_f32 = hostile as f32;
+        let suspicious_f32 = match suspicious_block {
+            Some(block) => block
+                .thresholds
+                .get(route)
+                .map(|&s| s as f32)
+                .unwrap_or(hostile_f32),
+            None => derive_suspicious_from_hostile(hostile_f32),
+        };
         let t = Thresholds {
-            suspicious: suspicious as f32,
-            hostile: hostile as f32,
+            suspicious: suspicious_f32,
+            hostile: hostile_f32,
         };
         if t.validate().is_ok() {
             out.insert(route.clone(), t);
@@ -1370,22 +1438,24 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u8) -> HashMap<String, 
             );
         }
     }
-    for (route, &suspicious) in &entry.suspicious.thresholds {
-        if out.contains_key(route) {
-            continue;
-        }
-        let t = Thresholds {
-            suspicious: suspicious as f32,
-            hostile: 1.0,
-        };
-        if t.validate().is_ok() {
-            out.insert(route.clone(), t);
-        } else {
-            tracing::error!(
-                route = %route, level = level,
-                suspicious = t.suspicious, hostile = t.hostile,
-                "ignoring invalid suspicious-only thresholds in ensemble config"
-            );
+    if let Some(block) = suspicious_block {
+        for (route, &suspicious) in &block.thresholds {
+            if out.contains_key(route) {
+                continue;
+            }
+            let t = Thresholds {
+                suspicious: suspicious as f32,
+                hostile: 1.0,
+            };
+            if t.validate().is_ok() {
+                out.insert(route.clone(), t);
+            } else {
+                tracing::error!(
+                    route = %route, level = level,
+                    suspicious = t.suspicious, hostile = t.hostile,
+                    "ignoring invalid suspicious-only thresholds in ensemble config"
+                );
+            }
         }
     }
     out
@@ -2542,8 +2612,8 @@ mod tests {
     #[test]
     fn load_severity_thresholds_rejects_invalid_level() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let err = load_severity_thresholds(dir.path(), 20).expect_err("level 20 is invalid");
-        assert!(err.to_string().contains("0..=19"));
+        let err = load_severity_thresholds(dir.path(), 101).expect_err("level 101 is invalid");
+        assert!(err.to_string().contains("0..=100"));
         Ok(())
     }
 

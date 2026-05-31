@@ -35,12 +35,12 @@ litmus /srv/npm-mirror                   # recursive; archives unpacked
 litmus --format json --show all pkg/     # JSONL for pipelines
 litmus ps                                # classify running processes
 litmus -0 release.tgz                    # zero false positives; strictest
-litmus --loose release.tgz               # level 1: least noisy
-litmus -9 release.tgz                    # paranoid: catch the long tail
-litmus -l 14 release.tgz                 # any level 0-19 via -l/--level
+litmus --loose release.tgz               # level 10: least noisy
+litmus -9 release.tgz                    # paranoid: catch the long tail (L90)
+litmus -l 50 release.tgz                 # any level 0-100 via -l/--level (L50 is the default)
 ```
 
-Sensitivity is gzip-style: `-0` through `-9` (or `-l <N>` / `--level <N>` for the full `0`-`19` range), default `-3`; higher levels are more sensitive and noisier. For exact cutoffs use `--threshold-hostile` / `--threshold-suspicious`. `--model-dir` swaps in a custom model bundle.
+Sensitivity is on the per-100M-benigns scale: `-0` through `-9` for the round-decade shorthand (L0, L10, L20, ..., L90), or `-l <N>` / `--level <N>` for any integer in `0..=100`. Default is L50 (= 50 FP per 100M ≡ 0.5 FP/M). Lower numbers are stricter. For exact cutoffs use `--threshold-hostile` / `--threshold-suspicious`. `--model-dir` swaps in a custom model bundle.
 
 Exit codes: `0` clean, `1` hostile, `2` suspicious, `3` error.
 

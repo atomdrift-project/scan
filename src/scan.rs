@@ -149,7 +149,7 @@ impl ScanConfig {
     /// Attach the severity level that produced the resolved thresholds.
     ///
     /// `None` indicates manual thresholds (no level applies); `Some(n)` is the
-    /// 0..=19 level that was used to pick `thresholds` from the model's
+    /// 0..=100 level that was used to pick `thresholds` from the model's
     /// `severity_levels[]` table. Emitted as `ml.level` in the JSON envelope so
     /// downstream consumers can correlate verdicts with FPR severity.
     #[must_use]
@@ -194,7 +194,7 @@ impl ScanConfig {
         self.extra
     }
 
-    /// Severity level (0..=19) used to pick thresholds, or `None` when manual
+    /// Severity level (0..=100) used to pick thresholds, or `None` when manual
     /// thresholds were supplied via `--suspicious-threshold` / `--hostile-threshold`.
     #[must_use]
     pub const fn level(&self) -> Option<u8> {
@@ -368,7 +368,7 @@ pub struct ScanResult {
     /// Cutoff defining the verdict band — the same value `probability` was
     /// compared against to produce `classification`.
     pub threshold: f32,
-    /// Severity level (0..=19) that produced the thresholds, or `None` when
+    /// Severity level (0..=100) that produced the thresholds, or `None` when
     /// manual thresholds were supplied via `--suspicious-threshold` /
     /// `--hostile-threshold`.
     pub level: Option<u8>,
@@ -1505,7 +1505,7 @@ pub struct MlSection {
     #[serde(rename = "prob")]
     pub(crate) probability: f32,
     pub(crate) threshold: f32,
-    /// Severity level (0..=19) that selected the deciding threshold, or `null`
+    /// Severity level (0..=100) that selected the deciding threshold, or `null`
     /// when manual `--suspicious-threshold` / `--hostile-threshold` were used.
     pub(crate) level: Option<u8>,
     #[serde(rename = "models", skip_serializing_if = "Vec::is_empty")]
@@ -1541,7 +1541,7 @@ pub struct MlSectionRef<'a> {
     #[serde(rename = "prob")]
     pub(crate) probability: f32,
     pub(crate) threshold: f32,
-    /// Severity level (0..=19) that selected the deciding threshold, or `null`
+    /// Severity level (0..=100) that selected the deciding threshold, or `null`
     /// when manual `--suspicious-threshold` / `--hostile-threshold` were used.
     pub(crate) level: Option<u8>,
     #[serde(rename = "models", skip_serializing_if = "route_scores_empty")]

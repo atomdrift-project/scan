@@ -106,7 +106,7 @@ impl Analyzer {
         Ok(self)
     }
 
-    /// Attach the FPR severity level (0..=19) that produced the resolved
+    /// Attach the FPR severity level (0..=100) that produced the resolved
     /// thresholds. Surfaces as `ml.level` in the JSON envelope. Pass `None` to
     /// indicate manual thresholds with no level metadata.
     #[must_use]
