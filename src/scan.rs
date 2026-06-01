@@ -149,7 +149,7 @@ impl ScanConfig {
     /// Attach the severity level that produced the resolved thresholds.
     ///
     /// `None` indicates manual thresholds (no level applies); `Some(n)` is the
-    /// 0..=1000 level that was used to pick `thresholds` from the model's
+    /// 0..=10000 level that was used to pick `thresholds` from the model's
     /// `severity_levels[]` table. Folded into `ml.l` in the JSON envelope (which
     /// also encodes the benign verdict via the `-1` sentinel) so downstream
     /// consumers can correlate verdicts with FPR severity.
@@ -195,7 +195,7 @@ impl ScanConfig {
         self.extra
     }
 
-    /// Severity level (0..=1000) used to pick thresholds, or `None` when manual
+    /// Severity level (0..=10000) used to pick thresholds, or `None` when manual
     /// thresholds were supplied via `--suspicious-threshold` / `--hostile-threshold`.
     #[must_use]
     pub const fn level(&self) -> Option<u16> {
@@ -422,7 +422,7 @@ pub struct ScanResult {
     pub threshold: f32,
     /// Level-independent envelope marker (`ml.l`): the lowest false-positive
     /// level (FP per 100M benigns) at which this file's hostile decision fires.
-    /// `Some(-1)` = never fires (clean); `Some(0..=1000)` = the firing level;
+    /// `Some(-1)` = never fires (clean); `Some(0..=10000)` = the firing level;
     /// `None` = manual-threshold mode. Independent of the deploy `-l`, so the
     /// envelope is identical across levels and cache-shareable — `-l` only moves
     /// the cutoffs that turn `l` into `classification`.
@@ -1567,7 +1567,7 @@ pub struct MlSection {
     pub(crate) probability: f32,
     /// Resolved verdict marker, always serialized (including as `null`):
     /// - `Some(-1)` → benign.
-    /// - `Some(0..=1000)` → hostile; the per-100M-benigns level that selected
+    /// - `Some(0..=10000)` → hostile; the per-100M-benigns level that selected
     ///   the firing threshold.
     /// - `None` → hostile; manual `--threshold-hostile` / `--threshold-suspicious`
     ///   were used and no level applies.

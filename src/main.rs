@@ -93,8 +93,8 @@ struct Cli {
     #[arg(long)]
     threshold_hostile: Option<f32>,
 
-    /// Tune thresholds for false-positive level N (0-1000, FP per 100M benigns; default L50): higher = more sensitive, noisier
-    #[arg(short = 'l', long, value_name = "N", value_parser = clap::value_parser!(u16).range(0..=1000), global = true)]
+    /// Tune thresholds for false-positive level N (0-10000, FP per 100M benigns): higher = more sensitive, noisier. Bundle decides which levels are calibrated.
+    #[arg(short = 'l', long, value_name = "N", value_parser = clap::value_parser!(u16).range(0..=10000), global = true)]
     level: Option<u16>,
 
     /// Use severity level 0: zero false positives; strictest
