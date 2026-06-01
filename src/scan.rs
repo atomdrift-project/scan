@@ -266,7 +266,8 @@ mod envelope_tests {
             classification: Classification::Benign,
             probability: 0.10,
             threshold: 0.65,
-            level: Some(3),
+            // Benign that never fires at any grid level.
+            l: Some(-1),
             version: "test".to_string(),
             analyzed_at: "2026-04-16T00:00:00Z".to_string(),
             cleave: None,
@@ -287,13 +288,12 @@ mod envelope_tests {
     }
 
     #[test]
-    fn envelope_benign_emits_negative_one_sentinel() {
-        // Benign always serializes l=-1 regardless of how thresholds were
-        // resolved (level-driven or manual). The dropped `class`/`threshold`
-        // fields must not appear anywhere in the envelope.
+    fn envelope_serializes_l_and_drops_legacy_fields() {
+        // `ml.l` is the model's level-independent marker, serialized verbatim
+        // (`-1` for a file that never fires). The dropped v5 fields must not
+        // appear anywhere in the envelope.
         let r = base_result();
-        let envelope = r.to_envelope();
-        let json = serde_json::to_value(&envelope).expect("serialize");
+        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
         assert_eq!(json["ml"]["v"].as_str(), Some("6"));
         assert_eq!(json["ml"]["l"].as_i64(), Some(-1));
         for dropped in ["class", "threshold", "level", "thresholds", "oclass", "oprob"] {
@@ -305,56 +305,73 @@ mod envelope_tests {
     }
 
     #[test]
-    fn envelope_benign_with_manual_thresholds_still_emits_negative_one() {
+    fn envelope_emits_null_l_in_manual_mode() {
         let mut r = base_result();
-        r.level = None;
-        let envelope = r.to_envelope();
-        let json = serde_json::to_value(&envelope).expect("serialize");
-        assert_eq!(
-            json["ml"]["l"].as_i64(),
-            Some(-1),
-            "benign overrides manual-threshold null and emits the sentinel"
+        r.l = None;
+        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
+        assert!(
+            json["ml"]["l"].is_null(),
+            "manual-threshold mode (no level table) serializes l as null"
         );
     }
 
     #[test]
-    fn envelope_hostile_with_level_emits_level() {
+    fn envelope_emits_firing_level() {
         let mut r = base_result();
         r.classification = Classification::Hostile;
         r.probability = 0.99;
-        r.threshold = 0.80;
-        r.level = Some(7);
-        let envelope = r.to_envelope();
-        let json = serde_json::to_value(&envelope).expect("serialize");
+        r.l = Some(7);
+        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
         assert_eq!(json["ml"]["l"].as_i64(), Some(7));
     }
 
     #[test]
-    fn envelope_hostile_with_manual_thresholds_emits_null() {
+    fn envelope_l_is_independent_of_verdict() {
+        // A file the model only flags at a high level reports that true level
+        // even when the active caps render it benign — the envelope (hence the
+        // cache key) is identical regardless of the deploy `-l`.
         let mut r = base_result();
-        r.classification = Classification::Hostile;
-        r.probability = 0.99;
-        r.threshold = 0.80;
-        r.level = None;
-        let envelope = r.to_envelope();
-        let json = serde_json::to_value(&envelope).expect("serialize");
-        assert!(
-            json["ml"]["l"].is_null(),
-            "hostile + manual thresholds must serialize l as null"
-        );
+        r.classification = Classification::Benign;
+        r.l = Some(500);
+        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
+        assert_eq!(json["ml"]["l"].as_i64(), Some(500));
     }
 
     #[test]
-    fn envelope_suspicious_treated_as_hostile_for_l() {
-        // collimator no longer emits suspicious thresholds; litmus derives the
-        // band consumer-side. For envelope purposes Suspicious must behave like
-        // Hostile — `l` is the resolved level (or null), never the benign -1.
+    fn envelope_per_file_l_reflects_each_member() {
+        // Each `fs[]` row reports its own file's lowest-firing-level: the root
+        // carries the envelope `l`, members their own (matched by path suffix).
         let mut r = base_result();
-        r.classification = Classification::Suspicious;
-        r.level = Some(50);
-        let envelope = r.to_envelope();
-        let json = serde_json::to_value(&envelope).expect("serialize");
-        assert_eq!(json["ml"]["l"].as_i64(), Some(50));
+        r.l = Some(20);
+        r.probability = 0.97;
+        r.cleave = Some(serde_json::json!({
+            "fs": [
+                {"id": 0, "dp": 0, "path": "/tmp/x"},
+                {"id": 1, "dp": 1, "path": "/tmp/x!!evil.sh"},
+                {"id": 2, "dp": 1, "path": "/tmp/x!!readme.txt"},
+            ]
+        }));
+        let member = |path: &str, l: Option<i32>, prob: f32| EmbeddedFile {
+            path: path.to_string(),
+            file_type: "unknown".to_string(),
+            classification: Classification::Benign,
+            probability: prob,
+            threshold: 0.8,
+            l,
+            model_scores: Vec::new(),
+            skipped_models: Vec::new(),
+            formula: String::new(),
+            top_findings: Vec::new(),
+        };
+        r.embedded_files = vec![
+            member("evil.sh", Some(2), 0.99),
+            member("readme.txt", Some(-1), 0.01),
+        ];
+        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
+        let fs = json["ml"]["fs"].as_array().expect("fs array");
+        assert_eq!(fs[0]["l"].as_i64(), Some(20), "root row carries envelope l");
+        assert_eq!(fs[1]["l"].as_i64(), Some(2), "evil.sh reports its own l");
+        assert_eq!(fs[2]["l"].as_i64(), Some(-1), "readme.txt reports its own l");
     }
 }
 
@@ -403,10 +420,13 @@ pub struct ScanResult {
     /// Cutoff defining the verdict band — the same value `probability` was
     /// compared against to produce `classification`.
     pub threshold: f32,
-    /// Severity level (0..=1000) that produced the thresholds, or `None` when
-    /// manual thresholds were supplied via `--suspicious-threshold` /
-    /// `--hostile-threshold`.
-    pub level: Option<u16>,
+    /// Level-independent envelope marker (`ml.l`): the lowest false-positive
+    /// level (FP per 100M benigns) at which this file's hostile decision fires.
+    /// `Some(-1)` = never fires (clean); `Some(0..=1000)` = the firing level;
+    /// `None` = manual-threshold mode. Independent of the deploy `-l`, so the
+    /// envelope is identical across levels and cache-shareable — `-l` only moves
+    /// the cutoffs that turn `l` into `classification`.
+    pub l: Option<i32>,
     /// Model version identifier (spec version, ABI version, model hash prefix).
     pub version: String,
     /// UTC timestamp of when this analysis was performed (RFC 3339).
@@ -491,6 +511,9 @@ pub struct EmbeddedFile {
     pub probability: f32,
     /// Cutoff that defined this embedded file's verdict band.
     pub threshold: f32,
+    /// Level-independent lowest-firing-level marker for this member. See
+    /// [`ScanResult::l`].
+    pub l: Option<i32>,
     /// Per-model route scores for this embedded file.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_scores: Vec<RouteScore>,
@@ -600,7 +623,7 @@ fn format_eta(secs: f64) -> String {
 /// Returns an error if the target path does not exist, model artifacts cannot
 /// be loaded, or `cleave` analysis fails for the overall scan operation.
 pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
-    let model = Model::load(config.model_dir(), config.thresholds())?;
+    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
 
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
@@ -852,7 +875,7 @@ fn record_file_result(
 /// Propagates model-load and cleave setup failures. Per-file analysis errors
 /// are recorded in the summary, not returned.
 pub fn run_paths(paths: &[PathBuf], config: &ScanConfig) -> Result<ScanSummary> {
-    let model = Model::load(config.model_dir(), config.thresholds())?;
+    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
 
@@ -962,6 +985,9 @@ pub(crate) struct ClassifiedReport {
     pub(crate) classification: Classification,
     pub(crate) probability: f32,
     pub(crate) threshold: f32,
+    /// Level-independent lowest-firing-level marker for the root file. See
+    /// [`ScanResult::l`].
+    pub(crate) l: Option<i32>,
     pub(crate) finding_counts: FindingCounts,
     pub(crate) formula: String,
     pub(crate) reasons: Vec<Reason>,
@@ -1081,6 +1107,7 @@ pub(crate) fn classify_report(
                     class: Classification::Benign,
                     probability: 0.0,
                     threshold: model.thresholds().suspicious,
+                    l: None,
                 },
                 Vec::new(),
                 Vec::new(),
@@ -1120,6 +1147,7 @@ pub(crate) fn classify_report(
             classification: ef_decision.class,
             probability: ef_decision.probability,
             threshold: ef_decision.threshold,
+            l: ef_decision.l,
             model_scores: ef_model_scores,
             skipped_models: ef_skipped_models,
             formula: ef["f"].as_str().unwrap_or("").to_string(),
@@ -1153,6 +1181,7 @@ pub(crate) fn classify_report(
         classification: final_decision.class,
         probability: final_decision.probability,
         threshold: final_decision.threshold,
+        l: final_decision.l,
         finding_counts,
         formula,
         reasons,
@@ -1208,7 +1237,7 @@ pub(crate) fn process_report(
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,
-        level: config.level(),
+        l: cr.l,
         version: model_version_string(model.info()),
         analyzed_at: now_rfc3339(),
         cleave,
@@ -1471,35 +1500,19 @@ fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
     routes.is_empty()
 }
 
-/// Collapse a `(classification, level)` pair into the wire-format `l` value.
-///
-/// - Benign verdicts always serialize as `Some(-1)` regardless of how
-///   thresholds were resolved.
-/// - Hostile (and suspicious — consumer-side derived) verdicts preserve the
-///   per-100M-benigns level when it is known, or `None` (→ JSON `null`) when
-///   manual `--threshold-hostile` / `--threshold-suspicious` were supplied.
-#[must_use]
-pub(crate) fn envelope_l(classification: Classification, level: Option<u16>) -> Option<i32> {
-    match classification {
-        Classification::Benign => Some(-1),
-        _ => level.map(i32::from),
-    }
-}
-
 /// Build per-file ML classification entries for the `ml.fs` array.
 ///
-/// Each entry contains `{id, prob, l}` keyed by the cleave `fs[].id` field.
-/// The root file (`dp=0`) inherits the parent envelope's classification and
-/// probability; embedded archive members report their own probability matched
-/// by path suffix. Members do not carry their own level — they inherit the
-/// envelope-level `l` so a single hostile-with-known-level scan is consistent
-/// per-row.
+/// Each entry is `{id, prob, l}` keyed by the cleave `fs[].id` field. The root
+/// file (`dp=0`) carries the envelope's probability and `l`; embedded archive
+/// members are matched by path suffix and report their *own* probability and
+/// lowest-firing-level `l` — every row's `l` is therefore the level-independent
+/// marker for that specific file. A member with no recorded evaluation (e.g.
+/// truncated past the embedded-file cap) falls back to the root values.
 fn build_ml_fs(
     report_json: &serde_json::Value,
-    classification: &Classification,
-    probability: f32,
+    root_prob: f32,
+    root_l: Option<i32>,
     embedded_files: &[EmbeddedFile],
-    parent_l: Option<i32>,
 ) -> Vec<serde_json::Value> {
     let Some(fs) = report_json.get("fs").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -1516,30 +1529,22 @@ fn build_ml_fs(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
 
-        let (member_class, prob) = if depth == 0 {
-            (*classification, probability)
+        let (prob, l) = if depth == 0 {
+            (root_prob, root_l)
         } else {
             let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let suffix = path.rsplit_once("!!").map(|(_, r)| r).unwrap_or(path);
             embedded_files
                 .iter()
                 .find(|ef| ef.path == suffix)
-                .map(|ef| (ef.classification, ef.probability))
-                .unwrap_or((*classification, probability))
-        };
-
-        // Each row resolves its own `l` so benign embedded members inside a
-        // hostile archive (and vice-versa) report the correct sentinel,
-        // borrowing the envelope's manual-vs-level encoding from `parent_l`.
-        let row_l = match member_class {
-            Classification::Benign => Some(-1),
-            _ => parent_l.filter(|v| *v != -1),
+                .map(|ef| (ef.probability, ef.l))
+                .unwrap_or((root_prob, root_l))
         };
 
         out.push(serde_json::json!({
             "id": id,
             "prob": prob,
-            "l": row_l,
+            "l": l,
         }));
     }
     out
@@ -1642,14 +1647,8 @@ impl ScanResult {
     #[must_use]
     pub fn to_envelope(&self) -> ScanResultEnvelope {
         let raw = self.cleave.clone().unwrap_or(serde_json::json!({}));
-        let l = envelope_l(self.classification, self.level);
-        let ml_fs = build_ml_fs(
-            &raw,
-            &self.classification,
-            self.probability,
-            &self.embedded_files,
-            l,
-        );
+        let l = self.l;
+        let ml_fs = build_ml_fs(&raw, self.probability, l, &self.embedded_files);
         ScanResultEnvelope {
             ml: MlSection {
                 v: self.v,
@@ -1674,14 +1673,8 @@ impl ScanResult {
     #[must_use]
     pub fn into_envelope(self) -> ScanResultEnvelope {
         let raw = self.cleave.unwrap_or(serde_json::json!({}));
-        let l = envelope_l(self.classification, self.level);
-        let ml_fs = build_ml_fs(
-            &raw,
-            &self.classification,
-            self.probability,
-            &self.embedded_files,
-            l,
-        );
+        let l = self.l;
+        let ml_fs = build_ml_fs(&raw, self.probability, l, &self.embedded_files);
         ScanResultEnvelope {
             ml: MlSection {
                 v: self.v,
@@ -1710,14 +1703,8 @@ impl ScanResult {
             Some(v) => v,
             None => EMPTY_RAW.get_or_init(|| serde_json::json!({})),
         };
-        let l = envelope_l(self.classification, self.level);
-        let ml_fs = build_ml_fs(
-            raw,
-            &self.classification,
-            self.probability,
-            &self.embedded_files,
-            l,
-        );
+        let l = self.l;
+        let ml_fs = build_ml_fs(raw, self.probability, l, &self.embedded_files);
         ScanResultEnvelopeRef {
             ml: MlSectionRef {
                 v: self.v,

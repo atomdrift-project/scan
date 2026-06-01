@@ -43,7 +43,7 @@ fn onnx_bundle_dispatches_to_onnx_backend() {
         panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
     };
     let dir = copy_bundle(&src, &["model.onnx", "feature_spec.json"]);
-    let model = Model::load(dir.path(), None).expect("load ONNX bundle");
+    let model = Model::load(dir.path(), None, None).expect("load ONNX bundle");
     assert_eq!(model.backend_kind(), "onnx");
     assert!(model.spec().total_features() > 0);
 
@@ -75,14 +75,14 @@ fn multi_seed_onnx_bundle_loads_and_predicts() {
     // Bystander file — must be ignored, not loaded.
     std::fs::write(models_dir.join("README.md"), b"hi").unwrap();
 
-    let model = Model::load(dir.path(), None).expect("load multi-seed bundle");
+    let model = Model::load(dir.path(), None, None).expect("load multi-seed bundle");
     assert_eq!(model.backend_kind(), "onnx");
     let zeros = vec![0.0f32; model.spec().total_features()];
     let (prob, _class) = model.predict(&zeros).expect("predict zeros");
     assert!(prob.is_finite() && (0.0..=1.0).contains(&prob));
 
     let single = copy_bundle(&src, &["model.onnx", "feature_spec.json"]);
-    let single_model = Model::load(single.path(), None).expect("load single bundle");
+    let single_model = Model::load(single.path(), None, None).expect("load single bundle");
     let (single_prob, _) = single_model.predict(&zeros).expect("predict zeros");
     assert!(
         (prob - single_prob).abs() < 1e-6,
@@ -109,7 +109,7 @@ fn ambiguous_onnx_legacy_plus_multi_seed_layout_is_rejected() {
     std::fs::create_dir(&models_dir).unwrap();
     std::fs::copy(src.join("model.onnx"), models_dir.join("seed_42.onnx")).unwrap();
 
-    let err = Model::load(dir.path(), None).expect_err("ambiguous layout must error");
+    let err = Model::load(dir.path(), None, None).expect_err("ambiguous layout must error");
     let msg = format!("{err:#}");
     assert!(msg.contains("ambiguous"), "error should mention 'ambiguous': {msg}");
 }
@@ -123,7 +123,7 @@ fn native_txt_model_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("feature_spec.json"), b"{}").unwrap();
         std::fs::write(dir.path().join(native), b"stub").unwrap();
-        let err = Model::load(dir.path(), None).expect_err("native model must be rejected");
+        let err = Model::load(dir.path(), None, None).expect_err("native model must be rejected");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("incomplete") || msg.contains("model.onnx"),
@@ -135,7 +135,7 @@ fn native_txt_model_is_rejected() {
 #[test]
 fn empty_bundle_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let err = Model::load(dir.path(), None).expect_err("empty dir must error");
+    let err = Model::load(dir.path(), None, None).expect_err("empty dir must error");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("incomplete") || msg.contains("missing"),
@@ -147,7 +147,7 @@ fn empty_bundle_is_rejected() {
 fn bundle_with_spec_but_no_model_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("feature_spec.json"), b"{}").unwrap();
-    let err = Model::load(dir.path(), None).expect_err("spec-only must error");
+    let err = Model::load(dir.path(), None, None).expect_err("spec-only must error");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("model.onnx"),
@@ -165,7 +165,7 @@ fn empty_models_dir_falls_through_to_incomplete_error() {
     std::fs::create_dir(dir.path().join("models")).unwrap();
     std::fs::write(dir.path().join("models").join("README.md"), b"hi").unwrap();
 
-    let err = Model::load(dir.path(), None).expect_err("empty models dir must error");
+    let err = Model::load(dir.path(), None, None).expect_err("empty models dir must error");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("incomplete") || msg.contains("missing"),

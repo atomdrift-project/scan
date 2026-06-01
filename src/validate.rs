@@ -37,7 +37,7 @@ pub fn run(config: &ScanConfig) -> Result<()> {
         false,
     )?);
 
-    let model = Model::load(config.model_dir(), config.thresholds())?;
+    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let thresholds = model.thresholds();
     let ctx = ExtractContext::new(model.spec());
 

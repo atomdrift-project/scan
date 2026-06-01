@@ -59,7 +59,11 @@ impl Analyzer {
     /// not an error.
     pub fn load(model_dir: impl Into<PathBuf>) -> Result<Self> {
         let model_dir = model_dir.into();
-        let model = Model::load(&model_dir, None)?;
+        // Library callers deploy at the default severity level so the verdict
+        // is computed and the envelope's `l` is populated. `l` itself is
+        // level-independent (the lowest-firing-level sweep), so consumers wanting
+        // a different cutoff reinterpret `l` rather than reloading the model.
+        let model = Model::load(&model_dir, None, Some(crate::model::DEFAULT_SEVERITY_LEVEL))?;
         let ctx = ExtractContext::new(model.spec());
         let shap = ShapImportance::load(&model_dir).ok();
         // Library callers always get the full cleave report attached to the
@@ -72,7 +76,8 @@ impl Analyzer {
             DisplayFilter::alerts_only(),
             4_000,
             false,
-        )?;
+        )?
+        .with_level(Some(crate::model::DEFAULT_SEVERITY_LEVEL));
         // Warm cleave's globals from this (non-rayon) thread so the first
         // analysis cannot race into a deadlock against rayon workers.
         cleave::prefetch_shared_resources(true);

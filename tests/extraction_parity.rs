@@ -172,7 +172,7 @@ fn full_pipeline_matches_collimator() {
         eprintln!("SKIPPED: feature_spec.json not found");
         return;
     };
-    let model = Model::load(&dir, None).expect("failed to load model");
+    let model = Model::load(&dir, None, None).expect("failed to load model");
     let ctx = ExtractContext::new(&spec);
 
     for (i, sample) in fixture.samples.iter().enumerate() {

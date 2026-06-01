@@ -460,14 +460,13 @@ fn load_model_resources(
     thresholds: Option<Thresholds>,
     level: Option<u16>,
 ) -> Result<Arc<ModelResources>> {
-    let model = Model::load(model_dir, thresholds).context("loading model")?;
+    let model = Model::load(model_dir, thresholds, level).context("loading model")?;
     let shap = ShapImportance::load(model_dir).ok();
     let ctx = ExtractContext::new(model.spec());
     Ok(Arc::new(ModelResources {
         model,
         shap,
         ctx,
-        level,
     }))
 }
 

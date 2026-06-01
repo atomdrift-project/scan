@@ -384,8 +384,6 @@ pub(crate) struct ModelResources {
     pub(crate) model: Model,
     pub(crate) shap: Option<ShapImportance>,
     pub(crate) ctx: ExtractContext,
-    /// Severity level folded into the JSON envelope's `ml.l` field.
-    pub(crate) level: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -484,6 +482,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         let model_dir = config.model_dir().to_path_buf();
         let model_dir_shap = config.model_dir().to_path_buf();
         let thresholds = config.thresholds();
+        let level = config.level();
         let slow_rule_ms = config.slow_rule_ms();
         tokio::spawn(async move {
             let init_start = Instant::now();
@@ -498,7 +497,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     let queue_ms = model_spawned_at.elapsed().as_millis();
                     let t = Instant::now();
                     tracing::info!(queue_ms, "loading ONNX model and feature spec");
-                    let model = Model::load(&model_dir, thresholds)?;
+                    let model = Model::load(&model_dir, thresholds, level)?;
                     let ctx = ExtractContext::new(model.spec());
                     tracing::info!(
                         queue_ms,
@@ -562,7 +561,6 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                                 model,
                                 shap,
                                 ctx,
-                                level: bg.level,
                             }));
                             if let Ok(mut init_error) = bg.init_error.write() {
                                 *init_error = None;

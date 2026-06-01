@@ -33,7 +33,7 @@ obvious things. The tables below are the key.
 | ------------- | ------------------------- | ---------------------- | ---------------------------------------------------- |
 | `v`           | `v`                       | string                 | Envelope schema version. Currently `"6"`.            |
 | `prob`        | `probability`             | f32 in `[0, 1]`        | Probability the verdict was decided on.              |
-| `l`           | `l`                       | i32 or null            | Verdict-and-level marker. See **The verdict encoding** below. |
+| `l`           | `l`                       | i32 or null            | Lowest-false-positive-level marker. See **The verdict encoding** below. |
 | `models`      | `model_scores`            | array of `RouteScore`  | Per-route ensemble scores. Omitted if empty.         |
 | `skip`        | `skipped_models`          | array of `SkippedRoute`| Routes that were applicable but unused.              |
 | `version`     | `version`                 | string                 | Model version: spec, ABI, hash prefix.               |
@@ -44,39 +44,57 @@ obvious things. The tables below are the key.
 
 ## The verdict encoding
 
-The envelope no longer carries `class` or `threshold`. Both are
-collapsed into a single field — `l` — which a consumer reads as:
+The envelope carries no `class` or `threshold`. Instead it reports a
+single number — `l` — that is a **property of the file and the model,
+not of your deploy setting**:
 
-- `l == -1` (sentinel) → the file is **benign**, regardless of how
-  thresholds were resolved.
-- `l` in `0..=1000` → the file is **hostile**, and the integer is the
-  per-100M-benigns level that selected the firing threshold
-  (so `l=50` ≡ 0.5 FP/M, `l=1000` ≡ 10 FP/M).
-- `l == null` → the file is **hostile**, but manual
-  `--threshold-hostile` / `--threshold-suspicious` were supplied, so
-  no level table applies.
+> `l` is the lowest false-positive budget — in false positives per 100
+> million benign files — at which the model flags this file as hostile.
 
-In short: `l == -1` iff benign; anything else (including `null`) iff
-hostile.
+A consumer reads it as:
 
-`prob` is the value the decision was made on — the firing route's
-probability for OR-rule policies, the blend's sigmoid output for
-learned-blend policies, or the elevating embedded file's probability
-when an archive member outranked its parent.
+- `l` in `0..=1000` → the lowest level at which the file fires. Lower
+  means more obviously hostile: `l=2` fires even under an extremely
+  strict 2-FP-per-100M budget, while `l=500` is only caught once you
+  tolerate 500 (`l=50` ≡ 0.5 FP/M, `l=1000` ≡ 10 FP/M).
+- `l == -1` (sentinel) → the file fires at **no** grid level. Nothing
+  short of disabling the model would flag it — it is clean.
+- `l == null` → manual `--threshold-hostile` / `--threshold-suspicious`
+  were supplied, so no level table applies.
 
-Suspicious is derived consumer-side as a **level-table lookup**: for
-an active hostile level `N`, litmus reads the hostile threshold at
-level `min(1000, 4 × N)` from the same `levels[]` table and uses it
-as the suspicious cutoff (so a deploy at L50 hostile uses L200's
-hostile threshold for its suspicious band — a 4× wider FP budget that
-catches more "maybe-bad" files). The envelope itself does not surface
-the suspicious band: a Suspicious result is encoded the same way as
-Hostile — `l` is the resolved level (or `null`), never `-1`. Manual
-`--threshold-hostile` skips the derivation entirely; only
-hostile/benign verdicts are possible in that mode.
+**`l` does not depend on `-l`.** It is computed by sweeping the full
+level grid regardless of the deploy level, so the entire `ml` envelope
+(including `prob` and `models[]`) is byte-identical no matter what
+`-l` the caller used. That is deliberate: a result can be **cached once
+and shared across every deploy level**.
 
-Each `ml.fs[]` entry carries its own `prob` and `l`, following the
-same rules.
+### Deriving the verdict
+
+The hostile/suspicious/benign label is *not* stored — the consumer
+derives it from `l` and the active level `N` (default `50`):
+
+- **hostile** when `l <= N` (default: `l <= 50`),
+- **suspicious** when `l <= min(1000, 4 × N)` (default: `l <= 200`) —
+  the L×4 rule gives the suspicious band a 4× wider FP budget that
+  catches more "maybe-bad" files,
+- **benign** otherwise. Note a file with, say, `l = 500` is benign
+  under the default caps yet still reports `l = 500`; raising `-l` is
+  what turns the same envelope into a suspicious or hostile verdict.
+
+The litmus CLI/server applies these caps internally to pick exit codes
+and terminal output; downstream consumers reading stored envelopes
+apply whichever caps they prefer.
+
+`prob` is the value the firing decision was made on — the firing
+route's probability for OR-rule policies, the blend's sigmoid output
+for learned-blend policies, or the elevating embedded file's
+probability when an archive member outranked its parent. It is raw
+model confidence, not a verdict; for a confidence-style figure, map
+`l` onto a scale (e.g. 100% at `l=0` sliding to 10% at `l=1000`).
+
+Each `ml.fs[]` entry carries its **own** `prob` and `l`: the root file
+(`dp=0`) repeats the envelope's, and every archive member reports the
+lowest firing level for that specific member.
 
 ## `RouteScore`
 
@@ -109,6 +127,7 @@ per archive member when the input is an archive.
 | `classification`  | u8                      | Per-member classification.                       |
 | `probability`     | f32                     | Per-member probability.                          |
 | `threshold`       | f32                     | Per-member deciding cutoff.                      |
+| `l`               | i32 or null             | Per-member lowest-firing-level marker (same encoding as `ml.l`). |
 | `model_scores`    | array of `RouteScore`   | Omitted if empty.                                |
 | `skipped_models`  | array of `SkippedRoute` | Omitted if empty.                                |
 | `formula`         | string                  | Molecular formula. Omitted if empty.             |

@@ -361,6 +361,7 @@ async fn do_model_reload(
     let start = Instant::now();
     let model_dir = state.model_dir.clone();
     let thresholds = state.threshold_overrides;
+    let level = state.level;
 
     const RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
     let result = tokio::time::timeout(
@@ -379,7 +380,7 @@ async fn do_model_reload(
             };
             cleave::clear_all_thread_caches();
 
-            let model = Model::load(&model_dir, thresholds)?;
+            let model = Model::load(&model_dir, thresholds, level)?;
             let shap = ShapImportance::load(&model_dir).ok();
             let ctx = ExtractContext::new(model.spec());
             Ok::<_, anyhow::Error>((model, shap, ctx, traits_reload_error))
@@ -420,7 +421,6 @@ async fn do_model_reload(
                 model,
                 shap,
                 ctx,
-                level: state.level,
             }));
             if let Ok(mut init_error) = state.init_error.write() {
                 *init_error = None;
@@ -1075,7 +1075,7 @@ fn scan_result_from(
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,
-        level: resources.level,
+        l: cr.l,
         version: crate::scan::model_version_string(resources.model.info()),
         analyzed_at: crate::scan::now_rfc3339(),
         cleave: Some(cr.report_json),

@@ -29,6 +29,36 @@ fn onnx_bundle() -> Option<PathBuf> {
     (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
 }
 
+/// A full ensemble bundle (`general/` + `config.json` + `route_policies.json`).
+fn ensemble_bundle() -> Option<PathBuf> {
+    let p = std::env::var("AZOTH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("../azoth"));
+    p.join("general").is_dir().then_some(p)
+}
+
+/// Loading the real bundle parses the full per-level grid from the multi-MB
+/// `route_policies.json` and `config.json`, then calibrates every level. The
+/// `l` sweep is level-independent, so the active level passed at load time must
+/// not change whether the bundle loads. Gated on a real bundle:
+///
+/// ```sh
+/// AZOTH_DIR=../azoth cargo test --test ensemble_dispatch \
+///     real_azoth_bundle_loads_grid_at_every_level -- --ignored
+/// ```
+#[test]
+#[ignore]
+fn real_azoth_bundle_loads_grid_at_every_level() {
+    let Some(dir) = ensemble_bundle() else {
+        eprintln!("set AZOTH_DIR to a real ensemble bundle to run this test");
+        return;
+    };
+    for level in [Some(0_u16), Some(50), Some(200), Some(1000), None] {
+        Model::load(&dir, None, level)
+            .unwrap_or_else(|e| panic!("azoth must load at level {level:?}: {e}"));
+    }
+}
+
 /// Stage `general/` plus optionally `filegroups/<group>` and
 /// `filetypes/<type>` from a single source bundle. All routes get the same
 /// model, which is sufficient to exercise the routing decision (each route's
@@ -70,7 +100,7 @@ fn ensemble_routes_to_filetype_specialist_when_present() {
       "filetype_to_filegroup": { "elf": "native", "pe": "native" }
     }"#;
     let dir = stage_ensemble(&src, &["native"], &["elf"], cfg);
-    let model = Model::load(dir.path(), None).expect("load ensemble");
+    let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
     let zeros = vec![0.0f32; model.spec().total_features()];
 
@@ -101,7 +131,7 @@ fn ensemble_routes_to_filegroup_when_filetype_absent() {
     }"#;
     // No filetypes/pe specialist; pe routes through filegroup(native) + general.
     let dir = stage_ensemble(&src, &["native"], &[], cfg);
-    let model = Model::load(dir.path(), None).expect("load ensemble");
+    let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
     let zeros = vec![0.0f32; model.spec().total_features()];
     let (prob, _) = model.predict_for("pe", &zeros).expect("predict pe");
@@ -116,7 +146,7 @@ fn ensemble_with_only_general_falls_back_to_general() {
     };
     let cfg = r#"{}"#;
     let dir = stage_ensemble(&src, &[], &[], cfg);
-    let model = Model::load(dir.path(), None).expect("load ensemble");
+    let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
     let zeros = vec![0.0f32; model.spec().total_features()];
     let (prob_general, _) = model.predict(&zeros).expect("predict general");
@@ -136,7 +166,7 @@ fn ensemble_required_route_missing_is_fatal() {
       "required_routes": ["filetype:nonexistent"]
     }"#;
     let dir = stage_ensemble(&src, &[], &[], cfg);
-    let err = Model::load(dir.path(), None).expect_err("missing required must fail");
+    let err = Model::load(dir.path(), None, None).expect_err("missing required must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("nonexistent") && msg.contains("required"),

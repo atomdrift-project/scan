@@ -130,48 +130,56 @@ Errors share a single shape:
 
 ## Thresholds
 
-One hostile threshold per model. The v6 envelope no longer wire-encodes
-a verdict class; consumers derive it from `ml.l`:
+The v6 envelope no longer wire-encodes a verdict class. `ml.l` is the
+lowest false-positive budget (FP per 100M benigns) at which the model
+flags the file as hostile — a property of the file and model, not of
+the deploy level:
 
-    l == -1            -> benign  (prob below hostile threshold)
-    l in 0..=1000      -> hostile at that severity level
-    l == null          -> hostile, manual thresholds (no severity level)
+    l in 0..=1000      -> lowest level at which the file fires (lower = more hostile)
+    l == -1            -> fires at no grid level (clean)
+    l == null          -> manual --threshold-* mode (no level table)
 
-Suspicious is derived consumer-side as a **level-table lookup**: given
-the active hostile level `N`, litmus reads the threshold at level
-`min(1000, 4 × N)` from the same `levels[]` table and uses it as the
-suspicious cutoff. So a deploy at L50 hostile uses L200's threshold
-for suspicious — a 4× wider FP budget that catches more "maybe-bad"
-files while keeping hostile crisp. When `--threshold-hostile` is
-supplied (manual mode, no level), no suspicious is derived; only
-hostile/benign verdicts are possible.
+Because `l` is swept over the full grid independent of `-l`, the whole
+`ml` envelope is identical across deploy levels, so a result can be
+cached once and shared. The consumer derives the verdict from `l` and
+the active level `N` (default 50):
 
-The hostile threshold is resolved in this order, each step overriding
-the previous one:
+    hostile     when l <= N                      (default l <= 50)
+    suspicious  when l <= min(1000, 4 × N)        (default l <= 200)
+    benign      otherwise
 
-1. `evaluation.json` in the model bundle (`src/model.rs:270`).
-2. Severity level flags `-0` … `-9` (round-decade shorthand: L0,
-   L10, ..., L90), or `-l <N>` / `--level <N>` for any integer in the
-   `0`-`1000` range on the per-100M-benigns scale, pick a row from the
-   bundle (`src/main.rs:160`). Higher numbers are more sensitive (more
-   permitted FP per 100M benigns). The default deploy level is L50
-   (= 50 FP/100M ≡ 0.5 FP/M); the grid tops out at L1000
-   (= 10 FP/M) for aggressive triage profiles.
-3. `--threshold-hostile` overrides everything (`src/main.rs:301`).
-   With no severity level, `ml.l` is `null` and suspicious is not
-   derived (suspicious == hostile, so the band collapses).
-4. If the bundle carries no threshold and no flag is passed, the
-   fallback is `hostile = 0.90` (`src/model.rs:425`).
+The L×4 rule gives suspicious a 4× wider FP budget that catches more
+"maybe-bad" files while keeping hostile crisp. A file with `l = 500` is
+benign under the defaults yet still reports `l = 500`; raising `-l` is
+what reclassifies the same envelope. When `--threshold-*` is supplied
+(manual mode), `l` is `null` and only hostile/benign verdicts apply.
 
-Thresholds are baked in at server start. To change them: stop the
-server, or edit the bundle and `POST /_/reload`, or push new models
-and `POST /_/update`. There is no per-request override.
+The verdict mode is resolved as follows:
 
-The `ml.l` field reports the severity level that selected the cutoff
-(`-1` benign, `0..=1000` hostile, `null` for manual thresholds). The
-verdict is always consistent with `ml.prob` and the active hostile
-threshold, so the response is self-describing. See [JSON.md](JSON.md)
-for the full envelope.
+1. **Level mode (default).** The model's per-level grid
+   (`route_policies.json`, falling back to `config.json` `levels[]`)
+   drives the per-file `l` sweep. The active level `N` sets the verdict
+   caps and comes from the severity-level flags `-0` … `-9` (round-decade
+   shorthand: L0, L10, ..., L90) or `-l <N>` / `--level <N>` for any
+   integer in `0`-`1000` (`src/main.rs`). The default deploy level is L50
+   (= 50 FP/100M ≡ 0.5 FP/M); the grid tops out at L1000 (= 10 FP/M) for
+   aggressive triage. Higher `N` is more sensitive. Crucially, `N` only
+   moves the caps — it does **not** change `l` or the serialized envelope.
+2. **Manual mode.** `--threshold-hostile` / `--threshold-suspicious`
+   bypass the level grid entirely: the verdict comes from those raw
+   cutoffs, `ml.l` is `null`, and only hostile/benign verdicts are
+   possible (suspicious is not derived).
+3. If the bundle carries no level grid (e.g. a single-bundle dev model),
+   the verdict falls back to the bundle's recommended/fallback thresholds
+   and `ml.l` is `null`.
+
+The level/grid is baked in at server start. To change models: stop the
+server, or edit the bundle and `POST /_/reload`, or push new models and
+`POST /_/update`. The active level is fixed per server process; there is
+no per-request override.
+
+See [JSON.md](JSON.md) for the full `ml.l` encoding and how consumers
+derive hostile/suspicious/benign from it.
 
 ## Security
 

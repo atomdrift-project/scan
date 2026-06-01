@@ -150,7 +150,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     }
 
     // Load model and scan each unique binary.
-    let model = Model::load(config.model_dir(), config.thresholds())?;
+    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -314,7 +314,7 @@ fn build_result(
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,
-        level: config.level(),
+        l: cr.l,
         version: crate::scan::model_version_string(model.info()),
         analyzed_at: crate::scan::now_rfc3339(),
         cleave,

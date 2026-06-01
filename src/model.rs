@@ -589,23 +589,28 @@ impl Thresholds {
     /// - Benign: `suspicious` (the cutoff `prob` did not reach)
     #[must_use]
     pub fn decide(&self, probability: f32) -> Decision {
+        // The raw threshold path carries no level table (manual `--threshold-*`
+        // mode, single-bundle, or the no-grid fallback), so `l` is `None`.
         if probability >= self.hostile {
             Decision {
                 class: Classification::Hostile,
                 probability,
                 threshold: self.hostile,
+                l: None,
             }
         } else if probability >= self.suspicious {
             Decision {
                 class: Classification::Suspicious,
                 probability,
                 threshold: self.suspicious,
+                l: None,
             }
         } else {
             Decision {
                 class: Classification::Benign,
                 probability,
                 threshold: self.suspicious,
+                l: None,
             }
         }
     }
@@ -626,6 +631,15 @@ pub struct Decision {
     pub probability: f32,
     /// Cutoff defining the verdict band.
     pub threshold: f32,
+    /// Level-independent envelope marker (the JSON `l`): the lowest
+    /// false-positive level (FP per 100M benigns) at which this file's hostile
+    /// decision fires. `Some(-1)` when it never fires at any grid level (clean);
+    /// `Some(0..=grid_max)` for the firing level; `None` in manual-threshold
+    /// mode, where no level table applies. Independent of the deploy `-l`, so
+    /// the serialized envelope is identical across levels and cache-shareable —
+    /// `-l` only moves the hostile/suspicious cutoffs applied to `l` to produce
+    /// `class`.
+    pub l: Option<i32>,
 }
 
 /// Validation error for [`Thresholds`].
@@ -1062,20 +1076,52 @@ struct EnsembleConfig {
     /// emitted in `levels[].hostile.thresholds`: `"general"`,
     /// `"filegroups/<name>"`, `"filetypes/<name>"`.
     route_thresholds: HashMap<String, Thresholds>,
+    /// General route's hostile threshold at every level, ascending by level.
+    /// Drives the verdict sweep for filetypes with no route policy. Calibrated
+    /// space, matching the general route's emitted probability.
+    general_grid: Vec<(u16, f32)>,
+    /// Largest level present in the `levels[]` grid. The suspicious cap is
+    /// `min(grid_max, 4 × active_level)`.
+    grid_max: u16,
 }
 
 /// Per-filetype route policy loaded from `route_policies.json`.
+///
+/// `by_filetype` holds the policy resolved at the *active* deploy level and
+/// drives the diagnostic per-route classification (`models[]`). `grid` retains
+/// the hostile policy at *every* level so the verdict path can sweep for the
+/// lowest false-positive level at which a file fires — that swept level is the
+/// envelope's `l` (see `sweep_policy_grid` and `Model::decide_swept`).
 #[derive(Debug, Default)]
 struct RoutePolicies {
     by_filetype: HashMap<String, RoutePolicy>,
+    grid: HashMap<String, Vec<LevelPolicy>>,
 }
 
 impl RoutePolicies {
+    /// True when `route` is referenced by any policy at any level. Used to
+    /// decide whether an on-disk specialist participates in the ensemble — a
+    /// route referenced only at non-active levels must still load so the sweep
+    /// can evaluate it.
     fn contains_route(&self, route: &str) -> bool {
-        self.by_filetype.values().any(|policy| {
-            policy.hostile.references_route(route) || policy.suspicious.references_route(route)
-        })
+        self.grid
+            .values()
+            .flatten()
+            .any(|lp| lp.hostile.references_route(route))
+            || self.by_filetype.values().any(|policy| {
+                policy.hostile.references_route(route)
+                    || policy.suspicious.references_route(route)
+            })
     }
+}
+
+/// Hostile decision policy for one filetype at one severity level. A filetype's
+/// grid is kept in ascending `level` order at load time so the sweep can take
+/// the first (lowest) firing level.
+#[derive(Debug, Clone)]
+struct LevelPolicy {
+    level: u16,
+    hostile: PolicySeverity,
 }
 
 #[derive(Debug, Clone)]
@@ -1296,10 +1342,29 @@ fn load_ensemble_config(model_dir: &Path, level: u16) -> Option<EnsembleConfig> 
 
     let route_thresholds = thresholds_at_level(&json.levels, level);
 
+    // General route's hostile threshold per level, ascending. Used by the
+    // verdict sweep for filetypes that have no route policy of their own.
+    #[allow(clippy::cast_possible_truncation)]
+    let mut general_grid: Vec<(u16, f32)> = json
+        .levels
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .hostile
+                .thresholds
+                .get("general")
+                .map(|&t| (entry.level, t as f32))
+        })
+        .collect();
+    general_grid.sort_by_key(|&(level, _)| level);
+    let grid_max = json.levels.iter().map(|e| e.level).max().unwrap_or(0);
+
     Some(EnsembleConfig {
         filetype_to_filegroup: json.filetype_to_group,
         required_routes: json.required_routes,
         route_thresholds,
+        general_grid,
+        grid_max,
     })
 }
 
@@ -1324,20 +1389,37 @@ fn load_route_policies(model_dir: &Path, level: u16) -> RoutePolicies {
     };
 
     let mut by_filetype = HashMap::new();
+    let mut grid: HashMap<String, Vec<LevelPolicy>> = HashMap::new();
     for (_route_name, route) in json.routes {
+        // Retain the hostile policy at every level (ascending) for the verdict
+        // sweep. A level whose hostile block can't be loaded is dropped from
+        // the grid — the sweep simply can't fire there.
+        let mut levels: Vec<LevelPolicy> = route
+            .levels
+            .iter()
+            .filter_map(|entry| {
+                policy_severity_from_json(&entry.hostile).map(|hostile| LevelPolicy {
+                    level: entry.level,
+                    hostile,
+                })
+            })
+            .collect();
+        levels.sort_by_key(|lp| lp.level);
+        if !levels.is_empty() {
+            grid.insert(route.filetype.clone(), levels);
+        }
+
+        // The active-level policy drives the diagnostic per-route classification
+        // in the `models[]` array. Its suspicious band is derived in level-space
+        // via the L×4 lookup: pull the hostile policy from level
+        // `min(max, 4 × level)`. An explicit `suspicious` block, when collimator
+        // emits one, wins; the active level's hostile is the final fallback.
         let Some(level_entry) = route.levels.iter().find(|entry| entry.level == level) else {
             continue;
         };
         let Some(hostile) = policy_severity_from_json(&level_entry.hostile) else {
-            // Hostile is primary; without it we can't safely synthesize a
-            // suspicious band, so skip the level entirely.
             continue;
         };
-        // Suspicious is derived in level-space via the L×4 lookup: pull the
-        // hostile policy from level `min(max, 4 × level)` and use it as the
-        // suspicious cutoff. When that looser row is absent (rare — implies
-        // the bundle's grid is truncated), or when collimator did emit a
-        // `suspicious` block, those win in that order.
         let suspicious = if let Some(explicit) = level_entry
             .suspicious
             .as_ref()
@@ -1367,9 +1449,10 @@ fn load_route_policies(model_dir: &Path, level: u16) -> RoutePolicies {
         path = %path.display(),
         level = level,
         routes = by_filetype.len(),
+        grid_routes = grid.len(),
         "loaded route policies",
     );
-    RoutePolicies { by_filetype }
+    RoutePolicies { by_filetype, grid }
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -1969,6 +2052,7 @@ fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -> Option<De
             class: Classification::Hostile,
             probability: p,
             threshold: t,
+            l: None,
         });
     }
     if let Some((p, t)) = policy.suspicious.fire(scores) {
@@ -1976,9 +2060,74 @@ fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -> Option<De
             class: Classification::Suspicious,
             probability: p,
             threshold: t,
+            l: None,
         });
     }
     None
+}
+
+/// Lowest level (FP per 100M benigns) at which a filetype's per-level hostile
+/// policy fires, with the deciding `(probability, threshold)` at that level.
+///
+/// `grid` is ascending by level. Hostile thresholds loosen as the level rises,
+/// so once a file fires it keeps firing — the minimum firing level is the
+/// strictest budget that still flags it. Scanning every level and keeping the
+/// minimum stays correct even if a bundle's grid isn't perfectly monotone.
+/// Returns `None` when the file fires at no level (clean).
+fn sweep_policy_grid(
+    grid: &[LevelPolicy],
+    scores: &[RouteProbability],
+) -> Option<(u16, f32, f32)> {
+    let mut best: Option<(u16, f32, f32)> = None;
+    for lp in grid {
+        if let Some((p, t)) = lp.hostile.fire(scores)
+            && best.is_none_or(|(bl, _, _)| lp.level < bl)
+        {
+            best = Some((lp.level, p, t));
+        }
+    }
+    best
+}
+
+/// Map a file's lowest firing level to a verdict at the active deploy level.
+///
+/// `fired_level` is the level-independent `l` (from the grid sweep); `level` is
+/// the active `-l`. A file is **hostile** when it fires within the hostile
+/// budget (`l <= level`), **suspicious** within the looser L×4 budget
+/// (`l <= min(grid_max, 4 × level)`), and **benign** beyond it — even though
+/// `l` still reports the true firing level in that last case.
+fn verdict_for_level(fired_level: u16, level: u16, grid_max: u16) -> Classification {
+    let suspicious_cap = grid_max.min(level.saturating_mul(4));
+    if fired_level <= level {
+        Classification::Hostile
+    } else if fired_level <= suspicious_cap {
+        Classification::Suspicious
+    } else {
+        Classification::Benign
+    }
+}
+
+/// Lowest level at which the general/OR fallback fires, for filetypes with no
+/// route policy. Mirrors [`Model::decide_from_scores`]: at each level a file
+/// fires if any route's probability crosses that level's general hostile
+/// threshold. The highest crossing probability is reported for that level.
+fn sweep_general_grid(
+    grid: &[(u16, f32)],
+    scores: &[RouteProbability],
+) -> Option<(u16, f32, f32)> {
+    let mut best: Option<(u16, f32, f32)> = None;
+    for &(level, thr) in grid {
+        if let Some(p) = scores
+            .iter()
+            .map(|s| s.probability)
+            .filter(|&p| p >= thr)
+            .reduce(f32::max)
+            && best.is_none_or(|(bl, _, _)| level < bl)
+        {
+            best = Some((level, p, thr));
+        }
+    }
+    best
 }
 
 /// Push each per-route threshold in `route_policies.json` through that route's
@@ -1993,23 +2142,31 @@ fn calibrate_policy_thresholds_with<'a>(
     lookup: impl Fn(&str) -> Option<&'a IsotonicCalibrator>,
 ) {
     let mut adjusted = 0_usize;
+    // Blend severities are calibrated at fit time (the policy writer applies
+    // isotonic to the per-route inputs before fitting LR), so their threshold
+    // and weights are already in calibrated-prob space. Skipping the per-route
+    // mapping is intentional — the logistic combination doesn't decompose
+    // through isotonic the way per-route OR-rule thresholds do.
+    let mut calibrate = |severity: &mut PolicySeverity| {
+        if severity.blend.is_some() {
+            return;
+        }
+        for (route_name, threshold) in severity.thresholds.iter_mut() {
+            if let Some(cal) = lookup(route_name) {
+                *threshold = cal.apply(*threshold);
+                adjusted += 1;
+            }
+        }
+    };
     for policy in policies.by_filetype.values_mut() {
-        for severity in [&mut policy.hostile, &mut policy.suspicious] {
-            // Blend severities are calibrated at fit time (the policy writer
-            // applies isotonic to the per-route inputs before fitting LR), so
-            // their threshold and weights are already in calibrated-prob
-            // space. Skipping the per-route mapping is intentional — the
-            // logistic combination doesn't decompose through isotonic the
-            // way per-route OR-rule thresholds do.
-            if severity.blend.is_some() {
-                continue;
-            }
-            for (route_name, threshold) in severity.thresholds.iter_mut() {
-                if let Some(cal) = lookup(route_name) {
-                    *threshold = cal.apply(*threshold);
-                    adjusted += 1;
-                }
-            }
+        calibrate(&mut policy.hostile);
+        calibrate(&mut policy.suspicious);
+    }
+    // The verdict sweep compares against the per-level grid, so every retained
+    // level's hostile policy must be calibrated into the same space too.
+    for levels in policies.grid.values_mut() {
+        for lp in levels.iter_mut() {
+            calibrate(&mut lp.hostile);
         }
     }
     if adjusted > 0 {
@@ -2083,6 +2240,16 @@ pub struct Model {
     /// `inner.predict` everywhere we score with the general route. Mirrors
     /// the per-route calibrator on Route; backward compat = None.
     general_calibrator: Option<IsotonicCalibrator>,
+    /// Active deploy level (FP per 100M benigns) that drives the verdict and
+    /// the `l` envelope marker. `None` in manual-threshold mode (`--threshold-*`)
+    /// and on single-bundle deployments with no level grid; the sweep is then
+    /// bypassed and `l` serializes as `null`.
+    active_level: Option<u16>,
+    /// General route's hostile threshold per level (ascending), for the
+    /// no-policy verdict sweep. Empty on single-bundle / pre-grid deployments.
+    general_grid: Vec<(u16, f32)>,
+    /// Largest grid level; suspicious cap = `min(grid_max, 4 × active_level)`.
+    grid_max: u16,
 }
 
 impl Model {
@@ -2117,20 +2284,28 @@ impl Model {
     ///
     /// If explicit thresholds are provided *and* `evaluation.json` contains
     /// recommendations, a warning is emitted when they diverge significantly.
-    pub fn load(model_dir: &Path, thresholds: Option<Thresholds>) -> Result<Self> {
+    pub fn load(
+        model_dir: &Path,
+        thresholds: Option<Thresholds>,
+        active_level: Option<u16>,
+    ) -> Result<Self> {
         // Detect ensemble layout by the presence of `general/` immediately
         // under model_dir. Otherwise treat model_dir itself as a single bundle.
         if model_dir.join("general").is_dir() {
-            Self::load_ensemble(model_dir, thresholds)
+            Self::load_ensemble(model_dir, thresholds, active_level)
         } else {
-            Self::load_single_bundle(model_dir, thresholds)
+            Self::load_single_bundle(model_dir, thresholds, active_level)
         }
     }
 
     /// Load a single-bundle layout (legacy / dev). The model artifacts
     /// (`model.txt`/`model.json`, `feature_spec.json`, `config.json`,
     /// `evaluation.json`) sit directly in `model_dir`. No specialists.
-    fn load_single_bundle(model_dir: &Path, thresholds: Option<Thresholds>) -> Result<Self> {
+    fn load_single_bundle(
+        model_dir: &Path,
+        thresholds: Option<Thresholds>,
+        active_level: Option<u16>,
+    ) -> Result<Self> {
         let bundle = load_bundle(model_dir, thresholds.as_ref(), /* is_general = */ true)?;
         tracing::info!(
             backend = bundle.backend.kind(),
@@ -2157,17 +2332,34 @@ impl Model {
             info,
             routes: RouteSet::default(),
             general_calibrator: bundle.calibrator,
+            // Single-bundle deployments carry no level grid, so the verdict
+            // sweep has nothing to sweep: `decide` falls back to the threshold
+            // path and `l` serializes as `null`.
+            active_level,
+            general_grid: Vec::new(),
+            grid_max: 0,
         })
     }
 
     /// Load an ensemble layout (`general/` + `filegroups/*` + `filetypes/*`).
     /// See module-level docs for the on-disk shape and config schema.
     #[allow(clippy::too_many_lines)]
-    fn load_ensemble(model_dir: &Path, thresholds: Option<Thresholds>) -> Result<Self> {
+    fn load_ensemble(
+        model_dir: &Path,
+        thresholds: Option<Thresholds>,
+        active_level: Option<u16>,
+    ) -> Result<Self> {
         // Ensemble-level config.json carries the routing map and the per-route
         // thresholds for every level. We resolve thresholds from it before
         // loading any individual route bundle so each bundle gets the right
         // pre-resolved thresholds and skips its own (nonexistent) config.json.
+        //
+        // The diagnostic `by_filetype` policy and per-route thresholds are
+        // pinned to DEFAULT_SEVERITY_LEVEL (not the active level) so the
+        // `models[]` array and emitted `prob` are identical regardless of the
+        // caller's `-l` — the JSON envelope stays cacheable across levels. The
+        // active level enters only the final verdict derivation, via the
+        // level-independent `l` sweep over `policies.grid` / `general_grid`.
         let ensemble_cfg =
             load_ensemble_config(model_dir, DEFAULT_SEVERITY_LEVEL).unwrap_or_default();
         let policies = load_route_policies(model_dir, DEFAULT_SEVERITY_LEVEL);
@@ -2277,6 +2469,9 @@ impl Model {
                 policies,
             },
             general_calibrator: general.calibrator,
+            active_level,
+            general_grid: ensemble_cfg.general_grid,
+            grid_max: ensemble_cfg.grid_max,
         })
     }
 
@@ -2550,8 +2745,13 @@ impl Model {
         Ok((route_probs, scores, skipped))
     }
 
-    /// Pick the final [`Decision`] from per-route scores, applying the
-    /// per-filetype policy when one is configured.
+    /// Pick the final [`Decision`] from per-route scores.
+    ///
+    /// In level mode the verdict comes from the level-independent `l` sweep (see
+    /// [`Self::decide_swept`]). In manual-threshold mode (`active_level` is
+    /// `None`) it keeps the pre-level behaviour: the per-filetype policy at the
+    /// default level when one exists, else the OR over the model's thresholds —
+    /// with `l = None`, since no level table applies.
     fn decide_from_routes(
         &self,
         file_type: &str,
@@ -2559,35 +2759,86 @@ impl Model {
         skipped: &mut Vec<SkippedRoute>,
     ) -> Decision {
         let policy = self.routes.policies.by_filetype.get(file_type);
-        let Some(policy) = policy else {
-            return self.decide_from_scores(route_probs);
-        };
-        for route in policy
-            .hostile
-            .thresholds
-            .keys()
-            .chain(policy.suspicious.thresholds.keys())
-        {
-            if !route_probs.iter().any(|score| score.route == *route) {
-                skipped.push(SkippedRoute {
-                    model: compact_route_name(route),
-                    reason: "unavailable",
-                });
+        // Diagnostic: note routes the active-level policy references but that
+        // produced no score this run.
+        if let Some(policy) = policy {
+            for route in policy
+                .hostile
+                .thresholds
+                .keys()
+                .chain(policy.suspicious.thresholds.keys())
+            {
+                if !route_probs.iter().any(|score| score.route == *route) {
+                    skipped.push(SkippedRoute {
+                        model: compact_route_name(route),
+                        reason: "unavailable",
+                    });
+                }
             }
         }
-        policy_decide(policy, route_probs).unwrap_or_else(|| {
-            // Benign fallback: report general's prob against the model's
-            // suspicious cutoff. That's the cutoff the score didn't reach.
-            let general_prob = route_probs
-                .iter()
-                .find(|s| s.route == "general")
-                .map_or(0.0, |s| s.probability);
-            Decision {
-                class: Classification::Benign,
-                probability: general_prob,
-                threshold: self.thresholds.suspicious,
-            }
-        })
+
+        let Some(level) = self.active_level else {
+            // Manual-threshold mode: pre-level semantics, `l` is null.
+            return match policy {
+                Some(policy) => policy_decide(policy, route_probs)
+                    .unwrap_or_else(|| self.benign_fallback(route_probs, None)),
+                None => self.decide_from_scores(route_probs),
+            };
+        };
+
+        self.decide_swept(file_type, route_probs, level)
+    }
+
+    /// Benign decision reporting the general route's probability against the
+    /// model's suspicious cutoff (the band the score didn't reach), tagged with
+    /// the given `l`.
+    fn benign_fallback(&self, route_probs: &[RouteProbability], l: Option<i32>) -> Decision {
+        let general_prob = route_probs
+            .iter()
+            .find(|s| s.route == "general")
+            .map_or(0.0, |s| s.probability);
+        Decision {
+            class: Classification::Benign,
+            probability: general_prob,
+            threshold: self.thresholds.suspicious,
+            l,
+        }
+    }
+
+    /// Derive the verdict from the level-independent lowest-firing-level sweep.
+    ///
+    /// `l` (the swept level) is computed over the full grid with no reference to
+    /// `level`, so it — and the entire serialized envelope — is identical
+    /// regardless of the deploy `-l`, keeping the result cache-shareable. The
+    /// active `level` only positions the cutoffs: hostile when `l <= level`,
+    /// suspicious when `l <= min(grid_max, 4 × level)`, else benign. A file that
+    /// fires at no grid level is clean and reports `l = -1`.
+    fn decide_swept(
+        &self,
+        file_type: &str,
+        route_probs: &[RouteProbability],
+        level: u16,
+    ) -> Decision {
+        let swept = if let Some(grid) = self.routes.policies.grid.get(file_type) {
+            sweep_policy_grid(grid, route_probs)
+        } else if self.general_grid.is_empty() {
+            // No grid to sweep (general-only bundle without a levels[] table):
+            // fall back to the threshold path; `l` stays null.
+            return self.decide_from_scores(route_probs);
+        } else {
+            sweep_general_grid(&self.general_grid, route_probs)
+        };
+
+        let Some((fired_level, probability, threshold)) = swept else {
+            return self.benign_fallback(route_probs, Some(-1));
+        };
+
+        Decision {
+            class: verdict_for_level(fired_level, level, self.grid_max),
+            probability,
+            threshold,
+            l: Some(i32::from(fired_level)),
+        }
     }
 
     /// Inference backend identifier (always `"onnx"`).
@@ -2626,7 +2877,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("model.json"), b"{}")?;
 
-        let Err(err) = Model::load(dir.path(), None) else {
+        let Err(err) = Model::load(dir.path(), None, None) else {
             anyhow::bail!("missing feature spec should be rejected");
         };
         let message = err.to_string();
@@ -2895,6 +3146,7 @@ mod tests {
         };
         let mut policies = RoutePolicies {
             by_filetype: HashMap::from([("elf".to_string(), policy)]),
+            ..Default::default()
         };
 
         calibrate_policy_thresholds_with(&mut policies, |route| match route {
@@ -3034,6 +3286,107 @@ mod tests {
         );
     }
 
+    fn general_only(prob: f32) -> Vec<RouteProbability> {
+        vec![RouteProbability {
+            route: "general".to_string(),
+            probability: prob,
+        }]
+    }
+
+    /// Build a single-route ("general") hostile OR-rule policy grid: each level
+    /// pairs with the general threshold that fires at it. Thresholds loosen as
+    /// the level rises, matching the real grid's shape.
+    fn general_policy_grid(rows: &[(u16, f32)]) -> Vec<LevelPolicy> {
+        rows.iter()
+            .map(|&(level, thr)| LevelPolicy {
+                level,
+                hostile: PolicySeverity {
+                    thresholds: HashMap::from([("general".to_string(), thr)]),
+                    blend: None,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sweep_returns_lowest_firing_level() {
+        // Grid: stricter levels demand higher probabilities.
+        let grid =
+            general_policy_grid(&[(2, 0.99), (20, 0.85), (50, 0.70), (200, 0.40), (500, 0.10)]);
+
+        // p=0.88 clears the L20 cutoff (0.85) but not L2 (0.99) → lowest is 20.
+        let swept = sweep_policy_grid(&grid, &general_only(0.88)).expect("fires");
+        assert_eq!(swept.0, 20);
+
+        // p=0.30 only clears L500 (0.10) → lowest firing level is 500.
+        let swept = sweep_policy_grid(&grid, &general_only(0.30)).expect("fires");
+        assert_eq!(swept.0, 500);
+
+        // p=0.05 clears nothing → never fires.
+        assert!(sweep_policy_grid(&grid, &general_only(0.05)).is_none());
+    }
+
+    #[test]
+    fn sweep_is_independent_of_active_level() {
+        // The swept level is a property of the file + model, not of `-l`: the
+        // same scores yield the same `l` whatever the deploy level. Only the
+        // verdict derived from it changes. This is what makes the envelope
+        // cache-shareable across `-l`.
+        let grid = general_policy_grid(&[(2, 0.99), (20, 0.85), (50, 0.70)]);
+        let l = sweep_policy_grid(&grid, &general_only(0.88)).expect("fires").0;
+        assert_eq!(l, 20);
+        for active in [0_u16, 10, 20, 50, 200, 1000] {
+            // l is unchanged; only the class depends on `active`.
+            let _ = verdict_for_level(l, active, 1000);
+        }
+    }
+
+    #[test]
+    fn verdict_for_level_applies_caps() {
+        // Defaults: hostile cap 50, suspicious cap min(grid_max, 4×50)=200.
+        let grid_max = 1000;
+        assert_eq!(verdict_for_level(20, 50, grid_max), Classification::Hostile);
+        assert_eq!(verdict_for_level(50, 50, grid_max), Classification::Hostile);
+        assert_eq!(
+            verdict_for_level(100, 50, grid_max),
+            Classification::Suspicious
+        );
+        assert_eq!(
+            verdict_for_level(200, 50, grid_max),
+            Classification::Suspicious
+        );
+        // A file that only fires at 500 is benign under the default caps —
+        // even though the envelope still reports l=500.
+        assert_eq!(verdict_for_level(500, 50, grid_max), Classification::Benign);
+
+        // A stricter deploy (-l 10): hostile cap 10, suspicious cap 40.
+        assert_eq!(verdict_for_level(20, 10, grid_max), Classification::Suspicious);
+        assert_eq!(verdict_for_level(50, 10, grid_max), Classification::Benign);
+
+        // Suspicious cap clamps to grid_max when 4×level overflows the grid.
+        assert_eq!(verdict_for_level(100, 50, 100), Classification::Suspicious);
+    }
+
+    #[test]
+    fn sweep_general_grid_uses_max_crossing_route() {
+        // General-route OR fallback: any route crossing the level's general
+        // threshold fires it. A weak general but strong specialist still fires.
+        let grid = [(2_u16, 0.99_f32), (20, 0.85), (200, 0.40)];
+        let scores = vec![
+            RouteProbability {
+                route: "general".to_string(),
+                probability: 0.10,
+            },
+            RouteProbability {
+                route: "filetypes/elf".to_string(),
+                probability: 0.90,
+            },
+        ];
+        let swept = sweep_general_grid(&grid, &scores).expect("fires");
+        assert_eq!(swept.0, 20, "0.90 clears L20 (0.85) but not L2 (0.99)");
+        assert!((swept.1 - 0.90).abs() < 1e-6, "reports the crossing prob");
+    }
+
     #[test]
     fn blend_policy_fires_on_hand_built_inputs() {
         // Construct a blend that fires when general's prob is high enough on
@@ -3149,6 +3502,7 @@ mod tests {
         };
         let mut policies = RoutePolicies {
             by_filetype: HashMap::from([("elf".to_string(), policy)]),
+            ..Default::default()
         };
         // A calibrator that shifts every input by +0.1 (clamped to [0, 1]).
         let cal = IsotonicCalibrator {
@@ -3224,7 +3578,7 @@ mod tests {
         // but leave it empty so general/ has no model artifacts.
         std::fs::create_dir_all(dir.path().join("general"))?;
         let err =
-            Model::load(dir.path(), None).expect_err("ensemble with empty general/ must fail");
+            Model::load(dir.path(), None, None).expect_err("ensemble with empty general/ must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("loading general route") || msg.contains("incomplete"),
@@ -3246,7 +3600,7 @@ mod tests {
         // We can't actually load general here without a real model bundle, so
         // we expect either "loading general route" or the required-route check
         // depending on order. Either error mode confirms the loader caught it.
-        let err = Model::load(dir.path(), None).expect_err("must fail");
+        let err = Model::load(dir.path(), None, None).expect_err("must fail");
         let _ = err;
         Ok(())
     }

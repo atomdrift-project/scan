@@ -13,7 +13,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use litmus::scan::DisplayFilter;
 use litmus::OutputFormat;
@@ -303,32 +303,21 @@ enum Commands {
 }
 
 fn threshold_overrides_for_model(
-    model_dir: &Path,
-    severity_level: Option<u16>,
     threshold_suspicious: Option<f32>,
     threshold_hostile: Option<f32>,
-) -> Result<Option<litmus::model::Thresholds>> {
-    if let Some(level) = severity_level {
-        let thresholds =
-            litmus::model::load_severity_thresholds(model_dir, level)?.with_context(|| {
-                format!(
-                    "model bundle does not contain severity level {level} thresholds; \
-                     run 'litmus update-rules' to refresh the installed models"
-                )
-            })?;
-        return Ok(Some(thresholds));
-    }
-
-    // Only construct explicit thresholds if at least one CLI flag was provided.
-    // When both are omitted, pass None so Model::load uses model metadata.
+) -> Option<litmus::model::Thresholds> {
+    // Level mode resolves the verdict from the model's level grid — the
+    // per-file `l` sweep plus the active level's hostile/suspicious cutoffs —
+    // so no explicit thresholds are loaded here; `Model::load` keeps its
+    // level-independent defaults and the active level is passed separately.
     //
-    // Manual-thresholds case: we do NOT derive a suspicious cutoff here. The
-    // L×4 lookup needs a `severity_levels[]` table and a known hostile level;
-    // neither applies when the operator picks `--threshold-hostile` directly.
-    // Collapsing suspicious to hostile means `classify` never returns
-    // Suspicious — the operator gets hostile-vs-benign verdicts only, which
-    // is what we want for manual mode.
-    Ok(match (threshold_suspicious, threshold_hostile) {
+    // Only manual `--threshold-*` overrides produce a Thresholds. We do NOT
+    // derive a suspicious cutoff: the L×4 lookup needs a level table and a known
+    // level, neither of which applies when the operator picks
+    // `--threshold-hostile` directly. Collapsing suspicious to hostile means
+    // `classify` never returns Suspicious — the operator gets hostile-vs-benign
+    // verdicts only, which is what we want for manual mode.
+    match (threshold_suspicious, threshold_hostile) {
         (None, None) => None,
         (sus, hos) => {
             let hostile = hos.unwrap_or(litmus::model::Thresholds::FALLBACK_HOSTILE);
@@ -338,7 +327,7 @@ fn threshold_overrides_for_model(
                 hostile,
             })
         }
-    })
+    }
 }
 
 fn main() -> Result<()> {
@@ -565,14 +554,8 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to resolve model directory: {e}")),
         }
     };
-    let threshold_overrides = |model_dir: &Path| -> Result<Option<litmus::model::Thresholds>> {
-        threshold_overrides_for_model(
-            model_dir,
-            selected_severity_level,
-            threshold_suspicious,
-            threshold_hostile,
-        )
-    };
+    let threshold_overrides =
+        || threshold_overrides_for_model(threshold_suspicious, threshold_hostile);
     // The envelope's `ml.l` encodes the FPR severity that produced the
     // resolved thresholds (or the `-1` benign sentinel — see scan::envelope_l).
     // Manual `--threshold-*` overrides bypass the levels table entirely, so we
@@ -596,7 +579,7 @@ fn main() -> Result<()> {
     match command {
         Commands::Scan { paths } => {
             let model_dir = resolve_model_dir()?;
-            let thresholds = threshold_overrides(&model_dir)?;
+            let thresholds = threshold_overrides();
             let config = litmus::ScanConfig::new(
                 model_dir,
                 cli.format,
@@ -610,7 +593,7 @@ fn main() -> Result<()> {
         }
         Commands::Ps => {
             let model_dir = resolve_model_dir()?;
-            let thresholds = threshold_overrides(&model_dir)?;
+            let thresholds = threshold_overrides();
             let config = litmus::ScanConfig::new(
                 model_dir,
                 cli.format,
@@ -655,7 +638,7 @@ fn main() -> Result<()> {
             let max_rss_bytes = resolve_process_max_rss_bytes(max_rss_gb);
             log_max_rss_resolution("server", MaxRssPolicy::from_cli(max_rss_gb), max_rss_bytes);
             let model_dir = resolve_model_dir()?;
-            let thresholds = threshold_overrides(&model_dir)?;
+            let thresholds = threshold_overrides();
             let config = litmus::server::ServerConfig::new(
                 bind,
                 max_size_mb.saturating_mul(1024 * 1024),
@@ -703,7 +686,7 @@ fn main() -> Result<()> {
                 if let Some(prev) = prev_models_head.as_deref() {
                     match litmus::models_repo::model_dir() {
                         Ok(dir) => {
-                            if let Err(load_err) = litmus::model::Model::load(&dir, None) {
+                            if let Err(load_err) = litmus::model::Model::load(&dir, None, None) {
                                 eprintln!("Pulled models failed to load: {load_err}");
                                 eprintln!("Rolling back to {prev}...");
                                 if let Err(rb) = litmus::models_repo::rollback(prev) {
@@ -728,7 +711,7 @@ fn main() -> Result<()> {
         }
         Commands::Validate => {
             let model_dir = resolve_model_dir()?;
-            let thresholds = threshold_overrides(&model_dir)?;
+            let thresholds = threshold_overrides();
             let config = litmus::ScanConfig::new(
                 model_dir,
                 litmus::OutputFormat::Terminal,
@@ -792,7 +775,7 @@ fn main() -> Result<()> {
                 });
             });
             let model_dir = resolve_model_dir()?;
-            let thresholds = threshold_overrides(&model_dir)?;
+            let thresholds = threshold_overrides();
             let validate_config = litmus::ScanConfig::new(
                 model_dir.clone(),
                 litmus::OutputFormat::Terminal,
@@ -1326,7 +1309,7 @@ mod tests {
         assert_eq!(cli.selected_severity_level(), Some(12));
 
         // Out-of-range and conflicting selections are rejected.
-        assert!(Cli::try_parse_from(["litmus", "-l", "101", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["litmus", "-l", "1001", "/tmp/a"]).is_err());
         assert!(Cli::try_parse_from(["litmus", "-l", "3", "-5", "/tmp/a"]).is_err());
         Ok(())
     }
