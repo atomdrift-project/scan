@@ -62,14 +62,14 @@
 //!   ],
 //!   "levels": [
 //!     {
-//!       "level": 5,
+//!       "level": 50,
 //!       "hostile": {
-//!         "target_per_million": 5.0,
+//!         "target_per_100M": 50,
+//!         "hostile_per_million": 0.5,
 //!         "budget": 8,
 //!         "thresholds": { "general": 0.997, "filetypes/elf": 0.951, … },
 //!         "tp": …, "fp": …, "recall": …
-//!       },
-//!       "suspicious": { "thresholds": {…}, … }
+//!       }
 //!     },
 //!     …
 //!   ],
@@ -93,7 +93,7 @@
 //!     "filetypes/elf": {
 //!       "filetype": "elf",
 //!       "levels": [{
-//!         "level": 5,
+//!         "level": 50,
 //!         "hostile": {
 //!           "best": {
 //!             "policy": "specialist_primary_with_escape",
@@ -102,8 +102,7 @@
 //!               "general": 0.968
 //!             }
 //!           }
-//!         },
-//!         "suspicious": {"best": {"thresholds": {"filetypes/elf": 0.980}}}
+//!         }
 //!       }]
 //!     }
 //!   }

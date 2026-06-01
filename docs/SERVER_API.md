@@ -130,36 +130,42 @@ Errors share a single shape:
 
 ## Thresholds
 
-Two numbers per model. Classification is:
+One hostile threshold per model. The v6 envelope no longer wire-encodes
+a verdict class; consumers derive it from `ml.l`:
 
-    prob >= hostile     -> 2 (hostile)
-    prob >= suspicious  -> 1 (suspicious)
-    otherwise           -> 0 (benign)
+    l == -1            -> benign  (prob below hostile threshold)
+    l in 0..=100       -> hostile at that severity level
+    l == null          -> hostile, manual thresholds (no severity level)
 
-The numbers are resolved in this order, each step overriding the
-previous one:
+Suspicious is a consumer-side concept; it is not carried in the
+envelope. Litmus derives a suspicious band locally as a fixed
+10-percentage-point window below the hostile threshold
+(`suspicious = (hostile - 0.10).clamp(0.0, hostile)`).
+
+The hostile threshold is resolved in this order, each step overriding
+the previous one:
 
 1. `evaluation.json` in the model bundle (`src/model.rs:270`).
 2. Severity level flags `-0` … `-9` (round-decade shorthand: L0,
    L10, ..., L90), or `-l <N>` / `--level <N>` for any integer in the
    `0`-`100` range on the per-100M-benigns scale, pick a row from the
    bundle (`src/main.rs:160`). Higher numbers are more sensitive (more
-   permitted FP per 100M benigns).
-3. `--threshold-suspicious` and `--threshold-hostile` override
-   everything (`src/main.rs:301`).
-4. If the bundle carries no thresholds and no flag is passed, the
-   fallbacks are `suspicious = 0.65`, `hostile = 0.90`
-   (`src/model.rs:425`).
+   permitted FP per 100M benigns). The default deploy level is L50
+   (= 50 FP/100M ≡ 0.5 FP/M).
+3. `--threshold-hostile` overrides everything (`src/main.rs:301`).
+   With no severity level, `ml.l` is `null`.
+4. If the bundle carries no threshold and no flag is passed, the
+   fallback is `hostile = 0.90` (`src/model.rs:425`).
 
 Thresholds are baked in at server start. To change them: stop the
 server, or edit the bundle and `POST /_/reload`, or push new models
 and `POST /_/update`. There is no per-request override.
 
-The `ml.threshold` field reports the cutoff that produced the verdict
-and `ml.level` reports the severity level that selected it (`null`
-when manual thresholds were used). The pair is always consistent with
-`ml.class` and `ml.prob`, so the response is self-describing. See
-[JSON.md](JSON.md) for the full envelope.
+The `ml.l` field reports the severity level that selected the cutoff
+(`-1` benign, `0..=100` hostile, `null` for manual thresholds). The
+verdict is always consistent with `ml.prob` and the active hostile
+threshold, so the response is self-describing. See [JSON.md](JSON.md)
+for the full envelope.
 
 ## Security
 
@@ -198,9 +204,9 @@ The server is built for trusted networks. The defaults reflect that.
     $ curl -s http://127.0.0.1:49999/_/health | jq -r .status
     ok
     $ curl -s -F file=@/bin/ls http://127.0.0.1:49999/analyze \
-        | jq '.ml | {class, prob, version}'
+        | jq '.ml | {l, prob, version}'
     {
-      "class": 0,
+      "l": -1,
       "prob": 0.01,
       "version": "spec=4 abi=1 hash=8f3a91"
     }
