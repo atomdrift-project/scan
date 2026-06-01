@@ -1128,6 +1128,64 @@ impl RoutePolicies {
                     || policy.suspicious.references_route(route)
             })
     }
+
+    /// Look up the active-level policy for a file type, transparently
+    /// stripping pure-compression suffixes. `tar.gz` → `tar`, `tar.bz2.xz`
+    /// → `tar`. Tries the original spelling first so a bundle that
+    /// pre-dates the normalization (its keys still carry the suffix) keeps
+    /// working without a re-train. Mirrors
+    /// `collimator.data.normalize_archive_filetype`.
+    fn policy_for(&self, file_type: &str) -> Option<&RoutePolicy> {
+        if let Some(p) = self.by_filetype.get(file_type) {
+            return Some(p);
+        }
+        let normalized = normalize_archive_filetype(file_type);
+        if normalized != file_type {
+            return self.by_filetype.get(&normalized);
+        }
+        None
+    }
+
+    /// Look up the per-level policy grid for a file type, with the same
+    /// suffix-stripping fallback as [`Self::policy_for`]. Used by the
+    /// envelope-`l` sweep.
+    fn grid_for(&self, file_type: &str) -> Option<&Vec<LevelPolicy>> {
+        if let Some(g) = self.grid.get(file_type) {
+            return Some(g);
+        }
+        let normalized = normalize_archive_filetype(file_type);
+        if normalized != file_type {
+            return self.grid.get(&normalized);
+        }
+        None
+    }
+}
+
+/// Pure-compression suffixes — formats with no multi-file container of
+/// their own. Stripped from the tail of compound filetype strings (e.g.
+/// `tar.gz` → `tar`). Source of truth in
+/// `collimator/src/collimator/data.py::_PURE_COMPRESSION_SUFFIXES`; keep
+/// the two lists in sync — collimator emits training labels using this
+/// rule and litmus routes scan-time files using it.
+const PURE_COMPRESSION_SUFFIXES: &[&str] = &["gz", "bz2", "xz", "zst", "z", "lzma"];
+
+/// Strip pure-compression suffixes from a cleave-reported filetype label.
+/// `tar.gz` → `tar`, `tar.bz2.xz` → `tar`. Bare compression labels
+/// (`gz`, `bz2`, …) are returned unchanged — litmus decompresses and
+/// re-routes those at extraction time; the wrapper has no route of its
+/// own. See [`RoutePolicies::policy_for`] for the call site.
+fn normalize_archive_filetype(file_type: &str) -> String {
+    let mut normalized = file_type.trim().to_ascii_lowercase();
+    loop {
+        let Some((head, tail)) = normalized.rsplit_once('.') else {
+            break;
+        };
+        if head.is_empty() || !PURE_COMPRESSION_SUFFIXES.contains(&tail) {
+            break;
+        }
+        normalized = head.to_string();
+    }
+    normalized
 }
 
 /// Hostile decision policy for one filetype at one severity level. A filetype's
@@ -2688,7 +2746,7 @@ impl Model {
     where
         F: FnMut(&Route) -> Result<(f32, Classification)>,
     {
-        let policy = self.routes.policies.by_filetype.get(file_type);
+        let policy = self.routes.policies.policy_for(file_type);
         let general_prob = self.predict_general_calibrated(general_features)?;
         let general_class = policy.map_or_else(
             || self.thresholds.classify(general_prob),
@@ -2771,7 +2829,7 @@ impl Model {
         route_probs: &[RouteProbability],
         skipped: &mut Vec<SkippedRoute>,
     ) -> Decision {
-        let policy = self.routes.policies.by_filetype.get(file_type);
+        let policy = self.routes.policies.policy_for(file_type);
         // Diagnostic: note routes the active-level policy references but that
         // produced no score this run.
         if let Some(policy) = policy {
@@ -2832,7 +2890,7 @@ impl Model {
         route_probs: &[RouteProbability],
         level: u16,
     ) -> Decision {
-        let swept = if let Some(grid) = self.routes.policies.grid.get(file_type) {
+        let swept = if let Some(grid) = self.routes.policies.grid_for(file_type) {
             sweep_policy_grid(grid, route_probs)
         } else if self.general_grid.is_empty() {
             // No grid to sweep (general-only bundle without a levels[] table):
@@ -2884,6 +2942,29 @@ impl Model {
 mod tests {
     use super::*;
     use anyhow::Result;
+
+    #[test]
+    fn normalize_archive_filetype_strips_pure_compression() {
+        // Compound archive labels collapse onto their container.
+        assert_eq!(normalize_archive_filetype("tar.gz"), "tar");
+        assert_eq!(normalize_archive_filetype("tar.bz2"), "tar");
+        assert_eq!(normalize_archive_filetype("tar.xz"), "tar");
+        assert_eq!(normalize_archive_filetype("tar.zst"), "tar");
+        assert_eq!(normalize_archive_filetype("tar.Z"), "tar");
+        assert_eq!(normalize_archive_filetype("TAR.GZ"), "tar");
+        // Repeated stripping for stacked suffixes.
+        assert_eq!(normalize_archive_filetype("tar.bz2.xz"), "tar");
+        // Bare compression labels keep their identity — RAW_COMPRESSED_FILETYPES
+        // logic on the collimator side already gates them.
+        assert_eq!(normalize_archive_filetype("gz"), "gz");
+        assert_eq!(normalize_archive_filetype("bz2"), "bz2");
+        // Containers without a compression suffix pass through.
+        assert_eq!(normalize_archive_filetype("zip"), "zip");
+        assert_eq!(normalize_archive_filetype("pe"), "pe");
+        // Empty / whitespace.
+        assert_eq!(normalize_archive_filetype(""), "");
+        assert_eq!(normalize_archive_filetype("  tar.gz  "), "tar");
+    }
 
     #[test]
     fn load_rejects_missing_feature_spec_with_update_guidance() -> Result<()> {
