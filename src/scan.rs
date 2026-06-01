@@ -95,7 +95,7 @@ pub struct ScanConfig {
     filter: DisplayFilter,
     slow_rule_ms: u64,
     extra: bool,
-    level: Option<u8>,
+    level: Option<u16>,
 }
 
 impl ScanConfig {
@@ -149,12 +149,12 @@ impl ScanConfig {
     /// Attach the severity level that produced the resolved thresholds.
     ///
     /// `None` indicates manual thresholds (no level applies); `Some(n)` is the
-    /// 0..=100 level that was used to pick `thresholds` from the model's
+    /// 0..=1000 level that was used to pick `thresholds` from the model's
     /// `severity_levels[]` table. Folded into `ml.l` in the JSON envelope (which
     /// also encodes the benign verdict via the `-1` sentinel) so downstream
     /// consumers can correlate verdicts with FPR severity.
     #[must_use]
-    pub const fn with_level(mut self, level: Option<u8>) -> Self {
+    pub const fn with_level(mut self, level: Option<u16>) -> Self {
         self.level = level;
         self
     }
@@ -195,10 +195,10 @@ impl ScanConfig {
         self.extra
     }
 
-    /// Severity level (0..=100) used to pick thresholds, or `None` when manual
+    /// Severity level (0..=1000) used to pick thresholds, or `None` when manual
     /// thresholds were supplied via `--suspicious-threshold` / `--hostile-threshold`.
     #[must_use]
-    pub const fn level(&self) -> Option<u8> {
+    pub const fn level(&self) -> Option<u16> {
         self.level
     }
 }
@@ -403,10 +403,10 @@ pub struct ScanResult {
     /// Cutoff defining the verdict band — the same value `probability` was
     /// compared against to produce `classification`.
     pub threshold: f32,
-    /// Severity level (0..=100) that produced the thresholds, or `None` when
+    /// Severity level (0..=1000) that produced the thresholds, or `None` when
     /// manual thresholds were supplied via `--suspicious-threshold` /
     /// `--hostile-threshold`.
-    pub level: Option<u8>,
+    pub level: Option<u16>,
     /// Model version identifier (spec version, ABI version, model hash prefix).
     pub version: String,
     /// UTC timestamp of when this analysis was performed (RFC 3339).
@@ -1479,7 +1479,7 @@ fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
 ///   per-100M-benigns level when it is known, or `None` (→ JSON `null`) when
 ///   manual `--threshold-hostile` / `--threshold-suspicious` were supplied.
 #[must_use]
-pub(crate) fn envelope_l(classification: Classification, level: Option<u8>) -> Option<i32> {
+pub(crate) fn envelope_l(classification: Classification, level: Option<u16>) -> Option<i32> {
     match classification {
         Classification::Benign => Some(-1),
         _ => level.map(i32::from),
@@ -1562,7 +1562,7 @@ pub struct MlSection {
     pub(crate) probability: f32,
     /// Resolved verdict marker, always serialized (including as `null`):
     /// - `Some(-1)` → benign.
-    /// - `Some(0..=100)` → hostile; the per-100M-benigns level that selected
+    /// - `Some(0..=1000)` → hostile; the per-100M-benigns level that selected
     ///   the firing threshold.
     /// - `None` → hostile; manual `--threshold-hostile` / `--threshold-suspicious`
     ///   were used and no level applies.

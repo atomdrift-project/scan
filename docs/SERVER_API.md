@@ -134,13 +134,17 @@ One hostile threshold per model. The v6 envelope no longer wire-encodes
 a verdict class; consumers derive it from `ml.l`:
 
     l == -1            -> benign  (prob below hostile threshold)
-    l in 0..=100       -> hostile at that severity level
+    l in 0..=1000      -> hostile at that severity level
     l == null          -> hostile, manual thresholds (no severity level)
 
-Suspicious is a consumer-side concept; it is not carried in the
-envelope. Litmus derives a suspicious band locally as a fixed
-10-percentage-point window below the hostile threshold
-(`suspicious = (hostile - 0.10).clamp(0.0, hostile)`).
+Suspicious is derived consumer-side as a **level-table lookup**: given
+the active hostile level `N`, litmus reads the threshold at level
+`min(1000, 4 × N)` from the same `levels[]` table and uses it as the
+suspicious cutoff. So a deploy at L50 hostile uses L200's threshold
+for suspicious — a 4× wider FP budget that catches more "maybe-bad"
+files while keeping hostile crisp. When `--threshold-hostile` is
+supplied (manual mode, no level), no suspicious is derived; only
+hostile/benign verdicts are possible.
 
 The hostile threshold is resolved in this order, each step overriding
 the previous one:
@@ -148,12 +152,14 @@ the previous one:
 1. `evaluation.json` in the model bundle (`src/model.rs:270`).
 2. Severity level flags `-0` … `-9` (round-decade shorthand: L0,
    L10, ..., L90), or `-l <N>` / `--level <N>` for any integer in the
-   `0`-`100` range on the per-100M-benigns scale, pick a row from the
+   `0`-`1000` range on the per-100M-benigns scale, pick a row from the
    bundle (`src/main.rs:160`). Higher numbers are more sensitive (more
    permitted FP per 100M benigns). The default deploy level is L50
-   (= 50 FP/100M ≡ 0.5 FP/M).
+   (= 50 FP/100M ≡ 0.5 FP/M); the grid tops out at L1000
+   (= 10 FP/M) for aggressive triage profiles.
 3. `--threshold-hostile` overrides everything (`src/main.rs:301`).
-   With no severity level, `ml.l` is `null`.
+   With no severity level, `ml.l` is `null` and suspicious is not
+   derived (suspicious == hostile, so the band collapses).
 4. If the bundle carries no threshold and no flag is passed, the
    fallback is `hostile = 0.90` (`src/model.rs:425`).
 
@@ -162,7 +168,7 @@ server, or edit the bundle and `POST /_/reload`, or push new models
 and `POST /_/update`. There is no per-request override.
 
 The `ml.l` field reports the severity level that selected the cutoff
-(`-1` benign, `0..=100` hostile, `null` for manual thresholds). The
+(`-1` benign, `0..=1000` hostile, `null` for manual thresholds). The
 verdict is always consistent with `ml.prob` and the active hostile
 threshold, so the response is self-describing. See [JSON.md](JSON.md)
 for the full envelope.

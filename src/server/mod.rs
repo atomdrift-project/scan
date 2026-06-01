@@ -52,7 +52,7 @@ pub struct ServerConfig {
     extract_dir: Option<PathBuf>,
     workers: usize,
     allow_cidrs: Vec<Cidr>,
-    level: Option<u8>,
+    level: Option<u16>,
     /// Per-request analysis timeout in seconds. 0 disables.
     analysis_timeout_secs: u64,
 }
@@ -136,10 +136,10 @@ impl ServerConfig {
         })
     }
 
-    /// Attach the FPR severity level (0..=100) that produced the resolved
+    /// Attach the FPR severity level (0..=1000) that produced the resolved
     /// thresholds. Folded into `ml.l` in the JSON envelope.
     #[must_use]
-    pub const fn with_level(mut self, level: Option<u8>) -> Self {
+    pub const fn with_level(mut self, level: Option<u16>) -> Self {
         self.level = level;
         self
     }
@@ -157,10 +157,10 @@ impl ServerConfig {
         self.analysis_timeout_secs
     }
 
-    /// Severity level (0..=100) used to pick thresholds, or `None` for manual
+    /// Severity level (0..=1000) used to pick thresholds, or `None` for manual
     /// thresholds.
     #[must_use]
-    pub const fn level(&self) -> Option<u8> {
+    pub const fn level(&self) -> Option<u16> {
         self.level
     }
 
@@ -385,7 +385,7 @@ pub(crate) struct ModelResources {
     pub(crate) shap: Option<ShapImportance>,
     pub(crate) ctx: ExtractContext,
     /// Severity level folded into the JSON envelope's `ml.l` field.
-    pub(crate) level: Option<u8>,
+    pub(crate) level: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -396,7 +396,7 @@ struct AppState {
     model_dir: PathBuf,
     threshold_overrides: Option<Thresholds>,
     slow_rule_ms: u64,
-    level: Option<u8>,
+    level: Option<u16>,
     allowed_dirs: Vec<PathBuf>,
     extract_dir: Option<PathBuf>,
     allow_cidrs: Vec<Cidr>,

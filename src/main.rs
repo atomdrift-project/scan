@@ -93,9 +93,9 @@ struct Cli {
     #[arg(long)]
     threshold_hostile: Option<f32>,
 
-    /// Tune thresholds for false-positive level N (0-100, FP per 100M benigns): higher = more sensitive, noisier
-    #[arg(short = 'l', long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=100), global = true)]
-    level: Option<u8>,
+    /// Tune thresholds for false-positive level N (0-1000, FP per 100M benigns; default L50): higher = more sensitive, noisier
+    #[arg(short = 'l', long, value_name = "N", value_parser = clap::value_parser!(u16).range(0..=1000), global = true)]
+    level: Option<u16>,
 
     /// Use severity level 0: zero false positives; strictest
     #[arg(short = '0', global = true, action = clap::ArgAction::SetTrue)]
@@ -157,7 +157,7 @@ struct Cli {
 }
 
 impl Cli {
-    fn selected_severity_level(&self) -> Option<u8> {
+    fn selected_severity_level(&self) -> Option<u16> {
         if let Some(level) = self.level {
             return Some(level);
         }
@@ -304,7 +304,7 @@ enum Commands {
 
 fn threshold_overrides_for_model(
     model_dir: &Path,
-    severity_level: Option<u8>,
+    severity_level: Option<u16>,
     threshold_suspicious: Option<f32>,
     threshold_hostile: Option<f32>,
 ) -> Result<Option<litmus::model::Thresholds>> {
@@ -321,12 +321,23 @@ fn threshold_overrides_for_model(
 
     // Only construct explicit thresholds if at least one CLI flag was provided.
     // When both are omitted, pass None so Model::load uses model metadata.
+    //
+    // Manual-thresholds case: we do NOT derive a suspicious cutoff here. The
+    // L×4 lookup needs a `severity_levels[]` table and a known hostile level;
+    // neither applies when the operator picks `--threshold-hostile` directly.
+    // Collapsing suspicious to hostile means `classify` never returns
+    // Suspicious — the operator gets hostile-vs-benign verdicts only, which
+    // is what we want for manual mode.
     Ok(match (threshold_suspicious, threshold_hostile) {
         (None, None) => None,
-        (sus, hos) => Some(litmus::model::Thresholds {
-            suspicious: sus.unwrap_or(litmus::model::Thresholds::FALLBACK_SUSPICIOUS),
-            hostile: hos.unwrap_or(litmus::model::Thresholds::FALLBACK_HOSTILE),
-        }),
+        (sus, hos) => {
+            let hostile = hos.unwrap_or(litmus::model::Thresholds::FALLBACK_HOSTILE);
+            let suspicious = sus.unwrap_or(hostile);
+            Some(litmus::model::Thresholds {
+                suspicious,
+                hostile,
+            })
+        }
     })
 }
 
@@ -567,7 +578,7 @@ fn main() -> Result<()> {
     // Manual `--threshold-*` overrides bypass the levels table entirely, so we
     // pass `None` here; benign verdicts will still surface as `-1` regardless.
     let manual_thresholds = threshold_suspicious.is_some() || threshold_hostile.is_some();
-    let envelope_level: Option<u8> = if manual_thresholds {
+    let envelope_level: Option<u16> = if manual_thresholds {
         None
     } else {
         Some(

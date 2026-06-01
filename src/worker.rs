@@ -448,9 +448,9 @@ pub struct WorkerConfig {
     pub slow_rule_ms: u64,
     /// Exit after this many jobs have been analyzed (None = run forever).
     pub max_jobs: Option<u64>,
-    /// FPR severity level (0..=100) that produced the thresholds, or `None` when
+    /// FPR severity level (0..=1000) that produced the thresholds, or `None` when
     /// manual thresholds were supplied. Folded into `ml.l` in the envelope.
-    pub level: Option<u8>,
+    pub level: Option<u16>,
     /// Nice value applied to the process at startup (0 = leave unchanged).
     pub nice: i32,
 }
@@ -458,7 +458,7 @@ pub struct WorkerConfig {
 fn load_model_resources(
     model_dir: &Path,
     thresholds: Option<Thresholds>,
-    level: Option<u8>,
+    level: Option<u16>,
 ) -> Result<Arc<ModelResources>> {
     let model = Model::load(model_dir, thresholds).context("loading model")?;
     let shap = ShapImportance::load(model_dir).ok();
@@ -475,7 +475,7 @@ fn validate_and_load_resources(
     model_dir: &Path,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
-    level: Option<u8>,
+    level: Option<u16>,
 ) -> Result<Arc<ModelResources>> {
     let validate_config = crate::ScanConfig::new(
         model_dir,
@@ -498,7 +498,7 @@ fn renew_resources_once(
     model_dir: &Path,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
-    level: Option<u8>,
+    level: Option<u16>,
 ) -> Result<Option<Arc<ModelResources>>> {
     let (prev_models_head, models_after, models_changed) = match crate::models_repo::update(true) {
         Ok(prev) => {
@@ -579,7 +579,7 @@ fn spawn_resource_renewal_task(
     model_dir: PathBuf,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
-    level: Option<u8>,
+    level: Option<u16>,
     shutdown: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {

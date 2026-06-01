@@ -49,9 +49,9 @@ collapsed into a single field — `l` — which a consumer reads as:
 
 - `l == -1` (sentinel) → the file is **benign**, regardless of how
   thresholds were resolved.
-- `l` in `0..=100` → the file is **hostile**, and the integer is the
+- `l` in `0..=1000` → the file is **hostile**, and the integer is the
   per-100M-benigns level that selected the firing threshold
-  (so `l=50` ≡ 0.5 FP/M).
+  (so `l=50` ≡ 0.5 FP/M, `l=1000` ≡ 10 FP/M).
 - `l == null` → the file is **hostile**, but manual
   `--threshold-hostile` / `--threshold-suspicious` were supplied, so
   no level table applies.
@@ -64,12 +64,16 @@ probability for OR-rule policies, the blend's sigmoid output for
 learned-blend policies, or the elevating embedded file's probability
 when an archive member outranked its parent.
 
-Suspicious is now consumer-side. Collimator no longer emits suspicious
-thresholds, and litmus does not classify into a suspicious band on the
-wire. A consumer that wants one derives it from `prob` against its own
-suspicious cutoff. As far as this envelope is concerned, a Suspicious
-result is encoded the same way as Hostile — `l` is the resolved level
-or `null`, never `-1`.
+Suspicious is derived consumer-side as a **level-table lookup**: for
+an active hostile level `N`, litmus reads the hostile threshold at
+level `min(1000, 4 × N)` from the same `levels[]` table and uses it
+as the suspicious cutoff (so a deploy at L50 hostile uses L200's
+hostile threshold for its suspicious band — a 4× wider FP budget that
+catches more "maybe-bad" files). The envelope itself does not surface
+the suspicious band: a Suspicious result is encoded the same way as
+Hostile — `l` is the resolved level (or `null`), never `-1`. Manual
+`--threshold-hostile` skips the derivation entirely; only
+hostile/benign verdicts are possible in that mode.
 
 Each `ml.fs[]` entry carries its own `prob` and `l`, following the
 same rules.
@@ -184,7 +188,7 @@ was on the wire three times.
 `v=6` collapses all three into `l`:
 
 - benign is `l = -1`,
-- hostile-with-known-level is `l = 0..=100`,
+- hostile-with-known-level is `l = 0..=1000`,
 - hostile-with-manual-threshold is `l = null`.
 
 The deciding cutoff itself is no longer transmitted. Consumers that
