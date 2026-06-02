@@ -727,6 +727,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "2.0.0-rc.4"
+source = "git+https://codeberg.org/atomdrift/cleave.git#cbd396003d5fa538fd91398cc2869397710bd761"
 dependencies = [
  "aes 0.8.4",
  "aho-corasick",
@@ -814,6 +815,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#cbd396003d5fa538fd91398cc2869397710bd761"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1544,7 +1546,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "0.8.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#35f49574a26ed8b811ac0f8493086932ec126c71"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#4b0a6002e3a265febeb962d6f5014b92d1db0085"
 dependencies = [
  "aho-corasick",
  "bincode",
@@ -2726,6 +2728,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#cbd396003d5fa538fd91398cc2869397710bd761"
 
 [[package]]
 name = "lzxd"
@@ -2745,6 +2748,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#cbd396003d5fa538fd91398cc2869397710bd761"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -3568,6 +3572,7 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#cbd396003d5fa538fd91398cc2869397710bd761"
 dependencies = [
  "flate2",
  "memchr",
@@ -4137,6 +4142,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#cbd396003d5fa538fd91398cc2869397710bd761"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4669,6 +4675,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#cbd396003d5fa538fd91398cc2869397710bd761"
 
 [[package]]
 name = "tap"
@@ -5359,7 +5366,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#35f49574a26ed8b811ac0f8493086932ec126c71"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#4b0a6002e3a265febeb962d6f5014b92d1db0085"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -6624,6 +6631,7 @@ dependencies = [
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#cbd396003d5fa538fd91398cc2869397710bd761"
 
 [[package]]
 name = "yara-x"
