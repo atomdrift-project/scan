@@ -403,14 +403,23 @@ fn main() -> Result<()> {
         unsafe { std::env::set_var("LITMUS_MODELS_REF", reference) };
     }
 
+    const RAYON_FALLBACK_THREADS: usize = 4;
+    let detected_cores = detect_cpu_count();
     let rayon_threads = std::env::var("CLEAVE_RAYON_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(4)
+            detected_cores.unwrap_or_else(|| {
+                tracing::warn!(
+                    fallback = RAYON_FALLBACK_THREADS,
+                    "CPU count detection failed; rayon pool DOWNGRADED to \
+                     {RAYON_FALLBACK_THREADS} threads. On a many-core host this throttles \
+                     throughput and oversubscribes workers — set CLEAVE_RAYON_THREADS to the \
+                     core count.",
+                );
+                RAYON_FALLBACK_THREADS
+            })
         });
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
@@ -420,8 +429,22 @@ fn main() -> Result<()> {
     {
         tracing::warn!(error = %e, "failed to install global rayon pool; using default");
     }
+    let active_threads = rayon::current_num_threads();
+    // A pool smaller than the detected core count is a resource downgrade that
+    // oversubscribes the worker slots — surface it loudly so it is diagnosable
+    // from a single log line.
+    if let Some(cores) = detected_cores
+        && active_threads < cores
+    {
+        tracing::warn!(
+            rayon_threads = active_threads,
+            detected_cores = cores,
+            "rayon pool smaller than detected cores; worker slots may oversubscribe the CPU",
+        );
+    }
     tracing::info!(
-        threads = rayon::current_num_threads(),
+        threads = active_threads,
+        detected_cores,
         stack_mb = 64,
         "rayon pool ready"
     );
@@ -836,11 +859,40 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// CPU count available to this process.
+///
+/// `std::thread::available_parallelism()` returns `Err(Unsupported)` on
+/// illumos/Solaris, where it would otherwise silently collapse the rayon pool
+/// to a small fallback on a many-core host. Probe `sysconf` directly there.
+/// Returns `None` only when no source works, so callers can log a downgrade.
+///
+/// Kept local rather than using `cleave::memory_tracker::cpu_count` because the
+/// `cleave` dependency is pinned to a published git revision; this fix must take
+/// effect in the worker binary without waiting for that pin to advance.
+fn detect_cpu_count() -> Option<usize> {
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    {
+        // SAFETY: sysconf is a pure C function; `_SC_NPROCESSORS_ONLN` is a
+        // well-defined POSIX selector and a non-positive return is rejected.
+        let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        if n > 0 {
+            return Some(n as usize);
+        }
+    }
+    std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZero::get)
+}
+
 /// Default worker count: at least 2, and half the available CPU cores.
 fn default_workers() -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4);
+    let cores = detect_cpu_count().unwrap_or_else(|| {
+        tracing::warn!(
+            fallback = 4,
+            "CPU count detection failed; defaulting worker basis to 4 cores",
+        );
+        4
+    });
     std::cmp::max(2, cores / 2)
 }
 
