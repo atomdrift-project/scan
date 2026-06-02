@@ -156,8 +156,3 @@ path = "src/main.rs"
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
 
-# TODO(deps): local cleave until a published rev exposes
-# memory_tracker::available_memory() (sysmem::available_memory). Replace this
-# patch with a git-rev bump of the cleave dependency.
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
