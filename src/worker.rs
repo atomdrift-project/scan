@@ -4,7 +4,7 @@
 //! When a slot is free, it claims work from hopper's `/api/next` endpoint,
 //! analyzes the file, and posts the result back to `/api/result`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
@@ -71,6 +71,10 @@ static NEXT_ANALYSIS_ID: AtomicU64 = AtomicU64::new(1);
 static BLOCKING_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLOCKING_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Cadence for the dedicated `/api/heartbeat` check-in. Fixed and independent of
+/// the work-claim poll so a busy worker — prefetch buffer full, never polling
+/// `/api/next` — still reports liveness, RSS, load, and queue depth on time.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 type ResourceHandle = Arc<RwLock<Arc<ModelResources>>>;
 
@@ -741,6 +745,9 @@ struct PrefetchedJob {
     /// `Err(Skipped)` = job rejected without attempting download (e.g. oversized);
     /// do not retry, post the error result directly.
     data: std::result::Result<Option<Vec<u8>>, PrefetchError>,
+    /// Local-queue id assigned by the prefetcher when the job is staged; passed
+    /// to `WorkerMetrics::complete` once analysis finishes. 0 until staged.
+    queue_id: u64,
 }
 
 /// Why a prefetch did not produce bytes.
@@ -834,6 +841,177 @@ fn apply_nice(nice: i32) {
     }
 }
 
+/// Trailing window for the throughput and error-count metrics.
+const METRICS_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// One-minute completion buckets for a trailing files-per-second rate. Bucketing
+/// (vs. a list of every completion instant) keeps memory O(1) regardless of how
+/// fast a worker churns. Slot `minute % 15` holds the count for that minute;
+/// a slot whose stored minute is stale is reset on first use in the new minute.
+struct RateWindow {
+    buckets: [(u64, u32); 15],
+}
+
+impl RateWindow {
+    fn new() -> Self {
+        Self { buckets: [(u64::MAX, 0); 15] }
+    }
+
+    fn record(&mut self, minute: u64) {
+        let slot = &mut self.buckets[(minute % 15) as usize];
+        if slot.0 != minute {
+            *slot = (minute, 0);
+        }
+        slot.1 += 1;
+    }
+
+    fn per_sec(&self, minute: u64) -> f64 {
+        let total: u32 = self
+            .buckets
+            .iter()
+            .filter(|(m, _)| *m != u64::MAX && minute.saturating_sub(*m) < 15)
+            .map(|(_, c)| c)
+            .sum();
+        f64::from(total) / METRICS_WINDOW.as_secs() as f64
+    }
+}
+
+/// Error instants within the trailing window plus the most recent message.
+#[derive(Default)]
+struct ErrorWindow {
+    times: VecDeque<Instant>,
+    last: Option<(Instant, String)>,
+}
+
+impl ErrorWindow {
+    fn record(&mut self, msg: &str, now: Instant) {
+        self.prune(now);
+        self.times.push_back(now);
+        self.last = Some((now, msg.to_string()));
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&t) = self.times.front() {
+            if now.duration_since(t) <= METRICS_WINDOW {
+                break;
+            }
+            self.times.pop_front();
+        }
+    }
+}
+
+/// Point-in-time view of [`WorkerMetrics`], assembled for one heartbeat.
+struct MetricsSnapshot {
+    /// Age of the oldest item still in the local queue (staged or running).
+    oldest_age: Option<Duration>,
+    /// Time since the most recent job completion.
+    last_completion_age: Option<Duration>,
+    /// Files processed per second, averaged over the trailing window.
+    files_per_sec: f64,
+    /// Number of analysis errors within the trailing window.
+    errors_recent: usize,
+    /// Most recent error: how long ago it happened and its message.
+    last_error: Option<(Duration, String)>,
+}
+
+/// Live per-worker metrics surfaced through the heartbeat. Updated on the job
+/// hot path — `enqueue` when a sample is staged, `complete`/`record_error` when
+/// analysis finishes — and snapshotted by the heartbeat task. The worker reports
+/// ages and rates (never wall-clock timestamps), so clock skew between worker
+/// and hopper can't distort the dashboard.
+struct WorkerMetrics {
+    /// Monotonic base for the throughput minute index.
+    start: Instant,
+    next_id: AtomicU64,
+    /// Enqueue instant per in-queue item, keyed by id; oldest age = min elapsed.
+    enqueued: Mutex<HashMap<u64, Instant>>,
+    last_completion: Mutex<Option<Instant>>,
+    throughput: Mutex<RateWindow>,
+    errors: Mutex<ErrorWindow>,
+}
+
+// Each method holds one of the metrics mutexes only for a trivial,
+// panic-free critical section; a poisoned lock means a prior holder panicked,
+// which is already unrecoverable, so propagating via expect is correct.
+#[allow(clippy::expect_used)]
+impl WorkerMetrics {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            next_id: AtomicU64::new(0),
+            enqueued: Mutex::new(HashMap::new()),
+            last_completion: Mutex::new(None),
+            throughput: Mutex::new(RateWindow::new()),
+            errors: Mutex::new(ErrorWindow::default()),
+        }
+    }
+
+    fn minute(&self) -> u64 {
+        self.start.elapsed().as_secs() / 60
+    }
+
+    /// Register a freshly staged queue item; returns its id for `complete`.
+    fn enqueue(&self) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.enqueued
+            .lock()
+            .expect("metrics mutex poisoned")
+            .insert(id, Instant::now());
+        id
+    }
+
+    /// Mark a queue item finished: drop it, stamp the completion, tick the rate.
+    fn complete(&self, id: u64) {
+        self.enqueued
+            .lock()
+            .expect("metrics mutex poisoned")
+            .remove(&id);
+        *self.last_completion.lock().expect("metrics mutex poisoned") = Some(Instant::now());
+        let minute = self.minute();
+        self.throughput
+            .lock()
+            .expect("metrics mutex poisoned")
+            .record(minute);
+    }
+
+    fn record_error(&self, msg: &str) {
+        self.errors.lock().expect("metrics mutex poisoned").record(msg, Instant::now());
+    }
+
+    fn snapshot(&self) -> MetricsSnapshot {
+        let oldest_age = self
+            .enqueued
+            .lock()
+            .expect("metrics mutex poisoned")
+            .values()
+            .min()
+            .map(Instant::elapsed);
+        let last_completion_age = self
+            .last_completion
+            .lock()
+            .expect("metrics mutex poisoned")
+            .map(|t| t.elapsed());
+        let files_per_sec = self
+            .throughput
+            .lock()
+            .expect("metrics mutex poisoned")
+            .per_sec(self.minute());
+        let (errors_recent, last_error) = {
+            let mut errors = self.errors.lock().expect("metrics mutex poisoned");
+            errors.prune(Instant::now());
+            let last = errors.last.as_ref().map(|(t, m)| (t.elapsed(), m.clone()));
+            (errors.times.len(), last)
+        };
+        MetricsSnapshot {
+            oldest_age,
+            last_completion_age,
+            files_per_sec,
+            errors_recent,
+            last_error,
+        }
+    }
+}
+
 /// Run the worker loop. Blocks until cancelled.
 pub async fn run(config: WorkerConfig) -> Result<()> {
     apply_nice(config.nice);
@@ -924,6 +1102,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let encoded_name: String = url_encode(&name);
     let available_tools = crate::tools::available_names().join(",");
     let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let metrics = Arc::new(WorkerMetrics::new());
+    // Cloned before `available_tools`/`encoded_name` move into the prefetcher so
+    // the heartbeat task can report the same identity on its own cadence.
+    let heartbeat_tools = available_tools.clone();
+    let heartbeat_name = url_encode(&name);
 
     let max_buffer_bytes: usize =
         if cleave::memory_tracker::total_memory().unwrap_or(0) >= 16 * 1024 * 1024 * 1024 {
@@ -932,7 +1115,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             512 * 1024 * 1024 // 512 MiB otherwise
         };
 
-    // Background prefetch keeps `3 × slots` samples staged at all times so a
+    // Background prefetch keeps `1.1 × slots` samples staged at all times so a
     // free worker slot never waits on a download. The prefetcher polls and
     // downloads on its own task, pushing each sample into `rx` the instant its
     // download finishes; this loop only pulls ready samples and dispatches
@@ -941,7 +1124,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<PrefetchedJob>();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let outstanding = Arc::new(AtomicUsize::new(0));
-    let target_depth = slots.saturating_mul(3).max(1);
+    let target_depth = (slots.saturating_mul(11) / 10).max(1);
 
     tokio::spawn(
         Prefetcher {
@@ -955,6 +1138,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             max_buffer_bytes,
             poll_secs,
             target_depth,
+            metrics: Arc::clone(&metrics),
         }
         .run(
             tx,
@@ -993,6 +1177,44 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     completed = completed.load(Ordering::Acquire),
                     "worker summary",
                 );
+            }
+        });
+    }
+
+    // Dedicated check-in. The claim loop only contacts hopper via `/api/next`
+    // when the prefetch buffer has room, so a saturated worker can go long
+    // stretches without reporting. This task pings `/api/heartbeat` on a fixed
+    // cadence regardless of buffer state, carrying live RSS, load, and an
+    // accurate queue depth (staged backlog + running slots).
+    {
+        let client = client.clone();
+        let base_url = Arc::clone(&base_url);
+        let encoded_name = heartbeat_name;
+        let available_tools = heartbeat_tools;
+        let outstanding = Arc::clone(&outstanding);
+        let semaphore = Arc::clone(&semaphore);
+        let metrics = Arc::clone(&metrics);
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            while !shutdown.load(Ordering::Relaxed) {
+                interruptible_sleep(HEARTBEAT_INTERVAL, &shutdown).await;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                let report = HeartbeatReport {
+                    slots,
+                    active: slots.saturating_sub(semaphore.available_permits()),
+                    queue: outstanding.load(Ordering::Acquire),
+                    metrics: metrics.snapshot(),
+                };
+                let url = heartbeat_url(&base_url, &encoded_name, &available_tools, &report);
+                match client.get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => {}
+                    Ok(resp) => {
+                        tracing::debug!(status = %resp.status(), "heartbeat: non-success response");
+                    }
+                    Err(e) => tracing::debug!(error = %e, "heartbeat request failed"),
+                }
             }
         });
     }
@@ -1062,14 +1284,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 // lease, then carry on.
                 tracing::error!(error = %error, "cannot snapshot worker resources; failing job");
                 drop(permit);
-                post_result(
-                    &client,
-                    &base_url,
-                    &name,
-                    &pj.job.sha256,
-                    Err(format!("worker resource snapshot failed: {error}")),
-                )
-                .await;
+                let failure = format!("worker resource snapshot failed: {error}");
+                metrics.record_error(&failure);
+                post_result(&client, &base_url, &name, &pj.job.sha256, Err(failure)).await;
+                metrics.complete(pj.queue_id);
                 completed.fetch_add(1, Ordering::Release);
                 continue;
             }
@@ -1091,6 +1309,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let name = Arc::clone(&name);
         let local_index = local_index.clone();
         let completed = Arc::clone(&completed);
+        let metrics = Arc::clone(&metrics);
         let pools = Arc::clone(&pools);
 
         tokio::spawn(async move {
@@ -1118,8 +1337,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     error = %e,
                     "analysis failed",
                 );
+                metrics.record_error(&e.to_string());
             }
             post_result(&client, &url, &name, &pj.job.sha256, result).await;
+            metrics.complete(pj.queue_id);
             let n = completed.fetch_add(1, Ordering::Release) + 1;
             if n.is_multiple_of(100) {
                 tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
@@ -1156,7 +1377,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 /// back to hopper immediately. This prevents a pathological single file from
 /// blowing past the worker's prefetch memory budget.
 /// Background prefetcher: owns the polling and download side of the worker.
-/// Keeps `target_depth` (`3 × slots`) samples staged in the dispatch channel,
+/// Keeps `target_depth` (`1.1 × slots`) samples staged in the dispatch channel,
 /// downloading payloads concurrently and emitting each the moment it lands so a
 /// free worker slot never blocks on the network.
 struct Prefetcher {
@@ -1172,8 +1393,10 @@ struct Prefetcher {
     /// Soft cap on total staged payload bytes.
     max_buffer_bytes: usize,
     poll_secs: u64,
-    /// Staged + in-flight sample target (`3 × slots`).
+    /// Staged + in-flight sample target (`1.1 × slots`).
     target_depth: usize,
+    /// Shared metrics; the prefetcher stamps each sample's local-queue entry.
+    metrics: Arc<WorkerMetrics>,
 }
 
 impl Prefetcher {
@@ -1258,12 +1481,15 @@ impl Prefetcher {
                     }
                     while let Some(res) = set.join_next().await {
                         match res {
-                            Ok(pj) => {
+                            Ok(mut pj) => {
                                 let bytes = pj
                                     .data
                                     .as_ref()
                                     .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
                                 queued_bytes.fetch_add(bytes, Ordering::Release);
+                                // Enters the local queue now; tracked until the
+                                // dispatch loop finishes analysing it.
+                                pj.queue_id = self.metrics.enqueue();
                                 if tx.send(pj).is_err() {
                                     return; // dispatch loop gone
                                 }
@@ -1353,7 +1579,7 @@ async fn prefetch_one(
             "file size {} exceeds per-job prefetch cap of {} bytes",
             job.size_bytes, max_single_bytes,
         ));
-        return PrefetchedJob { job, data: Err(err) };
+        return PrefetchedJob { job, data: Err(err), queue_id: 0 };
     }
 
     let local_path = data_dir.as_deref().map(|d| d.join(&job.path));
@@ -1366,7 +1592,7 @@ async fn prefetch_one(
             Err(e) => Err(PrefetchError::Transient(e)),
         }
     };
-    PrefetchedJob { job, data }
+    PrefetchedJob { job, data, queue_id: 0 }
 }
 
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
@@ -1741,10 +1967,18 @@ async fn post_result(
         }
     };
 
-    // Reuse the same exponential-backoff-with-jitter logic as poll failures.
-    // base=2s gives delays of 2s, 4s, 8s, 16s, 32s across 6 attempts (~90s total).
-    const MAX_ATTEMPTS: u32 = 6;
-    for attempt in 0..MAX_ATTEMPTS {
+    // Retry with the same exponential-backoff-with-jitter schedule as poll
+    // failures (2s, 4s, 8s, 16s, 32s, then capped at ~60s) for up to
+    // RETRY_BUDGET. Hopper only re-leases a dropped result after its 30-minute
+    // claim expiry, so a ~20-minute retry window recovers most hopper restarts
+    // and short outages without forcing a full re-analysis elsewhere. The post
+    // is idempotent on hopper, so re-sending after an ambiguous timeout is safe.
+    // Sleeps are deliberately not shutdown-interruptible: a worker shutting down
+    // mid-retry loses at most one result, which the lease recovers anyway.
+    const RETRY_BUDGET: Duration = Duration::from_secs(20 * 60);
+    let started = Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
         if attempt > 0 {
             tokio::time::sleep(backoff_duration(attempt)).await;
         }
@@ -1759,7 +1993,7 @@ async fn post_result(
         }
         match request.send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(sha256 = %sha256, elapsed_ms = crate::duration_ms(post_start.elapsed()), "result posted");
+                tracing::debug!(sha256 = %sha256, elapsed_ms = crate::duration_ms(post_start.elapsed()), attempt, "result posted");
                 return;
             }
             Ok(resp) => {
@@ -1770,8 +2004,17 @@ async fn post_result(
                 tracing::warn!(sha256 = %sha256, error = %e, elapsed_ms = crate::duration_ms(post_start.elapsed()), attempt, "post result: send failed");
             }
         }
+        attempt += 1;
+        if started.elapsed() >= RETRY_BUDGET {
+            break;
+        }
     }
-    tracing::error!(sha256 = %sha256, "post result: giving up after {MAX_ATTEMPTS} attempts");
+    tracing::error!(
+        sha256 = %sha256,
+        attempts = attempt,
+        elapsed_s = started.elapsed().as_secs(),
+        "post result: giving up after retry budget exhausted",
+    );
 }
 
 fn body_excerpt(body: &str) -> String {
@@ -1951,6 +2194,70 @@ fn system_load_avg() -> Option<f64> {
     {
         None
     }
+}
+
+/// Build the `/api/heartbeat` URL. Mirrors `Prefetcher::poll_url`'s live signals
+/// (traits, RSS, load, tools) but claims no work and adds the worker's own queue
+/// view: `active` running slots and `queue` staged-but-not-yet-dispatched jobs.
+/// Live counts plus a metrics snapshot for one heartbeat.
+struct HeartbeatReport {
+    /// Configured analysis slots.
+    slots: usize,
+    /// Slots currently running an analysis.
+    active: usize,
+    /// Staged samples waiting for a free slot.
+    queue: usize,
+    metrics: MetricsSnapshot,
+}
+
+fn heartbeat_url(
+    base_url: &str,
+    encoded_name: &str,
+    available_tools: &str,
+    report: &HeartbeatReport,
+) -> String {
+    use std::fmt::Write;
+    let metrics = &report.metrics;
+    let mut url = format!(
+        "{}/api/heartbeat?worker={}&slots={}&active={}&queue={}&version={}",
+        base_url,
+        encoded_name,
+        report.slots,
+        report.active,
+        report.queue,
+        env!("CARGO_PKG_VERSION"),
+    );
+    // 5-char prefix matches hopper's litmusTraitsVersion() truncation so the
+    // dashboard's stale-traits comparison can string-equal the two.
+    if let Some(traits) = cleave::traits_repo::version() {
+        let prefix: String = traits.chars().take(5).collect();
+        let _ = write!(url, "&traits={}", prefix);
+    }
+    if let Some(rss) = cleave::memory_tracker::current_rss() {
+        let _ = write!(url, "&rss_mb={}", rss / 1024 / 1024);
+    }
+    if let Some(load) = system_load_avg() {
+        let _ = write!(url, "&load1={:.2}", load);
+    }
+    // Local-queue metrics. Ages are sent in seconds (relative, not wall-clock)
+    // so hopper renders "x ago" without depending on synchronised clocks.
+    if let Some(age) = metrics.oldest_age {
+        let _ = write!(url, "&oldest_s={}", age.as_secs());
+    }
+    if let Some(age) = metrics.last_completion_age {
+        let _ = write!(url, "&done_age_s={}", age.as_secs());
+    }
+    let _ = write!(url, "&fps={:.3}", metrics.files_per_sec);
+    let _ = write!(url, "&errs={}", metrics.errors_recent);
+    if let Some((age, ref msg)) = metrics.last_error {
+        let _ = write!(url, "&err_age_s={}&err=", age.as_secs());
+        // Trim to keep the URL bounded; hopper only displays a short summary.
+        let trimmed: String = msg.chars().take(200).collect();
+        url_encode_into(&trimmed, &mut url);
+    }
+    let _ = write!(url, "&tools=");
+    url_encode_into(available_tools, &mut url);
+    url
 }
 
 /// Percent-encode a string for use in URL query parameters.
@@ -2296,6 +2603,7 @@ mod tests {
                 max_buffer_bytes: 1 << 30,
                 poll_secs: 1,
                 target_depth,
+                metrics: Arc::new(WorkerMetrics::new()),
             }
             .run(
                 tx,
@@ -2348,5 +2656,66 @@ mod tests {
             "prefetcher did not exit on shutdown",
         );
         while rx.recv().await.is_some() {}
+    }
+
+    #[test]
+    fn rate_window_counts_only_the_trailing_window() {
+        let mut w = RateWindow::new();
+        // Three completions in minute 100, two in minute 101.
+        w.record(100);
+        w.record(100);
+        w.record(100);
+        w.record(101);
+        w.record(101);
+        // At minute 101 all five are within the trailing 15 one-minute buckets.
+        assert!((w.per_sec(101) - 5.0 / 900.0).abs() < 1e-9);
+        // The window spans diffs 0..14 (15 buckets). At minute 115 the minute-100
+        // bucket has aged out (diff 15) but the minute-101 bucket (diff 14) holds,
+        // leaving its two completions.
+        assert!((w.per_sec(115) - 2.0 / 900.0).abs() < 1e-9);
+        // Far in the future every bucket has aged out.
+        assert_eq!(w.per_sec(200), 0.0);
+    }
+
+    #[test]
+    fn rate_window_bucket_reuse_resets_stale_minute() {
+        let mut w = RateWindow::new();
+        w.record(0); // slot 0 holds minute 0
+        w.record(15); // minute 15 reuses slot 0; must reset, not accumulate
+        assert!((w.per_sec(15) - 1.0 / 900.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn error_window_prunes_and_keeps_last() {
+        let mut e = ErrorWindow::default();
+        let base = Instant::now();
+        e.record("old", base);
+        e.record("recent", base + Duration::from_secs(60));
+        // Pruning relative to a moment just past the window from `base` drops the
+        // first error but keeps the second, while `last` still reflects "recent".
+        e.prune(base + METRICS_WINDOW + Duration::from_secs(1));
+        assert_eq!(e.times.len(), 1);
+        assert_eq!(e.last.as_ref().map(|(_, m)| m.as_str()), Some("recent"));
+    }
+
+    #[test]
+    fn worker_metrics_track_queue_completion_and_errors() {
+        let m = WorkerMetrics::new();
+        let a = m.enqueue();
+        let _b = m.enqueue();
+        // Two items queued; an oldest age exists.
+        let snap = m.snapshot();
+        assert!(snap.oldest_age.is_some());
+        assert!(snap.last_completion_age.is_none());
+        assert_eq!(snap.errors_recent, 0);
+
+        m.record_error("boom");
+        m.complete(a);
+        let snap = m.snapshot();
+        // One item still queued, one completion recorded, one error in window.
+        assert!(snap.oldest_age.is_some());
+        assert!(snap.last_completion_age.is_some());
+        assert_eq!(snap.errors_recent, 1);
+        assert_eq!(snap.last_error.as_ref().map(|(_, msg)| msg.as_str()), Some("boom"));
     }
 }
