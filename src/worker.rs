@@ -1718,6 +1718,29 @@ async fn post_result(
     };
 
     let url = format!("{}/api/result", url);
+
+    // Serialize and compress once, then reuse across retries. Cleave reports are
+    // large, highly repetitive JSON; zstd typically shrinks them 3-5x, cutting
+    // upload time for the multi-hundred-MB archive reports. Level 3 is zstd's
+    // default — its speed is dwarfed by the analysis that produced the payload.
+    // If serialization fails the result is unrecoverable; if compression fails we
+    // degrade to sending the body uncompressed so a result is never dropped.
+    const ZSTD_RESULT_LEVEL: i32 = 3;
+    let json = match serde_json::to_vec(&payload) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::error!(sha256 = %sha256, error = %e, "post result: serialize failed");
+            return;
+        }
+    };
+    let (body, encoding) = match zstd::encode_all(json.as_slice(), ZSTD_RESULT_LEVEL) {
+        Ok(compressed) => (compressed, Some("zstd")),
+        Err(e) => {
+            tracing::warn!(sha256 = %sha256, error = %e, "post result: zstd compress failed; sending uncompressed");
+            (json, None)
+        }
+    };
+
     // Reuse the same exponential-backoff-with-jitter logic as poll failures.
     // base=2s gives delays of 2s, 4s, 8s, 16s, 32s across 6 attempts (~90s total).
     const MAX_ATTEMPTS: u32 = 6;
@@ -1727,7 +1750,14 @@ async fn post_result(
         }
         tracing::debug!(sha256 = %sha256, attempt, "posting result to server");
         let post_start = Instant::now();
-        match client.post(&url).json(&payload).send().await {
+        let mut request = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.clone());
+        if let Some(enc) = encoding {
+            request = request.header(reqwest::header::CONTENT_ENCODING, enc);
+        }
+        match request.send().await {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!(sha256 = %sha256, elapsed_ms = crate::duration_ms(post_start.elapsed()), "result posted");
                 return;

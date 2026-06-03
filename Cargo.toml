@@ -63,6 +63,10 @@ proclist = { git = "https://codeberg.org/atomdrift/proclist.git" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Compresses result POST bodies to hopper. Cleave reports are large, highly
+# repetitive JSON; zstd cuts them 3-5x on the wire. Already present transitively
+# in the lock graph, so this only promotes it to a direct dependency.
+zstd = "0.13"
 toml = "0.8"
 semver = "1"
 regex = "1"
