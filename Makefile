@@ -25,7 +25,7 @@ WORKERS  ?=
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -99,7 +99,7 @@ tarball: release
 # outer invocation's `-j`/`--jobserver-*` flags plus command-line `URL=` into
 # the env, which tikv-jemalloc-sys's build.rs re-passes to its bundled `make`,
 # producing `*** No rule to make target '-j'` inside the jemalloc build.
-deploy-server deploy-worker deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
+deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
 
 deploy: deploy-server
 
@@ -116,7 +116,7 @@ deploy-worker:
 	git pull
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/worker/worker-macos.sh "$(URL)" ;; \
-		FreeBSD) ./scripts/worker/worker-bastille.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)" ;; \
+		FreeBSD) ./scripts/worker/worker-freebsd.sh "$(URL)" ;; \
 		Linux)   if [ -n "$(WORKER_REMOTE)" ]; then \
 		           ./scripts/worker/worker-debian.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)"; \
 		         elif [ -f /etc/alpine-release ]; then \
@@ -131,6 +131,18 @@ deploy-worker:
 		*) echo "error: no deploy-worker target for $$(uname -s)"; exit 1 ;; \
 	esac
 
+# Jailed worker deploy: builds in a Bastille build jail and runs the rc.d
+# service inside a separate run jail. Use this instead of deploy-worker when
+# isolating the worker in a jail; deploy-worker installs natively on the host.
+deploy-jail-worker:
+	@[ -n "$(URL)" ] || { echo "Usage: make deploy-jail-worker URL=<url> [BUILD=<jail>] [WORKER_RUN=<jail>]"; exit 1; }
+	git stash
+	git pull
+	@case "$$(uname -s)" in \
+		FreeBSD) ./scripts/worker/worker-bastille.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)" ;; \
+		*) echo "error: jail worker deployments are FreeBSD/bastille-only; run from a FreeBSD host"; exit 1 ;; \
+	esac
+
 uninstall-server:
 	@case "$$(uname -s)" in \
 		FreeBSD) ./scripts/server/uninstall-bastille.sh "$(SERVER_RUN)" ;; \
@@ -140,7 +152,7 @@ uninstall-server:
 uninstall-worker:
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/worker/uninstall-macos.sh ;; \
-		FreeBSD) ./scripts/worker/uninstall-bastille.sh "$(WORKER_RUN)" ;; \
+		FreeBSD) ./scripts/worker/uninstall-freebsd.sh ;; \
 		Linux)   if [ -n "$(WORKER_REMOTE)" ]; then \
 		           ./scripts/worker/uninstall-debian.sh "$(WORKER_RUN)"; \
 		         elif [ -f /etc/alpine-release ]; then \
@@ -152,6 +164,13 @@ uninstall-worker:
 		         fi ;; \
 		OpenBSD) ./scripts/worker/uninstall-openbsd.sh ;; \
 		*) echo "error: no uninstall-worker target for $$(uname -s)"; exit 1 ;; \
+	esac
+
+# Remove the jailed worker service (counterpart to deploy-jail-worker).
+uninstall-jail-worker:
+	@case "$$(uname -s)" in \
+		FreeBSD) ./scripts/worker/uninstall-bastille.sh "$(WORKER_RUN)" ;; \
+		*) echo "error: jail worker deployments are FreeBSD/bastille-only; run from a FreeBSD host"; exit 1 ;; \
 	esac
 
 deploy-worker-nodes:

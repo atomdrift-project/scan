@@ -70,6 +70,13 @@ The worker is designed to share a host with other work.
 - **Idempotent deploys.** The worker tolerates repeated launches and
   trait/model directories that already exist; it does not re-clone if
   the working tree is current.
+- **FreeBSD.** `make deploy-worker` installs natively on the host: an
+  unprivileged `litmus` user and an rc.d service supervised by
+  `daemon(8)`, which restarts the worker forever (5s back-off) after an
+  OOM kill or panic. `make deploy-jail-worker` instead builds in a
+  Bastille build jail and runs the same rc.d service in a separate run
+  jail. Both share one service definition
+  (`scripts/worker/lib/freebsd-rcd.sh`).
 - **Bastille jails.** Before upgrading the binary inside a jail,
   force-kill the worker with `kill -9`. Graceful shutdown can stall
   during rizin teardown.

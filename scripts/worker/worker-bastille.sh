@@ -12,11 +12,14 @@ URL="$3"
 
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 WORKERS="${WORKERS:-}"
-worker_args="worker --url $URL"
-[ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
+
+# Shared rc.d service definition (also used by the native worker-freebsd.sh).
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+. "$SCRIPT_DIR/lib/freebsd-rcd.sh"
+worker_args=$(litmus_worker_args "$URL" "$WORKERS")
 
 install_missing_build_packages() {
     missing=""
@@ -81,36 +84,8 @@ doas bastille cmd "$RUN" su -l litmus -c "litmus update-rules" \
 
 log "Creating rc.d service"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
-doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/litmus-worker >/dev/null <<EOF
-#!/bin/sh
-
-# PROVIDE: litmus_worker
-# REQUIRE: LOGIN DAEMON NETWORKING
-# KEYWORD: shutdown
-
-. /etc/rc.subr
-
-name="litmus_worker"
-rcvar="litmus_worker_enable"
-
-load_rc_config \$name
-
-: \${litmus_worker_enable:="NO"}
-: \${litmus_worker_logfile:="/var/log/litmus-worker.log"}
-
-pidfile="/var/run/\${name}.pid"
-command="/usr/sbin/daemon"
-# MALLOC_CONF tunes FreeBSD's jemalloc to return freed memory to the OS
-# promptly instead of holding dirty pages for 10s (the default). Critical
-# under bursty analysis workloads where RSS would otherwise drift upward.
-# Set via /usr/bin/env so it survives daemon(8)'s user switch and any
-# login.conf environment filtering.
-malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,abort_conf:true"
-command_args="-c -f -P \${pidfile} -r -o \${litmus_worker_logfile} -u litmus /usr/bin/env MALLOC_CONF=\${malloc_conf} /usr/local/share/litmus/litmus $worker_args"
-
-run_rc_command "\$1"
-EOF
-
+litmus_rcd_script /usr/local/share/litmus/litmus "$worker_args" \
+    | doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/litmus-worker >/dev/null
 doas bastille cmd "$RUN" chmod 755 /usr/local/etc/rc.d/litmus-worker
 
 log "Enabling and restarting litmus-worker service"

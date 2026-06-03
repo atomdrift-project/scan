@@ -1,0 +1,29 @@
+#!/bin/sh
+# uninstall-freebsd.sh - Remove the native litmus worker rc.d service on FreeBSD.
+#
+# Stops and disables the service and removes the rc.d script. Leaves the
+# `litmus` user, its home, and the installed binary intact (remove manually
+# for a fully clean state).
+set -eu
+
+die() { echo "error: $*" >&2; exit 1; }
+log() { printf '==> %s\n' "$*"; }
+
+if command -v doas >/dev/null 2>&1; then
+	SUDO=doas
+elif command -v sudo >/dev/null 2>&1; then
+	SUDO=sudo
+else
+	die "need doas or sudo"
+fi
+
+log "Disabling and stopping litmus-worker service"
+$SUDO sysrc litmus_worker_enable=NO >/dev/null 2>&1 || true
+$SUDO service litmus-worker stop 2>/dev/null || true
+$SUDO pkill -9 -F /var/run/litmus_worker.pid 2>/dev/null || true
+
+log "Removing rc.d script"
+$SUDO rm -f /usr/local/etc/rc.d/litmus-worker
+
+log "Note: service user 'litmus', ~litmus, and /usr/local/bin/litmus left intact."
+log "Uninstall complete"
