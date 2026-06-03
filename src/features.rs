@@ -950,6 +950,20 @@ pub struct ExtractContext {
     path_to_id: HashMap<String, u32>,
     bigram_id_lookup: HashMap<(u32, u32), usize>,
     trigram_id_lookup: HashMap<(u32, u32, u32), usize>,
+
+    // Base indices of the families written by raw `base + idx` offset, anchored
+    // to their real position in the spec's `feature_names`. `None` when the
+    // family is absent from the spec (the writer then skips it). See `new()`.
+    present_base: Option<usize>,
+    maxcrit_base: Option<usize>,
+    bigram_base: Option<usize>,
+    trigram_base: Option<usize>,
+    unsigned_bigram_base: Option<usize>,
+
+    /// Offset families that are present in the spec but laid out incompatibly
+    /// (partial or out of vocab order). Empty for a healthy bundle; surfaced by
+    /// [`Self::validate_layout`] so a bad bundle is rejected at load time.
+    layout_errors: Vec<&'static str>,
 }
 
 impl ExtractContext {
@@ -996,6 +1010,71 @@ impl ExtractContext {
                 trigram_id_lookup.insert((ids[0], ids[1], ids[2]), i);
             }
         }
+
+        // Global feature name -> index. Built before `Self` so the anchored
+        // family bases below can be derived from it.
+        let absolute_lookup: HashMap<String, usize> = spec
+            .feature_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+
+        // Anchor the offset-written families (presence, max-crit, bigram,
+        // trigram, unsigned-bigram) to their real position in `feature_names`
+        // rather than to a hand-maintained running cursor. The cursor approach
+        // silently drifted once — a metrics-block miscount left every later
+        // family 26 slots too high and ran the unsigned-bigram block off the
+        // end of the vector — and a release build has no `debug_assert` to
+        // catch it.
+        //
+        // `base + idx` is only valid if the family occupies a contiguous
+        // base..base+len run in vocab order, so verify that whole invariant here
+        // (once per model load) instead of trusting it. Two outcomes return
+        // `None` (the writer then skips the family, leaving zeros), but they
+        // mean different things:
+        //   * fully absent  — the family was pruned/disabled in the spec; the
+        //     model was trained without it, so skipping is correct, not an error.
+        //   * partially present or out of order — `base + idx` would land on the
+        //     wrong slots; recorded in `layout_errors` so `validate_layout` can
+        //     reject the bundle rather than serve corrupted features.
+        let mut layout_errors: Vec<&'static str> = Vec::new();
+        let mut family_base = |prefix: &'static str, vocab: &[String]| -> Option<usize> {
+            if vocab.is_empty() {
+                return None;
+            }
+            let indices: Vec<Option<usize>> = vocab
+                .iter()
+                .map(|v| absolute_lookup.get(&format!("{prefix}{v}")).copied())
+                .collect();
+            if indices.iter().all(Option::is_none) {
+                return None; // pruned/disabled entirely — skip gracefully
+            }
+            let base = indices[0];
+            let contiguous = base.is_some_and(|base| {
+                indices
+                    .iter()
+                    .enumerate()
+                    .all(|(i, idx)| *idx == Some(base + i))
+            });
+            if contiguous {
+                base
+            } else {
+                tracing::warn!(
+                    family = prefix,
+                    "offset feature family is partially present or not contiguous \
+                     in vocab order; skipping to avoid misaligned writes — the \
+                     model bundle is incompatible with this litmus build",
+                );
+                layout_errors.push(prefix);
+                None
+            }
+        };
+        let present_base = family_base("present:", &spec.presence_vocab);
+        let maxcrit_base = family_base("maxcrit:", &spec.presence_vocab);
+        let bigram_base = family_base("bigrams:", &spec.bigram_vocab);
+        let trigram_base = family_base("trigram:", &spec.trigram_vocab);
+        let unsigned_bigram_base = family_base("unsigned_bigram:", &spec.bigram_vocab);
 
         Self {
             presence_lookup,
@@ -1066,17 +1145,42 @@ impl ExtractContext {
                         || n.as_str() == "agg:suspicious_trigram_count"
                 })
                 .count(),
-            absolute_lookup: spec
-                .feature_names
-                .iter()
-                .enumerate()
-                .map(|(i, n)| (n.clone(), i))
-                .collect(),
+            absolute_lookup,
             ghost_vocab: spec.ghost_vocab.clone(),
             total_features: spec.total_features,
             path_to_id,
             bigram_id_lookup,
             trigram_id_lookup,
+            present_base,
+            maxcrit_base,
+            bigram_base,
+            trigram_base,
+            unsigned_bigram_base,
+            layout_errors,
+        }
+    }
+
+    /// Reject a model bundle whose offset-written feature families are present
+    /// but laid out incompatibly with this build's extractor.
+    ///
+    /// A family that is laid out non-contiguously / out of vocab order would
+    /// make `base + idx` writes land on the wrong slots (before anchoring, off
+    /// the end of the vector entirely). A family that is simply *absent* is not
+    /// an error — it was pruned/disabled in the spec and the extractor skips it.
+    ///
+    /// This is deterministic and corpus-independent, so `validate` calls it to
+    /// reject a bad bundle at load time (triggering rollback) instead of relying
+    /// on the benign corpus to happen to exercise the broken family.
+    pub fn validate_layout(&self) -> Result<()> {
+        if self.layout_errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "model bundle incompatible with this litmus build: offset feature \
+                 families [{}] are present in the spec but not laid out \
+                 contiguously in vocab order",
+                self.layout_errors.join(", "),
+            )
         }
     }
 
@@ -1135,13 +1239,18 @@ impl ExtractContext {
             1.0
         };
 
-        // G1: Presence
-        let presence_offset = offsets.take(self.n_presence);
-        self.write_presence_features_v16(&combined, vec, presence_offset, score_weight);
+        // G1: Presence. Cursor advanced only to feed the layout-drift check at
+        // the end; the write itself is anchored to the spec (see `new()`).
+        offsets.take(self.n_presence);
+        if let Some(base) = self.present_base {
+            self.write_presence_features_v16(&combined, vec, base, score_weight);
+        }
 
         // G2: Max crit
-        let maxcrit_offset = offsets.take(self.n_presence);
-        self.write_max_crit_features_v16(&combined, vec, maxcrit_offset, score_weight);
+        offsets.take(self.n_presence);
+        if let Some(base) = self.maxcrit_base {
+            self.write_max_crit_features_v16(&combined, vec, base, score_weight);
+        }
 
         // G3: Aggregates
         let n_crit = self.n_crit_unigram + self.n_crit_bigram + self.n_crit_trigram;
@@ -1422,8 +1531,10 @@ impl ExtractContext {
         offsets.take(2 + self.n_ft); // score
 
         // G11: Bigrams (optimized — still uses offset for performance)
-        let bigrams_offset = offsets.take(self.n_bigram);
-        self.write_bigram_features_optimized(&summaries, vec, bigrams_offset);
+        offsets.take(self.n_bigram);
+        if let Some(base) = self.bigram_base {
+            self.write_bigram_features_optimized(&summaries, vec, base);
+        }
 
         // G11b: Tiered report-level notable+ bigrams.
         offsets.take(self.n_tiered_bigram);
@@ -1459,8 +1570,10 @@ impl ExtractContext {
         );
 
         // G16: Trigrams (optimized)
-        let trigram_offset = offsets.take(self.n_trigram);
-        self.write_trigram_features_optimized(&summaries, vec, trigram_offset);
+        offsets.take(self.n_trigram);
+        if let Some(base) = self.trigram_base {
+            self.write_trigram_features_optimized(&summaries, vec, base);
+        }
 
         // G19: Logic Gaps
         offsets.take(LOGIC_GAP_CATEGORIES.len());
@@ -1474,9 +1587,11 @@ impl ExtractContext {
         );
 
         // G20: Signature Synergy
-        let unsigned_bigram_offset = offsets.take(self.n_bigram);
-        if combined.sample_paths.contains_key("metadata/unsigned") {
-            self.write_bigram_features_optimized(&summaries, vec, unsigned_bigram_offset);
+        offsets.take(self.n_bigram);
+        if let Some(base) = self.unsigned_bigram_base
+            && combined.sample_paths.contains_key("metadata/unsigned")
+        {
+            self.write_bigram_features_optimized(&summaries, vec, base);
         }
 
         // G22: Intent Gaps
@@ -1546,7 +1661,28 @@ impl ExtractContext {
             );
         }
 
-        debug_assert_eq!(offsets.offset, self.total_features);
+        // The hand-maintained cursor should still land exactly on
+        // `total_features`. It is no longer load-bearing — every offset-written
+        // family above is anchored to the spec's `feature_names`, so extraction
+        // stays correct even when this disagrees — but a mismatch means the
+        // layout constants in this file have drifted from the model's
+        // `feature_spec.json` and should be resynced with collimator. Surface it
+        // once (a `debug_assert` here was compiled out of the release workers,
+        // which is how a 26-slot metrics drift shipped undetected) and never
+        // panic: a bad layout must degrade gracefully, not kill the analysis.
+        if offsets.offset != self.total_features {
+            static DRIFT_WARNED: std::sync::Once = std::sync::Once::new();
+            DRIFT_WARNED.call_once(|| {
+                tracing::warn!(
+                    cursor = offsets.offset,
+                    total_features = self.total_features,
+                    "feature-layout cursor disagrees with spec total_features; \
+                     offset families are anchored to the spec so extraction is \
+                     still correct, but the layout constants in features.rs have \
+                     drifted from collimator and should be resynced",
+                );
+            });
+        }
     }
 
     fn write_presence_features_v16(
@@ -1561,7 +1697,9 @@ impl ExtractContext {
                 && let Some(&idx) = self.presence_lookup.get(path.as_str())
             {
                 let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0);
-                vec[offset + idx] = (score_weight * conf) as f32;
+                if let Some(slot) = vec.get_mut(offset + idx) {
+                    *slot = (score_weight * conf) as f32;
+                }
             }
         }
     }
@@ -1576,7 +1714,9 @@ impl ExtractContext {
         for (path, &max_ord) in &summary.sample_paths {
             if let Some(&idx) = self.presence_lookup.get(path.as_str()) {
                 let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0);
-                vec[offset + idx] = (f64::from(max_ord) * score_weight * conf) as f32;
+                if let Some(slot) = vec.get_mut(offset + idx) {
+                    *slot = (f64::from(max_ord) * score_weight * conf) as f32;
+                }
             }
         }
     }
@@ -1600,8 +1740,10 @@ impl ExtractContext {
             for i in 0..ids.len() {
                 for j in (i + 1)..ids.len() {
                     let key = (ids[i].min(ids[j]), ids[i].max(ids[j]));
-                    if let Some(&idx) = self.bigram_id_lookup.get(&key) {
-                        vec[offset + idx] = 1.0;
+                    if let Some(&idx) = self.bigram_id_lookup.get(&key)
+                        && let Some(slot) = vec.get_mut(offset + idx)
+                    {
+                        *slot = 1.0;
                     }
                 }
             }
@@ -1633,8 +1775,9 @@ impl ExtractContext {
                         if let Some(&idx) = self
                             .trigram_id_lookup
                             .get(&(sorted[0], sorted[1], sorted[2]))
+                            && let Some(slot) = vec.get_mut(offset + idx)
                         {
-                            vec[offset + idx] = 1.0;
+                            *slot = 1.0;
                         }
                     }
                 }
@@ -3855,5 +3998,132 @@ mod tests {
         };
         assert!(err.to_string().contains("feature_names length"));
         Ok(())
+    }
+
+    /// Minimal spec carrying only the fields the offset-family anchoring reads.
+    fn anchor_spec(
+        presence_vocab: Vec<String>,
+        bigram_vocab: Vec<String>,
+        trigram_vocab: Vec<String>,
+        feature_names: Vec<String>,
+    ) -> FeatureSpec {
+        FeatureSpec {
+            version: 17,
+            abi_version: 17,
+            presence_vocab,
+            bigram_vocab,
+            trigram_vocab,
+            total_features: feature_names.len(),
+            feature_names,
+            filetype_vocab: vec![],
+            element_vocab: vec![],
+            ghost_vocab: vec![],
+            skeleton_vocab: vec![],
+            rare_element_vocab: vec![],
+            metric_vocab: vec![],
+            crit_unigram_vocab: vec![],
+            crit_bigram_vocab: vec![],
+            crit_trigram_vocab: vec![],
+            attack_bigram_vocab: vec![],
+            attack_trigram_vocab: vec![],
+            mbc_bigram_vocab: vec![],
+            mbc_trigram_vocab: vec![],
+            tiered_bigram_vocab: vec![],
+            tiered_trigram_vocab: vec![],
+            kv_vocab: vec![],
+            symbol_vocab: vec![],
+            symbol_bigram_vocab: vec![],
+            symbol_trigram_vocab: vec![],
+            feature_means: None,
+            feature_stds: None,
+            standardized: false,
+        }
+    }
+
+    #[test]
+    fn offset_families_anchor_to_real_spec_positions() {
+        // feature_names deliberately places every offset family somewhere a
+        // hand-maintained running cursor would NOT land. Anchoring must follow
+        // the spec, not the cursor — this is the exact drift that ran the
+        // unsigned-bigram block off the end of the vector in production.
+        let feature_names = vec![
+            "filler:0".to_string(),               // 0
+            "present:objectives".to_string(),     // 1
+            "maxcrit:objectives".to_string(),     // 2
+            "filler:1".to_string(),               // 3
+            "bigrams:a + b".to_string(),          // 4
+            "bigrams:a + c".to_string(),          // 5
+            "trigram:a + b + c".to_string(),      // 6
+            "unsigned_bigram:a + b".to_string(),  // 7
+            "unsigned_bigram:a + c".to_string(),  // 8
+        ];
+        let spec = anchor_spec(
+            vec!["objectives".to_string()],
+            vec!["a + b".to_string(), "a + c".to_string()],
+            vec!["a + b + c".to_string()],
+            feature_names,
+        );
+        let ctx = ExtractContext::new(&spec);
+        assert_eq!(ctx.present_base, Some(1));
+        assert_eq!(ctx.maxcrit_base, Some(2));
+        assert_eq!(ctx.bigram_base, Some(4));
+        assert_eq!(ctx.trigram_base, Some(6));
+        assert_eq!(ctx.unsigned_bigram_base, Some(7));
+    }
+
+    #[test]
+    fn non_contiguous_offset_family_is_rejected() {
+        // The bigram family is laid out reversed vs vocab order, breaking the
+        // `base + idx` invariant; the writer must skip it (None → zeros) AND
+        // `validate_layout` must reject the bundle rather than serve corruption.
+        let feature_names = vec![
+            "bigrams:a + c".to_string(), // 0 — vocab idx 1, but base + 0
+            "bigrams:a + b".to_string(), // 1 — vocab idx 0, but base + 1
+        ];
+        let spec = anchor_spec(
+            vec![],
+            vec!["a + b".to_string(), "a + c".to_string()],
+            vec![],
+            feature_names,
+        );
+        let ctx = ExtractContext::new(&spec);
+        assert_eq!(ctx.bigram_base, None);
+        let err = ctx.validate_layout().unwrap_err().to_string();
+        assert!(err.contains("bigrams:"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn fully_absent_family_is_skipped_not_rejected() {
+        // bigram_vocab is non-empty but feature_names has no "bigrams:"/
+        // "unsigned_bigram:" entries: the family was pruned/disabled in the spec.
+        // The extractor skips it; this is a legitimately smaller model, not an
+        // incompatibility, so validation must pass.
+        let spec = anchor_spec(
+            vec![],
+            vec!["a + b".to_string()],
+            vec![],
+            vec!["filler:0".to_string()],
+        );
+        let ctx = ExtractContext::new(&spec);
+        assert_eq!(ctx.bigram_base, None);
+        assert!(ctx.validate_layout().is_ok());
+    }
+
+    #[test]
+    fn validate_layout_accepts_anchored_spec() {
+        // Both bigram families present and contiguous: a healthy bundle.
+        let spec = anchor_spec(
+            vec![],
+            vec!["a + b".to_string()],
+            vec![],
+            vec![
+                "bigrams:a + b".to_string(),
+                "unsigned_bigram:a + b".to_string(),
+            ],
+        );
+        let ctx = ExtractContext::new(&spec);
+        assert_eq!(ctx.bigram_base, Some(0));
+        assert_eq!(ctx.unsigned_bigram_base, Some(1));
+        assert!(ctx.validate_layout().is_ok());
     }
 }

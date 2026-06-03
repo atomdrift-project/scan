@@ -41,6 +41,13 @@ pub fn run(config: &ScanConfig) -> Result<()> {
     let thresholds = model.thresholds();
     let ctx = ExtractContext::new(model.spec());
 
+    // Reject a structurally incompatible bundle deterministically, before any
+    // file is analyzed. The benign corpus below can't be relied on to exercise
+    // every offset-written family (the unsigned-bigram overflow only triggers
+    // on packed/unsigned samples), so anchor-failure must fail validation here.
+    ctx.validate_layout()
+        .context("feature layout validation")?;
+
     let results: Vec<(PathBuf, Result<ClassifiedReport>)> = targets
         .into_par_iter()
         .map(|path| {
