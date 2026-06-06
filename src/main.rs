@@ -604,13 +604,24 @@ fn main() -> Result<()> {
     // Manual `--threshold-*` overrides bypass the levels table entirely, so we
     // pass `None` here; benign verdicts will still surface as `-1` regardless.
     let manual_thresholds = threshold_suspicious.is_some() || threshold_hostile.is_some();
-    let envelope_level: Option<u16> = if manual_thresholds {
-        None
-    } else {
-        Some(
-            selected_severity_level
-                .unwrap_or(litmus::model::DEFAULT_SEVERITY_LEVEL),
-        )
+    // Operating-point resolution, in priority order:
+    //   1. explicit CLI level (`-l`/`--level-*`)
+    //   2. the model-prescribed default baked into the bundle's config.json
+    //      (`default_severity_level`) — so a bundle calibrated at L50 deploys at
+    //      L50 with no litmus rebuild
+    //   3. the `DEFAULT_SEVERITY_LEVEL` const fallback (older configless bundles)
+    // Manual `--threshold-*` overrides bypass the levels table, so the envelope
+    // level is None then. Resolved per model_dir because (2) lives in the bundle.
+    let resolve_envelope_level = |model_dir: &Path| -> Option<u16> {
+        if manual_thresholds {
+            None
+        } else {
+            Some(
+                selected_severity_level
+                    .or_else(|| litmus::model::model_default_level(model_dir))
+                    .unwrap_or(litmus::model::DEFAULT_SEVERITY_LEVEL),
+            )
+        }
     };
     let all = cli.show.iter().any(|s| matches!(s, Show::All));
     let filter = DisplayFilter::new(
@@ -622,6 +633,7 @@ fn main() -> Result<()> {
     match command {
         Commands::Scan { paths } => {
             let model_dir = resolve_model_dir()?;
+            let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
             let config = litmus::ScanConfig::new(
                 model_dir,
@@ -636,6 +648,7 @@ fn main() -> Result<()> {
         }
         Commands::Ps => {
             let model_dir = resolve_model_dir()?;
+            let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
             let config = litmus::ScanConfig::new(
                 model_dir,
@@ -681,6 +694,7 @@ fn main() -> Result<()> {
             let max_rss_bytes = resolve_process_max_rss_bytes(max_rss_gb);
             log_max_rss_resolution("server", MaxRssPolicy::from_cli(max_rss_gb), max_rss_bytes);
             let model_dir = resolve_model_dir()?;
+            let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
             let config = litmus::server::ServerConfig::new(
                 bind,
@@ -754,6 +768,7 @@ fn main() -> Result<()> {
         }
         Commands::Validate => {
             let model_dir = resolve_model_dir()?;
+            let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
             let config = litmus::ScanConfig::new(
                 model_dir,
@@ -827,6 +842,7 @@ fn main() -> Result<()> {
                 });
             }
             let model_dir = resolve_model_dir()?;
+            let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
             if no_validate {
                 tracing::warn!(

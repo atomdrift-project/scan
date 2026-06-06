@@ -964,6 +964,15 @@ pub struct ExtractContext {
     /// (partial or out of vocab order). Empty for a healthy bundle; surfaced by
     /// [`Self::validate_layout`] so a bad bundle is rejected at load time.
     layout_errors: Vec<&'static str>,
+
+    /// Set during extraction if the spec declares MORE features than the
+    /// extractor's layout fills — i.e. `total_features > cursor`, meaning some
+    /// `feature_names` slots are reached by no family writer and extract to a
+    /// silent zero (real collimator↔features.rs drift). An allowlist makes the
+    /// spec a SUBSET of the full layout (`total_features < cursor`), which is
+    /// expected and never sets this. Surfaced by [`Self::had_layout_drift`] so
+    /// `validate` fails a drifted bundle rather than shipping zeroed features.
+    layout_drift: std::sync::atomic::AtomicBool,
 }
 
 impl ExtractContext {
@@ -1157,6 +1166,7 @@ impl ExtractContext {
             trigram_base,
             unsigned_bigram_base,
             layout_errors,
+            layout_drift: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1182,6 +1192,16 @@ impl ExtractContext {
                 self.layout_errors.join(", "),
             )
         }
+    }
+
+    /// Whether any extraction so far has observed feature-layout drift, i.e.
+    /// `total_features > cursor` (feature_names declares slots no writer fills,
+    /// so they extract to zero). False for a healthy or allowlist-pruned bundle.
+    /// Only meaningful after at least one extraction has run; `validate` checks
+    /// it after the benign corpus pass so a drifted bundle fails to deploy.
+    #[must_use]
+    pub fn had_layout_drift(&self) -> bool {
+        self.layout_drift.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Extract features from a cleave AnalysisReport serialized as JSON.
@@ -1661,25 +1681,35 @@ impl ExtractContext {
             );
         }
 
-        // The hand-maintained cursor should still land exactly on
-        // `total_features`. It is no longer load-bearing — every offset-written
-        // family above is anchored to the spec's `feature_names`, so extraction
-        // stays correct even when this disagrees — but a mismatch means the
-        // layout constants in this file have drifted from the model's
-        // `feature_spec.json` and should be resynced with collimator. Surface it
-        // once (a `debug_assert` here was compiled out of the release workers,
-        // which is how a 26-slot metrics drift shipped undetected) and never
-        // panic: a bad layout must degrade gracefully, not kill the analysis.
-        if offsets.offset != self.total_features {
+        // The hand-maintained cursor sums the FULL layout (every family at its
+        // spec vocab length plus the fixed blocks). Writes are anchored to the
+        // spec's `feature_names`, so the cursor is not load-bearing for
+        // correctness — but it still detects layout drift, with a direction that
+        // matters:
+        //
+        //   * `total_features < cursor` — the spec is a SUBSET of the full
+        //     layout. This is exactly what an allowlist (COLLIMATOR_ALLOWED_
+        //     FEATURES_FILE) produces: feature_names is pruned while litmus walks
+        //     the full layout. Healthy and common; must NOT warn (it would fire
+        //     on every pruned bundle and block deploys that gate on warnings).
+        //
+        //   * `total_features > cursor` — feature_names declares MORE slots than
+        //     any family writer fills, so the surplus slots extract to a silent
+        //     zero. This is real drift: features.rs layout constants have fallen
+        //     behind collimator (a new fixed family it doesn't know to write).
+        //     Flag it so `validate` fails the bundle; never panic mid-analysis.
+        if self.total_features > offsets.offset {
+            self.layout_drift
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             static DRIFT_WARNED: std::sync::Once = std::sync::Once::new();
             DRIFT_WARNED.call_once(|| {
                 tracing::warn!(
                     cursor = offsets.offset,
                     total_features = self.total_features,
-                    "feature-layout cursor disagrees with spec total_features; \
-                     offset families are anchored to the spec so extraction is \
-                     still correct, but the layout constants in features.rs have \
-                     drifted from collimator and should be resynced",
+                    "feature-layout declares more features than the extractor \
+                     writes; the surplus feature_names slots are unreachable and \
+                     extract to zero — features.rs layout constants have drifted \
+                     behind collimator and must be resynced",
                 );
             });
         }

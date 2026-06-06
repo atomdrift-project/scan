@@ -1063,17 +1063,16 @@ struct LoadedBundle {
     calibrator: Option<IsotonicCalibrator>,
 }
 
-/// Default severity level used to pick thresholds out of the levels[] table
-/// when the caller hasn't asked for a different one. On the per-100M-benigns
-/// scale, so 4 = 4 FP per 100M ≡ 0.04 FP/M ≡ ~4 false positives per 100M
-/// scans/day at deploy scale.
-///
-/// **Cross-repo mirror.** This constant has peers in collimator,
-/// autocollie, prism, and promoter — change all of them together. See
-/// the `CROSS_REPO_NOTE` in
-/// `collimator/src/collimator/thresholds/__init__.py` for the canonical
-/// list.
-pub const DEFAULT_SEVERITY_LEVEL: u16 = 4;
+/// FALLBACK default severity level (per-100M-benigns scale; 50 = 50 FP/100M ≡
+/// 0.5 FP/M). The operating point is resolved as: explicit CLI level → the
+/// model-prescribed default from the bundle's config.json
+/// (`model_default_level`, baked by collimator from its `DEFAULT_SEVERITY_LEVEL`)
+/// → THIS const. So the tuning goal normally travels embedded in the model and
+/// this is only used for older bundles whose config.json lacks
+/// `default_severity_level`. Keep it equal to collimator's current default so
+/// the fallback is sane; `make deploy` (collimator's azoth-deploy-final) fails
+/// if the staged bundle's level, collimator's const, and this const disagree.
+pub const DEFAULT_SEVERITY_LEVEL: u16 = 50;
 
 /// Ensemble-level config parsed from the top-level `config.json`. Every field
 /// is optional — an ensemble bundle with only `general/` populated and no
@@ -1327,6 +1326,26 @@ struct EnsembleConfigJson {
     required_routes: Vec<String>,
     #[serde(default)]
     levels: Vec<LevelEntryJson>,
+    /// Deploy tuning goal prescribed by the model (collimator bakes its
+    /// `DEFAULT_SEVERITY_LEVEL` here). Read by `model_default_level`; used as the
+    /// operating point when the caller hasn't selected a level on the CLI.
+    /// Absent on older bundles → consumers fall back to `DEFAULT_SEVERITY_LEVEL`.
+    #[serde(default)]
+    default_severity_level: Option<u16>,
+}
+
+/// The deploy tuning goal prescribed by THIS model's `config.json`
+/// (`default_severity_level`), or `None` if the bundle predates the field.
+///
+/// Resolution order for the operating point is: explicit CLI level → this
+/// model-prescribed default → the `DEFAULT_SEVERITY_LEVEL` const fallback. So a
+/// bundle calibrated at L50 operates at L50 without any litmus rebuild, and a
+/// caller can still pin a different level explicitly.
+#[must_use]
+pub fn model_default_level(model_dir: &Path) -> Option<u16> {
+    let data = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
+    let json: EnsembleConfigJson = serde_json::from_str(&data).ok()?;
+    json.default_severity_level
 }
 
 #[derive(Debug, serde::Deserialize)]

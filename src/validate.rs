@@ -70,6 +70,27 @@ pub fn run(config: &ScanConfig) -> Result<()> {
 
     let (passed, total, warnings) = evaluate(results, thresholds)?;
 
+    // The corpus pass above sets this if any extraction saw feature-layout drift
+    // (total_features > cursor: feature_names slots no writer fills, extracting
+    // to zero). Fail before reporting ok — a drifted bundle must not deploy.
+    if ctx.had_layout_drift() {
+        anyhow::bail!(
+            "feature-layout drift: the spec declares more features than the extractor \
+             writes, so some feature_names slots extract to zero (see WARN above); \
+             resync features.rs layout constants with collimator before deploying"
+        );
+    }
+
+    // Every target is a known-benign file (platform utilities + cleave's
+    // does-nothing corpus), so any non-benign grade is a false positive — a
+    // quality regression that must block the deploy, not merely print a warning.
+    if warnings > 0 {
+        anyhow::bail!(
+            "{warnings} benign-corpus sample(s) graded non-benign (false positives); \
+             see the WARN lines above"
+        );
+    }
+
     let models_ver = crate::models_repo::version()
         .map(|v| format!("  models: {v}"))
         .unwrap_or_default();
