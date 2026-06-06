@@ -494,7 +494,7 @@ fn validate_and_load_resources(
         false,
     )?
     .with_level(level);
-    crate::validate::run(&validate_config)?;
+    crate::validate::run(&validate_config, false)?;
     load_model_resources(model_dir, thresholds, level)
 }
 

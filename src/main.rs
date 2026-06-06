@@ -202,7 +202,13 @@ enum Commands {
     },
 
     /// Validate cleave traits, load the model, and ensure benign samples stay benign
-    Validate,
+    Validate {
+        /// Skip cleave trait-corpus validation; validate the model only
+        /// (feature-layout + benign-corpus inference). Traits are versioned
+        /// separately from the deployed model.
+        #[arg(long)]
+        skip_traits: bool,
+    },
 
     /// Run as an HTTP classification server
     Serve {
@@ -553,7 +559,7 @@ fn main() -> Result<()> {
         command,
         Commands::Scan { .. }
             | Commands::Ps
-            | Commands::Validate
+            | Commands::Validate { .. }
             | Commands::Serve { .. }
             | Commands::Worker { .. }
     ) {
@@ -766,7 +772,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Validate => {
+        Commands::Validate { skip_traits } => {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
@@ -779,7 +785,7 @@ fn main() -> Result<()> {
                 cli.extra,
             )?
             .with_level(envelope_level);
-            litmus::validate::run(&config)?;
+            litmus::validate::run(&config, skip_traits)?;
         }
         Commands::Worker {
             url,
@@ -859,7 +865,7 @@ fn main() -> Result<()> {
                     cli.extra,
                 )?
                 .with_level(envelope_level);
-                if let Err(e) = litmus::validate::run(&validate_config) {
+                if let Err(e) = litmus::validate::run(&validate_config, false) {
                     eprintln!("Worker startup validation failed: {e:#}");
                     process::exit(1);
                 }

@@ -13,12 +13,22 @@ use crate::scan::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 ///
 /// The analyzed corpus mirrors `cleave validate`: common platform utilities plus
 /// every file in the cleave traits `testdata/does-nothing` tree.
-pub fn run(config: &ScanConfig) -> Result<()> {
+///
+/// When `skip_traits` is set, the cleave trait-corpus validation is skipped and
+/// only the model is validated (feature-layout + benign-corpus inference). Use
+/// it to validate a model bundle independently of trait-corpus churn — the trait
+/// definitions are versioned separately from the deployed model.
+pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     let targets = collect_targets()?;
 
-    let cleave_output = cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None)
-        .context("cleave validate")?;
-    print!("{cleave_output}");
+    if skip_traits {
+        println!("(skipping cleave trait-corpus validation: --skip-traits; validating model only)");
+    } else {
+        let cleave_output =
+            cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None)
+                .context("cleave validate")?;
+        print!("{cleave_output}");
+    }
 
     // Keep model validation aligned with `cleave validate`: no YARA/radare2/UPX,
     // one mapper shared by all target analyses, and the same benign corpus.
