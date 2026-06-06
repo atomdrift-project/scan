@@ -234,6 +234,7 @@ worker-benchmark: release ## Benchmark the worker model over a local dataset via
 	echo "hopper: port=$$port jobs=$$jobs"; \
 	tflag=$$( [ "$$(uname -s)" = "Darwin" ] && echo -l || echo -v ); \
 	CLEAVE_SKIP_CACHE=1 LITMUS_HEARTBEAT_SECS=$(HEARTBEAT_SECS) \
+	$(if $(GRID),LITMUS_PER_SLOT_POOLS=1,) \
 	/usr/bin/time $$tflag ./out/$(BINARY) --verbose worker \
 		--url "http://127.0.0.1:$$port" \
 		--data-dir "$(WORKER_BENCH_PATH)" \

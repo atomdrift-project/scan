@@ -646,6 +646,50 @@ fn spawn_resource_renewal_task(
 // rayon threads stay capped at the pool size (not `slots × per-slot-threads`),
 // which in turn caps cleave's per-thread YARA scanners.
 
+/// Benchmark-only A/B switch. When `LITMUS_PER_SLOT_POOLS` is set, analyses run
+/// on a grid of `slots` isolated rayon pools (the pre-Phase-2 model) instead of
+/// the shared global pool, so both thread models can be measured on one binary
+/// against the same dataset. Default (`None`) is the shared-pool model — this
+/// exists only to quantify the change, not as a supported runtime mode.
+static LEGACY_PER_SLOT_GRID: OnceLock<Option<Vec<Arc<rayon::ThreadPool>>>> = OnceLock::new();
+
+/// Initialise the A/B grid once, from `run`. Builds `slots` pools of
+/// `max(global_threads / slots, 4)` threads (the old `threads_per_slot` floor)
+/// only when `LITMUS_PER_SLOT_POOLS` is set; otherwise records `None`.
+#[allow(clippy::expect_used)]
+fn init_legacy_grid(slots: usize, global_threads: usize) -> bool {
+    let grid = std::env::var_os("LITMUS_PER_SLOT_POOLS").map(|_| {
+        let per = (global_threads / slots.max(1)).max(4);
+        (0..slots.max(1))
+            .map(|i| {
+                Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(per)
+                        .thread_name(move |j| format!("cleave-{i}-{j}"))
+                        .stack_size(64 * 1024 * 1024)
+                        .build()
+                        .expect("build legacy A/B per-slot pool"),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let active = grid.is_some();
+    let _ = LEGACY_PER_SLOT_GRID.set(grid);
+    active
+}
+
+/// Run `body` on a legacy per-slot pool when the A/B grid is active (selecting a
+/// pool round-robin by `idx`), else directly on the shared global pool.
+fn run_analysis<T: Send>(idx: u64, body: impl FnOnce() -> T + Send) -> T {
+    match LEGACY_PER_SLOT_GRID.get().and_then(Option::as_ref) {
+        Some(grid) if !grid.is_empty() => {
+            let i = (idx % grid.len() as u64) as usize;
+            grid[i].install(body)
+        }
+        _ => body(),
+    }
+}
+
 #[derive(Deserialize)]
 struct ClaimResponse {
     jobs: Vec<ClaimJob>,
@@ -980,12 +1024,22 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // no per-slot grid, no `slots × threads_per_slot` multiplication. This is
     // the headline number that caps cleave's per-thread YARA scanners.
     let global_rayon_threads = rayon::current_num_threads();
-    tracing::info!(
-        slots,
-        rayon_threads = global_rayon_threads,
-        "worker concurrency: up to {slots} analyses share one shared \
-         {global_rayon_threads}-thread rayon pool (no per-slot pools)",
-    );
+    if init_legacy_grid(slots, global_rayon_threads) {
+        let per = (global_rayon_threads / slots.max(1)).max(4);
+        tracing::warn!(
+            slots,
+            threads_per_slot = per,
+            total_worker_threads = slots.saturating_mul(per),
+            "LITMUS_PER_SLOT_POOLS A/B: legacy per-slot grid active (pre-Phase-2 model)",
+        );
+    } else {
+        tracing::info!(
+            slots,
+            rayon_threads = global_rayon_threads,
+            "worker concurrency: up to {slots} analyses share one shared \
+             {global_rayon_threads}-thread rayon pool (no per-slot pools)",
+        );
+    }
 
     tracing::info!(
         name = %name,
@@ -1797,11 +1851,12 @@ async fn run_job(
         "analysis starting",
     );
     let handle = tokio::task::spawn_blocking(move || {
-        // Runs on a tokio blocking thread; cleave's `par_iter` fan-out
-        // work-steals across the one shared global rayon pool (no per-slot
-        // pool). Lifecycle logs report `thread_id` — the blocking thread an
-        // operator samples to find a wedged analysis; the CPU work itself runs
-        // on the shared `rayon-N` pool threads.
+        // Runs on a tokio blocking thread; `run_analysis` dispatches cleave's
+        // `par_iter` fan-out onto the shared global rayon pool (default) or, when
+        // the A/B grid is active, this analysis's per-slot pool. Lifecycle logs
+        // report `thread_id` — the blocking thread an operator samples to find a
+        // wedged analysis; the CPU work runs on the rayon pool threads.
+        run_analysis(analysis_id, || {
         let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let thread_id = os_thread_id();
         let inflight_blocking =
@@ -1855,6 +1910,7 @@ async fn run_job(
             "analysis complete on worker thread",
         );
         result
+        })
     });
 
     let result = handle.await;
