@@ -14,21 +14,41 @@ use crate::scan::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 /// The analyzed corpus mirrors `cleave validate`: common platform utilities plus
 /// every file in the cleave traits `testdata/does-nothing` tree.
 ///
-/// When `skip_traits` is set, the cleave trait-corpus validation is skipped and
-/// only the model is validated (feature-layout + benign-corpus inference). Use
-/// it to validate a model bundle independently of trait-corpus churn — the trait
-/// definitions are versioned separately from the deployed model.
+/// When `skip_traits` is set, both the explicit cleave trait validation AND the
+/// benign-corpus inference are skipped — the latter necessarily, because it loads
+/// the trait corpus to extract features. Only the trait-independent model check
+/// (feature-layout) runs. Use it to validate a model bundle independently of
+/// trait-corpus churn; traits are versioned separately from the deployed model.
 pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
-    let targets = collect_targets()?;
+    // Feature-layout validation is trait-independent: load the model and reject a
+    // structurally incompatible bundle deterministically, before any trait corpus
+    // is touched or any file is analyzed. The benign corpus below can't be relied
+    // on to exercise every offset-written family (the unsigned-bigram overflow
+    // only triggers on packed/unsigned samples), so anchor-failure must fail here.
+    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
+    let thresholds = model.thresholds();
+    let ctx = ExtractContext::new(model.spec());
+    ctx.validate_layout()
+        .context("feature layout validation")?;
 
     if skip_traits {
-        println!("(skipping cleave trait-corpus validation: --skip-traits; validating model only)");
-    } else {
-        let cleave_output =
-            cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None)
-                .context("cleave validate")?;
-        print!("{cleave_output}");
+        // The benign-corpus inference below requires loading the cleave trait
+        // corpus (the CapabilityMapper extracts features through it), which would
+        // re-run trait validation. --skip-traits validates the model structurally
+        // (feature layout) and skips the trait-dependent benign-corpus pass —
+        // traits are versioned separately from the deployed model.
+        eprintln!(
+            "validate ok (--skip-traits): model feature layout valid; \
+             benign-corpus inference skipped (it requires the cleave trait corpus)"
+        );
+        return Ok(());
     }
+
+    let targets = collect_targets()?;
+
+    let cleave_output = cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None)
+        .context("cleave validate")?;
+    print!("{cleave_output}");
 
     // Keep model validation aligned with `cleave validate`: no YARA/radare2/UPX,
     // one mapper shared by all target analyses, and the same benign corpus.
@@ -46,17 +66,6 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
         true,
         false,
     )?);
-
-    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
-    let thresholds = model.thresholds();
-    let ctx = ExtractContext::new(model.spec());
-
-    // Reject a structurally incompatible bundle deterministically, before any
-    // file is analyzed. The benign corpus below can't be relied on to exercise
-    // every offset-written family (the unsigned-bigram overflow only triggers
-    // on packed/unsigned samples), so anchor-failure must fail validation here.
-    ctx.validate_layout()
-        .context("feature layout validation")?;
 
     let results: Vec<(PathBuf, Result<ClassifiedReport>)> = targets
         .into_par_iter()
