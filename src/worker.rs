@@ -9,7 +9,7 @@ use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -452,6 +452,11 @@ pub struct WorkerConfig {
     pub slow_rule_ms: u64,
     /// Exit after this many jobs have been analyzed (None = run forever).
     pub max_jobs: Option<u64>,
+    /// Exit cleanly once the hopper reports no further work and the prefetch
+    /// queue has drained (for benchmarks / batch runs over a finite dataset).
+    /// Unlike `max_jobs`, this does not depend on knowing the job count and
+    /// cannot wedge the dispatch loop on a blocked claim.
+    pub exit_if_empty: bool,
     /// FPR severity level (0..=10000) that produced the thresholds, or `None` when
     /// manual thresholds were supplied. Folded into `ml.l` in the envelope.
     pub level: Option<u16>,
@@ -633,79 +638,13 @@ fn spawn_resource_renewal_task(
     });
 }
 
-/// A fixed grid of dedicated rayon thread pools — one per worker slot.
-///
-/// With N concurrent analyses competing for a single rayon pool the work-
-/// stealing scheduler piles joins from unrelated analyses onto the same
-/// thread; each thread ends up holding a deep stack of half-completed jobs
-/// from every other caller and effective parallelism collapses. Giving each
-/// worker slot its own isolated pool eliminates that cross-contamination:
-/// an analysis's `par_iter` fan-out only ever touches its own pool.
-///
-/// The tokio semaphore already guarantees at most `slots` concurrent
-/// analyses, so the free-list can never be starved in practice. The
-/// condvar is kept as a cheap safety net.
-pub(crate) struct WorkerPools {
-    free: Mutex<Vec<(usize, Arc<rayon::ThreadPool>)>>,
-    available: Condvar,
-}
-
-impl WorkerPools {
-    /// Build `slots` pools, each sized `threads_per_slot`.
-    ///
-    /// Panics if rayon pool construction fails (OOM at startup).
-    #[allow(clippy::expect_used)]
-    pub(crate) fn new(slots: usize, threads_per_slot: usize) -> Arc<Self> {
-        let slots = slots.max(1);
-        let threads_per_slot = threads_per_slot.max(1);
-        let free: Vec<(usize, Arc<rayon::ThreadPool>)> = (0..slots)
-            .map(|i| {
-                let p = rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads_per_slot)
-                    .thread_name(move |j| format!("cleave-{i}-{j}"))
-                    .stack_size(64 * 1024 * 1024)
-                    .build()
-                    .expect("build cleave worker pool");
-                (i, Arc::new(p))
-            })
-            .collect();
-        Arc::new(Self {
-            free: Mutex::new(free),
-            available: Condvar::new(),
-        })
-    }
-
-    /// Run `f` on a pool from the free-list, passing the slot index so callers
-    /// can correlate logs with the `cleave-N-M` rayon thread names visible in
-    /// stack samples.
-    ///
-    /// Panics if the pool mutex is poisoned (another worker panicked while
-    /// holding the lock) — in that case the process state is unrecoverable.
-    #[allow(clippy::expect_used)]
-    pub(crate) fn install<T, F>(&self, f: F) -> T
-    where
-        F: FnOnce(usize) -> T + Send,
-        T: Send,
-    {
-        let (slot, pool) = {
-            let mut g = self.free.lock().expect("worker pool mutex poisoned");
-            while g.is_empty() {
-                g = self
-                    .available
-                    .wait(g)
-                    .expect("worker pool condvar poisoned");
-            }
-            g.pop().expect("non-empty checked above")
-        };
-        let result = pool.install(|| f(slot));
-        self.free
-            .lock()
-            .expect("worker pool mutex poisoned")
-            .push((slot, pool));
-        self.available.notify_one();
-        result
-    }
-}
+// Phase 2 (WORKER_POOL_PLAN.md): litmus no longer manages rayon. There is no
+// per-slot pool grid — analyses run on the one process-global rayon pool that
+// main installs (sized to the host's cores, 64 MB stacks). The tokio semaphore
+// alone bounds concurrency; cleave's `par_iter` fan-out work-steals across the
+// shared pool, so a single large archive can use the whole machine while total
+// rayon threads stay capped at the pool size (not `slots × per-slot-threads`),
+// which in turn caps cleave's per-thread YARA scanners.
 
 #[derive(Deserialize)]
 struct ClaimResponse {
@@ -1035,27 +974,24 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(Arc::clone(&shutdown));
 
-    // Each slot's rayon pool must have enough threads to absorb cleave's
-    // nested archive `par_iter` without starvation. With only 2 threads,
-    // recursive tar→tar→member analysis commits both workers to depth-first
-    // joins and the outer join has no thread left to reap — a true deadlock
-    // that work-stealing cannot escape. 4 threads gives enough headroom for
-    // the nested-join chain to always have a stealable worker.
-    //
-    // This trades some throughput (pools × 4 can exceed `num_cpus`) for
-    // deadlock safety. The alternative — flattening cleave's archive
-    // recursion to a single top-level par_iter — is the durable fix but
-    // lives upstream.
-    const MIN_THREADS_PER_SLOT: usize = 4;
-    let threads_per_slot = (rayon::current_num_threads() / slots.max(1)).max(MIN_THREADS_PER_SLOT);
-    let pools = WorkerPools::new(slots, threads_per_slot);
+    // Phase 2 thread model: `slots` (the tokio semaphore) bounds how many
+    // analyses run concurrently; the one process-global rayon pool provides the
+    // parallelism. Total rayon threads = the pool size, independent of slots —
+    // no per-slot grid, no `slots × threads_per_slot` multiplication. This is
+    // the headline number that caps cleave's per-thread YARA scanners.
+    let global_rayon_threads = rayon::current_num_threads();
+    tracing::info!(
+        slots,
+        rayon_threads = global_rayon_threads,
+        "worker concurrency: up to {slots} analyses share one shared \
+         {global_rayon_threads}-thread rayon pool (no per-slot pools)",
+    );
 
     tracing::info!(
         name = %name,
         slots = slots,
-        threads_per_slot = threads_per_slot.max(1),
         hopper = %config.hopper_url,
-        global_rayon_threads = rayon::current_num_threads(),
+        global_rayon_threads,
         pid = std::process::id(),
         "worker starting; send `kill -USR1 <pid>` for an all-thread backtrace",
     );
@@ -1099,6 +1035,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let slow_rule_ms = config.slow_rule_ms;
     let max_jobs = config.max_jobs;
     let max_rss_gb = config.max_rss_gb;
+    let exit_if_empty = config.exit_if_empty;
     let encoded_name: String = url_encode(&name);
     let available_tools = crate::tools::available_names().join(",");
     let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1139,6 +1076,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             poll_secs,
             target_depth,
             metrics: Arc::clone(&metrics),
+            exit_if_empty,
         }
         .run(
             tx,
@@ -1156,9 +1094,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let outstanding = Arc::clone(&outstanding);
         let queued_bytes = Arc::clone(&queued_bytes);
         let shutdown = Arc::clone(&shutdown);
+        // Default 60 s; `LITMUS_HEARTBEAT_SECS` lowers it (min 1 s) so a short
+        // benchmark run still emits a usable rss / active-slot time series.
+        let heartbeat = Duration::from_secs(
+            std::env::var("LITMUS_HEARTBEAT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map_or(60, |s| s.max(1)),
+        );
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
-                interruptible_sleep(Duration::from_secs(60), &shutdown).await;
+                interruptible_sleep(heartbeat, &shutdown).await;
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
@@ -1310,7 +1256,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let local_index = local_index.clone();
         let completed = Arc::clone(&completed);
         let metrics = Arc::clone(&metrics);
-        let pools = Arc::clone(&pools);
 
         tokio::spawn(async move {
             let result = run_job(
@@ -1321,7 +1266,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 &resources,
                 slow_rule_ms,
                 pj.data,
-                &pools,
             )
             .await;
             // The archive and its expanded members are freed when `run_job`
@@ -1349,21 +1293,33 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         });
     }
 
-    // Drain any in-flight work before exiting, but cap the wait so a stuck
-    // cleave unpack can't indefinitely block shutdown. Jobs that haven't
-    // finished by the timeout are still alive on the tokio blocking pool;
-    // they'll complete (or be killed with the process) at shutdown time.
+    // Drain any in-flight work before exiting. Each analysis releases its slot
+    // permit only after posting its result, so acquiring every permit means all
+    // results have reached hopper.
+    //
+    // On a graceful (SIGTERM) shutdown the wait is capped so a stuck cleave
+    // unpack can't block shutdown indefinitely — hopper re-leases anything left
+    // running. But `--exit-if-empty` is batch mode: the operator asked to
+    // process a finite dataset to completion, so we wait unbounded — a 60 s cap
+    // would silently drop the result of any analysis slower than the drain
+    // window (e.g. a large archive), which on a finite run is a lost finding,
+    // not a re-lease.
     let slot_count = u32::try_from(slots).unwrap_or(u32::MAX);
     let drain = semaphore.acquire_many(slot_count);
-    match tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_SECS), drain).await {
-        Ok(_) => tracing::info!("all in-flight jobs finished, exiting"),
-        Err(_) => {
-            let still_running = slots.saturating_sub(semaphore.available_permits());
-            tracing::warn!(
-                still_running,
-                drain_secs = SHUTDOWN_DRAIN_SECS,
-                "drain timeout reached, exiting with in-flight analyses still running",
-            );
+    if exit_if_empty {
+        let _ = drain.await;
+        tracing::info!("all in-flight jobs finished (batch drain), exiting");
+    } else {
+        match tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_SECS), drain).await {
+            Ok(_) => tracing::info!("all in-flight jobs finished, exiting"),
+            Err(_) => {
+                let still_running = slots.saturating_sub(semaphore.available_permits());
+                tracing::warn!(
+                    still_running,
+                    drain_secs = SHUTDOWN_DRAIN_SECS,
+                    "drain timeout reached, exiting with in-flight analyses still running",
+                );
+            }
         }
     }
     Ok(())
@@ -1397,6 +1353,9 @@ struct Prefetcher {
     target_depth: usize,
     /// Shared metrics; the prefetcher stamps each sample's local-queue entry.
     metrics: Arc<WorkerMetrics>,
+    /// Stop (closing the dispatch channel) when the hopper reports no work and
+    /// the queue has drained — drives clean batch/benchmark termination.
+    exit_if_empty: bool,
 }
 
 impl Prefetcher {
@@ -1464,6 +1423,18 @@ impl Prefetcher {
             match claim_jobs(&self.client, &url).await {
                 Ok(None) => {
                     consecutive_errors = 0;
+                    // Batch/benchmark mode: once the hopper has no work AND the
+                    // dispatch channel is drained (every claimed job picked up),
+                    // stop. Returning drops `tx`, so the dispatch loop's
+                    // `rx.recv()` yields `None` and runs its normal drain — which
+                    // waits for any still-in-flight analyses — instead of
+                    // blocking forever on a claim that will never arrive.
+                    if self.exit_if_empty && outstanding.load(Ordering::Acquire) == 0 {
+                        tracing::info!(
+                            "hopper drained and queue empty; --exit-if-empty stopping prefetch",
+                        );
+                        return;
+                    }
                     interruptible_sleep(Duration::from_secs(self.poll_secs), &shutdown).await;
                 }
                 Ok(Some(jobs)) => {
@@ -1607,7 +1578,6 @@ async fn run_job(
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
     prefetched: std::result::Result<Option<Vec<u8>>, PrefetchError>,
-    pools: &Arc<WorkerPools>,
 ) -> Result<(crate::scan::MlSection, serde_json::Value, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     // `Arc<str>` so the watcher and the blocking closure share the basename
@@ -1826,72 +1796,65 @@ async fn run_job(
         size = input_size,
         "analysis starting",
     );
-    let pools_for_blocking = Arc::clone(pools);
     let handle = tokio::task::spawn_blocking(move || {
-        // Run the whole analysis inside this slot's dedicated rayon pool so
-        // any `par_iter` fan-out stays local to this analysis and can't pile
-        // joins onto sibling workers' stacks. Lifecycle logs are emitted from
-        // INSIDE the install closure so the `thread_id` they report is the
-        // rayon worker (cleave-N-M), the thread an operator should sample to
-        // diagnose a wedged analysis. Sampling the outer tokio blocking
-        // thread would just show it parked in a rayon `LockLatch`.
-        pools_for_blocking.install(|slot| {
-            let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-            let thread_id = os_thread_id();
-            let inflight_blocking =
-                started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
-            tracing::info!(
-                analysis_id,
-                sha256 = %sha_short2,
-                file = %label_for_blocking,
-                slot,
-                thread_id,
-                inflight_blocking,
-                started_total = started,
-                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-                "analysis starting on rayon slot",
-            );
-            let result = if let Some(data) = downloaded {
-                classify_bytes(
-                    data,
-                    &label_for_blocking,
-                    &resources,
-                    slow_rule_ms,
-                    Some(&cancel2),
-                    Some(&phase),
-                )
-            } else if let Some(path) = local.as_ref() {
-                classify_file(
-                    path,
-                    &label_for_blocking,
-                    &resources,
-                    slow_rule_ms,
-                    None,
-                    Some(&cancel2),
-                    Some(&phase),
-                )
-            } else {
-                Err(anyhow::anyhow!(
-                    "no downloaded bytes and no local path for {label_for_blocking}"
-                ))
-            };
-            let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-            let inflight_blocking = BLOCKING_STARTED_TOTAL
-                .load(Ordering::Relaxed)
-                .saturating_sub(finished);
-            tracing::debug!(
-                analysis_id,
-                sha256 = %sha_short2,
-                slot,
-                thread_id,
-                inflight_blocking,
-                finished_total = finished,
-                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-                elapsed_ms = crate::duration_ms(start.elapsed()),
-                "analysis complete on rayon slot",
-            );
-            result
-        })
+        // Runs on a tokio blocking thread; cleave's `par_iter` fan-out
+        // work-steals across the one shared global rayon pool (no per-slot
+        // pool). Lifecycle logs report `thread_id` — the blocking thread an
+        // operator samples to find a wedged analysis; the CPU work itself runs
+        // on the shared `rayon-N` pool threads.
+        let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let thread_id = os_thread_id();
+        let inflight_blocking =
+            started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
+        tracing::info!(
+            analysis_id,
+            sha256 = %sha_short2,
+            file = %label_for_blocking,
+            thread_id,
+            inflight_blocking,
+            started_total = started,
+            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+            "analysis starting on worker thread",
+        );
+        let result = if let Some(data) = downloaded {
+            classify_bytes(
+                data,
+                &label_for_blocking,
+                &resources,
+                slow_rule_ms,
+                Some(&cancel2),
+                Some(&phase),
+            )
+        } else if let Some(path) = local.as_ref() {
+            classify_file(
+                path,
+                &label_for_blocking,
+                &resources,
+                slow_rule_ms,
+                None,
+                Some(&cancel2),
+                Some(&phase),
+            )
+        } else {
+            Err(anyhow::anyhow!(
+                "no downloaded bytes and no local path for {label_for_blocking}"
+            ))
+        };
+        let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let inflight_blocking = BLOCKING_STARTED_TOTAL
+            .load(Ordering::Relaxed)
+            .saturating_sub(finished);
+        tracing::debug!(
+            analysis_id,
+            sha256 = %sha_short2,
+            thread_id,
+            inflight_blocking,
+            finished_total = finished,
+            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+            elapsed_ms = crate::duration_ms(start.elapsed()),
+            "analysis complete on worker thread",
+        );
+        result
     });
 
     let result = handle.await;
@@ -2604,6 +2567,7 @@ mod tests {
                 poll_secs: 1,
                 target_depth,
                 metrics: Arc::new(WorkerMetrics::new()),
+                exit_if_empty: false,
             }
             .run(
                 tx,

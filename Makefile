@@ -25,7 +25,7 @@ WORKERS  ?=
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -206,6 +206,48 @@ worker: release
 	./out/$(BINARY) worker --url "$(URL)" \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		$(if $(NICE),--nice $(NICE),)
+
+# Self-contained worker benchmark: start the bundled mock hopper on a local
+# dataset, point a real worker at it, and measure the worker's wall + maxrss.
+# The litmus analogue of cleave's `make benchmark DATASET=...`. Override the
+# dataset and slot count, e.g.:
+#   make worker-benchmark WORKER_BENCH_DATASET=realworld-small WORKERS=12
+WORKER_BENCH_DATASET ?= $(DATASET)
+WORKER_BENCH_PATH    ?= $(BENCHMARK_ROOT)/$(WORKER_BENCH_DATASET)
+HEARTBEAT_SECS       ?= 5
+worker-benchmark: release ## Benchmark the worker model over a local dataset via the bundled mock hopper
+	@[ -e "$(WORKER_BENCH_PATH)" ] || { echo "error: dataset not found: $(WORKER_BENCH_PATH)"; exit 1; }
+	@echo "worker-benchmark: dataset=$(WORKER_BENCH_PATH) workers=$(if $(WORKERS),$(WORKERS),default)"
+	@out=$$(mktemp); results=/tmp/litmus-worker-results.jsonl; rm -f $$results; \
+	./target/release/litmus-bench-hopper --dataset "$(WORKER_BENCH_PATH)" --port 0 --dump $$results \
+		>$$out 2>/tmp/litmus-bench-hopper.err & \
+	hp=$$!; \
+	trap 'kill $$hp 2>/dev/null' EXIT INT TERM; \
+	port=; jobs=; \
+	for i in $$(seq 1 100); do \
+		port=$$(sed -n 's/^PORT=//p' $$out); \
+		jobs=$$(sed -n 's/^JOBS=//p' $$out); \
+		[ -n "$$port" ] && [ -n "$$jobs" ] && break; \
+		sleep 0.1; \
+	done; \
+	[ -n "$$port" ] || { echo "error: mock hopper did not start"; cat $$out; exit 1; }; \
+	echo "hopper: port=$$port jobs=$$jobs"; \
+	tflag=$$( [ "$$(uname -s)" = "Darwin" ] && echo -l || echo -v ); \
+	CLEAVE_SKIP_CACHE=1 LITMUS_HEARTBEAT_SECS=$(HEARTBEAT_SECS) \
+	/usr/bin/time $$tflag ./out/$(BINARY) --verbose worker \
+		--url "http://127.0.0.1:$$port" \
+		--data-dir "$(WORKER_BENCH_PATH)" \
+		--exit-if-empty --nice 0 --no-update --no-validate \
+		$(if $(WORKERS),--workers $(WORKERS),) \
+		2>&1 | tee /tmp/litmus-worker-benchmark.log; \
+	sleep 0.5; \
+	received=$$(sort -u $$results 2>/dev/null | grep -c .); \
+	echo "✓ log: /tmp/litmus-worker-benchmark.log"; \
+	echo "--- thread budget (from log) ---"; \
+	grep -E "thread budget|oversubscribes|rayon pool ready" /tmp/litmus-worker-benchmark.log | head; \
+	echo "--- completeness (SERVER-side): hopper received $$received / $$jobs results ---"; \
+	[ "$$received" = "$$jobs" ] && echo "✓ COMPLETE: all $$jobs results reached the hopper" \
+		|| echo "❌ INCOMPLETE: $$received/$$jobs — worker dropped results (see /tmp/litmus-bench-hopper.err)"
 
 profile-worker:
 	$(CARGO) build --profile profiling

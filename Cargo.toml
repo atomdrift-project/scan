@@ -152,6 +152,11 @@ path = "src/lib.rs"
 name = "litmus"
 path = "src/main.rs"
 
+# Mock hopper for self-contained worker benchmarks (see `make worker-benchmark`).
+[[bin]]
+name = "litmus-bench-hopper"
+path = "src/bin/bench_hopper.rs"
+
 # FreeBSD/aarch64 support for wasmtime's signal trap handler, pulled in
 # transitively via yara-x (cleave -> yara-x -> wasmtime 43.0.2). Upstream
 # 43.0.2 lacks the freebsd/aarch64 arm in store_handler_in_ucontext, so the

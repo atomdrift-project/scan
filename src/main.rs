@@ -296,6 +296,26 @@ enum Commands {
         /// processes can only raise the nice value.
         #[arg(long, default_value = "18", allow_hyphen_values = true)]
         nice: i32,
+
+        /// Skip the startup model/traits refresh (git pull), running against
+        /// whatever rules are already on disk. Use when the local traits/models
+        /// are intentionally ahead of (or diverged from) the remote, e.g. local
+        /// edits that would block the pull.
+        #[arg(long)]
+        no_update: bool,
+
+        /// Skip the strict startup trait-validation gate. Use for benchmarking
+        /// or dev runs against locally-edited (possibly not-yet-valid) traits;
+        /// the analysis path tolerates lint-level issues the pre-flight rejects.
+        #[arg(long)]
+        no_validate: bool,
+
+        /// Exit cleanly once the hopper reports no further work and the prefetch
+        /// queue drains. For benchmarks / batch runs over a finite dataset;
+        /// unlike `--max-jobs` it needs no job count and can't wedge on a
+        /// blocked claim.
+        #[arg(long)]
+        exit_if_empty: bool,
     },
 
     /// Print version information
@@ -756,6 +776,9 @@ fn main() -> Result<()> {
             max_jobs,
             traits_dir,
             nice,
+            no_update,
+            no_validate,
+            exit_if_empty,
         } => {
             if let Some(p) = traits_dir.as_ref() {
                 cleave::traits_repo::set_override_dir(Some(p.into()));
@@ -785,32 +808,45 @@ fn main() -> Result<()> {
             // Refresh models and traits at startup so long-lived workers pick up
             // new rules on each restart. Failures are non-fatal — a worker in a
             // disconnected environment must still start with whatever is on disk.
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    if let Err(e) = litmus::models_repo::update(false) {
-                        eprintln!("Warning: model update failed: {e}");
-                    }
+            // `--no-update` skips the refresh; `--no-validate` skips the strict
+            // pre-flight (benchmark / local-dev against on-disk rules as-is).
+            if no_update {
+                tracing::warn!("--no-update: skipping startup model/traits refresh");
+            } else {
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        if let Err(e) = litmus::models_repo::update(false) {
+                            eprintln!("Warning: model update failed: {e}");
+                        }
+                    });
+                    s.spawn(|| {
+                        if let Err(e) = litmus::traits_repo::update(false, false) {
+                            eprintln!("Warning: traits update failed: {e}");
+                        }
+                    });
                 });
-                s.spawn(|| {
-                    if let Err(e) = litmus::traits_repo::update(false, false) {
-                        eprintln!("Warning: traits update failed: {e}");
-                    }
-                });
-            });
+            }
             let model_dir = resolve_model_dir()?;
             let thresholds = threshold_overrides();
-            let validate_config = litmus::ScanConfig::new(
-                model_dir.clone(),
-                litmus::OutputFormat::Terminal,
-                thresholds,
-                DisplayFilter::alerts_only(),
-                cli.slow_rule_ms,
-                cli.extra,
-            )?
-            .with_level(envelope_level);
-            if let Err(e) = litmus::validate::run(&validate_config) {
-                eprintln!("Worker startup validation failed: {e:#}");
-                process::exit(1);
+            if no_validate {
+                tracing::warn!(
+                    "--no-validate: skipping the trait-validation gate; running \
+                     against on-disk rules as-is",
+                );
+            } else {
+                let validate_config = litmus::ScanConfig::new(
+                    model_dir.clone(),
+                    litmus::OutputFormat::Terminal,
+                    thresholds,
+                    DisplayFilter::alerts_only(),
+                    cli.slow_rule_ms,
+                    cli.extra,
+                )?
+                .with_level(envelope_level);
+                if let Err(e) = litmus::validate::run(&validate_config) {
+                    eprintln!("Worker startup validation failed: {e:#}");
+                    process::exit(1);
+                }
             }
             log_max_rss_resolution(
                 "worker",
@@ -830,6 +866,7 @@ fn main() -> Result<()> {
                 slow_rule_ms: cli.slow_rule_ms,
                 level: envelope_level,
                 nice,
+                exit_if_empty,
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
