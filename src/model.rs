@@ -459,9 +459,15 @@ pub struct RouteScore {
     /// Compact model route name, e.g. `az`, `az/native`, `az/elf`.
     #[serde(rename = "m")]
     pub model: String,
-    /// Probability emitted by this route's model.
+    /// Probability emitted by this route's model. This is the calibrated value
+    /// (the space thresholds live in) and drives the verdict.
     #[serde(rename = "prob")]
     pub probability: f32,
+    /// Raw (pre-isotonic) model probability. The calibrated `probability`
+    /// saturates the upper tail to 1.0, so the raw score is what's surfaced to
+    /// humans for triage — it preserves resolution the calibrated number loses.
+    #[serde(rename = "raw")]
+    pub raw: f32,
     /// Classification after applying this route's calibrated thresholds.
     #[serde(rename = "class")]
     pub classification: Classification,
@@ -2057,11 +2063,20 @@ impl Route {
     /// this route output for this file" — used by every code path that
     /// previously called `backend.predict` directly.
     fn predict_calibrated(&self, features: &[f32]) -> Result<f32> {
+        Ok(self.predict_raw_calibrated(features)?.1)
+    }
+
+    /// Score a feature vector and return `(raw, calibrated)`. The raw value is
+    /// the backend's pre-isotonic probability; the calibrated value is what
+    /// every decision path consumes. Used where both are wanted (route-score
+    /// diagnostics that display raw while the verdict uses calibrated).
+    fn predict_raw_calibrated(&self, features: &[f32]) -> Result<(f32, f32)> {
         let raw = self.backend.predict(features)?;
-        Ok(match &self.calibrator {
+        let calibrated = match &self.calibrator {
             Some(cal) => cal.apply(raw),
             None => raw,
-        })
+        };
+        Ok((raw, calibrated))
     }
 }
 
@@ -2347,11 +2362,17 @@ impl Model {
     /// Single source of truth for the general path's calibrated output —
     /// every previous direct `self.inner.predict` call now goes through here.
     fn predict_general_calibrated(&self, features: &[f32]) -> Result<f32> {
+        Ok(self.predict_general_raw_calibrated(features)?.1)
+    }
+
+    /// General route `(raw, calibrated)`. See [`Route::predict_raw_calibrated`].
+    fn predict_general_raw_calibrated(&self, features: &[f32]) -> Result<(f32, f32)> {
         let raw = self.inner.predict(features)?;
-        Ok(match &self.general_calibrator {
+        let calibrated = match &self.general_calibrator {
             Some(cal) => cal.apply(raw),
             None => raw,
-        })
+        };
+        Ok((raw, calibrated))
     }
 }
 
@@ -2676,18 +2697,21 @@ impl Model {
     fn score_route_report(
         route: &Route,
         report: &serde_json::Value,
-    ) -> Result<(f32, Classification)> {
+    ) -> Result<(f32, f32, Classification)> {
         let mut features = route.ctx.extract(report);
         route.spec.standardize(&mut features);
-        let probability = route.predict_calibrated(&features)?;
-        Ok((probability, route.thresholds.classify(probability)))
+        let (raw, probability) = route.predict_raw_calibrated(&features)?;
+        Ok((raw, probability, route.thresholds.classify(probability)))
     }
 
-    fn score_route_file(route: &Route, file: &serde_json::Value) -> Result<(f32, Classification)> {
+    fn score_route_file(
+        route: &Route,
+        file: &serde_json::Value,
+    ) -> Result<(f32, f32, Classification)> {
         let mut features = route.ctx.extract_file(file);
         route.spec.standardize(&mut features);
-        let probability = route.predict_calibrated(&features)?;
-        Ok((probability, route.thresholds.classify(probability)))
+        let (raw, probability) = route.predict_raw_calibrated(&features)?;
+        Ok((raw, probability, route.thresholds.classify(probability)))
     }
 
     /// Routed prediction from a full cleave report.
@@ -2763,10 +2787,11 @@ impl Model {
         mut score: F,
     ) -> Result<(Vec<RouteProbability>, Vec<RouteScore>, Vec<SkippedRoute>)>
     where
-        F: FnMut(&Route) -> Result<(f32, Classification)>,
+        F: FnMut(&Route) -> Result<(f32, f32, Classification)>,
     {
         let policy = self.routes.policies.policy_for(file_type);
-        let general_prob = self.predict_general_calibrated(general_features)?;
+        let (general_raw, general_prob) =
+            self.predict_general_raw_calibrated(general_features)?;
         let general_class = policy.map_or_else(
             || self.thresholds.classify(general_prob),
             |policy| policy_route_class(policy, "general", general_prob),
@@ -2778,6 +2803,7 @@ impl Model {
         let mut scores = vec![RouteScore {
             model: "az".to_string(),
             probability: general_prob,
+            raw: general_raw,
             classification: general_class,
         }];
         let mut skipped = Vec::new();
@@ -2789,13 +2815,14 @@ impl Model {
         if let Some(group_name) = self.routes.filetype_to_filegroup.get(file_type) {
             if let Some(route) = self.routes.filegroups.get(group_name) {
                 let route_name = format!("filegroups/{group_name}");
-                let (prob, class) = score(route)?;
+                let (raw, prob, class) = score(route)?;
                 let class = policy.map_or(class, |policy| {
                     policy_route_class(policy, &route_name, prob)
                 });
                 scores.push(RouteScore {
                     model: format!("az/{group_name}"),
                     probability: prob,
+                    raw,
                     classification: class,
                 });
                 route_probs.push(RouteProbability {
@@ -2812,13 +2839,14 @@ impl Model {
 
         if let Some(route) = self.routes.filetypes.get(file_type) {
             let route_name = format!("filetypes/{file_type}");
-            let (prob, class) = score(route)?;
+            let (raw, prob, class) = score(route)?;
             let class = policy.map_or(class, |policy| {
                 policy_route_class(policy, &route_name, prob)
             });
             scores.push(RouteScore {
                 model: format!("az/{file_type}"),
                 probability: prob,
+                raw,
                 classification: class,
             });
             route_probs.push(RouteProbability {

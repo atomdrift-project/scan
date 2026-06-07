@@ -295,6 +295,25 @@ fn colored_pct(
     fg(accent, &pct)
 }
 
+/// Header severity token: the matched operating-point level (`L0`) when the
+/// file fired, otherwise the rescaled benign percentage. For a fired file the
+/// level is the honest signal — isotonic saturation pins the calibrated
+/// percentage near 100% regardless of the true margin, so it's not shown.
+fn colored_level_or_pct(
+    probability: f32,
+    classification: &Classification,
+    threshold: f32,
+    l: Option<i32>,
+) -> String {
+    match l {
+        Some(n) => {
+            let (_, _, accent) = indicator_colors(probability, classification, threshold);
+            fg(accent, &format!("{:>4}", format!("L{n}")))
+        }
+        None => colored_pct(probability, classification, threshold),
+    }
+}
+
 /// Classification label colored to match the band.
 fn colored_label(classification: &Classification, p: &Palette) -> String {
     match classification {
@@ -316,10 +335,11 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extr
         &result.classification,
         result.threshold,
     );
-    let pct = colored_pct(
+    let pct = colored_level_or_pct(
         result.probability,
         &result.classification,
         result.threshold,
+        result.l,
     );
     let label = colored_label(&result.classification, p);
 
@@ -352,10 +372,11 @@ pub fn print_ps_result(
         &result.classification,
         result.threshold,
     );
-    let pct = colored_pct(
+    let pct = colored_level_or_pct(
         result.probability,
         &result.classification,
         result.threshold,
+        result.l,
     );
 
     // Format PID list.
@@ -394,9 +415,14 @@ pub fn print_ps_result(
 fn print_detail_lines(result: &ScanResult, p: &Palette) {
     let dot = fg(p.dot_sep, "\u{00b7}");
 
-    // Line 2: filetype · formula
+    // Line 2: filetype · L<level> · formula. The level (operating point the
+    // file mapped to) is the actionable signal, so it sits up front — but only
+    // when the file actually fired, to keep benign output uncluttered.
     let mut meta: Vec<String> = Vec::new();
     meta.push(fg(p.filetype, &result.file_type));
+    if result.l.is_some() {
+        meta.push(fg(p.filetype, &format_level(result.l)));
+    }
     if !result.formula.is_empty() {
         meta.push(fg(p.formula, &result.formula));
     }
@@ -444,25 +470,35 @@ fn print_reasons(result: &ScanResult, p: &Palette) {
     }
 }
 
-/// Format a route-score list as `route=prob` tokens. The probabilities alone
-/// reveal which route drove (or diverged from) the final grade — e.g. an
-/// embedded member's `az/elf=1.000000` against a benign container. Per-route
-/// verdicts are intentionally omitted: blend-driven routes have no
+/// Format a route-score list as `route=raw` tokens, using the *raw*
+/// (pre-isotonic) model score. The calibrated probability saturates the upper
+/// tail to 1.0, so it hides which route actually drove the grade and how
+/// confident the model really was — the raw score preserves that resolution.
+/// Per-route verdicts are intentionally omitted: blend-driven routes have no
 /// individually-attributable classification (see `policy_route_class`).
 fn format_route_scores(scores: &[RouteScore]) -> String {
     scores
         .iter()
-        .map(|s| format!("{}={:.6}", s.model, s.probability))
+        .map(|s| format!("{}={:.6}", s.model, s.raw))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Print raw probability and SHAP feature values (hidden --extra mode).
+/// Render a matched operating-point level for display: `L0`, `L50`, or `—`
+/// when the file fired at no calibrated level (benign past the loosest row).
+fn format_level(l: Option<i32>) -> String {
+    l.map_or_else(|| "\u{2014}".to_string(), |n| format!("L{n}"))
+}
+
+/// Print the matched level, raw route scores, and SHAP feature values
+/// (hidden --extra mode). Leads with the level — the operating point a file
+/// maps to is the actionable signal; the calibrated probability is not shown
+/// because isotonic saturation collapses it to 1.0 across the whole upper tail.
 fn print_extra(result: &ScanResult, p: &Palette) {
     eprintln!(
         "           {} {}",
-        fg(p.dim, "prob:"),
-        fg(p.dim, &format!("{:.6}", result.probability)),
+        fg(p.dim, "level:"),
+        fg(p.dim, &format_level(result.l)),
     );
     if !result.model_scores.is_empty() {
         eprintln!(
@@ -480,11 +516,12 @@ fn print_extra(result: &ScanResult, p: &Palette) {
             continue;
         }
         eprintln!(
-            "           {} {} {} {}",
+            "           {} {} {} {} {}",
             fg(p.dim, "embedded:"),
             fg(p.dim, &ef.path),
-            fg(p.dim, &format!("[{}]", ef.file_type)),
+            fg(p.dim, &format!("[{} {}]", ef.file_type, format_level(ef.l))),
             fg(p.dim, &format_route_scores(&ef.model_scores)),
+            fg(p.very_dim, "(raw scores)"),
         );
     }
     if !result.skipped_models.is_empty() {
