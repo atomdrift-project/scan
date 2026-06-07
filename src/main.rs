@@ -1419,8 +1419,9 @@ mod tests {
             .context("--level 12 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(12));
 
-        // Out-of-range and conflicting selections are rejected.
-        assert!(Cli::try_parse_from(["litmus", "-l", "1001", "/tmp/a"]).is_err());
+        // Out-of-range and conflicting selections are rejected. The level
+        // range is per-100M (0..=10000) since the per-million migration.
+        assert!(Cli::try_parse_from(["litmus", "-l", "10001", "/tmp/a"]).is_err());
         assert!(Cli::try_parse_from(["litmus", "-l", "3", "-5", "/tmp/a"]).is_err());
         Ok(())
     }

@@ -3,7 +3,7 @@
 
 use std::sync::{LazyLock, RwLock};
 
-use crate::model::Classification;
+use crate::model::{Classification, RouteScore};
 use crate::scan::{ScanResult, ScanSummary};
 
 const BLOCK: &str = "\u{2588}";
@@ -444,6 +444,19 @@ fn print_reasons(result: &ScanResult, p: &Palette) {
     }
 }
 
+/// Format a route-score list as `route=prob` tokens. The probabilities alone
+/// reveal which route drove (or diverged from) the final grade — e.g. an
+/// embedded member's `az/elf=1.000000` against a benign container. Per-route
+/// verdicts are intentionally omitted: blend-driven routes have no
+/// individually-attributable classification (see `policy_route_class`).
+fn format_route_scores(scores: &[RouteScore]) -> String {
+    scores
+        .iter()
+        .map(|s| format!("{}={:.6}", s.model, s.probability))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Print raw probability and SHAP feature values (hidden --extra mode).
 fn print_extra(result: &ScanResult, p: &Palette) {
     eprintln!(
@@ -452,15 +465,26 @@ fn print_extra(result: &ScanResult, p: &Palette) {
         fg(p.dim, &format!("{:.6}", result.probability)),
     );
     if !result.model_scores.is_empty() {
-        let models: Vec<String> = result
-            .model_scores
-            .iter()
-            .map(|s| format!("{}={:.6}", s.model, s.probability))
-            .collect();
         eprintln!(
             "           {} {}",
             fg(p.dim, "models:"),
-            fg(p.dim, &models.join(" "))
+            fg(p.dim, &format_route_scores(&result.model_scores)),
+        );
+    }
+    // Surface the routing of archive members. A container often inherits a
+    // member's verdict (see `elevated archive classification`), so when the
+    // container's own models disagree with the final grade, the responsible
+    // route lives here — not above.
+    for ef in &result.embedded_files {
+        if ef.model_scores.is_empty() {
+            continue;
+        }
+        eprintln!(
+            "           {} {} {} {}",
+            fg(p.dim, "embedded:"),
+            fg(p.dim, &ef.path),
+            fg(p.dim, &format!("[{}]", ef.file_type)),
+            fg(p.dim, &format_route_scores(&ef.model_scores)),
         );
     }
     if !result.skipped_models.is_empty() {
