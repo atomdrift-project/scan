@@ -3,7 +3,7 @@
 //! Catches model/code version drift at CI time rather than in production.
 
 use anyhow::{Context, Result};
-use litmus::features::{FeatureSpec, EXPECTED_MODEL_ABI_VERSION, EXPECTED_SPEC_VERSION};
+use litmus::features::{EXPECTED_MODEL_ABI_VERSION, EXPECTED_SPEC_VERSION, FeatureSpec};
 
 fn model_dir() -> Result<std::path::PathBuf> {
     std::env::var("LITMUS_MODELS_DIR")

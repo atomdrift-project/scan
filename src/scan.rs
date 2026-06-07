@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::explain::ShapImportance;
-use crate::features::{crit_ordinal, ExtractContext};
-use crate::model::{Classification, Decision, Model, RouteScore, SkippedRoute, Thresholds};
 use crate::OutputFormat;
+use crate::explain::ShapImportance;
+use crate::features::{ExtractContext, crit_ordinal};
+use crate::model::{Classification, Decision, Model, RouteScore, SkippedRoute, Thresholds};
 
 pub use crate::explain::Reason;
 
@@ -293,10 +293,17 @@ mod envelope_tests {
         // (`-1` for a file that never fires). The dropped v5 fields must not
         // appear anywhere in the envelope.
         let r = base_result();
-        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
+        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         assert_eq!(json["ml"]["v"].as_str(), Some("6"));
         assert_eq!(json["ml"]["l"].as_i64(), Some(-1));
-        for dropped in ["class", "threshold", "level", "thresholds", "oclass", "oprob"] {
+        for dropped in [
+            "class",
+            "threshold",
+            "level",
+            "thresholds",
+            "oclass",
+            "oprob",
+        ] {
             assert!(
                 json["ml"].get(dropped).is_none(),
                 "v6 envelope must not emit `{dropped}`"
@@ -308,7 +315,7 @@ mod envelope_tests {
     fn envelope_emits_null_l_in_manual_mode() {
         let mut r = base_result();
         r.l = None;
-        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
+        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         assert!(
             json["ml"]["l"].is_null(),
             "manual-threshold mode (no level table) serializes l as null"
@@ -321,7 +328,7 @@ mod envelope_tests {
         r.classification = Classification::Hostile;
         r.probability = 0.99;
         r.l = Some(7);
-        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
+        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         assert_eq!(json["ml"]["l"].as_i64(), Some(7));
     }
 
@@ -333,7 +340,7 @@ mod envelope_tests {
         let mut r = base_result();
         r.classification = Classification::Benign;
         r.l = Some(500);
-        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
+        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         assert_eq!(json["ml"]["l"].as_i64(), Some(500));
     }
 
@@ -367,11 +374,15 @@ mod envelope_tests {
             member("evil.sh", Some(2), 0.99),
             member("readme.txt", Some(-1), 0.01),
         ];
-        let json = serde_json::to_value(&r.to_envelope()).expect("serialize");
+        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         let fs = json["ml"]["fs"].as_array().expect("fs array");
         assert_eq!(fs[0]["l"].as_i64(), Some(20), "root row carries envelope l");
         assert_eq!(fs[1]["l"].as_i64(), Some(2), "evil.sh reports its own l");
-        assert_eq!(fs[2]["l"].as_i64(), Some(-1), "readme.txt reports its own l");
+        assert_eq!(
+            fs[2]["l"].as_i64(),
+            Some(-1),
+            "readme.txt reports its own l"
+        );
     }
 }
 

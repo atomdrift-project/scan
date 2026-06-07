@@ -118,8 +118,9 @@ impl MemoryAdmission {
         let fraction = env_f64("LITMUS_MEM_BUDGET_FRAC")
             .filter(|f| *f > 0.0 && *f <= 1.0)
             .unwrap_or(DEFAULT_BUDGET_FRACTION);
-        let expansion_factor =
-            env_u64("LITMUS_ARCHIVE_EXPANSION").filter(|f| *f >= 1).unwrap_or(DEFAULT_EXPANSION_FACTOR);
+        let expansion_factor = env_u64("LITMUS_ARCHIVE_EXPANSION")
+            .filter(|f| *f >= 1)
+            .unwrap_or(DEFAULT_EXPANSION_FACTOR);
 
         let (budget_bytes, free_floor_bytes) = match cleave::memory_tracker::total_memory() {
             Some(total) if total > 0 => {
@@ -188,7 +189,15 @@ impl MemoryAdmission {
 
         loop {
             if self.try_reserve(est, started.elapsed() >= FORCE_ADMIT_AFTER) {
-                return self.register(sha256, path, file_type, on_disk_bytes, est, started, logged_stall);
+                return self.register(
+                    sha256,
+                    path,
+                    file_type,
+                    on_disk_bytes,
+                    est,
+                    started,
+                    logged_stall,
+                );
             }
             if !logged_stall && started.elapsed() >= STALL_LOG_AFTER {
                 self.log_inflight("dispatch stalled: in-flight memory budget reached");
@@ -221,7 +230,15 @@ impl MemoryAdmission {
 
         loop {
             if self.try_reserve(est, started.elapsed() >= FORCE_ADMIT_AFTER) {
-                return self.register(sha256, path, file_type, on_disk_bytes, est, started, logged_stall);
+                return self.register(
+                    sha256,
+                    path,
+                    file_type,
+                    on_disk_bytes,
+                    est,
+                    started,
+                    logged_stall,
+                );
             }
             if !logged_stall && started.elapsed() >= STALL_LOG_AFTER {
                 self.log_inflight("scan stalled: in-flight memory budget reached");
@@ -232,6 +249,9 @@ impl MemoryAdmission {
     }
 
     /// Record an admitted job (its `est` is already reserved) and return its guard.
+    /// Private two-call-site helper; the arguments mirror `Inflight`'s fields
+    /// plus the wait bookkeeping, so a parameter struct would just restate it.
+    #[allow(clippy::too_many_arguments)]
     fn register(
         self: &Arc<Self>,
         sha256: Arc<str>,
@@ -403,6 +423,10 @@ impl Drop for AdmissionGuard {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+// `MB` is 1 MiB in an i64 (matching `admit`'s `on_disk_bytes`); casting it to
+// usize/u64 in budget fixtures can never truncate or change sign.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 mod tests {
     use super::*;
 
@@ -471,13 +495,18 @@ mod tests {
         let waiter = tokio::spawn(async move {
             // 40 MB would push reserved to 120 MB > 100 MB; blocks until `first`
             // frees and the escape hatch (reserved == 0) re-opens admission.
-            let _guard = g2.admit("b".into(), "q".into(), "bin".into(), 40 * MB).await;
+            let _guard = g2
+                .admit("b".into(), "q".into(), "bin".into(), 40 * MB)
+                .await;
             g2.reserved.load(Ordering::Acquire)
         });
 
         // Give the waiter a moment to block, then release the first job.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!waiter.is_finished(), "second job should be waiting on budget");
+        assert!(
+            !waiter.is_finished(),
+            "second job should be waiting on budget"
+        );
         drop(first);
 
         let reserved_after = waiter.await.unwrap();
@@ -489,11 +518,15 @@ mod tests {
         // Job estimate exceeds the whole budget, but nothing is in flight, so
         // it must still admit (forward progress).
         let g = gate(100 * MB as usize, 1);
-        let _guard = g.admit("a".into(), "p".into(), "bin".into(), 10_000 * MB).await;
+        let _guard = g
+            .admit("a".into(), "p".into(), "bin".into(), 10_000 * MB)
+            .await;
         // Estimate capped at budget.
         assert_eq!(g.reserved.load(Ordering::Acquire), 100 * MB as usize);
     }
 
+    // Signature is fixed by `MemoryAdmission.available_fn: fn() -> Option<u64>`.
+    #[allow(clippy::unnecessary_wraps)]
     fn avail_200mb() -> Option<u64> {
         Some(200 * MB as u64)
     }

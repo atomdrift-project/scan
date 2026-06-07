@@ -28,8 +28,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let thresholds = model.thresholds();
     let ctx = ExtractContext::new(model.spec());
-    ctx.validate_layout()
-        .context("feature layout validation")?;
+    ctx.validate_layout().context("feature layout validation")?;
 
     if skip_traits {
         // The benign-corpus inference below requires loading the cleave trait

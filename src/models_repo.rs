@@ -273,7 +273,9 @@ pub fn check_updates() -> Result<()> {
     if fetch.status.success() && stderr.trim().is_empty() {
         eprintln!("Models are up to date ({local}, ref={display}).");
     } else {
-        eprintln!("Updates available (current: {local}, ref={display}). Run 'litmus update-rules' to update.");
+        eprintln!(
+            "Updates available (current: {local}, ref={display}). Run 'litmus update-rules' to update."
+        );
     }
 
     if let Some(days) = days_since_last_commit(&base) {
@@ -400,8 +402,7 @@ fn has_model_artifact(path: &Path) -> bool {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             return false;
         };
-        name.starts_with("seed_")
-            && path.extension().and_then(|ext| ext.to_str()) == Some("onnx")
+        name.starts_with("seed_") && path.extension().and_then(|ext| ext.to_str()) == Some("onnx")
     })
 }
 

@@ -111,7 +111,10 @@ fn ambiguous_onnx_legacy_plus_multi_seed_layout_is_rejected() {
 
     let err = Model::load(dir.path(), None, None).expect_err("ambiguous layout must error");
     let msg = format!("{err:#}");
-    assert!(msg.contains("ambiguous"), "error should mention 'ambiguous': {msg}");
+    assert!(
+        msg.contains("ambiguous"),
+        "error should mention 'ambiguous': {msg}"
+    );
 }
 
 #[test]

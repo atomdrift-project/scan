@@ -9,8 +9,6 @@ use std::collections::BTreeMap;
 #[derive(serde::Deserialize)]
 struct Fixture {
     n_features: usize,
-    #[serde(default)]
-    feature_names: Vec<String>,
     samples: Vec<Sample>,
 }
 
@@ -70,9 +68,7 @@ fn family_of(name: &str) -> &'static str {
 fn audit_per_route_divergences() {
     let dir = std::env::var("LITMUS_MODELS_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from("/home/t/collimator/out/models/azoth")
-        });
+        .unwrap_or_else(|_| std::path::PathBuf::from("/home/t/collimator/out/models/azoth"));
     let mut found = 0usize;
     for parent in ["filetypes", "filegroups"] {
         let parent_dir = dir.join(parent);
@@ -127,7 +123,10 @@ fn audit_per_route_divergences() {
                 .display()
                 .to_string();
             eprintln!("=== {route_label} ({} samples) ===", fixture.samples.len());
-            eprintln!("  {:<16} {:>9}   {:>9}   {}", "family", "diverge", "non-zero", "slots");
+            eprintln!(
+                "  {:<16} {:>9}   {:>9}   slots",
+                "family", "diverge", "non-zero"
+            );
             for (fam, (div, total)) in &by_family_div {
                 let nz = by_family_nonzero.get(fam).copied().unwrap_or(0);
                 if *div > 0 || nz > 0 {

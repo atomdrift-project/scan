@@ -15,8 +15,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use litmus::scan::DisplayFilter;
 use litmus::OutputFormat;
+use litmus::scan::DisplayFilter;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -447,9 +447,17 @@ fn main() -> Result<()> {
                 RAYON_FALLBACK_THREADS
             })
         });
+    // 256 MB stacks: cleave's archive analysis is nested-parallel, and a rayon
+    // worker blocked in an inner join steals other pending tasks — including
+    // other in-flight analyses' tasks on this shared pool — and runs them on
+    // top of its current stack. Frames from independent deep analyses stack
+    // up, so the headroom must cover several, not one (64 MB overflowed in
+    // production with 4 large archives in flight). Stacks are virtual memory;
+    // only pages actually touched are committed, so the cost of the extra
+    // headroom is address space, not RSS.
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
-        .stack_size(64 * 1024 * 1024)
+        .stack_size(256 * 1024 * 1024)
         .thread_name(|i| format!("rayon-{i}"))
         .build_global()
     {
@@ -571,10 +579,7 @@ fn main() -> Result<()> {
     // restart and shouldn't print transient notices into their logs.
     if matches!(
         command,
-        Commands::Scan { .. }
-            | Commands::Ps
-            | Commands::Version
-            | Commands::UpdateRules { .. }
+        Commands::Scan { .. } | Commands::Ps | Commands::Version | Commands::UpdateRules { .. }
     ) {
         litmus::update_check::maybe_notify(cli.no_update_check);
     }
@@ -728,9 +733,7 @@ fn main() -> Result<()> {
                     eprintln!("Error checking model updates: {e}");
                     process::exit(1);
                 }
-                if !models_only
-                    && let Err(e) = litmus::traits_repo::check_updates()
-                {
+                if !models_only && let Err(e) = litmus::traits_repo::check_updates() {
                     eprintln!("Error checking traits updates: {e}");
                     process::exit(1);
                 }
@@ -764,9 +767,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                if !models_only
-                    && let Err(e) = litmus::traits_repo::update(false, false)
-                {
+                if !models_only && let Err(e) = litmus::traits_repo::update(false, false) {
                     eprintln!("Error updating traits: {e}");
                     process::exit(1);
                 }
@@ -1258,7 +1259,7 @@ fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litm
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb, Cli, Commands, MaxRssPolicy, GIB,
+        Cli, Commands, GIB, MaxRssPolicy, resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
@@ -1439,5 +1440,4 @@ mod tests {
             Cli::try_parse_from(["litmus", "-9", "--threshold-hostile", "0.90", "/tmp/a"]).is_err()
         );
     }
-
 }

@@ -16,14 +16,14 @@
 mod acl;
 mod handlers;
 
-pub use acl::{parse_cidr_list, Cidr};
+pub use acl::{Cidr, parse_cidr_list};
 pub(crate) use handlers::classify_bytes;
 pub(crate) use handlers::classify_file;
 
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, post};
-use axum::Router;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -557,11 +557,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     tracing::info!("all resources ready, installing into AppState");
                     match bg.resources.write() {
                         Ok(mut lock) => {
-                            *lock = Some(Arc::new(ModelResources {
-                                model,
-                                shap,
-                                ctx,
-                            }));
+                            *lock = Some(Arc::new(ModelResources { model, shap, ctx }));
                             if let Ok(mut init_error) = bg.init_error.write() {
                                 *init_error = None;
                             }

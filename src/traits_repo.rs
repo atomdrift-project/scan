@@ -71,7 +71,8 @@ pub fn update(force: bool, quiet: bool) -> Result<bool> {
     let Ok(traits_dir) = cleave::traits_repo::try_resolve() else {
         // No local checkout yet: cleave clones a fresh tree, which is by
         // definition a change.
-        cleave::traits_repo::update(force).map_err(|e| anyhow::anyhow!("traits update failed: {e}"))?;
+        cleave::traits_repo::update(force)
+            .map_err(|e| anyhow::anyhow!("traits update failed: {e}"))?;
         return Ok(true);
     };
 
@@ -127,7 +128,7 @@ pub fn update(force: bool, quiet: bool) -> Result<bool> {
             &["-C", &path, "pull", "--ff-only"],
             git_cmd::NETWORK_TIMEOUT,
         )
-            .context("git pull failed")?;
+        .context("git pull failed")?;
         if !pull.status.success() {
             anyhow::bail!("traits update failed: {}", git_cmd::format_failure(&pull));
         }

@@ -147,7 +147,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::features::{ExtractContext, FeatureSpec, EXPECTED_MODEL_ABI_VERSION};
+use crate::features::{EXPECTED_MODEL_ABI_VERSION, ExtractContext, FeatureSpec};
 
 /// Recommended thresholds loaded from collimator's model metadata.
 ///
@@ -729,9 +729,7 @@ pub struct ModelInfo {
 struct OnnxBackend {
     /// Pre-optimized tract plan. Stored as a runnable model so
     /// `.run` calls don't re-optimize each prediction.
-    plan: tract_onnx::prelude::TypedRunnableModel<
-        tract_onnx::prelude::TypedModel,
-    >,
+    plan: tract_onnx::prelude::TypedRunnableModel<tract_onnx::prelude::TypedModel>,
     n_features: usize,
 }
 
@@ -765,7 +763,9 @@ impl OnnxBackend {
         let n_features = input_fact_dyn
             .shape
             .dim(1)
-            .ok_or_else(|| anyhow::anyhow!("ONNX input has no feature dimension in {}", path.display()))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("ONNX input has no feature dimension in {}", path.display())
+            })?
             .concretize()
             .ok_or_else(|| anyhow::anyhow!("non-concrete feature dim in {}", path.display()))?
             .to_usize()
@@ -799,12 +799,10 @@ impl OnnxBackend {
         // Build a (1, n_features) f32 tensor. We copy because tract
         // takes owned input. For single-sample inference at scan time
         // this is a single allocation per call; perfectly cheap.
-        let input: Tensor = tract_ndarray::Array2::from_shape_vec(
-            (1, self.n_features),
-            features.to_vec(),
-        )
-        .context("building ONNX input tensor")?
-        .into();
+        let input: Tensor =
+            tract_ndarray::Array2::from_shape_vec((1, self.n_features), features.to_vec())
+                .context("building ONNX input tensor")?
+                .into();
         let outputs = self
             .plan
             .run(tvec!(input.into()))
@@ -1129,8 +1127,7 @@ impl RoutePolicies {
             .flatten()
             .any(|lp| lp.hostile.references_route(route))
             || self.by_filetype.values().any(|policy| {
-                policy.hostile.references_route(route)
-                    || policy.suspicious.references_route(route)
+                policy.hostile.references_route(route) || policy.suspicious.references_route(route)
             })
     }
 
@@ -1181,10 +1178,7 @@ const PURE_COMPRESSION_SUFFIXES: &[&str] = &["gz", "bz2", "xz", "zst", "z", "lzm
 /// own. See [`RoutePolicies::policy_for`] for the call site.
 fn normalize_archive_filetype(file_type: &str) -> String {
     let mut normalized = file_type.trim().to_ascii_lowercase();
-    loop {
-        let Some((head, tail)) = normalized.rsplit_once('.') else {
-            break;
-        };
+    while let Some((head, tail)) = normalized.rsplit_once('.') {
         if head.is_empty() || !PURE_COMPRESSION_SUFFIXES.contains(&tail) {
             break;
         }
@@ -1261,8 +1255,7 @@ impl PolicySeverity {
                 && score.probability >= t
             {
                 let margin = score.probability - t;
-                let best_margin =
-                    best.map(|(p, bt)| p - bt).unwrap_or(f32::NEG_INFINITY);
+                let best_margin = best.map(|(p, bt)| p - bt).unwrap_or(f32::NEG_INFINITY);
                 if margin > best_margin {
                     best = Some((score.probability, t));
                 }
@@ -1556,10 +1549,7 @@ fn load_route_policies(model_dir: &Path, level: u16) -> RoutePolicies {
 #[allow(clippy::cast_possible_truncation)]
 fn policy_severity_from_json(json: &RoutePolicySeverityJson) -> Option<PolicySeverity> {
     let best = json.best.as_ref()?;
-    let blend = best
-        .blend
-        .as_ref()
-        .and_then(blend_policy_from_json);
+    let blend = best.blend.as_ref().and_then(blend_policy_from_json);
     let mut thresholds = HashMap::new();
     for (route, &threshold) in &best.thresholds {
         let threshold = threshold as f32;
@@ -2111,11 +2101,7 @@ impl RouteSet {
 
 /// OR over classifications: pick the more severe of two outcomes.
 const fn max_class(a: Classification, b: Classification) -> Classification {
-    if (a as u8) >= (b as u8) {
-        a
-    } else {
-        b
-    }
+    if (a as u8) >= (b as u8) { a } else { b }
 }
 
 #[derive(Debug, Clone)]
@@ -2181,10 +2167,7 @@ fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -> Option<De
 /// strictest budget that still flags it. Scanning every level and keeping the
 /// minimum stays correct even if a bundle's grid isn't perfectly monotone.
 /// Returns `None` when the file fires at no level (clean).
-fn sweep_policy_grid(
-    grid: &[LevelPolicy],
-    scores: &[RouteProbability],
-) -> Option<(u16, f32, f32)> {
+fn sweep_policy_grid(grid: &[LevelPolicy], scores: &[RouteProbability]) -> Option<(u16, f32, f32)> {
     let mut best: Option<(u16, f32, f32)> = None;
     for lp in grid {
         if let Some((p, t)) = lp.hostile.fire(scores)
@@ -2216,10 +2199,7 @@ fn verdict_for_level(fired_level: u16, level: u16, _grid_max: u16) -> Classifica
 /// route policy. Mirrors [`Model::decide_from_scores`]: at each level a file
 /// fires if any route's probability crosses that level's general hostile
 /// threshold. The highest crossing probability is reported for that level.
-fn sweep_general_grid(
-    grid: &[(u16, f32)],
-    scores: &[RouteProbability],
-) -> Option<(u16, f32, f32)> {
+fn sweep_general_grid(grid: &[(u16, f32)], scores: &[RouteProbability]) -> Option<(u16, f32, f32)> {
     let mut best: Option<(u16, f32, f32)> = None;
     for &(level, thr) in grid {
         if let Some(p) = scores
@@ -2738,11 +2718,10 @@ impl Model {
         general_features: &[f32],
         report: &serde_json::Value,
     ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
-        let (route_probs, scores, mut skipped) = self.score_all_routes(
-            file_type,
-            general_features,
-            |route| Self::score_route_report(route, report),
-        )?;
+        let (route_probs, scores, mut skipped) =
+            self.score_all_routes(file_type, general_features, |route| {
+                Self::score_route_report(route, report)
+            })?;
         let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
         Ok((decision, scores, skipped))
     }
@@ -2754,8 +2733,7 @@ impl Model {
         general_features: &[f32],
         file: &serde_json::Value,
     ) -> Result<(f32, Classification)> {
-        let (decision, _, _) =
-            self.predict_for_file_detailed(file_type, general_features, file)?;
+        let (decision, _, _) = self.predict_for_file_detailed(file_type, general_features, file)?;
         Ok((decision.probability, decision.class))
     }
 
@@ -2766,11 +2744,10 @@ impl Model {
         general_features: &[f32],
         file: &serde_json::Value,
     ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
-        let (route_probs, scores, mut skipped) = self.score_all_routes(
-            file_type,
-            general_features,
-            |route| Self::score_route_file(route, file),
-        )?;
+        let (route_probs, scores, mut skipped) =
+            self.score_all_routes(file_type, general_features, |route| {
+                Self::score_route_file(route, file)
+            })?;
         let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
         Ok((decision, scores, skipped))
     }
@@ -2790,8 +2767,7 @@ impl Model {
         F: FnMut(&Route) -> Result<(f32, f32, Classification)>,
     {
         let policy = self.routes.policies.policy_for(file_type);
-        let (general_raw, general_prob) =
-            self.predict_general_raw_calibrated(general_features)?;
+        let (general_raw, general_prob) = self.predict_general_raw_calibrated(general_features)?;
         let general_class = policy.map_or_else(
             || self.thresholds.classify(general_prob),
             |policy| policy_route_class(policy, "general", general_prob),
@@ -3476,7 +3452,9 @@ mod tests {
         // verdict derived from it changes. This is what makes the envelope
         // cache-shareable across `-l`.
         let grid = general_policy_grid(&[(2, 0.99), (20, 0.85), (50, 0.70)]);
-        let l = sweep_policy_grid(&grid, &general_only(0.88)).expect("fires").0;
+        let l = sweep_policy_grid(&grid, &general_only(0.88))
+            .expect("fires")
+            .0;
         assert_eq!(l, 20);
         for active in [0_u16, 10, 20, 50, 200, 1000] {
             // l is unchanged; only the class depends on `active`.
@@ -3491,16 +3469,34 @@ mod tests {
         let grid_max = 1000;
         assert_eq!(verdict_for_level(20, 50, grid_max), Classification::Hostile);
         assert_eq!(verdict_for_level(50, 50, grid_max), Classification::Hostile);
-        assert_eq!(verdict_for_level(100, 50, grid_max), Classification::Suspicious);
-        assert_eq!(verdict_for_level(200, 50, grid_max), Classification::Suspicious);
+        assert_eq!(
+            verdict_for_level(100, 50, grid_max),
+            Classification::Suspicious
+        );
+        assert_eq!(
+            verdict_for_level(200, 50, grid_max),
+            Classification::Suspicious
+        );
         // A file that only fires loosely is still suspicious — anything above
         // critical's FP level rings as such.
-        assert_eq!(verdict_for_level(500, 50, grid_max), Classification::Suspicious);
-        assert_eq!(verdict_for_level(10000, 50, grid_max), Classification::Suspicious);
+        assert_eq!(
+            verdict_for_level(500, 50, grid_max),
+            Classification::Suspicious
+        );
+        assert_eq!(
+            verdict_for_level(10000, 50, grid_max),
+            Classification::Suspicious
+        );
 
         // Stricter deploy (-l 10): only l <= 10 is hostile.
-        assert_eq!(verdict_for_level(20, 10, grid_max), Classification::Suspicious);
-        assert_eq!(verdict_for_level(50, 10, grid_max), Classification::Suspicious);
+        assert_eq!(
+            verdict_for_level(20, 10, grid_max),
+            Classification::Suspicious
+        );
+        assert_eq!(
+            verdict_for_level(50, 10, grid_max),
+            Classification::Suspicious
+        );
     }
 
     #[test]
@@ -3598,10 +3594,7 @@ mod tests {
             }"#,
         )?;
         let policies = load_route_policies(dir.path(), 5);
-        let policy = policies
-            .by_filetype
-            .get("elf")
-            .expect("elf policy loaded");
+        let policy = policies.by_filetype.get("elf").expect("elf policy loaded");
         let blend = policy.hostile.blend.as_ref().expect("blend loaded");
         assert_eq!(blend.routes.len(), 3);
         assert_eq!(blend.weights.len(), 3);
@@ -3713,8 +3706,8 @@ mod tests {
         // Make the layout look like an ensemble (general/ subdir present)
         // but leave it empty so general/ has no model artifacts.
         std::fs::create_dir_all(dir.path().join("general"))?;
-        let err =
-            Model::load(dir.path(), None, None).expect_err("ensemble with empty general/ must fail");
+        let err = Model::load(dir.path(), None, None)
+            .expect_err("ensemble with empty general/ must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("loading general route") || msg.contains("incomplete"),

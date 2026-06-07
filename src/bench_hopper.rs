@@ -153,7 +153,9 @@ impl BenchHopper {
     }
 
     fn serve_next(&self, stream: &mut TcpStream, target: &str) -> io::Result<()> {
-        let count = query_param(target, "count").and_then(|v| v.parse().ok()).unwrap_or(1);
+        let count = query_param(target, "count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
         let start = self.cursor.fetch_add(count, Ordering::SeqCst);
         if start >= self.jobs.len() {
             // Drained: the real hopper returns 204 when no work remains.
@@ -300,7 +302,10 @@ fn read_request(stream: &mut TcpStream) -> io::Result<(String, String, Vec<u8>)>
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.len() > 1 << 20 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "header too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "header too large",
+            ));
         }
     };
 
@@ -314,7 +319,9 @@ fn read_request(stream: &mut TcpStream) -> io::Result<(String, String, Vec<u8>)>
     let content_len = lines
         .find_map(|l| {
             let (k, v) = l.split_once(':')?;
-            k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse().ok())
         })
         .flatten()
         .unwrap_or(0usize);
@@ -333,9 +340,8 @@ fn read_request(stream: &mut TcpStream) -> io::Result<(String, String, Vec<u8>)>
 }
 
 fn respond_head(stream: &mut TcpStream, status: &str, content_len: u64) -> io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {content_len}\r\nConnection: close\r\n\r\n"
-    );
+    let head =
+        format!("HTTP/1.1 {status}\r\nContent-Length: {content_len}\r\nConnection: close\r\n\r\n");
     stream.write_all(head.as_bytes())
 }
 
@@ -351,9 +357,11 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn query_param<'a>(target: &'a str, key: &str) -> Option<&'a str> {
     let query = target.split('?').nth(1)?;
-    query
-        .split('&')
-        .find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v))
+    query.split('&').find_map(|kv| {
+        kv.split_once('=')
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    })
 }
 
 /// Percent-decode one path segment (reverses the worker's `url_encode_into`).
@@ -424,7 +432,11 @@ mod tests {
         let mut resp = Vec::new();
         stream.read_to_end(&mut resp).unwrap();
         let split = find_subslice(&resp, b"\r\n\r\n").unwrap();
-        let status = String::from_utf8_lossy(&resp[..split]).lines().next().unwrap().to_string();
+        let status = String::from_utf8_lossy(&resp[..split])
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
         (status, resp[split + 4..].to_vec())
     }
 
@@ -467,7 +479,8 @@ mod tests {
     fn first_sha256_takes_top_level_hash() {
         let h = "a".repeat(64);
         let m = "b".repeat(64);
-        let body = format!("{{\"sha256\":\"{h}\",\"worker\":\"w\",\"raw\":{{\"sha256\":\"{m}\"}}}}");
+        let body =
+            format!("{{\"sha256\":\"{h}\",\"worker\":\"w\",\"raw\":{{\"sha256\":\"{m}\"}}}}");
         assert_eq!(first_sha256(body.as_bytes()).as_deref(), Some(h.as_str()));
         assert_eq!(first_sha256(b"{\"worker\":\"w\"}"), None);
     }

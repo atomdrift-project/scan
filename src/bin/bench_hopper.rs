@@ -39,14 +39,20 @@ struct Args {
 fn main() -> ExitCode {
     let args = Args::parse();
     if !args.dataset.is_dir() {
-        eprintln!("error: dataset is not a directory: {}", args.dataset.display());
+        eprintln!(
+            "error: dataset is not a directory: {}",
+            args.dataset.display()
+        );
         return ExitCode::FAILURE;
     }
 
     let hopper = match BenchHopper::build(&args.dataset, args.dump) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("error: failed to build hopper from {}: {e}", args.dataset.display());
+            eprintln!(
+                "error: failed to build hopper from {}: {e}",
+                args.dataset.display()
+            );
             return ExitCode::FAILURE;
         }
     };

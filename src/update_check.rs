@@ -197,7 +197,11 @@ fn resolve_ref(manifest: &str, installed: &str) -> Option<String> {
                 Some(rule.git_ref.clone())
             }
             _ => {
-                tracing::debug!(manifest, version = installed, "no manifest rule matched; using default ref");
+                tracing::debug!(
+                    manifest,
+                    version = installed,
+                    "no manifest rule matched; using default ref"
+                );
                 None
             }
         },
@@ -217,12 +221,21 @@ mod tests {
     fn manifest_url_joins_and_marks() {
         // SAFETY: the test binary is single-threaded at this point.
         unsafe { std::env::set_var("LITMUS_UPDATE_URL", "https://example.test/u/") };
-        assert_eq!(manifest_url("litmus.toml", false), "https://example.test/u/litmus.toml");
-        assert_eq!(manifest_url("litmus.toml", true), "https://example.test/u/litmus.toml?update=1");
+        assert_eq!(
+            manifest_url("litmus.toml", false),
+            "https://example.test/u/litmus.toml"
+        );
+        assert_eq!(
+            manifest_url("litmus.toml", true),
+            "https://example.test/u/litmus.toml?update=1"
+        );
 
         // A base without a trailing slash still joins correctly.
         unsafe { std::env::set_var("LITMUS_UPDATE_URL", "https://example.test/u") };
-        assert_eq!(manifest_url("cleave.toml", false), "https://example.test/u/cleave.toml");
+        assert_eq!(
+            manifest_url("cleave.toml", false),
+            "https://example.test/u/cleave.toml"
+        );
         unsafe { std::env::remove_var("LITMUS_UPDATE_URL") };
     }
 }

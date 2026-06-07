@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
-use crate::server::{classify_bytes, classify_file, ModelResources};
+use crate::server::{ModelResources, classify_bytes, classify_file};
 
 #[derive(Debug, Clone)]
 struct IndexedLocalFile {
@@ -472,11 +472,7 @@ fn load_model_resources(
     let model = Model::load(model_dir, thresholds, level).context("loading model")?;
     let shap = ShapImportance::load(model_dir).ok();
     let ctx = ExtractContext::new(model.spec());
-    Ok(Arc::new(ModelResources {
-        model,
-        shap,
-        ctx,
-    }))
+    Ok(Arc::new(ModelResources { model, shap, ctx }))
 }
 
 fn validate_and_load_resources(
@@ -539,12 +535,7 @@ fn renew_resources_once(
         "rules changed; revalidating bundle",
     );
 
-    let resources = match validate_and_load_resources(
-        model_dir,
-        thresholds,
-        slow_rule_ms,
-        level,
-    ) {
+    let resources = match validate_and_load_resources(model_dir, thresholds, slow_rule_ms, level) {
         Ok(resources) => resources,
         Err(error) => {
             if let Some(prev) = prev_models_head.as_deref() {
@@ -640,7 +631,7 @@ fn spawn_resource_renewal_task(
 
 // Phase 2 (WORKER_POOL_PLAN.md): litmus no longer manages rayon. There is no
 // per-slot pool grid — analyses run on the one process-global rayon pool that
-// main installs (sized to the host's cores, 64 MB stacks). The tokio semaphore
+// main installs (sized to the host's cores, 256 MB stacks). The tokio semaphore
 // alone bounds concurrency; cleave's `par_iter` fan-out work-steals across the
 // shared pool, so a single large archive can use the whole machine while total
 // rayon threads stay capped at the pool size (not `slots × per-slot-threads`),
@@ -666,7 +657,7 @@ fn init_legacy_grid(slots: usize, global_threads: usize) -> bool {
                     rayon::ThreadPoolBuilder::new()
                         .num_threads(per)
                         .thread_name(move |j| format!("cleave-{i}-{j}"))
-                        .stack_size(64 * 1024 * 1024)
+                        .stack_size(256 * 1024 * 1024)
                         .build()
                         .expect("build legacy A/B per-slot pool"),
                 )
@@ -683,6 +674,8 @@ fn init_legacy_grid(slots: usize, global_threads: usize) -> bool {
 fn run_analysis<T: Send>(idx: u64, body: impl FnOnce() -> T + Send) -> T {
     match LEGACY_PER_SLOT_GRID.get().and_then(Option::as_ref) {
         Some(grid) if !grid.is_empty() => {
+            // idx % len < len <= usize::MAX, so the cast back is lossless.
+            #[allow(clippy::cast_possible_truncation)]
             let i = (idx % grid.len() as u64) as usize;
             grid[i].install(body)
         }
@@ -778,7 +771,7 @@ fn install_shutdown_handler(shutdown: Arc<AtomicBool>) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let sigterm = signal(SignalKind::terminate());
             let sigint = signal(SignalKind::interrupt());
             let (mut sigterm, mut sigint) = match (sigterm, sigint) {
@@ -837,7 +830,9 @@ struct RateWindow {
 
 impl RateWindow {
     fn new() -> Self {
-        Self { buckets: [(u64::MAX, 0); 15] }
+        Self {
+            buckets: [(u64::MAX, 0); 15],
+        }
     }
 
     fn record(&mut self, minute: u64) {
@@ -958,7 +953,10 @@ impl WorkerMetrics {
     }
 
     fn record_error(&self, msg: &str) {
-        self.errors.lock().expect("metrics mutex poisoned").record(msg, Instant::now());
+        self.errors
+            .lock()
+            .expect("metrics mutex poisoned")
+            .record(msg, Instant::now());
     }
 
     fn snapshot(&self) -> MetricsSnapshot {
@@ -1060,11 +1058,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // pool. See cleave::shared_resources::yara_engine for the contract.
     cleave::prefetch_shared_resources(true);
 
-    let resources = load_model_resources(
-        &config.model_dir,
-        config.thresholds,
-        config.level,
-    )?;
+    let resources = load_model_resources(&config.model_dir, config.thresholds, config.level)?;
     let resources: ResourceHandle = Arc::new(RwLock::new(resources));
     spawn_resource_renewal_task(
         Arc::clone(&resources),
@@ -1245,9 +1239,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     "memory pressure: pausing dispatch",
                 );
                 admission.log_inflight("reactive RSS pause: max_rss_gb exceeded");
-                if let Err(e) =
-                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await
-                {
+                if let Err(e) = tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await {
                     tracing::warn!(error = %e, "cache-clear task failed");
                 }
                 interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
@@ -1604,7 +1596,11 @@ async fn prefetch_one(
             "file size {} exceeds per-job prefetch cap of {} bytes",
             job.size_bytes, max_single_bytes,
         ));
-        return PrefetchedJob { job, data: Err(err), queue_id: 0 };
+        return PrefetchedJob {
+            job,
+            data: Err(err),
+            queue_id: 0,
+        };
     }
 
     let local_path = data_dir.as_deref().map(|d| d.join(&job.path));
@@ -1617,7 +1613,11 @@ async fn prefetch_one(
             Err(e) => Err(PrefetchError::Transient(e)),
         }
     };
-    PrefetchedJob { job, data, queue_id: 0 }
+    PrefetchedJob {
+        job,
+        data,
+        queue_id: 0,
+    }
 }
 
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
@@ -1857,59 +1857,59 @@ async fn run_job(
         // report `thread_id` — the blocking thread an operator samples to find a
         // wedged analysis; the CPU work runs on the rayon pool threads.
         run_analysis(analysis_id, || {
-        let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-        let thread_id = os_thread_id();
-        let inflight_blocking =
-            started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
-        tracing::info!(
-            analysis_id,
-            sha256 = %sha_short2,
-            file = %label_for_blocking,
-            thread_id,
-            inflight_blocking,
-            started_total = started,
-            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-            "analysis starting on worker thread",
-        );
-        let result = if let Some(data) = downloaded {
-            classify_bytes(
-                data,
-                &label_for_blocking,
-                &resources,
-                slow_rule_ms,
-                Some(&cancel2),
-                Some(&phase),
-            )
-        } else if let Some(path) = local.as_ref() {
-            classify_file(
-                path,
-                &label_for_blocking,
-                &resources,
-                slow_rule_ms,
-                None,
-                Some(&cancel2),
-                Some(&phase),
-            )
-        } else {
-            Err(anyhow::anyhow!(
-                "no downloaded bytes and no local path for {label_for_blocking}"
-            ))
-        };
-        let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-        let inflight_blocking = BLOCKING_STARTED_TOTAL
-            .load(Ordering::Relaxed)
-            .saturating_sub(finished);
-        tracing::debug!(
-            analysis_id,
-            sha256 = %sha_short2,
-            thread_id,
-            inflight_blocking,
-            finished_total = finished,
-            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-            elapsed_ms = crate::duration_ms(start.elapsed()),
-            "analysis complete on worker thread",
-        );
-        result
+            let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+            let thread_id = os_thread_id();
+            let inflight_blocking =
+                started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
+            tracing::info!(
+                analysis_id,
+                sha256 = %sha_short2,
+                file = %label_for_blocking,
+                thread_id,
+                inflight_blocking,
+                started_total = started,
+                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                "analysis starting on worker thread",
+            );
+            let result = if let Some(data) = downloaded {
+                classify_bytes(
+                    data,
+                    &label_for_blocking,
+                    &resources,
+                    slow_rule_ms,
+                    Some(&cancel2),
+                    Some(&phase),
+                )
+            } else if let Some(path) = local.as_ref() {
+                classify_file(
+                    path,
+                    &label_for_blocking,
+                    &resources,
+                    slow_rule_ms,
+                    None,
+                    Some(&cancel2),
+                    Some(&phase),
+                )
+            } else {
+                Err(anyhow::anyhow!(
+                    "no downloaded bytes and no local path for {label_for_blocking}"
+                ))
+            };
+            let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+            let inflight_blocking = BLOCKING_STARTED_TOTAL
+                .load(Ordering::Relaxed)
+                .saturating_sub(finished);
+            tracing::debug!(
+                analysis_id,
+                sha256 = %sha_short2,
+                thread_id,
+                inflight_blocking,
+                finished_total = finished,
+                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                elapsed_ms = crate::duration_ms(start.elapsed()),
+                "analysis complete on worker thread",
+            );
+            result
         })
     });
 
@@ -1941,7 +1941,11 @@ async fn post_result(
             // v6 envelope no longer carries `class` on the wire — the verdict
             // is encoded in `l` (-1 = benign, anything else = hostile). The
             // suspicious band is consumer-side and not visible here.
-            let verdict = if ml.l == Some(-1) { "benign" } else { "hostile" };
+            let verdict = if ml.l == Some(-1) {
+                "benign"
+            } else {
+                "hostile"
+            };
             tracing::info!(sha256 = %sha256, duration_ms, verdict, "analysis complete");
             ResultPayload {
                 sha256: sha256.to_string(),
@@ -1977,6 +1981,35 @@ async fn post_result(
             tracing::error!(sha256 = %sha256, error = %e, "post result: serialize failed");
             return;
         }
+    };
+    // Hopper bounds the decompressed result body at 256 MiB
+    // (maxResultBodyBytes in hopper's api.go); a larger document is truncated
+    // mid-stream and rejected as invalid JSON — permanently, since retries
+    // resend identical bytes. If the serialized report exceeds the limit, drop
+    // the raw cleave report and send the ML verdict alone: hopper stores the
+    // verdict and only skips archive explosion, which beats losing the whole
+    // 5-minute analysis.
+    const HOPPER_MAX_RESULT_BODY_BYTES: usize = 256 << 20;
+    let json = if json.len() > HOPPER_MAX_RESULT_BODY_BYTES {
+        tracing::warn!(
+            sha256 = %sha256,
+            json_bytes = json.len(),
+            limit_bytes = HOPPER_MAX_RESULT_BODY_BYTES,
+            "result JSON exceeds hopper's body limit; dropping raw report, posting ML verdict only",
+        );
+        let payload = ResultPayload {
+            raw: None,
+            ..payload
+        };
+        match serde_json::to_vec(&payload) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::error!(sha256 = %sha256, error = %e, "post result: serialize failed");
+                return;
+            }
+        }
+    } else {
+        json
     };
     let (body, encoding) = match zstd::encode_all(json.as_slice(), ZSTD_RESULT_LEVEL) {
         Ok(compressed) => (compressed, Some("zstd")),
@@ -2017,7 +2050,20 @@ async fn post_result(
             }
             Ok(resp) => {
                 let status = resp.status();
-                tracing::warn!(sha256 = %sha256, %status, elapsed_ms = crate::duration_ms(post_start.elapsed()), attempt, "post result: non-success response");
+                let elapsed_ms = crate::duration_ms(post_start.elapsed());
+                let body = resp.text().await.unwrap_or_default();
+                // A 4xx means hopper rejected this exact payload; resending
+                // identical bytes can never succeed, so retrying just burns
+                // 20 minutes. 408 (timeout) and 429 (throttled) are the
+                // transient exceptions.
+                if status.is_client_error()
+                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
+                    tracing::error!(sha256 = %sha256, %status, body = %body_excerpt(&body), elapsed_ms, attempt, "post result: rejected by server; not retrying");
+                    return;
+                }
+                tracing::warn!(sha256 = %sha256, %status, body = %body_excerpt(&body), elapsed_ms, attempt, "post result: non-success response");
             }
             Err(e) => {
                 tracing::warn!(sha256 = %sha256, error = %e, elapsed_ms = crate::duration_ms(post_start.elapsed()), attempt, "post result: send failed");
@@ -2198,11 +2244,7 @@ fn system_load_avg() -> Option<f64> {
     {
         let mut avg: [libc::c_double; 1] = [0.0];
         let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
-        if ret == 1 {
-            Some(avg[0])
-        } else {
-            None
-        }
+        if ret == 1 { Some(avg[0]) } else { None }
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -2672,7 +2714,9 @@ mod tests {
         // 4. Shutdown stops the prefetcher and closes the channel.
         shutdown.store(true, Ordering::Relaxed);
         assert!(
-            tokio::time::timeout(Duration::from_secs(5), handle).await.is_ok(),
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .is_ok(),
             "prefetcher did not exit on shutdown",
         );
         while rx.recv().await.is_some() {}
@@ -2736,6 +2780,9 @@ mod tests {
         assert!(snap.oldest_age.is_some());
         assert!(snap.last_completion_age.is_some());
         assert_eq!(snap.errors_recent, 1);
-        assert_eq!(snap.last_error.as_ref().map(|(_, msg)| msg.as_str()), Some("boom"));
+        assert_eq!(
+            snap.last_error.as_ref().map(|(_, msg)| msg.as_str()),
+            Some("boom")
+        );
     }
 }

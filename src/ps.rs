@@ -11,12 +11,12 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::OutputFormat;
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Classification, Model};
 use crate::output;
 use crate::scan::{Progress, ScanConfig, ScanResult, ScanSummary};
-use crate::OutputFormat;
 
 /// A group of processes sharing the same executable binary (by SHA256).
 struct ProcessGroup {

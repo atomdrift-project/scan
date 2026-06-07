@@ -65,7 +65,7 @@ pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output> {
             Some(_) => {
                 return child
                     .wait_with_output()
-                    .context("failed to read git output")
+                    .context("failed to read git output");
             }
             None if Instant::now() >= deadline => {
                 kill_group(pid);

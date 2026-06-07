@@ -3,8 +3,8 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::Builder as TempBuilder;
 
@@ -154,11 +154,7 @@ fn system_load_avg() -> Option<f64> {
     {
         let mut avg: [libc::c_double; 1] = [0.0];
         let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
-        if ret == 1 {
-            Some(avg[0])
-        } else {
-            None
-        }
+        if ret == 1 { Some(avg[0]) } else { None }
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -303,7 +299,10 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
         }))
             .into_response();
     }
-    tracing::debug!("GET /_/health -> 200 (rss={rss_mb:?}MB, active={active_tasks}, long_running={}, stuck_orphans={stuck_orphans}, load={load:.2})", long_running.len());
+    tracing::debug!(
+        "GET /_/health -> 200 (rss={rss_mb:?}MB, active={active_tasks}, long_running={}, stuck_orphans={stuck_orphans}, load={load:.2})",
+        long_running.len()
+    );
     Json(serde_json::json!({
         "status": "ok",
         "rss_mb": rss_mb,
@@ -417,11 +416,7 @@ async fn do_model_reload(
 
     match state.resources.write() {
         Ok(mut lock) => {
-            *lock = Some(Arc::new(super::ModelResources {
-                model,
-                shap,
-                ctx,
-            }));
+            *lock = Some(Arc::new(super::ModelResources { model, shap, ctx }));
             if let Ok(mut init_error) = state.init_error.write() {
                 *init_error = None;
             }
@@ -1274,8 +1269,7 @@ pub(super) async fn analyze_path(
             let mut scan_result = *scan_result;
             // Inject extracted_path into the raw cleave JSON so cyclotron
             // knows where archive members were extracted on disk.
-            if let (Some(extract_dir), Some(raw)) =
-                (&state.extract_dir, &mut scan_result.cleave)
+            if let (Some(extract_dir), Some(raw)) = (&state.extract_dir, &mut scan_result.cleave)
                 && let Some(fs) = raw.get("fs").and_then(|f| f.as_array())
                 && let Some(first) = fs
                     .first()

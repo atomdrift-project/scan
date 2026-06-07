@@ -428,7 +428,9 @@ impl FeatureSpec {
                     "feature spec has {} features (extractor knows {} optional-inclusive features) — {} optional features absent from this model",
                     self.feature_names.len(),
                     expected_feature_names.len(),
-                    expected_feature_names.len().saturating_sub(self.feature_names.len()),
+                    expected_feature_names
+                        .len()
+                        .saturating_sub(self.feature_names.len()),
                 );
             }
         }
@@ -450,7 +452,9 @@ impl FeatureSpec {
             }
             (None, None, false) => {}
             (None, None, true) => {
-                anyhow::bail!("feature spec is marked standardized but feature_means/feature_stds are missing");
+                anyhow::bail!(
+                    "feature spec is marked standardized but feature_means/feature_stds are missing"
+                );
             }
             (Some(_), None, _) | (None, Some(_), _) => {
                 anyhow::bail!(
@@ -1919,17 +1923,17 @@ impl FileSummary {
         let raw_findings: Vec<serde_json::Value> =
             findings_raw.iter().map(|f| (*f).clone()).collect();
         let has_imports_key = file_entry.get("is").is_some()
-            || file_entry
-                .get("ff")
-                .and_then(|f| f.get("i"))
-                .is_some();
+            || file_entry.get("ff").and_then(|f| f.get("i")).is_some();
 
         // Cleave v5 facts block `ff` carries `m` (metrics), `v` (flat values),
         // `s` (strings), `i` (imports), `x` (exports), `fn` (function names).
         // v4 reports stash these at top-level keys: `ms`, `k`, `ss`, `is`.
         // Mirror the resolution order Python uses (collimator/features.py
         // file_metrics/file_values/file_strings/file_imports).
-        let facts = file_entry.get("ff").cloned().unwrap_or(serde_json::Value::Null);
+        let facts = file_entry
+            .get("ff")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let raw_metrics = facts
             .get("m")
             .filter(|v| v.is_object())
@@ -1945,20 +1949,12 @@ impl FileSummary {
         let raw_strings = facts
             .get("s")
             .and_then(|v| v.as_array().cloned())
-            .or_else(|| {
-                file_entry
-                    .get("ss")
-                    .and_then(|v| v.as_array().cloned())
-            })
+            .or_else(|| file_entry.get("ss").and_then(|v| v.as_array().cloned()))
             .unwrap_or_default();
         let raw_imports = facts
             .get("i")
             .and_then(|v| v.as_array().cloned())
-            .or_else(|| {
-                file_entry
-                    .get("is")
-                    .and_then(|v| v.as_array().cloned())
-            })
+            .or_else(|| file_entry.get("is").and_then(|v| v.as_array().cloned()))
             .unwrap_or_default();
         let raw_exports = facts
             .get("x")
@@ -3457,7 +3453,11 @@ fn looks_base64ish(value: &str) -> bool {
 
 /// `_looks_hexish` — fraction of hex digits after whitespace strip.
 fn looks_hexish(value: &str) -> bool {
-    let compact: String = value.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    let compact: String = value
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let len = compact.chars().count();
     if len < 16 {
         return false;
@@ -3481,7 +3481,12 @@ fn extract_string_entry(item: &serde_json::Value) -> Option<(String, bool)> {
     }
     let is_wide = arr[1..arr.len().saturating_sub(1)].iter().any(|part| {
         part.as_str()
-            .map(|s| matches!(s.to_lowercase().as_str(), "wide" | "u16" | "utf16le" | "utf-16le"))
+            .map(|s| {
+                matches!(
+                    s.to_lowercase().as_str(),
+                    "wide" | "u16" | "utf16le" | "utf-16le"
+                )
+            })
             .unwrap_or(false)
     });
     Some((value, is_wide))
@@ -3536,9 +3541,16 @@ fn collect_file_symbols(summary: &FileSummary) -> HashSet<String> {
         }
     }
 
-    for raw in summary.raw_exports.iter().chain(summary.raw_functions.iter()) {
+    for raw in summary
+        .raw_exports
+        .iter()
+        .chain(summary.raw_functions.iter())
+    {
         let candidate = if let Some(arr) = raw.as_array() {
-            arr.first().and_then(|v| v.as_str()).unwrap_or("").to_string()
+            arr.first()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
         } else if let Some(s) = raw.as_str() {
             s.to_string()
         } else {
@@ -3606,7 +3618,10 @@ fn emit_kv_value_tokens(base: &str, value: &serde_json::Value, w: &mut FeatureWr
     // (off by default), so we skip them entirely here.
     match value {
         serde_json::Value::Bool(b) => {
-            w.set(&format!("kv:{base}={}", if *b { "true" } else { "false" }), 1.0);
+            w.set(
+                &format!("kv:{base}={}", if *b { "true" } else { "false" }),
+                1.0,
+            );
         }
         serde_json::Value::String(s) => {
             let val = normalize_vocab_token(s, 80);
@@ -3659,10 +3674,7 @@ fn write_symbol_features(
                 for j in (i + 1)..cap {
                     for k in (j + 1)..cap {
                         w.set(
-                            &format!(
-                                "symbol_tri:{}||{}||{}",
-                                sorted[i], sorted[j], sorted[k]
-                            ),
+                            &format!("symbol_tri:{}||{}||{}", sorted[i], sorted[j], sorted[k]),
                             1.0,
                         );
                     }
@@ -3751,7 +3763,10 @@ fn write_textenc_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) 
     w.set("textenc:string_count_log", log1p(n_f) as f32);
     w.set("textenc:avg_len_log", log1p(sum_len as f64 / denom) as f32);
     w.set("textenc:max_len_log", log1p(max_len as f64) as f32);
-    w.set("textenc:base64ish_ratio", (f64::from(base64ish) / denom) as f32);
+    w.set(
+        "textenc:base64ish_ratio",
+        (f64::from(base64ish) / denom) as f32,
+    );
     w.set("textenc:hexish_ratio", (f64::from(hexish) / denom) as f32);
     w.set("textenc:urlish_ratio", (f64::from(urlish) / denom) as f32);
     w.set("textenc:pathish_ratio", (f64::from(pathish) / denom) as f32);
@@ -3760,16 +3775,22 @@ fn write_textenc_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) 
         (f64::from(unicode_escape) / denom) as f32,
     );
     w.set("textenc:wide_ratio", (f64::from(wide_n) / denom) as f32);
-    w.set("textenc:high_entropy_ratio", (f64::from(high_entropy) / denom) as f32);
-    w.set("textenc:long_token_ratio", (f64::from(long_token) / denom) as f32);
-    w.set("textenc:short_junk_ratio", (f64::from(short_junk) / denom) as f32);
+    w.set(
+        "textenc:high_entropy_ratio",
+        (f64::from(high_entropy) / denom) as f32,
+    );
+    w.set(
+        "textenc:long_token_ratio",
+        (f64::from(long_token) / denom) as f32,
+    );
+    w.set(
+        "textenc:short_junk_ratio",
+        (f64::from(short_junk) / denom) as f32,
+    );
 }
 
 /// Cross-metric derived ratios. Mirrors collimator `_BATCH1_RATIOS`.
-fn write_derived_metric_features(
-    merged_metrics: &serde_json::Value,
-    w: &mut FeatureWriter<'_>,
-) {
+fn write_derived_metric_features(merged_metrics: &serde_json::Value, w: &mut FeatureWriter<'_>) {
     let get = |group: &str, field: &str| -> f64 {
         merged_metrics
             .get(group)
@@ -3777,13 +3798,7 @@ fn write_derived_metric_features(
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0)
     };
-    let ratio = |num: f64, denom: f64| -> f64 {
-        if denom == 0.0 {
-            0.0
-        } else {
-            num / denom
-        }
-    };
+    let ratio = |num: f64, denom: f64| -> f64 { if denom == 0.0 { 0.0 } else { num / denom } };
     let string_count = get("binary", "string_count");
     let function_count = get("binary", "function_count");
     let import_count = get("binary", "import_count");
@@ -3840,10 +3855,7 @@ fn write_suspicious_ngram_counts(combined: &FindingSummary, w: &mut FeatureWrite
             n_tri += (k_end.saturating_sub(j + 1)) as u64;
         }
     }
-    w.set(
-        "agg:suspicious_bigram_count",
-        (n_bi as f64).ln_1p() as f32,
-    );
+    w.set("agg:suspicious_bigram_count", (n_bi as f64).ln_1p() as f32);
     w.set(
         "agg:suspicious_trigram_count",
         (n_tri as f64).ln_1p() as f32,
@@ -3913,14 +3925,14 @@ mod tests {
         let syms = collect_file_symbols(&summary);
 
         for expected in [
-            "open",                                       // import
-            "libc!open",                                  // composite import
-            "exported_fn",                                // export
-            "render",                                     // function
-            "client.get",                                 // ff.ct
-            "attempt.url().origin",                       // ff.ct
-            "window.localStorage",                        // ff.mc
-            "process.env.PATH",                           // ff.mc
+            "open",                 // import
+            "libc!open",            // composite import
+            "exported_fn",          // export
+            "render",               // function
+            "client.get",           // ff.ct
+            "attempt.url().origin", // ff.ct
+            "window.localStorage",  // ff.mc
+            "process.env.PATH",     // ff.mc
         ] {
             assert!(
                 syms.contains(expected),
@@ -3976,7 +3988,10 @@ mod tests {
     #[test]
     fn test_load_rejects_missing_feature_names() -> Result<()> {
         let mut file = tempfile::NamedTempFile::new()?;
-        writeln!(file, "{{\"version\":16,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"total_features\":51,\"standardized\":false}}")?;
+        writeln!(
+            file,
+            "{{\"version\":16,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"total_features\":51,\"standardized\":false}}"
+        )?;
         let Err(err) = FeatureSpec::load(file.path()) else {
             anyhow::bail!("missing feature_names should be rejected");
         };
@@ -4031,15 +4046,15 @@ mod tests {
         // the spec, not the cursor — this is the exact drift that ran the
         // unsigned-bigram block off the end of the vector in production.
         let feature_names = vec![
-            "filler:0".to_string(),               // 0
-            "present:objectives".to_string(),     // 1
-            "maxcrit:objectives".to_string(),     // 2
-            "filler:1".to_string(),               // 3
-            "bigrams:a + b".to_string(),          // 4
-            "bigrams:a + c".to_string(),          // 5
-            "trigram:a + b + c".to_string(),      // 6
-            "unsigned_bigram:a + b".to_string(),  // 7
-            "unsigned_bigram:a + c".to_string(),  // 8
+            "filler:0".to_string(),              // 0
+            "present:objectives".to_string(),    // 1
+            "maxcrit:objectives".to_string(),    // 2
+            "filler:1".to_string(),              // 3
+            "bigrams:a + b".to_string(),         // 4
+            "bigrams:a + c".to_string(),         // 5
+            "trigram:a + b + c".to_string(),     // 6
+            "unsigned_bigram:a + b".to_string(), // 7
+            "unsigned_bigram:a + c".to_string(), // 8
         ];
         let spec = anchor_spec(
             vec!["objectives".to_string()],

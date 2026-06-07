@@ -2,8 +2,8 @@
 #![allow(clippy::panic)] // the whole point of this test is to trigger a panic and assert no leak
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 // Mocking enough of AppState to test the logic

@@ -258,11 +258,7 @@ fn indicator_colors(
 ///
 /// The colors shift across the band itself, so threshold-adjacent results
 /// stay visually distinct from high-confidence results in the same class.
-fn confidence_blocks(
-    probability: f32,
-    classification: &Classification,
-    threshold: f32,
-) -> String {
+fn confidence_blocks(probability: f32, classification: &Classification, threshold: f32) -> String {
     let (left, right, _) = indicator_colors(probability, classification, threshold);
     format!("{}{}", fg(left, BLOCK), fg(right, BLOCK))
 }
@@ -282,14 +278,13 @@ fn display_probability(raw: f32, threshold: f32) -> f32 {
 }
 
 /// Color percentage text to match the classification band.
-fn colored_pct(
-    probability: f32,
-    classification: &Classification,
-    threshold: f32,
-) -> String {
+fn colored_pct(probability: f32, classification: &Classification, threshold: f32) -> String {
     let pct = format!(
         "{:>4}",
-        format!("{:.0}%", display_probability(probability, threshold) * 100.0)
+        format!(
+            "{:.0}%",
+            display_probability(probability, threshold) * 100.0
+        )
     );
     let (_, _, accent) = indicator_colors(probability, classification, threshold);
     fg(accent, &pct)
@@ -330,11 +325,7 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extr
     }
 
     let p = palette();
-    let blocks = confidence_blocks(
-        result.probability,
-        &result.classification,
-        result.threshold,
-    );
+    let blocks = confidence_blocks(result.probability, &result.classification, result.threshold);
     let pct = colored_level_or_pct(
         result.probability,
         &result.classification,
@@ -367,11 +358,7 @@ pub fn print_ps_result(
         eprint!("\r\x1b[2K");
     }
     let p = palette();
-    let blocks = confidence_blocks(
-        result.probability,
-        &result.classification,
-        result.threshold,
-    );
+    let blocks = confidence_blocks(result.probability, &result.classification, result.threshold);
     let pct = colored_level_or_pct(
         result.probability,
         &result.classification,

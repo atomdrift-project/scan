@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use litmus::server::{build_app, ServerConfig};
+use litmus::server::{ServerConfig, build_app};
 use std::net::SocketAddr;
 use tower::ServiceExt;
 use tracing_subscriber::EnvFilter;
@@ -163,10 +163,7 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
 
     let l = ml["l"].as_i64();
     if let Some(l) = l {
-        assert!(
-            l == -1 || (0..=100).contains(&l),
-            "unexpected l value: {l}"
-        );
+        assert!(l == -1 || (0..=100).contains(&l), "unexpected l value: {l}");
     } // null is also valid (manual thresholds on a hostile verdict)
     Ok(())
 }
