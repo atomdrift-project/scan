@@ -496,6 +496,11 @@ fn main() -> Result<()> {
         litmus::output::detect_theme();
     }
 
+    // Name the in-flight analyses if the process aborts (e.g. a stack overflow
+    // deep in cleave's analysis). Adds a suspect list to the abort log after the
+    // runtime's own overflow message. Best-effort and async-signal-safe.
+    litmus::crash_dump::install();
+
     // Dump all thread backtraces on SIGUSR1 (Linux equivalent of BSD SIGINFO / Ctrl-T).
     // Attaches lldb/gdb to ourselves so every thread is reported with symbols.
     // Best-effort: if spawning fails we simply don't get backtraces on signal.

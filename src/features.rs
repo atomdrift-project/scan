@@ -39,13 +39,18 @@ impl FeatureWriter<'_> {
 
 /// Feature spec version this build was compiled against.
 /// Must match the version in the loaded feature_spec.json.
-pub const EXPECTED_SPEC_VERSION: u32 = 17;
+///
+/// v18 grows the extended-metrics block by `ast_depth_capped` (collimator's
+/// ALWAYS_KEEP_METRICS allowlist keeps that rare anti-analysis signal past the
+/// frequency prune). The metric is read by name from the spec vocab, so older
+/// v16/v17 bundles still load — the extractor just doesn't place a slot they
+/// don't list.
+pub const EXPECTED_SPEC_VERSION: u32 = 18;
 
-/// Earliest spec version this build can still load. v16 specs are
-/// loadable too: v17 added the `cluster:*` feature family and new
-/// `agg:static_*` aggregates that the extractor doesn't yet produce,
-/// but the loader extracts known features and zeros out unknowns —
-/// v16 bundles still work end-to-end.
+/// Earliest spec version this build can still load. v16/v17 specs are
+/// loadable too: each newer version added feature families/columns the
+/// extractor produces, but the loader extracts known features and zeros out
+/// unknowns, so older bundles still work end-to-end.
 pub const MIN_LOADABLE_SPEC_VERSION: u32 = 16;
 /// Stable model ABI version shared with collimator.
 /// Keep this in sync with EXPECTED_SPEC_VERSION for a single compatibility number.

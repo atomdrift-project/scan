@@ -1871,6 +1871,13 @@ async fn run_job(
                 rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                 "analysis starting on worker thread",
             );
+            // Record this analysis as in flight so the SIGABRT handler can name
+            // it if a deep analysis overflows the stack and aborts the process.
+            // The guard frees the slot on normal completion; an abort skips the
+            // drop, leaving the entry live for the dump — exactly the suspect
+            // set we want. See `crate::crash_dump`.
+            let _inflight =
+                crate::crash_dump::register(analysis_id, thread_id, &sha_short2, &label_for_blocking);
             let result = if let Some(data) = downloaded {
                 classify_bytes(
                     data,
