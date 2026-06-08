@@ -362,10 +362,10 @@ fn load_evaluation_severity_thresholds(model_dir: &Path, level: u16) -> Option<T
 /// fallback.
 ///
 /// # Errors
-/// Returns an error if `level` is outside `0..=10000`.
+/// Returns an error if `level` is outside `0..=25000`.
 pub fn load_severity_thresholds(model_dir: &Path, level: u16) -> Result<Option<Thresholds>> {
-    if !(0..=10000).contains(&level) {
-        anyhow::bail!("severity level must be in 0..=10000, got {level}");
+    if !(0..=25000).contains(&level) {
+        anyhow::bail!("severity level must be in 0..=25000, got {level}");
     }
     Ok(load_config_severity_thresholds(model_dir, level)
         .or_else(|| load_evaluation_severity_thresholds(model_dir, level)))
@@ -2947,6 +2947,13 @@ impl Model {
         &self.spec
     }
 
+    /// Largest calibrated grid level (the suspicious ceiling). Used by the
+    /// trait floor to assign off-grid synthetic levels (`grid_max + 1/2`).
+    #[must_use]
+    pub(crate) const fn grid_max(&self) -> u16 {
+        self.grid_max
+    }
+
     /// Classification thresholds carried by this loaded model.
     #[must_use]
     pub const fn thresholds(&self) -> Thresholds {
@@ -3083,8 +3090,8 @@ mod tests {
     #[test]
     fn load_severity_thresholds_rejects_invalid_level() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let err = load_severity_thresholds(dir.path(), 10001).expect_err("level 10001 is invalid");
-        assert!(err.to_string().contains("0..=10000"));
+        let err = load_severity_thresholds(dir.path(), 25001).expect_err("level 25001 is invalid");
+        assert!(err.to_string().contains("0..=25000"));
         Ok(())
     }
 

@@ -628,6 +628,14 @@ fn build_expected_feature_names(
         format!("agg:top{TOP_K_RISK_FILES}_file_hostile_density_sum"),
         format!("agg:top{TOP_K_RISK_FILES}_file_suspicious_category_breadth_sum"),
         format!("agg:top{TOP_K_RISK_FILES}_file_hostile_category_breadth_sum"),
+        // Size-invariant crit-tier severity fractions (collimator's
+        // include_severity_fractions group). Only land if the spec carries the
+        // slots; written unconditionally here since litmus produces a superset.
+        "agg:crit3_finding_fraction".to_string(),
+        "agg:crit4_finding_fraction".to_string(),
+        "agg:hostile_finding_fraction".to_string(),
+        "agg:severe_to_mundane_ratio".to_string(),
+        "agg:crit4_present".to_string(),
         "agg:hostile_escalation_rate".to_string(),
         "agg:hostile_share_of_suspicious".to_string(),
         "agg:suspicious_finding_escalation_rate".to_string(),
@@ -2317,6 +2325,36 @@ fn write_aggregate_features(
     w.set(
         "agg:unique_hostile_ids_log",
         (summary.unique_hostile_ids as f32).ln_1p() / log_kb_p1,
+    );
+
+    // Size-invariant crit-tier severity fractions — mirror of collimator's
+    // include_severity_fractions block (count of crit>=N findings as a share of
+    // ALL findings, not per-KB). `w.set` no-ops when the spec lacks the slot, so
+    // these only materialize when the model was trained with the feature group.
+    let total_findings = summary.filtered_finding_count.max(1) as f32;
+    let mundane = summary
+        .filtered_finding_count
+        .saturating_sub(summary.notable_finding_count)
+        .max(1) as f32;
+    w.set(
+        "agg:crit3_finding_fraction",
+        summary.notable_finding_count as f32 / total_findings,
+    );
+    w.set(
+        "agg:crit4_finding_fraction",
+        summary.suspicious_finding_count as f32 / total_findings,
+    );
+    w.set(
+        "agg:hostile_finding_fraction",
+        summary.hostile_finding_count as f32 / total_findings,
+    );
+    w.set(
+        "agg:severe_to_mundane_ratio",
+        summary.notable_finding_count as f32 / mundane,
+    );
+    w.set(
+        "agg:crit4_present",
+        if summary.suspicious_finding_count > 0 { 1.0 } else { 0.0 },
     );
 
     let topk = topk_file_risk_features_from_summaries(summaries);
