@@ -273,7 +273,8 @@ mod trait_floor_tests {
     /// A report with `n` findings at crit `crit`/confidence `conf`, padded with
     /// `pad` baseline (crit-0) findings so the total/fraction can be controlled.
     fn report(crit: u64, conf: f64, n: usize, pad: usize) -> serde_json::Value {
-        let mut ts: Vec<serde_json::Value> = (0..n).map(|_| json!({"l": crit, "c": conf})).collect();
+        let mut ts: Vec<serde_json::Value> =
+            (0..n).map(|_| json!({"l": crit, "c": conf})).collect();
         ts.extend((0..pad).map(|_| json!({"l": 0, "c": 0.9})));
         json!({ "ts": ts })
     }
@@ -1179,9 +1180,9 @@ fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
 /// crit-4s does not.
 ///
 /// Only raises Benign → Suspicious; never lowers a model verdict (a file the
-/// model already graded suspicious/hostile is left untouched). `verdict_for_level`
-/// maps any `l > active_level` to Suspicious, so the synthetic levels classify
-/// correctly without changing the verdict logic.
+/// model already graded suspicious/hostile is left untouched). Synthetic levels
+/// sit above the model grid so the envelope records that this was a trait-floor
+/// escalation rather than an ordinary swept model level.
 fn apply_trait_floor(
     decision: &mut Decision,
     report: &serde_json::Value,

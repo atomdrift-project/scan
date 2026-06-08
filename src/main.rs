@@ -338,8 +338,8 @@ fn threshold_overrides_for_model(
     // level-independent defaults and the active level is passed separately.
     //
     // Only manual `--threshold-*` overrides produce a Thresholds. We do NOT
-    // derive a suspicious cutoff: the L×4 lookup needs a level table and a known
-    // level, neither of which applies when the operator picks
+    // derive a suspicious cutoff: the level-space lookup needs a level table and
+    // a known level, neither of which applies when the operator picks
     // `--threshold-hostile` directly. Collapsing suspicious to hostile means
     // `classify` never returns Suspicious — the operator gets hostile-vs-benign
     // verdicts only, which is what we want for manual mode.

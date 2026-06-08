@@ -148,19 +148,6 @@ fn collect_targets() -> Result<Vec<PathBuf>> {
     Ok(targets)
 }
 
-/// Benign-corpus samples temporarily excluded from validation by file name.
-///
-/// `does-nothing-linux-386` is a minimal do-nothing Go ELF. The elf specialist
-/// robustly grades it non-benign (raw ~0.82): its features — Go runtime strings,
-/// build/debug metadata, tiny binary — match the Go malware stubs it trained on,
-/// and the model's prior is ~69% malware. Suppressing it via retraining costs
-/// ~8pp ELF recall (autocollie-confirmed), a bad trade for one synthetic
-/// fixture. Skipped pending benign-Go-ELF data growth, not fixed.
-///
-/// TODO(2026-09): review — drop this skip once the benign pool covers minimal
-/// Go ELFs (or confirm the model still disagrees and decide deliberately).
-const SKIPPED_BENIGN_SAMPLES: &[&str] = &["does-nothing-linux-386.xz"];
-
 fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?
@@ -174,14 +161,6 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             }
             walk_files(&path, out)?;
         } else if file_type.is_file() {
-            let name = entry.file_name();
-            if SKIPPED_BENIGN_SAMPLES.contains(&name.to_string_lossy().as_ref()) {
-                eprintln!(
-                    "validate: skipping benign-corpus sample {} (temporary waiver, see SKIPPED_BENIGN_SAMPLES; review 2026-09)",
-                    path.display(),
-                );
-                continue;
-            }
             out.push(path);
         }
     }
@@ -212,10 +191,12 @@ fn evaluate(
         if result.classification != Classification::Benign {
             file_warned = true;
             eprintln!(
-                "WARN {}: grade={} probability={:.4} thresholds suspicious={:.4} hostile={:.4}",
+                "WARN {}: grade={} level={} probability={:.4} decision_threshold={:.4} active_thresholds suspicious={:.4} hostile={:.4}",
                 path.display(),
                 result.classification,
+                format_level(result.l),
                 result.probability,
+                result.threshold,
                 thresholds.suspicious,
                 thresholds.hostile,
             );
@@ -225,11 +206,13 @@ fn evaluate(
             if embedded.classification != Classification::Benign {
                 file_warned = true;
                 eprintln!(
-                    "WARN {}!!{}: grade={} probability={:.4} thresholds suspicious={:.4} hostile={:.4}",
+                    "WARN {}!!{}: grade={} level={} probability={:.4} decision_threshold={:.4} active_thresholds suspicious={:.4} hostile={:.4}",
                     path.display(),
                     embedded.path,
                     embedded.classification,
+                    format_level(embedded.l),
                     embedded.probability,
+                    embedded.threshold,
                     thresholds.suspicious,
                     thresholds.hostile,
                 );
@@ -250,6 +233,14 @@ fn evaluate(
         );
     }
     Ok((passed, total, warnings))
+}
+
+fn format_level(l: Option<i32>) -> String {
+    match l {
+        Some(-1) => "clean".to_string(),
+        Some(n) => format!("L{n}"),
+        None => "manual".to_string(),
+    }
 }
 
 fn print_top_findings(findings: &[scan::TopFinding], indent: &str) {

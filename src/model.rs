@@ -132,12 +132,9 @@
 //!
 //! Collimator no longer emits a `suspicious` field in any of the JSONs it
 //! writes (`config.json`, `evaluation.json`, `route_policies.json`). Litmus
-//! derives it consumer-side as a **level-table lookup**: given the active
-//! hostile level N, the suspicious threshold is the hostile threshold at
-//! level `min(max_grid_level, 4 × N)` (the looser-budget row in the same
-//! `severity_levels[]` / `levels[]` table). For example, a deploy at L50
-//! hostile uses L200's threshold as the suspicious cutoff — a 4× wider FP
-//! budget that catches more "maybe-bad" files while keeping hostile crisp.
+//! derives it consumer-side as a **level-table lookup**: the suspicious
+//! threshold is the hostile threshold at level `min(max_grid_level, 20000)`
+//! (the looser-budget row in the same `severity_levels[]` / `levels[]` table).
 //! Manual `--threshold-hostile <val>` (no `-l`) skips the derivation: the
 //! `Thresholds` struct carries `suspicious == hostile`, so `classify` only
 //! ever returns Benign or Hostile.
@@ -199,17 +196,19 @@ const fn default_model_abi_version() -> u32 {
     EXPECTED_MODEL_ABI_VERSION
 }
 
+/// Current suspicious ceiling (FP per 100M benigns) for level-sweep decisions.
+const SUSPICIOUS_LEVEL_CEILING: u16 = 20_000;
+
 /// Derive the suspicious LEVEL from the hostile level.
 ///
-/// Rule: suspicious = `max_grid_level` (typically 1000). Any file that fires
-/// at a level looser than the operator's selected hostile level — but not
-/// at the hostile level itself — is classified as suspicious.
+/// Rule: suspicious = `min(max_grid_level, 20000)`. Any file that fires at a
+/// level looser than the operator's selected hostile level — but not above the
+/// suspicious ceiling — is classified as suspicious.
 ///
 /// The previous L×4 policy proved too narrow once we saw real recall curves:
-/// the recall plateau between L4 and L1000 is flat for almost every file
-/// type, so the entire "above critical" band is operationally equivalent.
-/// Collapsing suspicious to "fires anywhere up to L_max but not at L_hostile"
-/// captures the user-meaningful distinction in a single threshold lookup.
+/// the recall plateau above the critical level is flat for almost every file
+/// type. Keep a high but finite ceiling so very loose levels can remain
+/// informational without becoming suspicious verdicts.
 ///
 /// `hostile_level` is unused but kept in the signature for source-compatibility
 /// with the prior derivation; callers that were passing it can leave the
@@ -219,7 +218,7 @@ pub(crate) fn derive_suspicious_level_from_hostile(
     _hostile_level: u16,
     max_grid_level: u16,
 ) -> u16 {
-    max_grid_level
+    max_grid_level.min(SUSPICIOUS_LEVEL_CEILING)
 }
 
 /// Try to load thresholds from config.json in the model directory.
@@ -227,7 +226,7 @@ pub(crate) fn derive_suspicious_level_from_hostile(
 /// config.json is the primary model-level configuration and takes precedence
 /// over evaluation.json recommendations. The `suspicious` field, if present,
 /// is honored as-is; otherwise we set `suspicious == hostile` (hostile-only
-/// behavior) — the level-space L×4 lookup only applies when a severity level
+/// behavior) — the level-space lookup only applies when a severity level
 /// is in play, not for the top-level fallback constants.
 // Threshold values from JSON are in 0.0..1.0; narrowing to f32 is safe.
 #[allow(clippy::cast_possible_truncation)]
@@ -260,7 +259,7 @@ fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
 /// Look up the HOSTILE threshold at a specific level in a `severity_levels[]`
 /// table. Returns `None` when the level isn't present or its hostile metric
 /// has no threshold. Used as the building block for both the per-level
-/// hostile lookup and the L×4 suspicious lookup.
+/// hostile lookup and the suspicious-ceiling lookup.
 #[allow(clippy::cast_possible_truncation)]
 fn hostile_threshold_at_level(levels: &[SeverityLevel], level: u16) -> Option<f32> {
     let entry = levels.iter().find(|entry| entry.level == level)?;
@@ -269,7 +268,7 @@ fn hostile_threshold_at_level(levels: &[SeverityLevel], level: u16) -> Option<f3
 }
 
 /// Largest level value present in a `severity_levels[]` table, or `None` when
-/// the table is empty. Used to clamp the L×4 suspicious lookup so we never
+/// the table is empty. Used to clamp the suspicious lookup so we never
 /// ask for a level the bundle doesn't have.
 fn max_level(levels: &[SeverityLevel]) -> Option<u16> {
     levels.iter().map(|e| e.level).max()
@@ -280,9 +279,9 @@ fn max_level(levels: &[SeverityLevel]) -> Option<u16> {
 ///
 /// Suspicious resolution order:
 /// 1. Explicit per-level `suspicious.threshold` (when collimator emits one).
-/// 2. L×4 level-space lookup: the hostile threshold at level
-///    `min(max_level, 4 × level)`.
-/// 3. Hostile-only fallback (suspicious == hostile) when the L×4 row is
+/// 2. Level-space lookup: the hostile threshold at level
+///    `min(max_level, 20000)`.
+/// 3. Hostile-only fallback (suspicious == hostile) when the suspicious row is
 ///    absent — typical when the bundle's grid is truncated.
 #[allow(clippy::cast_possible_truncation)]
 fn thresholds_from_severity_levels(levels: &[SeverityLevel], level: u16) -> Option<Thresholds> {
@@ -300,7 +299,7 @@ fn thresholds_from_severity_levels(levels: &[SeverityLevel], level: u16) -> Opti
             hostile_threshold_at_level(levels, suspicious_level).unwrap_or(hostile)
         }
     };
-    // Suspicious cutoff sits ABOVE hostile only if the L×4 row's hostile is
+    // Suspicious cutoff sits ABOVE hostile only if the suspicious row's hostile is
     // tighter than the active level's hostile — that would invert the band,
     // so clamp to the hostile threshold as a safety net.
     let suspicious = suspicious.min(hostile);
@@ -391,7 +390,7 @@ fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
         let hostile = rec.hostile? as f32;
         // Top-level `recommended_thresholds` is the no-level fallback. When
         // suspicious is absent we collapse to hostile-only (suspicious ==
-        // hostile) — the L×4 lookup needs a `severity_levels[]` table, which
+        // hostile) — the level-space lookup needs a `severity_levels[]` table, which
         // this branch doesn't have access to.
         let suspicious = rec.suspicious.map(|s| s as f32).unwrap_or(hostile);
         let t = Thresholds {
@@ -1099,7 +1098,7 @@ struct EnsembleConfig {
     /// space, matching the general route's emitted probability.
     general_grid: Vec<(u16, f32)>,
     /// Largest level present in the `levels[]` grid. The suspicious cap is
-    /// `min(grid_max, 4 × active_level)`.
+    /// `min(grid_max, 20000)`.
     grid_max: u16,
 }
 
@@ -1502,8 +1501,8 @@ fn load_route_policies(model_dir: &Path, level: u16) -> RoutePolicies {
 
         // The active-level policy drives the diagnostic per-route classification
         // in the `models[]` array. Its suspicious band is derived in level-space
-        // via the L×4 lookup: pull the hostile policy from level
-        // `min(max, 4 × level)`. An explicit `suspicious` block, when collimator
+        // via the suspicious-ceiling lookup: pull the hostile policy from level
+        // `min(max, 20000)`. An explicit `suspicious` block, when collimator
         // emits one, wins; the active level's hostile is the final fallback.
         let Some(level_entry) = route.levels.iter().find(|entry| entry.level == level) else {
             continue;
@@ -1607,9 +1606,9 @@ fn blend_policy_from_json(json: &BlendPolicyJson) -> Option<BlendPolicy> {
 
 /// Pull per-route thresholds from `levels[]` at the requested level. Pairs up
 /// hostile and suspicious thresholds for each route. When the JSON omits a
-/// `suspicious` block, suspicious is derived in level-space (L×4 lookup) by
+/// `suspicious` block, suspicious is derived in level-space by
 /// reading the hostile threshold for the same route at level
-/// `min(max_grid_level, 4 × level)`.
+/// `min(max_grid_level, 20000)`.
 #[allow(clippy::cast_possible_truncation)]
 fn thresholds_at_level(levels: &[LevelEntryJson], level: u16) -> HashMap<String, Thresholds> {
     let Some(entry) = levels.iter().find(|e| e.level == level) else {
@@ -1637,7 +1636,7 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u16) -> HashMap<String,
         // `suspicious` block but a specific route is absent from it, that
         // route stays active as hostile-only (suspicious == hostile). When
         // collimator omits the `suspicious` block entirely, derive the
-        // suspicious cutoff from the L×4 row's hostile threshold for the
+        // suspicious cutoff from the ceiling row's hostile threshold for the
         // same route (level-space lookup, falls back to hostile-only when
         // the route is missing from the looser row).
         let hostile_f32 = hostile as f32;
@@ -2183,15 +2182,15 @@ fn sweep_policy_grid(grid: &[LevelPolicy], scores: &[RouteProbability]) -> Optio
 ///
 /// `fired_level` is the level-independent `l` (from the grid sweep); `level` is
 /// the active `-l`. A file is **hostile** when it fires within the hostile
-/// budget (`l <= level`) and **suspicious** when it fires anywhere above that
-/// budget but still within the calibrated grid (`l <= grid_max`). Beyond
-/// `grid_max` is benign (off-grid noise). The `_grid_max` parameter is kept in
-/// the signature for source-compatibility with callers from the old L×4 era.
-fn verdict_for_level(fired_level: u16, level: u16, _grid_max: u16) -> Classification {
+/// budget (`l <= level`) and **suspicious** when it fires above that budget but
+/// within the derived suspicious ceiling. Beyond that ceiling is benign.
+fn verdict_for_level(fired_level: u16, level: u16, grid_max: u16) -> Classification {
     if fired_level <= level {
         Classification::Hostile
-    } else {
+    } else if fired_level <= derive_suspicious_level_from_hostile(level, grid_max) {
         Classification::Suspicious
+    } else {
+        Classification::Benign
     }
 }
 
@@ -2333,7 +2332,7 @@ pub struct Model {
     /// General route's hostile threshold per level (ascending), for the
     /// no-policy verdict sweep. Empty on single-bundle / pre-grid deployments.
     general_grid: Vec<(u16, f32)>,
-    /// Largest grid level; suspicious cap = `min(grid_max, 4 × active_level)`.
+    /// Largest grid level; suspicious cap = `min(grid_max, 20000)`.
     grid_max: u16,
 }
 
@@ -2905,7 +2904,7 @@ impl Model {
     /// `level`, so it — and the entire serialized envelope — is identical
     /// regardless of the deploy `-l`, keeping the result cache-shareable. The
     /// active `level` only positions the cutoffs: hostile when `l <= level`,
-    /// suspicious when `l <= min(grid_max, 4 × level)`, else benign. A file that
+    /// suspicious when `l <= min(grid_max, 20000)`, else benign. A file that
     /// fires at no grid level is clean and reports `l = -1`.
     fn decide_swept(
         &self,
@@ -3013,7 +3012,7 @@ mod tests {
     #[test]
     fn load_severity_thresholds_honors_explicit_suspicious_when_present() -> Result<()> {
         // When collimator emits an explicit `suspicious` block for a level,
-        // the L×4 lookup is bypassed and the explicit value is used as-is.
+        // the level-space lookup is bypassed and the explicit value is used as-is.
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),
@@ -3036,14 +3035,14 @@ mod tests {
         )?;
 
         let level_1 = load_severity_thresholds(dir.path(), 1)?.context("level 1")?;
-        // Explicit per-level `suspicious.threshold` wins over the L×4 lookup.
+        // Explicit per-level `suspicious.threshold` wins over the level-space lookup.
         assert_eq!(level_1.hostile, 0.99);
         assert_eq!(level_1.suspicious, 0.99);
         assert_eq!(level_1.classify(0.99), Classification::Hostile);
 
         let level_9 = load_severity_thresholds(dir.path(), 9)?.context("level 9")?;
         assert_eq!(level_9.hostile, 0.80);
-        // Explicit suspicious threshold honored even when the L×4 lookup
+        // Explicit suspicious threshold honored even when the level-space lookup
         // would otherwise miss (L36 absent from this table).
         assert_eq!(level_9.suspicious, 0.50);
         Ok(())
@@ -3055,7 +3054,7 @@ mod tests {
         // cutoff comes from the level-table's HOSTILE threshold at the loosest
         // (noisiest) grid level: anything that fires up there is "still firing
         // above the operator's critical line" and should ring as suspicious.
-        // For this table that's L1000's hostile (0.70).
+        // For this table that's the ceiling row's hostile (0.70).
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),
@@ -3073,17 +3072,18 @@ mod tests {
         assert_eq!(l50.hostile, 0.99);
         assert_eq!(
             l50.suspicious, 0.70,
-            "L50 suspicious should be the loosest-row (L1000) hostile threshold"
+            "L50 suspicious should be the ceiling-row hostile threshold"
         );
 
         let l300 = load_severity_thresholds(dir.path(), 300);
         // L300 is absent from this table so the loader returns None — but the
-        // derivation rule (suspicious = max_grid_level, regardless of hostile)
-        // is exercised via `derive_suspicious_level_from_hostile` directly below.
+        // derivation rule is exercised via
+        // `derive_suspicious_level_from_hostile` directly below.
         assert!(matches!(l300, Ok(None)));
         assert_eq!(derive_suspicious_level_from_hostile(300, 1000), 1000);
         assert_eq!(derive_suspicious_level_from_hostile(50, 1000), 1000);
         assert_eq!(derive_suspicious_level_from_hostile(1000, 1000), 1000);
+        assert_eq!(derive_suspicious_level_from_hostile(50, 25_000), 20_000);
         Ok(())
     }
 
@@ -3471,9 +3471,9 @@ mod tests {
 
     #[test]
     fn verdict_for_level_applies_caps() {
-        // Rule: `l <= active level` is hostile, anything else is suspicious.
-        // grid_max is unused now (kept in the signature for source-compat).
-        let grid_max = 1000;
+        // Rule: `l <= active level` is hostile, `active < l <= suspicious cap`
+        // is suspicious, and anything beyond the cap is benign.
+        let grid_max = 25_000;
         assert_eq!(verdict_for_level(20, 50, grid_max), Classification::Hostile);
         assert_eq!(verdict_for_level(50, 50, grid_max), Classification::Hostile);
         assert_eq!(
@@ -3484,15 +3484,17 @@ mod tests {
             verdict_for_level(200, 50, grid_max),
             Classification::Suspicious
         );
-        // A file that only fires loosely is still suspicious — anything above
-        // critical's FP level rings as such.
         assert_eq!(
-            verdict_for_level(500, 50, grid_max),
+            verdict_for_level(20_000, 50, grid_max),
             Classification::Suspicious
         );
         assert_eq!(
-            verdict_for_level(10000, 50, grid_max),
-            Classification::Suspicious
+            verdict_for_level(20_001, 50, grid_max),
+            Classification::Benign
+        );
+        assert_eq!(
+            verdict_for_level(25_000, 50, grid_max),
+            Classification::Benign
         );
 
         // Stricter deploy (-l 10): only l <= 10 is hostile.
