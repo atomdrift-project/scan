@@ -1126,11 +1126,36 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 .map_or(60, |s| s.max(1)),
         );
         tokio::spawn(async move {
+            // Per-slot census state, carried across ticks.
+            // `cpu`/`at`: previous CPU-seconds + wall sample, for cores-busy.
+            // `stage_since`: when each analysis entered its current phase, so the
+            // census can report time-in-stage (a phase that never advances is the
+            // signature of a wedge). Pruned to the live set each tick.
+            let mut last_cpu = crate::inflight::process_cpu_secs();
+            let mut last_at = Instant::now();
+            let mut stage_since: std::collections::HashMap<u64, (String, Instant)> =
+                std::collections::HashMap::new();
+            // Slots whose analysis has run past this long are flagged as stuck and
+            // logged at WARN so a wedge stands out in the stream.
+            const STUCK_WARN_SECS: u64 = 300;
+            // Cap census lines so a saturated worker can't flood the log; oldest
+            // first means the most-stuck slots always appear.
+            const CENSUS_MAX_LINES: usize = 64;
             while !shutdown.load(Ordering::Relaxed) {
                 interruptible_sleep(heartbeat, &shutdown).await;
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
+                let now = Instant::now();
+                let cpu = crate::inflight::process_cpu_secs();
+                let wall = now.duration_since(last_at).as_secs_f64().max(1e-6);
+                // Average cores busy since the last tick. With slots full but this
+                // near zero, the worker is blocked (locks / subprocess / I/O), not
+                // grinding — the key blocked-vs-busy bit for triaging a wedge.
+                let cpu_cores_busy = ((cpu - last_cpu) / wall).max(0.0);
+                last_cpu = cpu;
+                last_at = now;
+
                 let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
                 let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
                 let available_slots = semaphore.available_permits();
@@ -1140,12 +1165,74 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     prefetch_buffer_mb = queued_bytes.load(Ordering::Relaxed) / (1024 * 1024),
                     active_slots = slots.saturating_sub(available_slots),
                     available_slots,
+                    cpu_cores_busy = format!("{cpu_cores_busy:.1}"),
+                    rayon_threads = global_rayon_threads,
                     blocking_started_total = started,
                     blocking_finished_total = finished,
                     inflight_blocking = started.saturating_sub(finished),
                     completed = completed.load(Ordering::Acquire),
                     "worker summary",
                 );
+
+                // Per-slot census: one line per in-flight analysis — file, size,
+                // how long it has been running, the stage it is in (and for how
+                // long), the worker thread, and what a blocked thread is waiting
+                // on. Lets an operator name a wedged slot from the log alone.
+                let census = crate::inflight::snapshot();
+                let live: std::collections::HashSet<u64> =
+                    census.iter().map(|e| e.analysis_id).collect();
+                stage_since.retain(|id, _| live.contains(id));
+                for entry in census.iter().take(CENSUS_MAX_LINES) {
+                    let phase = entry.phase.get();
+                    let stage = if phase.is_empty() { "(starting)" } else { phase.as_str() };
+                    let slot = stage_since
+                        .entry(entry.analysis_id)
+                        .or_insert_with(|| (phase.clone(), now));
+                    if slot.0 != phase {
+                        *slot = (phase.clone(), now);
+                    }
+                    let stage_elapsed = now.duration_since(slot.1);
+                    let total_elapsed = now.duration_since(entry.started);
+                    let thread_id = entry.thread_id.load(Ordering::Relaxed);
+                    let waiting = crate::inflight::wait_channel(thread_id)
+                        .unwrap_or_else(|| format!("stage:{stage}"));
+                    if total_elapsed.as_secs() >= STUCK_WARN_SECS {
+                        tracing::warn!(
+                            analysis_id = entry.analysis_id,
+                            sha256 = %entry.sha,
+                            file = %entry.file,
+                            size_bytes = entry.size_bytes,
+                            file_type = %entry.file_type,
+                            thread_id,
+                            stuck_for_ms = crate::duration_ms(total_elapsed),
+                            stage,
+                            stage_for_ms = crate::duration_ms(stage_elapsed),
+                            waiting,
+                            "slot in-flight (STUCK)",
+                        );
+                    } else {
+                        tracing::info!(
+                            analysis_id = entry.analysis_id,
+                            sha256 = %entry.sha,
+                            file = %entry.file,
+                            size_bytes = entry.size_bytes,
+                            file_type = %entry.file_type,
+                            thread_id,
+                            elapsed_ms = crate::duration_ms(total_elapsed),
+                            stage,
+                            stage_for_ms = crate::duration_ms(stage_elapsed),
+                            waiting,
+                            "slot in-flight",
+                        );
+                    }
+                }
+                if census.len() > CENSUS_MAX_LINES {
+                    tracing::info!(
+                        truncated = census.len() - CENSUS_MAX_LINES,
+                        shown = CENSUS_MAX_LINES,
+                        "slot census truncated",
+                    );
+                }
             }
         });
     }
@@ -1692,6 +1779,18 @@ async fn run_job(
     // reporting a count.
     let phase = cleave::PhaseTracker::with_label(format!("{sha_short} {label}"));
     let phase2 = phase.clone();
+    // Register this analysis in the live in-flight census so the periodic worker
+    // summary can report its file, size, stage, time stuck, and what it is
+    // waiting on. The guard deregisters it when `run_job` returns.
+    let _inflight_census = crate::inflight::register(
+        analysis_id,
+        Arc::clone(&sha_short),
+        Arc::clone(&label),
+        u64::try_from(job.size_bytes).unwrap_or(0),
+        Arc::from(job.file_type.as_str()),
+        start,
+        phase.clone(),
+    );
     let label2 = Arc::clone(&label);
     let label_for_blocking = Arc::clone(&label);
     // Pre-clone for the blocking closure before the watcher captures its copy.
@@ -1834,6 +1933,10 @@ async fn run_job(
         run_analysis(analysis_id, || {
             let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
             let thread_id = os_thread_id();
+            // Attach the worker thread to the live census so the periodic summary
+            // can report which thread each in-flight analysis is wedged on and
+            // read its kernel wait-channel.
+            crate::inflight::set_thread_id(analysis_id, thread_id);
             let inflight_blocking =
                 started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
             tracing::info!(
