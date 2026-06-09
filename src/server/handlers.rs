@@ -503,20 +503,19 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
     // to the reload step regardless so we still pick up any partial state.
     //
     // The outer timeout is only a backstop around the sequential models +
-    // traits updates. Each git process already enforces its own 10-minute
-    // process-group timeout internally.
-    //
-    // `prev_models_head` captures the commit before the pull so we can roll back
-    // the models repo on disk if the new model fails to load.
+    // traits updates. model_update validates each bundle (Model::load) before
+    // swapping it in, so a broken bundle never lands on disk and there's nothing
+    // to roll back.
     const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(21 * 60);
     let pull_result = tokio::time::timeout(
         PULL_TIMEOUT,
         tokio::task::spawn_blocking(|| {
-            let (models_err, prev_models_head) = match crate::models_repo::update(false) {
-                Ok(prev) => (None, prev),
+            let dir = crate::models_repo::install_target();
+            let models_err = match crate::model_update::update(&dir, false) {
+                Ok(()) => None,
                 Err(e) => {
                     tracing::warn!("models update failed: {e}");
-                    (Some(e.to_string()), None)
+                    Some(e.to_string())
                 }
             };
             let traits_err = match crate::traits_repo::update(false, false) {
@@ -526,22 +525,22 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
                     Some(e.to_string())
                 }
             };
-            (models_err, prev_models_head, traits_err)
+            (models_err, traits_err)
         }),
     )
     .await;
 
-    let (models_err, prev_models_head, traits_err) = match pull_result {
+    let (models_err, traits_err) = match pull_result {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
             tracing::warn!("update pull task join error: {e}");
             let msg = "task join failed".to_string();
-            (Some(msg.clone()), None, Some(msg))
+            (Some(msg.clone()), Some(msg))
         }
         Err(_elapsed) => {
             tracing::warn!("update pull timed out after {}s", PULL_TIMEOUT.as_secs());
-            let msg = format!("git pull timed out after {}s", PULL_TIMEOUT.as_secs());
-            (Some(msg.clone()), None, Some(msg))
+            let msg = format!("update timed out after {}s", PULL_TIMEOUT.as_secs());
+            (Some(msg.clone()), Some(msg))
         }
     };
 
@@ -565,19 +564,9 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
         }
         Err((status, msg)) => {
             // The in-memory model was not swapped, so requests continue against
-            // the previous model. Roll the models repo back on disk too so future
-            // reloads don't re-encounter the broken state.
-            if let Some(rev) = prev_models_head {
-                tracing::error!(
-                    rev,
-                    "model reload failed after pull; rolling back models repo to previous commit"
-                );
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = crate::models_repo::rollback(&rev) {
-                        tracing::error!("models rollback failed: {e}");
-                    }
-                });
-            }
+            // the previous model. The on-disk bundle was validated before install,
+            // so there's nothing to roll back — a reload failure here is in-memory.
+            tracing::error!("model reload failed after update: {msg}");
             (
                 status,
                 Json(serde_json::json!({

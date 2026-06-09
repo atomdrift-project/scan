@@ -32,7 +32,6 @@ pub mod bench_hopper;
 pub mod crash_dump;
 pub mod explain;
 pub mod features;
-pub(crate) mod git_cmd;
 pub mod model;
 pub mod model_update;
 pub mod models_repo;

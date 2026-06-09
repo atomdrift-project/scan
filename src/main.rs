@@ -592,7 +592,8 @@ fn main() -> Result<()> {
     if cli.update {
         std::thread::scope(|s| {
             s.spawn(|| {
-                if let Err(e) = litmus::models_repo::update(false) {
+                let dir = litmus::models_repo::install_target();
+                if let Err(e) = litmus::model_update::update(&dir, false) {
                     eprintln!("Warning: model update failed: {e}");
                 }
             });
@@ -820,7 +821,8 @@ fn main() -> Result<()> {
             } else {
                 std::thread::scope(|s| {
                     s.spawn(|| {
-                        if let Err(e) = litmus::models_repo::update(false) {
+                        let dir = litmus::models_repo::install_target();
+                        if let Err(e) = litmus::model_update::update(&dir, false) {
                             eprintln!("Warning: model update failed: {e}");
                         }
                     });

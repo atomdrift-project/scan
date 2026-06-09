@@ -504,15 +504,18 @@ fn renew_resources_once(
     slow_rule_ms: u64,
     level: Option<u16>,
 ) -> Result<Option<Arc<ModelResources>>> {
-    let (prev_models_head, models_after, models_changed) = match crate::models_repo::update(true) {
-        Ok(prev) => {
-            let after = crate::models_repo::version();
-            let changed = prev.as_deref() != after.as_deref();
-            (prev, after, changed)
-        }
+    // model_update validates the freshly extracted bundle (Model::load) before
+    // swapping it in, so a broken bundle never lands on disk — there's no
+    // last-known-good state to roll back to. A combined-validation failure below
+    // propagates; the worker keeps serving its current in-memory resources until
+    // the next successful renewal or a restart.
+    let dir = crate::models_repo::install_target();
+    let before = crate::model_update::installed(&dir).map(|i| i.commit);
+    let models_changed = match crate::model_update::update(&dir, false) {
+        Ok(()) => before != crate::model_update::installed(&dir).map(|i| i.commit),
         Err(error) => {
-            tracing::warn!(error = %error, "model renewal fetch failed; treating models as unchanged");
-            (None, None, false)
+            tracing::warn!(error = %error, "model renewal failed; treating models as unchanged");
+            false
         }
     };
     let traits_changed = match crate::traits_repo::update(false, true) {
@@ -527,41 +530,13 @@ fn renew_resources_once(
         return Ok(None);
     }
 
-    tracing::info!(
-        models_changed,
-        traits_changed,
-        models_from = prev_models_head.as_deref().unwrap_or("none"),
-        models_to = models_after.as_deref().unwrap_or("unknown"),
-        "rules changed; revalidating bundle",
-    );
+    tracing::info!(models_changed, traits_changed, "rules changed; revalidating bundle");
 
-    let resources = match validate_and_load_resources(model_dir, thresholds, slow_rule_ms, level) {
-        Ok(resources) => resources,
-        Err(error) => {
-            if let Some(prev) = prev_models_head.as_deref() {
-                tracing::error!(rollback_to = %prev, "renewed models failed validation; rolling back");
-                if let Err(rollback_error) = crate::models_repo::rollback(prev) {
-                    tracing::error!(error = %rollback_error, "model rollback after failed renewal failed");
-                }
-            }
-            return Err(error);
-        }
-    };
+    let resources = validate_and_load_resources(model_dir, thresholds, slow_rule_ms, level)?;
 
-    match cleave::reload_capability_mapper() {
-        Ok((traits, composites)) => {
-            tracing::info!(traits, composites, "cleave capability mapper renewed");
-        }
-        Err(error) => {
-            if let Some(prev) = prev_models_head.as_deref() {
-                tracing::error!(rollback_to = %prev, "capability mapper reload failed after renewal; rolling back models");
-                if let Err(rollback_error) = crate::models_repo::rollback(prev) {
-                    tracing::error!(error = %rollback_error, "model rollback after mapper reload failure failed");
-                }
-            }
-            anyhow::bail!("reload cleave capability mapper: {error}");
-        }
-    }
+    let (traits, composites) = cleave::reload_capability_mapper()
+        .map_err(|error| anyhow::anyhow!("reload cleave capability mapper: {error}"))?;
+    tracing::info!(traits, composites, "cleave capability mapper renewed");
 
     Ok(Some(resources))
 }
