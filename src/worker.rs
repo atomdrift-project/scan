@@ -1214,7 +1214,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     // stuck on (yara symbol / pipe_wait subprocess / futex lock).
                     let thread_waits =
                         crate::inflight::format_wait_summary(&crate::inflight::thread_wait_summary());
-                    let crumbs = cleave::breadcrumb::snapshot();
                     tracing::warn!(
                         newly_stuck = newly_stuck.len(),
                         inflight = census.len(),
@@ -1222,7 +1221,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         rayon_threads = global_rayon_threads,
                         stuck_threshold_s = stuck_warn_secs,
                         thread_waits,
-                        breadcrumbs = crumbs.len(),
                         "WEDGE DETECTED: analyses exceeded the stuck threshold; per-slot detail follows",
                     );
                     for entry in &newly_stuck {
@@ -1245,8 +1243,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     // Per-thread cleave breadcrumbs: which member each rayon
                     // worker is on. For an archive wedge the work is spread
                     // across the pool, so this names the member-level culprits the
-                    // per-slot (coordinator) lines can't.
-                    for crumb in crumbs.into_iter().take(CENSUS_MAX_LINES) {
+                    // per-slot (coordinator) lines can't. Gated on the
+                    // `cleave-breadcrumbs` feature, which requires a cleave build
+                    // exposing `cleave::breadcrumb` (not yet in the released rev).
+                    #[cfg(feature = "cleave-breadcrumbs")]
+                    for crumb in cleave::breadcrumb::snapshot().into_iter().take(CENSUS_MAX_LINES) {
                         tracing::warn!(
                             rayon_index = ?crumb.rayon_index,
                             thread_id = crumb.thread_id,

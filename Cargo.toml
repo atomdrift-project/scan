@@ -124,6 +124,12 @@ tikv-jemallocator = "0.6"
 # Analyze with: jeprof --text ./out/litmus.heap out/heap/jeprof.*.heap
 jemalloc-prof = ["tikv-jemallocator/profiling"]
 
+# Emit per-member rayon-thread breadcrumbs in the SIGUSR1/wedge dump. Requires a
+# cleave build that exposes `cleave::breadcrumb` (the diagnostics PR); off by
+# default so the released-cleave build is unaffected. Enable with a matching
+# cleave via `[patch]` or a version bump.
+cleave-breadcrumbs = []
+
 # Thin LTO + cu=16 keeps most of fat LTO's runtime gain at roughly a
 # third of the link time — the right default for everyday `cargo build
 # --release`. Use the `release-lto` profile for container/distribution
