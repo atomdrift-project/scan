@@ -231,6 +231,7 @@ fn install(dir: &Path, artifact: &Artifact, source: &str) -> Result<()> {
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>> {
+    eprintln!("fetching {url}");
     let client = reqwest::blocking::Client::builder()
         .timeout(TIMEOUT)
         .build()
