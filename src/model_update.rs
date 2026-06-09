@@ -76,8 +76,22 @@ pub fn installed(dir: &Path) -> Option<Installed> {
     toml::from_str(&text).ok()
 }
 
+/// True if the dir is a git checkout (or symlinked to one) — a dev tree we must
+/// never overwrite. `join(".git").exists()` follows the symlink, so it catches
+/// both the symlinked-to-a-checkout and the direct-checkout cases.
+fn is_git_managed(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
 /// Install or refresh the model bundle compatible with this litmus release.
 pub fn update(dir: &Path, force: bool) -> Result<()> {
+    if is_git_managed(dir) {
+        eprintln!(
+            "Models at {} are git-managed (a checkout or symlink to one); leaving them untouched.\nUse 'git pull' there to update, or remove the directory to switch to bundle updates.",
+            dir.display()
+        );
+        return Ok(());
+    }
     let manifest = fetch_manifest()?;
     let (key, source) = resolve(&manifest)?;
     let artifact = artifact_for(&manifest, &key)?;
@@ -108,6 +122,13 @@ pub fn update(dir: &Path, force: bool) -> Result<()> {
 
 /// Report what would be installed without changing anything.
 pub fn check(dir: &Path) -> Result<()> {
+    if is_git_managed(dir) {
+        eprintln!(
+            "Models at {} are git-managed; use 'git pull' there to update.",
+            dir.display()
+        );
+        return Ok(());
+    }
     let manifest = fetch_manifest()?;
     let (key, source) = resolve(&manifest)?;
     let artifact = artifact_for(&manifest, &key)?;
