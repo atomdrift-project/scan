@@ -72,4 +72,8 @@ pub enum OutputFormat {
     Terminal,
     /// Newline-delimited JSON, one object per file.
     Json,
+    /// Compact, context-centric text for feeding a local LLM: a litmus verdict
+    /// line (gate, confidence, matched FP level) followed by cleave's annotated
+    /// context. See [`crate::output::format_tiny`].
+    Tiny,
 }

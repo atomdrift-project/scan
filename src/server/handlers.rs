@@ -1076,6 +1076,7 @@ fn scan_result_from(
         size_bytes: cr.size_bytes,
         sha256: cr.sha256,
         embedded_files: cr.embedded_files,
+        context_tiny: cr.context_tiny,
     }
 }
 

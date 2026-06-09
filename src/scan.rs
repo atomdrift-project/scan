@@ -384,6 +384,7 @@ mod envelope_tests {
             size_bytes: 0,
             sha256: String::new(),
             embedded_files: Vec::new(),
+            context_tiny: String::new(),
         }
     }
 
@@ -680,6 +681,9 @@ pub struct ScanResult {
     pub model_scores: Vec<RouteScore>,
     /// Applicable model routes skipped by the routed ensemble.
     pub skipped_models: Vec<SkippedRoute>,
+    /// cleave's context-centric render (`--format tiny`), captured while the
+    /// typed report was in scope. Empty unless the run requested tiny output.
+    pub context_tiny: String,
 }
 
 /// A representative cleave finding surfaced alongside a classification.
@@ -1212,7 +1216,28 @@ fn emit_result(
             }
             let _ = out.write_all(b"\n");
         }
+        OutputFormat::Tiny => {
+            let Ok(mut out) = stdout.lock() else {
+                return;
+            };
+            write_tiny(&mut *out, r);
+        }
     }
+}
+
+/// Write the tiny (LLM) rendering: litmus's ML verdict — the gate it meets, the
+/// calibrated confidence, the matched false-positive level — followed by
+/// cleave's annotated context. This is the unit fed to a local LLM.
+pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
+    let fp_level = r
+        .level
+        .map_or_else(|| "-".to_string(), |n| format!("L{n}"));
+    let verdict = format!(
+        "litmus verdict={} confidence={:.3} fp-level={} threshold={:.3}\n",
+        r.classification, r.probability, fp_level, r.threshold,
+    );
+    let _ = out.write_all(verdict.as_bytes());
+    let _ = out.write_all(r.context_tiny.as_bytes());
 }
 
 /// Intermediate classification result from the model pipeline.
@@ -1235,6 +1260,8 @@ pub(crate) struct ClassifiedReport {
     pub(crate) sha256: String,
     pub(crate) embedded_files: Vec<EmbeddedFile>,
     pub(crate) report_json: serde_json::Value,
+    /// cleave's context-centric render, for `--format tiny`.
+    pub(crate) context_tiny: String,
 }
 
 /// crit-4 fraction gate for the trait floor's suspicious arm. A sparse, severe
@@ -1372,6 +1399,10 @@ pub(crate) fn classify_report(
     embedded_file_limit: Option<usize>,
 ) -> Result<ClassifiedReport> {
     report.finalize();
+    // Render cleave's context-centric text now, while the typed (finalized)
+    // report is in scope. Cheap relative to the model inference below; consumed
+    // only by `--format tiny`.
+    let context_tiny = cleave::output::format_tiny(&report);
     let compact = cleave::types::compact::compact_from_files(&report.files);
     let formula = compact
         .files
@@ -1565,6 +1596,7 @@ pub(crate) fn classify_report(
         sha256,
         embedded_files,
         report_json,
+        context_tiny,
     })
 }
 
@@ -1626,6 +1658,7 @@ pub(crate) fn process_report(
         size_bytes: cr.size_bytes,
         sha256: cr.sha256,
         embedded_files: cr.embedded_files,
+        context_tiny: cr.context_tiny,
     })
 }
 
