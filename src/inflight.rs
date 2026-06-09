@@ -162,17 +162,23 @@ pub fn wait_channels(thread_ids: &[u64]) -> std::collections::HashMap<u64, Strin
             }
         }
     }
+    // BSD/SysV `ps` treat everything after the first `=` in an -o argument as
+    // literal header text (so `-o tid=,wchan=` is ONE column named ",wchan=").
+    // Each column must be its own -o flag to get null headers. Verified on
+    // FreeBSD 14: `-o tid= -o wchan=` emits `tid wchan` pairs matching thr_self.
     #[cfg(target_os = "freebsd")]
     {
         let pid = std::process::id().to_string();
-        if let Some(found) = ps_thread_channels(&["-p", &pid, "-H", "-o", "tid=,wchan="]) {
+        if let Some(found) = ps_thread_channels(&["-p", &pid, "-H", "-o", "tid=", "-o", "wchan="]) {
             map = filter_to(found, thread_ids);
         }
     }
     #[cfg(any(target_os = "illumos", target_os = "solaris"))]
     {
         let pid = std::process::id().to_string();
-        if let Some(found) = ps_thread_channels(&["-L", "-o", "lwp=,s=,wchan=", "-p", &pid]) {
+        if let Some(found) =
+            ps_thread_channels(&["-L", "-o", "lwp=", "-o", "s=", "-o", "wchan=", "-p", &pid])
+        {
             map = filter_to(found, thread_ids);
         }
     }
@@ -380,7 +386,10 @@ mod tests {
         tally.insert("futex".to_string(), 3);
         tally.insert("pipe_wait".to_string(), 5);
         tally.insert("(running)".to_string(), 1);
-        assert_eq!(format_wait_summary(&tally), "pipe_wait=5 futex=3 (running)=1");
+        assert_eq!(
+            format_wait_summary(&tally),
+            "pipe_wait=5 futex=3 (running)=1"
+        );
     }
 
     #[test]

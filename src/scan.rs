@@ -149,7 +149,7 @@ impl ScanConfig {
     /// Attach the severity level that produced the resolved thresholds.
     ///
     /// `None` indicates manual thresholds (no level applies); `Some(n)` is the
-    /// 0..=10000 level that was used to pick `thresholds` from the model's
+    /// 0..=25000 level that was used to pick `thresholds` from the model's
     /// `severity_levels[]` table. Folded into `ml.l` in the JSON envelope (which
     /// also encodes the benign verdict via the `-1` sentinel) so downstream
     /// consumers can correlate verdicts with FPR severity.
@@ -195,7 +195,7 @@ impl ScanConfig {
         self.extra
     }
 
-    /// Severity level (0..=10000) used to pick thresholds, or `None` when manual
+    /// Severity level (0..=25000) used to pick thresholds, or `None` when manual
     /// thresholds were supplied via `--suspicious-threshold` / `--hostile-threshold`.
     #[must_use]
     pub const fn level(&self) -> Option<u16> {
@@ -387,6 +387,28 @@ mod envelope_tests {
     }
 
     #[test]
+    fn level_confidence_maps_known_grid_and_override_markers() {
+        let cases = [
+            (None, None),
+            (Some(-1), Some(0)),
+            (Some(0), Some(100)),
+            (Some(1), Some(99)),
+            (Some(2), Some(98)),
+            (Some(5), Some(95)),
+            (Some(50), Some(90)),
+            (Some(25000), Some(29)),
+            (Some(25001), Some(28)),
+            (Some(25002), Some(27)),
+            (Some(50000), Some(17)),
+            (Some(50001), Some(16)),
+            (Some(50002), Some(15)),
+        ];
+        for (level, want) in cases {
+            assert_eq!(level_confidence(level), want, "level {level:?}");
+        }
+    }
+
+    #[test]
     fn envelope_serializes_l_and_drops_legacy_fields() {
         // `ml.l` is the model's level-independent marker, serialized verbatim
         // (`-1` for a file that never fires). The dropped v5 fields must not
@@ -395,6 +417,7 @@ mod envelope_tests {
         let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         assert_eq!(json["ml"]["v"].as_str(), Some("6"));
         assert_eq!(json["ml"]["l"].as_i64(), Some(-1));
+        assert_eq!(json["ml"]["conf"].as_u64(), Some(0));
         for dropped in [
             "class",
             "threshold",
@@ -419,6 +442,10 @@ mod envelope_tests {
             json["ml"]["l"].is_null(),
             "manual-threshold mode (no level table) serializes l as null"
         );
+        assert!(
+            json["ml"]["conf"].is_null(),
+            "manual-threshold mode serializes conf as null"
+        );
     }
 
     #[test]
@@ -429,6 +456,7 @@ mod envelope_tests {
         r.l = Some(7);
         let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         assert_eq!(json["ml"]["l"].as_i64(), Some(7));
+        assert_eq!(json["ml"]["conf"].as_u64(), Some(94));
     }
 
     #[test]
@@ -515,6 +543,79 @@ pub struct FindingCounts {
     pub baseline: u32,
 }
 
+/// Map a level marker (`ml.l`) to a pessimistic human-facing confidence percent.
+///
+/// This is a display/export confidence, not the model probability (`ml.prob`) and
+/// not a posterior probability. The table is intentionally integer-valued and
+/// strictly separated across the calibrated deploy grid. `25001` and `25002`
+/// are off-grid trait-floor override markers (`grid_max + 1/2`) and sit just
+/// below the current L25000 tail. `50001`/`50002` are reserved for the same
+/// meaning if the calibrated grid grows to L50000.
+#[must_use]
+pub const fn level_confidence(l: Option<i32>) -> Option<u8> {
+    match l {
+        None => None,
+        Some(n) if n < 0 => Some(0),
+        Some(0) => Some(100),
+        Some(1) => Some(99),
+        Some(2) => Some(98),
+        Some(3) => Some(97),
+        Some(4) => Some(96),
+        Some(5) => Some(95),
+        Some(10) => Some(94),
+        Some(20) => Some(93),
+        Some(30) => Some(92),
+        Some(40) => Some(91),
+        Some(50) => Some(90),
+        Some(60) => Some(89),
+        Some(70) => Some(88),
+        Some(80) => Some(87),
+        Some(90) => Some(86),
+        Some(100) => Some(85),
+        Some(200) => Some(82),
+        Some(300) => Some(80),
+        Some(500) => Some(78),
+        Some(1000) => Some(75),
+        Some(2000) => Some(66),
+        Some(5000) => Some(54),
+        Some(7500) => Some(49),
+        Some(10000) => Some(45),
+        Some(15000) => Some(38),
+        Some(20000) => Some(33),
+        Some(25000) => Some(29),
+        Some(25001) => Some(28),
+        Some(25002) => Some(27),
+        Some(50000) => Some(17),
+        Some(50001) => Some(16),
+        Some(50002) => Some(15),
+        Some(n) if n > 50002 => Some(15),
+        Some(n) if n > 25002 => Some(26),
+        Some(n) if n > 25000 => Some(28),
+        Some(n) if n > 20000 => Some(29),
+        Some(n) if n > 15000 => Some(33),
+        Some(n) if n > 10000 => Some(38),
+        Some(n) if n > 7500 => Some(45),
+        Some(n) if n > 5000 => Some(49),
+        Some(n) if n > 2000 => Some(54),
+        Some(n) if n > 1000 => Some(66),
+        Some(n) if n > 500 => Some(75),
+        Some(n) if n > 300 => Some(78),
+        Some(n) if n > 200 => Some(80),
+        Some(n) if n > 100 => Some(82),
+        Some(n) if n > 90 => Some(85),
+        Some(n) if n > 80 => Some(86),
+        Some(n) if n > 70 => Some(87),
+        Some(n) if n > 60 => Some(88),
+        Some(n) if n > 50 => Some(89),
+        Some(n) if n > 40 => Some(90),
+        Some(n) if n > 30 => Some(91),
+        Some(n) if n > 20 => Some(92),
+        Some(n) if n > 10 => Some(93),
+        Some(n) if n > 5 => Some(94),
+        Some(_) => Some(95),
+    }
+}
+
 /// Classification result for a single analyzed file or executable.
 ///
 /// In terminal mode only a subset of results may be shown, but in JSON mode
@@ -532,7 +633,7 @@ pub struct ScanResult {
     pub threshold: f32,
     /// Level-independent envelope marker (`ml.l`): the lowest false-positive
     /// level (FP per 100M benigns) at which this file's hostile decision fires.
-    /// `Some(-1)` = never fires (clean); `Some(0..=10000)` = the firing level;
+    /// `Some(-1)` = never fires (clean); `Some(0..=25000)` = the firing level;
     /// `None` = manual-threshold mode. Independent of the deploy `-l`, so the
     /// envelope is identical across levels and cache-shareable — `-l` only moves
     /// the cutoffs that turn `l` into `classification`.
@@ -1750,7 +1851,7 @@ fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
 
 /// Build per-file ML classification entries for the `ml.fs` array.
 ///
-/// Each entry is `{id, prob, l}` keyed by the cleave `fs[].id` field. The root
+/// Each entry is `{id, prob, l, conf}` keyed by the cleave `fs[].id` field. The root
 /// file (`dp=0`) carries the envelope's probability and `l`; embedded archive
 /// members are matched by path suffix and report their *own* probability and
 /// lowest-firing-level `l` — every row's `l` is therefore the level-independent
@@ -1793,6 +1894,7 @@ fn build_ml_fs(
             "id": id,
             "prob": prob,
             "l": l,
+            "conf": level_confidence(l),
         }));
     }
     out
@@ -1815,12 +1917,15 @@ pub struct MlSection {
     pub(crate) probability: f32,
     /// Resolved verdict marker, always serialized (including as `null`):
     /// - `Some(-1)` → benign.
-    /// - `Some(0..=10000)` → hostile; the per-100M-benigns level that selected
+    /// - `Some(0..=25000)` → hostile; the per-100M-benigns level that selected
     ///   the firing threshold.
     /// - `None` → hostile; manual `--threshold-hostile` / `--threshold-suspicious`
     ///   were used and no level applies.
     #[serde(rename = "l")]
     pub(crate) l: Option<i32>,
+    /// Pessimistic integer confidence percent derived from `l`; `null` when no
+    /// level table applies (manual-threshold mode).
+    pub(crate) conf: Option<u8>,
     #[serde(rename = "models", skip_serializing_if = "Vec::is_empty")]
     pub(crate) model_scores: Vec<crate::model::RouteScore>,
     #[serde(rename = "skip", skip_serializing_if = "Vec::is_empty")]
@@ -1854,6 +1959,8 @@ pub struct MlSectionRef<'a> {
     /// See [`MlSection::l`] for the encoding of this field.
     #[serde(rename = "l")]
     pub(crate) l: Option<i32>,
+    /// See [`MlSection::conf`].
+    pub(crate) conf: Option<u8>,
     #[serde(rename = "models", skip_serializing_if = "route_scores_empty")]
     pub(crate) model_scores: &'a [crate::model::RouteScore],
     #[serde(rename = "skip", skip_serializing_if = "skipped_routes_empty")]
@@ -1902,6 +2009,7 @@ impl ScanResult {
                 v: self.v,
                 probability: self.probability,
                 l,
+                conf: level_confidence(l),
                 model_scores: self.model_scores.clone(),
                 skipped_models: self.skipped_models.clone(),
                 version: self.version.clone(),
@@ -1928,6 +2036,7 @@ impl ScanResult {
                 v: self.v,
                 probability: self.probability,
                 l,
+                conf: level_confidence(l),
                 model_scores: self.model_scores,
                 skipped_models: self.skipped_models,
                 version: self.version,
@@ -1958,6 +2067,7 @@ impl ScanResult {
                 v: self.v,
                 probability: self.probability,
                 l,
+                conf: level_confidence(l),
                 model_scores: &self.model_scores,
                 skipped_models: &self.skipped_models,
                 version: &self.version,

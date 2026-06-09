@@ -135,9 +135,22 @@ lowest false-positive budget (FP per 100M benigns) at which the model
 flags the file as hostile — a property of the file and model, not of
 the deploy level:
 
-    l in 0..=1000      -> lowest level at which the file fires (lower = more hostile)
+    l in grid          -> lowest level at which the file fires (lower = more hostile)
     l == -1            -> fires at no grid level (clean)
     l == null          -> manual --threshold-* mode (no level table)
+
+The calibrated grid currently tops out at L25000, and consumers should
+tolerate a future L50000. Litmus also reserves off-grid `grid_max + 1`
+and `grid_max + 2` markers for trait-floor overrides where the model was
+clean but confident severe cleave traits manually raised the result to
+suspicious; with today's grid those are `25001` and `25002`.
+
+`ml.conf` is the same level rendered as a pessimistic integer confidence
+percent for display/export. It is `null` when `ml.l` is `null`, `0` for
+the benign `-1` sentinel, `100` at L0, `99` at L1, `98` at L2, `95` at
+L5, `90` at L50, `29` at L25000, `28`/`27` for `25001`/`25002`, and
+`17` at L50000. `ml.prob` remains the raw model score used for the
+decision.
 
 Because `l` is swept over the full grid independent of `-l`, the whole
 `ml` envelope is identical across deploy levels, so a result can be
@@ -145,7 +158,7 @@ cached once and shared. The consumer derives the verdict from `l` and
 the active level `N` (default 50):
 
     hostile     when l <= N                      (default l <= 50)
-    suspicious  when l <= min(1000, 4 × N)        (default l <= 200)
+    suspicious  when l <= min(grid_max, 4 × N)    (default l <= 200)
     benign      otherwise
 
 The L×4 rule gives suspicious a 4× wider FP budget that catches more
@@ -161,9 +174,8 @@ The verdict mode is resolved as follows:
    drives the per-file `l` sweep. The active level `N` sets the verdict
    caps and comes from the severity-level flags `-0` … `-9` (round-decade
    shorthand: L0, L10, ..., L90) or `-l <N>` / `--level <N>` for any
-   integer in `0`-`1000` (`src/main.rs`). The default deploy level is L50
-   (= 50 FP/100M ≡ 0.5 FP/M); the grid tops out at L1000 (= 10 FP/M) for
-   aggressive triage. Higher `N` is more sensitive. Crucially, `N` only
+   integer in `0`-`25000` (`src/main.rs`). The default deploy level is L50
+   (= 50 FP/100M = 0.5 FP/M). Higher `N` is more sensitive. Crucially, `N` only
    moves the caps — it does **not** change `l` or the serialized envelope.
 2. **Manual mode.** `--threshold-hostile` / `--threshold-suspicious`
    bypass the level grid entirely: the verdict comes from those raw

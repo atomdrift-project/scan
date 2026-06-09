@@ -176,3 +176,6 @@ path = "src/bin/bench_hopper.rs"
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
 
+
+[patch."https://codeberg.org/atomdrift/cleave.git"]
+cleave = { path = "../cleave" }

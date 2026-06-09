@@ -4,7 +4,7 @@
 use std::sync::{LazyLock, RwLock};
 
 use crate::model::{Classification, RouteScore};
-use crate::scan::{ScanResult, ScanSummary};
+use crate::scan::{ScanResult, ScanSummary, level_confidence};
 
 const BLOCK: &str = "\u{2588}";
 
@@ -290,20 +290,18 @@ fn colored_pct(probability: f32, classification: &Classification, threshold: f32
     fg(accent, &pct)
 }
 
-/// Header severity token: the matched operating-point level (`L0`) when the
-/// file fired, otherwise the rescaled benign percentage. For a fired file the
-/// level is the honest signal — isotonic saturation pins the calibrated
-/// percentage near 100% regardless of the true margin, so it's not shown.
-fn colored_level_or_pct(
+/// Header severity token: the level-derived confidence percent when the level
+/// marker exists, otherwise the rescaled threshold-relative percentage.
+fn colored_conf_or_pct(
     probability: f32,
     classification: &Classification,
     threshold: f32,
     l: Option<i32>,
 ) -> String {
-    match l {
-        Some(n) => {
+    match level_confidence(l) {
+        Some(conf) => {
             let (_, _, accent) = indicator_colors(probability, classification, threshold);
-            fg(accent, &format!("{:>4}", format!("L{n}")))
+            fg(accent, &format!("{:>4}", format!("{conf}%")))
         }
         None => colored_pct(probability, classification, threshold),
     }
@@ -326,7 +324,7 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extr
 
     let p = palette();
     let blocks = confidence_blocks(result.probability, &result.classification, result.threshold);
-    let pct = colored_level_or_pct(
+    let pct = colored_conf_or_pct(
         result.probability,
         &result.classification,
         result.threshold,
@@ -359,7 +357,7 @@ pub fn print_ps_result(
     }
     let p = palette();
     let blocks = confidence_blocks(result.probability, &result.classification, result.threshold);
-    let pct = colored_level_or_pct(
+    let pct = colored_conf_or_pct(
         result.probability,
         &result.classification,
         result.threshold,
@@ -402,14 +400,10 @@ pub fn print_ps_result(
 fn print_detail_lines(result: &ScanResult, p: &Palette) {
     let dot = fg(p.dot_sep, "\u{00b7}");
 
-    // Line 2: filetype · L<level> · formula. The level (operating point the
-    // file mapped to) is the actionable signal, so it sits up front — but only
-    // when the file actually fired, to keep benign output uncluttered.
+    // Line 2: filetype · formula. The headline carries the confidence; the raw
+    // level remains available in --extra output for debugging.
     let mut meta: Vec<String> = Vec::new();
     meta.push(fg(p.filetype, &result.file_type));
-    if result.l.is_some() {
-        meta.push(fg(p.filetype, &format_level(result.l)));
-    }
     if !result.formula.is_empty() {
         meta.push(fg(p.formula, &result.formula));
     }

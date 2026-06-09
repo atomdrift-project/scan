@@ -34,6 +34,7 @@ obvious things. The tables below are the key.
 | `v`           | `v`                       | string                 | Envelope schema version. Currently `"6"`.            |
 | `prob`        | `probability`             | f32 in `[0, 1]`        | Probability the verdict was decided on.              |
 | `l`           | `l`                       | i32 or null            | Lowest-false-positive-level marker. See **The verdict encoding** below. |
+| `conf`        | `conf`                    | u8 percent or null     | Pessimistic display/export confidence derived from `l`; `null` when no level table applies. |
 | `models`      | `model_scores`            | array of `RouteScore`  | Per-route ensemble scores. Omitted if empty.         |
 | `skip`        | `skipped_models`          | array of `SkippedRoute`| Routes that were applicable but unused.              |
 | `version`     | `version`                 | string                 | Model version: spec, ABI, hash prefix.               |
@@ -53,14 +54,60 @@ not of your deploy setting**:
 
 A consumer reads it as:
 
-- `l` in `0..=1000` → the lowest level at which the file fires. Lower
+- `l` in the calibrated grid (`0..=25000` today; consumers should
+  tolerate `50000`) → the lowest level at which the file fires. Lower
   means more obviously hostile: `l=2` fires even under an extremely
   strict 2-FP-per-100M budget, while `l=500` is only caught once you
-  tolerate 500 (`l=50` ≡ 0.5 FP/M, `l=1000` ≡ 10 FP/M).
+  tolerate 500 (`l=50` == 0.5 FP/M, `l=1000` == 10 FP/M).
+- `l == 25001` or `l == 25002` → off-grid trait-floor override
+  markers (`grid_max + 1/2`) where litmus manually raised a model-clean
+  result to suspicious because cleave found confident severe traits.
 - `l == -1` (sentinel) → the file fires at **no** grid level. Nothing
   short of disabling the model would flag it — it is clean.
 - `l == null` → manual `--threshold-hostile` / `--threshold-suspicious`
   were supplied, so no level table applies.
+
+`conf` is the same `l` rendered as a deliberately pessimistic integer
+percentage for humans and APIs that need a confidence-style field. It
+is not a posterior probability and it does not replace `prob`. The
+current anchors are:
+
+| `l` | `conf` |
+| --- | ------ |
+| `0` | `100` |
+| `1` | `99` |
+| `2` | `98` |
+| `3` | `97` |
+| `4` | `96` |
+| `5` | `95` |
+| `10` | `94` |
+| `20` | `93` |
+| `30` | `92` |
+| `40` | `91` |
+| `50` | `90` |
+| `60` | `89` |
+| `70` | `88` |
+| `80` | `87` |
+| `90` | `86` |
+| `100` | `85` |
+| `200` | `82` |
+| `300` | `80` |
+| `500` | `78` |
+| `1000` | `75` |
+| `2000` | `66` |
+| `5000` | `54` |
+| `7500` | `49` |
+| `10000` | `45` |
+| `15000` | `38` |
+| `20000` | `33` |
+| `25000` | `29` |
+| `25001` | `28` |
+| `25002` | `27` |
+| `50000` | `17` |
+
+Future `50001`/`50002` override markers are reserved as `16`/`15`.
+Intermediate non-grid levels round down to the next-lower confidence
+bucket.
 
 **`l` does not depend on `-l`.** It is computed by sweeping the full
 level grid regardless of the deploy level, so the entire `ml` envelope
@@ -74,7 +121,7 @@ The hostile/suspicious/benign label is *not* stored — the consumer
 derives it from `l` and the active level `N` (default `50`):
 
 - **hostile** when `l <= N` (default: `l <= 50`),
-- **suspicious** when `l <= min(1000, 4 × N)` (default: `l <= 200`) —
+- **suspicious** when `l <= min(grid_max, 4 × N)` (default: `l <= 200`) —
   the L×4 rule gives the suspicious band a 4× wider FP budget that
   catches more "maybe-bad" files,
 - **benign** otherwise. Note a file with, say, `l = 500` is benign
@@ -89,12 +136,13 @@ apply whichever caps they prefer.
 route's probability for OR-rule policies, the blend's sigmoid output
 for learned-blend policies, or the elevating embedded file's
 probability when an archive member outranked its parent. It is raw
-model confidence, not a verdict; for a confidence-style figure, map
-`l` onto a scale (e.g. 100% at `l=0` sliding to 10% at `l=1000`).
+model confidence, not a verdict; use `conf` for the level-derived
+confidence-style figure.
 
-Each `ml.fs[]` entry carries its **own** `prob` and `l`: the root file
-(`dp=0`) repeats the envelope's, and every archive member reports the
-lowest firing level for that specific member.
+Each `ml.fs[]` entry carries its **own** `prob`, `l`, and `conf`: the
+root file (`dp=0`) repeats the envelope's, and every archive member
+reports the lowest firing level and derived confidence for that
+specific member.
 
 ## `RouteScore`
 
@@ -128,6 +176,7 @@ per archive member when the input is an archive.
 | `probability`     | f32                     | Per-member probability.                          |
 | `threshold`       | f32                     | Per-member deciding cutoff.                      |
 | `l`               | i32 or null             | Per-member lowest-firing-level marker (same encoding as `ml.l`). |
+| `conf`            | u8 percent or null      | Per-member confidence derived from `l`.          |
 | `model_scores`    | array of `RouteScore`   | Omitted if empty.                                |
 | `skipped_models`  | array of `SkippedRoute` | Omitted if empty.                                |
 | `formula`         | string                  | Molecular formula. Omitted if empty.             |
@@ -207,13 +256,13 @@ was on the wire three times.
 `v=6` collapses all three into `l`:
 
 - benign is `l = -1`,
-- hostile-with-known-level is `l = 0..=1000`,
+- hostile-with-known-level is `l = 0..=grid_max`,
 - hostile-with-manual-threshold is `l = null`.
 
 The deciding cutoff itself is no longer transmitted. Consumers that
 want to derive a Suspicious band do so against their own threshold;
 the envelope does not commit to one. Members of `ml.fs[]` follow the
-same shape — `{id, prob, l}` — instead of the prior
+same shape — `{id, prob, l, conf}` — instead of the prior
 `{id, class, prob, threshold}`.
 
 ## Migration from v=4

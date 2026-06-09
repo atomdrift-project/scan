@@ -34,7 +34,9 @@ const MIB: u64 = 1024 * 1024;
 /// Fraction of physical RAM the in-flight estimate may reach when *live*
 /// available memory can't be read (the only-thing-to-go-by fallback). When
 /// available memory is readable it governs instead — see `try_reserve`.
-const DEFAULT_BUDGET_FRACTION: f64 = 0.75;
+/// Matches the worker's 85% RSS policy (`resolve_worker_max_rss_gb`) so the
+/// admission budget and the reactive RSS gate agree on the ceiling.
+const DEFAULT_BUDGET_FRACTION: f64 = 0.85;
 
 /// Headroom left free when admitting a lone job against live available memory,
 /// so a single large archive makes progress without allocating to the edge.
