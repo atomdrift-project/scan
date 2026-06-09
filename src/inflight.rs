@@ -147,6 +147,9 @@ pub fn wait_channel(thread_id: u64) -> Option<String> {
 /// Threads that are running (no wait channel) are simply absent from the map.
 #[must_use]
 pub fn wait_channels(thread_ids: &[u64]) -> std::collections::HashMap<u64, String> {
+    // `mut` is used on platforms whose arm populates the map (Linux) or replaces
+    // it (FreeBSD/illumos); macOS and others leave it empty.
+    #[allow(unused_mut)]
     let mut map = std::collections::HashMap::new();
     if thread_ids.is_empty() {
         return map;
@@ -294,6 +297,14 @@ mod tests {
         // tid 0 is never a real worker thread; on every platform this yields None
         // so the census falls back to the analysis stage.
         assert_eq!(wait_channel(0), None);
+    }
+
+    #[test]
+    fn wait_channels_empty_input_is_empty() {
+        // No threads to resolve must never fork `ps` or touch procfs.
+        assert!(wait_channels(&[]).is_empty());
+        // tid 0 resolves to nothing on every platform.
+        assert!(wait_channels(&[0]).get(&0).is_none());
     }
 
     #[test]
