@@ -41,8 +41,12 @@ pub fn register_self() {
     }
 }
 
-/// OS thread id for the calling thread, matching `/proc/<pid>/task` and `ps`.
-fn os_thread_id() -> u64 {
+/// OS-level thread id for the calling thread.
+///
+/// Matches what `/proc/<pid>/task`, `ps`, and a debugger report, so log lines,
+/// the in-flight census, and the wait-channel lookup can all correlate on it.
+/// The single canonical implementation for the crate.
+pub(crate) fn os_thread_id() -> u64 {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: `gettid` takes no arguments and cannot fail.
@@ -62,7 +66,29 @@ fn os_thread_id() -> u64 {
         unsafe { libc::thr_self(&mut tid) };
         u64::try_from(tid).unwrap_or(0)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    #[cfg(target_os = "openbsd")]
+    {
+        // SAFETY: `getthrid` takes no arguments and cannot fail.
+        unsafe { libc::getthrid() as u64 }
+    }
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    {
+        // The LWP id matches `/proc/<pid>/lwp/<id>` and the `lwp` column of
+        // `ps -L`; the `libc` crate doesn't bind `_lwp_self(2)`, so declare it.
+        unsafe extern "C" {
+            fn _lwp_self() -> libc::id_t;
+        }
+        // SAFETY: `_lwp_self` takes no arguments and cannot fail.
+        unsafe { _lwp_self() as u64 }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris"
+    )))]
     {
         0
     }
@@ -142,7 +168,12 @@ mod capture {
             let pid = libc::c_long::from(unsafe { libc::getpid() });
             // SAFETY: `tgkill(tgid, tid, sig)` with our own pid and a valid signal.
             let ret = unsafe {
-                libc::syscall(libc::SYS_tgkill, pid, tid, libc::c_long::from(CAPTURE_SIGNAL))
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    pid,
+                    tid,
+                    libc::c_long::from(CAPTURE_SIGNAL),
+                )
             };
             ret == 0
         }
@@ -222,7 +253,9 @@ fn write_registered_backtraces(out: &mut impl Write) {
     }
     capture::CAPTURING.store(false, Ordering::Release);
 
-    let captured = capture::NEXT_SLOT.load(Ordering::Acquire).min(capture::MAX_THREADS);
+    let captured = capture::NEXT_SLOT
+        .load(Ordering::Acquire)
+        .min(capture::MAX_THREADS);
     let _ = writeln!(
         out,
         "  {captured}/{signalled} analysis threads captured (registered={})",
@@ -235,7 +268,8 @@ fn write_registered_backtraces(out: &mut impl Write) {
             .min(capture::MAX_FRAMES);
         let _ = writeln!(out, "  thread tid={tid}:");
         for frame in 0..frames {
-            let ip = capture::SLOT_FRAMES[slot][frame].load(Ordering::Relaxed) as *mut std::ffi::c_void;
+            let ip =
+                capture::SLOT_FRAMES[slot][frame].load(Ordering::Relaxed) as *mut std::ffi::c_void;
             let mut printed = false;
             // SAFETY: `resolve` only reads symbol tables for the address; off the
             // signal path, so allocation inside the callback is fine.

@@ -530,7 +530,11 @@ fn renew_resources_once(
         return Ok(None);
     }
 
-    tracing::info!(models_changed, traits_changed, "rules changed; revalidating bundle");
+    tracing::info!(
+        models_changed,
+        traits_changed,
+        "rules changed; revalidating bundle"
+    );
 
     let resources = validate_and_load_resources(model_dir, thresholds, slow_rule_ms, level)?;
 
@@ -1013,6 +1017,20 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
              {global_rayon_threads}-thread rayon pool (no per-slot pools)",
         );
     }
+    // Each in-flight analysis parks a coordinator on the pool and fans member
+    // work into it; slots far beyond the pool size just queue analyses against
+    // each other (observed: 16 slots on a 4-thread illumos zone → 5 s to run a
+    // trivial rayon task, 28 KB jobs taking minutes). Likely a --workers value
+    // copied from a larger host.
+    if slots > global_rayon_threads.saturating_mul(2) {
+        tracing::warn!(
+            slots,
+            rayon_threads = global_rayon_threads,
+            "worker slots exceed 2x the rayon pool; analyses will queue against \
+             each other for pool threads — lower --workers (or raise \
+             CLEAVE_RAYON_THREADS) to restore throughput",
+        );
+    }
 
     tracing::info!(
         name = %name,
@@ -1137,7 +1155,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             let mut last_at = Instant::now();
             let mut stage_since: std::collections::HashMap<u64, (String, Instant)> =
                 std::collections::HashMap::new();
-            let mut wedge_latched: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut wedge_latched: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
             // Slots whose analysis has run past this long are flagged as stuck and
             // logged at WARN so a wedge stands out in the stream. Tunable via
             // `LITMUS_STUCK_WARN_SECS` (min 1) for noisy shards or test runs.
@@ -1212,8 +1231,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     // real blockage is on rayon workers, not the per-slot
                     // coordinator, so this names the resource classes the pool is
                     // stuck on (yara symbol / pipe_wait subprocess / futex lock).
-                    let thread_waits =
-                        crate::inflight::format_wait_summary(&crate::inflight::thread_wait_summary());
+                    let thread_waits = crate::inflight::format_wait_summary(
+                        &crate::inflight::thread_wait_summary(),
+                    );
                     tracing::warn!(
                         newly_stuck = newly_stuck.len(),
                         inflight = census.len(),
@@ -1226,7 +1246,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     for entry in &newly_stuck {
                         wedge_latched.insert(entry.analysis_id);
                         let phase = entry.phase.get();
-                        let stage = if phase.is_empty() { "(starting)" } else { phase.as_str() };
+                        let stage = if phase.is_empty() {
+                            "(starting)"
+                        } else {
+                            phase.as_str()
+                        };
                         tracing::warn!(
                             analysis_id = entry.analysis_id,
                             sha256 = %entry.sha,
@@ -1247,7 +1271,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     // `cleave-breadcrumbs` feature, which requires a cleave build
                     // exposing `cleave::breadcrumb` (not yet in the released rev).
                     #[cfg(feature = "cleave-breadcrumbs")]
-                    for crumb in cleave::breadcrumb::snapshot().into_iter().take(CENSUS_MAX_LINES) {
+                    for crumb in cleave::breadcrumb::snapshot()
+                        .into_iter()
+                        .take(CENSUS_MAX_LINES)
+                    {
                         tracing::warn!(
                             rayon_index = ?crumb.rayon_index,
                             thread_id = crumb.thread_id,
@@ -1274,6 +1301,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     active_slots = slots.saturating_sub(available_slots),
                     available_slots,
                     cpu_cores_busy = format!("{cpu_cores_busy:.1}"),
+                    load1 = system_load_avg().map(|l| format!("{l:.1}")),
                     rayon_threads = global_rayon_threads,
                     blocking_started_total = started,
                     blocking_finished_total = finished,
@@ -1288,7 +1316,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 // on. Lets an operator name a wedged slot from the log alone.
                 for entry in census.iter().take(CENSUS_MAX_LINES) {
                     let phase = entry.phase.get();
-                    let stage = if phase.is_empty() { "(starting)" } else { phase.as_str() };
+                    let stage = if phase.is_empty() {
+                        "(starting)"
+                    } else {
+                        phase.as_str()
+                    };
                     let slot = stage_since
                         .entry(entry.analysis_id)
                         .or_insert_with(|| (phase.clone(), now));
@@ -2035,7 +2067,7 @@ async fn run_job(
         // wedged analysis; the CPU work runs on the rayon pool threads.
         run_analysis(analysis_id, || {
             let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-            let thread_id = os_thread_id();
+            let thread_id = crate::thread_dump::os_thread_id();
             // Attach the worker thread to the live census so the periodic summary
             // can report which thread each in-flight analysis is wedged on and
             // read its kernel wait-channel.
@@ -2060,8 +2092,12 @@ async fn run_job(
             // The guard frees the slot on normal completion; an abort skips the
             // drop, leaving the entry live for the dump — exactly the suspect
             // set we want. See `crate::crash_dump`.
-            let _inflight =
-                crate::crash_dump::register(analysis_id, thread_id, &sha_short2, &label_for_blocking);
+            let _inflight = crate::crash_dump::register(
+                analysis_id,
+                thread_id,
+                &sha_short2,
+                &label_for_blocking,
+            );
             let result = if let Some(data) = downloaded {
                 classify_bytes(
                     data,
@@ -2385,56 +2421,6 @@ fn backoff_duration(consecutive_errors: u32) -> Duration {
     // Jitter: ±25% using a cheap deterministic hash of the error count.
     let jitter = (consecutive_errors as u64 * 7 + 3) % (capped / 4 + 1);
     Duration::from_secs(capped.saturating_add(jitter))
-}
-
-/// Returns the OS-level thread ID for the calling thread.
-///
-/// The returned value matches what `lldb`'s `thread list`, `sample`, and
-/// `/proc/self/task/` show, making it possible to correlate log lines with
-/// debugger or profiler output when diagnosing stuck analyses.
-fn os_thread_id() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut tid: u64 = 0;
-        unsafe { libc::pthread_threadid_np(0, &mut tid) };
-        tid
-    }
-    #[cfg(target_os = "freebsd")]
-    {
-        let mut tid: libc::c_long = 0;
-        unsafe { libc::thr_self(&mut tid) };
-        tid as u64
-    }
-    #[cfg(target_os = "openbsd")]
-    {
-        unsafe { libc::getthrid() as u64 }
-    }
-    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
-    {
-        // The LWP id matches `/proc/<pid>/lwp/<id>` and the `lwp` column of
-        // `ps -L`, so the in-flight census's wait-channel lookup can key on it.
-        // `_lwp_self(2)` is the stable libc entry point; declare it directly
-        // since the `libc` crate doesn't bind it for these targets.
-        unsafe extern "C" {
-            fn _lwp_self() -> libc::id_t;
-        }
-        unsafe { _lwp_self() as u64 }
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "illumos",
-        target_os = "solaris"
-    )))]
-    {
-        0
-    }
 }
 
 /// Returns the 1-minute system load average, or None on unsupported platforms.
