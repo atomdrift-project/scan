@@ -1208,12 +1208,19 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 // wedge cadence, so a hang self-documents without waiting for the
                 // summary heartbeat.
                 if !newly_stuck.is_empty() {
+                    // Aggregate every thread's wait-channel: for archive wedges the
+                    // real blockage is on rayon workers, not the per-slot
+                    // coordinator, so this names the resource classes the pool is
+                    // stuck on (yara symbol / pipe_wait subprocess / futex lock).
+                    let thread_waits =
+                        crate::inflight::format_wait_summary(&crate::inflight::thread_wait_summary());
                     tracing::warn!(
                         newly_stuck = newly_stuck.len(),
                         inflight = census.len(),
                         cpu_cores_busy = format!("{cpu_cores_busy:.1}"),
                         rayon_threads = global_rayon_threads,
                         stuck_threshold_s = stuck_warn_secs,
+                        thread_waits,
                         "WEDGE DETECTED: analyses exceeded the stuck threshold; per-slot detail follows",
                     );
                     for entry in &newly_stuck {
@@ -1231,6 +1238,20 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                             stage,
                             waiting = waiting_for(entry, stage),
                             "WEDGE slot",
+                        );
+                    }
+                    // Per-thread cleave breadcrumbs: which member each rayon
+                    // worker is on. For an archive wedge the work is spread
+                    // across the pool, so this names the member-level culprits the
+                    // per-slot (coordinator) lines can't.
+                    for crumb in cleave::breadcrumb::snapshot().into_iter().take(CENSUS_MAX_LINES) {
+                        tracing::warn!(
+                            rayon_index = ?crumb.rayon_index,
+                            thread_id = crumb.thread_id,
+                            analyzer = crumb.analyzer,
+                            target = %crumb.target,
+                            age_ms = crate::duration_ms(crumb.age),
+                            "WEDGE breadcrumb",
                         );
                     }
                 }

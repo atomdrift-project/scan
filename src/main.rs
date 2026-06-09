@@ -459,6 +459,10 @@ fn main() -> Result<()> {
         .num_threads(rayon_threads)
         .stack_size(256 * 1024 * 1024)
         .thread_name(|i| format!("rayon-{i}"))
+        // Register each pool worker for the SIGUSR1 in-process thread dump, so a
+        // wedge can be backtraced without a debugger (lldb/gdb can't attach in
+        // the production jails).
+        .start_handler(|_| litmus::thread_dump::register_self())
         .build_global()
     {
         tracing::warn!(error = %e, "failed to install global rayon pool; using default");

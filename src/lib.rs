@@ -40,6 +40,7 @@ pub mod output;
 pub mod ps;
 pub mod scan;
 pub mod server;
+pub mod thread_dump;
 pub mod tools;
 pub mod traits_repo;
 pub mod update_check;

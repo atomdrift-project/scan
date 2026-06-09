@@ -216,6 +216,73 @@ fn ps_thread_channels(args: &[&str]) -> Option<std::collections::HashMap<u64, St
     Some(map)
 }
 
+/// Tally the kernel wait-channel of every thread in this process, keyed by
+/// channel.
+///
+/// The per-slot census tracks only the analysis's coordinator thread, but an
+/// archive fans its members across the whole rayon pool — so a wedged archive's
+/// real blockage is on `rayon-*` workers the census never names. This aggregate
+/// fills that gap: on a wedge it shows the *resource classes* the process is
+/// stuck on (e.g. many threads in a YARA/wasmtime symbol, some in `pipe_wait` on
+/// a subprocess, some in `futex` on a lock), turning the archive black box into
+/// a resource breakdown. Running threads (no wait channel) tally under
+/// `(running)`, so a high count there reads as CPU-busy rather than blocked.
+///
+/// Linux reads procfs directly (no fork); FreeBSD/illumos shell one `ps`. Empty
+/// on platforms with no per-thread wait channel (e.g. macOS).
+#[must_use]
+pub fn thread_wait_summary() -> std::collections::BTreeMap<String, usize> {
+    // `mut` is used on platforms whose arm populates the tally; macOS leaves it empty.
+    #[allow(unused_mut)]
+    let mut tally = std::collections::BTreeMap::new();
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+        for tid in entries.flatten() {
+            let chan = std::fs::read_to_string(tid.path().join("wchan")).unwrap_or_default();
+            *tally.entry(normalize_channel(chan.trim())).or_insert(0) += 1;
+        }
+    }
+    #[cfg(any(target_os = "freebsd", target_os = "illumos", target_os = "solaris"))]
+    {
+        let pid = std::process::id().to_string();
+        #[cfg(target_os = "freebsd")]
+        let args = ["-p", &pid, "-H", "-o", "wchan="];
+        #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+        let args = ["-L", "-o", "wchan=", "-p", &pid];
+        if let Ok(output) = std::process::Command::new("ps").args(args).output()
+            && output.status.success()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                *tally.entry(normalize_channel(line.trim())).or_insert(0) += 1;
+            }
+        }
+    }
+    tally
+}
+
+/// Map an empty / running wait channel to a stable `(running)` key.
+#[allow(dead_code)] // unused on platforms without a per-thread wait channel (macOS)
+fn normalize_channel(chan: &str) -> String {
+    if chan.is_empty() || chan == "0" || chan == "-" {
+        "(running)".to_string()
+    } else {
+        chan.to_string()
+    }
+}
+
+/// Render a [`thread_wait_summary`] tally as `chan=count` pairs, busiest first,
+/// for a single log field.
+#[must_use]
+pub fn format_wait_summary(tally: &std::collections::BTreeMap<String, usize>) -> String {
+    let mut pairs: Vec<(&String, &usize)> = tally.iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    pairs
+        .iter()
+        .map(|(chan, count)| format!("{chan}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Total user+system CPU seconds consumed by this process so far (`RUSAGE_SELF`).
 ///
 /// Sampling the delta across two heartbeats yields average cores busy, which
@@ -305,6 +372,24 @@ mod tests {
         assert!(wait_channels(&[]).is_empty());
         // tid 0 resolves to nothing on every platform.
         assert!(wait_channels(&[0]).get(&0).is_none());
+    }
+
+    #[test]
+    fn format_wait_summary_orders_by_count_then_name() {
+        let mut tally = std::collections::BTreeMap::new();
+        tally.insert("futex".to_string(), 3);
+        tally.insert("pipe_wait".to_string(), 5);
+        tally.insert("(running)".to_string(), 1);
+        assert_eq!(format_wait_summary(&tally), "pipe_wait=5 futex=3 (running)=1");
+    }
+
+    #[test]
+    fn thread_wait_summary_never_panics() {
+        // Contents are platform-dependent (empty on macOS); it must never panic
+        // and counts must be positive where present.
+        for count in thread_wait_summary().values() {
+            assert!(*count > 0);
+        }
     }
 
     #[test]

@@ -71,6 +71,7 @@ release: check-cargo $(OUT_DIR)
 # bundle = git archive azoth@commit | zstd. Layout: <remote>/litmus/versions.toml
 # + <remote>/litmus/azoth/<date>-<commit>.tar.zst.
 MANIFEST_GEN ?= ../cleave/tools/manifest-gen
+TRAITS ?= ../azoth
 R2_REMOTE ?= atomdrift-updates:atomdrift-updates
 R2_LITMUS ?= litmus
 ISSUER ?= https://accounts.google.com
@@ -80,9 +81,13 @@ publish-models: release ## Compat-test azoth vs last (VERSIONS-1) litmus release
 	@[ -n "$(IDENTITY)" ] || { echo "publish-models: IDENTITY=<signer> required (e.g. releaser@<project>.iam.gserviceaccount.com)"; exit 1; }
 	@command -v rclone >/dev/null || { echo "publish-models: rclone not found"; exit 1; }
 	@command -v cosign >/dev/null || { echo "publish-models: cosign not found"; exit 1; }
+	# manifest-gen reads the traits repo's LOCAL git log (no fetch), so the newest
+	# azoth commit must already be checked out. Fast-forward to the remote tip and
+	# abort the publish if it can't (diverged/dirty/offline) — never publish stale.
+	git -C $(TRAITS) pull --ff-only
 	cd $(MANIFEST_GEN) && GOWORK=off go build -o manifest-gen .
 	$(MANIFEST_GEN)/manifest-gen \
-	  --traits ../azoth --repo . --out "$(DIST)" \
+	  --traits $(TRAITS) --repo . --out "$(DIST)" \
 	  --engine-bin litmus --traits-env LITMUS_MODELS_DIR --validate-args "validate --skip-traits" \
 	  --head-engine ./target/release/$(BINARY) \
 	  --releases $(shell expr $(VERSIONS) - 1) --commits 100 --soak-days 0 \
