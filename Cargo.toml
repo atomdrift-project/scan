@@ -170,3 +170,9 @@ path = "src/bin/bench_hopper.rs"
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
 
+# DEV-ONLY: consume the local cleave checkout so the per-thread breadcrumb
+# diagnostics (cleave::breadcrumb) can be co-developed before a cleave release.
+# Replace with a pinned git rev / version bump once those land upstream.
+[patch."https://codeberg.org/atomdrift/cleave.git"]
+cleave = { path = "../cleave" }
+

@@ -505,15 +505,19 @@ fn main() -> Result<()> {
     // runtime's own overflow message. Best-effort and async-signal-safe.
     litmus::crash_dump::install();
 
-    // Dump all thread backtraces on SIGUSR1 (Linux equivalent of BSD SIGINFO / Ctrl-T).
-    // Attaches lldb/gdb to ourselves so every thread is reported with symbols.
-    // Best-effort: if spawning fails we simply don't get backtraces on signal.
+    // Install the in-process backtrace capture handler so SIGUSR1 can dump every
+    // analysis thread's stack without a debugger (lldb/gdb can't attach in the
+    // production jails). Must precede the SIGUSR1 thread below.
+    litmus::thread_dump::install();
+
+    // Dump all analysis-thread backtraces on SIGUSR1 (Linux equivalent of BSD
+    // SIGINFO / Ctrl-T), captured in-process — works in jails where ptrace is
+    // unavailable. Best-effort: if spawning the handler thread fails we simply
+    // don't get backtraces on signal.
     #[cfg(unix)]
     let _sigusr1_thread = std::thread::Builder::new()
         .name("sigusr1".into())
         .spawn(|| {
-            use std::io::Write;
-            use std::process::{Command, Stdio};
             let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
             unsafe {
                 libc::sigemptyset(&mut mask);
@@ -524,45 +528,9 @@ fn main() -> Result<()> {
                 if unsafe { libc::sigwait(&mask, &mut sig) } != 0 {
                     continue;
                 }
-                let pid = std::process::id().to_string();
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "\n--- SIGUSR1 all-thread backtrace (pid {pid}) ---"
-                );
-                let lldb = Command::new("lldb")
-                    .args([
-                        "--batch",
-                        "-p",
-                        &pid,
-                        "-o",
-                        "thread backtrace all",
-                        "-o",
-                        "detach",
-                        "-o",
-                        "quit",
-                    ])
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status();
-                if !matches!(lldb, Ok(s) if s.success()) {
-                    let _ = Command::new("gdb")
-                        .args([
-                            "-batch",
-                            "-nx",
-                            "-p",
-                            &pid,
-                            "-ex",
-                            "thread apply all bt",
-                            "-ex",
-                            "detach",
-                            "-ex",
-                            "quit",
-                        ])
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .status();
-                }
-                let _ = writeln!(std::io::stderr(), "--- end backtrace ---\n");
+                // In-process capture: no debugger, works in jails. See
+                // `litmus::thread_dump`.
+                litmus::thread_dump::dump_all_threads();
             }
         });
 

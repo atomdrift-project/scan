@@ -1214,6 +1214,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     // stuck on (yara symbol / pipe_wait subprocess / futex lock).
                     let thread_waits =
                         crate::inflight::format_wait_summary(&crate::inflight::thread_wait_summary());
+                    let crumbs = cleave::breadcrumb::snapshot();
                     tracing::warn!(
                         newly_stuck = newly_stuck.len(),
                         inflight = census.len(),
@@ -1221,6 +1222,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         rayon_threads = global_rayon_threads,
                         stuck_threshold_s = stuck_warn_secs,
                         thread_waits,
+                        breadcrumbs = crumbs.len(),
                         "WEDGE DETECTED: analyses exceeded the stuck threshold; per-slot detail follows",
                     );
                     for entry in &newly_stuck {
@@ -1244,7 +1246,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     // worker is on. For an archive wedge the work is spread
                     // across the pool, so this names the member-level culprits the
                     // per-slot (coordinator) lines can't.
-                    for crumb in cleave::breadcrumb::snapshot().into_iter().take(CENSUS_MAX_LINES) {
+                    for crumb in crumbs.into_iter().take(CENSUS_MAX_LINES) {
                         tracing::warn!(
                             rayon_index = ?crumb.rayon_index,
                             thread_id = crumb.thread_id,
@@ -2037,6 +2039,9 @@ async fn run_job(
             // can report which thread each in-flight analysis is wedged on and
             // read its kernel wait-channel.
             crate::inflight::set_thread_id(analysis_id, thread_id);
+            // Register the blocking analysis thread for the SIGUSR1 thread dump
+            // (rayon workers register via the pool's start handler).
+            crate::thread_dump::register_self();
             let inflight_blocking =
                 started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
             tracing::info!(
