@@ -34,6 +34,7 @@ pub mod explain;
 pub mod features;
 pub(crate) mod git_cmd;
 pub mod model;
+pub mod model_update;
 pub mod models_repo;
 pub mod output;
 pub mod ps;

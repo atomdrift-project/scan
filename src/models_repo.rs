@@ -287,7 +287,19 @@ pub fn check_updates() -> Result<()> {
 /// Get the short commit hash of the current models HEAD, if available.
 #[must_use]
 pub fn version() -> Option<String> {
-    git_cmd::short_head(&current_models_dir())
+    let dir = current_models_dir();
+    // R2-installed bundles have no .git; the content id is in the sidecar.
+    if let Some(installed) = crate::model_update::installed(&dir) {
+        return Some(installed.commit.chars().take(12).collect());
+    }
+    git_cmd::short_head(&dir)
+}
+
+/// Directory the R2 updater should install into: `LITMUS_MODELS_DIR` override or
+/// the default bundle path. Public, and doesn't require the dir to exist.
+#[must_use]
+pub fn install_target() -> PathBuf {
+    current_models_dir()
 }
 
 /// Default on-disk path for the model bundle.

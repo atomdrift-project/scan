@@ -98,6 +98,7 @@ tracing = "0.1"
 # tracing's directive memcmp/TLS lookups. Without the bridge, those calls
 # are no-ops at the `log!` macro site.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi", "smallvec", "std"] }
+tar = "0.4.46"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

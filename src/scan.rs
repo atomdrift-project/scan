@@ -1126,6 +1126,11 @@ const TRAIT_FLOOR_CRIT4_FRACTION: f32 = 0.05;
 /// no /usr/bin benign trips the crit-5 arm.
 const TRAIT_FLOOR_MIN_CONFIDENCE: f32 = 0.76;
 
+#[allow(clippy::cast_possible_truncation)]
+fn cleave_confidence_as_f32(value: f64) -> f32 {
+    value as f32
+}
+
 /// Confidence-filtered crit-5/crit-4 tallies plus the file's total finding count.
 /// The crit tiers count only findings with `c >= TRAIT_FLOOR_MIN_CONFIDENCE`; the
 /// total is every finding (the fraction's denominator is the file's whole activity,
@@ -1155,7 +1160,7 @@ fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
         out.total += 1;
         let conf = f["c"]
             .as_f64()
-            .map_or(DEFAULT_TRAIT_CONFIDENCE, |x| x as f32);
+            .map_or(DEFAULT_TRAIT_CONFIDENCE, cleave_confidence_as_f32);
         if conf < TRAIT_FLOOR_MIN_CONFIDENCE {
             continue;
         }

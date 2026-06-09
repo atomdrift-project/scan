@@ -733,8 +733,11 @@ fn main() -> Result<()> {
         }
 
         Commands::UpdateRules { models_only, check } => {
+            // R2-backed: model_update validates the staged bundle (Model::load)
+            // before swapping it in, so a broken bundle never goes live.
+            let dir = litmus::models_repo::install_target();
             if check {
-                if let Err(e) = litmus::models_repo::check_updates() {
+                if let Err(e) = litmus::model_update::check(&dir) {
                     eprintln!("Error checking model updates: {e}");
                     process::exit(1);
                 }
@@ -743,34 +746,9 @@ fn main() -> Result<()> {
                     process::exit(1);
                 }
             } else {
-                // Pull models, then validate the new bundle by attempting to load it.
-                // If the load fails we roll the on-disk repo back to the prior commit
-                // so future invocations (and litmus workers that pull on startup)
-                // see the last-known-good state rather than the broken one.
-                let prev_models_head = match litmus::models_repo::update(false) {
-                    Ok(prev) => prev,
-                    Err(e) => {
-                        eprintln!("Error updating models: {e}");
-                        process::exit(1);
-                    }
-                };
-                if let Some(prev) = prev_models_head.as_deref() {
-                    match litmus::models_repo::model_dir() {
-                        Ok(dir) => {
-                            if let Err(load_err) = litmus::model::Model::load(&dir, None, None) {
-                                eprintln!("Pulled models failed to load: {load_err}");
-                                eprintln!("Rolling back to {prev}...");
-                                if let Err(rb) = litmus::models_repo::rollback(prev) {
-                                    eprintln!("Rollback to {prev} failed: {rb}");
-                                }
-                                process::exit(1);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Error resolving model directory for validation: {e}");
-                            process::exit(1);
-                        }
-                    }
+                if let Err(e) = litmus::model_update::update(&dir, false) {
+                    eprintln!("Error updating models: {e}");
+                    process::exit(1);
                 }
                 if !models_only && let Err(e) = litmus::traits_repo::update(false, false) {
                     eprintln!("Error updating traits: {e}");
