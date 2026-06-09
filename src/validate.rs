@@ -194,7 +194,7 @@ fn evaluate(
                 "WARN {}: grade={} level={} probability={:.4} decision_threshold={:.4} active_thresholds suspicious={:.4} hostile={:.4}",
                 path.display(),
                 result.classification,
-                format_level(result.l),
+                format_level(result.level),
                 result.probability,
                 result.threshold,
                 thresholds.suspicious,
@@ -210,7 +210,7 @@ fn evaluate(
                     path.display(),
                     embedded.path,
                     embedded.classification,
-                    format_level(embedded.l),
+                    format_level(embedded.level),
                     embedded.probability,
                     embedded.threshold,
                     thresholds.suspicious,
@@ -235,8 +235,8 @@ fn evaluate(
     Ok((passed, total, warnings))
 }
 
-fn format_level(l: Option<i32>) -> String {
-    match l {
+fn format_level(level: Option<i32>) -> String {
+    match level {
         Some(-1) => "clean".to_string(),
         Some(n) => format!("L{n}"),
         None => "manual".to_string(),

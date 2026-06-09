@@ -1055,11 +1055,11 @@ fn scan_result_from(
     resources: &super::ModelResources,
 ) -> ScanResult {
     ScanResult {
-        v: "6",
+        v: "7",
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,
-        l: cr.l,
+        level: cr.level,
         version: crate::scan::model_version_string(resources.model.info()),
         analyzed_at: crate::scan::now_rfc3339(),
         cleave: Some(cr.report_json),
@@ -1259,8 +1259,11 @@ pub(super) async fn analyze_path(
             // Inject extracted_path into the raw cleave JSON so cyclotron
             // knows where archive members were extracted on disk.
             if let (Some(extract_dir), Some(raw)) = (&state.extract_dir, &mut scan_result.cleave)
-                && let Some(fs) = raw.get("fs").and_then(|f| f.as_array())
-                && let Some(first) = fs
+                && let Some(raw_files) = raw
+                    .get("files")
+                    .or_else(|| raw.get("fs"))
+                    .and_then(|f| f.as_array())
+                && let Some(first) = raw_files
                     .first()
                     .and_then(|f| f.get("sha"))
                     .and_then(|s| s.as_str())

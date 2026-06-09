@@ -296,9 +296,9 @@ fn colored_conf_or_pct(
     probability: f32,
     classification: &Classification,
     threshold: f32,
-    l: Option<i32>,
+    level: Option<i32>,
 ) -> String {
-    match level_confidence(l) {
+    match level_confidence(level) {
         Some(conf) => {
             let (_, _, accent) = indicator_colors(probability, classification, threshold);
             fg(accent, &format!("{:>4}", format!("{conf}%")))
@@ -328,7 +328,7 @@ pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extr
         result.probability,
         &result.classification,
         result.threshold,
-        result.l,
+        result.level,
     );
     let label = colored_label(&result.classification, p);
 
@@ -361,7 +361,7 @@ pub fn print_ps_result(
         result.probability,
         &result.classification,
         result.threshold,
-        result.l,
+        result.level,
     );
 
     // Format PID list.
@@ -467,8 +467,8 @@ fn format_route_scores(scores: &[RouteScore]) -> String {
 
 /// Render a matched operating-point level for display: `L0`, `L50`, or `—`
 /// when the file fired at no calibrated level (benign past the loosest row).
-fn format_level(l: Option<i32>) -> String {
-    l.map_or_else(|| "\u{2014}".to_string(), |n| format!("L{n}"))
+fn format_level(level: Option<i32>) -> String {
+    level.map_or_else(|| "\u{2014}".to_string(), |n| format!("L{n}"))
 }
 
 /// Print the matched level, raw route scores, and SHAP feature values
@@ -479,7 +479,7 @@ fn print_extra(result: &ScanResult, p: &Palette) {
     eprintln!(
         "           {} {}",
         fg(p.dim, "level:"),
-        fg(p.dim, &format_level(result.l)),
+        fg(p.dim, &format_level(result.level)),
     );
     if !result.model_scores.is_empty() {
         eprintln!(
@@ -500,7 +500,10 @@ fn print_extra(result: &ScanResult, p: &Palette) {
             "           {} {} {} {} {}",
             fg(p.dim, "embedded:"),
             fg(p.dim, &ef.path),
-            fg(p.dim, &format!("[{} {}]", ef.file_type, format_level(ef.l))),
+            fg(
+                p.dim,
+                &format!("[{} {}]", ef.file_type, format_level(ef.level)),
+            ),
             fg(p.dim, &format_route_scores(&ef.model_scores)),
             fg(p.very_dim, "(raw scores)"),
         );

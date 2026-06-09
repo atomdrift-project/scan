@@ -65,7 +65,24 @@ const TOP_K_RISK_FILES: usize = 1;
 /// Read v4 criticality ordinal from a finding JSON value.
 /// v4 crit is already an integer: 0=filtered, 1=component, 2=baseline, 3=notable, 4=suspicious, 5=hostile.
 pub(crate) fn crit_ordinal(finding: &serde_json::Value) -> u32 {
-    finding["l"].as_u64().unwrap_or(0) as u32
+    json_alias(finding, &["crit", "l"])
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32
+}
+
+fn json_alias<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a serde_json::Value> {
+    names.iter().find_map(|name| value.get(*name))
+}
+
+fn json_alias_array<'a>(
+    value: &'a serde_json::Value,
+    names: &[&str],
+) -> Option<&'a Vec<serde_json::Value>> {
+    json_alias(value, names).and_then(serde_json::Value::as_array)
+}
+
+fn json_alias_str<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
+    json_alias(value, names).and_then(serde_json::Value::as_str)
 }
 
 /// Key metrics extracted from the report's `metrics` object.
@@ -1341,10 +1358,10 @@ impl ExtractContext {
             let mut mbcs: HashSet<String> = HashSet::new();
             for s in &summaries {
                 for f in &s.raw_findings {
-                    if let Some(a) = f.get("a").and_then(|v| v.as_str()) {
+                    if let Some(a) = json_alias_str(f, &["atk", "a"]) {
                         attacks.insert(a.to_string());
                     }
-                    if let Some(m) = f.get("m").and_then(|v| v.as_str()) {
+                    if let Some(m) = json_alias_str(f, &["mbc", "m"]) {
                         mbcs.insert(m.to_string());
                     }
                 }
@@ -1813,9 +1830,9 @@ struct FileSummary {
     /// Full raw cleave metrics JSON (preserves strings, lists, dicts that
     /// the numeric `metrics` map drops). Used by kv: token extraction.
     raw_metrics: serde_json::Value,
-    /// Flat structural values from `ff.v` or `k` (kv: source for v.* paths).
+    /// Flat structural values from `fact.val` / `ff.v` or `k` (kv: source for v.* paths).
     raw_values: serde_json::Value,
-    /// String tuples from `ff.s` or `ss` (textenc source).
+    /// String tuples from `fact.str` / `ff.s` or `ss` (textenc source).
     raw_strings: Vec<serde_json::Value>,
     findings: FindingSummary,
     risk: FileRiskStats,
@@ -1823,16 +1840,16 @@ struct FileSummary {
     imports: HashSet<String>,
     /// Cleave imports array (preserves [lib, name, ...] tuples for symbol port).
     raw_imports: Vec<serde_json::Value>,
-    /// Cleave exports (`ff.x`) — list of export entries; one source for `symbol:`.
+    /// Cleave exports (`fact.exp` / `ff.x`) — list of export entries; one source for `symbol:`.
     raw_exports: Vec<serde_json::Value>,
-    /// Cleave function names (`ff.fn`) — second source for `symbol:`.
+    /// Cleave function names (`fact.fn` / `ff.fn`) — second source for `symbol:`.
     raw_functions: Vec<serde_json::Value>,
-    /// Filefacts call targets (`ff.ct`) — dotted call paths
+    /// Filefacts call targets (`fact.tgt` / `ff.ct`) — dotted call paths
     /// (`Symbol::Call.target`). Sourced from cleave's v5 compact AST
     /// emission; flows into `symbol:` when the spec's symbol_vocab
     /// contains the token.
     raw_call_targets: Vec<serde_json::Value>,
-    /// Filefacts member chains (`ff.mc`) — dotted access chains
+    /// Filefacts member chains (`fact.mbr` / `ff.mc`) — dotted access chains
     /// (`Symbol::Member.path`). Same flow as call targets.
     raw_member_chains: Vec<serde_json::Value>,
     /// (finding_id, confidence, crit_ordinal) for cross-file unique ID dedup.
@@ -1843,13 +1860,14 @@ struct FileSummary {
 
 impl FileSummary {
     fn new(file_entry: &serde_json::Value) -> Self {
-        let findings_raw: Vec<&serde_json::Value> = file_entry["ts"]
-            .as_array()
+        let findings_raw: Vec<&serde_json::Value> = json_alias_array(file_entry, &["find", "ts"])
             .map(|a| a.iter().collect())
             .unwrap_or_default();
         let findings = summarize_findings(&findings_raw);
 
-        let size_bytes = file_entry["sz"].as_f64().unwrap_or(0.0);
+        let size_bytes = json_alias(file_entry, &["size", "sz"])
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
         let size_kb = (size_bytes / 1024.0).max(1.0) as f32;
         let denom = findings.filtered_finding_count.max(1) as f32;
         let max_crit = findings.sample_paths.values().copied().max().unwrap_or(0);
@@ -1871,8 +1889,10 @@ impl FileSummary {
         let mut unique_3level_paths: Vec<String> = findings_raw
             .iter()
             .filter_map(|f| {
-                let fid = f["i"].as_str()?;
-                let conf = f["c"].as_f64().unwrap_or(1.0);
+                let fid = json_alias_str(f, &["id", "i"])?;
+                let conf = json_alias(f, &["conf", "c"])
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(1.0);
                 let crit = crit_ordinal(f);
                 (conf >= MIN_CONFIDENCE && crit >= 3)
                     .then(|| fid.split("::").next().unwrap_or(fid).to_string())
@@ -1882,11 +1902,12 @@ impl FileSummary {
             .collect();
         unique_3level_paths.sort();
 
-        // Resolve metrics: prefer v5 `ff.m`, fall back to v4 top-level `ms`.
+        // Resolve metrics: prefer v7 `fact.met`, fall back to v6 `ff.m`, then v4 top-level `ms`.
         // Matches `file_metrics` in collimator/src/collimator/features.py.
         let metrics_source = file_entry
-            .get("ff")
-            .and_then(|f| f.get("m"))
+            .get("fact")
+            .or_else(|| file_entry.get("ff"))
+            .and_then(|f| json_alias(f, &["met", "m"]))
             .filter(|v| v.is_object())
             .or_else(|| file_entry.get("ms"));
         let metrics: HashMap<String, HashMap<String, f64>> = metrics_source
@@ -1917,10 +1938,11 @@ impl FileSummary {
             .copied()
             .unwrap_or(0.0);
 
-        // Imports — v5 prefers `ff.i`, falls back to v4 `is`.
+        // Imports: prefer v7 `fact.imp`, fall back to v6 `ff.i`, then v4 `is`.
         let imports_array = file_entry
-            .get("ff")
-            .and_then(|f| f.get("i"))
+            .get("fact")
+            .or_else(|| file_entry.get("ff"))
+            .and_then(|f| json_alias(f, &["imp", "i"]))
             .and_then(|v| v.as_array())
             .or_else(|| file_entry.get("is").and_then(|v| v.as_array()));
         let imports: HashSet<String> = imports_array
@@ -1936,54 +1958,52 @@ impl FileSummary {
         let raw_findings: Vec<serde_json::Value> =
             findings_raw.iter().map(|f| (*f).clone()).collect();
         let has_imports_key = file_entry.get("is").is_some()
-            || file_entry.get("ff").and_then(|f| f.get("i")).is_some();
+            || file_entry
+                .get("fact")
+                .or_else(|| file_entry.get("ff"))
+                .and_then(|f| json_alias(f, &["imp", "i"]))
+                .is_some();
 
-        // Cleave v5 facts block `ff` carries `m` (metrics), `v` (flat values),
-        // `s` (strings), `i` (imports), `x` (exports), `fn` (function names).
+        // Cleave v7 facts block `fact` carries `met` (metrics), `val` (flat values),
+        // `str` (strings), `imp` (imports), `exp` (exports), `fn` (function names).
+        // v6 used `ff` with shorter keys (`m`, `v`, `s`, `i`, `x`, ...).
         // v4 reports stash these at top-level keys: `ms`, `k`, `ss`, `is`.
         // Mirror the resolution order Python uses (collimator/features.py
         // file_metrics/file_values/file_strings/file_imports).
         let facts = file_entry
-            .get("ff")
+            .get("fact")
+            .or_else(|| file_entry.get("ff"))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let raw_metrics = facts
-            .get("m")
+        let raw_metrics = json_alias(&facts, &["met", "m"])
             .filter(|v| v.is_object())
             .cloned()
             .or_else(|| file_entry.get("ms").cloned())
             .unwrap_or(serde_json::Value::Null);
-        let raw_values = facts
-            .get("v")
+        let raw_values = json_alias(&facts, &["val", "v"])
             .filter(|v| v.is_object())
             .cloned()
             .or_else(|| file_entry.get("k").cloned())
             .unwrap_or(serde_json::Value::Null);
-        let raw_strings = facts
-            .get("s")
-            .and_then(|v| v.as_array().cloned())
+        let raw_strings = json_alias_array(&facts, &["str", "s"])
+            .cloned()
             .or_else(|| file_entry.get("ss").and_then(|v| v.as_array().cloned()))
             .unwrap_or_default();
-        let raw_imports = facts
-            .get("i")
-            .and_then(|v| v.as_array().cloned())
+        let raw_imports = json_alias_array(&facts, &["imp", "i"])
+            .cloned()
             .or_else(|| file_entry.get("is").and_then(|v| v.as_array().cloned()))
             .unwrap_or_default();
-        let raw_exports = facts
-            .get("x")
-            .and_then(|v| v.as_array().cloned())
+        let raw_exports = json_alias_array(&facts, &["exp", "x"])
+            .cloned()
             .unwrap_or_default();
-        let raw_functions = facts
-            .get("fn")
-            .and_then(|v| v.as_array().cloned())
+        let raw_functions = json_alias_array(&facts, &["fn"])
+            .cloned()
             .unwrap_or_default();
-        let raw_call_targets = facts
-            .get("ct")
-            .and_then(|v| v.as_array().cloned())
+        let raw_call_targets = json_alias_array(&facts, &["tgt", "ct"])
+            .cloned()
             .unwrap_or_default();
-        let raw_member_chains = facts
-            .get("mc")
-            .and_then(|v| v.as_array().cloned())
+        let raw_member_chains = json_alias_array(&facts, &["mbr", "mc"])
+            .cloned()
             .unwrap_or_default();
 
         Self {
@@ -2041,11 +2061,13 @@ fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
     let mut hostile_ids: HashSet<&str> = HashSet::new();
 
     for finding in findings {
-        let fid = finding["i"].as_str().unwrap_or("");
+        let fid = json_alias_str(finding, &["id", "i"]).unwrap_or("");
         if fid.is_empty() {
             continue;
         }
-        let conf = finding["c"].as_f64().unwrap_or(1.0);
+        let conf = json_alias(finding, &["conf", "c"])
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(1.0);
         if conf < MIN_CONFIDENCE {
             continue;
         }
@@ -2177,11 +2199,13 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
 
         // Re-scan raw findings to deduplicate unique IDs across files.
         for finding in &s.raw_findings {
-            let fid = finding["i"].as_str().unwrap_or("");
+            let fid = json_alias_str(finding, &["id", "i"]).unwrap_or("");
             if fid.is_empty() {
                 continue;
             }
-            let conf = finding["c"].as_f64().unwrap_or(1.0);
+            let conf = json_alias(finding, &["conf", "c"])
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1.0);
             if conf < MIN_CONFIDENCE {
                 continue;
             }
@@ -2354,7 +2378,11 @@ fn write_aggregate_features(
     );
     w.set(
         "agg:crit4_present",
-        if summary.suspicious_finding_count > 0 { 1.0 } else { 0.0 },
+        if summary.suspicious_finding_count > 0 {
+            1.0
+        } else {
+            0.0
+        },
     );
 
     let topk = topk_file_risk_features_from_summaries(summaries);
@@ -2508,15 +2536,15 @@ fn write_aggregate_features(
     w.set("agg:hostile_2level_breadth", hostile_2level.len() as f32);
     w.set("agg:objectives_breadth", objectives_2level.len() as f32);
 
-    // ATT&CK / MBC features from 'a' and 'm' fields in findings.
+    // ATT&CK / MBC features from `atk`/`mbc` fields in findings.
     let mut attack_techniques: HashSet<String> = HashSet::new();
     let mut mbc_behaviors: HashSet<String> = HashSet::new();
     for s in summaries {
         for finding in &s.raw_findings {
-            if let Some(a) = finding.get("a").and_then(|v| v.as_str()) {
+            if let Some(a) = json_alias_str(finding, &["atk", "a"]) {
                 attack_techniques.insert(a.to_string());
             }
-            if let Some(m) = finding.get("m").and_then(|v| v.as_str()) {
+            if let Some(m) = json_alias_str(finding, &["mbc", "m"]) {
                 mbc_behaviors.insert(m.to_string());
             }
         }
@@ -3037,34 +3065,28 @@ fn canonical_fields_from_primary_file(file: Option<&serde_json::Value>) -> (Stri
     let Some(file) = file else {
         return (String::new(), String::new(), 0);
     };
-    let formula = file
-        .get("f")
-        .and_then(serde_json::Value::as_str)
+    let formula = json_alias_str(file, &["mol", "f"])
         .unwrap_or("")
         .to_string();
     let elements: String = formula
         .chars()
         .filter(|c| !('\u{2080}'..='\u{2089}').contains(c))
         .collect();
-    let score = file
-        .get("x")
+    let score = json_alias(file, &["risk", "x"])
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
     (formula, elements, score)
 }
 
 fn primary_file(report: &serde_json::Value) -> Option<&serde_json::Value> {
-    report
-        .get("fs")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|files| {
-            files.iter().find(|file| {
-                file.get("dp")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0)
-                    == 0
-            })
+    json_alias_array(report, &["files", "fs"]).and_then(|files| {
+        files.iter().find(|file| {
+            file.get("dp")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                == 0
         })
+    })
 }
 
 fn write_logic_gap_features(
@@ -3340,8 +3362,7 @@ fn write_structural_features(
 }
 
 fn report_files(report: &serde_json::Value) -> Vec<&serde_json::Value> {
-    report["fs"]
-        .as_array()
+    json_alias_array(report, &["files", "fs"])
         .map(|a| a.iter().collect())
         .unwrap_or_default()
 }

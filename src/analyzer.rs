@@ -60,9 +60,9 @@ impl Analyzer {
     pub fn load(model_dir: impl Into<PathBuf>) -> Result<Self> {
         let model_dir = model_dir.into();
         // Library callers deploy at the default severity level so the verdict
-        // is computed and the envelope's `l` is populated. `l` itself is
+        // is computed and the envelope's `level` is populated. `level` itself is
         // level-independent (the lowest-firing-level sweep), so consumers wanting
-        // a different cutoff reinterpret `l` rather than reloading the model.
+        // a different cutoff reinterpret `level` rather than reloading the model.
         let model = Model::load(&model_dir, None, Some(crate::model::DEFAULT_SEVERITY_LEVEL))?;
         let ctx = ExtractContext::new(model.spec());
         let shap = ShapImportance::load(&model_dir).ok();
@@ -112,7 +112,7 @@ impl Analyzer {
     }
 
     /// Attach the FPR severity level (0..=10000) that produced the resolved
-    /// thresholds. Folded into the JSON envelope's `ml.l` field (alongside the
+    /// thresholds. Folded into the JSON envelope's `ml.lvl` field (alongside the
     /// `-1` benign sentinel). Pass `None` to indicate manual thresholds with no
     /// level metadata.
     #[must_use]

@@ -456,7 +456,7 @@ impl std::fmt::Display for Classification {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RouteScore {
     /// Compact model route name, e.g. `az`, `az/native`, `az/elf`.
-    #[serde(rename = "m")]
+    #[serde(rename = "rte")]
     pub model: String,
     /// Probability emitted by this route's model. This is the calibrated value
     /// (the space thresholds live in) and drives the verdict.
@@ -468,7 +468,7 @@ pub struct RouteScore {
     #[serde(rename = "raw")]
     pub raw: f32,
     /// Classification after applying this route's calibrated thresholds.
-    #[serde(rename = "class")]
+    #[serde(rename = "cls")]
     pub classification: Classification,
 }
 
@@ -476,7 +476,7 @@ pub struct RouteScore {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SkippedRoute {
     /// Compact model route name, e.g. `az/native`.
-    #[serde(rename = "m")]
+    #[serde(rename = "rte")]
     pub model: String,
     /// Short reason the route was not used.
     #[serde(rename = "why")]
@@ -604,27 +604,27 @@ impl Thresholds {
     #[must_use]
     pub fn decide(&self, probability: f32) -> Decision {
         // The raw threshold path carries no level table (manual `--threshold-*`
-        // mode, single-bundle, or the no-grid fallback), so `l` is `None`.
+        // mode, single-bundle, or the no-grid fallback), so `level` is `None`.
         if probability >= self.hostile {
             Decision {
                 class: Classification::Hostile,
                 probability,
                 threshold: self.hostile,
-                l: None,
+                level: None,
             }
         } else if probability >= self.suspicious {
             Decision {
                 class: Classification::Suspicious,
                 probability,
                 threshold: self.suspicious,
-                l: None,
+                level: None,
             }
         } else {
             Decision {
                 class: Classification::Benign,
                 probability,
                 threshold: self.suspicious,
-                l: None,
+                level: None,
             }
         }
     }
@@ -645,15 +645,15 @@ pub struct Decision {
     pub probability: f32,
     /// Cutoff defining the verdict band.
     pub threshold: f32,
-    /// Level-independent envelope marker (the JSON `l`): the lowest
+    /// Level-independent envelope marker (serialized as JSON `lvl`): the lowest
     /// false-positive level (FP per 100M benigns) at which this file's hostile
     /// decision fires. `Some(-1)` when it never fires at any grid level (clean);
     /// `Some(0..=grid_max)` for the firing level; `None` in manual-threshold
     /// mode, where no level table applies. Independent of the deploy `-l`, so
     /// the serialized envelope is identical across levels and cache-shareable —
-    /// `-l` only moves the hostile/suspicious cutoffs applied to `l` to produce
+    /// `-l` only moves the hostile/suspicious cutoffs applied to `level` to produce
     /// `class`.
-    pub l: Option<i32>,
+    pub level: Option<i32>,
 }
 
 /// Validation error for [`Thresholds`].
@@ -1108,7 +1108,7 @@ struct EnsembleConfig {
 /// drives the diagnostic per-route classification (`models[]`). `grid` retains
 /// the hostile policy at *every* level so the verdict path can sweep for the
 /// lowest false-positive level at which a file fires — that swept level is the
-/// envelope's `l` (see `sweep_policy_grid` and `Model::decide_swept`).
+/// envelope level marker (see `sweep_policy_grid` and `Model::decide_swept`).
 #[derive(Debug, Default)]
 struct RoutePolicies {
     by_filetype: HashMap<String, RoutePolicy>,
@@ -1149,7 +1149,7 @@ impl RoutePolicies {
 
     /// Look up the per-level policy grid for a file type, with the same
     /// suffix-stripping fallback as [`Self::policy_for`]. Used by the
-    /// envelope-`l` sweep.
+    /// envelope-level sweep.
     fn grid_for(&self, file_type: &str) -> Option<&Vec<LevelPolicy>> {
         if let Some(g) = self.grid.get(file_type) {
             return Some(g);
@@ -2144,7 +2144,7 @@ fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -> Option<De
             class: Classification::Hostile,
             probability: p,
             threshold: t,
-            l: None,
+            level: None,
         });
     }
     if let Some((p, t)) = policy.suspicious.fire(scores) {
@@ -2152,7 +2152,7 @@ fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -> Option<De
             class: Classification::Suspicious,
             probability: p,
             threshold: t,
-            l: None,
+            level: None,
         });
     }
     None
@@ -2180,10 +2180,11 @@ fn sweep_policy_grid(grid: &[LevelPolicy], scores: &[RouteProbability]) -> Optio
 
 /// Map a file's lowest firing level to a verdict at the active deploy level.
 ///
-/// `fired_level` is the level-independent `l` (from the grid sweep); `level` is
+/// `fired_level` is the level-independent marker from the grid sweep; `level` is
 /// the active `-l`. A file is **hostile** when it fires within the hostile
-/// budget (`l <= level`) and **suspicious** when it fires above that budget but
-/// within the derived suspicious ceiling. Beyond that ceiling is benign.
+/// budget (`fired_level <= level`) and **suspicious** when it fires above that
+/// budget but within the derived suspicious ceiling. Beyond that ceiling is
+/// benign.
 fn verdict_for_level(fired_level: u16, level: u16, grid_max: u16) -> Classification {
     if fired_level <= level {
         Classification::Hostile
@@ -2325,9 +2326,9 @@ pub struct Model {
     /// the per-route calibrator on Route; backward compat = None.
     general_calibrator: Option<IsotonicCalibrator>,
     /// Active deploy level (FP per 100M benigns) that drives the verdict and
-    /// the `l` envelope marker. `None` in manual-threshold mode (`--threshold-*`)
+    /// the envelope level marker. `None` in manual-threshold mode (`--threshold-*`)
     /// and on single-bundle deployments with no level grid; the sweep is then
-    /// bypassed and `l` serializes as `null`.
+    /// bypassed and the level serializes as `null`.
     active_level: Option<u16>,
     /// General route's hostile threshold per level (ascending), for the
     /// no-policy verdict sweep. Empty on single-bundle / pre-grid deployments.
@@ -2424,7 +2425,7 @@ impl Model {
             general_calibrator: bundle.calibrator,
             // Single-bundle deployments carry no level grid, so the verdict
             // sweep has nothing to sweep: `decide` falls back to the threshold
-            // path and `l` serializes as `null`.
+            // path and the level serializes as `null`.
             active_level,
             general_grid: Vec::new(),
             grid_max: 0,
@@ -2449,7 +2450,7 @@ impl Model {
         // `models[]` array and emitted `prob` are identical regardless of the
         // caller's `-l` — the JSON envelope stays cacheable across levels. The
         // active level enters only the final verdict derivation, via the
-        // level-independent `l` sweep over `policies.grid` / `general_grid`.
+        // level-independent sweep over `policies.grid` / `general_grid`.
         let ensemble_cfg =
             load_ensemble_config(model_dir, DEFAULT_SEVERITY_LEVEL).unwrap_or_default();
         let policies = load_route_policies(model_dir, DEFAULT_SEVERITY_LEVEL);
@@ -2840,11 +2841,11 @@ impl Model {
 
     /// Pick the final [`Decision`] from per-route scores.
     ///
-    /// In level mode the verdict comes from the level-independent `l` sweep (see
+    /// In level mode the verdict comes from the level-independent sweep (see
     /// [`Self::decide_swept`]). In manual-threshold mode (`active_level` is
     /// `None`) it keeps the pre-level behaviour: the per-filetype policy at the
     /// default level when one exists, else the OR over the model's thresholds —
-    /// with `l = None`, since no level table applies.
+    /// with no level marker, since no level table applies.
     fn decide_from_routes(
         &self,
         file_type: &str,
@@ -2871,7 +2872,7 @@ impl Model {
         }
 
         let Some(level) = self.active_level else {
-            // Manual-threshold mode: pre-level semantics, `l` is null.
+            // Manual-threshold mode: pre-level semantics, level is null.
             return match policy {
                 Some(policy) => policy_decide(policy, route_probs)
                     .unwrap_or_else(|| self.benign_fallback(route_probs, None)),
@@ -2884,8 +2885,12 @@ impl Model {
 
     /// Benign decision reporting the general route's probability against the
     /// model's suspicious cutoff (the band the score didn't reach), tagged with
-    /// the given `l`.
-    fn benign_fallback(&self, route_probs: &[RouteProbability], l: Option<i32>) -> Decision {
+    /// the given level marker.
+    fn benign_fallback(
+        &self,
+        route_probs: &[RouteProbability],
+        level_marker: Option<i32>,
+    ) -> Decision {
         let general_prob = route_probs
             .iter()
             .find(|s| s.route == "general")
@@ -2894,18 +2899,19 @@ impl Model {
             class: Classification::Benign,
             probability: general_prob,
             threshold: self.thresholds.suspicious,
-            l,
+            level: level_marker,
         }
     }
 
     /// Derive the verdict from the level-independent lowest-firing-level sweep.
     ///
-    /// `l` (the swept level) is computed over the full grid with no reference to
-    /// `level`, so it — and the entire serialized envelope — is identical
-    /// regardless of the deploy `-l`, keeping the result cache-shareable. The
-    /// active `level` only positions the cutoffs: hostile when `l <= level`,
-    /// suspicious when `l <= min(grid_max, 20000)`, else benign. A file that
-    /// fires at no grid level is clean and reports `l = -1`.
+    /// The swept level is computed over the full grid with no reference to the
+    /// active deploy level, so it — and the entire serialized envelope — is
+    /// identical regardless of the deploy `-l`, keeping the result
+    /// cache-shareable. The active deploy level only positions the cutoffs:
+    /// hostile when the swept level is <= the deploy level, suspicious when it
+    /// is <= min(grid_max, 20000), else benign. A file that fires at no grid
+    /// level is clean and reports `-1`.
     fn decide_swept(
         &self,
         file_type: &str,
@@ -2916,7 +2922,7 @@ impl Model {
             sweep_policy_grid(grid, route_probs)
         } else if self.general_grid.is_empty() {
             // No grid to sweep (general-only bundle without a levels[] table):
-            // fall back to the threshold path; `l` stays null.
+            // fall back to the threshold path; the level stays null.
             return self.decide_from_scores(route_probs);
         } else {
             sweep_general_grid(&self.general_grid, route_probs)
@@ -2930,7 +2936,7 @@ impl Model {
             class: verdict_for_level(fired_level, level, self.grid_max),
             probability,
             threshold,
-            l: Some(i32::from(fired_level)),
+            level: Some(i32::from(fired_level)),
         }
     }
 
@@ -3455,24 +3461,25 @@ mod tests {
     #[test]
     fn sweep_is_independent_of_active_level() {
         // The swept level is a property of the file + model, not of `-l`: the
-        // same scores yield the same `l` whatever the deploy level. Only the
-        // verdict derived from it changes. This is what makes the envelope
+        // same scores yield the same level marker whatever the deploy level. Only
+        // the verdict derived from it changes. This is what makes the envelope
         // cache-shareable across `-l`.
         let grid = general_policy_grid(&[(2, 0.99), (20, 0.85), (50, 0.70)]);
-        let l = sweep_policy_grid(&grid, &general_only(0.88))
+        let swept_level = sweep_policy_grid(&grid, &general_only(0.88))
             .expect("fires")
             .0;
-        assert_eq!(l, 20);
+        assert_eq!(swept_level, 20);
         for active in [0_u16, 10, 20, 50, 200, 1000] {
-            // l is unchanged; only the class depends on `active`.
-            let _ = verdict_for_level(l, active, 1000);
+            // Swept level is unchanged; only the class depends on `active`.
+            let _ = verdict_for_level(swept_level, active, 1000);
         }
     }
 
     #[test]
     fn verdict_for_level_applies_caps() {
-        // Rule: `l <= active level` is hostile, `active < l <= suspicious cap`
-        // is suspicious, and anything beyond the cap is benign.
+        // Rule: swept level <= active level is hostile; swept level above active
+        // but within the suspicious cap is suspicious; anything beyond the cap
+        // is benign.
         let grid_max = 25_000;
         assert_eq!(verdict_for_level(20, 50, grid_max), Classification::Hostile);
         assert_eq!(verdict_for_level(50, 50, grid_max), Classification::Hostile);
@@ -3497,7 +3504,7 @@ mod tests {
             Classification::Benign
         );
 
-        // Stricter deploy (-l 10): only l <= 10 is hostile.
+        // Stricter deploy (-l 10): only levels <= 10 are hostile.
         assert_eq!(
             verdict_for_level(20, 10, grid_max),
             Classification::Suspicious

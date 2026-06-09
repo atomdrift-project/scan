@@ -333,7 +333,7 @@ fn threshold_overrides_for_model(
     threshold_hostile: Option<f32>,
 ) -> Option<litmus::model::Thresholds> {
     // Level mode resolves the verdict from the model's level grid — the
-    // per-file `l` sweep plus the active level's hostile/suspicious cutoffs —
+    // per-file level sweep plus the active level's hostile/suspicious cutoffs —
     // so no explicit thresholds are loaded here; `Model::load` keeps its
     // level-independent defaults and the active level is passed separately.
     //
@@ -588,8 +588,8 @@ fn main() -> Result<()> {
     };
     let threshold_overrides =
         || threshold_overrides_for_model(threshold_suspicious, threshold_hostile);
-    // The envelope's `ml.l` encodes the FPR severity that produced the
-    // resolved thresholds (or the `-1` benign sentinel — see scan::envelope_l).
+    // The envelope's `ml.lvl` encodes the FPR severity that produced the
+    // resolved thresholds (or the `-1` benign sentinel — see scan::level_confidence).
     // Manual `--threshold-*` overrides bypass the levels table entirely, so we
     // pass `None` here; benign verdicts will still surface as `-1` regardless.
     let manual_thresholds = threshold_suspicious.is_some() || threshold_hostile.is_some();

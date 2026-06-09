@@ -150,7 +150,7 @@ impl ScanConfig {
     ///
     /// `None` indicates manual thresholds (no level applies); `Some(n)` is the
     /// 0..=25000 level that was used to pick `thresholds` from the model's
-    /// `severity_levels[]` table. Folded into `ml.l` in the JSON envelope (which
+    /// `severity_levels[]` table. Folded into `ml.lvl` in the JSON envelope (which
     /// also encodes the benign verdict via the `-1` sentinel) so downstream
     /// consumers can correlate verdicts with FPR severity.
     #[must_use]
@@ -266,17 +266,18 @@ mod trait_floor_tests {
             class: Classification::Benign,
             probability: 0.1,
             threshold: 0.65,
-            l: Some(-1),
+            level: Some(-1),
         }
     }
 
     /// A report with `n` findings at crit `crit`/confidence `conf`, padded with
     /// `pad` baseline (crit-0) findings so the total/fraction can be controlled.
     fn report(crit: u64, conf: f64, n: usize, pad: usize) -> serde_json::Value {
-        let mut ts: Vec<serde_json::Value> =
-            (0..n).map(|_| json!({"l": crit, "c": conf})).collect();
-        ts.extend((0..pad).map(|_| json!({"l": 0, "c": 0.9})));
-        json!({ "ts": ts })
+        let mut ts: Vec<serde_json::Value> = (0..n)
+            .map(|_| json!({"crit": crit, "conf": conf}))
+            .collect();
+        ts.extend((0..pad).map(|_| json!({"crit": 0, "conf": 0.9})));
+        json!({ "find": ts })
     }
 
     #[test]
@@ -284,7 +285,7 @@ mod trait_floor_tests {
         let mut d = benign();
         apply_trait_floor(&mut d, &report(5, 0.8, 1, 0), 100, "test");
         assert_eq!(d.class, Classification::Suspicious);
-        assert_eq!(d.l, Some(101));
+        assert_eq!(d.level, Some(101));
     }
 
     #[test]
@@ -301,7 +302,7 @@ mod trait_floor_tests {
         // 4 confident crit-4 out of 4 total → fraction 1.0 >= 0.05.
         apply_trait_floor(&mut d, &report(4, 0.9, 4, 0), 100, "test");
         assert_eq!(d.class, Classification::Suspicious);
-        assert_eq!(d.l, Some(102));
+        assert_eq!(d.level, Some(102));
     }
 
     #[test]
@@ -316,10 +317,10 @@ mod trait_floor_tests {
     fn low_confidence_crit4_does_not_count_toward_pair() {
         let mut d = benign();
         // Only one confident crit-4; the other two are below threshold.
-        let report = json!({"ts": [
-            {"l": 4, "c": 0.9},
-            {"l": 4, "c": 0.5},
-            {"l": 4, "c": 0.6},
+        let report = json!({"find": [
+            {"crit": 4, "conf": 0.9},
+            {"crit": 4, "conf": 0.5},
+            {"crit": 4, "conf": 0.6},
         ]});
         apply_trait_floor(&mut d, &report, 100, "test");
         assert_eq!(d.class, Classification::Benign);
@@ -328,8 +329,8 @@ mod trait_floor_tests {
     #[test]
     fn missing_confidence_defaults_below_threshold() {
         let mut d = benign();
-        // `c` omitted → DEFAULT_TRAIT_CONFIDENCE (0.5) < 0.76, so it never counts.
-        let report = json!({"ts": [{"l": 5}, {"l": 5}]});
+        // `conf` omitted → DEFAULT_TRAIT_CONFIDENCE (0.5) < 0.76, so it never counts.
+        let report = json!({"find": [{"crit": 5}, {"crit": 5}]});
         apply_trait_floor(&mut d, &report, 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
@@ -338,19 +339,19 @@ mod trait_floor_tests {
     fn never_lowers_a_non_benign_verdict() {
         let mut d = benign();
         d.class = Classification::Hostile;
-        d.l = Some(50);
+        d.level = Some(50);
         apply_trait_floor(&mut d, &report(5, 0.9, 5, 0), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
-        assert_eq!(d.l, Some(50));
+        assert_eq!(d.level, Some(50));
     }
 
     #[test]
-    fn reads_findings_from_embedded_fs_shape() {
+    fn reads_findings_from_embedded_files_shape() {
         let mut d = benign();
-        let report = json!({"fs": [{"ts": [{"l": 5, "c": 0.8}]}]});
+        let report = json!({"files": [{"find": [{"crit": 5, "conf": 0.8}]}]});
         apply_trait_floor(&mut d, &report, 100, "test");
         assert_eq!(d.class, Classification::Suspicious);
-        assert_eq!(d.l, Some(101));
+        assert_eq!(d.level, Some(101));
     }
 }
 
@@ -361,12 +362,12 @@ mod envelope_tests {
 
     fn base_result() -> ScanResult {
         ScanResult {
-            v: "6",
+            v: "7",
             classification: Classification::Benign,
             probability: 0.10,
             threshold: 0.65,
             // Benign that never fires at any grid level.
-            l: Some(-1),
+            level: Some(-1),
             version: "test".to_string(),
             analyzed_at: "2026-04-16T00:00:00Z".to_string(),
             cleave: None,
@@ -409,17 +410,18 @@ mod envelope_tests {
     }
 
     #[test]
-    fn envelope_serializes_l_and_drops_legacy_fields() {
-        // `ml.l` is the model's level-independent marker, serialized verbatim
+    fn envelope_serializes_lvl_and_drops_legacy_fields() {
+        // `ml.lvl` is the model's level-independent marker, serialized verbatim
         // (`-1` for a file that never fires). The dropped v5 fields must not
         // appear anywhere in the envelope.
         let r = base_result();
         let json = serde_json::to_value(r.to_envelope()).expect("serialize");
-        assert_eq!(json["ml"]["v"].as_str(), Some("6"));
-        assert_eq!(json["ml"]["l"].as_i64(), Some(-1));
+        assert_eq!(json["ml"]["v"].as_str(), Some("7"));
+        assert_eq!(json["ml"]["lvl"].as_i64(), Some(-1));
         assert_eq!(json["ml"]["conf"].as_u64(), Some(0));
         for dropped in [
             "class",
+            "l",
             "threshold",
             "level",
             "thresholds",
@@ -428,19 +430,19 @@ mod envelope_tests {
         ] {
             assert!(
                 json["ml"].get(dropped).is_none(),
-                "v6 envelope must not emit `{dropped}`"
+                "v7 envelope must not emit `{dropped}`"
             );
         }
     }
 
     #[test]
-    fn envelope_emits_null_l_in_manual_mode() {
+    fn envelope_emits_null_lvl_in_manual_mode() {
         let mut r = base_result();
-        r.l = None;
+        r.level = None;
         let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         assert!(
-            json["ml"]["l"].is_null(),
-            "manual-threshold mode (no level table) serializes l as null"
+            json["ml"]["lvl"].is_null(),
+            "manual-threshold mode (no level table) serializes lvl as null"
         );
         assert!(
             json["ml"]["conf"].is_null(),
@@ -453,45 +455,45 @@ mod envelope_tests {
         let mut r = base_result();
         r.classification = Classification::Hostile;
         r.probability = 0.99;
-        r.l = Some(7);
+        r.level = Some(7);
         let json = serde_json::to_value(r.to_envelope()).expect("serialize");
-        assert_eq!(json["ml"]["l"].as_i64(), Some(7));
+        assert_eq!(json["ml"]["lvl"].as_i64(), Some(7));
         assert_eq!(json["ml"]["conf"].as_u64(), Some(94));
     }
 
     #[test]
-    fn envelope_l_is_independent_of_verdict() {
+    fn envelope_level_is_independent_of_verdict() {
         // A file the model only flags at a high level reports that true level
         // even when the active caps render it benign — the envelope (hence the
         // cache key) is identical regardless of the deploy `-l`.
         let mut r = base_result();
         r.classification = Classification::Benign;
-        r.l = Some(500);
+        r.level = Some(500);
         let json = serde_json::to_value(r.to_envelope()).expect("serialize");
-        assert_eq!(json["ml"]["l"].as_i64(), Some(500));
+        assert_eq!(json["ml"]["lvl"].as_i64(), Some(500));
     }
 
     #[test]
-    fn envelope_per_file_l_reflects_each_member() {
-        // Each `fs[]` row reports its own file's lowest-firing-level: the root
-        // carries the envelope `l`, members their own (matched by path suffix).
+    fn envelope_per_file_level_reflects_each_member() {
+        // Each `files[]` row reports its own file's lowest-firing-level: the root
+        // carries the envelope `lvl`, members their own (matched by path suffix).
         let mut r = base_result();
-        r.l = Some(20);
+        r.level = Some(20);
         r.probability = 0.97;
         r.cleave = Some(serde_json::json!({
-            "fs": [
+            "files": [
                 {"id": 0, "dp": 0, "path": "/tmp/x"},
                 {"id": 1, "dp": 1, "path": "/tmp/x!!evil.sh"},
                 {"id": 2, "dp": 1, "path": "/tmp/x!!readme.txt"},
             ]
         }));
-        let member = |path: &str, l: Option<i32>, prob: f32| EmbeddedFile {
+        let member = |path: &str, level: Option<i32>, prob: f32| EmbeddedFile {
             path: path.to_string(),
             file_type: "unknown".to_string(),
             classification: Classification::Benign,
             probability: prob,
             threshold: 0.8,
-            l,
+            level,
             model_scores: Vec::new(),
             skipped_models: Vec::new(),
             formula: String::new(),
@@ -502,13 +504,21 @@ mod envelope_tests {
             member("readme.txt", Some(-1), 0.01),
         ];
         let json = serde_json::to_value(r.to_envelope()).expect("serialize");
-        let fs = json["ml"]["fs"].as_array().expect("fs array");
-        assert_eq!(fs[0]["l"].as_i64(), Some(20), "root row carries envelope l");
-        assert_eq!(fs[1]["l"].as_i64(), Some(2), "evil.sh reports its own l");
+        let files = json["ml"]["files"].as_array().expect("files array");
         assert_eq!(
-            fs[2]["l"].as_i64(),
+            files[0]["lvl"].as_i64(),
+            Some(20),
+            "root row carries envelope lvl"
+        );
+        assert_eq!(
+            files[1]["lvl"].as_i64(),
+            Some(2),
+            "evil.sh reports its own lvl"
+        );
+        assert_eq!(
+            files[2]["lvl"].as_i64(),
             Some(-1),
-            "readme.txt reports its own l"
+            "readme.txt reports its own lvl"
         );
     }
 }
@@ -543,7 +553,7 @@ pub struct FindingCounts {
     pub baseline: u32,
 }
 
-/// Map a level marker (`ml.l`) to a pessimistic human-facing confidence percent.
+/// Map a level marker (`ml.lvl`) to a pessimistic human-facing confidence percent.
 ///
 /// This is a display/export confidence, not the model probability (`ml.prob`) and
 /// not a posterior probability. The table is intentionally integer-valued and
@@ -552,8 +562,8 @@ pub struct FindingCounts {
 /// below the current L25000 tail. `50001`/`50002` are reserved for the same
 /// meaning if the calibrated grid grows to L50000.
 #[must_use]
-pub const fn level_confidence(l: Option<i32>) -> Option<u8> {
-    match l {
+pub const fn level_confidence(level: Option<i32>) -> Option<u8> {
+    match level {
         None => None,
         Some(n) if n < 0 => Some(0),
         Some(0) => Some(100),
@@ -631,13 +641,13 @@ pub struct ScanResult {
     /// Cutoff defining the verdict band — the same value `probability` was
     /// compared against to produce `classification`.
     pub threshold: f32,
-    /// Level-independent envelope marker (`ml.l`): the lowest false-positive
+    /// Level-independent envelope marker (`ml.lvl`): the lowest false-positive
     /// level (FP per 100M benigns) at which this file's hostile decision fires.
     /// `Some(-1)` = never fires (clean); `Some(0..=25000)` = the firing level;
     /// `None` = manual-threshold mode. Independent of the deploy `-l`, so the
     /// envelope is identical across levels and cache-shareable — `-l` only moves
-    /// the cutoffs that turn `l` into `classification`.
-    pub l: Option<i32>,
+    /// the cutoffs that turn `level` into `classification`.
+    pub level: Option<i32>,
     /// Model version identifier (spec version, ABI version, model hash prefix).
     pub version: String,
     /// UTC timestamp of when this analysis was performed (RFC 3339).
@@ -687,24 +697,39 @@ pub struct TopFinding {
     pub desc: String,
 }
 
-/// Default cleave trait confidence when the JSON `c` field is omitted.
+/// Default cleave trait confidence when the JSON `conf`/`c` field is omitted.
 /// Mirrors `DEFAULT_CONF` in `cleave::types::compact`.
 const DEFAULT_TRAIT_CONFIDENCE: f32 = 0.5;
 
+fn json_alias<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a serde_json::Value> {
+    names.iter().find_map(|name| value.get(*name))
+}
+
+fn json_alias_array<'a>(
+    value: &'a serde_json::Value,
+    names: &[&str],
+) -> Option<&'a Vec<serde_json::Value>> {
+    json_alias(value, names).and_then(serde_json::Value::as_array)
+}
+
+fn json_alias_str<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
+    json_alias(value, names).and_then(serde_json::Value::as_str)
+}
+
 impl From<&serde_json::Value> for TopFinding {
     fn from(f: &serde_json::Value) -> Self {
-        // Cleave's compact-v4 omits `c` when it equals the 0.5 default. The
+        // Cleave omits `conf` when it equals the 0.5 default. The
         // float values are bucketed to two decimals so the f64→f32 down-cast
         // is exact for every value the analyzer actually emits.
         #[allow(clippy::cast_possible_truncation)]
-        let conf = f["c"]
-            .as_f64()
+        let conf = json_alias(f, &["conf", "c"])
+            .and_then(serde_json::Value::as_f64)
             .map_or(DEFAULT_TRAIT_CONFIDENCE, |x| x as f32);
         Self {
-            id: f["i"].as_str().unwrap_or("").to_string(),
+            id: json_alias_str(f, &["id", "i"]).unwrap_or("").to_string(),
             crit: crit_ordinal(f),
             conf,
-            desc: f["d"].as_str().unwrap_or("").to_string(),
+            desc: json_alias_str(f, &["desc", "d"]).unwrap_or("").to_string(),
         }
     }
 }
@@ -723,8 +748,8 @@ pub struct EmbeddedFile {
     /// Cutoff that defined this embedded file's verdict band.
     pub threshold: f32,
     /// Level-independent lowest-firing-level marker for this member. See
-    /// [`ScanResult::l`].
-    pub l: Option<i32>,
+    /// [`ScanResult::level`].
+    pub level: Option<i32>,
     /// Per-model route scores for this embedded file.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_scores: Vec<RouteScore>,
@@ -1197,8 +1222,8 @@ pub(crate) struct ClassifiedReport {
     pub(crate) probability: f32,
     pub(crate) threshold: f32,
     /// Level-independent lowest-firing-level marker for the root file. See
-    /// [`ScanResult::l`].
-    pub(crate) l: Option<i32>,
+    /// [`ScanResult::level`].
+    pub(crate) level: Option<i32>,
     pub(crate) finding_counts: FindingCounts,
     pub(crate) formula: String,
     pub(crate) reasons: Vec<Reason>,
@@ -1243,11 +1268,10 @@ struct TraitFloorCounts {
 }
 
 fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
-    let findings = report["ts"].as_array().or_else(|| {
-        report["fs"]
-            .as_array()
+    let findings = json_alias_array(report, &["find", "ts"]).or_else(|| {
+        json_alias_array(report, &["files", "fs"])
             .and_then(|a| a.first())
-            .and_then(|f| f["ts"].as_array())
+            .and_then(|f| json_alias_array(f, &["find", "ts"]))
     });
     let mut out = TraitFloorCounts {
         hostile: 0,
@@ -1259,13 +1283,13 @@ fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
     };
     for f in findings {
         out.total += 1;
-        let conf = f["c"]
-            .as_f64()
+        let conf = json_alias(f, &["conf", "c"])
+            .and_then(serde_json::Value::as_f64)
             .map_or(DEFAULT_TRAIT_CONFIDENCE, cleave_confidence_as_f32);
         if conf < TRAIT_FLOOR_MIN_CONFIDENCE {
             continue;
         }
-        match f["l"].as_u64().unwrap_or(0) {
+        match crit_ordinal(f) {
             5 => out.hostile += 1,
             4 => out.suspicious += 1,
             _ => {}
@@ -1301,7 +1325,7 @@ fn apply_trait_floor(
     let counts = trait_floor_counts(report);
     if counts.hostile >= 1 {
         decision.class = Classification::Suspicious;
-        decision.l = Some(i32::from(grid_max) + 1);
+        decision.level = Some(i32::from(grid_max) + 1);
         // Loud by design: the model graded this benign yet cleave is confident it
         // carries a hostile (crit-5) trait. If the models are doing their job this
         // is extraordinary — every occurrence is a model gap worth investigating.
@@ -1319,7 +1343,7 @@ fn apply_trait_floor(
         && counts.suspicious as f32 / counts.total as f32 >= TRAIT_FLOOR_CRIT4_FRACTION
     {
         decision.class = Classification::Suspicious;
-        decision.l = Some(i32::from(grid_max) + 2);
+        decision.level = Some(i32::from(grid_max) + 2);
         tracing::warn!(
             path = %label,
             arm = "crit4_fraction",
@@ -1350,9 +1374,9 @@ pub(crate) fn classify_report(
     report.finalize();
     let compact = cleave::types::compact::compact_from_files(&report.files);
     let formula = compact
-        .fs
+        .files
         .first()
-        .and_then(|file| file.f.clone())
+        .and_then(|file| file.formula.clone())
         .unwrap_or_default();
 
     let report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
@@ -1377,12 +1401,13 @@ pub(crate) fn classify_report(
     // The cleave file_type drives ensemble routing; pull it from the top-level
     // file in the report. Single-bundle deployments ignore it via predict_for's
     // fast path.
-    let pf = report_json["fs"]
-        .as_array()
+    let pf = json_alias_array(&report_json, &["files", "fs"])
         .and_then(|a| a.first())
         .unwrap_or(&report_json);
     let file_type = pf["type"].as_str().unwrap_or("unknown").to_string();
-    let size_bytes = pf["sz"].as_u64().unwrap_or(0);
+    let size_bytes = json_alias(pf, &["size", "sz"])
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let sha256 = pf["sha"].as_str().unwrap_or("").to_string();
 
     let (mut decision, model_scores, skipped_models) =
@@ -1416,8 +1441,7 @@ pub(crate) fn classify_report(
     // decision outranks it. Ordinary scans cap embedded work to prevent
     // resource exhaustion; validation passes None so every Cleave-produced
     // embedded file is checked.
-    let embedded_iter = report_json["fs"]
-        .as_array()
+    let embedded_iter = json_alias_array(&report_json, &["files", "fs"])
         .into_iter()
         .flatten()
         .filter(|f| f["dp"].as_u64().unwrap_or(0) > 0);
@@ -1446,7 +1470,7 @@ pub(crate) fn classify_report(
                     class: Classification::Benign,
                     probability: 0.0,
                     threshold: model.thresholds().suspicious,
-                    l: None,
+                    level: None,
                 },
                 Vec::new(),
                 Vec::new(),
@@ -1469,8 +1493,7 @@ pub(crate) fn classify_report(
             .unwrap_or(full_path)
             .to_string();
 
-        let ef_top_findings: Vec<TopFinding> = ef["ts"]
-            .as_array()
+        let ef_top_findings: Vec<TopFinding> = json_alias_array(ef, &["find", "ts"])
             .into_iter()
             .flatten()
             .filter(|ff| crit_ordinal(ff) >= 4)
@@ -1496,10 +1519,10 @@ pub(crate) fn classify_report(
             classification: ef_decision.class,
             probability: ef_decision.probability,
             threshold: ef_decision.threshold,
-            l: ef_decision.l,
+            level: ef_decision.level,
             model_scores: ef_model_scores,
             skipped_models: ef_skipped_models,
-            formula: ef["f"].as_str().unwrap_or("").to_string(),
+            formula: json_alias_str(ef, &["mol", "f"]).unwrap_or("").to_string(),
             top_findings: ef_top_findings,
         });
     }
@@ -1530,7 +1553,7 @@ pub(crate) fn classify_report(
         classification: final_decision.class,
         probability: final_decision.probability,
         threshold: final_decision.threshold,
-        l: final_decision.l,
+        level: final_decision.level,
         finding_counts,
         formula,
         reasons,
@@ -1582,11 +1605,11 @@ pub(crate) fn process_report(
     let cleave = if is_json { Some(cr.report_json) } else { None };
 
     Ok(ScanResult {
-        v: "6",
+        v: "7",
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,
-        l: cr.l,
+        level: cr.level,
         version: model_version_string(model.info()),
         analyzed_at: now_rfc3339(),
         cleave,
@@ -1610,11 +1633,10 @@ pub(crate) fn process_report(
 /// the primary file entry inside that report.
 #[must_use]
 pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
-    let findings = report["ts"].as_array().or_else(|| {
-        report["fs"]
-            .as_array()
+    let findings = json_alias_array(report, &["find", "ts"]).or_else(|| {
+        json_alias_array(report, &["files", "fs"])
             .and_then(|a| a.first())
-            .and_then(|f| f["ts"].as_array())
+            .and_then(|f| json_alias_array(f, &["find", "ts"]))
     });
 
     let Some(findings) = findings else {
@@ -1623,7 +1645,7 @@ pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
 
     let mut counts = FindingCounts::default();
     for f in findings {
-        match f["l"].as_u64().unwrap_or(0) {
+        match crit_ordinal(f) {
             5 => counts.hostile += 1,
             4 => counts.suspicious += 1,
             3 => counts.notable += 1,
@@ -1703,13 +1725,11 @@ pub fn extract_top_findings_from_json(
     report: &serde_json::Value,
     classification: &Classification,
 ) -> Vec<TopFinding> {
-    let findings = report["ts"]
-        .as_array()
+    let findings = json_alias_array(report, &["find", "ts"])
         .or_else(|| {
-            report["fs"]
-                .as_array()
+            json_alias_array(report, &["files", "fs"])
                 .and_then(|a| a.first())
-                .and_then(|f| f["ts"].as_array())
+                .and_then(|f| json_alias_array(f, &["find", "ts"]))
         })
         .cloned()
         .unwrap_or_default();
@@ -1748,20 +1768,18 @@ pub fn extract_top_findings_from_json(
 
 /// Crate-private helper for [`ScanResult::top_traits`]. Walks the cleave
 /// compact report directly because we don't (yet) hold it in typed form on
-/// `ScanResult`. Pulls from `report.ts` (single-file analyses) or, failing
-/// that, `report.fs[0].ts` (compact-v4 envelopes).
+/// `ScanResult`. Pulls from `report.find` (single-file analyses) or, failing
+/// that, `report.files[0].find` (compact envelopes).
 ///
 /// Returns `Vec<TopFinding>` with `conf` populated, sorted by
 /// `crit × conf` descending, deduplicated by base id, truncated to `n`.
 #[allow(clippy::cast_precision_loss)]
 fn top_traits_by_score(report: &serde_json::Value, n: usize) -> Vec<TopFinding> {
-    let findings = report["ts"]
-        .as_array()
+    let findings = json_alias_array(report, &["find", "ts"])
         .or_else(|| {
-            report["fs"]
-                .as_array()
+            json_alias_array(report, &["files", "fs"])
                 .and_then(|a| a.first())
-                .and_then(|f| f["ts"].as_array())
+                .and_then(|f| json_alias_array(f, &["find", "ts"]))
         })
         .cloned()
         .unwrap_or_default();
@@ -1849,26 +1867,26 @@ fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
     routes.is_empty()
 }
 
-/// Build per-file ML classification entries for the `ml.fs` array.
+/// Build per-file ML classification entries for the `ml.files` array.
 ///
-/// Each entry is `{id, prob, l, conf}` keyed by the cleave `fs[].id` field. The root
-/// file (`dp=0`) carries the envelope's probability and `l`; embedded archive
+/// Each entry is `{id, prob, lvl, conf}` keyed by the cleave `files[].id` field. The root
+/// file (`dp=0`) carries the envelope's probability and `lvl`; embedded archive
 /// members are matched by path suffix and report their *own* probability and
-/// lowest-firing-level `l` — every row's `l` is therefore the level-independent
+/// lowest-firing-level `lvl` — every row's `lvl` is therefore the level-independent
 /// marker for that specific file. A member with no recorded evaluation (e.g.
 /// truncated past the embedded-file cap) falls back to the root values.
-fn build_ml_fs(
+fn build_ml_files(
     report_json: &serde_json::Value,
     root_prob: f32,
-    root_l: Option<i32>,
+    root_level: Option<i32>,
     embedded_files: &[EmbeddedFile],
 ) -> Vec<serde_json::Value> {
-    let Some(fs) = report_json.get("fs").and_then(|v| v.as_array()) else {
+    let Some(report_files) = json_alias_array(report_json, &["files", "fs"]) else {
         return Vec::new();
     };
 
-    let mut out = Vec::with_capacity(fs.len());
-    for (idx, entry) in fs.iter().enumerate() {
+    let mut out = Vec::with_capacity(report_files.len());
+    for (idx, entry) in report_files.iter().enumerate() {
         let id = entry
             .get("id")
             .and_then(serde_json::Value::as_u64)
@@ -1878,23 +1896,23 @@ fn build_ml_fs(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
 
-        let (prob, l) = if depth == 0 {
-            (root_prob, root_l)
+        let (prob, file_level) = if depth == 0 {
+            (root_prob, root_level)
         } else {
             let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let suffix = path.rsplit_once("!!").map(|(_, r)| r).unwrap_or(path);
             embedded_files
                 .iter()
                 .find(|ef| ef.path == suffix)
-                .map(|ef| (ef.probability, ef.l))
-                .unwrap_or((root_prob, root_l))
+                .map(|ef| (ef.probability, ef.level))
+                .unwrap_or((root_prob, root_level))
         };
 
         out.push(serde_json::json!({
             "id": id,
             "prob": prob,
-            "l": l,
-            "conf": level_confidence(l),
+            "lvl": file_level,
+            "conf": level_confidence(file_level),
         }));
     }
     out
@@ -1921,18 +1939,19 @@ pub struct MlSection {
     ///   the firing threshold.
     /// - `None` → hostile; manual `--threshold-hostile` / `--threshold-suspicious`
     ///   were used and no level applies.
-    #[serde(rename = "l")]
-    pub(crate) l: Option<i32>,
-    /// Pessimistic integer confidence percent derived from `l`; `null` when no
+    #[serde(rename = "lvl")]
+    pub(crate) level: Option<i32>,
+    /// Pessimistic integer confidence percent derived from `level`; `null` when no
     /// level table applies (manual-threshold mode).
     pub(crate) conf: Option<u8>,
-    #[serde(rename = "models", skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "mods", skip_serializing_if = "Vec::is_empty")]
     pub(crate) model_scores: Vec<crate::model::RouteScore>,
     #[serde(rename = "skip", skip_serializing_if = "Vec::is_empty")]
     pub(crate) skipped_models: Vec<crate::model::SkippedRoute>,
     pub(crate) version: String,
     pub(crate) analyzed_at: String,
-    pub(crate) fs: Vec<serde_json::Value>,
+    #[serde(rename = "files")]
+    pub(crate) files: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1956,18 +1975,19 @@ pub struct MlSectionRef<'a> {
     pub(crate) v: &'static str,
     #[serde(rename = "prob")]
     pub(crate) probability: f32,
-    /// See [`MlSection::l`] for the encoding of this field.
-    #[serde(rename = "l")]
-    pub(crate) l: Option<i32>,
+    /// See [`MlSection::level`] for the encoding of this field.
+    #[serde(rename = "lvl")]
+    pub(crate) level: Option<i32>,
     /// See [`MlSection::conf`].
     pub(crate) conf: Option<u8>,
-    #[serde(rename = "models", skip_serializing_if = "route_scores_empty")]
+    #[serde(rename = "mods", skip_serializing_if = "route_scores_empty")]
     pub(crate) model_scores: &'a [crate::model::RouteScore],
     #[serde(rename = "skip", skip_serializing_if = "skipped_routes_empty")]
     pub(crate) skipped_models: &'a [crate::model::SkippedRoute],
     pub(crate) version: &'a str,
     pub(crate) analyzed_at: &'a str,
-    pub(crate) fs: Vec<serde_json::Value>,
+    #[serde(rename = "files")]
+    pub(crate) files: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pids: Option<&'a [u32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2002,19 +2022,19 @@ impl ScanResult {
     #[must_use]
     pub fn to_envelope(&self) -> ScanResultEnvelope {
         let raw = self.cleave.clone().unwrap_or(serde_json::json!({}));
-        let l = self.l;
-        let ml_fs = build_ml_fs(&raw, self.probability, l, &self.embedded_files);
+        let level = self.level;
+        let ml_files = build_ml_files(&raw, self.probability, level, &self.embedded_files);
         ScanResultEnvelope {
             ml: MlSection {
                 v: self.v,
                 probability: self.probability,
-                l,
-                conf: level_confidence(l),
+                level,
+                conf: level_confidence(level),
                 model_scores: self.model_scores.clone(),
                 skipped_models: self.skipped_models.clone(),
                 version: self.version.clone(),
                 analyzed_at: self.analyzed_at.clone(),
-                fs: ml_fs,
+                files: ml_files,
                 pids: self.pids.clone(),
                 deleted: self.deleted,
             },
@@ -2029,19 +2049,19 @@ impl ScanResult {
     #[must_use]
     pub fn into_envelope(self) -> ScanResultEnvelope {
         let raw = self.cleave.unwrap_or(serde_json::json!({}));
-        let l = self.l;
-        let ml_fs = build_ml_fs(&raw, self.probability, l, &self.embedded_files);
+        let level = self.level;
+        let ml_files = build_ml_files(&raw, self.probability, level, &self.embedded_files);
         ScanResultEnvelope {
             ml: MlSection {
                 v: self.v,
                 probability: self.probability,
-                l,
-                conf: level_confidence(l),
+                level,
+                conf: level_confidence(level),
                 model_scores: self.model_scores,
                 skipped_models: self.skipped_models,
                 version: self.version,
                 analyzed_at: self.analyzed_at,
-                fs: ml_fs,
+                files: ml_files,
                 pids: self.pids,
                 deleted: self.deleted,
             },
@@ -2060,19 +2080,19 @@ impl ScanResult {
             Some(v) => v,
             None => EMPTY_RAW.get_or_init(|| serde_json::json!({})),
         };
-        let l = self.l;
-        let ml_fs = build_ml_fs(raw, self.probability, l, &self.embedded_files);
+        let level = self.level;
+        let ml_files = build_ml_files(raw, self.probability, level, &self.embedded_files);
         ScanResultEnvelopeRef {
             ml: MlSectionRef {
                 v: self.v,
                 probability: self.probability,
-                l,
-                conf: level_confidence(l),
+                level,
+                conf: level_confidence(level),
                 model_scores: &self.model_scores,
                 skipped_models: &self.skipped_models,
                 version: &self.version,
                 analyzed_at: &self.analyzed_at,
-                fs: ml_fs,
+                files: ml_files,
                 pids: self.pids.as_deref(),
                 deleted: self.deleted,
             },

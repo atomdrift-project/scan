@@ -137,7 +137,7 @@ impl ServerConfig {
     }
 
     /// Attach the FPR severity level (0..=10000) that produced the resolved
-    /// thresholds. Folded into `ml.l` in the JSON envelope.
+    /// thresholds. Folded into `ml.lvl` in the JSON envelope.
     #[must_use]
     pub const fn with_level(mut self, level: Option<u16>) -> Self {
         self.level = level;

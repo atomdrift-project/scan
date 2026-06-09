@@ -310,11 +310,11 @@ fn build_result(
     let cleave = if is_json { Some(cr.report_json) } else { None };
 
     Ok(ScanResult {
-        v: "6",
+        v: "7",
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,
-        l: cr.l,
+        level: cr.level,
         version: crate::scan::model_version_string(model.info()),
         analyzed_at: crate::scan::now_rfc3339(),
         cleave,

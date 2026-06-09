@@ -458,7 +458,7 @@ pub struct WorkerConfig {
     /// cannot wedge the dispatch loop on a blocked claim.
     pub exit_if_empty: bool,
     /// FPR severity level (0..=10000) that produced the thresholds, or `None` when
-    /// manual thresholds were supplied. Folded into `ml.l` in the envelope.
+    /// manual thresholds were supplied. Folded into `ml.lvl` in the envelope.
     pub level: Option<u16>,
     /// Nice value applied to the process at startup (0 = leave unchanged).
     pub nice: i32,
@@ -1301,7 +1301,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     active_slots = slots.saturating_sub(available_slots),
                     available_slots,
                     cpu_cores_busy = format!("{cpu_cores_busy:.1}"),
-                    load1 = system_load_avg().map(|l| format!("{l:.1}")),
+                    load1 = system_load_avg().map(|load| format!("{load:.1}")),
                     rayon_threads = global_rayon_threads,
                     blocking_started_total = started,
                     blocking_finished_total = finished,
@@ -2165,10 +2165,10 @@ async fn post_result(
 ) {
     let payload = match result {
         Ok((ml, raw, duration_ms)) => {
-            // v6 envelope no longer carries `class` on the wire — the verdict
-            // is encoded in `l` (-1 = benign, anything else = hostile). The
+            // v7 envelope no longer carries `class` on the wire; the verdict
+            // is encoded in `lvl` (-1 = benign, anything else = hostile). The
             // suspicious band is consumer-side and not visible here.
-            let verdict = if ml.l == Some(-1) {
+            let verdict = if ml.level == Some(-1) {
                 "benign"
             } else {
                 "hostile"

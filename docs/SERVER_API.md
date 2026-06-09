@@ -130,14 +130,14 @@ Errors share a single shape:
 
 ## Thresholds
 
-The v6 envelope no longer wire-encodes a verdict class. `ml.l` is the
+The v7 envelope no longer wire-encodes a verdict class. `ml.lvl` is the
 lowest false-positive budget (FP per 100M benigns) at which the model
 flags the file as hostile — a property of the file and model, not of
 the deploy level:
 
-    l in grid          -> lowest level at which the file fires (lower = more hostile)
-    l == -1            -> fires at no grid level (clean)
-    l == null          -> manual --threshold-* mode (no level table)
+    lvl in grid        -> lowest level at which the file fires (lower = more hostile)
+    lvl == -1          -> fires at no grid level (clean)
+    lvl == null        -> manual --threshold-* mode (no level table)
 
 The calibrated grid currently tops out at L25000, and consumers should
 tolerate a future L50000. Litmus also reserves off-grid `grid_max + 1`
@@ -146,51 +146,51 @@ clean but confident severe cleave traits manually raised the result to
 suspicious; with today's grid those are `25001` and `25002`.
 
 `ml.conf` is the same level rendered as a pessimistic integer confidence
-percent for display/export. It is `null` when `ml.l` is `null`, `0` for
+percent for display/export. It is `null` when `ml.lvl` is `null`, `0` for
 the benign `-1` sentinel, `100` at L0, `99` at L1, `98` at L2, `95` at
 L5, `90` at L50, `29` at L25000, `28`/`27` for `25001`/`25002`, and
 `17` at L50000. `ml.prob` remains the raw model score used for the
 decision.
 
-Because `l` is swept over the full grid independent of `-l`, the whole
+Because `lvl` is swept over the full grid independent of `-l`, the whole
 `ml` envelope is identical across deploy levels, so a result can be
-cached once and shared. The consumer derives the verdict from `l` and
+cached once and shared. The consumer derives the verdict from `lvl` and
 the active level `N` (default 50):
 
-    hostile     when l <= N                      (default l <= 50)
-    suspicious  when l <= min(grid_max, 4 × N)    (default l <= 200)
+    hostile     when lvl <= N                      (default lvl <= 50)
+    suspicious  when lvl <= min(grid_max, 4 × N)    (default lvl <= 200)
     benign      otherwise
 
 The L×4 rule gives suspicious a 4× wider FP budget that catches more
-"maybe-bad" files while keeping hostile crisp. A file with `l = 500` is
-benign under the defaults yet still reports `l = 500`; raising `-l` is
+"maybe-bad" files while keeping hostile crisp. A file with `lvl = 500` is
+benign under the defaults yet still reports `lvl = 500`; raising `-l` is
 what reclassifies the same envelope. When `--threshold-*` is supplied
-(manual mode), `l` is `null` and only hostile/benign verdicts apply.
+(manual mode), `lvl` is `null` and only hostile/benign verdicts apply.
 
 The verdict mode is resolved as follows:
 
 1. **Level mode (default).** The model's per-level grid
    (`route_policies.json`, falling back to `config.json` `levels[]`)
-   drives the per-file `l` sweep. The active level `N` sets the verdict
+   drives the per-file `lvl` sweep. The active level `N` sets the verdict
    caps and comes from the severity-level flags `-0` … `-9` (round-decade
    shorthand: L0, L10, ..., L90) or `-l <N>` / `--level <N>` for any
    integer in `0`-`25000` (`src/main.rs`). The default deploy level is L50
    (= 50 FP/100M = 0.5 FP/M). Higher `N` is more sensitive. Crucially, `N` only
-   moves the caps — it does **not** change `l` or the serialized envelope.
+   moves the caps — it does **not** change `lvl` or the serialized envelope.
 2. **Manual mode.** `--threshold-hostile` / `--threshold-suspicious`
    bypass the level grid entirely: the verdict comes from those raw
-   cutoffs, `ml.l` is `null`, and only hostile/benign verdicts are
+   cutoffs, `ml.lvl` is `null`, and only hostile/benign verdicts are
    possible (suspicious is not derived).
 3. If the bundle carries no level grid (e.g. a single-bundle dev model),
    the verdict falls back to the bundle's recommended/fallback thresholds
-   and `ml.l` is `null`.
+   and `ml.lvl` is `null`.
 
 The level/grid is baked in at server start. To change models: stop the
 server, or edit the bundle and `POST /_/reload`, or push new models and
 `POST /_/update`. The active level is fixed per server process; there is
 no per-request override.
 
-See [JSON.md](JSON.md) for the full `ml.l` encoding and how consumers
+See [JSON.md](JSON.md) for the full `ml.lvl` encoding and how consumers
 derive hostile/suspicious/benign from it.
 
 ## Security
@@ -230,9 +230,9 @@ The server is built for trusted networks. The defaults reflect that.
     $ curl -s http://127.0.0.1:49999/_/health | jq -r .status
     ok
     $ curl -s -F file=@/bin/ls http://127.0.0.1:49999/analyze \
-        | jq '.ml | {l, prob, version}'
+        | jq '.ml | {lvl, prob, version}'
     {
-      "l": -1,
+      "lvl": -1,
       "prob": 0.01,
       "version": "spec=4 abi=1 hash=8f3a91"
     }
