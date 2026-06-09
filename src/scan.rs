@@ -1233,11 +1233,18 @@ pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
         .level
         .map_or_else(|| "-".to_string(), |n| format!("L{n}"));
     let verdict = format!(
-        "litmus verdict={} confidence={:.3} fp-level={} threshold={:.3}\n",
-        r.classification, r.probability, fp_level, r.threshold,
+        "litmus verdict={} confidence={:.3} fp-level={}\n",
+        r.classification, r.probability, fp_level,
     );
     let _ = out.write_all(verdict.as_bytes());
-    let _ = out.write_all(r.context_tiny.as_bytes());
+    // cleave's format_tiny leads with a `# ctx:` legend; litmus owns the header
+    // (the verdict line above), so drop that line and emit just the annotated
+    // context body. A benign file with nothing to show emits only the verdict.
+    let body = match r.context_tiny.split_once('\n') {
+        Some((first, rest)) if first.starts_with("# ctx:") => rest,
+        _ => r.context_tiny.as_str(),
+    };
+    let _ = out.write_all(body.as_bytes());
 }
 
 /// Intermediate classification result from the model pipeline.
