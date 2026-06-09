@@ -65,6 +65,44 @@ release: check-cargo $(OUT_DIR)
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
 	fi
 
+# --- Model publishing (R2-backed, via cleave's manifest-gen) -----------------
+# Reuses the proven cleave manifest-gen with litmus/azoth params: model version =
+# azoth commit, oracle = `litmus validate --skip-traits` (feature/ABI compat),
+# bundle = git archive azoth@commit | zstd. Layout: <remote>/litmus/versions.toml
+# + <remote>/litmus/azoth/<date>-<commit>.tar.zst.
+MANIFEST_GEN ?= ../cleave/tools/manifest-gen
+R2_REMOTE ?= atomdrift-updates:atomdrift-updates
+R2_LITMUS ?= litmus
+ISSUER ?= https://accounts.google.com
+DIST ?= dist
+VERSIONS ?= 3
+publish-models: release ## Compat-test azoth vs last (VERSIONS-1) litmus releases → sign → verify → upload to R2 (IDENTITY=<signer>)
+	@[ -n "$(IDENTITY)" ] || { echo "publish-models: IDENTITY=<signer> required (e.g. releaser@<project>.iam.gserviceaccount.com)"; exit 1; }
+	@command -v rclone >/dev/null || { echo "publish-models: rclone not found"; exit 1; }
+	@command -v cosign >/dev/null || { echo "publish-models: cosign not found"; exit 1; }
+	cd $(MANIFEST_GEN) && GOWORK=off go build -o manifest-gen .
+	$(MANIFEST_GEN)/manifest-gen \
+	  --traits ../azoth --repo . --out "$(DIST)" \
+	  --engine-bin litmus --traits-env LITMUS_MODELS_DIR --validate-args "validate --skip-traits" \
+	  --head-engine ./target/release/$(BINARY) \
+	  --releases $(shell expr $(VERSIONS) - 1) --commits 100 --soak-days 0 \
+	  --channels stable --artifact-prefix "azoth/" \
+	  --sign --identity "$(IDENTITY)"
+	python3 $(MANIFEST_GEN)/check-manifest.py "$(DIST)"
+	@echo "→ verifying signature"
+	cosign verify-blob --new-bundle-format \
+	  --bundle "$(DIST)/versions.toml.sigstore.json" \
+	  --certificate-identity "$(IDENTITY)" --certificate-oidc-issuer "$(ISSUER)" \
+	  "$(DIST)/versions.toml" && echo "✓ signature verifies for $(IDENTITY)"
+	@echo "→ uploading to R2"
+	rclone copy "$(DIST)" "$(R2_REMOTE)/$(R2_LITMUS)/azoth/" --include "*.tar.zst" \
+	  --header-upload "Cache-Control: public, max-age=31536000, immutable" --progress
+	rclone copyto "$(DIST)/versions.toml" "$(R2_REMOTE)/$(R2_LITMUS)/versions.toml" \
+	  --header-upload "Cache-Control: public, max-age=60"
+	rclone copyto "$(DIST)/versions.toml.sigstore.json" "$(R2_REMOTE)/$(R2_LITMUS)/versions.toml.sigstore.json" \
+	  --header-upload "Cache-Control: public, max-age=60"
+	@echo "✓ publish-models complete: compat-tested HEAD + last $(shell expr $(VERSIONS) - 1) release(s), signed, verified, uploaded"
+
 # Fat LTO + single codegen unit. Multi-minute link, marginal runtime win
 # over the default release profile. Use for container/tarball builds.
 release-lto: check-cargo $(OUT_DIR)
