@@ -1202,9 +1202,6 @@ fn emit_result(
     stdout: &Mutex<std::io::Stdout>,
 ) {
     match config.format() {
-        OutputFormat::Terminal => {
-            crate::output::print_file_result_streaming(r, show_progress, config.extra());
-        }
         OutputFormat::Json => {
             let envelope = r.envelope_ref();
             let Ok(mut out) = stdout.lock() else {
@@ -1216,7 +1213,10 @@ fn emit_result(
             }
             let _ = out.write_all(b"\n");
         }
-        OutputFormat::Tiny => {
+        // Terminal and tiny share cleave's context renderer (density chosen in
+        // `tiny_opts_for`); only color (auto, by tty) differs.
+        OutputFormat::Terminal | OutputFormat::Tiny => {
+            let _ = show_progress;
             let Ok(mut out) = stdout.lock() else {
                 return;
             };
@@ -1225,32 +1225,47 @@ fn emit_result(
     }
 }
 
-/// Write the tiny (LLM) rendering: litmus's ML verdict — the gate it meets, the
-/// calibrated confidence, the matched false-positive level — followed by
-/// cleave's annotated context. This is the unit fed to a local LLM.
+/// The cleave context density litmus renders at: the full cleave tiny for
+/// `--format tiny` (so the two are identical bar the verdict line), and a
+/// concise top-3 / single-line cut for the terminal.
+pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
+    if matches!(config.format(), OutputFormat::Tiny) {
+        cleave::output::TinyOpts::tiny()
+    } else {
+        cleave::output::TinyOpts {
+            top_n: 3,
+            min_crit: cleave::types::Criticality::Suspicious,
+            context_lines: Some(1),
+            first_match_only: true,
+            rich_header: false,
+        }
+    }
+}
+
+/// Write litmus's view: one ML-verdict line (the gate, calibrated confidence,
+/// matched false-positive level) then cleave's annotated context. Uses the same
+/// `colored` crate as cleave, so it auto-plains when piped (`… | llm`).
 pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
-    // The matched FP level is only meaningful for a non-benign gate; omit it
-    // (and its `L-1` placeholder) when the verdict is benign.
+    use colored::Colorize;
+    let (cr, cg, cb) = match r.classification {
+        Classification::Hostile => (215, 95, 95),
+        Classification::Suspicious => (255, 175, 0),
+        Classification::Benign => (95, 175, 95),
+    };
+    let class = r.classification.to_string().truecolor(cr, cg, cb).bold();
     let verdict = if matches!(r.classification, Classification::Benign) {
-        format!("litmus verdict={} confidence={:.3}\n", r.classification, r.probability)
+        format!("litmus {class} confidence={:.3}\n", r.probability)
     } else {
         let fp_level = r
             .level
             .map_or_else(|| "-".to_string(), |n| format!("L{n}"));
         format!(
-            "litmus verdict={} confidence={:.3} fp-level={}\n",
-            r.classification, r.probability, fp_level,
+            "litmus {class} confidence={:.3} fp-level={fp_level}\n",
+            r.probability,
         )
     };
     let _ = out.write_all(verdict.as_bytes());
-    // cleave's format_tiny leads with a `# ctx:` legend; litmus owns the header
-    // (the verdict line above), so drop that line and emit just the annotated
-    // context body. A benign file with nothing to show emits only the verdict.
-    let body = match r.context_tiny.split_once('\n') {
-        Some((first, rest)) if first.starts_with("# ctx:") => rest,
-        _ => r.context_tiny.as_str(),
-    };
-    let _ = out.write_all(body.as_bytes());
+    let _ = out.write_all(r.context_tiny.as_bytes());
 }
 
 /// Intermediate classification result from the model pipeline.
@@ -1410,12 +1425,13 @@ pub(crate) fn classify_report(
     shap: Option<&ShapImportance>,
     cancellation: Option<&Arc<AtomicBool>>,
     embedded_file_limit: Option<usize>,
+    tiny_opts: &cleave::output::TinyOpts,
 ) -> Result<ClassifiedReport> {
     report.finalize();
-    // Render cleave's context-centric text now, while the typed (finalized)
-    // report is in scope. Cheap relative to the model inference below; consumed
-    // only by `--format tiny`.
-    let context_tiny = cleave::output::format_tiny(&report);
+    // Render cleave's context view now, while the typed (finalized) report is in
+    // scope. Density is the caller's choice: the full cleave tiny for `--format
+    // tiny`, a concise top-3/1-line cut for the terminal.
+    let context_tiny = cleave::output::format_context(&report, tiny_opts);
     let compact = cleave::types::compact::compact_from_files(&report.files);
     let formula = compact
         .files
@@ -1643,6 +1659,7 @@ pub(crate) fn process_report(
         shap,
         cancellation,
         Some(100),
+        &tiny_opts_for(config),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

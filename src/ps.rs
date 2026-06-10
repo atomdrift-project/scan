@@ -304,6 +304,7 @@ fn build_result(
         shap,
         cancellation,
         Some(100),
+        &crate::scan::tiny_opts_for(config),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

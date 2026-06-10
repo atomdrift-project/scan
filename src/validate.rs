@@ -80,6 +80,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         None,
                         None,
                         None,
+                        &cleave::output::TinyOpts::tiny(),
                     )
                 });
             (path, result)

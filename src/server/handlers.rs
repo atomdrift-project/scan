@@ -996,6 +996,7 @@ pub(crate) fn classify_file(
         resources.shap.as_ref(),
         cancellation,
         Some(100),
+        &cleave::output::TinyOpts::tiny(),
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -1043,6 +1044,7 @@ pub(crate) fn classify_bytes(
         resources.shap.as_ref(),
         cancellation,
         Some(100),
+        &cleave::output::TinyOpts::tiny(),
     )?;
 
     Ok(scan_result_from(label, cr, resources))
