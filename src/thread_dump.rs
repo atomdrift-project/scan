@@ -24,21 +24,49 @@
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
-/// Registry of analysis-thread OS ids to signal during a dump. Long-lived
-/// threads (rayon pool, pooled `spawn_blocking`) register once; ids are never
-/// removed, so a since-exited thread merely fails to signal (harmless).
+/// Registry of analysis-thread OS ids to signal during a dump. Rayon pool
+/// threads live for the process; tokio `spawn_blocking` threads are recycled
+/// after idle timeout, so each registration installs a thread-local guard that
+/// removes the id when its thread exits — otherwise dead tids would accumulate
+/// for the life of a long-running worker.
 fn registry() -> &'static Mutex<std::collections::BTreeSet<u64>> {
     static REGISTRY: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
 }
 
+/// Removes its thread's id from the registry when the thread exits (thread-local
+/// destructors run on normal thread termination, including tokio blocking-pool
+/// recycling).
+struct Unregister(u64);
+
+impl Drop for Unregister {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = registry().lock() {
+            reg.remove(&self.0);
+        }
+    }
+}
+
+thread_local! {
+    static REGISTERED: std::cell::RefCell<Option<Unregister>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Register the calling thread as an analysis thread to include in dumps. Cheap
 /// and idempotent; call it from each rayon worker's start handler and at the top
-/// of each blocking analysis.
+/// of each blocking analysis. The registration is dropped automatically when the
+/// thread exits.
 pub fn register_self() {
-    if let Ok(mut reg) = registry().lock() {
-        reg.insert(os_thread_id());
-    }
+    let tid = os_thread_id();
+    REGISTERED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            if let Ok(mut reg) = registry().lock() {
+                reg.insert(tid);
+            }
+            *slot = Some(Unregister(tid));
+        }
+    });
 }
 
 /// OS-level thread id for the calling thread.
