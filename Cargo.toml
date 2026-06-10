@@ -47,7 +47,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "litmus"
-version = "2.0.0-rc.5"
+version = "2.0.0-rc.6"
 default-run = "litmus"
 edition = "2024"
 authors = ["The Atomdrift Project"]
