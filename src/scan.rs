@@ -1229,13 +1229,19 @@ fn emit_result(
 /// calibrated confidence, the matched false-positive level — followed by
 /// cleave's annotated context. This is the unit fed to a local LLM.
 pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
-    let fp_level = r
-        .level
-        .map_or_else(|| "-".to_string(), |n| format!("L{n}"));
-    let verdict = format!(
-        "litmus verdict={} confidence={:.3} fp-level={}\n",
-        r.classification, r.probability, fp_level,
-    );
+    // The matched FP level is only meaningful for a non-benign gate; omit it
+    // (and its `L-1` placeholder) when the verdict is benign.
+    let verdict = if matches!(r.classification, Classification::Benign) {
+        format!("litmus verdict={} confidence={:.3}\n", r.classification, r.probability)
+    } else {
+        let fp_level = r
+            .level
+            .map_or_else(|| "-".to_string(), |n| format!("L{n}"));
+        format!(
+            "litmus verdict={} confidence={:.3} fp-level={}\n",
+            r.classification, r.probability, fp_level,
+        )
+    };
     let _ = out.write_all(verdict.as_bytes());
     // cleave's format_tiny leads with a `# ctx:` legend; litmus owns the header
     // (the verdict line above), so drop that line and emit just the annotated
