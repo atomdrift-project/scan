@@ -901,6 +901,7 @@ fn main() -> Result<()> {
                 level: envelope_level,
                 nice,
                 exit_if_empty,
+                interpret: interpret_cfg.clone(),
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

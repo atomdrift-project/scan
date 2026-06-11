@@ -462,22 +462,25 @@ pub struct WorkerConfig {
     pub level: Option<u16>,
     /// Nice value applied to the process at startup (0 = leave unchanged).
     pub nice: i32,
+    /// Optional LLM interpretation config (`--interpret`); `None` disables the
+    /// pass. Reattached to every reloaded `ModelResources` so renewals keep it.
+    pub interpret: Option<crate::interpret::InterpretConfig>,
 }
 
 fn load_model_resources(
     model_dir: &Path,
     thresholds: Option<Thresholds>,
     level: Option<u16>,
+    interpret: Option<crate::interpret::InterpretConfig>,
 ) -> Result<Arc<ModelResources>> {
     let model = Model::load(model_dir, thresholds, level).context("loading model")?;
     let shap = ShapImportance::load(model_dir).ok();
     let ctx = ExtractContext::new(model.spec());
-    // The hopper worker is a batch backend; LLM interpretation is a follow-up.
     Ok(Arc::new(ModelResources {
         model,
         shap,
         ctx,
-        interpret: None,
+        interpret,
     }))
 }
 
@@ -486,6 +489,7 @@ fn validate_and_load_resources(
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
     level: Option<u16>,
+    interpret: Option<crate::interpret::InterpretConfig>,
 ) -> Result<Arc<ModelResources>> {
     let validate_config = crate::ScanConfig::new(
         model_dir,
@@ -497,7 +501,7 @@ fn validate_and_load_resources(
     )?
     .with_level(level);
     crate::validate::run(&validate_config, false)?;
-    load_model_resources(model_dir, thresholds, level)
+    load_model_resources(model_dir, thresholds, level, interpret)
 }
 
 /// Pull upstream rules and, **only if something actually changed**, re-validate
@@ -509,6 +513,7 @@ fn renew_resources_once(
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
     level: Option<u16>,
+    interpret: Option<crate::interpret::InterpretConfig>,
 ) -> Result<Option<Arc<ModelResources>>> {
     // model_update validates the freshly extracted bundle (Model::load) before
     // swapping it in, so a broken bundle never lands on disk — there's no
@@ -542,7 +547,8 @@ fn renew_resources_once(
         "rules changed; revalidating bundle"
     );
 
-    let resources = validate_and_load_resources(model_dir, thresholds, slow_rule_ms, level)?;
+    let resources =
+        validate_and_load_resources(model_dir, thresholds, slow_rule_ms, level, interpret)?;
 
     let (traits, composites) = cleave::reload_capability_mapper()
         .map_err(|error| anyhow::anyhow!("reload cleave capability mapper: {error}"))?;
@@ -564,6 +570,7 @@ fn spawn_resource_renewal_task(
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
     level: Option<u16>,
+    interpret: Option<crate::interpret::InterpretConfig>,
     shutdown: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
@@ -578,8 +585,9 @@ fn spawn_resource_renewal_task(
                 "worker resource renewal check starting",
             );
             let model_dir = model_dir.clone();
+            let interpret = interpret.clone();
             let result = tokio::task::spawn_blocking(move || {
-                renew_resources_once(&model_dir, thresholds, slow_rule_ms, level)
+                renew_resources_once(&model_dir, thresholds, slow_rule_ms, level, interpret)
             })
             .await;
 
@@ -1182,7 +1190,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // pool. See cleave::shared_resources::yara_engine for the contract.
     cleave::prefetch_shared_resources(true);
 
-    let resources = load_model_resources(&config.model_dir, config.thresholds, config.level)?;
+    let resources = load_model_resources(
+        &config.model_dir,
+        config.thresholds,
+        config.level,
+        config.interpret.clone(),
+    )?;
     let resources: ResourceHandle = Arc::new(RwLock::new(resources));
     spawn_resource_renewal_task(
         Arc::clone(&resources),
@@ -1190,6 +1203,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         config.thresholds,
         config.slow_rule_ms,
         config.level,
+        config.interpret.clone(),
         Arc::clone(&shutdown),
     );
 

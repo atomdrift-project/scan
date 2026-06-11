@@ -179,3 +179,8 @@ path = "src/bin/bench_hopper.rs"
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
 
+# LOCAL DEV: build against the working-tree cleave (archive finding-provenance
+# `src` work) until those changes are committed/pushed and the git pin bumped.
+[patch."https://codeberg.org/atomdrift/cleave.git"]
+cleave = { path = "../cleave" }
+

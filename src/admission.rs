@@ -317,7 +317,9 @@ impl Drop for AdmissionGuard {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+// `used_9gb`/`used_11gb` must keep the `Option<u64>` return to match the
+// `fn() -> Option<u64>` pointer `gate` takes (shared with `no_used` → None).
+#[allow(clippy::unwrap_used, clippy::unnecessary_wraps)]
 mod tests {
     use super::*;
 
