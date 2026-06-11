@@ -654,9 +654,131 @@ fn init_legacy_grid(slots: usize, global_threads: usize) -> bool {
     active
 }
 
-/// Run `body` on a legacy per-slot pool when the A/B grid is active (selecting a
-/// pool round-robin by `idx`), else directly on the shared global pool.
-fn run_analysis<T: Send>(idx: u64, body: impl FnOnce() -> T + Send) -> T {
+/// How long a staged job may be passed over by smaller arrivals before SJF
+/// dispatches it anyway. Bounds a big job's staging delay under a continuous
+/// stream of small jobs, so SJF can't starve archives indefinitely.
+///
+/// Must sit well above typical *large-job service time*, not small-job time: on
+/// the realworld dataset (medium/large analyses run 6–25 minutes) a 120 s bound
+/// aged out every staged archive while slots ground through earlier work, and
+/// the oldest-aged-first rule then preempted every small job — dispatch
+/// degenerated to FIFO and the SJF latency win vanished. 15 minutes keeps the
+/// guarantee (no archive waits forever behind a small-job stream) without
+/// re-creating the starvation SJF exists to fix. `LITMUS_SJF_MAX_WAIT_SECS`
+/// overrides for experiments.
+const SJF_MAX_STAGED_WAIT: Duration = Duration::from_secs(900);
+
+/// Resolved aging bound: [`SJF_MAX_STAGED_WAIT`] unless overridden.
+fn sjf_max_staged_wait() -> Duration {
+    std::env::var("LITMUS_SJF_MAX_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(SJF_MAX_STAGED_WAIT, Duration::from_secs)
+}
+
+/// E1 experiment (`LITMUS_SJF=1`): take the smallest staged job, not the oldest.
+///
+/// Sweeps everything currently in the prefetch channel into `reorder` (the
+/// dispatch loop holds jobs the prefetcher has already claimed and downloaded),
+/// then picks the smallest by hopper-reported size — unless something has waited
+/// past [`SJF_MAX_STAGED_WAIT`], in which case the oldest such job goes first.
+/// Blocks only when the window is empty. Returns `None` once the channel is
+/// closed *and* the window is drained, matching `recv()`'s termination contract.
+async fn next_smallest_staged(
+    rx: &mut mpsc::UnboundedReceiver<PrefetchedJob>,
+    reorder: &mut Vec<(PrefetchedJob, Instant)>,
+) -> Option<PrefetchedJob> {
+    // Sweep all ready jobs into the window without blocking.
+    while let Ok(pj) = rx.try_recv() {
+        reorder.push((pj, Instant::now()));
+    }
+    // Empty window: block for the next arrival like FIFO would, then sweep
+    // again so a burst that landed together is reordered together.
+    if reorder.is_empty() {
+        let first = rx.recv().await?;
+        reorder.push((first, Instant::now()));
+        while let Ok(pj) = rx.try_recv() {
+            reorder.push((pj, Instant::now()));
+        }
+    }
+
+    let now = Instant::now();
+    let max_wait = sjf_max_staged_wait();
+    let aged = reorder
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, staged_at))| now.duration_since(*staged_at) >= max_wait)
+        .min_by_key(|(_, (_, staged_at))| *staged_at)
+        .map(|(i, _)| i);
+    #[allow(clippy::expect_used)]
+    let idx = aged.unwrap_or_else(|| {
+        reorder
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (pj, _))| pj.job.size_bytes.max(0))
+            .map(|(i, _)| i)
+            .expect("reorder window is non-empty")
+    });
+    Some(reorder.swap_remove(idx).0)
+}
+
+/// E4 experiment (`LITMUS_LITTLE_POOL=1`): a tiny dedicated rayon pool for
+/// small jobs, so a 2000-member archive's task fan-out on the shared global
+/// pool can't crowd out a script that needs milliseconds of CPU. The little:big
+/// analogue at the thread-pool level — slot scheduling alone can't fix this,
+/// because a small job *holding a slot* still queues its parallel work behind
+/// the archive's tasks. `None` (the default) routes everything to the shared
+/// pool. Size threshold: `LITMUS_LITTLE_MAX_MB` (default 16); thread count:
+/// `LITMUS_LITTLE_THREADS` (default 2 — small files gain nothing from wide
+/// parallelism). Stacks match the global pool's 256 MB (cleave recursion).
+static LITTLE_POOL: OnceLock<Option<(rayon::ThreadPool, u64)>> = OnceLock::new();
+
+#[allow(clippy::expect_used)]
+fn little_pool_for(input_bytes: u64) -> Option<&'static rayon::ThreadPool> {
+    let (pool, max_bytes) = LITTLE_POOL
+        .get_or_init(|| {
+            std::env::var("LITMUS_LITTLE_POOL")
+                .is_ok_and(|v| v != "0")
+                .then(|| {
+                    let max_mb = std::env::var("LITMUS_LITTLE_MAX_MB")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|mb| *mb > 0)
+                        .unwrap_or(16);
+                    let threads = std::env::var("LITMUS_LITTLE_THREADS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|t| *t > 0)
+                        .unwrap_or(2);
+                    tracing::info!(
+                        threads,
+                        max_mb,
+                        "little-pool experiment active: small jobs bypass the shared rayon pool",
+                    );
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .thread_name(|i| format!("cleave-little-{i}"))
+                        .stack_size(256 * 1024 * 1024)
+                        // Same SIGUSR1 thread-dump registration as the global pool.
+                        .start_handler(|_| crate::thread_dump::register_self())
+                        .build()
+                        .expect("build little-pool");
+                    (pool, max_mb * 1024 * 1024)
+                })
+        })
+        .as_ref()?;
+    (input_bytes < *max_bytes).then_some(pool)
+}
+
+/// Run `body` on the pool the experiment flags select for this job: the little
+/// pool when active and the input is small, a legacy per-slot pool when the A/B
+/// grid is active (round-robin by `idx`), else directly on the shared global
+/// pool. `input_bytes` is the analysed payload size (local file or download).
+fn run_analysis<T: Send>(idx: u64, input_bytes: u64, body: impl FnOnce() -> T + Send) -> T {
+    if let Some(pool) = little_pool_for(input_bytes) {
+        return pool.install(body);
+    }
     match LEGACY_PER_SLOT_GRID.get().and_then(Option::as_ref) {
         Some(grid) if !grid.is_empty() => {
             // idx % len < len <= usize::MAX, so the cast back is lossless.
@@ -1110,7 +1232,30 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<PrefetchedJob>();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let outstanding = Arc::new(AtomicUsize::new(0));
-    let target_depth = (slots.saturating_mul(11) / 10).max(1);
+    // E1 experiment (`LITMUS_SJF=1`): dispatch the smallest staged job first
+    // instead of FIFO, so tiny jobs stop queueing behind multi-minute archives.
+    // SJF needs a window to reorder over, so it deepens the prefetch target to
+    // 2× slots (the worker claims ahead of capacity and self-optimizes locally;
+    // hopper's handout strategy stays simple). `LITMUS_PREFETCH_DEPTH` overrides
+    // the slots multiplier in either mode.
+    let sjf = std::env::var("LITMUS_SJF").is_ok_and(|v| v != "0");
+    let depth_factor = std::env::var("LITMUS_PREFETCH_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|f| *f >= 1.0)
+        .unwrap_or(if sjf { 2.0 } else { 1.1 });
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let target_depth = ((slots as f64 * depth_factor).ceil() as usize).max(1);
+    if sjf {
+        tracing::info!(
+            target_depth,
+            "SJF experiment active: smallest staged job dispatches first",
+        );
+    }
 
     tokio::spawn(
         Prefetcher {
@@ -1418,6 +1563,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         });
     }
 
+    // SJF reorder window: jobs pulled off the channel but not yet dispatched,
+    // each with its staging time for the anti-starvation age check.
+    let mut reorder: Vec<(PrefetchedJob, Instant)> = Vec::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             tracing::info!("shutdown signalled, draining in-flight work");
@@ -1432,7 +1580,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             break;
         }
 
-
         // Claim a worker slot, then take the next staged sample: work begins as
         // soon as both a free slot and a ready sample exist. An empty channel
         // means the prefetcher has exited (shutdown) — drain and stop.
@@ -1441,7 +1588,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             .acquire_owned()
             .await
             .context("semaphore closed")?;
-        let Some(pj) = rx.recv().await else {
+        let next = if sjf {
+            next_smallest_staged(&mut rx, &mut reorder).await
+        } else {
+            rx.recv().await
+        };
+        let Some(pj) = next else {
             drop(permit);
             shutdown.store(true, Ordering::Relaxed);
             break;
@@ -2054,7 +2206,7 @@ async fn run_job(
         // the A/B grid is active, this analysis's per-slot pool. Lifecycle logs
         // report `thread_id` — the blocking thread an operator samples to find a
         // wedged analysis; the CPU work runs on the rayon pool threads.
-        run_analysis(analysis_id, || {
+        run_analysis(analysis_id, input_size, || {
             let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
             let thread_id = crate::thread_dump::os_thread_id();
             // Attach the worker thread to the live census so the periodic summary
@@ -2899,6 +3051,90 @@ mod tests {
             "prefetcher did not exit on shutdown",
         );
         while rx.recv().await.is_some() {}
+    }
+
+    fn staged_pj(sha: &str, size_bytes: i64) -> PrefetchedJob {
+        PrefetchedJob {
+            job: ClaimJob {
+                sha256: sha.to_string(),
+                path: format!("{sha}.bin"),
+                size_bytes,
+                file_type: "data".to_string(),
+            },
+            data: Ok(None),
+            queue_id: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn sjf_picks_smallest_staged_job_first() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<PrefetchedJob>();
+        let mut reorder = Vec::new();
+        tx.send(staged_pj("big", 500 * 1024 * 1024)).unwrap();
+        tx.send(staged_pj("tiny", 4 * 1024)).unwrap();
+        tx.send(staged_pj("mid", 8 * 1024 * 1024)).unwrap();
+
+        let order = [
+            next_smallest_staged(&mut rx, &mut reorder).await.unwrap(),
+            next_smallest_staged(&mut rx, &mut reorder).await.unwrap(),
+            next_smallest_staged(&mut rx, &mut reorder).await.unwrap(),
+        ];
+        let shas: Vec<&str> = order.iter().map(|pj| pj.job.sha256.as_str()).collect();
+        assert_eq!(shas, ["tiny", "mid", "big"]);
+
+        // Channel closed and window drained → None, like recv().
+        drop(tx);
+        assert!(next_smallest_staged(&mut rx, &mut reorder).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sjf_drains_reorder_window_after_channel_close() {
+        // Jobs staged in the window must still dispatch after the prefetcher
+        // exits, or --exit-if-empty would drop the tail of the queue.
+        let (tx, mut rx) = mpsc::unbounded_channel::<PrefetchedJob>();
+        let mut reorder = Vec::new();
+        tx.send(staged_pj("a", 100)).unwrap();
+        tx.send(staged_pj("b", 50)).unwrap();
+        drop(tx);
+
+        assert_eq!(
+            next_smallest_staged(&mut rx, &mut reorder)
+                .await
+                .unwrap()
+                .job
+                .sha256,
+            "b"
+        );
+        assert_eq!(
+            next_smallest_staged(&mut rx, &mut reorder)
+                .await
+                .unwrap()
+                .job
+                .sha256,
+            "a"
+        );
+        assert!(next_smallest_staged(&mut rx, &mut reorder).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sjf_ages_long_waiting_job_to_front() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<PrefetchedJob>();
+        // A big job already staged longer than the aging bound beats a fresh
+        // tiny job, so SJF cannot starve archives indefinitely.
+        let mut reorder = vec![(
+            staged_pj("old-big", 500 * 1024 * 1024),
+            Instant::now() - SJF_MAX_STAGED_WAIT,
+        )];
+        tx.send(staged_pj("fresh-tiny", 4 * 1024)).unwrap();
+
+        assert_eq!(
+            next_smallest_staged(&mut rx, &mut reorder)
+                .await
+                .unwrap()
+                .job
+                .sha256,
+            "old-big"
+        );
     }
 
     #[test]

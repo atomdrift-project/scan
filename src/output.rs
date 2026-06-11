@@ -316,6 +316,93 @@ fn colored_label(classification: &Classification, p: &Palette) -> String {
     }
 }
 
+/// litmus's verdict stamp that leads cleave's headline: the band percentage on
+/// a filled, classification-colored background — ` 100% ` (red hostile, orange
+/// suspicious, green benign) — so the color alone carries the verdict and the
+/// word is unnecessary. Plain `100%` when color is disabled (piped). Returns the
+/// stamp and its visible width (for aligning lines beneath it).
+pub(crate) fn terminal_badge(
+    classification: &Classification,
+    probability: f32,
+    threshold: f32,
+    level: Option<i32>,
+) -> (String, usize) {
+    let pct = level_confidence(level).map_or_else(
+        || {
+            format!(
+                "{:.0}%",
+                display_probability(probability, threshold) * 100.0
+            )
+        },
+        |conf| format!("{conf}%"),
+    );
+    if !colored::control::SHOULD_COLORIZE.should_colorize() {
+        let width = pct.chars().count();
+        return (pct, width);
+    }
+    // Bold white on the band color, padded with a space either side — so the
+    // visible width is the percentage plus the two padding spaces.
+    let Rgb(r, g, b) = indicator_colors(probability, classification, threshold).2;
+    let width = pct.chars().count() + 2;
+    (
+        format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {pct} \x1b[0m"),
+        width,
+    )
+}
+
+/// The one-line summary that trails the file type on the headline: `· <text>`.
+/// `--interpret` data supersedes the model's own reasoning when present;
+/// otherwise the SHAP reasons. `None` when neither exists.
+pub(crate) fn terminal_trailer(
+    reasons: &[crate::explain::Reason],
+    interpretation: Option<&crate::interpret::Interpretation>,
+) -> Option<String> {
+    let color = colored::control::SHOULD_COLORIZE.should_colorize();
+    let (body, review) = if let Some(llm) = interpretation {
+        let body = llm.error.as_deref().map_or_else(
+            || llm.interpretation.clone(),
+            |_| "interpretation unavailable".into(),
+        );
+        (body, llm.review)
+    } else if reasons.is_empty() {
+        return None;
+    } else {
+        let joined = reasons
+            .iter()
+            .take(3)
+            .map(|r| r.description.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        (joined, false)
+    };
+    let flag = if review { "  \u{26a0} review" } else { "" };
+    if color {
+        let p = palette();
+        Some(format!(
+            "{} {}{}",
+            fg(p.dim, "\u{00b7}"),
+            fg(p.reason, &body),
+            flag
+        ))
+    } else {
+        Some(format!("\u{00b7} {body}{flag}"))
+    }
+}
+
+/// The line beneath the headline: the full SHA-256 (copy-able for lookups), no
+/// label, indented to align under the filename. `None` when absent.
+pub(crate) fn terminal_subtitle(sha256: &str, indent: usize) -> Option<String> {
+    if sha256.is_empty() {
+        return None;
+    }
+    let hash = if colored::control::SHOULD_COLORIZE.should_colorize() {
+        fg(palette().dim, sha256)
+    } else {
+        sha256.to_string()
+    };
+    Some(format!("{}{hash}", " ".repeat(indent)))
+}
+
 /// Print a single file result immediately, clearing progress line if active.
 pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extra: bool) {
     if has_progress {

@@ -106,9 +106,7 @@ impl MemoryAdmission {
             .unwrap_or(DEFAULT_PER_SLOT_ESTIMATE_BYTES);
 
         if ceiling_bytes == 0 {
-            tracing::warn!(
-                "memory admission disabled (max-rss 0); dispatch is slot-limited only"
-            );
+            tracing::warn!("memory admission disabled (max-rss 0); dispatch is slot-limited only");
         } else {
             tracing::info!(
                 ceiling_gb = ceiling_bytes as f64 / GIB,
@@ -329,12 +327,15 @@ mod tests {
         None
     }
 
+    // Signatures are fixed by `MemoryAdmission.used_fn: fn() -> Option<u64>`.
     /// 9 GB live usage — leaves < 1.5 GB below a 10 GB ceiling.
+    #[allow(clippy::unnecessary_wraps)]
     fn used_9gb() -> Option<u64> {
         Some(9 * GB as u64)
     }
 
     /// 11 GB live usage — already past a 10 GB ceiling.
+    #[allow(clippy::unnecessary_wraps)]
     fn used_11gb() -> Option<u64> {
         Some(11 * GB as u64)
     }

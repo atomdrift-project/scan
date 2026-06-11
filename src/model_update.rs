@@ -209,8 +209,7 @@ fn install(dir: &Path, artifact: &Artifact, source: &str) -> Result<()> {
     }
 
     let parent = dir.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
     let staging = parent.join(".litmus-models-staging");
     let backup = parent.join(".litmus-models-backup");
@@ -224,8 +223,12 @@ fn install(dir: &Path, artifact: &Artifact, source: &str) -> Result<()> {
         .with_context(|| format!("extracting {}", artifact.file))?;
 
     // Validate before going live: load the staged bundle.
-    crate::model::Model::load(&staging, None, None)
-        .with_context(|| format!("staged bundle {} failed to load; not installing", artifact.file))?;
+    crate::model::Model::load(&staging, None, None).with_context(|| {
+        format!(
+            "staged bundle {} failed to load; not installing",
+            artifact.file
+        )
+    })?;
 
     let meta = Installed {
         commit: artifact.commit.clone(),
@@ -263,7 +266,10 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
         .with_context(|| format!("GET {url}"))?;
-    Ok(resp.bytes().with_context(|| format!("reading {url}"))?.to_vec())
+    Ok(resp
+        .bytes()
+        .with_context(|| format!("reading {url}"))?
+        .to_vec())
 }
 
 fn hex(bytes: &[u8]) -> String {

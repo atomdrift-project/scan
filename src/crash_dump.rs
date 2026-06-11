@@ -16,7 +16,7 @@
 //! offending file is one of the in-flight set, not necessarily the last to
 //! start — dumping them all is the honest answer.
 
-pub use imp::{install, register, Guard};
+pub use imp::{Guard, install, register};
 
 #[cfg(unix)]
 mod imp {
@@ -196,8 +196,7 @@ mod imp {
     /// errors — there is nothing useful to do with them mid-abort.
     fn write_all(mut bytes: &[u8]) {
         while !bytes.is_empty() {
-            let n =
-                unsafe { libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len()) };
+            let n = unsafe { libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len()) };
             if n <= 0 {
                 break;
             }

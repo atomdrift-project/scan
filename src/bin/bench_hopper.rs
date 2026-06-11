@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use litmus::bench_hopper::BenchHopper;
+use litmus::bench_hopper::{BenchHopper, Order};
 
 #[derive(Parser)]
 #[command(about = "Mock hopper serving a local dataset for worker benchmarks")]
@@ -34,6 +34,16 @@ struct Args {
     /// for parity diffing between worker runs.
     #[arg(long)]
     dump: Option<PathBuf>,
+
+    /// Job handout order: fifo, shuffle[:seed], big-first, or small-first.
+    /// big-first reproduces the small-job-starvation worst case.
+    #[arg(long, default_value = "fifo")]
+    order: Order,
+
+    /// Write the latency/throughput summary JSON here (rewritten after every
+    /// result, so it is current whenever the benchmark harness reads it).
+    #[arg(long)]
+    summary: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -46,7 +56,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let hopper = match BenchHopper::build(&args.dataset, args.dump) {
+    let hopper = match BenchHopper::build(&args.dataset, args.dump, args.order, args.summary) {
         Ok(h) => h,
         Err(e) => {
             eprintln!(

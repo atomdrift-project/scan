@@ -15,6 +15,16 @@
 //! - `POST /api/result` → tallied (and optionally appended to a dump file for
 //!   parity diffing between runs).
 //!
+//! Beyond serving jobs, the hopper is the benchmark's *measurement point*: it
+//! stamps each job at claim and at result, so per-job sojourn (claim → result,
+//! covering download + queue wait + admission + analysis + post) is measured
+//! from outside the worker. A summary — wall over the job window, throughput,
+//! and sojourn percentiles broken out by size class — is rewritten to the
+//! `summary` path after every result, so it is always current no matter when
+//! the benchmark harness stops the process. Job handout order is controlled by
+//! [`Order`]: dataset order, seeded shuffle (reproducible realistic mix), or
+//! biggest-first (the small-job-starvation worst case).
+//!
 //! Pure `std` (`std::net`, `std::thread`, `std::fs`) plus `sha2`; no async
 //! runtime and no extra dependencies.
 
@@ -23,10 +33,76 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
+
+/// Job handout order. Parsed from `--order`; `shuffle` without a seed uses 42.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    /// Dataset enumeration order (path-sorted) — the historical default.
+    Fifo,
+    /// Deterministic Fisher–Yates shuffle with the given seed: a reproducible
+    /// realistic size mix.
+    Shuffle(u64),
+    /// Largest files first: reproduces the small-job-starvation worst case.
+    BigFirst,
+    /// Smallest files first: the other extreme, for bracketing.
+    SmallFirst,
+    /// Each size class spread evenly across the stream, so every claim window
+    /// contains a mix of sizes. Emulates a hopper-side size-aware handout — the
+    /// global scheduling lever a worker-local reorder window cannot reach.
+    Mixed,
+}
+
+impl FromStr for Order {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "fifo" => Ok(Self::Fifo),
+            "big-first" => Ok(Self::BigFirst),
+            "small-first" => Ok(Self::SmallFirst),
+            "mixed" => Ok(Self::Mixed),
+            "shuffle" => Ok(Self::Shuffle(42)),
+            other => match other.strip_prefix("shuffle:") {
+                Some(seed) => seed
+                    .parse()
+                    .map(Self::Shuffle)
+                    .map_err(|e| format!("bad shuffle seed {seed:?}: {e}")),
+                None => Err(format!(
+                    "unknown order {other:?} (fifo|shuffle[:seed]|big-first|small-first|mixed)"
+                )),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for Order {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fifo => write!(f, "fifo"),
+            Self::Shuffle(seed) => write!(f, "shuffle:{seed}"),
+            Self::BigFirst => write!(f, "big-first"),
+            Self::SmallFirst => write!(f, "small-first"),
+            Self::Mixed => write!(f, "mixed"),
+        }
+    }
+}
+
+/// xorshift64* step — a tiny, deterministic PRNG for the seeded shuffle, so the
+/// bench needs no rand dependency.
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
 
 /// One served file, precomputed at build time.
 #[derive(Clone, Debug)]
@@ -38,44 +114,74 @@ struct Job {
     size_bytes: u64,
 }
 
+/// Per-job claim/result timestamps, indexed in lockstep with `jobs`. One mutex
+/// guards both: every access touches claim and result state together, and the
+/// post rate (one lock per HTTP request) makes contention irrelevant.
+#[derive(Debug, Default)]
+struct Timings {
+    claimed: Vec<Option<Instant>>,
+    resulted: Vec<Option<Instant>>,
+}
+
 /// A built, ready-to-serve mock hopper. Walk the dataset once (hashing every
 /// file), then [`serve`](BenchHopper::serve) it on a port.
 #[derive(Debug)]
 pub struct BenchHopper {
     jobs: Vec<Job>,
     by_path: HashMap<String, PathBuf>,
+    /// sha256 → job indices (a dataset may contain duplicate content; each
+    /// result is attributed to the first unresolved index for its sha).
+    by_sha: HashMap<String, Vec<usize>>,
+    order: Order,
     cursor: AtomicUsize,
     results: Arc<AtomicUsize>,
+    timings: Mutex<Timings>,
     dump: Option<Arc<Mutex<File>>>,
+    /// Summary JSON destination, rewritten after every result post so the file
+    /// is always current no matter when the harness stops this process.
+    summary: Option<PathBuf>,
 }
 
-/// A running hopper: the bound port plus live counters. Dropping it leaves the
-/// accept thread running (detached) — fine for a short-lived benchmark process
-/// or a test that ends with process teardown.
+/// A running hopper. Dropping it leaves the accept thread running (detached) —
+/// fine for a short-lived benchmark process or a test that ends with process
+/// teardown.
 #[derive(Debug)]
 pub struct Handle {
     /// The port the hopper bound (resolved if `serve(0)` was used).
     pub port: u16,
     /// Total number of jobs (dataset files) the hopper will hand out.
     pub jobs_total: usize,
-    results: Arc<AtomicUsize>,
+    server: Arc<BenchHopper>,
 }
 
 impl Handle {
     /// Number of `/api/result` posts received so far.
     #[must_use]
     pub fn results_received(&self) -> usize {
-        self.results.load(Ordering::Relaxed)
+        self.server.results.load(Ordering::Relaxed)
+    }
+
+    /// Render the current latency/throughput summary as JSON.
+    #[must_use]
+    pub fn summary_json(&self) -> String {
+        self.server.summary_json()
     }
 }
 
 impl BenchHopper {
-    /// Walk `dataset` recursively, hashing every file, and build the job set.
-    /// `dump`, if set, is a file each posted result body is appended to.
-    pub fn build(dataset: &Path, dump: Option<PathBuf>) -> io::Result<Self> {
+    /// Walk `dataset` recursively, hashing every file, and build the job set in
+    /// the given handout `order`. `dump`, if set, is a file each posted result
+    /// body is appended to; `summary`, if set, receives the latency summary
+    /// JSON (rewritten after every result).
+    pub fn build(
+        dataset: &Path,
+        dump: Option<PathBuf>,
+        order: Order,
+        summary: Option<PathBuf>,
+    ) -> io::Result<Self> {
         let mut files = Vec::new();
         collect_files(dataset, dataset, &mut files)?;
-        files.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic job order across runs
+        files.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic base order across runs
 
         let mut jobs = Vec::with_capacity(files.len());
         let mut by_path = HashMap::with_capacity(files.len());
@@ -88,6 +194,12 @@ impl BenchHopper {
                 size_bytes,
             });
         }
+        order_jobs(&mut jobs, order);
+
+        let mut by_sha: HashMap<String, Vec<usize>> = HashMap::with_capacity(jobs.len());
+        for (i, job) in jobs.iter().enumerate() {
+            by_sha.entry(job.sha256.clone()).or_default().push(i);
+        }
 
         let dump = match dump {
             Some(path) => Some(Arc::new(Mutex::new(
@@ -96,12 +208,21 @@ impl BenchHopper {
             None => None,
         };
 
+        let timings = Mutex::new(Timings {
+            claimed: vec![None; jobs.len()],
+            resulted: vec![None; jobs.len()],
+        });
+
         Ok(Self {
             jobs,
             by_path,
+            by_sha,
+            order,
             cursor: AtomicUsize::new(0),
             results: Arc::new(AtomicUsize::new(0)),
+            timings,
             dump,
+            summary,
         })
     }
 
@@ -110,15 +231,15 @@ impl BenchHopper {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let bound = listener.local_addr()?.port();
         let jobs_total = self.jobs.len();
-        let results = Arc::clone(&self.results);
         let server = Arc::new(self);
+        let accept_server = Arc::clone(&server);
 
         std::thread::Builder::new()
             .name("bench-hopper".into())
             .spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
-                    let server = Arc::clone(&server);
+                    let server = Arc::clone(&accept_server);
                     // Thread-per-connection: a handful of worker connections at
                     // a time; simplicity beats a pool here.
                     let _ = std::thread::Builder::new()
@@ -132,7 +253,7 @@ impl BenchHopper {
         Ok(Handle {
             port: bound,
             jobs_total,
-            results,
+            server,
         })
     }
 
@@ -162,6 +283,14 @@ impl BenchHopper {
             return respond_head(stream, "204 No Content", 0);
         }
         let end = (start + count).min(self.jobs.len());
+        {
+            let now = Instant::now();
+            #[allow(clippy::expect_used)]
+            let mut t = self.timings.lock().expect("timings mutex poisoned");
+            for slot in &mut t.claimed[start..end] {
+                *slot = Some(now);
+            }
+        }
         let mut body = String::from("{\"jobs\":[");
         for (i, job) in self.jobs[start..end].iter().enumerate() {
             if i > 0 {
@@ -207,15 +336,227 @@ impl BenchHopper {
 
     fn serve_result(&self, stream: &mut TcpStream, body: &[u8]) -> io::Result<()> {
         self.results.fetch_add(1, Ordering::Relaxed);
+        let sha = result_sample_sha256(body);
         if let Some(dump) = &self.dump {
             // The worker zstd-compresses result bodies (raw JSON on fallback).
             // Record one clean line per result — the sample's top-level sha256 —
             // so completeness = distinct lines, not unparseable binary blobs.
             if let Ok(mut f) = dump.lock() {
-                let _ = writeln!(f, "{}", result_sample_sha256(body));
+                let _ = writeln!(f, "{sha}");
             }
         }
+        self.record_result(&sha);
+        if let Some(path) = &self.summary {
+            // Rewrite the whole summary after every result: O(n log n) over a
+            // few thousand jobs is nothing next to a multi-second analysis, and
+            // it guarantees the file is complete whenever the harness reads it.
+            let _ = std::fs::write(path, self.summary_json());
+        }
         respond_body(stream, "200 OK", b"{}")
+    }
+
+    /// Stamp the result time on the first unresolved job index for `sha`.
+    /// Duplicate-content datasets resolve one index per post; retries past the
+    /// last index (or an unknown sha) are ignored.
+    fn record_result(&self, sha: &str) {
+        let Some(indices) = self.by_sha.get(sha) else {
+            return;
+        };
+        let now = Instant::now();
+        #[allow(clippy::expect_used)]
+        let mut t = self.timings.lock().expect("timings mutex poisoned");
+        if let Some(&i) = indices.iter().find(|&&i| t.resulted[i].is_none()) {
+            t.resulted[i] = Some(now);
+        }
+    }
+
+    /// Render the latency/throughput summary as JSON: wall over the job window
+    /// (first claim → last result), throughput, and per-size-class sojourn
+    /// percentiles. One class object per line, so the raw file reads as a table.
+    fn summary_json(&self) -> String {
+        // Snapshot under the lock, then format with it released.
+        #[allow(clippy::expect_used)]
+        let t = self.timings.lock().expect("timings mutex poisoned");
+
+        let first_claim = t.claimed.iter().flatten().min().copied();
+        let last_result = t.resulted.iter().flatten().max().copied();
+        let wall_ms = match (first_claim, last_result) {
+            (Some(a), Some(b)) => b.duration_since(a).as_millis(),
+            _ => 0,
+        };
+        let done = t.resulted.iter().flatten().count();
+
+        // Two latencies per finished job, bucketed by size class:
+        //  - sojourn: claim → result (worker-internal queueing + analysis);
+        //  - flow: first claim of the run → result. All bench jobs "arrive" at
+        //    t0, so flow is the classic flow-time objective that size-aware
+        //    scheduling optimizes — pre-claim queue time counts here, where the
+        //    shallow prefetch depth hides it from sojourn.
+        let mut classes: Vec<(&str, Vec<u128>, Vec<u128>)> = SIZE_CLASSES
+            .iter()
+            .map(|(name, _)| (*name, Vec::new(), Vec::new()))
+            .collect();
+        let (mut all, mut all_flow) = (Vec::with_capacity(done), Vec::with_capacity(done));
+        for (i, job) in self.jobs.iter().enumerate() {
+            let (Some(claim), Some(result)) = (t.claimed[i], t.resulted[i]) else {
+                continue;
+            };
+            let ms = result.duration_since(claim).as_millis();
+            let flow = first_claim.map_or(ms, |t0| result.duration_since(t0).as_millis());
+            let class = &mut classes[size_class(job.size_bytes)];
+            class.1.push(ms);
+            class.2.push(flow);
+            all.push(ms);
+            all_flow.push(flow);
+        }
+        drop(t);
+        #[allow(clippy::cast_precision_loss)]
+        let throughput_jps = if wall_ms > 0 {
+            done as f64 / (wall_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        let mut out = String::from("{\n");
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "  \"order\": \"{}\",\n  \"jobs\": {},\n  \"done\": {},\n  \
+                 \"wall_ms\": {},\n  \"throughput_jps\": {:.3},\n  \"classes\": [\n",
+                self.order,
+                self.jobs.len(),
+                done,
+                wall_ms,
+                throughput_jps,
+            ),
+        );
+        let rows = classes
+            .iter()
+            .map(|(name, ms, flow)| (*name, ms, flow))
+            .chain(std::iter::once(("all", &all, &all_flow)));
+        let total = classes.len() + 1;
+        for (i, (name, ms, flow)) in rows.enumerate() {
+            out.push_str("    ");
+            out.push_str(&class_row_json(name, ms, flow));
+            out.push_str(if i + 1 < total { ",\n" } else { "\n" });
+        }
+        out.push_str("  ]\n}\n");
+        out
+    }
+}
+
+/// Sojourn size classes: small jobs are the starvation canary, large archives
+/// the head-of-line blockers. Upper bounds in bytes; the last is open-ended.
+const SIZE_CLASSES: [(&str, u64); 3] = [
+    ("small", 1024 * 1024),       // < 1 MiB
+    ("medium", 32 * 1024 * 1024), // 1–32 MiB
+    ("large", u64::MAX),          // > 32 MiB
+];
+
+fn size_class(size_bytes: u64) -> usize {
+    SIZE_CLASSES
+        .iter()
+        .position(|(_, max)| size_bytes < *max)
+        .unwrap_or(SIZE_CLASSES.len() - 1)
+}
+
+/// One summary row: count plus sojourn (claim → result) and flow (run start →
+/// result) mean/p50/p95/p99/max in milliseconds.
+fn class_row_json(name: &str, ms: &[u128], flow: &[u128]) -> String {
+    let stats = |vals: &[u128]| -> (u128, u128, u128, u128, u128) {
+        let mut sorted = vals.to_vec();
+        sorted.sort_unstable();
+        let mean = if sorted.is_empty() {
+            0
+        } else {
+            sorted.iter().sum::<u128>() / sorted.len() as u128
+        };
+        (
+            mean,
+            percentile(&sorted, 50),
+            percentile(&sorted, 95),
+            percentile(&sorted, 99),
+            sorted.last().copied().unwrap_or(0),
+        )
+    };
+    let (mean, p50, p95, p99, max) = stats(ms);
+    let (fmean, fp50, fp95, fp99, fmax) = stats(flow);
+    format!(
+        "{{\"class\": \"{}\", \"count\": {}, \"mean_ms\": {}, \"p50_ms\": {}, \
+         \"p95_ms\": {}, \"p99_ms\": {}, \"max_ms\": {}, \
+         \"flow_mean_ms\": {}, \"flow_p50_ms\": {}, \"flow_p95_ms\": {}, \
+         \"flow_p99_ms\": {}, \"flow_max_ms\": {}}}",
+        name,
+        ms.len(),
+        mean,
+        p50,
+        p95,
+        p99,
+        max,
+        fmean,
+        fp50,
+        fp95,
+        fp99,
+        fmax,
+    )
+}
+
+/// Nearest-rank percentile over an already-sorted slice; 0 when empty.
+fn percentile(sorted: &[u128], p: usize) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (sorted.len() * p).div_ceil(100).max(1);
+    sorted[rank - 1]
+}
+
+/// Reorder jobs for handout. `Fifo` keeps the path-sorted base order; the size
+/// orders tie-break on path so runs stay deterministic.
+fn order_jobs(jobs: &mut [Job], order: Order) {
+    match order {
+        Order::Fifo => {}
+        Order::BigFirst => {
+            jobs.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes).then(a.path.cmp(&b.path)));
+        }
+        Order::SmallFirst => {
+            jobs.sort_by(|a, b| a.size_bytes.cmp(&b.size_bytes).then(a.path.cmp(&b.path)));
+        }
+        Order::Shuffle(seed) => {
+            // Fisher–Yates over the path-sorted base, so a seed names exactly
+            // one permutation regardless of filesystem enumeration order.
+            let mut state = seed.max(1); // xorshift state must be non-zero
+            for i in (1..jobs.len()).rev() {
+                #[allow(clippy::cast_possible_truncation)]
+                let j = (xorshift64(&mut state) % (i as u64 + 1)) as usize;
+                jobs.swap(i, j);
+            }
+        }
+        Order::Mixed => {
+            // Sort by each job's fractional position within its size class —
+            // the k-th of n jobs in a class lands at (2k+1)/2n of the stream —
+            // so every class is spread evenly and every claim window sees a
+            // mix. Compared as exact rationals (cross-multiplied u128s scaled
+            // to a common grid) to keep ordering integer-deterministic;
+            // original index tie-breaks.
+            let mut counts = [0u128; SIZE_CLASSES.len()];
+            for job in jobs.iter() {
+                counts[size_class(job.size_bytes)] += 1;
+            }
+            let mut seen = [0u128; SIZE_CLASSES.len()];
+            let mut keyed: Vec<(u128, Job)> = jobs
+                .iter()
+                .map(|job| {
+                    let class = size_class(job.size_bytes);
+                    let key = ((2 * seen[class] + 1) << 32) / (2 * counts[class]);
+                    seen[class] += 1;
+                    (key, job.clone())
+                })
+                .collect();
+            keyed.sort_by_key(|kj| kj.0);
+            for (slot, (_, job)) in jobs.iter_mut().zip(keyed) {
+                *slot = job;
+            }
+        }
     }
 }
 
@@ -447,7 +788,7 @@ mod tests {
         write_file(&dir, "a.txt", b"hello");
         write_file(&dir, "sub/b dir.txt", b"world!!");
 
-        let hopper = BenchHopper::build(&dir, None).unwrap();
+        let hopper = BenchHopper::build(&dir, None, Order::Fifo, None).unwrap();
         assert_eq!(hopper.jobs.len(), 2);
         let handle = hopper.serve(0).unwrap();
         let port = handle.port;
@@ -502,5 +843,130 @@ mod tests {
         assert_eq!(percent_decode("a%20b"), "a b");
         assert_eq!(percent_decode("c%25d"), "c%d");
         assert_eq!(percent_decode("plain.txt"), "plain.txt");
+    }
+
+    fn job(path: &str, size: u64) -> Job {
+        Job {
+            sha256: format!("{:064}", size),
+            path: path.to_string(),
+            size_bytes: size,
+        }
+    }
+
+    #[test]
+    fn order_parses_and_round_trips() {
+        assert_eq!("fifo".parse::<Order>().unwrap(), Order::Fifo);
+        assert_eq!("shuffle".parse::<Order>().unwrap(), Order::Shuffle(42));
+        assert_eq!("shuffle:7".parse::<Order>().unwrap(), Order::Shuffle(7));
+        assert_eq!("big-first".parse::<Order>().unwrap(), Order::BigFirst);
+        assert!("nope".parse::<Order>().is_err());
+        assert!("shuffle:x".parse::<Order>().is_err());
+        assert_eq!(Order::Shuffle(7).to_string(), "shuffle:7");
+    }
+
+    #[test]
+    fn order_jobs_sorts_and_shuffles_deterministically() {
+        let base = vec![job("a", 10), job("b", 30), job("c", 20)];
+
+        let mut big = base.clone();
+        order_jobs(&mut big, Order::BigFirst);
+        assert_eq!(
+            big.iter().map(|j| j.size_bytes).collect::<Vec<_>>(),
+            [30, 20, 10]
+        );
+
+        let mut small = base.clone();
+        order_jobs(&mut small, Order::SmallFirst);
+        assert_eq!(
+            small.iter().map(|j| j.size_bytes).collect::<Vec<_>>(),
+            [10, 20, 30]
+        );
+
+        // Same seed → same permutation; different seed → (here) a different one.
+        let (mut s1, mut s2, mut s3) = (base.clone(), base.clone(), base.clone());
+        order_jobs(&mut s1, Order::Shuffle(1));
+        order_jobs(&mut s2, Order::Shuffle(1));
+        order_jobs(&mut s3, Order::Shuffle(2));
+        let paths = |v: &[Job]| v.iter().map(|j| j.path.clone()).collect::<Vec<_>>();
+        assert_eq!(paths(&s1), paths(&s2));
+        assert_ne!(paths(&s1), paths(&s3));
+    }
+
+    #[test]
+    fn mixed_spreads_each_size_class_evenly() {
+        // 4 smalls + 1 large: the large lands mid-stream (position 1/2 falls
+        // between the smalls at 1/8, 3/8 and 5/8, 7/8), not at either end.
+        let big = 100 * 1024 * 1024;
+        let mut jobs = vec![
+            job("s1", 10),
+            job("s2", 20),
+            job("s3", 30),
+            job("s4", 40),
+            job("big", big),
+        ];
+        order_jobs(&mut jobs, Order::Mixed);
+        let paths: Vec<&str> = jobs.iter().map(|j| j.path.as_str()).collect();
+        assert_eq!(paths, ["s1", "s2", "big", "s3", "s4"]);
+
+        // Round-trip parse for the CLI.
+        assert_eq!("mixed".parse::<Order>().unwrap(), Order::Mixed);
+        assert_eq!(Order::Mixed.to_string(), "mixed");
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank() {
+        let v: Vec<u128> = (1..=100).collect();
+        assert_eq!(percentile(&v, 50), 50);
+        assert_eq!(percentile(&v, 95), 95);
+        assert_eq!(percentile(&v, 99), 99);
+        assert_eq!(percentile(&[7], 99), 7);
+        assert_eq!(percentile(&[], 50), 0);
+    }
+
+    #[test]
+    fn size_class_buckets_by_bounds() {
+        assert_eq!(size_class(0), 0); // small
+        assert_eq!(size_class(1024 * 1024), 1); // exactly 1 MiB → medium
+        assert_eq!(size_class(32 * 1024 * 1024), 2); // exactly 32 MiB → large
+        assert_eq!(size_class(u64::MAX), 2);
+    }
+
+    #[test]
+    fn summary_tracks_claim_to_result_sojourn() {
+        let dir = std::env::temp_dir().join(format!("bench_hopper_sum_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "x.bin", b"abc");
+        write_file(&dir, "y.bin", b"defgh");
+
+        let hopper = BenchHopper::build(&dir, None, Order::Fifo, None).unwrap();
+        let shas: Vec<String> = hopper.jobs.iter().map(|j| j.sha256.clone()).collect();
+        let handle = hopper.serve(0).unwrap();
+        let port = handle.port;
+
+        // Claim both jobs, then post a result for the first sha only.
+        let (status, _) = get(port, "/api/next?count=10");
+        assert!(status.contains("200"), "status: {status}");
+        let body = format!("{{\"sha256\":\"{}\",\"worker\":\"w\"}}", shas[0]);
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            stream,
+            "POST /api/result HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).unwrap();
+
+        let summary = handle.summary_json();
+        assert!(summary.contains("\"jobs\": 2"), "summary: {summary}");
+        assert!(summary.contains("\"done\": 1"), "summary: {summary}");
+        // Both files are tiny → the one finished job lands in the small class.
+        assert!(
+            summary.contains("\"class\": \"small\", \"count\": 1"),
+            "summary: {summary}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

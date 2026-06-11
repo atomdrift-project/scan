@@ -251,18 +251,24 @@ worker: release
 		$(if $(NICE),--nice $(NICE),)
 
 # Self-contained worker benchmark: start the bundled mock hopper on a local
-# dataset, point a real worker at it, and measure the worker's wall + maxrss.
-# The litmus analogue of cleave's `make benchmark DATASET=...`. Override the
-# dataset and slot count, e.g.:
-#   make worker-benchmark WORKER_BENCH_DATASET=realworld-small WORKERS=12
+# dataset, point a real worker at it, and measure the worker's wall + maxrss
+# plus per-job latency (claim → result, measured hopper-side). Iterate with
+# realworld-small; reserve realworld for final verification. Override the
+# dataset, slot count, and job handout order, e.g.:
+#   make worker-benchmark WORKER_BENCH_DATASET=realworld-small WORKERS=12 ORDER=big-first
+# ORDER: fifo (default), shuffle[:seed] (reproducible realistic mix),
+# big-first (small-job-starvation worst case), small-first.
 WORKER_BENCH_DATASET ?= $(DATASET)
 WORKER_BENCH_PATH    ?= $(BENCHMARK_ROOT)/$(WORKER_BENCH_DATASET)
 HEARTBEAT_SECS       ?= 5
+ORDER                ?= fifo
+BENCH_SUMMARY        ?= /tmp/litmus-worker-bench-summary.json
 worker-benchmark: release ## Benchmark the worker model over a local dataset via the bundled mock hopper
 	@[ -e "$(WORKER_BENCH_PATH)" ] || { echo "error: dataset not found: $(WORKER_BENCH_PATH)"; exit 1; }
-	@echo "worker-benchmark: dataset=$(WORKER_BENCH_PATH) workers=$(if $(WORKERS),$(WORKERS),default)"
-	@out=$$(mktemp); results=/tmp/litmus-worker-results.jsonl; rm -f $$results; \
+	@echo "worker-benchmark: dataset=$(WORKER_BENCH_PATH) workers=$(if $(WORKERS),$(WORKERS),default) order=$(ORDER)"
+	@out=$$(mktemp); results=/tmp/litmus-worker-results.jsonl; rm -f $$results "$(BENCH_SUMMARY)"; \
 	./target/release/litmus-bench-hopper --dataset "$(WORKER_BENCH_PATH)" --port 0 --dump $$results \
+		--order "$(ORDER)" --summary "$(BENCH_SUMMARY)" \
 		>$$out 2>/tmp/litmus-bench-hopper.err & \
 	hp=$$!; \
 	trap 'kill $$hp 2>/dev/null' EXIT INT TERM; \
@@ -291,7 +297,10 @@ worker-benchmark: release ## Benchmark the worker model over a local dataset via
 	grep -E "thread budget|oversubscribes|rayon pool ready" /tmp/litmus-worker-benchmark.log | head; \
 	echo "--- completeness (SERVER-side): hopper received $$received / $$jobs results ---"; \
 	[ "$$received" = "$$jobs" ] && echo "✓ COMPLETE: all $$jobs results reached the hopper" \
-		|| echo "❌ INCOMPLETE: $$received/$$jobs — worker dropped results (see /tmp/litmus-bench-hopper.err)"
+		|| echo "❌ INCOMPLETE: $$received/$$jobs — worker dropped results (see /tmp/litmus-bench-hopper.err)"; \
+	echo "--- latency summary (hopper-side, claim → result) ---"; \
+	cat "$(BENCH_SUMMARY)" 2>/dev/null || echo "(no summary written)"; \
+	echo "✓ summary: $(BENCH_SUMMARY)"
 
 profile-worker:
 	$(CARGO) build --profile profiling

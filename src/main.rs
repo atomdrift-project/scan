@@ -154,17 +154,17 @@ struct Cli {
     #[arg(long, global = true)]
     interpret: bool,
 
-    /// LLM endpoint base URL (env: LITMUS_OPENAI_BASE_URL)
-    #[arg(long, global = true, value_name = "URL")]
-    llm_url: Option<String>,
+    /// LLM endpoint or provider (env: LITMUS_LLM)
+    #[arg(long, global = true, value_name = "LLM")]
+    llm: Option<String>,
 
-    /// LLM model name (env: LITMUS_OPENAI_MODEL)
+    /// LLM model name (env: LITMUS_LLM_MODEL)
     #[arg(long, global = true, value_name = "NAME")]
     llm_model: Option<String>,
 
-    /// LLM bearer token (env: LITMUS_OPENAI_API_KEY / OPENAI_API_KEY); omit for local endpoints
+    /// LLM bearer token (env: LITMUS_LLM_KEY); omit for local endpoints
     #[arg(long, global = true, value_name = "KEY")]
-    llm_api_key: Option<String>,
+    llm_key: Option<String>,
 
     /// Minimum ML probability for a sample to be sent to the LLM
     #[arg(long, global = true, default_value_t = litmus::interpret::DEFAULT_MIN_PROB, value_name = "P")]
@@ -182,7 +182,7 @@ struct Cli {
 }
 
 impl Cli {
-    /// Build the LLM interpretation config from `--interpret` and the `--llm-*`
+    /// Build the LLM interpretation config from `--interpret` and the `--llm*`
     /// flags, falling back to env vars. `None` when `--interpret` is not set.
     fn interpret_config(&self) -> Option<litmus::interpret::InterpretConfig> {
         if !self.interpret {
@@ -195,12 +195,11 @@ impl Cli {
                 .filter(|s| !s.is_empty())
         };
         Some(litmus::interpret::InterpretConfig {
-            base_url: from_env(&self.llm_url, "LITMUS_OPENAI_BASE_URL")
+            base_url: from_env(&self.llm, "LITMUS_LLM")
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            model: from_env(&self.llm_model, "LITMUS_OPENAI_MODEL")
+            model: from_env(&self.llm_model, "LITMUS_LLM_MODEL")
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            api_key: from_env(&self.llm_api_key, "LITMUS_OPENAI_API_KEY")
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty())),
+            api_key: from_env(&self.llm_key, "LITMUS_LLM_KEY"),
             min_prob: self.interpret_min_prob,
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             max_concurrency: DEFAULT_MAX_CONCURRENCY,

@@ -59,7 +59,8 @@ pub fn update(force: bool, _quiet: bool) -> Result<bool> {
     prepare_runtime_env();
     let dir = cleave::traits_repo::install_target();
     let before = cleave::rule_update::installed(&dir).map(|i| i.commit);
-    cleave::rule_update::update(&dir, force).map_err(|e| anyhow::anyhow!("traits update failed: {e}"))?;
+    cleave::rule_update::update(&dir, force)
+        .map_err(|e| anyhow::anyhow!("traits update failed: {e}"))?;
     let after = cleave::rule_update::installed(&dir).map(|i| i.commit);
     Ok(before != after)
 }

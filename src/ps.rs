@@ -333,7 +333,7 @@ fn build_result(
         size_bytes: cr.size_bytes,
         sha256: group.sha256.clone(),
         embedded_files: cr.embedded_files,
-        context_tiny: cr.context_tiny,
+        rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
     })
 }
@@ -366,7 +366,7 @@ fn emit_result(
             let Ok(mut out) = stdout.lock() else {
                 return;
             };
-            crate::scan::write_tiny(&mut *out, r, false);
+            crate::scan::write_tiny(&mut *out, r);
         }
     }
 }

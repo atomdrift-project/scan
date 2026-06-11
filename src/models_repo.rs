@@ -80,7 +80,8 @@ pub fn model_dir() -> Result<PathBuf> {
 /// Get the installed model commit (short), from the bundle's sidecar.
 #[must_use]
 pub fn version() -> Option<String> {
-    crate::model_update::installed(&current_models_dir()).map(|i| i.commit.chars().take(12).collect())
+    crate::model_update::installed(&current_models_dir())
+        .map(|i| i.commit.chars().take(12).collect())
 }
 
 /// Directory the updater should install into: `LITMUS_MODELS_DIR` override or

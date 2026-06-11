@@ -400,7 +400,7 @@ mod envelope_tests {
             size_bytes: 0,
             sha256: String::new(),
             embedded_files: Vec::new(),
-            context_tiny: String::new(),
+            rendered_context: String::new(),
             interpretation: None,
         }
     }
@@ -698,9 +698,10 @@ pub struct ScanResult {
     pub model_scores: Vec<RouteScore>,
     /// Applicable model routes skipped by the routed ensemble.
     pub skipped_models: Vec<SkippedRoute>,
-    /// cleave's context-centric render (`--format tiny`), captured while the
-    /// typed report was in scope. Empty unless the run requested tiny output.
-    pub context_tiny: String,
+    /// cleave's rendered context view (the annotated hex/source block), captured
+    /// while the typed report was in scope. Body-only for the terminal format
+    /// (litmus draws the headline); header-prefixed for `--format tiny`.
+    pub rendered_context: String,
     /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
     /// Serialized as the response `llm` section; `None` when interpretation was
     /// disabled or gated out.
@@ -1234,63 +1235,54 @@ fn emit_result(
             }
             let _ = out.write_all(b"\n");
         }
-        // Terminal and tiny share cleave's context renderer (density chosen in
-        // `tiny_opts_for`); only color (auto, by tty) differs.
-        OutputFormat::Terminal | OutputFormat::Tiny => {
+        // The terminal view's full render (litmus badge + cleave header/body)
+        // was built in `classify_report`; write it verbatim.
+        OutputFormat::Terminal => {
             let _ = show_progress;
             let Ok(mut out) = stdout.lock() else {
                 return;
             };
-            // tiny is LLM-facing — never colored; terminal colors (auto by tty).
-            let color = !matches!(config.format(), OutputFormat::Tiny);
-            write_tiny(&mut *out, r, color);
+            let _ = out.write_all(r.rendered_context.as_bytes());
+        }
+        // `--format tiny` prefixes the machine verdict line, never colored.
+        OutputFormat::Tiny => {
+            let Ok(mut out) = stdout.lock() else {
+                return;
+            };
+            write_tiny(&mut *out, r);
         }
     }
 }
 
-/// The cleave context density litmus renders at: the full cleave tiny for
-/// `--format tiny` (so the two are identical bar the verdict line), and a
-/// concise top-3 / single-line cut for the terminal.
+/// The cleave context density litmus renders at. `--format tiny` uses cleave's
+/// full tiny (machine/LLM). The terminal view is cut from cleave's own terminal
+/// render — same rich header and body — but capped at the top 3 traits (cleave
+/// shows all notable+), with litmus adding a verdict badge + subtitle on top.
 pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
     if matches!(config.format(), OutputFormat::Tiny) {
         cleave::output::TinyOpts::tiny()
     } else {
         cleave::output::TinyOpts {
             top_n: 3,
-            min_crit: cleave::types::Criticality::Suspicious,
+            // Only the hit lines/rows — no surrounding context, no `⋯` gap
+            // markers, no padding rows in the hex view.
             context_lines: Some(1),
-            first_match_only: true,
-            rich_header: false,
-            color: true,
+            full_context: false,
+            header: cleave::output::HeaderStyle::Rich,
+            ..cleave::output::TinyOpts::terminal()
         }
     }
 }
 
-/// Write litmus's view: one ML-verdict line (the gate, calibrated confidence,
-/// matched false-positive level) then cleave's annotated context. Uses the same
-/// `colored` crate as cleave, so it auto-plains when piped (`… | llm`).
-pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult, color: bool) {
-    use colored::Colorize;
-    let class = if color {
-        let (cr, cg, cb) = match r.classification {
-            Classification::Hostile => (215, 95, 95),
-            Classification::Suspicious => (255, 175, 0),
-            Classification::Benign => (95, 175, 95),
-        };
-        r.classification
-            .to_string()
-            .truecolor(cr, cg, cb)
-            .bold()
-            .to_string()
-    } else {
-        r.classification.to_string()
-    };
+/// Write litmus's `--format tiny` view (machine/LLM-facing, never colored): one
+/// ML-verdict line — the gate, calibrated confidence, matched false-positive
+/// level — then cleave's annotated context.
+pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
+    let class = r.classification.to_string();
     let verdict = if matches!(r.classification, Classification::Benign) {
         format!("litmus {class} confidence={:.3}\n", r.probability)
     } else {
-        let fp_level = r
-            .level
-            .map_or_else(|| "-".to_string(), |n| format!("L{n}"));
+        let fp_level = r.level.map_or_else(|| "-".to_string(), |n| format!("L{n}"));
         format!(
             "litmus {class} confidence={:.3} fp-level={fp_level}\n",
             r.probability,
@@ -1298,9 +1290,9 @@ pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult, color: bo
     };
     let _ = out.write_all(verdict.as_bytes());
     if let Some(llm) = &r.interpretation {
-        let _ = out.write_all(format_llm_line(llm, color).as_bytes());
+        let _ = out.write_all(format_llm_line(llm, false).as_bytes());
     }
-    let _ = out.write_all(r.context_tiny.as_bytes());
+    let _ = out.write_all(r.rendered_context.as_bytes());
 }
 
 /// One-line LLM verdict, colored by the blended outcome. Shown under the ML
@@ -1366,8 +1358,8 @@ pub(crate) struct ClassifiedReport {
     pub(crate) sha256: String,
     pub(crate) embedded_files: Vec<EmbeddedFile>,
     pub(crate) report_json: serde_json::Value,
-    /// cleave's context-centric render, for `--format tiny`.
-    pub(crate) context_tiny: String,
+    /// cleave's rendered context view (annotated hex/source block).
+    pub(crate) rendered_context: String,
     /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
     pub(crate) interpretation: Option<crate::interpret::Interpretation>,
 }
@@ -1510,10 +1502,6 @@ pub(crate) fn classify_report(
     interpret: Option<&crate::interpret::InterpretConfig>,
 ) -> Result<ClassifiedReport> {
     report.finalize();
-    // Render cleave's context view now, while the typed (finalized) report is in
-    // scope. Density is the caller's choice: the full cleave tiny for `--format
-    // tiny`, a concise top-3/1-line cut for the terminal.
-    let context_tiny = cleave::output::format_context(&report, tiny_opts);
     let compact = cleave::types::compact::compact_from_files(&report.files);
     let formula = compact
         .files
@@ -1715,6 +1703,44 @@ pub(crate) fn classify_report(
         )
     });
 
+    // Render cleave's context view now, while the typed (finalized) report is in
+    // scope and the verdict (incl. any interpretation) is known. The terminal
+    // view extends cleave's rich render with litmus's verdict badge + subtitle;
+    // `--format tiny` uses cleave's machine render verbatim.
+    let rendered_context = if tiny_opts.header == cleave::output::HeaderStyle::Rich {
+        let (badge, badge_w) = crate::output::terminal_badge(
+            &final_decision.class,
+            final_decision.probability,
+            final_decision.threshold,
+            final_decision.level,
+        );
+        // The filename starts after the stamp and one separator space.
+        let indent = badge_w + 1;
+        let trailer = crate::output::terminal_trailer(&reasons, interpretation.as_ref());
+        let subtitle = crate::output::terminal_subtitle(&sha256, indent);
+        let adorn = cleave::output::HeaderBadge {
+            badge: Some(&badge),
+            trailer: trailer.as_deref(),
+            subtitle: subtitle.as_deref(),
+        };
+        let body = cleave::output::format_context_badged(&report, tiny_opts, adorn);
+        if body.is_empty() {
+            // No notable+ traits to anchor a header on: still surface the
+            // verdict headline so a flagged file is never silent.
+            let trail = trailer.map(|t| format!(" {t}")).unwrap_or_default();
+            let mut head = format!("{badge} {label}{trail}\n");
+            if let Some(sub) = &subtitle {
+                head.push_str(sub);
+                head.push('\n');
+            }
+            head
+        } else {
+            body
+        }
+    } else {
+        cleave::output::format_context(&report, tiny_opts)
+    };
+
     Ok(ClassifiedReport {
         classification: final_decision.class,
         probability: final_decision.probability,
@@ -1731,7 +1757,7 @@ pub(crate) fn classify_report(
         sha256,
         embedded_files,
         report_json,
-        context_tiny,
+        rendered_context,
         interpretation,
     })
 }
@@ -1796,7 +1822,7 @@ pub(crate) fn process_report(
         size_bytes: cr.size_bytes,
         sha256: cr.sha256,
         embedded_files: cr.embedded_files,
-        context_tiny: cr.context_tiny,
+        rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
     })
 }

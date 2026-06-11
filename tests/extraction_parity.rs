@@ -64,7 +64,10 @@ fn load_spec() -> Option<FeatureSpec> {
     match FeatureSpec::load(&path) {
         Ok(spec) => Some(spec),
         Err(e) => {
-            eprintln!("skipping extraction parity: {} unusable: {e}", path.display());
+            eprintln!(
+                "skipping extraction parity: {} unusable: {e}",
+                path.display()
+            );
             None
         }
     }
