@@ -77,8 +77,8 @@ pub fn register_self() {
 pub(crate) fn os_thread_id() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: `gettid` takes no arguments and cannot fail.
-        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+        // SAFETY: `gettid` takes no arguments and cannot fail; the tid is positive.
+        u64::try_from(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap_or(0)
     }
     #[cfg(target_os = "macos")]
     {
@@ -223,7 +223,7 @@ pub fn install() {
         // valid disposition; `SA_RESTART` keeps interrupted syscalls transparent.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = capture::on_capture as usize;
+            action.sa_sigaction = capture::on_capture as *const () as usize;
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = libc::SA_RESTART;
             libc::sigaction(capture::CAPTURE_SIGNAL, &action, std::ptr::null_mut());
@@ -299,9 +299,9 @@ fn write_registered_backtraces(out: &mut impl Write) {
             let ip =
                 capture::SLOT_FRAMES[slot][frame].load(Ordering::Relaxed) as *mut std::ffi::c_void;
             let mut printed = false;
-            // SAFETY: `resolve` only reads symbol tables for the address; off the
-            // signal path, so allocation inside the callback is fine.
-            unsafe {
+            // `resolve` is safe; off the signal path, so allocation inside the
+            // callback is fine.
+            {
                 backtrace::resolve(ip, |symbol| {
                     let name = symbol
                         .name()

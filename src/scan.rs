@@ -96,6 +96,7 @@ pub struct ScanConfig {
     slow_rule_ms: u64,
     extra: bool,
     level: Option<u16>,
+    interpret: Option<crate::interpret::InterpretConfig>,
 }
 
 impl ScanConfig {
@@ -143,6 +144,7 @@ impl ScanConfig {
             slow_rule_ms,
             extra,
             level: None,
+            interpret: None,
         })
     }
 
@@ -157,6 +159,20 @@ impl ScanConfig {
     pub const fn with_level(mut self, level: Option<u16>) -> Self {
         self.level = level;
         self
+    }
+
+    /// Attach an LLM interpretation config (`--interpret`). `None` disables the
+    /// pass; callers like `validate` always leave it unset.
+    #[must_use]
+    pub fn with_interpret(mut self, interpret: Option<crate::interpret::InterpretConfig>) -> Self {
+        self.interpret = interpret;
+        self
+    }
+
+    /// LLM interpretation config, or `None` when `--interpret` was not set.
+    #[must_use]
+    pub fn interpret(&self) -> Option<&crate::interpret::InterpretConfig> {
+        self.interpret.as_ref()
     }
 
     /// Directory containing `model.json` and `feature_spec.json`.
@@ -385,6 +401,7 @@ mod envelope_tests {
             sha256: String::new(),
             embedded_files: Vec::new(),
             context_tiny: String::new(),
+            interpretation: None,
         }
     }
 
@@ -684,6 +701,10 @@ pub struct ScanResult {
     /// cleave's context-centric render (`--format tiny`), captured while the
     /// typed report was in scope. Empty unless the run requested tiny output.
     pub context_tiny: String,
+    /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
+    /// Serialized as the response `llm` section; `None` when interpretation was
+    /// disabled or gated out.
+    pub interpretation: Option<crate::interpret::Interpretation>,
 }
 
 /// A representative cleave finding surfaced alongside a classification.
@@ -1220,7 +1241,9 @@ fn emit_result(
             let Ok(mut out) = stdout.lock() else {
                 return;
             };
-            write_tiny(&mut *out, r);
+            // tiny is LLM-facing — never colored; terminal colors (auto by tty).
+            let color = !matches!(config.format(), OutputFormat::Tiny);
+            write_tiny(&mut *out, r, color);
         }
     }
 }
@@ -1238,6 +1261,7 @@ pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
             context_lines: Some(1),
             first_match_only: true,
             rich_header: false,
+            color: true,
         }
     }
 }
@@ -1245,14 +1269,22 @@ pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
 /// Write litmus's view: one ML-verdict line (the gate, calibrated confidence,
 /// matched false-positive level) then cleave's annotated context. Uses the same
 /// `colored` crate as cleave, so it auto-plains when piped (`… | llm`).
-pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
+pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult, color: bool) {
     use colored::Colorize;
-    let (cr, cg, cb) = match r.classification {
-        Classification::Hostile => (215, 95, 95),
-        Classification::Suspicious => (255, 175, 0),
-        Classification::Benign => (95, 175, 95),
+    let class = if color {
+        let (cr, cg, cb) = match r.classification {
+            Classification::Hostile => (215, 95, 95),
+            Classification::Suspicious => (255, 175, 0),
+            Classification::Benign => (95, 175, 95),
+        };
+        r.classification
+            .to_string()
+            .truecolor(cr, cg, cb)
+            .bold()
+            .to_string()
+    } else {
+        r.classification.to_string()
     };
-    let class = r.classification.to_string().truecolor(cr, cg, cb).bold();
     let verdict = if matches!(r.classification, Classification::Benign) {
         format!("litmus {class} confidence={:.3}\n", r.probability)
     } else {
@@ -1265,7 +1297,53 @@ pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
         )
     };
     let _ = out.write_all(verdict.as_bytes());
+    if let Some(llm) = &r.interpretation {
+        let _ = out.write_all(format_llm_line(llm, color).as_bytes());
+    }
     let _ = out.write_all(r.context_tiny.as_bytes());
+}
+
+/// One-line LLM verdict, colored by the blended outcome. Shown under the ML
+/// verdict in terminal output when `--interpret` produced a result. `color` is
+/// false for `--format tiny` (LLM-facing output is never colored).
+pub(crate) fn format_llm_line(llm: &crate::interpret::Interpretation, color: bool) -> String {
+    use colored::Colorize;
+    if !color {
+        if let Some(err) = &llm.error {
+            return format!("llm error  {err}\n");
+        }
+        let review = if llm.review { "  ⚠ review" } else { "" };
+        let grade = llm.grade.map_or("?", crate::interpret::LlmGrade::as_str);
+        return format!(
+            "llm {grade} → {} blended={:.3}{review}  {}\n",
+            llm.outcome, llm.blended, llm.interpretation,
+        );
+    }
+    if let Some(err) = &llm.error {
+        return format!(
+            "llm {}  {}\n",
+            "error".truecolor(255, 175, 0),
+            err.bright_black(),
+        );
+    }
+    let (r, g, b) = match llm.outcome {
+        Classification::Hostile => (215, 95, 95),
+        Classification::Suspicious => (255, 175, 0),
+        Classification::Benign => (95, 175, 95),
+    };
+    let outcome = llm.outcome.to_string().truecolor(r, g, b).bold();
+    let review = if llm.review {
+        "  ⚠ review".truecolor(255, 175, 0).to_string()
+    } else {
+        String::new()
+    };
+    let grade = llm.grade.map_or("?", crate::interpret::LlmGrade::as_str);
+    format!(
+        "llm {} → {outcome} blended={:.3}{review}  {}\n",
+        grade.bright_black(),
+        llm.blended,
+        llm.interpretation.bright_black(),
+    )
 }
 
 /// Intermediate classification result from the model pipeline.
@@ -1290,6 +1368,8 @@ pub(crate) struct ClassifiedReport {
     pub(crate) report_json: serde_json::Value,
     /// cleave's context-centric render, for `--format tiny`.
     pub(crate) context_tiny: String,
+    /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
+    pub(crate) interpretation: Option<crate::interpret::Interpretation>,
 }
 
 /// crit-4 fraction gate for the trait floor's suspicious arm. A sparse, severe
@@ -1417,6 +1497,7 @@ fn apply_trait_floor(
 /// Run the full cleave-finalize + model inference pipeline on a report.
 /// This is the single authoritative inference path used by scan, ps, and the server.
 #[allow(clippy::needless_pass_by_value)] // Arc clones at call sites are negligible; ownership simplifies callers.
+#[allow(clippy::too_many_arguments)] // single authoritative inference path; bundling would just shift the noise.
 pub(crate) fn classify_report(
     label: &str,
     mut report: cleave::AnalysisReport,
@@ -1426,6 +1507,7 @@ pub(crate) fn classify_report(
     cancellation: Option<&Arc<AtomicBool>>,
     embedded_file_limit: Option<usize>,
     tiny_opts: &cleave::output::TinyOpts,
+    interpret: Option<&crate::interpret::InterpretConfig>,
 ) -> Result<ClassifiedReport> {
     report.finalize();
     // Render cleave's context view now, while the typed (finalized) report is in
@@ -1609,6 +1691,30 @@ pub(crate) fn classify_report(
 
     let top_findings = extract_top_findings_from_json(&report_json, &final_decision.class);
 
+    // LLM second opinion (root file only). Render the full cleave tiny context
+    // for the model regardless of the display density, then blend.
+    let interpretation = interpret.and_then(|cfg| {
+        if final_decision.probability < cfg.min_prob {
+            tracing::info!(
+                path = %label,
+                probability = format!("{:.4}", final_decision.probability),
+                cutoff = format!("{:.4}", cfg.min_prob),
+                "below --interpret-min-prob cutoff; skipping LLM interpretation",
+            );
+            return None;
+        }
+        let llm_ctx = crate::interpret::sanitize_context(&cleave::output::format_context(
+            &report,
+            &cleave::output::TinyOpts::tiny(),
+        ));
+        crate::interpret::interpret(
+            cfg,
+            &llm_ctx,
+            final_decision.class,
+            final_decision.probability,
+        )
+    });
+
     Ok(ClassifiedReport {
         classification: final_decision.class,
         probability: final_decision.probability,
@@ -1626,6 +1732,7 @@ pub(crate) fn classify_report(
         embedded_files,
         report_json,
         context_tiny,
+        interpretation,
     })
 }
 
@@ -1660,6 +1767,7 @@ pub(crate) fn process_report(
         cancellation,
         Some(100),
         &tiny_opts_for(config),
+        config.interpret(),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
@@ -1689,6 +1797,7 @@ pub(crate) fn process_report(
         sha256: cr.sha256,
         embedded_files: cr.embedded_files,
         context_tiny: cr.context_tiny,
+        interpretation: cr.interpretation,
     })
 }
 
@@ -1986,6 +2095,9 @@ fn build_ml_files(
 pub struct ScanResultEnvelope {
     /// ML classification section.
     pub ml: MlSection,
+    /// LLM interpretation section (`--interpret`); omitted when not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm: Option<crate::interpret::Interpretation>,
     /// Raw cleave analysis report.
     pub raw: serde_json::Value,
 }
@@ -2028,6 +2140,9 @@ pub struct MlSection {
 pub struct ScanResultEnvelopeRef<'a> {
     /// ML classification section (borrowed).
     pub ml: MlSectionRef<'a>,
+    /// LLM interpretation section (`--interpret`); omitted when not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm: Option<&'a crate::interpret::Interpretation>,
     /// Raw cleave analysis report (borrowed).
     pub raw: &'a serde_json::Value,
 }
@@ -2101,6 +2216,7 @@ impl ScanResult {
                 pids: self.pids.clone(),
                 deleted: self.deleted,
             },
+            llm: self.interpretation.clone(),
             raw,
         }
     }
@@ -2128,6 +2244,7 @@ impl ScanResult {
                 pids: self.pids,
                 deleted: self.deleted,
             },
+            llm: self.interpretation,
             raw,
         }
     }
@@ -2159,6 +2276,7 @@ impl ScanResult {
                 pids: self.pids.as_deref(),
                 deleted: self.deleted,
             },
+            llm: self.interpretation.as_ref(),
             raw,
         }
     }

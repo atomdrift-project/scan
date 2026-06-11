@@ -472,7 +472,13 @@ fn load_model_resources(
     let model = Model::load(model_dir, thresholds, level).context("loading model")?;
     let shap = ShapImportance::load(model_dir).ok();
     let ctx = ExtractContext::new(model.spec());
-    Ok(Arc::new(ModelResources { model, shap, ctx }))
+    // The hopper worker is a batch backend; LLM interpretation is a follow-up.
+    Ok(Arc::new(ModelResources {
+        model,
+        shap,
+        ctx,
+        interpret: None,
+    }))
 }
 
 fn validate_and_load_resources(

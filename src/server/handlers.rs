@@ -60,7 +60,8 @@ async fn await_with_timeout(
 fn current_thread_id() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+        // SAFETY: `gettid` takes no arguments and cannot fail; the tid is positive.
+        u64::try_from(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap_or(0)
     }
     #[cfg(target_os = "macos")]
     {
@@ -416,7 +417,12 @@ async fn do_model_reload(
 
     match state.resources.write() {
         Ok(mut lock) => {
-            *lock = Some(Arc::new(super::ModelResources { model, shap, ctx }));
+            *lock = Some(Arc::new(super::ModelResources {
+                model,
+                shap,
+                ctx,
+                interpret: state.interpret.clone(),
+            }));
             if let Ok(mut init_error) = state.init_error.write() {
                 *init_error = None;
             }
@@ -997,6 +1003,7 @@ pub(crate) fn classify_file(
         cancellation,
         Some(100),
         &cleave::output::TinyOpts::tiny(),
+        resources.interpret.as_ref(),
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -1045,6 +1052,7 @@ pub(crate) fn classify_bytes(
         cancellation,
         Some(100),
         &cleave::output::TinyOpts::tiny(),
+        resources.interpret.as_ref(),
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -1079,6 +1087,7 @@ fn scan_result_from(
         sha256: cr.sha256,
         embedded_files: cr.embedded_files,
         context_tiny: cr.context_tiny,
+        interpretation: cr.interpretation,
     }
 }
 

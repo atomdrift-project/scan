@@ -388,6 +388,9 @@ pub fn print_ps_result(
         fg_bold(p.path_name, &result.path),
     );
 
+    if let Some(llm) = &result.interpretation {
+        eprint!("    {}", crate::scan::format_llm_line(llm, true));
+    }
     print_detail_lines(result, p);
     print_reasons(result, p);
     if extra {

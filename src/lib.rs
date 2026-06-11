@@ -33,6 +33,7 @@ pub mod crash_dump;
 pub mod explain;
 pub mod features;
 pub mod inflight;
+pub mod interpret;
 pub mod model;
 pub mod model_update;
 pub mod models_repo;

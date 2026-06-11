@@ -377,7 +377,7 @@ mod tests {
         // No threads to resolve must never fork `ps` or touch procfs.
         assert!(wait_channels(&[]).is_empty());
         // tid 0 resolves to nothing on every platform.
-        assert!(wait_channels(&[0]).get(&0).is_none());
+        assert!(!wait_channels(&[0]).contains_key(&0));
     }
 
     #[test]

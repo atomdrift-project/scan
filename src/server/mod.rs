@@ -55,6 +55,7 @@ pub struct ServerConfig {
     level: Option<u16>,
     /// Per-request analysis timeout in seconds. 0 disables.
     analysis_timeout_secs: u64,
+    interpret: Option<crate::interpret::InterpretConfig>,
 }
 
 /// Default per-request analysis timeout: 5 minutes. Covers cold cleave scans
@@ -133,7 +134,21 @@ impl ServerConfig {
             allow_cidrs,
             level: None,
             analysis_timeout_secs: DEFAULT_ANALYSIS_TIMEOUT_SECS,
+            interpret: None,
         })
+    }
+
+    /// Attach an LLM interpretation config (`--interpret`); `None` disables it.
+    #[must_use]
+    pub fn with_interpret(mut self, interpret: Option<crate::interpret::InterpretConfig>) -> Self {
+        self.interpret = interpret;
+        self
+    }
+
+    /// LLM interpretation config, or `None` when `--interpret` was not set.
+    #[must_use]
+    pub fn interpret(&self) -> Option<&crate::interpret::InterpretConfig> {
+        self.interpret.as_ref()
     }
 
     /// Attach the FPR severity level (0..=10000) that produced the resolved
@@ -384,6 +399,8 @@ pub(crate) struct ModelResources {
     pub(crate) model: Model,
     pub(crate) shap: Option<ShapImportance>,
     pub(crate) ctx: ExtractContext,
+    /// LLM interpretation config (`--interpret`); `None` disables the pass.
+    pub(crate) interpret: Option<crate::interpret::InterpretConfig>,
 }
 
 #[derive(Debug)]
@@ -398,6 +415,9 @@ struct AppState {
     allowed_dirs: Vec<PathBuf>,
     extract_dir: Option<PathBuf>,
     allow_cidrs: Vec<Cidr>,
+    /// LLM interpretation config (`--interpret`); shared into every
+    /// [`ModelResources`] so handlers can run the pass.
+    interpret: Option<crate::interpret::InterpretConfig>,
     /// Process uptime anchor — captured when build_app runs, very close to
     /// process start. /_/health reports `now - started_at` as uptime_secs.
     started_at: Instant,
@@ -462,6 +482,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         allowed_dirs: config.allowed_dirs().to_vec(),
         extract_dir: config.extract_dir().map(PathBuf::from),
         allow_cidrs: config.allow_cidrs().to_vec(),
+        interpret: config.interpret().cloned(),
         started_at: Instant::now(),
         ready: AtomicBool::new(false),
         init_error: RwLock::new(None),
@@ -557,7 +578,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     tracing::info!("all resources ready, installing into AppState");
                     match bg.resources.write() {
                         Ok(mut lock) => {
-                            *lock = Some(Arc::new(ModelResources { model, shap, ctx }));
+                            *lock = Some(Arc::new(ModelResources {
+                                model,
+                                shap,
+                                ctx,
+                                interpret: bg.interpret.clone(),
+                            }));
                             if let Ok(mut init_error) = bg.init_error.write() {
                                 *init_error = None;
                             }

@@ -149,6 +149,31 @@ struct Cli {
     #[arg(long, hide = true)]
     extra: bool,
 
+    /// Send non-trivial samples to a local LLM for a second opinion, blended
+    /// with the ML verdict (stored in the `llm` JSON section and shown inline)
+    #[arg(long, global = true)]
+    interpret: bool,
+
+    /// LLM endpoint base URL (env: LITMUS_OPENAI_BASE_URL)
+    #[arg(long, global = true, value_name = "URL")]
+    llm_url: Option<String>,
+
+    /// LLM model name (env: LITMUS_OPENAI_MODEL)
+    #[arg(long, global = true, value_name = "NAME")]
+    llm_model: Option<String>,
+
+    /// LLM bearer token (env: LITMUS_OPENAI_API_KEY / OPENAI_API_KEY); omit for local endpoints
+    #[arg(long, global = true, value_name = "KEY")]
+    llm_api_key: Option<String>,
+
+    /// Minimum ML probability for a sample to be sent to the LLM
+    #[arg(long, global = true, default_value_t = litmus::interpret::DEFAULT_MIN_PROB, value_name = "P")]
+    interpret_min_prob: f32,
+
+    /// Per-request LLM timeout, in seconds
+    #[arg(long, global = true, default_value_t = litmus::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
+    llm_timeout: u64,
+
     /// Paths to files or directories to scan (shorthand for `litmus scan <paths...>`)
     paths: Vec<PathBuf>,
 
@@ -157,6 +182,31 @@ struct Cli {
 }
 
 impl Cli {
+    /// Build the LLM interpretation config from `--interpret` and the `--llm-*`
+    /// flags, falling back to env vars. `None` when `--interpret` is not set.
+    fn interpret_config(&self) -> Option<litmus::interpret::InterpretConfig> {
+        if !self.interpret {
+            return None;
+        }
+        use litmus::interpret::{DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY, DEFAULT_MODEL};
+        let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
+            flag.clone()
+                .or_else(|| std::env::var(key).ok())
+                .filter(|s| !s.is_empty())
+        };
+        Some(litmus::interpret::InterpretConfig {
+            base_url: from_env(&self.llm_url, "LITMUS_OPENAI_BASE_URL")
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            model: from_env(&self.llm_model, "LITMUS_OPENAI_MODEL")
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            api_key: from_env(&self.llm_api_key, "LITMUS_OPENAI_API_KEY")
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty())),
+            min_prob: self.interpret_min_prob,
+            timeout: std::time::Duration::from_secs(self.llm_timeout),
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+        })
+    }
+
     fn selected_severity_level(&self) -> Option<u16> {
         if let Some(level) = self.level {
             return Some(level);
@@ -376,6 +426,8 @@ fn main() -> Result<()> {
     let selected_severity_level = cli.selected_severity_level();
     let threshold_suspicious = cli.threshold_suspicious;
     let threshold_hostile = cli.threshold_hostile;
+    // Resolve before `cli.command` is moved out below; only one arm uses it.
+    let interpret_cfg = cli.interpret_config();
 
     // Default to Scan when bare paths are given without a subcommand.
     let command = match cli.command {
@@ -632,7 +684,8 @@ fn main() -> Result<()> {
                 cli.slow_rule_ms,
                 cli.extra,
             )?
-            .with_level(envelope_level);
+            .with_level(envelope_level)
+            .with_interpret(interpret_cfg.clone());
             exit_for_summary(&run_scan_paths(&paths, &config)?);
         }
         Commands::Ps => {
@@ -647,7 +700,8 @@ fn main() -> Result<()> {
                 cli.slow_rule_ms,
                 cli.extra,
             )?
-            .with_level(envelope_level);
+            .with_level(envelope_level)
+            .with_interpret(interpret_cfg.clone());
             exit_for_summary(&litmus::ps::run(&config)?);
         }
         Commands::Serve {
@@ -697,7 +751,8 @@ fn main() -> Result<()> {
                 workers,
                 allow_cidrs,
             )?
-            .with_level(envelope_level);
+            .with_level(envelope_level)
+            .with_interpret(interpret_cfg.clone());
             eprintln!("Starting litmus server on http://{} ...", bind);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

@@ -305,6 +305,7 @@ fn build_result(
         cancellation,
         Some(100),
         &crate::scan::tiny_opts_for(config),
+        config.interpret(),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
@@ -333,6 +334,7 @@ fn build_result(
         sha256: group.sha256.clone(),
         embedded_files: cr.embedded_files,
         context_tiny: cr.context_tiny,
+        interpretation: cr.interpretation,
     })
 }
 
@@ -364,7 +366,7 @@ fn emit_result(
             let Ok(mut out) = stdout.lock() else {
                 return;
             };
-            crate::scan::write_tiny(&mut *out, r);
+            crate::scan::write_tiny(&mut *out, r, false);
         }
     }
 }
