@@ -685,7 +685,7 @@ fn sjf_max_staged_wait() -> Duration {
         .map_or(SJF_MAX_STAGED_WAIT, Duration::from_secs)
 }
 
-/// E1 experiment (`LITMUS_SJF=1`): take the smallest staged job, not the oldest.
+/// Size-aware dispatch (default): take the smallest staged job, not the oldest.
 ///
 /// Sweeps everything currently in the prefetch channel into `reorder` (the
 /// dispatch loop holds jobs the prefetcher has already claimed and downloaded),
@@ -693,6 +693,14 @@ fn sjf_max_staged_wait() -> Duration {
 /// past [`SJF_MAX_STAGED_WAIT`], in which case the oldest such job goes first.
 /// Blocks only when the window is empty. Returns `None` once the channel is
 /// closed *and* the window is drained, matching `recv()`'s termination contract.
+///
+/// Pairs with hopper's size-interleaved Tier 1 handout: hopper guarantees every
+/// claim batch carries a size mix, this picker guarantees the small ones go
+/// first. Measured on the realworld dataset: median small-sample flow 15.3 →
+/// 6.4 minutes at neutral wall. The known trade-off is at the tail — deferring
+/// archives clusters them wherever small jobs thin out, which raised drain-mode
+/// small p95 and peak RSS (the memory-admission gate is the backstop there).
+/// `LITMUS_SJF=0` restores FIFO dispatch.
 async fn next_smallest_staged(
     rx: &mut mpsc::UnboundedReceiver<PrefetchedJob>,
     reorder: &mut Vec<(PrefetchedJob, Instant)>,
@@ -1246,13 +1254,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<PrefetchedJob>();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let outstanding = Arc::new(AtomicUsize::new(0));
-    // E1 experiment (`LITMUS_SJF=1`): dispatch the smallest staged job first
-    // instead of FIFO, so tiny jobs stop queueing behind multi-minute archives.
-    // SJF needs a window to reorder over, so it deepens the prefetch target to
-    // 2× slots (the worker claims ahead of capacity and self-optimizes locally;
-    // hopper's handout strategy stays simple). `LITMUS_PREFETCH_DEPTH` overrides
+    // Size-aware dispatch (default on): the smallest staged job dispatches
+    // first instead of FIFO, so tiny samples stop queueing behind multi-minute
+    // archives — on the realworld benchmark with hopper's size-interleaved
+    // handout this cut the median small-sample turnaround 15.3 → 6.4 minutes
+    // at neutral wall time. SJF needs a window to reorder over, so it deepens
+    // the prefetch target to 2× slots (the worker claims ahead of capacity and
+    // self-optimizes locally; hopper's handout strategy stays simple) — a
+    // 7-point depth sweep put the knee at 1.75–2× with nothing gained beyond.
+    // `LITMUS_SJF=0` restores FIFO dispatch; `LITMUS_PREFETCH_DEPTH` overrides
     // the slots multiplier in either mode.
-    let sjf = std::env::var("LITMUS_SJF").is_ok_and(|v| v != "0");
+    let sjf = std::env::var("LITMUS_SJF").ok().is_none_or(|v| v != "0");
     let depth_factor = std::env::var("LITMUS_PREFETCH_DEPTH")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -1267,8 +1279,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     if sjf {
         tracing::info!(
             target_depth,
-            "SJF experiment active: smallest staged job dispatches first",
+            max_staged_wait_s = sjf_max_staged_wait().as_secs(),
+            "size-aware dispatch: smallest staged job first (LITMUS_SJF=0 for FIFO)",
         );
+    } else {
+        tracing::info!(target_depth, "FIFO dispatch (LITMUS_SJF=0)");
     }
 
     tokio::spawn(
