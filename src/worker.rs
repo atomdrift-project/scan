@@ -988,10 +988,13 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(slots));
     // Slot count bounds concurrency but not memory: a slot analysing a huge
     // archive holds it (plus expanded members) resident while a slot analysing a
-    // 4 KB script holds nothing. This gate caps the aggregate estimated
-    // footprint of in-flight analyses to a fraction of RAM so a burst of large
-    // archives serialises instead of co-residing and exhausting memory.
-    let admission = crate::admission::MemoryAdmission::new();
+    // 4 KB script holds nothing. This gate pauses admission on live memory
+    // pressure — at the resolved `--max-rss-gb` ceiling (default 85% of RAM) —
+    // so a burst of large archives serialises instead of co-residing and
+    // exhausting memory. It pauses and reclaims; it never kills the worker.
+    let admission = crate::admission::MemoryAdmission::new(
+        config.max_rss_gb.saturating_mul(1024 * 1024 * 1024),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(Arc::clone(&shutdown));
 
@@ -1075,7 +1078,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let poll_secs = config.poll_secs;
     let slow_rule_ms = config.slow_rule_ms;
     let max_jobs = config.max_jobs;
-    let max_rss_gb = config.max_rss_gb;
     let exit_if_empty = config.exit_if_empty;
     let encoded_name: String = url_encode(&name);
     let available_tools = crate::tools::available_names().join(",");
@@ -1424,25 +1426,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             break;
         }
 
-        // Pause dispatch under memory pressure; staged samples stay queued.
-        if max_rss_gb > 0 {
-            let max_bytes = max_rss_gb.saturating_mul(1024 * 1024 * 1024);
-            if let Some(rss) = cleave::memory_tracker::current_rss()
-                && rss > max_bytes
-            {
-                tracing::warn!(
-                    rss_mb = rss / 1024 / 1024,
-                    max_rss_mb = max_bytes / 1024 / 1024,
-                    "memory pressure: pausing dispatch",
-                );
-                admission.log_inflight("reactive RSS pause: max_rss_gb exceeded");
-                if let Err(e) = tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await {
-                    tracing::warn!(error = %e, "cache-clear task failed");
-                }
-                interruptible_sleep(Duration::from_secs(poll_secs), &shutdown).await;
-                continue;
-            }
-        }
 
         // Claim a worker slot, then take the next staged sample: work begins as
         // soon as both a free slot and a ready sample exist. An empty channel
