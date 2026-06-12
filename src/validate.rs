@@ -30,6 +30,25 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     let ctx = ExtractContext::new(model.spec());
     ctx.validate_layout().context("feature layout validation")?;
 
+    // A model whose spec declares features this build's extractor cannot
+    // produce is a hard failure in validate mode, not a warning: those slots
+    // extract to zero, so the deployed model is silently degraded relative to
+    // its training. A normal scan only WARNs here (it degrades gracefully), but
+    // a deploy gate must not let a degraded model through. Absent *optional*
+    // features — feature groups disabled at training, the normal subset case —
+    // never appear in this list, so they stay non-fatal.
+    let degraded = model.spec().degraded_feature_names();
+    if !degraded.is_empty() {
+        let preview: Vec<&str> = degraded.iter().map(String::as_str).take(10).collect();
+        anyhow::bail!(
+            "model degraded: feature_spec.json declares {} feature(s) this litmus build's \
+             extractor cannot produce, so they extract as zeros (e.g. {preview:?}); the model \
+             is out of sync with collimator — rebuild litmus with matching feature extraction \
+             before deploying",
+            degraded.len(),
+        );
+    }
+
     if skip_traits {
         // The benign-corpus inference below requires loading the cleave trait
         // corpus (the CapabilityMapper extracts features through it), which would

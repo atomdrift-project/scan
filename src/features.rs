@@ -419,14 +419,7 @@ impl FeatureSpec {
             // verify_azoth_litmus_runtime.py's exit-code gate, see
             // collimator/scripts) so CI/operator sees the degradation
             // immediately and can decide whether to add proper extraction.
-            let expected_set: std::collections::HashSet<&str> =
-                expected_feature_names.iter().map(String::as_str).collect();
-            let unknown_features: Vec<&str> = self
-                .feature_names
-                .iter()
-                .map(String::as_str)
-                .filter(|n| !expected_set.contains(*n))
-                .collect();
+            let unknown_features = self.unknown_feature_names(&expected_feature_names);
             if !unknown_features.is_empty() {
                 let preview: Vec<&str> = unknown_features.iter().copied().take(5).collect();
                 // WARN-level (not ERROR): graceful degradation, not a deploy
@@ -486,6 +479,60 @@ impl FeatureSpec {
         }
 
         Ok(())
+    }
+
+    /// Feature names this spec declares that the extractor built into this
+    /// binary does not produce. `expected` is the extractor's full
+    /// feature-name list. Each returned slot extracts to zero at runtime, so
+    /// the model receives no signal where it expects some. Empty in the normal
+    /// case (the spec is a clean subset of what the extractor knows).
+    fn unknown_feature_names<'a>(&'a self, expected: &[String]) -> Vec<&'a str> {
+        let expected_set: std::collections::HashSet<&str> =
+            expected.iter().map(String::as_str).collect();
+        self.feature_names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !expected_set.contains(*n))
+            .collect()
+    }
+
+    /// Feature names this spec declares that this build's extractor cannot
+    /// produce; each extracts to zero, silently degrading the model on those
+    /// slots relative to its training. A non-empty result means the loaded
+    /// model is degraded — `litmus validate` treats this as fatal, while a
+    /// normal scan only WARNs (the model still degrades gracefully). This is
+    /// distinct from *absent optional* features (the spec being a strict subset
+    /// of what the extractor knows, the normal case), which never appear here.
+    #[must_use]
+    pub fn degraded_feature_names(&self) -> Vec<String> {
+        let expected_feature_names = build_expected_feature_names(
+            &self.presence_vocab,
+            &self.filetype_vocab,
+            &self.element_vocab,
+            &self.bigram_vocab,
+            &self.ghost_vocab,
+            &self.skeleton_vocab,
+            &self.rare_element_vocab,
+            &self.trigram_vocab,
+            &self.metric_vocab,
+            &self.crit_unigram_vocab,
+            &self.crit_bigram_vocab,
+            &self.crit_trigram_vocab,
+            &self.attack_bigram_vocab,
+            &self.attack_trigram_vocab,
+            &self.mbc_bigram_vocab,
+            &self.mbc_trigram_vocab,
+            &self.tiered_bigram_vocab,
+            &self.tiered_trigram_vocab,
+            &self.kv_vocab,
+            &self.symbol_vocab,
+            &self.symbol_bigram_vocab,
+            &self.symbol_trigram_vocab,
+        );
+        self.unknown_feature_names(&expected_feature_names)
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
     }
 }
 
