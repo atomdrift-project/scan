@@ -1,18 +1,18 @@
-# Wolfi package definition for litmus (binary) and litmus-models (data).
+# Wolfi package definition for ascan (binary) and ascan-models (data).
 #
 # Status: LOCAL DEV ONLY. Two upstream blockers:
 #   (1) cleave depends on filefacts via a sibling path dep — same issue
 #       as cleave/packaging/wolfi/melange.yaml.
-#   (2) litmus depends on cleave via a git dep; this file fetches that
+#   (2) scan depends on cleave via a git dep; this file fetches that
 #       tag. wolfi-dev/os would prefer the cleave apk it already
 #       hosts (once (1) is resolved and cleave is upstreamed).
 #
 # The local build (`make wolfi`) bypasses both by staging cleave + filefacts
-# alongside litmus and using a Cargo `[patch]` override.
+# alongside scan and using a Cargo `[patch]` override.
 # See packaging/wolfi/README.md.
 
 package:
-  name: litmus
+  name: ascan
   version: 1.2.1
   epoch: 0
   description: ML-powered malware classification using cleave static analysis
@@ -52,27 +52,27 @@ pipeline:
   # local builds so melange's --source-dir wins. Upstream keeps it.
   - uses: git-checkout
     with:
-      repository: https://codeberg.org/atomdrift/litmus
+      repository: https://codeberg.org/atomdrift/scan
       tag: v${{package.version}}
       expected-commit: b10074a9d13dc91e5134a8f6e9e79811e77285fc
   # LOCAL_BUILD_STRIP_END
 
-  - name: Build litmus
+  - name: Build ascan
     runs: |
       set -eu
       # LOCAL_BUILD_CD_HERE  — scripts/build.sh replaces this with
-      # `cd litmus` for local builds (cleave is staged as a sibling).
-      cargo auditable build --profile release-lto --locked --bin litmus
-      install -Dm755 target/release-lto/litmus "${{targets.destdir}}/usr/bin/litmus"
+      # `cd scan` for local builds (cleave is staged as a sibling).
+      cargo auditable build --profile release-lto --locked --bin ascan
+      install -Dm755 target/release-lto/ascan "${{targets.destdir}}/usr/bin/ascan"
 
   - uses: strip
 
 subpackages:
-  - name: litmus-models
-    description: Azoth XGBoost models loaded by litmus at runtime
+  - name: ascan-models
+    description: Azoth XGBoost models loaded by ascan at runtime
     dependencies:
       runtime:
-        - litmus
+        - ascan
     pipeline:
       # LOCAL_BUILD_STRIP_BEGIN  — scripts/build.sh removes this step
       # and replaces the marker below with a copy from the host-staged
@@ -95,12 +95,12 @@ subpackages:
           # Force 0755 — melange's runs: shell inherits a restrictive
           # umask, otherwise the dir lands 0700 and the nonroot runtime
           # user (uid 65532 in apko.yaml) cannot traverse it.
-          install -d -m 0755 "${{targets.subpkgdir}}/usr/share/litmus/models/azoth"
-          cp -a models-src/. "${{targets.subpkgdir}}/usr/share/litmus/models/azoth/"
-          chmod -R a+rX "${{targets.subpkgdir}}/usr/share/litmus/models"
-          # Litmus loads via the bundle name (azoth). Sanity-check the
+          install -d -m 0755 "${{targets.subpkgdir}}/usr/share/atomdrift/scan/models/azoth"
+          cp -a models-src/. "${{targets.subpkgdir}}/usr/share/atomdrift/scan/models/azoth/"
+          chmod -R a+rX "${{targets.subpkgdir}}/usr/share/atomdrift/scan/models"
+          # Atomdrift Scan loads via the bundle name (azoth). Sanity-check the
           # presence of the manifest file before we ship.
-          test -f "${{targets.subpkgdir}}/usr/share/litmus/models/azoth/config.json" \
+          test -f "${{targets.subpkgdir}}/usr/share/atomdrift/scan/models/azoth/config.json" \
             || { echo "ERROR: azoth config.json missing" >&2; exit 1; }
 
 test:
@@ -108,12 +108,12 @@ test:
     - name: Version reports correctly
       runs: |
         set -euo pipefail
-        litmus --version
-        litmus --version | grep -q '1\.2\.1'
+        ascan --version
+        ascan --version | grep -q '1\.2\.1'
     - name: Help works
       runs: |
         set -euo pipefail
-        litmus --help >/dev/null
+        ascan --help >/dev/null
 
 update:
   enabled: true

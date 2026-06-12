@@ -39,7 +39,7 @@ const MIB: u64 = 1024 * 1024;
 /// each source member spawns a tree-sitter parse tree, so a slot's true peak is
 /// wildly file-dependent and routinely far above its on-disk size; a flat,
 /// deliberately pessimistic estimate bounds concurrency safely without pretending
-/// to predict per-file blowup. Override with `LITMUS_PER_SLOT_ESTIMATE_MB`.
+/// to predict per-file blowup. Override with `SCAN_PER_SLOT_ESTIMATE_MB`.
 const DEFAULT_PER_SLOT_ESTIMATE_BYTES: usize = 1536 * 1024 * 1024;
 
 /// Re-poll interval while waiting for memory to free (bounds feedback latency
@@ -100,7 +100,7 @@ impl MemoryAdmission {
     /// auto = 85% of RAM); `0` disables proactive throttling so an operator who
     /// opts out, or an unsupported platform, degrades to slot-limited dispatch.
     pub fn new(ceiling_bytes: u64) -> Arc<Self> {
-        let est_bytes = env_usize("LITMUS_PER_SLOT_ESTIMATE_MB")
+        let est_bytes = env_usize("SCAN_PER_SLOT_ESTIMATE_MB")
             .and_then(|mb| mb.checked_mul(1024 * 1024))
             .filter(|b| *b > 0)
             .unwrap_or(DEFAULT_PER_SLOT_ESTIMATE_BYTES);

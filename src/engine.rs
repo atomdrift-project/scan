@@ -109,7 +109,7 @@ impl ScanConfig {
     ///
     /// # Example
     /// ```
-    /// use litmus::{DisplayFilter, OutputFormat, ScanConfig, Thresholds};
+    /// use scan::{DisplayFilter, OutputFormat, ScanConfig, Thresholds};
     ///
     /// let config = ScanConfig::new(
     ///     "/path/to/models",
@@ -1292,11 +1292,11 @@ pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
 pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
     let class = r.classification.to_string();
     let verdict = if matches!(r.classification, Classification::Benign) {
-        format!("litmus {class} confidence={:.3}\n", r.probability)
+        format!("ascan {class} confidence={:.3}\n", r.probability)
     } else {
         let fp_level = r.level.map_or_else(|| "-".to_string(), |n| format!("L{n}"));
         format!(
-            "litmus {class} confidence={:.3} fp-level={fp_level}\n",
+            "ascan {class} confidence={:.3} fp-level={fp_level}\n",
             r.probability,
         )
     };

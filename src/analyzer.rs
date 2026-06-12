@@ -12,7 +12,7 @@
 //!
 //! # Example
 //! ```no_run
-//! use litmus::Analyzer;
+//! use scan::Analyzer;
 //!
 //! let analyzer = Analyzer::load("/path/to/models")?;
 //! let result = analyzer.scan_bytes(b"#!/bin/sh\necho hi".to_vec(), "install.sh")?;
@@ -27,7 +27,7 @@ use anyhow::Result;
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
-use crate::scan::{self, ScanResult, ScanSummary};
+use crate::engine::{self, ScanResult, ScanSummary};
 use crate::{DisplayFilter, OutputFormat, ScanConfig};
 
 /// Bundled analyzer holding everything needed to classify a payload.
@@ -68,7 +68,7 @@ impl Analyzer {
         let shap = ShapImportance::load(&model_dir).ok();
         // Library callers always get the full cleave report attached to the
         // ScanResult (`OutputFormat::Json`); humans calling the CLI go
-        // through `scan::run` directly, which builds its own config.
+        // through `engine::run` directly, which builds its own config.
         let config = ScanConfig::new(
             model_dir.clone(),
             OutputFormat::Json,
@@ -143,7 +143,7 @@ impl Analyzer {
     /// # Errors
     /// Propagates cleave analysis failures and model inference errors.
     pub fn scan_bytes(&self, data: Vec<u8>, filename: &str) -> Result<ScanResult> {
-        scan::scan_bytes(
+        engine::scan_bytes(
             data,
             filename,
             &self.model,
@@ -159,7 +159,7 @@ impl Analyzer {
     /// # Errors
     /// Propagates filesystem errors and cleave analysis failures.
     pub fn scan_path(&self, path: &Path) -> Result<ScanSummary> {
-        scan::run(path, &self.config)
+        engine::run(path, &self.config)
     }
 
     fn rebuild_config(
@@ -185,13 +185,13 @@ mod tests {
     use super::*;
 
     /// `Analyzer::load` needs real model artifacts on disk, so this test is
-    /// `#[ignore]` by default — run with `LITMUS_MODELS_DIR=... cargo test
+    /// `#[ignore]` by default — run with `SCAN_MODELS_DIR=... cargo test
     /// -- --ignored analyzer_loads_and_scans` to exercise it.
     #[test]
     #[ignore]
     fn analyzer_loads_and_scans() {
-        let dir = std::env::var("LITMUS_MODELS_DIR")
-            .expect("set LITMUS_MODELS_DIR to a populated model directory");
+        let dir = std::env::var("SCAN_MODELS_DIR")
+            .expect("set SCAN_MODELS_DIR to a populated model directory");
         let analyzer = Analyzer::load(dir).expect("load");
         let r = analyzer
             .scan_bytes(b"#!/bin/sh\necho hi\n".to_vec(), "install.sh")

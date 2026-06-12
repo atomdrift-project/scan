@@ -12,8 +12,8 @@
 //! (azoth models) and [`traits_ref`] reads `cleave.toml` (cleave traits).
 //!
 //! The opt-out is honored everywhere: pass `--no-update-check` or set
-//! `LITMUS_NO_UPDATE_CHECK` to disable the notice. The base URL is overridable
-//! via `LITMUS_UPDATE_URL` (primarily for testing against a local server).
+//! `SCAN_NO_UPDATE_CHECK` to disable the notice. The base URL is overridable
+//! via `SCAN_UPDATE_URL` (primarily for testing against a local server).
 
 use crate::update_manifest::{self, Manifest};
 use anyhow::{Context, Result};
@@ -29,9 +29,9 @@ const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 /// never noticeably delay a command, and an offline host should fail fast.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Resolve the manifest base URL (overridable via `LITMUS_UPDATE_URL`).
+/// Resolve the manifest base URL (overridable via `SCAN_UPDATE_URL`).
 fn base_url() -> String {
-    std::env::var("LITMUS_UPDATE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned())
+    std::env::var("SCAN_UPDATE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned())
 }
 
 /// Build the URL for a named manifest. Apply-time fetches set the `?update=1`
@@ -50,7 +50,7 @@ fn fetch(name: &str, marker: bool) -> Result<Manifest> {
     let client = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .connect_timeout(FETCH_TIMEOUT)
-        .user_agent(concat!("litmus/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("ascan/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building update-check HTTP client")?;
     let text = client
@@ -76,9 +76,14 @@ struct Cache {
     url: Option<String>,
 }
 
-/// Path to the notice cache (`<cache_dir>/litmus/update-check.toml`).
+/// Path to the notice cache (`<cache_dir>/atomdrift/scan/update-check.toml`).
 fn cache_path() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("litmus").join("update-check.toml"))
+    Some(
+        dirs::cache_dir()?
+            .join("atomdrift")
+            .join("scan")
+            .join("update-check.toml"),
+    )
 }
 
 /// Current Unix time in seconds (0 if the clock predates the epoch).
@@ -113,9 +118,9 @@ fn notify(latest: &str, url: Option<&str>, installed: &str) {
     }
     match url {
         Some(url) => {
-            eprintln!("update available: litmus {latest} (you have {installed}) — {url}");
+            eprintln!("update available: Atomdrift Scan {latest} (you have {installed}) — {url}");
         }
-        None => eprintln!("update available: litmus {latest} (you have {installed})"),
+        None => eprintln!("update available: Atomdrift Scan {latest} (you have {installed})"),
     }
 }
 
@@ -127,7 +132,7 @@ fn notify(latest: &str, url: Option<&str>, installed: &str) {
 /// parse failure is logged at debug level and otherwise ignored — the check is
 /// strictly best-effort and never blocks or fails a command.
 pub fn maybe_notify(disabled_by_flag: bool) {
-    if disabled_by_flag || std::env::var_os("LITMUS_NO_UPDATE_CHECK").is_some() {
+    if disabled_by_flag || std::env::var_os("SCAN_NO_UPDATE_CHECK").is_some() {
         return;
     }
     let installed = env!("CARGO_PKG_VERSION");
@@ -220,7 +225,7 @@ mod tests {
     #[test]
     fn manifest_url_joins_and_marks() {
         // SAFETY: the test binary is single-threaded at this point.
-        unsafe { std::env::set_var("LITMUS_UPDATE_URL", "https://example.test/u/") };
+        unsafe { std::env::set_var("SCAN_UPDATE_URL", "https://example.test/u/") };
         assert_eq!(
             manifest_url("litmus.toml", false),
             "https://example.test/u/litmus.toml"
@@ -231,11 +236,11 @@ mod tests {
         );
 
         // A base without a trailing slash still joins correctly.
-        unsafe { std::env::set_var("LITMUS_UPDATE_URL", "https://example.test/u") };
+        unsafe { std::env::set_var("SCAN_UPDATE_URL", "https://example.test/u") };
         assert_eq!(
             manifest_url("cleave.toml", false),
             "https://example.test/u/cleave.toml"
         );
-        unsafe { std::env::remove_var("LITMUS_UPDATE_URL") };
+        unsafe { std::env::remove_var("SCAN_UPDATE_URL") };
     }
 }

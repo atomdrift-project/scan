@@ -5,8 +5,8 @@
 //! real claim → prefetch → analyze → result-post path with no external hopper:
 //!
 //! ```text
-//! litmus-bench-hopper --dataset ~/data/benchmark/realworld-small --port 8090
-//! litmus worker --url http://127.0.0.1:8090 --data-dir ~/data/benchmark/realworld-small \
+//! scan-bench-hopper --dataset ~/data/benchmark/realworld-small --port 8090
+//! ascan worker --url http://127.0.0.1:8090 --data-dir ~/data/benchmark/realworld-small \
 //!     --workers 12 --max-jobs <file-count>
 //! ```
 //!
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use litmus::bench_hopper::{BenchHopper, Order};
+use scan::bench_hopper::{BenchHopper, Order};
 
 #[derive(Parser)]
 #[command(about = "Mock hopper serving a local dataset for worker benchmarks")]

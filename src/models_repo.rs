@@ -1,22 +1,22 @@
 //! Locates the model bundle and installs/updates it from the R2 bundle.
 //!
 //! Models are distributed as signed `.tar.zst` bundles from the update bucket —
-//! see [`crate::model_update`], which `litmus update-rules` drives. This module
+//! see [`crate::model_update`], which `ascan update-rules` drives. This module
 //! handles *resolution* (where the bundle lives) and the first-run bootstrap
 //! install. The bundle root *is* what [`crate::model::Model::load`] reads:
 //! `feature_spec.json` + `model.onnx` (or `models/seed_*.onnx`) at the top, or a
 //! `general/` ensemble subdirectory. No git.
 //!
-//! On-disk layout under `dirs::data_dir()/litmus/models/<bundle>` where
-//! `<bundle>` comes from the last path segment of `LITMUS_MODELS_REPO`
+//! On-disk layout under `dirs::data_dir()/atomdrift/scan/models/<bundle>` where
+//! `<bundle>` comes from the last path segment of `SCAN_MODELS_REPO`
 //! (`.../azoth.git` → `azoth`), so a per-filetype variant lands at a sibling dir.
 //!
 //! Resolution order:
-//! 1. `LITMUS_MODELS_DIR` env var (a ready-to-load bundle directory)
+//! 1. `SCAN_MODELS_DIR` env var (a ready-to-load bundle directory)
 //! 2. The bundle directory derived from the upstream URL (bootstrapped if missing)
 //!
 //! For development, symlink the bundle path to a local working tree:
-//!   ln -sfn ~/dev/atomdrift/azoth ~/.local/share/litmus/models/azoth
+//!   ln -sfn ~/dev/atomdrift/azoth ~/.local/share/atomdrift/scan/models/azoth
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -36,18 +36,18 @@ const MODEL_FILES: &[&str] = &["model.onnx"];
 /// used now — to derive the on-disk bundle directory name.
 ///
 /// Resolution order:
-/// 1. `LITMUS_MODELS_REPO=URL#ref` — the trailing fragment, if present, is the ref.
-/// 2. `LITMUS_MODELS_REF=...` — used only if no `#ref` is embedded in the URL.
+/// 1. `SCAN_MODELS_REPO=URL#ref` — the trailing fragment, if present, is the ref.
+/// 2. `SCAN_MODELS_REF=...` — used only if no `#ref` is embedded in the URL.
 /// 3. Built-in default URL.
 fn configured_repo() -> (String, String) {
     let raw =
-        std::env::var("LITMUS_MODELS_REPO").unwrap_or_else(|_| DEFAULT_MODELS_REPO_URL.to_owned());
+        std::env::var("SCAN_MODELS_REPO").unwrap_or_else(|_| DEFAULT_MODELS_REPO_URL.to_owned());
     let (url, embedded_ref) = match raw.rsplit_once('#') {
         Some((url, ref_name)) => (url.to_owned(), Some(ref_name.to_owned())),
         None => (raw, None),
     };
     let ref_name = embedded_ref
-        .or_else(|| std::env::var("LITMUS_MODELS_REF").ok())
+        .or_else(|| std::env::var("SCAN_MODELS_REF").ok())
         .unwrap_or_else(|| REMOTE_DEFAULT_REF.to_owned());
     (url, ref_name)
 }
@@ -56,13 +56,13 @@ fn configured_repo() -> (String, String) {
 ///
 /// Returns the path suitable for [`crate::model::Model::load`].
 pub fn model_dir() -> Result<PathBuf> {
-    if let Ok(explicit) = std::env::var("LITMUS_MODELS_DIR") {
+    if let Ok(explicit) = std::env::var("SCAN_MODELS_DIR") {
         let p = PathBuf::from(&explicit);
         if p.is_dir() {
-            tracing::debug!("Using models from LITMUS_MODELS_DIR={}", p.display());
+            tracing::debug!("Using models from SCAN_MODELS_DIR={}", p.display());
             return Ok(p);
         }
-        anyhow::bail!("LITMUS_MODELS_DIR={explicit} does not exist");
+        anyhow::bail!("SCAN_MODELS_DIR={explicit} does not exist");
     }
 
     let data_dir = default_models_dir();
@@ -71,7 +71,7 @@ pub fn model_dir() -> Result<PathBuf> {
         return Ok(data_dir);
     }
 
-    eprintln!("First run: downloading litmus models...");
+    eprintln!("First run: downloading Atomdrift Scan models...");
     crate::model_update::update(&data_dir, false)
         .with_context(|| format!("failed to install models to {}", data_dir.display()))?;
     Ok(data_dir)
@@ -84,21 +84,22 @@ pub fn version() -> Option<String> {
         .map(|i| i.commit.chars().take(12).collect())
 }
 
-/// Directory the updater should install into: `LITMUS_MODELS_DIR` override or
+/// Directory the updater should install into: `SCAN_MODELS_DIR` override or
 /// the default bundle path. Public, and doesn't require the dir to exist.
 #[must_use]
 pub fn install_target() -> PathBuf {
     current_models_dir()
 }
 
-/// Default on-disk path for the model bundle: `<data_dir>/litmus/models/<bundle>`,
+/// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/<bundle>`,
 /// where `<bundle>` is the last path segment of the configured upstream URL.
 fn default_models_dir() -> PathBuf {
     let (url, _) = configured_repo();
     let bundle = bundle_name_from_url(&url).unwrap_or_else(|| "azoth".to_owned());
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("litmus")
+        .join("atomdrift")
+        .join("scan")
         .join("models")
         .join(bundle)
 }
@@ -120,7 +121,7 @@ fn bundle_name_from_url(url: &str) -> Option<String> {
 
 /// Resolve the models directory currently in use (without bootstrapping).
 fn current_models_dir() -> PathBuf {
-    if let Ok(explicit) = std::env::var("LITMUS_MODELS_DIR") {
+    if let Ok(explicit) = std::env::var("SCAN_MODELS_DIR") {
         return PathBuf::from(explicit);
     }
     default_models_dir()
@@ -251,49 +252,49 @@ mod tests {
     fn configured_repo_splits_url_fragment() {
         // SAFETY: env-var manipulation in tests; these vars are only read here.
         unsafe {
-            let saved_repo = std::env::var("LITMUS_MODELS_REPO").ok();
-            let saved_ref = std::env::var("LITMUS_MODELS_REF").ok();
+            let saved_repo = std::env::var("SCAN_MODELS_REPO").ok();
+            let saved_ref = std::env::var("SCAN_MODELS_REF").ok();
 
-            std::env::set_var("LITMUS_MODELS_REPO", "https://example.com/foo.git#v3");
-            std::env::set_var("LITMUS_MODELS_REF", "v9");
+            std::env::set_var("SCAN_MODELS_REPO", "https://example.com/foo.git#v3");
+            std::env::set_var("SCAN_MODELS_REF", "v9");
             let (url, r) = configured_repo();
             assert_eq!(url, "https://example.com/foo.git");
             assert_eq!(r, "v3");
 
-            std::env::set_var("LITMUS_MODELS_REPO", "https://example.com/bar.git");
-            std::env::set_var("LITMUS_MODELS_REF", "v9");
+            std::env::set_var("SCAN_MODELS_REPO", "https://example.com/bar.git");
+            std::env::set_var("SCAN_MODELS_REF", "v9");
             let (url, r) = configured_repo();
             assert_eq!(url, "https://example.com/bar.git");
             assert_eq!(r, "v9");
 
-            std::env::remove_var("LITMUS_MODELS_REPO");
-            std::env::remove_var("LITMUS_MODELS_REF");
+            std::env::remove_var("SCAN_MODELS_REPO");
+            std::env::remove_var("SCAN_MODELS_REF");
             let (_, r) = configured_repo();
             assert_eq!(r, "");
 
             match saved_repo {
-                Some(v) => std::env::set_var("LITMUS_MODELS_REPO", v),
-                None => std::env::remove_var("LITMUS_MODELS_REPO"),
+                Some(v) => std::env::set_var("SCAN_MODELS_REPO", v),
+                None => std::env::remove_var("SCAN_MODELS_REPO"),
             }
             match saved_ref {
-                Some(v) => std::env::set_var("LITMUS_MODELS_REF", v),
-                None => std::env::remove_var("LITMUS_MODELS_REF"),
+                Some(v) => std::env::set_var("SCAN_MODELS_REF", v),
+                None => std::env::remove_var("SCAN_MODELS_REF"),
             }
         }
     }
 
     #[test]
     fn env_var_overrides_default() {
-        // SAFETY: set_var is unsound under parallel test execution; LITMUS_MODELS_DIR
+        // SAFETY: set_var is unsound under parallel test execution; SCAN_MODELS_DIR
         // is only read here.
         unsafe {
-            let original = std::env::var("LITMUS_MODELS_DIR").ok();
-            std::env::set_var("LITMUS_MODELS_DIR", "/tmp/test-models");
+            let original = std::env::var("SCAN_MODELS_DIR").ok();
+            std::env::set_var("SCAN_MODELS_DIR", "/tmp/test-models");
             let result = current_models_dir();
             assert_eq!(result, PathBuf::from("/tmp/test-models"));
             match original {
-                Some(v) => std::env::set_var("LITMUS_MODELS_DIR", v),
-                None => std::env::remove_var("LITMUS_MODELS_DIR"),
+                Some(v) => std::env::set_var("SCAN_MODELS_DIR", v),
+                None => std::env::remove_var("SCAN_MODELS_DIR"),
             }
         }
     }

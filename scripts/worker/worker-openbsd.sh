@@ -1,5 +1,5 @@
 #!/bin/sh
-# worker-openbsd.sh - Deploy litmus worker on OpenBSD
+# worker-openbsd.sh - Deploy Atomdrift Scan worker on OpenBSD
 # Usage: ./worker-openbsd.sh <url>
 # Runs on the local machine. Re-run to update.
 # Must be invoked from the repository root.
@@ -17,9 +17,9 @@ WORKERS="${WORKERS:-}"
 worker_args="worker --url $URL"
 [ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
 
-BINARY=litmus
+BINARY=ascan
 BIN_DIR="$HOME/bin"
-LOG="$HOME/.local/share/litmus/litmus-worker.log"
+LOG="$HOME/.local/share/atomdrift/scan/ascan-worker.log"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -45,12 +45,12 @@ if ! cmp -s "target/release/$BINARY" "$BIN_DIR/$BINARY" 2>/dev/null; then
 fi
 
 log "Installing cron entry"
-cron_cmd="* * * * * pgrep -af 'litmus worker' >/dev/null 2>&1 || { ulimit -d \$(ulimit -Hd); nohup $BIN_DIR/$BINARY $worker_args < /dev/null >> $LOG 2>&1 & }"
-(crontab -l 2>/dev/null | grep -v "litmus worker" || true; echo "$cron_cmd") | crontab -
+cron_cmd="* * * * * pgrep -af 'ascan worker' >/dev/null 2>&1 || { ulimit -d \$(ulimit -Hd); nohup $BIN_DIR/$BINARY $worker_args < /dev/null >> $LOG 2>&1 & }"
+(crontab -l 2>/dev/null | grep -v "ascan worker" || true; echo "$cron_cmd") | crontab -
 
 if [ "$restart_needed" -eq 1 ]; then
-    log "Restarting litmus worker"
-    pkill -f "litmus worker" 2>/dev/null || true
+    log "Restarting ascan worker"
+    pkill -f "ascan worker" 2>/dev/null || true
     sleep 1
     nohup "$BIN_DIR/$BINARY" $worker_args < /dev/null >> "$LOG" 2>&1 &
 else

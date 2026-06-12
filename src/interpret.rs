@@ -21,7 +21,7 @@ use serde::Serialize;
 use crate::model::Classification;
 
 /// Default OpenAI-compatible endpoint — a local server (override with `--llm`
-/// or `LITMUS_LLM`).
+/// or `SCAN_LLM`).
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
 /// Default model name (the dense Qwen the pipeline targets).
 pub const DEFAULT_MODEL: &str = "Qwen/Qwen3.6-27B";
@@ -468,7 +468,7 @@ impl CallError {
 fn request(cfg: &InterpretConfig, user: &str) -> std::result::Result<(LlmGrade, String), CallError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(cfg.timeout)
-        .user_agent(concat!("litmus/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("ascan/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building LLM HTTP client")
         .map_err(CallError::Transport)?;
@@ -538,7 +538,7 @@ fn request(cfg: &InterpretConfig, user: &str) -> std::result::Result<(LlmGrade, 
 fn probe_endpoint(cfg: &InterpretConfig) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(cfg.timeout.min(HEALTH_PROBE_TIMEOUT))
-        .user_agent(concat!("litmus/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("ascan/", env!("CARGO_PKG_VERSION")))
         .build()
     else {
         return false;
@@ -579,7 +579,8 @@ fn prompt_hash(model: &str, user: &str) -> String {
 fn cache_path(hash: &str) -> Option<PathBuf> {
     Some(
         dirs::cache_dir()?
-            .join("litmus")
+            .join("atomdrift")
+            .join("scan")
             .join("interpret")
             .join(format!("{hash}.json")),
     )

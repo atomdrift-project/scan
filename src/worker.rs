@@ -630,7 +630,7 @@ fn spawn_resource_renewal_task(
 // rayon threads stay capped at the pool size (not `slots × per-slot-threads`),
 // which in turn caps cleave's per-thread YARA scanners.
 
-/// Benchmark-only A/B switch. When `LITMUS_PER_SLOT_POOLS` is set, analyses run
+/// Benchmark-only A/B switch. When `SCAN_PER_SLOT_POOLS` is set, analyses run
 /// on a grid of `slots` isolated rayon pools (the pre-Phase-2 model) instead of
 /// the shared global pool, so both thread models can be measured on one binary
 /// against the same dataset. Default (`None`) is the shared-pool model — this
@@ -639,10 +639,10 @@ static LEGACY_PER_SLOT_GRID: OnceLock<Option<Vec<Arc<rayon::ThreadPool>>>> = Onc
 
 /// Initialise the A/B grid once, from `run`. Builds `slots` pools of
 /// `max(global_threads / slots, 4)` threads (the old `threads_per_slot` floor)
-/// only when `LITMUS_PER_SLOT_POOLS` is set; otherwise records `None`.
+/// only when `SCAN_PER_SLOT_POOLS` is set; otherwise records `None`.
 #[allow(clippy::expect_used)]
 fn init_legacy_grid(slots: usize, global_threads: usize) -> bool {
-    let grid = std::env::var_os("LITMUS_PER_SLOT_POOLS").map(|_| {
+    let grid = std::env::var_os("SCAN_PER_SLOT_POOLS").map(|_| {
         let per = (global_threads / slots.max(1)).max(4);
         (0..slots.max(1))
             .map(|i| {
@@ -672,13 +672,13 @@ fn init_legacy_grid(slots: usize, global_threads: usize) -> bool {
 /// the oldest-aged-first rule then preempted every small job — dispatch
 /// degenerated to FIFO and the SJF latency win vanished. 15 minutes keeps the
 /// guarantee (no archive waits forever behind a small-job stream) without
-/// re-creating the starvation SJF exists to fix. `LITMUS_SJF_MAX_WAIT_SECS`
+/// re-creating the starvation SJF exists to fix. `SCAN_SJF_MAX_WAIT_SECS`
 /// overrides for experiments.
 const SJF_MAX_STAGED_WAIT: Duration = Duration::from_secs(900);
 
 /// Resolved aging bound: [`SJF_MAX_STAGED_WAIT`] unless overridden.
 fn sjf_max_staged_wait() -> Duration {
-    std::env::var("LITMUS_SJF_MAX_WAIT_SECS")
+    std::env::var("SCAN_SJF_MAX_WAIT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|s| *s > 0)
@@ -700,7 +700,7 @@ fn sjf_max_staged_wait() -> Duration {
 /// 6.4 minutes at neutral wall. The known trade-off is at the tail — deferring
 /// archives clusters them wherever small jobs thin out, which raised drain-mode
 /// small p95 and peak RSS (the memory-admission gate is the backstop there).
-/// `LITMUS_SJF=0` restores FIFO dispatch.
+/// `SCAN_SJF=0` restores FIFO dispatch.
 async fn next_smallest_staged(
     rx: &mut mpsc::UnboundedReceiver<PrefetchedJob>,
     reorder: &mut Vec<(PrefetchedJob, Instant)>,
@@ -739,14 +739,14 @@ async fn next_smallest_staged(
     Some(reorder.swap_remove(idx).0)
 }
 
-/// E4 experiment (`LITMUS_LITTLE_POOL=1`): a tiny dedicated rayon pool for
+/// E4 experiment (`SCAN_LITTLE_POOL=1`): a tiny dedicated rayon pool for
 /// small jobs, so a 2000-member archive's task fan-out on the shared global
 /// pool can't crowd out a script that needs milliseconds of CPU. The little:big
 /// analogue at the thread-pool level — slot scheduling alone can't fix this,
 /// because a small job *holding a slot* still queues its parallel work behind
 /// the archive's tasks. `None` (the default) routes everything to the shared
-/// pool. Size threshold: `LITMUS_LITTLE_MAX_MB` (default 16); thread count:
-/// `LITMUS_LITTLE_THREADS` (default 2 — small files gain nothing from wide
+/// pool. Size threshold: `SCAN_LITTLE_MAX_MB` (default 16); thread count:
+/// `SCAN_LITTLE_THREADS` (default 2 — small files gain nothing from wide
 /// parallelism). Stacks match the global pool's 256 MB (cleave recursion).
 static LITTLE_POOL: OnceLock<Option<(rayon::ThreadPool, u64)>> = OnceLock::new();
 
@@ -754,15 +754,15 @@ static LITTLE_POOL: OnceLock<Option<(rayon::ThreadPool, u64)>> = OnceLock::new()
 fn little_pool_for(input_bytes: u64) -> Option<&'static rayon::ThreadPool> {
     let (pool, max_bytes) = LITTLE_POOL
         .get_or_init(|| {
-            std::env::var("LITMUS_LITTLE_POOL")
+            std::env::var("SCAN_LITTLE_POOL")
                 .is_ok_and(|v| v != "0")
                 .then(|| {
-                    let max_mb = std::env::var("LITMUS_LITTLE_MAX_MB")
+                    let max_mb = std::env::var("SCAN_LITTLE_MAX_MB")
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
                         .filter(|mb| *mb > 0)
                         .unwrap_or(16);
-                    let threads = std::env::var("LITMUS_LITTLE_THREADS")
+                    let threads = std::env::var("SCAN_LITTLE_THREADS")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
                         .filter(|t| *t > 0)
@@ -828,7 +828,7 @@ struct ResultPayload {
     // struct once into HTTP body bytes; the prior shape allocated an intermediate
     // Value tree via `serde_json::to_value(&envelope.ml)` on every result post.
     #[serde(skip_serializing_if = "Option::is_none")]
-    ml: Option<crate::scan::MlSection>,
+    ml: Option<crate::engine::MlSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     raw: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1154,7 +1154,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             slots,
             threads_per_slot = per,
             total_worker_threads = slots.saturating_mul(per),
-            "LITMUS_PER_SLOT_POOLS A/B: legacy per-slot grid active (pre-Phase-2 model)",
+            "SCAN_PER_SLOT_POOLS A/B: legacy per-slot grid active (pre-Phase-2 model)",
         );
     } else {
         tracing::info!(
@@ -1262,10 +1262,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // the prefetch target to 2× slots (the worker claims ahead of capacity and
     // self-optimizes locally; hopper's handout strategy stays simple) — a
     // 7-point depth sweep put the knee at 1.75–2× with nothing gained beyond.
-    // `LITMUS_SJF=0` restores FIFO dispatch; `LITMUS_PREFETCH_DEPTH` overrides
+    // `SCAN_SJF=0` restores FIFO dispatch; `SCAN_PREFETCH_DEPTH` overrides
     // the slots multiplier in either mode.
-    let sjf = std::env::var("LITMUS_SJF").ok().is_none_or(|v| v != "0");
-    let depth_factor = std::env::var("LITMUS_PREFETCH_DEPTH")
+    let sjf = std::env::var("SCAN_SJF").ok().is_none_or(|v| v != "0");
+    let depth_factor = std::env::var("SCAN_PREFETCH_DEPTH")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|f| *f >= 1.0)
@@ -1280,10 +1280,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         tracing::info!(
             target_depth,
             max_staged_wait_s = sjf_max_staged_wait().as_secs(),
-            "size-aware dispatch: smallest staged job first (LITMUS_SJF=0 for FIFO)",
+            "size-aware dispatch: smallest staged job first (SCAN_SJF=0 for FIFO)",
         );
     } else {
-        tracing::info!(target_depth, "FIFO dispatch (LITMUS_SJF=0)");
+        tracing::info!(target_depth, "FIFO dispatch (SCAN_SJF=0)");
     }
 
     tokio::spawn(
@@ -1317,10 +1317,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let outstanding = Arc::clone(&outstanding);
         let queued_bytes = Arc::clone(&queued_bytes);
         let shutdown = Arc::clone(&shutdown);
-        // Default 60 s; `LITMUS_HEARTBEAT_SECS` lowers it (min 1 s) so a short
+        // Default 60 s; `SCAN_HEARTBEAT_SECS` lowers it (min 1 s) so a short
         // benchmark run still emits a usable rss / active-slot time series.
         let heartbeat = Duration::from_secs(
-            std::env::var("LITMUS_HEARTBEAT_SECS")
+            std::env::var("SCAN_HEARTBEAT_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .map_or(60, |s| s.max(1)),
@@ -1341,8 +1341,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 std::collections::HashSet::new();
             // Slots whose analysis has run past this long are flagged as stuck and
             // logged at WARN so a wedge stands out in the stream. Tunable via
-            // `LITMUS_STUCK_WARN_SECS` (min 1) for noisy shards or test runs.
-            let stuck_warn_secs = std::env::var("LITMUS_STUCK_WARN_SECS")
+            // `SCAN_STUCK_WARN_SECS` (min 1) for noisy shards or test runs.
+            let stuck_warn_secs = std::env::var("SCAN_STUCK_WARN_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .map_or(300, |s| s.max(1));
@@ -1999,7 +1999,7 @@ async fn run_job(
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
     prefetched: std::result::Result<Option<Vec<u8>>, PrefetchError>,
-) -> Result<(crate::scan::MlSection, serde_json::Value, i64), String> {
+) -> Result<(crate::engine::MlSection, serde_json::Value, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     // `Arc<str>` so the watcher and the blocking closure share the basename
     // allocation instead of each cloning a fresh `String`.
@@ -2331,7 +2331,7 @@ async fn post_result(
     url: &str,
     worker: &str,
     sha256: &str,
-    result: Result<(crate::scan::MlSection, serde_json::Value, i64), String>,
+    result: Result<(crate::engine::MlSection, serde_json::Value, i64), String>,
 ) {
     let payload = match result {
         Ok((ml, raw, duration_ms)) => {

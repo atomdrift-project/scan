@@ -4,7 +4,7 @@
 use std::sync::{LazyLock, RwLock};
 
 use crate::model::{Classification, RouteScore};
-use crate::scan::{ScanResult, ScanSummary, level_confidence};
+use crate::engine::{ScanResult, ScanSummary, level_confidence};
 
 const BLOCK: &str = "\u{2588}";
 
@@ -104,7 +104,7 @@ static THEME: LazyLock<RwLock<Option<Theme>>> = LazyLock::new(|| RwLock::new(Non
 
 /// Detect the terminal theme, with env var override.
 ///
-/// Priority: `LITMUS_THEME` env var > terminal query > default (dark).
+/// Priority: `SCAN_THEME` env var > terminal query > default (dark).
 pub fn detect_theme() -> Theme {
     if let Ok(theme) = THEME.read()
         && let Some(theme) = *theme
@@ -112,7 +112,7 @@ pub fn detect_theme() -> Theme {
         return theme;
     }
 
-    let detected = if let Ok(val) = std::env::var("LITMUS_THEME") {
+    let detected = if let Ok(val) = std::env::var("SCAN_THEME") {
         match val.to_ascii_lowercase().as_str() {
             "light" | "white" => Theme::Light,
             _ => Theme::Dark,
@@ -476,7 +476,7 @@ pub fn print_ps_result(
     );
 
     if let Some(llm) = &result.interpretation {
-        eprint!("    {}", crate::scan::format_llm_line(llm, true));
+        eprint!("    {}", crate::engine::format_llm_line(llm, true));
     }
     print_detail_lines(result, p);
     print_reasons(result, p);

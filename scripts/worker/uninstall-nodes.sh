@@ -1,5 +1,5 @@
 #!/bin/sh
-# uninstall-nodes.sh - Remove litmus worker persistence from remote nodes via SSH
+# uninstall-nodes.sh - Remove Atomdrift Scan worker persistence from remote nodes via SSH
 # Usage: ./uninstall-nodes.sh <node> [node ...]
 
 if [ $# -eq 0 ]; then
@@ -13,7 +13,7 @@ for node in "$@"; do
     printf "==> [%s] uninstalling ...\n" "$node"
     start=$(date +%s)
 
-    ssh -t "$node" "uname -a && cd litmus && git pull && make uninstall-worker"
+    ssh -t "$node" "uname -a && cd scan && git pull && make uninstall-worker"
     exit_code=$?
 
     elapsed=$(( $(date +%s) - start ))

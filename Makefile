@@ -1,8 +1,8 @@
 SHELL := /bin/sh
-BINARY = litmus
+BINARY = ascan
 OUT_DIR = out
 BUILD ?= build
-SERVER_RUN ?= litmus
+SERVER_RUN ?= ascan
 WORKER_RUN ?= litworker
 DATASET ?= slow
 
@@ -73,6 +73,11 @@ release: check-cargo $(OUT_DIR)
 MANIFEST_GEN ?= ../cleave/tools/manifest-gen
 TRAITS ?= ../azoth
 R2_REMOTE ?= atomdrift-updates:atomdrift-updates
+# Published model-distribution channel path. Intentionally NOT rebranded to
+# `ascan`: existing release bundles and clients already resolve models under
+# this prefix, and `--engine-bin litmus` below compat-tests historical release
+# binaries (named `litmus`). Renaming the channel is a separate, coordinated
+# migration (re-upload + client default change), not part of the CLI rebrand.
 R2_LITMUS ?= litmus
 ISSUER ?= https://accounts.google.com
 DIST ?= dist
@@ -88,7 +93,7 @@ publish-models: release ## Compat-test azoth vs last (VERSIONS-1) litmus release
 	cd $(MANIFEST_GEN) && GOWORK=off go build -o manifest-gen .
 	$(MANIFEST_GEN)/manifest-gen \
 	  --traits $(TRAITS) --repo . --out "$(DIST)" \
-	  --engine-bin litmus --traits-env LITMUS_MODELS_DIR --validate-args "validate --skip-traits" \
+	  --engine-bin litmus --traits-env SCAN_MODELS_DIR --validate-args "validate --skip-traits" \
 	  --head-engine ./target/release/$(BINARY) \
 	  --releases $(shell expr $(VERSIONS) - 1) --commits 100 --soak-days 0 \
 	  --channels stable --artifact-prefix "azoth/" \
@@ -135,8 +140,8 @@ install: release
 	echo "✓ Installed to $$dest"
 
 tarball: release
-	tar -czf $(OUT_DIR)/litmus.tgz -C $(OUT_DIR) litmus
-	@echo "Tarball: $(OUT_DIR)/litmus.tgz"
+	tar -czf $(OUT_DIR)/ascan.tgz -C $(OUT_DIR) $(BINARY)
+	@echo "Tarball: $(OUT_DIR)/ascan.tgz"
 
 # Clear MAKEFLAGS for deploy recipes: GNU Make would otherwise inject the
 # outer invocation's `-j`/`--jobserver-*` flags plus command-line `URL=` into
@@ -267,9 +272,9 @@ worker-benchmark: release ## Benchmark the worker model over a local dataset via
 	@[ -e "$(WORKER_BENCH_PATH)" ] || { echo "error: dataset not found: $(WORKER_BENCH_PATH)"; exit 1; }
 	@echo "worker-benchmark: dataset=$(WORKER_BENCH_PATH) workers=$(if $(WORKERS),$(WORKERS),default) order=$(ORDER)"
 	@out=$$(mktemp); results=/tmp/litmus-worker-results.jsonl; rm -f $$results "$(BENCH_SUMMARY)"; \
-	./target/release/litmus-bench-hopper --dataset "$(WORKER_BENCH_PATH)" --port 0 --dump $$results \
+	./target/release/scan-bench-hopper --dataset "$(WORKER_BENCH_PATH)" --port 0 --dump $$results \
 		--order "$(ORDER)" --summary "$(BENCH_SUMMARY)" \
-		>$$out 2>/tmp/litmus-bench-hopper.err & \
+		>$$out 2>/tmp/scan-bench-hopper.err & \
 	hp=$$!; \
 	trap 'kill $$hp 2>/dev/null' EXIT INT TERM; \
 	port=; jobs=; \
@@ -282,8 +287,8 @@ worker-benchmark: release ## Benchmark the worker model over a local dataset via
 	[ -n "$$port" ] || { echo "error: mock hopper did not start"; cat $$out; exit 1; }; \
 	echo "hopper: port=$$port jobs=$$jobs"; \
 	tflag=$$( [ "$$(uname -s)" = "Darwin" ] && echo -l || echo -v ); \
-	CLEAVE_SKIP_CACHE=1 LITMUS_HEARTBEAT_SECS=$(HEARTBEAT_SECS) \
-	$(if $(GRID),LITMUS_PER_SLOT_POOLS=1,) \
+	CLEAVE_SKIP_CACHE=1 SCAN_HEARTBEAT_SECS=$(HEARTBEAT_SECS) \
+	$(if $(GRID),SCAN_PER_SLOT_POOLS=1,) \
 	/usr/bin/time $$tflag ./out/$(BINARY) --verbose worker \
 		--url "http://127.0.0.1:$$port" \
 		--data-dir "$(WORKER_BENCH_PATH)" \
@@ -297,7 +302,7 @@ worker-benchmark: release ## Benchmark the worker model over a local dataset via
 	grep -E "thread budget|oversubscribes|rayon pool ready" /tmp/litmus-worker-benchmark.log | head; \
 	echo "--- completeness (SERVER-side): hopper received $$received / $$jobs results ---"; \
 	[ "$$received" = "$$jobs" ] && echo "✓ COMPLETE: all $$jobs results reached the hopper" \
-		|| echo "❌ INCOMPLETE: $$received/$$jobs — worker dropped results (see /tmp/litmus-bench-hopper.err)"; \
+		|| echo "❌ INCOMPLETE: $$received/$$jobs — worker dropped results (see /tmp/scan-bench-hopper.err)"; \
 	echo "--- latency summary (hopper-side, claim → result) ---"; \
 	cat "$(BENCH_SUMMARY)" 2>/dev/null || echo "(no summary written)"; \
 	echo "✓ summary: $(BENCH_SUMMARY)"
@@ -384,7 +389,7 @@ tuna-once: ## One cleave-tuna cycle, then cherry-pick accepted experiments
 	@test -z "$$(git status --porcelain)" || { echo "working tree must be clean before tuna-once"; exit 1; }
 	@before=$$(git rev-parse HEAD); \
 	$(TUNA_BIN) --source $(CURDIR) --root $(TUNA_REPO) --dataset $(TUNA_DATASET) \
-		--name litmus \
+		--name ascan \
 		--bench-arg --slow-rule-ms --bench-arg $(SLOW_RULE_MS) --bench-arg -f --bench-arg json \
 		--bench-env CLEAVE_SKIP_CACHE=1 \
 		--deny vendor/ --deny packaging/ --deny scripts/ --deny testdata/ \
@@ -418,11 +423,11 @@ $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
 # ----- Wolfi packaging ----------------------------------------------------
-# Build a Wolfi-based OCI image for litmus via melange + apko. Mirrors
+# Build a Wolfi-based OCI image for ascan via melange + apko. Mirrors
 # the cleave/packaging/wolfi flow; depends on a sibling cleave checkout
-# at ../cleave (the local build stages cleave + filefacts + litmus and
-# overrides the cleave git dep via a Cargo [patch] block). On macOS the
-# build runs inside a dedicated Lima VM (`litmus-wolfi`). See
+# at ../cleave (the local build stages cleave + filefacts + the scan
+# source repo and overrides the cleave git dep via a Cargo [patch] block).
+# On macOS the build runs inside a dedicated Lima VM (`ascan-wolfi`). See
 # packaging/wolfi/README.md.
 WOLFI_DIR = packaging/wolfi
 WOLFI_OUT = $(OUT_DIR)/wolfi
@@ -435,16 +440,16 @@ wolfi-bootstrap:
 
 wolfi-build:
 	@WOLFI_ARCH="$(WOLFI_ARCH)" $(WOLFI_DIR)/scripts/build.sh
-	@echo "✓ Wolfi image: $(WOLFI_OUT)/litmus.tar"
+	@echo "✓ Wolfi image: $(WOLFI_OUT)/ascan.tar"
 
 wolfi-test:
 	@$(WOLFI_DIR)/scripts/smoke-test.sh
 
 wolfi-shell:
-	@[ -f $(WOLFI_OUT)/litmus.tar ] || { echo "error: run 'make wolfi-build' first"; exit 1; }
+	@[ -f $(WOLFI_OUT)/ascan.tar ] || { echo "error: run 'make wolfi-build' first"; exit 1; }
 	@case "$$(uname -s)" in \
-		Darwin) limactl shell --workdir / litmus-wolfi nerdctl run --rm -it --entrypoint /bin/sh litmus:smoke ;; \
-		Linux)  for r in nerdctl docker podman; do command -v $$r >/dev/null 2>&1 && { exec $$r run --rm -it --entrypoint /bin/sh litmus:smoke; }; done; echo "no container runtime"; exit 1 ;; \
+		Darwin) limactl shell --workdir / ascan-wolfi nerdctl run --rm -it --entrypoint /bin/sh ascan:smoke ;; \
+		Linux)  for r in nerdctl docker podman; do command -v $$r >/dev/null 2>&1 && { exec $$r run --rm -it --entrypoint /bin/sh ascan:smoke; }; done; echo "no container runtime"; exit 1 ;; \
 	esac
 
 wolfi-clean:
@@ -453,13 +458,13 @@ wolfi-clean:
 
 wolfi-nuke: wolfi-clean
 	@case "$$(uname -s)" in \
-		Darwin) limactl delete --force litmus-wolfi 2>/dev/null || true ;; \
+		Darwin) limactl delete --force ascan-wolfi 2>/dev/null || true ;; \
 	esac
-	rm -rf $$HOME/.cache/litmus-wolfi
+	rm -rf $$HOME/.cache/ascan-wolfi
 	@echo "✓ Wolfi VM and cache removed"
 
 # ----- Publish -----------------------------------------------------------
-# Push the multi-arch litmus image to a registry and sign it keyless with
+# Push the multi-arch ascan image to a registry and sign it keyless with
 # cosign via Google OIDC. Override REGISTRY / ORG / ARCHS via env. See
 # packaging/wolfi/README.md for prerequisites.
 REGISTRY ?= docker.io
@@ -467,7 +472,7 @@ ORG      ?= atomdrift
 
 docker-login: wolfi-bootstrap ## Log the lima VM's runtime into REGISTRY (interactive)
 	@case "$$(uname -s)" in \
-		Darwin) limactl shell --workdir / litmus-wolfi nerdctl login $(REGISTRY) ;; \
+		Darwin) limactl shell --workdir / ascan-wolfi nerdctl login $(REGISTRY) ;; \
 		Linux)  for r in nerdctl docker podman; do command -v $$r >/dev/null 2>&1 && { exec $$r login $(REGISTRY); }; done; echo "no container runtime"; exit 1 ;; \
 	esac
 

@@ -1,12 +1,12 @@
 #!/bin/sh
-# worker-omnios.sh - Deploy litmus worker inside an OmniOS zone (as root).
+# worker-omnios.sh - Deploy Atomdrift Scan worker inside an OmniOS zone (as root).
 # Usage: ./worker-omnios.sh <hopper-url>
-# Must be invoked from the litmus repository root inside the zone.
+# Must be invoked from the scan repository root inside the zone.
 # Idempotent: re-run to update.
 #
 # rust + 7zip come from pkgsrc; innoextract, upx, and rizin (HEAD) are
 # built from upstream source only when they are not already available. The
-# worker runs as the unprivileged `litmus` user under SMF, with
+# worker runs as the unprivileged `ascan` user under SMF, with
 # ignore_error=core,signal so a crashing
 # backend triggers a restart instead of dropping into maintenance.
 
@@ -24,28 +24,28 @@ die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
 PKG_PREFIX=/opt/local
-# Source builds and the litmus binary install under /opt/litmus rather than
+# Source builds and the ascan binary install under /opt/atomdrift/scan rather than
 # /usr/local: in sparse zones /usr is a read-only lofs mount from the global,
 # so /usr/local is unwritable. /opt is writable per-zone.
-SRC_PREFIX=/opt/litmus
-SRC_DIR=/var/litmus/src
-LITMUS_USER=litmus
-LITMUS_GROUP=litmus
-LITMUS_HOME=/var/litmus
-LITMUS_LOG_DIR=/var/log/litmus
+SRC_PREFIX=/opt/atomdrift/scan
+SRC_DIR=/var/atomdrift/scan/src
+SCAN_USER=ascan
+SCAN_GROUP=ascan
+SCAN_HOME=/var/atomdrift/scan
+SCAN_LOG_DIR=/var/log/atomdrift/scan
 # Disk-backed scratch dir. /tmp on illumos is tmpfs (swap-backed); large
 # unpacks (innoextract, 7z, rizin) can exhaust swap and wedge the whole
 # zone — including /etc/svc/volatile, which then blocks svc.startd.
-LITMUS_TMP_DIR=/var/litmus/tmp
-LITMUS_BIN=$SRC_PREFIX/bin/litmus
-SMF_MANIFEST=/lib/svc/manifest/site/litmus-worker.xml
-SMF_FMRI=svc:/site/litmus-worker:default
+SCAN_TMP_DIR=/var/atomdrift/scan/tmp
+SCAN_BIN=$SRC_PREFIX/bin/ascan
+SMF_MANIFEST=/lib/svc/manifest/site/ascan-worker.xml
+SMF_FMRI=svc:/site/ascan-worker:default
 
 PATH=$PKG_PREFIX/sbin:$PKG_PREFIX/bin:$SRC_PREFIX/sbin:$SRC_PREFIX/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 [ "$(id -u)" -eq 0 ] || die "must be run as root inside the zone"
-[ -f Cargo.toml ] || die "must be invoked from the litmus repository root"
+[ -f Cargo.toml ] || die "must be invoked from the scan repository root"
 command -v pkgin >/dev/null 2>&1 || die "pkgin not found; install pkgsrc bootstrap first"
 command -v pkg >/dev/null 2>&1   || die "IPS pkg(1) not found; not running on illumos?"
 
@@ -96,7 +96,7 @@ else
     log "All pkgsrc dependencies already installed"
 fi
 
-current_litmus_rev() {
+current_ascan_rev() {
     if ! command -v git >/dev/null 2>&1; then
         echo unknown
         return
@@ -110,15 +110,15 @@ current_litmus_rev() {
     fi
 }
 
-LITMUS_REV=$(current_litmus_rev)
-LITMUS_REV_MARKER=$SRC_PREFIX/.litmus-installed-rev
-litmus_build_needed=1
-case "$LITMUS_REV" in
-    unknown|*-dirty) litmus_build_needed=1 ;;
+SCAN_REV=$(current_ascan_rev)
+SCAN_REV_MARKER=$SRC_PREFIX/.ascan-installed-rev
+ascan_build_needed=1
+case "$SCAN_REV" in
+    unknown|*-dirty) ascan_build_needed=1 ;;
     *)
-        if [ -x "$LITMUS_BIN" ] && [ -f "$LITMUS_REV_MARKER" ] \
-                && [ "$(cat "$LITMUS_REV_MARKER")" = "$LITMUS_REV" ]; then
-            litmus_build_needed=0
+        if [ -x "$SCAN_BIN" ] && [ -f "$SCAN_REV_MARKER" ] \
+                && [ "$(cat "$SCAN_REV_MARKER")" = "$SCAN_REV" ]; then
+            ascan_build_needed=0
         fi
         ;;
 esac
@@ -142,7 +142,7 @@ ensure_ips() {
     return "$rc"
 }
 
-if [ "$need_source_builds" -eq 1 ] || [ "$litmus_build_needed" -eq 1 ]; then
+if [ "$need_source_builds" -eq 1 ] || [ "$ascan_build_needed" -eq 1 ]; then
     log "Ensuring IPS build prerequisites (headers, ld, crt files)"
     # build-essential pulls headers + ld; c-runtime supplies
     # /usr/lib/{,amd64/}crt1.o which build-essential does NOT pull in on
@@ -281,51 +281,51 @@ ensure_source_tool upx          https://github.com/upx/upx.git                v4
 ensure_source_tool rizin        https://github.com/rizinorg/rizin.git         HEAD     build_rizin
 
 ###############################################################################
-# litmus user, build, install
+# ascan user, build, install
 ###############################################################################
 
-log "Ensuring $LITMUS_USER user/group exist"
-getent group "$LITMUS_GROUP" >/dev/null 2>&1 || groupadd "$LITMUS_GROUP"
-id "$LITMUS_USER" >/dev/null 2>&1 || \
-    useradd -m -d "$LITMUS_HOME" -g "$LITMUS_GROUP" -s /bin/sh \
-            -c "Litmus Worker" "$LITMUS_USER"
-mkdir -p "$LITMUS_HOME" "$LITMUS_LOG_DIR" "$LITMUS_TMP_DIR"
-chown "$LITMUS_USER:$LITMUS_GROUP" "$LITMUS_HOME" "$LITMUS_LOG_DIR" "$LITMUS_TMP_DIR"
-chmod 700 "$LITMUS_TMP_DIR"
+log "Ensuring $SCAN_USER user/group exist"
+getent group "$SCAN_GROUP" >/dev/null 2>&1 || groupadd "$SCAN_GROUP"
+id "$SCAN_USER" >/dev/null 2>&1 || \
+    useradd -m -d "$SCAN_HOME" -g "$SCAN_GROUP" -s /bin/sh \
+            -c "Atomdrift Scan Worker" "$SCAN_USER"
+mkdir -p "$SCAN_HOME" "$SCAN_LOG_DIR" "$SCAN_TMP_DIR"
+chown "$SCAN_USER:$SCAN_GROUP" "$SCAN_HOME" "$SCAN_LOG_DIR" "$SCAN_TMP_DIR"
+chmod 700 "$SCAN_TMP_DIR"
 # Sweep leftovers from any prior wedged run so the dir doesn't grow unbounded
 # across restarts. Safe: only the worker writes here.
-find "$LITMUS_TMP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+find "$SCAN_TMP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-litmus_changed=0
-if [ "$litmus_build_needed" -eq 1 ]; then
-    log "Building litmus from source tree ($LITMUS_REV)"
+ascan_changed=0
+if [ "$ascan_build_needed" -eq 1 ]; then
+    log "Building ascan from source tree ($SCAN_REV)"
     # unrar-sys builds the unrar library as C++ but doesn't emit a link-lib for
     # libstdc++, so the final link (with -nodefaultlibs) leaves operator new,
     # std::__cxx11 string symbols, and __gxx_personality_v0 unresolved on illumos.
     # Force rustc to append -lstdc++ to the link line.
     RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-lstdc++" cargo build --release \
-        || die "litmus build failed"
+        || die "ascan build failed"
 
-    log "Installing litmus binary to $LITMUS_BIN"
+    log "Installing ascan binary to $SCAN_BIN"
     # illumos install(1) is the old SunOS variant with incompatible flags;
     # use cp+chmod for portability. Stage to .new then rename for atomicity
     # (replacing a running binary while the SMF service is up is otherwise racy).
-    cp -f target/release/litmus "$LITMUS_BIN.new"
-    chmod 755 "$LITMUS_BIN.new"
-    mv -f "$LITMUS_BIN.new" "$LITMUS_BIN"
-    case "$LITMUS_REV" in
-        unknown|*-dirty) rm -f "$LITMUS_REV_MARKER" ;;
-        *) echo "$LITMUS_REV" > "$LITMUS_REV_MARKER" ;;
+    cp -f target/release/ascan "$SCAN_BIN.new"
+    chmod 755 "$SCAN_BIN.new"
+    mv -f "$SCAN_BIN.new" "$SCAN_BIN"
+    case "$SCAN_REV" in
+        unknown|*-dirty) rm -f "$SCAN_REV_MARKER" ;;
+        *) echo "$SCAN_REV" > "$SCAN_REV_MARKER" ;;
     esac
-    litmus_changed=1
+    ascan_changed=1
 else
-    log "litmus $LITMUS_REV already installed; skipping cargo build"
+    log "ascan $SCAN_REV already installed; skipping cargo build"
 fi
 
-log "Refreshing rules/models as $LITMUS_USER"
+log "Refreshing rules/models as $SCAN_USER"
 rules_changed=0
-update_log=/tmp/litmus-update-rules.$$.log
-if su - "$LITMUS_USER" -c "PATH=$PATH $LITMUS_BIN update-rules" > "$update_log" 2>&1; then
+update_log=/tmp/ascan-update-rules.$$.log
+if su - "$SCAN_USER" -c "PATH=$PATH $SCAN_BIN update-rules" > "$update_log" 2>&1; then
     cat "$update_log"
 else
     cat "$update_log" >&2
@@ -341,10 +341,10 @@ rm -f "$update_log"
 # SMF manifest
 ###############################################################################
 
-manifest_tmp=/tmp/litmus-worker.$$.xml
+manifest_tmp=/tmp/ascan-worker.$$.xml
 manifest_changed=0
 
-# duration=child: litmus runs in the foreground (doesn't fork), so SMF must
+# duration=child: ascan runs in the foreground (doesn't fork), so SMF must
 # treat the start method's process itself as the service. With contract mode
 # SMF would expect start to fork+exit and would kill the worker as a
 # "method exit timeout" after timeout_seconds. With child mode SMF tracks
@@ -354,8 +354,8 @@ manifest_changed=0
 cat > "$manifest_tmp" <<EOF
 <?xml version="1.0"?>
 <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
-<service_bundle type="manifest" name="litmus-worker">
-  <service name="site/litmus-worker" type="service" version="1">
+<service_bundle type="manifest" name="ascan-worker">
+  <service name="site/ascan-worker" type="service" version="1">
     <create_default_instance enabled="true"/>
     <single_instance/>
     <dependency name="network" grouping="require_all" restart_on="error" type="service">
@@ -365,21 +365,21 @@ cat > "$manifest_tmp" <<EOF
       <service_fmri value="svc:/system/filesystem/local:default"/>
     </dependency>
     <method_context>
-      <method_credential user="$LITMUS_USER" group="$LITMUS_GROUP"/>
+      <method_credential user="$SCAN_USER" group="$SCAN_GROUP"/>
       <method_environment>
         <envvar name="PATH" value="$PATH"/>
-        <envvar name="HOME" value="$LITMUS_HOME"/>
-        <!-- illumos's ld.so.1 doesn't search /opt/litmus/lib by default;
+        <envvar name="HOME" value="$SCAN_HOME"/>
+        <!-- illumos's ld.so.1 doesn't search /opt/atomdrift/scan/lib by default;
              set LD_LIBRARY_PATH so rizin can find librz_util.so.0.x and
              friends, plus pkgsrc libs at /opt/local/lib for transitive deps. -->
         <envvar name="LD_LIBRARY_PATH" value="$SRC_PREFIX/lib:$PKG_PREFIX/lib"/>
-        <envvar name="TMPDIR" value="$LITMUS_TMP_DIR"/>
-        <envvar name="TMP"    value="$LITMUS_TMP_DIR"/>
-        <envvar name="TEMP"   value="$LITMUS_TMP_DIR"/>
+        <envvar name="TMPDIR" value="$SCAN_TMP_DIR"/>
+        <envvar name="TMP"    value="$SCAN_TMP_DIR"/>
+        <envvar name="TEMP"   value="$SCAN_TMP_DIR"/>
       </method_environment>
     </method_context>
     <exec_method type="method" name="start"
-                 exec="$LITMUS_BIN $worker_args"
+                 exec="$SCAN_BIN $worker_args"
                  timeout_seconds="0"/>
     <exec_method type="method" name="stop" exec=":kill" timeout_seconds="60"/>
     <property_group name="startd" type="framework">
@@ -388,7 +388,7 @@ cat > "$manifest_tmp" <<EOF
     </property_group>
     <stability value="Unstable"/>
     <template>
-      <common_name><loctext xml:lang="C">Litmus Worker</loctext></common_name>
+      <common_name><loctext xml:lang="C">Atomdrift Scan Worker</loctext></common_name>
     </template>
   </service>
 </service_bundle>
@@ -418,7 +418,7 @@ if [ "$manifest_changed" -eq 1 ] || [ "$service_was_configured" -eq 0 ]; then
     svccfg import "$SMF_MANIFEST"
 fi
 
-if [ "$litmus_changed" -eq 1 ] || [ "$rules_changed" -eq 1 ] \
+if [ "$ascan_changed" -eq 1 ] || [ "$rules_changed" -eq 1 ] \
         || [ "$manifest_changed" -eq 1 ] || [ "$service_was_configured" -eq 0 ]; then
     log "Clearing maintenance state and restarting $SMF_FMRI"
     svcadm clear "$SMF_FMRI" 2>/dev/null || true

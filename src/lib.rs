@@ -4,13 +4,13 @@
 //!
 //! The crate exposes a small public API centered around:
 //! - [`ScanConfig`] for validated scan settings
-//! - [`scan::run`] for recursive file and directory scans
+//! - [`engine::run`] for recursive file and directory scans
 //! - [`ps::run`] for process scans
 //! - [`Classification`] and [`Thresholds`] for interpreting model output
 //!
 //! # Example
 //! ```no_run
-//! use litmus::{DisplayFilter, OutputFormat, ScanConfig, Thresholds};
+//! use scan::{DisplayFilter, OutputFormat, ScanConfig, Thresholds};
 //!
 //! let config = ScanConfig::new(
 //!     "/path/to/models",
@@ -21,7 +21,7 @@
 //!     false,
 //! )?;
 //!
-//! let summary = litmus::scan::run(std::path::Path::new("/tmp/sample.exe"), &config)?;
+//! let summary = scan::engine::run(std::path::Path::new("/tmp/sample.exe"), &config)?;
 //! println!("scanned {} file(s)", summary.total_files);
 //! # Ok::<(), anyhow::Error>(())
 //! ```
@@ -39,8 +39,9 @@ pub mod model_update;
 pub mod models_repo;
 pub mod output;
 pub mod ps;
-pub mod scan;
+pub mod engine;
 pub mod server;
+pub mod sys;
 pub mod thread_dump;
 pub mod tools;
 pub mod traits_repo;
@@ -52,7 +53,7 @@ pub mod worker;
 pub use analyzer::Analyzer;
 pub use model::Classification;
 pub use model::Thresholds;
-pub use scan::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
+pub use engine::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
 
 /// Convert a [`std::time::Duration`] to milliseconds as `u64`, saturating at [`u64::MAX`].
 ///

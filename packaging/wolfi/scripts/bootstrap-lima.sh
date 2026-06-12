@@ -1,18 +1,18 @@
 #!/bin/sh
-# Idempotently ensure the litmus-wolfi Lima VM is up and ready to build.
+# Idempotently ensure the ascan-wolfi Lima VM is up and ready to build.
 # Mirrors cleave/packaging/wolfi/scripts/bootstrap-lima.sh but with
-# different mount paths and a smaller VM (no fat LTO in litmus).
+# different mount paths and a smaller VM (no fat LTO in scan).
 
 set -eu
 
-VM_NAME="litmus-wolfi"
+VM_NAME="ascan-wolfi"
 HERE=$(cd "$(dirname "$0")" && pwd)
 PKG_DIR=$(cd "$HERE/.." && pwd)
 REPO_ROOT=$(cd "$PKG_DIR/../.." && pwd)
-# Source mount = PARENT of litmus, so cleave (sibling) is also visible.
+# Source mount = PARENT of scan, so cleave (sibling) is also visible.
 SRC_DIR=$(cd "$REPO_ROOT/.." && pwd)
 OUT_DIR="$REPO_ROOT/out/wolfi"
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/litmus-wolfi"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ascan-wolfi"
 LIMA_TEMPLATE="$PKG_DIR/lima.yaml"
 APKO_IMAGE="${APKO_IMAGE:-cgr.dev/chainguard/apko:latest}"
 MELANGE_IMAGE="${MELANGE_IMAGE:-cgr.dev/chainguard/melange:latest}"
@@ -20,10 +20,10 @@ MELANGE_IMAGE="${MELANGE_IMAGE:-cgr.dev/chainguard/melange:latest}"
 mkdir -p "$OUT_DIR" "$CACHE_DIR"
 
 # Sibling cleave repo is required for the [patch] override and for
-# bundling the cleave apk into litmus's image.
+# bundling the cleave apk into ascan's image.
 [ -d "$SRC_DIR/cleave" ] || {
   echo "error: sibling 'cleave' repo not found at $SRC_DIR/cleave" >&2
-  echo "       litmus's wolfi build needs cleave checked out alongside it." >&2
+  echo "       ascan's wolfi build needs cleave checked out alongside it." >&2
   exit 1
 }
 
@@ -37,7 +37,7 @@ case "$os" in
 
     if ! limactl list --format '{{.Name}}' 2>/dev/null | grep -qx "$VM_NAME"; then
       echo "==> creating Lima VM '$VM_NAME' (this takes a few minutes the first time)"
-      rendered=$(mktemp -t litmus-wolfi-lima.XXXXXX)
+      rendered=$(mktemp -t ascan-wolfi-lima.XXXXXX)
       trap 'rm -f "$rendered"' EXIT
       sed \
         -e "s|__SRC_DIR__|$SRC_DIR|g" \

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use litmus::server::{ServerConfig, build_app};
+use scan::server::{ServerConfig, build_app};
 use std::net::SocketAddr;
 use tower::ServiceExt;
 use tracing_subscriber::EnvFilter;
@@ -31,9 +31,9 @@ fn init_tracing() {
 }
 
 fn model_dir() -> Result<std::path::PathBuf> {
-    std::env::var("LITMUS_MODELS_DIR")
+    std::env::var("SCAN_MODELS_DIR")
         .map(std::path::PathBuf::from)
-        .context("set LITMUS_MODELS_DIR to run integration tests against real model artifacts")
+        .context("set SCAN_MODELS_DIR to run integration tests against real model artifacts")
 }
 
 fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
@@ -56,8 +56,8 @@ fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
 #[tokio::test]
 async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     init_tracing();
-    if std::env::var_os("LITMUS_MODELS_DIR").is_none() {
-        eprintln!("skipping: LITMUS_MODELS_DIR is not set");
+    if std::env::var_os("SCAN_MODELS_DIR").is_none() {
+        eprintln!("skipping: SCAN_MODELS_DIR is not set");
         return Ok(());
     }
 

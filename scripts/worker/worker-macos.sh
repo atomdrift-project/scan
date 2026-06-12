@@ -1,5 +1,5 @@
 #!/bin/sh
-# worker-macos.sh - Deploy litmus worker on macOS using launchd
+# worker-macos.sh - Deploy Atomdrift Scan worker on macOS using launchd
 # Usage: ./worker-macos.sh <server-url>
 # Runs entirely on the local machine. Re-run to update.
 # Must be invoked from the repository root.
@@ -12,15 +12,15 @@ URL="$1"
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 WORKERS="${WORKERS:-}"
 
-BINARY=litmus
-INSTALL_DIR=/usr/local/share/litmus
-MODELS_DIR=/usr/local/share/litmus/models
-TRAITS_DIR=/usr/local/share/litmus/traits
-BIN_LINK=/usr/local/bin/litmus
-PLIST=/Library/LaunchDaemons/com.atomdrift.litmus-worker.plist
-LABEL=com.atomdrift.litmus-worker
-SERVICE_USER=_litmus
-LOG=/var/log/litmus-worker.log
+BINARY=ascan
+INSTALL_DIR=/usr/local/share/atomdrift/scan
+MODELS_DIR=/usr/local/share/atomdrift/scan/models
+TRAITS_DIR=/usr/local/share/atomdrift/scan/traits
+BIN_LINK=/usr/local/bin/ascan
+PLIST=/Library/LaunchDaemons/com.atomdrift.ascan-worker.plist
+LABEL=com.atomdrift.ascan-worker
+SERVICE_USER=_ascan
+LOG=/var/log/ascan-worker.log
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -46,7 +46,7 @@ if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     done
     sudo dscl . -create "/Users/$SERVICE_USER"
     sudo dscl . -create "/Users/$SERVICE_USER" UserShell /usr/bin/false
-    sudo dscl . -create "/Users/$SERVICE_USER" RealName "Litmus Worker"
+    sudo dscl . -create "/Users/$SERVICE_USER" RealName "Atomdrift Scan Worker"
     sudo dscl . -create "/Users/$SERVICE_USER" UniqueID "$uid"
     sudo dscl . -create "/Users/$SERVICE_USER" PrimaryGroupID 1
     sudo dscl . -create "/Users/$SERVICE_USER" NFSHomeDirectory /var/empty
@@ -69,8 +69,8 @@ fi
 
 log "Installing binary"
 restart_needed=0
-if ! cmp -s "out/litmus" "$INSTALL_DIR/$BINARY" 2>/dev/null; then
-    install -m 755 out/litmus "$INSTALL_DIR/$BINARY"
+if ! cmp -s "out/ascan" "$INSTALL_DIR/$BINARY" 2>/dev/null; then
+    install -m 755 out/ascan "$INSTALL_DIR/$BINARY"
     restart_needed=1
 fi
 
@@ -110,7 +110,7 @@ ${workers_args}    </array>
     <dict>
         <key>PATH</key>
         <string>$BREW_PREFIX/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>LITMUS_MODELS_DIR</key>
+        <key>SCAN_MODELS_DIR</key>
         <string>$MODELS_DIR</string>
     </dict>
     <key>UserName</key>

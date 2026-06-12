@@ -1,6 +1,6 @@
-# Litmus Server API
+# Atomdrift Scan Server API
 
-`litmus serve` is an HTTP daemon that takes a file and returns a
+`ascan serve` is an HTTP daemon that takes a file and returns a
 classification. It binds to loopback. It has no authentication. Treat
 it as a local service and put a reverse proxy in front of it if
 anything else needs to reach it.
@@ -10,7 +10,7 @@ For the response schema, see [JSON.md](JSON.md).
 
 ## Running the server
 
-    litmus serve
+    ascan serve
 
 The defaults are deliberate. Override them only when you have a reason.
 
@@ -31,8 +31,8 @@ Environment variables read at startup:
 | ---------------------- | ------------------------------------------------------------ |
 | `CLEAVE_TRAITS_DIR`    | Traits directory. `--traits-dir` overrides.                  |
 | `CLEAVE_RAYON_THREADS` | Override rayon pool size. Default is system parallelism.     |
-| `LITMUS_MODELS_REPO`   | Model repository URL.                                        |
-| `LITMUS_MODELS_REF`    | Branch or commit to pull.                                    |
+| `SCAN_MODELS_REPO`   | Model repository URL.                                        |
+| `SCAN_MODELS_REF`    | Branch or commit to pull.                                    |
 
 The listener binds before the model is loaded. While loading, every
 route returns 503 with `{"error":"server starting"}`. Poll `/_/health`
@@ -140,7 +140,7 @@ the deploy level:
     lvl == null        -> manual --threshold-* mode (no level table)
 
 The calibrated grid currently tops out at L25000, and consumers should
-tolerate a future L50000. Litmus also reserves off-grid `grid_max + 1`
+tolerate a future L50000. Atomdrift Scan also reserves off-grid `grid_max + 1`
 and `grid_max + 2` markers for trait-floor overrides where the model was
 clean but confident severe cleave traits manually raised the result to
 suspicious; with today's grid those are `25001` and `25002`.
@@ -226,7 +226,7 @@ The server is built for trusted networks. The defaults reflect that.
 
 ## Example session
 
-    $ litmus serve --bind 127.0.0.1:49999 --workers 4
+    $ ascan serve --bind 127.0.0.1:49999 --workers 4
     $ curl -s http://127.0.0.1:49999/_/health | jq -r .status
     ok
     $ curl -s -F file=@/bin/ls http://127.0.0.1:49999/analyze \

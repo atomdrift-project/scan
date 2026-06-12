@@ -1,8 +1,8 @@
 #!/bin/sh
-# worker-freebsd.sh - Install litmus worker as a native FreeBSD rc.d service.
+# worker-freebsd.sh - Install Atomdrift Scan worker as a native FreeBSD rc.d service.
 #
 # Local install for a FreeBSD host (no jail). Builds as the invoking user,
-# installs the binary, creates an unprivileged `litmus` service user, and runs
+# installs the binary, creates an unprivileged `ascan` service user, and runs
 # the worker under rc.d via daemon(8). This mirrors the systemd deploy
 # (worker-linux.sh): one host, one supervised service. For a jailed deploy
 # use `make deploy-jail-worker` (scripts/worker/worker-bastille.sh) instead.
@@ -25,9 +25,9 @@ URL="${1:-}"
 
 WORKERS="${WORKERS:-}"
 
-BINARY=litmus
+BINARY=ascan
 BIN_PATH=/usr/local/bin/${BINARY}
-RCD_FILE=/usr/local/etc/rc.d/litmus-worker
+RCD_FILE=/usr/local/etc/rc.d/ascan-worker
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
@@ -80,13 +80,13 @@ RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --release || die "build failed
 # --- Service user -----------------------------------------------------------
 # A home directory is required: the worker resolves cleave's traits/models
 # under the service user's data dir, and daemon(8) -u sets HOME from it. The
-# shell is /bin/sh (not nologin) so the `su -l litmus` model refresh below can
+# shell is /bin/sh (not nologin) so the `su -l ascan` model refresh below can
 # run; the account has no password, so it is not remotely loginable. This
 # mirrors the run-jail user in worker-bastille.sh.
 
-if ! id -u litmus >/dev/null 2>&1; then
-	log "Creating service user 'litmus'"
-	$SUDO pw useradd litmus -m -s /bin/sh -c "Litmus Worker"
+if ! id -u ascan >/dev/null 2>&1; then
+	log "Creating service user 'ascan'"
+	$SUDO pw useradd ascan -m -s /bin/sh -c "Atomdrift Scan Worker"
 fi
 
 # --- Binary -----------------------------------------------------------------
@@ -103,18 +103,18 @@ else
 fi
 
 # --- Models and traits ------------------------------------------------------
-# Populate the litmus user's data dir so the first worker start is not racing
+# Populate the ascan user's data dir so the first worker start is not racing
 # a clone. Idempotent: update-rules pulls when a checkout already exists.
 
 log "Refreshing models and traits"
-$SUDO su -l litmus -c "${BIN_PATH} update-rules" || die "update-rules failed"
+$SUDO su -l ascan -c "${BIN_PATH} update-rules" || die "update-rules failed"
 
 # --- rc.d service -----------------------------------------------------------
 
-worker_args=$(litmus_worker_args "$URL" "$WORKERS")
+worker_args=$(ascan_worker_args "$URL" "$WORKERS")
 
-TMP_RCD=$(mktemp -t litmus-worker.rcd.XXXXXX)
-litmus_rcd_script "${BIN_PATH}" "$worker_args" >"$TMP_RCD"
+TMP_RCD=$(mktemp -t ascan-worker.rcd.XXXXXX)
+ascan_rcd_script "${BIN_PATH}" "$worker_args" >"$TMP_RCD"
 
 rcd_changed=0
 if $SUDO cmp -s "$TMP_RCD" "$RCD_FILE" 2>/dev/null; then
@@ -128,18 +128,18 @@ fi
 # --- Activate ---------------------------------------------------------------
 
 # sysrc is idempotent; enable so the service also comes back across reboots.
-$SUDO sysrc litmus_worker_enable=YES >/dev/null
+$SUDO sysrc ascan_worker_enable=YES >/dev/null
 
 if [ "$binary_changed" -eq 1 ] || [ "$rcd_changed" -eq 1 ]; then
-	log "Restarting litmus-worker"
-	$SUDO service litmus-worker stop 2>/dev/null || true
+	log "Restarting ascan-worker"
+	$SUDO service ascan-worker stop 2>/dev/null || true
 	# Force-kill a worker stuck in rizin teardown so the restart is clean.
-	$SUDO pkill -9 -F /var/run/litmus_worker.pid 2>/dev/null || true
-	$SUDO service litmus-worker start || die "service failed to start; see /var/log/litmus-worker.log"
+	$SUDO pkill -9 -F /var/run/ascan_worker.pid 2>/dev/null || true
+	$SUDO service ascan-worker start || die "service failed to start; see /var/log/ascan-worker.log"
 else
-	log "No changes; ensuring litmus-worker is running"
-	$SUDO service litmus-worker status >/dev/null 2>&1 || $SUDO service litmus-worker start
+	log "No changes; ensuring ascan-worker is running"
+	$SUDO service ascan-worker status >/dev/null 2>&1 || $SUDO service ascan-worker start
 fi
 
-$SUDO service litmus-worker status || true
+$SUDO service ascan-worker status || true
 log "Deployment complete"

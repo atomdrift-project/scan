@@ -1,4 +1,4 @@
-# Lima VM template for building litmus Wolfi packages on macOS.
+# Lima VM template for building ascan Wolfi packages on macOS.
 # Mirrors cleave/packaging/wolfi/lima.yaml; kept as a separate VM so
 # each project can be iterated on independently without one's build
 # breaking the other's environment.
@@ -13,7 +13,7 @@ images:
   - location: "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-arm64.img"
     arch: "aarch64"
 
-# The wolfi build uses litmus's `release-lto` profile (lto="fat" +
+# The wolfi build uses scan's `release-lto` profile (lto="fat" +
 # codegen-units=1), which exhausts ~10GB during the final link step
 # (cleave + filefacts compile in via the [patch] override). 12GiB
 # headroom matches the cleave-wolfi VM and survives the link with
@@ -22,7 +22,7 @@ cpus: 4
 memory: "12GiB"
 disk: "30GiB"
 
-# __SRC_DIR__ is the PARENT of the litmus repo so both `litmus/` and
+# __SRC_DIR__ is the PARENT of the scan repo so both `scan/` and
 # its sibling `cleave/` are visible (for the [patch] override).
 mounts:
   - location: "__SRC_DIR__"

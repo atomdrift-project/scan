@@ -1,4 +1,4 @@
-//! Integration tests for ensemble routing in `litmus::model::Model`.
+//! Integration tests for ensemble routing in `scan::model::Model`.
 //!
 //! Builds a temporary ensemble bundle (general/ + filegroups/native/ +
 //! filetypes/elf/) from a real ONNX bundle and verifies:
@@ -12,7 +12,7 @@
 //! disk. Run with:
 //!
 //! ```sh
-//! LITMUS_ONNX_BUNDLE=/home/t/azoth/filetypes/pe \
+//! SCAN_ONNX_BUNDLE=/home/t/azoth/filetypes/pe \
 //!     cargo test --test ensemble_dispatch -- --ignored
 //! ```
 
@@ -20,10 +20,10 @@
 
 use std::path::{Path, PathBuf};
 
-use litmus::model::Model;
+use scan::model::Model;
 
 fn onnx_bundle() -> Option<PathBuf> {
-    let p = std::env::var("LITMUS_ONNX_BUNDLE")
+    let p = std::env::var("SCAN_ONNX_BUNDLE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/home/t/azoth/filetypes/pe"));
     (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
@@ -91,10 +91,10 @@ fn stage_ensemble(
 }
 
 #[test]
-#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a real ONNX bundle"]
+#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_routes_to_filetype_specialist_when_present() {
     let Some(src) = onnx_bundle() else {
-        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
+        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
     let cfg = r#"{
       "filetype_to_filegroup": { "elf": "native", "pe": "native" }
@@ -121,10 +121,10 @@ fn ensemble_routes_to_filetype_specialist_when_present() {
 }
 
 #[test]
-#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a real ONNX bundle"]
+#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_routes_to_filegroup_when_filetype_absent() {
     let Some(src) = onnx_bundle() else {
-        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
+        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
     let cfg = r#"{
       "filetype_to_filegroup": { "pe": "native" }
@@ -139,10 +139,10 @@ fn ensemble_routes_to_filegroup_when_filetype_absent() {
 }
 
 #[test]
-#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a real ONNX bundle"]
+#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_with_only_general_falls_back_to_general() {
     let Some(src) = onnx_bundle() else {
-        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
+        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
     let cfg = r#"{}"#;
     let dir = stage_ensemble(&src, &[], &[], cfg);
@@ -156,10 +156,10 @@ fn ensemble_with_only_general_falls_back_to_general() {
 }
 
 #[test]
-#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a real ONNX bundle"]
+#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_required_route_missing_is_fatal() {
     let Some(src) = onnx_bundle() else {
-        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
+        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
     let cfg = r#"{
       "filetype_to_filegroup": {},

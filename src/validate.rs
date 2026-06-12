@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::features::ExtractContext;
 use crate::model::{Classification, Model, Thresholds};
-use crate::scan::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
+use crate::engine::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 
 /// Run full validation: cleave trait validation, model loading, and benign-corpus inference.
 ///
@@ -91,7 +91,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
             let result = cleave::analyze_file_with_mapper(&path, &options, &mapper)
                 .with_context(|| format!("cleave analysis of {}", path.display()))
                 .and_then(|report| {
-                    scan::classify_report(
+                    engine::classify_report(
                         &path.display().to_string(),
                         report,
                         &ctx,
@@ -264,7 +264,7 @@ fn format_level(level: Option<i32>) -> String {
     }
 }
 
-fn print_top_findings(findings: &[scan::TopFinding], indent: &str) {
+fn print_top_findings(findings: &[engine::TopFinding], indent: &str) {
     for finding in findings {
         eprintln!("{indent}l{} {}  {}", finding.crit, finding.id, finding.desc);
     }

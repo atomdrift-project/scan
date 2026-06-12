@@ -1,5 +1,5 @@
 #!/bin/sh
-# update-nodes.sh - Deploy litmus worker to remote nodes via SSH in parallel
+# update-nodes.sh - Deploy Atomdrift Scan worker to remote nodes via SSH in parallel
 # Usage: ./update-nodes.sh <url> <node> [node ...]
 
 if [ $# -lt 2 ]; then
@@ -28,7 +28,7 @@ deploy_node() {
 
     printf "==> [%s] deploying ...\n" "$node"
 
-    ssh -o ConnectTimeout=10 "$node" "uname -a && uptime && cd litmus && git pull && make deploy-worker URL=$URL" &
+    ssh -o ConnectTimeout=10 "$node" "uname -a && uptime && cd scan && git pull && make deploy-worker URL=$URL" &
     ssh_pid=$!
     ( sleep 300; kill "$ssh_pid" 2>/dev/null ) &
     timer_pid=$!

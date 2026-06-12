@@ -1,8 +1,8 @@
 #!/bin/sh
-# Build (multi-arch) and publish the litmus OCI image to a registry,
+# Build (multi-arch) and publish the ascan OCI image to a registry,
 # then sign it keyless via cosign + Google OIDC.
 #
-# Default target: docker.io/atomdrift/litmus:<version> and :latest
+# Default target: docker.io/atomdrift/ascan:<version> and :latest
 # Override with REGISTRY=, ORG=, ARCHS=.
 #
 # Prerequisites (script will check):
@@ -19,7 +19,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 PKG_DIR=$(cd "$HERE/.." && pwd)
 REPO_ROOT=$(cd "$PKG_DIR/../.." && pwd)
 OUT_DIR="$REPO_ROOT/out/wolfi"
-VM_NAME="litmus-wolfi"
+VM_NAME="ascan-wolfi"
 
 REGISTRY="${REGISTRY:-docker.io}"
 ORG="${ORG:-atomdrift}"
@@ -28,7 +28,7 @@ APKO_IMAGE="${APKO_IMAGE:-cgr.dev/chainguard/apko:latest}"
 OIDC_ISSUER="${OIDC_ISSUER:-https://accounts.google.com}"
 DRY_RUN="${DRY_RUN:-}"
 
-IMAGE="$REGISTRY/$ORG/litmus"
+IMAGE="$REGISTRY/$ORG/ascan"
 
 # Read the version from the upstream-shape yaml; that's the source of truth.
 VERSION=$(awk '/^  version:/ { gsub(/[" ]/, "", $2); print $2; exit }' "$PKG_DIR/melange.yaml")
@@ -59,7 +59,7 @@ case "$(uname -s)" in
     else echo "error: no container runtime" >&2; exit 1; fi
     SRC_IN_RT="$OUT_DIR/source"
     OUT_IN_RT="$OUT_DIR"
-    CACHE_IN_RT="${XDG_CACHE_HOME:-$HOME/.cache}/litmus-wolfi"
+    CACHE_IN_RT="${XDG_CACHE_HOME:-$HOME/.cache}/ascan-wolfi"
     ;;
   *) echo "error: unsupported OS" >&2; exit 1 ;;
 esac
@@ -86,7 +86,7 @@ else
     -v "$CACHE_IN_RT:/cache" \
     -w /out \
     "$APKO_IMAGE" publish \
-      /src/litmus/packaging/wolfi/apko.yaml \
+      /src/scan/packaging/wolfi/apko.yaml \
       $TAGS \
       --arch "$ARCHS" \
       --keyring-append /out/melange.rsa.pub \

@@ -492,7 +492,7 @@ pub struct SkippedRoute {
 ///
 /// # Example
 /// ```
-/// use litmus::{Classification, Thresholds};
+/// use scan::{Classification, Thresholds};
 ///
 /// let thresholds = Thresholds {
 ///     suspicious: 0.8,
@@ -503,7 +503,7 @@ pub struct SkippedRoute {
 /// assert_eq!(thresholds.classify(0.2), Classification::Benign);
 /// assert_eq!(thresholds.classify(0.85), Classification::Suspicious);
 /// assert_eq!(thresholds.classify(0.99), Classification::Hostile);
-/// # Ok::<(), litmus::model::ThresholdValidationError>(())
+/// # Ok::<(), scan::model::ThresholdValidationError>(())
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Thresholds {
@@ -960,7 +960,7 @@ impl IsotonicCalibrator {
             // applying a calibrator we don't understand.
             if schema != "azoth.calibrator.isotonic.v1" {
                 anyhow::bail!(
-                    "calibrator at {} has unsupported schema {schema}; this litmus only supports azoth.calibrator.isotonic.v1",
+                    "calibrator at {} has unsupported schema {schema}; this Atomdrift Scan build only supports azoth.calibrator.isotonic.v1",
                     path.display()
                 );
             }
@@ -1820,7 +1820,7 @@ fn load_bundle(
     if !spec_path.is_file() {
         if is_general {
             anyhow::bail!(
-                "model bundle is incomplete: missing {}. Run 'litmus update-rules' to refresh the installed models.",
+                "model bundle is incomplete: missing {}. Run 'ascan update-rules' to refresh the installed models.",
                 spec_path.display(),
             );
         }
@@ -3011,7 +3011,7 @@ mod tests {
         };
         let message = err.to_string();
         assert!(message.contains("model bundle is incomplete"));
-        assert!(message.contains("Run 'litmus update-rules'"));
+        assert!(message.contains("Run 'ascan update-rules'"));
         Ok(())
     }
 

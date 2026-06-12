@@ -1,6 +1,6 @@
 //! R2-backed model updates.
 //!
-//! `litmus update-rules` fetches a manifest from the update bucket, resolves the
+//! `ascan update-rules` fetches a manifest from the update bucket, resolves the
 //! model bundle compatible with *this* litmus release, downloads it, verifies its
 //! sha256, validates it by loading, and atomically installs it.
 //!
@@ -103,7 +103,7 @@ pub fn update(dir: &Path, force: bool) -> Result<()> {
     }
 
     eprintln!(
-        "Installing models {} ({}) for litmus {} [{}]...",
+        "Installing models {} ({}) for Atomdrift Scan {} [{}]...",
         key,
         artifact.date,
         our_version(),
@@ -178,7 +178,7 @@ fn artifact_for<'a>(m: &'a Manifest, key: &str) -> Result<&'a Artifact> {
 fn warn_if_behind(m: &Manifest) {
     if let Some(target) = m.upgrade.get(our_version()) {
         eprintln!(
-            "Note: litmus {} cannot use the newest models. Upgrade to litmus {} for the latest detections.",
+            "Note: Atomdrift Scan {} cannot use the newest models. Upgrade to Atomdrift Scan {} for the latest detections.",
             our_version(),
             target
         );

@@ -83,7 +83,7 @@ impl ServerConfig {
     ///
     /// # Example
     /// ```
-    /// use litmus::server::ServerConfig;
+    /// use scan::server::ServerConfig;
     ///
     /// let config = ServerConfig::new(
     ///     "127.0.0.1:49999".parse()?,

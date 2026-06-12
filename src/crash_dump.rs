@@ -169,7 +169,7 @@ mod imp {
 
     extern "C" fn on_abort(_sig: libc::c_int) {
         // Async-signal-safe only: atomic loads, a stack copy, and `write(2)`.
-        write_all(b"\n--- litmus aborting: in-flight analyses (one is the likely culprit) ---\n");
+        write_all(b"\n--- ascan aborting: in-flight analyses (one is the likely culprit) ---\n");
         for slot in REGISTRY.iter() {
             let id = slot.id.load(Ordering::Acquire);
             if id == 0 || id == CLAIMING {

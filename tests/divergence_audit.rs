@@ -3,7 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use litmus::features::{ExtractContext, FeatureSpec};
+use scan::features::{ExtractContext, FeatureSpec};
 use std::collections::BTreeMap;
 
 #[derive(serde::Deserialize)]
@@ -66,7 +66,7 @@ fn family_of(name: &str) -> &'static str {
 
 #[test]
 fn audit_per_route_divergences() {
-    let dir = std::env::var("LITMUS_MODELS_DIR")
+    let dir = std::env::var("SCAN_MODELS_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/home/t/collimator/out/models/azoth"));
     let mut found = 0usize;

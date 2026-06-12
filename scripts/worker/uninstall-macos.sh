@@ -1,10 +1,10 @@
 #!/bin/sh
-# uninstall-macos.sh - Remove litmus worker persistence on macOS
+# uninstall-macos.sh - Remove Atomdrift Scan worker persistence on macOS
 set -ex
 
-LABEL=com.atomdrift.litmus-worker
-PLIST=/Library/LaunchDaemons/com.atomdrift.litmus-worker.plist
-BINARY=litmus
+LABEL=com.atomdrift.ascan-worker
+PLIST=/Library/LaunchDaemons/com.atomdrift.ascan-worker.plist
+BINARY=ascan
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }

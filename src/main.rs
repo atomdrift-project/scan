@@ -1,4 +1,4 @@
-//! litmus — ML-powered malware classification CLI.
+//! Atomdrift Scan (`ascan`) — ML-powered malware classification CLI.
 
 #[cfg(all(
     unix,
@@ -15,8 +15,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use litmus::OutputFormat;
-use litmus::scan::DisplayFilter;
+use scan::OutputFormat;
+use scan::engine::DisplayFilter;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -36,9 +36,9 @@ enum Show {
 }
 
 #[derive(Parser)]
-#[command(name = "litmus")]
+#[command(name = "ascan")]
 #[command(version)]
-#[command(about = "Malware classification powered by ML + static analysis")]
+#[command(about = "Atomdrift Scan — context-free malware detection (ML + static analysis)")]
 #[command(group(
     clap::ArgGroup::new("severity_level")
         .args([
@@ -49,7 +49,7 @@ enum Show {
         .conflicts_with_all(["threshold_suspicious", "threshold_hostile"])
 ))]
 struct Cli {
-    /// Enable debug logging for litmus and cleave
+    /// Enable debug logging for Atomdrift Scan and cleave
     #[arg(long)]
     verbose: bool,
 
@@ -57,7 +57,7 @@ struct Cli {
     #[arg(short = 'u', long)]
     update: bool,
 
-    /// Disable the periodic update notice (also: LITMUS_NO_UPDATE_CHECK=1)
+    /// Disable the periodic update notice (also: SCAN_NO_UPDATE_CHECK=1)
     #[arg(long)]
     no_update_check: bool,
 
@@ -73,11 +73,11 @@ struct Cli {
     #[arg(long)]
     model_dir: Option<PathBuf>,
 
-    /// Override the models repository URL (env: LITMUS_MODELS_REPO)
+    /// Override the models repository URL (env: SCAN_MODELS_REPO)
     #[arg(long)]
     models_repo: Option<String>,
 
-    /// Override the models repository ref — branch or tag (env: LITMUS_MODELS_REF)
+    /// Override the models repository ref — branch or tag (env: SCAN_MODELS_REF)
     #[arg(long)]
     models_ref: Option<String>,
 
@@ -154,27 +154,27 @@ struct Cli {
     #[arg(long, global = true)]
     interpret: bool,
 
-    /// LLM endpoint or provider (env: LITMUS_LLM)
+    /// LLM endpoint or provider (env: SCAN_LLM)
     #[arg(long, global = true, value_name = "LLM")]
     llm: Option<String>,
 
-    /// LLM model name (env: LITMUS_LLM_MODEL)
+    /// LLM model name (env: SCAN_LLM_MODEL)
     #[arg(long, global = true, value_name = "NAME")]
     llm_model: Option<String>,
 
-    /// LLM bearer token (env: LITMUS_LLM_KEY); omit for local endpoints
+    /// LLM bearer token (env: SCAN_LLM_KEY); omit for local endpoints
     #[arg(long, global = true, value_name = "KEY")]
     llm_key: Option<String>,
 
     /// Minimum ML probability for a sample to be sent to the LLM
-    #[arg(long, global = true, default_value_t = litmus::interpret::DEFAULT_MIN_PROB, value_name = "P")]
+    #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_MIN_PROB, value_name = "P")]
     interpret_min_prob: f32,
 
     /// Per-request LLM timeout, in seconds
-    #[arg(long, global = true, default_value_t = litmus::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
+    #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
     llm_timeout: u64,
 
-    /// Paths to files or directories to scan (shorthand for `litmus scan <paths...>`)
+    /// Paths to files or directories to scan (shorthand for `ascan fs <paths...>`)
     paths: Vec<PathBuf>,
 
     #[command(subcommand)]
@@ -184,22 +184,22 @@ struct Cli {
 impl Cli {
     /// Build the LLM interpretation config from `--interpret` and the `--llm*`
     /// flags, falling back to env vars. `None` when `--interpret` is not set.
-    fn interpret_config(&self) -> Option<litmus::interpret::InterpretConfig> {
+    fn interpret_config(&self) -> Option<scan::interpret::InterpretConfig> {
         if !self.interpret {
             return None;
         }
-        use litmus::interpret::{DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY, DEFAULT_MODEL};
+        use scan::interpret::{DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY, DEFAULT_MODEL};
         let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
             flag.clone()
                 .or_else(|| std::env::var(key).ok())
                 .filter(|s| !s.is_empty())
         };
-        Some(litmus::interpret::InterpretConfig {
-            base_url: from_env(&self.llm, "LITMUS_LLM")
+        Some(scan::interpret::InterpretConfig {
+            base_url: from_env(&self.llm, "SCAN_LLM")
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            model: from_env(&self.llm_model, "LITMUS_LLM_MODEL")
+            model: from_env(&self.llm_model, "SCAN_LLM_MODEL")
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            api_key: from_env(&self.llm_key, "LITMUS_LLM_KEY"),
+            api_key: from_env(&self.llm_key, "SCAN_LLM_KEY"),
             min_prob: self.interpret_min_prob,
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
@@ -230,7 +230,8 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Scan files or directories for hostile/suspicious content
-    Scan {
+    #[command(alias = "scan")]
+    Fs {
         /// Paths to files or directories to scan
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
@@ -238,6 +239,11 @@ enum Commands {
 
     /// Scan executables of all running processes
     Ps,
+
+    /// Triage this host: running-process executables plus common persistence
+    /// and temp locations where malware stages
+    #[command(alias = "host")]
+    Sys,
 
     /// Update models (and optionally cleave traits)
     UpdateRules {
@@ -380,7 +386,7 @@ enum Commands {
 fn threshold_overrides_for_model(
     threshold_suspicious: Option<f32>,
     threshold_hostile: Option<f32>,
-) -> Option<litmus::model::Thresholds> {
+) -> Option<scan::model::Thresholds> {
     // Level mode resolves the verdict from the model's level grid — the
     // per-file level sweep plus the active level's hostile/suspicious cutoffs —
     // so no explicit thresholds are loaded here; `Model::load` keeps its
@@ -395,9 +401,9 @@ fn threshold_overrides_for_model(
     match (threshold_suspicious, threshold_hostile) {
         (None, None) => None,
         (sus, hos) => {
-            let hostile = hos.unwrap_or(litmus::model::Thresholds::FALLBACK_HOSTILE);
+            let hostile = hos.unwrap_or(scan::model::Thresholds::FALLBACK_HOSTILE);
             let suspicious = sus.unwrap_or(hostile);
-            Some(litmus::model::Thresholds {
+            Some(scan::model::Thresholds {
                 suspicious,
                 hostile,
             })
@@ -428,16 +434,16 @@ fn main() -> Result<()> {
     // Resolve before `cli.command` is moved out below; only one arm uses it.
     let interpret_cfg = cli.interpret_config();
 
-    // Default to Scan when bare paths are given without a subcommand.
+    // Default to a file scan when bare paths are given without a subcommand.
     let command = match cli.command {
         Some(cmd) => cmd,
         None => {
             if !cli.paths.is_empty() {
-                Commands::Scan {
+                Commands::Fs {
                     paths: cli.paths.clone(),
                 }
             } else {
-                Cli::parse_from(["litmus", "--help"]);
+                Cli::parse_from(["ascan", "--help"]);
                 std::process::exit(0);
             }
         }
@@ -445,11 +451,11 @@ fn main() -> Result<()> {
 
     let is_serve = matches!(command, Commands::Serve { .. } | Commands::Worker { .. });
     let filter = if cli.verbose {
-        tracing_subscriber::EnvFilter::new("litmus=debug,cleave=debug")
+        tracing_subscriber::EnvFilter::new("scan=debug,cleave=debug")
     } else if is_serve {
-        tracing_subscriber::EnvFilter::new("litmus=info,cleave=warn")
+        tracing_subscriber::EnvFilter::new("scan=info,cleave=warn")
     } else {
-        tracing_subscriber::EnvFilter::new("litmus=warn,cleave=error")
+        tracing_subscriber::EnvFilter::new("scan=warn,cleave=error")
     };
     let fmt = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -464,7 +470,7 @@ fn main() -> Result<()> {
     // Stabilize cleave trait discovery before any cleave shared resources are
     // initialized. This avoids clone-into-existing-directory failures when the
     // default traits checkout was installed by cleave or another litmus run.
-    litmus::traits_repo::prepare_runtime_env();
+    scan::traits_repo::prepare_runtime_env();
 
     // Surface CLI overrides for the models repo to the resolver in
     // `models_repo.rs`, which reads these env vars. Doing it here means worker
@@ -474,10 +480,10 @@ fn main() -> Result<()> {
     // this point the program is still single-threaded — rayon and tokio
     // pools are constructed below.
     if let Some(url) = cli.models_repo.as_deref() {
-        unsafe { std::env::set_var("LITMUS_MODELS_REPO", url) };
+        unsafe { std::env::set_var("SCAN_MODELS_REPO", url) };
     }
     if let Some(reference) = cli.models_ref.as_deref() {
-        unsafe { std::env::set_var("LITMUS_MODELS_REF", reference) };
+        unsafe { std::env::set_var("SCAN_MODELS_REF", reference) };
     }
 
     const RAYON_FALLBACK_THREADS: usize = 4;
@@ -513,7 +519,7 @@ fn main() -> Result<()> {
         // Register each pool worker for the SIGUSR1 in-process thread dump, so a
         // wedge can be backtraced without a debugger (lldb/gdb can't attach in
         // the production jails).
-        .start_handler(|_| litmus::thread_dump::register_self())
+        .start_handler(|_| scan::thread_dump::register_self())
         .build_global()
     {
         tracing::warn!(error = %e, "failed to install global rayon pool; using default");
@@ -541,25 +547,28 @@ fn main() -> Result<()> {
     // Terminal theme detection is only needed for scan/ps with terminal output.
     // The OSC color-scheme query blocks on a TTY response and hangs in any
     // environment that doesn't reply (SSH, some tmux configs, worker daemons).
-    let needs_terminal_theme = cli.format == litmus::OutputFormat::Terminal
-        && matches!(command, Commands::Scan { .. } | Commands::Ps);
+    let needs_terminal_theme = cli.format == scan::OutputFormat::Terminal
+        && matches!(
+            command,
+            Commands::Fs { .. } | Commands::Ps | Commands::Sys
+        );
     if cli.light {
-        litmus::output::set_theme(litmus::output::Theme::Light);
+        scan::output::set_theme(scan::output::Theme::Light);
     } else if cli.dark {
-        litmus::output::set_theme(litmus::output::Theme::Dark);
+        scan::output::set_theme(scan::output::Theme::Dark);
     } else if needs_terminal_theme {
-        litmus::output::detect_theme();
+        scan::output::detect_theme();
     }
 
     // Name the in-flight analyses if the process aborts (e.g. a stack overflow
     // deep in cleave's analysis). Adds a suspect list to the abort log after the
     // runtime's own overflow message. Best-effort and async-signal-safe.
-    litmus::crash_dump::install();
+    scan::crash_dump::install();
 
     // Install the in-process backtrace capture handler so SIGUSR1 can dump every
     // analysis thread's stack without a debugger (lldb/gdb can't attach in the
     // production jails). Must precede the SIGUSR1 thread below.
-    litmus::thread_dump::install();
+    scan::thread_dump::install();
 
     // Dump all analysis-thread backtraces on SIGUSR1 (Linux equivalent of BSD
     // SIGINFO / Ctrl-T), captured in-process — works in jails where ptrace is
@@ -580,26 +589,27 @@ fn main() -> Result<()> {
                     continue;
                 }
                 // In-process capture: no debugger, works in jails. See
-                // `litmus::thread_dump`.
-                litmus::thread_dump::dump_all_threads();
+                // `scan::thread_dump`.
+                scan::thread_dump::dump_all_threads();
             }
         });
 
     #[cfg(debug_assertions)]
     tracing::warn!(
-        "DEBUG binary — litmus will be very slow; use `make release` for production builds"
+        "DEBUG binary — ascan will be very slow; use `make release` for production builds"
     );
 
     // Warn about missing analysis tools for commands that will run cleave.
     if matches!(
         command,
-        Commands::Scan { .. }
+        Commands::Fs { .. }
             | Commands::Ps
+            | Commands::Sys
             | Commands::Validate { .. }
             | Commands::Serve { .. }
             | Commands::Worker { .. }
     ) {
-        litmus::tools::warn_missing();
+        scan::tools::warn_missing();
     }
 
     // Interactive commands get a once-a-day, zero-telemetry update notice. The
@@ -607,21 +617,25 @@ fn main() -> Result<()> {
     // restart and shouldn't print transient notices into their logs.
     if matches!(
         command,
-        Commands::Scan { .. } | Commands::Ps | Commands::Version | Commands::UpdateRules { .. }
+        Commands::Fs { .. }
+            | Commands::Ps
+            | Commands::Sys
+            | Commands::Version
+            | Commands::UpdateRules { .. }
     ) {
-        litmus::update_check::maybe_notify(cli.no_update_check);
+        scan::update_check::maybe_notify(cli.no_update_check);
     }
 
     if cli.update {
         std::thread::scope(|s| {
             s.spawn(|| {
-                let dir = litmus::models_repo::install_target();
-                if let Err(e) = litmus::model_update::update(&dir, false) {
+                let dir = scan::models_repo::install_target();
+                if let Err(e) = scan::model_update::update(&dir, false) {
                     eprintln!("Warning: model update failed: {e}");
                 }
             });
             s.spawn(|| {
-                if let Err(e) = litmus::traits_repo::update(false, false) {
+                if let Err(e) = scan::traits_repo::update(false, false) {
                     eprintln!("Warning: traits update failed: {e}");
                 }
             });
@@ -633,14 +647,14 @@ fn main() -> Result<()> {
     let resolve_model_dir = || -> Result<PathBuf> {
         match &cli.model_dir {
             Some(d) => Ok(d.clone()),
-            None => litmus::models_repo::model_dir()
+            None => scan::models_repo::model_dir()
                 .map_err(|e| anyhow::anyhow!("failed to resolve model directory: {e}")),
         }
     };
     let threshold_overrides =
         || threshold_overrides_for_model(threshold_suspicious, threshold_hostile);
     // The envelope's `ml.lvl` encodes the FPR severity that produced the
-    // resolved thresholds (or the `-1` benign sentinel — see scan::level_confidence).
+    // resolved thresholds (or the `-1` benign sentinel — see engine::level_confidence).
     // Manual `--threshold-*` overrides bypass the levels table entirely, so we
     // pass `None` here; benign verdicts will still surface as `-1` regardless.
     let manual_thresholds = threshold_suspicious.is_some() || threshold_hostile.is_some();
@@ -658,8 +672,8 @@ fn main() -> Result<()> {
         } else {
             Some(
                 selected_severity_level
-                    .or_else(|| litmus::model::model_default_level(model_dir))
-                    .unwrap_or(litmus::model::DEFAULT_SEVERITY_LEVEL),
+                    .or_else(|| scan::model::model_default_level(model_dir))
+                    .unwrap_or(scan::model::DEFAULT_SEVERITY_LEVEL),
             )
         }
     };
@@ -671,11 +685,11 @@ fn main() -> Result<()> {
     );
 
     match command {
-        Commands::Scan { paths } => {
+        Commands::Fs { paths } => {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            let config = litmus::ScanConfig::new(
+            let config = scan::ScanConfig::new(
                 model_dir,
                 cli.format,
                 thresholds,
@@ -687,11 +701,11 @@ fn main() -> Result<()> {
             .with_interpret(interpret_cfg.clone());
             exit_for_summary(&run_scan_paths(&paths, &config)?);
         }
-        Commands::Ps => {
+        Commands::Sys => {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            let config = litmus::ScanConfig::new(
+            let config = scan::ScanConfig::new(
                 model_dir,
                 cli.format,
                 thresholds,
@@ -701,7 +715,23 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone());
-            exit_for_summary(&litmus::ps::run(&config)?);
+            exit_for_summary(&scan::sys::run(&config)?);
+        }
+        Commands::Ps => {
+            let model_dir = resolve_model_dir()?;
+            let envelope_level = resolve_envelope_level(&model_dir);
+            let thresholds = threshold_overrides();
+            let config = scan::ScanConfig::new(
+                model_dir,
+                cli.format,
+                thresholds,
+                filter,
+                cli.slow_rule_ms,
+                cli.extra,
+            )?
+            .with_level(envelope_level)
+            .with_interpret(interpret_cfg.clone());
+            exit_for_summary(&scan::ps::run(&config)?);
         }
         Commands::Serve {
             bind,
@@ -729,7 +759,7 @@ fn main() -> Result<()> {
                 .collect();
             let workers = workers.unwrap_or_else(default_workers);
             let allow_cidrs = match allow_cidr {
-                Some(s) => litmus::server::parse_cidr_list(&s)
+                Some(s) => scan::server::parse_cidr_list(&s)
                     .map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?,
                 None => Vec::new(),
             };
@@ -738,7 +768,7 @@ fn main() -> Result<()> {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            let config = litmus::server::ServerConfig::new(
+            let config = scan::server::ServerConfig::new(
                 bind,
                 max_size_mb.saturating_mul(1024 * 1024),
                 max_rss_bytes,
@@ -752,32 +782,32 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone());
-            eprintln!("Starting litmus server on http://{} ...", bind);
+            eprintln!("Starting Atomdrift Scan server on http://{} ...", bind);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(litmus::server::run(config))?;
+                .block_on(scan::server::run(config))?;
         }
 
         Commands::UpdateRules { models_only, check } => {
             // R2-backed: model_update validates the staged bundle (Model::load)
             // before swapping it in, so a broken bundle never goes live.
-            let dir = litmus::models_repo::install_target();
+            let dir = scan::models_repo::install_target();
             if check {
-                if let Err(e) = litmus::model_update::check(&dir) {
+                if let Err(e) = scan::model_update::check(&dir) {
                     eprintln!("Error checking model updates: {e}");
                     process::exit(1);
                 }
-                if !models_only && let Err(e) = litmus::traits_repo::check_updates() {
+                if !models_only && let Err(e) = scan::traits_repo::check_updates() {
                     eprintln!("Error checking traits updates: {e}");
                     process::exit(1);
                 }
             } else {
-                if let Err(e) = litmus::model_update::update(&dir, false) {
+                if let Err(e) = scan::model_update::update(&dir, false) {
                     eprintln!("Error updating models: {e}");
                     process::exit(1);
                 }
-                if !models_only && let Err(e) = litmus::traits_repo::update(false, false) {
+                if !models_only && let Err(e) = scan::traits_repo::update(false, false) {
                     eprintln!("Error updating traits: {e}");
                     process::exit(1);
                 }
@@ -787,16 +817,16 @@ fn main() -> Result<()> {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            let config = litmus::ScanConfig::new(
+            let config = scan::ScanConfig::new(
                 model_dir,
-                litmus::OutputFormat::Terminal,
+                scan::OutputFormat::Terminal,
                 thresholds,
                 DisplayFilter::alerts_only(),
                 cli.slow_rule_ms,
                 cli.extra,
             )?
             .with_level(envelope_level);
-            litmus::validate::run(&config, skip_traits)?;
+            scan::validate::run(&config, skip_traits)?;
         }
         Commands::Worker {
             url,
@@ -847,13 +877,13 @@ fn main() -> Result<()> {
             } else {
                 std::thread::scope(|s| {
                     s.spawn(|| {
-                        let dir = litmus::models_repo::install_target();
-                        if let Err(e) = litmus::model_update::update(&dir, false) {
+                        let dir = scan::models_repo::install_target();
+                        if let Err(e) = scan::model_update::update(&dir, false) {
                             eprintln!("Warning: model update failed: {e}");
                         }
                     });
                     s.spawn(|| {
-                        if let Err(e) = litmus::traits_repo::update(false, false) {
+                        if let Err(e) = scan::traits_repo::update(false, false) {
                             eprintln!("Warning: traits update failed: {e}");
                         }
                     });
@@ -868,16 +898,16 @@ fn main() -> Result<()> {
                      against on-disk rules as-is",
                 );
             } else {
-                let validate_config = litmus::ScanConfig::new(
+                let validate_config = scan::ScanConfig::new(
                     model_dir.clone(),
-                    litmus::OutputFormat::Terminal,
+                    scan::OutputFormat::Terminal,
                     thresholds,
                     DisplayFilter::alerts_only(),
                     cli.slow_rule_ms,
                     cli.extra,
                 )?
                 .with_level(envelope_level);
-                if let Err(e) = litmus::validate::run(&validate_config, false) {
+                if let Err(e) = scan::validate::run(&validate_config, false) {
                     eprintln!("Worker startup validation failed: {e:#}");
                     process::exit(1);
                 }
@@ -887,7 +917,7 @@ fn main() -> Result<()> {
                 MaxRssPolicy::from_cli(raw_max_rss_gb),
                 max_rss_gb.saturating_mul(GIB),
             );
-            let config = litmus::worker::WorkerConfig {
+            let config = scan::worker::WorkerConfig {
                 hopper_url: url,
                 name,
                 workers,
@@ -906,19 +936,19 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(litmus::worker::run(config))?;
+            rt.block_on(scan::worker::run(config))?;
         }
         Commands::Version => {
-            if cli.format == litmus::OutputFormat::Json {
+            if cli.format == scan::OutputFormat::Json {
                 let version = serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
-                    "models": litmus::models_repo::version(),
+                    "models": scan::models_repo::version(),
                     "traits": cleave::traits_repo::version(),
                 });
                 println!("{version}");
             } else {
-                println!("litmus {}", env!("CARGO_PKG_VERSION"));
-                if let Some(v) = litmus::models_repo::version() {
+                println!("ascan {}", env!("CARGO_PKG_VERSION"));
+                if let Some(v) = scan::models_repo::version() {
                     println!("  models: {v}");
                 }
                 if let Some(v) = cleave::traits_repo::version() {
@@ -1242,7 +1272,7 @@ fn log_max_rss_resolution(role: &'static str, policy: MaxRssPolicy, resolved_byt
 }
 
 /// Exit with the appropriate code based on scan summary counters.
-fn exit_for_summary(summary: &litmus::ScanSummary) {
+fn exit_for_summary(summary: &scan::ScanSummary) {
     if summary.hostile > 0 {
         process::exit(1);
     }
@@ -1254,7 +1284,7 @@ fn exit_for_summary(summary: &litmus::ScanSummary) {
     }
 }
 
-fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litmus::ScanSummary> {
+fn run_scan_paths(paths: &[PathBuf], config: &scan::ScanConfig) -> Result<scan::ScanSummary> {
     // Warm YARA + capability mapper off the rayon pool before any analysis
     // spawns rayon work. Directory scans run on a dedicated rayon pool; if
     // any of those workers is the first to hit `yara_engine()`, the init's
@@ -1264,7 +1294,7 @@ fn run_scan_paths(paths: &[PathBuf], config: &litmus::ScanConfig) -> Result<litm
 
     // Explicit files are analyzed as one parallel batch and each directory is
     // streamed; run_paths shares one model load and verdict tally across all.
-    litmus::scan::run_paths(paths, config)
+    scan::engine::run_paths(paths, config)
 }
 
 #[cfg(test)]
@@ -1282,7 +1312,7 @@ mod tests {
     #[test]
     fn bare_paths_default_to_scan_shorthand() -> Result<()> {
         let cli =
-            Cli::try_parse_from(["litmus", "/tmp/a", "/tmp/b"]).context("parse should work")?;
+            Cli::try_parse_from(["ascan", "/tmp/a", "/tmp/b"]).context("parse should work")?;
         assert_eq!(
             cli.paths,
             vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
@@ -1292,11 +1322,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_subcommand_accepts_multiple_paths() -> Result<()> {
-        let cli = Cli::try_parse_from(["litmus", "scan", "/tmp/a", "/tmp/b"])
-            .context("parse should work")?;
-        match cli.command.context("scan subcommand expected")? {
-            Commands::Scan { paths } => {
+    fn fs_subcommand_accepts_multiple_paths() -> Result<()> {
+        let cli =
+            Cli::try_parse_from(["ascan", "fs", "/tmp/a", "/tmp/b"]).context("parse should work")?;
+        match cli.command.context("fs subcommand expected")? {
+            Commands::Fs { paths } => {
                 assert_eq!(
                     paths,
                     vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
@@ -1308,9 +1338,19 @@ mod tests {
     }
 
     #[test]
+    fn scan_alias_maps_to_fs() -> Result<()> {
+        let cli = Cli::try_parse_from(["ascan", "scan", "/tmp/a"]).context("parse should work")?;
+        match cli.command.context("fs subcommand expected via alias")? {
+            Commands::Fs { paths } => assert_eq!(paths, vec![PathBuf::from("/tmp/a")]),
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn serve_and_worker_accept_negative_max_rss_disable() -> Result<()> {
         let cli = Cli::try_parse_from([
-            "litmus",
+            "ascan",
             "serve",
             "--bind",
             "127.0.0.1:49999",
@@ -1329,7 +1369,7 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from([
-            "litmus",
+            "ascan",
             "worker",
             "--url",
             "http://127.0.0.1:8081",
@@ -1369,7 +1409,7 @@ mod tests {
 
     #[test]
     fn server_config_treats_zero_max_rss_as_disabled() {
-        let cfg = litmus::server::ServerConfig::new(
+        let cfg = scan::server::ServerConfig::new(
             "127.0.0.1:0".parse().expect("addr"),
             1024 * 1024,
             0,
@@ -1384,7 +1424,7 @@ mod tests {
         .expect("valid config");
         assert!(cfg.max_rss_bytes().is_none(), "0 must mean disabled");
 
-        let cfg = litmus::server::ServerConfig::new(
+        let cfg = scan::server::ServerConfig::new(
             "127.0.0.1:0".parse().expect("addr"),
             1024 * 1024,
             8 * GIB,
@@ -1406,50 +1446,50 @@ mod tests {
 
     #[test]
     fn severity_level_flags_parse() -> Result<()> {
-        let cli = Cli::try_parse_from(["litmus", "-1", "/tmp/a"]).context("-1 should parse")?;
+        let cli = Cli::try_parse_from(["ascan", "-1", "/tmp/a"]).context("-1 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(10));
 
         let cli =
-            Cli::try_parse_from(["litmus", "--loose", "/tmp/a"]).context("--loose should parse")?;
+            Cli::try_parse_from(["ascan", "--loose", "/tmp/a"]).context("--loose should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(10));
 
-        let cli = Cli::try_parse_from(["litmus", "--paranoid", "/tmp/a"])
+        let cli = Cli::try_parse_from(["ascan", "--paranoid", "/tmp/a"])
             .context("--paranoid should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(90));
 
-        let cli = Cli::try_parse_from(["litmus", "scan", "--paranoid", "/tmp/a"])
+        let cli = Cli::try_parse_from(["ascan", "scan", "--paranoid", "/tmp/a"])
             .context("global --paranoid should parse after scan")?;
         assert_eq!(cli.selected_severity_level(), Some(90));
 
-        let cli = Cli::try_parse_from(["litmus", "-0", "/tmp/a"]).context("-0 should parse")?;
+        let cli = Cli::try_parse_from(["ascan", "-0", "/tmp/a"]).context("-0 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(0));
 
-        let cli = Cli::try_parse_from(["litmus", "-l", "100", "/tmp/a"])
+        let cli = Cli::try_parse_from(["ascan", "-l", "100", "/tmp/a"])
             .context("-l 100 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(100));
 
-        let cli = Cli::try_parse_from(["litmus", "--level", "12", "/tmp/a"])
+        let cli = Cli::try_parse_from(["ascan", "--level", "12", "/tmp/a"])
             .context("--level 12 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(12));
 
         // Out-of-range and conflicting selections are rejected. The level
         // range is per-100M (0..=25000) since the per-million migration.
-        assert!(Cli::try_parse_from(["litmus", "-l", "25001", "/tmp/a"]).is_err());
-        assert!(Cli::try_parse_from(["litmus", "-l", "3", "-5", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["ascan", "-l", "25001", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["ascan", "-l", "3", "-5", "/tmp/a"]).is_err());
         Ok(())
     }
 
     #[test]
     fn gzip_long_aliases_are_not_accepted() {
-        assert!(Cli::try_parse_from(["litmus", "--fast", "/tmp/a"]).is_err());
-        assert!(Cli::try_parse_from(["litmus", "--best", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["ascan", "--fast", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["ascan", "--best", "/tmp/a"]).is_err());
     }
 
     #[test]
     fn severity_level_flags_conflict_with_each_other_and_manual_thresholds() {
-        assert!(Cli::try_parse_from(["litmus", "-1", "-9", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["ascan", "-1", "-9", "/tmp/a"]).is_err());
         assert!(
-            Cli::try_parse_from(["litmus", "-9", "--threshold-hostile", "0.90", "/tmp/a"]).is_err()
+            Cli::try_parse_from(["ascan", "-9", "--threshold-hostile", "0.90", "/tmp/a"]).is_err()
         );
     }
 }

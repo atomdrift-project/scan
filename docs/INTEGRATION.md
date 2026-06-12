@@ -1,10 +1,10 @@
-# Integrating with Litmus
+# Integrating with Atomdrift Scan
 
 Three paths in. Pick by volume.
 
 | Path        | Pick when                                              | Reference                                    |
 | ----------- | ------------------------------------------------------ | -------------------------------------------- |
-| CLI         | One-shot or batch use up to ~5 scans / minute.         | `litmus --help`                              |
+| CLI         | One-shot or batch use up to ~5 scans / minute.         | `ascan --help`                               |
 | HTTP server | Sustained traffic past ~5 scans / minute.              | [SERVER_API.md](SERVER_API.md)               |
 | Worker      | Pull-based from a hopper queue.                        | [WORKERS.md](WORKERS.md)                     |
 | Rust library| You are already in Rust and need direct access.        | source — `classify_file`, `classify_bytes`   |

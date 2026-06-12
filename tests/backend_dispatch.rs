@@ -1,4 +1,4 @@
-//! Integration test for the model-backend dispatch in `litmus::model::Model`.
+//! Integration test for the model-backend dispatch in `scan::model::Model`.
 //!
 //! litmus is ONNX-only: the native LightGBM (`.txt`) and XGBoost (`.json`)
 //! loaders were retired. These tests verify that:
@@ -11,7 +11,7 @@
 //! ONNX bundle on disk. To run:
 //!
 //! ```sh
-//! LITMUS_ONNX_BUNDLE=/home/t/azoth/filetypes/pe \
+//! SCAN_ONNX_BUNDLE=/home/t/azoth/filetypes/pe \
 //!     cargo test --test backend_dispatch -- --ignored
 //! ```
 
@@ -19,10 +19,10 @@
 
 use std::path::{Path, PathBuf};
 
-use litmus::model::Model;
+use scan::model::Model;
 
 fn onnx_bundle() -> Option<PathBuf> {
-    let p = std::env::var("LITMUS_ONNX_BUNDLE")
+    let p = std::env::var("SCAN_ONNX_BUNDLE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/home/t/azoth/filetypes/pe"));
     (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
@@ -37,10 +37,10 @@ fn copy_bundle(src: &Path, files: &[&str]) -> tempfile::TempDir {
 }
 
 #[test]
-#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle (default: /home/t/azoth/filetypes/pe)"]
+#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle (default: /home/t/azoth/filetypes/pe)"]
 fn onnx_bundle_dispatches_to_onnx_backend() {
     let Some(src) = onnx_bundle() else {
-        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
+        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
     let dir = copy_bundle(&src, &["model.onnx", "feature_spec.json"]);
     let model = Model::load(dir.path(), None, None).expect("load ONNX bundle");
@@ -53,14 +53,14 @@ fn onnx_bundle_dispatches_to_onnx_backend() {
 }
 
 #[test]
-#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle"]
+#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle"]
 fn multi_seed_onnx_bundle_loads_and_predicts() {
     // Two seed members loaded from the same source model.onnx — averaging two
     // identical models must produce a probability identical to either member's
     // single prediction (within f32 noise). Confirms the K-member load and
     // predict paths are wired correctly without needing two distinct models.
     let Some(src) = onnx_bundle() else {
-        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
+        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::copy(
@@ -91,12 +91,12 @@ fn multi_seed_onnx_bundle_loads_and_predicts() {
 }
 
 #[test]
-#[ignore = "needs LITMUS_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle"]
+#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle"]
 fn ambiguous_onnx_legacy_plus_multi_seed_layout_is_rejected() {
     // A bundle with BOTH top-level `model.onnx` and `models/seed_*.onnx` is
     // ambiguous — the deploy should choose one layout. We refuse to guess.
     let Some(src) = onnx_bundle() else {
-        panic!("LITMUS_ONNX_BUNDLE not set or missing artifacts");
+        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::copy(

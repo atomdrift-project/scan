@@ -1,5 +1,5 @@
 #!/bin/sh
-# worker-debian.sh - Deploy litmus worker to Debian nodes via SSH
+# worker-debian.sh - Deploy Atomdrift Scan worker to Debian nodes via SSH
 # Usage: ./worker-debian.sh [build-host] [run-host] <url>
 #
 # build-host / run-host are SSH targets (e.g. "user@host" or an ssh_config alias).
@@ -8,7 +8,7 @@
 set -ex
 
 BUILD="${1:-build}"
-RUN="${2:-litmus}"
+RUN="${2:-ascan}"
 URL="$3"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
@@ -32,27 +32,27 @@ bssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
         cargo rustc git pkg-config build-essential clang lld sccache ca-certificates"
 
 log "Ensuring build user exists on $BUILD"
-bssh "id -u litmus >/dev/null 2>&1 || sudo useradd -m -s /bin/sh -c 'Litmus Build' litmus"
+bssh "id -u ascan >/dev/null 2>&1 || sudo useradd -m -s /bin/sh -c 'Atomdrift Scan Build' ascan"
 
 log "Syncing source to build host (excluding target/, out/, .git)"
-bssh "sudo -u litmus mkdir -p /home/litmus/litmus"
+bssh "sudo -u ascan mkdir -p /home/ascan/scan"
 tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
-    | bssh "sudo -u litmus tar -xf - -C /home/litmus/litmus"
+    | bssh "sudo -u ascan tar -xf - -C /home/ascan/scan"
 
 log "Building tarball on $BUILD"
-bssh "sudo -u litmus sh -c 'cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" make tarball'" \
+bssh "sudo -u ascan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" make tarball'" \
     || die "build failed on build host"
 
 log "Running tests on $BUILD"
-bssh "sudo -u litmus sh -c 'cd ~/litmus && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" cargo test --release -- --nocapture'" \
+bssh "sudo -u ascan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" cargo test --release -- --nocapture'" \
     || die "tests failed on build host"
 
 log "Transferring tarball from $BUILD to $RUN"
-bssh "sudo cat /home/litmus/litmus/out/litmus.tgz" \
-    | rssh "sudo tee /tmp/litmus.tgz >/dev/null"
+bssh "sudo cat /home/ascan/scan/out/ascan.tgz" \
+    | rssh "sudo tee /tmp/ascan.tgz >/dev/null"
 
 log "Ensuring run user exists on $RUN"
-rssh "id -u litmus >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -d /nonexistent -c 'Litmus Worker' litmus"
+rssh "id -u ascan >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -d /nonexistent -c 'Atomdrift Scan Worker' ascan"
 
 log "Installing runtime dependencies on $RUN"
 rssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
@@ -60,28 +60,28 @@ rssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
         git ca-certificates p7zip-full upx rizin innoextract"
 
 log "Extracting tarball on $RUN"
-rssh "sudo rm -rf /usr/local/share/litmus && \
-      sudo mkdir -p /usr/local/share/litmus && \
-      sudo tar -xzf /tmp/litmus.tgz -C /usr/local/share/litmus && \
-      sudo rm -f /tmp/litmus.tgz && \
-      sudo ln -sf /usr/local/share/litmus/litmus /usr/local/bin/litmus"
+rssh "sudo rm -rf /usr/local/share/atomdrift/scan && \
+      sudo mkdir -p /usr/local/share/atomdrift/scan && \
+      sudo tar -xzf /tmp/ascan.tgz -C /usr/local/share/atomdrift/scan && \
+      sudo rm -f /tmp/ascan.tgz && \
+      sudo ln -sf /usr/local/share/atomdrift/scan/ascan /usr/local/bin/ascan"
 
 log "Installing systemd unit on $RUN"
-rssh "sudo tee /etc/systemd/system/litmus-worker.service >/dev/null" <<EOF
+rssh "sudo tee /etc/systemd/system/ascan-worker.service >/dev/null" <<EOF
 [Unit]
-Description=Litmus worker
+Description=Atomdrift Scan worker
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=litmus
-Group=litmus
-ExecStart=/usr/local/share/litmus/litmus $worker_args
+User=ascan
+Group=ascan
+ExecStart=/usr/local/share/atomdrift/scan/ascan $worker_args
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/var/log/litmus-worker.log
-StandardError=append:/var/log/litmus-worker.log
+StandardOutput=append:/var/log/ascan-worker.log
+StandardError=append:/var/log/ascan-worker.log
 
 # Hardening
 NoNewPrivileges=true
@@ -99,14 +99,14 @@ WantedBy=multi-user.target
 EOF
 
 log "Preparing log file on $RUN"
-rssh "sudo touch /var/log/litmus-worker.log && sudo chown litmus:litmus /var/log/litmus-worker.log"
+rssh "sudo touch /var/log/ascan-worker.log && sudo chown ascan:ascan /var/log/ascan-worker.log"
 
-log "Enabling and restarting litmus-worker service on $RUN"
+log "Enabling and restarting ascan-worker service on $RUN"
 rssh "sudo systemctl daemon-reload && \
-      sudo systemctl enable litmus-worker.service && \
-      sudo systemctl restart litmus-worker.service"
+      sudo systemctl enable ascan-worker.service && \
+      sudo systemctl restart ascan-worker.service"
 
 log "Service status:"
-rssh "sudo systemctl --no-pager --full status litmus-worker.service" || true
+rssh "sudo systemctl --no-pager --full status ascan-worker.service" || true
 
 log "Deployment complete"

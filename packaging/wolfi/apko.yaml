@@ -1,5 +1,5 @@
-# Local OCI image for litmus. NOT upstreamed — Wolfi only hosts apks.
-# Pulls litmus + litmus-models from the local melange-built repo, plus
+# Local OCI image for ascan. NOT upstreamed — Wolfi only hosts apks.
+# Pulls ascan + ascan-models from the local melange-built repo, plus
 # cleave + cleave-traits from the cleave packaging output (same repo
 # path; the build script ensures the cleave apks are present).
 
@@ -15,8 +15,8 @@ contents:
     - wolfi-baselayout
     - cleave
     - cleave-traits
-    - litmus
-    - litmus-models
+    - ascan
+    - ascan-models
 
 accounts:
   groups:
@@ -29,11 +29,11 @@ accounts:
   run-as: 65532
 
 entrypoint:
-  command: /usr/bin/litmus
+  command: /usr/bin/ascan
 
 environment:
   CLEAVE_TRAITS_DIR: /usr/share/cleave/traits
-  LITMUS_MODELS_DIR: /usr/share/litmus/models/azoth
+  SCAN_MODELS_DIR: /usr/share/atomdrift/scan/models/azoth
   PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 archs:
@@ -41,7 +41,7 @@ archs:
   - x86_64
 
 annotations:
-  org.opencontainers.image.source: https://codeberg.org/atomdrift/litmus
-  org.opencontainers.image.title: litmus
+  org.opencontainers.image.source: https://codeberg.org/atomdrift/scan
+  org.opencontainers.image.title: ascan
   org.opencontainers.image.description: ML-powered malware classification using cleave static analysis
   org.opencontainers.image.licenses: Apache-2.0

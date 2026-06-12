@@ -17,7 +17,7 @@ use super::AppState;
 #[derive(Debug)]
 enum AnalysisOutcome {
     /// Task completed (inner `Result` is the analyzer's result).
-    Ok(anyhow::Result<Box<crate::scan::ScanResult>>),
+    Ok(anyhow::Result<Box<crate::engine::ScanResult>>),
     /// Task join failed (panic, runtime shutdown, etc.).
     JoinError(tokio::task::JoinError),
     /// Task exceeded the configured timeout. Slot is released; the blocking
@@ -32,7 +32,7 @@ enum AnalysisOutcome {
 /// `Timeout`. The blocking task is **not** aborted — tokio can't force-stop
 /// a blocking thread — but the HTTP slot is released so new work can land.
 async fn await_with_timeout(
-    handle: tokio::task::JoinHandle<anyhow::Result<crate::scan::ScanResult>>,
+    handle: tokio::task::JoinHandle<anyhow::Result<crate::engine::ScanResult>>,
     timeout_secs: u64,
     cancellation: &AtomicBool,
     stuck_orphans: &AtomicUsize,
@@ -142,7 +142,7 @@ fn analysis_error_status(error: &anyhow::Error) -> StatusCode {
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::Model;
-use crate::scan::ScanResult;
+use crate::engine::ScanResult;
 
 /// Returns the 1-minute system load average, or None on unsupported platforms.
 fn system_load_avg() -> Option<f64> {
@@ -671,7 +671,7 @@ pub(super) async fn analyze(
     // is recognized as PackageJson, not Unknown).
     let fname_for_temp = filename.clone();
     let temp_dir =
-        match tokio::task::spawn_blocking(move || TempBuilder::new().prefix("litmus-").tempdir())
+        match tokio::task::spawn_blocking(move || TempBuilder::new().prefix("ascan-").tempdir())
             .await
         {
             Ok(Ok(d)) => d,
@@ -994,7 +994,7 @@ pub(crate) fn classify_file(
     if let Some(p) = phase {
         p.set("features+model");
     }
-    let cr = crate::scan::classify_report(
+    let cr = crate::engine::classify_report(
         label,
         report,
         &resources.ctx,
@@ -1043,7 +1043,7 @@ pub(crate) fn classify_bytes(
     if let Some(p) = phase {
         p.set("features+model");
     }
-    let cr = crate::scan::classify_report(
+    let cr = crate::engine::classify_report(
         label,
         report,
         &resources.ctx,
@@ -1061,7 +1061,7 @@ pub(crate) fn classify_bytes(
 /// Build a [`ScanResult`] from a classified report.
 fn scan_result_from(
     label: &str,
-    cr: crate::scan::ClassifiedReport,
+    cr: crate::engine::ClassifiedReport,
     resources: &super::ModelResources,
 ) -> ScanResult {
     ScanResult {
@@ -1070,8 +1070,8 @@ fn scan_result_from(
         probability: cr.probability,
         threshold: cr.threshold,
         level: cr.level,
-        version: crate::scan::model_version_string(resources.model.info()),
-        analyzed_at: crate::scan::now_rfc3339(),
+        version: crate::engine::model_version_string(resources.model.info()),
+        analyzed_at: crate::engine::now_rfc3339(),
         cleave: Some(cr.report_json),
         pids: None,
         deleted: None,

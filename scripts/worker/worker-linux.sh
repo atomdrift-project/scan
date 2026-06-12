@@ -1,5 +1,5 @@
 #!/bin/sh
-# worker-linux.sh - Install litmus worker as a hardened systemd service.
+# worker-linux.sh - Install Atomdrift Scan worker as a hardened systemd service.
 #
 # Local install for any systemd-equipped Linux with apt-get (Debian, Ubuntu,
 # Mint, Pop!_OS, ...) or pacman (Arch, CachyOS, EndeavourOS, Manjaro, ...).
@@ -19,11 +19,11 @@ set -eu
 URL="${1:-}"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
-SERVICE_USER=litmus
-SERVICE_NAME=litmus-worker
-BINARY=litmus
+SERVICE_USER=ascan
+SERVICE_NAME=ascan-worker
+BINARY=ascan
 BIN_PATH=/usr/local/bin/${BINARY}
-STATE_HOME=/var/lib/litmus
+STATE_HOME=/var/lib/atomdrift/scan
 UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
 DATA_DIR="${DATA_DIR:-}"
@@ -99,7 +99,7 @@ if ! getent passwd "${SERVICE_USER}" >/dev/null; then
     log "Creating service user '${SERVICE_USER}'"
     sudo useradd --system --home-dir "${STATE_HOME}" --no-create-home \
                  --shell /usr/sbin/nologin \
-                 --comment "Litmus worker" "${SERVICE_USER}"
+                 --comment "Atomdrift Scan worker" "${SERVICE_USER}"
 fi
 
 # Pre-create state dir so an early failure doesn't leave us without one;
@@ -122,19 +122,19 @@ fi
 # --- Compose ExecStart ------------------------------------------------------
 
 # %S is a systemd specifier that expands to /var/lib at unit-load time, so
-# --traits-dir resolves to /var/lib/litmus/traits inside the namespace.
-exec_args="worker --url ${URL} --traits-dir %S/litmus/traits --max-rss-gb ${MAX_RSS_GB}"
+# --traits-dir resolves to /var/lib/atomdrift/scan/traits inside the namespace.
+exec_args="worker --url ${URL} --traits-dir %S/atomdrift/scan/traits --max-rss-gb ${MAX_RSS_GB}"
 if [ -n "${WORKERS}" ];  then exec_args="${exec_args} --workers ${WORKERS}";   fi
 if [ -n "${DATA_DIR}" ]; then exec_args="${exec_args} --data-dir ${DATA_DIR}"; fi
 
 # --- Unit -------------------------------------------------------------------
 
-TMP_UNIT=$(mktemp -t litmus-worker.service.XXXXXX)
+TMP_UNIT=$(mktemp -t ascan-worker.service.XXXXXX)
 
 cat >"$TMP_UNIT" <<EOF
 [Unit]
-Description=Litmus worker (analyses samples claimed from hopper)
-Documentation=https://codeberg.org/atomdrift/litmus
+Description=Atomdrift Scan worker (analyses samples claimed from hopper)
+Documentation=https://codeberg.org/atomdrift/scan
 After=network-online.target
 Wants=network-online.target
 
@@ -143,16 +143,16 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 
-StateDirectory=litmus
+StateDirectory=ascan
 StateDirectoryMode=0750
 
-WorkingDirectory=%S/litmus
+WorkingDirectory=%S/atomdrift/scan
 ExecStart=${BIN_PATH} ${exec_args}
 Restart=always
 RestartSec=10s
 TimeoutStopSec=30s
 
-Environment=HOME=%S/litmus
+Environment=HOME=%S/atomdrift/scan
 
 # Resource caps. Under systemd we disable the worker's in-process RSS
 # throttling (--max-rss-gb=-1) and let MemoryMax do the enforcement: a
@@ -212,11 +212,11 @@ fi
 
 # --- Migrate from the cron-based deploy ------------------------------------
 
-if crontab -l 2>/dev/null | grep -q "litmus worker"; then
+if crontab -l 2>/dev/null | grep -q "ascan worker"; then
     log "Removing legacy cron entry from $(id -un)'s crontab"
-    (crontab -l 2>/dev/null | grep -v "litmus worker" || true) | crontab -
-    log "Stopping any user-owned 'litmus worker' processes from the cron era"
-    pkill -u "$(id -u)" -f "litmus worker" 2>/dev/null || true
+    (crontab -l 2>/dev/null | grep -v "ascan worker" || true) | crontab -
+    log "Stopping any user-owned 'ascan worker' processes from the cron era"
+    pkill -u "$(id -u)" -f "ascan worker" 2>/dev/null || true
 fi
 
 # --- Activate ---------------------------------------------------------------

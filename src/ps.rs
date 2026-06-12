@@ -16,7 +16,7 @@ use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Classification, Model};
 use crate::output;
-use crate::scan::{Progress, ScanConfig, ScanResult, ScanSummary};
+use crate::engine::{Progress, ScanConfig, ScanResult, ScanSummary};
 
 /// A group of processes sharing the same executable binary (by SHA256).
 struct ProcessGroup {
@@ -296,7 +296,7 @@ fn build_result(
     group: &ProcessGroup,
     cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
-    let cr = crate::scan::classify_report(
+    let cr = crate::engine::classify_report(
         &display_path.display().to_string(),
         report,
         ctx,
@@ -304,7 +304,7 @@ fn build_result(
         shap,
         cancellation,
         Some(100),
-        &crate::scan::tiny_opts_for(config),
+        &crate::engine::tiny_opts_for(config),
         config.interpret(),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
@@ -317,8 +317,8 @@ fn build_result(
         probability: cr.probability,
         threshold: cr.threshold,
         level: cr.level,
-        version: crate::scan::model_version_string(model.info()),
-        analyzed_at: crate::scan::now_rfc3339(),
+        version: crate::engine::model_version_string(model.info()),
+        analyzed_at: crate::engine::now_rfc3339(),
         cleave,
         pids: Some(group.pids.clone()),
         deleted: group.deleted.then_some(true),
@@ -366,7 +366,7 @@ fn emit_result(
             let Ok(mut out) = stdout.lock() else {
                 return;
             };
-            crate::scan::write_tiny(&mut *out, r);
+            crate::engine::write_tiny(&mut *out, r);
         }
     }
 }

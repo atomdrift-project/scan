@@ -254,8 +254,8 @@ impl FeatureSpec {
 
         if raw.version < MIN_LOADABLE_SPEC_VERSION || raw.version > EXPECTED_SPEC_VERSION {
             anyhow::bail!(
-                "feature spec version mismatch: this installed model uses spec v{}, but this litmus build accepts v{MIN_LOADABLE_SPEC_VERSION}..=v{EXPECTED_SPEC_VERSION}. \
-                 The model is incompatible with this build. Run 'litmus update-rules' to install a matching model bundle.",
+                "feature spec version mismatch: this installed model uses spec v{}, but this Atomdrift Scan build accepts v{MIN_LOADABLE_SPEC_VERSION}..=v{EXPECTED_SPEC_VERSION}. \
+                 The model is incompatible with this build. Run 'ascan update-rules' to install a matching model bundle.",
                 raw.version,
             );
         }
@@ -372,7 +372,7 @@ impl FeatureSpec {
         }
         if self.abi_version != EXPECTED_MODEL_ABI_VERSION {
             anyhow::bail!(
-                "feature spec ABI mismatch: spec has ABI v{} but litmus requires ABI v{}",
+                "feature spec ABI mismatch: spec has ABI v{} but Atomdrift Scan requires ABI v{}",
                 self.abi_version,
                 EXPECTED_MODEL_ABI_VERSION
             );

@@ -1,9 +1,9 @@
 #!/bin/sh
-# uninstall-linux.sh - Stop and remove the litmus-worker systemd service.
+# uninstall-linux.sh - Stop and remove the ascan-worker systemd service.
 # Also clears any legacy cron entry from the previous cron-based deploy.
 set -eu
 
-SERVICE_NAME=litmus-worker
+SERVICE_NAME=ascan-worker
 UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
 log() { printf '==> %s\n' "$*"; }
@@ -16,14 +16,14 @@ if command -v systemctl >/dev/null 2>&1 && [ -f "$UNIT_FILE" ]; then
     sudo systemctl daemon-reload
 fi
 
-if crontab -l 2>/dev/null | grep -q "litmus worker"; then
+if crontab -l 2>/dev/null | grep -q "ascan worker"; then
     log "Removing legacy cron entry"
-    (crontab -l 2>/dev/null | grep -v "litmus worker" || true) | crontab -
+    (crontab -l 2>/dev/null | grep -v "ascan worker" || true) | crontab -
 fi
 
-log "Killing any remaining litmus worker processes"
-sudo pkill -f "litmus worker" 2>/dev/null || true
-pkill -u "$(id -u)" -f "litmus worker" 2>/dev/null || true
+log "Killing any remaining ascan worker processes"
+sudo pkill -f "ascan worker" 2>/dev/null || true
+pkill -u "$(id -u)" -f "ascan worker" 2>/dev/null || true
 
 log "Uninstall complete"
-log "Note: service user 'litmus' and /var/lib/litmus left intact (remove manually for a fresh state)."
+log "Note: service user 'ascan' and /var/lib/atomdrift/scan left intact (remove manually for a fresh state)."

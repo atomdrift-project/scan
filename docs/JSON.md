@@ -1,4 +1,4 @@
-# Litmus JSON Report
+# Atomdrift Scan JSON Report
 
 Every analysis — whether returned by [the server](SERVER_API.md), posted
 by [a worker](WORKERS.md), or written to disk by the CLI — uses the
@@ -9,7 +9,7 @@ same envelope:
       "raw": { ... full cleave report ... }
     }
 
-`ml` is litmus. `raw` is the cleave [AnalysisReport](../../cleave/docs/JSON.md);
+`ml` is Atomdrift Scan. `raw` is the cleave [AnalysisReport](../../cleave/docs/JSON.md);
 the cleave repo owns its schema.
 
 ## Why the field names are short
@@ -60,7 +60,7 @@ A consumer reads it as:
   strict 2-FP-per-100M budget, while `lvl=500` is only caught once you
   tolerate 500 (`lvl=50` == 0.5 FP/M, `lvl=1000` == 10 FP/M).
 - `lvl == 25001` or `lvl == 25002` → off-grid trait-floor override
-  markers (`grid_max + 1/2`) where litmus manually raised a model-clean
+  markers (`grid_max + 1/2`) where Atomdrift Scan manually raised a model-clean
   result to suspicious because cleave found confident severe traits.
 - `lvl == -1` (sentinel) → the file fires at **no** grid level. Nothing
   short of disabling the model would flag it — it is clean.
@@ -128,7 +128,7 @@ derives it from `lvl` and the active level `N` (default `50`):
   under the default caps yet still reports `lvl = 500`; raising `-l` is
   what turns the same envelope into a suspicious or hostile verdict.
 
-The litmus CLI/server applies these caps internally to pick exit codes
+The Atomdrift Scan CLI/server applies these caps internally to pick exit codes
 and terminal output; downstream consumers reading stored envelopes
 apply whichever caps they prefer.
 

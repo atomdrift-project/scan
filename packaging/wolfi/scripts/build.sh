@@ -1,18 +1,18 @@
 #!/bin/sh
-# Build litmus + litmus-models apks via melange, then assemble an OCI
+# Build ascan + ascan-models apks via melange, then assemble an OCI
 # image via apko. Idempotent: skips work when source + yaml hashes match
 # the on-disk stamp.
 #
 # Local layout in $STAGE_DIR:
 #   cleave/      — cleave repo (with _filefacts vendored, Cargo.toml patched);
 #                  same staging recipe as cleave/packaging/wolfi/scripts/build.sh
-#   litmus/      — litmus repo, Cargo.toml extended with a [patch] block that
+#   scan/      — scan repo, Cargo.toml extended with a [patch] block that
 #                  overrides the upstream cleave git dep with `../cleave`.
 #
 # melange's --source-dir is $STAGE_DIR, so /home/build inside the chroot
-# has both subdirs; the build pipeline does `cd litmus && cargo build`.
+# has both subdirs; the build pipeline does `cd scan && cargo build`.
 # The upstream-shape melange.yaml has the same `cargo build` line without
-# the cd; build.sh substitutes a `cd litmus` over a marker comment.
+# the cd; build.sh substitutes a `cd scan` over a marker comment.
 
 set -eu
 
@@ -26,13 +26,13 @@ AZOTH_REPO="$SIBLING_DIR/azoth"
 OUT_DIR="$REPO_ROOT/out/wolfi"
 STAGE_DIR="$OUT_DIR/source"
 STAMP="$OUT_DIR/.build.stamp"
-VM_NAME="litmus-wolfi"
+VM_NAME="ascan-wolfi"
 APKO_IMAGE="${APKO_IMAGE:-cgr.dev/chainguard/apko:latest}"
 MELANGE_IMAGE="${MELANGE_IMAGE:-cgr.dev/chainguard/melange:latest}"
 
 [ -d "$CLEAVE_REPO" ]    || { echo "error: missing $CLEAVE_REPO" >&2; exit 1; }
 [ -d "$FILEFACTS_REPO" ] || { echo "error: missing $FILEFACTS_REPO" >&2; exit 1; }
-[ -d "$AZOTH_REPO" ]     || { echo "error: missing $AZOTH_REPO (needed for litmus-models subpackage)" >&2; exit 1; }
+[ -d "$AZOTH_REPO" ]     || { echo "error: missing $AZOTH_REPO (needed for ascan-models subpackage)" >&2; exit 1; }
 
 # Default to multi-arch (aarch64,x86_64) so the apks we produce match
 # what the publish step needs. For fast single-arch local iteration,
@@ -52,8 +52,8 @@ mkdir -p "$OUT_DIR/packages" "$STAGE_DIR"
 # only re-run the work whose inputs actually changed:
 #   cleave_hash:  cleave src + filefacts src + cleave's melange.yaml.
 #                 Invalidates the cleave + cleave-traits apks.
-#   litmus_hash:  litmus src + azoth + litmus's melange.yaml + cleave_hash.
-#                 Invalidates the litmus + litmus-models apks.
+#   ascan_hash:   scan src + azoth + scan's melange.yaml + cleave_hash.
+#                 Invalidates the ascan + ascan-models apks.
 #   image_hash:   everything above + apko.yaml + arch.
 #                 Invalidates the OCI tarball.
 hash_tree() {
@@ -70,7 +70,7 @@ cleave_hash=$( {
     echo "arch=$WOLFI_ARCH"
   } | shasum -a 256 | awk '{print $1}')
 
-litmus_hash=$( {
+ascan_hash=$( {
     echo "cleave=$cleave_hash"
     hash_tree "$REPO_ROOT"  src Cargo.toml Cargo.lock
     hash_tree "$AZOTH_REPO" .
@@ -79,14 +79,14 @@ litmus_hash=$( {
   } | shasum -a 256 | awk '{print $1}')
 
 image_hash=$( {
-    echo "litmus=$litmus_hash"
+    echo "ascan=$ascan_hash"
     shasum -a 256 "$PKG_DIR/apko.yaml" 2>/dev/null
   } | shasum -a 256 | awk '{print $1}')
 
 CLEAVE_STAMP="$OUT_DIR/.cleave.stamp"
-LITMUS_STAMP="$OUT_DIR/.litmus.stamp"
+SCAN_STAMP="$OUT_DIR/.ascan.stamp"
 
-if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$image_hash" ] && [ -f "$OUT_DIR/litmus.tar" ]; then
+if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$image_hash" ] && [ -f "$OUT_DIR/ascan.tar" ]; then
   echo "==> up to date (image hash $image_hash); skipping build"
   echo "    force rebuild: rm $STAMP"
   exit 0
@@ -94,7 +94,7 @@ fi
 
 # Generate the local-build variant of melange.yaml:
 #   1. Strip the upstream git-checkout step.
-#   2. Substitute `cd litmus` for the # LOCAL_BUILD_CD_HERE marker.
+#   2. Substitute `cd scan` for the # LOCAL_BUILD_CD_HERE marker.
 #   3. Drop --locked from cargo (the appended [patch] block makes the
 #      lock want to refresh; --locked forbids it).
 LOCAL_YAML="$OUT_DIR/melange.local.yaml"
@@ -102,7 +102,7 @@ awk '
   /# LOCAL_BUILD_STRIP_BEGIN/ { skip = 1; next }
   /# LOCAL_BUILD_STRIP_END/   { skip = 0; next }
   skip { next }
-  /# LOCAL_BUILD_CD_HERE/    { sub(/# LOCAL_BUILD_CD_HERE.*/,    "cd litmus");                       print; next }
+  /# LOCAL_BUILD_CD_HERE/    { sub(/# LOCAL_BUILD_CD_HERE.*/,    "cd scan");                       print; next }
   /# LOCAL_BUILD_AZOTH_HERE/ { sub(/# LOCAL_BUILD_AZOTH_HERE.*/, "cp -a /home/build/azoth/. models-src/"); print; next }
   { print }
 ' "$PKG_DIR/melange.yaml" \
@@ -123,8 +123,8 @@ awk '
   | sed 's/ --locked//g' \
   > "$CLEAVE_LOCAL_YAML.new" && mv -f "$CLEAVE_LOCAL_YAML.new" "$CLEAVE_LOCAL_YAML"
 
-# Stage cleave + filefacts + litmus into a clean tree. Same recipe as
-# cleave's packaging for the cleave/_filefacts vendoring; litmus gets a
+# Stage cleave + filefacts + scan into a clean tree. Same recipe as
+# cleave's packaging for the cleave/_filefacts vendoring; scan gets a
 # `[patch]` block appended that points at the staged cleave.
 echo "==> staging source into $STAGE_DIR"
 command -v rsync >/dev/null 2>&1 || { echo "error: rsync required" >&2; exit 1; }
@@ -135,7 +135,7 @@ rsync -a --delete $EXCLUDES "$CLEAVE_REPO/"    "$STAGE_DIR/cleave/"
 # shellcheck disable=SC2086
 rsync -a --delete $EXCLUDES "$FILEFACTS_REPO/" "$STAGE_DIR/cleave/_filefacts/"
 # shellcheck disable=SC2086
-rsync -a --delete $EXCLUDES "$REPO_ROOT/"      "$STAGE_DIR/litmus/"
+rsync -a --delete $EXCLUDES "$REPO_ROOT/"      "$STAGE_DIR/scan/"
 # shellcheck disable=SC2086
 rsync -a --delete $EXCLUDES "$AZOTH_REPO/"     "$STAGE_DIR/azoth/"
 
@@ -157,10 +157,10 @@ mv -f "$STAGE_DIR/cleave/Cargo.toml.new" "$STAGE_DIR/cleave/Cargo.toml"
 grep -q '^filefacts = { path = "_filefacts" }$' "$STAGE_DIR/cleave/Cargo.toml" \
   || { echo "error: cleave Cargo.toml filefacts rewrite failed" >&2; exit 1; }
 
-# Append [patch] to litmus's Cargo.toml so cargo uses the staged cleave
+# Append [patch] to scan's Cargo.toml so cargo uses the staged cleave
 # instead of fetching from codeberg. Idempotent: only append if missing.
-if ! grep -q '^\[patch\."https://codeberg.org/atomdrift/cleave.git"\]' "$STAGE_DIR/litmus/Cargo.toml"; then
-  cat >> "$STAGE_DIR/litmus/Cargo.toml" <<'PATCH'
+if ! grep -q '^\[patch\."https://codeberg.org/atomdrift/cleave.git"\]' "$STAGE_DIR/scan/Cargo.toml"; then
+  cat >> "$STAGE_DIR/scan/Cargo.toml" <<'PATCH'
 
 # Appended by packaging/wolfi/scripts/build.sh — points cargo at the
 # locally-staged cleave tree (which has _filefacts vendored).
@@ -184,7 +184,7 @@ case "$os" in
     else echo "error: no container runtime" >&2; exit 1; fi
     SRC_IN_RT="$STAGE_DIR"
     OUT_IN_RT="$OUT_DIR"
-    CACHE_IN_RT="${XDG_CACHE_HOME:-$HOME/.cache}/litmus-wolfi"
+    CACHE_IN_RT="${XDG_CACHE_HOME:-$HOME/.cache}/ascan-wolfi"
     mkdir -p "$CACHE_IN_RT"
     ;;
   *) echo "error: unsupported OS '$os'" >&2; exit 1 ;;
@@ -223,14 +223,14 @@ else
   echo "$cleave_hash" > "$CLEAVE_STAMP.new" && mv -f "$CLEAVE_STAMP.new" "$CLEAVE_STAMP"
 fi
 
-have_litmus_apks() {
-  ls "$OUT_DIR/packages/$WOLFI_ARCH/litmus-"[0-9]*.apk   >/dev/null 2>&1 && \
-  ls "$OUT_DIR/packages/$WOLFI_ARCH/litmus-models-"*.apk >/dev/null 2>&1
+have_ascan_apks() {
+  ls "$OUT_DIR/packages/$WOLFI_ARCH/ascan-"[0-9]*.apk   >/dev/null 2>&1 && \
+  ls "$OUT_DIR/packages/$WOLFI_ARCH/ascan-models-"*.apk >/dev/null 2>&1
 }
-if [ -f "$LITMUS_STAMP" ] && [ "$(cat "$LITMUS_STAMP")" = "$litmus_hash" ] && have_litmus_apks; then
-  echo "==> litmus apks up to date (hash $litmus_hash); skipping litmus melange"
+if [ -f "$SCAN_STAMP" ] && [ "$(cat "$SCAN_STAMP")" = "$ascan_hash" ] && have_ascan_apks; then
+  echo "==> ascan apks up to date (hash $ascan_hash); skipping ascan melange"
 else
-  echo "==> building litmus + litmus-models ($WOLFI_ARCH)"
+  echo "==> building ascan + ascan-models ($WOLFI_ARCH)"
   $NERDCTL run --rm \
     -v "$SRC_IN_RT:/src:ro" \
     -v "$OUT_IN_RT:/out" \
@@ -244,16 +244,16 @@ else
       --cache-dir /cache/melange \
       --signing-key /out/melange.rsa \
       --out-dir /out/packages
-  echo "$litmus_hash" > "$LITMUS_STAMP.new" && mv -f "$LITMUS_STAMP.new" "$LITMUS_STAMP"
+  echo "$ascan_hash" > "$SCAN_STAMP.new" && mv -f "$SCAN_STAMP.new" "$SCAN_STAMP"
 fi
 
 cp -f "$OUT_DIR/melange.rsa.pub" "$OUT_DIR/packages/melange.rsa.pub"
 
 echo "==> assembling OCI image with apko (local smoke-test image, $HOST_WOLFI_ARCH only)"
-# The local litmus.tar is used by smoke-test.sh which loads it into the
+# The local ascan.tar is used by smoke-test.sh which loads it into the
 # host container runtime — only the host arch matters here. Multi-arch
 # publishing happens via scripts/publish.sh.
-TAR_TMP="$OUT_DIR/litmus.tar.new"
+TAR_TMP="$OUT_DIR/ascan.tar.new"
 rm -f "$TAR_TMP"
 $NERDCTL run --rm \
   -v "$SRC_IN_RT:/src:ro" \
@@ -261,14 +261,14 @@ $NERDCTL run --rm \
   -v "$CACHE_IN_RT:/cache" \
   -w /out \
   "$APKO_IMAGE" build \
-    /src/litmus/packaging/wolfi/apko.yaml \
-    litmus:latest \
-    /out/litmus.tar.new \
+    /src/scan/packaging/wolfi/apko.yaml \
+    ascan:latest \
+    /out/ascan.tar.new \
     --arch "$HOST_WOLFI_ARCH" \
     --keyring-append /out/melange.rsa.pub \
     --cache-dir /cache/apko
 
-mv -f "$TAR_TMP" "$OUT_DIR/litmus.tar"
+mv -f "$TAR_TMP" "$OUT_DIR/ascan.tar"
 echo "$image_hash" > "$STAMP.new" && mv -f "$STAMP.new" "$STAMP"
 
-echo "==> done: $OUT_DIR/litmus.tar"
+echo "==> done: $OUT_DIR/ascan.tar"

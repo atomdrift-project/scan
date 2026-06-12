@@ -3,18 +3,18 @@
 //! Catches model/code version drift at CI time rather than in production.
 
 use anyhow::{Context, Result};
-use litmus::features::{EXPECTED_MODEL_ABI_VERSION, EXPECTED_SPEC_VERSION, FeatureSpec};
+use scan::features::{EXPECTED_MODEL_ABI_VERSION, EXPECTED_SPEC_VERSION, FeatureSpec};
 
 fn model_dir() -> Result<std::path::PathBuf> {
-    std::env::var("LITMUS_MODELS_DIR")
+    std::env::var("SCAN_MODELS_DIR")
         .map(std::path::PathBuf::from)
-        .context("set LITMUS_MODELS_DIR to run integration tests against real model artifacts")
+        .context("set SCAN_MODELS_DIR to run integration tests against real model artifacts")
 }
 
 #[test]
 fn spec_version_matches_expected() -> Result<()> {
-    if std::env::var_os("LITMUS_MODELS_DIR").is_none() {
-        eprintln!("skipping: LITMUS_MODELS_DIR is not set");
+    if std::env::var_os("SCAN_MODELS_DIR").is_none() {
+        eprintln!("skipping: SCAN_MODELS_DIR is not set");
         return Ok(());
     }
 
@@ -28,7 +28,7 @@ fn spec_version_matches_expected() -> Result<()> {
     };
     assert!(
         spec_path.exists(),
-        "{} not found — set LITMUS_MODELS_DIR or clone the models repo",
+        "{} not found — set SCAN_MODELS_DIR or clone the models repo",
         spec_path.display()
     );
 

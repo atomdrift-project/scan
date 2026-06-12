@@ -1,6 +1,6 @@
-# Litmus Workers
+# Atomdrift Scan Workers
 
-`litmus worker` is the pull-based counterpart to `litmus serve`. It
+`ascan worker` is the pull-based counterpart to `ascan serve`. It
 exposes no HTTP. It polls a [hopper](https://codeberg.org/atomdrift/hopper)
 instance for jobs, analyses each file, and posts the result back.
 
@@ -11,7 +11,7 @@ result carries.
 
 ## Running a worker
 
-    litmus worker --url http://hopper-host:8081
+    ascan worker --url http://hopper-host:8081
 
 `--url` is required. Everything else has a sensible default.
 
@@ -28,8 +28,8 @@ result carries.
 | `--nice`         | `10`             | `nice(2)` value applied at startup. `0` leaves priority unchanged.       |
 
 The same environment variables apply as for the server:
-`CLEAVE_TRAITS_DIR`, `CLEAVE_RAYON_THREADS`, `LITMUS_MODELS_REPO`,
-`LITMUS_MODELS_REF`.
+`CLEAVE_TRAITS_DIR`, `CLEAVE_RAYON_THREADS`, `SCAN_MODELS_REPO`,
+`SCAN_MODELS_REF`.
 
 ## Job lifecycle
 
@@ -71,7 +71,7 @@ The worker is designed to share a host with other work.
   trait/model directories that already exist; it does not re-clone if
   the working tree is current.
 - **FreeBSD.** `make deploy-worker` installs natively on the host: an
-  unprivileged `litmus` user and an rc.d service supervised by
+  unprivileged `ascan` user and an rc.d service supervised by
   `daemon(8)`, which restarts the worker forever (5s back-off) after an
   OOM kill or panic. `make deploy-jail-worker` instead builds in a
   Bastille build jail and runs the same rc.d service in a separate run

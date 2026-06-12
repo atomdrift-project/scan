@@ -46,13 +46,14 @@ significant_drop_in_scrutinee = "warn"
 significant_drop_tightening = "warn"
 
 [package]
-name = "litmus"
+name = "atomdrift-scan"
 version = "2.0.0-rc.6"
-default-run = "litmus"
+default-run = "ascan"
 edition = "2024"
 authors = ["The Atomdrift Project"]
 description = "ML-powered malware classification using cleave static analysis"
 license = "Apache-2.0"
+repository = "https://codeberg.org/atomdrift/scan"
 
 [dependencies]
 # default-features = false drops cleave's `jemalloc` default (its only default
@@ -83,7 +84,7 @@ terminal-colorsaurus = "0.4"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
 tower = { version = "0.5", features = ["limit"] }
-# Same terminal-color crate cleave uses, so litmus's verdict line and cleave's
+# Same terminal-color crate cleave uses, so ascan's verdict line and cleave's
 # context body gate (tty / NO_COLOR) and color identically.
 colored = "3.1"
 tempfile = "3"
@@ -120,11 +121,11 @@ tikv-jemallocator = "0.6"
 
 [features]
 # Enables jemalloc heap profiling. Build with:
-#   cargo build --profile profiling --features jemalloc-prof --bin litmus
+#   cargo build --profile profiling --features jemalloc-prof --bin ascan
 # Run with (note the `_RJEM_` prefix — tikv-jemalloc renames MALLOC_CONF):
 #   _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_interval:28,prof_prefix:out/heap/jeprof" \
-#     ./out/litmus.heap worker ...
-# Analyze with: jeprof --text ./out/litmus.heap out/heap/jeprof.*.heap
+#     ./out/ascan.heap worker ...
+# Analyze with: jeprof --text ./out/ascan.heap out/heap/jeprof.*.heap
 jemalloc-prof = ["tikv-jemallocator/profiling"]
 
 # Emit per-member rayon-thread breadcrumbs in the SIGUSR1/wedge dump. Requires a
@@ -159,16 +160,19 @@ debug = 2
 workspace = true
 
 [lib]
-name = "litmus"
+name = "scan"
 path = "src/lib.rs"
 
+# Atomdrift Scan — the product. The crates.io package is `atomdrift-scan`, but
+# the library is imported as `scan` (lib name below); the CLI binary is `ascan`
+# (the `a` prefix avoids colliding with avast's /usr/bin/scan).
 [[bin]]
-name = "litmus"
+name = "ascan"
 path = "src/main.rs"
 
 # Mock hopper for self-contained worker benchmarks (see `make worker-benchmark`).
 [[bin]]
-name = "litmus-bench-hopper"
+name = "scan-bench-hopper"
 path = "src/bin/bench_hopper.rs"
 
 # FreeBSD/aarch64 support for wasmtime's signal trap handler, pulled in

@@ -11,7 +11,7 @@
 //! `run_scan_paths`, the binary will hang under `CLEAVE_SKIP_YARA_CACHE=1`
 //! and this test will trip its timeout.
 //!
-//! **Requires `LITMUS_MODELS_DIR` to be set** (same convention as
+//! **Requires `SCAN_MODELS_DIR` to be set** (same convention as
 //! `server_analyze.rs`).
 
 #![allow(clippy::expect_used, clippy::panic)]
@@ -36,9 +36,9 @@ fn scan_ran_to_completion(code: i32) -> bool {
 
 #[test]
 fn scan_cli_completes_under_cold_yara_cache() {
-    let Ok(models_dir) = std::env::var("LITMUS_MODELS_DIR") else {
+    let Ok(models_dir) = std::env::var("SCAN_MODELS_DIR") else {
         eprintln!(
-            "skipping: LITMUS_MODELS_DIR not set (same convention as \
+            "skipping: SCAN_MODELS_DIR not set (same convention as \
              server_analyze.rs integration tests)"
         );
         return;
@@ -57,7 +57,7 @@ fn scan_cli_completes_under_cold_yara_cache() {
         .expect("write sample");
     let sample_path = sample.path().to_path_buf();
 
-    let bin = env!("CARGO_BIN_EXE_litmus");
+    let bin = env!("CARGO_BIN_EXE_ascan");
 
     // Capture the child's stderr to a FILE, not a pipe. An undrained pipe can
     // fill its OS buffer (~64KB) and block the child on write — which would
@@ -80,7 +80,7 @@ fn scan_cli_completes_under_cold_yara_cache() {
         // a non-rayon thread before any rayon analysis fires). Without it,
         // the process hangs.
         .env("CLEAVE_SKIP_YARA_CACHE", "1")
-        .env("LITMUS_MODELS_DIR", &models_dir)
+        .env("SCAN_MODELS_DIR", &models_dir)
         .env("RUST_BACKTRACE", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(child_stderr))
