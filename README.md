@@ -1,10 +1,26 @@
-<p align="center">
+<p alig
+    n="center">
   <img src="media/logo.svg" alt="Atomdrift Scan" width="240">
 </p>
 
 # Atomdrift Scan
 
-Context-free malware detection. The `ascan` command classifies a file, directory, or running process as `hostile`, `suspicious`, or `benign`, and shows which behaviors drove the call — no signatures, no reputation lookups, no network round-trips.
+Atomdrift Scan is an embeddable open-source malware scanner, tuned for open-source ecosystems, and designed to catch supply-chain attacks no matter the file format: ELF, Ruby, Python, Shell, PHP, C, Go, PE, whatever (we extract 95+ different filetypes!)
+
+AS is designed to replace proprietary scanners such as socket.dev, ReversingLabs, and Aikido, as well as legacy open-source
+scanners such as ClamAV and malcontent. To fight fire with fire, AS makes use of local AI models - but ones that are designed to be explicitly deterministic and designed to run on any hardware or operating system.
+
+Unlike most scanners, you get to pick your false-positive level, based on predicted occurrence over 100 million samples. Paranoid about your CI pipeline? use `ascan -l500 <files>`; don't want to bombard the SOC with alerts? use `ascan -l0`. 
+
+AS is in active development using the following architectures - chances are if you are elsewhere - it'll still work, but PRs welcome.
+
+* Linux [x86-64]
+* macOS [arm64]
+* FreeBSD [arm64, x86-64]
+* OpenBSD [x86-64]
+* OmniOS/illumos [x86-64]
+
+Atomdrift's core values are: privacy-first, local-only, fast, and comprehensive.
 
 <p align="center">
   <img src="media/screenshot.png" alt="Atomdrift Scan terminal output" width="760">
@@ -12,48 +28,78 @@ Context-free malware detection. The `ascan` command classifies a file, directory
 
 ## How it works
 
-Atomdrift Scan runs each sample through [cleave](https://codeberg.org/atomdrift/cleave) to extract capabilities (50,000+ rules mapped to [MBC](https://github.com/MBCProject/mbc-markdown) and [ATT&CK](https://attack.mitre.org/)), then scores them with **azoth**, our gradient-boosted tree model (trained with LightGBM, shipped as ONNX) for context-free malware detection. Every verdict ships with a SHAP-ranked list of the capabilities that drove the score.
+Atomdrift Scan is a multi-stage analyzer bringing together the best that open-source has to offer for reverse-engineering
+binaries and source code. 
 
-CPU-only inference. No GPU, no network, no telemetry. Same weights on a laptop, CI runner, or fleet.
+AS is able to cover as much ground as it does by expressing the AI model in terms of a YAML-based expert system with over 75,000 rules, analyzing using a large ensemble of LightGBM ML models. AS also supports the use of local GPU-based analysis via OpenAI-compatible endpoints [vLLM, for example] for additional accuracy and interpretation, but that's entirely optional.
+
+```mermaid
+flowchart LR
+    IN([file · dir · process]) --> CLEAVE
+
+    subgraph CLEAVE[cleave — capability extraction]
+        direction TB
+        UPX[upx<br/>unpack]
+        TS[tree-sitter<br/>parse scripts]
+        YARA[YARA<br/>pattern match]
+        RIZIN[rizin<br/>disassemble]
+    end
+
+    CLEAVE -->|AnalysisReport<br/>50k rules → MBC + ATT&CK| FF[filefacts<br/>feature extraction]
+    FF -->|standardized<br/>feature vector| SCAN[scan<br/>ONNX inference]
+    AZOTH[(azoth<br/>GBT ensemble)] -.loads.-> SCAN
+    SCAN -->|Decision + SHAP reasons| OUT{{verdict<br/>hostile · suspicious · benign}}
+    SCAN -.->|prob ≥ gate| INTERPRET[--interpret<br/>local LLM blend]
+    INTERPRET -.-> OUT
+
+    click CLEAVE "https://atomdrift.org/cleave" _blank
+    click FF "https://atomdrift.org/filefacts" _blank
+    click AZOTH "https://atomdrift.org/azoth" _blank
+    click SCAN "https://atomdrift.org/scan" _blank
+    click UPX "https://upx.github.io/" _blank
+    click TS "https://tree-sitter.github.io/tree-sitter/" _blank
+    click YARA "https://virustotal.github.io/yara-x/" _blank
+    click RIZIN "https://rizin.re/" _blank
+```
+
+## Dependencies
+
+* Rust 1.96 or higher
+* upx [optional, recommended]
+* rizin [optional, recommended]
+* innoextract [optional, recommended]
 
 ## Install
 
+For Linux and macOS users using Homebrew:
+
 ```bash
 brew tap atomdrift/tap https://codeberg.org/atomdrift/homebrew-tap.git
-brew install ascan
+brew install atomdrift-scan
 ```
 
-Or from source: `git clone https://codeberg.org/atomdrift/scan.git && cd scan && make install`.
+For everyone else, source compiles are trivial:
 
-Optional: [rizin](https://github.com/rizinorg/rizin) for disassembly, [upx](https://github.com/upx/upx) for unpacking. Runs on illumos, OpenBSD, FreeBSD, Linux, and macOS.
+```bash
+git clone https://codeberg.org/atomdrift/scan.git
+cd scan
+make install
+```
 
 ## Usage
 
 ```bash
-ascan suspect.tgz                        # one sample (shorthand for `ascan fs`)
-ascan fs /srv/npm-mirror                 # recursive; archives unpacked
-ascan fs --format json --show all pkg/   # JSONL for pipelines
+ascan fs /bin/                           # recursive; archives unpacked
 ascan ps                                 # classify running processes
-ascan sys                                # triage the host: processes + persistence/temp locations
-ascan -0 release.tgz                     # zero false positives; strictest
-ascan --loose release.tgz                # level 10: least noisy
-ascan -9 release.tgz                     # paranoid: catch the long tail (L90)
-ascan -l 50 release.tgz                  # any level 0-1000 via -l/--level (L50 is the default)
 ```
 
-Sensitivity is on the per-100M-benigns scale: `-0` through `-9` for the round-decade shorthand (L0, L10, L20, ..., L90), or `-l <N>` / `--level <N>` for any integer in `0..=1000`. Default is L50 (= 50 FP per 100M ≡ 0.5 FP/M); the grid tops out at L1000 (= 10 FP/M) for aggressive triage. Lower numbers are stricter. For exact cutoffs use `--threshold-hostile` / `--threshold-suspicious`. `--model-dir` swaps in a custom model bundle.
+By default, ascan is tuned for 50 false-positives per 100-million files, tune it for your use case using -l <X-per-100M>. To be ultra conservative and avoid any likelihood of false-positive, use:
 
-Exit codes: `0` clean, `1` hostile, `2` suspicious, `3` error.
+```bash
+ascan -l 0 /sbin/sulogin
+```
 
-## Modes
-
-- `ascan fs <path>` — scan files or directories (bare `ascan <path>` is shorthand)
-- `ascan ps` — classify running processes; `ascan sys` triages processes plus common persistence and temp locations
-- `ascan fs --format json` — JSONL output, full cleave report attached ([schema](docs/JSON.md))
-- `ascan serve` — HTTP API; loopback default, CIDR allowlist, bounded concurrency, RSS ceiling that rejects before the box swaps ([API reference](docs/SERVER_API.md))
-- `ascan worker` — pulls jobs from a [hopper](https://codeberg.org/atomdrift/hopper) queue with SHA256-verified local paths ([worker guide](docs/WORKERS.md))
-
-Models and rules are plain git repos; `--update` pulls new versions on demand.
+If you only care about rules for a particular platform, say macos or JunOS; use `--platform` to mask everything else out. Nothing is more annoying than seeing a Windows-specific alert on your ArchLinux CI pipeline.
 
 ## Documentation
 
