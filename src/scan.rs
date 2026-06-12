@@ -644,6 +644,18 @@ pub const fn level_confidence(level: Option<i32>) -> Option<u8> {
     }
 }
 
+/// Synthetic false-positive level for an LLM-driven verdict, used when the blend
+/// shifts the class away from ML's. Hostile gets the stronger (stricter) level,
+/// suspicious a loose review level, benign the clean marker — mapping through
+/// [`level_confidence`] to ≈85% / ≈80% / 0%.
+const fn interpreted_level(outcome: Classification) -> i32 {
+    match outcome {
+        Classification::Hostile => 100,
+        Classification::Suspicious => 250,
+        Classification::Benign => -1,
+    }
+}
+
 /// Classification result for a single analyzed file or executable.
 ///
 /// In terminal mode only a subset of results may be shown, but in JSON mode
@@ -1663,7 +1675,7 @@ pub(crate) fn classify_report(
     }
 
     // If an embedded file's decision outranks the parent, elevate.
-    let final_decision = if decision_outranks(&max_decision, &decision) {
+    let mut final_decision = if decision_outranks(&max_decision, &decision) {
         tracing::info!(
             path = %label,
             original_probability = format!("{:.4}", decision.probability),
@@ -1702,6 +1714,26 @@ pub(crate) fn classify_report(
             final_decision.probability,
         )
     });
+
+    // Adopt the blended verdict as the effective one when the LLM out-read ML
+    // (escalating a missed threat, or clearing an ML false positive). The `ml`
+    // section reflects litmus's final answer; the LLM's raw grade + rationale
+    // stay in the `llm` section. A synthetic "interpreted" level surfaces an
+    // escalation (L100 hostile / L250 suspicious) or clears a benign (L-1).
+    if let Some(interp) = &interpretation
+        && interp.grade.is_some()
+        && interp.outcome as u8 != final_decision.class as u8
+    {
+        tracing::info!(
+            path = %label,
+            ml = ?final_decision.class,
+            blended = ?interp.outcome,
+            "LLM interpretation shifted the verdict",
+        );
+        final_decision.class = interp.outcome;
+        final_decision.probability = interp.blended;
+        final_decision.level = Some(interpreted_level(interp.outcome));
+    }
 
     // Render cleave's context view now, while the typed (finalized) report is in
     // scope and the verdict (incl. any interpretation) is known. The terminal
