@@ -461,6 +461,11 @@ fn request(cfg: &InterpretConfig, user: &str) -> std::result::Result<(LlmGrade, 
     };
 
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    tracing::debug!(
+        model = %cfg.model,
+        url = %url,
+        "LLM request\n--- system ---\n{SYSTEM_PROMPT}\n--- user ---\n{user}",
+    );
     let mut req = client.post(&url).json(&body);
     if let Some(key) = cfg.api_key.as_deref().filter(|k| !k.is_empty()) {
         req = req.bearer_auth(key);
@@ -489,6 +494,7 @@ fn request(cfg: &InterpretConfig, user: &str) -> std::result::Result<(LlmGrade, 
         .next()
         .map(|c| c.message.text())
         .unwrap_or_default();
+    tracing::debug!(model = %cfg.model, "LLM response\n{content}");
 
     parse_grade_reason(&content)
         .ok_or_else(|| CallError::BadReply(anyhow!("no parseable grade in reply: {content:?}")))
