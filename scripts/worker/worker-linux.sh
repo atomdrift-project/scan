@@ -143,7 +143,11 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 
-StateDirectory=ascan
+# One writable namespace under /var/lib for all atomdrift tools: the worker's
+# HOME is %S/atomdrift/scan, and cleave (and any future tool) caches alongside
+# it under %S/atomdrift/<tool>. Declaring the parent keeps the unit stable as
+# tools are added.
+StateDirectory=atomdrift
 StateDirectoryMode=0750
 
 WorkingDirectory=%S/atomdrift/scan
