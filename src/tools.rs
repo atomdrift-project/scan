@@ -42,11 +42,7 @@ pub fn missing() -> Vec<MissingTool> {
         })
         .collect();
 
-    // 7-Zip ships under several binary names depending on the platform.
-    if !["7z", "7za", "7zz", "7zr"]
-        .iter()
-        .any(|&n| bin_available(n))
-    {
+    if !sevenzip_available() {
         absent.push(MissingTool {
             name: "7z",
             purpose: "7-Zip / CAB / tar archive extraction",
@@ -69,10 +65,7 @@ pub fn available_names() -> Vec<&'static str> {
         .map(|&(name, _, _)| name)
         .collect();
 
-    if ["7z", "7za", "7zz", "7zr"]
-        .iter()
-        .any(|&n| bin_available(n))
-    {
+    if sevenzip_available() {
         available.push("7z");
     }
 
@@ -142,6 +135,14 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "brew install innoextract  |  apt-get install innoextract  |  apk add innoextract",
     ),
 ];
+
+/// 7-Zip ships under several binary names depending on the platform.
+const SEVENZIP_BINS: &[&str] = &["7z", "7za", "7zz", "7zr"];
+
+/// Returns `true` if any 7-Zip binary variant is present in PATH.
+fn sevenzip_available() -> bool {
+    SEVENZIP_BINS.iter().any(|&n| bin_available(n))
+}
 
 /// Returns `true` if `name` resolves to an executable file in PATH.
 ///

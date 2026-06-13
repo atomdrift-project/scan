@@ -639,6 +639,9 @@ pub(super) async fn analyze(
     // collapse .. to prevent path traversal, and right-truncate to 63 characters so that
     // the extension is preserved. Used as both the `path` label and the temp file suffix
     // so that cleave can detect the file type from the extension.
+    // Right-truncation below preserves the tail (and thus the extension). All
+    // remaining chars are ASCII (filter above) so byte indexing is safe.
+    #[allow(clippy::string_slice)]
     let filename: String = {
         let raw = field
             .file_name()
@@ -656,11 +659,7 @@ pub(super) async fn analyze(
             .collect::<String>()
             .replace("..", "__");
         if sanitized.len() > 63 {
-            // Right-truncate: preserve the tail (and thus the extension).
-            // All remaining chars are ASCII (filter above) so byte indexing is safe.
-            #[allow(clippy::string_slice)]
-            let s = sanitized[sanitized.len() - 63..].to_string();
-            s
+            sanitized[sanitized.len() - 63..].to_string()
         } else {
             sanitized
         }
@@ -1091,7 +1090,6 @@ fn scan_result_from(
     }
 }
 
-/// Check RSS memory pressure. Returns a 503 response if the server is overloaded,
 // --- /analyze-path endpoint ---
 
 #[derive(serde::Deserialize)]

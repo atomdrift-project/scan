@@ -754,6 +754,16 @@ fn json_alias_str<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'
     json_alias(value, names).and_then(serde_json::Value::as_str)
 }
 
+/// The cleave findings array, taken from a single-file report (`find`/`ts`) or,
+/// failing that, the first file entry of a compact envelope (`files[0].find`).
+fn report_findings(report: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    json_alias_array(report, &["find", "ts"]).or_else(|| {
+        json_alias_array(report, &["files", "fs"])
+            .and_then(|a| a.first())
+            .and_then(|f| json_alias_array(f, &["find", "ts"]))
+    })
+}
+
 impl From<&serde_json::Value> for TopFinding {
     fn from(f: &serde_json::Value) -> Self {
         // Cleave omits `conf` when it equals the 0.5 default. The
@@ -1391,11 +1401,6 @@ const TRAIT_FLOOR_CRIT4_FRACTION: f32 = 0.05;
 /// no /usr/bin benign trips the crit-5 arm.
 const TRAIT_FLOOR_MIN_CONFIDENCE: f32 = 0.76;
 
-#[allow(clippy::cast_possible_truncation)]
-fn cleave_confidence_as_f32(value: f64) -> f32 {
-    value as f32
-}
-
 /// Confidence-filtered crit-5/crit-4 tallies plus the file's total finding count.
 /// The crit tiers count only findings with `c >= TRAIT_FLOOR_MIN_CONFIDENCE`; the
 /// total is every finding (the fraction's denominator is the file's whole activity,
@@ -1407,11 +1412,7 @@ struct TraitFloorCounts {
 }
 
 fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
-    let findings = json_alias_array(report, &["find", "ts"]).or_else(|| {
-        json_alias_array(report, &["files", "fs"])
-            .and_then(|a| a.first())
-            .and_then(|f| json_alias_array(f, &["find", "ts"]))
-    });
+    let findings = report_findings(report);
     let mut out = TraitFloorCounts {
         hostile: 0,
         suspicious: 0,
@@ -1422,9 +1423,10 @@ fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
     };
     for f in findings {
         out.total += 1;
+        #[allow(clippy::cast_possible_truncation)]
         let conf = json_alias(f, &["conf", "c"])
             .and_then(serde_json::Value::as_f64)
-            .map_or(DEFAULT_TRAIT_CONFIDENCE, cleave_confidence_as_f32);
+            .map_or(DEFAULT_TRAIT_CONFIDENCE, |x| x as f32);
         if conf < TRAIT_FLOOR_MIN_CONFIDENCE {
             continue;
         }
@@ -1863,11 +1865,7 @@ pub(crate) fn process_report(
 /// the primary file entry inside that report.
 #[must_use]
 pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
-    let findings = json_alias_array(report, &["find", "ts"]).or_else(|| {
-        json_alias_array(report, &["files", "fs"])
-            .and_then(|a| a.first())
-            .and_then(|f| json_alias_array(f, &["find", "ts"]))
-    });
+    let findings = report_findings(report);
 
     let Some(findings) = findings else {
         return FindingCounts::default();
@@ -1955,14 +1953,7 @@ pub fn extract_top_findings_from_json(
     report: &serde_json::Value,
     classification: &Classification,
 ) -> Vec<TopFinding> {
-    let findings = json_alias_array(report, &["find", "ts"])
-        .or_else(|| {
-            json_alias_array(report, &["files", "fs"])
-                .and_then(|a| a.first())
-                .and_then(|f| json_alias_array(f, &["find", "ts"]))
-        })
-        .cloned()
-        .unwrap_or_default();
+    let findings = report_findings(report).cloned().unwrap_or_default();
 
     let min_crit: u32 = match classification {
         Classification::Hostile => 5,
@@ -2005,14 +1996,7 @@ pub fn extract_top_findings_from_json(
 /// `crit × conf` descending, deduplicated by base id, truncated to `n`.
 #[allow(clippy::cast_precision_loss)]
 fn top_traits_by_score(report: &serde_json::Value, n: usize) -> Vec<TopFinding> {
-    let findings = json_alias_array(report, &["find", "ts"])
-        .or_else(|| {
-            json_alias_array(report, &["files", "fs"])
-                .and_then(|a| a.first())
-                .and_then(|f| json_alias_array(f, &["find", "ts"]))
-        })
-        .cloned()
-        .unwrap_or_default();
+    let findings = report_findings(report).cloned().unwrap_or_default();
 
     let mut scored: Vec<TopFinding> = findings
         .iter()
@@ -2049,11 +2033,8 @@ pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
     if info.sha256.is_empty() {
         return format!("v{}.{}", info.version, info.abi_version);
     }
-    let sha_prefix = if info.sha256.len() >= 8 {
-        info.sha256.get(..8).unwrap_or(&info.sha256)
-    } else {
-        &info.sha256
-    };
+    // get(..8) yields None when the string is shorter than 8 bytes.
+    let sha_prefix = info.sha256.get(..8).unwrap_or(&info.sha256);
     match &info.commit {
         Some(commit) => format!(
             "v{}.{}-{}-{}",

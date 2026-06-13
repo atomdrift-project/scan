@@ -1977,7 +1977,7 @@ fn load_specialists(
             );
             skipped.insert(name);
             continue;
-        };
+        }
         match load_specialist(&path, &name, Some(route_t.unwrap_or_default())) {
             Ok(route) => {
                 out.insert(name, route);
@@ -2111,14 +2111,13 @@ struct RouteProbability {
 
 fn compact_route_name(route: &str) -> String {
     if route == "general" {
-        "az".to_string()
-    } else if let Some(name) = route.strip_prefix("filegroups/") {
-        format!("az/{name}")
-    } else if let Some(name) = route.strip_prefix("filetypes/") {
-        format!("az/{name}")
-    } else {
-        format!("az/{route}")
+        return "az".to_string();
     }
+    let name = route
+        .strip_prefix("filegroups/")
+        .or_else(|| route.strip_prefix("filetypes/"))
+        .unwrap_or(route);
+    format!("az/{name}")
 }
 
 #[cfg(test)]

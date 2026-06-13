@@ -247,7 +247,10 @@ pub fn interpret(
     // changes and never on a mere rebuild. A hit skips the HTTP call; we always
     // re-blend with the current ML verdict, which can shift with
     // `--level`/thresholds.
-    let user = user_prompt(context);
+    // The user message is the analysis verbatim (no ML verdict, so the opinion is
+    // independent and the prompt caches by content). The system prompt already
+    // frames it, so no wrapper text is added.
+    let user = context.to_string();
     let cache = cache_path(&prompt_hash(&cfg.model, &user));
     if let Some((grade, reason)) = cache
         .as_deref()
@@ -318,13 +321,6 @@ fn failure(
         model: cfg.model.clone(),
         error: Some(error),
     }
-}
-
-/// The user message sent to the model: the analysis verbatim (no ML verdict, so
-/// the opinion is independent and the prompt caches by content). The system
-/// prompt already frames it, so no wrapper text is added.
-fn user_prompt(context: &str) -> String {
-    context.to_string()
 }
 
 /// Prepare a cleave tiny render for the LLM by stripping any ANSI escapes (tiny

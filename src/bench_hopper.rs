@@ -621,9 +621,10 @@ fn hash_file(path: &Path) -> io::Result<(String, u64)> {
         size += n as u64;
     }
     let digest = hasher.finalize();
+    use std::fmt::Write;
     let mut hex = String::with_capacity(64);
     for b in digest {
-        hex.push_str(&format!("{b:02x}"));
+        let _ = write!(hex, "{b:02x}");
     }
     Ok((hex, size))
 }

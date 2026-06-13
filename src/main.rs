@@ -1016,8 +1016,7 @@ fn log_worker_startup_diagnostics(d: &WorkerStartupDiagnostics<'_>) {
     let total_memory_mb = cleave::memory_tracker::total_memory().map(|b| b / MIB);
     let memory_limit_mb = cleave::memory_tracker::memory_limit() / MIB;
     let current_rss_mb = cleave::memory_tracker::current_rss().map(|b| b / MIB);
-    let proc_memtotal = proc_memtotal_mb();
-    let (proc_memtotal_mb, proc_memtotal_error) = match proc_memtotal {
+    let (proc_memtotal_mb, proc_memtotal_error) = match proc_memtotal_mb() {
         Ok(mb) => (Some(mb), None),
         Err(e) => (None, Some(e)),
     };

@@ -147,17 +147,16 @@ pub fn set_theme(theme: Theme) {
     }
 }
 
+/// The active theme, defaulting to dark when unset or the lock is poisoned.
+fn current_theme() -> Theme {
+    THEME.read().ok().and_then(|theme| *theme).unwrap_or(Theme::Dark)
+}
+
 fn palette() -> &'static Palette {
     static DARK: Palette = Palette::dark();
     static LIGHT: Palette = Palette::light();
 
-    let theme = THEME
-        .read()
-        .ok()
-        .and_then(|theme| *theme)
-        .unwrap_or(Theme::Dark);
-
-    match theme {
+    match current_theme() {
         Theme::Dark => &DARK,
         Theme::Light => &LIGHT,
     }
@@ -209,11 +208,7 @@ fn indicator_colors(
     threshold: f32,
 ) -> (Rgb, Rgb, Rgb) {
     let t = band_progress(probability, classification, threshold);
-    let theme = THEME
-        .read()
-        .ok()
-        .and_then(|theme| *theme)
-        .unwrap_or(Theme::Dark);
+    let theme = current_theme();
 
     match (theme, classification) {
         // Benign shifts from strong green toward yellow-green near the suspicious boundary.

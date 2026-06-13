@@ -1337,11 +1337,6 @@ impl ExtractContext {
             ]
             .into_iter()
             .collect();
-            let crit_pfx = |c: u32| match c {
-                5 => "h",
-                4 => "s",
-                _ => "n",
-            };
             let mut pmc: HashMap<String, u32> = HashMap::new();
             for (path, &mo) in &combined.sample_paths {
                 if mo < 3 {
@@ -1361,7 +1356,7 @@ impl ExtractContext {
             }
             let mut tokens: Vec<String> = pmc
                 .iter()
-                .map(|(k, &c)| format!("{}:{k}", crit_pfx(c)))
+                .map(|(k, &c)| format!("{}:{k}", tier_prefix(c)))
                 .collect();
             tokens.sort();
             let lookup = &self.absolute_lookup;
@@ -2675,7 +2670,9 @@ fn truncate_path_depth(path: &str, depth: usize) -> String {
     path.split('/').take(depth).collect::<Vec<_>>().join("/")
 }
 
-fn write_tiered_bigram_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
+/// Sorted `tier:path` tokens (crit-3+ findings, paths truncated to depth 3),
+/// shared by the tiered bigram and trigram feature builders.
+fn tiered_path_tokens(summary: &FindingSummary) -> Vec<String> {
     let mut token_max_crit: HashMap<String, u32> = HashMap::new();
     for (path, &max_ord) in &summary.sample_paths {
         if max_ord < 3 {
@@ -2691,6 +2688,11 @@ fn write_tiered_bigram_features(summary: &FindingSummary, w: &mut FeatureWriter<
         .map(|(path, crit)| format!("{}:{path}", tier_prefix(crit)))
         .collect();
     tokens.sort();
+    tokens
+}
+
+fn write_tiered_bigram_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
+    let tokens = tiered_path_tokens(summary);
     if tokens.len() > 512 {
         tracing::warn!(
             tokens = tokens.len(),
@@ -2706,21 +2708,7 @@ fn write_tiered_bigram_features(summary: &FindingSummary, w: &mut FeatureWriter<
 }
 
 fn write_tiered_trigram_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
-    let mut token_max_crit: HashMap<String, u32> = HashMap::new();
-    for (path, &max_ord) in &summary.sample_paths {
-        if max_ord < 3 {
-            continue;
-        }
-        let key = truncate_path_depth(path, 3);
-        let entry = token_max_crit.entry(key).or_insert(0);
-        *entry = (*entry).max(max_ord);
-    }
-
-    let mut tokens: Vec<String> = token_max_crit
-        .into_iter()
-        .map(|(path, crit)| format!("{}:{path}", tier_prefix(crit)))
-        .collect();
-    tokens.sort();
+    let tokens = tiered_path_tokens(summary);
     if tokens.len() > 512 {
         tracing::warn!(
             tokens = tokens.len(),
