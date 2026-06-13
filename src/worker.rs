@@ -843,7 +843,7 @@ struct PrefetchedJob {
     /// `Err(Transient)` = download failed (fall back to direct download),
     /// `Err(Skipped)` = job rejected without attempting download (e.g. oversized);
     /// do not retry, post the error result directly.
-    data: std::result::Result<Option<Vec<u8>>, PrefetchError>,
+    data: std::result::Result<Option<bytes::Bytes>, PrefetchError>,
     /// Local-queue id assigned by the prefetcher when the job is staged; passed
     /// to `WorkerMetrics::complete` once analysis finishes. 0 until staged.
     queue_id: u64,
@@ -1630,7 +1630,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let staged_bytes = pj
             .data
             .as_ref()
-            .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
+            .map_or(0, |d| d.as_ref().map_or(0, bytes::Bytes::len));
         queued_bytes.fetch_sub(staged_bytes, Ordering::Release);
         outstanding.fetch_sub(1, Ordering::Release);
 
@@ -1869,7 +1869,7 @@ impl Prefetcher {
                                 let bytes = pj
                                     .data
                                     .as_ref()
-                                    .map_or(0, |d| d.as_ref().map_or(0, Vec::len));
+                                    .map_or(0, |d| d.as_ref().map_or(0, bytes::Bytes::len));
                                 queued_bytes.fetch_add(bytes, Ordering::Release);
                                 // Enters the local queue now; tracked until the
                                 // dispatch loop finishes analysing it.
@@ -1998,7 +1998,7 @@ async fn run_job(
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
-    prefetched: std::result::Result<Option<Vec<u8>>, PrefetchError>,
+    prefetched: std::result::Result<Option<bytes::Bytes>, PrefetchError>,
 ) -> Result<(crate::engine::MlSection, serde_json::Value, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     // `Arc<str>` so the watcher and the blocking closure share the basename
@@ -2049,7 +2049,7 @@ async fn run_job(
     };
 
     // Use prefetched bytes, or fall back to downloading if prefetch failed.
-    let downloaded: Option<Vec<u8>> = if use_local {
+    let downloaded: Option<bytes::Bytes> = if use_local {
         None
     } else {
         match prefetched {
@@ -2497,7 +2497,7 @@ async fn download_bytes(
     base_url: &str,
     sha256: &str,
     path: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<bytes::Bytes, String> {
     if path.is_empty() || path == "." {
         return Err(format!(
             "download {sha256}: empty path from hopper, cannot fetch"
@@ -2538,7 +2538,7 @@ async fn download_bytes(
             elapsed_ms = crate::duration_ms(start.elapsed()),
             "download complete via /data/",
         );
-        return Ok(bytes.to_vec());
+        return Ok(bytes);
     }
     let data_status = resp.status();
     let data_body = resp
@@ -2577,7 +2577,7 @@ async fn download_bytes(
         elapsed_ms = crate::duration_ms(start.elapsed()),
         "download complete via /api/file/ (fallback)",
     );
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// Exponential backoff with jitter, capped at 2 minutes.
@@ -3058,7 +3058,7 @@ mod tests {
         //    refills back to target, polling the hopper again.
         for _ in 0..slots {
             let pj = rx.recv().await.unwrap();
-            assert_eq!(pj.data.unwrap(), Some(PAYLOAD.to_vec()), "payload mismatch");
+            assert_eq!(pj.data.unwrap().as_deref(), Some(PAYLOAD), "payload mismatch");
             queued_bytes.fetch_sub(PAYLOAD.len(), Ordering::Release);
             outstanding.fetch_sub(1, Ordering::Release);
         }

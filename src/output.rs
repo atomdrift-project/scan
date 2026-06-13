@@ -398,34 +398,6 @@ pub(crate) fn terminal_subtitle(sha256: &str, indent: usize) -> Option<String> {
     Some(format!("{}{hash}", " ".repeat(indent)))
 }
 
-/// Print a single file result immediately, clearing progress line if active.
-pub fn print_file_result_streaming(result: &ScanResult, has_progress: bool, extra: bool) {
-    if has_progress {
-        eprint!("\r\x1b[2K");
-    }
-
-    let p = palette();
-    let blocks = confidence_blocks(result.probability, &result.classification, result.threshold);
-    let pct = colored_conf_or_pct(
-        result.probability,
-        &result.classification,
-        result.threshold,
-        result.level,
-    );
-    let label = colored_label(&result.classification, p);
-
-    eprintln!(
-        "  {blocks} {pct} {label}  {}",
-        fg_bold(p.path_name, &result.path),
-    );
-    print_detail_lines(result, p);
-    print_reasons(result, p);
-    if extra {
-        print_extra(result, p);
-    }
-    eprintln!();
-}
-
 /// Print a process scan result with PID annotations.
 pub fn print_ps_result(
     result: &ScanResult,

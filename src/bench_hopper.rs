@@ -35,7 +35,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
@@ -285,24 +285,25 @@ impl BenchHopper {
         let end = (start + count).min(self.jobs.len());
         {
             let now = Instant::now();
-            #[allow(clippy::expect_used)]
-            let mut t = self.timings.lock().expect("timings mutex poisoned");
+            let mut t = self.timings.lock().unwrap_or_else(PoisonError::into_inner);
             for slot in &mut t.claimed[start..end] {
                 *slot = Some(now);
             }
         }
+        use std::fmt::Write;
         let mut body = String::from("{\"jobs\":[");
         for (i, job) in self.jobs[start..end].iter().enumerate() {
             if i > 0 {
                 body.push(',');
             }
             // file_type left as "data"; cleave detects the real type from bytes.
-            body.push_str(&format!(
+            let _ = write!(
+                body,
                 "{{\"sha256\":\"{}\",\"path\":{},\"size_bytes\":{},\"file_type\":\"data\"}}",
                 job.sha256,
                 json_string(&job.path),
                 job.size_bytes,
-            ));
+            );
         }
         body.push_str("]}");
         respond_body(stream, "200 OK", body.as_bytes())
@@ -363,8 +364,7 @@ impl BenchHopper {
             return;
         };
         let now = Instant::now();
-        #[allow(clippy::expect_used)]
-        let mut t = self.timings.lock().expect("timings mutex poisoned");
+        let mut t = self.timings.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(&i) = indices.iter().find(|&&i| t.resulted[i].is_none()) {
             t.resulted[i] = Some(now);
         }
@@ -375,8 +375,7 @@ impl BenchHopper {
     /// percentiles. One class object per line, so the raw file reads as a table.
     fn summary_json(&self) -> String {
         // Snapshot under the lock, then format with it released.
-        #[allow(clippy::expect_used)]
-        let t = self.timings.lock().expect("timings mutex poisoned");
+        let t = self.timings.lock().unwrap_or_else(PoisonError::into_inner);
 
         let first_claim = t.claimed.iter().flatten().min().copied();
         let last_result = t.resulted.iter().flatten().max().copied();

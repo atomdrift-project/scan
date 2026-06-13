@@ -250,8 +250,8 @@ pub fn interpret(
     // The user message is the analysis verbatim (no ML verdict, so the opinion is
     // independent and the prompt caches by content). The system prompt already
     // frames it, so no wrapper text is added.
-    let user = context.to_string();
-    let cache = cache_path(&prompt_hash(&cfg.model, &user));
+    let user = context;
+    let cache = cache_path(&prompt_hash(&cfg.model, user));
     if let Some((grade, reason)) = cache
         .as_deref()
         .and_then(cache_get)
@@ -276,7 +276,7 @@ pub fn interpret(
     }
 
     let _permit = Permit::acquire(cfg.max_concurrency);
-    match request(cfg, &user) {
+    match request(cfg, user) {
         Ok((grade, reason)) => {
             health().set(true);
             if let Some(path) = &cache {

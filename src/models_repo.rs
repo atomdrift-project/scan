@@ -107,10 +107,8 @@ fn default_models_dir() -> PathBuf {
 /// Extract the bundle directory name from a git URL: the last path segment
 /// with any trailing `.git` and `/` stripped.
 fn bundle_name_from_url(url: &str) -> Option<String> {
-    let stripped = url
-        .trim_end_matches('/')
-        .strip_suffix(".git")
-        .unwrap_or_else(|| url.trim_end_matches('/'));
+    let trimmed = url.trim_end_matches('/');
+    let stripped = trimmed.strip_suffix(".git").unwrap_or(trimmed);
     let segment = stripped.rsplit(&['/', ':']).next()?;
     if segment.is_empty() {
         None

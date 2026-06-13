@@ -67,7 +67,7 @@ impl ShapImportance {
             .iter()
             .filter_map(|shap| {
                 let idx = name_to_idx.get(shap.name.as_str())?;
-                let value = feature_values[*idx] as f64;
+                let value = *feature_values.get(*idx)? as f64;
                 if value == 0.0 {
                     return None;
                 }

@@ -1480,7 +1480,7 @@ fn load_route_policies(model_dir: &Path, level: u16) -> RoutePolicies {
 
     let mut by_filetype = HashMap::new();
     let mut grid: HashMap<String, Vec<LevelPolicy>> = HashMap::new();
-    for (_route_name, route) in json.routes {
+    for route in json.routes.into_values() {
         // Retain the hostile policy at every level (ascending) for the verdict
         // sweep. A level whose hostile block can't be loaded is dropped from
         // the grid — the sweep simply can't fire there.
@@ -1960,10 +1960,10 @@ fn load_specialists(
         if !path.is_dir() {
             continue;
         }
-        let name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n.to_owned(),
-            None => continue,
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
         };
+        let name = name.to_owned();
         let route_name = format!("{category}/{name}");
         // Skip on-disk subdirectories that the deployment config doesn't list.
         // These are common as artifacts of experimentation; loading them with

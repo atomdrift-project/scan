@@ -58,23 +58,6 @@ impl DisplayFilter {
         }
     }
 
-    /// Returns whether hostile files are included.
-    #[must_use]
-    pub const fn shows_hostile(&self) -> bool {
-        self.hostile
-    }
-
-    /// Returns whether suspicious files are included.
-    #[must_use]
-    pub const fn shows_suspicious(&self) -> bool {
-        self.suspicious
-    }
-
-    /// Returns whether benign files are included.
-    #[must_use]
-    pub const fn shows_benign(&self) -> bool {
-        self.benign
-    }
 }
 
 impl Default for DisplayFilter {
@@ -109,7 +92,7 @@ impl ScanConfig {
     ///
     /// # Example
     /// ```
-    /// use scan::{DisplayFilter, OutputFormat, ScanConfig, Thresholds};
+    /// use scan::{Classification, DisplayFilter, OutputFormat, ScanConfig, Thresholds};
     ///
     /// let config = ScanConfig::new(
     ///     "/path/to/models",
@@ -121,7 +104,7 @@ impl ScanConfig {
     /// )?;
     ///
     /// assert_eq!(config.format(), OutputFormat::Terminal);
-    /// assert!(config.filter().shows_hostile());
+    /// assert!(config.filter().shows(&Classification::Hostile));
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new(
@@ -1953,7 +1936,7 @@ pub fn extract_top_findings_from_json(
     report: &serde_json::Value,
     classification: &Classification,
 ) -> Vec<TopFinding> {
-    let findings = report_findings(report).cloned().unwrap_or_default();
+    let findings = report_findings(report).map(Vec::as_slice).unwrap_or(&[]);
 
     let min_crit: u32 = match classification {
         Classification::Hostile => 5,
@@ -1985,46 +1968,6 @@ pub fn extract_top_findings_from_json(
     relevant.sort_by_key(|f| std::cmp::Reverse(f.crit));
     relevant.truncate(5);
     relevant
-}
-
-/// Crate-private helper for [`ScanResult::top_traits`]. Walks the cleave
-/// compact report directly because we don't (yet) hold it in typed form on
-/// `ScanResult`. Pulls from `report.find` (single-file analyses) or, failing
-/// that, `report.files[0].find` (compact envelopes).
-///
-/// Returns `Vec<TopFinding>` with `conf` populated, sorted by
-/// `crit × conf` descending, deduplicated by base id, truncated to `n`.
-#[allow(clippy::cast_precision_loss)]
-fn top_traits_by_score(report: &serde_json::Value, n: usize) -> Vec<TopFinding> {
-    let findings = report_findings(report).cloned().unwrap_or_default();
-
-    let mut scored: Vec<TopFinding> = findings
-        .iter()
-        .filter_map(|f| {
-            let finding = TopFinding::from(f);
-            // Drop filtered (0) and component-tier (1) traits — they're noise
-            // for ranking. Anything with no id is also worthless.
-            if finding.crit < 2 || finding.id.is_empty() {
-                return None;
-            }
-            Some(finding)
-        })
-        .collect();
-
-    // Sort first, then dedupe by base id — that way each family keeps its
-    // highest-scored representative.
-    scored.sort_by(|a, b| {
-        let sa = (a.crit as f32) * a.conf;
-        let sb = (b.crit as f32) * b.conf;
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut seen = std::collections::HashSet::new();
-    scored.retain(|t| {
-        let base = t.id.split("::").next().unwrap_or(&t.id).to_owned();
-        seen.insert(base)
-    });
-    scored.truncate(n);
-    scored
 }
 
 /// Build a compact model version string from ModelInfo.
@@ -2212,25 +2155,6 @@ pub struct MlSectionRef<'a> {
 }
 
 impl ScanResult {
-    /// Return up to `n` cleave traits from this result, ranked by
-    /// `criticality × confidence` (highest first).
-    ///
-    /// Filtered traits (criticality 0) and component-tier traits (criticality 1)
-    /// are dropped; remaining traits are deduplicated by their first
-    /// `::`-delimited segment so families (`shell::bash`, `shell::sh`) don't
-    /// crowd each other out.
-    ///
-    /// Returns an empty `Vec` when the result has no attached cleave report
-    /// (i.e. `cleave` is `None` because the analyzer was configured with
-    /// [`OutputFormat::Terminal`]).
-    #[must_use]
-    pub fn top_traits(&self, n: usize) -> Vec<TopFinding> {
-        self.cleave
-            .as_ref()
-            .map(|r| top_traits_by_score(r, n))
-            .unwrap_or_default()
-    }
-
     /// Build the `{"ml": {...}, "raw": {...}}` envelope for JSON output.
     ///
     /// Prefer [`Self::into_envelope`] when the caller owns the `ScanResult`.

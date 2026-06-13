@@ -30,13 +30,9 @@ pub fn prepare_runtime_env() {
 }
 
 fn existing_traits_dir() -> Option<PathBuf> {
-    candidate_traits_dirs()
+    [PathBuf::from("traits"), default_traits_dir()]
         .into_iter()
         .find(|path| looks_like_traits_dir(path))
-}
-
-fn candidate_traits_dirs() -> Vec<PathBuf> {
-    vec![PathBuf::from("traits"), default_traits_dir()]
 }
 
 fn default_traits_dir() -> PathBuf {

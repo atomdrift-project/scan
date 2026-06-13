@@ -1272,12 +1272,18 @@ impl ExtractContext {
         primary_file: Option<&serde_json::Value>,
         vec: &mut [f32],
     ) {
+        use std::fmt::Write;
         // Small warm-cache reports are cheaper to summarize serially than to
         // fan out into rayon jobs.
+        let needs = RawNeeds {
+            kv: self.n_kv > 0,
+            textenc: self.n_textenc > 0,
+            symbol: self.n_symbol > 0 || self.n_symbol_bi > 0 || self.n_symbol_tri > 0,
+        };
         let file_summaries: Vec<FileSummary> = if raw_files.len() < 8 {
-            raw_files.iter().map(|&f| FileSummary::new(f)).collect()
+            raw_files.iter().map(|&f| FileSummary::new(f, needs)).collect()
         } else {
-            raw_files.par_iter().map(|&f| FileSummary::new(f)).collect()
+            raw_files.par_iter().map(|&f| FileSummary::new(f, needs)).collect()
         };
 
         // If no files, we need at least one empty summary for structural logic.
@@ -1360,8 +1366,11 @@ impl ExtractContext {
                 .collect();
             tokens.sort();
             let lookup = &self.absolute_lookup;
+            let mut key = String::new();
             for t in &tokens {
-                if let Some(&i) = lookup.get(&format!("crit:{t}")) {
+                key.clear();
+                let _ = write!(key, "crit:{t}");
+                if let Some(&i) = lookup.get(key.as_str()) {
                     vec[i] = 1.0;
                 }
             }
@@ -1370,16 +1379,18 @@ impl ExtractContext {
             if tokens.len() <= 512 {
                 for (i, t1) in tokens.iter().enumerate() {
                     for t2 in &tokens[i + 1..] {
-                        if let Some(&idx) = lookup.get(&format!("critbi:{t1} + {t2}")) {
+                        key.clear();
+                        let _ = write!(key, "critbi:{t1} + {t2}");
+                        if let Some(&idx) = lookup.get(key.as_str()) {
                             vec[idx] = 1.0;
                         }
                     }
                     if tokens.len() <= 128 {
                         for j in i + 1..tokens.len() {
                             for t3 in &tokens[j + 1..] {
-                                if let Some(&idx) =
-                                    lookup.get(&format!("crittri:{t1} + {} + {t3}", tokens[j]))
-                                {
+                                key.clear();
+                                let _ = write!(key, "crittri:{t1} + {} + {t3}", tokens[j]);
+                                if let Some(&idx) = lookup.get(key.as_str()) {
                                     vec[idx] = 1.0;
                                 }
                             }
@@ -1400,28 +1411,31 @@ impl ExtractContext {
             let mut mbcs: HashSet<String> = HashSet::new();
             for s in &summaries {
                 for f in &s.raw_findings {
-                    if let Some(a) = json_alias_str(f, &["atk", "a"]) {
-                        attacks.insert(a.to_string());
+                    if let Some(a) = &f.atk {
+                        attacks.insert(a.clone());
                     }
-                    if let Some(m) = json_alias_str(f, &["mbc", "m"]) {
-                        mbcs.insert(m.to_string());
+                    if let Some(m) = &f.mbc {
+                        mbcs.insert(m.clone());
                     }
                 }
             }
             let lookup = &self.absolute_lookup;
+            let mut key = String::new();
             let mut sa: Vec<_> = attacks.iter().collect();
             sa.sort();
             if sa.len() <= 512 {
                 for (i, a1) in sa.iter().enumerate() {
                     for (j, a2) in sa[i + 1..].iter().enumerate() {
-                        if let Some(&idx) = lookup.get(&format!("atkbi:{a1} + {a2}")) {
+                        key.clear();
+                        let _ = write!(key, "atkbi:{a1} + {a2}");
+                        if let Some(&idx) = lookup.get(key.as_str()) {
                             vec[idx] = 1.0;
                         }
                         if sa.len() <= 128 {
                             for a3 in &sa[i + 1 + j + 1..] {
-                                if let Some(&idx) =
-                                    lookup.get(&format!("atktri:{a1} + {a2} + {a3}"))
-                                {
+                                key.clear();
+                                let _ = write!(key, "atktri:{a1} + {a2} + {a3}");
+                                if let Some(&idx) = lookup.get(key.as_str()) {
                                     vec[idx] = 1.0;
                                 }
                             }
@@ -1440,14 +1454,16 @@ impl ExtractContext {
             if sm.len() <= 512 {
                 for (i, m1) in sm.iter().enumerate() {
                     for (j, m2) in sm[i + 1..].iter().enumerate() {
-                        if let Some(&idx) = lookup.get(&format!("mbcbi:{m1} + {m2}")) {
+                        key.clear();
+                        let _ = write!(key, "mbcbi:{m1} + {m2}");
+                        if let Some(&idx) = lookup.get(key.as_str()) {
                             vec[idx] = 1.0;
                         }
                         if sm.len() <= 128 {
                             for m3 in &sm[i + 1 + j + 1..] {
-                                if let Some(&idx) =
-                                    lookup.get(&format!("mbctri:{m1} + {m2} + {m3}"))
-                                {
+                                key.clear();
+                                let _ = write!(key, "mbctri:{m1} + {m2} + {m3}");
+                                if let Some(&idx) = lookup.get(key.as_str()) {
                                     vec[idx] = 1.0;
                                 }
                             }
@@ -1585,10 +1601,11 @@ impl ExtractContext {
         offsets.take(self.n_bigram);
         self.write_bigram_features_optimized(&summaries, vec, &self.bigram_slots);
 
-        // G11b: Tiered report-level notable+ bigrams.
+        // G11b/G11c: Tiered report-level notable+ n-grams. Both share one token set.
+        let tiered_tokens = tiered_path_tokens(&combined);
         offsets.take(self.n_tiered_bigram);
         write_tiered_bigram_features(
-            &combined,
+            &tiered_tokens,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1596,7 +1613,7 @@ impl ExtractContext {
         );
         offsets.take(self.n_tiered_trigram);
         write_tiered_trigram_features(
-            &combined,
+            &tiered_tokens,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1859,6 +1876,18 @@ impl FeatureCursor {
     }
 }
 
+/// The finding fields retained for cross-file aggregation: ID dedup and
+/// ATT&CK/MBC code rollups. Keeping just these avoids cloning the whole
+/// finding JSON subtree for every file.
+#[derive(Debug, Clone, Default)]
+struct RawFinding {
+    id: String,
+    conf: f64,
+    crit: u32,
+    atk: Option<String>,
+    mbc: Option<String>,
+}
+
 /// Pre-calculated data for a single file entry in a report.
 #[derive(Debug, Clone, Default)]
 struct FileSummary {
@@ -1894,14 +1923,23 @@ struct FileSummary {
     /// Filefacts member chains (`fact.mbr` / `ff.mc`) — dotted access chains
     /// (`Symbol::Member.path`). Same flow as call targets.
     raw_member_chains: Vec<serde_json::Value>,
-    /// (finding_id, confidence, crit_ordinal) for cross-file unique ID dedup.
-    raw_findings: Vec<serde_json::Value>,
+    /// Findings reduced to the fields used for cross-file aggregation.
+    raw_findings: Vec<RawFinding>,
     /// Whether the "is" key exists in the cleave JSON (even if empty).
     has_imports_key: bool,
 }
 
+/// Which optional feature families are active for this route, so [`FileSummary::new`]
+/// only clones the raw JSON subtrees those families actually read.
+#[derive(Clone, Copy)]
+struct RawNeeds {
+    kv: bool,
+    textenc: bool,
+    symbol: bool,
+}
+
 impl FileSummary {
-    fn new(file_entry: &serde_json::Value) -> Self {
+    fn new(file_entry: &serde_json::Value, needs: RawNeeds) -> Self {
         let findings_raw: Vec<&serde_json::Value> = json_alias_array(file_entry, &["find", "ts"])
             .map(|a| a.iter().collect())
             .unwrap_or_default();
@@ -1997,8 +2035,18 @@ impl FileSummary {
             .map(str::to_string)
             .collect();
 
-        let raw_findings: Vec<serde_json::Value> =
-            findings_raw.iter().map(|f| (*f).clone()).collect();
+        let raw_findings: Vec<RawFinding> = findings_raw
+            .iter()
+            .map(|f| RawFinding {
+                id: json_alias_str(f, &["id", "i"]).unwrap_or("").to_string(),
+                conf: json_alias(f, &["conf", "c"])
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(1.0),
+                crit: crit_ordinal(f),
+                atk: json_alias_str(f, &["atk", "a"]).map(str::to_string),
+                mbc: json_alias_str(f, &["mbc", "m"]).map(str::to_string),
+            })
+            .collect();
         let has_imports_key = file_entry.get("is").is_some()
             || file_entry
                 .get("fact")
@@ -2012,41 +2060,64 @@ impl FileSummary {
         // v4 reports stash these at top-level keys: `ms`, `k`, `ss`, `is`.
         // Mirror the resolution order Python uses (collimator/features.py
         // file_metrics/file_values/file_strings/file_imports).
-        let facts = file_entry
-            .get("fact")
-            .or_else(|| file_entry.get("ff"))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let raw_metrics = json_alias(&facts, &["met", "m"])
-            .filter(|v| v.is_object())
-            .cloned()
-            .or_else(|| file_entry.get("ms").cloned())
-            .unwrap_or(serde_json::Value::Null);
-        let raw_values = json_alias(&facts, &["val", "v"])
-            .filter(|v| v.is_object())
-            .cloned()
-            .or_else(|| file_entry.get("k").cloned())
-            .unwrap_or(serde_json::Value::Null);
-        let raw_strings = json_alias_array(&facts, &["str", "s"])
-            .cloned()
-            .or_else(|| file_entry.get("ss").and_then(|v| v.as_array().cloned()))
-            .unwrap_or_default();
-        let raw_imports = json_alias_array(&facts, &["imp", "i"])
-            .cloned()
-            .or_else(|| file_entry.get("is").and_then(|v| v.as_array().cloned()))
-            .unwrap_or_default();
-        let raw_exports = json_alias_array(&facts, &["exp", "x"])
-            .cloned()
-            .unwrap_or_default();
-        let raw_functions = json_alias_array(&facts, &["fn"])
-            .cloned()
-            .unwrap_or_default();
-        let raw_call_targets = json_alias_array(&facts, &["tgt", "ct"])
-            .cloned()
-            .unwrap_or_default();
-        let raw_member_chains = json_alias_array(&facts, &["mbr", "mc"])
-            .cloned()
-            .unwrap_or_default();
+        // Borrow the facts block (don't clone it whole) and clone out only the
+        // subtrees whose feature family is active on this route.
+        let facts = file_entry.get("fact").or_else(|| file_entry.get("ff"));
+        let (raw_metrics, raw_values) = if needs.kv {
+            (
+                facts
+                    .and_then(|f| json_alias(f, &["met", "m"]))
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .or_else(|| file_entry.get("ms").cloned())
+                    .unwrap_or(serde_json::Value::Null),
+                facts
+                    .and_then(|f| json_alias(f, &["val", "v"]))
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .or_else(|| file_entry.get("k").cloned())
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        } else {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        };
+        let raw_strings = if needs.textenc {
+            facts
+                .and_then(|f| json_alias_array(f, &["str", "s"]))
+                .cloned()
+                .or_else(|| file_entry.get("ss").and_then(|v| v.as_array().cloned()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let (raw_imports, raw_exports, raw_functions, raw_call_targets, raw_member_chains) =
+            if needs.symbol {
+                (
+                    facts
+                        .and_then(|f| json_alias_array(f, &["imp", "i"]))
+                        .cloned()
+                        .or_else(|| file_entry.get("is").and_then(|v| v.as_array().cloned()))
+                        .unwrap_or_default(),
+                    facts
+                        .and_then(|f| json_alias_array(f, &["exp", "x"]))
+                        .cloned()
+                        .unwrap_or_default(),
+                    facts
+                        .and_then(|f| json_alias_array(f, &["fn"]))
+                        .cloned()
+                        .unwrap_or_default(),
+                    facts
+                        .and_then(|f| json_alias_array(f, &["tgt", "ct"]))
+                        .cloned()
+                        .unwrap_or_default(),
+                    facts
+                        .and_then(|f| json_alias_array(f, &["mbr", "mc"]))
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
 
         Self {
             path: file_entry["path"].as_str().unwrap_or("").to_string(),
@@ -2241,17 +2312,14 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
 
         // Re-scan raw findings to deduplicate unique IDs across files.
         for finding in &s.raw_findings {
-            let fid = json_alias_str(finding, &["id", "i"]).unwrap_or("");
+            let fid = finding.id.as_str();
             if fid.is_empty() {
                 continue;
             }
-            let conf = json_alias(finding, &["conf", "c"])
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(1.0);
-            if conf < MIN_CONFIDENCE {
+            if finding.conf < MIN_CONFIDENCE {
                 continue;
             }
-            let crit = crit_ordinal(finding);
+            let crit = finding.crit;
             if crit >= 3 {
                 notable_ids.insert(fid);
             }
@@ -2283,7 +2351,7 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
     combined
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct FileRiskStats {
     suspicious_ratio: f32,
     hostile_ratio: f32,
@@ -2499,25 +2567,26 @@ fn write_aggregate_features(
         host_density_global + 0.25 * susp_density_global,
     );
 
-    let mut stats: Vec<FileRiskStats> = summaries.iter().map(|s| s.risk.clone()).collect();
-    stats.sort_by(|a, b| {
-        let ka = (
-            a.hostile_density + 0.25 * a.suspicious_density,
-            a.hostile_density,
-            a.suspicious_density,
-        );
-        let kb = (
-            b.hostile_density + 0.25 * b.suspicious_density,
-            b.hostile_density,
-            b.suspicious_density,
-        );
-        kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let top_weighted: f32 = stats
+    // TOP_K_RISK_FILES == 1, so the "top-k weighted sum" is the single max; min_by
+    // over the same descending comparator picks the same first-maximum file a stable
+    // sort + take(1) would. Raising the constant would need a partial sort here.
+    let top_weighted = summaries
         .iter()
-        .take(TOP_K_RISK_FILES)
-        .map(|s| s.hostile_density + 0.25 * s.suspicious_density)
-        .sum();
+        .map(|s| &s.risk)
+        .min_by(|a, b| {
+            let ka = (
+                a.hostile_density + 0.25 * a.suspicious_density,
+                a.hostile_density,
+                a.suspicious_density,
+            );
+            let kb = (
+                b.hostile_density + 0.25 * b.suspicious_density,
+                b.hostile_density,
+                b.suspicious_density,
+            );
+            kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or(0.0, |s| s.hostile_density + 0.25 * s.suspicious_density);
     w.set("agg:top1_file_hostile_weighted_density_sum", top_weighted);
 
     w.set(
@@ -2583,11 +2652,11 @@ fn write_aggregate_features(
     let mut mbc_behaviors: HashSet<String> = HashSet::new();
     for s in summaries {
         for finding in &s.raw_findings {
-            if let Some(a) = json_alias_str(finding, &["atk", "a"]) {
-                attack_techniques.insert(a.to_string());
+            if let Some(a) = &finding.atk {
+                attack_techniques.insert(a.clone());
             }
-            if let Some(m) = json_alias_str(finding, &["mbc", "m"]) {
-                mbc_behaviors.insert(m.to_string());
+            if let Some(m) = &finding.mbc {
+                mbc_behaviors.insert(m.clone());
             }
         }
     }
@@ -2691,8 +2760,7 @@ fn tiered_path_tokens(summary: &FindingSummary) -> Vec<String> {
     tokens
 }
 
-fn write_tiered_bigram_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
-    let tokens = tiered_path_tokens(summary);
+fn write_tiered_bigram_features(tokens: &[String], w: &mut FeatureWriter<'_>) {
     if tokens.len() > 512 {
         tracing::warn!(
             tokens = tokens.len(),
@@ -2700,15 +2768,18 @@ fn write_tiered_bigram_features(summary: &FindingSummary, w: &mut FeatureWriter<
         );
         return;
     }
+    use std::fmt::Write;
+    let mut key = String::new();
     for (i, t1) in tokens.iter().enumerate() {
         for t2 in &tokens[i + 1..] {
-            w.set(&format!("tierbi:{t1} + {t2}"), 1.0);
+            key.clear();
+            let _ = write!(key, "tierbi:{t1} + {t2}");
+            w.set(&key, 1.0);
         }
     }
 }
 
-fn write_tiered_trigram_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
-    let tokens = tiered_path_tokens(summary);
+fn write_tiered_trigram_features(tokens: &[String], w: &mut FeatureWriter<'_>) {
     if tokens.len() > 512 {
         tracing::warn!(
             tokens = tokens.len(),
@@ -2716,72 +2787,70 @@ fn write_tiered_trigram_features(summary: &FindingSummary, w: &mut FeatureWriter
         );
         return;
     }
+    use std::fmt::Write;
+    let mut key = String::new();
     for (i, t1) in tokens.iter().enumerate() {
         for j in i + 1..tokens.len() {
             let t2 = &tokens[j];
             for t3 in &tokens[j + 1..] {
-                w.set(&format!("tiertri:{t1} + {t2} + {t3}"), 1.0);
+                key.clear();
+                let _ = write!(key, "tiertri:{t1} + {t2} + {t3}");
+                w.set(&key, 1.0);
             }
         }
     }
 }
 
 fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8] {
-    if summaries.is_empty() || TOP_K_RISK_FILES == 0 {
+    // The block sums over the single highest-risk file by each ordering. min_by with
+    // the descending comparators below returns the same first-maximum file a stable
+    // sort + take(1) would; raising TOP_K_RISK_FILES would require a partial sort.
+    const _: () = assert!(TOP_K_RISK_FILES == 1);
+
+    let top_susp = summaries.iter().map(|s| &s.risk).min_by(|a, b| {
+        (
+            b.suspicious_ratio,
+            b.suspicious_findings,
+            b.hostile_ratio,
+            b.hostile_findings,
+        )
+            .partial_cmp(&(
+                a.suspicious_ratio,
+                a.suspicious_findings,
+                a.hostile_ratio,
+                a.hostile_findings,
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_host = summaries.iter().map(|s| &s.risk).min_by(|a, b| {
+        (
+            b.hostile_ratio,
+            b.hostile_findings,
+            b.suspicious_ratio,
+            b.suspicious_findings,
+        )
+            .partial_cmp(&(
+                a.hostile_ratio,
+                a.hostile_findings,
+                a.suspicious_ratio,
+                a.suspicious_findings,
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let (Some(top_susp), Some(top_host)) = (top_susp, top_host) else {
         return [0.0; 8];
-    }
-    let mut stats: Vec<FileRiskStats> = summaries.iter().map(|s| s.risk.clone()).collect();
-
-    let mut by_susp = stats.clone();
-    by_susp.sort_by(|a, b| {
-        (
-            b.suspicious_ratio,
-            b.suspicious_findings,
-            b.hostile_ratio,
-            b.hostile_findings,
-        )
-            .partial_cmp(&(
-                a.suspicious_ratio,
-                a.suspicious_findings,
-                a.hostile_ratio,
-                a.hostile_findings,
-            ))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let top_susp = &by_susp[..TOP_K_RISK_FILES.min(by_susp.len())];
-
-    stats.sort_by(|a, b| {
-        (
-            b.hostile_ratio,
-            b.hostile_findings,
-            b.suspicious_ratio,
-            b.suspicious_findings,
-        )
-            .partial_cmp(&(
-                a.hostile_ratio,
-                a.hostile_findings,
-                a.suspicious_ratio,
-                a.suspicious_findings,
-            ))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let top_host = &stats[..TOP_K_RISK_FILES.min(stats.len())];
+    };
 
     [
-        top_susp.iter().map(|s| s.suspicious_ratio).sum(),
-        top_host.iter().map(|s| s.hostile_ratio).sum(),
-        (top_susp.iter().map(|s| s.suspicious_findings).sum::<u32>() as f32 + 1.0).ln(),
-        (top_host.iter().map(|s| s.hostile_findings).sum::<u32>() as f32 + 1.0).ln(),
-        top_susp.iter().map(|s| s.suspicious_density).sum(),
-        top_host.iter().map(|s| s.hostile_density).sum(),
-        top_susp
-            .iter()
-            .map(|s| s.suspicious_category_breadth as f32)
-            .sum(),
-        top_host
-            .iter()
-            .map(|s| s.hostile_category_breadth as f32)
-            .sum(),
+        top_susp.suspicious_ratio,
+        top_host.hostile_ratio,
+        (top_susp.suspicious_findings as f32 + 1.0).ln(),
+        (top_host.hostile_findings as f32 + 1.0).ln(),
+        top_susp.suspicious_density,
+        top_host.hostile_density,
+        top_susp.suspicious_category_breadth as f32,
+        top_host.hostile_category_breadth as f32,
     ]
 }
 
@@ -2863,14 +2932,19 @@ fn write_format_hint_features(summaries: &[FileSummary], w: &mut FeatureWriter<'
     let mut known_files = 0usize;
     let mut present_groups = HashSet::new();
 
+    // Each file's format groups, resolved once — the loop below is O(groups × files).
+    let file_groups: Vec<Vec<&'static str>> = summaries
+        .iter()
+        .map(|s| format_groups_for_type(&s.file_type))
+        .collect();
+
     for &(group, _) in FORMAT_GROUPS {
         let mut group_count = 0usize;
         let mut inner_count = 0usize;
         let mut suspicious_count = 0usize;
         let mut hostile_count = 0usize;
 
-        for s in summaries {
-            let groups = format_groups_for_type(&s.file_type);
+        for (s, groups) in summaries.iter().zip(&file_groups) {
             if groups.is_empty() {
                 continue;
             }
@@ -3264,8 +3338,10 @@ fn write_external_summary_features(summary: &FindingSummary, w: &mut FeatureWrit
     w.set("ext:has_yara_match", f32::from(summary.has_yara));
 }
 
-fn merge_metric_summaries(summaries: &[FileSummary]) -> serde_json::Value {
-    let mut merged: HashMap<String, HashMap<String, f64>> = HashMap::new();
+type MetricMap = HashMap<String, HashMap<String, f64>>;
+
+fn merge_metric_summaries(summaries: &[FileSummary]) -> MetricMap {
+    let mut merged: MetricMap = HashMap::new();
     for s in summaries {
         for (group, fields) in &s.metrics {
             let group_map = merged.entry(group.clone()).or_default();
@@ -3275,25 +3351,25 @@ fn merge_metric_summaries(summaries: &[FileSummary]) -> serde_json::Value {
             }
         }
     }
-    serde_json::to_value(&merged).unwrap_or(serde_json::Value::Null)
+    merged
 }
 
-fn write_metric_features(
-    metrics: &serde_json::Value,
-    w: &mut FeatureWriter<'_>,
-    metric_vocab: &[String],
-) {
-    let base_keys: HashSet<String> = KEY_METRICS
+/// The `{group}_{field}` keys of [`KEY_METRICS`], computed once. The extended
+/// vocab is filtered against these so a base metric is never emitted twice.
+static BASE_METRIC_KEYS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(|| {
+    KEY_METRICS
         .iter()
         .map(|&(g, f, _)| format!("{g}_{f}"))
-        .collect();
+        .collect()
+});
 
+fn write_metric_features(metrics: &MetricMap, w: &mut FeatureWriter<'_>, metric_vocab: &[String]) {
     // Base KEY_METRICS with explicit log transforms.
     for &(group, field_name, use_log) in KEY_METRICS {
         let value = metrics
             .get(group)
             .and_then(|g| g.get(field_name))
-            .and_then(serde_json::Value::as_f64)
+            .copied()
             .unwrap_or(0.0) as f32;
         let val = if use_log {
             (value.abs() + 1.0).ln()
@@ -3306,14 +3382,11 @@ fn write_metric_features(
     // Extended metrics from dynamic vocab — skip keys already in KEY_METRICS.
     for mk in metric_vocab {
         let parts: Vec<&str> = mk.splitn(2, '_').collect();
-        if parts.len() == 2 && !base_keys.contains(mk.as_str()) {
+        if parts.len() == 2 && !BASE_METRIC_KEYS.contains(mk.as_str()) {
             let value = metrics
                 .get(parts[0])
                 .and_then(|g| g.get(parts[1]))
-                .and_then(|v| {
-                    v.as_f64()
-                        .or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 }))
-                })
+                .copied()
                 .unwrap_or(0.0) as f32;
             let use_log = ["count", "size", "total", "bytes", "length"]
                 .iter()
@@ -3749,10 +3822,14 @@ fn write_symbol_features(
     emit_bigrams: bool,
     emit_trigrams: bool,
 ) {
+    use std::fmt::Write;
+    let mut key = String::new();
     for s in summaries {
         let symbols = collect_file_symbols(s);
         for sym in &symbols {
-            w.set(&format!("symbol:{sym}"), 1.0);
+            key.clear();
+            let _ = write!(key, "symbol:{sym}");
+            w.set(&key, 1.0);
         }
         if !emit_bigrams && !emit_trigrams {
             continue;
@@ -3763,7 +3840,9 @@ fn write_symbol_features(
             let cap = sorted.len().min(SYMBOL_BIGRAM_CAP);
             for i in 0..cap {
                 for j in (i + 1)..cap {
-                    w.set(&format!("symbol_bi:{}||{}", sorted[i], sorted[j]), 1.0);
+                    key.clear();
+                    let _ = write!(key, "symbol_bi:{}||{}", sorted[i], sorted[j]);
+                    w.set(&key, 1.0);
                 }
             }
         }
@@ -3772,10 +3851,9 @@ fn write_symbol_features(
             for i in 0..cap {
                 for j in (i + 1)..cap {
                     for k in (j + 1)..cap {
-                        w.set(
-                            &format!("symbol_tri:{}||{}||{}", sorted[i], sorted[j], sorted[k]),
-                            1.0,
-                        );
+                        key.clear();
+                        let _ = write!(key, "symbol_tri:{}||{}||{}", sorted[i], sorted[j], sorted[k]);
+                        w.set(&key, 1.0);
                     }
                 }
             }
@@ -3889,12 +3967,12 @@ fn write_textenc_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) 
 }
 
 /// Cross-metric derived ratios. Mirrors collimator `_BATCH1_RATIOS`.
-fn write_derived_metric_features(merged_metrics: &serde_json::Value, w: &mut FeatureWriter<'_>) {
+fn write_derived_metric_features(merged_metrics: &MetricMap, w: &mut FeatureWriter<'_>) {
     let get = |group: &str, field: &str| -> f64 {
         merged_metrics
             .get(group)
             .and_then(|g| g.get(field))
-            .and_then(serde_json::Value::as_f64)
+            .copied()
             .unwrap_or(0.0)
     };
     let ratio = |num: f64, denom: f64| -> f64 { if denom == 0.0 { 0.0 } else { num / denom } };
@@ -4020,7 +4098,14 @@ mod tests {
                 "fn": [["render"], ["x"]]                 // "x" too short, skipped
             }
         });
-        let summary = FileSummary::new(&file);
+        let summary = FileSummary::new(
+            &file,
+            RawNeeds {
+                kv: true,
+                textenc: true,
+                symbol: true,
+            },
+        );
         let syms = collect_file_symbols(&summary);
 
         for expected in [

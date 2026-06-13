@@ -1,4 +1,4 @@
-//! Zero-telemetry update notifier and manifest-backed ref resolution.
+//! Zero-telemetry update notifier.
 //!
 //! On first run and at most once every 24 hours, litmus fetches a small static
 //! TOML manifest (`litmus.toml`) and prints a one-line notice when a newer
@@ -6,10 +6,6 @@
 //! identity, or any other data is sent — so it leaks nothing even if the host
 //! logs requests. A fresh result is cached locally so subsequent runs print the
 //! notice without touching the network at all.
-//!
-//! The same manifests also tell `update-rules` which git ref each release line
-//! should track for its data repository: [`models_ref`] reads `litmus.toml`
-//! (azoth models) and [`traits_ref`] reads `cleave.toml` (cleave traits).
 //!
 //! The opt-out is honored everywhere: pass `--no-update-check` or set
 //! `SCAN_NO_UPDATE_CHECK` to disable the notice. The base URL is overridable
@@ -168,51 +164,6 @@ pub fn maybe_notify(disabled_by_flag: bool) {
                 url: prev.url.clone(),
             });
             notify(&prev.latest, prev.url.as_deref(), installed);
-        }
-    }
-}
-
-/// Resolve the azoth models ref the installed litmus version should track,
-/// per `litmus.toml`. `None` means no rule applied (or the fetch failed) — the
-/// caller keeps its existing default. This is an apply-time fetch, so the
-/// `?update=1` marker is set.
-#[must_use]
-pub fn models_ref() -> Option<String> {
-    resolve_ref("litmus.toml", env!("CARGO_PKG_VERSION"))
-}
-
-/// Resolve the cleave traits ref to track, per `cleave.toml`.
-///
-/// Keyed on the cleave version embedded in this binary. cleave does not yet
-/// export its crate version, and the litmus and cleave release lines track each
-/// other, so litmus's own version is used as the key until `cleave::VERSION`
-/// (or equivalent) is available to read directly.
-#[must_use]
-pub fn traits_ref() -> Option<String> {
-    resolve_ref("cleave.toml", env!("CARGO_PKG_VERSION"))
-}
-
-/// Shared logic for [`models_ref`] / [`traits_ref`]: fetch the named manifest
-/// and return the git ref its rules map `installed` to, if any.
-fn resolve_ref(manifest: &str, installed: &str) -> Option<String> {
-    match fetch(manifest, true) {
-        Ok(m) => match m.resolve(installed) {
-            Some(rule) if !rule.git_ref.is_empty() => {
-                tracing::info!(manifest, version = installed, git_ref = %rule.git_ref, "ref resolved from update manifest");
-                Some(rule.git_ref.clone())
-            }
-            _ => {
-                tracing::debug!(
-                    manifest,
-                    version = installed,
-                    "no manifest rule matched; using default ref"
-                );
-                None
-            }
-        },
-        Err(e) => {
-            tracing::debug!(manifest, error = %format!("{e:#}"), "manifest fetch failed; using default ref");
-            None
         }
     }
 }

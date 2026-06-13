@@ -159,13 +159,6 @@ impl ServerConfig {
         self
     }
 
-    /// Override the default per-request analysis timeout. Pass `0` to disable.
-    #[must_use]
-    pub const fn with_analysis_timeout_secs(mut self, secs: u64) -> Self {
-        self.analysis_timeout_secs = secs;
-        self
-    }
-
     /// Per-request analysis timeout in seconds. 0 = disabled.
     #[must_use]
     pub const fn analysis_timeout_secs(&self) -> u64 {

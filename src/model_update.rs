@@ -199,7 +199,7 @@ fn install(dir: &Path, artifact: &Artifact, source: &str) -> Result<()> {
     let url = format!("{BASE_URL}/{}", artifact.file);
     let bytes = http_get(&url)?;
 
-    let got = hex(Sha256::digest(&bytes).as_slice());
+    let got = format!("{:x}", Sha256::digest(&bytes));
     if got != artifact.sha256 {
         bail!(
             "sha256 mismatch for {}: got {got}, manifest says {}",
@@ -272,12 +272,3 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .to_vec())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
-}

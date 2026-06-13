@@ -281,6 +281,7 @@ dependencies = [
  "anyhow",
  "axum",
  "backtrace",
+ "bytes",
  "clap",
  "cleave",
  "colored",
@@ -772,7 +773,6 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "2.0.0-rc.6"
-source = "git+https://codeberg.org/atomdrift/cleave.git#9254b67125db2872804cbb3839b37625593adb2f"
 dependencies = [
  "aes 0.8.4",
  "aho-corasick",
@@ -781,6 +781,7 @@ dependencies = [
  "ar",
  "axum",
  "base64",
+ "bytes",
  "bzip2 0.6.1",
  "cab",
  "cbc",
@@ -860,7 +861,6 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#9254b67125db2872804cbb3839b37625593adb2f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2733,7 +2733,6 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#9254b67125db2872804cbb3839b37625593adb2f"
 
 [[package]]
 name = "lzxd"
@@ -2753,7 +2752,6 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#9254b67125db2872804cbb3839b37625593adb2f"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -3553,7 +3551,6 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#9254b67125db2872804cbb3839b37625593adb2f"
 dependencies = [
  "flate2",
  "memchr",
@@ -4123,7 +4120,6 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#9254b67125db2872804cbb3839b37625593adb2f"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4640,7 +4636,6 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#9254b67125db2872804cbb3839b37625593adb2f"
 
 [[package]]
 name = "tap"
@@ -6596,7 +6591,6 @@ dependencies = [
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/cleave.git#9254b67125db2872804cbb3839b37625593adb2f"
 
 [[package]]
 name = "yara-x"

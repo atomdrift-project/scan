@@ -512,9 +512,10 @@ fn main() -> Result<()> {
     // production with 4 large archives in flight). Stacks are virtual memory;
     // only pages actually touched are committed, so the cost of the extra
     // headroom is address space, not RSS.
+    const RAYON_STACK_MB: usize = 256;
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
-        .stack_size(256 * 1024 * 1024)
+        .stack_size(RAYON_STACK_MB * 1024 * 1024)
         .thread_name(|i| format!("rayon-{i}"))
         // Register each pool worker for the SIGUSR1 in-process thread dump, so a
         // wedge can be backtraced without a debugger (lldb/gdb can't attach in
@@ -540,7 +541,7 @@ fn main() -> Result<()> {
     tracing::info!(
         threads = active_threads,
         detected_cores,
-        stack_mb = 64,
+        stack_mb = RAYON_STACK_MB,
         "rayon pool ready"
     );
 
@@ -782,7 +783,7 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone());
-            eprintln!("Starting Atomdrift Scan server on http://{} ...", bind);
+            eprintln!("Starting Atomdrift Scan server on http://{bind} ...");
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
