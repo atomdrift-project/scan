@@ -2675,77 +2675,67 @@ impl Model {
 
     fn score_route_report(
         route: &Route,
-        report: &serde_json::Value,
+        parsed: &crate::features::ParsedReport,
     ) -> Result<(f32, f32, Classification)> {
-        let mut features = route.ctx.extract(report);
+        let mut features = route.ctx.extract_from_parsed(parsed);
         route.spec.standardize(&mut features);
         let (raw, probability) = route.predict_raw_calibrated(&features)?;
         Ok((raw, probability, route.thresholds.classify(probability)))
+    }
+
+    /// Union of every specialist route's raw-subtree needs, so the report can be
+    /// parsed once (with all consumers' needs) and shared across general + routes.
+    pub(crate) fn route_needs_union(&self) -> crate::features::RawNeeds {
+        self.routes
+            .filegroups
+            .values()
+            .chain(self.routes.filetypes.values())
+            .fold(crate::features::RawNeeds::none(), |acc, r| {
+                acc.union(r.ctx.raw_needs())
+            })
     }
 
     fn score_route_file(
         route: &Route,
-        file: &serde_json::Value,
+        parsed: &crate::features::ParsedReport,
     ) -> Result<(f32, f32, Classification)> {
-        let mut features = route.ctx.extract_file(file);
+        let mut features = route.ctx.extract_from_parsed(parsed);
         route.spec.standardize(&mut features);
         let (raw, probability) = route.predict_raw_calibrated(&features)?;
         Ok((raw, probability, route.thresholds.classify(probability)))
     }
 
-    /// Routed prediction from a full cleave report.
+    /// Routed prediction from a full cleave report, with per-route scores
+    /// retained for JSON and `--extra` output.
     ///
     /// This is the production ensemble path. General is scored from the
-    /// caller-provided general feature vector, while each specialist extracts
-    /// and standardizes its own route-specific vector from `report`.
-    pub fn predict_for_report(
+    /// caller-provided general feature vector; each specialist scores its own
+    /// route-specific vector from the shared [`crate::features::ParsedReport`].
+    pub(crate) fn predict_for_report_detailed(
         &self,
         file_type: &str,
         general_features: &[f32],
-        report: &serde_json::Value,
-    ) -> Result<(f32, Classification)> {
-        let (decision, _, _) =
-            self.predict_for_report_detailed(file_type, general_features, report)?;
-        Ok((decision.probability, decision.class))
-    }
-
-    /// Same as [`Self::predict_for_report`], with per-route scores retained
-    /// for JSON and `--extra` output.
-    pub fn predict_for_report_detailed(
-        &self,
-        file_type: &str,
-        general_features: &[f32],
-        report: &serde_json::Value,
+        parsed: &crate::features::ParsedReport,
     ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
         let (route_probs, scores, mut skipped) =
             self.score_all_routes(file_type, general_features, |route| {
-                Self::score_route_report(route, report)
+                Self::score_route_report(route, parsed)
             })?;
         let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
         Ok((decision, scores, skipped))
     }
 
-    /// Routed prediction for one embedded-file JSON object.
-    pub fn predict_for_file(
+    /// Routed prediction for one embedded-file (archive member), with per-route
+    /// scores retained. Shares the member's parse across general + every route.
+    pub(crate) fn predict_for_file_detailed(
         &self,
         file_type: &str,
         general_features: &[f32],
-        file: &serde_json::Value,
-    ) -> Result<(f32, Classification)> {
-        let (decision, _, _) = self.predict_for_file_detailed(file_type, general_features, file)?;
-        Ok((decision.probability, decision.class))
-    }
-
-    /// Same as [`Self::predict_for_file`], with per-route scores retained.
-    pub fn predict_for_file_detailed(
-        &self,
-        file_type: &str,
-        general_features: &[f32],
-        file: &serde_json::Value,
+        parsed: &crate::features::ParsedReport,
     ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
         let (route_probs, scores, mut skipped) =
             self.score_all_routes(file_type, general_features, |route| {
-                Self::score_route_file(route, file)
+                Self::score_route_file(route, parsed)
             })?;
         let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
         Ok((decision, scores, skipped))

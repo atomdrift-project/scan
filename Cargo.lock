@@ -773,6 +773,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "2.0.0-rc.6"
+source = "git+https://codeberg.org/atomdrift/cleave.git#ea535873a03b3c25a2c95ecd7b7464854e5e6b8f"
 dependencies = [
  "aes 0.8.4",
  "aho-corasick",
@@ -861,6 +862,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#ea535873a03b3c25a2c95ecd7b7464854e5e6b8f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1231,9 +1233,9 @@ dependencies = [
 
 [[package]]
 name = "daachorse"
-version = "3.0.1"
+version = "3.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d90e4c4a7034cde152cbbac492a8d61c5d85b0fe9972afdf32737ff5fc17c9ff"
+checksum = "99251f238b74cd219a86fe6ea9328308ebb223fcbb5b8eb5aa400b847a41dded"
 
 [[package]]
 name = "darling"
@@ -1591,7 +1593,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.0.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#cb42f214bd1d8a9ae25110b211fdfad4c225b1d5"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#9e722bede4b81de410ee1df62707bafe07f5fed2"
 dependencies = [
  "aho-corasick",
  "bincode",
@@ -2733,6 +2735,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#ea535873a03b3c25a2c95ecd7b7464854e5e6b8f"
 
 [[package]]
 name = "lzxd"
@@ -2752,6 +2755,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#ea535873a03b3c25a2c95ecd7b7464854e5e6b8f"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -3551,6 +3555,7 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#ea535873a03b3c25a2c95ecd7b7464854e5e6b8f"
 dependencies = [
  "flate2",
  "memchr",
@@ -4120,6 +4125,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#ea535873a03b3c25a2c95ecd7b7464854e5e6b8f"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4509,7 +4515,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "1.6.1"
-source = "git+https://codeberg.org/atomdrift/stng.git#4cf87cbc8541d8d43d136f6263ebf7bace56cd49"
+source = "git+https://codeberg.org/atomdrift/stng.git#882b16aeacf5c2cc3a0837ab3d85764248718b04"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4528,7 +4534,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "terminal_size",
- "thiserror 2.0.18",
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",
@@ -4636,6 +4641,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#ea535873a03b3c25a2c95ecd7b7464854e5e6b8f"
 
 [[package]]
 name = "tap"
@@ -5326,7 +5332,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#cb42f214bd1d8a9ae25110b211fdfad4c225b1d5"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#9e722bede4b81de410ee1df62707bafe07f5fed2"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -6591,6 +6597,7 @@ dependencies = [
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#ea535873a03b3c25a2c95ecd7b7464854e5e6b8f"
 
 [[package]]
 name = "yara-x"

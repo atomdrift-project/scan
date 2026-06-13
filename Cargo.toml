@@ -186,8 +186,5 @@ path = "src/bin/bench_hopper.rs"
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
 
-# Build against the local cleave checkout (scan is cleave's only consumer), so
-# the two evolve together and scan can use cleave's zero-copy `analyze_bytes_shared`.
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
+
 

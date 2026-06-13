@@ -1252,13 +1252,6 @@ impl ExtractContext {
         vec
     }
 
-    /// Extract features for a single compact file entry.
-    #[must_use]
-    pub fn extract_file(&self, file: &serde_json::Value) -> Vec<f32> {
-        let mut vec = vec![0.0f32; self.total_features];
-        self.extract_files_into(std::slice::from_ref(&file), Some(file), &mut vec);
-        vec
-    }
 
     fn extract_report_into(&self, report: &serde_json::Value, vec: &mut [f32]) {
         let raw_files = report_files(report);
@@ -1272,33 +1265,39 @@ impl ExtractContext {
         primary_file: Option<&serde_json::Value>,
         vec: &mut [f32],
     ) {
-        use std::fmt::Write;
-        // Small warm-cache reports are cheaper to summarize serially than to
-        // fan out into rayon jobs.
-        let needs = RawNeeds {
+        let parsed = ParsedReport::from_files(raw_files, primary_file, self.raw_needs());
+        self.write_features(&parsed, vec);
+    }
+
+    /// This route's active raw-subtree needs (which optional families it emits).
+    pub(crate) fn raw_needs(&self) -> RawNeeds {
+        RawNeeds {
             kv: self.n_kv > 0,
             textenc: self.n_textenc > 0,
             symbol: self.n_symbol > 0 || self.n_symbol_bi > 0 || self.n_symbol_tri > 0,
-        };
-        let file_summaries: Vec<FileSummary> = if raw_files.len() < 8 {
-            raw_files.iter().map(|&f| FileSummary::new(f, needs)).collect()
-        } else {
-            raw_files.par_iter().map(|&f| FileSummary::new(f, needs)).collect()
-        };
+        }
+    }
 
-        // If no files, we need at least one empty summary for structural logic.
-        let summaries = if file_summaries.is_empty() {
-            vec![FileSummary::default()]
-        } else {
-            file_summaries
-        };
+    /// Allocate and fill this route's feature vector from a shared [`ParsedReport`].
+    pub(crate) fn extract_from_parsed(&self, parsed: &ParsedReport) -> Vec<f32> {
+        let mut vec = vec![0.0f32; self.total_features];
+        self.write_features(parsed, &mut vec);
+        vec
+    }
 
-        let combined = summarize_report_summaries(&summaries);
-        let merged_metrics = merge_metric_summaries(&summaries);
+    /// Emit this route's features into `vec` from an already-parsed report.
+    /// The parse is route-independent (see [`ParsedReport`]); only the writes
+    /// below depend on this context's vocab/slots.
+    fn write_features(&self, parsed: &ParsedReport, vec: &mut [f32]) {
+        use std::fmt::Write;
+        let summaries = parsed.summaries.as_slice();
+        let combined = &parsed.combined;
+        let merged_metrics = &parsed.merged_metrics;
+        let formula_str = parsed.formula_str.as_str();
+        let elements_str = parsed.elements_str.as_str();
+        let sample_score = parsed.sample_score;
         let mut offsets = FeatureCursor::default();
 
-        let (formula_str, elements_str, sample_score) =
-            canonical_fields_from_primary_file(primary_file);
         let score_weight: f64 = if sample_score > 0 {
             (sample_score as f64).ln_1p()
         } else {
@@ -1308,11 +1307,11 @@ impl ExtractContext {
         // G1: Presence. Cursor advanced only to feed the layout-drift check at
         // the end; the write itself is anchored to the spec (see `new()`).
         offsets.take(self.n_presence);
-        self.write_presence_features_v16(&combined, vec, &self.present_slots, score_weight);
+        self.write_presence_features_v16(combined, vec, &self.present_slots, score_weight);
 
         // G2: Max crit
         offsets.take(self.n_presence);
-        self.write_max_crit_features_v16(&combined, vec, &self.maxcrit_slots, score_weight);
+        self.write_max_crit_features_v16(combined, vec, &self.maxcrit_slots, score_weight);
 
         // G3: Aggregates
         let n_crit = self.n_crit_unigram + self.n_crit_bigram + self.n_crit_trigram;
@@ -1320,8 +1319,8 @@ impl ExtractContext {
             self.n_atk_bigram + self.n_atk_trigram + self.n_mbc_bigram + self.n_mbc_trigram;
         offsets.take(57 + n_crit + n_code_ngrams);
         write_aggregate_features(
-            &combined,
-            &summaries,
+            combined,
+            summaries,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1409,7 +1408,7 @@ impl ExtractContext {
         {
             let mut attacks: HashSet<String> = HashSet::new();
             let mut mbcs: HashSet<String> = HashSet::new();
-            for s in &summaries {
+            for s in summaries {
                 for f in &s.raw_findings {
                     if let Some(a) = &f.atk {
                         attacks.insert(a.clone());
@@ -1481,7 +1480,7 @@ impl ExtractContext {
         // G4: External (name-based)
         offsets.take(6); // reserve space for offset tracking compatibility
         write_external_summary_features(
-            &combined,
+            combined,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1491,7 +1490,7 @@ impl ExtractContext {
         // G5: Metrics (base + extended vocab)
         offsets.take(KEY_METRICS.len() + self.n_ext_metrics);
         write_metric_features(
-            &merged_metrics,
+            merged_metrics,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1505,7 +1504,7 @@ impl ExtractContext {
         // G6b: Format hints
         offsets.take(self.n_format);
         write_format_hint_features(
-            &summaries,
+            summaries,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1519,7 +1518,7 @@ impl ExtractContext {
                 vec,
                 lookup: &self.absolute_lookup,
             },
-            &summaries,
+            summaries,
             combined.filtered_finding_count,
         );
 
@@ -1560,7 +1559,7 @@ impl ExtractContext {
                     0.0
                 },
             );
-            for s in &summaries {
+            for s in summaries {
                 w.set(&format!("inter:{}*score", s.file_type), sample_score as f32);
             }
 
@@ -1599,10 +1598,10 @@ impl ExtractContext {
 
         // G11: Bigrams (optimized — resolved per-member via the slot map)
         offsets.take(self.n_bigram);
-        self.write_bigram_features_optimized(&summaries, vec, &self.bigram_slots);
+        self.write_bigram_features_optimized(summaries, vec, &self.bigram_slots);
 
         // G11b/G11c: Tiered report-level notable+ n-grams. Both share one token set.
-        let tiered_tokens = tiered_path_tokens(&combined);
+        let tiered_tokens = tiered_path_tokens(combined);
         offsets.take(self.n_tiered_bigram);
         write_tiered_bigram_features(
             &tiered_tokens,
@@ -1627,8 +1626,8 @@ impl ExtractContext {
         // G15: Structural Extensions
         offsets.take(13);
         write_structural_extensions(
-            &summaries,
-            &combined,
+            summaries,
+            combined,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1637,13 +1636,13 @@ impl ExtractContext {
 
         // G16: Trigrams (optimized)
         offsets.take(self.n_trigram);
-        self.write_trigram_features_optimized(&summaries, vec, &self.trigram_slots);
+        self.write_trigram_features_optimized(summaries, vec, &self.trigram_slots);
 
         // G19: Logic Gaps
         offsets.take(LOGIC_GAP_CATEGORIES.len());
         write_logic_gap_features(
-            &combined,
-            &summaries,
+            combined,
+            summaries,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1653,13 +1652,13 @@ impl ExtractContext {
         // G20: Signature Synergy (unsigned-bigram block; same bigram ids, own slots)
         offsets.take(self.n_bigram);
         if combined.sample_paths.contains_key("metadata/unsigned") {
-            self.write_bigram_features_optimized(&summaries, vec, &self.unsigned_bigram_slots);
+            self.write_bigram_features_optimized(summaries, vec, &self.unsigned_bigram_slots);
         }
 
         // G22: Intent Gaps
         offsets.take(INTENT_GAP_CATEGORIES.len());
         write_intent_gap_features(
-            &combined,
+            combined,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1670,8 +1669,8 @@ impl ExtractContext {
         let missing_count: usize = EXPECTED_GHOSTS.iter().map(|(_, t)| t.len()).sum();
         offsets.take(missing_count);
         write_negative_space_features(
-            &combined,
-            &summaries,
+            combined,
+            summaries,
             &mut FeatureWriter {
                 vec,
                 lookup: &self.absolute_lookup,
@@ -1689,34 +1688,34 @@ impl ExtractContext {
 
         if self.n_extra_agg > 0 {
             offsets.take(self.n_extra_agg);
-            write_suspicious_ngram_counts(&combined, &mut tail_writer);
+            write_suspicious_ngram_counts(combined, &mut tail_writer);
         }
         if self.n_derived_metrics > 0 {
             offsets.take(self.n_derived_metrics);
-            write_derived_metric_features(&merged_metrics, &mut tail_writer);
+            write_derived_metric_features(merged_metrics, &mut tail_writer);
         }
         if self.n_silent_packer > 0 {
             offsets.take(self.n_silent_packer);
             write_silent_packer_signal(
-                &summaries,
+                summaries,
                 combined.filtered_finding_count,
                 &mut tail_writer,
             );
         }
         if self.n_textenc > 0 {
             offsets.take(self.n_textenc);
-            write_textenc_features(&summaries, &mut tail_writer);
+            write_textenc_features(summaries, &mut tail_writer);
         }
         if self.n_kv > 0 {
             offsets.take(self.n_kv);
-            for s in &summaries {
+            for s in summaries {
                 write_kv_features(s, &mut tail_writer);
             }
         }
         if self.n_symbol > 0 || self.n_symbol_bi > 0 || self.n_symbol_tri > 0 {
             offsets.take(self.n_symbol + self.n_symbol_bi + self.n_symbol_tri);
             write_symbol_features(
-                &summaries,
+                summaries,
                 &mut tail_writer,
                 self.n_symbol_bi > 0,
                 self.n_symbol_tri > 0,
@@ -1932,10 +1931,93 @@ struct FileSummary {
 /// Which optional feature families are active for this route, so [`FileSummary::new`]
 /// only clones the raw JSON subtrees those families actually read.
 #[derive(Clone, Copy)]
-struct RawNeeds {
+pub(crate) struct RawNeeds {
     kv: bool,
     textenc: bool,
     symbol: bool,
+}
+
+impl RawNeeds {
+    /// No families active — the identity for [`RawNeeds::union`] folds.
+    pub(crate) const fn none() -> Self {
+        Self {
+            kv: false,
+            textenc: false,
+            symbol: false,
+        }
+    }
+
+    /// The needs of any of two consumers — used to parse a report once for the
+    /// general pass and every route, cloning a subtree if *any* of them reads it.
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self {
+            kv: self.kv || other.kv,
+            textenc: self.textenc || other.textenc,
+            symbol: self.symbol || other.symbol,
+        }
+    }
+}
+
+/// A report parsed into the route-independent summaries the feature writers read.
+///
+/// Building this is the expensive part of extraction (per-file `FileSummary`
+/// construction, cross-file finding/metric aggregation). It depends only on the
+/// report and the union of active families, never on a specific route's vocab —
+/// so the general pass and every ML route share one `ParsedReport` instead of
+/// each re-summarizing the same report.
+pub(crate) struct ParsedReport {
+    summaries: Vec<FileSummary>,
+    combined: FindingSummary,
+    merged_metrics: MetricMap,
+    formula_str: String,
+    elements_str: String,
+    sample_score: i64,
+}
+
+impl ParsedReport {
+    pub(crate) fn from_report(report: &serde_json::Value, needs: RawNeeds) -> Self {
+        Self::from_files(&report_files(report), primary_file(report), needs)
+    }
+
+    /// Parse a single compact-file entry (an archive member) on its own.
+    pub(crate) fn from_file(file: &serde_json::Value, needs: RawNeeds) -> Self {
+        Self::from_files(std::slice::from_ref(&file), Some(file), needs)
+    }
+
+    fn from_files(
+        raw_files: &[&serde_json::Value],
+        primary_file: Option<&serde_json::Value>,
+        needs: RawNeeds,
+    ) -> Self {
+        // Small warm-cache reports are cheaper to summarize serially than to fan
+        // out into rayon jobs.
+        let file_summaries: Vec<FileSummary> = if raw_files.len() < 8 {
+            raw_files.iter().map(|&f| FileSummary::new(f, needs)).collect()
+        } else {
+            raw_files
+                .par_iter()
+                .map(|&f| FileSummary::new(f, needs))
+                .collect()
+        };
+        // If no files, we need at least one empty summary for structural logic.
+        let summaries = if file_summaries.is_empty() {
+            vec![FileSummary::default()]
+        } else {
+            file_summaries
+        };
+        let combined = summarize_report_summaries(&summaries);
+        let merged_metrics = merge_metric_summaries(&summaries);
+        let (formula_str, elements_str, sample_score) =
+            canonical_fields_from_primary_file(primary_file);
+        Self {
+            summaries,
+            combined,
+            merged_metrics,
+            formula_str,
+            elements_str,
+            sample_score,
+        }
+    }
 }
 
 impl FileSummary {

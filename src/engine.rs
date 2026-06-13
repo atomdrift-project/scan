@@ -1507,7 +1507,14 @@ pub(crate) fn classify_report(
         .unwrap_or_default();
 
     let report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
-    let mut raw_features = ctx.extract(&report_json);
+    // Parse the report once (with the needs of the general pass and every route),
+    // then share it — each route differs only in which features it writes, not in
+    // how the report is summarized.
+    let parsed = crate::features::ParsedReport::from_report(
+        &report_json,
+        ctx.raw_needs().union(model.route_needs_union()),
+    );
+    let mut raw_features = ctx.extract_from_parsed(&parsed);
     let nonzero = raw_features.iter().filter(|&&v| v != 0.0).count();
     let expected = model.spec().total_features();
     if raw_features.len() != expected {
@@ -1538,7 +1545,7 @@ pub(crate) fn classify_report(
     let sha256 = pf["sha"].as_str().unwrap_or("").to_string();
 
     let (mut decision, model_scores, skipped_models) =
-        model.predict_for_report_detailed(&file_type, &raw_features, &report_json)?;
+        model.predict_for_report_detailed(&file_type, &raw_features, &parsed)?;
 
     let finding_counts = count_findings_from_json(&report_json);
 
@@ -1580,6 +1587,7 @@ pub(crate) fn classify_report(
     let mut embedded_files: Vec<EmbeddedFile> = Vec::with_capacity(embedded_entries.len());
     let mut max_decision: Decision = decision;
 
+    let embedded_needs = ctx.raw_needs().union(model.route_needs_union());
     for ef in &embedded_entries {
         if let Some(c) = cancellation
             && c.load(Ordering::Relaxed)
@@ -1587,11 +1595,12 @@ pub(crate) fn classify_report(
             anyhow::bail!("analysis cancelled during embedded file processing");
         }
 
-        let mut ef_features = ctx.extract_file(ef);
+        let ef_parsed = crate::features::ParsedReport::from_file(ef, embedded_needs);
+        let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
         model.spec().standardize(&mut ef_features);
         let ef_type = ef["type"].as_str().unwrap_or("unknown");
         let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
-            .predict_for_file_detailed(ef_type, &ef_features, ef)
+            .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
             .unwrap_or((
                 Decision {
                     class: Classification::Benign,
