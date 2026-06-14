@@ -726,16 +726,21 @@ struct ClaimJob {
 struct ResultPayload {
     sha256: String,
     worker: String,
-    // Typed `MlSection` instead of `serde_json::Value` so serialization walks the
-    // struct once into HTTP body bytes; the prior shape allocated an intermediate
-    // Value tree via `serde_json::to_value(&envelope.ml)` on every result post.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ml: Option<crate::engine::MlSection>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    raw: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     duration_ms: i64,
+    // The `{ml, llm?, raw}` analysis envelope, flattened onto the payload so the
+    // wire form is `{sha256, worker, duration_ms, ml, llm, raw}`. This is the
+    // SAME `ScanResultEnvelope` litmus emits for local `--json` output and the
+    // server `/analyze` response — embedding it (rather than re-declaring
+    // ml/llm/raw here) keeps the worker upload structurally identical to those
+    // paths, so any future envelope field flows through automatically instead of
+    // silently dropping at this boundary. `None` when analysis failed outright:
+    // only the transport metadata and `error` are sent. The envelope keeps `ml`
+    // typed as `MlSection`, so serialization still streams the struct straight
+    // into HTTP body bytes with no intermediate `serde_json::Value` tree.
+    #[serde(flatten)]
+    envelope: Option<crate::engine::ScanResultEnvelope>,
 }
 
 /// A job with its file data pre-downloaded (or marked for local access).
@@ -1884,7 +1889,7 @@ async fn run_job(
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
     prefetched: std::result::Result<Option<bytes::Bytes>, PrefetchError>,
-) -> Result<(crate::engine::MlSection, serde_json::Value, i64), String> {
+) -> Result<(crate::engine::ScanResultEnvelope, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     // `Arc<str>` so the watcher and the blocking closure share the basename
     // allocation instead of each cloning a fresh `String`.
@@ -2198,10 +2203,7 @@ async fn run_job(
     let elapsed_ms = crate::duration_ms(start.elapsed()) as i64;
 
     match result {
-        Ok(Ok(scan_result)) => {
-            let envelope = scan_result.into_envelope();
-            Ok((envelope.ml, envelope.raw, elapsed_ms))
-        }
+        Ok(Ok(scan_result)) => Ok((scan_result.into_envelope(), elapsed_ms)),
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(e) => Err(format!("task join error: {e}")),
     }
@@ -2213,14 +2215,14 @@ async fn post_result(
     url: &str,
     worker: &str,
     sha256: &str,
-    result: Result<(crate::engine::MlSection, serde_json::Value, i64), String>,
+    result: Result<(crate::engine::ScanResultEnvelope, i64), String>,
 ) {
-    let payload = match result {
-        Ok((ml, raw, duration_ms)) => {
+    let mut payload = match result {
+        Ok((envelope, duration_ms)) => {
             // v7 envelope no longer carries `class` on the wire; the verdict
             // is encoded in `lvl` (-1 = benign, anything else = hostile). The
             // suspicious band is consumer-side and not visible here.
-            let verdict = if ml.level == Some(-1) {
+            let verdict = if envelope.ml.level == Some(-1) {
                 "benign"
             } else {
                 "hostile"
@@ -2229,19 +2231,17 @@ async fn post_result(
             ResultPayload {
                 sha256: sha256.to_string(),
                 worker: worker.to_string(),
-                ml: Some(ml),
-                raw: Some(raw),
                 error: None,
                 duration_ms,
+                envelope: Some(envelope),
             }
         }
         Err(e) => ResultPayload {
             sha256: sha256.to_string(),
             worker: worker.to_string(),
-            ml: None,
-            raw: None,
             error: Some(e),
             duration_ms: 0,
+            envelope: None,
         },
     };
 
@@ -2261,14 +2261,14 @@ async fn post_result(
             return;
         }
     };
-    // Hopper bounds the decompressed result body at 256 MiB
+    // Hopper bounds the decompressed result body at 512 MiB
     // (maxResultBodyBytes in hopper's api.go); a larger document is truncated
     // mid-stream and rejected as invalid JSON — permanently, since retries
     // resend identical bytes. If the serialized report exceeds the limit, drop
     // the raw cleave report and send the ML verdict alone: hopper stores the
     // verdict and only skips archive explosion, which beats losing the whole
     // 5-minute analysis.
-    const HOPPER_MAX_RESULT_BODY_BYTES: usize = 256 << 20;
+    const HOPPER_MAX_RESULT_BODY_BYTES: usize = 512 << 20;
     let json = if json.len() > HOPPER_MAX_RESULT_BODY_BYTES {
         tracing::warn!(
             sha256 = %sha256,
@@ -2276,10 +2276,12 @@ async fn post_result(
             limit_bytes = HOPPER_MAX_RESULT_BODY_BYTES,
             "result JSON exceeds hopper's body limit; dropping raw report, posting ML verdict only",
         );
-        let payload = ResultPayload {
-            raw: None,
-            ..payload
-        };
+        // Empty the cleave report but keep the ml/llm verdict. `{}` (not null)
+        // mirrors the envelope litmus produces when there is no cleave report,
+        // so the dropped-raw form stays a structurally valid envelope.
+        if let Some(envelope) = payload.envelope.as_mut() {
+            envelope.raw = serde_json::json!({});
+        }
         match serde_json::to_vec(&payload) {
             Ok(json) => json,
             Err(e) => {

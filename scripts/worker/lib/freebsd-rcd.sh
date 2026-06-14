@@ -11,16 +11,15 @@
 # the caller pipes the output wherever it needs to land — a local file, or
 # `bastille cmd <jail> tee`.
 
-# Compose the `worker ...` argument string from a hopper URL, an optional
-# worker count, and the LLM interpret gate (min ML probability to interpret a
-# sample; defaults to 0.15). The endpoint itself is supplied via the SCAN_LLM
-# environment variable in ascan_rcd_script, not here.
-# Usage: ascan_worker_args <url> [workers] [min_prob]
+# Compose the `worker ...` argument string from a hopper URL and an optional
+# worker count. The interpret gate (min ML probability) is left at the binary's
+# default. The endpoint itself is supplied via the SCAN_LLM environment variable
+# in ascan_rcd_script, not here.
+# Usage: ascan_worker_args <url> [workers]
 ascan_worker_args() {
 	_lwa_url="$1"
 	_lwa_workers="$2"
-	_lwa_min_prob="${3:-0.15}"
-	_lwa_args="worker --url $_lwa_url --interpret --interpret-min-prob $_lwa_min_prob"
+	_lwa_args="worker --url $_lwa_url --interpret"
 	[ -n "$_lwa_workers" ] && _lwa_args="$_lwa_args --workers $_lwa_workers"
 	printf '%s' "$_lwa_args"
 }

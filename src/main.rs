@@ -429,6 +429,14 @@ fn main() -> Result<()> {
     let threshold_hostile = cli.threshold_hostile;
     // Resolve before `cli.command` is moved out below; only one arm uses it.
     let interpret_cfg = cli.interpret_config();
+    if let Some(cfg) = &interpret_cfg {
+        tracing::info!(
+            endpoint = %cfg.base_url,
+            model = %cfg.model,
+            min_prob = format!("{:.4}", cfg.min_prob),
+            "LLM interpretation enabled",
+        );
+    }
 
     // Default to a file scan when bare paths are given without a subcommand.
     let command = match cli.command {

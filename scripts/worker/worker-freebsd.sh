@@ -18,7 +18,6 @@
 # Environment overrides:
 #   WORKERS             concurrency (--workers)                  (default: worker auto)
 #   LLM                 OpenAI-compatible LLM endpoint (SCAN_LLM) (default: http://10.9.8.149:8000/v1)
-#   INTERPRET_MIN_PROB  min ML probability to interpret a sample  (default: 0.15)
 
 set -eu
 
@@ -27,7 +26,6 @@ URL="${1:-}"
 
 WORKERS="${WORKERS:-}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
-INTERPRET_MIN_PROB="${INTERPRET_MIN_PROB:-0.15}"
 
 BINARY=ascan
 BIN_PATH=/usr/local/bin/${BINARY}
@@ -115,7 +113,7 @@ $SUDO su -l ascan -c "${BIN_PATH} update-rules" || die "update-rules failed"
 
 # --- rc.d service -----------------------------------------------------------
 
-worker_args=$(ascan_worker_args "$URL" "$WORKERS" "$INTERPRET_MIN_PROB")
+worker_args=$(ascan_worker_args "$URL" "$WORKERS")
 
 TMP_RCD=$(mktemp -t ascan-worker.rcd.XXXXXX)
 ascan_rcd_script "${BIN_PATH}" "$worker_args" "$LLM" >"$TMP_RCD"

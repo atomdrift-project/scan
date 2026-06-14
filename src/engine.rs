@@ -1448,6 +1448,13 @@ pub(crate) fn classify_report(
     interpret: Option<&crate::interpret::InterpretConfig>,
 ) -> Result<ClassifiedReport> {
     report.finalize();
+    // Drop component/baseline traits no composite fired on before the report is
+    // summarized, featurized, and posted. finalize() has already inherited and
+    // re-evaluated composites up the whole archive/embedding chain, so stripping
+    // here never starves a parent composite of its building blocks. This shrinks
+    // the raw report posted to hopper (large archive reports otherwise blow past
+    // its body limit) and is the report the model is now featurized from.
+    report.strip_unmatched_traits();
     let compact = cleave::types::compact::compact_from_files(&report.files);
     let formula = compact
         .files
@@ -1647,12 +1654,25 @@ pub(crate) fn classify_report(
             &report,
             &cleave::output::TinyOpts::tiny(),
         ));
-        crate::interpret::interpret(
+        let interp = crate::interpret::interpret(
             cfg,
             &llm_ctx,
             final_decision.class,
             final_decision.probability,
-        )
+        )?;
+        if let Some(grade) = interp.grade {
+            tracing::info!(
+                file = %label,
+                sha256 = %sha256,
+                grade = grade.as_str(),
+                outcome = %interp.outcome,
+                conf = format!("{:.4}", interp.blended),
+                review = interp.review,
+                interpretation = %interp.interpretation,
+                "fetched LLM interpretation",
+            );
+        }
+        Some(interp)
     });
 
     // Adopt the blended verdict as the effective one when the LLM out-read ML
@@ -1671,6 +1691,7 @@ pub(crate) fn classify_report(
             grade = interp.grade.map_or("?", crate::interpret::LlmGrade::as_str),
             conf = format!("{:.4}", interp.blended),
             review = interp.review,
+            reason = %interp.interpretation,
             "LLM interpretation shifted the verdict",
         );
         final_decision.class = interp.outcome;

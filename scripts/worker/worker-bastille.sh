@@ -14,7 +14,6 @@ URL="$3"
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
-INTERPRET_MIN_PROB="${INTERPRET_MIN_PROB:-0.15}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -22,7 +21,7 @@ log() { echo "==> $*"; }
 # Shared rc.d service definition (also used by the native worker-freebsd.sh).
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/lib/freebsd-rcd.sh"
-worker_args=$(ascan_worker_args "$URL" "$WORKERS" "$INTERPRET_MIN_PROB")
+worker_args=$(ascan_worker_args "$URL" "$WORKERS")
 
 install_missing_build_packages() {
     missing=""

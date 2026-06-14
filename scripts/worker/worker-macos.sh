@@ -13,7 +13,6 @@ URL="$1"
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
-INTERPRET_MIN_PROB="${INTERPRET_MIN_PROB:-0.15}"
 
 BINARY=ascan
 INSTALL_DIR=/usr/local/share/atomdrift/scan
@@ -109,8 +108,6 @@ cat > "$new_plist" <<EOF
         <string>--traits-dir</string>
         <string>$TRAITS_DIR</string>
         <string>--interpret</string>
-        <string>--interpret-min-prob</string>
-        <string>$INTERPRET_MIN_PROB</string>
 ${workers_args}    </array>
     <key>EnvironmentVariables</key>
     <dict>
