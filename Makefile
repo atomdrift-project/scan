@@ -99,7 +99,7 @@ publish-models: release ## Compat-test azoth vs last (VERSIONS-1) litmus release
 	cd $(MANIFEST_GEN) && GOWORK=off go build -o manifest-gen .
 	$(MANIFEST_GEN)/manifest-gen \
 	  --traits $(TRAITS) --repo . --out "$(DIST)" \
-	  --engine-bin litmus --traits-env SCAN_MODELS_DIR --validate-args "validate --skip-traits" \
+	  --engine-bin litmus,ascan --traits-env SCAN_MODELS_DIR --validate-args "validate --skip-traits" \
 	  --head-engine ./target/release/$(BINARY) \
 	  --releases $(shell expr $(VERSIONS) - 1) --commits 100 --soak-days 0 \
 	  --channels stable --artifact-prefix "azoth/" \
