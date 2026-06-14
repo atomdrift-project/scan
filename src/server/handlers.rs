@@ -138,10 +138,10 @@ fn classify_analysis_error(message: &str) -> (StatusCode, String) {
 
     (status, message.to_string())
 }
+use crate::engine::ScanResult;
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::Model;
-use crate::engine::ScanResult;
 use crate::system_load_avg;
 
 /// GET /_/health — liveness check with memory and concurrency status.

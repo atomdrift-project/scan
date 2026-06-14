@@ -2150,12 +2150,8 @@ async fn run_job(
         // The guard frees the slot on normal completion; an abort skips the
         // drop, leaving the entry live for the dump — exactly the suspect
         // set we want. See `crate::crash_dump`.
-        let _inflight = crate::crash_dump::register(
-            analysis_id,
-            thread_id,
-            &sha_short2,
-            &label_for_blocking,
-        );
+        let _inflight =
+            crate::crash_dump::register(analysis_id, thread_id, &sha_short2, &label_for_blocking);
         let result = if let Some(data) = downloaded {
             classify_bytes(
                 data,
@@ -2917,7 +2913,11 @@ mod tests {
         //    refills back to target, polling the hopper again.
         for _ in 0..slots {
             let pj = rx.recv().await.unwrap();
-            assert_eq!(pj.data.unwrap().as_deref(), Some(PAYLOAD), "payload mismatch");
+            assert_eq!(
+                pj.data.unwrap().as_deref(),
+                Some(PAYLOAD),
+                "payload mismatch"
+            );
             queued_bytes.fetch_sub(PAYLOAD.len(), Ordering::Release);
             outstanding.fetch_sub(1, Ordering::Release);
         }

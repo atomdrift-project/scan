@@ -3,8 +3,8 @@
 
 use std::sync::{LazyLock, RwLock};
 
-use crate::model::{Classification, RouteScore};
 use crate::engine::{ScanResult, ScanSummary, level_confidence};
+use crate::model::{Classification, RouteScore};
 
 const BLOCK: &str = "\u{2588}";
 
@@ -149,7 +149,11 @@ pub fn set_theme(theme: Theme) {
 
 /// The active theme, defaulting to dark when unset or the lock is poisoned.
 fn current_theme() -> Theme {
-    THEME.read().ok().and_then(|theme| *theme).unwrap_or(Theme::Dark)
+    THEME
+        .read()
+        .ok()
+        .and_then(|theme| *theme)
+        .unwrap_or(Theme::Dark)
 }
 
 fn palette() -> &'static Palette {

@@ -271,4 +271,3 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("reading {url}"))?
         .to_vec())
 }
-

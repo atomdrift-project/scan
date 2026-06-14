@@ -24,10 +24,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::engine::{self, ScanResult, ScanSummary};
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
-use crate::engine::{self, ScanResult, ScanSummary};
 use crate::{DisplayFilter, OutputFormat, ScanConfig};
 
 /// Bundled analyzer holding everything needed to classify a payload.

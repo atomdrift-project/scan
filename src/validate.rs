@@ -5,9 +5,9 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::engine::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 use crate::features::ExtractContext;
 use crate::model::{Classification, Model, Thresholds};
-use crate::engine::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 
 /// Run full validation: cleave trait validation, model loading, and benign-corpus inference.
 ///

@@ -30,6 +30,7 @@ pub mod admission;
 pub mod analyzer;
 pub mod bench_hopper;
 pub mod crash_dump;
+pub mod engine;
 pub mod explain;
 pub mod features;
 pub mod inflight;
@@ -39,7 +40,6 @@ pub mod model_update;
 pub mod models_repo;
 pub mod output;
 pub mod ps;
-pub mod engine;
 pub mod server;
 pub mod sys;
 pub mod thread_dump;
@@ -51,9 +51,9 @@ pub mod validate;
 pub mod worker;
 
 pub use analyzer::Analyzer;
+pub use engine::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
 pub use model::Classification;
 pub use model::Thresholds;
-pub use engine::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
 
 /// Convert a [`std::time::Duration`] to milliseconds as `u64`, saturating at [`u64::MAX`].
 ///

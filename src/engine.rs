@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::OutputFormat;
-use crate::{json_alias, json_alias_array, json_alias_str};
 use crate::explain::ShapImportance;
 use crate::features::{ExtractContext, crit_ordinal};
 use crate::model::{Classification, Decision, Model, RouteScore, SkippedRoute, Thresholds};
+use crate::{json_alias, json_alias_array, json_alias_str};
 
 pub use crate::explain::Reason;
 
@@ -58,7 +58,6 @@ impl DisplayFilter {
             Classification::Benign => self.benign,
         }
     }
-
 }
 
 impl Default for DisplayFilter {
@@ -1456,6 +1455,7 @@ pub(crate) fn classify_report(
     // its body limit) and is the report the model is now featurized from.
     report.strip_unmatched_traits();
     let compact = cleave::types::compact::compact_from_files(&report.files);
+    validate_report_references(label, &compact);
     let formula = compact
         .files
         .first()
@@ -1944,6 +1944,50 @@ pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
     }
 }
 
+/// Verify every cross-reference in the compact report resolves to an emitted
+/// file. An inherited finding's `src` and a composite's `srcs[].f` both index
+/// into `files[]`; if a member is ever dropped or renumbered without remapping
+/// these, the index dangles and the trait renders downstream (hopper/prism) with
+/// no file context — the silent defect that left older reports with orphaned
+/// composites. We can't repair it here, but a producer-side log turns it into a
+/// visible signal instead of a mystery on the rendering side. The check is a
+/// HashSet membership scan over findings — negligible beside model inference.
+fn validate_report_references(label: &str, report: &cleave::types::compact::CompactReport) {
+    let ids: std::collections::HashSet<u32> = report.files.iter().map(|f| f.id).collect();
+    let mut dangling = 0usize;
+    let mut sample: Vec<String> = Vec::new();
+    let mut note = |trait_id: &str, missing: u32| {
+        dangling += 1;
+        if sample.len() < 3 {
+            sample.push(format!("{trait_id}->#{missing}"));
+        }
+    };
+    for file in &report.files {
+        for finding in &file.findings {
+            if let Some(src) = finding.src
+                && !ids.contains(&src)
+            {
+                note(&finding.id, src);
+            }
+            for s in &finding.sources {
+                if !ids.contains(&s.file) {
+                    note(&finding.id, s.file);
+                }
+            }
+        }
+    }
+    if dangling > 0 {
+        tracing::error!(
+            label,
+            dangling,
+            files = report.files.len(),
+            examples = %sample.join(", "),
+            "compact report integrity: cross-file references point at file ids not in files[]; \
+             affected traits will render without file context downstream"
+        );
+    }
+}
+
 /// Return the current time as an RFC 3339 string in UTC.
 pub(crate) fn now_rfc3339() -> String {
     let d = std::time::SystemTime::now()
@@ -2043,6 +2087,12 @@ pub struct ScanResultEnvelope {
     pub raw: serde_json::Value,
 }
 
+/// This scan binary's build version, stamped into every `ml` envelope so a
+/// stored result records which engine produced it. Distinct from `version` (the
+/// ML model) and `raw.tv` (the traits-repo commit); together they pin the build
+/// that generated a report, which is otherwise unrecoverable from the JSON.
+pub(crate) const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The `ml` section of the response envelope.
 #[derive(Debug, serde::Serialize)]
 pub struct MlSection {
@@ -2065,6 +2115,8 @@ pub struct MlSection {
     #[serde(rename = "skip", skip_serializing_if = "Vec::is_empty")]
     pub(crate) skipped_models: Vec<crate::model::SkippedRoute>,
     pub(crate) version: String,
+    /// Scan engine build (`CARGO_PKG_VERSION`) that produced this report.
+    pub(crate) eng: &'static str,
     pub(crate) analyzed_at: String,
     #[serde(rename = "files")]
     pub(crate) files: Vec<serde_json::Value>,
@@ -2104,6 +2156,8 @@ pub struct MlSectionRef<'a> {
     #[serde(rename = "skip", skip_serializing_if = "skipped_routes_empty")]
     pub(crate) skipped_models: &'a [crate::model::SkippedRoute],
     pub(crate) version: &'a str,
+    /// Scan engine build (`CARGO_PKG_VERSION`) that produced this report.
+    pub(crate) eng: &'static str,
     pub(crate) analyzed_at: &'a str,
     #[serde(rename = "files")]
     pub(crate) files: Vec<serde_json::Value>,
@@ -2133,6 +2187,7 @@ impl ScanResult {
                 model_scores: self.model_scores.clone(),
                 skipped_models: self.skipped_models.clone(),
                 version: self.version.clone(),
+                eng: ENGINE_VERSION,
                 analyzed_at: self.analyzed_at.clone(),
                 files: ml_files,
                 pids: self.pids.clone(),
@@ -2161,6 +2216,7 @@ impl ScanResult {
                 model_scores: self.model_scores,
                 skipped_models: self.skipped_models,
                 version: self.version,
+                eng: ENGINE_VERSION,
                 analyzed_at: self.analyzed_at,
                 files: ml_files,
                 pids: self.pids,
@@ -2193,6 +2249,7 @@ impl ScanResult {
                 model_scores: &self.model_scores,
                 skipped_models: &self.skipped_models,
                 version: &self.version,
+                eng: ENGINE_VERSION,
                 analyzed_at: &self.analyzed_at,
                 files: ml_files,
                 pids: self.pids.as_deref(),

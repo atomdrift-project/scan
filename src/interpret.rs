@@ -254,9 +254,7 @@ pub fn interpret(
     // Health gate: only send work to a healthy endpoint. If it's currently down,
     // wait for it to recover (re-probing every `HEALTH_RETRY_INTERVAL`) up to the
     // request timeout, rather than firing a doomed 2-minute request per file.
-    if !health().wait_until_healthy(cfg.timeout, HEALTH_RETRY_INTERVAL, &|| {
-        probe_endpoint(cfg)
-    }) {
+    if !health().wait_until_healthy(cfg.timeout, HEALTH_RETRY_INTERVAL, &|| probe_endpoint(cfg)) {
         let error = format!(
             "LLM endpoint {} did not become healthy within {}s",
             cfg.base_url,
@@ -452,7 +450,10 @@ impl CallError {
 }
 
 /// POST the prebuilt user message to the endpoint and parse `{grade, reason}`.
-fn request(cfg: &InterpretConfig, user: &str) -> std::result::Result<(LlmGrade, String), CallError> {
+fn request(
+    cfg: &InterpretConfig,
+    user: &str,
+) -> std::result::Result<(LlmGrade, String), CallError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(cfg.timeout)
         .user_agent(concat!("ascan/", env!("CARGO_PKG_VERSION")))
@@ -910,7 +911,10 @@ mod tests {
         let rendered = "\x1b[1mq6_fw.b00.zst\x1b[0m\telf 1KB 12\n\x1b[31m. # S finding\x1b[0m\nq6_fw.b00.zst/payload\telf 2KB 9\n";
         let clean = sanitize_context(rendered);
         assert!(!clean.contains('\x1b'), "no ANSI escapes remain");
-        assert!(clean.starts_with("q6_fw.b00.zst\telf 1KB 12"), "root header kept");
+        assert!(
+            clean.starts_with("q6_fw.b00.zst\telf 1KB 12"),
+            "root header kept"
+        );
         assert!(
             clean.contains("q6_fw.b00.zst/payload\telf 2KB 9"),
             "archive-relative member header kept intact",

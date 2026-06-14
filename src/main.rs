@@ -550,10 +550,7 @@ fn main() -> Result<()> {
     // The OSC color-scheme query blocks on a TTY response and hangs in any
     // environment that doesn't reply (SSH, some tmux configs, worker daemons).
     let needs_terminal_theme = cli.format == scan::OutputFormat::Terminal
-        && matches!(
-            command,
-            Commands::Fs { .. } | Commands::Ps | Commands::Sys
-        );
+        && matches!(command, Commands::Fs { .. } | Commands::Ps | Commands::Sys);
     if cli.light {
         scan::output::set_theme(scan::output::Theme::Light);
     } else if cli.dark {
@@ -1324,8 +1321,8 @@ mod tests {
 
     #[test]
     fn fs_subcommand_accepts_multiple_paths() -> Result<()> {
-        let cli =
-            Cli::try_parse_from(["ascan", "fs", "/tmp/a", "/tmp/b"]).context("parse should work")?;
+        let cli = Cli::try_parse_from(["ascan", "fs", "/tmp/a", "/tmp/b"])
+            .context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
             Commands::Fs { paths } => {
                 assert_eq!(
@@ -1465,8 +1462,8 @@ mod tests {
         let cli = Cli::try_parse_from(["ascan", "-0", "/tmp/a"]).context("-0 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(0));
 
-        let cli = Cli::try_parse_from(["ascan", "-l", "100", "/tmp/a"])
-            .context("-l 100 should parse")?;
+        let cli =
+            Cli::try_parse_from(["ascan", "-l", "100", "/tmp/a"]).context("-l 100 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(100));
 
         let cli = Cli::try_parse_from(["ascan", "--level", "12", "/tmp/a"])

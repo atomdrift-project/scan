@@ -1216,7 +1216,6 @@ impl ExtractContext {
         vec
     }
 
-
     fn extract_report_into(&self, report: &serde_json::Value, vec: &mut [f32]) {
         let raw_files = report_files(report);
         let primary_file = primary_file(report);
@@ -1948,7 +1947,10 @@ impl ParsedReport {
         // Small warm-cache reports are cheaper to summarize serially than to fan
         // out into rayon jobs.
         let file_summaries: Vec<FileSummary> = if raw_files.len() < 8 {
-            raw_files.iter().map(|&f| FileSummary::new(f, needs)).collect()
+            raw_files
+                .iter()
+                .map(|&f| FileSummary::new(f, needs))
+                .collect()
         } else {
             raw_files
                 .par_iter()
@@ -3890,7 +3892,11 @@ fn write_symbol_features(
                 for j in (i + 1)..cap {
                     for k in (j + 1)..cap {
                         key.clear();
-                        let _ = write!(key, "symbol_tri:{}||{}||{}", sorted[i], sorted[j], sorted[k]);
+                        let _ = write!(
+                            key,
+                            "symbol_tri:{}||{}||{}",
+                            sorted[i], sorted[j], sorted[k]
+                        );
                         w.set(&key, 1.0);
                     }
                 }
