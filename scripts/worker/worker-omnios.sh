@@ -17,7 +17,10 @@ URL="${1:-}"
 
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 WORKERS="${WORKERS:-}"
-worker_args="worker --url $URL"
+# LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
+LLM="${LLM:-http://10.9.8.149:8000/v1}"
+INTERPRET_MIN_PROB="${INTERPRET_MIN_PROB:-0.15}"
+worker_args="worker --url $URL --interpret --interpret-min-prob $INTERPRET_MIN_PROB"
 [ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -376,6 +379,8 @@ cat > "$manifest_tmp" <<EOF
         <envvar name="TMPDIR" value="$SCAN_TMP_DIR"/>
         <envvar name="TMP"    value="$SCAN_TMP_DIR"/>
         <envvar name="TEMP"   value="$SCAN_TMP_DIR"/>
+        <!-- OpenAI-compatible endpoint for the --interpret LLM second-opinion pass. -->
+        <envvar name="SCAN_LLM" value="$LLM"/>
       </method_environment>
     </method_context>
     <exec_method type="method" name="start"

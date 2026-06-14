@@ -14,7 +14,10 @@ URL="$1"
 
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 WORKERS="${WORKERS:-}"
-worker_args="worker --url $URL"
+# LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
+LLM="${LLM:-http://10.9.8.149:8000/v1}"
+INTERPRET_MIN_PROB="${INTERPRET_MIN_PROB:-0.15}"
+worker_args="worker --url $URL --interpret --interpret-min-prob $INTERPRET_MIN_PROB"
 [ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
 
 BINARY=ascan
@@ -45,14 +48,14 @@ if ! cmp -s "target/release/$BINARY" "$BIN_DIR/$BINARY" 2>/dev/null; then
 fi
 
 log "Installing cron entry"
-cron_cmd="* * * * * pgrep -af 'ascan worker' >/dev/null 2>&1 || { ulimit -d \$(ulimit -Hd); nohup $BIN_DIR/$BINARY $worker_args < /dev/null >> $LOG 2>&1 & }"
+cron_cmd="* * * * * pgrep -af 'ascan worker' >/dev/null 2>&1 || { ulimit -d \$(ulimit -Hd); SCAN_LLM=$LLM nohup $BIN_DIR/$BINARY $worker_args < /dev/null >> $LOG 2>&1 & }"
 (crontab -l 2>/dev/null | grep -v "ascan worker" || true; echo "$cron_cmd") | crontab -
 
 if [ "$restart_needed" -eq 1 ]; then
     log "Restarting ascan worker"
     pkill -f "ascan worker" 2>/dev/null || true
     sleep 1
-    nohup "$BIN_DIR/$BINARY" $worker_args < /dev/null >> "$LOG" 2>&1 &
+    SCAN_LLM="$LLM" nohup "$BIN_DIR/$BINARY" $worker_args < /dev/null >> "$LOG" 2>&1 &
 else
     log "Binary unchanged, skipping restart"
 fi

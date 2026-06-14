@@ -11,18 +11,26 @@
 # the caller pipes the output wherever it needs to land — a local file, or
 # `bastille cmd <jail> tee`.
 
-# Compose the `worker ...` argument string from a hopper URL and an optional
-# worker count. Usage: ascan_worker_args <url> [workers]
+# Compose the `worker ...` argument string from a hopper URL, an optional
+# worker count, and the LLM interpret gate (min ML probability to interpret a
+# sample; defaults to 0.15). The endpoint itself is supplied via the SCAN_LLM
+# environment variable in ascan_rcd_script, not here.
+# Usage: ascan_worker_args <url> [workers] [min_prob]
 ascan_worker_args() {
 	_lwa_url="$1"
 	_lwa_workers="$2"
-	_lwa_args="worker --url $_lwa_url"
+	_lwa_min_prob="${3:-0.15}"
+	_lwa_args="worker --url $_lwa_url --interpret --interpret-min-prob $_lwa_min_prob"
 	[ -n "$_lwa_workers" ] && _lwa_args="$_lwa_args --workers $_lwa_workers"
 	printf '%s' "$_lwa_args"
 }
 
 # Emit the rc.d service script to stdout.
-# Usage: ascan_rcd_script <binary_path> <worker_args>
+# Usage: ascan_rcd_script <binary_path> <worker_args> [llm_url]
+#
+# llm_url is baked into the service as the SCAN_LLM environment variable (the
+# OpenAI-compatible endpoint for the --interpret LLM second-opinion pass);
+# override at runtime via ascan_worker_llm in rc.conf.
 #
 # The worker is expected to run forever; an OOM kill or a panic should bring
 # it straight back. daemon(8) is the supervisor: `-r` restarts the child
@@ -33,6 +41,7 @@ ascan_worker_args() {
 ascan_rcd_script() {
 	_lrs_bin="$1"
 	_lrs_worker_args="$2"
+	_lrs_llm="${3:-http://10.9.8.149:8000/v1}"
 	cat <<EOF
 #!/bin/sh
 
@@ -49,6 +58,8 @@ load_rc_config \$name
 
 : \${ascan_worker_enable:="NO"}
 : \${ascan_worker_logfile:="/var/log/ascan-worker.log"}
+# OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
+: \${ascan_worker_llm:="$_lrs_llm"}
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
@@ -62,7 +73,7 @@ malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,abort_c
 #           any exit, so an OOM kill or panic self-heals. -P is the supervisor
 #           pidfile; \`service ascan-worker stop\` signals it to tear the
 #           whole tree down.
-command_args="-c -f -r -R 5 -P \${pidfile} -o \${ascan_worker_logfile} -u ascan /usr/bin/env MALLOC_CONF=\${malloc_conf} $_lrs_bin $_lrs_worker_args"
+command_args="-c -f -r -R 5 -P \${pidfile} -o \${ascan_worker_logfile} -u ascan /usr/bin/env MALLOC_CONF=\${malloc_conf} SCAN_LLM=\${ascan_worker_llm} $_lrs_bin $_lrs_worker_args"
 
 run_rc_command "\$1"
 EOF

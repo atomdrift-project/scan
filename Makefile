@@ -19,6 +19,12 @@ SCAN_THREADS ?=
 SLOW_RULE_MS ?= 200
 MAX_JOBS ?= 25
 WORKERS  ?=
+# LLM second-opinion pass for `make worker` (matches the deploy scripts'
+# defaults). LLM is exported as SCAN_LLM; INTERPRET_MIN_PROB gates which samples
+# are sent. The benchmark/profile targets deliberately omit interpret so LLM
+# round-trips don't distort wall/RSS measurements.
+LLM ?= http://10.9.8.149:8000/v1
+INTERPRET_MIN_PROB ?= 0.15
 
 # Scrub GNU make's jobserver from cargo's environment. Without this, build
 # scripts that spawn their own `make` (e.g. tikv-jemalloc-sys) inherit a
@@ -250,8 +256,9 @@ benchmark-worker: release
 # Run a worker in the foreground for interactive use. The worker self-nices
 # to 10 by default; pass NICE=0 to disable.
 worker: release
-	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>]"; exit 1; }
-	./out/$(BINARY) worker --url "$(URL)" \
+	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>] [LLM=<endpoint>]"; exit 1; }
+	SCAN_LLM="$(LLM)" ./out/$(BINARY) worker --url "$(URL)" \
+		--interpret --interpret-min-prob $(INTERPRET_MIN_PROB) \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		$(if $(NICE),--nice $(NICE),)
 

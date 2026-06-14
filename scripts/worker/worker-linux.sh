@@ -13,6 +13,8 @@
 #   WORKERS     concurrency (--workers)                        (default: worker auto)
 #   MAX_RSS_GB  pause threshold (--max-rss-gb)                 (default: -1 = off; systemd MemoryMax handles OOM)
 #   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, 80%, infinity)     (default: 80%)
+#   LLM         OpenAI-compatible LLM endpoint (SCAN_LLM)      (default: http://10.9.8.149:8000/v1)
+#   INTERPRET_MIN_PROB  min ML probability to interpret a sample (default: 0.15)
 
 set -eu
 
@@ -30,6 +32,8 @@ DATA_DIR="${DATA_DIR:-}"
 WORKERS="${WORKERS:-}"
 MAX_RSS_GB="${MAX_RSS_GB:--1}"
 MEMORY_MAX="${MEMORY_MAX:-80%}"
+LLM="${LLM:-http://10.9.8.149:8000/v1}"
+INTERPRET_MIN_PROB="${INTERPRET_MIN_PROB:-0.15}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
@@ -124,6 +128,7 @@ fi
 # %S is a systemd specifier that expands to /var/lib at unit-load time, so
 # --traits-dir resolves to /var/lib/atomdrift/scan/traits inside the namespace.
 exec_args="worker --url ${URL} --traits-dir %S/atomdrift/scan/traits --max-rss-gb ${MAX_RSS_GB}"
+exec_args="${exec_args} --interpret --interpret-min-prob ${INTERPRET_MIN_PROB}"
 if [ -n "${WORKERS}" ];  then exec_args="${exec_args} --workers ${WORKERS}";   fi
 if [ -n "${DATA_DIR}" ]; then exec_args="${exec_args} --data-dir ${DATA_DIR}"; fi
 
@@ -157,6 +162,8 @@ RestartSec=10s
 TimeoutStopSec=30s
 
 Environment=HOME=%S/atomdrift/scan
+# OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
+Environment=SCAN_LLM=${LLM}
 
 # Resource caps. Under systemd we disable the worker's in-process RSS
 # throttling (--max-rss-gb=-1) and let MemoryMax do the enforcement: a

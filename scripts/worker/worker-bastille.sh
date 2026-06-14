@@ -12,6 +12,9 @@ URL="$3"
 
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 WORKERS="${WORKERS:-}"
+# LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
+LLM="${LLM:-http://10.9.8.149:8000/v1}"
+INTERPRET_MIN_PROB="${INTERPRET_MIN_PROB:-0.15}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -19,7 +22,7 @@ log() { echo "==> $*"; }
 # Shared rc.d service definition (also used by the native worker-freebsd.sh).
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/lib/freebsd-rcd.sh"
-worker_args=$(ascan_worker_args "$URL" "$WORKERS")
+worker_args=$(ascan_worker_args "$URL" "$WORKERS" "$INTERPRET_MIN_PROB")
 
 install_missing_build_packages() {
     missing=""
@@ -84,7 +87,7 @@ doas bastille cmd "$RUN" su -l ascan -c "ascan update-rules" \
 
 log "Creating rc.d service"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
-ascan_rcd_script /usr/local/share/atomdrift/scan/ascan "$worker_args" \
+ascan_rcd_script /usr/local/share/atomdrift/scan/ascan "$worker_args" "$LLM" \
     | doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/ascan-worker >/dev/null
 doas bastille cmd "$RUN" chmod 755 /usr/local/etc/rc.d/ascan-worker
 
