@@ -32,7 +32,6 @@ Environment variables read at startup:
 | `CLEAVE_TRAITS_DIR`    | Traits directory. `--traits-dir` overrides.                  |
 | `CLEAVE_RAYON_THREADS` | Override rayon pool size. Default is system parallelism.     |
 | `SCAN_MODELS_REPO`   | Model repository URL.                                        |
-| `SCAN_MODELS_REF`    | Branch or commit to pull.                                    |
 
 The listener binds before the model is loaded. While loading, every
 route returns 503 with `{"error":"server starting"}`. Poll `/_/health`

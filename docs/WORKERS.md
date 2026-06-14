@@ -28,8 +28,7 @@ result carries.
 | `--nice`         | `10`             | `nice(2)` value applied at startup. `0` leaves priority unchanged.       |
 
 The same environment variables apply as for the server:
-`CLEAVE_TRAITS_DIR`, `CLEAVE_RAYON_THREADS`, `SCAN_MODELS_REPO`,
-`SCAN_MODELS_REF`.
+`CLEAVE_TRAITS_DIR`, `CLEAVE_RAYON_THREADS`, `SCAN_MODELS_REPO`.
 
 ## Job lifecycle
 

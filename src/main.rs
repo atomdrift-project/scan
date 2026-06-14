@@ -77,10 +77,6 @@ struct Cli {
     #[arg(long)]
     models_repo: Option<String>,
 
-    /// Override the models repository ref — branch or tag (env: SCAN_MODELS_REF)
-    #[arg(long)]
-    models_ref: Option<String>,
-
     /// Output format
     #[arg(short, long, default_value = "terminal")]
     format: OutputFormat,
@@ -481,9 +477,6 @@ fn main() -> Result<()> {
     // pools are constructed below.
     if let Some(url) = cli.models_repo.as_deref() {
         unsafe { std::env::set_var("SCAN_MODELS_REPO", url) };
-    }
-    if let Some(reference) = cli.models_ref.as_deref() {
-        unsafe { std::env::set_var("SCAN_MODELS_REF", reference) };
     }
 
     const RAYON_FALLBACK_THREADS: usize = 4;

@@ -2673,7 +2673,9 @@ impl Model {
         Ok((max_prob, classification))
     }
 
-    fn score_route_report(
+    /// Extract this route's feature vector from the shared parse, standardize,
+    /// and score it into `(raw, calibrated_probability, classification)`.
+    fn score_route(
         route: &Route,
         parsed: &crate::features::ParsedReport,
     ) -> Result<(f32, f32, Classification)> {
@@ -2695,16 +2697,6 @@ impl Model {
             })
     }
 
-    fn score_route_file(
-        route: &Route,
-        parsed: &crate::features::ParsedReport,
-    ) -> Result<(f32, f32, Classification)> {
-        let mut features = route.ctx.extract_from_parsed(parsed);
-        route.spec.standardize(&mut features);
-        let (raw, probability) = route.predict_raw_calibrated(&features)?;
-        Ok((raw, probability, route.thresholds.classify(probability)))
-    }
-
     /// Routed prediction from a full cleave report, with per-route scores
     /// retained for JSON and `--extra` output.
     ///
@@ -2719,7 +2711,7 @@ impl Model {
     ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
         let (route_probs, scores, mut skipped) =
             self.score_all_routes(file_type, general_features, |route| {
-                Self::score_route_report(route, parsed)
+                Self::score_route(route, parsed)
             })?;
         let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
         Ok((decision, scores, skipped))
@@ -2735,7 +2727,7 @@ impl Model {
     ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
         let (route_probs, scores, mut skipped) =
             self.score_all_routes(file_type, general_features, |route| {
-                Self::score_route_file(route, parsed)
+                Self::score_route(route, parsed)
             })?;
         let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
         Ok((decision, scores, skipped))

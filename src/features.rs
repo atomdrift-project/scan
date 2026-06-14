@@ -13,6 +13,7 @@
 // counts, ratios, or scores that fit well within f32 range.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
+use crate::{json_alias, json_alias_array, json_alias_str};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -68,21 +69,6 @@ pub(crate) fn crit_ordinal(finding: &serde_json::Value) -> u32 {
     json_alias(finding, &["crit", "l"])
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0) as u32
-}
-
-fn json_alias<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a serde_json::Value> {
-    names.iter().find_map(|name| value.get(*name))
-}
-
-fn json_alias_array<'a>(
-    value: &'a serde_json::Value,
-    names: &[&str],
-) -> Option<&'a Vec<serde_json::Value>> {
-    json_alias(value, names).and_then(serde_json::Value::as_array)
-}
-
-fn json_alias_str<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
-    json_alias(value, names).and_then(serde_json::Value::as_str)
 }
 
 /// Key metrics extracted from the report's `metrics` object.
@@ -330,12 +316,6 @@ impl FeatureSpec {
     #[must_use]
     pub const fn total_features(&self) -> usize {
         self.total_features
-    }
-
-    /// Whether raw features should be standardized before inference.
-    #[must_use]
-    pub const fn is_standardized(&self) -> bool {
-        self.standardized
     }
 
     /// Apply z-score standardization using training statistics.
@@ -3177,7 +3157,7 @@ fn write_structural_extensions(
         w.set("struct:mtime_range_hours", ((mx - mn) / 3600.0) as f32);
         let mean = mtimes.iter().sum::<f64>() / mtimes.len() as f64;
         let var = mtimes.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / mtimes.len() as f64;
-        w.set("struct:mtime_stddev_hours", (var.sqrt() / 3600.0) as f32);
+        w.set("struct:mtime_std_dev_hours", (var.sqrt() / 3600.0) as f32);
     }
     w.set(
         "struct:max_nesting_depth_log",

@@ -21,6 +21,7 @@ use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
 use crate::server::{ModelResources, classify_bytes, classify_file};
+use crate::system_load_avg;
 
 #[derive(Debug, Clone)]
 struct IndexedLocalFile {
@@ -630,38 +631,6 @@ fn spawn_resource_renewal_task(
 // rayon threads stay capped at the pool size (not `slots × per-slot-threads`),
 // which in turn caps cleave's per-thread YARA scanners.
 
-/// Benchmark-only A/B switch. When `SCAN_PER_SLOT_POOLS` is set, analyses run
-/// on a grid of `slots` isolated rayon pools (the pre-Phase-2 model) instead of
-/// the shared global pool, so both thread models can be measured on one binary
-/// against the same dataset. Default (`None`) is the shared-pool model — this
-/// exists only to quantify the change, not as a supported runtime mode.
-static LEGACY_PER_SLOT_GRID: OnceLock<Option<Vec<Arc<rayon::ThreadPool>>>> = OnceLock::new();
-
-/// Initialise the A/B grid once, from `run`. Builds `slots` pools of
-/// `max(global_threads / slots, 4)` threads (the old `threads_per_slot` floor)
-/// only when `SCAN_PER_SLOT_POOLS` is set; otherwise records `None`.
-#[allow(clippy::expect_used)]
-fn init_legacy_grid(slots: usize, global_threads: usize) -> bool {
-    let grid = std::env::var_os("SCAN_PER_SLOT_POOLS").map(|_| {
-        let per = (global_threads / slots.max(1)).max(4);
-        (0..slots.max(1))
-            .map(|i| {
-                Arc::new(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(per)
-                        .thread_name(move |j| format!("cleave-{i}-{j}"))
-                        .stack_size(256 * 1024 * 1024)
-                        .build()
-                        .expect("build legacy A/B per-slot pool"),
-                )
-            })
-            .collect::<Vec<_>>()
-    });
-    let active = grid.is_some();
-    let _ = LEGACY_PER_SLOT_GRID.set(grid);
-    active
-}
-
 /// How long a staged job may be passed over by smaller arrivals before SJF
 /// dispatches it anyway. Bounds a big job's staging delay under a continuous
 /// stream of small jobs, so SJF can't starve archives indefinitely.
@@ -737,73 +706,6 @@ async fn next_smallest_staged(
             .expect("reorder window is non-empty")
     });
     Some(reorder.swap_remove(idx).0)
-}
-
-/// E4 experiment (`SCAN_LITTLE_POOL=1`): a tiny dedicated rayon pool for
-/// small jobs, so a 2000-member archive's task fan-out on the shared global
-/// pool can't crowd out a script that needs milliseconds of CPU. The little:big
-/// analogue at the thread-pool level — slot scheduling alone can't fix this,
-/// because a small job *holding a slot* still queues its parallel work behind
-/// the archive's tasks. `None` (the default) routes everything to the shared
-/// pool. Size threshold: `SCAN_LITTLE_MAX_MB` (default 16); thread count:
-/// `SCAN_LITTLE_THREADS` (default 2 — small files gain nothing from wide
-/// parallelism). Stacks match the global pool's 256 MB (cleave recursion).
-static LITTLE_POOL: OnceLock<Option<(rayon::ThreadPool, u64)>> = OnceLock::new();
-
-#[allow(clippy::expect_used)]
-fn little_pool_for(input_bytes: u64) -> Option<&'static rayon::ThreadPool> {
-    let (pool, max_bytes) = LITTLE_POOL
-        .get_or_init(|| {
-            std::env::var("SCAN_LITTLE_POOL")
-                .is_ok_and(|v| v != "0")
-                .then(|| {
-                    let max_mb = std::env::var("SCAN_LITTLE_MAX_MB")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .filter(|mb| *mb > 0)
-                        .unwrap_or(16);
-                    let threads = std::env::var("SCAN_LITTLE_THREADS")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .filter(|t| *t > 0)
-                        .unwrap_or(2);
-                    tracing::info!(
-                        threads,
-                        max_mb,
-                        "little-pool experiment active: small jobs bypass the shared rayon pool",
-                    );
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads)
-                        .thread_name(|i| format!("cleave-little-{i}"))
-                        .stack_size(256 * 1024 * 1024)
-                        // Same SIGUSR1 thread-dump registration as the global pool.
-                        .start_handler(|_| crate::thread_dump::register_self())
-                        .build()
-                        .expect("build little-pool");
-                    (pool, max_mb * 1024 * 1024)
-                })
-        })
-        .as_ref()?;
-    (input_bytes < *max_bytes).then_some(pool)
-}
-
-/// Run `body` on the pool the experiment flags select for this job: the little
-/// pool when active and the input is small, a legacy per-slot pool when the A/B
-/// grid is active (round-robin by `idx`), else directly on the shared global
-/// pool. `input_bytes` is the analysed payload size (local file or download).
-fn run_analysis<T: Send>(idx: u64, input_bytes: u64, body: impl FnOnce() -> T + Send) -> T {
-    if let Some(pool) = little_pool_for(input_bytes) {
-        return pool.install(body);
-    }
-    match LEGACY_PER_SLOT_GRID.get().and_then(Option::as_ref) {
-        Some(grid) if !grid.is_empty() => {
-            // idx % len < len <= usize::MAX, so the cast back is lossless.
-            #[allow(clippy::cast_possible_truncation)]
-            let i = (idx % grid.len() as u64) as usize;
-            grid[i].install(body)
-        }
-        _ => body(),
-    }
 }
 
 #[derive(Deserialize)]
@@ -1148,22 +1050,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // no per-slot grid, no `slots × threads_per_slot` multiplication. This is
     // the headline number that caps cleave's per-thread YARA scanners.
     let global_rayon_threads = rayon::current_num_threads();
-    if init_legacy_grid(slots, global_rayon_threads) {
-        let per = (global_rayon_threads / slots.max(1)).max(4);
-        tracing::warn!(
-            slots,
-            threads_per_slot = per,
-            total_worker_threads = slots.saturating_mul(per),
-            "SCAN_PER_SLOT_POOLS A/B: legacy per-slot grid active (pre-Phase-2 model)",
-        );
-    } else {
-        tracing::info!(
-            slots,
-            rayon_threads = global_rayon_threads,
-            "worker concurrency: up to {slots} analyses share one shared \
-             {global_rayon_threads}-thread rayon pool (no per-slot pools)",
-        );
-    }
+    tracing::info!(
+        slots,
+        rayon_threads = global_rayon_threads,
+        "worker concurrency: up to {slots} analyses share one shared \
+         {global_rayon_threads}-thread rayon pool (no per-slot pools)",
+    );
     // Each in-flight analysis parks a coordinator on the pool and fans member
     // work into it; slots far beyond the pool size just queue analyses against
     // each other (observed: 16 slots on a 4-thread illumos zone → 5 s to run a
@@ -1738,13 +1630,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     Ok(())
 }
 
-/// Claim jobs from hopper and prefetch file data for all of them concurrently.
-/// Returns `Ok(None)` if no work is available (HTTP 204).
-///
-/// Jobs whose hopper-reported size exceeds `max_single_bytes` are not
-/// downloaded — they're returned with an oversize error so the result posts
-/// back to hopper immediately. This prevents a pathological single file from
-/// blowing past the worker's prefetch memory budget.
 /// Background prefetcher: owns the polling and download side of the worker.
 /// Keeps `target_depth` (`1.1 × slots`) samples staged in the dispatch channel,
 /// downloading payloads concurrently and emitting each the moment it lands so a
@@ -2230,84 +2115,81 @@ async fn run_job(
         "analysis starting",
     );
     let handle = tokio::task::spawn_blocking(move || {
-        // Runs on a tokio blocking thread; `run_analysis` dispatches cleave's
-        // `par_iter` fan-out onto the shared global rayon pool (default) or, when
-        // the A/B grid is active, this analysis's per-slot pool. Lifecycle logs
-        // report `thread_id` — the blocking thread an operator samples to find a
-        // wedged analysis; the CPU work runs on the rayon pool threads.
-        run_analysis(analysis_id, input_size, || {
-            let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-            let thread_id = crate::thread_dump::os_thread_id();
-            // Attach the worker thread to the live census so the periodic summary
-            // can report which thread each in-flight analysis is wedged on and
-            // read its kernel wait-channel.
-            crate::inflight::set_thread_id(analysis_id, thread_id);
-            // Register the blocking analysis thread for the SIGUSR1 thread dump
-            // (rayon workers register via the pool's start handler).
-            crate::thread_dump::register_self();
-            let inflight_blocking =
-                started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
-            tracing::info!(
-                analysis_id,
-                sha256 = %sha_short2,
-                file = %label_for_blocking,
-                thread_id,
-                inflight_blocking,
-                started_total = started,
-                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-                "analysis starting on worker thread",
-            );
-            // Record this analysis as in flight so the SIGABRT handler can name
-            // it if a deep analysis overflows the stack and aborts the process.
-            // The guard frees the slot on normal completion; an abort skips the
-            // drop, leaving the entry live for the dump — exactly the suspect
-            // set we want. See `crate::crash_dump`.
-            let _inflight = crate::crash_dump::register(
-                analysis_id,
-                thread_id,
-                &sha_short2,
+        // Runs on a tokio blocking thread; cleave's `par_iter` fan-out work-steals
+        // across the shared global rayon pool. Lifecycle logs report `thread_id` —
+        // the blocking thread an operator samples to find a wedged analysis; the
+        // CPU work itself runs on the rayon pool threads.
+        let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let thread_id = crate::thread_dump::os_thread_id();
+        // Attach the worker thread to the live census so the periodic summary
+        // can report which thread each in-flight analysis is wedged on and
+        // read its kernel wait-channel.
+        crate::inflight::set_thread_id(analysis_id, thread_id);
+        // Register the blocking analysis thread for the SIGUSR1 thread dump
+        // (rayon workers register via the pool's start handler).
+        crate::thread_dump::register_self();
+        let inflight_blocking =
+            started.saturating_sub(BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed));
+        tracing::info!(
+            analysis_id,
+            sha256 = %sha_short2,
+            file = %label_for_blocking,
+            thread_id,
+            inflight_blocking,
+            started_total = started,
+            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+            "analysis starting on worker thread",
+        );
+        // Record this analysis as in flight so the SIGABRT handler can name
+        // it if a deep analysis overflows the stack and aborts the process.
+        // The guard frees the slot on normal completion; an abort skips the
+        // drop, leaving the entry live for the dump — exactly the suspect
+        // set we want. See `crate::crash_dump`.
+        let _inflight = crate::crash_dump::register(
+            analysis_id,
+            thread_id,
+            &sha_short2,
+            &label_for_blocking,
+        );
+        let result = if let Some(data) = downloaded {
+            classify_bytes(
+                data,
                 &label_for_blocking,
-            );
-            let result = if let Some(data) = downloaded {
-                classify_bytes(
-                    data,
-                    &label_for_blocking,
-                    &resources,
-                    slow_rule_ms,
-                    Some(&cancel2),
-                    Some(&phase),
-                )
-            } else if let Some(path) = local.as_ref() {
-                classify_file(
-                    path,
-                    &label_for_blocking,
-                    &resources,
-                    slow_rule_ms,
-                    None,
-                    Some(&cancel2),
-                    Some(&phase),
-                )
-            } else {
-                Err(anyhow::anyhow!(
-                    "no downloaded bytes and no local path for {label_for_blocking}"
-                ))
-            };
-            let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-            let inflight_blocking = BLOCKING_STARTED_TOTAL
-                .load(Ordering::Relaxed)
-                .saturating_sub(finished);
-            tracing::debug!(
-                analysis_id,
-                sha256 = %sha_short2,
-                thread_id,
-                inflight_blocking,
-                finished_total = finished,
-                rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-                elapsed_ms = crate::duration_ms(start.elapsed()),
-                "analysis complete on worker thread",
-            );
-            result
-        })
+                &resources,
+                slow_rule_ms,
+                Some(&cancel2),
+                Some(&phase),
+            )
+        } else if let Some(path) = local.as_ref() {
+            classify_file(
+                path,
+                &label_for_blocking,
+                &resources,
+                slow_rule_ms,
+                None,
+                Some(&cancel2),
+                Some(&phase),
+            )
+        } else {
+            Err(anyhow::anyhow!(
+                "no downloaded bytes and no local path for {label_for_blocking}"
+            ))
+        };
+        let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let inflight_blocking = BLOCKING_STARTED_TOTAL
+            .load(Ordering::Relaxed)
+            .saturating_sub(finished);
+        tracing::debug!(
+            analysis_id,
+            sha256 = %sha_short2,
+            thread_id,
+            inflight_blocking,
+            finished_total = finished,
+            rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+            elapsed_ms = crate::duration_ms(start.elapsed()),
+            "analysis complete on worker thread",
+        );
+        result
     });
 
     let result = handle.await;
@@ -2580,7 +2462,6 @@ async fn download_bytes(
     Ok(bytes)
 }
 
-/// Exponential backoff with jitter, capped at 2 minutes.
 /// Exponential backoff with jitter for hopper outage recovery.
 /// Starts at 1s, doubles each attempt, caps at 60s. Jitter prevents
 /// thundering herd when multiple workers reconnect simultaneously.
@@ -2591,30 +2472,6 @@ fn backoff_duration(consecutive_errors: u32) -> Duration {
     // Jitter: ±25% using a cheap deterministic hash of the error count.
     let jitter = (consecutive_errors as u64 * 7 + 3) % (capped / 4 + 1);
     Duration::from_secs(capped.saturating_add(jitter))
-}
-
-/// Returns the 1-minute system load average, or None on unsupported platforms.
-fn system_load_avg() -> Option<f64> {
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd"
-    ))]
-    {
-        let mut avg: [libc::c_double; 1] = [0.0];
-        let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
-        if ret == 1 { Some(avg[0]) } else { None }
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd"
-    )))]
-    {
-        None
-    }
 }
 
 /// Build the `/api/heartbeat` URL. Mirrors `Prefetcher::poll_url`'s live signals

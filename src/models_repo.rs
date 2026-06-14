@@ -23,33 +23,23 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/azoth.git";
 
-/// Sentinel for "no ref pinned"; only affects bundle-name derivation now.
-const REMOTE_DEFAULT_REF: &str = "";
-
 /// Files that must be present in a complete bundle. The model file is checked
 /// separately because it may live at the top level or under `models/`.
 const REQUIRED_ARTIFACTS: &[&str] = &["feature_spec.json"];
 /// litmus is ONNX-only — the native LightGBM/XGBoost loaders were retired.
 const MODEL_FILES: &[&str] = &["model.onnx"];
 
-/// Resolve the configured upstream URL (and any pinned ref). Only the URL is
-/// used now — to derive the on-disk bundle directory name.
-///
-/// Resolution order:
-/// 1. `SCAN_MODELS_REPO=URL#ref` — the trailing fragment, if present, is the ref.
-/// 2. `SCAN_MODELS_REF=...` — used only if no `#ref` is embedded in the URL.
-/// 3. Built-in default URL.
-fn configured_repo() -> (String, String) {
+/// Resolve the configured upstream URL: `SCAN_MODELS_REPO` or the built-in
+/// default. Used only to derive the on-disk bundle directory name. Any `#ref`
+/// fragment is dropped — bundles are version-keyed R2 downloads, so a ref no
+/// longer selects anything (see [`crate::model_update`]).
+fn models_repo_url() -> String {
     let raw =
         std::env::var("SCAN_MODELS_REPO").unwrap_or_else(|_| DEFAULT_MODELS_REPO_URL.to_owned());
-    let (url, embedded_ref) = match raw.rsplit_once('#') {
-        Some((url, ref_name)) => (url.to_owned(), Some(ref_name.to_owned())),
-        None => (raw, None),
-    };
-    let ref_name = embedded_ref
-        .or_else(|| std::env::var("SCAN_MODELS_REF").ok())
-        .unwrap_or_else(|| REMOTE_DEFAULT_REF.to_owned());
-    (url, ref_name)
+    match raw.rsplit_once('#') {
+        Some((url, _)) => url.to_owned(),
+        None => raw,
+    }
 }
 
 /// Resolve the models bundle directory, bootstrap-installing if necessary.
@@ -94,7 +84,7 @@ pub fn install_target() -> PathBuf {
 /// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/<bundle>`,
 /// where `<bundle>` is the last path segment of the configured upstream URL.
 fn default_models_dir() -> PathBuf {
-    let (url, _) = configured_repo();
+    let url = models_repo_url();
     let bundle = bundle_name_from_url(&url).unwrap_or_else(|| "azoth".to_owned());
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -247,36 +237,26 @@ mod tests {
     }
 
     #[test]
-    fn configured_repo_splits_url_fragment() {
-        // SAFETY: env-var manipulation in tests; these vars are only read here.
+    fn models_repo_url_resolves_and_drops_fragment() {
+        // SAFETY: env-var manipulation in tests; this var is only read here.
         unsafe {
             let saved_repo = std::env::var("SCAN_MODELS_REPO").ok();
-            let saved_ref = std::env::var("SCAN_MODELS_REF").ok();
 
+            // A `#ref` fragment is stripped so the bundle name stays clean.
             std::env::set_var("SCAN_MODELS_REPO", "https://example.com/foo.git#v3");
-            std::env::set_var("SCAN_MODELS_REF", "v9");
-            let (url, r) = configured_repo();
-            assert_eq!(url, "https://example.com/foo.git");
-            assert_eq!(r, "v3");
+            assert_eq!(models_repo_url(), "https://example.com/foo.git");
 
+            // A plain URL passes through unchanged.
             std::env::set_var("SCAN_MODELS_REPO", "https://example.com/bar.git");
-            std::env::set_var("SCAN_MODELS_REF", "v9");
-            let (url, r) = configured_repo();
-            assert_eq!(url, "https://example.com/bar.git");
-            assert_eq!(r, "v9");
+            assert_eq!(models_repo_url(), "https://example.com/bar.git");
 
+            // Unset falls back to the built-in default.
             std::env::remove_var("SCAN_MODELS_REPO");
-            std::env::remove_var("SCAN_MODELS_REF");
-            let (_, r) = configured_repo();
-            assert_eq!(r, "");
+            assert_eq!(models_repo_url(), DEFAULT_MODELS_REPO_URL);
 
             match saved_repo {
                 Some(v) => std::env::set_var("SCAN_MODELS_REPO", v),
                 None => std::env::remove_var("SCAN_MODELS_REPO"),
-            }
-            match saved_ref {
-                Some(v) => std::env::set_var("SCAN_MODELS_REF", v),
-                None => std::env::remove_var("SCAN_MODELS_REF"),
             }
         }
     }

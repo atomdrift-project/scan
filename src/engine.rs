@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::OutputFormat;
+use crate::{json_alias, json_alias_array, json_alias_str};
 use crate::explain::ShapImportance;
 use crate::features::{ExtractContext, crit_ordinal};
 use crate::model::{Classification, Decision, Model, RouteScore, SkippedRoute, Thresholds};
@@ -729,21 +730,6 @@ pub struct TopFinding {
 /// Mirrors `DEFAULT_CONF` in `cleave::types::compact`.
 const DEFAULT_TRAIT_CONFIDENCE: f32 = 0.5;
 
-fn json_alias<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a serde_json::Value> {
-    names.iter().find_map(|name| value.get(*name))
-}
-
-fn json_alias_array<'a>(
-    value: &'a serde_json::Value,
-    names: &[&str],
-) -> Option<&'a Vec<serde_json::Value>> {
-    json_alias(value, names).and_then(serde_json::Value::as_array)
-}
-
-fn json_alias_str<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
-    json_alias(value, names).and_then(serde_json::Value::as_str)
-}
-
 /// The cleave findings array, taken from a single-file report (`find`/`ts`) or,
 /// failing that, the first file entry of a compact envelope (`files[0].find`).
 fn report_findings(report: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
@@ -925,35 +911,23 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 
     // Single-file path: handle directly without the directory streaming API.
     if path.is_file() {
-        let result = analyze_single(path, &cleave_opts, &ctx, &model, shap.as_ref(), config);
-        let (mut hostile, mut suspicious, mut benign, mut errors) = (0u32, 0u32, 0u32, 0u32);
+        let tally = Tally::default();
         let stdout = Mutex::new(std::io::stdout());
-        match result {
-            Ok(r) => {
-                match r.classification {
-                    Classification::Hostile => hostile += 1,
-                    Classification::Suspicious => suspicious += 1,
-                    Classification::Benign => benign += 1,
-                }
-                if config.format() == OutputFormat::Json || config.filter().shows(&r.classification)
-                {
-                    emit_result(&r, config, false, &stdout);
-                }
-            }
-            Err(e) => {
-                let msg = crate::tools::enrich_error(&e).unwrap_or_else(|| format!("{e:#}"));
-                tracing::warn!("error analyzing {}: {}", path.display(), msg);
-                errors += 1;
-            }
-        }
-        let summary = ScanSummary {
-            total_files: 1,
-            hostile,
-            suspicious,
-            benign,
-            errors,
-            duration_ms: crate::duration_ms(scan_start.elapsed()),
-        };
+        let cleave_result = cleave::analyze_file(path, &cleave_opts)
+            .with_context(|| format!("cleave analysis of {}", path.display()));
+        record_file_result(
+            path,
+            cleave_result,
+            &ctx,
+            &model,
+            shap.as_ref(),
+            config,
+            cleave_opts.cancellation.as_ref(),
+            &tally,
+            &stdout,
+            None,
+        );
+        let summary = tally.summary(scan_start);
         if is_terminal {
             crate::output::print_summary(&summary);
         }
@@ -967,10 +941,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     // Directory scan: delegate walking and parallel analysis to cleave, which
     // loads CapabilityMapper and YARA once and streams results via callback.
     let total_files: OnceLock<u32> = OnceLock::new();
-    let hostile_count = AtomicU32::new(0);
-    let suspicious_count = AtomicU32::new(0);
-    let benign_count = AtomicU32::new(0);
-    let error_count = AtomicU32::new(0);
+    let tally = Tally::default();
     let stdout = Mutex::new(std::io::stdout());
     let progress: OnceLock<Progress> = OnceLock::new();
 
@@ -989,49 +960,18 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             path: ref file_path,
             result,
         } => {
-            let scan_result = result.and_then(|report| {
-                process_report(
-                    file_path,
-                    report,
-                    &ctx,
-                    &model,
-                    shap.as_ref(),
-                    config,
-                    cleave_opts.cancellation.as_ref(),
-                )
-            });
-            let prog = progress.get();
-            if let Some(p) = prog {
-                p.increment();
-            }
-            match scan_result {
-                Ok(r) => {
-                    match r.classification {
-                        Classification::Hostile => {
-                            hostile_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Classification::Suspicious => {
-                            suspicious_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Classification::Benign => {
-                            benign_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    if config.format() == OutputFormat::Json
-                        || config.filter().shows(&r.classification)
-                    {
-                        emit_result(&r, config, prog.is_some(), &stdout);
-                        if let Some(p) = prog {
-                            p.redraw();
-                        }
-                    }
-                }
-                Err(e) => {
-                    let msg = crate::tools::enrich_error(&e).unwrap_or_else(|| format!("{e:#}"));
-                    tracing::warn!("error analyzing {}: {}", file_path.display(), msg);
-                    error_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            record_file_result(
+                file_path,
+                *result,
+                &ctx,
+                &model,
+                shap.as_ref(),
+                config,
+                cleave_opts.cancellation.as_ref(),
+                &tally,
+                &stdout,
+                progress.get(),
+            );
         }
     })?;
 
@@ -1039,21 +979,12 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
         p.finish();
     }
 
-    let hostile = hostile_count.load(Ordering::Relaxed);
-    let suspicious = suspicious_count.load(Ordering::Relaxed);
-    let benign = benign_count.load(Ordering::Relaxed);
-    let errors = error_count.load(Ordering::Relaxed);
-    let summary = ScanSummary {
-        total_files: total_files
-            .get()
-            .copied()
-            .unwrap_or(hostile + suspicious + benign + errors),
-        hostile,
-        suspicious,
-        benign,
-        errors,
-        duration_ms: crate::duration_ms(scan_start.elapsed()),
-    };
+    // Every analyzed file is tallied, so the tally's sum is the total — but
+    // prefer cleave's upfront count when the walk reported one.
+    let mut summary = tally.summary(scan_start);
+    if let Some(&total) = total_files.get() {
+        summary.total_files = total;
+    }
 
     if is_terminal {
         crate::output::print_summary(&summary);
@@ -1102,8 +1033,11 @@ impl Tally {
 
 /// Run the ML pipeline on one cleave result and record the verdict.
 ///
-/// Shared by the file-batch and per-directory streams in [`run_paths`]. Called
-/// from rayon worker threads, so every shared input is behind `&`/atomics.
+/// The single home for every scan's per-file recording: [`run`]'s single-file
+/// and directory scans and [`run_paths`]'s file-batch and per-directory streams.
+/// Called from rayon worker threads, so every shared input is behind `&`/atomics.
+/// `progress`, when present, is advanced per file and redrawn after each shown
+/// result.
 #[allow(clippy::too_many_arguments)]
 fn record_file_result(
     file_path: &Path,
@@ -1115,15 +1049,22 @@ fn record_file_result(
     cancellation: Option<&Arc<AtomicBool>>,
     tally: &Tally,
     stdout: &Mutex<std::io::Stdout>,
+    progress: Option<&Progress>,
 ) {
     let scan_result = cleave_result.and_then(|report| {
         process_report(file_path, report, ctx, model, shap, config, cancellation)
     });
+    if let Some(p) = progress {
+        p.increment();
+    }
     match scan_result {
         Ok(r) => {
             tally.count(r.classification);
             if config.format() == OutputFormat::Json || config.filter().shows(&r.classification) {
-                emit_result(&r, config, false, stdout);
+                emit_result(&r, config, progress.is_some(), stdout);
+                if let Some(p) = progress {
+                    p.redraw();
+                }
             }
         }
         Err(e) => {
@@ -1202,6 +1143,7 @@ pub fn run_paths(paths: &[PathBuf], config: &ScanConfig) -> Result<ScanSummary> 
             Some(&cancellation),
             &tally,
             &stdout,
+            None,
         );
     };
 
@@ -1693,7 +1635,7 @@ pub(crate) fn classify_report(
     // for the model regardless of the display density, then blend.
     let interpretation = interpret.and_then(|cfg| {
         if final_decision.probability < cfg.min_prob {
-            tracing::info!(
+            tracing::debug!(
                 path = %label,
                 probability = format!("{:.4}", final_decision.probability),
                 cutoff = format!("{:.4}", cfg.min_prob),
@@ -1722,10 +1664,13 @@ pub(crate) fn classify_report(
         && interp.grade.is_some()
         && interp.outcome as u8 != final_decision.class as u8
     {
-        tracing::info!(
+        tracing::warn!(
             path = %label,
             ml = ?final_decision.class,
-            blended = ?interp.outcome,
+            outcome = ?interp.outcome,
+            grade = interp.grade.map_or("?", crate::interpret::LlmGrade::as_str),
+            conf = format!("{:.4}", interp.blended),
+            review = interp.review,
             "LLM interpretation shifted the verdict",
         );
         final_decision.class = interp.outcome;
@@ -1877,28 +1822,6 @@ pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
         }
     }
     counts
-}
-
-/// Analyze a single file end-to-end (cleave + litmus model).
-fn analyze_single(
-    path: &Path,
-    cleave_opts: &cleave::AnalysisOptions,
-    ctx: &ExtractContext,
-    model: &Model,
-    shap: Option<&ShapImportance>,
-    config: &ScanConfig,
-) -> Result<ScanResult> {
-    let report = cleave::analyze_file(path, cleave_opts)
-        .with_context(|| format!("cleave analysis of {}", path.display()))?;
-    process_report(
-        path,
-        report,
-        ctx,
-        model,
-        shap,
-        config,
-        cleave_opts.cancellation.as_ref(),
-    )
 }
 
 /// Classify a payload held entirely in memory.

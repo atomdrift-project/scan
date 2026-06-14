@@ -92,11 +92,13 @@ fn current_thread_id() -> u64 {
     }
 }
 
-fn analysis_error_response(error: &anyhow::Error) -> Response {
+/// Classify an analysis error into its HTTP status and JSON body. Returns the
+/// status alongside the response so callers can log it without reclassifying.
+fn analysis_error_response(error: &anyhow::Error) -> (StatusCode, Response) {
     let (status, message) = classify_analysis_error(error.root_cause().to_string().as_str());
     let detail = format!("{error:#}");
 
-    (
+    let response = (
         status,
         Json(if detail == message {
             serde_json::json!({ "error": message })
@@ -104,7 +106,8 @@ fn analysis_error_response(error: &anyhow::Error) -> Response {
             serde_json::json!({ "error": message, "detail": detail })
         }),
     )
-        .into_response()
+        .into_response();
+    (status, response)
 }
 
 fn classify_analysis_error(message: &str) -> (StatusCode, String) {
@@ -135,38 +138,11 @@ fn classify_analysis_error(message: &str) -> (StatusCode, String) {
 
     (status, message.to_string())
 }
-
-fn analysis_error_status(error: &anyhow::Error) -> StatusCode {
-    classify_analysis_error(error.root_cause().to_string().as_str()).0
-}
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
 use crate::model::Model;
 use crate::engine::ScanResult;
-
-/// Returns the 1-minute system load average, or None on unsupported platforms.
-fn system_load_avg() -> Option<f64> {
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd"
-    ))]
-    {
-        let mut avg: [libc::c_double; 1] = [0.0];
-        let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
-        if ret == 1 { Some(avg[0]) } else { None }
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd"
-    )))]
-    {
-        None
-    }
-}
+use crate::system_load_avg;
 
 /// GET /_/health — liveness check with memory and concurrency status.
 /// Returns 503 while resources are still loading or when RSS exceeds the
@@ -921,9 +897,9 @@ pub(super) async fn analyze(
             resp
         }
         AnalysisOutcome::Ok(Err(e)) => {
-            let status = analysis_error_status(&e);
+            let (status, response) = analysis_error_response(&e);
             tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analysis failed");
-            analysis_error_response(&e)
+            response
         }
         AnalysisOutcome::JoinError(e) => {
             tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
@@ -982,30 +958,7 @@ pub(crate) fn classify_file(
     };
     let report =
         cleave::analyze_file(path, &opts).with_context(|| format!("cleave analysis of {label}"))?;
-
-    // If the timeout fired while cleave was running, bail now rather than
-    // burning CPU on feature extraction and model inference for a result
-    // nobody is waiting for.
-    if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
-        anyhow::bail!("analysis cancelled");
-    }
-
-    if let Some(p) = phase {
-        p.set("features+model");
-    }
-    let cr = crate::engine::classify_report(
-        label,
-        report,
-        &resources.ctx,
-        &resources.model,
-        resources.shap.as_ref(),
-        cancellation,
-        Some(100),
-        &cleave::output::TinyOpts::tiny(),
-        resources.interpret.as_ref(),
-    )?;
-
-    Ok(scan_result_from(label, cr, resources))
+    finish_classify(label, report, resources, cancellation, phase)
 }
 
 /// Like [`classify_file`] but operates on in-memory data, avoiding disk I/O.
@@ -1034,7 +987,21 @@ pub(crate) fn classify_bytes(
     };
     let report = cleave::analyze_bytes_shared(data, label, &opts)
         .with_context(|| format!("cleave analysis of {label}"))?;
+    finish_classify(label, report, resources, cancellation, phase)
+}
 
+/// Shared tail of [`classify_file`]/[`classify_bytes`]: honor a late cancellation,
+/// run feature extraction + model inference, and assemble the [`ScanResult`].
+fn finish_classify(
+    label: &str,
+    report: cleave::AnalysisReport,
+    resources: &super::ModelResources,
+    cancellation: Option<&Arc<AtomicBool>>,
+    phase: Option<&cleave::PhaseTracker>,
+) -> anyhow::Result<ScanResult> {
+    // If the timeout fired while cleave was running, bail now rather than
+    // burning CPU on feature extraction and model inference for a result
+    // nobody is waiting for.
     if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
         anyhow::bail!("analysis cancelled");
     }
@@ -1303,9 +1270,9 @@ pub(super) async fn analyze_path(
             resp
         }
         AnalysisOutcome::Ok(Err(e)) => {
-            let status = analysis_error_status(&e);
+            let (status, response) = analysis_error_response(&e);
             tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analysis failed");
-            analysis_error_response(&e)
+            response
         }
         AnalysisOutcome::JoinError(e) => {
             tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");

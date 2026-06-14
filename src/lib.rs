@@ -66,6 +66,52 @@ pub(crate) fn duration_ms(d: std::time::Duration) -> u64 {
         .saturating_add(u64::from(d.subsec_millis()))
 }
 
+/// The 1-minute system load average, or `None` on unsupported platforms.
+pub(crate) fn system_load_avg() -> Option<f64> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    ))]
+    {
+        let mut avg: [libc::c_double; 1] = [0.0];
+        let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
+        if ret == 1 { Some(avg[0]) } else { None }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )))]
+    {
+        None
+    }
+}
+
+/// First JSON value present under any of `names`, in order. Used throughout
+/// report parsing to accept both cleave's verbose and compact field spellings.
+pub(crate) fn json_alias<'a>(
+    value: &'a serde_json::Value,
+    names: &[&str],
+) -> Option<&'a serde_json::Value> {
+    names.iter().find_map(|name| value.get(*name))
+}
+
+/// [`json_alias`] resolved to an array.
+pub(crate) fn json_alias_array<'a>(
+    value: &'a serde_json::Value,
+    names: &[&str],
+) -> Option<&'a Vec<serde_json::Value>> {
+    json_alias(value, names).and_then(serde_json::Value::as_array)
+}
+
+/// [`json_alias`] resolved to a string.
+pub(crate) fn json_alias_str<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
+    json_alias(value, names).and_then(serde_json::Value::as_str)
+}
+
 /// Output format for scan results.
 #[derive(Debug, Clone, Copy, Default, PartialEq, clap::ValueEnum)]
 pub enum OutputFormat {
