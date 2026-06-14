@@ -483,9 +483,9 @@ mod envelope_tests {
         r.probability = 0.97;
         r.cleave = Some(serde_json::json!({
             "files": [
-                {"id": 0, "dp": 0, "path": "/tmp/x"},
-                {"id": 1, "dp": 1, "path": "/tmp/x!!evil.sh"},
-                {"id": 2, "dp": 1, "path": "/tmp/x!!readme.txt"},
+                {"id": 0, "dp": 0, "path": "/tmp/x", "type": "zip"},
+                {"id": 1, "dp": 1, "path": "/tmp/x!!evil.sh", "type": "shell"},
+                {"id": 2, "dp": 1, "path": "/tmp/x!!readme.txt", "type": "text"},
             ]
         }));
         let member = |path: &str, level: Option<i32>, prob: f32| EmbeddedFile {
@@ -521,6 +521,13 @@ mod envelope_tests {
             Some(-1),
             "readme.txt reports its own lvl"
         );
+        assert_eq!(
+            files[0]["type"].as_str(),
+            Some("zip"),
+            "each row carries its file type"
+        );
+        assert_eq!(files[1]["type"].as_str(), Some("shell"));
+        assert_eq!(files[2]["type"].as_str(), Some("text"));
     }
 }
 
@@ -2029,7 +2036,7 @@ fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
 
 /// Build per-file ML classification entries for the `ml.files` array.
 ///
-/// Each entry is `{id, prob, lvl, conf}` keyed by the cleave `files[].id` field. The root
+/// Each entry is `{id, type, prob, lvl, conf}` keyed by the cleave `files[].id` field. The root
 /// file (`dp=0`) carries the envelope's probability and `lvl`; embedded archive
 /// members are matched by path suffix and report their *own* probability and
 /// lowest-firing-level `lvl` — every row's `lvl` is therefore the level-independent
@@ -2055,6 +2062,7 @@ fn build_ml_files(
             .get("dp")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
+        let file_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         let (prob, file_level) = if depth == 0 {
             (root_prob, root_level)
@@ -2070,6 +2078,7 @@ fn build_ml_files(
 
         out.push(serde_json::json!({
             "id": id,
+            "type": file_type,
             "prob": prob,
             "lvl": file_level,
             "conf": level_confidence(file_level),
