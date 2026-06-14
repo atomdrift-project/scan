@@ -1930,7 +1930,7 @@ struct FileSummary {
 
 /// Which optional feature families are active for this route, so [`FileSummary::new`]
 /// only clones the raw JSON subtrees those families actually read.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct RawNeeds {
     kv: bool,
     textenc: bool,
@@ -1938,17 +1938,9 @@ pub(crate) struct RawNeeds {
 }
 
 impl RawNeeds {
-    /// No families active — the identity for [`RawNeeds::union`] folds.
-    pub(crate) const fn none() -> Self {
-        Self {
-            kv: false,
-            textenc: false,
-            symbol: false,
-        }
-    }
-
     /// The needs of any of two consumers — used to parse a report once for the
     /// general pass and every route, cloning a subtree if *any* of them reads it.
+    /// `RawNeeds::default()` (no families) is the identity for folding these.
     pub(crate) fn union(self, other: Self) -> Self {
         Self {
             kv: self.kv || other.kv,
@@ -1981,7 +1973,7 @@ impl ParsedReport {
 
     /// Parse a single compact-file entry (an archive member) on its own.
     pub(crate) fn from_file(file: &serde_json::Value, needs: RawNeeds) -> Self {
-        Self::from_files(std::slice::from_ref(&file), Some(file), needs)
+        Self::from_files(&[file], Some(file), needs)
     }
 
     fn from_files(

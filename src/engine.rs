@@ -1509,11 +1509,9 @@ pub(crate) fn classify_report(
     let report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
     // Parse the report once (with the needs of the general pass and every route),
     // then share it — each route differs only in which features it writes, not in
-    // how the report is summarized.
-    let parsed = crate::features::ParsedReport::from_report(
-        &report_json,
-        ctx.raw_needs().union(model.route_needs_union()),
-    );
+    // how the report is summarized. The same union covers embedded members below.
+    let needs = ctx.raw_needs().union(model.route_needs_union());
+    let parsed = crate::features::ParsedReport::from_report(&report_json, needs);
     let mut raw_features = ctx.extract_from_parsed(&parsed);
     let nonzero = raw_features.iter().filter(|&&v| v != 0.0).count();
     let expected = model.spec().total_features();
@@ -1587,7 +1585,6 @@ pub(crate) fn classify_report(
     let mut embedded_files: Vec<EmbeddedFile> = Vec::with_capacity(embedded_entries.len());
     let mut max_decision: Decision = decision;
 
-    let embedded_needs = ctx.raw_needs().union(model.route_needs_union());
     for ef in &embedded_entries {
         if let Some(c) = cancellation
             && c.load(Ordering::Relaxed)
@@ -1595,7 +1592,7 @@ pub(crate) fn classify_report(
             anyhow::bail!("analysis cancelled during embedded file processing");
         }
 
-        let ef_parsed = crate::features::ParsedReport::from_file(ef, embedded_needs);
+        let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
         let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
         model.spec().standardize(&mut ef_features);
         let ef_type = ef["type"].as_str().unwrap_or("unknown");

@@ -2690,7 +2690,7 @@ impl Model {
             .filegroups
             .values()
             .chain(self.routes.filetypes.values())
-            .fold(crate::features::RawNeeds::none(), |acc, r| {
+            .fold(crate::features::RawNeeds::default(), |acc, r| {
                 acc.union(r.ctx.raw_needs())
             })
     }
