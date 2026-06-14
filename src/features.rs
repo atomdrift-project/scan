@@ -358,30 +358,7 @@ impl FeatureSpec {
             );
         }
 
-        let expected_feature_names = build_expected_feature_names(
-            &self.presence_vocab,
-            &self.filetype_vocab,
-            &self.element_vocab,
-            &self.bigram_vocab,
-            &self.ghost_vocab,
-            &self.skeleton_vocab,
-            &self.rare_element_vocab,
-            &self.trigram_vocab,
-            &self.metric_vocab,
-            &self.crit_unigram_vocab,
-            &self.crit_bigram_vocab,
-            &self.crit_trigram_vocab,
-            &self.attack_bigram_vocab,
-            &self.attack_trigram_vocab,
-            &self.mbc_bigram_vocab,
-            &self.mbc_trigram_vocab,
-            &self.tiered_bigram_vocab,
-            &self.tiered_trigram_vocab,
-            &self.kv_vocab,
-            &self.symbol_vocab,
-            &self.symbol_bigram_vocab,
-            &self.symbol_trigram_vocab,
-        );
+        let expected_feature_names = self.expected_feature_names();
         if self.feature_names != expected_feature_names {
             // The spec is allowed to be a SUBSET of what this extractor knows
             // (some feature groups disabled at training via
@@ -485,7 +462,18 @@ impl FeatureSpec {
     /// of what the extractor knows, the normal case), which never appear here.
     #[must_use]
     pub fn degraded_feature_names(&self) -> Vec<String> {
-        let expected_feature_names = build_expected_feature_names(
+        let expected_feature_names = self.expected_feature_names();
+        self.unknown_feature_names(&expected_feature_names)
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    /// The full feature-name list this extractor emits for the spec's
+    /// vocabularies — the canonical layout that `feature_names` is checked
+    /// against. The 22 vocab fields are threaded through once, here.
+    fn expected_feature_names(&self) -> Vec<String> {
+        build_expected_feature_names(
             &self.presence_vocab,
             &self.filetype_vocab,
             &self.element_vocab,
@@ -508,11 +496,7 @@ impl FeatureSpec {
             &self.symbol_vocab,
             &self.symbol_bigram_vocab,
             &self.symbol_trigram_vocab,
-        );
-        self.unknown_feature_names(&expected_feature_names)
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect()
+        )
     }
 }
 

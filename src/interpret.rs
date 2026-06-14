@@ -103,15 +103,6 @@ impl LlmGrade {
         }
     }
 
-    /// Severity rank, matching [`Classification`]'s ordering.
-    fn rank(self) -> u8 {
-        match self {
-            Self::Benign => 0,
-            Self::Suspicious => 1,
-            Self::Hostile => 2,
-        }
-    }
-
     /// Lowercase label.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -206,7 +197,7 @@ const HOSTILE_ESCALATION_CONF: f32 = 0.85;
 fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade) -> (Classification, f32, bool) {
     use std::cmp::Ordering;
     let p = ml_prob.clamp(0.0, 1.0);
-    match llm.rank().cmp(&class_rank(ml)) {
+    match class_rank(llm.classification()).cmp(&class_rank(ml)) {
         Ordering::Greater => {
             let conf = if matches!(llm, LlmGrade::Hostile) {
                 HOSTILE_ESCALATION_CONF

@@ -199,25 +199,17 @@ const fn default_model_abi_version() -> u32 {
 /// Current suspicious ceiling (FP per 100M benigns) for level-sweep decisions.
 const SUSPICIOUS_LEVEL_CEILING: u16 = 20_000;
 
-/// Derive the suspicious LEVEL from the hostile level.
+/// The suspicious LEVEL for a grid: `min(max_grid_level, 20000)`.
 ///
-/// Rule: suspicious = `min(max_grid_level, 20000)`. Any file that fires at a
-/// level looser than the operator's selected hostile level — but not above the
-/// suspicious ceiling — is classified as suspicious.
+/// Any file that fires at a level looser than the operator's selected hostile
+/// level — but not above the suspicious ceiling — is classified as suspicious.
 ///
 /// The previous L×4 policy proved too narrow once we saw real recall curves:
 /// the recall plateau above the critical level is flat for almost every file
 /// type. Keep a high but finite ceiling so very loose levels can remain
 /// informational without becoming suspicious verdicts.
-///
-/// `hostile_level` is unused but kept in the signature for source-compatibility
-/// with the prior derivation; callers that were passing it can leave the
-/// call sites alone while their import audits catch up.
 #[must_use]
-pub(crate) fn derive_suspicious_level_from_hostile(
-    _hostile_level: u16,
-    max_grid_level: u16,
-) -> u16 {
+pub(crate) fn capped_suspicious_level(max_grid_level: u16) -> u16 {
     max_grid_level.min(SUSPICIOUS_LEVEL_CEILING)
 }
 
@@ -291,7 +283,7 @@ fn thresholds_from_severity_levels(levels: &[SeverityLevel], level: u16) -> Opti
         explicit as f32
     } else {
         let max = max_level(levels).unwrap_or(level);
-        let suspicious_level = derive_suspicious_level_from_hostile(level, max);
+        let suspicious_level = capped_suspicious_level(max);
         if suspicious_level == level {
             // Already at the top of the grid; no looser row to pull from.
             hostile
@@ -357,7 +349,7 @@ fn load_evaluation_severity_thresholds(model_dir: &Path, level: u16) -> Option<T
 /// severity metadata.
 ///
 /// Suspicious is derived in level-space (see
-/// [`derive_suspicious_level_from_hostile`]) — there is no probability-space
+/// [`capped_suspicious_level`]) — there is no probability-space
 /// fallback.
 ///
 /// # Errors
@@ -1518,7 +1510,7 @@ fn load_route_policies(model_dir: &Path, level: u16) -> RoutePolicies {
             explicit
         } else {
             let max = route.levels.iter().map(|e| e.level).max().unwrap_or(level);
-            let suspicious_level = derive_suspicious_level_from_hostile(level, max);
+            let suspicious_level = capped_suspicious_level(max);
             route
                 .levels
                 .iter()
@@ -1623,7 +1615,7 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u16) -> HashMap<String,
     };
 
     let max = levels.iter().map(|e| e.level).max().unwrap_or(level);
-    let suspicious_level = derive_suspicious_level_from_hostile(level, max);
+    let suspicious_level = capped_suspicious_level(max);
     let loose_hostile = (suspicious_level != level)
         .then(|| levels.iter().find(|e| e.level == suspicious_level))
         .flatten()
@@ -2187,7 +2179,7 @@ fn sweep_policy_grid(grid: &[LevelPolicy], scores: &[RouteProbability]) -> Optio
 fn verdict_for_level(fired_level: u16, level: u16, grid_max: u16) -> Classification {
     if fired_level <= level {
         Classification::Hostile
-    } else if fired_level <= derive_suspicious_level_from_hostile(level, grid_max) {
+    } else if fired_level <= capped_suspicious_level(grid_max) {
         Classification::Suspicious
     } else {
         Classification::Benign
@@ -3064,13 +3056,11 @@ mod tests {
 
         let l300 = load_severity_thresholds(dir.path(), 300);
         // L300 is absent from this table so the loader returns None — but the
-        // derivation rule is exercised via
-        // `derive_suspicious_level_from_hostile` directly below.
+        // ceiling rule is exercised via `capped_suspicious_level` directly below.
         assert!(matches!(l300, Ok(None)));
-        assert_eq!(derive_suspicious_level_from_hostile(300, 1000), 1000);
-        assert_eq!(derive_suspicious_level_from_hostile(50, 1000), 1000);
-        assert_eq!(derive_suspicious_level_from_hostile(1000, 1000), 1000);
-        assert_eq!(derive_suspicious_level_from_hostile(50, 25_000), 20_000);
+        assert_eq!(capped_suspicious_level(1000), 1000); // below ceiling: passes through
+        assert_eq!(capped_suspicious_level(20_000), 20_000); // at the ceiling
+        assert_eq!(capped_suspicious_level(25_000), 20_000); // above ceiling: capped
         Ok(())
     }
 
