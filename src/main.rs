@@ -170,6 +170,37 @@ struct Cli {
     #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
     llm_timeout: u64,
 
+    /// [EXPERIMENTAL] Fetch the external references discovered in analyzed
+    /// files, re-analyze each payload, and fold it into the verdict. A
+    /// comma-separated selection of what to fetch: `deps` (registry packages)
+    /// and/or `refs` (bare/encoded URLs and IP endpoints, the larger exposure).
+    /// Bare `--fetch` selects all kinds. Omitted: off. Also settable per
+    /// deployment via the `SCAN_FETCH` env var (e.g. `SCAN_FETCH=refs`). An
+    /// opt-in online step performed after the offline analysis.
+    #[arg(
+        long,
+        global = true,
+        value_name = "KINDS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "deps,refs",
+        env = "SCAN_FETCH"
+    )]
+    fetch: Option<scan::fetch::FetchPolicy>,
+
+    /// [EXPERIMENTAL] How many hops of references to follow when `--fetch` is on:
+    /// `1` fetches only what the scanned files reference, `2` also follows
+    /// references found inside those payloads (reaching a stage-3 `curl | bash`
+    /// dropper), and so on. Also settable via `SCAN_FETCH_DEPTH`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        default_value_t = scan::fetch::DEFAULT_FETCH_DEPTH,
+        env = "SCAN_FETCH_DEPTH"
+    )]
+    fetch_depth: u8,
+
     /// Paths to files or directories to scan (shorthand for `ascan fs <paths...>`)
     paths: Vec<PathBuf>,
 
@@ -429,6 +460,13 @@ fn main() -> Result<()> {
     let threshold_hostile = cli.threshold_hostile;
     // Resolve before `cli.command` is moved out below; only one arm uses it.
     let interpret_cfg = cli.interpret_config();
+    // The kind selection comes from `--fetch`; the hop count from `--fetch-depth`
+    // (its own flag/env). Combine them into one policy for every scan path.
+    let fetch_policy = {
+        let mut policy = cli.fetch.unwrap_or_default();
+        policy.depth = cli.fetch_depth;
+        policy
+    };
     if let Some(cfg) = &interpret_cfg {
         tracing::info!(
             endpoint = %cfg.base_url,
@@ -697,7 +735,8 @@ fn main() -> Result<()> {
                 cli.extra,
             )?
             .with_level(envelope_level)
-            .with_interpret(interpret_cfg.clone());
+            .with_interpret(interpret_cfg.clone())
+            .with_fetch(fetch_policy);
             exit_for_summary(&run_scan_paths(&paths, &config)?);
         }
         Commands::Sys => {
@@ -713,7 +752,8 @@ fn main() -> Result<()> {
                 cli.extra,
             )?
             .with_level(envelope_level)
-            .with_interpret(interpret_cfg.clone());
+            .with_interpret(interpret_cfg.clone())
+            .with_fetch(fetch_policy);
             exit_for_summary(&scan::sys::run(&config)?);
         }
         Commands::Ps => {
@@ -729,7 +769,8 @@ fn main() -> Result<()> {
                 cli.extra,
             )?
             .with_level(envelope_level)
-            .with_interpret(interpret_cfg.clone());
+            .with_interpret(interpret_cfg.clone())
+            .with_fetch(fetch_policy);
             exit_for_summary(&scan::ps::run(&config)?);
         }
         Commands::Serve {
@@ -780,7 +821,8 @@ fn main() -> Result<()> {
                 allow_cidrs,
             )?
             .with_level(envelope_level)
-            .with_interpret(interpret_cfg.clone());
+            .with_interpret(interpret_cfg.clone())
+            .with_fetch(fetch_policy);
             eprintln!("Starting Atomdrift Scan server on http://{bind} ...");
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

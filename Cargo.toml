@@ -61,8 +61,12 @@ repository = "https://codeberg.org/atomdrift/scan"
 # its own #[global_allocator] in main.rs (cfg-gated to skip illumos/Solaris/the
 # BSDs that ship jemalloc natively), so we don't need cleave's copy.
 cleave = { git = "https://codeberg.org/atomdrift/cleave.git", default-features = false }
+# fletch finds and fetches the external references cleave surfaces, so scan can
+# pull staged payloads and supply-chain dependencies into the same report.
+# Path dependency: fletch is not yet published to a registry/remote.
+fletch = { path = "../fletch" }
 proclist = { git = "https://codeberg.org/atomdrift/proclist.git" }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Compresses result POST bodies to hopper. Cleave reports are large, highly
@@ -185,6 +189,23 @@ path = "src/bin/bench_hopper.rs"
 # fix lands upstream (bytecodealliance/wasmtime#5499) and yara-x bumps past it.
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
+
+# Local cleave: scan consumes the per-file `filefacts.references` it surfaces
+# (FilefactsView) to drive fletch fetching, before that change is published.
+# Remove once a cleave release carries it.
+[patch."https://codeberg.org/atomdrift/cleave.git"]
+cleave = { path = "../cleave" }
+
+# fletch uses `../filefacts` by path; cleave pulls filefacts via git. A built
+# crate's own `[patch]` table is ignored when it is a dependency, so the whole
+# graph (cleave + fletch) must be steered to ONE filefacts here, or the shared
+# `filefacts::ExternalRef` type fails to unify across the two. stng follows for
+# the same reason (the local filefacts depends on the unreleased local stng).
+[patch."https://codeberg.org/atomdrift/filefacts.git"]
+filefacts = { path = "../filefacts" }
+
+[patch."https://codeberg.org/atomdrift/stng.git"]
+stng = { path = "../stng" }
 
 
 

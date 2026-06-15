@@ -56,6 +56,10 @@ pub struct ServerConfig {
     /// Per-request analysis timeout in seconds. 0 disables.
     analysis_timeout_secs: u64,
     interpret: Option<crate::interpret::InterpretConfig>,
+    /// External-reference fetch policy. Off by default: an upload server driving
+    /// outbound fetches is an SSRF-shaped exposure (the transport's resolver
+    /// guards internal IPs, but enabling it is an explicit operator decision).
+    fetch: crate::fetch::FetchPolicy,
 }
 
 /// Default per-request analysis timeout: 5 minutes. Covers cold cleave scans
@@ -135,6 +139,7 @@ impl ServerConfig {
             level: None,
             analysis_timeout_secs: DEFAULT_ANALYSIS_TIMEOUT_SECS,
             interpret: None,
+            fetch: crate::fetch::FetchPolicy::default(),
         })
     }
 
@@ -143,6 +148,20 @@ impl ServerConfig {
     pub fn with_interpret(mut self, interpret: Option<crate::interpret::InterpretConfig>) -> Self {
         self.interpret = interpret;
         self
+    }
+
+    /// Set the external-reference fetch policy (off by default). Enabling it on
+    /// the server makes uploaded samples drive outbound fetches.
+    #[must_use]
+    pub const fn with_fetch(mut self, policy: crate::fetch::FetchPolicy) -> Self {
+        self.fetch = policy;
+        self
+    }
+
+    /// The server's external-reference fetch policy.
+    #[must_use]
+    pub(crate) const fn fetch(&self) -> crate::fetch::FetchPolicy {
+        self.fetch
     }
 
     /// LLM interpretation config, or `None` when `--interpret` was not set.
@@ -394,6 +413,8 @@ pub(crate) struct ModelResources {
     pub(crate) ctx: ExtractContext,
     /// LLM interpretation config (`--interpret`); `None` disables the pass.
     pub(crate) interpret: Option<crate::interpret::InterpretConfig>,
+    /// External-reference fetch policy; default (empty) disables fetching.
+    pub(crate) fetch: crate::fetch::FetchPolicy,
 }
 
 #[derive(Debug)]
@@ -411,6 +432,8 @@ struct AppState {
     /// LLM interpretation config (`--interpret`); shared into every
     /// [`ModelResources`] so handlers can run the pass.
     interpret: Option<crate::interpret::InterpretConfig>,
+    /// External-reference fetch policy; shared into every [`ModelResources`].
+    fetch: crate::fetch::FetchPolicy,
     /// Process uptime anchor — captured when build_app runs, very close to
     /// process start. /_/health reports `now - started_at` as uptime_secs.
     started_at: Instant,
@@ -476,6 +499,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         extract_dir: config.extract_dir().map(PathBuf::from),
         allow_cidrs: config.allow_cidrs().to_vec(),
         interpret: config.interpret().cloned(),
+        fetch: config.fetch(),
         started_at: Instant::now(),
         ready: AtomicBool::new(false),
         init_error: RwLock::new(None),
@@ -576,6 +600,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                                 shap,
                                 ctx,
                                 interpret: bg.interpret.clone(),
+                                fetch: bg.fetch,
                             }));
                             if let Ok(mut init_error) = bg.init_error.write() {
                                 *init_error = None;

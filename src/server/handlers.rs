@@ -398,6 +398,7 @@ async fn do_model_reload(
                 shap,
                 ctx,
                 interpret: state.interpret.clone(),
+                fetch: state.fetch,
             }));
             if let Ok(mut init_error) = state.init_error.write() {
                 *init_error = None;
@@ -1019,6 +1020,12 @@ fn finish_classify(
         Some(100),
         &cleave::output::TinyOpts::tiny(),
         resources.interpret.as_ref(),
+        // The server analyzes uploaded bytes, not a disk file; the root
+        // imperative hunt (which re-reads the path) is therefore skipped, but
+        // declared references from the report are still fetched when the
+        // operator enabled it. `label` is a best-effort path for that hunt.
+        std::path::Path::new(label),
+        resources.fetch,
     )?;
 
     Ok(scan_result_from(label, cr, resources))

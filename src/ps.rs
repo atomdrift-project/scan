@@ -306,6 +306,8 @@ fn build_result(
         Some(100),
         &crate::engine::tiny_opts_for(config),
         config.interpret(),
+        display_path,
+        config.fetch_policy(),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

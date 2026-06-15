@@ -80,6 +80,7 @@ pub struct ScanConfig {
     extra: bool,
     level: Option<u16>,
     interpret: Option<crate::interpret::InterpretConfig>,
+    fetch: crate::fetch::FetchPolicy,
 }
 
 impl ScanConfig {
@@ -128,7 +129,24 @@ impl ScanConfig {
             extra,
             level: None,
             interpret: None,
+            fetch: crate::fetch::FetchPolicy::default(),
         })
+    }
+
+    /// Set the external-reference fetch policy: which kinds of reference
+    /// (registry packages, bare URLs) discovered in analyzed files to fetch,
+    /// re-analyze, and graft into the report. The default [`FetchPolicy`]
+    /// selects nothing and disables fetching.
+    #[must_use]
+    pub const fn with_fetch(mut self, policy: crate::fetch::FetchPolicy) -> Self {
+        self.fetch = policy;
+        self
+    }
+
+    /// The external-reference fetch policy (off by default).
+    #[must_use]
+    pub(crate) const fn fetch_policy(&self) -> crate::fetch::FetchPolicy {
+        self.fetch
     }
 
     /// Attach the severity level that produced the resolved thresholds.
@@ -1445,8 +1463,16 @@ pub(crate) fn classify_report(
     embedded_file_limit: Option<usize>,
     tiny_opts: &cleave::output::TinyOpts,
     interpret: Option<&crate::interpret::InterpretConfig>,
+    root_path: &Path,
+    fetch: crate::fetch::FetchPolicy,
 ) -> Result<ClassifiedReport> {
     report.finalize();
+    // Fetch the external references the analysis surfaced and graft each payload
+    // into report.files as a uniform node — after finalize() (which populates
+    // files[] and the per-file declared references) and before featurization, so
+    // fetched content feeds the verdict like any other file. Off unless the
+    // policy selects a kind. The returned edges are attached to report_json below.
+    let fetch_edges = crate::fetch::orchestrate(&mut report, root_path, fetch);
     // Drop component/baseline traits no composite fired on before the report is
     // summarized, featurized, and posted. finalize() has already inherited and
     // re-evaluated composites up the whole archive/embedding chain, so stripping
@@ -1462,7 +1488,18 @@ pub(crate) fn classify_report(
         .and_then(|file| file.formula.clone())
         .unwrap_or_default();
 
-    let report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
+    let mut report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
+    // Attach the fetch edge log at report level (`source_sha256 → content_sha256`
+    // per reference). Report-level, not per-file: a fetch is a per-event
+    // observation, so it never falsely dedups when content is exploded by hash.
+    if !fetch_edges.is_empty()
+        && let Some(obj) = report_json.as_object_mut()
+    {
+        obj.insert(
+            "fetched".to_string(),
+            serde_json::to_value(&fetch_edges).unwrap_or_default(),
+        );
+    }
     // Parse the report once (with the needs of the general pass and every route),
     // then share it — each route differs only in which features it writes, not in
     // how the report is summarized. The same union covers embedded members below.
@@ -1790,6 +1827,8 @@ pub(crate) fn process_report(
         Some(100),
         &tiny_opts_for(config),
         config.interpret(),
+        path,
+        config.fetch_policy(),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

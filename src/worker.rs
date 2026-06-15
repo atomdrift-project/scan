@@ -482,6 +482,8 @@ fn load_model_resources(
         shap,
         ctx,
         interpret,
+        // The worker/validate path classifies a fixed corpus; never fetch.
+        fetch: crate::fetch::FetchPolicy::default(),
     }))
 }
 

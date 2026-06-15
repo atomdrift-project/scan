@@ -101,6 +101,8 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         None,
                         &cleave::output::TinyOpts::tiny(),
                         None, // validation corpus never calls the LLM
+                        &path,
+                        crate::fetch::FetchPolicy::default(),
                     )
                 });
             (path, result)
