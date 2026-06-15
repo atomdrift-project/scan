@@ -1183,6 +1183,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         tracing::info!(target_depth, "FIFO dispatch (SCAN_SJF=0)");
     }
 
+    // Poll telemetry shared between the prefetcher (writer) and the heartbeat
+    // task (reader) so a check-in can report why the worker is/isn't claiming.
+    let poll_state = Arc::new(PollState::default());
+
     tokio::spawn(
         Prefetcher {
             client: client.clone(),
@@ -1196,6 +1200,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             poll_secs,
             target_depth,
             metrics: Arc::clone(&metrics),
+            poll_state: Arc::clone(&poll_state),
             exit_if_empty,
         }
         .run(
@@ -1465,6 +1470,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let semaphore = Arc::clone(&semaphore);
         let metrics = Arc::clone(&metrics);
         let shutdown = Arc::clone(&shutdown);
+        let admission = Arc::clone(&admission);
+        let poll_state = Arc::clone(&poll_state);
+        const MIB: u64 = 1024 * 1024;
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 interruptible_sleep(HEARTBEAT_INTERVAL, &shutdown).await;
@@ -1475,6 +1483,16 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     slots,
                     active: slots.saturating_sub(semaphore.available_permits()),
                     queue: outstanding.load(Ordering::Acquire),
+                    mem_reserved_mb: admission.reserved_bytes() as u64 / MIB,
+                    mem_ceiling_mb: admission.ceiling_bytes() / MIB,
+                    poll_age_s: metrics
+                        .start
+                        .elapsed()
+                        .as_secs()
+                        .saturating_sub(poll_state.last_poll_secs.load(Ordering::Acquire)),
+                    last_want: poll_state.last_want.load(Ordering::Acquire),
+                    last_claim: poll_state.last_claim.load(Ordering::Acquire),
+                    buffer_room: poll_state.buffer_room.load(Ordering::Acquire),
                     metrics: metrics.snapshot(),
                 };
                 let url = heartbeat_url(&base_url, &encoded_name, &available_tools, &report);
@@ -1656,6 +1674,8 @@ struct Prefetcher {
     target_depth: usize,
     /// Shared metrics; the prefetcher stamps each sample's local-queue entry.
     metrics: Arc<WorkerMetrics>,
+    /// Poll telemetry surfaced on the heartbeat (last want/claim, buffer room).
+    poll_state: Arc<PollState>,
     /// Stop (closing the dispatch channel) when the hopper reports no work and
     /// the queue has drained — drives clean batch/benchmark termination.
     exit_if_empty: bool,
@@ -1713,6 +1733,9 @@ impl Prefetcher {
             let room = self
                 .target_depth
                 .saturating_sub(outstanding.load(Ordering::Acquire));
+            // Publish free buffer room every iteration: 0 here is the heartbeat's
+            // signal that the worker is saturated and deliberately not polling.
+            self.poll_state.buffer_room.store(room, Ordering::Release);
             let over_budget = queued_bytes.load(Ordering::Acquire) >= self.max_buffer_bytes;
             if room == 0 || over_budget {
                 interruptible_sleep(Duration::from_millis(100), &shutdown).await;
@@ -1723,8 +1746,14 @@ impl Prefetcher {
             // bounded; the depth fills over a few polls.
             let count = room.min(self.slots);
             let url = self.poll_url(count);
+            // Stamp the poll so the heartbeat can report poll age and want/claim.
+            self.poll_state
+                .last_poll_secs
+                .store(self.metrics.start.elapsed().as_secs(), Ordering::Release);
+            self.poll_state.last_want.store(count, Ordering::Release);
             match claim_jobs(&self.client, &url).await {
                 Ok(None) => {
+                    self.poll_state.last_claim.store(0, Ordering::Release);
                     consecutive_errors = 0;
                     // Batch/benchmark mode: once the hopper has no work AND the
                     // dispatch channel is drained (every claimed job picked up),
@@ -1741,6 +1770,9 @@ impl Prefetcher {
                     interruptible_sleep(Duration::from_secs(self.poll_secs), &shutdown).await;
                 }
                 Ok(Some(jobs)) => {
+                    self.poll_state
+                        .last_claim
+                        .store(jobs.len(), Ordering::Release);
                     consecutive_errors = 0;
                     outstanding.fetch_add(jobs.len(), Ordering::Release);
                     let mut set = tokio::task::JoinSet::new();
@@ -2476,6 +2508,24 @@ fn backoff_duration(consecutive_errors: u32) -> Duration {
 /// (traits, RSS, load, tools) but claims no work and adds the worker's own queue
 /// view: `active` running slots and `queue` staged-but-not-yet-dispatched jobs.
 /// Live counts plus a metrics snapshot for one heartbeat.
+/// Poll-side telemetry the prefetcher shares with the heartbeat task so a
+/// check-in can explain *why* a worker isn't claiming: how full its buffer is,
+/// what it last asked hopper for, what it got, and how long since it asked.
+#[derive(Default)]
+struct PollState {
+    /// `WorkerMetrics::start`-relative seconds of the last `/api/next` attempt.
+    /// A `poll_age` far past the poll cadence means the loop is wedged.
+    last_poll_secs: AtomicU64,
+    /// Jobs requested on the last poll.
+    last_want: AtomicUsize,
+    /// Jobs returned by the last poll (0 = hopper had nothing for this worker).
+    last_claim: AtomicUsize,
+    /// Free prefetch depth right now (`target_depth - outstanding`). 0 means the
+    /// buffer is full, so the prefetcher is deliberately not polling — the
+    /// signature of a worker saturated by slow jobs rather than starved.
+    buffer_room: AtomicUsize,
+}
+
 struct HeartbeatReport {
     /// Configured analysis slots.
     slots: usize,
@@ -2483,6 +2533,17 @@ struct HeartbeatReport {
     active: usize,
     /// Staged samples waiting for a free slot.
     queue: usize,
+    /// In-flight memory reservation held by the admission gate, in MiB.
+    mem_reserved_mb: u64,
+    /// Memory ceiling that throttles intake (resolved `--max-rss-gb`), in MiB;
+    /// 0 = gate disabled. This is the worker's RAM limit.
+    mem_ceiling_mb: u64,
+    /// Seconds since the prefetcher last polled `/api/next` (large = stalled).
+    poll_age_s: u64,
+    /// Jobs requested and returned on the last poll, and current free buffer room.
+    last_want: usize,
+    last_claim: usize,
+    buffer_room: usize,
     metrics: MetricsSnapshot,
 }
 
@@ -2531,6 +2592,15 @@ fn heartbeat_url(
         let trimmed: String = msg.chars().take(200).collect();
         url_encode_into(&trimmed, &mut url);
     }
+    // Admission / poll diagnostics: why the worker is (or isn't) claiming.
+    // mem_ceiling_mb is the RAM limit that throttles intake; buffer_room=0 with
+    // a large poll_age_s means it's saturated by slow jobs, not starved.
+    let _ = write!(url, "&mem_reserved_mb={}", report.mem_reserved_mb);
+    let _ = write!(url, "&mem_ceiling_mb={}", report.mem_ceiling_mb);
+    let _ = write!(url, "&poll_age_s={}", report.poll_age_s);
+    let _ = write!(url, "&want={}", report.last_want);
+    let _ = write!(url, "&last_claim={}", report.last_claim);
+    let _ = write!(url, "&buffer_room={}", report.buffer_room);
     let _ = write!(url, "&tools=");
     url_encode_into(available_tools, &mut url);
     url
@@ -2880,6 +2950,7 @@ mod tests {
                 poll_secs: 1,
                 target_depth,
                 metrics: Arc::new(WorkerMetrics::new()),
+                poll_state: Arc::new(PollState::default()),
                 exit_if_empty: false,
             }
             .run(

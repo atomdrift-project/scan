@@ -128,6 +128,19 @@ impl MemoryAdmission {
 
     /// Acquire admission, awaiting free memory asynchronously (worker dispatch
     /// loop). The returned guard releases the reservation on drop. `on_disk_bytes`
+    /// Current sum of in-flight memory reservations, in bytes. Surfaced on the
+    /// worker heartbeat so hopper can see how close to the ceiling a worker is
+    /// running (and thus whether memory admission is about to pause intake).
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved.load(Ordering::Acquire)
+    }
+
+    /// Configured memory ceiling in bytes — the resolved `--max-rss-gb` that
+    /// throttles intake. `0` means the gate is disabled (slot-limited only).
+    pub fn ceiling_bytes(&self) -> u64 {
+        self.ceiling_bytes
+    }
+
     /// is the hopper-reported size, recorded only for the per-slot diagnostics.
     pub async fn admit(
         self: &Arc<Self>,
