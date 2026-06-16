@@ -193,19 +193,19 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # Local cleave: scan consumes the per-file `filefacts.references` it surfaces
 # (FilefactsView) to drive fletch fetching, before that change is published.
 # Remove once a cleave release carries it.
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
+#[patch."https://codeberg.org/atomdrift/cleave.git"]
+#cleave = { path = "../cleave" }
 
 # fletch uses `../filefacts` by path; cleave pulls filefacts via git. A built
 # crate's own `[patch]` table is ignored when it is a dependency, so the whole
 # graph (cleave + fletch) must be steered to ONE filefacts here, or the shared
 # `filefacts::ExternalRef` type fails to unify across the two. stng follows for
 # the same reason (the local filefacts depends on the unreleased local stng).
-[patch."https://codeberg.org/atomdrift/filefacts.git"]
-filefacts = { path = "../filefacts" }
+#[patch."https://codeberg.org/atomdrift/filefacts.git"]
+#filefacts = { path = "../filefacts" }
 
-[patch."https://codeberg.org/atomdrift/stng.git"]
-stng = { path = "../stng" }
+#[patch."https://codeberg.org/atomdrift/stng.git"]
+#stng = { path = "../stng" }
 
 
 
