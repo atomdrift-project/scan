@@ -140,6 +140,7 @@
 //! ever returns Benign or Hostile.
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -1947,6 +1948,12 @@ fn load_specialists(
         }
     };
 
+    // Pass 1 (serial, cheap): enumerate the directory and apply the
+    // config-gating filter. Building each specialist's runnable tract plan is
+    // the expensive part — defer it to pass 2 so the per-route `into_optimized`
+    // work can run in parallel rather than serializing the whole zoo (~30
+    // routes / 97 ONNX graphs) on the startup thread.
+    let mut pending: Vec<(PathBuf, String, Thresholds)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -1970,7 +1977,21 @@ fn load_specialists(
             skipped.insert(name);
             continue;
         }
-        match load_specialist(&path, &name, Some(route_t.unwrap_or_default())) {
+        pending.push((path, name, route_t.unwrap_or_default()));
+    }
+
+    // Pass 2 (parallel): load the gated bundles concurrently. Order is
+    // irrelevant — results land in a HashMap keyed by name.
+    let loaded: Vec<(String, Result<Route>)> = pending
+        .into_par_iter()
+        .map(|(path, name, route_t)| {
+            let route = load_specialist(&path, &name, Some(route_t));
+            (name, route)
+        })
+        .collect();
+
+    for (name, result) in loaded {
+        match result {
             Ok(route) => {
                 out.insert(name, route);
             }
@@ -2464,6 +2485,7 @@ impl Model {
         // Walk filegroups/<name>/ and filetypes/<name>/, loading each
         // specialist that exists. Specialists with ABI mismatch or bad spec
         // subset are dropped with a warning, not a hard failure.
+        let specialist_start = std::time::Instant::now();
         load_specialists(
             &model_dir.join("filegroups"),
             &ensemble_cfg.route_thresholds,
@@ -2479,6 +2501,12 @@ impl Model {
             "filetypes",
             &mut filetypes,
             &mut skipped_filetypes,
+        );
+        tracing::info!(
+            filegroups = filegroups.len(),
+            filetypes = filetypes.len(),
+            elapsed_ms = specialist_start.elapsed().as_millis(),
+            "loaded specialist routes",
         );
 
         // Required routes from config: any listed name that didn't load is
