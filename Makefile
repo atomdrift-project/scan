@@ -326,7 +326,7 @@ profile-slow:
 	$(CARGO) build --profile profiling
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
 	samply record --save-only --duration 20 -o /tmp/litmus-$(DATASET)-profile.json.gz -- \
-		env CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./target/profiling/$(BINARY) --slow-rule-ms "$(SLOW_RULE_MS)" -f json "$(BENCHMARK_PATH)"
+		env CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" CLEAVE_SKIP_YARA_CACHE=0 ./target/profiling/$(BINARY) --slow-rule-ms "$(SLOW_RULE_MS)" -f json "$(BENCHMARK_PATH)"
 
 # ----- cleave-tuna integration --------------------------------------------
 # Standardized targets that cleave-tuna drives. The naming mirrors cleave's
@@ -348,7 +348,7 @@ bench-build: $(OUT_DIR) ## Build benchmark binary (profiling profile, release + 
 sampled-benchmark: bench-build ## Benchmark with samply CPU profiling
 	@command -v samply >/dev/null 2>&1 || { echo "Error: samply not installed. Run: cargo install samply"; exit 1; }
 	@[ -e "$(TUNA_BENCH_PATH)" ] || { echo "error: benchmark path not found: $(TUNA_BENCH_PATH)"; exit 1; }
-	CLEAVE_SKIP_CACHE=1 samply record --save-only -o $(OUT_DIR)/bench.profile.json.gz -- \
+	CLEAVE_SKIP_CACHE=1 CLEAVE_SKIP_YARA_CACHE=0 samply record --save-only -o $(OUT_DIR)/bench.profile.json.gz -- \
 		$(OUT_DIR)/$(BINARY).bench --slow-rule-ms $(SLOW_RULE_MS) -f json $(TUNA_BENCH_PATH) \
 		>$(OUT_DIR)/bench.out 2>$(OUT_DIR)/bench.err
 	@echo "✓ Profile: $(OUT_DIR)/bench.profile.json.gz  Logs: $(OUT_DIR)/bench.err"
