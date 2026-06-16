@@ -63,8 +63,7 @@ repository = "https://codeberg.org/atomdrift/scan"
 cleave = { git = "https://codeberg.org/atomdrift/cleave.git", default-features = false }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
-# Path dependency: fletch is not yet published to a registry/remote.
-fletch = { path = "../fletch" }
+fletch = { git = "https://codeberg.org/atomdrift/fletch.git" }
 proclist = { git = "https://codeberg.org/atomdrift/proclist.git" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
