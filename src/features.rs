@@ -1980,7 +1980,7 @@ impl ParsedReport {
 
 impl FileSummary {
     fn new(file_entry: &serde_json::Value, needs: RawNeeds) -> Self {
-        let findings_raw: Vec<&serde_json::Value> = json_alias_array(file_entry, &["find", "ts"])
+        let findings_raw: Vec<&serde_json::Value> = json_alias_array(file_entry, &["traits", "find", "ts"])
             .map(|a| a.iter().collect())
             .unwrap_or_default();
         let findings = summarize_findings(&findings_raw);
@@ -2025,9 +2025,10 @@ impl FileSummary {
         // Resolve metrics: prefer v7 `fact.met`, fall back to v6 `ff.m`, then v4 top-level `ms`.
         // Matches `file_metrics` in collimator/src/collimator/features.py.
         let metrics_source = file_entry
-            .get("fact")
+            .get("facts")
+            .or_else(|| file_entry.get("fact"))
             .or_else(|| file_entry.get("ff"))
-            .and_then(|f| json_alias(f, &["met", "m"]))
+            .and_then(|f| json_alias(f, &["metrics", "met", "m"]))
             .filter(|v| v.is_object())
             .or_else(|| file_entry.get("ms"));
         let metrics: HashMap<String, HashMap<String, f64>> = metrics_source
@@ -2060,7 +2061,8 @@ impl FileSummary {
 
         // Imports: prefer v7 `fact.imp`, fall back to v6 `ff.i`, then v4 `is`.
         let imports_array = file_entry
-            .get("fact")
+            .get("facts")
+            .or_else(|| file_entry.get("fact"))
             .or_else(|| file_entry.get("ff"))
             .and_then(|f| json_alias(f, &["imp", "i"]))
             .and_then(|v| v.as_array())
@@ -2102,17 +2104,17 @@ impl FileSummary {
         // file_metrics/file_values/file_strings/file_imports).
         // Borrow the facts block (don't clone it whole) and clone out only the
         // subtrees whose feature family is active on this route.
-        let facts = file_entry.get("fact").or_else(|| file_entry.get("ff"));
+        let facts = file_entry.get("facts").or_else(|| file_entry.get("fact")).or_else(|| file_entry.get("ff"));
         let (raw_metrics, raw_values) = if needs.kv {
             (
                 facts
-                    .and_then(|f| json_alias(f, &["met", "m"]))
+                    .and_then(|f| json_alias(f, &["metrics", "met", "m"]))
                     .filter(|v| v.is_object())
                     .cloned()
                     .or_else(|| file_entry.get("ms").cloned())
                     .unwrap_or(serde_json::Value::Null),
                 facts
-                    .and_then(|f| json_alias(f, &["val", "v"]))
+                    .and_then(|f| json_alias(f, &["val", "v"]))  // val unchanged in v8
                     .filter(|v| v.is_object())
                     .cloned()
                     .or_else(|| file_entry.get("k").cloned())
@@ -3230,7 +3232,7 @@ fn canonical_fields_from_primary_file(file: Option<&serde_json::Value>) -> (Stri
 fn primary_file(report: &serde_json::Value) -> Option<&serde_json::Value> {
     json_alias_array(report, &["files", "fs"]).and_then(|files| {
         files.iter().find(|file| {
-            file.get("dp")
+            json_alias(file, &["depth", "dp"])
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0)
                 == 0
