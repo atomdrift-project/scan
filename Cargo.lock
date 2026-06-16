@@ -774,6 +774,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "2.0.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#70f309f06b040e1cc55a800f629aeda358e73e22"
 dependencies = [
  "aes 0.8.4",
  "aho-corasick",
@@ -862,6 +863,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#70f309f06b040e1cc55a800f629aeda358e73e22"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1592,6 +1594,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.0.1"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#7a08f950a60f715f8d8a23247c3047ea9fac6a9a"
 dependencies = [
  "aho-corasick",
  "bincode",
@@ -1705,6 +1708,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/fletch.git#4debcf721d76854d2e400b076c7b34bf4cff3464"
 dependencies = [
  "anyhow",
  "base64",
@@ -2500,9 +2504,9 @@ dependencies = [
 
 [[package]]
 name = "leb128"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cc46bac87ef8093eed6f272babb833b6443374399985ac8ed28471ee0918545"
+checksum = "c83bff1d572d6b9aeef67ddfc8448e4a3737909cb28e81f97c791b9018703e52"
 
 [[package]]
 name = "leb128fmt"
@@ -2751,6 +2755,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#70f309f06b040e1cc55a800f629aeda358e73e22"
 
 [[package]]
 name = "lzxd"
@@ -2770,6 +2775,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#70f309f06b040e1cc55a800f629aeda358e73e22"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -3569,6 +3575,7 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#70f309f06b040e1cc55a800f629aeda358e73e22"
 dependencies = [
  "flate2",
  "memchr",
@@ -4138,6 +4145,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#70f309f06b040e1cc55a800f629aeda358e73e22"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4527,6 +4535,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "1.6.2"
+source = "git+https://codeberg.org/atomdrift/stng.git#d3618380c759ed51ce1e68c781ba1172b9720cc8"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4652,6 +4661,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#70f309f06b040e1cc55a800f629aeda358e73e22"
 
 [[package]]
 name = "tap"
@@ -5342,6 +5352,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#7a08f950a60f715f8d8a23247c3047ea9fac6a9a"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -6604,8 +6615,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yansi"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
+
+[[package]]
 name = "yara-classify"
 version = "0.1.0"
+source = "git+https://codeberg.org/atomdrift/cleave.git#70f309f06b040e1cc55a800f629aeda358e73e22"
 
 [[package]]
 name = "yara-x"
@@ -6679,9 +6697,9 @@ dependencies = [
 
 [[package]]
 name = "yara-x-macros"
-version = "1.17.0"
+version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eff2e4994394cb743155ee2a560e19cbc42e8e829593a8c1faa02e3ddc897638"
+checksum = "f3ed838cfc6391f383db4b408ae65f0b113277222b6bb98a3baa29b5f34e3293"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -6709,12 +6727,16 @@ dependencies = [
 
 [[package]]
 name = "yara-x-proto"
-version = "1.17.0"
+version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dca87838f8e4179cad1266e4b833cc91ab4fe8414391557886df4d92dac018ef"
+checksum = "ca09c91e779d5c7ae2b384cc7761b10593e327c9f953d9789608eeca6d491c80"
 dependencies = [
+ "base64",
+ "chrono",
+ "itertools 0.14.0",
  "protobuf",
  "protobuf-codegen",
+ "yansi",
 ]
 
 [[package]]
