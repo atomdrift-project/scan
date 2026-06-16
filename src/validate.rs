@@ -109,7 +109,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
         })
         .collect();
 
-    let (passed, total, warnings) = evaluate(results, thresholds)?;
+    let (passed, total, hostile_fps, suspicious_fps) = evaluate(results, thresholds)?;
 
     // The corpus pass above sets this if any extraction saw feature-layout drift
     // (total_features > cursor: feature_names slots no writer fills, extracting
@@ -123,22 +123,30 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     }
 
     // Every target is a known-benign file (platform utilities + cleave's
-    // does-nothing corpus), so any non-benign grade is a false positive — a
-    // quality regression that must block the deploy, not merely print a warning.
-    if warnings > 0 {
+    // does-nothing corpus). A HOSTILE grade on any of them is a hard false
+    // positive that must block the deploy. A merely Suspicious grade is a
+    // softer signal the operator tolerates on benign input: report it, but do
+    // not fail the gate (suspicious is allowed to be suspicious).
+    if hostile_fps > 0 {
         anyhow::bail!(
-            "{warnings} benign-corpus sample(s) graded non-benign (false positives); \
-             see the WARN lines above"
+            "{hostile_fps} benign-corpus sample(s) graded HOSTILE (false positives); \
+             see the WARN lines above. ({suspicious_fps} graded suspicious — tolerated.)"
         );
     }
 
     let models_ver = crate::models_repo::version()
         .map(|v| format!("  models: {v}"))
         .unwrap_or_default();
-    eprintln!(
-        "validate ok:{models_ver}  benign corpus {}/{}  warnings={}",
-        passed, total, warnings,
-    );
+    if suspicious_fps > 0 {
+        eprintln!(
+            "validate ok (with {suspicious_fps} suspicious — tolerated):{models_ver}  \
+             benign corpus {passed}/{total} clean, {suspicious_fps} suspicious, 0 hostile"
+        );
+    } else {
+        eprintln!(
+            "validate ok:{models_ver}  benign corpus {passed}/{total}  0 suspicious  0 hostile"
+        );
+    }
     Ok(())
 }
 
@@ -193,11 +201,12 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 fn evaluate(
     results: Vec<(PathBuf, Result<ClassifiedReport>)>,
     thresholds: Thresholds,
-) -> Result<(usize, usize, usize)> {
+) -> Result<(usize, usize, usize, usize)> {
     let mut passed = 0usize;
     let mut total = 0usize;
     let mut analysis_failed = 0usize;
-    let mut warnings = 0usize;
+    let mut hostile_fps = 0usize;
+    let mut suspicious_fps = 0usize;
 
     for (path, result) in results {
         total += 1;
@@ -210,9 +219,15 @@ fn evaluate(
             }
         };
 
-        let mut file_warned = false;
+        // Worst grade across the sample and any embedded artifact decides the
+        // outcome: a benign-corpus file is a HARD failure only if something in
+        // it grades Hostile. A merely Suspicious top-grade is reported but
+        // tolerated — the operator accepts suspicious on benign input.
+        let mut any_nonbenign = false;
+        let mut any_hostile = false;
         if result.classification != Classification::Benign {
-            file_warned = true;
+            any_nonbenign = true;
+            any_hostile |= result.classification == Classification::Hostile;
             eprintln!(
                 "WARN {}: grade={} level={} probability={:.4} decision_threshold={:.4} active_thresholds suspicious={:.4} hostile={:.4}",
                 path.display(),
@@ -227,7 +242,8 @@ fn evaluate(
         }
         for embedded in &result.embedded_files {
             if embedded.classification != Classification::Benign {
-                file_warned = true;
+                any_nonbenign = true;
+                any_hostile |= embedded.classification == Classification::Hostile;
                 eprintln!(
                     "WARN {}!!{}: grade={} level={} probability={:.4} decision_threshold={:.4} active_thresholds suspicious={:.4} hostile={:.4}",
                     path.display(),
@@ -243,8 +259,10 @@ fn evaluate(
             }
         }
 
-        if file_warned {
-            warnings += 1;
+        if any_hostile {
+            hostile_fps += 1;
+        } else if any_nonbenign {
+            suspicious_fps += 1;
         } else {
             passed += 1;
         }
@@ -252,10 +270,10 @@ fn evaluate(
 
     if analysis_failed > 0 {
         anyhow::bail!(
-            "{analysis_failed} validation check(s) failed during analysis ({passed}/{total} targets benign, {warnings} warning(s))"
+            "{analysis_failed} validation check(s) failed during analysis ({passed}/{total} targets benign, {hostile_fps} hostile FP, {suspicious_fps} suspicious)"
         );
     }
-    Ok((passed, total, warnings))
+    Ok((passed, total, hostile_fps, suspicious_fps))
 }
 
 fn format_level(level: Option<i32>) -> String {

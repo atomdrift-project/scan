@@ -1214,6 +1214,13 @@ fn emit_result(
                 return;
             };
             let _ = out.write_all(r.rendered_context.as_bytes());
+            // `--extra`: append the full ML diagnostics that explain the grade —
+            // which route drove it and the top SHAP features behind it. The
+            // terminal view's cleave body only shows static findings; route
+            // scores + reasons are computed but were previously dropped here.
+            if config.extra() {
+                write_extra_diagnostics(&mut *out, r);
+            }
         }
         // `--format tiny` prefixes the machine verdict line, never colored.
         OutputFormat::Tiny => {
@@ -1241,6 +1248,43 @@ pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
             full_context: false,
             header: cleave::output::HeaderStyle::Rich,
             ..cleave::output::TinyOpts::terminal()
+        }
+    }
+}
+
+/// Append full ML diagnostics (route scores + SHAP reasons) under the rendered
+/// context, for `--extra`. Shows which route drove the grade and the top SHAP
+/// features behind the top-level featurization. Embedded archive members list
+/// their route scores; per-member SHAP reasons are not computed (reasons exist
+/// only for the top-level file), so to attribute an embedded hit, scan the
+/// extracted member directly — it then becomes the top-level file.
+pub(crate) fn write_extra_diagnostics(out: &mut dyn std::io::Write, r: &ScanResult) {
+    if !r.model_scores.is_empty() {
+        let _ = writeln!(
+            out,
+            "  routes (raw): {}",
+            crate::output::format_route_scores(&r.model_scores),
+        );
+    }
+    if !r.reasons.is_empty() {
+        let _ = writeln!(out, "  shap (top features by importance):");
+        for reason in r.reasons.iter().take(12) {
+            let _ = writeln!(
+                out,
+                "    imp={:.4} val={:.4}  {}  [{}]",
+                reason.importance, reason.value, reason.feature, reason.description,
+            );
+        }
+    }
+    for ef in &r.embedded_files {
+        if !ef.model_scores.is_empty() {
+            let _ = writeln!(
+                out,
+                "  embedded {} ({}): routes (raw) {}",
+                ef.path,
+                ef.file_type,
+                crate::output::format_route_scores(&ef.model_scores),
+            );
         }
     }
 }

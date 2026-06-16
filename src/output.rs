@@ -518,7 +518,7 @@ fn print_reasons(result: &ScanResult, p: &Palette) {
 /// confident the model really was — the raw score preserves that resolution.
 /// Per-route verdicts are intentionally omitted: blend-driven routes have no
 /// individually-attributable classification (see `policy_route_class`).
-fn format_route_scores(scores: &[RouteScore]) -> String {
+pub(crate) fn format_route_scores(scores: &[RouteScore]) -> String {
     scores
         .iter()
         .map(|s| format!("{}={:.6}", s.model, s.raw))
