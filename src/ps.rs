@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -138,7 +138,24 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         group.deleted |= deleted;
     }
 
-    let groups: Vec<ProcessGroup> = by_sha.into_values().collect();
+    let mut groups: Vec<ProcessGroup> = by_sha.into_values().collect();
+    // Optional cap for fast iteration / benchmarking: `SCAN_PS_LIMIT=N` scans
+    // only the first N unique binaries. Sorted by path first so the chosen
+    // subset is stable across runs (modulo which processes are alive at the
+    // time), which keeps before/after timings comparable. Unset = scan all.
+    if let Some(limit) = std::env::var("SCAN_PS_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        groups.sort_by(|a, b| a.path.cmp(&b.path));
+        groups.truncate(limit);
+        tracing::info!(
+            limit,
+            kept = groups.len(),
+            "SCAN_PS_LIMIT active — scanning first {limit} unique binaries (path-sorted)"
+        );
+    }
+    let groups = groups;
     let total = u32::try_from(groups.len()).unwrap_or(u32::MAX);
 
     if is_terminal {
@@ -180,15 +197,17 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         None
     };
 
-    let mut hostile = 0u32;
-    let mut suspicious = 0u32;
-    let mut benign = 0u32;
-    let mut errors = hash_errors;
+    let hostile = AtomicU32::new(0);
+    let suspicious = AtomicU32::new(0);
+    let benign = AtomicU32::new(0);
+    let errors = AtomicU32::new(hash_errors);
 
+    // Map each scan path back to its process group for PID annotation. Deleted
+    // binaries that aren't scannable are counted as errors here and omitted.
+    let mut scan_paths: Vec<PathBuf> = Vec::with_capacity(groups.len());
+    let mut by_scan_path: HashMap<PathBuf, &ProcessGroup> =
+        HashMap::with_capacity(groups.len());
     for group in &groups {
-        if cancellation.load(Ordering::Relaxed) {
-            break;
-        }
         let scan_path = if group.deleted && !group.path.exists() {
             // On Linux, try scanning via /proc/pid/exe.
             #[cfg(target_os = "linux")]
@@ -202,22 +221,36 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                     group.path.display(),
                     group.pids
                 );
-                errors += 1;
+                errors.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         } else {
             group.path.clone()
         };
+        by_scan_path.insert(scan_path.clone(), group);
+        scan_paths.push(scan_path);
+    }
 
-        let report = match cleave::analyze_file(&scan_path, &cleave_opts) {
+    // Analyze the unique binaries through cleave's batch API: it loads the
+    // CapabilityMapper + YARA engine once and fans the files out across a single
+    // rayon pass. A hand-rolled `par_iter` over the single-file `analyze_file`
+    // instead nests rayon inside rayon — each file's inner parallelism multiplied
+    // by the outer fan-out oversubscribed the pool and ran *slower* than serial
+    // (measured: 2.8× util, 3× the CPU). Verdict order in the output stream is
+    // now completion order, which JSON/terminal consumers already tolerate.
+    let analyze = |scan_path: &std::path::Path, result: Result<cleave::AnalysisReport>| {
+        let Some(group) = by_scan_path.get(scan_path) else {
+            return;
+        };
+        let report = match result {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("error analyzing {}: {e}", group.path.display());
-                errors += 1;
+                errors.fetch_add(1, Ordering::Relaxed);
                 if let Some(p) = &progress {
                     p.increment();
                 }
-                continue;
+                return;
             }
         };
 
@@ -237,10 +270,10 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         ) {
             Ok(result) => {
                 match result.classification {
-                    Classification::Hostile => hostile += 1,
-                    Classification::Suspicious => suspicious += 1,
-                    Classification::Benign => benign += 1,
-                }
+                    Classification::Hostile => hostile.fetch_add(1, Ordering::Relaxed),
+                    Classification::Suspicious => suspicious.fetch_add(1, Ordering::Relaxed),
+                    Classification::Benign => benign.fetch_add(1, Ordering::Relaxed),
+                };
                 if config.format() == OutputFormat::Json
                     || config.filter().shows(&result.classification)
                 {
@@ -259,10 +292,21 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
             }
             Err(e) => {
                 tracing::warn!("error processing {}: {e}", group.path.display());
-                errors += 1;
+                errors.fetch_add(1, Ordering::Relaxed);
             }
         }
-    }
+    };
+
+    cleave::scan_files(&scan_paths, &cleave_opts, |event| {
+        if let cleave::ScanEvent::File { path, result } = event {
+            analyze(&path, *result);
+        }
+    })?;
+
+    let hostile = hostile.load(Ordering::Relaxed);
+    let suspicious = suspicious.load(Ordering::Relaxed);
+    let benign = benign.load(Ordering::Relaxed);
+    let errors = errors.load(Ordering::Relaxed);
 
     if let Some(p) = &progress {
         p.finish();
