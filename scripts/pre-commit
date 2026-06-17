@@ -1,0 +1,43 @@
+#!/bin/sh
+# Pre-commit gate for atomdrift-scan. Install with `make install-precommit`.
+#
+# Refuses the commit unless:
+#   1. Cargo.toml has no active local path overrides ([patch] entries pointing
+#      at a sibling checkout via `path = "../..."`). These build against an
+#      unpublished local crate and must never be committed.
+#   2. `make lint` passes (clippy with -D warnings).
+#   3. `make test` passes.
+#   4. `ascan validate` exits cleanly (model loads, benign corpus stays benign).
+#
+# Bypass intentionally with `git commit --no-verify`.
+
+set -e
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# 1. Reject uncommented `path = "../..."` overrides in Cargo.toml. The active
+# wasmtime [patch] uses a git source, so only a relative path = ".." is flagged.
+if grep -nE '^[[:space:]]*[^#].*path[[:space:]]*=[[:space:]]*"\.\.' Cargo.toml; then
+	echo "pre-commit: refusing commit — Cargo.toml has a local path override (shown above)." >&2
+	echo "Comment it out before committing, or bypass with: git commit --no-verify" >&2
+	exit 1
+fi
+
+echo "pre-commit: running make lint..."
+make lint
+
+echo "pre-commit: running make test..."
+make test
+
+# 4. Build the CLI and run `ascan validate`. This loads the deployed model and
+# verifies the benign corpus stays benign — a degraded or drifted bundle, or a
+# feature-extraction regression, must not slip through. set -e aborts the commit
+# on a non-zero exit.
+echo "pre-commit: building ascan..."
+cargo build --bin ascan
+
+echo "pre-commit: running ascan validate..."
+target/debug/ascan validate
+
+echo "pre-commit: all checks passed."
