@@ -1,10 +1,11 @@
 #!/bin/sh
 # deploy-workers.sh - Redeploy the Atomdrift Scan worker pool, one node at a time.
 #
-# For each worker node, over SSH:
-#     cd scan && git pull && make stop-worker && make deploy-worker URL=<url>
-# The hopper node is redeployed instead with:
+# The hopper node is redeployed FIRST, over SSH:
 #     cd hopper && git pull && make deploy
+# so the fresh queue server is up before the workers reconnect to it. Then each
+# worker node, over SSH:
+#     cd scan && git pull && make stop-worker && make deploy-worker URL=<url>
 #
 # Nodes are processed strictly sequentially (never in parallel) because each
 # SSH login needs a YubiKey touch — overlapping logins would race the token.
@@ -57,15 +58,15 @@ run_node() {
 	results="$results $host:$status:${elapsed}s"
 }
 
-# Workers, in the given order.
+# Hopper first: bring up the fresh queue server before the workers reconnect.
+run_node "$HOPPER_NODE" "hopper redeploy" \
+	"cd hopper && git pull && make deploy"
+
+# Then the workers, in the given order.
 for node in $WORKER_NODES; do
 	run_node "$node" "worker redeploy" \
 		"cd scan && git pull && make stop-worker && make deploy-worker URL=$URL"
 done
-
-# Hopper last.
-run_node "$HOPPER_NODE" "hopper redeploy" \
-	"cd hopper && git pull && make deploy"
 
 # Summary.
 printf '\n%-16s %-8s %s\n' "NODE" "STATUS" "DURATION"

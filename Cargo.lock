@@ -288,6 +288,7 @@ dependencies = [
  "ctrlc",
  "dashmap",
  "dirs",
+ "filefacts",
  "fletch",
  "hostname",
  "libc",
@@ -1594,7 +1595,6 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.0.1"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#7f6b7fc3a6b274e6969fe91d51ac44e1bd7cb0d7"
 dependencies = [
  "aho-corasick",
  "bincode",
@@ -4535,7 +4535,6 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "1.6.2"
-source = "git+https://codeberg.org/atomdrift/stng.git#56b01150884ebdab2fab445df86240e0480a327e"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5352,7 +5351,6 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#7f6b7fc3a6b274e6969fe91d51ac44e1bd7cb0d7"
 dependencies = [
  "cc",
  "tree-sitter",

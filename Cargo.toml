@@ -65,6 +65,10 @@ cleave = { git = "https://codeberg.org/atomdrift/cleave.git", default-features =
 # pull staged payloads and supply-chain dependencies into the same report.
 fletch = { git = "https://codeberg.org/atomdrift/fletch.git" }
 proclist = { git = "https://codeberg.org/atomdrift/proclist.git" }
+# Direct handle on filefacts (already in the graph via cleave/fletch) so the
+# `ps` subcommand can tune rizin for low-latency live-process scanning:
+# native-arch-only, a tighter timeout, and a size gate on giant binaries.
+filefacts = { git = "https://codeberg.org/atomdrift/filefacts.git" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -192,6 +196,10 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # Local cleave: scan consumes the per-file `filefacts.references` it surfaces
 # (FilefactsView) to drive fletch fetching, before that change is published.
 # Remove once a cleave release carries it.
+# NOTE: cleave intentionally stays on git — local ../cleave is out of sync with
+# this scan's API (CompactTrait.src/sources). Only filefacts is patched local,
+# for the rizin tuning below; my additions are backward-compatible so git cleave
+# consumes the local filefacts fine.
 #[patch."https://codeberg.org/atomdrift/cleave.git"]
 #cleave = { path = "../cleave" }
 
@@ -200,11 +208,11 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # graph (cleave + fletch) must be steered to ONE filefacts here, or the shared
 # `filefacts::ExternalRef` type fails to unify across the two. stng follows for
 # the same reason (the local filefacts depends on the unreleased local stng).
-#[patch."https://codeberg.org/atomdrift/filefacts.git"]
-#filefacts = { path = "../filefacts" }
+[patch."https://codeberg.org/atomdrift/filefacts.git"]
+filefacts = { path = "../filefacts" }
 
-#[patch."https://codeberg.org/atomdrift/stng.git"]
-#stng = { path = "../stng" }
+[patch."https://codeberg.org/atomdrift/stng.git"]
+stng = { path = "../stng" }
 
 
 
