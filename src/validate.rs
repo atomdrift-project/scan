@@ -65,7 +65,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     let targets = collect_targets()?;
 
     let cleave_output =
-        cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None)
+        cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None, false)
             .context("cleave validate")?;
     print!("{cleave_output}");
 
