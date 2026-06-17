@@ -3480,7 +3480,7 @@ fn write_structural_features(
         "struct:no_imports",
         f32::from(import_candidates > 0 && importless_candidates == import_candidates),
     );
-    w.set("struct:no_findings", f32::from(filtered_finding_count == 0));
+    w.set("struct:zero_findings", f32::from(filtered_finding_count == 0));
     w.set(
         "struct:finding_count_log",
         (filtered_finding_count as f32 + 1.0).ln(),
