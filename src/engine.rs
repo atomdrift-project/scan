@@ -2028,8 +2028,8 @@ pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
 }
 
 /// Verify every cross-reference in the compact report resolves to an emitted
-/// file. An inherited finding's `src` and a composite's `srcs[].f` both index
-/// into `files[]`; if a member is ever dropped or renumbered without remapping
+/// file. A finding's `from[].file` entries index into `files[]`; if a member is
+/// ever dropped or renumbered without remapping
 /// these, the index dangles and the trait renders downstream (hopper/prism) with
 /// no file context — the silent defect that left older reports with orphaned
 /// composites. We can't repair it here, but a producer-side log turns it into a
@@ -2047,12 +2047,9 @@ fn validate_report_references(label: &str, report: &cleave::types::compact::Comp
     };
     for file in &report.files {
         for finding in &file.findings {
-            if let Some(src) = finding.src
-                && !ids.contains(&src)
-            {
-                note(&finding.id, src);
-            }
-            for s in &finding.sources {
+            // v8 merged the old `src` (inherited single source) and `sources[]`
+            // (cross-file composite members) into one `from: Vec<CompactSource>`.
+            for s in &finding.from {
                 if !ids.contains(&s.file) {
                     note(&finding.id, s.file);
                 }
