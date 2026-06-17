@@ -1010,6 +1010,51 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     Ok(summary)
 }
 
+/// Analyze in-memory bytes — a fetched artifact — exactly as a single local
+/// file: classify, render, and tally. `label` is the display path (the URL or
+/// PURL); `name` drives cleave's extension-based type detection. Powers the
+/// `pkg`/`url` subcommands. Honors `config`'s fetch policy, so the fetched
+/// package's own declared references are followed when `--fetch` is set.
+pub fn run_bytes(
+    label: &str,
+    name: &str,
+    bytes: Vec<u8>,
+    config: &ScanConfig,
+) -> Result<ScanSummary> {
+    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
+    let shap = ShapImportance::load(config.model_dir()).ok();
+    let ctx = ExtractContext::new(model.spec());
+    let cleave_opts = cleave::AnalysisOptions {
+        slow_rule_ms: config.slow_rule_ms(),
+        ..Default::default()
+    };
+    let is_terminal = matches!(config.format(), OutputFormat::Terminal);
+    let scan_start = Instant::now();
+    let tally = Tally::default();
+    let stdout = Mutex::new(std::io::stdout());
+
+    let report = cleave::analyze_bytes_owned(bytes, name, &cleave_opts)
+        .with_context(|| format!("cleave analysis of {label}"));
+    record_file_result(
+        Path::new(label),
+        report,
+        &ctx,
+        &model,
+        shap.as_ref(),
+        config,
+        None,
+        &tally,
+        &stdout,
+        None,
+    );
+
+    let summary = tally.summary(scan_start);
+    if is_terminal {
+        crate::output::print_summary(&summary);
+    }
+    Ok(summary)
+}
+
 /// Aggregate verdict counters shared across the parallel scan workers.
 #[derive(Default)]
 struct Tally {
@@ -1509,14 +1554,23 @@ pub(crate) fn classify_report(
     interpret: Option<&crate::interpret::InterpretConfig>,
     root_path: &Path,
     fetch: crate::fetch::FetchPolicy,
+    fetch_progress: bool,
 ) -> Result<ClassifiedReport> {
     report.finalize();
+    // The sha256s of the sample's own files, captured before fetching grafts any
+    // external payload onto report.files. The sample's own verdict is featurized
+    // from these alone (see `root_json` below): fetched content is external —
+    // reached via a reference — and may *escalate* the verdict through the
+    // per-file embedded path, but must never dilute the sample's own aggregate
+    // (a benign fetched dependency would otherwise mask a hostile manifest).
+    let own_shas: std::collections::HashSet<String> =
+        report.files.iter().map(|f| f.sha256.clone()).collect();
     // Fetch the external references the analysis surfaced and graft each payload
     // into report.files as a uniform node — after finalize() (which populates
     // files[] and the per-file declared references) and before featurization, so
     // fetched content feeds the verdict like any other file. Off unless the
     // policy selects a kind. The returned edges are attached to report_json below.
-    let fetch_edges = crate::fetch::orchestrate(&mut report, root_path, fetch);
+    let fetch_edges = crate::fetch::orchestrate(&mut report, root_path, fetch, fetch_progress);
     // Drop component/baseline traits no composite fired on before the report is
     // summarized, featurized, and posted. finalize() has already inherited and
     // re-evaluated composites up the whole archive/embedding chain, so stripping
@@ -1548,7 +1602,24 @@ pub(crate) fn classify_report(
     // then share it — each route differs only in which features it writes, not in
     // how the report is summarized. The same union covers embedded members below.
     let needs = ctx.raw_needs().union(model.route_needs_union());
-    let parsed = crate::features::ParsedReport::from_report(&report_json, needs);
+    // The sample's own decision featurizes its own files only. With nothing
+    // fetched this is the whole report; otherwise drop the grafted payloads so
+    // they can't dilute the aggregate (they still classify individually via the
+    // embedded path on the full `report_json`, where a hostile one elevates).
+    let root_json = if fetch_edges.is_empty() {
+        std::borrow::Cow::Borrowed(&report_json)
+    } else {
+        let mut rj = report_json.clone();
+        if let Some(files) = rj.get_mut("files").and_then(serde_json::Value::as_array_mut) {
+            files.retain(|f| {
+                f.get("sha")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| own_shas.contains(s))
+            });
+        }
+        std::borrow::Cow::Owned(rj)
+    };
+    let parsed = crate::features::ParsedReport::from_report(&root_json, needs);
     let mut raw_features = ctx.extract_from_parsed(&parsed);
     let nonzero = raw_features.iter().filter(|&&v| v != 0.0).count();
     let expected = model.spec().total_features();
@@ -1613,7 +1684,12 @@ pub(crate) fn classify_report(
     let embedded_iter = json_alias_array(&report_json, &["files", "fs"])
         .into_iter()
         .flatten()
-        .filter(|f| f["dp"].as_u64().unwrap_or(0) > 0);
+        .filter(|f| {
+            json_alias(f, &["depth", "dp"])
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+        });
     let embedded_entries: Vec<&serde_json::Value> = match embedded_file_limit {
         Some(limit) => embedded_iter.take(limit).collect(),
         None => embedded_iter.collect(),
@@ -1621,6 +1697,21 @@ pub(crate) fn classify_report(
 
     let mut embedded_files: Vec<EmbeddedFile> = Vec::with_capacity(embedded_entries.len());
     let mut max_decision: Decision = decision;
+
+    // Fetched payloads keyed by the sha of the content retrieved, with the
+    // declaring file + the byte the reference sits at. When the embedded pass
+    // classifies one of these hostile/suspicious, that verdict is pinned back
+    // onto the declaring manifest at the reference byte (below the loop).
+    let fetched_by_content: std::collections::HashMap<&str, (&str, Option<u64>, &str)> = fetch_edges
+        .iter()
+        .filter_map(|r| {
+            r.content_sha256
+                .as_deref()
+                .map(|c| (c, (r.source_sha256.as_str(), r.source_offset, r.locator.as_str())))
+        })
+        .collect();
+    // (declaring sha, reference offset, dependency locator, confirmed class).
+    let mut dep_backrefs: Vec<(String, Option<u64>, String, Classification)> = Vec::new();
 
     for ef in &embedded_entries {
         if let Some(c) = cancellation
@@ -1656,6 +1747,24 @@ pub(crate) fn classify_report(
             ef["path"].as_str().unwrap_or(label),
         );
 
+        // A fetched dependency that classifies hostile/suspicious is pinned back
+        // onto the file that declared it (request: the manifest names the bad
+        // dependency at its byte). Keyed by content sha so it matches the
+        // retrieved payload node.
+        if matches!(
+            ef_decision.class,
+            Classification::Suspicious | Classification::Hostile
+        ) && let Some(sha) = ef["sha"].as_str()
+            && let Some(&(src_sha, src_off, locator)) = fetched_by_content.get(sha)
+        {
+            dep_backrefs.push((
+                src_sha.to_string(),
+                src_off,
+                locator.to_string(),
+                ef_decision.class,
+            ));
+        }
+
         let full_path = ef["path"].as_str().unwrap_or("");
         let rel_path = full_path
             .rsplit_once("!!")
@@ -1663,7 +1772,7 @@ pub(crate) fn classify_report(
             .unwrap_or(full_path)
             .to_string();
 
-        let ef_top_findings: Vec<TopFinding> = json_alias_array(ef, &["find", "ts"])
+        let ef_top_findings: Vec<TopFinding> = json_alias_array(ef, &["traits", "find", "ts"])
             .into_iter()
             .flatten()
             .filter(|ff| crit_ordinal(ff) >= 4)
@@ -1716,6 +1825,15 @@ pub(crate) fn classify_report(
     } else {
         decision
     };
+
+    // Pin each confirmed hostile/suspicious fetched dependency back onto the
+    // file that declared it, at the reference byte — so the manifest carries a
+    // citable trait naming the bad dependency, and prism's galaxy view can light
+    // the offending edge. Display/attribution only; the verdict was already
+    // elevated by the embedded pass above.
+    for (src_sha, src_off, locator, class) in &dep_backrefs {
+        inject_dependency_backref(&mut report_json, &report, src_sha, *src_off, locator, *class);
+    }
 
     let top_findings = extract_top_findings_from_json(&report_json, &final_decision.class);
 
@@ -1839,6 +1957,62 @@ pub(crate) fn classify_report(
     })
 }
 
+/// Pin a fetched dependency's verdict onto the file that declared it: push a
+/// synthetic trait onto the declaring file's compact entry, at the reference's
+/// byte span, naming the dependency and its class. The verdict was already
+/// elevated upstream; this is the citable back-reference (and the galaxy edge
+/// prism lights). The span length comes from the declared reference's evidence
+/// in the typed report; the offset is the reference site.
+fn inject_dependency_backref(
+    report_json: &mut serde_json::Value,
+    report: &cleave::AnalysisReport,
+    source_sha: &str,
+    source_offset: Option<u64>,
+    locator: &str,
+    class: Classification,
+) {
+    let (crit, word) = match class {
+        Classification::Hostile => (5u8, "hostile"),
+        _ => (4u8, "suspicious"),
+    };
+    let off = source_offset.unwrap_or(0);
+    let len = report
+        .files
+        .iter()
+        .find(|f| f.sha256 == source_sha)
+        .and_then(|f| f.filefacts.as_ref())
+        .and_then(|ff| ff.references.iter().find(|r| r.offset == off))
+        .map_or(1, |r| u64::try_from(r.evidence.len()).unwrap_or(u64::MAX));
+    // Friendly name: drop the `pkg:npm/` prefix and decode the `%40` scope.
+    let dep = locator
+        .strip_prefix("pkg:npm/")
+        .unwrap_or(locator)
+        .replace("%40", "@");
+    let new_trait = serde_json::json!({
+        "id": "fetch/dependency-verdict",
+        "crit": crit,
+        "desc": format!("Fetched dependency {dep} classified {word}"),
+        "spans": [[off, len]],
+    });
+    let Some(files) = report_json.get_mut("files").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for f in files {
+        if f.get("sha").and_then(serde_json::Value::as_str) != Some(source_sha) {
+            continue;
+        }
+        match f.get_mut("traits").and_then(serde_json::Value::as_array_mut) {
+            Some(traits) => traits.push(new_trait),
+            None => {
+                if let Some(obj) = f.as_object_mut() {
+                    obj.insert("traits".to_string(), serde_json::json!([new_trait]));
+                }
+            }
+        }
+        return;
+    }
+}
+
 /// Returns `true` when `candidate` should replace `current` as the dominant
 /// decision: higher class wins; on ties, higher probability wins.
 fn decision_outranks(candidate: &Decision, current: &Decision) -> bool {
@@ -1873,6 +2047,10 @@ pub(crate) fn process_report(
         config.interpret(),
         path,
         config.fetch_policy(),
+        // Render the live-vs-cache fetch log only on the interactive terminal
+        // path; JSON and tiny output stay machine-clean (the edges ride along in
+        // the JSON `fetched` array regardless).
+        matches!(config.format(), OutputFormat::Terminal),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
@@ -2126,8 +2304,7 @@ fn build_ml_files(
             .get("id")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(idx as u64);
-        let depth = entry
-            .get("dp")
+        let depth = json_alias(entry, &["depth", "dp"])
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         let file_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");

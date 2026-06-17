@@ -367,6 +367,7 @@ fn build_result(
         config.interpret(),
         display_path,
         config.fetch_policy(),
+        false, // ps emits machine-readable output; no interactive fetch log
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

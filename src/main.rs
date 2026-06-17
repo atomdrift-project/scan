@@ -272,6 +272,19 @@ enum Commands {
     #[command(alias = "host")]
     Sys,
 
+    /// Fetch a URL and scan the retrieved bytes
+    Url {
+        /// URL to fetch and scan (e.g. https://host/path/file)
+        url: String,
+    },
+
+    /// Fetch a package by PURL and scan it (e.g. pkg:npm/left-pad@1.3.0)
+    Pkg {
+        /// Package URL to resolve, fetch, and scan. A versionless PURL
+        /// (`pkg:npm/foo`) resolves to the registry's current release.
+        purl: String,
+    },
+
     /// Update models (and optionally cleave traits)
     UpdateRules {
         /// Only update models; skip cleave traits update
@@ -588,7 +601,14 @@ fn main() -> Result<()> {
     // The OSC color-scheme query blocks on a TTY response and hangs in any
     // environment that doesn't reply (SSH, some tmux configs, worker daemons).
     let needs_terminal_theme = cli.format == scan::OutputFormat::Terminal
-        && matches!(command, Commands::Fs { .. } | Commands::Ps | Commands::Sys);
+        && matches!(
+            command,
+            Commands::Fs { .. }
+                | Commands::Ps
+                | Commands::Sys
+                | Commands::Url { .. }
+                | Commands::Pkg { .. }
+        );
     if cli.light {
         scan::output::set_theme(scan::output::Theme::Light);
     } else if cli.dark {
@@ -642,6 +662,8 @@ fn main() -> Result<()> {
         Commands::Fs { .. }
             | Commands::Ps
             | Commands::Sys
+            | Commands::Url { .. }
+            | Commands::Pkg { .. }
             | Commands::Validate { .. }
             | Commands::Serve { .. }
             | Commands::Worker { .. }
@@ -657,6 +679,8 @@ fn main() -> Result<()> {
         Commands::Fs { .. }
             | Commands::Ps
             | Commands::Sys
+            | Commands::Url { .. }
+            | Commands::Pkg { .. }
             | Commands::Version
             | Commands::UpdateRules { .. }
     ) {
@@ -772,6 +796,40 @@ fn main() -> Result<()> {
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy);
             exit_for_summary(&scan::ps::run(&config)?);
+        }
+        Commands::Url { url } => {
+            let model_dir = resolve_model_dir()?;
+            let envelope_level = resolve_envelope_level(&model_dir);
+            let thresholds = threshold_overrides();
+            let config = scan::ScanConfig::new(
+                model_dir,
+                cli.format,
+                thresholds,
+                filter,
+                cli.slow_rule_ms,
+                cli.extra,
+            )?
+            .with_level(envelope_level)
+            .with_interpret(interpret_cfg.clone())
+            .with_fetch(fetch_policy);
+            exit_for_summary(&scan::pkg::run_url(&url, &config)?);
+        }
+        Commands::Pkg { purl } => {
+            let model_dir = resolve_model_dir()?;
+            let envelope_level = resolve_envelope_level(&model_dir);
+            let thresholds = threshold_overrides();
+            let config = scan::ScanConfig::new(
+                model_dir,
+                cli.format,
+                thresholds,
+                filter,
+                cli.slow_rule_ms,
+                cli.extra,
+            )?
+            .with_level(envelope_level)
+            .with_interpret(interpret_cfg.clone())
+            .with_fetch(fetch_policy);
+            exit_for_summary(&scan::pkg::run_pkg(&purl, &config)?);
         }
         Commands::Serve {
             bind,

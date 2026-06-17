@@ -203,11 +203,19 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 #[patch."https://codeberg.org/atomdrift/cleave.git"]
 #cleave = { path = "../cleave" }
 
-# fletch uses `../filefacts` by path; cleave pulls filefacts via git. A built
-# crate's own `[patch]` table is ignored when it is a dependency, so the whole
-# graph (cleave + fletch) must be steered to ONE filefacts here, or the shared
-# `filefacts::ExternalRef` type fails to unify across the two. stng follows for
-# the same reason (the local filefacts depends on the unreleased local stng).
+# Local filefacts + fletch: scan drives fetching off the package.json
+# dependencies filefacts now emits and fletch's registry resolution of an
+# unversioned npm PURL to the current release, before either change is
+# published. A built crate's own `[patch]` table is ignored when it is a
+# dependency, so the whole graph (cleave + fletch) must be steered to ONE
+# filefacts here, or the shared `filefacts::ExternalRef` type fails to unify
+# across the two. stng follows for the same reason (the local filefacts depends
+# on the unreleased local stng). cleave stays on git — local ../cleave is out of
+# sync with this scan's API; my filefacts additions are backward-compatible, so
+# git cleave consumes the local filefacts fine. Remove once releases carry these.
+#[patch."https://codeberg.org/atomdrift/fletch.git"]
+#fletch = { path = "../fletch" }
+
 #[patch."https://codeberg.org/atomdrift/filefacts.git"]
 #filefacts = { path = "../filefacts" }
 

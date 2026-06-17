@@ -1026,6 +1026,7 @@ fn finish_classify(
         // operator enabled it. `label` is a best-effort path for that hunt.
         std::path::Path::new(label),
         resources.fetch,
+        false, // server returns JSON; the fetch log would corrupt structured logs
     )?;
 
     Ok(scan_result_from(label, cr, resources))

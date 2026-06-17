@@ -32,8 +32,10 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use cleave::{AnalysisOptions, AnalysisReport};
-use fletch::fetch::{BlobCache, FetchBudget, FetchRecord, HttpFetch, Outcome, fetch_references};
-use fletch::{ExternalRef, RefLocator, find};
+use fletch::fetch::{
+    BlobCache, FetchBudget, FetchRecord, HttpFetch, Outcome, fetch_ref, fetch_references,
+};
+use fletch::{ExternalRef, RefKind, RefLocator, find};
 
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
@@ -140,6 +142,7 @@ pub(crate) fn orchestrate(
     report: &mut AnalysisReport,
     root_path: &Path,
     policy: FetchPolicy,
+    progress: bool,
 ) -> Vec<FetchRecord> {
     if !policy.enabled() {
         return Vec::new();
@@ -161,6 +164,10 @@ pub(crate) fn orchestrate(
     // Hop 0's work-list: declared references from every file in the report plus
     // fletch's imperative discovery over the root sample's bytes. Each later hop
     // works from the references found *inside* the previous hop's payloads.
+    // Whether the "fetching external references" header has been emitted — it is
+    // printed lazily before the first fetched record so a run that fetches
+    // nothing (everything filtered out) stays silent.
+    let mut header_printed = false;
     let mut worklist = collect_references(report, root_path);
     for _hop in 0..policy.depth {
         if worklist.is_empty() {
@@ -201,13 +208,171 @@ pub(crate) fn orchestrate(
             budget.max_count = budget.max_count.saturating_sub(spent);
             budget.max_bytes = budget.max_bytes.saturating_sub(bytes);
             for rec in &fetched {
+                if progress {
+                    if !header_printed {
+                        eprintln!(
+                            "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
+                        );
+                        header_printed = true;
+                    }
+                    report_fetch(rec);
+                }
                 next.extend(graft(report, rec, &res.cache, &opts));
             }
             records.extend(fetched);
         }
         worklist = next;
     }
+    if header_printed {
+        report_summary(&records);
+    }
     records
+}
+
+/// Fetch a single external reference — a `pkg:` PURL or a URL — and return its
+/// bytes, a filename for cleave's type detection, and the fetch record. Powers
+/// the `pkg`/`url` subcommands: one artifact, pulled and handed to the scanner.
+/// On a terminal (`progress`), logs the live/cache outcome and resolved URL,
+/// matching `--fetch`. Errors if the client/cache is unavailable or nothing was
+/// retrieved (unresolved, failed, skipped).
+pub fn fetch_one(
+    locator: RefLocator,
+    progress: bool,
+) -> anyhow::Result<(Vec<u8>, String, FetchRecord)> {
+    let Some(res) = shared_resources() else {
+        anyhow::bail!("fetch unavailable: HTTP client or blob cache could not be initialized");
+    };
+    let kind = match &locator {
+        RefLocator::Purl(_) => RefKind::Dependency,
+        RefLocator::Url(_) => RefKind::UrlFetch,
+    };
+    let reference = ExternalRef {
+        locator,
+        kind,
+        source: "cli".to_string(),
+        evidence: String::new(),
+        offset: 0,
+        pinned_hash: None,
+        content_sha256: None,
+    };
+    let rec = fetch_ref(&reference, &res.net, &res.cache);
+    if progress {
+        eprintln!(
+            "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching\x1b[0m"
+        );
+        report_fetch(&rec);
+    }
+    if !matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
+        let target = if rec.resolved_url.is_empty() {
+            rec.locator.as_str()
+        } else {
+            rec.resolved_url.as_str()
+        };
+        anyhow::bail!("fetch retrieved nothing for {target}: {:?}", rec.outcome);
+    }
+    let bytes = res
+        .cache
+        .load(&rec.locator)
+        .ok_or_else(|| anyhow::anyhow!("fetched content for {} not in cache", rec.locator))?;
+    let name = payload_name(&rec);
+    Ok((bytes, name, rec))
+}
+
+/// Render one fetched reference to stderr, distinguishing a live network fetch
+/// from a cache hit and naming the actual URL that was (or would be) retrieved.
+/// Only the interactive terminal path passes `progress`; JSON/server callers
+/// stay silent. Colors mirror the scan progress bar's truecolor palette.
+fn report_fetch(rec: &FetchRecord) {
+    // (glyph, label, r, g, b, detail) — detail replaces the size column when a
+    // fetch never delivered bytes (a failure or a skip).
+    let (glyph, label, r, g, b, detail) = match &rec.outcome {
+        Outcome::PinMismatch => {
+            ('\u{2716}', "pin!", 255, 90, 90, Some("hash mismatch".to_string()))
+        }
+        Outcome::Ok if rec.stale => ('\u{25cf}', "stale", 230, 180, 80, None),
+        Outcome::Ok if rec.cached => ('\u{25cf}', "cache", 120, 200, 140, None),
+        Outcome::Ok => ('\u{2b07}', "live", 100, 180, 255, None),
+        Outcome::BudgetExceeded => {
+            ('\u{25cb}', "budget", 230, 180, 80, Some("over fetch budget".to_string()))
+        }
+        Outcome::Unresolved => {
+            ('\u{00b7}', "skip", 120, 120, 120, Some("unresolved".to_string()))
+        }
+        Outcome::Skipped => ('\u{00b7}', "skip", 120, 120, 120, Some("not a target".to_string())),
+        Outcome::Failed(why) => ('\u{2716}', "fail", 255, 90, 90, Some(failure_detail(rec, why))),
+    };
+
+    // The actual URL fetched; fall back to the bare locator (PURL) when the
+    // reference never resolved to one.
+    let url = if rec.resolved_url.is_empty() {
+        rec.locator.as_str()
+    } else {
+        rec.resolved_url.as_str()
+    };
+    // A redirect lands the payload elsewhere — show where, dimmed.
+    let redirect = match &rec.final_url {
+        Some(f) if f != &rec.resolved_url => format!("  \x1b[2m\u{2192} {f}\x1b[0m"),
+        _ => String::new(),
+    };
+    let column = detail.unwrap_or_else(|| rec.size.map_or(String::new(), human_bytes));
+
+    eprintln!(
+        "    \x1b[38;2;{r};{g};{b}m{glyph} {label:<6}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {url}{redirect}"
+    );
+}
+
+/// The compact failure note for a failed fetch — the HTTP status when one was
+/// seen (the common, informative case), else the transport reason trimmed.
+fn failure_detail(rec: &FetchRecord, why: &str) -> String {
+    rec.status.map_or_else(
+        || why.split(['\n', ':']).next().unwrap_or(why).trim().to_string(),
+        |s| format!("HTTP {s}"),
+    )
+}
+
+/// Tally the run's fetches into a one-line summary mirroring the progress bar's
+/// completion line: how many came live off the network vs. served from cache,
+/// how many failed, and the total bytes pulled.
+fn report_summary(records: &[FetchRecord]) {
+    let mut live = 0u32;
+    let mut cached = 0u32;
+    let mut failed = 0u32;
+    let mut bytes = 0u64;
+    for rec in records {
+        bytes += rec.size.unwrap_or(0);
+        match &rec.outcome {
+            Outcome::Ok | Outcome::PinMismatch if rec.cached => cached += 1,
+            Outcome::Ok | Outcome::PinMismatch => live += 1,
+            Outcome::Failed(_) => failed += 1,
+            Outcome::BudgetExceeded | Outcome::Unresolved | Outcome::Skipped => {}
+        }
+    }
+    let mut parts = vec![format!("{live} live"), format!("{cached} cached")];
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    parts.push(human_bytes(bytes));
+    eprintln!(
+        "  \x1b[38;2;80;220;80m\u{2713}\x1b[0m  \x1b[38;2;160;160;160m{}\x1b[0m",
+        parts.join("  \u{b7}  ")
+    );
+}
+
+/// Bytes in a compact human-readable form (`45.2 KB`), for the fetch log.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    #[allow(clippy::cast_precision_loss)] // display only; magnitude, not exact bytes
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// References to fetch, grouped by the sha256 of the file that declared them.
@@ -486,6 +651,7 @@ mod tests {
     fn payload_name_prefers_url_basename_then_falls_back_to_hash() {
         let mut rec = FetchRecord {
             source_sha256: String::new(),
+            source_offset: None,
             locator: "pkg:npm/x".to_string(),
             resolved_url: "https://reg.test/x/-/x-1.0.0.tgz".to_string(),
             final_url: None,

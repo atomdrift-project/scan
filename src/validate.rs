@@ -64,8 +64,9 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
 
     let targets = collect_targets()?;
 
-    let cleave_output = cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None)
-        .context("cleave validate")?;
+    let cleave_output =
+        cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None)
+            .context("cleave validate")?;
     print!("{cleave_output}");
 
     // Keep model validation aligned with `cleave validate`: no YARA/radare2/UPX,
@@ -103,6 +104,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         None, // validation corpus never calls the LLM
                         &path,
                         crate::fetch::FetchPolicy::default(),
+                        false, // validation corpus runs offline; no fetch log
                     )
                 });
             (path, result)

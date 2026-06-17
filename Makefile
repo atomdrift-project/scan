@@ -31,7 +31,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -442,6 +442,13 @@ lint:
 
 test:
 	$(CARGO) test
+
+# Install the pre-commit gate (no local Cargo.toml path overrides + make lint +
+# make test). Bypass an individual commit with `git commit --no-verify`.
+install-precommit:
+	cp scripts/pre-commit "$$(git rev-parse --git-dir)/hooks/pre-commit"
+	chmod +x "$$(git rev-parse --git-dir)/hooks/pre-commit"
+	@echo "✓ Pre-commit hook installed."
 
 clean:
 	$(CARGO) clean
