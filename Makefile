@@ -31,7 +31,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes uninstall-server uninstall-server-nodes uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers uninstall-server uninstall-server-nodes stop-worker uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint test clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -203,6 +203,12 @@ uninstall-server:
 		*) echo "error: server deployments are bastille-only; run from a FreeBSD host"; exit 1 ;; \
 	esac
 
+# Hard-stop the running worker without uninstalling it: stops the systemd unit
+# (so Restart= can't respawn) then escalates SIGTERM -> SIGKILL. Used before a
+# redeploy so the old process frees its RAM before the rebuild. Idempotent.
+stop-worker:
+	./scripts/worker/stop-worker.sh
+
 uninstall-worker:
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/worker/uninstall-macos.sh ;; \
@@ -231,6 +237,14 @@ deploy-worker-nodes:
 	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker-nodes URL=<url> NODES=\"node1 node2\""; exit 1; }
 	@[ -n "$(NODES)" ] || { echo "Usage: make deploy-worker-nodes URL=<url> NODES=\"node1 node2\""; exit 1; }
 	./scripts/worker/update-nodes.sh "$(URL)" $(NODES)
+
+# Roll the standing worker pool, one node at a time (YubiKey-friendly), then
+# redeploy hopper. Each worker runs `git pull && make stop-worker &&
+# make deploy-worker` over SSH. Override defaults with URL=, WORKER_NODES=,
+# HOPPER_NODE= (see scripts/worker/deploy-workers.sh).
+deploy-workers:
+	URL="$(URL)" WORKER_NODES="$(WORKER_NODES)" HOPPER_NODE="$(HOPPER_NODE)" \
+		./scripts/worker/deploy-workers.sh
 
 uninstall-server-nodes:
 	@[ -n "$(NODES)" ] || { echo "Usage: make uninstall-server-nodes NODES=\"node1 node2\""; exit 1; }
