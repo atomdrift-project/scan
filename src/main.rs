@@ -262,6 +262,13 @@ enum Commands {
         /// Paths to files or directories to scan
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
+
+        /// Renew each result on a hopper instance by POSTing its envelope to
+        /// `<URL>/api/result`. Assumes the SHA256 was already ingested by
+        /// hopper; this refreshes the stored verdict with the local build's
+        /// traits and model. Upload failures are logged, never fatal.
+        #[arg(long, visible_alias = "upload", value_name = "URL")]
+        hopper: Option<String>,
     },
 
     /// Scan executables of all running processes
@@ -496,6 +503,7 @@ fn main() -> Result<()> {
             if !cli.paths.is_empty() {
                 Commands::Fs {
                     paths: cli.paths.clone(),
+                    hopper: None,
                 }
             } else {
                 Cli::parse_from(["ascan", "--help"]);
@@ -746,7 +754,7 @@ fn main() -> Result<()> {
     );
 
     match command {
-        Commands::Fs { paths } => {
+        Commands::Fs { paths, hopper } => {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
@@ -760,7 +768,8 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy);
+            .with_fetch(fetch_policy)
+            .with_hopper(hopper);
             exit_for_summary(&run_scan_paths(&paths, &config)?);
         }
         Commands::Sys => {
@@ -1424,7 +1433,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ascan", "fs", "/tmp/a", "/tmp/b"])
             .context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
-            Commands::Fs { paths } => {
+            Commands::Fs { paths, .. } => {
                 assert_eq!(
                     paths,
                     vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
@@ -1436,10 +1445,36 @@ mod tests {
     }
 
     #[test]
+    fn fs_hopper_flag_and_upload_alias_parse() -> Result<()> {
+        for flag in ["--hopper", "--upload"] {
+            let cli = Cli::try_parse_from(["ascan", "fs", flag, "http://hopper:8081", "/tmp/a"])
+                .context("parse should work")?;
+            match cli.command.context("fs subcommand expected")? {
+                Commands::Fs { paths, hopper } => {
+                    assert_eq!(paths, vec![PathBuf::from("/tmp/a")]);
+                    assert_eq!(hopper.as_deref(), Some("http://hopper:8081"));
+                }
+                other => anyhow::bail!("unexpected command: {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fs_without_hopper_defaults_to_none() -> Result<()> {
+        let cli = Cli::try_parse_from(["ascan", "fs", "/tmp/a"]).context("parse should work")?;
+        match cli.command.context("fs subcommand expected")? {
+            Commands::Fs { hopper, .. } => assert!(hopper.is_none()),
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn scan_alias_maps_to_fs() -> Result<()> {
         let cli = Cli::try_parse_from(["ascan", "scan", "/tmp/a"]).context("parse should work")?;
         match cli.command.context("fs subcommand expected via alias")? {
-            Commands::Fs { paths } => assert_eq!(paths, vec![PathBuf::from("/tmp/a")]),
+            Commands::Fs { paths, .. } => assert_eq!(paths, vec![PathBuf::from("/tmp/a")]),
             other => anyhow::bail!("unexpected command: {other:?}"),
         }
         Ok(())

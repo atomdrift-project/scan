@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, mpsc};
 
@@ -722,27 +722,6 @@ struct ClaimJob {
     size_bytes: i64,
     #[serde(default)]
     file_type: String,
-}
-
-#[derive(Serialize)]
-struct ResultPayload {
-    sha256: String,
-    worker: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    duration_ms: i64,
-    // The `{ml, llm?, raw}` analysis envelope, flattened onto the payload so the
-    // wire form is `{sha256, worker, duration_ms, ml, llm, raw}`. This is the
-    // SAME `ScanResultEnvelope` litmus emits for local `--json` output and the
-    // server `/analyze` response — embedding it (rather than re-declaring
-    // ml/llm/raw here) keeps the worker upload structurally identical to those
-    // paths, so any future envelope field flows through automatically instead of
-    // silently dropping at this boundary. `None` when analysis failed outright:
-    // only the transport metadata and `error` are sent. The envelope keeps `ml`
-    // typed as `MlSection`, so serialization still streams the struct straight
-    // into HTTP body bytes with no intermediate `serde_json::Value` tree.
-    #[serde(flatten)]
-    envelope: Option<crate::engine::ScanResultEnvelope>,
 }
 
 /// A job with its file data pre-downloaded (or marked for local access).
@@ -2247,7 +2226,7 @@ async fn post_result(
     sha256: &str,
     result: Result<(crate::engine::ScanResultEnvelope, i64), String>,
 ) {
-    let mut payload = match result {
+    let payload = match result {
         Ok((envelope, duration_ms)) => {
             // v7 envelope no longer carries `class` on the wire; the verdict
             // is encoded in `lvl` (-1 = benign, anything else = hostile). The
@@ -2258,7 +2237,7 @@ async fn post_result(
                 "hostile"
             };
             tracing::info!(sha256 = %sha256, duration_ms, verdict, "analysis complete");
-            ResultPayload {
+            crate::upload::ResultPayload {
                 sha256: sha256.to_string(),
                 worker: worker.to_string(),
                 error: None,
@@ -2266,7 +2245,7 @@ async fn post_result(
                 envelope: Some(envelope),
             }
         }
-        Err(e) => ResultPayload {
+        Err(e) => crate::upload::ResultPayload {
             sha256: sha256.to_string(),
             worker: worker.to_string(),
             error: Some(e),
@@ -2277,57 +2256,12 @@ async fn post_result(
 
     let url = format!("{}/api/result", url);
 
-    // Serialize and compress once, then reuse across retries. Cleave reports are
-    // large, highly repetitive JSON; zstd typically shrinks them 3-5x, cutting
-    // upload time for the multi-hundred-MB archive reports. Level 3 is zstd's
-    // default — its speed is dwarfed by the analysis that produced the payload.
-    // If serialization fails the result is unrecoverable; if compression fails we
-    // degrade to sending the body uncompressed so a result is never dropped.
-    const ZSTD_RESULT_LEVEL: i32 = 3;
-    let json = match serde_json::to_vec(&payload) {
-        Ok(json) => json,
-        Err(e) => {
-            tracing::error!(sha256 = %sha256, error = %e, "post result: serialize failed");
-            return;
-        }
-    };
-    // Hopper bounds the decompressed result body at 512 MiB
-    // (maxResultBodyBytes in hopper's api.go); a larger document is truncated
-    // mid-stream and rejected as invalid JSON — permanently, since retries
-    // resend identical bytes. If the serialized report exceeds the limit, drop
-    // the raw cleave report and send the ML verdict alone: hopper stores the
-    // verdict and only skips archive explosion, which beats losing the whole
-    // 5-minute analysis.
-    const HOPPER_MAX_RESULT_BODY_BYTES: usize = 512 << 20;
-    let json = if json.len() > HOPPER_MAX_RESULT_BODY_BYTES {
-        tracing::warn!(
-            sha256 = %sha256,
-            json_bytes = json.len(),
-            limit_bytes = HOPPER_MAX_RESULT_BODY_BYTES,
-            "result JSON exceeds hopper's body limit; dropping raw report, posting ML verdict only",
-        );
-        // Empty the cleave report but keep the ml/llm verdict. `{}` (not null)
-        // mirrors the envelope litmus produces when there is no cleave report,
-        // so the dropped-raw form stays a structurally valid envelope.
-        if let Some(envelope) = payload.envelope.as_mut() {
-            envelope.raw = serde_json::json!({});
-        }
-        match serde_json::to_vec(&payload) {
-            Ok(json) => json,
-            Err(e) => {
-                tracing::error!(sha256 = %sha256, error = %e, "post result: serialize failed");
-                return;
-            }
-        }
-    } else {
-        json
-    };
-    let (body, encoding) = match zstd::encode_all(json.as_slice(), ZSTD_RESULT_LEVEL) {
-        Ok(compressed) => (compressed, Some("zstd")),
-        Err(e) => {
-            tracing::warn!(sha256 = %sha256, error = %e, "post result: zstd compress failed; sending uncompressed");
-            (json, None)
-        }
+    // Serialize and compress once, then reuse the bytes across retries: cleave
+    // reports are large, repetitive JSON that zstd shrinks 3-5x. Shared with the
+    // local `scan fs --hopper` uploader so both speak hopper's `/api/result`
+    // byte-identically. `None` means serialization failed unrecoverably.
+    let Some((body, encoding)) = crate::upload::encode_result_body(payload, sha256) else {
+        return;
     };
 
     // Retry with the same exponential-backoff-with-jitter schedule as poll

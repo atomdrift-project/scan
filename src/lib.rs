@@ -49,6 +49,7 @@ pub mod tools;
 pub mod traits_repo;
 pub mod update_check;
 pub mod update_manifest;
+pub mod upload;
 pub mod validate;
 pub mod worker;
 

@@ -81,6 +81,7 @@ pub struct ScanConfig {
     level: Option<u16>,
     interpret: Option<crate::interpret::InterpretConfig>,
     fetch: crate::fetch::FetchPolicy,
+    hopper: Option<String>,
 }
 
 impl ScanConfig {
@@ -130,7 +131,24 @@ impl ScanConfig {
             level: None,
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
+            hopper: None,
         })
+    }
+
+    /// Upload (renew) each scan result on the hopper instance at `url` by POSTing
+    /// its envelope to `/api/result`. `None` (default) disables uploading. Used by
+    /// `scan fs --hopper`; failures degrade to logged warnings and never affect
+    /// the scan's outcome.
+    #[must_use]
+    pub fn with_hopper(mut self, url: Option<String>) -> Self {
+        self.hopper = url;
+        self
+    }
+
+    /// Hopper base URL to renew results on, or `None` when uploading is disabled.
+    #[must_use]
+    pub(crate) fn hopper(&self) -> Option<&str> {
+        self.hopper.as_deref()
     }
 
     /// Set the external-reference fetch policy: which kinds of reference
@@ -943,6 +961,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             &tally,
             &stdout,
             None,
+            None,
         );
         let summary = tally.summary(scan_start);
         if is_terminal {
@@ -988,6 +1007,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                 &tally,
                 &stdout,
                 progress.get(),
+                None,
             );
         }
     })?;
@@ -1045,6 +1065,7 @@ pub fn run_bytes(
         None,
         &tally,
         &stdout,
+        None,
         None,
     );
 
@@ -1112,6 +1133,7 @@ fn record_file_result(
     tally: &Tally,
     stdout: &Mutex<std::io::Stdout>,
     progress: Option<&Progress>,
+    uploader: Option<&crate::upload::Uploader>,
 ) {
     let scan_result = cleave_result.and_then(|report| {
         process_report(file_path, report, ctx, model, shap, config, cancellation)
@@ -1127,6 +1149,15 @@ fn record_file_result(
                 if let Some(p) = progress {
                     p.redraw();
                 }
+            }
+            // Renew this result on hopper if `--hopper` was set. Done after
+            // emit so local output is never delayed by the handoff; the upload
+            // itself runs on the uploader's own thread. Only successful results
+            // are sent — an error envelope has an empty file type, which hopper
+            // treats as a delete. `into_envelope` consumes `r`, so it goes last.
+            if let Some(uploader) = uploader {
+                let sha256 = r.sha256.clone();
+                uploader.submit(sha256, r.into_envelope());
             }
         }
         Err(e) => {
@@ -1194,36 +1225,49 @@ pub fn run_paths(paths: &[PathBuf], config: &ScanConfig) -> Result<ScanSummary> 
         }
     }
 
-    let record = |file_path: &Path, result: Result<cleave::AnalysisReport>| {
-        record_file_result(
-            file_path,
-            result,
-            &ctx,
-            &model,
-            shap.as_ref(),
-            config,
-            Some(&cancellation),
-            &tally,
-            &stdout,
-            None,
-        );
-    };
+    // `--hopper`: renew every result on hopper as it completes. The uploader
+    // owns a background thread; dropping it (below, after the scan closures
+    // release their borrow) flushes and joins in-flight uploads.
+    let uploader = config
+        .hopper()
+        .map(|url| crate::upload::Uploader::new(url, crate::upload::default_worker_name()));
 
-    if !files.is_empty() {
-        cleave::scan_files(&files, &cleave_opts, |event| {
-            if let cleave::ScanEvent::File { path, result } = event {
-                record(&path, *result);
-            }
-        })?;
-    }
+    {
+        let record = |file_path: &Path, result: Result<cleave::AnalysisReport>| {
+            record_file_result(
+                file_path,
+                result,
+                &ctx,
+                &model,
+                shap.as_ref(),
+                config,
+                Some(&cancellation),
+                &tally,
+                &stdout,
+                None,
+                uploader.as_ref(),
+            );
+        };
 
-    for dir in &dirs {
-        cleave::scan_directory(dir, &cleave_opts, |event| {
-            if let cleave::ScanEvent::File { path, result } = event {
-                record(&path, *result);
-            }
-        })?;
+        if !files.is_empty() {
+            cleave::scan_files(&files, &cleave_opts, |event| {
+                if let cleave::ScanEvent::File { path, result } = event {
+                    record(&path, *result);
+                }
+            })?;
+        }
+
+        for dir in &dirs {
+            cleave::scan_directory(dir, &cleave_opts, |event| {
+                if let cleave::ScanEvent::File { path, result } = event {
+                    record(&path, *result);
+                }
+            })?;
+        }
     }
+    // `record` (and its borrow of `uploader`) is now out of scope; flush and
+    // join the uploader before reporting the summary so every result is renewed.
+    drop(uploader);
 
     let summary = tally.summary(scan_start);
     if is_terminal {
