@@ -30,6 +30,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cleave::{AnalysisOptions, AnalysisReport};
 use fletch::fetch::{
@@ -42,17 +43,31 @@ use fletch::{ExternalRef, RefKind, RefLocator, find};
 /// `curl | bash` droppers are the common case.
 pub const DEFAULT_FETCH_DEPTH: u8 = 2;
 
-/// What to fetch — a selection of reference kinds, parsed from the
-/// comma-separated `--fetch=KINDS` flag (`deps`, `refs`) — plus how many hops to
-/// follow. An empty kind selection (the default) disables fetching. Designed to
-/// grow new kinds (e.g. `sigs`) without changing the flag's shape.
+/// What to fetch — a selection of reference *kinds*, parsed from the
+/// comma-separated `--fetch=KINDS` flag (`urls`, `packages`, `deps`) — plus how
+/// many hops to follow. An empty kind selection (the default) disables fetching.
+///
+/// The three kinds map onto [`fletch`]'s [`RefKind`] taxonomy, so the selection
+/// distinguishes how strongly a reference is bound to the artifact:
+///
+/// - `deps`     → [`RefKind::Dependency`]: a **strict dependency** declared in a
+///   manifest or lockfile (`package.json`, `Cargo.lock`, `.SRCINFO depends`).
+/// - `packages` → [`RefKind::Command`]: a **package merely mentioned** by an
+///   install-command invocation (`npm install foo`, `pip install bar`,
+///   `cargo install baz`) — typically injected by a build/lifecycle script
+///   rather than pinned in a manifest.
+/// - `urls`     → [`RefKind::UrlFetch`]: a **raw URL** with no package identity
+///   (a `curl`/`wget` target, a staged download) — the largest exposure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FetchPolicy {
-    /// Fetch declared/installed **dependencies** — registry packages (PURLs).
+    /// Fetch raw `http(s)` URLs ([`RefKind::UrlFetch`]).
+    pub urls: bool,
+    /// Fetch packages named by an install command ([`RefKind::Command`]) — e.g.
+    /// `npm install foo`. These are *mentioned*, not declared.
+    pub packages: bool,
+    /// Fetch strict declared dependencies ([`RefKind::Dependency`]) — manifest
+    /// and lockfile entries.
     pub deps: bool,
-    /// Fetch bare/arbitrary **references** — `http(s)` URLs (the larger
-    /// exposure: curl/wget targets, staged downloads).
-    pub refs: bool,
     /// How many hops to follow: `1` fetches the references found in the root,
     /// `2` also follows references found *inside* those payloads, and so on.
     pub depth: u8,
@@ -61,8 +76,9 @@ pub struct FetchPolicy {
 impl Default for FetchPolicy {
     fn default() -> Self {
         Self {
+            urls: false,
+            packages: false,
             deps: false,
-            refs: false,
             depth: DEFAULT_FETCH_DEPTH,
         }
     }
@@ -72,30 +88,50 @@ impl FetchPolicy {
     /// True when at least one kind is selected — the master switch.
     #[must_use]
     pub(crate) const fn enabled(&self) -> bool {
-        self.deps || self.refs
+        self.urls || self.packages || self.deps
+    }
+
+    /// Whether `kind` is selected by this policy. References whose kind is
+    /// neither a URL, a command-mentioned package, nor a declared dependency
+    /// (e.g. [`RefKind::Repository`] identity) are never fetched.
+    #[must_use]
+    fn wants(&self, kind: RefKind) -> bool {
+        match kind {
+            RefKind::UrlFetch => self.urls,
+            RefKind::Command => self.packages,
+            RefKind::Dependency => self.deps,
+            _ => false,
+        }
     }
 }
 
 impl std::str::FromStr for FetchPolicy {
     type Err = String;
 
-    /// Parse a comma-separated kind list (`deps`, `refs`). Empty entries are
-    /// ignored; an unknown kind or an empty selection is an error so a typo is
-    /// never silently a no-op.
+    /// Parse a comma-separated kind list (`urls`, `packages`, `deps`, or `all`).
+    /// `all` selects every kind. Empty entries are ignored; an unknown kind or an
+    /// empty selection is an error so a typo is never silently a no-op.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        const VALID: &str = "valid: all, urls, packages, deps";
         let mut policy = Self::default();
         for kind in s.split(',') {
             match kind.trim() {
                 "" => {}
+                "all" => {
+                    policy.urls = true;
+                    policy.packages = true;
+                    policy.deps = true;
+                }
+                "urls" => policy.urls = true,
+                "packages" => policy.packages = true,
                 "deps" => policy.deps = true,
-                "refs" => policy.refs = true,
                 other => {
-                    return Err(format!("unknown fetch kind {other:?} (valid: deps, refs)"));
+                    return Err(format!("unknown fetch kind {other:?} ({VALID})"));
                 }
             }
         }
         if !policy.enabled() {
-            return Err("empty fetch selection (valid: deps, refs)".to_string());
+            return Err(format!("empty fetch selection ({VALID})"));
         }
         Ok(policy)
     }
@@ -175,17 +211,13 @@ pub(crate) fn orchestrate(
         }
         let mut next = Vec::new();
         for (source_sha, refs) in std::mem::take(&mut worklist) {
-            // Keep only the kinds this policy selected (packages need `deps`,
-            // URLs need `refs`) and that haven't been fetched yet this run.
+            // Keep only the kinds this policy selected — by RefKind, so a
+            // command-mentioned package (`packages`) is distinct from a declared
+            // dependency (`deps`) even though both are PURLs — and that haven't
+            // been fetched yet this run.
             let selected: Vec<ExternalRef> = refs
                 .into_iter()
-                .filter(|r| {
-                    let wanted = match r.locator {
-                        RefLocator::Purl(_) => policy.deps,
-                        RefLocator::Url(_) => policy.refs,
-                    };
-                    wanted && seen.insert(locator_key(r))
-                })
+                .filter(|r| policy.wants(r.kind) && seen.insert(locator_key(r)))
                 .collect();
             if selected.is_empty() {
                 continue;
@@ -193,7 +225,7 @@ pub(crate) fn orchestrate(
             let fetched = fetch_references(
                 &selected,
                 &source_sha,
-                policy.refs,
+                policy.urls,
                 &res.net,
                 &res.cache,
                 budget,
@@ -207,8 +239,12 @@ pub(crate) fn orchestrate(
             let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
             budget.max_count = budget.max_count.saturating_sub(spent);
             budget.max_bytes = budget.max_bytes.saturating_sub(bytes);
-            for rec in &fetched {
-                if progress {
+
+            // Report the fetch outcomes up front — they're known the moment the
+            // (cached or live) fetch returns, so the operator sees the full
+            // edge list immediately rather than drip-fed behind each analysis.
+            if progress {
+                for rec in &fetched {
                     if !header_printed {
                         eprintln!(
                             "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
@@ -217,7 +253,17 @@ pub(crate) fn orchestrate(
                     }
                     report_fetch(rec);
                 }
-                next.extend(graft(report, rec, &res.cache, &opts));
+            }
+
+            // Analyze the payloads concurrently (bounded), then merge each into
+            // the report serially in fetch order so file ids stay deterministic.
+            // The analysis — a full cleave pass per payload — is the real cost
+            // here; the fetch is near-free on a cache hit.
+            let analyzed = analyze_payloads(&fetched, &res.cache, &opts);
+            for (rec, payload) in fetched.iter().zip(analyzed) {
+                if let Some(payload) = payload {
+                    next.extend(merge_payload(report, rec, payload));
+                }
             }
             records.extend(fetched);
         }
@@ -286,20 +332,49 @@ fn report_fetch(rec: &FetchRecord) {
     // (glyph, label, r, g, b, detail) — detail replaces the size column when a
     // fetch never delivered bytes (a failure or a skip).
     let (glyph, label, r, g, b, detail) = match &rec.outcome {
-        Outcome::PinMismatch => {
-            ('\u{2716}', "pin!", 255, 90, 90, Some("hash mismatch".to_string()))
-        }
+        Outcome::PinMismatch => (
+            '\u{2716}',
+            "pin!",
+            255,
+            90,
+            90,
+            Some("hash mismatch".to_string()),
+        ),
         Outcome::Ok if rec.stale => ('\u{25cf}', "stale", 230, 180, 80, None),
         Outcome::Ok if rec.cached => ('\u{25cf}', "cache", 120, 200, 140, None),
         Outcome::Ok => ('\u{2b07}', "live", 100, 180, 255, None),
-        Outcome::BudgetExceeded => {
-            ('\u{25cb}', "budget", 230, 180, 80, Some("over fetch budget".to_string()))
-        }
-        Outcome::Unresolved => {
-            ('\u{00b7}', "skip", 120, 120, 120, Some("unresolved".to_string()))
-        }
-        Outcome::Skipped => ('\u{00b7}', "skip", 120, 120, 120, Some("not a target".to_string())),
-        Outcome::Failed(why) => ('\u{2716}', "fail", 255, 90, 90, Some(failure_detail(rec, why))),
+        Outcome::BudgetExceeded => (
+            '\u{25cb}',
+            "budget",
+            230,
+            180,
+            80,
+            Some("over fetch budget".to_string()),
+        ),
+        Outcome::Unresolved => (
+            '\u{00b7}',
+            "skip",
+            120,
+            120,
+            120,
+            Some("unresolved".to_string()),
+        ),
+        Outcome::Skipped => (
+            '\u{00b7}',
+            "skip",
+            120,
+            120,
+            120,
+            Some("not a target".to_string()),
+        ),
+        Outcome::Failed(why) => (
+            '\u{2716}',
+            "fail",
+            255,
+            90,
+            90,
+            Some(failure_detail(rec, why)),
+        ),
     };
 
     // The actual URL fetched; fall back to the bare locator (PURL) when the
@@ -325,7 +400,13 @@ fn report_fetch(rec: &FetchRecord) {
 /// seen (the common, informative case), else the transport reason trimmed.
 fn failure_detail(rec: &FetchRecord, why: &str) -> String {
     rec.status.map_or_else(
-        || why.split(['\n', ':']).next().unwrap_or(why).trim().to_string(),
+        || {
+            why.split(['\n', ':'])
+                .next()
+                .unwrap_or(why)
+                .trim()
+                .to_string()
+        },
         |s| format!("HTTP {s}"),
     )
 }
@@ -443,47 +524,133 @@ fn locator_key(r: &ExternalRef) -> String {
     }
 }
 
-/// Analyze a fetched payload (when one was retrieved), append its file nodes to
-/// the report nested under the file that declared the reference, and return the
-/// references found *inside* the payload — the next hop's work. The fetch edge
-/// (`source_sha256 → content_sha256`) is the authoritative link; ids and depth
-/// are renumbered so the grafted nodes are a well-formed subtree that never
-/// collides with the main report's.
-fn graft(
-    report: &mut AnalysisReport,
+/// Concurrent analyses of fetched payloads per group. Kept deliberately low:
+/// analyzing a single archive is *already* rayon-parallel internally (one job
+/// fans its members across the shared pool), so running many payload analyses
+/// at once would oversubscribe that pool and thrash rather than speed up. Two
+/// overlaps the serial portions (I/O, setup, the container parse) of one
+/// analysis with another's member fan-out without contending for the whole CPU.
+/// A worker-style global admission scheme could safely go higher, but that is
+/// more machinery than this online side-channel warrants.
+const ANALYSIS_CONCURRENCY: usize = 2;
+
+/// The product of analyzing one fetched payload: the finalized sub-report to
+/// graft (absent if the payload couldn't be analyzed) and the next-hop
+/// references found in its own bytes. Produced off the report so the expensive
+/// analysis can run concurrently; [`merge_payload`] folds it in serially.
+struct Analyzed {
+    sub: Option<AnalysisReport>,
+    content_sha: String,
+    next_from_bytes: Vec<(String, Vec<ExternalRef>)>,
+}
+
+/// Analyze the bytes of fetched payloads concurrently, returning one slot per
+/// input record in the same order (`None` where there was nothing to analyze).
+/// Bounded by [`ANALYSIS_CONCURRENCY`] and run on plain OS threads — not the
+/// shared rayon pool each analysis itself uses — so a fetching run never starves
+/// the pool. Output order is the input order regardless of completion order, so
+/// the serial merge that follows assigns file ids deterministically.
+fn analyze_payloads(
+    fetched: &[FetchRecord],
+    cache: &BlobCache,
+    opts: &AnalysisOptions,
+) -> Vec<Option<Analyzed>> {
+    let n = fetched.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let cursor = AtomicUsize::new(0);
+    let workers = ANALYSIS_CONCURRENCY.min(n);
+    let collected: Vec<Vec<(usize, Analyzed)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        if let Some(a) = analyze_payload(&fetched[i], cache, opts) {
+                            local.push((i, a));
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    let mut slots: Vec<Option<Analyzed>> = (0..n).map(|_| None).collect();
+    for chunk in collected {
+        for (i, a) in chunk {
+            slots[i] = Some(a);
+        }
+    }
+    slots
+}
+
+/// Analyze a fetched payload's bytes (the expensive, report-independent half of
+/// grafting): hunt its own bytes for next-hop references and run cleave over it.
+/// Returns `None` when there is nothing to analyze (a skipped/unresolved/failed
+/// fetch, or bytes that vanished from cache). Pure with respect to the report,
+/// so it is safe to run concurrently; [`merge_payload`] does the report mutation.
+fn analyze_payload(
     rec: &FetchRecord,
     cache: &BlobCache,
     opts: &AnalysisOptions,
-) -> Vec<(String, Vec<ExternalRef>)> {
+) -> Option<Analyzed> {
     // Scan whatever bytes we hold: a clean fetch or a pin mismatch (a mismatch
     // is exactly the case worth analyzing). Skipped/unresolved/failed have none.
     if !matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
-        return Vec::new();
+        return None;
     }
-    let Some(bytes) = cache.load(&rec.locator) else {
-        return Vec::new();
-    };
+    let bytes = cache.load(&rec.locator)?;
     let name = payload_name(rec);
     let content_sha = rec.content_sha256.clone().unwrap_or_default();
 
     // Next-hop references discovered in the payload's own bytes — the full hunt,
     // so a stage-2 script's `curl | bash` (or an encoded URL) is followed.
-    let mut next = Vec::new();
+    let mut next_from_bytes = Vec::new();
     let payload_refs = find::references_in_bytes(&bytes, &name);
     if !content_sha.is_empty() && !payload_refs.is_empty() {
-        next.push((content_sha.clone(), payload_refs));
+        next_from_bytes.push((content_sha.clone(), payload_refs));
     }
 
-    let mut sub = match cleave::analyze_bytes_owned(bytes, &name, opts) {
-        Ok(sub) => sub,
+    let sub = match cleave::analyze_bytes_owned(bytes, &name, opts) {
+        Ok(mut sub) => {
+            // finalize() collapses the sub-analysis into its files[]; without it
+            // the payload's data stays in top-level fields and files[] is empty.
+            sub.finalize();
+            Some(sub)
+        }
         Err(e) => {
             tracing::warn!("analysis of fetched {} failed: {e:#}", rec.locator);
-            return next;
+            None
         }
     };
-    // finalize() collapses the sub-analysis into its files[]; without it the
-    // payload's data stays in top-level fields and files[] is empty.
-    sub.finalize();
+    Some(Analyzed {
+        sub,
+        content_sha,
+        next_from_bytes,
+    })
+}
+
+/// Fold an [`Analyzed`] payload into the report: append its file nodes nested
+/// under the file that declared the reference, and return the references the
+/// payload yields for the next hop. The fetch edge (`source_sha256 →
+/// content_sha256`) is the authoritative link; ids and depth are renumbered so
+/// the grafted nodes are a well-formed subtree that never collides with the main
+/// report's. Must run serially — it reads and extends `report.files`.
+fn merge_payload(
+    report: &mut AnalysisReport,
+    rec: &FetchRecord,
+    analyzed: Analyzed,
+) -> Vec<(String, Vec<ExternalRef>)> {
+    let mut next = analyzed.next_from_bytes;
+    let Some(sub) = analyzed.sub else {
+        return next;
+    };
 
     // Attach under the file that declared the reference (its sha256 is the
     // edge's source endpoint); fall back to the root file.
@@ -505,7 +672,7 @@ fn graft(
     // hooks) are the next hop too — the bytes hunt above only saw the container.
     // The payload's own node is skipped; the bytes hunt already covered it.
     for file in &report.files[first_new..] {
-        if file.sha256 == content_sha {
+        if file.sha256 == analyzed.content_sha {
             continue;
         }
         if let Some(view) = &file.filefacts {
@@ -559,20 +726,32 @@ mod tests {
             })
         );
         assert_eq!(
-            "refs".parse(),
+            "packages".parse(),
             Ok(FetchPolicy {
-                refs: true,
+                packages: true,
                 ..FetchPolicy::default()
             })
         );
         assert_eq!(
-            " deps , refs ".parse(),
+            " urls , packages , deps ".parse(),
             Ok(FetchPolicy {
+                urls: true,
+                packages: true,
                 deps: true,
-                refs: true,
                 ..FetchPolicy::default()
             })
         );
+        // `all` is shorthand for every kind.
+        assert_eq!(
+            "all".parse(),
+            Ok(FetchPolicy {
+                urls: true,
+                packages: true,
+                deps: true,
+                ..FetchPolicy::default()
+            })
+        );
+        assert_eq!("all".parse::<FetchPolicy>(), "urls,packages,deps".parse());
         // Parsing leaves depth at its default — the CLI sets it separately.
         assert_eq!(
             "deps".parse::<FetchPolicy>().unwrap().depth,
@@ -580,8 +759,27 @@ mod tests {
         );
         assert!("".parse::<FetchPolicy>().is_err());
         assert!("sigs".parse::<FetchPolicy>().is_err());
+        // The retired vocabulary is now a hard error, not a silent no-op.
+        assert!("refs".parse::<FetchPolicy>().is_err());
         assert!("deps,bogus".parse::<FetchPolicy>().is_err());
         assert!(!FetchPolicy::default().enabled());
+
+        // Selection is by kind: `packages` fetches command-mentioned packages
+        // but not declared deps, and vice versa.
+        let pkgs: FetchPolicy = "packages".parse().unwrap();
+        assert!(pkgs.wants(RefKind::Command));
+        assert!(!pkgs.wants(RefKind::Dependency));
+        assert!(!pkgs.wants(RefKind::UrlFetch));
+        let deps: FetchPolicy = "deps".parse().unwrap();
+        assert!(deps.wants(RefKind::Dependency));
+        assert!(!deps.wants(RefKind::Command));
+        // Repository identity is never a fetch target.
+        assert!(
+            !"urls,packages,deps"
+                .parse::<FetchPolicy>()
+                .unwrap()
+                .wants(RefKind::Repository)
+        );
     }
 
     #[test]

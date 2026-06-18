@@ -466,6 +466,11 @@ pub struct WorkerConfig {
     /// Optional LLM interpretation config (`--interpret`); `None` disables the
     /// pass. Reattached to every reloaded `ModelResources` so renewals keep it.
     pub interpret: Option<crate::interpret::InterpretConfig>,
+    /// External-reference fetch policy (`SCAN_FETCH`). Default (empty) keeps the
+    /// worker fully offline; a non-empty policy makes every job fetch and
+    /// re-analyze the references it discovers. Reattached to each reloaded
+    /// `ModelResources` so renewals preserve it.
+    pub fetch: crate::fetch::FetchPolicy,
 }
 
 fn load_model_resources(
@@ -473,6 +478,7 @@ fn load_model_resources(
     thresholds: Option<Thresholds>,
     level: Option<u16>,
     interpret: Option<crate::interpret::InterpretConfig>,
+    fetch: crate::fetch::FetchPolicy,
 ) -> Result<Arc<ModelResources>> {
     let model = Model::load(model_dir, thresholds, level).context("loading model")?;
     let shap = ShapImportance::load(model_dir).ok();
@@ -482,8 +488,10 @@ fn load_model_resources(
         shap,
         ctx,
         interpret,
-        // The worker/validate path classifies a fixed corpus; never fetch.
-        fetch: crate::fetch::FetchPolicy::default(),
+        // Per-job scanning honors the worker's fetch policy (`SCAN_FETCH`). The
+        // fixed validate corpus never fetches — it runs through
+        // `crate::validate::run`, which builds its own offline resources.
+        fetch,
     }))
 }
 
@@ -493,6 +501,7 @@ fn validate_and_load_resources(
     slow_rule_ms: u64,
     level: Option<u16>,
     interpret: Option<crate::interpret::InterpretConfig>,
+    fetch: crate::fetch::FetchPolicy,
 ) -> Result<Arc<ModelResources>> {
     let validate_config = crate::ScanConfig::new(
         model_dir,
@@ -504,7 +513,7 @@ fn validate_and_load_resources(
     )?
     .with_level(level);
     crate::validate::run(&validate_config, false)?;
-    load_model_resources(model_dir, thresholds, level, interpret)
+    load_model_resources(model_dir, thresholds, level, interpret, fetch)
 }
 
 /// Pull upstream rules and, **only if something actually changed**, re-validate
@@ -517,6 +526,7 @@ fn renew_resources_once(
     slow_rule_ms: u64,
     level: Option<u16>,
     interpret: Option<crate::interpret::InterpretConfig>,
+    fetch: crate::fetch::FetchPolicy,
 ) -> Result<Option<Arc<ModelResources>>> {
     // model_update validates the freshly extracted bundle (Model::load) before
     // swapping it in, so a broken bundle never lands on disk — there's no
@@ -551,7 +561,7 @@ fn renew_resources_once(
     );
 
     let resources =
-        validate_and_load_resources(model_dir, thresholds, slow_rule_ms, level, interpret)?;
+        validate_and_load_resources(model_dir, thresholds, slow_rule_ms, level, interpret, fetch)?;
 
     let (traits, composites) = cleave::reload_capability_mapper()
         .map_err(|error| anyhow::anyhow!("reload cleave capability mapper: {error}"))?;
@@ -567,6 +577,11 @@ fn current_resources(handle: &ResourceHandle) -> Result<Arc<ModelResources>> {
     Ok(Arc::clone(&guard))
 }
 
+// Mirrors the resource-loading parameter set (model location, thresholds,
+// level, interpret, fetch) plus the renewal handle/shutdown; threading them
+// individually keeps the call chain explicit rather than introducing a struct
+// used in exactly one place.
+#[allow(clippy::too_many_arguments)]
 fn spawn_resource_renewal_task(
     handle: ResourceHandle,
     model_dir: PathBuf,
@@ -574,6 +589,7 @@ fn spawn_resource_renewal_task(
     slow_rule_ms: u64,
     level: Option<u16>,
     interpret: Option<crate::interpret::InterpretConfig>,
+    fetch: crate::fetch::FetchPolicy,
     shutdown: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
@@ -590,7 +606,14 @@ fn spawn_resource_renewal_task(
             let model_dir = model_dir.clone();
             let interpret = interpret.clone();
             let result = tokio::task::spawn_blocking(move || {
-                renew_resources_once(&model_dir, thresholds, slow_rule_ms, level, interpret)
+                renew_resources_once(
+                    &model_dir,
+                    thresholds,
+                    slow_rule_ms,
+                    level,
+                    interpret,
+                    fetch,
+                )
             })
             .await;
 
@@ -1081,6 +1104,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         config.thresholds,
         config.level,
         config.interpret.clone(),
+        config.fetch,
     )?;
     let resources: ResourceHandle = Arc::new(RwLock::new(resources));
     spawn_resource_renewal_task(
@@ -1090,6 +1114,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         config.slow_rule_ms,
         config.level,
         config.interpret.clone(),
+        config.fetch,
         Arc::clone(&shutdown),
     );
 

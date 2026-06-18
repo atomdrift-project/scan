@@ -73,9 +73,7 @@ impl ShapImportance {
         ]
         .into_iter()
         .find(|p| p.is_file())
-        .with_context(|| {
-            format!("no shap_importance.json under {}", model_dir.display())
-        })?;
+        .with_context(|| format!("no shap_importance.json under {}", model_dir.display()))?;
         let data = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let v: serde_json::Value = serde_json::from_str(&data).context("parsing SHAP data")?;
@@ -87,9 +85,7 @@ impl ShapImportance {
                     .collect()
             })
             .unwrap_or_default();
-        let feature_names_sha256 = v["feature_names_sha256"]
-            .as_str()
-            .map(ToString::to_string);
+        let feature_names_sha256 = v["feature_names_sha256"].as_str().map(ToString::to_string);
 
         tracing::info!("loaded {} SHAP importance features", features.len());
         Ok(Self {

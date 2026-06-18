@@ -220,8 +220,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // Map each scan path back to its process group for PID annotation. Deleted
     // binaries that aren't scannable are counted as errors here and omitted.
     let mut scan_paths: Vec<PathBuf> = Vec::with_capacity(groups.len());
-    let mut by_scan_path: HashMap<PathBuf, &ProcessGroup> =
-        HashMap::with_capacity(groups.len());
+    let mut by_scan_path: HashMap<PathBuf, &ProcessGroup> = HashMap::with_capacity(groups.len());
     for group in &groups {
         let scan_path = if group.deleted && !group.path.exists() {
             // On Linux, try scanning via /proc/pid/exe.

@@ -172,18 +172,26 @@ struct Cli {
 
     /// [EXPERIMENTAL] Fetch the external references discovered in analyzed
     /// files, re-analyze each payload, and fold it into the verdict. A
-    /// comma-separated selection of what to fetch: `deps` (registry packages)
-    /// and/or `refs` (bare/encoded URLs and IP endpoints, the larger exposure).
-    /// Bare `--fetch` selects all kinds. Omitted: off. Also settable per
-    /// deployment via the `SCAN_FETCH` env var (e.g. `SCAN_FETCH=refs`). An
-    /// opt-in online step performed after the offline analysis.
+    /// comma-separated selection of what to fetch, by how strongly the reference
+    /// is bound to the artifact:
+    ///   `deps`     — strict dependencies declared in a manifest/lockfile
+    ///                (package.json, Cargo.lock, .SRCINFO depends);
+    ///   `packages` — packages merely mentioned by an install command
+    ///                (`npm install foo`, `pip install bar`), typically injected
+    ///                by a build/lifecycle script rather than pinned;
+    ///   `urls`     — raw URLs with no package identity (curl/wget targets,
+    ///                staged downloads), the largest exposure.
+    /// `all` (or a bare `--fetch`) selects every kind. Omitted: off. Also
+    /// settable per deployment via the `SCAN_FETCH` env var (e.g.
+    /// `SCAN_FETCH=urls,packages` or `SCAN_FETCH=all`), which is how a worker
+    /// fleet opts in. An opt-in online step performed after the offline analysis.
     #[arg(
         long,
         global = true,
         value_name = "KINDS",
         num_args = 0..=1,
         require_equals = true,
-        default_missing_value = "deps,refs",
+        default_missing_value = "all",
         env = "SCAN_FETCH"
     )]
     fetch: Option<scan::fetch::FetchPolicy>,
@@ -544,6 +552,20 @@ fn main() -> Result<()> {
     // pools are constructed below.
     if let Some(url) = cli.models_repo.as_deref() {
         unsafe { std::env::set_var("SCAN_MODELS_REPO", url) };
+    }
+
+    // The trait-validation gate run by `validate` and at worker startup is a
+    // runtime deploy gate, not a trait-authoring lint: a bundle must be rejected
+    // only when it won't load or silently loses detections, never for authoring
+    // hygiene (taxonomy, size, dedup, regex style, precision). Request cleave's
+    // soft validation via env so it applies to the in-process
+    // `cleave::commands::validate::run` call without threading a flag through
+    // (and is silently ignored by engines predating soft support).
+    //
+    // SAFETY: as above — still single-threaded here; rayon and tokio pools are
+    // constructed below.
+    if matches!(command, Commands::Validate { .. } | Commands::Worker { .. }) {
+        unsafe { std::env::set_var("CLEAVE_VALIDATE_SOFT", "1") };
     }
 
     const RAYON_FALLBACK_THREADS: usize = 4;
@@ -1040,6 +1062,7 @@ fn main() -> Result<()> {
                 nice,
                 exit_if_empty,
                 interpret: interpret_cfg.clone(),
+                fetch: fetch_policy,
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

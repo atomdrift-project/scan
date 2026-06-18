@@ -1980,9 +1980,10 @@ impl ParsedReport {
 
 impl FileSummary {
     fn new(file_entry: &serde_json::Value, needs: RawNeeds) -> Self {
-        let findings_raw: Vec<&serde_json::Value> = json_alias_array(file_entry, &["traits", "find", "ts"])
-            .map(|a| a.iter().collect())
-            .unwrap_or_default();
+        let findings_raw: Vec<&serde_json::Value> =
+            json_alias_array(file_entry, &["traits", "find", "ts"])
+                .map(|a| a.iter().collect())
+                .unwrap_or_default();
         let findings = summarize_findings(&findings_raw);
 
         let size_bytes = json_alias(file_entry, &["size", "sz"])
@@ -2104,7 +2105,10 @@ impl FileSummary {
         // file_metrics/file_values/file_strings/file_imports).
         // Borrow the facts block (don't clone it whole) and clone out only the
         // subtrees whose feature family is active on this route.
-        let facts = file_entry.get("facts").or_else(|| file_entry.get("fact")).or_else(|| file_entry.get("ff"));
+        let facts = file_entry
+            .get("facts")
+            .or_else(|| file_entry.get("fact"))
+            .or_else(|| file_entry.get("ff"));
         let (raw_metrics, raw_values) = if needs.kv {
             (
                 facts
@@ -2114,7 +2118,7 @@ impl FileSummary {
                     .or_else(|| file_entry.get("ms").cloned())
                     .unwrap_or(serde_json::Value::Null),
                 facts
-                    .and_then(|f| json_alias(f, &["val", "v"]))  // val unchanged in v8
+                    .and_then(|f| json_alias(f, &["val", "v"])) // val unchanged in v8
                     .filter(|v| v.is_object())
                     .cloned()
                     .or_else(|| file_entry.get("k").cloned())
@@ -3480,7 +3484,10 @@ fn write_structural_features(
         "struct:no_imports",
         f32::from(import_candidates > 0 && importless_candidates == import_candidates),
     );
-    w.set("struct:zero_findings", f32::from(filtered_finding_count == 0));
+    w.set(
+        "struct:zero_findings",
+        f32::from(filtered_finding_count == 0),
+    );
     w.set(
         "struct:finding_count_log",
         (filtered_finding_count as f32 + 1.0).ln(),

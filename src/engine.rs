@@ -1104,7 +1104,10 @@ impl Tally {
         let benign = self.benign.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
         ScanSummary {
-            total_files: hostile + suspicious + benign + errors,
+            // Only files that were actually analyzed count as scanned. Errors
+            // (missing paths, read failures) are reported separately so a path
+            // that was never opened is never tallied as a clean scan.
+            total_files: hostile + suspicious + benign,
             hostile,
             suspicious,
             benign,
@@ -1162,7 +1165,7 @@ fn record_file_result(
         }
         Err(e) => {
             let msg = crate::tools::enrich_error(&e).unwrap_or_else(|| format!("{e:#}"));
-            tracing::warn!("error analyzing {}: {}", file_path.display(), msg);
+            tracing::error!("error analyzing {}: {}", file_path.display(), msg);
             tally.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1220,7 +1223,7 @@ pub fn run_paths(paths: &[PathBuf], config: &ScanConfig) -> Result<ScanSummary> 
         } else if path.is_dir() {
             dirs.push(path.clone());
         } else {
-            tracing::warn!("path does not exist: {}", path.display());
+            tracing::error!("path does not exist: {}", path.display());
             tally.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1654,7 +1657,10 @@ pub(crate) fn classify_report(
         std::borrow::Cow::Borrowed(&report_json)
     } else {
         let mut rj = report_json.clone();
-        if let Some(files) = rj.get_mut("files").and_then(serde_json::Value::as_array_mut) {
+        if let Some(files) = rj
+            .get_mut("files")
+            .and_then(serde_json::Value::as_array_mut)
+        {
             files.retain(|f| {
                 f.get("sha")
                     .and_then(serde_json::Value::as_str)
@@ -1746,14 +1752,22 @@ pub(crate) fn classify_report(
     // declaring file + the byte the reference sits at. When the embedded pass
     // classifies one of these hostile/suspicious, that verdict is pinned back
     // onto the declaring manifest at the reference byte (below the loop).
-    let fetched_by_content: std::collections::HashMap<&str, (&str, Option<u64>, &str)> = fetch_edges
-        .iter()
-        .filter_map(|r| {
-            r.content_sha256
-                .as_deref()
-                .map(|c| (c, (r.source_sha256.as_str(), r.source_offset, r.locator.as_str())))
-        })
-        .collect();
+    let fetched_by_content: std::collections::HashMap<&str, (&str, Option<u64>, &str)> =
+        fetch_edges
+            .iter()
+            .filter_map(|r| {
+                r.content_sha256.as_deref().map(|c| {
+                    (
+                        c,
+                        (
+                            r.source_sha256.as_str(),
+                            r.source_offset,
+                            r.locator.as_str(),
+                        ),
+                    )
+                })
+            })
+            .collect();
     // (declaring sha, reference offset, dependency locator, confirmed class).
     let mut dep_backrefs: Vec<(String, Option<u64>, String, Classification)> = Vec::new();
 
@@ -1876,7 +1890,14 @@ pub(crate) fn classify_report(
     // the offending edge. Display/attribution only; the verdict was already
     // elevated by the embedded pass above.
     for (src_sha, src_off, locator, class) in &dep_backrefs {
-        inject_dependency_backref(&mut report_json, &report, src_sha, *src_off, locator, *class);
+        inject_dependency_backref(
+            &mut report_json,
+            &report,
+            src_sha,
+            *src_off,
+            locator,
+            *class,
+        );
     }
 
     let top_findings = extract_top_findings_from_json(&report_json, &final_decision.class);
@@ -2045,7 +2066,10 @@ fn inject_dependency_backref(
         if f.get("sha").and_then(serde_json::Value::as_str) != Some(source_sha) {
             continue;
         }
-        match f.get_mut("traits").and_then(serde_json::Value::as_array_mut) {
+        match f
+            .get_mut("traits")
+            .and_then(serde_json::Value::as_array_mut)
+        {
             Some(traits) => traits.push(new_trait),
             None => {
                 if let Some(obj) = f.as_object_mut() {

@@ -614,16 +614,28 @@ pub fn print_summary(summary: &ScanSummary) {
     eprintln!("  {line}");
 
     if summary.total_files == 0 {
+        let (icon, msg) = if summary.errors > 0 {
+            (
+                fg(p.warning, "!"),
+                format!(
+                    "no files scanned, {}",
+                    fg(p.header_path, &format!("{} errors", summary.errors)),
+                ),
+            )
+        } else {
+            (fg(p.warning, "!"), "no scannable files found".to_string())
+        };
         eprintln!(
-            "  {}  no scannable files found  {}",
-            fg(p.warning, "!"),
+            "  {}  {}  {}",
+            icon,
+            msg,
             fg(p.very_dim, &format_elapsed(summary.duration_ms)),
         );
         eprintln!();
         return;
     }
 
-    if summary.hostile == 0 && summary.suspicious == 0 {
+    if summary.hostile == 0 && summary.suspicious == 0 && summary.errors == 0 {
         eprintln!(
             "  {}  {} files scanned, all clean  {}",
             fg(p.benign, "\u{2713}"),

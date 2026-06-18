@@ -208,6 +208,21 @@ impl Drop for Uploader {
     }
 }
 
+/// Flatten an error and its `source()` chain into one message. reqwest's
+/// top-level `Display` is just "error sending request for url (...)"; the real
+/// cause (connection refused, DNS failure, timeout) lives one or more links down
+/// the chain, so log the whole chain to make a failed upload diagnosable.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let _ = write!(out, ": {cause}");
+        source = cause.source();
+    }
+    out
+}
+
 /// POST one result to hopper, retrying transient failures a few times. A 4xx
 /// (other than 408/429) can never succeed on resend, so it stops immediately.
 fn post_one(client: &reqwest::blocking::Client, result_url: &str, worker: &str, job: Job) {
@@ -255,7 +270,7 @@ fn post_one(client: &reqwest::blocking::Client, result_url: &str, worker: &str, 
                 tracing::warn!(sha256 = %sha256, %status, attempt, "upload: non-success response");
             }
             Err(e) => {
-                tracing::warn!(sha256 = %sha256, error = %e, attempt, "upload: send failed");
+                tracing::warn!(sha256 = %sha256, error = %error_chain(&e), attempt, "upload: send failed");
             }
         }
     }
