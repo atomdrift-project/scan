@@ -167,6 +167,43 @@ inherits = "release"
 strip = "none"
 debug = 2
 
+[profile.dev]
+debug = "line-tables-only"
+
+# Match cleave's dev-profile tuning for the heavy analysis stack. `ascan`
+# frequently gets profiled and validated from `target/debug`; without these
+# overrides, cleave/YARA/regex code runs unoptimized and small fixture scans can
+# look tens of seconds slower than the release binary.
+[profile.dev.package.cleave]
+opt-level = 3
+
+[profile.dev.package.yara-x]
+opt-level = 3
+
+[profile.dev.package.regex]
+opt-level = 3
+
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
+[profile.dev.package.aho-corasick]
+opt-level = 3
+
+[profile.dev.package.wasmtime]
+opt-level = 3
+
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.serde_yaml]
+opt-level = 3
+
 [lints]
 workspace = true
 
@@ -197,10 +234,9 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # Local cleave: scan consumes the per-file `filefacts.references` it surfaces
 # (FilefactsView) to drive fletch fetching, before that change is published.
 # Remove once a cleave release carries it.
-# NOTE: cleave intentionally stays on git — local ../cleave is out of sync with
-# this scan's API (CompactTrait.src/sources). Only filefacts is patched local,
-# for the rizin tuning below; my additions are backward-compatible so git cleave
-# consumes the local filefacts fine.
+# NOTE: cleave intentionally stays on git. Use a temporary local patch while
+# profiling cross-repo changes, then update the git revision once cleave carries
+# the change.
 #[patch."https://codeberg.org/atomdrift/cleave.git"]
 #cleave = { path = "../cleave" }
 
@@ -222,5 +258,3 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 
 #[patch."https://codeberg.org/atomdrift/stng.git"]
 #stng = { path = "../stng" }
-
-
