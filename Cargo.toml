@@ -47,7 +47,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.1.0-rc.2"
+version = "2.1.0"
 default-run = "ascan"
 edition = "2024"
 authors = ["The Atomdrift Project"]
@@ -86,6 +86,7 @@ dirs = "6.0"
 # handles the TreeEnsembleClassifier op LightGBM models compile down to
 # with onnxmltools.
 tract-onnx = { version = "0.21", default-features = false }
+tract-linalg = "0.21"
 sha2 = "0.10"
 terminal-colorsaurus = "0.4"
 axum = { version = "0.8", features = ["multipart"] }
@@ -127,7 +128,7 @@ backtrace = "0.3"
 # and Solaris ship libumem (a comparable arena allocator) and tikv-jemalloc-sys
 # bundles a pre-illumos config.sub that fails to recognize the host triple.
 [target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
 [features]
 # Enables jemalloc heap profiling. Build with:
@@ -221,6 +222,5 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 
 #[patch."https://codeberg.org/atomdrift/stng.git"]
 #stng = { path = "../stng" }
-
 
 

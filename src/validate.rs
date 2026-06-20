@@ -3,29 +3,34 @@
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::engine::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
 use crate::features::ExtractContext;
 use crate::model::{Classification, Model, Thresholds};
 
-/// Run full validation: cleave trait validation, model loading, and benign-corpus inference.
+const PROGRESS_EVERY: usize = 10;
+const SLOW_FIXTURE_THRESHOLD: Duration = Duration::from_secs(15);
+
+/// Run validation: model loading, feature-layout checks, and benign fixture inference.
 ///
-/// The analyzed corpus mirrors `cleave validate`: common platform utilities plus
-/// every file in the cleave traits `testdata/does-nothing` tree.
-///
-/// When `skip_traits` is set, both the explicit cleave trait validation AND the
-/// benign-corpus inference are skipped — the latter necessarily, because it loads
-/// the trait corpus to extract features. Only the trait-independent model check
-/// (feature-layout) runs. Use it to validate a model bundle independently of
-/// trait-corpus churn; traits are versioned separately from the deployed model.
+/// The analyzed corpus mirrors the Atomdrift model false-positive gate: common
+/// platform utilities plus every file in the cleave traits `testdata/does-nothing`
+/// tree. Full cleave trait-rule validation remains the job of `cleave validate`;
+/// running it here as a second uncached pass made this command too slow for a
+/// local deploy/pre-commit gate.
 pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     // Feature-layout validation is trait-independent: load the model and reject a
     // structurally incompatible bundle deterministically, before any trait corpus
-    // is touched or any file is analyzed. The benign corpus below can't be relied
+    // is touched or any file is analyzed. The benign smoke pass below can't be relied
     // on to exercise every offset-written family (the unsigned-bigram overflow
     // only triggers on packed/unsigned samples), so anchor-failure must fail here.
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
+    model
+        .validate_all_routes()
+        .context("validating specialist model routes")?;
     let thresholds = model.thresholds();
     let ctx = ExtractContext::new(model.spec());
     ctx.validate_layout().context("feature layout validation")?;
@@ -50,28 +55,27 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     }
 
     if skip_traits {
-        // The benign-corpus inference below requires loading the cleave trait
-        // corpus (the CapabilityMapper extracts features through it), which would
-        // re-run trait validation. --skip-traits validates the model structurally
-        // (feature layout) and skips the trait-dependent benign-corpus pass —
-        // traits are versioned separately from the deployed model.
+        let models_ver = crate::models_repo::version()
+            .map(|v| format!("  models: {v}"))
+            .unwrap_or_default();
         eprintln!(
-            "validate ok (--skip-traits): model feature layout valid; \
-             benign-corpus inference skipped (it requires the cleave trait corpus)"
+            "validate ok:{models_ver}  model feature layout valid; \
+             benign fixture inference skipped"
         );
         return Ok(());
     }
 
     let targets = collect_targets()?;
+    if targets.is_empty() {
+        anyhow::bail!("no benign fixture targets found");
+    }
 
-    let cleave_output =
-        cleave::commands::validate::run(&cleave::cli::OutputFormat::Terminal, None, false)
-            .context("cleave validate")?;
-    print!("{cleave_output}");
-
-    // Keep model validation aligned with `cleave validate`: no YARA/radare2/UPX,
-    // one mapper shared by all target analyses, and the same benign corpus.
-    cleave::cache::set_skip_cache_override(Some(true));
+    // Keep model fixture validation cheap and deterministic: no YARA/radare2/UPX,
+    // one mapper shared by all target analyses, and analysis caching enabled.
+    // The cache key includes the traits revision, so current trait edits still
+    // invalidate stale reports without forcing every pre-commit run to rescan
+    // the whole cleave fixture tree.
+    cleave::cache::set_skip_cache_override(Some(false));
     let options = cleave::AnalysisOptions {
         disable_yara: true,
         disable_radare2: true,
@@ -82,17 +86,26 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     let mapper = Arc::new(cleave::CapabilityMapper::try_new_with_load_options(
         cleave::CapabilityMapper::DEFAULT_MIN_HOSTILE_PRECISION,
         cleave::CapabilityMapper::DEFAULT_MIN_SUSPICIOUS_PRECISION,
-        true,
+        false,
         false,
     )?);
+
+    let total_targets = targets.len();
+    eprintln!("validate fixtures: scanning {total_targets} benign targets...");
+    let completed = AtomicUsize::new(0);
+    let slow_fixtures = Mutex::new(Vec::new());
 
     let results: Vec<(PathBuf, Result<ClassifiedReport>)> = targets
         .into_par_iter()
         .map(|path| {
+            let started = Instant::now();
+            let analysis_started = Instant::now();
             let result = cleave::analyze_file_with_mapper(&path, &options, &mapper)
                 .with_context(|| format!("cleave analysis of {}", path.display()))
                 .and_then(|report| {
-                    engine::classify_report(
+                    let analysis_elapsed = analysis_started.elapsed();
+                    let classify_started = Instant::now();
+                    let classified = engine::classify_report(
                         &path.display().to_string(),
                         report,
                         &ctx,
@@ -105,11 +118,43 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         &path,
                         crate::fetch::FetchPolicy::default(),
                         false, // validation corpus runs offline; no fetch log
-                    )
+                    );
+                    let classify_elapsed = classify_started.elapsed();
+                    if analysis_elapsed > SLOW_FIXTURE_THRESHOLD
+                        || classify_elapsed > SLOW_FIXTURE_THRESHOLD
+                    {
+                        eprintln!(
+                            "SLOW fixture stages {}: analysis={:.1}s classify={:.1}s",
+                            path.display(),
+                            analysis_elapsed.as_secs_f64(),
+                            classify_elapsed.as_secs_f64()
+                        );
+                    }
+                    classified
                 });
+            let elapsed = started.elapsed();
+            if elapsed > SLOW_FIXTURE_THRESHOLD {
+                eprintln!(
+                    "SLOW fixture {}: {:.1}s",
+                    path.display(),
+                    elapsed.as_secs_f64()
+                );
+                if let Ok(mut slow) = slow_fixtures.lock() {
+                    slow.push((path.clone(), elapsed));
+                }
+            }
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if done == total_targets || done.is_multiple_of(PROGRESS_EVERY) {
+                eprintln!("validate fixtures: {done}/{total_targets} complete");
+            }
             (path, result)
         })
         .collect();
+
+    let slow_count = slow_fixtures.lock().map_or(0, |slow| slow.len());
+    if slow_count > 0 {
+        eprintln!("validate fixtures: {slow_count} fixture(s) exceeded 15s");
+    }
 
     let (passed, total, hostile_fps, suspicious_fps) = evaluate(results, thresholds)?;
 
@@ -131,7 +176,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     // not fail the gate (suspicious is allowed to be suspicious).
     if hostile_fps > 0 {
         anyhow::bail!(
-            "{hostile_fps} benign-corpus sample(s) graded HOSTILE (false positives); \
+            "{hostile_fps} benign fixture sample(s) graded HOSTILE (false positives); \
              see the WARN lines above. ({suspicious_fps} graded suspicious — tolerated.)"
         );
     }
@@ -142,11 +187,11 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     if suspicious_fps > 0 {
         eprintln!(
             "validate ok (with {suspicious_fps} suspicious — tolerated):{models_ver}  \
-             benign corpus {passed}/{total} clean, {suspicious_fps} suspicious, 0 hostile"
+             benign fixtures {passed}/{total} clean, {suspicious_fps} suspicious, 0 hostile"
         );
     } else {
         eprintln!(
-            "validate ok:{models_ver}  benign corpus {passed}/{total}  0 suspicious  0 hostile"
+            "validate ok:{models_ver}  benign fixtures {passed}/{total}  0 suspicious  0 hostile"
         );
     }
     Ok(())
@@ -223,7 +268,7 @@ fn evaluate(
         };
 
         // Worst grade across the sample and any embedded artifact decides the
-        // outcome: a benign-corpus file is a HARD failure only if something in
+        // outcome: a benign fixture file is a HARD failure only if something in
         // it grades Hostile. A merely Suspicious top-grade is reported but
         // tolerated — the operator accepts suspicious on benign input.
         let mut any_nonbenign = false;

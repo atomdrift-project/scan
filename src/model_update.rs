@@ -222,13 +222,17 @@ fn install(dir: &Path, artifact: &Artifact, source: &str) -> Result<()> {
         .unpack(&staging)
         .with_context(|| format!("extracting {}", artifact.file))?;
 
-    // Validate before going live: load the staged bundle.
-    crate::model::Model::load(&staging, None, None).with_context(|| {
+    // Validate before going live: load the staged bundle and force every
+    // specialist route to construct its ONNX graph at least once.
+    let staged_model = crate::model::Model::load(&staging, None, None).with_context(|| {
         format!(
             "staged bundle {} failed to load; not installing",
             artifact.file
         )
     })?;
+    staged_model
+        .validate_all_routes()
+        .with_context(|| format!("staged bundle {} has invalid specialist routes", artifact.file))?;
 
     let meta = Installed {
         commit: artifact.commit.clone(),

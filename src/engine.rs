@@ -1645,10 +1645,11 @@ pub(crate) fn classify_report(
             serde_json::to_value(&fetch_edges).unwrap_or_default(),
         );
     }
-    // Parse the report once (with the needs of the general pass and every route),
-    // then share it — each route differs only in which features it writes, not in
-    // how the report is summarized. The same union covers embedded members below.
-    let needs = ctx.raw_needs().union(model.route_needs_union());
+    // Parse the report once with every optional raw subtree any specialist may
+    // read, then share it across the root and embedded-file scoring passes.
+    // Specialist ONNX graphs still load on demand; this only keeps archive
+    // members with different filetypes from missing route-specific raw fields.
+    let needs = ctx.raw_needs().union(crate::features::RawNeeds::all());
     // The sample's own decision featurizes its own files only. With nothing
     // fetched this is the whole report; otherwise drop the grafted payloads so
     // they can't dilute the aggregate (they still classify individually via the

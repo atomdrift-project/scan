@@ -1193,7 +1193,7 @@ impl ExtractContext {
     /// missing members are skipped. There is therefore nothing to reject here for
     /// those families; litmus accepts any layout the spec presents. Whole-bundle
     /// drift (the spec declaring more features than any writer fills) is caught
-    /// separately by [`Self::had_layout_drift`] after the benign-corpus pass.
+    /// separately by [`Self::had_layout_drift`] after the benign fixture pass.
     pub fn validate_layout(&self) -> Result<()> {
         Ok(())
     }
@@ -1202,7 +1202,7 @@ impl ExtractContext {
     /// `total_features > cursor` (feature_names declares slots no writer fills,
     /// so they extract to zero). False for a healthy or allowlist-pruned bundle.
     /// Only meaningful after at least one extraction has run; `validate` checks
-    /// it after the benign corpus pass so a drifted bundle fails to deploy.
+    /// it after the benign fixture pass so a drifted bundle fails to deploy.
     #[must_use]
     pub fn had_layout_drift(&self) -> bool {
         self.layout_drift.load(std::sync::atomic::Ordering::Relaxed)
@@ -1901,6 +1901,15 @@ pub(crate) struct RawNeeds {
 }
 
 impl RawNeeds {
+    /// All optional raw subtrees needed by any specialist feature family.
+    pub(crate) const fn all() -> Self {
+        Self {
+            kv: true,
+            textenc: true,
+            symbol: true,
+        }
+    }
+
     /// The needs of any of two consumers — used to parse a report once for the
     /// general pass and every route, cloning a subtree if *any* of them reads it.
     /// `RawNeeds::default()` (no families) is the identity for folding these.

@@ -311,11 +311,9 @@ enum Commands {
         check: bool,
     },
 
-    /// Validate cleave traits, load the model, and ensure benign samples stay benign
+    /// Validate the model bundle and benign fixture corpus
     Validate {
-        /// Skip cleave trait-corpus validation; validate the model only
-        /// (feature-layout + benign-corpus inference). Traits are versioned
-        /// separately from the deployed model.
+        /// Skip trait-dependent fixture inference; validate model layout only
         #[arg(long)]
         skip_traits: bool,
     },

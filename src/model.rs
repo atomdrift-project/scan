@@ -144,6 +144,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use crate::features::{EXPECTED_MODEL_ABI_VERSION, ExtractContext, FeatureSpec};
 
@@ -718,22 +719,76 @@ pub struct ModelInfo {
 /// inputs `("input", float32, [N, n_features])`, outputs
 /// `[label (int64, [N]), probabilities (float32, [N, 2])]`. We
 /// ignore the label output and use column 1 of probabilities.
+#[derive(Debug)]
 struct OnnxBackend {
+    inner: OnnxRuntime,
+}
+
+#[derive(Debug)]
+enum OnnxRuntime {
+    Fast(FastTreeBackend),
+    Tract(TractOnnxBackend),
+}
+
+struct TractOnnxBackend {
     /// Pre-optimized tract plan. Stored as a runnable model so
     /// `.run` calls don't re-optimize each prediction.
     plan: tract_onnx::prelude::TypedRunnableModel<tract_onnx::prelude::TypedModel>,
     n_features: usize,
 }
 
-impl std::fmt::Debug for OnnxBackend {
+impl std::fmt::Debug for TractOnnxBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OnnxBackend")
+        f.debug_struct("TractOnnxBackend")
             .field("n_features", &self.n_features)
             .finish_non_exhaustive()
     }
 }
 
 impl OnnxBackend {
+    fn load(path: &Path) -> Result<Self> {
+        match FastTreeBackend::load(path) {
+            Ok(fast) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    features = fast.n_features,
+                    trees = fast.trees.len(),
+                    "loaded fast ONNX tree ensemble"
+                );
+                return Ok(Self {
+                    inner: OnnxRuntime::Fast(fast),
+                });
+            }
+            Err(error) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %error,
+                    "fast ONNX tree loader did not accept model; falling back to tract"
+                );
+            }
+        }
+
+        Ok(Self {
+            inner: OnnxRuntime::Tract(TractOnnxBackend::load(path)?),
+        })
+    }
+
+    fn predict(&self, features: &[f32]) -> Result<f32> {
+        match &self.inner {
+            OnnxRuntime::Fast(fast) => fast.predict(features),
+            OnnxRuntime::Tract(tract) => tract.predict(features),
+        }
+    }
+
+    const fn n_features(&self) -> usize {
+        match &self.inner {
+            OnnxRuntime::Fast(fast) => fast.n_features,
+            OnnxRuntime::Tract(tract) => tract.n_features,
+        }
+    }
+}
+
+impl TractOnnxBackend {
     fn load(path: &Path) -> Result<Self> {
         use tract_onnx::prelude::*;
         // Parse the ONNX graph first to recover n_features from the
@@ -823,6 +878,461 @@ impl OnnxBackend {
 }
 
 #[derive(Debug)]
+struct FastTreeBackend {
+    n_features: usize,
+    n_classes: usize,
+    trees: Vec<usize>,
+    nodes: Vec<FastTreeNode>,
+    leaves: Vec<(usize, f32)>,
+    base_values: Vec<f32>,
+    post_transform: FastPostTransform,
+    binary_result_layout: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FastPostTransform {
+    None,
+    Logistic,
+    Softmax,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FastCmp {
+    Equal,
+    NotEqual,
+    Less,
+    Greater,
+    LessEqual,
+    GreaterEqual,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FastTreeNode {
+    Branch {
+        feature_id: usize,
+        threshold: f32,
+        true_id: usize,
+        false_id: usize,
+        cmp: FastCmp,
+        nan_is_true: bool,
+    },
+    Leaf {
+        start: usize,
+        end: usize,
+    },
+}
+
+impl FastTreeBackend {
+    fn load(path: &Path) -> Result<Self> {
+        use tract_onnx::prelude::Framework;
+        let proto = tract_onnx::onnx()
+            .proto_model_for_path(path)
+            .with_context(|| format!("parsing ONNX protobuf {}", path.display()))?;
+        let graph = proto
+            .graph
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ONNX model has no graph"))?;
+        let node = graph
+            .node
+            .iter()
+            .find(|node| node.op_type == "TreeEnsembleClassifier")
+            .ok_or_else(|| anyhow::anyhow!("ONNX graph has no TreeEnsembleClassifier node"))?;
+
+        let n_features = onnx_input_feature_count(graph)?;
+        let n_classes = onnx_class_count(node)?;
+        let nodes_featureids = attr_usizes(node, "nodes_featureids")?;
+        if nodes_featureids.is_empty() {
+            anyhow::bail!("TreeEnsembleClassifier has no nodes");
+        }
+        let n_nodes = nodes_featureids.len();
+        let node_ids = attr_usizes_exact(node, "nodes_nodeids", n_nodes)?;
+        let tree_ids = attr_usizes_exact(node, "nodes_treeids", n_nodes)?;
+        let true_ids = attr_usizes_exact(node, "nodes_truenodeids", n_nodes)?;
+        let false_ids = attr_usizes_exact(node, "nodes_falsenodeids", n_nodes)?;
+        let node_values = attr_floats_exact(node, "nodes_values", n_nodes)?;
+        let node_modes = attr_strings_exact(node, "nodes_modes", n_nodes)?;
+        let nan_is_true = optional_attr_bools(node, "nodes_missing_value_tracks_true", n_nodes)?;
+
+        let leaf_node_ids = attr_usizes(node, "class_nodeids")?;
+        if leaf_node_ids.is_empty() {
+            anyhow::bail!("TreeEnsembleClassifier has no class leaves");
+        }
+        let n_leaves = leaf_node_ids.len();
+        let leaf_tree_ids = attr_usizes_exact(node, "class_treeids", n_leaves)?;
+        let leaf_class_ids = attr_usizes_exact(node, "class_ids", n_leaves)?;
+        let leaf_weights = attr_floats_exact(node, "class_weights", n_leaves)?;
+
+        if tree_ids.first().copied() != Some(0) || leaf_tree_ids.first().copied() != Some(0) {
+            anyhow::bail!("TreeEnsembleClassifier tree ids must start at 0");
+        }
+        let n_trees = tree_ids
+            .last()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier has no tree ids"))?
+            + 1;
+        if leaf_tree_ids.last().copied() != Some(n_trees - 1) {
+            anyhow::bail!("TreeEnsembleClassifier node/leaf tree counts mismatch");
+        }
+
+        let mut node_order: Vec<usize> = (0..n_nodes).collect();
+        node_order.sort_by_key(|&idx| (tree_ids[idx], node_ids[idx]));
+        let mut leaf_order: Vec<usize> = (0..n_leaves).collect();
+        leaf_order.sort_by_key(|&idx| (leaf_tree_ids[idx], leaf_node_ids[idx]));
+
+        let mut trees = Vec::with_capacity(n_trees);
+        let mut nodes = Vec::with_capacity(n_nodes);
+        let mut leaves = Vec::with_capacity(n_leaves);
+        let mut current_tree_id = None;
+        let mut in_leaf_idx = 0usize;
+        for node_idx in node_order {
+            let tree_id = tree_ids[node_idx];
+            if Some(tree_id) != current_tree_id {
+                current_tree_id = Some(tree_id);
+                trees.push(nodes.len());
+            }
+
+            if let Some(cmp) = parse_fast_cmp(&node_modes[node_idx])? {
+                let tree_offset = *trees
+                    .last()
+                    .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier missing tree root"))?;
+                nodes.push(FastTreeNode::Branch {
+                    feature_id: nodes_featureids[node_idx],
+                    threshold: node_values[node_idx],
+                    true_id: true_ids[node_idx] + tree_offset,
+                    false_id: false_ids[node_idx] + tree_offset,
+                    cmp,
+                    nan_is_true: nan_is_true[node_idx],
+                });
+            } else {
+                let start = leaves.len();
+                while in_leaf_idx < leaf_order.len() {
+                    let leaf_idx = leaf_order[in_leaf_idx];
+                    if leaf_tree_ids[leaf_idx] != tree_id
+                        || leaf_node_ids[leaf_idx] != node_ids[node_idx]
+                    {
+                        break;
+                    }
+                    leaves.push((leaf_class_ids[leaf_idx], leaf_weights[leaf_idx]));
+                    in_leaf_idx += 1;
+                }
+                nodes.push(FastTreeNode::Leaf {
+                    start,
+                    end: leaves.len(),
+                });
+            }
+        }
+
+        if in_leaf_idx != leaf_order.len() {
+            anyhow::bail!("TreeEnsembleClassifier has leaves that do not match any node");
+        }
+        let max_feature = nodes_featureids.iter().copied().max().unwrap_or(0);
+        if max_feature >= n_features {
+            anyhow::bail!(
+                "TreeEnsembleClassifier uses feature {max_feature}, input has {n_features}"
+            );
+        }
+        if leaf_class_ids.iter().any(|&class_id| class_id >= n_classes) {
+            anyhow::bail!("TreeEnsembleClassifier leaf class id exceeds class count");
+        }
+
+        let mut base_values = optional_attr_floats(node, "base_values")
+            .unwrap_or_else(|| vec![0.0; n_classes]);
+        if base_values.is_empty() {
+            base_values.resize(n_classes, 0.0);
+        }
+        if base_values.len() != n_classes {
+            anyhow::bail!(
+                "TreeEnsembleClassifier base_values length {} != class count {}",
+                base_values.len(),
+                n_classes
+            );
+        }
+
+        let post_transform = match optional_attr_string(node, "post_transform")?.as_deref() {
+            None | Some("NONE") => FastPostTransform::None,
+            Some("LOGISTIC") => FastPostTransform::Logistic,
+            Some("SOFTMAX") => FastPostTransform::Softmax,
+            Some(other) => anyhow::bail!("unsupported post_transform {other}"),
+        };
+        let binary_result_layout =
+            n_classes < 3 && leaves.iter().all(|(class_id, _)| *class_id == 0);
+
+        Ok(Self {
+            n_features,
+            n_classes,
+            trees,
+            nodes,
+            leaves,
+            base_values,
+            post_transform,
+            binary_result_layout,
+        })
+    }
+
+    fn predict(&self, features: &[f32]) -> Result<f32> {
+        if features.len() != self.n_features {
+            anyhow::bail!(
+                "feature vector length {} != ONNX expected {}",
+                features.len(),
+                self.n_features
+            );
+        }
+
+        let mut scores = vec![0.0f32; self.n_classes];
+        for &root in &self.trees {
+            let mut node_idx = root;
+            loop {
+                match self.nodes.get(node_idx) {
+                    Some(FastTreeNode::Branch {
+                        feature_id,
+                        threshold,
+                        true_id,
+                        false_id,
+                        cmp,
+                        nan_is_true,
+                    }) => {
+                        let feature = features[*feature_id];
+                        node_idx = if fast_compare(*cmp, feature, *threshold, *nan_is_true) {
+                            *true_id
+                        } else {
+                            *false_id
+                        };
+                    }
+                    Some(FastTreeNode::Leaf { start, end }) => {
+                        for &(class_id, weight) in &self.leaves[*start..*end] {
+                            scores[class_id] += weight;
+                        }
+                        break;
+                    }
+                    None => anyhow::bail!("TreeEnsembleClassifier branch points outside node table"),
+                }
+            }
+        }
+
+        for (score, base) in scores.iter_mut().zip(&self.base_values) {
+            *score += *base;
+        }
+        match self.post_transform {
+            FastPostTransform::None => {}
+            FastPostTransform::Logistic => {
+                (tract_linalg::ops().sigmoid_f32)()
+                    .run(&mut scores)
+                    .context("ONNX sigmoid post-transform failed")?;
+            }
+            FastPostTransform::Softmax => {
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for score in &mut scores {
+                    *score = (*score - max).exp();
+                    sum += *score;
+                }
+                if sum != 0.0 {
+                    for score in &mut scores {
+                        *score /= sum;
+                    }
+                }
+            }
+        }
+
+        if self.binary_result_layout {
+            scores
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier emitted no score"))
+        } else {
+            scores
+                .get(1)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier emitted no positive class"))
+        }
+    }
+}
+
+fn onnx_attr<'a>(
+    node: &'a tract_onnx::pb::NodeProto,
+    name: &str,
+) -> Result<&'a tract_onnx::pb::AttributeProto> {
+    node.attribute
+        .iter()
+        .find(|attr| attr.name == name)
+        .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier missing attribute {name}"))
+}
+
+fn optional_onnx_attr<'a>(
+    node: &'a tract_onnx::pb::NodeProto,
+    name: &str,
+) -> Option<&'a tract_onnx::pb::AttributeProto> {
+    node.attribute.iter().find(|attr| attr.name == name)
+}
+
+fn attr_usizes(node: &tract_onnx::pb::NodeProto, name: &str) -> Result<Vec<usize>> {
+    onnx_attr(node, name)?
+        .ints
+        .iter()
+        .map(|&value| usize::try_from(value).with_context(|| format!("attribute {name} has negative value {value}")))
+        .collect()
+}
+
+fn attr_usizes_exact(
+    node: &tract_onnx::pb::NodeProto,
+    name: &str,
+    expected: usize,
+) -> Result<Vec<usize>> {
+    let values = attr_usizes(node, name)?;
+    if values.len() != expected {
+        anyhow::bail!(
+            "attribute {name} length {} != expected {expected}",
+            values.len()
+        );
+    }
+    Ok(values)
+}
+
+fn attr_floats_exact(
+    node: &tract_onnx::pb::NodeProto,
+    name: &str,
+    expected: usize,
+) -> Result<Vec<f32>> {
+    let values = onnx_attr(node, name)?.floats.clone();
+    if values.len() != expected {
+        anyhow::bail!(
+            "attribute {name} length {} != expected {expected}",
+            values.len()
+        );
+    }
+    Ok(values)
+}
+
+fn optional_attr_floats(
+    node: &tract_onnx::pb::NodeProto,
+    name: &str,
+) -> Option<Vec<f32>> {
+    optional_onnx_attr(node, name).map(|attr| attr.floats.clone())
+}
+
+fn attr_strings_exact(
+    node: &tract_onnx::pb::NodeProto,
+    name: &str,
+    expected: usize,
+) -> Result<Vec<String>> {
+    let values: Vec<String> = onnx_attr(node, name)?
+        .strings
+        .iter()
+        .map(|bytes| {
+            std::str::from_utf8(bytes)
+                .map(str::to_owned)
+                .with_context(|| format!("attribute {name} contains non-UTF8 string"))
+        })
+        .collect::<Result<_>>()?;
+    if values.len() != expected {
+        anyhow::bail!(
+            "attribute {name} length {} != expected {expected}",
+            values.len()
+        );
+    }
+    Ok(values)
+}
+
+fn optional_attr_string(
+    node: &tract_onnx::pb::NodeProto,
+    name: &str,
+) -> Result<Option<String>> {
+    optional_onnx_attr(node, name)
+        .map(|attr| {
+            std::str::from_utf8(&attr.s)
+                .map(str::to_owned)
+                .with_context(|| format!("attribute {name} contains non-UTF8 string"))
+        })
+        .transpose()
+}
+
+fn optional_attr_bools(
+    node: &tract_onnx::pb::NodeProto,
+    name: &str,
+    expected: usize,
+) -> Result<Vec<bool>> {
+    let Some(attr) = optional_onnx_attr(node, name) else {
+        return Ok(vec![false; expected]);
+    };
+    if attr.ints.len() != expected {
+        anyhow::bail!(
+            "attribute {name} length {} != expected {expected}",
+            attr.ints.len()
+        );
+    }
+    Ok(attr.ints.iter().map(|&value| value != 0).collect())
+}
+
+fn onnx_class_count(node: &tract_onnx::pb::NodeProto) -> Result<usize> {
+    let int_count = optional_onnx_attr(node, "classlabels_int64s").map(|attr| attr.ints.len());
+    let string_count = optional_onnx_attr(node, "classlabels_strings").map(|attr| attr.strings.len());
+    match (int_count, string_count) {
+        (Some(count), None) | (None, Some(count)) if count > 0 => Ok(count),
+        (Some(_), Some(_)) => anyhow::bail!(
+            "TreeEnsembleClassifier has both integer and string class labels"
+        ),
+        _ => anyhow::bail!("TreeEnsembleClassifier has no class labels"),
+    }
+}
+
+fn onnx_input_feature_count(graph: &tract_onnx::pb::GraphProto) -> Result<usize> {
+    let input = graph
+        .input
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("ONNX graph has no input"))?;
+    let value = input
+        .r#type
+        .as_ref()
+        .and_then(|ty| ty.value.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("ONNX input has no type"))?;
+    let tract_onnx::pb::type_proto::Value::TensorType(tensor_type) = value;
+    let shape = tensor_type
+        .shape
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("ONNX input tensor has no shape"))?;
+    let feature_dim = shape
+        .dim
+        .get(1)
+        .and_then(|dim| dim.value.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("ONNX input has no feature dimension"))?;
+    match feature_dim {
+        tract_onnx::pb::tensor_shape_proto::dimension::Value::DimValue(value) => {
+            usize::try_from(*value).context("ONNX feature dimension is negative")
+        }
+        tract_onnx::pb::tensor_shape_proto::dimension::Value::DimParam(param) => {
+            anyhow::bail!("ONNX feature dimension is symbolic: {param}")
+        }
+    }
+}
+
+fn parse_fast_cmp(mode: &str) -> Result<Option<FastCmp>> {
+    match mode {
+        "BRANCH_LEQ" => Ok(Some(FastCmp::LessEqual)),
+        "BRANCH_LT" => Ok(Some(FastCmp::Less)),
+        "BRANCH_GTE" => Ok(Some(FastCmp::GreaterEqual)),
+        "BRANCH_GT" => Ok(Some(FastCmp::Greater)),
+        "BRANCH_EQ" => Ok(Some(FastCmp::Equal)),
+        "BRANCH_NEQ" => Ok(Some(FastCmp::NotEqual)),
+        "LEAF" => Ok(None),
+        other => anyhow::bail!("unsupported tree node mode {other}"),
+    }
+}
+
+fn fast_compare(cmp: FastCmp, feature: f32, threshold: f32, nan_is_true: bool) -> bool {
+    if feature.is_nan() {
+        return nan_is_true;
+    }
+    match cmp {
+        FastCmp::Equal => feature == threshold,
+        FastCmp::NotEqual => feature != threshold,
+        FastCmp::Less => feature < threshold,
+        FastCmp::Greater => feature > threshold,
+        FastCmp::LessEqual => feature <= threshold,
+        FastCmp::GreaterEqual => feature >= threshold,
+    }
+}
+
+#[derive(Debug)]
 enum InnerModel {
     Onnx(Box<OnnxBackend>),
 }
@@ -830,7 +1340,7 @@ enum InnerModel {
 impl InnerModel {
     fn num_features(&self) -> usize {
         match self {
-            Self::Onnx(m) => m.n_features,
+            Self::Onnx(m) => m.n_features(),
         }
     }
 
@@ -875,10 +1385,11 @@ impl Backend {
         // Average member predictions in f64 to keep the rounding noise-floor
         // below f32 precision even for K up to a few dozen seeds. The K=1
         // path is mathematically identical to a direct `models[0].predict`.
-        let mut sum = 0.0_f64;
-        for m in &self.models {
-            sum += f64::from(m.predict(features)?);
-        }
+        let sum = self
+            .models
+            .par_iter()
+            .map(|m| m.predict(features).map(f64::from))
+            .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))?;
         // Safety: `models` is non-empty by construction. The narrowing cast
         // is intentional — every member emits f32 probabilities and our caller
         // surface is f32, so the f64 accumulator only exists to keep summation
@@ -1724,10 +2235,15 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
         )
     };
 
-    let mut models = Vec::with_capacity(model_paths.len());
+    let loaded: Vec<Result<(PathBuf, InnerModel)>> = model_paths
+        .into_par_iter()
+        .map(|path| load_inner_model(&path).map(|inner| (path, inner)))
+        .collect();
+
+    let mut models = Vec::with_capacity(loaded.len());
     let mut first_n_features: Option<usize> = None;
-    for path in &model_paths {
-        let inner = load_inner_model(path)?;
+    for loaded_model in loaded {
+        let (path, inner) = loaded_model?;
         // Refuse to mix feature counts — averaging across heterogeneous
         // feature spaces would silently produce nonsense scores.
         let n = inner.num_features();
@@ -1935,9 +2451,8 @@ fn load_specialists(
     parent: &Path,
     route_thresholds: &HashMap<String, Thresholds>,
     route_policies: &RoutePolicies,
-    category: &str,
-    out: &mut HashMap<String, Route>,
-    skipped: &mut HashSet<String>,
+    category: &'static str,
+    out: &mut RouteStore,
 ) {
     let entries = match std::fs::read_dir(parent) {
         Ok(rd) => rd,
@@ -1948,11 +2463,9 @@ fn load_specialists(
         }
     };
 
-    // Pass 1 (serial, cheap): enumerate the directory and apply the
-    // config-gating filter. Building each specialist's runnable tract plan is
-    // the expensive part — defer it to pass 2 so the per-route `into_optimized`
-    // work can run in parallel rather than serializing the whole zoo (~30
-    // routes / 97 ONNX graphs) on the startup thread.
+    // Enumerate the directory and apply the config-gating filter. Building
+    // each specialist's runnable tract plan is the expensive part, so normal
+    // scans retain lazy descriptors after cheap calibrator validation.
     let mut pending: Vec<(PathBuf, String, Thresholds)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1974,36 +2487,31 @@ fn load_specialists(
                 name = %name,
                 "skipping specialist directory: no thresholds in ensemble config"
             );
-            skipped.insert(name);
+            out.insert_skipped(name);
             continue;
         }
         pending.push((path, name, route_t.unwrap_or_default()));
     }
 
-    // Pass 2 (parallel): load the gated bundles concurrently. Order is
-    // irrelevant — results land in a HashMap keyed by name.
-    let loaded: Vec<(String, Result<Route>)> = pending
-        .into_par_iter()
-        .map(|(path, name, route_t)| {
-            let route = load_specialist(&path, &name, Some(route_t));
-            (name, route)
-        })
-        .collect();
-
-    for (name, result) in loaded {
-        match result {
-            Ok(route) => {
-                out.insert(name, route);
-            }
-            Err(e) => {
+    for (path, name, route_t) in pending {
+        let calibrator = match IsotonicCalibrator::load_optional(&path) {
+            Ok(calibrator) => calibrator,
+            Err(error) => {
                 tracing::warn!(
                     category = %category,
                     name = %name,
-                    error = ?e,
-                    "dropping specialist; route will degrade to general or filegroup",
+                    path = %path.display(),
+                    error = ?error,
+                    "dropping specialist with invalid calibrator",
                 );
+                out.insert_skipped(name);
+                continue;
             }
-        }
+        };
+        out.insert_lazy(
+            name.clone(),
+            LazyRoute::new(path, name, category, route_t, calibrator),
+        );
     }
 }
 
@@ -2082,20 +2590,155 @@ impl Route {
     }
 }
 
+#[derive(Debug)]
+struct LazyRoute {
+    bundle_dir: PathBuf,
+    name: String,
+    category: &'static str,
+    thresholds: Thresholds,
+    calibrator: Option<IsotonicCalibrator>,
+    loaded: OnceLock<RouteLoad>,
+}
+
+#[derive(Debug)]
+enum RouteLoad {
+    Loaded(Arc<Route>),
+    Failed(String),
+}
+
+impl LazyRoute {
+    fn new(
+        bundle_dir: PathBuf,
+        name: String,
+        category: &'static str,
+        thresholds: Thresholds,
+        calibrator: Option<IsotonicCalibrator>,
+    ) -> Self {
+        Self {
+            bundle_dir,
+            name,
+            category,
+            thresholds,
+            calibrator,
+            loaded: OnceLock::new(),
+        }
+    }
+
+    fn load_once(&self) -> &RouteLoad {
+        self.loaded.get_or_init(|| {
+            match load_specialist(&self.bundle_dir, &self.name, Some(self.thresholds)) {
+                Ok(route) => RouteLoad::Loaded(Arc::new(route)),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    tracing::warn!(
+                        category = %self.category,
+                        name = %self.name,
+                        path = %self.bundle_dir.display(),
+                        error = %message,
+                        "dropping lazy specialist; route will degrade to general or filegroup",
+                    );
+                    RouteLoad::Failed(message)
+                }
+            }
+        })
+    }
+
+    fn get(&self) -> Option<Arc<Route>> {
+        match self.load_once() {
+            RouteLoad::Loaded(route) => Some(Arc::clone(route)),
+            RouteLoad::Failed(_) => None,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self.load_once() {
+            RouteLoad::Loaded(_) => Ok(()),
+            RouteLoad::Failed(message) => {
+                anyhow::bail!(
+                    "specialist {}/{} at {} failed to load: {}",
+                    self.category,
+                    self.name,
+                    self.bundle_dir.display(),
+                    message
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RouteStore {
+    loaded: HashMap<String, Arc<Route>>,
+    lazy: HashMap<String, LazyRoute>,
+    skipped: HashSet<String>,
+}
+
+impl RouteStore {
+    fn insert_lazy(&mut self, name: String, route: LazyRoute) {
+        self.lazy.insert(name, route);
+    }
+
+    fn insert_skipped(&mut self, name: String) {
+        self.skipped.insert(name);
+    }
+
+    fn is_skipped(&self, name: &str) -> bool {
+        self.skipped.contains(name)
+    }
+
+    fn get(&self, name: &str) -> Option<Arc<Route>> {
+        self.loaded
+            .get(name)
+            .map(Arc::clone)
+            .or_else(|| self.lazy.get(name).and_then(LazyRoute::get))
+    }
+
+    fn calibrator(&self, name: &str) -> Option<&IsotonicCalibrator> {
+        self.loaded
+            .get(name)
+            .and_then(|route| route.calibrator.as_ref())
+            .or_else(|| self.lazy.get(name).and_then(|route| route.calibrator.as_ref()))
+    }
+
+    fn available_len(&self) -> usize {
+        self.loaded.len() + self.lazy.len()
+    }
+
+    fn lazy_len(&self) -> usize {
+        self.lazy.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.loaded.is_empty() && self.lazy.is_empty()
+    }
+
+    fn validate_all(&self) -> Result<()> {
+        self.lazy
+            .par_iter()
+            .try_for_each(|(_, route)| route.validate())
+    }
+
+    fn validate_route(&self, name: &str) -> Result<()> {
+        if self.loaded.contains_key(name) {
+            return Ok(());
+        }
+        match self.lazy.get(name) {
+            Some(route) => route.validate(),
+            None => anyhow::bail!("route {name:?} is not available"),
+        }
+    }
+}
+
 /// Routing decision: which route to consult for a file of type `T` in group `G`.
 ///
 /// DESIGN.md says: filetype if present → filegroup if present → general always.
 /// Each present route contributes to the OR over thresholds.
 #[derive(Debug, Default)]
 struct RouteSet {
-    /// Filegroup name → specialist model.
-    filegroups: HashMap<String, Route>,
-    /// Filetype name → specialist model.
-    filetypes: HashMap<String, Route>,
-    /// Filegroup routes present on disk but omitted from calibration.
-    skipped_filegroups: HashSet<String>,
-    /// Filetype routes present on disk but omitted from calibration.
-    skipped_filetypes: HashSet<String>,
+    /// Filegroup name → specialist model or lazy descriptor.
+    filegroups: RouteStore,
+    /// Filetype name → specialist model or lazy descriptor.
+    filetypes: RouteStore,
     /// Filetype → filegroup mapping from `config.json`. Used to translate a
     /// scanned file's `type` into the applicable filegroup specialist.
     filetype_to_filegroup: HashMap<String, String>,
@@ -2104,10 +2747,28 @@ struct RouteSet {
 }
 
 impl RouteSet {
-    /// True when there are no specialist routes loaded; routed prediction
+    /// True when there are no specialist routes available; routed prediction
     /// then degrades to the general route alone.
     fn is_empty(&self) -> bool {
         self.filegroups.is_empty() && self.filetypes.is_empty()
+    }
+
+    fn filegroup(&self, name: &str) -> Option<Arc<Route>> {
+        self.filegroups.get(name)
+    }
+
+    fn filetype(&self, name: &str) -> Option<Arc<Route>> {
+        self.filetypes.get(name)
+    }
+
+    fn validate_all(&self) -> Result<()> {
+        let (filegroups, filetypes) = rayon::join(
+            || self.filegroups.validate_all(),
+            || self.filetypes.validate_all(),
+        );
+        filegroups.context("validating filegroup specialist routes")?;
+        filetypes.context("validating filetype specialist routes")?;
+        Ok(())
     }
 }
 
@@ -2276,16 +2937,16 @@ fn calibrate_policy_thresholds_with<'a>(
 fn calibrate_policy_thresholds(
     policies: &mut RoutePolicies,
     general_calibrator: &Option<IsotonicCalibrator>,
-    filegroups: &HashMap<String, Route>,
-    filetypes: &HashMap<String, Route>,
+    filegroups: &RouteStore,
+    filetypes: &RouteStore,
 ) {
     calibrate_policy_thresholds_with(policies, |route_name| {
         if route_name == "general" {
             general_calibrator.as_ref()
         } else if let Some(name) = route_name.strip_prefix("filegroups/") {
-            filegroups.get(name).and_then(|r| r.calibrator.as_ref())
+            filegroups.calibrator(name)
         } else if let Some(name) = route_name.strip_prefix("filetypes/") {
-            filetypes.get(name).and_then(|r| r.calibrator.as_ref())
+            filetypes.calibrator(name)
         } else {
             None
         }
@@ -2470,43 +3131,53 @@ impl Model {
         let general_dir = model_dir.join("general");
         let general_thresholds =
             thresholds.or_else(|| ensemble_cfg.route_thresholds.get("general").copied());
-        let general = load_bundle(
-            &general_dir,
-            general_thresholds.as_ref(),
-            /* is_general = */ true,
-        )
-        .with_context(|| format!("loading general route from {}", general_dir.display()))?;
-
-        let mut filegroups: HashMap<String, Route> = HashMap::new();
-        let mut filetypes: HashMap<String, Route> = HashMap::new();
-        let mut skipped_filegroups: HashSet<String> = HashSet::new();
-        let mut skipped_filetypes: HashSet<String> = HashSet::new();
+        let mut filegroups = RouteStore::default();
+        let mut filetypes = RouteStore::default();
 
         // Walk filegroups/<name>/ and filetypes/<name>/, loading each
         // specialist that exists. Specialists with ABI mismatch or bad spec
         // subset are dropped with a warning, not a hard failure.
         let specialist_start = std::time::Instant::now();
-        load_specialists(
-            &model_dir.join("filegroups"),
-            &ensemble_cfg.route_thresholds,
-            &policies,
-            "filegroups",
-            &mut filegroups,
-            &mut skipped_filegroups,
+        let (general, _) = rayon::join(
+            || {
+                load_bundle(
+                    &general_dir,
+                    general_thresholds.as_ref(),
+                    /* is_general = */ true,
+                )
+                .with_context(|| format!("loading general route from {}", general_dir.display()))
+            },
+            || {
+                rayon::join(
+                    || {
+                        load_specialists(
+                            &model_dir.join("filegroups"),
+                            &ensemble_cfg.route_thresholds,
+                            &policies,
+                            "filegroups",
+                            &mut filegroups,
+                        );
+                    },
+                    || {
+                        load_specialists(
+                            &model_dir.join("filetypes"),
+                            &ensemble_cfg.route_thresholds,
+                            &policies,
+                            "filetypes",
+                            &mut filetypes,
+                        );
+                    },
+                )
+            },
         );
-        load_specialists(
-            &model_dir.join("filetypes"),
-            &ensemble_cfg.route_thresholds,
-            &policies,
-            "filetypes",
-            &mut filetypes,
-            &mut skipped_filetypes,
-        );
+        let general = general?;
         tracing::info!(
-            filegroups = filegroups.len(),
-            filetypes = filetypes.len(),
+            filegroups = filegroups.available_len(),
+            filetypes = filetypes.available_len(),
+            lazy_filegroups = filegroups.lazy_len(),
+            lazy_filetypes = filetypes.lazy_len(),
             elapsed_ms = specialist_start.elapsed().as_millis(),
-            "loaded specialist routes",
+            "prepared specialist routes",
         );
 
         // Required routes from config: any listed name that didn't load is
@@ -2516,17 +3187,17 @@ impl Model {
                 continue;
             }
             if let Some(name) = required.strip_prefix("filegroups/") {
-                if !filegroups.contains_key(name) {
-                    anyhow::bail!(
+                filegroups.validate_route(name).with_context(|| {
+                    format!(
                         "ensemble config marks filegroup {name:?} as required but it failed to load"
-                    );
-                }
+                    )
+                })?;
             } else if let Some(name) = required.strip_prefix("filetypes/") {
-                if !filetypes.contains_key(name) {
-                    anyhow::bail!(
+                filetypes.validate_route(name).with_context(|| {
+                    format!(
                         "ensemble config marks filetype {name:?} as required but it failed to load"
-                    );
-                }
+                    )
+                })?;
             } else {
                 anyhow::bail!(
                     "unknown required-route name {required:?} in ensemble config; \
@@ -2553,8 +3224,8 @@ impl Model {
             threshold_hostile = general.thresholds.hostile,
             threshold_source = general.threshold_source,
             spec_version = general.spec.version(),
-            filegroups = filegroups.len(),
-            filetypes = filetypes.len(),
+            filegroups = filegroups.available_len(),
+            filetypes = filetypes.available_len(),
             layout = "ensemble",
             "model loaded",
         );
@@ -2573,8 +3244,6 @@ impl Model {
             routes: RouteSet {
                 filegroups,
                 filetypes,
-                skipped_filegroups,
-                skipped_filetypes,
                 filetype_to_filegroup: ensemble_cfg.filetype_to_filegroup,
                 policies,
             },
@@ -2583,6 +3252,27 @@ impl Model {
             general_grid: ensemble_cfg.general_grid,
             grid_max: ensemble_cfg.grid_max,
         })
+    }
+
+    /// Force every calibrated specialist route to load and validate.
+    ///
+    /// Normal scanning initializes specialist ONNX graphs on demand from the
+    /// observed file type. Validation and install gates call this explicitly so
+    /// malformed specialist artifacts are caught even if the current fixture set
+    /// never routes to them.
+    pub fn validate_all_routes(&self) -> Result<()> {
+        if self.routes.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        self.routes.validate_all()?;
+        tracing::info!(
+            filegroups = self.routes.filegroups.available_len(),
+            filetypes = self.routes.filetypes.available_len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "validated specialist routes",
+        );
+        Ok(())
     }
 
     /// Run inference on a feature vector against the general route only.
@@ -2705,18 +3395,6 @@ impl Model {
         Ok((raw, probability, route.thresholds.classify(probability)))
     }
 
-    /// Union of every specialist route's raw-subtree needs, so the report can be
-    /// parsed once (with all consumers' needs) and shared across general + routes.
-    pub(crate) fn route_needs_union(&self) -> crate::features::RawNeeds {
-        self.routes
-            .filegroups
-            .values()
-            .chain(self.routes.filetypes.values())
-            .fold(crate::features::RawNeeds::default(), |acc, r| {
-                acc.union(r.ctx.raw_needs())
-            })
-    }
-
     /// Routed prediction from a full cleave report, with per-route scores
     /// retained for JSON and `--extra` output.
     ///
@@ -2762,75 +3440,111 @@ impl Model {
         &self,
         file_type: &str,
         general_features: &[f32],
-        mut score: F,
+        score: F,
     ) -> Result<(Vec<RouteProbability>, Vec<RouteScore>, Vec<SkippedRoute>)>
     where
-        F: FnMut(&Route) -> Result<(f32, f32, Classification)>,
+        F: Fn(&Route) -> Result<(f32, f32, Classification)> + Sync,
     {
         let policy = self.routes.policies.policy_for(file_type);
-        let (general_raw, general_prob) = self.predict_general_raw_calibrated(general_features)?;
-        let general_class = policy.map_or_else(
-            || self.thresholds.classify(general_prob),
-            |policy| policy_route_class(policy, "general", general_prob),
-        );
-        let mut route_probs = vec![RouteProbability {
-            route: "general".to_string(),
-            probability: general_prob,
-        }];
-        let mut scores = vec![RouteScore {
-            model: "az".to_string(),
-            probability: general_prob,
-            raw: general_raw,
-            classification: general_class,
-        }];
-        let mut skipped = Vec::new();
 
-        if self.routes.is_empty() {
-            return Ok((route_probs, scores, skipped));
-        }
+        let group_name = self.routes.filetype_to_filegroup.get(file_type).cloned();
+        let group_route = group_name
+            .as_deref()
+            .and_then(|name| self.routes.filegroup(name));
+        let filetype_route = self.routes.filetype(file_type);
 
-        if let Some(group_name) = self.routes.filetype_to_filegroup.get(file_type) {
-            if let Some(route) = self.routes.filegroups.get(group_name) {
-                let route_name = format!("filegroups/{group_name}");
-                let (raw, prob, class) = score(route)?;
-                let class = policy.map_or(class, |policy| {
-                    policy_route_class(policy, &route_name, prob)
-                });
-                scores.push(RouteScore {
+        let score_general = || -> Result<(RouteProbability, RouteScore)> {
+            let (general_raw, general_prob) =
+                self.predict_general_raw_calibrated(general_features)?;
+            let general_class = policy.map_or_else(
+                || self.thresholds.classify(general_prob),
+                |policy| policy_route_class(policy, "general", general_prob),
+            );
+            Ok((
+                RouteProbability {
+                    route: "general".to_string(),
+                    probability: general_prob,
+                },
+                RouteScore {
+                    model: "az".to_string(),
+                    probability: general_prob,
+                    raw: general_raw,
+                    classification: general_class,
+                },
+            ))
+        };
+
+        let score_group = || -> Result<Option<(RouteProbability, RouteScore)>> {
+            let (Some(group_name), Some(route)) = (group_name.as_deref(), group_route.as_ref())
+            else {
+                return Ok(None);
+            };
+            let route_name = format!("filegroups/{group_name}");
+            let (raw, prob, class) = score(route)?;
+            let class = policy.map_or(class, |policy| {
+                policy_route_class(policy, &route_name, prob)
+            });
+            Ok(Some((
+                RouteProbability {
+                    route: route_name,
+                    probability: prob,
+                },
+                RouteScore {
                     model: format!("az/{group_name}"),
                     probability: prob,
                     raw,
                     classification: class,
-                });
-                route_probs.push(RouteProbability {
-                    route: route_name,
-                    probability: prob,
-                });
-            } else if self.routes.skipped_filegroups.contains(group_name) {
-                skipped.push(SkippedRoute {
-                    model: format!("az/{group_name}"),
-                    reason: "uncalibrated",
-                });
-            }
-        }
+                },
+            )))
+        };
 
-        if let Some(route) = self.routes.filetypes.get(file_type) {
+        let score_filetype = || -> Result<Option<(RouteProbability, RouteScore)>> {
+            let Some(route) = filetype_route.as_ref() else {
+                return Ok(None);
+            };
             let route_name = format!("filetypes/{file_type}");
             let (raw, prob, class) = score(route)?;
             let class = policy.map_or(class, |policy| {
                 policy_route_class(policy, &route_name, prob)
             });
-            scores.push(RouteScore {
-                model: format!("az/{file_type}"),
-                probability: prob,
-                raw,
-                classification: class,
+            Ok(Some((
+                RouteProbability {
+                    route: route_name,
+                    probability: prob,
+                },
+                RouteScore {
+                    model: format!("az/{file_type}"),
+                    probability: prob,
+                    raw,
+                    classification: class,
+                },
+            )))
+        };
+
+        let (general_result, (group_result, filetype_result)) =
+            rayon::join(score_general, || rayon::join(score_group, score_filetype));
+
+        let (general_prob, general_score) = general_result?;
+        let mut route_probs = vec![general_prob];
+        let mut scores = vec![general_score];
+        let mut skipped = Vec::new();
+
+        if let Some((route_prob, route_score)) = group_result? {
+            route_probs.push(route_prob);
+            scores.push(route_score);
+        } else if let Some(group_name) = group_name.as_deref()
+            && self.routes.filegroups.is_skipped(group_name)
+        {
+            skipped.push(SkippedRoute {
+                model: format!("az/{group_name}"),
+                reason: "uncalibrated",
             });
-            route_probs.push(RouteProbability {
-                route: route_name,
-                probability: prob,
-            });
-        } else if self.routes.skipped_filetypes.contains(file_type) {
+        }
+
+        if let Some((route_prob, route_score)) = filetype_result? {
+            route_probs.push(route_prob);
+            scores.push(route_score);
+        } else if self.routes.filetypes.is_skipped(file_type) {
             skipped.push(SkippedRoute {
                 model: format!("az/{file_type}"),
                 reason: "uncalibrated",
