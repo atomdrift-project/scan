@@ -1,8 +1,10 @@
 #!/bin/sh
 # worker-linux.sh - Install Atomdrift Scan worker as a hardened systemd service.
 #
-# Local install for any systemd-equipped Linux with apt-get (Debian, Ubuntu,
-# Mint, Pop!_OS, ...) or pacman (Arch, CachyOS, EndeavourOS, Manjaro, ...).
+# Local install for any systemd-equipped Linux. Packages are installed via the
+# host's native manager — apt-get (Debian, Ubuntu, Mint, Pop!_OS, ...),
+# dnf/yum (Fedora, RHEL, Rocky, Alma, CentOS), zypper (openSUSE, SLE),
+# pacman (Arch, CachyOS, EndeavourOS, Manjaro, ...) or xbps (Void).
 # Re-runnable: idempotent. The unit is daemon-reloaded and the service is
 # restarted only when the binary or unit file actually changed on disk.
 #
@@ -47,32 +49,100 @@ command -v systemctl >/dev/null 2>&1 || die "systemctl not found (systemd requir
 command -v sudo      >/dev/null 2>&1 || die "sudo required"
 command -v rizin     >/dev/null 2>&1 || die "rizin not found — install from https://rizin.re first"
 
-# --- Packages (apt or pacman) -----------------------------------------------
+# --- Packages ---------------------------------------------------------------
+#
+# Detect the host package manager, then install two groups:
+#   core  — build toolchain; the build cannot proceed without these.
+#   extra — unpacking helpers (7z, upx, innoextract) used during analysis.
+#           Installed best-effort: names and availability drift across distros,
+#           and a missing unpacker only degrades the worker (it skips that
+#           archive format) rather than blocking the build.
+# Package names differ per distro, so each manager carries its own spelling.
 
-if command -v apt-get >/dev/null 2>&1; then
-    pkgs_needed=""
-    for pkg in git pkg-config build-essential clang lld ca-certificates \
-               p7zip-full upx-ucl innoextract; do
-        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
-            || pkgs_needed="$pkgs_needed $pkg"
-    done
-    if [ -n "$pkgs_needed" ]; then
-        log "Installing missing apt packages:$pkgs_needed"
-        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        # shellcheck disable=SC2086
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkgs_needed
-    else
-        log "All apt packages already installed"
-    fi
-elif command -v pacman >/dev/null 2>&1; then
-    # pacman -S --needed is idempotent; -y syncs the package DB so a stale
-    # mirror snapshot doesn't cause spurious 'target not found' failures.
-    log "Ensuring pacman packages"
-    sudo pacman -Sy --needed --noconfirm \
-        git pkgconf base-devel clang lld p7zip upx innoextract ca-certificates
-else
-    die "no supported package manager found (need apt-get or pacman)"
+if   command -v apt-get       >/dev/null 2>&1; then PKG=apt
+elif command -v dnf           >/dev/null 2>&1; then PKG=dnf
+elif command -v yum           >/dev/null 2>&1; then PKG=yum
+elif command -v zypper        >/dev/null 2>&1; then PKG=zypper
+elif command -v pacman        >/dev/null 2>&1; then PKG=pacman
+elif command -v xbps-install  >/dev/null 2>&1; then PKG=xbps
+else die "no supported package manager (need apt-get, dnf, yum, zypper, pacman, or xbps)"
 fi
+log "Using package manager: $PKG"
+
+case "$PKG" in
+    apt)    core="git pkg-config build-essential clang lld ca-certificates"
+            extra="p7zip-full upx-ucl innoextract" ;;
+    dnf)    core="git pkgconf-pkg-config gcc gcc-c++ make clang lld ca-certificates"
+            extra="p7zip p7zip-plugins upx innoextract" ;;
+    yum)    core="git pkgconfig gcc gcc-c++ make clang lld ca-certificates"
+            extra="p7zip p7zip-plugins upx innoextract" ;;
+    zypper) core="git pkg-config gcc gcc-c++ make clang lld ca-certificates"
+            extra="p7zip upx innoextract" ;;
+    pacman) core="git pkgconf base-devel clang lld ca-certificates"
+            extra="p7zip upx innoextract" ;;
+    xbps)   core="git pkgconf base-devel clang lld ca-certificates"
+            extra="p7zip upx innoextract" ;;
+esac
+
+# Is a package already installed? Lets us skip a metadata sync on warm re-runs.
+pkg_have() {
+    case "$PKG" in
+        apt)              dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed" ;;
+        dnf|yum|zypper)   rpm -q "$1"        >/dev/null 2>&1 ;;
+        pacman)           pacman -Qi "$1"    >/dev/null 2>&1 ;;
+        xbps)             xbps-query "$1"    >/dev/null 2>&1 ;;
+    esac
+}
+
+SYNCED=0
+pkg_sync() {
+    [ "$SYNCED" -eq 1 ] && return 0
+    case "$PKG" in
+        apt)    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq ;;
+        # dnf/yum/zypper refresh metadata on demand; pacman/xbps sync via -y/-S
+        # in pkg_install below. Nothing extra to do here.
+        *)      : ;;
+    esac
+    SYNCED=1
+}
+
+pkg_install() {
+    case "$PKG" in
+        apt)    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" ;;
+        dnf)    sudo dnf install -y --setopt=install_weak_deps=False "$@" ;;
+        yum)    sudo yum install -y "$@" ;;
+        zypper) sudo zypper --non-interactive install --no-recommends "$@" ;;
+        # --needed is idempotent; -y syncs the DB so a stale mirror snapshot
+        # doesn't cause spurious 'target not found' failures.
+        pacman) sudo pacman -Sy --needed --noconfirm "$@" ;;
+        xbps)   sudo xbps-install -Sy "$@" ;;
+    esac
+}
+
+needed=""
+for pkg in $core; do pkg_have "$pkg" || needed="$needed $pkg"; done
+if [ -n "$needed" ]; then
+    log "Installing core build packages:$needed"
+    pkg_sync
+    # shellcheck disable=SC2086
+    pkg_install $needed || die "failed to install core build packages:$needed"
+else
+    log "Core build packages already installed"
+fi
+
+for pkg in $extra; do
+    pkg_have "$pkg" && continue
+    pkg_sync
+    log "Installing analysis helper: $pkg"
+    pkg_install "$pkg" >/dev/null 2>&1 || log "  note: '$pkg' unavailable via $PKG, skipping"
+done
+
+# The build proceeds regardless, but warn loudly about any unpacker we lack so
+# silently-skipped sample formats are visible in the deploy log.
+command -v 7z >/dev/null 2>&1 || command -v 7za >/dev/null 2>&1 || command -v 7zz >/dev/null 2>&1 \
+    || log "warning: no 7z/7za/7zz on PATH — packed-archive samples won't unpack"
+command -v upx         >/dev/null 2>&1 || log "warning: upx not found — UPX-packed samples won't unpack"
+command -v innoextract >/dev/null 2>&1 || log "warning: innoextract not found — Inno Setup installers won't unpack"
 
 # --- Rust toolchain ---------------------------------------------------------
 
