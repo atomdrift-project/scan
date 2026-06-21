@@ -19,6 +19,7 @@ SCAN_THREADS ?=
 SLOW_RULE_MS ?= 200
 MAX_JOBS ?= 25
 WORKERS  ?=
+MAX_RSS_GB ?=
 # LLM second-opinion pass for `make worker` (matches the deploy scripts'
 # defaults). LLM is exported as SCAN_LLM; INTERPRET_MIN_PROB gates which samples
 # are sent. The benchmark/profile targets deliberately omit interpret so LLM
@@ -270,7 +271,7 @@ benchmark: release
 
 benchmark-worker: release
 	@[ -n "$(URL)" ] || { echo "Usage: make benchmark-worker URL=<hopper-url>"; exit 1; }
-	./out/$(BINARY) --verbose worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
+	./out/$(BINARY) worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		2>&1 | tee /tmp/litmus-worker-benchmark.log
 
@@ -298,7 +299,7 @@ ORDER                ?= fifo
 BENCH_SUMMARY        ?= /tmp/litmus-worker-bench-summary.json
 worker-benchmark: release ## Benchmark the worker model over a local dataset via the bundled mock hopper
 	@[ -e "$(WORKER_BENCH_PATH)" ] || { echo "error: dataset not found: $(WORKER_BENCH_PATH)"; exit 1; }
-	@echo "worker-benchmark: dataset=$(WORKER_BENCH_PATH) workers=$(if $(WORKERS),$(WORKERS),default) order=$(ORDER)"
+	@echo "worker-benchmark: dataset=$(WORKER_BENCH_PATH) workers=$(if $(WORKERS),$(WORKERS),default) order=$(ORDER) max_rss_gb=$(if $(MAX_RSS_GB),$(MAX_RSS_GB),auto)"
 	@out=$$(mktemp); results=/tmp/litmus-worker-results.jsonl; rm -f $$results "$(BENCH_SUMMARY)"; \
 	./target/release/scan-bench-hopper --dataset "$(WORKER_BENCH_PATH)" --port 0 --dump $$results \
 		--order "$(ORDER)" --summary "$(BENCH_SUMMARY)" \
@@ -317,11 +318,12 @@ worker-benchmark: release ## Benchmark the worker model over a local dataset via
 	tflag=$$( [ "$$(uname -s)" = "Darwin" ] && echo -l || echo -v ); \
 	CLEAVE_SKIP_CACHE=1 SCAN_HEARTBEAT_SECS=$(HEARTBEAT_SECS) \
 	$(if $(GRID),SCAN_PER_SLOT_POOLS=1,) \
-	/usr/bin/time $$tflag ./out/$(BINARY) --verbose worker \
+	/usr/bin/time $$tflag ./out/$(BINARY) worker \
 		--url "http://127.0.0.1:$$port" \
 		--data-dir "$(WORKER_BENCH_PATH)" \
 		--exit-if-empty --nice 0 --no-update --no-validate \
 		$(if $(WORKERS),--workers $(WORKERS),) \
+		$(if $(MAX_RSS_GB),--max-rss-gb $(MAX_RSS_GB),) \
 		2>&1 | tee /tmp/litmus-worker-benchmark.log; \
 	sleep 0.5; \
 	received=$$(sort -u $$results 2>/dev/null | grep -c .); \
@@ -339,7 +341,7 @@ profile-worker:
 	$(CARGO) build --profile profiling
 	@[ -n "$(URL)" ] || { echo "Usage: make profile-worker URL=<hopper-url>"; exit 1; }
 	samply record -o /tmp/litmus-worker-profile.json.gz -- \
-		./target/profiling/$(BINARY) --verbose worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
+		./target/profiling/$(BINARY) worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		2>&1 | tee /tmp/litmus-worker-benchmark.log
 

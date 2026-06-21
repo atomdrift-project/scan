@@ -230,9 +230,12 @@ fn install(dir: &Path, artifact: &Artifact, source: &str) -> Result<()> {
             artifact.file
         )
     })?;
-    staged_model
-        .validate_all_routes()
-        .with_context(|| format!("staged bundle {} has invalid specialist routes", artifact.file))?;
+    staged_model.validate_all_routes().with_context(|| {
+        format!(
+            "staged bundle {} has invalid specialist routes",
+            artifact.file
+        )
+    })?;
 
     let meta = Installed {
         commit: artifact.commit.clone(),

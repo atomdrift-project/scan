@@ -10,12 +10,15 @@
 //! a ceiling (the resolved `--max-rss-gb`, default 85% of RAM). Two checks gate
 //! each new job, both keyed on signals every supported platform exposes:
 //!
-//! * **Predictive** — each in-flight analysis reserves a flat per-slot estimate
-//!   (1.5 GB by default). A burst commits its full reservation the instant it is
-//!   admitted, so the gate closes *before* the archives expand, not after.
+//! * **Predictive** — each in-flight analysis reserves an estimated footprint.
+//!   Archive-shaped jobs reserve more than flat files because they expand into
+//!   member reports and parse trees. A burst commits its full reservation the
+//!   instant it is admitted, so the gate closes *before* archives expand, not
+//!   after.
 //! * **Reactive** — live memory usage (`total − MemAvailable` on Linux, this
-//!   process's RSS elsewhere) must leave room for one more slot. This catches
-//!   estimates that ran low and pressure from other processes on the host.
+//!   process's RSS elsewhere) must leave room for the next reservation. This
+//!   catches estimates that ran low and pressure from other processes on the
+//!   host.
 //!
 //! One always-admit hatch (when nothing is in flight) guarantees forward
 //! progress even on a host too small to fit a single slot's estimate.
@@ -35,12 +38,22 @@ use tokio::sync::Notify;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MIB: u64 = 1024 * 1024;
 
-/// Assumed peak resident footprint of one analysis slot. Archives decompress and
-/// each source member spawns a tree-sitter parse tree, so a slot's true peak is
-/// wildly file-dependent and routinely far above its on-disk size; a flat,
-/// deliberately pessimistic estimate bounds concurrency safely without pretending
-/// to predict per-file blowup. Override with `SCAN_PER_SLOT_ESTIMATE_MB`.
-const DEFAULT_PER_SLOT_ESTIMATE_BYTES: usize = 1536 * 1024 * 1024;
+/// Assumed peak resident footprint of a small, non-archive analysis.
+const DEFAULT_FLAT_ESTIMATE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Minimum reservation for archive-shaped jobs. Archives decompress and each
+/// source member can spawn a tree-sitter parse tree, so their true peak is often
+/// far above on-disk size.
+const MIN_ARCHIVE_ESTIMATE_BYTES: usize = 1536 * 1024 * 1024;
+
+/// Upper bound for the size-scaled archive estimate. Jobs larger than the
+/// ceiling still run via the one-job forward-progress hatch.
+const MAX_ARCHIVE_ESTIMATE_BYTES: usize = 10 * 1024 * 1024 * 1024;
+
+/// On-disk archive bytes are a weak lower bound for in-memory member state; this
+/// multiplier is intentionally pessimistic for large bundles while still letting
+/// small package archives co-reside.
+const ARCHIVE_ESTIMATE_MULTIPLIER: u64 = 64;
 
 /// Re-poll interval while waiting for memory to free (bounds feedback latency
 /// even if no release wakes us).
@@ -65,6 +78,67 @@ fn live_used() -> Option<u64> {
     }
 }
 
+fn dynamic_estimate_bytes(path: &str, file_type: &str, on_disk_bytes: i64) -> usize {
+    let bytes = u64::try_from(on_disk_bytes).unwrap_or(0);
+    if looks_like_archive(path, file_type) {
+        let scaled = bytes
+            .saturating_mul(ARCHIVE_ESTIMATE_MULTIPLIER)
+            .saturating_add(MIN_ARCHIVE_ESTIMATE_BYTES as u64)
+            .min(MAX_ARCHIVE_ESTIMATE_BYTES as u64);
+        usize::try_from(scaled)
+            .unwrap_or(usize::MAX)
+            .max(MIN_ARCHIVE_ESTIMATE_BYTES)
+    } else {
+        DEFAULT_FLAT_ESTIMATE_BYTES
+    }
+}
+
+fn looks_like_archive(path: &str, file_type: &str) -> bool {
+    let ft = file_type.trim().to_ascii_lowercase();
+    matches!(
+        ft.as_str(),
+        "7z" | "apk"
+            | "archive"
+            | "bz2"
+            | "conda"
+            | "crate"
+            | "crx"
+            | "deb"
+            | "dmg"
+            | "ear"
+            | "gem"
+            | "gz"
+            | "jar"
+            | "nupkg"
+            | "pkg"
+            | "rar"
+            | "rpm"
+            | "tar"
+            | "tar.bz2"
+            | "tar.gz"
+            | "tar.xz"
+            | "tbz2"
+            | "tgz"
+            | "txz"
+            | "vsix"
+            | "war"
+            | "whl"
+            | "xpi"
+            | "xz"
+            | "zip"
+            | "zst"
+    ) || {
+        let p = path.to_ascii_lowercase();
+        ARCHIVE_SUFFIXES.iter().any(|suffix| p.ends_with(suffix))
+    }
+}
+
+const ARCHIVE_SUFFIXES: &[&str] = &[
+    ".7z", ".apk", ".bz2", ".conda", ".crate", ".crx", ".deb", ".dmg", ".ear", ".gem", ".gz",
+    ".jar", ".nupkg", ".pkg", ".rar", ".rpm", ".tar", ".tar.bz2", ".tar.gz", ".tar.xz", ".tbz2",
+    ".tgz", ".txz", ".vsix", ".war", ".whl", ".xpi", ".xz", ".zip", ".zst",
+];
+
 /// One in-flight analysis, recorded for the per-slot memory diagnostics.
 #[derive(Debug)]
 struct Inflight {
@@ -73,6 +147,7 @@ struct Inflight {
     path: Arc<str>,
     file_type: Arc<str>,
     on_disk_bytes: u64,
+    est_bytes: usize,
     admitted: Instant,
 }
 
@@ -83,8 +158,9 @@ pub struct MemoryAdmission {
     /// live usage would push past it. `0` disables the gate (slot-limited only),
     /// matching a disabled `--max-rss-gb`.
     ceiling_bytes: u64,
-    /// Flat per-slot reservation; see [`DEFAULT_PER_SLOT_ESTIMATE_BYTES`].
-    est_bytes: usize,
+    /// Optional fixed reservation override. When absent, reservations are
+    /// estimated from the job path/type/size.
+    fixed_est_bytes: Option<usize>,
     /// Sum of in-flight reservations.
     reserved: AtomicUsize,
     next_id: AtomicU64,
@@ -100,24 +176,33 @@ impl MemoryAdmission {
     /// auto = 85% of RAM); `0` disables proactive throttling so an operator who
     /// opts out, or an unsupported platform, degrades to slot-limited dispatch.
     pub fn new(ceiling_bytes: u64) -> Arc<Self> {
-        let est_bytes = env_usize("SCAN_PER_SLOT_ESTIMATE_MB")
+        let fixed_est_bytes = env_usize("SCAN_PER_SLOT_ESTIMATE_MB")
             .and_then(|mb| mb.checked_mul(1024 * 1024))
-            .filter(|b| *b > 0)
-            .unwrap_or(DEFAULT_PER_SLOT_ESTIMATE_BYTES);
+            .filter(|b| *b > 0);
 
         if ceiling_bytes == 0 {
             tracing::warn!("memory admission disabled (max-rss 0); dispatch is slot-limited only");
         } else {
-            tracing::info!(
-                ceiling_gb = ceiling_bytes as f64 / GIB,
-                per_slot_estimate_gb = est_bytes as f64 / GIB,
-                "live memory admission enabled",
-            );
+            match fixed_est_bytes {
+                Some(est_bytes) => tracing::info!(
+                    ceiling_gb = ceiling_bytes as f64 / GIB,
+                    per_slot_estimate_gb = est_bytes as f64 / GIB,
+                    "live memory admission enabled with fixed per-slot estimate",
+                ),
+                None => tracing::info!(
+                    ceiling_gb = ceiling_bytes as f64 / GIB,
+                    flat_estimate_gb = DEFAULT_FLAT_ESTIMATE_BYTES as f64 / GIB,
+                    min_archive_estimate_gb = MIN_ARCHIVE_ESTIMATE_BYTES as f64 / GIB,
+                    max_archive_estimate_gb = MAX_ARCHIVE_ESTIMATE_BYTES as f64 / GIB,
+                    archive_multiplier = ARCHIVE_ESTIMATE_MULTIPLIER,
+                    "live memory admission enabled with dynamic estimates",
+                ),
+            }
         }
 
         Arc::new(Self {
             ceiling_bytes,
-            est_bytes,
+            fixed_est_bytes,
             reserved: AtomicUsize::new(0),
             next_id: AtomicU64::new(0),
             inflight: Mutex::new(Vec::new()),
@@ -151,10 +236,18 @@ impl MemoryAdmission {
     ) -> AdmissionGuard {
         let started = Instant::now();
         let mut paused = false;
+        let est = self.estimate_bytes(&path, &file_type, on_disk_bytes);
 
         loop {
-            if self.try_reserve() {
-                return self.register(sha256, path, file_type, on_disk_bytes, started, paused);
+            if self.try_reserve(est) {
+                let guard = self.register(sha256, path, file_type, on_disk_bytes, est);
+                if paused {
+                    tracing::info!(
+                        waited_s = started.elapsed().as_secs(),
+                        "job admitted after memory-pressure pause",
+                    );
+                }
+                return guard;
             }
             if !paused {
                 // First time the gate closes for this job: surface where memory
@@ -176,14 +269,22 @@ impl MemoryAdmission {
         }
     }
 
-    /// Reserve one slot if memory allows. Gated on committed reservations and on
+    /// Estimate a job's peak footprint for predictive admission. Operators can
+    /// force the historical flat estimate with `SCAN_PER_SLOT_ESTIMATE_MB`.
+    fn estimate_bytes(&self, path: &str, file_type: &str, on_disk_bytes: i64) -> usize {
+        if let Some(est) = self.fixed_est_bytes {
+            return est;
+        }
+        dynamic_estimate_bytes(path, file_type, on_disk_bytes)
+    }
+
+    /// Reserve one job if memory allows. Gated on committed reservations and on
     /// live usage, both against `ceiling_bytes`; an always-admit hatch (nothing
-    /// in flight) guarantees forward progress on a host too small for one slot.
+    /// in flight) guarantees forward progress on a host too small for one job or
+    /// whose allocator has retained RSS after earlier jobs.
     ///
     /// Single caller per loop iteration; releases only decrease `reserved`.
-    fn try_reserve(&self) -> bool {
-        let est = self.est_bytes;
-
+    fn try_reserve(&self, est: usize) -> bool {
         // Disabled: dispatch is bounded by slot count alone.
         if self.ceiling_bytes == 0 {
             self.reserved.fetch_add(est, Ordering::AcqRel);
@@ -193,22 +294,20 @@ impl MemoryAdmission {
         let reserved = self.reserved.load(Ordering::Acquire);
         let used = (self.used_fn)();
 
-        // Forward-progress hatch: with nothing of ours in flight, admit one slot
-        // unless the host is *already* past the ceiling (pressure from elsewhere).
+        // Forward-progress hatch: with nothing of ours in flight, admit one job
+        // even when the job estimate exceeds the ceiling, or when RSS stayed high
+        // because the allocator retained freed arenas.
         if reserved == 0 {
-            if used.is_some_and(|u| u > self.ceiling_bytes) {
-                return false;
-            }
             self.reserved.store(est, Ordering::Release);
             return true;
         }
 
-        // Predictive: committed reservations must leave room for one more slot.
+        // Predictive: committed reservations must leave room for this job.
         if (reserved as u64).saturating_add(est as u64) > self.ceiling_bytes {
             return false;
         }
 
-        // Reactive: live usage must leave room for one more slot, catching
+        // Reactive: live usage must leave room for this job, catching
         // estimates that ran low and pressure from other processes.
         if let Some(used) = used
             && used.saturating_add(est as u64) > self.ceiling_bytes
@@ -227,8 +326,7 @@ impl MemoryAdmission {
         path: Arc<str>,
         file_type: Arc<str>,
         on_disk_bytes: i64,
-        started: Instant,
-        paused: bool,
+        est_bytes: usize,
     ) -> AdmissionGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::expect_used)]
@@ -241,18 +339,13 @@ impl MemoryAdmission {
                 path,
                 file_type,
                 on_disk_bytes: u64::try_from(on_disk_bytes).unwrap_or(0),
+                est_bytes,
                 admitted: Instant::now(),
             });
-        if paused {
-            tracing::info!(
-                waited_s = started.elapsed().as_secs(),
-                "job admitted after memory-pressure pause",
-            );
-        }
         AdmissionGuard {
             admission: Arc::clone(self),
             id,
-            est: self.est_bytes,
+            est: est_bytes,
         }
     }
 
@@ -284,6 +377,7 @@ impl MemoryAdmission {
                         Arc::clone(&j.path),
                         Arc::clone(&j.file_type),
                         j.on_disk_bytes,
+                        j.est_bytes,
                         j.admitted.elapsed(),
                     )
                 })
@@ -301,13 +395,14 @@ impl MemoryAdmission {
             used_gb = used as f64 / GIB,
             "in-flight memory admission: per-slot breakdown follows",
         );
-        for (slot, (sha256, path, file_type, on_disk, age)) in jobs.iter().enumerate() {
+        for (slot, (sha256, path, file_type, on_disk, est, age)) in jobs.iter().enumerate() {
             tracing::warn!(
                 slot,
                 sha256 = %sha256,
                 path = %path,
                 file_type = %file_type,
                 on_disk_mb = on_disk / MIB,
+                est_gb = *est as f64 / GIB,
                 age_s = age.as_secs(),
                 "in-flight analysis",
             );
@@ -358,7 +453,7 @@ mod tests {
     fn gate(ceiling: usize, est: usize, used_fn: fn() -> Option<u64>) -> Arc<MemoryAdmission> {
         Arc::new(MemoryAdmission {
             ceiling_bytes: ceiling as u64,
-            est_bytes: est,
+            fixed_est_bytes: Some(est),
             reserved: AtomicUsize::new(0),
             next_id: AtomicU64::new(0),
             inflight: Mutex::new(Vec::new()),
@@ -371,7 +466,10 @@ mod tests {
     async fn reservation_releases_on_drop() {
         let g = gate(10 * GB, 1536 * 1024 * 1024, no_used);
         let guard = g.admit("a".into(), "p".into(), "bin".into(), 40).await;
-        assert_eq!(g.reserved.load(Ordering::Acquire), g.est_bytes);
+        assert_eq!(
+            g.reserved.load(Ordering::Acquire),
+            g.fixed_est_bytes.unwrap()
+        );
         assert_eq!(g.inflight.lock().unwrap().len(), 1);
         drop(guard);
         assert_eq!(g.reserved.load(Ordering::Acquire), 0);
@@ -381,22 +479,23 @@ mod tests {
     #[test]
     fn disabled_ceiling_always_admits() {
         let g = gate(0, GB, used_11gb);
-        assert!(g.try_reserve());
-        assert!(g.try_reserve());
+        assert!(g.try_reserve(GB));
+        assert!(g.try_reserve(GB));
         assert_eq!(g.reserved.load(Ordering::Acquire), 2 * GB);
     }
 
     #[test]
-    fn lone_job_admits_below_ceiling_but_not_when_already_over() {
+    fn lone_job_always_admits_for_forward_progress() {
         // Nothing in flight, host under the ceiling → the forward-progress hatch
         // admits even when one slot's estimate alone exceeds the ceiling.
         let g = gate(GB, 2 * GB, no_used);
-        assert!(g.try_reserve());
+        assert!(g.try_reserve(2 * GB));
 
-        // Nothing in flight but the host is already past the ceiling (other
-        // processes) → pause rather than pile on.
+        // Nothing in flight but RSS is already past the ceiling, commonly from
+        // allocator-retained arenas after earlier archive jobs. Still admit one
+        // job so a low ceiling cannot deadlock the worker.
         let g = gate(10 * GB, GB, used_11gb);
-        assert!(!g.try_reserve());
+        assert!(g.try_reserve(GB));
     }
 
     #[test]
@@ -406,7 +505,7 @@ mod tests {
         let est = 1536 * 1024 * 1024;
         let g = gate(10 * GB, est, no_used);
         let mut admitted = 0;
-        while g.try_reserve() {
+        while g.try_reserve(est) {
             admitted += 1;
             assert!(admitted < 100, "predictive cap never engaged");
         }
@@ -422,6 +521,19 @@ mod tests {
         let est = 1536 * 1024 * 1024;
         let g = gate(10 * GB, est, used_9gb);
         g.reserved.store(est, Ordering::Release);
-        assert!(!g.try_reserve());
+        assert!(!g.try_reserve(est));
+    }
+
+    #[test]
+    fn dynamic_estimate_scales_archives_by_size() {
+        let small_zip = dynamic_estimate_bytes("pkg.zip", "data", 10 * 1024 * 1024);
+        let big_zip = dynamic_estimate_bytes("pkg.zip", "data", 100 * 1024 * 1024);
+        assert!(small_zip >= MIN_ARCHIVE_ESTIMATE_BYTES);
+        assert!(big_zip > small_zip);
+        assert!(big_zip <= MAX_ARCHIVE_ESTIMATE_BYTES);
+        assert_eq!(
+            dynamic_estimate_bytes("plain.js", "javascript", 10 * 1024 * 1024),
+            DEFAULT_FLAT_ESTIMATE_BYTES,
+        );
     }
 }

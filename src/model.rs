@@ -1035,8 +1035,8 @@ impl FastTreeBackend {
             anyhow::bail!("TreeEnsembleClassifier leaf class id exceeds class count");
         }
 
-        let mut base_values = optional_attr_floats(node, "base_values")
-            .unwrap_or_else(|| vec![0.0; n_classes]);
+        let mut base_values =
+            optional_attr_floats(node, "base_values").unwrap_or_else(|| vec![0.0; n_classes]);
         if base_values.is_empty() {
             base_values.resize(n_classes, 0.0);
         }
@@ -1104,7 +1104,9 @@ impl FastTreeBackend {
                         }
                         break;
                     }
-                    None => anyhow::bail!("TreeEnsembleClassifier branch points outside node table"),
+                    None => {
+                        anyhow::bail!("TreeEnsembleClassifier branch points outside node table")
+                    }
                 }
             }
         }
@@ -1169,7 +1171,10 @@ fn attr_usizes(node: &tract_onnx::pb::NodeProto, name: &str) -> Result<Vec<usize
     onnx_attr(node, name)?
         .ints
         .iter()
-        .map(|&value| usize::try_from(value).with_context(|| format!("attribute {name} has negative value {value}")))
+        .map(|&value| {
+            usize::try_from(value)
+                .with_context(|| format!("attribute {name} has negative value {value}"))
+        })
         .collect()
 }
 
@@ -1203,10 +1208,7 @@ fn attr_floats_exact(
     Ok(values)
 }
 
-fn optional_attr_floats(
-    node: &tract_onnx::pb::NodeProto,
-    name: &str,
-) -> Option<Vec<f32>> {
+fn optional_attr_floats(node: &tract_onnx::pb::NodeProto, name: &str) -> Option<Vec<f32>> {
     optional_onnx_attr(node, name).map(|attr| attr.floats.clone())
 }
 
@@ -1233,10 +1235,7 @@ fn attr_strings_exact(
     Ok(values)
 }
 
-fn optional_attr_string(
-    node: &tract_onnx::pb::NodeProto,
-    name: &str,
-) -> Result<Option<String>> {
+fn optional_attr_string(node: &tract_onnx::pb::NodeProto, name: &str) -> Result<Option<String>> {
     optional_onnx_attr(node, name)
         .map(|attr| {
             std::str::from_utf8(&attr.s)
@@ -1265,12 +1264,13 @@ fn optional_attr_bools(
 
 fn onnx_class_count(node: &tract_onnx::pb::NodeProto) -> Result<usize> {
     let int_count = optional_onnx_attr(node, "classlabels_int64s").map(|attr| attr.ints.len());
-    let string_count = optional_onnx_attr(node, "classlabels_strings").map(|attr| attr.strings.len());
+    let string_count =
+        optional_onnx_attr(node, "classlabels_strings").map(|attr| attr.strings.len());
     match (int_count, string_count) {
         (Some(count), None) | (None, Some(count)) if count > 0 => Ok(count),
-        (Some(_), Some(_)) => anyhow::bail!(
-            "TreeEnsembleClassifier has both integer and string class labels"
-        ),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("TreeEnsembleClassifier has both integer and string class labels")
+        }
         _ => anyhow::bail!("TreeEnsembleClassifier has no class labels"),
     }
 }
@@ -2697,7 +2697,11 @@ impl RouteStore {
         self.loaded
             .get(name)
             .and_then(|route| route.calibrator.as_ref())
-            .or_else(|| self.lazy.get(name).and_then(|route| route.calibrator.as_ref()))
+            .or_else(|| {
+                self.lazy
+                    .get(name)
+                    .and_then(|route| route.calibrator.as_ref())
+            })
     }
 
     fn available_len(&self) -> usize {

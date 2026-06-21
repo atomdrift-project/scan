@@ -1358,7 +1358,10 @@ impl MaxRssPolicy {
 
 /// Auto-resolve the worker RSS ceiling: 85% of cleave's shared memory detector,
 /// which is cgroup-aware on Linux and falls back to 16 GiB only when no memory
-/// signal is available.
+/// signal is available. The fraction scales with the host, so it makes sense
+/// from a 16 GB Mac mini up to a 1 TB workstation; slot count scales with cores
+/// in parallel (`default_workers`), so the larger ceiling on a big host is what
+/// actually lets those extra slots run concurrently.
 fn auto_worker_max_rss_gb() -> u64 {
     let total_bytes = worker_memory_basis().bytes;
     std::cmp::max(1, (total_bytes * 85 / 100) / GIB)

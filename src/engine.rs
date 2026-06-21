@@ -1445,6 +1445,46 @@ pub(crate) fn format_llm_line(llm: &crate::interpret::Interpretation, color: boo
     )
 }
 
+fn render_terminal_context(
+    report: &cleave::AnalysisReport,
+    tiny_opts: &cleave::output::TinyOpts,
+    decision: &Decision,
+    reasons: &[Reason],
+    interpretation: Option<&crate::interpret::Interpretation>,
+    sha256: &str,
+    label: &str,
+) -> String {
+    let (badge, badge_w) = crate::output::terminal_badge(
+        &decision.class,
+        decision.probability,
+        decision.threshold,
+        decision.level,
+    );
+    // The filename starts after the stamp and one separator space.
+    let indent = badge_w + 1;
+    let trailer = crate::output::terminal_trailer(reasons, interpretation);
+    let subtitle = crate::output::terminal_subtitle(sha256, indent);
+    let adorn = cleave::output::HeaderBadge {
+        badge: Some(&badge),
+        trailer: trailer.as_deref(),
+        subtitle: subtitle.as_deref(),
+    };
+    let body = cleave::output::format_context_badged(report, tiny_opts, adorn);
+    if body.is_empty() {
+        // No notable+ traits to anchor a header on: still surface the verdict
+        // headline so a flagged file is never silent.
+        let trail = trailer.map(|t| format!(" {t}")).unwrap_or_default();
+        let mut head = format!("{badge} {label}{trail}\n");
+        if let Some(sub) = &subtitle {
+            head.push_str(sub);
+            head.push('\n');
+        }
+        head
+    } else {
+        body
+    }
+}
+
 /// Intermediate classification result from the model pipeline.
 /// Produced by `classify_report`, consumed when building a `ScanResult`.
 pub(crate) struct ClassifiedReport {
@@ -1602,6 +1642,7 @@ pub(crate) fn classify_report(
     root_path: &Path,
     fetch: crate::fetch::FetchPolicy,
     fetch_progress: bool,
+    render_context: bool,
 ) -> Result<ClassifiedReport> {
     report.finalize();
     // The sha256s of the sample's own files, captured before fetching grafts any
@@ -1968,36 +2009,18 @@ pub(crate) fn classify_report(
     // scope and the verdict (incl. any interpretation) is known. The terminal
     // view extends cleave's rich render with litmus's verdict badge + subtitle;
     // `--format tiny` uses cleave's machine render verbatim.
-    let rendered_context = if tiny_opts.header == cleave::output::HeaderStyle::Rich {
-        let (badge, badge_w) = crate::output::terminal_badge(
-            &final_decision.class,
-            final_decision.probability,
-            final_decision.threshold,
-            final_decision.level,
-        );
-        // The filename starts after the stamp and one separator space.
-        let indent = badge_w + 1;
-        let trailer = crate::output::terminal_trailer(&reasons, interpretation.as_ref());
-        let subtitle = crate::output::terminal_subtitle(&sha256, indent);
-        let adorn = cleave::output::HeaderBadge {
-            badge: Some(&badge),
-            trailer: trailer.as_deref(),
-            subtitle: subtitle.as_deref(),
-        };
-        let body = cleave::output::format_context_badged(&report, tiny_opts, adorn);
-        if body.is_empty() {
-            // No notable+ traits to anchor a header on: still surface the
-            // verdict headline so a flagged file is never silent.
-            let trail = trailer.map(|t| format!(" {t}")).unwrap_or_default();
-            let mut head = format!("{badge} {label}{trail}\n");
-            if let Some(sub) = &subtitle {
-                head.push_str(sub);
-                head.push('\n');
-            }
-            head
-        } else {
-            body
-        }
+    let rendered_context = if !render_context {
+        String::new()
+    } else if tiny_opts.header == cleave::output::HeaderStyle::Rich {
+        render_terminal_context(
+            &report,
+            tiny_opts,
+            &final_decision,
+            &reasons,
+            interpretation.as_ref(),
+            &sha256,
+            label,
+        )
     } else {
         cleave::output::format_context(&report, tiny_opts)
     };
@@ -2120,6 +2143,7 @@ pub(crate) fn process_report(
         // path; JSON and tiny output stay machine-clean (the edges ride along in
         // the JSON `fetched` array regardless).
         matches!(config.format(), OutputFormat::Terminal),
+        !matches!(config.format(), OutputFormat::Json),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

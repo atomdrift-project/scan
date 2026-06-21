@@ -1027,6 +1027,7 @@ fn finish_classify(
         std::path::Path::new(label),
         resources.fetch,
         false, // server returns JSON; the fetch log would corrupt structured logs
+        false, // JSON envelope does not include the rendered terminal context
     )?;
 
     Ok(scan_result_from(label, cr, resources))
