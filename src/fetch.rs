@@ -6,17 +6,21 @@
 //!
 //! cleave stays a pure offline analyzer; fletch is a pure find/fetch mechanism.
 //! This module is the only place the two meet. For every file (root and archive
-//! member) it runs fletch's *facts-based* discovery over the references and
-//! values cleave retained per file (`FilefactsView`) — declared dependencies
-//! plus value-driven hunts like npm lifecycle hooks. For the root sample, where
-//! the raw bytes are on disk, it additionally runs the *text-based* hunt
-//! (`curl|sh`, `npm install` in a `RUN`). It then retrieves the lot through the
-//! SSRF-guarded client and re-analyzes what came back with cleave.
+//! member) it runs fletch's *facts-based* discovery over the references, values,
+//! and symbols cleave retained per file (`FilefactsView`) — declared
+//! dependencies, value-driven hunts like npm lifecycle hooks, and module-load
+//! calls (`require`/`import`/`__import__`) recovered from the retained AST
+//! symbols. For the root sample, where the raw bytes are on disk, it
+//! additionally runs the *text-based* hunt (`curl|sh`, `npm install` in a
+//! `RUN`). It then retrieves the lot through the SSRF-guarded client and
+//! re-analyzes what came back with cleave.
 //!
 //! The remaining gap: an archive member that is itself a shell script or
-//! Dockerfile gets declared/value-based references only, not the text-based
-//! command-stream hunt — that needs the member's bytes, which a prior analysis
-//! extracted and discarded.
+//! Dockerfile gets declared/value/symbol-based references only, not the
+//! text-based command-stream hunt — that needs the member's bytes, which a
+//! prior analysis extracted and discarded. The facts-only import hunt above
+//! already covers the module-load vector (a member's `require("undeclared")`)
+//! without those bytes.
 //!
 //! The fetch *edges* (`source_sha256 → content_sha256`) are returned as
 //! [`FetchRecord`]s rather than embedded in any file: a fetch is a per-event
@@ -205,6 +209,22 @@ pub(crate) fn orchestrate(
     // nothing (everything filtered out) stays silent.
     let mut header_printed = false;
     let mut worklist = collect_references(report, root_path);
+    // Phantom-dependency signal: a package imperatively installed or loaded
+    // somewhere in this artifact but absent from its manifest's declared deps —
+    // a covertly-installed companion or a dependency-confusion target. Computed
+    // across the whole work-list so a member's `require("x")` is diffed against
+    // the root manifest's declarations.
+    let all_refs: Vec<ExternalRef> = worklist
+        .iter()
+        .flat_map(|(_, refs)| refs.iter().cloned())
+        .collect();
+    for u in find::undeclared_packages(&all_refs) {
+        tracing::warn!(
+            package = %locator_key(u),
+            source = %u.source,
+            "undeclared dependency: imperatively acquired but not declared in manifest"
+        );
+    }
     for _hop in 0..policy.depth {
         if worklist.is_empty() {
             break;
@@ -469,7 +489,11 @@ fn collect_references(
         // Declared references plus the value-driven hunt (npm lifecycle hooks),
         // both from facts the report already carries — so every archive member,
         // not just the root, contributes its references without re-extraction.
-        let refs = find::references_from_facts(&view.values, &view.references);
+        let mut refs = find::references_from_facts(&view.values, &view.references);
+        // Module-load calls from the member's retained AST symbols — the
+        // facts-only import vector, so `require("undeclared-pkg")` inside an
+        // archive member is hunted without re-extracting its discarded bytes.
+        refs.extend(find::import_calls(&view.symbols));
         if refs.is_empty() {
             continue;
         }
@@ -821,6 +845,49 @@ mod tests {
         assert!(
             locs.iter().any(|l| l == "https://stage.test/x.sh"),
             "hunted RUN url merged in: {locs:?}"
+        );
+    }
+
+    #[test]
+    fn member_require_of_undeclared_package_is_flagged() {
+        // A package.json declaring `mobx`, and an archive member index.js whose
+        // retained AST symbols `require("mobx")` (declared) and
+        // `require("db-dx-connector")` (covert). The facts-only import hunt runs
+        // on the member without its bytes; the diff flags only the undeclared one.
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [
+                { "id": 0, "path": "package/package.json", "depth": 1,
+                  "file_type": "package_json", "sha256": "cd".repeat(32), "size": 120u64,
+                  "filefacts": { "references": [{
+                      "locator": {"purl": "pkg:npm/mobx@^6.0.0"}, "kind": "dependency",
+                      "source": "package.json", "evidence": "mobx", "offset": 0 }] } },
+                { "id": 1, "path": "package/dist/index.js", "depth": 1,
+                  "file_type": "javascript", "sha256": "ef".repeat(32), "size": 300u64,
+                  "filefacts": { "symbols": [
+                      {"kind": "call", "target": "require",
+                       "args": [{"shape": "string", "value": "mobx"}]},
+                      {"kind": "call", "target": "require",
+                       "args": [{"shape": "string", "value": "db-dx-connector"}]}
+                  ] } }
+            ]
+        }))
+        .expect("report deserializes");
+
+        // No on-disk root text hunt — a missing path just skips it.
+        let groups = collect_references(&report, std::path::Path::new("/nonexistent"));
+        let all: Vec<ExternalRef> = groups.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
+        let undeclared: Vec<String> = find::undeclared_packages(&all)
+            .iter()
+            .map(|r| locator_key(r))
+            .collect();
+        assert!(
+            undeclared.contains(&"pkg:npm/db-dx-connector".to_string()),
+            "covert member require should be flagged undeclared: {undeclared:?}"
+        );
+        assert!(
+            !undeclared.iter().any(|u| u.contains("mobx")),
+            "declared dep must not be flagged: {undeclared:?}"
         );
     }
 

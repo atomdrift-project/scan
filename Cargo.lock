@@ -1793,7 +1793,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/fletch.git#1d7e8a918a623d8a16448a1a219bd6fd68d37c28"
+source = "git+https://codeberg.org/atomdrift/fletch.git#e42b15e80792ff01485c5e3e5c5eaa0170226fce"
 dependencies = [
  "anyhow",
  "base64",
@@ -7072,9 +7072,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
+checksum = "977347db8caa080403f6b6b7c1cda9479a8e869316f7e13a59b19076a40f94e3"
 
 [[package]]
 name = "zmij"
