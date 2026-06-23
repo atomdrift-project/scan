@@ -2336,7 +2336,7 @@ async fn post_result(
                 tracing::warn!(sha256 = %sha256, %status, body = %body_excerpt(&body), elapsed_ms, attempt, "post result: non-success response");
             }
             Err(e) => {
-                tracing::warn!(sha256 = %sha256, error = %e, elapsed_ms = crate::duration_ms(post_start.elapsed()), attempt, "post result: send failed");
+                tracing::warn!(sha256 = %sha256, error = %crate::upload::error_chain(&e), elapsed_ms = crate::duration_ms(post_start.elapsed()), attempt, "post result: send failed");
             }
         }
         attempt += 1;

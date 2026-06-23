@@ -212,7 +212,7 @@ impl Drop for Uploader {
 /// top-level `Display` is just "error sending request for url (...)"; the real
 /// cause (connection refused, DNS failure, timeout) lives one or more links down
 /// the chain, so log the whole chain to make a failed upload diagnosable.
-fn error_chain(err: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
     use std::fmt::Write;
     let mut out = err.to_string();
     let mut source = err.source();
