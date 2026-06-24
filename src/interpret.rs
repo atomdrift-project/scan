@@ -242,7 +242,14 @@ pub fn interpret(
     // independent and the prompt caches by content). The system prompt already
     // frames it, so no wrapper text is added.
     let user = context;
-    let cache = cache_path(&prompt_hash(&cfg.model, user));
+    // Honor cleave's `CLEAVE_SKIP_CACHE=1`: when set, bypass the verdict cache
+    // (both read and write) so a benchmark or prompt-tuning run always re-queries
+    // the LLM, mirroring how the same flag forces cleave to re-analyze. Reuse
+    // cleave's own resolver so the semantics (`1`/`true`, process-wide override)
+    // stay identical.
+    let cache = (!cleave::cache::skip_cache())
+        .then(|| cache_path(&prompt_hash(&cfg.model, user)))
+        .flatten();
     if let Some((grade, reason)) = cache
         .as_deref()
         .and_then(cache_get)
@@ -643,7 +650,8 @@ fn body_snippet(s: &str) -> &str {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    &s[..end]
+    // `end` is always a valid char boundary ≤ len, so the slice never misses.
+    s.get(..end).unwrap_or(s)
 }
 
 /// Extract `{"grade":...,"reason":...}` from a reply that may be wrapped in
