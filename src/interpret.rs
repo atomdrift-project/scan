@@ -512,10 +512,38 @@ fn request(
             CallError::BadReply(e)
         });
     }
-    let parsed: ChatResponse = resp
-        .json()
-        .context("decoding LLM response")
-        .map_err(CallError::BadReply)?;
+    let html_content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/html"));
+    // Buffer the body as text before parsing so an undecodable reply can show
+    // what the endpoint actually sent (empty body, an SSE stream, a proxy's HTML
+    // error page, a "model loading" notice) instead of a bare serde position.
+    // A read failure here is a dropped connection — a transport problem.
+    let raw = resp
+        .text()
+        .with_context(|| format!("reading response body from {url}"))
+        .map_err(CallError::Transport)?;
+    // A 200 carrying an HTML page means the base URL points at a web UI (a
+    // dashboard, a reverse-proxy landing page), not an OpenAI-compatible API.
+    // Say so plainly — the alternative is a serde "expected value at column 1"
+    // over a screenful of markup.
+    if html_content_type || raw.trim_start().starts_with('<') {
+        return Err(CallError::BadReply(anyhow!(
+            "endpoint at {url} returned an HTML page, not JSON — the base URL \
+             likely points at a web UI, not an OpenAI-compatible API; body \
+             starts: {:?}",
+            body_snippet(&raw),
+        )));
+    }
+    let parsed: ChatResponse = serde_json::from_str(&raw).map_err(|e| {
+        CallError::BadReply(anyhow!(
+            "decoding LLM response ({} bytes): {e}; body starts: {:?}",
+            raw.len(),
+            body_snippet(&raw),
+        ))
+    })?;
     let content = parsed
         .choices
         .into_iter()
@@ -603,6 +631,19 @@ fn cache_put(path: &Path, verdict: &CachedVerdict) {
     {
         let _ = tmp.persist(path);
     }
+}
+
+/// Longest body prefix included verbatim when a reply fails to decode — enough
+/// to recognize an HTML page or a stray streaming chunk without flooding the log.
+const BODY_SNIPPET: usize = 512;
+
+/// A char-boundary-safe leading slice of an undecodable body, for diagnostics.
+fn body_snippet(s: &str) -> &str {
+    let mut end = s.len().min(BODY_SNIPPET);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Extract `{"grade":...,"reason":...}` from a reply that may be wrapped in
