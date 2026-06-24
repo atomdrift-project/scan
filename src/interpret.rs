@@ -250,12 +250,23 @@ pub fn interpret(
     let cache = (!cleave::cache::skip_cache())
         .then(|| cache_path(&prompt_hash(&cfg.model, user)))
         .flatten();
-    if let Some((grade, reason)) = cache
-        .as_deref()
-        .and_then(cache_get)
-        .and_then(|v| LlmGrade::parse(&v.grade).map(|g| (g, v.reason)))
+    if let Some(v) = cache.as_deref().and_then(cache_get)
+        && let Some(grade) = LlmGrade::parse(&v.grade)
     {
-        return Some(blended(cfg, ml_class, ml_prob, grade, reason));
+        // Mirror the live path's request/response debug logs so `--verbose`
+        // shows what the model saw and said even when no HTTP call is made;
+        // the `(cached)` marker distinguishes a replay from a fresh query.
+        tracing::debug!(
+            model = %cfg.model,
+            "LLM request (cached)\n--- system ---\n{SYSTEM_PROMPT}\n--- user ---\n{user}",
+        );
+        tracing::debug!(
+            model = %cfg.model,
+            "LLM response (cached)\ngrade: {}\nreason: {}",
+            v.grade,
+            v.reason,
+        );
+        return Some(blended(cfg, ml_class, ml_prob, grade, v.reason));
     }
 
     // Health gate: only send work to a healthy endpoint. If it's currently down,

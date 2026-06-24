@@ -54,6 +54,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 /// the error count with absent directories. Both files (e.g. `/etc/crontab`) and
 /// directories are valid targets — `run_paths` walks each accordingly.
 fn curated_targets() -> Vec<PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut candidates: Vec<PathBuf> = Vec::new();
 
