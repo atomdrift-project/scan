@@ -119,6 +119,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         crate::fetch::FetchPolicy::default(),
                         false, // validation corpus runs offline; no fetch log
                         false, // validation only consumes ML verdicts
+                        false, // no manifest listing; validation reads findings only
                     );
                     let classify_elapsed = classify_started.elapsed();
                     if analysis_elapsed > SLOW_FIXTURE_THRESHOLD

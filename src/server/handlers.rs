@@ -1028,6 +1028,7 @@ fn finish_classify(
         resources.fetch,
         false, // server returns JSON; the fetch log would corrupt structured logs
         false, // JSON envelope does not include the rendered terminal context
+        false, // server reports analyzed files only; no full-manifest listing
     )?;
 
     Ok(scan_result_from(label, cr, resources))

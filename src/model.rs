@@ -1645,8 +1645,20 @@ impl RoutePolicies {
             return Some(p);
         }
         let normalized = normalize_archive_filetype(file_type);
-        if normalized != file_type {
-            return self.by_filetype.get(&normalized);
+        if normalized != file_type
+            && let Some(p) = self.by_filetype.get(&normalized)
+        {
+            return Some(p);
+        }
+        // Specialty-else-container: a packaged type with no policy of its own
+        // inherits its container archive's (gem → tar, whl → zip). Mirrors the
+        // route fallback in `RouteSet::specialist_keys` so the resolved policy
+        // and specialist keys agree.
+        if let Some(container) = container_filetype(file_type)
+            && container != file_type
+            && container != normalized
+        {
+            return self.by_filetype.get(&container);
         }
         None
     }
@@ -1659,8 +1671,17 @@ impl RoutePolicies {
             return Some(g);
         }
         let normalized = normalize_archive_filetype(file_type);
-        if normalized != file_type {
-            return self.grid.get(&normalized);
+        if normalized != file_type
+            && let Some(g) = self.grid.get(&normalized)
+        {
+            return Some(g);
+        }
+        // Specialty-else-container fallback, matching `policy_for`.
+        if let Some(container) = container_filetype(file_type)
+            && container != file_type
+            && container != normalized
+        {
+            return self.grid.get(&container);
         }
         None
     }
@@ -1688,6 +1709,24 @@ fn normalize_archive_filetype(file_type: &str) -> String {
         normalized = head.to_string();
     }
     normalized
+}
+
+/// The container archive label for a scanned file type, as filefacts defines
+/// it: `gem`/`crate`/`python_sdist` → `tar`, `whl`/`jar`/`nupkg` → `zip`, the
+/// compressed `tar.*` variants → `tar`. `None` when the type is not
+/// archive-backed (source, binaries, bare single-file compression like `gz`).
+///
+/// This is the specialty-else-container half of routing: a packaged type with
+/// no specialist of its own falls back to its container's. filefacts owns the
+/// archive→container knowledge — no table is duplicated here. Unlike
+/// [`normalize_archive_filetype`] (which only strips compression suffixes for
+/// collimator parity), this also collapses specialty package types onto their
+/// container, so it is consulted *after* the exact and compression-stripped
+/// lookups, never instead of them.
+fn container_filetype(file_type: &str) -> Option<String> {
+    filefacts::FileType::from_label(file_type.trim())
+        .and_then(filefacts::FileType::archive_format)
+        .map(|archive| archive.label().to_string())
 }
 
 /// Hostile decision policy for one filetype at one severity level. A filetype's
@@ -2774,9 +2813,23 @@ impl RouteSet {
     /// Mirrors the normalization `RoutePolicies::policy_for`/`grid_for` apply,
     /// so route selection and the policy's per-route threshold keys agree.
     fn specialist_keys(&self, file_type: &str) -> (String, Option<String>) {
-        let container = normalize_archive_filetype(file_type);
-        let group = self.filetype_to_filegroup.get(container.as_str()).cloned();
-        (container, group)
+        let normalized = normalize_archive_filetype(file_type);
+        // Specialty-else-container: prefer a specialist trained for the type
+        // itself (e.g. `gem`, `whl`, `python_sdist`); when none exists, fall
+        // back to its container archive (`tar`, `zip`) as filefacts defines
+        // it. Compression is already collapsed by `normalize_archive_filetype`
+        // (`tar.gz` → `tar`), so this only adds the package → container hop.
+        let route = if self.filetypes.get(&normalized).is_some() {
+            normalized
+        } else if let Some(container) =
+            container_filetype(file_type).filter(|c| self.filetypes.get(c).is_some())
+        {
+            container
+        } else {
+            normalized
+        };
+        let group = self.filetype_to_filegroup.get(route.as_str()).cloned();
+        (route, group)
     }
 
     fn validate_all(&self) -> Result<()> {
@@ -3738,6 +3791,28 @@ mod tests {
         // Empty / whitespace.
         assert_eq!(normalize_archive_filetype(""), "");
         assert_eq!(normalize_archive_filetype("  tar.gz  "), "tar");
+    }
+
+    #[test]
+    fn container_filetype_maps_packages_to_their_archive() {
+        // Specialty package types collapse onto their container archive —
+        // filefacts is the source of truth, so these stay correct as new
+        // package formats are added there.
+        assert_eq!(container_filetype("gem").as_deref(), Some("tar"));
+        assert_eq!(container_filetype("crate").as_deref(), Some("tar"));
+        assert_eq!(container_filetype("python_sdist").as_deref(), Some("tar"));
+        assert_eq!(container_filetype("npm").as_deref(), Some("tar"));
+        assert_eq!(container_filetype("whl").as_deref(), Some("zip"));
+        assert_eq!(container_filetype("jar").as_deref(), Some("zip"));
+        assert_eq!(container_filetype("nupkg").as_deref(), Some("zip"));
+        // Compressed tar variants resolve to the tar container too.
+        assert_eq!(container_filetype("tar.gz").as_deref(), Some("tar"));
+        assert_eq!(container_filetype("tar.zst").as_deref(), Some("tar"));
+        // Non-archive types and bare compression carry no container.
+        assert_eq!(container_filetype("pe"), None);
+        assert_eq!(container_filetype("python"), None);
+        assert_eq!(container_filetype("gz"), None);
+        assert_eq!(container_filetype("not_a_type"), None);
     }
 
     #[test]

@@ -58,6 +58,14 @@ impl DisplayFilter {
             Classification::Benign => self.benign,
         }
     }
+
+    /// Returns true when every classification is admitted (`--show=all`). This is
+    /// the cue to emit a complete archive manifest in JSON output — every member,
+    /// including the ones cleave never analyzed because they carry no findings.
+    #[must_use]
+    pub fn is_all(&self) -> bool {
+        self.hostile && self.suspicious && self.benign
+    }
 }
 
 impl Default for DisplayFilter {
@@ -235,6 +243,83 @@ impl ScanConfig {
     #[must_use]
     pub const fn level(&self) -> Option<u16> {
         self.level
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod manifest_tests {
+    use super::*;
+
+    fn stub(path: &str, ty: &str, sha: &str, size: u64) -> ArchiveMemberStub {
+        ArchiveMemberStub {
+            path: path.to_string(),
+            file_type: ty.to_string(),
+            sha256: sha.to_string(),
+            size_bytes: size,
+        }
+    }
+
+    #[test]
+    fn appends_unanalyzed_members_skipping_already_analyzed() {
+        // files[0] is the root archive; files[1] an analyzed member with a sha.
+        let mut report = serde_json::json!({
+            "files": [
+                {"id": 0, "path": "app.zip", "type": "zip", "sha": "root", "size": 4096},
+                {"id": 1, "path": "app.zip!!evil.sh", "type": "shell", "sha": "aaa", "size": 200, "risk": 9},
+            ]
+        });
+        let members = vec![
+            // Already analyzed (matches sha "aaa") — must be skipped, no duplicate.
+            stub("evil.sh", "shell", "aaa", 200),
+            // Never analyzed — must be appended as a listing-only entry.
+            stub("README.md", "markdown", "bbb", 1024),
+            // Nested member: single `!` becomes `!!`, depth counts the levels.
+            stub("inner.tar!logo.png", "png", "ccc", 8192),
+        ];
+        append_unanalyzed_members(&mut report, &members);
+
+        let files = report["files"].as_array().unwrap();
+        assert_eq!(files.len(), 4, "two listing-only members appended");
+
+        let readme = &files[2];
+        assert_eq!(readme["id"], 2);
+        assert_eq!(readme["path"], "app.zip!!README.md");
+        assert_eq!(readme["type"], "markdown");
+        assert_eq!(readme["size"], 1024);
+        assert_eq!(readme["depth"], 1);
+        assert_eq!(readme["risk"], -1, "sentinel marks the member unanalyzed");
+
+        let logo = &files[3];
+        assert_eq!(logo["path"], "app.zip!!inner.tar!!logo.png");
+        assert_eq!(logo["depth"], 2);
+        assert_eq!(logo["risk"], -1);
+    }
+
+    #[test]
+    fn build_ml_files_drops_listing_only_members() {
+        // A root file, an analyzed member, and a listing-only member (risk -1).
+        let report = serde_json::json!({
+            "files": [
+                {"id": 0, "path": "app.zip", "type": "zip", "depth": 0},
+                {"id": 1, "path": "app.zip!!evil.sh", "type": "shell", "depth": 1, "risk": 9},
+                {"id": 2, "path": "app.zip!!README.md", "type": "markdown", "depth": 1, "risk": -1},
+            ]
+        });
+        let ml = build_ml_files(&report, 0.9, Some(100), &[]);
+        let ids: Vec<u64> = ml.iter().map(|f| f["id"].as_u64().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "listing-only member is excluded from ml.files"
+        );
+    }
+
+    #[test]
+    fn is_all_only_when_every_class_shown() {
+        assert!(DisplayFilter::all().is_all());
+        assert!(!DisplayFilter::alerts_only().is_all());
+        assert!(!DisplayFilter::new(true, true, false).is_all());
     }
 }
 
@@ -1649,7 +1734,27 @@ pub(crate) fn classify_report(
     fetch: crate::fetch::FetchPolicy,
     fetch_progress: bool,
     render_context: bool,
+    list_all_members: bool,
 ) -> Result<ClassifiedReport> {
+    // Capture every archive member — including the ones cleave catalogues but
+    // never analyzes (docs, data files, images: non-program members it skips by
+    // default) — before `finalize()` clears `archive_contents`. With `--show=all`
+    // JSON output these are surfaced as listing-only entries below so the manifest
+    // is complete; otherwise the snapshot stays empty and nothing changes.
+    let listed_members: Vec<ArchiveMemberStub> = if list_all_members {
+        report
+            .archive_contents
+            .iter()
+            .map(|e| ArchiveMemberStub {
+                path: e.path.clone(),
+                file_type: e.file_type.clone(),
+                sha256: e.sha256.clone(),
+                size_bytes: e.size_bytes,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     report.finalize();
     // The sha256s of the sample's own files, captured before fetching grafts any
     // external payload onto report.files. The sample's own verdict is featurized
@@ -2031,6 +2136,15 @@ pub(crate) fn classify_report(
         cleave::output::format_context(&report, tiny_opts)
     };
 
+    // Surface the archive members cleave catalogued but never analyzed, so a
+    // `--show=all` JSON manifest lists every file (path/type/size) — not just the
+    // ones that produced findings. Appended last, after featurization and the
+    // embedded-file pass have consumed `report_json`, so the listing never feeds
+    // the model. Empty unless `--show=all` requested the manifest.
+    if !listed_members.is_empty() {
+        append_unanalyzed_members(&mut report_json, &listed_members);
+    }
+
     Ok(ClassifiedReport {
         classification: final_decision.class,
         probability: final_decision.probability,
@@ -2050,6 +2164,72 @@ pub(crate) fn classify_report(
         rendered_context,
         interpretation,
     })
+}
+
+/// A minimal archive-member record captured before `finalize()` discards
+/// `archive_contents`. Carries only what a `--show=all` listing needs.
+struct ArchiveMemberStub {
+    /// Archive-relative path (single `!` between nesting levels, as cleave
+    /// records it in `archive_contents`).
+    path: String,
+    /// Detected file type (e.g. "markdown", "png").
+    file_type: String,
+    /// SHA256 of the member's contents — the key used to skip members that were
+    /// already analyzed and therefore already present in `files[]`.
+    sha256: String,
+    /// Uncompressed size in bytes.
+    size_bytes: u64,
+}
+
+/// Append the archive members cleave never analyzed to `report_json["files"]` as
+/// listing-only entries (`id`/`path`/`type`/`sha`/`size`/`depth`). Members that
+/// were analyzed — matched by sha256 — are already present and skipped. Each
+/// appended entry carries a sentinel `risk` of -1 so a consumer can tell an
+/// unanalyzed listing (-1) apart from an analyzed member that simply produced no
+/// traits (0); [`build_ml_files`] reads the same sentinel to keep these out of
+/// the classified `ml.files` array.
+fn append_unanalyzed_members(report_json: &mut serde_json::Value, members: &[ArchiveMemberStub]) {
+    let Some(files) = report_json
+        .get_mut("files")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut seen: std::collections::HashSet<String> = files
+        .iter()
+        .filter_map(|f| f.get("sha").and_then(|v| v.as_str()).map(str::to_owned))
+        .collect();
+    // Compact paths join nesting levels with `!!` under the root file's path;
+    // `archive_contents` paths are archive-relative with single `!`. Re-root and
+    // normalize so the listing entries match their analyzed siblings.
+    let root_path = files
+        .first()
+        .and_then(|f| f.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let mut next_id = files
+        .iter()
+        .filter_map(|f| f.get("id").and_then(serde_json::Value::as_u64))
+        .max()
+        .map_or(0, |m| m + 1);
+    for m in members {
+        if m.sha256.is_empty() || !seen.insert(m.sha256.clone()) {
+            continue;
+        }
+        let path = format!("{root_path}!!{}", m.path.replace('!', "!!"));
+        let depth = m.path.matches('!').count() as u64 + 1;
+        files.push(serde_json::json!({
+            "id": next_id,
+            "path": path,
+            "type": m.file_type,
+            "sha": m.sha256,
+            "size": m.size_bytes,
+            "depth": depth,
+            "risk": -1,
+        }));
+        next_id += 1;
+    }
 }
 
 /// Pin a fetched dependency's verdict onto the file that declared it: push a
@@ -2133,6 +2313,7 @@ pub(crate) fn process_report(
     cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
     let path_display = path.display().to_string();
+    let is_json = matches!(config.format(), OutputFormat::Json);
     let cr = classify_report(
         &path_display,
         report,
@@ -2149,9 +2330,11 @@ pub(crate) fn process_report(
         // path; JSON and tiny output stay machine-clean (the edges ride along in
         // the JSON `fetched` array regardless).
         matches!(config.format(), OutputFormat::Terminal),
-        !matches!(config.format(), OutputFormat::Json),
+        !is_json,
+        // `--show=all` with JSON output: list every archive member, even the
+        // no-finding ones cleave skipped analyzing.
+        config.filter().is_all() && is_json,
     )?;
-    let is_json = matches!(config.format(), OutputFormat::Json);
 
     // Include raw cleave report for JSON output (unmutated — ML scores go in the ml section).
     let cleave = if is_json { Some(cr.report_json) } else { None };
@@ -2408,6 +2591,12 @@ fn build_ml_files(
 
     let mut out = Vec::with_capacity(report_files.len());
     for (idx, entry) in report_files.iter().enumerate() {
+        // Listing-only members (added for `--show=all`) were never analyzed, so
+        // they carry no ML verdict; their sentinel `risk` of -1 keeps them out of
+        // the classified `ml.files` while they remain in the raw `files` manifest.
+        if entry.get("risk").and_then(serde_json::Value::as_i64) == Some(-1) {
+            continue;
+        }
         let id = entry
             .get("id")
             .and_then(serde_json::Value::as_u64)

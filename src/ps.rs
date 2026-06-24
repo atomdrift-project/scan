@@ -368,6 +368,8 @@ fn build_result(
         config.fetch_policy(),
         false, // ps emits machine-readable output; no interactive fetch log
         matches!(config.format(), OutputFormat::Tiny),
+        // `--show=all` with JSON: list every member of an archive-backed image.
+        config.filter().is_all() && matches!(config.format(), OutputFormat::Json),
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
