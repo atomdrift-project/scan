@@ -40,12 +40,19 @@ use cleave::{AnalysisOptions, AnalysisReport};
 use fletch::fetch::{
     BlobCache, FetchBudget, FetchRecord, HttpFetch, Outcome, fetch_ref, fetch_references,
 };
-use fletch::{ExternalRef, RefKind, RefLocator, find};
+use fletch::{ExternalRef, RefKind, RefLocator, Registry, find};
 
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
 /// `curl | bash` droppers are the common case.
 pub const DEFAULT_FETCH_DEPTH: u8 = 2;
+
+/// Default age ceiling for fetching a declared dependency, in days. A version
+/// older than this has had a long window for community discovery, so the
+/// expensive fetch-and-scan is skipped by default; recent releases — where a
+/// supply-chain compromise is freshest and least-vetted — are still pulled.
+/// `0` disables the gate (every resolvable dependency is fetched).
+pub const DEFAULT_MAX_DEP_AGE_DAYS: u32 = 30;
 
 /// What to fetch — a selection of reference *kinds*, parsed from the
 /// comma-separated `--fetch=KINDS` flag (`urls`, `packages`, `deps`) — plus how
@@ -75,6 +82,12 @@ pub struct FetchPolicy {
     /// How many hops to follow: `1` fetches the references found in the root,
     /// `2` also follows references found *inside* those payloads, and so on.
     pub depth: u8,
+    /// Skip fetching a declared dependency older than this many days, judged by
+    /// the registry's publish date (looked up cheaply before the artifact is
+    /// pulled). `0` disables the gate. Applies to declared dependencies only —
+    /// URLs and command-mentioned packages are never age-gated, since their risk
+    /// isn't tied to a registry release date.
+    pub max_dep_age_days: u32,
 }
 
 impl Default for FetchPolicy {
@@ -84,6 +97,7 @@ impl Default for FetchPolicy {
             packages: false,
             deps: false,
             depth: DEFAULT_FETCH_DEPTH,
+            max_dep_age_days: DEFAULT_MAX_DEP_AGE_DAYS,
         }
     }
 }
@@ -225,6 +239,9 @@ pub(crate) fn orchestrate(
             "undeclared dependency: imperatively acquired but not declared in manifest"
         );
     }
+    // One wall-clock reading for the whole run, so every dependency's age is
+    // judged against the same instant.
+    let now = unix_now();
     for _hop in 0..policy.depth {
         if worklist.is_empty() {
             break;
@@ -239,6 +256,40 @@ pub(crate) fn orchestrate(
                 .into_iter()
                 .filter(|r| policy.wants(r.kind) && seen.insert(locator_key(r)))
                 .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            // Look up each declared dependency's registry metadata first. Every
+            // resolved record is materialized as a `*.registry.json` node so its
+            // facts are trait-matched, and releases older than the age ceiling
+            // are dropped before the expensive fetch+scan of their bytes. Skips
+            // are reported, never silent.
+            let (selected, registries) = age_gate(selected, &policy, res, now);
+            for (r, reg, aged_out) in &registries {
+                if let Some(sub) = registry_node(reg, &opts) {
+                    merge_registry(report, &source_sha, sub);
+                }
+                if !aged_out {
+                    continue;
+                }
+                tracing::info!(
+                    package = %locator_key(r),
+                    ecosystem = %reg.ecosystem,
+                    version = %reg.version,
+                    age_days = reg.age_days.unwrap_or(0),
+                    downloads = reg.downloads_recent.or(reg.downloads_total),
+                    "dependency older than --max-dep-age; registry cached, fetch skipped"
+                );
+                if progress {
+                    if !header_printed {
+                        eprintln!(
+                            "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
+                        );
+                        header_printed = true;
+                    }
+                    report_skip(r, reg, now);
+                }
+            }
             if selected.is_empty() {
                 continue;
             }
@@ -344,6 +395,74 @@ pub fn fetch_one(
     Ok((bytes, name, rec))
 }
 
+/// Look up the normalized registry metadata for a one-shot `pkg`/`url` target,
+/// using the shared fetch resources, with its relative age stamped. `None` for a
+/// raw URL, an unsupported ecosystem, or an unreachable registry — the metadata
+/// document is cached, so a later fetch of the same package pays nothing for it.
+#[must_use]
+pub fn registry(locator: &RefLocator) -> Option<Registry> {
+    let res = shared_resources()?;
+    fletch::registry(locator, &res.net, &res.cache).map(|reg| reg.with_age(unix_now()))
+}
+
+/// The `*.registry.json` document for a record — its name and serialized bytes —
+/// so the one-shot path can run it through the scan engine like any other file.
+#[must_use]
+pub fn registry_document(reg: &Registry) -> Option<(String, Vec<u8>)> {
+    Some((registry_doc_name(reg), serde_json::to_vec(reg).ok()?))
+}
+
+/// Print and log a package's normalized registry metadata for the one-shot
+/// `pkg`/`url` scan path, so the operator sees the registry's own account of an
+/// artifact (age, author, popularity, deprecation) beside the scan of its bytes.
+pub fn report_registry(reg: &Registry, progress: bool) {
+    tracing::info!(
+        ecosystem = %reg.ecosystem,
+        package = %reg.name,
+        version = %reg.version,
+        age_days = reg.age_days,
+        author = reg.author.as_deref(),
+        downloads = reg.downloads_recent.or(reg.downloads_total),
+        deprecated = reg.deprecated.as_deref(),
+        "package registry metadata"
+    );
+    if !progress {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !reg.version.is_empty() {
+        parts.push(format!("v{}", reg.version.trim_start_matches('v')));
+    }
+    if let Some(d) = reg.age_days {
+        parts.push(format!("{d}d old"));
+    }
+    if let Some(a) = &reg.author {
+        parts.push(format!("by {a}"));
+    }
+    if let Some(d) = reg.downloads_recent.or(reg.downloads_total) {
+        parts.push(format!("{d} dl"));
+    }
+    if let Some(r) = reg.rating {
+        parts.push(format!("\u{2605}{r:.1}"));
+    }
+    if let Some(l) = &reg.license {
+        parts.push(l.clone());
+    }
+    if let Some(dep) = &reg.deprecated {
+        parts.push(format!("\u{26a0} {dep}"));
+    }
+    eprintln!(
+        "\n  \x1b[38;2;180;160;255m\u{24d8}\x1b[0m  \x1b[38;2;160;160;160mregistry\x1b[0m \x1b[2m{}\x1b[0m",
+        reg.ecosystem
+    );
+    if !parts.is_empty() {
+        eprintln!(
+            "    \x1b[38;2;130;130;130m{}\x1b[0m",
+            parts.join("  \u{00b7}  ")
+        );
+    }
+}
+
 /// Render one fetched reference to stderr, distinguishing a live network fetch
 /// from a cache hit and naming the actual URL that was (or would be) retrieved.
 /// Only the interactive terminal path passes `progress`; JSON/server callers
@@ -429,6 +548,184 @@ fn failure_detail(rec: &FetchRecord, why: &str) -> String {
         },
         |s| format!("HTTP {s}"),
     )
+}
+
+/// Look up each declared dependency's registry metadata, stamp its relative
+/// age, and decide which to fetch. A dependency older than the policy's age
+/// ceiling is dropped before the expensive fetch+scan of its bytes; one whose
+/// age is unknown or under the ceiling is kept — fail open, so a registry hiccup
+/// or an unsupported ecosystem never silently hides a dependency from the scan.
+/// URLs and command-mentioned packages aren't gated: their risk isn't a function
+/// of a registry release date. Returns the refs to fetch plus, for *every*
+/// dependency that resolved a registry record, the `(ref, record, aged_out)`
+/// triple — the record is materialized as facts whether or not its bytes are
+/// fetched, and `aged_out` drives the skip report.
+fn age_gate(
+    selected: Vec<ExternalRef>,
+    policy: &FetchPolicy,
+    res: &Resources,
+    now: u64,
+) -> (Vec<ExternalRef>, Vec<(ExternalRef, Registry, bool)>) {
+    // `None` ceiling (the `--max-dep-age 0` opt-out) gates nothing, but registry
+    // records are still looked up and materialized.
+    let max_age =
+        (policy.max_dep_age_days > 0).then(|| u64::from(policy.max_dep_age_days) * 86_400);
+    // The network round-trips run concurrently up front; the gate decision below
+    // is then pure, so it stays deterministic in `selected` order.
+    let lookups = lookup_registries(&selected, res, now);
+    let mut keep = Vec::with_capacity(selected.len());
+    let mut registries = Vec::new();
+    for (r, lookup) in selected.into_iter().zip(lookups) {
+        match lookup {
+            // A resolved record: gate on its age, but materialize it either way.
+            Some(reg) => {
+                let aged_out =
+                    max_age.is_some_and(|max| reg.age_secs(now).is_some_and(|age| age >= max));
+                if !aged_out {
+                    keep.push(r.clone());
+                }
+                registries.push((r, reg, aged_out));
+            }
+            // A non-dependency, or a dependency whose record didn't resolve —
+            // fetch it (fail open).
+            None => keep.push(r),
+        }
+    }
+    (keep, registries)
+}
+
+/// Look up each declared dependency's registry record concurrently, returning
+/// one slot per input ref in `selected` order. A non-dependency ref, or one
+/// whose record can't be resolved, yields `None`. Bounded by
+/// [`REGISTRY_LOOKUP_CONCURRENCY`] on plain OS threads; each lookup is keyed by a
+/// distinct locator, so the shared cache sees no write contention.
+fn lookup_registries(selected: &[ExternalRef], res: &Resources, now: u64) -> Vec<Option<Registry>> {
+    let mut out: Vec<Option<Registry>> = selected.iter().map(|_| None).collect();
+    let targets: Vec<usize> = (0..selected.len())
+        .filter(|&i| selected[i].kind == RefKind::Dependency)
+        .collect();
+    if targets.is_empty() {
+        return out;
+    }
+    let cursor = AtomicUsize::new(0);
+    let workers = REGISTRY_LOOKUP_CONCURRENCY.min(targets.len());
+    let collected: Vec<Vec<(usize, Registry)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = Vec::new();
+                    loop {
+                        let t = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(&i) = targets.get(t) else {
+                            break;
+                        };
+                        if let Some(reg) =
+                            fletch::registry(&selected[i].locator, &res.net, &res.cache)
+                        {
+                            local.push((i, reg.with_age(now)));
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    for (i, reg) in collected.into_iter().flatten() {
+        out[i] = Some(reg);
+    }
+    out
+}
+
+/// Serialize a registry record to its `*.registry.json` document and analyze it
+/// with cleave, so filefacts parses the `registry.*` facts and the trait engine
+/// runs over them. The document is named by the package so detection routes it
+/// to `FileType::Registry`. `None` if it can't be serialized or analyzed.
+fn registry_node(reg: &Registry, opts: &AnalysisOptions) -> Option<AnalysisReport> {
+    let bytes = serde_json::to_vec(reg).ok()?;
+    match cleave::analyze_bytes_owned(bytes, &registry_doc_name(reg), opts) {
+        Ok(mut sub) => {
+            sub.finalize();
+            Some(sub)
+        }
+        Err(e) => {
+            tracing::warn!(package = %reg.name, "registry metadata analysis failed: {e:#}");
+            None
+        }
+    }
+}
+
+/// Graft a materialized registry sub-report under the file that declared the
+/// dependency (its sha256), mirroring [`merge_payload`]'s id/depth re-basing.
+/// The node carries only facts — a registry document references nothing to
+/// fetch — so no next-hop work-list is produced.
+fn merge_registry(report: &mut AnalysisReport, parent_sha: &str, sub: AnalysisReport) {
+    let (parent_id, parent_depth) = report
+        .files
+        .iter()
+        .find(|f| f.sha256 == parent_sha)
+        .map_or((0, 0), |f| (f.id, f.depth));
+    let id_base = report.files.iter().map(|f| f.id).max().map_or(0, |m| m + 1);
+    for mut file in sub.files {
+        file.id += id_base;
+        file.parent_id = Some(file.parent_id.map_or(parent_id, |p| p + id_base));
+        file.depth += parent_depth + 1;
+        report.files.push(file);
+    }
+}
+
+/// The synthetic filename for a registry document: `<name>@<version>.registry
+/// .json`, with path-unsafe characters folded to `_` so a scoped or `vendor/pkg`
+/// name can't escape into a directory. The `.registry.json` suffix is what
+/// filefacts detects.
+fn registry_doc_name(reg: &Registry) -> String {
+    let stem = if reg.version.is_empty() {
+        reg.name.clone()
+    } else {
+        format!("{}@{}", reg.name, reg.version)
+    };
+    let base: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{base}.registry.json")
+}
+
+/// Render one age-gated dependency to stderr in the fetch progress block: a
+/// muted "skip" line naming the package, its age in days, and the strongest
+/// reputation signal the registry gave (downloads, else votes/rating).
+fn report_skip(r: &ExternalRef, reg: &Registry, now: u64) {
+    let age_days = reg.age_secs(now).unwrap_or(0) / 86_400;
+    let signal = reg
+        .downloads_recent
+        .or(reg.downloads_total)
+        .map(|d| format!("{d} dl"))
+        .or_else(|| reg.rating_count.map(|v| format!("{v} votes")))
+        .unwrap_or_default();
+    let column = format!("{age_days}d old");
+    let detail = if signal.is_empty() {
+        String::new()
+    } else {
+        format!("  \x1b[2m{signal}\x1b[0m")
+    };
+    eprintln!(
+        "    \x1b[38;2;120;120;120m\u{00b7} skip  \x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {}{detail}",
+        locator_key(r)
+    );
+}
+
+/// Wall-clock now as Unix seconds, saturating to `0` before the epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Tally the run's fetches into a one-line summary mirroring the progress bar's
@@ -558,6 +855,12 @@ fn locator_key(r: &ExternalRef) -> String {
 /// more machinery than this online side-channel warrants.
 const ANALYSIS_CONCURRENCY: usize = 2;
 
+/// How many registry-metadata lookups run at once in [`age_gate`]. Unlike the
+/// CPU-bound payload analysis, these are I/O-bound (small, cached HTTP GETs), so
+/// a higher fan-out turns a manifest's worth of serial round-trips into a few
+/// parallel batches without taxing the CPU — while staying polite to registries.
+const REGISTRY_LOOKUP_CONCURRENCY: usize = 8;
+
 /// The product of analyzing one fetched payload: the finalized sub-report to
 /// graft (absent if the payload couldn't be analyzed) and the next-hop
 /// references found in its own bytes. Produced off the report so the expensive
@@ -568,12 +871,14 @@ struct Analyzed {
     next_from_bytes: Vec<(String, Vec<ExternalRef>)>,
 }
 
-/// Analyze the bytes of fetched payloads concurrently, returning one slot per
-/// input record in the same order (`None` where there was nothing to analyze).
-/// Bounded by [`ANALYSIS_CONCURRENCY`] and run on plain OS threads — not the
-/// shared rayon pool each analysis itself uses — so a fetching run never starves
-/// the pool. Output order is the input order regardless of completion order, so
-/// the serial merge that follows assigns file ids deterministically.
+/// Analyze the bytes of fetched payloads, returning one slot per input record
+/// in the same order (`None` where there was nothing to analyze).
+///
+/// Off the rayon pool this is bounded by [`ANALYSIS_CONCURRENCY`] and run on
+/// plain OS threads, not the shared rayon pool each analysis itself uses. When
+/// called from a rayon worker, it runs sequentially in-place: joining OS threads
+/// from a rayon worker while those threads call back into cleave can starve the
+/// pool if every worker is doing the same thing.
 fn analyze_payloads(
     fetched: &[FetchRecord],
     cache: &BlobCache,
@@ -582,6 +887,12 @@ fn analyze_payloads(
     let n = fetched.len();
     if n == 0 {
         return Vec::new();
+    }
+    if rayon::current_thread_index().is_some() {
+        return fetched
+            .iter()
+            .map(|rec| analyze_payload(rec, cache, opts))
+            .collect();
     }
     let cursor = AtomicUsize::new(0);
     let workers = ANALYSIS_CONCURRENCY.min(n);

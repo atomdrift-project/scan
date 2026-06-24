@@ -6,10 +6,9 @@
 //!
 //! The bug in production: litmus's worker/scan/server entry points used to
 //! trigger YARA initialization from a rayon worker under cold-cache load,
-//! which deadlocked the pool. The fix is a one-line `prefetch_shared_resources`
-//! call at the top of each entry point. If someone removes that call from
-//! `run_scan_paths`, the binary will hang under `CLEAVE_SKIP_YARA_CACHE=1`
-//! and this test will trip its timeout.
+//! which deadlocked the pool. Scan still prefetches shared cleave resources so
+//! cold-start work happens before analysis, and cleave's YARA loader is safe if
+//! a new entry point misses that prefetch.
 //!
 //! **Requires `SCAN_MODELS_DIR` to be set** (same convention as
 //! `server_analyze.rs`).

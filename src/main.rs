@@ -209,6 +209,21 @@ struct Cli {
     )]
     fetch_depth: u8,
 
+    /// [EXPERIMENTAL] Skip fetching a declared dependency whose registry publish
+    /// date is older than this many days — the cheap provenance lookup runs
+    /// first, and only recent (freshest-risk) releases are pulled and scanned.
+    /// `0` disables the gate (fetch every resolvable dependency). A dependency
+    /// whose age can't be determined is always fetched. Also settable via
+    /// `SCAN_MAX_DEP_AGE`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "DAYS",
+        default_value_t = scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
+        env = "SCAN_MAX_DEP_AGE"
+    )]
+    max_dep_age: u32,
+
     /// Paths to files or directories to scan (shorthand for `ascan fs <paths...>`)
     paths: Vec<PathBuf>,
 
@@ -487,10 +502,12 @@ fn main() -> Result<()> {
     // Resolve before `cli.command` is moved out below; only one arm uses it.
     let interpret_cfg = cli.interpret_config();
     // The kind selection comes from `--fetch`; the hop count from `--fetch-depth`
-    // (its own flag/env). Combine them into one policy for every scan path.
+    // and the dependency age ceiling from `--max-dep-age` (each its own
+    // flag/env). Combine them into one policy for every scan path.
     let fetch_policy = {
         let mut policy = cli.fetch.unwrap_or_default();
         policy.depth = cli.fetch_depth;
+        policy.max_dep_age_days = cli.max_dep_age;
         policy
     };
     if let Some(cfg) = &interpret_cfg {

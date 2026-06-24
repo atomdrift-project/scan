@@ -918,6 +918,8 @@ fn format_eta(secs: f64) -> String {
 /// Returns an error if the target path does not exist, model artifacts cannot
 /// be loaded, or `cleave` analysis fails for the overall scan operation.
 pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
+    prefetch_cleave_resources();
+
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
 
     let shap = ShapImportance::load(config.model_dir()).ok();
@@ -1041,6 +1043,8 @@ pub fn run_bytes(
     bytes: Vec<u8>,
     config: &ScanConfig,
 ) -> Result<ScanSummary> {
+    prefetch_cleave_resources();
+
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
@@ -1186,6 +1190,8 @@ fn record_file_result(
 /// Propagates model-load and cleave setup failures. Per-file analysis errors
 /// are recorded in the summary, not returned.
 pub fn run_paths(paths: &[PathBuf], config: &ScanConfig) -> Result<ScanSummary> {
+    prefetch_cleave_resources();
+
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
@@ -2224,6 +2230,8 @@ pub fn scan_bytes(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
+    prefetch_cleave_resources();
+
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
@@ -2239,6 +2247,13 @@ pub fn scan_bytes(
         config,
         None,
     )
+}
+
+fn prefetch_cleave_resources() {
+    // Keep cleave's cold-start work off rayon workers where possible. Cleave's
+    // loaders are worker-safe, but these library entry points are also used by
+    // pkg/url scans and fetched payload analysis where visible latency matters.
+    cleave::prefetch_shared_resources(true);
 }
 
 /// Extract a small set of human-facing findings relevant to the classification.

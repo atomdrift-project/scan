@@ -31,6 +31,16 @@ pub fn run_pkg(purl: &str, config: &ScanConfig) -> Result<ScanSummary> {
 
 fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
     let progress = matches!(config.format(), OutputFormat::Terminal);
+    // For a known package system, surface the registry's metadata (age, author,
+    // popularity, deprecation) and scan the normalized record itself, so traits
+    // over `registry.*` facts fire — the same metadata the dependency age-gate
+    // consults, looked up before the fetch.
+    if let Some(reg) = crate::fetch::registry(&locator) {
+        crate::fetch::report_registry(&reg, progress);
+        if let Some((name, bytes)) = crate::fetch::registry_document(&reg) {
+            crate::engine::run_bytes(&name, &name, bytes, config)?;
+        }
+    }
     let (bytes, name, rec) = crate::fetch::fetch_one(locator, progress)?;
     // Display under the resolved URL when there is one (a PURL resolves to its
     // download URL); fall back to the locator itself.

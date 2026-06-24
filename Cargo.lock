@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "atomdrift-scan"
-version = "2.1.0"
+version = "2.2.0-beta.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1680,7 +1680,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.1.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#84a0b39fbf8a8e42b0ee7ae37ec2b162c4e3ff42"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#61bff3888f8b4d74a98897608523d3cebbba785d"
 dependencies = [
  "aho-corasick",
  "cfb 0.10.0",
@@ -1793,7 +1793,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/fletch.git#e42b15e80792ff01485c5e3e5c5eaa0170226fce"
+source = "git+https://codeberg.org/atomdrift/fletch.git#5dcc5b5e4d283e8fca2d56c72ef8b809eb0583d8"
 dependencies = [
  "anyhow",
  "base64",
@@ -5588,7 +5588,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#84a0b39fbf8a8e42b0ee7ae37ec2b162c4e3ff42"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#61bff3888f8b4d74a98897608523d3cebbba785d"
 dependencies = [
  "cc",
  "tree-sitter",
