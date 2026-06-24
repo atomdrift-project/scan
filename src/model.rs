@@ -2765,6 +2765,20 @@ impl RouteSet {
         self.filetypes.get(name)
     }
 
+    /// Specialist lookup keys for a scanned `file_type`, selected by ARCHIVE
+    /// format rather than compression. A compressed label collapses onto its
+    /// container (`tar.gz` → `tar`, `tar.bz2.xz` → `tar`) so the compressed
+    /// variant reaches the same filetype/filegroup specialists — and the same
+    /// per-route policy thresholds — that collimator trained and calibrated
+    /// under the normalized label. Returns `(container_filetype, filegroup)`.
+    /// Mirrors the normalization `RoutePolicies::policy_for`/`grid_for` apply,
+    /// so route selection and the policy's per-route threshold keys agree.
+    fn specialist_keys(&self, file_type: &str) -> (String, Option<String>) {
+        let container = normalize_archive_filetype(file_type);
+        let group = self.filetype_to_filegroup.get(container.as_str()).cloned();
+        (container, group)
+    }
+
     fn validate_all(&self) -> Result<()> {
         let (filegroups, filetypes) = rayon::join(
             || self.filegroups.validate_all(),
@@ -3346,9 +3360,12 @@ impl Model {
         let mut classification = self.thresholds.classify(general_prob);
 
         // Optional filegroup specialist, looked up via the configured
-        // filetype → filegroup map.
-        if let Some(group_name) = self.routes.filetype_to_filegroup.get(file_type)
-            && let Some(route) = self.routes.filegroups.get(group_name)
+        // filetype → filegroup map. `specialist_keys` normalizes compression
+        // suffixes first so a `tar.gz`/`foo.zst` resolves to its container's
+        // group.
+        let (route_file_type, group_name) = self.routes.specialist_keys(file_type);
+        if let Some(group_name) = group_name
+            && let Some(route) = self.routes.filegroups.get(&group_name)
         {
             if route.spec.total_features() != features.len() {
                 tracing::debug!(
@@ -3366,11 +3383,11 @@ impl Model {
             }
         }
 
-        // Optional filetype specialist.
-        if let Some(route) = self.routes.filetypes.get(file_type) {
+        // Optional filetype specialist (same container normalization as above).
+        if let Some(route) = self.routes.filetypes.get(&route_file_type) {
             if route.spec.total_features() != features.len() {
                 tracing::debug!(
-                    route = %file_type,
+                    route = %route_file_type,
                     expected = route.spec.total_features(),
                     got = features.len(),
                     "skipping routed feature-vector prediction; use predict_for_report for heterogeneous specialists",
@@ -3451,11 +3468,14 @@ impl Model {
     {
         let policy = self.routes.policies.policy_for(file_type);
 
-        let group_name = self.routes.filetype_to_filegroup.get(file_type).cloned();
+        // Select specialists by ARCHIVE format, not compression: a `.tgz`
+        // resolves to the `tar` container specialist instead of routing
+        // general-only and surfacing `filetypes/tar` as an `unavailable` skip.
+        let (route_file_type, group_name) = self.routes.specialist_keys(file_type);
         let group_route = group_name
             .as_deref()
             .and_then(|name| self.routes.filegroup(name));
-        let filetype_route = self.routes.filetype(file_type);
+        let filetype_route = self.routes.filetype(&route_file_type);
 
         let score_general = || -> Result<(RouteProbability, RouteScore)> {
             let (general_raw, general_prob) =
@@ -3506,7 +3526,7 @@ impl Model {
             let Some(route) = filetype_route.as_ref() else {
                 return Ok(None);
             };
-            let route_name = format!("filetypes/{file_type}");
+            let route_name = format!("filetypes/{route_file_type}");
             let (raw, prob, class) = score(route)?;
             let class = policy.map_or(class, |policy| {
                 policy_route_class(policy, &route_name, prob)
@@ -3517,7 +3537,7 @@ impl Model {
                     probability: prob,
                 },
                 RouteScore {
-                    model: format!("az/{file_type}"),
+                    model: format!("az/{route_file_type}"),
                     probability: prob,
                     raw,
                     classification: class,
@@ -3548,9 +3568,9 @@ impl Model {
         if let Some((route_prob, route_score)) = filetype_result? {
             route_probs.push(route_prob);
             scores.push(route_score);
-        } else if self.routes.filetypes.is_skipped(file_type) {
+        } else if self.routes.filetypes.is_skipped(&route_file_type) {
             skipped.push(SkippedRoute {
-                model: format!("az/{file_type}"),
+                model: format!("az/{route_file_type}"),
                 reason: "uncalibrated",
             });
         }
@@ -3718,6 +3738,48 @@ mod tests {
         // Empty / whitespace.
         assert_eq!(normalize_archive_filetype(""), "");
         assert_eq!(normalize_archive_filetype("  tar.gz  "), "tar");
+    }
+
+    #[test]
+    fn specialist_keys_routes_compressed_archives_to_their_container() {
+        // collimator emits the filetype→filegroup map (and trains/calibrates
+        // every specialist) under the normalized container label, so the map
+        // carries `tar`/`javascript`, never `tar.gz`.
+        let routes = RouteSet {
+            filetype_to_filegroup: HashMap::from([
+                ("tar".to_string(), "archive".to_string()),
+                ("javascript".to_string(), "scripts".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        // A compressed tarball must resolve to the `tar` container specialist
+        // and its filegroup. This is the `.tgz` routing gap: selecting by the
+        // raw `tar.gz` label found no specialist, surfaced `filetypes/tar` as an
+        // `unavailable` skip, and let an obfuscated npm dropper score benign on
+        // the general route alone.
+        assert_eq!(
+            routes.specialist_keys("tar.gz"),
+            ("tar".to_string(), Some("archive".to_string())),
+        );
+        // Stacked compression suffixes collapse all the way to the container.
+        assert_eq!(
+            routes.specialist_keys("tar.bz2.xz"),
+            ("tar".to_string(), Some("archive".to_string())),
+        );
+        // The uncompressed container is unchanged.
+        assert_eq!(
+            routes.specialist_keys("tar"),
+            ("tar".to_string(), Some("archive".to_string())),
+        );
+        // Non-archive types pass through untouched and still resolve their group.
+        assert_eq!(
+            routes.specialist_keys("javascript"),
+            ("javascript".to_string(), Some("scripts".to_string())),
+        );
+        // A container with no configured filegroup yields no group, still
+        // normalized so its filetype specialist (if any) is reachable.
+        assert_eq!(routes.specialist_keys("zip"), ("zip".to_string(), None));
     }
 
     #[test]
