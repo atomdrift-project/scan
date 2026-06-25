@@ -1681,7 +1681,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.1.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#ca00d7b29dda00976bdd8665dda5944440bf7799"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#a8799824406d1e4b0c0900933028f44922c81e6c"
 dependencies = [
  "aho-corasick",
  "cfb 0.10.0",
@@ -1794,7 +1794,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/fletch.git#91f0d0541d952e2fb969167f40ba44144a33e80c"
+source = "git+https://codeberg.org/atomdrift/fletch.git#39d53d517c95b34a6f5181d03647043eab9c405c"
 dependencies = [
  "anyhow",
  "base64",
@@ -5608,7 +5608,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#ca00d7b29dda00976bdd8665dda5944440bf7799"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#a8799824406d1e4b0c0900933028f44922c81e6c"
 dependencies = [
  "cc",
  "tree-sitter",

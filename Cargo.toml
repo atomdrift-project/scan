@@ -254,11 +254,6 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # on the unreleased local stng). cleave stays on git — local ../cleave is out of
 # sync with this scan's API; my filefacts additions are backward-compatible, so
 # git cleave consumes the local filefacts fine. Remove once releases carry these.
-#[patch."https://codeberg.org/atomdrift/fletch.git"]
-#fletch = { path = "../fletch" }
-
-#[patch."https://codeberg.org/atomdrift/filefacts.git"]
-#filefacts = { path = "../filefacts" }
 
 #[patch."https://codeberg.org/atomdrift/stng.git"]
 #stng = { path = "../stng" }

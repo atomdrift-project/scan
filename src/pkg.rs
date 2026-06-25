@@ -41,14 +41,48 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
     let registry = crate::fetch::registry(&locator);
     if let Some(reg) = &registry {
         crate::fetch::report_registry(reg, progress);
+        // The registry lookup we just did (the packument we need for the record
+        // anyway) already tells us whether this version was pulled — so when it
+        // was, skip the doomed tarball fetch entirely and scan the registry
+        // record directly. No extra lookup, no wasted 404 round-trip.
+        if reg.version_removed == Some(true)
+            && let Some((name, bytes)) = crate::fetch::registry_document(reg)
+        {
+            if progress {
+                eprintln!(
+                    "\n  \x1b[38;2;230;180;80m\u{26a0}\x1b[0m  \x1b[38;2;160;160;160mversion unpublished — scanning registry metadata only\x1b[0m"
+                );
+            }
+            return crate::engine::run_bytes(&name, &name, bytes, config, None);
+        }
     }
-    let (bytes, name, rec) = crate::fetch::fetch_one(locator, progress)?;
-    // Display under the resolved URL when there is one (a PURL resolves to its
-    // download URL); fall back to the locator itself.
-    let label = if rec.resolved_url.is_empty() {
-        rec.locator.clone()
-    } else {
-        rec.resolved_url.clone()
-    };
-    crate::engine::run_bytes(&label, &name, bytes, config, registry.as_ref())
+    match crate::fetch::fetch_one(locator, progress) {
+        Ok((bytes, name, rec)) => {
+            // Display under the resolved URL when there is one (a PURL resolves to
+            // its download URL); fall back to the locator itself.
+            let label = if rec.resolved_url.is_empty() {
+                rec.locator.clone()
+            } else {
+                rec.resolved_url.clone()
+            };
+            crate::engine::run_bytes(&label, &name, bytes, config, registry.as_ref())
+        }
+        // The artifact couldn't be fetched — most often because the version was
+        // unpublished/removed (the metadata still resolves). Rather than fail the
+        // whole scan, fall back to scanning the registry record so its signals —
+        // including `registry.version_removed` and the freshness/custody anomalies
+        // — still produce a verdict. A removed days-old package is itself a strong
+        // supply-chain tell.
+        Err(e) => match registry.as_ref().and_then(crate::fetch::registry_document) {
+            Some((name, bytes)) => {
+                if progress {
+                    eprintln!(
+                        "\n  \x1b[38;2;230;180;80m\u{26a0}\x1b[0m  \x1b[38;2;160;160;160martifact unavailable — scanning registry metadata only\x1b[0m"
+                    );
+                }
+                crate::engine::run_bytes(&name, &name, bytes, config, None)
+            }
+            None => Err(e),
+        },
+    }
 }

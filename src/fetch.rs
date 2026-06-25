@@ -372,7 +372,7 @@ pub(crate) fn orchestrate(
             // materialized so the package pass below can pair an artifact with
             // its own registry metadata (see `apply_package_composites`).
             let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
-            for (r, reg, aged_out) in &registries {
+            for (r, reg, skipped) in &registries {
                 if let Some(sub) = registry_node(reg, &opts) {
                     registry_findings
                         .entry(locator_key(r))
@@ -380,16 +380,21 @@ pub(crate) fn orchestrate(
                         .extend(sub_findings(&sub));
                     merge_registry(report, &source_sha, sub);
                 }
-                if !aged_out {
+                if !skipped {
                     continue;
                 }
+                // The record is materialized either way; only the artifact fetch
+                // is skipped — because the dependency aged out, or because the
+                // version was removed (no artifact to fetch).
+                let removed = reg.version_removed == Some(true);
                 tracing::info!(
                     package = %locator_key(r),
                     ecosystem = %reg.ecosystem,
                     version = %reg.version,
                     age_days = reg.age_days.unwrap_or(0),
                     downloads = reg.downloads_recent.or(reg.downloads_total),
-                    "dependency older than --max-dep-age; registry cached, fetch skipped"
+                    reason = if removed { "version removed from registry" } else { "older than --max-dep-age" },
+                    "registry record materialized; artifact fetch skipped"
                 );
                 if progress {
                     if !header_printed {
@@ -536,13 +541,23 @@ pub fn registry(locator: &RefLocator) -> Option<Registry> {
     fletch::registry(locator, &res.net, &res.cache).map(|reg| reg.with_age(unix_now()))
 }
 
-/// Like [`registry`], but also returns the raw provider documents the lookup
-/// read, as `(url, bytes)` — recovered from the cache the scan already populated,
-/// so it costs no extra fetch. Used by `--upload` to archive the raw registry
-/// snapshot in hopper alongside the normalized record, the same re-parsing backup
-/// forager stores.
+/// Serialize a registry record to its `*.registry.json` document — its synthetic
+/// name and bytes — so the one-shot `pkg:`/`url` path can scan the registry
+/// metadata directly when the artifact itself can't be fetched (e.g. the version
+/// was unpublished). `None` if it can't be serialized.
 #[must_use]
-pub fn registry_with_sources(locator: &RefLocator) -> (Option<Registry>, Vec<(String, Vec<u8>)>) {
+pub fn registry_document(reg: &Registry) -> Option<(String, Vec<u8>)> {
+    Some((registry_doc_name(reg), serde_json::to_vec(reg).ok()?))
+}
+
+/// Like [`registry`], but also returns the raw provider documents the lookup
+/// read — recovered from the cache the scan already populated, so it costs no
+/// extra fetch. Used by `--upload` to archive the raw registry snapshot in hopper
+/// alongside the normalized record, the same re-parsing backup forager stores.
+#[must_use]
+pub fn registry_with_sources(
+    locator: &RefLocator,
+) -> (Option<Registry>, Vec<fletch::fetch::RecordedSource>) {
     let Some(res) = shared_resources() else {
         return (None, Vec::new());
     };
@@ -743,14 +758,19 @@ fn age_gate(
     let mut registries = Vec::new();
     for (r, lookup) in selected.into_iter().zip(lookups) {
         match lookup {
-            // A resolved record: gate on its age, but materialize it either way.
+            // A resolved record: gate on age, but materialize it either way. A
+            // version the registry has already removed has no fetchable artifact,
+            // so skip the doomed fetch too (its signals still surface from the
+            // materialized record). The bool means "skipped from fetching".
             Some(reg) => {
+                let removed = reg.version_removed == Some(true);
                 let aged_out =
                     max_age.is_some_and(|max| reg.age_secs(now).is_some_and(|age| age >= max));
-                if !aged_out {
+                let skipped = aged_out || removed;
+                if !skipped {
                     keep.push(r.clone());
                 }
-                registries.push((r, reg, aged_out));
+                registries.push((r, reg, skipped));
             }
             // A non-dependency, or a dependency whose record didn't resolve —
             // fetch it (fail open).
