@@ -40,7 +40,7 @@ use cleave::{AnalysisOptions, AnalysisReport};
 use fletch::fetch::{
     BlobCache, FetchBudget, FetchRecord, HttpFetch, Outcome, fetch_ref, fetch_references,
 };
-use fletch::{ExternalRef, RefKind, RefLocator, Registry, find};
+use fletch::{Reference, RefKind, RefLocator, Registry, find};
 
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
@@ -228,7 +228,7 @@ pub(crate) fn orchestrate(
     // a covertly-installed companion or a dependency-confusion target. Computed
     // across the whole work-list so a member's `require("x")` is diffed against
     // the root manifest's declarations.
-    let all_refs: Vec<ExternalRef> = worklist
+    let all_refs: Vec<Reference> = worklist
         .iter()
         .flat_map(|(_, refs)| refs.iter().cloned())
         .collect();
@@ -252,7 +252,7 @@ pub(crate) fn orchestrate(
             // command-mentioned package (`packages`) is distinct from a declared
             // dependency (`deps`) even though both are PURLs — and that haven't
             // been fetched yet this run.
-            let selected: Vec<ExternalRef> = refs
+            let selected: Vec<Reference> = refs
                 .into_iter()
                 .filter(|r| policy.wants(r.kind) && seen.insert(locator_key(r)))
                 .collect();
@@ -362,8 +362,9 @@ pub fn fetch_one(
     let kind = match &locator {
         RefLocator::Purl(_) => RefKind::Dependency,
         RefLocator::Url(_) => RefKind::UrlFetch,
+        RefLocator::Path(_) => RefKind::Local,
     };
-    let reference = ExternalRef {
+    let reference = Reference {
         locator,
         kind,
         source: "cli".to_string(),
@@ -561,11 +562,11 @@ fn failure_detail(rec: &FetchRecord, why: &str) -> String {
 /// triple — the record is materialized as facts whether or not its bytes are
 /// fetched, and `aged_out` drives the skip report.
 fn age_gate(
-    selected: Vec<ExternalRef>,
+    selected: Vec<Reference>,
     policy: &FetchPolicy,
     res: &Resources,
     now: u64,
-) -> (Vec<ExternalRef>, Vec<(ExternalRef, Registry, bool)>) {
+) -> (Vec<Reference>, Vec<(Reference, Registry, bool)>) {
     // `None` ceiling (the `--max-dep-age 0` opt-out) gates nothing, but registry
     // records are still looked up and materialized.
     let max_age =
@@ -599,7 +600,7 @@ fn age_gate(
 /// whose record can't be resolved, yields `None`. Bounded by
 /// [`REGISTRY_LOOKUP_CONCURRENCY`] on plain OS threads; each lookup is keyed by a
 /// distinct locator, so the shared cache sees no write contention.
-fn lookup_registries(selected: &[ExternalRef], res: &Resources, now: u64) -> Vec<Option<Registry>> {
+fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<Option<Registry>> {
     let mut out: Vec<Option<Registry>> = selected.iter().map(|_| None).collect();
     let targets: Vec<usize> = (0..selected.len())
         .filter(|&i| selected[i].kind == RefKind::Dependency)
@@ -700,7 +701,7 @@ fn registry_doc_name(reg: &Registry) -> String {
 /// Render one age-gated dependency to stderr in the fetch progress block: a
 /// muted "skip" line naming the package, its age in days, and the strongest
 /// reputation signal the registry gave (downloads, else votes/rating).
-fn report_skip(r: &ExternalRef, reg: &Registry, now: u64) {
+fn report_skip(r: &Reference, reg: &Registry, now: u64) {
     let age_days = reg.age_secs(now).unwrap_or(0) / 86_400;
     let signal = reg
         .downloads_recent
@@ -777,8 +778,8 @@ fn human_bytes(n: u64) -> String {
 fn collect_references(
     report: &AnalysisReport,
     root_path: &Path,
-) -> Vec<(String, Vec<ExternalRef>)> {
-    let mut groups: Vec<(String, Vec<ExternalRef>)> = Vec::new();
+) -> Vec<(String, Vec<Reference>)> {
+    let mut groups: Vec<(String, Vec<Reference>)> = Vec::new();
     for file in &report.files {
         let Some(view) = &file.filefacts else {
             continue;
@@ -819,9 +820,9 @@ fn collect_references(
 /// Merge the root's hunted references into its group (creating it if the root
 /// declared none), skipping any locator already present.
 fn merge_into_root(
-    groups: &mut Vec<(String, Vec<ExternalRef>)>,
+    groups: &mut Vec<(String, Vec<Reference>)>,
     root_sha: &str,
-    hunted: Vec<ExternalRef>,
+    hunted: Vec<Reference>,
 ) {
     if !groups.iter().any(|(sha, _)| sha == root_sha) {
         groups.push((root_sha.to_string(), Vec::new()));
@@ -838,10 +839,9 @@ fn merge_into_root(
 }
 
 /// A reference's locator as a stable string for dedup.
-fn locator_key(r: &ExternalRef) -> String {
+fn locator_key(r: &Reference) -> String {
     match &r.locator {
-        RefLocator::Purl(p) => p.clone(),
-        RefLocator::Url(u) => u.clone(),
+        RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
     }
 }
 
@@ -868,7 +868,7 @@ const REGISTRY_LOOKUP_CONCURRENCY: usize = 8;
 struct Analyzed {
     sub: Option<AnalysisReport>,
     content_sha: String,
-    next_from_bytes: Vec<(String, Vec<ExternalRef>)>,
+    next_from_bytes: Vec<(String, Vec<Reference>)>,
 }
 
 /// Analyze the bytes of fetched payloads, returning one slot per input record
@@ -981,7 +981,7 @@ fn merge_payload(
     report: &mut AnalysisReport,
     rec: &FetchRecord,
     analyzed: Analyzed,
-) -> Vec<(String, Vec<ExternalRef>)> {
+) -> Vec<(String, Vec<Reference>)> {
     let mut next = analyzed.next_from_bytes;
     let Some(sub) = analyzed.sub else {
         return next;
@@ -1039,8 +1039,8 @@ mod tests {
     use super::*;
     use fletch::RefKind;
 
-    fn url_ref(url: &str) -> ExternalRef {
-        ExternalRef {
+    fn url_ref(url: &str) -> Reference {
+        Reference {
             locator: RefLocator::Url(url.to_string()),
             kind: RefKind::UrlFetch,
             source: "test".to_string(),
@@ -1187,7 +1187,7 @@ mod tests {
 
         // No on-disk root text hunt — a missing path just skips it.
         let groups = collect_references(&report, std::path::Path::new("/nonexistent"));
-        let all: Vec<ExternalRef> = groups.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
+        let all: Vec<Reference> = groups.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
         let undeclared: Vec<String> = find::undeclared_packages(&all)
             .iter()
             .map(|r| locator_key(r))
