@@ -214,44 +214,86 @@ struct Cli {
     /// [EXPERIMENTAL] Skip fetching a declared dependency whose registry publish
     /// date is older than this many days — the cheap provenance lookup runs
     /// first, and only recent (freshest-risk) releases are pulled and scanned.
-    /// `0` disables the gate (fetch every resolvable dependency). A dependency
-    /// whose age can't be determined is always fetched. Also settable via
-    /// `SCAN_MAX_DEP_AGE`.
+    /// Applies to declared dependencies only; URLs are never age-gated. `0`
+    /// disables the gate (fetch every resolvable dependency). A dependency whose
+    /// age can't be determined is always fetched. Also settable via
+    /// `SCAN_FETCH_MAX_AGE`.
     #[arg(
         long,
         global = true,
         value_name = "DAYS",
         default_value_t = scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
-        env = "SCAN_MAX_DEP_AGE"
+        env = "SCAN_FETCH_MAX_AGE"
     )]
-    max_dep_age: u32,
+    fetch_max_age: u32,
 
-    /// [EXPERIMENTAL] Maximum size of a single fetched reference, in megabytes.
-    /// A response whose `Content-Length` (or streamed body) exceeds this is
-    /// abandoned, so one oversized artifact can't dominate a run. Also settable
-    /// via `SCAN_MAX_FETCH_MB`.
+    /// [EXPERIMENTAL] Size cap for a single downloaded artifact. Accepts a unit
+    /// suffix (`40M`, `2G`, `512K`); a bare number is bytes. A response larger
+    /// than this is abandoned, so one artifact can't dominate a run. Also
+    /// settable via `SCAN_FETCH_MAX_SIZE`.
     #[arg(
         long,
         global = true,
-        value_name = "MB",
-        default_value_t = scan::fetch::DEFAULT_MAX_FETCH_MB,
-        env = "SCAN_MAX_FETCH_MB"
+        value_name = "SIZE",
+        default_value = "40M",
+        value_parser = scan::fetch::parse_bytes,
+        env = "SCAN_FETCH_MAX_SIZE"
     )]
-    max_fetch_mb: u64,
+    fetch_max_size: u64,
 
-    /// [EXPERIMENTAL] Maximum number of *live* reference fetches per run (every
-    /// hop, every file). Cache hits are always served and never counted, so a
-    /// warm re-run is never throttled. References past the cap are recorded as
+    /// [EXPERIMENTAL] Maximum number of *live* fetches triggered by a single
+    /// scanned file. Cache hits are always served and never counted, so a warm
+    /// re-run is never throttled. References past the cap are recorded as
     /// budget-exceeded, never silently dropped. Also settable via
-    /// `SCAN_MAX_FETCH_COUNT`.
+    /// `SCAN_FETCH_MAX_FILE_FETCHES`.
     #[arg(
         long,
         global = true,
         value_name = "N",
-        default_value_t = scan::fetch::DEFAULT_MAX_FETCH_COUNT,
-        env = "SCAN_MAX_FETCH_COUNT"
+        default_value_t = scan::fetch::DEFAULT_MAX_FILE_FETCHES,
+        env = "SCAN_FETCH_MAX_FILE_FETCHES"
     )]
-    max_fetch_count: usize,
+    fetch_max_file_fetches: usize,
+
+    /// [EXPERIMENTAL] Maximum total bytes fetched on behalf of a single scanned
+    /// file. Accepts a unit suffix (`2G`); a bare number is bytes. Also settable
+    /// via `SCAN_FETCH_MAX_FILE_SIZE`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SIZE",
+        default_value = "2G",
+        value_parser = scan::fetch::parse_bytes,
+        env = "SCAN_FETCH_MAX_FILE_SIZE"
+    )]
+    fetch_max_file_size: u64,
+
+    /// [EXPERIMENTAL] Maximum number of *live* fetches across the whole
+    /// execution — a hard ceiling over every scanned file combined. Lifted in
+    /// long-lived server modes (`serve`/`worker`), where the per-file caps bound
+    /// each job instead. Also settable via `SCAN_FETCH_MAX_TOTAL_FETCHES`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        default_value_t = scan::fetch::DEFAULT_MAX_TOTAL_FETCHES,
+        env = "SCAN_FETCH_MAX_TOTAL_FETCHES"
+    )]
+    fetch_max_total_fetches: usize,
+
+    /// [EXPERIMENTAL] Maximum total bytes fetched across the whole execution.
+    /// Accepts a unit suffix (`10G`); a bare number is bytes. Lifted in
+    /// long-lived server modes (`serve`/`worker`). Also settable via
+    /// `SCAN_FETCH_MAX_TOTAL_SIZE`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SIZE",
+        default_value = "10G",
+        value_parser = scan::fetch::parse_bytes,
+        env = "SCAN_FETCH_MAX_TOTAL_SIZE"
+    )]
+    fetch_max_total_size: u64,
 
     /// Paths to files or directories to scan (shorthand for `ascan fs <paths...>`)
     paths: Vec<PathBuf>,
@@ -530,23 +572,24 @@ fn main() -> Result<()> {
     let threshold_hostile = cli.threshold_hostile;
     // Resolve before `cli.command` is moved out below; only one arm uses it.
     let interpret_cfg = cli.interpret_config();
-    // The kind selection comes from `--fetch`; the hop count from `--fetch-depth`
-    // and the dependency age ceiling from `--max-dep-age` (each its own
-    // flag/env). When `--fetch`/`SCAN_FETCH` is unset the default depends on run
-    // mode: an interactive scan fetches declared dependencies and
-    // install-command packages (the references bound to the artifact) but not
-    // raw URLs, while a worker fetches every kind. An explicit selection is
-    // honored verbatim in both. `--fetch-depth`/`--max-dep-age` always apply.
+    // The kind selection comes from `--fetch`; the hop count from `--fetch-depth`,
+    // the dependency age ceiling from `--fetch-max-age`, and the per-file ceilings
+    // from `--fetch-max-file-*` (each its own flag/env). When `--fetch`/`SCAN_FETCH`
+    // is unset the default depends on run mode: an interactive scan fetches
+    // declared dependencies and install-command packages (the references bound to
+    // the artifact) but not raw URLs, while a worker fetches every kind. An
+    // explicit selection is honored verbatim in both; the knobs always apply.
     let with_knobs = |mut policy: scan::fetch::FetchPolicy| {
         policy.depth = cli.fetch_depth;
-        policy.max_dep_age_days = cli.max_dep_age;
-        policy.max_fetch_count = cli.max_fetch_count;
+        policy.max_dep_age_days = cli.fetch_max_age;
+        policy.max_file_fetches = cli.fetch_max_file_fetches;
+        policy.max_file_bytes = cli.fetch_max_file_size;
         policy
     };
     // The per-fetch size ceiling is enforced in the HTTP layer, so it's a
     // process-global rather than a per-policy field — set it once here and every
-    // mode (interactive scan and worker alike) honors `--max-fetch-mb`.
-    scan::fetch::set_max_fetch_bytes(cli.max_fetch_mb.saturating_mul(1024 * 1024));
+    // mode (interactive scan and worker alike) honors `--fetch-max-size`.
+    scan::fetch::set_max_fetch_bytes(cli.fetch_max_size);
     let scan_default = scan::fetch::FetchPolicy {
         deps: true,
         packages: true,
@@ -586,6 +629,14 @@ fn main() -> Result<()> {
     };
 
     let is_serve = matches!(command, Commands::Serve { .. } | Commands::Worker { .. });
+    // Per-execution fetch ceiling: a hard cap across the whole invocation. The
+    // long-lived server modes (`serve`/`worker`) scan unboundedly many jobs over
+    // their lifetime, so they're exempt — each job is bounded by `--fetch-max-file-*`
+    // instead. A one-shot scan gets the full `--fetch-max-total-*` (the budget
+    // defaults to unlimited, so leaving it unset in server mode lifts it).
+    if !is_serve {
+        scan::fetch::set_total_budget(cli.fetch_max_total_fetches, cli.fetch_max_total_size);
+    }
     let filter = if cli.verbose {
         tracing_subscriber::EnvFilter::new("scan=debug,cleave=debug")
     } else if is_serve {

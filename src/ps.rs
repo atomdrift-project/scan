@@ -370,6 +370,7 @@ fn build_result(
         matches!(config.format(), OutputFormat::Tiny),
         // `--show=all` with JSON: list every member of an archive-backed image.
         config.filter().is_all() && matches!(config.format(), OutputFormat::Json),
+        None, // process images carry no fetched-package registry metadata
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

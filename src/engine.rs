@@ -1049,6 +1049,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             &stdout,
             None,
             None,
+            None,
         );
         let summary = tally.summary(scan_start);
         if is_terminal {
@@ -1095,6 +1096,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                 &stdout,
                 progress.get(),
                 None,
+                None,
             );
         }
     })?;
@@ -1127,6 +1129,7 @@ pub fn run_bytes(
     name: &str,
     bytes: Vec<u8>,
     config: &ScanConfig,
+    root_registry: Option<&fletch::Registry>,
 ) -> Result<ScanSummary> {
     prefetch_cleave_resources();
 
@@ -1156,6 +1159,7 @@ pub fn run_bytes(
         &stdout,
         None,
         None,
+        root_registry,
     );
 
     let summary = tally.summary(scan_start);
@@ -1226,9 +1230,19 @@ fn record_file_result(
     stdout: &Mutex<std::io::Stdout>,
     progress: Option<&Progress>,
     uploader: Option<&crate::upload::Uploader>,
+    root_registry: Option<&fletch::Registry>,
 ) {
     let scan_result = cleave_result.and_then(|report| {
-        process_report(file_path, report, ctx, model, shap, config, cancellation)
+        process_report(
+            file_path,
+            report,
+            ctx,
+            model,
+            shap,
+            config,
+            cancellation,
+            root_registry,
+        )
     });
     if let Some(p) = progress {
         p.increment();
@@ -1340,6 +1354,7 @@ pub fn run_paths(paths: &[PathBuf], config: &ScanConfig) -> Result<ScanSummary> 
                 &stdout,
                 None,
                 uploader.as_ref(),
+                None,
             );
         };
 
@@ -1735,6 +1750,12 @@ pub(crate) fn classify_report(
     fetch_progress: bool,
     render_context: bool,
     list_all_members: bool,
+    // The root artifact's own registry metadata, for the one-shot `pkg:`/`url`
+    // path. `None` for ordinary scans. Grafted as a child `registry` node (so it
+    // trains like any other file) and correlated with the artifact via a
+    // `scope: package` composite, mirroring what `fetch::orchestrate` does per
+    // fetched dependency.
+    root_registry: Option<&fletch::Registry>,
 ) -> Result<ClassifiedReport> {
     // Capture every archive member — including the ones cleave catalogues but
     // never analyzes (docs, data files, images: non-program members it skips by
@@ -1770,6 +1791,16 @@ pub(crate) fn classify_report(
     // fetched content feeds the verdict like any other file. Off unless the
     // policy selects a kind. The returned edges are attached to report_json below.
     let fetch_edges = crate::fetch::orchestrate(&mut report, root_path, fetch, fetch_progress);
+    // One-shot `pkg:`/`url`: graft the root artifact's own registry metadata as a
+    // child `registry` node and correlate the two with a `scope: package`
+    // composite. The `--fetch` path does the equivalent per fetched dependency
+    // inside `orchestrate`; here the registry record is the root's own. Runs
+    // after `orchestrate` (so the registry node sits outside the sample's own
+    // `own_shas` aggregate, like other grafted content) and before `strip` (so a
+    // package composite's `trait_refs` keep their building-block traits).
+    if let Some(reg) = root_registry {
+        crate::fetch::graft_root_registry(&mut report, reg);
+    }
     // Drop component/baseline traits no composite fired on before the report is
     // summarized, featurized, and posted. finalize() has already inherited and
     // re-evaluated composites up the whole archive/embedding chain, so stripping
@@ -2303,6 +2334,7 @@ fn decision_outranks(candidate: &Decision, current: &Decision) -> bool {
 
 /// Apply litmus model inference to a cleave report. Always returns a ScanResult
 /// (even for benign); the caller decides whether to display it.
+#[allow(clippy::too_many_arguments)] // mirrors classify_report's wide single-path signature
 pub(crate) fn process_report(
     path: &Path,
     report: cleave::AnalysisReport,
@@ -2311,6 +2343,7 @@ pub(crate) fn process_report(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
     cancellation: Option<&Arc<AtomicBool>>,
+    root_registry: Option<&fletch::Registry>,
 ) -> Result<ScanResult> {
     let path_display = path.display().to_string();
     let is_json = matches!(config.format(), OutputFormat::Json);
@@ -2334,6 +2367,7 @@ pub(crate) fn process_report(
         // `--show=all` with JSON output: list every archive member, even the
         // no-finding ones cleave skipped analyzing.
         config.filter().is_all() && is_json,
+        root_registry,
     )?;
 
     // Include raw cleave report for JSON output (unmutated — ML scores go in the ml section).
@@ -2428,6 +2462,7 @@ pub fn scan_bytes(
         model,
         shap,
         config,
+        None,
         None,
     )
 }

@@ -31,12 +31,12 @@
 //! Off by default. Enabled, it is an online step performed after the offline
 //! analysis; failures degrade gracefully to "no fetches".
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use cleave::{AnalysisOptions, AnalysisReport};
+use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
     BlobCache, FetchBudget, FetchRecord, HttpFetch, Outcome, fetch_ref, fetch_references,
 };
@@ -54,20 +54,93 @@ pub const DEFAULT_FETCH_DEPTH: u8 = 2;
 /// `0` disables the gate (every resolvable dependency is fetched).
 pub const DEFAULT_MAX_DEP_AGE_DAYS: u32 = 30;
 
-/// Default ceiling on *live* fetches per run (every hop, every file). Cache hits
-/// don't count, so a warm re-run is never throttled; this bounds the network
-/// fan-out a single crafted artifact can trigger on a cold cache.
-pub const DEFAULT_MAX_FETCH_COUNT: usize = 100;
+/// 1024-based size units, the basis for every `--fetch-max-*-size` ceiling.
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
 
-/// Default per-fetch size ceiling, in megabytes — mirrors fletch's
-/// [`fletch::fetch::DEFAULT_MAX_FETCH_BYTES`] (40 MiB) in the unit the
-/// `--max-fetch-mb` flag uses.
-pub const DEFAULT_MAX_FETCH_MB: u64 = 40;
+/// Default size ceiling for a single fetched artifact (`--fetch-max-size`) —
+/// mirrors fletch's [`fletch::fetch::DEFAULT_MAX_FETCH_BYTES`] (40 MiB). A
+/// response larger than this is abandoned, so one artifact can't dominate a run.
+pub const DEFAULT_MAX_FETCH_SIZE: u64 = 40 * MIB;
+
+/// Default ceiling on *live* fetches triggered by a single scanned file
+/// (`--fetch-max-file-fetches`). Cache hits don't count, so a warm re-run is
+/// never throttled; this bounds the fan-out one crafted file can trigger.
+pub const DEFAULT_MAX_FILE_FETCHES: usize = 100;
+
+/// Default ceiling on total bytes fetched on behalf of a single scanned file
+/// (`--fetch-max-file-size`).
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 2 * GIB;
+
+/// Default ceiling on *live* fetches across one whole execution
+/// (`--fetch-max-total-fetches`). Lifted in long-lived server modes, where each
+/// job is bounded by the per-file caps instead.
+pub const DEFAULT_MAX_TOTAL_FETCHES: usize = 1000;
+
+/// Default ceiling on total bytes fetched across one whole execution
+/// (`--fetch-max-total-size`). Lifted in long-lived server modes.
+pub const DEFAULT_MAX_TOTAL_SIZE: u64 = 10 * GIB;
 
 /// Set the process-wide per-fetch byte ceiling (re-exported from [`fletch`] so
 /// the binary configures it through `scan::fetch`). See
 /// [`fletch::fetch::set_max_fetch_bytes`].
 pub use fletch::fetch::set_max_fetch_bytes;
+
+/// Per-execution fetch budget — a running total shared by every [`orchestrate`]
+/// call in the process. Scans run concurrently, so it's atomic. Set once at
+/// startup via [`set_total_budget`] for one-shot runs; left at the unlimited
+/// default in long-lived server modes, where each job is bounded by the per-file
+/// caps instead. Each per-file [`FetchBudget`] is clamped to what remains here.
+static TOTAL_FETCH_COUNT: AtomicUsize = AtomicUsize::new(usize::MAX);
+static TOTAL_FETCH_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Set the process-wide per-execution fetch ceiling (`--fetch-max-total-*`).
+/// Called once at startup for one-shot scans; server modes leave it unlimited.
+pub fn set_total_budget(max_fetches: usize, max_bytes: u64) {
+    TOTAL_FETCH_COUNT.store(max_fetches, Ordering::Relaxed);
+    TOTAL_FETCH_BYTES.store(max_bytes, Ordering::Relaxed);
+}
+
+/// Charge the per-execution budget for one file's live fetches, saturating at
+/// zero so a charge never wraps. Cache hits and budget-skipped edges cost
+/// nothing (the caller filters them out before charging).
+fn charge_total_budget(fetches: usize, bytes: u64) {
+    let _ = TOTAL_FETCH_COUNT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(fetches))
+        });
+    let _ = TOTAL_FETCH_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(bytes))
+        });
+}
+
+/// Parse a byte size with an optional 1024-based unit suffix — `K`, `M`, `G`, or
+/// `T`, case-insensitive, with an optional trailing `B` (`40M`, `40MB`, and
+/// `40m` are equal). A bare number is bytes (`10240`). Powers every
+/// `--fetch-max-*-size` flag, so an operator writes the natural unit and the
+/// conversion happens once.
+///
+/// # Errors
+/// Returns a human-readable message when the number is missing, unparseable, or
+/// the result overflows `u64`.
+pub fn parse_bytes(s: &str) -> Result<u64, String> {
+    let lowered = s.trim().to_ascii_lowercase();
+    // Drop an optional trailing `b` so `40mb` == `40m` == `40`, then peel a unit
+    // suffix off the number — `strip_suffix` keeps us off byte indexing.
+    let body = lowered.strip_suffix('b').unwrap_or(&lowered);
+    let units = [('k', 1024_u64), ('m', MIB), ('g', GIB), ('t', 1024 * GIB)];
+    let (number, mult) = units
+        .iter()
+        .find_map(|&(suffix, mult)| body.strip_suffix(suffix).map(|n| (n, mult)))
+        .unwrap_or((body, 1));
+    let n: u64 = number
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid size {s:?}: {e} (examples: 40M, 2G, 10240)"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("size {s:?} is too large"))
+}
 
 /// What to fetch — a selection of reference *kinds*, parsed from the
 /// comma-separated `--fetch=KINDS` flag (`urls`, `packages`, `deps`) — plus how
@@ -103,10 +176,14 @@ pub struct FetchPolicy {
     /// URLs and command-mentioned packages are never age-gated, since their risk
     /// isn't tied to a registry release date.
     pub max_dep_age_days: u32,
-    /// Ceiling on *live* fetches per run. Cache hits are always served and never
+    /// Ceiling on *live* fetches triggered by a single scanned file
+    /// (`--fetch-max-file-fetches`). Cache hits are always served and never
     /// counted, so this caps only the cold-cache network fan-out, never a warm
     /// re-run. `0` disables fetching entirely.
-    pub max_fetch_count: usize,
+    pub max_file_fetches: usize,
+    /// Ceiling on total bytes fetched on behalf of a single scanned file
+    /// (`--fetch-max-file-size`). The sweep stops once retrieved bytes cross it.
+    pub max_file_bytes: u64,
 }
 
 impl Default for FetchPolicy {
@@ -117,7 +194,8 @@ impl Default for FetchPolicy {
             deps: false,
             depth: DEFAULT_FETCH_DEPTH,
             max_dep_age_days: DEFAULT_MAX_DEP_AGE_DAYS,
-            max_fetch_count: DEFAULT_MAX_FETCH_COUNT,
+            max_file_fetches: DEFAULT_MAX_FILE_FETCHES,
+            max_file_bytes: DEFAULT_MAX_FILE_SIZE,
         }
     }
 }
@@ -227,15 +305,15 @@ pub(crate) fn orchestrate(
 
     let opts = AnalysisOptions::default();
     let mut records = Vec::new();
-    // One budget across the whole run (every hop, every file) so a crafted chain
-    // can't multiply the per-file cap into a fetch storm. Refs past the cap are
-    // recorded as `BudgetExceeded`, never silently dropped. `max_count` is the
-    // operator-set live-fetch ceiling (`--max-fetch-count`); the byte ceiling
-    // stays at the library default safety backstop.
-    let mut budget = FetchBudget {
-        max_count: policy.max_fetch_count,
-        ..FetchBudget::default()
-    };
+    // Two budget tiers. Per scanned file: each file's references get a fresh
+    // ceiling (`--fetch-max-file-fetches` live fetches, `--fetch-max-file-size`
+    // bytes), so one file can't starve the rest. Per execution: a process-wide
+    // running total (`--fetch-max-total-*`, lifted in server modes) shared across
+    // every file scanned, so a crafted corpus can't multiply the per-file cap
+    // into a fetch storm. Each per-file budget below is clamped to what the total
+    // budget still allows, and every live fetch is charged against it. Cache hits
+    // are free and uncounted (a warm re-run is never throttled); refs past a cap
+    // become `BudgetExceeded`, never silently dropped.
     // Loop guard: a locator is fetched at most once per run, so a chain that
     // points back at an earlier stage can't cycle.
     let mut seen: HashSet<String> = HashSet::new();
@@ -290,8 +368,16 @@ pub(crate) fn orchestrate(
             // are dropped before the expensive fetch+scan of their bytes. Skips
             // are reported, never silent.
             let (selected, registries) = age_gate(selected, &policy, res, now);
+            // Registry findings keyed by locator, captured as each record is
+            // materialized so the package pass below can pair an artifact with
+            // its own registry metadata (see `apply_package_composites`).
+            let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
             for (r, reg, aged_out) in &registries {
                 if let Some(sub) = registry_node(reg, &opts) {
+                    registry_findings
+                        .entry(locator_key(r))
+                        .or_default()
+                        .extend(sub_findings(&sub));
                     merge_registry(report, &source_sha, sub);
                 }
                 if !aged_out {
@@ -318,6 +404,17 @@ pub(crate) fn orchestrate(
             if selected.is_empty() {
                 continue;
             }
+            // This file's ceiling, clamped to what the per-execution budget still
+            // allows. The total budget is a process global, so concurrent scans
+            // share one running total.
+            let budget = FetchBudget {
+                max_count: policy
+                    .max_file_fetches
+                    .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
+                max_bytes: policy
+                    .max_file_bytes
+                    .min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
+            };
             let fetched = fetch_references(
                 &selected,
                 &source_sha,
@@ -326,14 +423,12 @@ pub(crate) fn orchestrate(
                 &res.cache,
                 budget,
             );
-            // Charge what this group consumed so the next sees the remainder.
-            // Only live fetches count against `max_count` (cache hits are free,
-            // matching `fetch_references`); a `BudgetExceeded` edge consumes
-            // nothing.
+            // Charge the per-execution budget for what this file fetched live.
+            // Only live fetches count (cache hits are free, matching
+            // `fetch_references`); a `BudgetExceeded` edge consumes nothing.
             let spent = fetched.iter().filter(|r| fletch::fetch::counts_against_budget(r)).count();
             let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
-            budget.max_count = budget.max_count.saturating_sub(spent);
-            budget.max_bytes = budget.max_bytes.saturating_sub(bytes);
+            charge_total_budget(spent, bytes);
 
             // Report the fetch outcomes up front — they're known the moment the
             // (cached or live) fetch returns, so the operator sees the full
@@ -357,7 +452,18 @@ pub(crate) fn orchestrate(
             let analyzed = analyze_payloads(&fetched, &res.cache, &opts);
             for (rec, payload) in fetched.iter().zip(analyzed) {
                 if let Some(payload) = payload {
+                    // Capture the artifact's findings and identity before
+                    // `merge_payload` consumes the sub-report, then graft any
+                    // package-scoped composite that correlates them with this
+                    // package's registry metadata.
+                    let artifact = payload.sub.as_ref().map(sub_findings).unwrap_or_default();
+                    let artifact_sha = payload.content_sha.clone();
                     next.extend(merge_payload(report, rec, payload));
+                    // `rec.locator` is the original filefacts locator (the PURL),
+                    // the same key the registry findings were captured under.
+                    if let Some(reg) = registry_findings.get(rec.locator.as_str()) {
+                        apply_package_composites(report, &artifact_sha, &artifact, reg, &opts);
+                    }
                 }
             }
             records.extend(fetched);
@@ -430,11 +536,32 @@ pub fn registry(locator: &RefLocator) -> Option<Registry> {
     fletch::registry(locator, &res.net, &res.cache).map(|reg| reg.with_age(unix_now()))
 }
 
-/// The `*.registry.json` document for a record — its name and serialized bytes —
-/// so the one-shot path can run it through the scan engine like any other file.
-#[must_use]
-pub fn registry_document(reg: &Registry) -> Option<(String, Vec<u8>)> {
-    Some((registry_doc_name(reg), serde_json::to_vec(reg).ok()?))
+/// One-shot `pkg:`/`url`: graft the root artifact's own registry metadata into
+/// its finalized report as a child node of the root, then run the package pass.
+///
+/// The registry record is materialized as a `*.registry.json` node — detected as
+/// the `registry` filetype, carrying `registry.*` facts — and merged under the
+/// root, exactly as the `--fetch` path grafts a dependency's registry beside the
+/// dependency. So the registry metadata becomes a real layer of the analyzed
+/// package: it is trait-matched, featurized, and trained on like any other file,
+/// rather than living in a disconnected side report. With both halves now in one
+/// tree, [`apply_package_composites`] correlates the artifact's behavior with the
+/// registry's account of it. A no-op if the report has no root or the record
+/// can't be analyzed.
+pub(crate) fn graft_root_registry(report: &mut AnalysisReport, reg: &Registry) {
+    let Some(root_sha) = report.files.first().map(|f| f.sha256.clone()) else {
+        return;
+    };
+    let opts = AnalysisOptions::default();
+    let Some(sub) = registry_node(reg, &opts) else {
+        return;
+    };
+    // The artifact's own findings (before the registry node joins the tree) and
+    // the registry node's findings — the two halves of the package pass.
+    let artifact = sub_findings(report);
+    let registry = sub_findings(&sub);
+    merge_registry(report, &root_sha, sub);
+    apply_package_composites(report, &root_sha, &artifact, &registry, &opts);
 }
 
 /// Print and log a package's normalized registry metadata for the one-shot
@@ -862,11 +989,22 @@ fn merge_into_root(
     }
 }
 
-/// A reference's locator as a stable string for dedup.
+/// A reference's locator as a stable string for dedup and cross-record pairing
+/// (it matches `FetchRecord::locator`, the original filefacts locator).
 fn locator_key(r: &Reference) -> String {
     match &r.locator {
         RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
     }
+}
+
+/// Every finding a finalized sub-report carries, flattened across its file
+/// nodes — the seed half the package pass contributes from one side (artifact
+/// or registry metadata).
+fn sub_findings(sub: &AnalysisReport) -> Vec<Finding> {
+    sub.files
+        .iter()
+        .flat_map(|f| f.findings.iter().cloned())
+        .collect()
 }
 
 /// Concurrent analyses of fetched payloads per group. Kept deliberately low:
@@ -1042,6 +1180,37 @@ fn merge_payload(
         }
     }
     next
+}
+
+/// Run the package-scoped composite pass for one fetched artifact, grafting any
+/// composite that correlates its bytes with its registry metadata onto the
+/// artifact node. A `scope: package` (or `scope: outer`) rule can thus fire on,
+/// say, "deprecated on the registry **and** ships a native addon" even though
+/// the artifact and the registry document were analyzed as separate reports and
+/// never share an archive. The grafted composite carries its members in
+/// `trait_refs`, so the later `strip_unmatched_traits` keeps the registry
+/// building-block traits it fired on. A no-op when either side is empty.
+fn apply_package_composites(
+    report: &mut AnalysisReport,
+    artifact_sha: &str,
+    artifact_findings: &[Finding],
+    registry_findings: &[Finding],
+    opts: &AnalysisOptions,
+) {
+    match cleave::graft_package_composites(
+        report,
+        artifact_sha,
+        artifact_findings,
+        registry_findings,
+        opts,
+    ) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            grafted = n,
+            "package-scoped composites fired across artifact and registry metadata"
+        ),
+        Err(e) => tracing::warn!("package composite pass failed: {e:#}"),
+    }
 }
 
 /// A filename for a fetched payload: the final URL's basename, else the
@@ -1276,5 +1445,31 @@ mod tests {
         // No usable basename → content hash.
         rec.resolved_url = "https://reg.test/".to_string();
         assert_eq!(payload_name(&rec), "abc123");
+    }
+
+    #[test]
+    fn parse_bytes_reads_units_and_matches_cli_defaults() {
+        // Unit suffixes are 1024-based, case-insensitive, with an optional `B`.
+        assert_eq!(parse_bytes("40M"), Ok(40 * MIB));
+        assert_eq!(parse_bytes("40m"), Ok(40 * MIB));
+        assert_eq!(parse_bytes("40MB"), Ok(40 * MIB));
+        assert_eq!(parse_bytes("40mb"), Ok(40 * MIB));
+        assert_eq!(parse_bytes("2G"), Ok(2 * GIB));
+        assert_eq!(parse_bytes(" 1k "), Ok(1024));
+        assert_eq!(parse_bytes("512K"), Ok(512 * 1024));
+        // A bare number is bytes; a trailing `B` alone is bytes too.
+        assert_eq!(parse_bytes("10240"), Ok(10240));
+        assert_eq!(parse_bytes("4096B"), Ok(4096));
+        // Garbage, an empty number, or a lone unit are all errors.
+        assert!(parse_bytes("").is_err());
+        assert!(parse_bytes("abc").is_err());
+        assert!(parse_bytes("M").is_err());
+        assert!(parse_bytes("1.5G").is_err());
+
+        // The CLI default strings must parse to the matching constants, so the
+        // help text and the policy never drift apart.
+        assert_eq!(parse_bytes("40M"), Ok(DEFAULT_MAX_FETCH_SIZE));
+        assert_eq!(parse_bytes("2G"), Ok(DEFAULT_MAX_FILE_SIZE));
+        assert_eq!(parse_bytes("10G"), Ok(DEFAULT_MAX_TOTAL_SIZE));
     }
 }

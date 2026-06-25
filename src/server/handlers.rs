@@ -1029,6 +1029,7 @@ fn finish_classify(
         false, // server returns JSON; the fetch log would corrupt structured logs
         false, // JSON envelope does not include the rendered terminal context
         false, // server reports analyzed files only; no full-manifest listing
+        None, // the one-shot pkg/url package pass is a CLI path, not a server one
     )?;
 
     Ok(scan_result_from(label, cr, resources))
