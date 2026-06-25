@@ -54,6 +54,21 @@ pub const DEFAULT_FETCH_DEPTH: u8 = 2;
 /// `0` disables the gate (every resolvable dependency is fetched).
 pub const DEFAULT_MAX_DEP_AGE_DAYS: u32 = 30;
 
+/// Default ceiling on *live* fetches per run (every hop, every file). Cache hits
+/// don't count, so a warm re-run is never throttled; this bounds the network
+/// fan-out a single crafted artifact can trigger on a cold cache.
+pub const DEFAULT_MAX_FETCH_COUNT: usize = 100;
+
+/// Default per-fetch size ceiling, in megabytes — mirrors fletch's
+/// [`fletch::fetch::DEFAULT_MAX_FETCH_BYTES`] (40 MiB) in the unit the
+/// `--max-fetch-mb` flag uses.
+pub const DEFAULT_MAX_FETCH_MB: u64 = 40;
+
+/// Set the process-wide per-fetch byte ceiling (re-exported from [`fletch`] so
+/// the binary configures it through `scan::fetch`). See
+/// [`fletch::fetch::set_max_fetch_bytes`].
+pub use fletch::fetch::set_max_fetch_bytes;
+
 /// What to fetch — a selection of reference *kinds*, parsed from the
 /// comma-separated `--fetch=KINDS` flag (`urls`, `packages`, `deps`) — plus how
 /// many hops to follow. An empty kind selection (the default) disables fetching.
@@ -88,6 +103,10 @@ pub struct FetchPolicy {
     /// URLs and command-mentioned packages are never age-gated, since their risk
     /// isn't tied to a registry release date.
     pub max_dep_age_days: u32,
+    /// Ceiling on *live* fetches per run. Cache hits are always served and never
+    /// counted, so this caps only the cold-cache network fan-out, never a warm
+    /// re-run. `0` disables fetching entirely.
+    pub max_fetch_count: usize,
 }
 
 impl Default for FetchPolicy {
@@ -98,6 +117,7 @@ impl Default for FetchPolicy {
             deps: false,
             depth: DEFAULT_FETCH_DEPTH,
             max_dep_age_days: DEFAULT_MAX_DEP_AGE_DAYS,
+            max_fetch_count: DEFAULT_MAX_FETCH_COUNT,
         }
     }
 }
@@ -209,8 +229,13 @@ pub(crate) fn orchestrate(
     let mut records = Vec::new();
     // One budget across the whole run (every hop, every file) so a crafted chain
     // can't multiply the per-file cap into a fetch storm. Refs past the cap are
-    // recorded as `BudgetExceeded`, never silently dropped.
-    let mut budget = FetchBudget::default();
+    // recorded as `BudgetExceeded`, never silently dropped. `max_count` is the
+    // operator-set live-fetch ceiling (`--max-fetch-count`); the byte ceiling
+    // stays at the library default safety backstop.
+    let mut budget = FetchBudget {
+        max_count: policy.max_fetch_count,
+        ..FetchBudget::default()
+    };
     // Loop guard: a locator is fetched at most once per run, so a chain that
     // points back at an earlier stage can't cycle.
     let mut seen: HashSet<String> = HashSet::new();
@@ -301,12 +326,11 @@ pub(crate) fn orchestrate(
                 &res.cache,
                 budget,
             );
-            // Charge what this group consumed so the next sees the remainder (a
-            // `BudgetExceeded` record consumes nothing).
-            let spent = fetched
-                .iter()
-                .filter(|r| !matches!(r.outcome, Outcome::BudgetExceeded))
-                .count();
+            // Charge what this group consumed so the next sees the remainder.
+            // Only live fetches count against `max_count` (cache hits are free,
+            // matching `fetch_references`); a `BudgetExceeded` edge consumes
+            // nothing.
+            let spent = fetched.iter().filter(|r| fletch::fetch::counts_against_budget(r)).count();
             let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
             budget.max_count = budget.max_count.saturating_sub(spent);
             budget.max_bytes = budget.max_bytes.saturating_sub(bytes);

@@ -181,10 +181,12 @@ struct Cli {
     ///                by a build/lifecycle script rather than pinned;
     ///   `urls`     — raw URLs with no package identity (curl/wget targets,
     ///                staged downloads), the largest exposure.
-    /// `all` (or a bare `--fetch`) selects every kind. Omitted: off. Also
-    /// settable per deployment via the `SCAN_FETCH` env var (e.g.
-    /// `SCAN_FETCH=urls,packages` or `SCAN_FETCH=all`), which is how a worker
-    /// fleet opts in. An opt-in online step performed after the offline analysis.
+    /// `all` (or a bare `--fetch`) selects every kind. When omitted, an
+    /// interactive scan defaults to `deps,packages` (the references bound to the
+    /// artifact, not raw URLs); a worker defaults to `all`. Also settable per
+    /// deployment via the `SCAN_FETCH` env var (e.g. `SCAN_FETCH=urls,packages`
+    /// or `SCAN_FETCH=all`), which overrides the default in both modes. An online
+    /// step performed after the offline analysis.
     #[arg(
         long,
         global = true,
@@ -223,6 +225,33 @@ struct Cli {
         env = "SCAN_MAX_DEP_AGE"
     )]
     max_dep_age: u32,
+
+    /// [EXPERIMENTAL] Maximum size of a single fetched reference, in megabytes.
+    /// A response whose `Content-Length` (or streamed body) exceeds this is
+    /// abandoned, so one oversized artifact can't dominate a run. Also settable
+    /// via `SCAN_MAX_FETCH_MB`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "MB",
+        default_value_t = scan::fetch::DEFAULT_MAX_FETCH_MB,
+        env = "SCAN_MAX_FETCH_MB"
+    )]
+    max_fetch_mb: u64,
+
+    /// [EXPERIMENTAL] Maximum number of *live* reference fetches per run (every
+    /// hop, every file). Cache hits are always served and never counted, so a
+    /// warm re-run is never throttled. References past the cap are recorded as
+    /// budget-exceeded, never silently dropped. Also settable via
+    /// `SCAN_MAX_FETCH_COUNT`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        default_value_t = scan::fetch::DEFAULT_MAX_FETCH_COUNT,
+        env = "SCAN_MAX_FETCH_COUNT"
+    )]
+    max_fetch_count: usize,
 
     /// Paths to files or directories to scan (shorthand for `ascan fs <paths...>`)
     paths: Vec<PathBuf>,
@@ -503,13 +532,34 @@ fn main() -> Result<()> {
     let interpret_cfg = cli.interpret_config();
     // The kind selection comes from `--fetch`; the hop count from `--fetch-depth`
     // and the dependency age ceiling from `--max-dep-age` (each its own
-    // flag/env). Combine them into one policy for every scan path.
-    let fetch_policy = {
-        let mut policy = cli.fetch.unwrap_or_default();
+    // flag/env). When `--fetch`/`SCAN_FETCH` is unset the default depends on run
+    // mode: an interactive scan fetches declared dependencies and
+    // install-command packages (the references bound to the artifact) but not
+    // raw URLs, while a worker fetches every kind. An explicit selection is
+    // honored verbatim in both. `--fetch-depth`/`--max-dep-age` always apply.
+    let with_knobs = |mut policy: scan::fetch::FetchPolicy| {
         policy.depth = cli.fetch_depth;
         policy.max_dep_age_days = cli.max_dep_age;
+        policy.max_fetch_count = cli.max_fetch_count;
         policy
     };
+    // The per-fetch size ceiling is enforced in the HTTP layer, so it's a
+    // process-global rather than a per-policy field — set it once here and every
+    // mode (interactive scan and worker alike) honors `--max-fetch-mb`.
+    scan::fetch::set_max_fetch_bytes(cli.max_fetch_mb.saturating_mul(1024 * 1024));
+    let scan_default = scan::fetch::FetchPolicy {
+        deps: true,
+        packages: true,
+        ..scan::fetch::FetchPolicy::default()
+    };
+    let worker_default = scan::fetch::FetchPolicy {
+        urls: true,
+        packages: true,
+        deps: true,
+        ..scan::fetch::FetchPolicy::default()
+    };
+    let fetch_policy = with_knobs(cli.fetch.unwrap_or(scan_default));
+    let worker_fetch_policy = with_knobs(cli.fetch.unwrap_or(worker_default));
     if let Some(cfg) = &interpret_cfg {
         tracing::info!(
             endpoint = %cfg.base_url,
@@ -1077,7 +1127,7 @@ fn main() -> Result<()> {
                 nice,
                 exit_if_empty,
                 interpret: interpret_cfg.clone(),
-                fetch: fetch_policy,
+                fetch: worker_fetch_policy,
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
