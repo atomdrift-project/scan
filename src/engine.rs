@@ -480,6 +480,40 @@ mod trait_floor_tests {
 mod envelope_tests {
     use super::*;
 
+    #[test]
+    fn collect_upload_artifacts_offers_root_and_ok_deps_only() {
+        // A report with three fetch edges: one usable, one unresolved (no bytes),
+        // one Ok-but-sha-less. Only the scanned file and the usable dep should be
+        // offered; members inside an archive never appear here at all.
+        // `pkg:bogus/*` resolves to no registry without any network call.
+        let raw = serde_json::json!({
+            "fetched": [
+                {"outcome": "ok", "content_sha256": "c".repeat(64),
+                 "locator": "pkg:bogus/x@1", "final_url": "https://example/x-1.tgz", "size": 99},
+                {"outcome": "unresolved", "locator": "pkg:bogus/y@1"},
+                {"outcome": "ok", "locator": "pkg:bogus/z@1"},
+            ]
+        });
+        let arts = collect_upload_artifacts(
+            Path::new("/tmp/proj.tgz"),
+            &"a".repeat(64),
+            10,
+            &raw,
+            "ascan+test",
+        );
+
+        // Root file + the single usable dependency; the other two edges drop out.
+        assert_eq!(arts.len(), 2);
+        assert_eq!(arts[0].sha256, "a".repeat(64), "root file is offered first");
+        assert!(matches!(arts[0].bytes, crate::upload::ArtifactBytes::File(_)));
+        assert_eq!(arts[1].sha256, "c".repeat(64));
+        assert_eq!(arts[1].filename, "x-1.tgz", "filename derived from the fetch URL");
+        assert!(
+            matches!(&arts[1].bytes, crate::upload::ArtifactBytes::Cached { locator } if locator == "pkg:bogus/x@1"),
+            "a dependency's bytes load lazily from the cache by locator",
+        );
+    }
+
     fn base_result() -> ScanResult {
         ScanResult {
             v: "7",
@@ -1263,7 +1297,21 @@ fn record_file_result(
             // treats as a delete. `into_envelope` consumes `r`, so it goes last.
             if let Some(uploader) = uploader {
                 let sha256 = r.sha256.clone();
-                uploader.submit(sha256, r.into_envelope());
+                let size = r.size_bytes;
+                let envelope = r.into_envelope();
+                // Ensure hopper has the scanned file and any fetched dependency
+                // archives (with provenance) before renewing the verdict — only
+                // the ones it lacks actually move. Artifacts are queued first so a
+                // never-seen top-level file's row exists before its result lands.
+                let artifacts = collect_upload_artifacts(
+                    file_path,
+                    &sha256,
+                    size,
+                    &envelope.raw,
+                    upload_collector(),
+                );
+                uploader.submit_artifacts(artifacts);
+                uploader.submit(sha256, envelope);
             }
         }
         Err(e) => {
@@ -1272,6 +1320,113 @@ fn record_file_result(
             tally.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// The `fetch.collector` identity stamped on every sidecar this process uploads,
+/// computed once. Mirrors hopper's collector convention (`forager+<id>`,
+/// `prism`) so a sample's origin is legible.
+fn upload_collector() -> &'static str {
+    static COLLECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    COLLECTOR.get_or_init(|| format!("ascan+{}", crate::upload::default_worker_name()))
+}
+
+/// Collect the artifacts a `--upload` run should ensure hopper has: the scanned
+/// file itself, plus every fetched dependency archive (read from the report's
+/// fetch edges). Members *inside* an archive are deliberately never offered —
+/// hopper reconstructs those from the parent archive it already receives, so the
+/// negotiation stays one sha per standalone artifact. A fetched dependency's
+/// sidecar carries the registry record scan derived for it (re-read from the
+/// blob cache the fetch already populated — a cache hit, never a re-fetch).
+fn collect_upload_artifacts(
+    file_path: &Path,
+    sha256: &str,
+    size_bytes: u64,
+    raw: &serde_json::Value,
+    collector: &str,
+) -> Vec<crate::upload::UploadArtifact> {
+    use crate::upload::{ArtifactBytes, UploadArtifact};
+    let now = now_rfc3339();
+    let mut artifacts = Vec::new();
+
+    // The scanned file: bytes from disk, no registry (a local, un-fetched artifact).
+    let root_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    artifacts.push(UploadArtifact {
+        sha256: sha256.to_string(),
+        size: size_bytes,
+        filename: root_name.clone(),
+        bytes: ArtifactBytes::File(file_path.to_path_buf()),
+        sidecar: crate::provenance::build_sidecar(
+            &root_name, sha256, size_bytes, collector, &now, "", "", None, &[],
+        ),
+    });
+
+    // Each successfully fetched dependency archive, from the report's fetch edges.
+    let Some(edges) = raw.get("fetched").and_then(serde_json::Value::as_array) else {
+        return artifacts;
+    };
+    for edge in edges {
+        // Only an `ok` fetch has retrievable bytes; the rest are recorded empty.
+        if edge.get("outcome").and_then(serde_json::Value::as_str) != Some("ok") {
+            continue;
+        }
+        let (Some(content_sha), Some(locator)) = (
+            edge.get("content_sha256").and_then(serde_json::Value::as_str),
+            edge.get("locator").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let url = edge
+            .get("final_url")
+            .or_else(|| edge.get("resolved_url"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let dep_size = edge
+            .get("size")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let dep_name = artifact_filename(url, locator);
+        // The normalized record plus the raw provider documents it came from,
+        // both recovered from the warm cache the fetch already filled — no
+        // re-fetch. The raw rides along as hopper's re-parsing backup.
+        let (registry, sources) =
+            crate::fetch::registry_with_sources(&fletch::RefLocator::Purl(locator.to_string()));
+        artifacts.push(UploadArtifact {
+            sha256: content_sha.to_string(),
+            size: dep_size,
+            sidecar: crate::provenance::build_sidecar(
+                &dep_name, content_sha, dep_size, collector, &now, url, locator,
+                registry.as_ref(), &sources,
+            ),
+            filename: dep_name,
+            bytes: ArtifactBytes::Cached {
+                locator: locator.to_string(),
+            },
+        });
+    }
+    artifacts
+}
+
+/// A filename for an uploaded artifact: the last path segment of the fetch URL
+/// (query/fragment stripped), falling back to the locator's tail with PURL
+/// punctuation flattened. hopper uses it for the stored filename and type sniff.
+fn artifact_filename(url: &str, locator: &str) -> String {
+    let from_url = url
+        .rsplit('/')
+        .next()
+        .map(|seg| seg.split(['?', '#']).next().unwrap_or(seg))
+        .filter(|seg| !seg.is_empty());
+    if let Some(name) = from_url {
+        return name.to_string();
+    }
+    locator
+        .rsplit('/')
+        .next()
+        .unwrap_or(locator)
+        .replace(['@', ':'], "-")
 }
 
 /// Scan a set of file and directory paths, classifying every file.
@@ -1288,7 +1443,11 @@ fn record_file_result(
 /// # Errors
 /// Propagates model-load and cleave setup failures. Per-file analysis errors
 /// are recorded in the summary, not returned.
-pub fn run_paths(paths: &[PathBuf], config: &ScanConfig) -> Result<ScanSummary> {
+pub fn run_paths(
+    paths: &[PathBuf],
+    config: &ScanConfig,
+    root_registry: Option<&fletch::Registry>,
+) -> Result<ScanSummary> {
     prefetch_cleave_resources();
 
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
@@ -1354,7 +1513,7 @@ pub fn run_paths(paths: &[PathBuf], config: &ScanConfig) -> Result<ScanSummary> 
                 &stdout,
                 None,
                 uploader.as_ref(),
-                None,
+                root_registry,
             );
         };
 
@@ -2370,8 +2529,16 @@ pub(crate) fn process_report(
         root_registry,
     )?;
 
-    // Include raw cleave report for JSON output (unmutated — ML scores go in the ml section).
-    let cleave = if is_json { Some(cr.report_json) } else { None };
+    // Retain the raw cleave report for JSON output, and whenever uploading to
+    // hopper — the renewed result must carry the full report (so hopper stores it
+    // and explodes archive members), and the fetch edges inside it drive the
+    // content reconciliation in `record_file_result`. Without this, a terminal
+    // `--upload` would post a verdict with an empty report.
+    let cleave = if is_json || config.hopper().is_some() {
+        Some(cr.report_json)
+    } else {
+        None
+    };
 
     Ok(ScanResult {
         v: "7",

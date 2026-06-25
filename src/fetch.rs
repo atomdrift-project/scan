@@ -33,8 +33,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{OnceLock, PoisonError, RwLock};
 
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
@@ -536,6 +536,20 @@ pub fn registry(locator: &RefLocator) -> Option<Registry> {
     fletch::registry(locator, &res.net, &res.cache).map(|reg| reg.with_age(unix_now()))
 }
 
+/// Like [`registry`], but also returns the raw provider documents the lookup
+/// read, as `(url, bytes)` — recovered from the cache the scan already populated,
+/// so it costs no extra fetch. Used by `--upload` to archive the raw registry
+/// snapshot in hopper alongside the normalized record, the same re-parsing backup
+/// forager stores.
+#[must_use]
+pub fn registry_with_sources(locator: &RefLocator) -> (Option<Registry>, Vec<(String, Vec<u8>)>) {
+    let Some(res) = shared_resources() else {
+        return (None, Vec::new());
+    };
+    let (record, sources) = fletch::registry_with_sources(locator, &res.net, &res.cache);
+    (record.map(|reg| reg.with_age(unix_now())), sources)
+}
+
 /// One-shot `pkg:`/`url`: graft the root artifact's own registry metadata into
 /// its finalized report as a child node of the root, then run the package pass.
 ///
@@ -746,36 +760,62 @@ fn age_gate(
     (keep, registries)
 }
 
-/// Look up each declared dependency's registry record concurrently, returning
-/// one slot per input ref in `selected` order. A non-dependency ref, or one
-/// whose record can't be resolved, yields `None`. Bounded by
-/// [`REGISTRY_LOOKUP_CONCURRENCY`] on plain OS threads; each lookup is keyed by a
-/// distinct locator, so the shared cache sees no write contention.
+/// Process-wide memo of registry lookups, keyed by locator string. A package
+/// named across many scanned files resolves once: the first lookup fills this,
+/// and every later file reads the record straight from memory — no repeated disk
+/// read, JSON parse, and ecosystem mapping. The *un-aged* record is stored (age
+/// is relative to each scan's clock, so [`Registry::with_age`] is applied per
+/// read); `None` is memoized too, so an unsupported ecosystem or an unresolved
+/// package isn't re-attempted for every file that names it. Lives for the
+/// process, fronting the on-disk blob cache.
+fn registry_memo() -> &'static RwLock<HashMap<String, Option<Registry>>> {
+    static MEMO: OnceLock<RwLock<HashMap<String, Option<Registry>>>> = OnceLock::new();
+    MEMO.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Look up each declared dependency's registry record, returning one slot per
+/// input ref in `selected` order. A non-dependency ref, or one whose record
+/// can't be resolved, yields `None`. Memoized hits ([`registry_memo`]) are served
+/// from memory; the remaining misses are resolved concurrently, bounded by
+/// [`REGISTRY_LOOKUP_CONCURRENCY`] on plain OS threads, then folded back into the
+/// memo. Each lookup is keyed by a distinct locator, so the shared cache sees no
+/// write contention.
 fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<Option<Registry>> {
     let mut out: Vec<Option<Registry>> = selected.iter().map(|_| None).collect();
-    let targets: Vec<usize> = (0..selected.len())
-        .filter(|&i| selected[i].kind == RefKind::Dependency)
-        .collect();
-    if targets.is_empty() {
+
+    // Split dependency refs into memo hits — served from memory, no disk or
+    // network — and misses that still need a lookup.
+    let mut misses: Vec<usize> = Vec::new();
+    {
+        let memo = registry_memo().read().unwrap_or_else(PoisonError::into_inner);
+        for i in (0..selected.len()).filter(|&i| selected[i].kind == RefKind::Dependency) {
+            match memo.get(&locator_key(&selected[i])) {
+                // Stored un-aged; stamp the age signals from this scan's clock.
+                Some(hit) => out[i] = hit.clone().map(|reg| reg.with_age(now)),
+                None => misses.push(i),
+            }
+        }
+    }
+    if misses.is_empty() {
         return out;
     }
+
     let cursor = AtomicUsize::new(0);
-    let workers = REGISTRY_LOOKUP_CONCURRENCY.min(targets.len());
-    let collected: Vec<Vec<(usize, Registry)>> = std::thread::scope(|scope| {
+    let workers = REGISTRY_LOOKUP_CONCURRENCY.min(misses.len());
+    let collected: Vec<Vec<(usize, Option<Registry>)>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
                     let mut local = Vec::new();
                     loop {
                         let t = cursor.fetch_add(1, Ordering::Relaxed);
-                        let Some(&i) = targets.get(t) else {
+                        let Some(&i) = misses.get(t) else {
                             break;
                         };
-                        if let Some(reg) =
-                            fletch::registry(&selected[i].locator, &res.net, &res.cache)
-                        {
-                            local.push((i, reg.with_age(now)));
-                        }
+                        // The raw, un-aged record (or `None` for an unresolved or
+                        // unsupported package) — both worth memoizing so the
+                        // lookup isn't re-attempted for every file that names it.
+                        local.push((i, fletch::registry(&selected[i].locator, &res.net, &res.cache)));
                     }
                     local
                 })
@@ -783,9 +823,19 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
+
+    // Stamp the aged copy for this scan into each result slot, keeping the raw
+    // record to memoize.
+    let mut writes: Vec<(String, Option<Registry>)> = Vec::with_capacity(misses.len());
     for (i, reg) in collected.into_iter().flatten() {
-        out[i] = Some(reg);
+        out[i] = reg.clone().map(|reg| reg.with_age(now));
+        writes.push((locator_key(&selected[i]), reg));
     }
+    // One short critical section: nothing but the batch insert runs under the lock.
+    registry_memo()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .extend(writes);
     out
 }
 

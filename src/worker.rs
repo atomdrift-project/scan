@@ -745,6 +745,13 @@ struct ClaimJob {
     size_bytes: i64,
     #[serde(default)]
     file_type: String,
+    /// Whether hopper holds registry-metadata provenance for this sample. When
+    /// set, the worker fetches it (`/api/provenance/{sha256}`) and reasons over
+    /// the same registry facts a live `pkg`/`url` scan would — without a
+    /// refetch. A second round-trip is wasted when absent, so hopper flags it
+    /// here on the claim it already has to send.
+    #[serde(default)]
+    has_provenance: bool,
 }
 
 /// A job with its file data pre-downloaded (or marked for local access).
@@ -1999,6 +2006,17 @@ async fn run_job(
         }
     };
 
+    // Registry metadata hopper collected for this sample at fetch time, so the
+    // worker reasons over the same registry facts (age, custody, popularity,
+    // deprecation) a live `pkg`/`url` scan fetches — without a refetch. Only
+    // attempted when hopper flagged the sample as carrying it; best-effort, so a
+    // miss never fails the scan. Consumed as stamped at collection time.
+    let root_registry: Option<fletch::Registry> = if job.has_provenance {
+        download_provenance(client, base_url, &job.sha256).await
+    } else {
+        None
+    };
+
     let resources = Arc::clone(resources);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel2 = Arc::clone(&cancel);
@@ -2198,6 +2216,7 @@ async fn run_job(
                 slow_rule_ms,
                 Some(&cancel2),
                 Some(&phase),
+                root_registry.as_ref(),
             )
         } else if let Some(path) = local.as_ref() {
             classify_file(
@@ -2208,6 +2227,7 @@ async fn run_job(
                 None,
                 Some(&cancel2),
                 Some(&phase),
+                root_registry.as_ref(),
             )
         } else {
             Err(anyhow::anyhow!(
@@ -2451,6 +2471,52 @@ async fn download_bytes(
         "download complete via /api/file/ (fallback)",
     );
     Ok(bytes)
+}
+
+/// Fetch the registry-metadata provenance hopper holds for `sha256`, returning
+/// its normalized [`fletch::Registry`] record. Best-effort by design: an absent
+/// record (HTTP 204), an unreachable hopper, or a malformed body all yield
+/// `None` — registry provenance enriches a scan but must never fail one, exactly
+/// as a live scan fails open when a registry lookup can't be made.
+async fn download_provenance(
+    client: &reqwest::Client,
+    base_url: &str,
+    sha256: &str,
+) -> Option<fletch::Registry> {
+    let url = format!("{base_url}/api/provenance/{sha256}");
+    let resp = match client.get(&url).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::debug!(sha256 = %sha256, error = %e, "provenance fetch failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::debug!(sha256 = %sha256, status = %resp.status(), "no provenance");
+        return None;
+    }
+    let body = match resp.bytes().await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::debug!(sha256 = %sha256, error = %e, "provenance body read failed");
+            return None;
+        }
+    };
+    // 204 No Content (no stored provenance) arrives as an empty success body.
+    if body.is_empty() {
+        return None;
+    }
+    let record = crate::provenance::registry_record(&body);
+    if let Some(reg) = &record {
+        tracing::debug!(
+            sha256 = %sha256,
+            ecosystem = %reg.ecosystem,
+            package = %reg.name,
+            version = %reg.version,
+            "registry provenance applied",
+        );
+    }
+    record
 }
 
 /// Exponential backoff with jitter for hopper outage recovery.
@@ -2980,6 +3046,7 @@ mod tests {
                 path: format!("{sha}.bin"),
                 size_bytes,
                 file_type: "data".to_string(),
+                has_provenance: false,
             },
             data: Ok(None),
             queue_id: 0,

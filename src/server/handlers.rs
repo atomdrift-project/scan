@@ -849,6 +849,7 @@ pub(super) async fn analyze(
             None,
             Some(&cancel_flag),
             phase_tracker.as_ref(),
+            None, // interactive upload carries no fetch-time registry provenance
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -934,6 +935,7 @@ pub(super) async fn analyze(
 ///
 /// Runs on a blocking thread. `label` is used as the `path` field in the result
 /// (the original upload filename, not the temp file path).
+#[allow(clippy::too_many_arguments)] // one linear analysis path; splitting would only scatter it
 pub(crate) fn classify_file(
     path: &std::path::Path,
     label: &str,
@@ -942,6 +944,7 @@ pub(crate) fn classify_file(
     extract_dir: Option<&std::path::Path>,
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
+    root_registry: Option<&fletch::Registry>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
@@ -959,7 +962,7 @@ pub(crate) fn classify_file(
     };
     let report =
         cleave::analyze_file(path, &opts).with_context(|| format!("cleave analysis of {label}"))?;
-    finish_classify(label, report, resources, cancellation, phase)
+    finish_classify(label, report, resources, cancellation, phase, root_registry)
 }
 
 /// Like [`classify_file`] but operates on in-memory data, avoiding disk I/O.
@@ -967,6 +970,7 @@ pub(crate) fn classify_file(
 /// Adopts the refcounted `data` buffer via `cleave::analyze_bytes_shared`, which
 /// moves it into the analysis pipeline with no copy. At worker scale this
 /// eliminates one full-size memcpy per downloaded sample.
+#[allow(clippy::too_many_arguments)] // one linear analysis path; splitting would only scatter it
 pub(crate) fn classify_bytes(
     data: bytes::Bytes,
     label: &str,
@@ -974,6 +978,7 @@ pub(crate) fn classify_bytes(
     slow_rule_ms: u64,
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
+    root_registry: Option<&fletch::Registry>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
@@ -988,7 +993,7 @@ pub(crate) fn classify_bytes(
     };
     let report = cleave::analyze_bytes_shared(data, label, &opts)
         .with_context(|| format!("cleave analysis of {label}"))?;
-    finish_classify(label, report, resources, cancellation, phase)
+    finish_classify(label, report, resources, cancellation, phase, root_registry)
 }
 
 /// Shared tail of [`classify_file`]/[`classify_bytes`]: honor a late cancellation,
@@ -999,6 +1004,7 @@ fn finish_classify(
     resources: &super::ModelResources,
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
+    root_registry: Option<&fletch::Registry>,
 ) -> anyhow::Result<ScanResult> {
     // If the timeout fired while cleave was running, bail now rather than
     // burning CPU on feature extraction and model inference for a result
@@ -1029,7 +1035,10 @@ fn finish_classify(
         false, // server returns JSON; the fetch log would corrupt structured logs
         false, // JSON envelope does not include the rendered terminal context
         false, // server reports analyzed files only; no full-manifest listing
-        None, // the one-shot pkg/url package pass is a CLI path, not a server one
+        // Registry metadata collected at fetch time (worker provenance / CLI
+        // `--provenance`), so a hopper-sourced scan reasons over the same
+        // registry facts a live `pkg`/`url` scan fetches — without refetching.
+        root_registry,
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -1221,6 +1230,7 @@ pub(super) async fn analyze_path(
             extract_dir.as_deref(),
             Some(&cancel_flag),
             phase_tracker.as_ref(),
+            None, // interactive upload carries no fetch-time registry provenance
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();

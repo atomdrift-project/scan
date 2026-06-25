@@ -88,6 +88,10 @@ dirs = "6.0"
 tract-onnx = { version = "0.21", default-features = false }
 tract-linalg = "0.21"
 sha2 = "0.10"
+# Encodes non-JSON raw registry documents in an upload's provenance sidecar.
+# Already present transitively (reqwest/rustls), so this only promotes it to a
+# direct dependency.
+base64 = "0.22"
 terminal-colorsaurus = "0.4"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
@@ -97,7 +101,7 @@ tower = { version = "0.5", features = ["limit"] }
 colored = "3.1"
 tempfile = "3"
 dashmap = "6"
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking", "multipart"], default-features = false }
 # Same `Bytes` type reqwest yields, threaded into cleave's zero-copy
 # `analyze_bytes_shared` so a downloaded sample is analyzed without a Vec copy.
 bytes = "1"

@@ -13,7 +13,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use scan::OutputFormat;
 use scan::engine::DisplayFilter;
@@ -363,6 +363,14 @@ enum Commands {
         /// traits and model. Upload failures are logged, never fatal.
         #[arg(long, visible_alias = "upload", value_name = "URL")]
         hopper: Option<String>,
+
+        /// Apply pre-collected registry metadata as the scan's root registry,
+        /// instead of fetching it live. Takes a provenance sidecar produced by
+        /// `fletch registry <purl>` (the `{registry:{record,…}}` document hopper
+        /// also stores), so an offline scan reasons over the same registry facts
+        /// a live `pkg`/`url` scan would. Applies to every path scanned.
+        #[arg(long, value_name = "FILE")]
+        registry: Option<PathBuf>,
     },
 
     /// Scan executables of all running processes
@@ -620,6 +628,7 @@ fn main() -> Result<()> {
                 Commands::Fs {
                     paths: cli.paths.clone(),
                     hopper: None,
+                    registry: None,
                 }
             } else {
                 Cli::parse_from(["ascan", "--help"]);
@@ -892,7 +901,11 @@ fn main() -> Result<()> {
     );
 
     match command {
-        Commands::Fs { paths, hopper } => {
+        Commands::Fs {
+            paths,
+            hopper,
+            registry,
+        } => {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
@@ -908,7 +921,23 @@ fn main() -> Result<()> {
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy)
             .with_hopper(hopper);
-            exit_for_summary(&run_scan_paths(&paths, &config)?);
+            // `--registry <file>`: apply the pre-collected registry record as the
+            // root registry, so the scan reasons over the same facts a live scan
+            // fetches. A malformed/absent record is fatal here (unlike the
+            // worker's best-effort path): the operator named the file explicitly.
+            let root_registry = match &registry {
+                Some(path) => {
+                    let bytes = std::fs::read(path).with_context(|| {
+                        format!("reading registry provenance {}", path.display())
+                    })?;
+                    let record = scan::provenance::registry_record(&bytes).with_context(|| {
+                        format!("no registry record in provenance {}", path.display())
+                    })?;
+                    Some(record)
+                }
+                None => None,
+            };
+            exit_for_summary(&run_scan_paths(&paths, &config, root_registry.as_ref())?);
         }
         Commands::Sys => {
             let model_dir = resolve_model_dir()?;
@@ -1533,7 +1562,11 @@ fn exit_for_summary(summary: &scan::ScanSummary) {
     }
 }
 
-fn run_scan_paths(paths: &[PathBuf], config: &scan::ScanConfig) -> Result<scan::ScanSummary> {
+fn run_scan_paths(
+    paths: &[PathBuf],
+    config: &scan::ScanConfig,
+    root_registry: Option<&fletch::Registry>,
+) -> Result<scan::ScanSummary> {
     // Warm YARA + capability mapper off the rayon pool before any analysis
     // spawns rayon work. Directory scans run on a dedicated rayon pool; if
     // any of those workers is the first to hit `yara_engine()`, the init's
@@ -1543,7 +1576,7 @@ fn run_scan_paths(paths: &[PathBuf], config: &scan::ScanConfig) -> Result<scan::
 
     // Explicit files are analyzed as one parallel batch and each directory is
     // streamed; run_paths shares one model load and verdict tally across all.
-    scan::engine::run_paths(paths, config)
+    scan::engine::run_paths(paths, config, root_registry)
 }
 
 #[cfg(test)]
@@ -1592,7 +1625,7 @@ mod tests {
             let cli = Cli::try_parse_from(["ascan", "fs", flag, "http://hopper:8081", "/tmp/a"])
                 .context("parse should work")?;
             match cli.command.context("fs subcommand expected")? {
-                Commands::Fs { paths, hopper } => {
+                Commands::Fs { paths, hopper, .. } => {
                     assert_eq!(paths, vec![PathBuf::from("/tmp/a")]);
                     assert_eq!(hopper.as_deref(), Some("http://hopper:8081"));
                 }

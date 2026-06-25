@@ -42,7 +42,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let fs_summary = if targets.is_empty() {
         zero_summary()
     } else {
-        crate::engine::run_paths(&targets, config)?
+        crate::engine::run_paths(&targets, config, None)?
     };
 
     Ok(merge(&ps_summary, &fs_summary, start))

@@ -12,6 +12,8 @@
 //! analysis pool, and every failure degrades to a logged warning — a scan never
 //! fails because an upload did.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -131,12 +133,52 @@ pub fn default_worker_name() -> String {
     }
 }
 
-/// A result handed to the background uploader: the file's digest plus the
-/// envelope to renew on hopper.
+/// Where an artifact's bytes can be loaded from, on demand — only after the
+/// negotiation says hopper is missing them, so a known sha never reads a file or
+/// decompresses a cache blob.
 #[derive(Debug)]
-struct Job {
-    sha256: String,
-    envelope: ScanResultEnvelope,
+pub enum ArtifactBytes {
+    /// The scanned file itself, read from disk.
+    File(PathBuf),
+    /// A fetched dependency, loaded from fletch's blob cache by its locator.
+    Cached {
+        /// The reference locator (PURL/URL) the cache keys the bytes under.
+        locator: String,
+    },
+}
+
+/// An artifact (the scanned file or a fetched dependency archive) offered to
+/// hopper, with the provenance to record if hopper doesn't already have it.
+/// Bytes are loaded lazily so the common "hopper already has it" case moves only
+/// the 64-char sha across the wire, never the payload.
+#[derive(Debug)]
+pub struct UploadArtifact {
+    /// SHA-256 of the artifact's bytes — the negotiation and storage key.
+    pub sha256: String,
+    /// Size of the artifact's bytes, recorded in the provenance sidecar.
+    pub size: u64,
+    /// Filename hopper stores and sniffs the type from.
+    pub filename: String,
+    /// Where to load the bytes from, only if hopper turns out to need them.
+    pub bytes: ArtifactBytes,
+    /// Pre-serialized hopper `Sidecar` JSON (see [`crate::provenance::build_sidecar`]).
+    pub sidecar: Vec<u8>,
+}
+
+/// Work handed to the background uploader thread. Artifacts are reconciled before
+/// a result so a never-seen top-level file's row exists before its verdict POST.
+#[derive(Debug)]
+enum Job {
+    /// Renew a verdict on hopper (the original `--upload` behavior). Boxed: the
+    /// envelope dwarfs the other variant, so an unboxed enum would bloat every
+    /// queued job to its size.
+    Result {
+        sha256: String,
+        envelope: Box<ScanResultEnvelope>,
+    },
+    /// Ensure hopper has these artifacts' bytes+provenance, uploading only the
+    /// ones it's missing.
+    Artifacts(Vec<UploadArtifact>),
 }
 
 /// Background uploader that POSTs scan results to hopper without blocking the
@@ -156,7 +198,10 @@ impl Uploader {
     /// drops submissions so the scan still completes.
     #[must_use]
     pub fn new(hopper_url: &str, worker: String) -> Self {
-        let result_url = format!("{}/api/result", hopper_url.trim_end_matches('/'));
+        let base = hopper_url.trim_end_matches('/');
+        let result_url = format!("{base}/api/result");
+        let known_url = format!("{base}/api/known");
+        let upload_url = format!("{base}/api/upload");
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -165,8 +210,28 @@ impl Uploader {
         let handle = std::thread::Builder::new()
             .name("ascan-upload".into())
             .spawn(move || {
+                // The same default blob cache scan fetched dependencies into, so a
+                // missing dep's bytes are loaded locally rather than re-fetched.
+                let cache = fletch::fetch::BlobCache::open().ok();
+                // Shas reconciled this run, so a dependency shared by many scanned
+                // files is negotiated and uploaded at most once.
+                let mut seen: HashSet<String> = HashSet::new();
                 for job in rx {
-                    post_one(&client, &result_url, &worker, job);
+                    match job {
+                        Job::Result { sha256, envelope } => {
+                            post_one(&client, &result_url, &worker, &sha256, *envelope);
+                        }
+                        Job::Artifacts(artifacts) => {
+                            reconcile_artifacts(
+                                &client,
+                                &known_url,
+                                &upload_url,
+                                cache.as_ref(),
+                                &mut seen,
+                                artifacts,
+                            );
+                        }
+                    }
                 }
             });
         match handle {
@@ -191,7 +256,23 @@ impl Uploader {
     /// (backpressure); a closed channel drops the result silently.
     pub fn submit(&self, sha256: String, envelope: ScanResultEnvelope) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Job { sha256, envelope });
+            let _ = tx.send(Job::Result {
+                sha256,
+                envelope: Box::new(envelope),
+            });
+        }
+    }
+
+    /// Queue artifacts (the scanned file and any fetched dependency archives) for
+    /// content reconciliation: hopper is asked which it lacks, and only those are
+    /// uploaded with their provenance. Submit before the matching [`submit`] so a
+    /// new top-level file's row exists before its verdict lands.
+    pub fn submit_artifacts(&self, artifacts: Vec<UploadArtifact>) {
+        if artifacts.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Job::Artifacts(artifacts));
         }
     }
 }
@@ -223,20 +304,158 @@ pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
     out
 }
 
+/// Reconcile a batch of artifacts against hopper: negotiate which it's missing
+/// (one `/api/known` round-trip), then upload only those — bytes plus provenance.
+/// The `seen` set dedups across batches so a dependency shared by many files is
+/// handled once. Best-effort throughout: a failure logs and the scan continues.
+fn reconcile_artifacts(
+    client: &reqwest::blocking::Client,
+    known_url: &str,
+    upload_url: &str,
+    cache: Option<&fletch::fetch::BlobCache>,
+    seen: &mut HashSet<String>,
+    artifacts: Vec<UploadArtifact>,
+) {
+    // Drop anything reconciled earlier this run; mark the rest seen now so a
+    // later batch never re-negotiates them.
+    let fresh: Vec<UploadArtifact> = artifacts
+        .into_iter()
+        .filter(|a| seen.insert(a.sha256.clone()))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+
+    // The only question that gates the expensive byte transfer: which of these
+    // does hopper already have? Everything it has, we never send.
+    let shas: Vec<&str> = fresh.iter().map(|a| a.sha256.as_str()).collect();
+    let known = post_known(client, known_url, &shas);
+
+    for art in fresh {
+        if known.contains(&art.sha256) {
+            tracing::debug!(sha256 = %art.sha256, "upload: hopper already has artifact; skipping content");
+            continue;
+        }
+        let bytes = match &art.bytes {
+            ArtifactBytes::File(path) => std::fs::read(path).ok(),
+            ArtifactBytes::Cached { locator } => cache.and_then(|c| c.load(locator)),
+        };
+        let Some(bytes) = bytes else {
+            tracing::warn!(sha256 = %art.sha256, file = %art.filename, "upload: artifact bytes unavailable; skipping");
+            continue;
+        };
+        upload_one(client, upload_url, &art, &bytes);
+    }
+}
+
+/// POST the batch existence probe (`/api/known`) and return the subset hopper
+/// already holds. On any failure returns an empty set — the caller then treats
+/// every artifact as missing and tries to upload (hopper's upsert is idempotent),
+/// which is the safe direction: we never skip a needed upload because the probe
+/// failed.
+fn post_known(client: &reqwest::blocking::Client, known_url: &str, shas: &[&str]) -> HashSet<String> {
+    #[derive(Serialize)]
+    struct KnownRequest<'a> {
+        sha256: &'a [&'a str],
+    }
+    #[derive(serde::Deserialize)]
+    struct KnownResponse {
+        #[serde(default)]
+        known: Vec<String>,
+    }
+    let resp = client
+        .post(known_url)
+        .json(&KnownRequest { sha256: shas })
+        .send();
+    match resp {
+        Ok(resp) if resp.status().is_success() => match resp.json::<KnownResponse>() {
+            Ok(kr) => kr.known.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(error = %error_chain(&e), "upload: known response decode failed");
+                HashSet::new()
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(status = %resp.status(), "upload: known probe non-success");
+            HashSet::new()
+        }
+        Err(e) => {
+            tracing::warn!(error = %error_chain(&e), "upload: known probe failed");
+            HashSet::new()
+        }
+    }
+}
+
+/// Upload one artifact's bytes + provenance via the multipart `/api/upload`. The
+/// provenance part precedes the file part, as hopper's handler requires.
+/// Best-effort with a short retry: a 4xx (other than 408/429) is permanent.
+fn upload_one(
+    client: &reqwest::blocking::Client,
+    upload_url: &str,
+    art: &UploadArtifact,
+    bytes: &[u8],
+) {
+    use reqwest::blocking::multipart::{Form, Part};
+
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+        }
+        let provenance = match Part::bytes(art.sidecar.clone()).mime_str("application/json") {
+            Ok(part) => part,
+            Err(e) => {
+                tracing::warn!(sha256 = %art.sha256, error = %error_chain(&e), "upload: provenance part build failed");
+                return;
+            }
+        };
+        let form = Form::new().part("provenance", provenance).part(
+            "file",
+            Part::bytes(bytes.to_vec()).file_name(art.filename.clone()),
+        );
+        match client.post(upload_url).multipart(form).send() {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!(sha256 = %art.sha256, file = %art.filename, size = art.size, "upload: artifact stored on hopper");
+                return;
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_client_error()
+                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
+                    let body = resp.text().unwrap_or_default();
+                    tracing::warn!(sha256 = %art.sha256, %status, body = %body, "upload: artifact rejected by hopper; not retrying");
+                    return;
+                }
+                tracing::warn!(sha256 = %art.sha256, %status, attempt, "upload: artifact non-success response");
+            }
+            Err(e) => {
+                tracing::warn!(sha256 = %art.sha256, error = %error_chain(&e), attempt, "upload: artifact send failed");
+            }
+        }
+    }
+    tracing::warn!(sha256 = %art.sha256, attempts = MAX_ATTEMPTS, "upload: artifact giving up after retries");
+}
+
 /// POST one result to hopper, retrying transient failures a few times. A 4xx
 /// (other than 408/429) can never succeed on resend, so it stops immediately.
-fn post_one(client: &reqwest::blocking::Client, result_url: &str, worker: &str, job: Job) {
-    let sha256 = job.sha256;
+fn post_one(
+    client: &reqwest::blocking::Client,
+    result_url: &str,
+    worker: &str,
+    sha256: &str,
+    envelope: ScanResultEnvelope,
+) {
     let payload = ResultPayload {
-        sha256: sha256.clone(),
+        sha256: sha256.to_string(),
         worker: worker.to_string(),
         error: None,
         // fs renews don't track per-file analysis time; hopper treats this as
         // cosmetic. 0 keeps the wire shape identical to the worker's.
         duration_ms: 0,
-        envelope: Some(job.envelope),
+        envelope: Some(envelope),
     };
-    let Some((body, encoding)) = encode_result_body(payload, &sha256) else {
+    let Some((body, encoding)) = encode_result_body(payload, sha256) else {
         return;
     };
 
