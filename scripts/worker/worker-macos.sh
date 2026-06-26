@@ -73,6 +73,7 @@ log "Installing binary"
 restart_needed=0
 if ! cmp -s "out/scan" "$INSTALL_DIR/$BINARY" 2>/dev/null; then
     install -m 755 out/scan "$INSTALL_DIR/$BINARY"
+    codesign --force --sign - "$INSTALL_DIR/$BINARY"
     restart_needed=1
 fi
 
