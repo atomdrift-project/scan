@@ -155,18 +155,23 @@ build-bloom: ## Build bloom filters from the local hopper replica (or POOL=<ndjs
 	  ./target/release/scan-bloom-build --in "$(BLOOM_REPO)/pool.ndjson" --out "$(BLOOM_REPO)" --date "$(BLOOM_DATE)" && \
 	  rm -f "$(BLOOM_REPO)/pool.ndjson"; \
 	fi
-	@echo "✓ filters written to $(BLOOM_REPO) (not uploaded — run 'make publish-bloom' to release)"
+	@echo "✓ filters written to $(BLOOM_REPO)"
+	@echo "  → review & commit $(BLOOM_REPO), then 'make publish-bloom' to release"
 
-publish-bloom: build-bloom ## Build (build-bloom) then upload the filters + manifest to R2
+# Pure upload — no build, no database. Reads the build date from the manifest so
+# the immutable artifact path matches what the download flow resolves.
+publish-bloom: ## Upload the already-built filters in $(BLOOM_REPO) to R2 (run build-bloom first)
 	@command -v rclone >/dev/null || { echo "publish-bloom: rclone not found"; exit 1; }
-	@echo "→ uploading filters to R2 (dated, immutable)"
-	rclone copy "$(BLOOM_REPO)" "$(R2_REMOTE)/$(R2_LITMUS)/bloom/$(BLOOM_DATE)/" --include "*.adbl" \
-	  --header-upload "Cache-Control: public, max-age=31536000, immutable" --progress
-	@echo "→ publishing manifest pointer (short cache)"
+	@[ -f "$(BLOOM_REPO)/bloom.toml" ] || { echo "publish-bloom: no $(BLOOM_REPO)/bloom.toml — run 'make build-bloom' first"; exit 1; }
+	@built=$$(awk -F'"' '/^built/{print $$2}' "$(BLOOM_REPO)/bloom.toml"); \
+	[ -n "$$built" ] || { echo "publish-bloom: no 'built' date in bloom.toml"; exit 1; }; \
+	echo "→ uploading filters built $$built to R2 (dated, immutable)"; \
+	rclone copy "$(BLOOM_REPO)" "$(R2_REMOTE)/$(R2_LITMUS)/bloom/$$built/" --include "*.adbl" \
+	  --header-upload "Cache-Control: public, max-age=31536000, immutable" --progress; \
+	echo "→ publishing manifest pointer (short cache)"; \
 	rclone copyto "$(BLOOM_REPO)/bloom.toml" "$(R2_REMOTE)/$(R2_LITMUS)/bloom.toml" \
-	  --header-upload "Cache-Control: public, max-age=60"
-	@echo "✓ publish-bloom complete: $(BLOOM_DATE)"
-	@echo "  → review and commit $(BLOOM_REPO) to record this release in git"
+	  --header-upload "Cache-Control: public, max-age=60"; \
+	echo "✓ publish-bloom complete: $$built"
 
 # Fat LTO + single codegen unit. Multi-minute link, marginal runtime win
 # over the default release profile. Use for container/tarball builds.
