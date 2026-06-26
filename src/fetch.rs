@@ -656,7 +656,7 @@ pub fn report_registry(reg: &Registry, progress: bool) {
 fn report_fetch(rec: &FetchRecord) {
     // (glyph, label, r, g, b, detail) — detail replaces the size column when a
     // fetch never delivered bytes. A *fetched* dep the local bloom filters vouch
-    // for (or flag) is relabeled `bloom` instead of `live`/`cache` (green ✓ for
+    // for (or flag) is relabeled `known` instead of `live`/`cache` (green ✓ for
     // known-good, red ✗ for known-bad); `skip`/`fail` rows are left as-is.
     let (glyph, label, r, g, b, detail) = match &rec.outcome {
         Outcome::PinMismatch => (
@@ -735,7 +735,7 @@ fn report_fetch(rec: &FetchRecord) {
 type FetchRow = (char, &'static str, i32, i32, i32, Option<String>);
 
 /// A bloom verdict for a fetched artifact, as a `report_fetch` row override:
-/// both known-good and known-bad render as the `bloom` label, distinguished by
+/// both known-good and known-bad render as the `known` label, distinguished by
 /// color/glyph (green ✓ = good/not deeply scanned, red ✗ = bad/conflicted —
 /// flagged). `None` when bloom is disabled or the artifact is in neither set.
 /// Checks the fetched content's sha256 and, for a dependency, its PURL; a bad
@@ -760,10 +760,10 @@ fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
         .flatten()
         .any(|d| matches!(d, Decision::KnownBad | Decision::Conflicted))
     {
-        return Some(('\u{2717}', "bloom", 255, 90, 90, None));
+        return Some(('\u{2717}', "known", 255, 90, 90, None));
     }
     if decisions.iter().flatten().any(|d| *d == Decision::Skip) {
-        return Some(('\u{2713}', "bloom", 80, 200, 80, None));
+        return Some(('\u{2713}', "known", 80, 200, 80, None));
     }
     None
 }

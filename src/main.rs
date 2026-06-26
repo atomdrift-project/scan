@@ -35,17 +35,17 @@ enum Show {
     All,
 }
 
+/// Warn threshold for a single slow cleave rule (ms); was the `--slow-rule-ms`
+/// flag, now a fixed advisory default.
+const DEFAULT_SLOW_RULE_MS: u64 = 4000;
+
 #[derive(Parser)]
 #[command(name = "scan")]
 #[command(version)]
 #[command(about = "Atomdrift Scan — context-free malware detection (ML + static analysis)")]
 #[command(group(
     clap::ArgGroup::new("severity_level")
-        .args([
-            "level", "level_0", "level_1", "level_2", "level_3", "level_4",
-            "level_5", "level_6", "level_7", "level_8", "level_9",
-        ])
-        .multiple(false)
+        .args(["level"])
         .conflicts_with_all(["threshold_suspicious", "threshold_hostile"])
 ))]
 struct Cli {
@@ -56,10 +56,6 @@ struct Cli {
     /// Update models and traits before running (failures are non-fatal)
     #[arg(short = 'u', long)]
     update: bool,
-
-    /// Disable the periodic update notice (also: SCAN_NO_UPDATE_CHECK=1)
-    #[arg(long)]
-    no_update_check: bool,
 
     /// Force light-background color theme
     #[arg(long, conflicts_with = "dark")]
@@ -72,10 +68,6 @@ struct Cli {
     /// Override model directory (default: auto-resolved from models repo)
     #[arg(long)]
     model_dir: Option<PathBuf>,
-
-    /// Override the models repository URL (env: SCAN_MODELS_REPO)
-    #[arg(long)]
-    models_repo: Option<String>,
 
     /// Output format
     #[arg(short, long, default_value = "terminal")]
@@ -99,53 +91,9 @@ struct Cli {
     #[arg(short = 'l', long, value_name = "N", value_parser = clap::value_parser!(u16).range(0..=25000), global = true)]
     level: Option<u16>,
 
-    /// Use severity level 0: zero false positives; strictest
-    #[arg(short = '0', global = true, action = clap::ArgAction::SetTrue)]
-    level_0: bool,
-
-    /// Use severity level 10
-    #[arg(short = '1', long = "loose", global = true, action = clap::ArgAction::SetTrue)]
-    level_1: bool,
-
-    /// Use severity level 20
-    #[arg(short = '2', global = true, action = clap::ArgAction::SetTrue)]
-    level_2: bool,
-
-    /// Use severity level 30
-    #[arg(short = '3', global = true, action = clap::ArgAction::SetTrue)]
-    level_3: bool,
-
-    /// Use severity level 40
-    #[arg(short = '4', global = true, action = clap::ArgAction::SetTrue)]
-    level_4: bool,
-
-    /// Use severity level 50: default operating point (0.5 FP/M)
-    #[arg(short = '5', global = true, action = clap::ArgAction::SetTrue)]
-    level_5: bool,
-
-    /// Use severity level 60
-    #[arg(short = '6', global = true, action = clap::ArgAction::SetTrue)]
-    level_6: bool,
-
-    /// Use severity level 70
-    #[arg(short = '7', global = true, action = clap::ArgAction::SetTrue)]
-    level_7: bool,
-
-    /// Use severity level 80
-    #[arg(short = '8', global = true, action = clap::ArgAction::SetTrue)]
-    level_8: bool,
-
-    /// Use severity level 90: most sensitive
-    #[arg(short = '9', long = "paranoid", global = true, action = clap::ArgAction::SetTrue)]
-    level_9: bool,
-
     /// Classifications to display: hostile, suspicious, sus, benign, all (comma-separated)
     #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
     show: Vec<Show>,
-
-    /// Warn when a single rule takes longer than this many milliseconds
-    #[arg(long, default_value = "4000")]
-    slow_rule_ms: u64,
 
     /// Show raw probability and SHAP feature values in terminal output
     #[arg(long, hide = true)]
@@ -333,25 +281,6 @@ impl Cli {
         })
     }
 
-    fn selected_severity_level(&self) -> Option<u16> {
-        if let Some(level) = self.level {
-            return Some(level);
-        }
-        [
-            (self.level_0, 0),
-            (self.level_1, 10),
-            (self.level_2, 20),
-            (self.level_3, 30),
-            (self.level_4, 40),
-            (self.level_5, 50),
-            (self.level_6, 60),
-            (self.level_7, 70),
-            (self.level_8, 80),
-            (self.level_9, 90),
-        ]
-        .into_iter()
-        .find_map(|(selected, level)| selected.then_some(level))
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -582,7 +511,7 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    let selected_severity_level = cli.selected_severity_level();
+    let selected_severity_level = cli.level;
     let threshold_suspicious = cli.threshold_suspicious;
     let threshold_hostile = cli.threshold_hostile;
     // Resolve before `cli.command` is moved out below; only one arm uses it.
@@ -677,17 +606,6 @@ fn main() -> Result<()> {
     // initialized. This avoids clone-into-existing-directory failures when the
     // default traits checkout was installed by cleave or another litmus run.
     scan::traits_repo::prepare_runtime_env();
-
-    // Surface CLI overrides for the models repo to the resolver in
-    // `models_repo.rs`, which reads these env vars. Doing it here means worker
-    // restarts inherit the same configuration without threading flags through.
-    //
-    // SAFETY: set_var is technically unsound under concurrent access, but at
-    // this point the program is still single-threaded — rayon and tokio
-    // pools are constructed below.
-    if let Some(url) = cli.models_repo.as_deref() {
-        unsafe { std::env::set_var("SCAN_MODELS_REPO", url) };
-    }
 
     // The trait-validation gate run by `validate` and at worker startup is a
     // runtime deploy gate, not a trait-authoring lint: a bundle must be rejected
@@ -849,7 +767,7 @@ fn main() -> Result<()> {
             | Commands::Version
             | Commands::UpdateRules { .. }
     ) {
-        scan::update_check::maybe_notify(cli.no_update_check);
+        scan::update_check::maybe_notify(false);
     }
 
     if cli.update {
@@ -924,7 +842,7 @@ fn main() -> Result<()> {
                 cli.format,
                 thresholds,
                 filter,
-                cli.slow_rule_ms,
+                DEFAULT_SLOW_RULE_MS,
                 cli.extra,
             )?
             .with_level(envelope_level)
@@ -963,7 +881,7 @@ fn main() -> Result<()> {
                 cli.format,
                 thresholds,
                 filter,
-                cli.slow_rule_ms,
+                DEFAULT_SLOW_RULE_MS,
                 cli.extra,
             )?
             .with_level(envelope_level)
@@ -980,7 +898,7 @@ fn main() -> Result<()> {
                 cli.format,
                 thresholds,
                 filter,
-                cli.slow_rule_ms,
+                DEFAULT_SLOW_RULE_MS,
                 cli.extra,
             )?
             .with_level(envelope_level)
@@ -1001,7 +919,7 @@ fn main() -> Result<()> {
                 cli.format,
                 thresholds,
                 filter,
-                cli.slow_rule_ms,
+                DEFAULT_SLOW_RULE_MS,
                 cli.extra,
             )?
             .with_level(envelope_level)
@@ -1018,7 +936,7 @@ fn main() -> Result<()> {
                 cli.format,
                 thresholds,
                 filter,
-                cli.slow_rule_ms,
+                DEFAULT_SLOW_RULE_MS,
                 cli.extra,
             )?
             .with_level(envelope_level)
@@ -1070,7 +988,7 @@ fn main() -> Result<()> {
                 max_rss_bytes,
                 model_dir,
                 thresholds,
-                cli.slow_rule_ms,
+                DEFAULT_SLOW_RULE_MS,
                 dirs,
                 extract_dir.map(std::path::PathBuf::from),
                 workers,
@@ -1133,7 +1051,7 @@ fn main() -> Result<()> {
                 scan::OutputFormat::Terminal,
                 thresholds,
                 DisplayFilter::alerts_only(),
-                cli.slow_rule_ms,
+                DEFAULT_SLOW_RULE_MS,
                 cli.extra,
             )?
             .with_level(envelope_level);
@@ -1214,7 +1132,7 @@ fn main() -> Result<()> {
                     scan::OutputFormat::Terminal,
                     thresholds,
                     DisplayFilter::alerts_only(),
-                    cli.slow_rule_ms,
+                    DEFAULT_SLOW_RULE_MS,
                     cli.extra,
                 )?
                 .with_level(envelope_level);
@@ -1238,7 +1156,7 @@ fn main() -> Result<()> {
                 max_jobs,
                 model_dir,
                 thresholds,
-                slow_rule_ms: cli.slow_rule_ms,
+                slow_rule_ms: DEFAULT_SLOW_RULE_MS,
                 level: envelope_level,
                 nice,
                 exit_if_empty,
@@ -1812,37 +1730,26 @@ mod tests {
     }
 
     #[test]
-    fn severity_level_flags_parse() -> Result<()> {
-        let cli = Cli::try_parse_from(["scan", "-1", "/tmp/a"]).context("-1 should parse")?;
-        assert_eq!(cli.selected_severity_level(), Some(10));
-
-        let cli =
-            Cli::try_parse_from(["scan", "--loose", "/tmp/a"]).context("--loose should parse")?;
-        assert_eq!(cli.selected_severity_level(), Some(10));
-
-        let cli = Cli::try_parse_from(["scan", "--paranoid", "/tmp/a"])
-            .context("--paranoid should parse")?;
-        assert_eq!(cli.selected_severity_level(), Some(90));
-
-        let cli = Cli::try_parse_from(["scan", "scan", "--paranoid", "/tmp/a"])
-            .context("global --paranoid should parse after scan")?;
-        assert_eq!(cli.selected_severity_level(), Some(90));
-
-        let cli = Cli::try_parse_from(["scan", "-0", "/tmp/a"]).context("-0 should parse")?;
-        assert_eq!(cli.selected_severity_level(), Some(0));
-
+    fn level_flag_parses_and_shortcuts_removed() -> Result<()> {
         let cli =
             Cli::try_parse_from(["scan", "-l", "100", "/tmp/a"]).context("-l 100 should parse")?;
-        assert_eq!(cli.selected_severity_level(), Some(100));
+        assert_eq!(cli.level, Some(100));
 
         let cli = Cli::try_parse_from(["scan", "--level", "12", "/tmp/a"])
             .context("--level 12 should parse")?;
-        assert_eq!(cli.selected_severity_level(), Some(12));
+        assert_eq!(cli.level, Some(12));
 
-        // Out-of-range and conflicting selections are rejected. The level
-        // range is per-100M (0..=25000) since the per-million migration.
+        // Out-of-range rejected (0..=25000, per-100M since the per-million migration).
         assert!(Cli::try_parse_from(["scan", "-l", "25001", "/tmp/a"]).is_err());
-        assert!(Cli::try_parse_from(["scan", "-l", "3", "-5", "/tmp/a"]).is_err());
+        // --level still conflicts with explicit thresholds.
+        assert!(
+            Cli::try_parse_from(["scan", "-l", "10", "--threshold-hostile", "0.5", "/tmp/a"])
+                .is_err()
+        );
+        // The numeric shortcuts and their aliases were removed.
+        assert!(Cli::try_parse_from(["scan", "-5", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["scan", "--loose", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["scan", "--paranoid", "/tmp/a"]).is_err());
         Ok(())
     }
 
