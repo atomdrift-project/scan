@@ -647,7 +647,7 @@ pub(super) async fn analyze(
     // is recognized as PackageJson, not Unknown).
     let fname_for_temp = filename.clone();
     let temp_dir =
-        match tokio::task::spawn_blocking(move || TempBuilder::new().prefix("ascan-").tempdir())
+        match tokio::task::spawn_blocking(move || TempBuilder::new().prefix("scan-").tempdir())
             .await
         {
             Ok(Ok(d)) => d,

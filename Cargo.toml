@@ -48,7 +48,7 @@ significant_drop_tightening = "warn"
 [package]
 name = "atomdrift-scan"
 version = "2.2.0-beta.2"
-default-run = "ascan"
+default-run = "scan"
 edition = "2024"
 authors = ["The Atomdrift Project"]
 description = "ML-powered malware classification using cleave static analysis"
@@ -96,7 +96,7 @@ terminal-colorsaurus = "0.4"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
 tower = { version = "0.5", features = ["limit"] }
-# Same terminal-color crate cleave uses, so ascan's verdict line and cleave's
+# Same terminal-color crate cleave uses, so scan's verdict line and cleave's
 # context body gate (tty / NO_COLOR) and color identically.
 colored = "3.1"
 tempfile = "3"
@@ -136,11 +136,11 @@ tikv-jemallocator = "0.7"
 
 [features]
 # Enables jemalloc heap profiling. Build with:
-#   cargo build --profile profiling --features jemalloc-prof --bin ascan
+#   cargo build --profile profiling --features jemalloc-prof --bin scan
 # Run with (note the `_RJEM_` prefix — tikv-jemalloc renames MALLOC_CONF):
 #   _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_interval:28,prof_prefix:out/heap/jeprof" \
-#     ./out/ascan.heap worker ...
-# Analyze with: jeprof --text ./out/ascan.heap out/heap/jeprof.*.heap
+#     ./out/scan.heap worker ...
+# Analyze with: jeprof --text ./out/scan.heap out/heap/jeprof.*.heap
 jemalloc-prof = ["tikv-jemallocator/profiling"]
 
 # Emit per-member rayon-thread breadcrumbs in the SIGUSR1/wedge dump. Requires a
@@ -174,7 +174,7 @@ debug = 2
 [profile.dev]
 debug = "line-tables-only"
 
-# Match cleave's dev-profile tuning for the heavy analysis stack. `ascan`
+# Match cleave's dev-profile tuning for the heavy analysis stack. `scan`
 # frequently gets profiled and validated from `target/debug`; without these
 # overrides, cleave/YARA/regex code runs unoptimized and small fixture scans can
 # look tens of seconds slower than the release binary.
@@ -215,11 +215,13 @@ workspace = true
 name = "scan"
 path = "src/lib.rs"
 
-# Atomdrift Scan — the product. The crates.io package is `atomdrift-scan`, but
-# the library is imported as `scan` (lib name below); the CLI binary is `ascan`
-# (the `a` prefix avoids colliding with avast's /usr/bin/scan).
+# Atomdrift Scan — the product. The crates.io package is `atomdrift-scan`; both
+# the library (imported as `scan`) and the CLI binary build under the name
+# `scan`, matching the repo. `make install` installs the binary as `atomscan`
+# and adds a `scan` symlink only when no `scan` already exists on PATH — avast
+# ships its own `/usr/bin/scan`, so we never clobber it.
 [[bin]]
-name = "ascan"
+name = "scan"
 path = "src/main.rs"
 
 # Mock hopper for self-contained worker benchmarks (see `make worker-benchmark`).

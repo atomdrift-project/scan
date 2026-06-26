@@ -7,7 +7,7 @@
 #      unpublished local crate and must never be committed.
 #   2. `make lint` passes (clippy with -D warnings).
 #   3. `make test` passes.
-#   4. `ascan validate` exits cleanly (model loads and benign fixtures stay benign).
+#   4. `scan validate` exits cleanly (model loads and benign fixtures stay benign).
 #
 # Bypass intentionally with `git commit --no-verify`.
 
@@ -30,14 +30,14 @@ make lint
 echo "pre-commit: running make test..."
 make test
 
-# 4. Build the CLI and run `ascan validate`. This loads the deployed model and
+# 4. Build the CLI and run `scan validate`. This loads the deployed model and
 # verifies the benign fixtures stay benign — a degraded or drifted bundle, or a
 # feature-extraction regression, must not slip through. set -e aborts the commit
 # on a non-zero exit.
-echo "pre-commit: building ascan..."
-cargo build --bin ascan
+echo "pre-commit: building scan..."
+cargo build --bin scan
 
-echo "pre-commit: running ascan validate..."
-target/debug/ascan validate
+echo "pre-commit: running scan validate..."
+target/debug/scan validate
 
 echo "pre-commit: all checks passed."

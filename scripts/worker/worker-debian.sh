@@ -8,7 +8,7 @@
 set -ex
 
 BUILD="${1:-build}"
-RUN="${2:-ascan}"
+RUN="${2:-scan}"
 URL="$3"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
@@ -34,27 +34,27 @@ bssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
         cargo rustc git pkg-config build-essential clang lld sccache ca-certificates"
 
 log "Ensuring build user exists on $BUILD"
-bssh "id -u ascan >/dev/null 2>&1 || sudo useradd -m -s /bin/sh -c 'Atomdrift Scan Build' ascan"
+bssh "id -u scan >/dev/null 2>&1 || sudo useradd -m -s /bin/sh -c 'Atomdrift Scan Build' scan"
 
 log "Syncing source to build host (excluding target/, out/, .git)"
-bssh "sudo -u ascan mkdir -p /home/ascan/scan"
+bssh "sudo -u scan mkdir -p /home/scan/scan"
 tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
-    | bssh "sudo -u ascan tar -xf - -C /home/ascan/scan"
+    | bssh "sudo -u scan tar -xf - -C /home/scan/scan"
 
 log "Building tarball on $BUILD"
-bssh "sudo -u ascan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" make tarball'" \
+bssh "sudo -u scan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" make tarball'" \
     || die "build failed on build host"
 
 log "Running tests on $BUILD"
-bssh "sudo -u ascan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" cargo test --release -- --nocapture'" \
+bssh "sudo -u scan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" cargo test --release -- --nocapture'" \
     || die "tests failed on build host"
 
 log "Transferring tarball from $BUILD to $RUN"
-bssh "sudo cat /home/ascan/scan/out/ascan.tgz" \
-    | rssh "sudo tee /tmp/ascan.tgz >/dev/null"
+bssh "sudo cat /home/scan/scan/out/scan.tgz" \
+    | rssh "sudo tee /tmp/scan.tgz >/dev/null"
 
 log "Ensuring run user exists on $RUN"
-rssh "id -u ascan >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -d /nonexistent -c 'Atomdrift Scan Worker' ascan"
+rssh "id -u scan >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -d /nonexistent -c 'Atomdrift Scan Worker' scan"
 
 log "Installing runtime dependencies on $RUN"
 rssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
@@ -64,12 +64,12 @@ rssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
 log "Extracting tarball on $RUN"
 rssh "sudo rm -rf /usr/local/share/atomdrift/scan && \
       sudo mkdir -p /usr/local/share/atomdrift/scan && \
-      sudo tar -xzf /tmp/ascan.tgz -C /usr/local/share/atomdrift/scan && \
-      sudo rm -f /tmp/ascan.tgz && \
-      sudo ln -sf /usr/local/share/atomdrift/scan/ascan /usr/local/bin/ascan"
+      sudo tar -xzf /tmp/scan.tgz -C /usr/local/share/atomdrift/scan && \
+      sudo rm -f /tmp/scan.tgz && \
+      sudo ln -sf /usr/local/share/atomdrift/scan/scan /usr/local/bin/scan"
 
 log "Installing systemd unit on $RUN"
-rssh "sudo tee /etc/systemd/system/ascan-worker.service >/dev/null" <<EOF
+rssh "sudo tee /etc/systemd/system/scan-worker.service >/dev/null" <<EOF
 [Unit]
 Description=Atomdrift Scan worker
 After=network-online.target
@@ -77,13 +77,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ascan
-Group=ascan
-ExecStart=/usr/local/share/atomdrift/scan/ascan $worker_args
+User=scan
+Group=scan
+ExecStart=/usr/local/share/atomdrift/scan/scan $worker_args
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/var/log/ascan-worker.log
-StandardError=append:/var/log/ascan-worker.log
+StandardOutput=append:/var/log/scan-worker.log
+StandardError=append:/var/log/scan-worker.log
 
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
 Environment=SCAN_LLM=$LLM
@@ -104,14 +104,14 @@ WantedBy=multi-user.target
 EOF
 
 log "Preparing log file on $RUN"
-rssh "sudo touch /var/log/ascan-worker.log && sudo chown ascan:ascan /var/log/ascan-worker.log"
+rssh "sudo touch /var/log/scan-worker.log && sudo chown scan:scan /var/log/scan-worker.log"
 
-log "Enabling and restarting ascan-worker service on $RUN"
+log "Enabling and restarting scan-worker service on $RUN"
 rssh "sudo systemctl daemon-reload && \
-      sudo systemctl enable ascan-worker.service && \
-      sudo systemctl restart ascan-worker.service"
+      sudo systemctl enable scan-worker.service && \
+      sudo systemctl restart scan-worker.service"
 
 log "Service status:"
-rssh "sudo systemctl --no-pager --full status ascan-worker.service" || true
+rssh "sudo systemctl --no-pager --full status scan-worker.service" || true
 
 log "Deployment complete"

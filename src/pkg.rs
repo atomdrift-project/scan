@@ -1,4 +1,4 @@
-//! `ascan url <url>` and `ascan pkg <purl>`: fetch one external artifact and run
+//! `scan url <url>` and `scan pkg <purl>`: fetch one external artifact and run
 //! the full scan pipeline on it, exactly as if it were a local file.
 //!
 //! `url` takes a raw URL (`https://host/path`); `pkg` takes a package URL

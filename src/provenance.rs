@@ -201,7 +201,7 @@ mod tests {
             "left-pad-1.3.0.tgz",
             &"a".repeat(64),
             1234,
-            "ascan+host",
+            "scan+host",
             "2026-06-25T00:00:00Z",
             "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
             "pkg:npm/left-pad@1.3.0",
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(v["artifact"]["sha256"], "a".repeat(64));
         assert_eq!(v["artifact"]["size_bytes"], 1234);
         assert_eq!(v["fetch"]["category"], "submitted");
-        assert_eq!(v["fetch"]["collector"], "ascan+host");
+        assert_eq!(v["fetch"]["collector"], "scan+host");
         assert_eq!(v["package"]["purl"], "pkg:npm/left-pad@1.3.0");
         assert_eq!(v["registry"]["format"], "fletch.registry");
 
@@ -245,7 +245,7 @@ mod tests {
             "assertion-error-2.0.1.tgz",
             &"d".repeat(64),
             500,
-            "ascan+host",
+            "scan+host",
             "2026-06-25T00:00:00Z",
             "https://registry.npmjs.org/assertion-error/-/assertion-error-2.0.1.tgz",
             "pkg:npm/assertion-error@2.0.1",
@@ -264,7 +264,7 @@ mod tests {
             "mal.bin",
             &"b".repeat(64),
             10,
-            "ascan+host",
+            "scan+host",
             "2026-06-25T00:00:00Z",
             "",
             "",

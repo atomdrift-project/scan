@@ -127,7 +127,7 @@ pub fn default_worker_name() -> String {
         .take(MAX_WORKER_NAME_LEN)
         .collect();
     if sanitized.is_empty() {
-        "ascan-fs".to_string()
+        "scan-fs".to_string()
     } else {
         sanitized
     }
@@ -163,6 +163,11 @@ pub struct UploadArtifact {
     pub bytes: ArtifactBytes,
     /// Pre-serialized hopper `Sidecar` JSON (see [`crate::provenance::build_sidecar`]).
     pub sidecar: Vec<u8>,
+    /// Whether this artifact's provenance is worth backfilling onto a sample
+    /// hopper already has the bytes for — true for a fetched dependency (the
+    /// sidecar carries a registry record + PURL), false for the scanned root file
+    /// (whose sidecar is just artifact + fetch identity).
+    pub backfill: bool,
 }
 
 /// Work handed to the background uploader thread. Artifacts are reconciled before
@@ -202,13 +207,14 @@ impl Uploader {
         let result_url = format!("{base}/api/result");
         let known_url = format!("{base}/api/known");
         let upload_url = format!("{base}/api/upload");
+        let provenance_url = format!("{base}/api/provenance");
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
         let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(UPLOAD_QUEUE_DEPTH);
         let handle = std::thread::Builder::new()
-            .name("ascan-upload".into())
+            .name("scan-upload".into())
             .spawn(move || {
                 // The same default blob cache scan fetched dependencies into, so a
                 // missing dep's bytes are loaded locally rather than re-fetched.
@@ -226,6 +232,7 @@ impl Uploader {
                                 &client,
                                 &known_url,
                                 &upload_url,
+                                &provenance_url,
                                 cache.as_ref(),
                                 &mut seen,
                                 artifacts,
@@ -312,6 +319,7 @@ fn reconcile_artifacts(
     client: &reqwest::blocking::Client,
     known_url: &str,
     upload_url: &str,
+    provenance_url: &str,
     cache: Option<&fletch::fetch::BlobCache>,
     seen: &mut HashSet<String>,
     artifacts: Vec<UploadArtifact>,
@@ -333,7 +341,14 @@ fn reconcile_artifacts(
 
     for art in fresh {
         if known.contains(&art.sha256) {
-            tracing::debug!(sha256 = %art.sha256, "upload: hopper already has artifact; skipping content");
+            // hopper has the bytes. For a dependency, still backfill its registry
+            // provenance when hopper is missing it — the bytes never move, only
+            // the small sidecar. The root file's thin sidecar isn't worth it.
+            if art.backfill && provenance_missing(client, provenance_url, &art.sha256) {
+                upload_provenance_only(client, upload_url, &art);
+            } else {
+                tracing::debug!(sha256 = %art.sha256, "upload: hopper already has artifact; skipping");
+            }
             continue;
         }
         let bytes = match &art.bytes {
@@ -345,6 +360,20 @@ fn reconcile_artifacts(
             continue;
         };
         upload_one(client, upload_url, &art, &bytes);
+    }
+}
+
+/// HEAD `/api/provenance/{sha}` to learn whether hopper is missing provenance for
+/// a sample it already holds the bytes for. A `204 No Content` means missing →
+/// backfill it. Any other status, or a probe error, is treated as "present or
+/// unknown" → leave it, so a flaky probe never triggers a redundant upload.
+fn provenance_missing(client: &reqwest::blocking::Client, provenance_url: &str, sha256: &str) -> bool {
+    match client.head(format!("{provenance_url}/{sha256}")).send() {
+        Ok(resp) => resp.status() == reqwest::StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::debug!(sha256 = %sha256, error = %error_chain(&e), "upload: provenance probe failed");
+            false
+        }
     }
 }
 
@@ -386,37 +415,37 @@ fn post_known(client: &reqwest::blocking::Client, known_url: &str, shas: &[&str]
     }
 }
 
-/// Upload one artifact's bytes + provenance via the multipart `/api/upload`. The
-/// provenance part precedes the file part, as hopper's handler requires.
-/// Best-effort with a short retry: a 4xx (other than 408/429) is permanent.
-fn upload_one(
+/// Build the multipart provenance part from an artifact's sidecar.
+fn provenance_part(art: &UploadArtifact) -> Option<reqwest::blocking::multipart::Part> {
+    match reqwest::blocking::multipart::Part::bytes(art.sidecar.clone()).mime_str("application/json") {
+        Ok(part) => Some(part),
+        Err(e) => {
+            tracing::warn!(sha256 = %art.sha256, error = %error_chain(&e), "upload: provenance part build failed");
+            None
+        }
+    }
+}
+
+/// POST a multipart body to `/api/upload` with a short retry, rebuilding the
+/// (non-`Clone`) form each attempt via `build_form`. `kind` labels the log lines.
+/// Returns `true` on success. Best-effort: a 4xx (other than 408/429) is
+/// permanent and stops immediately; the caller logs its own success detail.
+fn post_upload(
     client: &reqwest::blocking::Client,
     upload_url: &str,
-    art: &UploadArtifact,
-    bytes: &[u8],
-) {
-    use reqwest::blocking::multipart::{Form, Part};
-
+    sha256: &str,
+    kind: &str,
+    build_form: impl Fn() -> Option<reqwest::blocking::multipart::Form>,
+) -> bool {
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
         }
-        let provenance = match Part::bytes(art.sidecar.clone()).mime_str("application/json") {
-            Ok(part) => part,
-            Err(e) => {
-                tracing::warn!(sha256 = %art.sha256, error = %error_chain(&e), "upload: provenance part build failed");
-                return;
-            }
+        let Some(form) = build_form() else {
+            return false; // part build failed — unrecoverable
         };
-        let form = Form::new().part("provenance", provenance).part(
-            "file",
-            Part::bytes(bytes.to_vec()).file_name(art.filename.clone()),
-        );
         match client.post(upload_url).multipart(form).send() {
-            Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(sha256 = %art.sha256, file = %art.filename, size = art.size, "upload: artifact stored on hopper");
-                return;
-            }
+            Ok(resp) if resp.status().is_success() => return true,
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_client_error()
@@ -424,17 +453,53 @@ fn upload_one(
                     && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
                     let body = resp.text().unwrap_or_default();
-                    tracing::warn!(sha256 = %art.sha256, %status, body = %body, "upload: artifact rejected by hopper; not retrying");
-                    return;
+                    tracing::warn!(sha256 = %sha256, kind, %status, body = %body, "upload: rejected by hopper; not retrying");
+                    return false;
                 }
-                tracing::warn!(sha256 = %art.sha256, %status, attempt, "upload: artifact non-success response");
+                tracing::warn!(sha256 = %sha256, kind, %status, attempt, "upload: non-success response");
             }
             Err(e) => {
-                tracing::warn!(sha256 = %art.sha256, error = %error_chain(&e), attempt, "upload: artifact send failed");
+                tracing::warn!(sha256 = %sha256, kind, error = %error_chain(&e), attempt, "upload: send failed");
             }
         }
     }
-    tracing::warn!(sha256 = %art.sha256, attempts = MAX_ATTEMPTS, "upload: artifact giving up after retries");
+    tracing::warn!(sha256 = %sha256, kind, attempts = MAX_ATTEMPTS, "upload: giving up after retries");
+    false
+}
+
+/// Upload one artifact's bytes + provenance via the multipart `/api/upload`. The
+/// provenance part precedes the file part, as hopper's handler requires.
+fn upload_one(
+    client: &reqwest::blocking::Client,
+    upload_url: &str,
+    art: &UploadArtifact,
+    bytes: &[u8],
+) {
+    use reqwest::blocking::multipart::{Form, Part};
+    let ok = post_upload(client, upload_url, &art.sha256, "artifact", || {
+        Some(
+            Form::new().part("provenance", provenance_part(art)?).part(
+                "file",
+                Part::bytes(bytes.to_vec()).file_name(art.filename.clone()),
+            ),
+        )
+    });
+    if ok {
+        tracing::debug!(sha256 = %art.sha256, file = %art.filename, size = art.size, "upload: artifact stored on hopper");
+    }
+}
+
+/// Backfill a dependency's registry provenance onto a sample hopper already holds
+/// the bytes for: the same multipart `/api/upload`, but with only the provenance
+/// part (no file). hopper attaches it without moving any bytes.
+fn upload_provenance_only(client: &reqwest::blocking::Client, upload_url: &str, art: &UploadArtifact) {
+    use reqwest::blocking::multipart::Form;
+    let ok = post_upload(client, upload_url, &art.sha256, "provenance backfill", || {
+        Some(Form::new().part("provenance", provenance_part(art)?))
+    });
+    if ok {
+        tracing::debug!(sha256 = %art.sha256, file = %art.filename, "upload: provenance backfilled on hopper");
+    }
 }
 
 /// POST one result to hopper, retrying transient failures a few times. A 4xx
@@ -508,7 +573,7 @@ mod tests {
     fn encode_result_body_round_trips_through_zstd() {
         let payload = ResultPayload {
             sha256: "a".repeat(64),
-            worker: "ascan-fs".to_string(),
+            worker: "scan-fs".to_string(),
             error: None,
             duration_ms: 0,
             envelope: None,
@@ -522,7 +587,7 @@ mod tests {
         // The flattened payload carries the transport fields and omits `error`
         // (skip_serializing_if), matching the worker's wire form.
         let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(value["worker"], "ascan-fs");
+        assert_eq!(value["worker"], "scan-fs");
         assert_eq!(value["duration_ms"], 0);
         assert!(value.get("error").is_none());
     }

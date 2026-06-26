@@ -5,7 +5,7 @@ Atomdrift Scan is an embeddable open-source malware scanner, tuned for open-sour
 AS is designed to replace proprietary scanners such as socket.dev, ReversingLabs, and Aikido, as well as legacy open-source
 scanners such as ClamAV and malcontent. To fight fire with fire, AS is based on efficient and deterministic local AI models - designed to run on any hardware or operating system. Unlike most scanners that rely on pattern mattching, it dissects each file - through active reverse engineering using tools like rizin and tree-sitter. Atomdrift decomposes each file into a tree of atoms, and from there looks for "malecule" shapes to derive probability.
 
-Unlike most scanners, AS allows you to set your acceptable false-positive level, based on predicted occurrence over 100 million samples based on the specific filetype involved. Paranoid about your CI pipeline? use `ascan -l5000 <files>`; don't want to bombard the SOC with alerts? use `ascan -l0` (the default is L50, or 50-per-100 million).
+Unlike most scanners, AS allows you to set your acceptable false-positive level, based on predicted occurrence over 100 million samples based on the specific filetype involved. Paranoid about your CI pipeline? use `scan -l5000 <files>`; don't want to bombard the SOC with alerts? use `scan -l0` (the default is L50, or 50-per-100 million).
 
 We're Apache 2.0 licensed, and in active development on the following architectures - chances are if you are on something else, it should still work (if not, PR's welcome).
 
@@ -81,17 +81,25 @@ cd scan
 make install
 ```
 
+`make install` lands the binary as **`atomscan`** and adds a **`scan`** symlink
+pointing to it — except when a `scan` already exists on your `PATH` (for example
+avast's `/usr/bin/scan`), which is left untouched. If an older `ascan` binary is
+found in the same directory it is migrated to a symlink so the name keeps
+working. Use the command that suits you; the examples below use `scan`. Run
+`make uninstall` to remove `atomscan` and any symlinks that point to it (a
+foreign `scan` is never removed).
+
 ## Usage
 
 ```bash
-ascan fs /bin/                           # recursive; archives unpacked
-ascan ps                                 # classify running processes
+scan fs /bin/                           # recursive; archives unpacked
+scan ps                                 # classify running processes
 ```
 
-By default, ascan is tuned for 50 false-positives per 100-million files, tune it for your use case using -l <X-per-100M>. To be ultra conservative and avoid any likelihood of false-positive, use:
+By default, scan is tuned for 50 false-positives per 100-million files, tune it for your use case using -l <X-per-100M>. To be ultra conservative and avoid any likelihood of false-positive, use:
 
 ```bash
-ascan -l 0 /sbin/sulogin                # 0-fp scan against a file
+scan -l 0 /sbin/sulogin                # 0-fp scan against a file
 ```
 
 If you want a second opinion for added accuracy, AS recently added support for efficiently sending evidence to a local LLM for analysis using `--interpret`. It defaults to the local OpenAI endpoint at https://127.0.0.1:8000/v1 - we currently recommend vLLM with Qwen 3.6-27B as a model. Models down to 9B are likely sufficient as well. LLM scores are blended against the ML scores for a final adjusted outcome.

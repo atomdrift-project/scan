@@ -1,7 +1,7 @@
 //! Locates the model bundle and installs/updates it from the R2 bundle.
 //!
 //! Models are distributed as signed `.tar.zst` bundles from the update bucket —
-//! see [`crate::model_update`], which `ascan update-rules` drives. This module
+//! see [`crate::model_update`], which `scan update-rules` drives. This module
 //! handles *resolution* (where the bundle lives) and the first-run bootstrap
 //! install. The bundle root *is* what [`crate::model::Model::load`] reads:
 //! `feature_spec.json` + `model.onnx` (or `models/seed_*.onnx`) at the top, or a

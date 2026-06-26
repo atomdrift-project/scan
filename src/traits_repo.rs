@@ -2,7 +2,7 @@
 //!
 //! cleave traits are distributed as signed `.tar.zst` bundles from the update
 //! bucket (`cleave::rule_update`); this module resolves the install dir and
-//! delegates, so `ascan update-rules` fetches traits the same way `cleave
+//! delegates, so `scan update-rules` fetches traits the same way `cleave
 //! update-rules` does. No git.
 
 use anyhow::Result;

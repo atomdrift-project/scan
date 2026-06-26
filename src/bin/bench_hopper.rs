@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! scan-bench-hopper --dataset ~/data/benchmark/realworld-small --port 8090
-//! ascan worker --url http://127.0.0.1:8090 --data-dir ~/data/benchmark/realworld-small \
+//! scan worker --url http://127.0.0.1:8090 --data-dir ~/data/benchmark/realworld-small \
 //!     --workers 12 --max-jobs <file-count>
 //! ```
 //!

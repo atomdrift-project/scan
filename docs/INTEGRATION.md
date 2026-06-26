@@ -18,8 +18,8 @@ brew install atomdrift-scan
 git clone https://codeberg.org/atomdrift/scan.git && cd scan && make install
 
 # scan a file, a directory, or an archive (archives unpack automatically)
-ascan suspicious_package.tar.gz
-ascan ./incoming/
+scan suspicious_package.tar.gz
+scan ./incoming/
 ```
 
 A clean run prints a one-line summary and exits `0`. A finding is printed
@@ -37,7 +37,7 @@ about how you parse results changes.
 
 | Path         | Use when                                                  | Cost                                            | Reference                          |
 | ------------ | -------------------------------------------------------- | ----------------------------------------------- | ---------------------------------- |
-| **CLI**      | One-shot or batch, up to ~5 scans/min.                   | Reloads the model on every run.                 | `ascan --help`                     |
+| **CLI**      | One-shot or batch, up to ~5 scans/min.                   | Reloads the model on every run.                 | `scan --help`                     |
 | **HTTP server** | Sustained traffic past ~5 scans/min.                 | You run a long-lived process.                   | [SERVER_API.md](SERVER_API.md)     |
 | **Worker**   | Distributed ingestion: workers pull jobs from a [hopper](https://codeberg.org/atomdrift/hopper) queue. | You run a hopper for them to poll. | [WORKERS.md](WORKERS.md)           |
 | **Rust library** | You are already in Rust and want in-process calls. | More setup, weaker API stability. See [Library](#library). | source — `classify_file`, `classify_bytes` |
@@ -50,7 +50,7 @@ into the **Worker**.
 The CLI turns a verdict into an exit code, so a gate is one line:
 
 ```bash
-ascan ./package/ || echo "flagged — block this upload"
+scan ./package/ || echo "flagged — block this upload"
 ```
 
 | Code | Meaning                                          |
@@ -71,10 +71,10 @@ abstract — you set a **false-positive level**: how many benign files you will
 tolerate being flagged, per 100 million, calibrated for each file type.
 
 ```bash
-ascan -0 ./pkg/        # zero false positives — strictest, fewest alerts
-ascan ./pkg/           # default: level 50 (~0.5 flagged per million benign)
-ascan -9 ./pkg/        # most sensitive — catches more, cries wolf more
-ascan -l 5000 ./pkg/   # any calibrated point on the 0–25000 grid
+scan -0 ./pkg/        # zero false positives — strictest, fewest alerts
+scan ./pkg/           # default: level 50 (~0.5 flagged per million benign)
+scan -9 ./pkg/        # most sensitive — catches more, cries wolf more
+scan -l 5000 ./pkg/   # any calibrated point on the 0–25000 grid
 ```
 
 Choose by where a mistake hurts. A hard upload gate wants a strict level
@@ -97,9 +97,9 @@ To drop rules for platforms you do not ship, add `--platform linux` (or
 `-f` is a global flag, so it comes before the path:
 
 ```bash
-ascan -f json ./pkg/    # NDJSON, one envelope per file, including archive members
-ascan -f tiny ./pkg/    # compact text, built to feed a local LLM
-ascan ./pkg/            # default: human-readable terminal output
+scan -f json ./pkg/    # NDJSON, one envelope per file, including archive members
+scan -f tiny ./pkg/    # compact text, built to feed a local LLM
+scan ./pkg/            # default: human-readable terminal output
 ```
 
 JSON gives you one line per file whatever the verdict. Read `ml.lvl` for the
@@ -116,7 +116,7 @@ with a Qwen3-class model works well, and ~9B is enough. Nothing leaves your
 network.
 
 ```bash
-ascan --interpret ./pkg/
+scan --interpret ./pkg/
 ```
 
 Point it elsewhere with `--llm`, `--llm-model`, `--llm-key`. Control which
@@ -131,8 +131,8 @@ points at — declared dependencies (`deps`) and bare or encoded URLs and IPs
 `curl | bash` dropper is caught as one chain.
 
 ```bash
-ascan --fetch=deps ./pkg/             # follow declared dependencies
-ascan --fetch --fetch-depth 3 ./pkg/  # follow everything, three hops deep
+scan --fetch=deps ./pkg/             # follow declared dependencies
+scan --fetch --fetch-depth 3 ./pkg/  # follow everything, three hops deep
 ```
 
 This is the only mode that touches the network while analyzing. Leave it off

@@ -236,7 +236,7 @@ pub fn install() {
 pub fn dump_all_threads() {
     let mut out = std::io::stderr().lock();
     let pid = std::process::id();
-    let _ = writeln!(out, "\n--- ascan in-process thread dump (pid {pid}) ---");
+    let _ = writeln!(out, "\n--- scan in-process thread dump (pid {pid}) ---");
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         write_registered_backtraces(&mut out);

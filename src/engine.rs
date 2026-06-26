@@ -499,14 +499,16 @@ mod envelope_tests {
             &"a".repeat(64),
             10,
             &raw,
-            "ascan+test",
+            "scan+test",
         );
 
         // Root file + the single usable dependency; the other two edges drop out.
         assert_eq!(arts.len(), 2);
         assert_eq!(arts[0].sha256, "a".repeat(64), "root file is offered first");
         assert!(matches!(arts[0].bytes, crate::upload::ArtifactBytes::File(_)));
+        assert!(!arts[0].backfill, "root file's thin sidecar is not backfilled");
         assert_eq!(arts[1].sha256, "c".repeat(64));
+        assert!(arts[1].backfill, "a dependency's registry provenance is backfillable");
         assert_eq!(arts[1].filename, "x-1.tgz", "filename derived from the fetch URL");
         assert!(
             matches!(&arts[1].bytes, crate::upload::ArtifactBytes::Cached { locator } if locator == "pkg:bogus/x@1"),
@@ -1327,7 +1329,7 @@ fn record_file_result(
 /// `prism`) so a sample's origin is legible.
 fn upload_collector() -> &'static str {
     static COLLECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    COLLECTOR.get_or_init(|| format!("ascan+{}", crate::upload::default_worker_name()))
+    COLLECTOR.get_or_init(|| format!("scan+{}", crate::upload::default_worker_name()))
 }
 
 /// Collect the artifacts a `--upload` run should ensure hopper has: the scanned
@@ -1362,6 +1364,9 @@ fn collect_upload_artifacts(
         sidecar: crate::provenance::build_sidecar(
             &root_name, sha256, size_bytes, collector, &now, "", "", None, &[],
         ),
+        // The root file's sidecar carries no registry/PURL, so there's nothing
+        // worth backfilling onto a copy hopper already has.
+        backfill: false,
     });
 
     // Each successfully fetched dependency archive, from the report's fetch edges.
@@ -1405,6 +1410,9 @@ fn collect_upload_artifacts(
             bytes: ArtifactBytes::Cached {
                 locator: locator.to_string(),
             },
+            // A dependency carries a registry record + PURL, worth backfilling
+            // onto a copy hopper holds the bytes for but has no provenance for.
+            backfill: true,
         });
     }
     artifacts
@@ -1652,11 +1660,11 @@ pub(crate) fn write_extra_diagnostics(out: &mut dyn std::io::Write, r: &ScanResu
 pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
     let class = r.classification.to_string();
     let verdict = if matches!(r.classification, Classification::Benign) {
-        format!("ascan {class} confidence={:.3}\n", r.probability)
+        format!("scan {class} confidence={:.3}\n", r.probability)
     } else {
         let fp_level = r.level.map_or_else(|| "-".to_string(), |n| format!("L{n}"));
         format!(
-            "ascan {class} confidence={:.3} fp-level={fp_level}\n",
+            "scan {class} confidence={:.3} fp-level={fp_level}\n",
             r.probability,
         )
     };

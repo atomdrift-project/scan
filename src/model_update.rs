@@ -1,6 +1,6 @@
 //! R2-backed model updates.
 //!
-//! `ascan update-rules` fetches a manifest from the update bucket, resolves the
+//! `scan update-rules` fetches a manifest from the update bucket, resolves the
 //! model bundle compatible with *this* litmus release, downloads it, verifies its
 //! sha256, validates it by loading, and atomically installs it.
 //!

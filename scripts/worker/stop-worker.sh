@@ -22,12 +22,12 @@
 # back to the generic SIGTERM -> SIGKILL escalation.
 set -u
 
-SERVICE_NAME=ascan-worker
-BINARY=ascan
+SERVICE_NAME=scan-worker
+BINARY=scan
 # Match the running worker, not this script or the make/ssh wrapper invoking it
 # ("make stop-worker"/"deploy-worker" contain no space, so they never match).
-PATTERN='ascan worker'
-LAUNCHD_LABEL=com.atomdrift.ascan-worker
+PATTERN='scan worker'
+LAUNCHD_LABEL=com.atomdrift.scan-worker
 
 log() { printf '==> %s\n' "$*"; }
 

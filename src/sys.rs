@@ -1,4 +1,4 @@
-//! Host triage (`ascan sys`): scan running-process executables together with the
+//! Host triage (`scan sys`): scan running-process executables together with the
 //! directories where malware commonly stages and persists, then merge the two
 //! tallies into a single verdict.
 //!

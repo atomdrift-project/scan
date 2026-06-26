@@ -241,7 +241,7 @@ impl FeatureSpec {
         if raw.version < MIN_LOADABLE_SPEC_VERSION || raw.version > EXPECTED_SPEC_VERSION {
             anyhow::bail!(
                 "feature spec version mismatch: this installed model uses spec v{}, but this Atomdrift Scan build accepts v{MIN_LOADABLE_SPEC_VERSION}..=v{EXPECTED_SPEC_VERSION}. \
-                 The model is incompatible with this build. Run 'ascan update-rules' to install a matching model bundle.",
+                 The model is incompatible with this build. Run 'scan update-rules' to install a matching model bundle.",
                 raw.version,
             );
         }

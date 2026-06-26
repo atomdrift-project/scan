@@ -1,4 +1,4 @@
-# Lima VM template for building ascan Wolfi packages on macOS.
+# Lima VM template for building scan Wolfi packages on macOS.
 # Mirrors cleave/packaging/wolfi/lima.yaml; kept as a separate VM so
 # each project can be iterated on independently without one's build
 # breaking the other's environment.

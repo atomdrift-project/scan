@@ -1,4 +1,4 @@
-# Wolfi package definition for ascan (binary) and ascan-models (data).
+# Wolfi package definition for scan (binary) and scan-models (data).
 #
 # Status: LOCAL DEV ONLY. Two upstream blockers:
 #   (1) cleave depends on filefacts via a sibling path dep — same issue
@@ -12,7 +12,7 @@
 # See packaging/wolfi/README.md.
 
 package:
-  name: ascan
+  name: scan
   version: 1.2.1
   epoch: 0
   description: ML-powered malware classification using cleave static analysis
@@ -57,22 +57,22 @@ pipeline:
       expected-commit: b10074a9d13dc91e5134a8f6e9e79811e77285fc
   # LOCAL_BUILD_STRIP_END
 
-  - name: Build ascan
+  - name: Build scan
     runs: |
       set -eu
       # LOCAL_BUILD_CD_HERE  — scripts/build.sh replaces this with
       # `cd scan` for local builds (cleave is staged as a sibling).
-      cargo auditable build --profile release-lto --locked --bin ascan
-      install -Dm755 target/release-lto/ascan "${{targets.destdir}}/usr/bin/ascan"
+      cargo auditable build --profile release-lto --locked --bin scan
+      install -Dm755 target/release-lto/scan "${{targets.destdir}}/usr/bin/scan"
 
   - uses: strip
 
 subpackages:
-  - name: ascan-models
-    description: Azoth XGBoost models loaded by ascan at runtime
+  - name: scan-models
+    description: Azoth XGBoost models loaded by scan at runtime
     dependencies:
       runtime:
-        - ascan
+        - scan
     pipeline:
       # LOCAL_BUILD_STRIP_BEGIN  — scripts/build.sh removes this step
       # and replaces the marker below with a copy from the host-staged
@@ -108,12 +108,12 @@ test:
     - name: Version reports correctly
       runs: |
         set -euo pipefail
-        ascan --version
-        ascan --version | grep -q '1\.2\.1'
+        scan --version
+        scan --version | grep -q '1\.2\.1'
     - name: Help works
       runs: |
         set -euo pipefail
-        ascan --help >/dev/null
+        scan --help >/dev/null
 
 update:
   enabled: true

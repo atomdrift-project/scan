@@ -14,15 +14,15 @@ WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 
-BINARY=ascan
+BINARY=scan
 INSTALL_DIR=/usr/local/share/atomdrift/scan
 MODELS_DIR=/usr/local/share/atomdrift/scan/models
 TRAITS_DIR=/usr/local/share/atomdrift/scan/traits
-BIN_LINK=/usr/local/bin/ascan
-PLIST=/Library/LaunchDaemons/com.atomdrift.ascan-worker.plist
-LABEL=com.atomdrift.ascan-worker
-SERVICE_USER=_ascan
-LOG=/var/log/ascan-worker.log
+BIN_LINK=/usr/local/bin/scan
+PLIST=/Library/LaunchDaemons/com.atomdrift.scan-worker.plist
+LABEL=com.atomdrift.scan-worker
+SERVICE_USER=_scan
+LOG=/var/log/scan-worker.log
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -71,8 +71,8 @@ fi
 
 log "Installing binary"
 restart_needed=0
-if ! cmp -s "out/ascan" "$INSTALL_DIR/$BINARY" 2>/dev/null; then
-    install -m 755 out/ascan "$INSTALL_DIR/$BINARY"
+if ! cmp -s "out/scan" "$INSTALL_DIR/$BINARY" 2>/dev/null; then
+    install -m 755 out/scan "$INSTALL_DIR/$BINARY"
     restart_needed=1
 fi
 

@@ -1,7 +1,7 @@
-# Wolfi packaging for ascan
+# Wolfi packaging for scan
 
-This directory builds [Wolfi](https://wolfi.dev) apks for `ascan` and a
-`ascan-models` data subpackage, then assembles them into a minimal OCI
+This directory builds [Wolfi](https://wolfi.dev) apks for `scan` and a
+`scan-models` data subpackage, then assembles them into a minimal OCI
 image alongside the cleave + cleave-traits apks built by
 `cleave/packaging/wolfi/`. The `melange.yaml` is shaped to be drop-in
 copyable into [wolfi-dev/os](https://github.com/wolfi-dev/os) for
@@ -12,7 +12,7 @@ can iterate without a Wolfi-dev clone.
 
 ```
 packaging/wolfi/
-  melange.yaml              # ascan + ascan-models subpackages (UPSTREAMABLE shape)
+  melange.yaml              # scan + scan-models subpackages (UPSTREAMABLE shape)
   apko.yaml                 # local OCI app image (NOT upstreamed)
   lima.yaml                 # Ubuntu 26.04 LTS sandbox for macOS builds
   scripts/
@@ -41,7 +41,7 @@ WOLFI_ARCH=$(uname -m | sed 's/arm64/aarch64/;s/amd64/x86_64/') \
   make wolfi-build
 ```
 
-The local smoke-test image (`out/wolfi/ascan.tar`) is built host-arch
+The local smoke-test image (`out/wolfi/scan.tar`) is built host-arch
 only regardless of `WOLFI_ARCH`, since `nerdctl run` on your host can
 only execute its own arch.
 
@@ -50,13 +50,13 @@ Idempotent + per-component caching:
 | Stamp file                  | Inputs                                                                | Skips                             |
 | --------------------------- | --------------------------------------------------------------------- | --------------------------------- |
 | `out/wolfi/.build.stamp`    | image_hash (everything)                                                | the entire pipeline               |
-| `out/wolfi/.ascan.stamp`    | scan src + azoth + ascan melange.yaml + cleave_hash                  | the ascan + ascan-models melange step |
+| `out/wolfi/.scan.stamp`    | scan src + azoth + scan melange.yaml + cleave_hash                  | the scan + scan-models melange step |
 | `out/wolfi/.cleave.stamp`   | cleave src + filefacts src + cleave melange.yaml                       | the cleave + cleave-traits melange step |
 
 Common cases:
 
 - **Touch nothing, re-run** → 0s (image stamp hits).
-- **Edit only scan source** → cleave melange skipped (~11 min saved); ascan melange runs (~11 min); apko + smoke.
+- **Edit only scan source** → cleave melange skipped (~11 min saved); scan melange runs (~11 min); apko + smoke.
 - **Edit only cleave source** → both melange steps run; full rebuild.
 - **Edit only apko.yaml** → both melange steps skipped (apks intact); apko + smoke only (~30s).
 
@@ -142,14 +142,14 @@ needs both fixed first.
 3. Update `melange.yaml`:
    - `package.version` → new version (drop the `v` prefix).
    - `expected-commit` in the first `git-checkout` → the tag's commit SHA.
-   - `expected-commit` in `ascan-models` subpackage → the azoth commit
+   - `expected-commit` in `scan-models` subpackage → the azoth commit
      you want shipped with this release.
 4. Validate locally: `make wolfi` should still pass after upstream
    changes are merged into scan.
 5. In a wolfi-dev/os clone:
    ```sh
-   cp .../scan/packaging/wolfi/melange.yaml packages/ascan.yaml
-   make package/ascan
+   cp .../scan/packaging/wolfi/melange.yaml packages/scan.yaml
+   make package/scan
    ```
 
 ## Improvements vs the cleave packaging
@@ -161,22 +161,22 @@ needs both fixed first.
 - **Single staging dir for the workspace** — cleave + filefacts +
   scan all sit under one staged tree; melange's `--source-dir`
   points at the parent and the build step `cd`s into `scan/`.
-- **Smoke test asserts ascan's documented exit codes** — accepts
+- **Smoke test asserts scan's documented exit codes** — accepts
   `0/1/2` from a real scan (clean/hostile/suspicious), fails only on
   `3+` which means scanning itself broke.
 
 ## Models
 
-`ascan-models` bundles a pinned snapshot of [azoth](https://codeberg.org/atomdrift/azoth)
+`scan-models` bundles a pinned snapshot of [azoth](https://codeberg.org/atomdrift/azoth)
 into the apk at build time, with `SCAN_MODELS_DIR` set in the apko
 config so the image never tries to clone at runtime. If you want fresh
 models, bump the `expected-commit` in `melange.yaml` and rebuild — the
 hash stamp will see the change and trigger a rebuild.
 
 For a lazy-clone variant (smaller image, requires git + network at
-runtime), drop the `ascan-models` subpackage from `apko.yaml`, add
+runtime), drop the `scan-models` subpackage from `apko.yaml`, add
 `git` and `ca-certificates-bundle` to the image, and remove the
-`SCAN_MODELS_DIR` env so ascan falls back to its auto-clone path.
+`SCAN_MODELS_DIR` env so scan falls back to its auto-clone path.
 
 ## Publishing to a registry
 
@@ -189,8 +189,8 @@ REGISTRY=ghcr.io ORG=foo make docker-publish   # override target
 
 This pushes:
 
-- `docker.io/atomdrift/ascan:<VERSION>` (from `melange.yaml`)
-- `docker.io/atomdrift/ascan:latest`
+- `docker.io/atomdrift/scan:<VERSION>` (from `melange.yaml`)
+- `docker.io/atomdrift/scan:latest`
 
 …both as multi-arch manifest lists with `aarch64` and `x86_64` platform
 manifests inside.
@@ -218,7 +218,7 @@ cosign skips the browser flow.
 cosign verify \
   --certificate-identity-regexp 'YOUR_EMAIL@DOMAIN' \
   --certificate-oidc-issuer https://accounts.google.com \
-  docker.io/atomdrift/ascan:1.2.1
+  docker.io/atomdrift/scan:1.2.1
 ```
 
 Replace `--certificate-identity-regexp` with whatever Google identity

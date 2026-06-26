@@ -6,7 +6,7 @@
 #
 # rust + 7zip come from pkgsrc; innoextract, upx, and rizin (HEAD) are
 # built from upstream source only when they are not already available. The
-# worker runs as the unprivileged `ascan` user under SMF, with
+# worker runs as the unprivileged `scan` user under SMF, with
 # ignore_error=core,signal so a crashing
 # backend triggers a restart instead of dropping into maintenance.
 
@@ -26,22 +26,22 @@ die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
 PKG_PREFIX=/opt/local
-# Source builds and the ascan binary install under /opt/atomdrift/scan rather than
+# Source builds and the scan binary install under /opt/atomdrift/scan rather than
 # /usr/local: in sparse zones /usr is a read-only lofs mount from the global,
 # so /usr/local is unwritable. /opt is writable per-zone.
 SRC_PREFIX=/opt/atomdrift/scan
 SRC_DIR=/var/atomdrift/scan/src
-SCAN_USER=ascan
-SCAN_GROUP=ascan
+SCAN_USER=scan
+SCAN_GROUP=scan
 SCAN_HOME=/var/atomdrift/scan
 SCAN_LOG_DIR=/var/log/atomdrift/scan
 # Disk-backed scratch dir. /tmp on illumos is tmpfs (swap-backed); large
 # unpacks (innoextract, 7z, rizin) can exhaust swap and wedge the whole
 # zone — including /etc/svc/volatile, which then blocks svc.startd.
 SCAN_TMP_DIR=/var/atomdrift/scan/tmp
-SCAN_BIN=$SRC_PREFIX/bin/ascan
-SMF_MANIFEST=/lib/svc/manifest/site/ascan-worker.xml
-SMF_FMRI=svc:/site/ascan-worker:default
+SCAN_BIN=$SRC_PREFIX/bin/scan
+SMF_MANIFEST=/lib/svc/manifest/site/scan-worker.xml
+SMF_FMRI=svc:/site/scan-worker:default
 
 PATH=$PKG_PREFIX/sbin:$PKG_PREFIX/bin:$SRC_PREFIX/sbin:$SRC_PREFIX/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -98,7 +98,7 @@ else
     log "All pkgsrc dependencies already installed"
 fi
 
-current_ascan_rev() {
+current_scan_rev() {
     if ! command -v git >/dev/null 2>&1; then
         echo unknown
         return
@@ -112,15 +112,15 @@ current_ascan_rev() {
     fi
 }
 
-SCAN_REV=$(current_ascan_rev)
-SCAN_REV_MARKER=$SRC_PREFIX/.ascan-installed-rev
-ascan_build_needed=1
+SCAN_REV=$(current_scan_rev)
+SCAN_REV_MARKER=$SRC_PREFIX/.scan-installed-rev
+scan_build_needed=1
 case "$SCAN_REV" in
-    unknown|*-dirty) ascan_build_needed=1 ;;
+    unknown|*-dirty) scan_build_needed=1 ;;
     *)
         if [ -x "$SCAN_BIN" ] && [ -f "$SCAN_REV_MARKER" ] \
                 && [ "$(cat "$SCAN_REV_MARKER")" = "$SCAN_REV" ]; then
-            ascan_build_needed=0
+            scan_build_needed=0
         fi
         ;;
 esac
@@ -144,7 +144,7 @@ ensure_ips() {
     return "$rc"
 }
 
-if [ "$need_source_builds" -eq 1 ] || [ "$ascan_build_needed" -eq 1 ]; then
+if [ "$need_source_builds" -eq 1 ] || [ "$scan_build_needed" -eq 1 ]; then
     log "Ensuring IPS build prerequisites (headers, ld, crt files)"
     # build-essential pulls headers + ld; c-runtime supplies
     # /usr/lib/{,amd64/}crt1.o which build-essential does NOT pull in on
@@ -283,7 +283,7 @@ ensure_source_tool upx          https://github.com/upx/upx.git                v4
 ensure_source_tool rizin        https://github.com/rizinorg/rizin.git         HEAD     build_rizin
 
 ###############################################################################
-# ascan user, build, install
+# scan user, build, install
 ###############################################################################
 
 log "Ensuring $SCAN_USER user/group exist"
@@ -298,35 +298,35 @@ chmod 700 "$SCAN_TMP_DIR"
 # across restarts. Safe: only the worker writes here.
 find "$SCAN_TMP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-ascan_changed=0
-if [ "$ascan_build_needed" -eq 1 ]; then
-    log "Building ascan from source tree ($SCAN_REV)"
+scan_changed=0
+if [ "$scan_build_needed" -eq 1 ]; then
+    log "Building scan from source tree ($SCAN_REV)"
     # unrar-sys builds the unrar library as C++ but doesn't emit a link-lib for
     # libstdc++, so the final link (with -nodefaultlibs) leaves operator new,
     # std::__cxx11 string symbols, and __gxx_personality_v0 unresolved on illumos.
     # Force rustc to append -lstdc++ to the link line.
     RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-lstdc++" cargo build --release \
-        || die "ascan build failed"
+        || die "scan build failed"
 
-    log "Installing ascan binary to $SCAN_BIN"
+    log "Installing scan binary to $SCAN_BIN"
     # illumos install(1) is the old SunOS variant with incompatible flags;
     # use cp+chmod for portability. Stage to .new then rename for atomicity
     # (replacing a running binary while the SMF service is up is otherwise racy).
-    cp -f target/release/ascan "$SCAN_BIN.new"
+    cp -f target/release/scan "$SCAN_BIN.new"
     chmod 755 "$SCAN_BIN.new"
     mv -f "$SCAN_BIN.new" "$SCAN_BIN"
     case "$SCAN_REV" in
         unknown|*-dirty) rm -f "$SCAN_REV_MARKER" ;;
         *) echo "$SCAN_REV" > "$SCAN_REV_MARKER" ;;
     esac
-    ascan_changed=1
+    scan_changed=1
 else
-    log "ascan $SCAN_REV already installed; skipping cargo build"
+    log "scan $SCAN_REV already installed; skipping cargo build"
 fi
 
 log "Refreshing rules/models as $SCAN_USER"
 rules_changed=0
-update_log=/tmp/ascan-update-rules.$$.log
+update_log=/tmp/scan-update-rules.$$.log
 if su - "$SCAN_USER" -c "PATH=$PATH $SCAN_BIN update-rules" > "$update_log" 2>&1; then
     cat "$update_log"
 else
@@ -343,10 +343,10 @@ rm -f "$update_log"
 # SMF manifest
 ###############################################################################
 
-manifest_tmp=/tmp/ascan-worker.$$.xml
+manifest_tmp=/tmp/scan-worker.$$.xml
 manifest_changed=0
 
-# duration=child: ascan runs in the foreground (doesn't fork), so SMF must
+# duration=child: scan runs in the foreground (doesn't fork), so SMF must
 # treat the start method's process itself as the service. With contract mode
 # SMF would expect start to fork+exit and would kill the worker as a
 # "method exit timeout" after timeout_seconds. With child mode SMF tracks
@@ -356,8 +356,8 @@ manifest_changed=0
 cat > "$manifest_tmp" <<EOF
 <?xml version="1.0"?>
 <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
-<service_bundle type="manifest" name="ascan-worker">
-  <service name="site/ascan-worker" type="service" version="1">
+<service_bundle type="manifest" name="scan-worker">
+  <service name="site/scan-worker" type="service" version="1">
     <create_default_instance enabled="true"/>
     <single_instance/>
     <dependency name="network" grouping="require_all" restart_on="error" type="service">
@@ -422,7 +422,7 @@ if [ "$manifest_changed" -eq 1 ] || [ "$service_was_configured" -eq 0 ]; then
     svccfg import "$SMF_MANIFEST"
 fi
 
-if [ "$ascan_changed" -eq 1 ] || [ "$rules_changed" -eq 1 ] \
+if [ "$scan_changed" -eq 1 ] || [ "$rules_changed" -eq 1 ] \
         || [ "$manifest_changed" -eq 1 ] || [ "$service_was_configured" -eq 0 ]; then
     log "Clearing maintenance state and restarting $SMF_FMRI"
     svcadm clear "$SMF_FMRI" 2>/dev/null || true

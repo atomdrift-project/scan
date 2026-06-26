@@ -22,9 +22,9 @@ set -eu
 URL="${1:-}"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
-SERVICE_USER=ascan
-SERVICE_NAME=ascan-worker
-BINARY=ascan
+SERVICE_USER=scan
+SERVICE_NAME=scan-worker
+BINARY=scan
 BIN_PATH=/usr/local/bin/${BINARY}
 STATE_HOME=/var/lib/atomdrift/scan
 UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
@@ -202,7 +202,7 @@ if [ -n "${DATA_DIR}" ]; then exec_args="${exec_args} --data-dir ${DATA_DIR}"; f
 
 # --- Unit -------------------------------------------------------------------
 
-TMP_UNIT=$(mktemp -t ascan-worker.service.XXXXXX)
+TMP_UNIT=$(mktemp -t scan-worker.service.XXXXXX)
 
 cat >"$TMP_UNIT" <<EOF
 [Unit]
@@ -291,11 +291,11 @@ fi
 
 # --- Migrate from the cron-based deploy ------------------------------------
 
-if crontab -l 2>/dev/null | grep -q "ascan worker"; then
+if crontab -l 2>/dev/null | grep -q "scan worker"; then
     log "Removing legacy cron entry from $(id -un)'s crontab"
-    (crontab -l 2>/dev/null | grep -v "ascan worker" || true) | crontab -
-    log "Stopping any user-owned 'ascan worker' processes from the cron era"
-    pkill -u "$(id -u)" -f "ascan worker" 2>/dev/null || true
+    (crontab -l 2>/dev/null | grep -v "scan worker" || true) | crontab -
+    log "Stopping any user-owned 'scan worker' processes from the cron era"
+    pkill -u "$(id -u)" -f "scan worker" 2>/dev/null || true
 fi
 
 # --- Activate ---------------------------------------------------------------

@@ -1,6 +1,6 @@
 # Atomdrift Scan Server API
 
-`ascan serve` is an HTTP daemon that takes a file and returns a
+`scan serve` is an HTTP daemon that takes a file and returns a
 classification. It binds to loopback. It has no authentication. Treat
 it as a local service and put a reverse proxy in front of it if
 anything else needs to reach it.
@@ -10,7 +10,7 @@ For the response schema, see [JSON.md](JSON.md).
 
 ## Running the server
 
-    ascan serve
+    scan serve
 
 The defaults are deliberate. Override them only when you have a reason.
 
@@ -225,7 +225,7 @@ The server is built for trusted networks. The defaults reflect that.
 
 ## Example session
 
-    $ ascan serve --bind 127.0.0.1:49999 --workers 4
+    $ scan serve --bind 127.0.0.1:49999 --workers 4
     $ curl -s http://127.0.0.1:49999/_/health | jq -r .status
     ok
     $ curl -s -F file=@/bin/ls http://127.0.0.1:49999/analyze \

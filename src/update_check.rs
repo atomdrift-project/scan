@@ -46,7 +46,7 @@ fn fetch(name: &str, marker: bool) -> Result<Manifest> {
     let client = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .connect_timeout(FETCH_TIMEOUT)
-        .user_agent(concat!("ascan/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building update-check HTTP client")?;
     let text = client

@@ -1,4 +1,4 @@
-//! Atomdrift Scan (`ascan`) — ML-powered malware classification CLI.
+//! Atomdrift Scan (`scan`) — ML-powered malware classification CLI.
 
 #[cfg(all(
     unix,
@@ -36,7 +36,7 @@ enum Show {
 }
 
 #[derive(Parser)]
-#[command(name = "ascan")]
+#[command(name = "scan")]
 #[command(version)]
 #[command(about = "Atomdrift Scan — context-free malware detection (ML + static analysis)")]
 #[command(group(
@@ -295,7 +295,7 @@ struct Cli {
     )]
     fetch_max_total_size: u64,
 
-    /// Paths to files or directories to scan (shorthand for `ascan fs <paths...>`)
+    /// Paths to files or directories to scan (shorthand for `scan fs <paths...>`)
     paths: Vec<PathBuf>,
 
     #[command(subcommand)]
@@ -631,7 +631,7 @@ fn main() -> Result<()> {
                     registry: None,
                 }
             } else {
-                Cli::parse_from(["ascan", "--help"]);
+                Cli::parse_from(["scan", "--help"]);
                 std::process::exit(0);
             }
         }
@@ -808,7 +808,7 @@ fn main() -> Result<()> {
 
     #[cfg(debug_assertions)]
     tracing::warn!(
-        "DEBUG binary — ascan will be very slow; use `make release` for production builds"
+        "DEBUG binary — scan will be very slow; use `make release` for production builds"
     );
 
     // Warn about missing analysis tools for commands that will run cleave.
@@ -1223,7 +1223,7 @@ fn main() -> Result<()> {
                 });
                 println!("{version}");
             } else {
-                println!("ascan {}", env!("CARGO_PKG_VERSION"));
+                println!("scan {}", env!("CARGO_PKG_VERSION"));
                 if let Some(v) = scan::models_repo::version() {
                     println!("  models: {v}");
                 }
@@ -1594,7 +1594,7 @@ mod tests {
     #[test]
     fn bare_paths_default_to_scan_shorthand() -> Result<()> {
         let cli =
-            Cli::try_parse_from(["ascan", "/tmp/a", "/tmp/b"]).context("parse should work")?;
+            Cli::try_parse_from(["scan", "/tmp/a", "/tmp/b"]).context("parse should work")?;
         assert_eq!(
             cli.paths,
             vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
@@ -1605,7 +1605,7 @@ mod tests {
 
     #[test]
     fn fs_subcommand_accepts_multiple_paths() -> Result<()> {
-        let cli = Cli::try_parse_from(["ascan", "fs", "/tmp/a", "/tmp/b"])
+        let cli = Cli::try_parse_from(["scan", "fs", "/tmp/a", "/tmp/b"])
             .context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
             Commands::Fs { paths, .. } => {
@@ -1622,7 +1622,7 @@ mod tests {
     #[test]
     fn fs_hopper_flag_and_upload_alias_parse() -> Result<()> {
         for flag in ["--hopper", "--upload"] {
-            let cli = Cli::try_parse_from(["ascan", "fs", flag, "http://hopper:8081", "/tmp/a"])
+            let cli = Cli::try_parse_from(["scan", "fs", flag, "http://hopper:8081", "/tmp/a"])
                 .context("parse should work")?;
             match cli.command.context("fs subcommand expected")? {
                 Commands::Fs { paths, hopper, .. } => {
@@ -1637,7 +1637,7 @@ mod tests {
 
     #[test]
     fn fs_without_hopper_defaults_to_none() -> Result<()> {
-        let cli = Cli::try_parse_from(["ascan", "fs", "/tmp/a"]).context("parse should work")?;
+        let cli = Cli::try_parse_from(["scan", "fs", "/tmp/a"]).context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
             Commands::Fs { hopper, .. } => assert!(hopper.is_none()),
             other => anyhow::bail!("unexpected command: {other:?}"),
@@ -1647,7 +1647,7 @@ mod tests {
 
     #[test]
     fn scan_alias_maps_to_fs() -> Result<()> {
-        let cli = Cli::try_parse_from(["ascan", "scan", "/tmp/a"]).context("parse should work")?;
+        let cli = Cli::try_parse_from(["scan", "scan", "/tmp/a"]).context("parse should work")?;
         match cli.command.context("fs subcommand expected via alias")? {
             Commands::Fs { paths, .. } => assert_eq!(paths, vec![PathBuf::from("/tmp/a")]),
             other => anyhow::bail!("unexpected command: {other:?}"),
@@ -1658,7 +1658,7 @@ mod tests {
     #[test]
     fn serve_and_worker_accept_negative_max_rss_disable() -> Result<()> {
         let cli = Cli::try_parse_from([
-            "ascan",
+            "scan",
             "serve",
             "--bind",
             "127.0.0.1:49999",
@@ -1677,7 +1677,7 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from([
-            "ascan",
+            "scan",
             "worker",
             "--url",
             "http://127.0.0.1:8081",
@@ -1754,50 +1754,50 @@ mod tests {
 
     #[test]
     fn severity_level_flags_parse() -> Result<()> {
-        let cli = Cli::try_parse_from(["ascan", "-1", "/tmp/a"]).context("-1 should parse")?;
+        let cli = Cli::try_parse_from(["scan", "-1", "/tmp/a"]).context("-1 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(10));
 
         let cli =
-            Cli::try_parse_from(["ascan", "--loose", "/tmp/a"]).context("--loose should parse")?;
+            Cli::try_parse_from(["scan", "--loose", "/tmp/a"]).context("--loose should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(10));
 
-        let cli = Cli::try_parse_from(["ascan", "--paranoid", "/tmp/a"])
+        let cli = Cli::try_parse_from(["scan", "--paranoid", "/tmp/a"])
             .context("--paranoid should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(90));
 
-        let cli = Cli::try_parse_from(["ascan", "scan", "--paranoid", "/tmp/a"])
+        let cli = Cli::try_parse_from(["scan", "scan", "--paranoid", "/tmp/a"])
             .context("global --paranoid should parse after scan")?;
         assert_eq!(cli.selected_severity_level(), Some(90));
 
-        let cli = Cli::try_parse_from(["ascan", "-0", "/tmp/a"]).context("-0 should parse")?;
+        let cli = Cli::try_parse_from(["scan", "-0", "/tmp/a"]).context("-0 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(0));
 
         let cli =
-            Cli::try_parse_from(["ascan", "-l", "100", "/tmp/a"]).context("-l 100 should parse")?;
+            Cli::try_parse_from(["scan", "-l", "100", "/tmp/a"]).context("-l 100 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(100));
 
-        let cli = Cli::try_parse_from(["ascan", "--level", "12", "/tmp/a"])
+        let cli = Cli::try_parse_from(["scan", "--level", "12", "/tmp/a"])
             .context("--level 12 should parse")?;
         assert_eq!(cli.selected_severity_level(), Some(12));
 
         // Out-of-range and conflicting selections are rejected. The level
         // range is per-100M (0..=25000) since the per-million migration.
-        assert!(Cli::try_parse_from(["ascan", "-l", "25001", "/tmp/a"]).is_err());
-        assert!(Cli::try_parse_from(["ascan", "-l", "3", "-5", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["scan", "-l", "25001", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["scan", "-l", "3", "-5", "/tmp/a"]).is_err());
         Ok(())
     }
 
     #[test]
     fn gzip_long_aliases_are_not_accepted() {
-        assert!(Cli::try_parse_from(["ascan", "--fast", "/tmp/a"]).is_err());
-        assert!(Cli::try_parse_from(["ascan", "--best", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["scan", "--fast", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["scan", "--best", "/tmp/a"]).is_err());
     }
 
     #[test]
     fn severity_level_flags_conflict_with_each_other_and_manual_thresholds() {
-        assert!(Cli::try_parse_from(["ascan", "-1", "-9", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(["scan", "-1", "-9", "/tmp/a"]).is_err());
         assert!(
-            Cli::try_parse_from(["ascan", "-9", "--threshold-hostile", "0.90", "/tmp/a"]).is_err()
+            Cli::try_parse_from(["scan", "-9", "--threshold-hostile", "0.90", "/tmp/a"]).is_err()
         );
     }
 }

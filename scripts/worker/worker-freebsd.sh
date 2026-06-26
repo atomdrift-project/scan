@@ -2,7 +2,7 @@
 # worker-freebsd.sh - Install Atomdrift Scan worker as a native FreeBSD rc.d service.
 #
 # Local install for a FreeBSD host (no jail). Builds as the invoking user,
-# installs the binary, creates an unprivileged `ascan` service user, and runs
+# installs the binary, creates an unprivileged `scan` service user, and runs
 # the worker under rc.d via daemon(8). This mirrors the systemd deploy
 # (worker-linux.sh): one host, one supervised service. For a jailed deploy
 # use `make deploy-jail-worker` (scripts/worker/worker-bastille.sh) instead.
@@ -27,9 +27,9 @@ URL="${1:-}"
 WORKERS="${WORKERS:-}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 
-BINARY=ascan
+BINARY=scan
 BIN_PATH=/usr/local/bin/${BINARY}
-RCD_FILE=/usr/local/etc/rc.d/ascan-worker
+RCD_FILE=/usr/local/etc/rc.d/scan-worker
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
@@ -82,13 +82,13 @@ RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --release || die "build failed
 # --- Service user -----------------------------------------------------------
 # A home directory is required: the worker resolves cleave's traits/models
 # under the service user's data dir, and daemon(8) -u sets HOME from it. The
-# shell is /bin/sh (not nologin) so the `su -l ascan` model refresh below can
+# shell is /bin/sh (not nologin) so the `su -l scan` model refresh below can
 # run; the account has no password, so it is not remotely loginable. This
 # mirrors the run-jail user in worker-bastille.sh.
 
-if ! id -u ascan >/dev/null 2>&1; then
-	log "Creating service user 'ascan'"
-	$SUDO pw useradd ascan -m -s /bin/sh -c "Atomdrift Scan Worker"
+if ! id -u scan >/dev/null 2>&1; then
+	log "Creating service user 'scan'"
+	$SUDO pw useradd scan -m -s /bin/sh -c "Atomdrift Scan Worker"
 fi
 
 # --- Binary -----------------------------------------------------------------
@@ -105,18 +105,18 @@ else
 fi
 
 # --- Models and traits ------------------------------------------------------
-# Populate the ascan user's data dir so the first worker start is not racing
+# Populate the scan user's data dir so the first worker start is not racing
 # a clone. Idempotent: update-rules pulls when a checkout already exists.
 
 log "Refreshing models and traits"
-$SUDO su -l ascan -c "${BIN_PATH} update-rules" || die "update-rules failed"
+$SUDO su -l scan -c "${BIN_PATH} update-rules" || die "update-rules failed"
 
 # --- rc.d service -----------------------------------------------------------
 
-worker_args=$(ascan_worker_args "$URL" "$WORKERS")
+worker_args=$(scan_worker_args "$URL" "$WORKERS")
 
-TMP_RCD=$(mktemp -t ascan-worker.rcd.XXXXXX)
-ascan_rcd_script "${BIN_PATH}" "$worker_args" "$LLM" >"$TMP_RCD"
+TMP_RCD=$(mktemp -t scan-worker.rcd.XXXXXX)
+scan_rcd_script "${BIN_PATH}" "$worker_args" "$LLM" >"$TMP_RCD"
 
 rcd_changed=0
 if $SUDO cmp -s "$TMP_RCD" "$RCD_FILE" 2>/dev/null; then
@@ -130,18 +130,18 @@ fi
 # --- Activate ---------------------------------------------------------------
 
 # sysrc is idempotent; enable so the service also comes back across reboots.
-$SUDO sysrc ascan_worker_enable=YES >/dev/null
+$SUDO sysrc scan_worker_enable=YES >/dev/null
 
 if [ "$binary_changed" -eq 1 ] || [ "$rcd_changed" -eq 1 ]; then
-	log "Restarting ascan-worker"
-	$SUDO service ascan-worker stop 2>/dev/null || true
+	log "Restarting scan-worker"
+	$SUDO service scan-worker stop 2>/dev/null || true
 	# Force-kill a worker stuck in rizin teardown so the restart is clean.
-	$SUDO pkill -9 -F /var/run/ascan_worker.pid 2>/dev/null || true
-	$SUDO service ascan-worker start || die "service failed to start; see /var/log/ascan-worker.log"
+	$SUDO pkill -9 -F /var/run/scan_worker.pid 2>/dev/null || true
+	$SUDO service scan-worker start || die "service failed to start; see /var/log/scan-worker.log"
 else
-	log "No changes; ensuring ascan-worker is running"
-	$SUDO service ascan-worker status >/dev/null 2>&1 || $SUDO service ascan-worker start
+	log "No changes; ensuring scan-worker is running"
+	$SUDO service scan-worker status >/dev/null 2>&1 || $SUDO service scan-worker start
 fi
 
-$SUDO service ascan-worker status || true
+$SUDO service scan-worker status || true
 log "Deployment complete"

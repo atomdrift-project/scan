@@ -20,7 +20,7 @@
 #   WORKER_NODES   space-separated worker hosts (default below)
 #   HOPPER_NODE    host to redeploy hopper on   (default below)
 #   STAGGER        seconds between window launches / touches (default 5)
-#   SESSION        tmux session name (default ascan-deploy)
+#   SESSION        tmux session name (default scan-deploy)
 set -u
 
 # Re-exec entry point: each tmux window runs `$0 _run <host> <label> <cmd>`.
@@ -46,7 +46,7 @@ URL="${1:-${URL:-http://10.9.8.5:8081/}}"
 WORKER_NODES="${WORKER_NODES:-10.9.8.2 10.9.8.8 10.9.8.9 10.9.8.149 10.9.8.13}"
 HOPPER_NODE="${HOPPER_NODE:-10.9.8.5}"
 STAGGER="${STAGGER:-5}"
-SESSION="${SESSION:-ascan-deploy}"
+SESSION="${SESSION:-scan-deploy}"
 
 command -v tmux >/dev/null 2>&1 || { echo "error: tmux not found" >&2; exit 1; }
 

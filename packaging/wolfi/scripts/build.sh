@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build ascan + ascan-models apks via melange, then assemble an OCI
+# Build scan + scan-models apks via melange, then assemble an OCI
 # image via apko. Idempotent: skips work when source + yaml hashes match
 # the on-disk stamp.
 #
@@ -26,13 +26,13 @@ AZOTH_REPO="$SIBLING_DIR/azoth"
 OUT_DIR="$REPO_ROOT/out/wolfi"
 STAGE_DIR="$OUT_DIR/source"
 STAMP="$OUT_DIR/.build.stamp"
-VM_NAME="ascan-wolfi"
+VM_NAME="scan-wolfi"
 APKO_IMAGE="${APKO_IMAGE:-cgr.dev/chainguard/apko:latest}"
 MELANGE_IMAGE="${MELANGE_IMAGE:-cgr.dev/chainguard/melange:latest}"
 
 [ -d "$CLEAVE_REPO" ]    || { echo "error: missing $CLEAVE_REPO" >&2; exit 1; }
 [ -d "$FILEFACTS_REPO" ] || { echo "error: missing $FILEFACTS_REPO" >&2; exit 1; }
-[ -d "$AZOTH_REPO" ]     || { echo "error: missing $AZOTH_REPO (needed for ascan-models subpackage)" >&2; exit 1; }
+[ -d "$AZOTH_REPO" ]     || { echo "error: missing $AZOTH_REPO (needed for scan-models subpackage)" >&2; exit 1; }
 
 # Default to multi-arch (aarch64,x86_64) so the apks we produce match
 # what the publish step needs. For fast single-arch local iteration,
@@ -52,8 +52,8 @@ mkdir -p "$OUT_DIR/packages" "$STAGE_DIR"
 # only re-run the work whose inputs actually changed:
 #   cleave_hash:  cleave src + filefacts src + cleave's melange.yaml.
 #                 Invalidates the cleave + cleave-traits apks.
-#   ascan_hash:   scan src + azoth + scan's melange.yaml + cleave_hash.
-#                 Invalidates the ascan + ascan-models apks.
+#   scan_hash:   scan src + azoth + scan's melange.yaml + cleave_hash.
+#                 Invalidates the scan + scan-models apks.
 #   image_hash:   everything above + apko.yaml + arch.
 #                 Invalidates the OCI tarball.
 hash_tree() {
@@ -70,7 +70,7 @@ cleave_hash=$( {
     echo "arch=$WOLFI_ARCH"
   } | shasum -a 256 | awk '{print $1}')
 
-ascan_hash=$( {
+scan_hash=$( {
     echo "cleave=$cleave_hash"
     hash_tree "$REPO_ROOT"  src Cargo.toml Cargo.lock
     hash_tree "$AZOTH_REPO" .
@@ -79,14 +79,14 @@ ascan_hash=$( {
   } | shasum -a 256 | awk '{print $1}')
 
 image_hash=$( {
-    echo "ascan=$ascan_hash"
+    echo "scan=$scan_hash"
     shasum -a 256 "$PKG_DIR/apko.yaml" 2>/dev/null
   } | shasum -a 256 | awk '{print $1}')
 
 CLEAVE_STAMP="$OUT_DIR/.cleave.stamp"
-SCAN_STAMP="$OUT_DIR/.ascan.stamp"
+SCAN_STAMP="$OUT_DIR/.scan.stamp"
 
-if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$image_hash" ] && [ -f "$OUT_DIR/ascan.tar" ]; then
+if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$image_hash" ] && [ -f "$OUT_DIR/scan.tar" ]; then
   echo "==> up to date (image hash $image_hash); skipping build"
   echo "    force rebuild: rm $STAMP"
   exit 0
@@ -184,7 +184,7 @@ case "$os" in
     else echo "error: no container runtime" >&2; exit 1; fi
     SRC_IN_RT="$STAGE_DIR"
     OUT_IN_RT="$OUT_DIR"
-    CACHE_IN_RT="${XDG_CACHE_HOME:-$HOME/.cache}/ascan-wolfi"
+    CACHE_IN_RT="${XDG_CACHE_HOME:-$HOME/.cache}/scan-wolfi"
     mkdir -p "$CACHE_IN_RT"
     ;;
   *) echo "error: unsupported OS '$os'" >&2; exit 1 ;;
@@ -223,14 +223,14 @@ else
   echo "$cleave_hash" > "$CLEAVE_STAMP.new" && mv -f "$CLEAVE_STAMP.new" "$CLEAVE_STAMP"
 fi
 
-have_ascan_apks() {
-  ls "$OUT_DIR/packages/$WOLFI_ARCH/ascan-"[0-9]*.apk   >/dev/null 2>&1 && \
-  ls "$OUT_DIR/packages/$WOLFI_ARCH/ascan-models-"*.apk >/dev/null 2>&1
+have_scan_apks() {
+  ls "$OUT_DIR/packages/$WOLFI_ARCH/scan-"[0-9]*.apk   >/dev/null 2>&1 && \
+  ls "$OUT_DIR/packages/$WOLFI_ARCH/scan-models-"*.apk >/dev/null 2>&1
 }
-if [ -f "$SCAN_STAMP" ] && [ "$(cat "$SCAN_STAMP")" = "$ascan_hash" ] && have_ascan_apks; then
-  echo "==> ascan apks up to date (hash $ascan_hash); skipping ascan melange"
+if [ -f "$SCAN_STAMP" ] && [ "$(cat "$SCAN_STAMP")" = "$scan_hash" ] && have_scan_apks; then
+  echo "==> scan apks up to date (hash $scan_hash); skipping scan melange"
 else
-  echo "==> building ascan + ascan-models ($WOLFI_ARCH)"
+  echo "==> building scan + scan-models ($WOLFI_ARCH)"
   $NERDCTL run --rm \
     -v "$SRC_IN_RT:/src:ro" \
     -v "$OUT_IN_RT:/out" \
@@ -244,16 +244,16 @@ else
       --cache-dir /cache/melange \
       --signing-key /out/melange.rsa \
       --out-dir /out/packages
-  echo "$ascan_hash" > "$SCAN_STAMP.new" && mv -f "$SCAN_STAMP.new" "$SCAN_STAMP"
+  echo "$scan_hash" > "$SCAN_STAMP.new" && mv -f "$SCAN_STAMP.new" "$SCAN_STAMP"
 fi
 
 cp -f "$OUT_DIR/melange.rsa.pub" "$OUT_DIR/packages/melange.rsa.pub"
 
 echo "==> assembling OCI image with apko (local smoke-test image, $HOST_WOLFI_ARCH only)"
-# The local ascan.tar is used by smoke-test.sh which loads it into the
+# The local scan.tar is used by smoke-test.sh which loads it into the
 # host container runtime — only the host arch matters here. Multi-arch
 # publishing happens via scripts/publish.sh.
-TAR_TMP="$OUT_DIR/ascan.tar.new"
+TAR_TMP="$OUT_DIR/scan.tar.new"
 rm -f "$TAR_TMP"
 $NERDCTL run --rm \
   -v "$SRC_IN_RT:/src:ro" \
@@ -262,13 +262,13 @@ $NERDCTL run --rm \
   -w /out \
   "$APKO_IMAGE" build \
     /src/scan/packaging/wolfi/apko.yaml \
-    ascan:latest \
-    /out/ascan.tar.new \
+    scan:latest \
+    /out/scan.tar.new \
     --arch "$HOST_WOLFI_ARCH" \
     --keyring-append /out/melange.rsa.pub \
     --cache-dir /cache/apko
 
-mv -f "$TAR_TMP" "$OUT_DIR/ascan.tar"
+mv -f "$TAR_TMP" "$OUT_DIR/scan.tar"
 echo "$image_hash" > "$STAMP.new" && mv -f "$STAMP.new" "$STAMP"
 
-echo "==> done: $OUT_DIR/ascan.tar"
+echo "==> done: $OUT_DIR/scan.tar"

@@ -481,7 +481,7 @@ fn request(
 ) -> std::result::Result<(LlmGrade, String), CallError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(cfg.timeout)
-        .user_agent(concat!("ascan/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building LLM HTTP client")
         .map_err(CallError::Transport)?;
@@ -579,7 +579,7 @@ fn request(
 fn probe_endpoint(cfg: &InterpretConfig) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(cfg.timeout.min(HEALTH_PROBE_TIMEOUT))
-        .user_agent(concat!("ascan/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
         .build()
     else {
         return false;

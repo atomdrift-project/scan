@@ -14,9 +14,9 @@
 # Compose the `worker ...` argument string from a hopper URL and an optional
 # worker count. The interpret gate (min ML probability) is left at the binary's
 # default. The endpoint itself is supplied via the SCAN_LLM environment variable
-# in ascan_rcd_script, not here.
-# Usage: ascan_worker_args <url> [workers]
-ascan_worker_args() {
+# in scan_rcd_script, not here.
+# Usage: scan_worker_args <url> [workers]
+scan_worker_args() {
 	_lwa_url="$1"
 	_lwa_workers="$2"
 	_lwa_args="worker --url $_lwa_url --interpret"
@@ -25,40 +25,40 @@ ascan_worker_args() {
 }
 
 # Emit the rc.d service script to stdout.
-# Usage: ascan_rcd_script <binary_path> <worker_args> [llm_url]
+# Usage: scan_rcd_script <binary_path> <worker_args> [llm_url]
 #
 # llm_url is baked into the service as the SCAN_LLM environment variable (the
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass);
-# override at runtime via ascan_worker_llm in rc.conf.
+# override at runtime via scan_worker_llm in rc.conf.
 #
 # The worker is expected to run forever; an OOM kill or a panic should bring
 # it straight back. daemon(8) is the supervisor: `-r` restarts the child
 # whenever it exits (any status), and `-R 5` paces those restarts 5s apart so
 # a hard crash loop (bad URL, missing model) backs off instead of pegging a
-# core. rc's `ascan_worker_enable=YES` brings it back across reboots, so the
-# only way the worker stays down is an explicit `service ascan-worker stop`.
-ascan_rcd_script() {
+# core. rc's `scan_worker_enable=YES` brings it back across reboots, so the
+# only way the worker stays down is an explicit `service scan-worker stop`.
+scan_rcd_script() {
 	_lrs_bin="$1"
 	_lrs_worker_args="$2"
 	_lrs_llm="${3:-http://10.9.8.149:8000/v1}"
 	cat <<EOF
 #!/bin/sh
 
-# PROVIDE: ascan_worker
+# PROVIDE: scan_worker
 # REQUIRE: LOGIN DAEMON NETWORKING
 # KEYWORD: shutdown
 
 . /etc/rc.subr
 
-name="ascan_worker"
-rcvar="ascan_worker_enable"
+name="scan_worker"
+rcvar="scan_worker_enable"
 
 load_rc_config \$name
 
-: \${ascan_worker_enable:="NO"}
-: \${ascan_worker_logfile:="/var/log/ascan-worker.log"}
+: \${scan_worker_enable:="NO"}
+: \${scan_worker_logfile:="/var/log/scan-worker.log"}
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
-: \${ascan_worker_llm:="$_lrs_llm"}
+: \${scan_worker_llm:="$_lrs_llm"}
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
@@ -70,9 +70,9 @@ command="/usr/sbin/daemon"
 malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,abort_conf:true"
 # -r -R 5 : supervise the worker and restart it forever (5s back-off) after
 #           any exit, so an OOM kill or panic self-heals. -P is the supervisor
-#           pidfile; \`service ascan-worker stop\` signals it to tear the
+#           pidfile; \`service scan-worker stop\` signals it to tear the
 #           whole tree down.
-command_args="-c -f -r -R 5 -P \${pidfile} -o \${ascan_worker_logfile} -u ascan /usr/bin/env MALLOC_CONF=\${malloc_conf} SCAN_LLM=\${ascan_worker_llm} $_lrs_bin $_lrs_worker_args"
+command_args="-c -f -r -R 5 -P \${pidfile} -o \${scan_worker_logfile} -u scan /usr/bin/env MALLOC_CONF=\${malloc_conf} SCAN_LLM=\${scan_worker_llm} $_lrs_bin $_lrs_worker_args"
 
 run_rc_command "\$1"
 EOF

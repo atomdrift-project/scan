@@ -1,8 +1,12 @@
 SHELL := /bin/sh
-BINARY = ascan
+BINARY = scan
+# Canonical name for the locally-installed binary. The build artifact is `scan`
+# (see Cargo.toml), but `make install` lands it as `atomscan` and adds a `scan`
+# symlink only when PATH has no `scan` already (avast ships /usr/bin/scan).
+INSTALL_NAME = atomscan
 OUT_DIR = out
 BUILD ?= build
-SERVER_RUN ?= ascan
+SERVER_RUN ?= scan
 WORKER_RUN ?= litworker
 DATASET ?= slow
 
@@ -32,7 +36,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: build release release-lto install check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -80,11 +84,12 @@ release: check-cargo $(OUT_DIR)
 MANIFEST_GEN ?= ../cleave/tools/manifest-gen
 TRAITS ?= ../azoth
 R2_REMOTE ?= atomdrift-updates:atomdrift-updates
-# Published model-distribution channel path. Intentionally NOT rebranded to
-# `ascan`: existing release bundles and clients already resolve models under
-# this prefix, and `--engine-bin litmus` below compat-tests historical release
-# binaries (named `litmus`). Renaming the channel is a separate, coordinated
-# migration (re-upload + client default change), not part of the CLI rebrand.
+# Published model-distribution channel path. Intentionally NOT rebranded:
+# existing release bundles and clients already resolve models under this
+# prefix, and `--engine-bin litmus,scan` below compat-tests historical release
+# binaries by name (`litmus` for older releases, `scan` going forward).
+# Renaming the channel is a separate, coordinated migration (re-upload + client
+# default change), not part of the CLI rebrand.
 R2_LITMUS ?= litmus
 ISSUER ?= https://accounts.google.com
 DIST ?= dist
@@ -100,7 +105,7 @@ publish-models: release ## Compat-test azoth vs last (VERSIONS-1) litmus release
 	cd $(MANIFEST_GEN) && GOWORK=off go build -o manifest-gen .
 	$(MANIFEST_GEN)/manifest-gen \
 	  --traits $(TRAITS) --repo . --out "$(DIST)" \
-	  --engine-bin litmus,ascan --traits-env SCAN_MODELS_DIR --validate-args "validate --skip-traits" \
+	  --engine-bin litmus,scan --traits-env SCAN_MODELS_DIR --validate-args "validate --skip-traits" \
 	  --head-engine ./target/release/$(BINARY) \
 	  --releases $(shell expr $(VERSIONS) - 1) --commits 100 --soak-days 0 \
 	  --channels stable --artifact-prefix "azoth/" \
@@ -132,23 +137,58 @@ release-lto: check-cargo $(OUT_DIR)
 install: release
 	@set -e; \
 	if echo "$$PATH" | tr ':' '\n' | grep -qx "$$HOME/.cargo/bin" && [ -d "$$HOME/.cargo/bin" ]; then \
-		dest="$$HOME/.cargo/bin/$(BINARY)"; \
+		bindir="$$HOME/.cargo/bin"; \
 	elif [ -d "$$HOME/bin" ] && [ -w "$$HOME/bin" ]; then \
-		dest="$$HOME/bin/$(BINARY)"; \
+		bindir="$$HOME/bin"; \
 	elif [ -d "$$HOME/.local/bin" ] && [ -w "$$HOME/.local/bin" ]; then \
-		dest="$$HOME/.local/bin/$(BINARY)"; \
+		bindir="$$HOME/.local/bin"; \
 	elif [ -w /usr/local/bin ]; then \
-		dest="/usr/local/bin/$(BINARY)"; \
+		bindir="/usr/local/bin"; \
 	else \
 		mkdir -p "$$HOME/.cargo/bin"; \
-		dest="$$HOME/.cargo/bin/$(BINARY)"; \
+		bindir="$$HOME/.cargo/bin"; \
 	fi; \
+	dest="$$bindir/$(INSTALL_NAME)"; \
 	install -m 755 $(OUT_DIR)/$(BINARY) "$$dest.new" && mv -f "$$dest.new" "$$dest"; \
-	echo "✓ Installed to $$dest"
+	echo "✓ Installed to $$dest"; \
+	link="$$bindir/scan"; \
+	if [ -e "$$link" ] || [ -L "$$link" ]; then \
+		echo "• Left existing $$link untouched (not linking scan -> $(INSTALL_NAME))"; \
+	else \
+		ln -s "$(INSTALL_NAME)" "$$link" && echo "✓ Linked $$link -> $(INSTALL_NAME)"; \
+	fi; \
+	legacy="$$bindir/ascan"; \
+	if [ -f "$$legacy" ] && [ ! -L "$$legacy" ]; then \
+		rm -f "$$legacy" && ln -s "$(INSTALL_NAME)" "$$legacy" \
+			&& echo "✓ Migrated legacy $$legacy (old binary) -> $(INSTALL_NAME)"; \
+	fi
+
+# Remove a local `make install`: the `atomscan` binary plus the `scan`/`ascan`
+# symlinks, but ONLY when those point at `atomscan` — a foreign `scan` (avast)
+# or a real `ascan` binary is left untouched.
+uninstall:
+	@set -e; \
+	found=0; \
+	for bindir in "$$HOME/.cargo/bin" "$$HOME/bin" "$$HOME/.local/bin" /usr/local/bin; do \
+		[ -d "$$bindir" ] || continue; \
+		target="$$bindir/$(INSTALL_NAME)"; \
+		{ [ -e "$$target" ] || [ -L "$$target" ]; } || continue; \
+		found=1; \
+		rm -f "$$target" && echo "✓ Removed $$target"; \
+		for alias in scan ascan; do \
+			link="$$bindir/$$alias"; \
+			if [ -L "$$link" ] && [ "$$(readlink "$$link")" = "$(INSTALL_NAME)" ]; then \
+				rm -f "$$link" && echo "✓ Removed $$link -> $(INSTALL_NAME)"; \
+			elif [ -e "$$link" ] || [ -L "$$link" ]; then \
+				echo "• Left $$link untouched (not our symlink)"; \
+			fi; \
+		done; \
+	done; \
+	[ "$$found" = 1 ] || echo "Nothing to uninstall (no $(INSTALL_NAME) in known bindirs)"
 
 tarball: release
-	tar -czf $(OUT_DIR)/ascan.tgz -C $(OUT_DIR) $(BINARY)
-	@echo "Tarball: $(OUT_DIR)/ascan.tgz"
+	tar -czf $(OUT_DIR)/scan.tgz -C $(OUT_DIR) $(BINARY)
+	@echo "Tarball: $(OUT_DIR)/scan.tgz"
 
 # Clear MAKEFLAGS for deploy recipes: GNU Make would otherwise inject the
 # outer invocation's `-j`/`--jobserver-*` flags plus command-line `URL=` into
@@ -419,7 +459,7 @@ tuna-once: ## One cleave-tuna cycle, then cherry-pick accepted experiments
 	@test -z "$$(git status --porcelain)" || { echo "working tree must be clean before tuna-once"; exit 1; }
 	@before=$$(git rev-parse HEAD); \
 	$(TUNA_BIN) --source $(CURDIR) --root $(TUNA_REPO) --dataset $(TUNA_DATASET) \
-		--name ascan \
+		--name scan \
 		--bench-arg --slow-rule-ms --bench-arg $(SLOW_RULE_MS) --bench-arg -f --bench-arg json \
 		--bench-env CLEAVE_SKIP_CACHE=1 \
 		--deny vendor/ --deny packaging/ --deny scripts/ --deny testdata/ \
@@ -488,11 +528,11 @@ $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
 # ----- Wolfi packaging ----------------------------------------------------
-# Build a Wolfi-based OCI image for ascan via melange + apko. Mirrors
+# Build a Wolfi-based OCI image for scan via melange + apko. Mirrors
 # the cleave/packaging/wolfi flow; depends on a sibling cleave checkout
 # at ../cleave (the local build stages cleave + filefacts + the scan
 # source repo and overrides the cleave git dep via a Cargo [patch] block).
-# On macOS the build runs inside a dedicated Lima VM (`ascan-wolfi`). See
+# On macOS the build runs inside a dedicated Lima VM (`scan-wolfi`). See
 # packaging/wolfi/README.md.
 WOLFI_DIR = packaging/wolfi
 WOLFI_OUT = $(OUT_DIR)/wolfi
@@ -505,16 +545,16 @@ wolfi-bootstrap:
 
 wolfi-build:
 	@WOLFI_ARCH="$(WOLFI_ARCH)" $(WOLFI_DIR)/scripts/build.sh
-	@echo "✓ Wolfi image: $(WOLFI_OUT)/ascan.tar"
+	@echo "✓ Wolfi image: $(WOLFI_OUT)/scan.tar"
 
 wolfi-test:
 	@$(WOLFI_DIR)/scripts/smoke-test.sh
 
 wolfi-shell:
-	@[ -f $(WOLFI_OUT)/ascan.tar ] || { echo "error: run 'make wolfi-build' first"; exit 1; }
+	@[ -f $(WOLFI_OUT)/scan.tar ] || { echo "error: run 'make wolfi-build' first"; exit 1; }
 	@case "$$(uname -s)" in \
-		Darwin) limactl shell --workdir / ascan-wolfi nerdctl run --rm -it --entrypoint /bin/sh ascan:smoke ;; \
-		Linux)  for r in nerdctl docker podman; do command -v $$r >/dev/null 2>&1 && { exec $$r run --rm -it --entrypoint /bin/sh ascan:smoke; }; done; echo "no container runtime"; exit 1 ;; \
+		Darwin) limactl shell --workdir / scan-wolfi nerdctl run --rm -it --entrypoint /bin/sh scan:smoke ;; \
+		Linux)  for r in nerdctl docker podman; do command -v $$r >/dev/null 2>&1 && { exec $$r run --rm -it --entrypoint /bin/sh scan:smoke; }; done; echo "no container runtime"; exit 1 ;; \
 	esac
 
 wolfi-clean:
@@ -523,13 +563,13 @@ wolfi-clean:
 
 wolfi-nuke: wolfi-clean
 	@case "$$(uname -s)" in \
-		Darwin) limactl delete --force ascan-wolfi 2>/dev/null || true ;; \
+		Darwin) limactl delete --force scan-wolfi 2>/dev/null || true ;; \
 	esac
-	rm -rf $$HOME/.cache/ascan-wolfi
+	rm -rf $$HOME/.cache/scan-wolfi
 	@echo "✓ Wolfi VM and cache removed"
 
 # ----- Publish -----------------------------------------------------------
-# Push the multi-arch ascan image to a registry and sign it keyless with
+# Push the multi-arch scan image to a registry and sign it keyless with
 # cosign via Google OIDC. Override REGISTRY / ORG / ARCHS via env. See
 # packaging/wolfi/README.md for prerequisites.
 REGISTRY ?= docker.io
@@ -537,7 +577,7 @@ ORG      ?= atomdrift
 
 docker-login: wolfi-bootstrap ## Log the lima VM's runtime into REGISTRY (interactive)
 	@case "$$(uname -s)" in \
-		Darwin) limactl shell --workdir / ascan-wolfi nerdctl login $(REGISTRY) ;; \
+		Darwin) limactl shell --workdir / scan-wolfi nerdctl login $(REGISTRY) ;; \
 		Linux)  for r in nerdctl docker podman; do command -v $$r >/dev/null 2>&1 && { exec $$r login $(REGISTRY); }; done; echo "no container runtime"; exit 1 ;; \
 	esac
 

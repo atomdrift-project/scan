@@ -56,7 +56,7 @@ fn scan_cli_completes_under_cold_yara_cache() {
         .expect("write sample");
     let sample_path = sample.path().to_path_buf();
 
-    let bin = env!("CARGO_BIN_EXE_ascan");
+    let bin = env!("CARGO_BIN_EXE_scan");
 
     // Capture the child's stderr to a FILE, not a pipe. An undrained pipe can
     // fill its OS buffer (~64KB) and block the child on write — which would
