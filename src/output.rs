@@ -690,7 +690,7 @@ pub fn print_summary(summary: &ScanSummary) {
     if !bloom.is_empty() {
         let mut parts = Vec::new();
         if bloom.skipped > 0 {
-            parts.push(fg(p.benign, &format!("{} skipped", bloom.skipped)));
+            parts.push(fg(p.benign, &format!("{} known-good", bloom.skipped)));
         }
         if bloom.flagged > 0 {
             parts.push(fg(p.hostile, &format!("{} known-bad", bloom.flagged)));
