@@ -2,7 +2,7 @@
 //!
 //! Mirrors the pull-based worker's `/api/result` contract — the same
 //! [`ResultPayload`] wire shape, the same zstd-compressed envelope — but driven
-//! by a local `scan fs` run instead of a poll loop. `scan fs --hopper=<url>`
+//! by a local `scan path` run instead of a poll loop. `scan path --hopper=<url>`
 //! uses it to *renew* a sample hopper has already ingested with this build's
 //! traits and model: hopper's `/api/result` is a lease-free `UPDATE ... WHERE
 //! sha256 = ?`, so posting a result for an already-scanned SHA replaces its
@@ -187,7 +187,7 @@ enum Job {
 }
 
 /// Background uploader that POSTs scan results to hopper without blocking the
-/// analysis threads. Created per `scan fs --hopper` run; results are handed off
+/// analysis threads. Created per `scan path --hopper` run; results are handed off
 /// via [`Uploader::submit`] and flushed when the uploader is dropped.
 #[derive(Debug)]
 pub struct Uploader {

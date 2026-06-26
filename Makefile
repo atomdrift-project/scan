@@ -125,6 +125,49 @@ publish-models: release ## Compat-test azoth vs last (VERSIONS-1) litmus release
 	  --header-upload "Cache-Control: public, max-age=60"
 	@echo "✓ publish-models complete: compat-tested HEAD + last $(shell expr $(VERSIONS) - 1) release(s), signed, verified, uploaded"
 
+# --- Bloom filter publishing (R2-backed; outputs revision-controlled in ../bloom)
+# Builds the known-good/known-bad filters from hopper's labelled samples into the
+# BLOOM_REPO git repo (the source of truth, like ../azoth for models) and uploads
+# them to R2. The pool defaults to the local hopper replica (same DSN collimator
+# trains from; auth via ~/.pgpass) — see scripts/bloom_pool.sql for the tier
+# predicates. Override with POOL=<file.ndjson> to build from a captured export.
+# Filters go to a dated, immutable prefix; the manifest is a short-cached pointer
+# the download flow resolves via its `built` date. No signing: the filters carry
+# no commit/authenticity claim, only a versioned layout and per-file sha256.
+BLOOM_REPO ?= ../bloom
+BLOOM_DB ?= postgres://hopper@localhost:5432/hopper
+BLOOM_POOL_SQL ?= scripts/bloom_pool.sql
+BLOOM_DATE ?= $(shell date -u +%F)
+# Only bless/flag samples analyzed within this many days, so the tables reflect
+# the current model/ruleset. 90 is a fair default; use 7 for quick test builds.
+BLOOM_MAX_AGE_DAYS ?= 90
+.PHONY: build-bloom publish-bloom
+build-bloom: ## Build bloom filters from the local hopper replica (or POOL=<ndjson>) into $(BLOOM_REPO) — no upload
+	$(CARGO) build --release --bin scan-bloom-build
+	mkdir -p "$(BLOOM_REPO)"
+	@if [ -n "$(POOL)" ]; then \
+	  echo "→ building filters from POOL=$(POOL)"; \
+	  ./target/release/scan-bloom-build --in "$(POOL)" --out "$(BLOOM_REPO)" --date "$(BLOOM_DATE)"; \
+	else \
+	  command -v psql >/dev/null || { echo "build-bloom: psql not found (need it for BLOOM_DB=$(BLOOM_DB), or pass POOL=<ndjson>)"; exit 1; }; \
+	  echo "→ exporting pool from replica $(BLOOM_DB) (analyzed within $(BLOOM_MAX_AGE_DAYS)d)"; \
+	  psql "$(BLOOM_DB)" -X -q -v ON_ERROR_STOP=1 -v max_age_days=$(BLOOM_MAX_AGE_DAYS) -f "$(BLOOM_POOL_SQL)" -o "$(BLOOM_REPO)/pool.ndjson" && \
+	  ./target/release/scan-bloom-build --in "$(BLOOM_REPO)/pool.ndjson" --out "$(BLOOM_REPO)" --date "$(BLOOM_DATE)" && \
+	  rm -f "$(BLOOM_REPO)/pool.ndjson"; \
+	fi
+	@echo "✓ filters written to $(BLOOM_REPO) (not uploaded — run 'make publish-bloom' to release)"
+
+publish-bloom: build-bloom ## Build (build-bloom) then upload the filters + manifest to R2
+	@command -v rclone >/dev/null || { echo "publish-bloom: rclone not found"; exit 1; }
+	@echo "→ uploading filters to R2 (dated, immutable)"
+	rclone copy "$(BLOOM_REPO)" "$(R2_REMOTE)/$(R2_LITMUS)/bloom/$(BLOOM_DATE)/" --include "*.adbl" \
+	  --header-upload "Cache-Control: public, max-age=31536000, immutable" --progress
+	@echo "→ publishing manifest pointer (short cache)"
+	rclone copyto "$(BLOOM_REPO)/bloom.toml" "$(R2_REMOTE)/$(R2_LITMUS)/bloom.toml" \
+	  --header-upload "Cache-Control: public, max-age=60"
+	@echo "✓ publish-bloom complete: $(BLOOM_DATE)"
+	@echo "  → review and commit $(BLOOM_REPO) to record this release in git"
+
 # Fat LTO + single codegen unit. Multi-minute link, marginal runtime win
 # over the default release profile. Use for container/tarball builds.
 release-lto: check-cargo $(OUT_DIR)

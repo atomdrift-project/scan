@@ -2303,7 +2303,7 @@ async fn post_result(
 
     // Serialize and compress once, then reuse the bytes across retries: cleave
     // reports are large, repetitive JSON that zstd shrinks 3-5x. Shared with the
-    // local `scan fs --hopper` uploader so both speak hopper's `/api/result`
+    // local `scan path --hopper` uploader so both speak hopper's `/api/result`
     // byte-identically. `None` means serialization failed unrecoverably.
     let Some((body, encoding)) = crate::upload::encode_result_body(payload, sha256) else {
         return;

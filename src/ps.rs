@@ -222,6 +222,24 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let mut scan_paths: Vec<PathBuf> = Vec::with_capacity(groups.len());
     let mut by_scan_path: HashMap<PathBuf, &ProcessGroup> = HashMap::with_capacity(groups.len());
     for group in &groups {
+        // Known-good/known-bad short-circuit by the executable's sha256: a
+        // known-good binary is skipped here (and counted benign); known-bad and
+        // conflicted are flagged but still analyzed below.
+        if let Some(lookup) = config.bloom()
+            && let Some(digest) = crate::bloom::parse_sha256_hex(&group.sha256)
+            && let Some(summary) = crate::engine::bloom_gate(
+                config,
+                &group.path.display().to_string(),
+                lookup.decide_sha256(&digest),
+            )
+        {
+            benign.fetch_add(summary.benign, Ordering::Relaxed);
+            if let Some(p) = &progress {
+                p.increment();
+            }
+            continue;
+        }
+
         let scan_path = if group.deleted && !group.path.exists() {
             // On Linux, try scanning via /proc/pid/exe.
             #[cfg(target_os = "linux")]

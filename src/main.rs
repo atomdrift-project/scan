@@ -81,6 +81,12 @@ struct Cli {
     #[arg(short, long, default_value = "terminal")]
     format: OutputFormat,
 
+    /// Scan mode: `fast` (bloom matching only), `balanced` (bloom short-circuits,
+    /// then full scan), or `slow` (no bloom; always full scan). Workers are
+    /// always slow.
+    #[arg(long, global = true, default_value = "balanced")]
+    mode: scan::Mode,
+
     /// Override suspicious threshold (0.0-1.0); omit to use model's recommendation
     #[arg(long)]
     threshold_suspicious: Option<f32>,
@@ -295,7 +301,7 @@ struct Cli {
     )]
     fetch_max_total_size: u64,
 
-    /// Paths to files or directories to scan (shorthand for `scan fs <paths...>`)
+    /// Paths to files or directories to scan (shorthand for `scan path <paths...>`)
     paths: Vec<PathBuf>,
 
     #[command(subcommand)]
@@ -351,8 +357,8 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Scan files or directories for hostile/suspicious content
-    #[command(alias = "scan")]
-    Fs {
+    #[command(aliases = ["fs", "scan"])]
+    Path {
         /// Paths to files or directories to scan
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
@@ -388,7 +394,8 @@ enum Commands {
     },
 
     /// Fetch a package by PURL and scan it (e.g. pkg:npm/left-pad@1.3.0)
-    Pkg {
+    #[command(aliases = ["pkg", "package", "pkgs"])]
+    Purl {
         /// Package URL to resolve, fetch, and scan. A versionless PURL
         /// (`pkg:npm/foo`) resolves to the registry's current release.
         purl: String,
@@ -625,7 +632,7 @@ fn main() -> Result<()> {
         Some(cmd) => cmd,
         None => {
             if !cli.paths.is_empty() {
-                Commands::Fs {
+                Commands::Path {
                     paths: cli.paths.clone(),
                     hopper: None,
                     registry: None,
@@ -638,6 +645,9 @@ fn main() -> Result<()> {
     };
 
     let is_serve = matches!(command, Commands::Serve { .. } | Commands::Worker { .. });
+    // Long-lived server modes never short-circuit on bloom filters: every job is
+    // analyzed on its own merits. Force slow mode there regardless of `--mode`.
+    let effective_mode = if is_serve { scan::Mode::Slow } else { cli.mode };
     // Per-execution fetch ceiling: a hard cap across the whole invocation. The
     // long-lived server modes (`serve`/`worker`) scan unboundedly many jobs over
     // their lifetime, so they're exempt — each job is bounded by `--fetch-max-file-*`
@@ -758,11 +768,11 @@ fn main() -> Result<()> {
     let needs_terminal_theme = cli.format == scan::OutputFormat::Terminal
         && matches!(
             command,
-            Commands::Fs { .. }
+            Commands::Path { .. }
                 | Commands::Ps
                 | Commands::Sys
                 | Commands::Url { .. }
-                | Commands::Pkg { .. }
+                | Commands::Purl { .. }
         );
     if cli.light {
         scan::output::set_theme(scan::output::Theme::Light);
@@ -814,11 +824,11 @@ fn main() -> Result<()> {
     // Warn about missing analysis tools for commands that will run cleave.
     if matches!(
         command,
-        Commands::Fs { .. }
+        Commands::Path { .. }
             | Commands::Ps
             | Commands::Sys
             | Commands::Url { .. }
-            | Commands::Pkg { .. }
+            | Commands::Purl { .. }
             | Commands::Validate { .. }
             | Commands::Serve { .. }
             | Commands::Worker { .. }
@@ -831,11 +841,11 @@ fn main() -> Result<()> {
     // restart and shouldn't print transient notices into their logs.
     if matches!(
         command,
-        Commands::Fs { .. }
+        Commands::Path { .. }
             | Commands::Ps
             | Commands::Sys
             | Commands::Url { .. }
-            | Commands::Pkg { .. }
+            | Commands::Purl { .. }
             | Commands::Version
             | Commands::UpdateRules { .. }
     ) {
@@ -901,7 +911,7 @@ fn main() -> Result<()> {
     );
 
     match command {
-        Commands::Fs {
+        Commands::Path {
             paths,
             hopper,
             registry,
@@ -909,7 +919,7 @@ fn main() -> Result<()> {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            let config = scan::ScanConfig::new(
+            let mut config = scan::ScanConfig::new(
                 model_dir,
                 cli.format,
                 thresholds,
@@ -921,6 +931,11 @@ fn main() -> Result<()> {
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy)
             .with_hopper(hopper);
+            // Per-file SHA-256 known-good/known-bad short-circuit (explicit file
+            // args only; directories are walked by cleave). Slow mode / workers skip it.
+            if effective_mode != scan::Mode::Slow {
+                config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
+            }
             // `--registry <file>`: apply the pre-collected registry record as the
             // root registry, so the scan reasons over the same facts a live scan
             // fetches. A malformed/absent record is fatal here (unlike the
@@ -960,7 +975,7 @@ fn main() -> Result<()> {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            let config = scan::ScanConfig::new(
+            let mut config = scan::ScanConfig::new(
                 model_dir,
                 cli.format,
                 thresholds,
@@ -971,6 +986,10 @@ fn main() -> Result<()> {
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy);
+            // Per-binary known-good/known-bad short-circuit (by executable sha256).
+            if effective_mode != scan::Mode::Slow {
+                config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
+            }
             exit_for_summary(&scan::ps::run(&config)?);
         }
         Commands::Url { url } => {
@@ -990,11 +1009,11 @@ fn main() -> Result<()> {
             .with_fetch(fetch_policy);
             exit_for_summary(&scan::pkg::run_url(&url, &config)?);
         }
-        Commands::Pkg { purl } => {
+        Commands::Purl { purl } => {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            let config = scan::ScanConfig::new(
+            let mut config = scan::ScanConfig::new(
                 model_dir,
                 cli.format,
                 thresholds,
@@ -1005,6 +1024,9 @@ fn main() -> Result<()> {
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy);
+            if effective_mode != scan::Mode::Slow {
+                config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
+            }
             exit_for_summary(&scan::pkg::run_pkg(&purl, &config)?);
         }
         Commands::Serve {
@@ -1077,6 +1099,12 @@ fn main() -> Result<()> {
                     eprintln!("Error checking traits updates: {e}");
                     process::exit(1);
                 }
+                // Bloom filters are an optional fast path; a check failure is non-fatal.
+                if !models_only
+                    && let Err(e) = scan::bloom_update::check(&scan::bloom_repo::install_dir())
+                {
+                    eprintln!("Warning: bloom filter check failed: {e}");
+                }
             } else {
                 if let Err(e) = scan::model_update::update(&dir, false) {
                     eprintln!("Error updating models: {e}");
@@ -1085,6 +1113,13 @@ fn main() -> Result<()> {
                 if !models_only && let Err(e) = scan::traits_repo::update(false, false) {
                     eprintln!("Error updating traits: {e}");
                     process::exit(1);
+                }
+                // Bloom filters are an optional fast path; a sync failure is non-fatal
+                // — the scan simply runs without the known-good/known-bad short-circuit.
+                if !models_only
+                    && let Err(e) = scan::bloom_update::update(&scan::bloom_repo::install_dir(), false)
+                {
+                    eprintln!("Warning: bloom filter update failed (non-fatal): {e}");
                 }
             }
         }
@@ -1608,7 +1643,7 @@ mod tests {
         let cli = Cli::try_parse_from(["scan", "fs", "/tmp/a", "/tmp/b"])
             .context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
-            Commands::Fs { paths, .. } => {
+            Commands::Path { paths, .. } => {
                 assert_eq!(
                     paths,
                     vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
@@ -1625,7 +1660,7 @@ mod tests {
             let cli = Cli::try_parse_from(["scan", "fs", flag, "http://hopper:8081", "/tmp/a"])
                 .context("parse should work")?;
             match cli.command.context("fs subcommand expected")? {
-                Commands::Fs { paths, hopper, .. } => {
+                Commands::Path { paths, hopper, .. } => {
                     assert_eq!(paths, vec![PathBuf::from("/tmp/a")]);
                     assert_eq!(hopper.as_deref(), Some("http://hopper:8081"));
                 }
@@ -1639,18 +1674,36 @@ mod tests {
     fn fs_without_hopper_defaults_to_none() -> Result<()> {
         let cli = Cli::try_parse_from(["scan", "fs", "/tmp/a"]).context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
-            Commands::Fs { hopper, .. } => assert!(hopper.is_none()),
+            Commands::Path { hopper, .. } => assert!(hopper.is_none()),
             other => anyhow::bail!("unexpected command: {other:?}"),
         }
         Ok(())
     }
 
     #[test]
-    fn scan_alias_maps_to_fs() -> Result<()> {
-        let cli = Cli::try_parse_from(["scan", "scan", "/tmp/a"]).context("parse should work")?;
-        match cli.command.context("fs subcommand expected via alias")? {
-            Commands::Fs { paths, .. } => assert_eq!(paths, vec![PathBuf::from("/tmp/a")]),
-            other => anyhow::bail!("unexpected command: {other:?}"),
+    fn path_subcommand_and_its_aliases_resolve() -> Result<()> {
+        for name in ["path", "fs", "scan"] {
+            let cli = Cli::try_parse_from(["scan", name, "/tmp/a"])
+                .with_context(|| format!("parse of `{name}` should work"))?;
+            match cli.command.with_context(|| format!("path expected via `{name}`"))? {
+                Commands::Path { paths, .. } => {
+                    assert_eq!(paths, vec![PathBuf::from("/tmp/a")])
+                }
+                other => anyhow::bail!("unexpected command for `{name}`: {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn purl_subcommand_and_its_aliases_resolve() -> Result<()> {
+        for name in ["purl", "pkg", "package", "pkgs"] {
+            let cli = Cli::try_parse_from(["scan", name, "pkg:npm/left-pad@1.3.0"])
+                .with_context(|| format!("parse of `{name}` should work"))?;
+            match cli.command.with_context(|| format!("purl expected via `{name}`"))? {
+                Commands::Purl { purl } => assert_eq!(purl, "pkg:npm/left-pad@1.3.0"),
+                other => anyhow::bail!("unexpected command for `{name}`: {other:?}"),
+            }
         }
         Ok(())
     }

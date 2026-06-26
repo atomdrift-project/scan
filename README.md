@@ -92,7 +92,7 @@ foreign `scan` is never removed).
 ## Usage
 
 ```bash
-scan fs /bin/                           # recursive; archives unpacked
+scan path /bin/                         # recursive; archives unpacked
 scan ps                                 # classify running processes
 ```
 

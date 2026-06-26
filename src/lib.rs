@@ -29,6 +29,10 @@
 pub mod admission;
 pub mod analyzer;
 pub mod bench_hopper;
+pub mod bloom;
+pub mod bloom_build;
+pub mod bloom_repo;
+pub mod bloom_update;
 pub mod crash_dump;
 pub mod engine;
 pub mod explain;
@@ -128,4 +132,20 @@ pub enum OutputFormat {
     /// line (gate, confidence, matched FP level) followed by cleave's annotated
     /// context. See [`crate::output::format_tiny`].
     Tiny,
+}
+
+/// How aggressively a scan consults the local known-good / known-bad bloom
+/// filters before doing expensive work. See [`crate::bloom_repo`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mode {
+    /// Bloom matching only: known-good is skipped, known-bad is flagged, and
+    /// anything in neither set is left unscanned. Fastest, least thorough.
+    Fast,
+    /// Bloom filters short-circuit known-good (skip) and known-bad (flag);
+    /// everything else gets a full scan. The default.
+    #[default]
+    Balanced,
+    /// No bloom lookups — every artifact is fully scanned. Always used by
+    /// long-lived workers, where each job must be analyzed on its own merits.
+    Slow,
 }

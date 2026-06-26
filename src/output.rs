@@ -3,6 +3,7 @@
 
 use std::sync::{LazyLock, RwLock};
 
+use crate::OutputFormat;
 use crate::engine::{ScanResult, ScanSummary, level_confidence};
 use crate::model::{Classification, RouteScore};
 
@@ -607,11 +608,102 @@ pub fn print_header(path: &std::path::Path, count: usize) {
     eprintln!();
 }
 
+/// A bloom-filter verdict, surfaced before (or instead of) expensive analysis.
+#[derive(Debug, Clone, Copy)]
+pub enum BloomVerdict {
+    /// Matched the known-good set — the scan was skipped.
+    KnownGood,
+    /// Matched the known-bad set — flagged, and still scanned to confirm.
+    KnownBad,
+    /// In both the good and bad sets — contradictory; flagged and scanned.
+    Conflicted,
+    /// In neither set; left unscanned because the mode is `fast`.
+    Unscanned,
+}
+
+impl BloomVerdict {
+    /// Whether the artifact still goes through full analysis after this verdict.
+    /// Known-bad and conflicted are flags, not short-circuits; good and unscanned
+    /// stop here.
+    const fn scanned(self) -> bool {
+        matches!(self, Self::KnownBad | Self::Conflicted)
+    }
+
+    const fn json_str(self) -> &'static str {
+        match self {
+            Self::KnownGood => "known-good",
+            Self::KnownBad => "known-bad",
+            Self::Conflicted => "conflicted",
+            Self::Unscanned => "unscanned",
+        }
+    }
+}
+
+/// Report a bloom decision as a real result, not a debug line: a JSON record on
+/// the output stream in `--format json`, a themed one-liner on stderr otherwise.
+pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFormat) {
+    if matches!(format, OutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": label,
+                "source": "bloom",
+                "verdict": verdict.json_str(),
+                "scanned": verdict.scanned(),
+            })
+        );
+        return;
+    }
+
+    let p = palette();
+    let (icon, name, reason) = match verdict {
+        BloomVerdict::KnownGood => {
+            (fg(p.benign, "\u{2713}"), fg(p.benign, "known-good"), "skipping scan")
+        }
+        BloomVerdict::KnownBad => {
+            (fg(p.hostile, "\u{2717}"), fg(p.hostile, "known-bad"), "flagged — scanning")
+        }
+        BloomVerdict::Conflicted => (
+            fg(p.warning, "\u{26a0}"),
+            fg(p.warning, "conflicted"),
+            "in good and bad — scanning",
+        ),
+        BloomVerdict::Unscanned => {
+            (fg(p.warning, "!"), fg(p.very_dim, "unscanned"), "not in known sets (fast mode)")
+        }
+    };
+    eprintln!(
+        "  {icon}  {name} {}  {}",
+        fg(p.very_dim, reason),
+        fg(p.header_path, label),
+    );
+}
+
 /// Print scan summary.
 pub fn print_summary(summary: &ScanSummary) {
     let p = palette();
     let line = fg(p.summary_line, &"\u{2500}".repeat(52));
     eprintln!("  {line}");
+
+    // Bloom decision tally (only when filters were consulted this run).
+    let bloom = crate::bloom_repo::counts();
+    if !bloom.is_empty() {
+        let mut parts = Vec::new();
+        if bloom.skipped > 0 {
+            parts.push(fg(p.benign, &format!("{} skipped", bloom.skipped)));
+        }
+        if bloom.flagged > 0 {
+            parts.push(fg(p.hostile, &format!("{} known-bad", bloom.flagged)));
+        }
+        if bloom.conflicted > 0 {
+            parts.push(fg(p.warning, &format!("{} conflicted", bloom.conflicted)));
+        }
+        if bloom.unscanned > 0 {
+            parts.push(fg(p.very_dim, &format!("{} unscanned", bloom.unscanned)));
+        }
+        let sep = format!("  {}  ", fg(p.dot_sep, "\u{00b7}"));
+        eprintln!("  {}  bloom  {}", fg(p.header_icon, "\u{25c6}"), parts.join(&sep));
+    }
 
     if summary.total_files == 0 {
         let (icon, msg) = if summary.errors > 0 {

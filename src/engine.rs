@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+use crate::Mode;
 use crate::OutputFormat;
+use crate::bloom_repo::{Decision as BloomDecision, Lookup};
 use crate::explain::ShapImportance;
 use crate::features::{ExtractContext, crit_ordinal};
 use crate::model::{Classification, Decision, Model, RouteScore, SkippedRoute, Thresholds};
@@ -90,6 +92,8 @@ pub struct ScanConfig {
     interpret: Option<crate::interpret::InterpretConfig>,
     fetch: crate::fetch::FetchPolicy,
     hopper: Option<String>,
+    mode: crate::Mode,
+    bloom: Option<Arc<Lookup>>,
 }
 
 impl ScanConfig {
@@ -140,12 +144,16 @@ impl ScanConfig {
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
+            // Bloom short-circuiting is opt-in via `with_bloom`; an unconfigured
+            // config runs a full scan (slow mode), so server/fs paths are unaffected.
+            mode: crate::Mode::Slow,
+            bloom: None,
         })
     }
 
     /// Upload (renew) each scan result on the hopper instance at `url` by POSTing
     /// its envelope to `/api/result`. `None` (default) disables uploading. Used by
-    /// `scan fs --hopper`; failures degrade to logged warnings and never affect
+    /// `scan path --hopper`; failures degrade to logged warnings and never affect
     /// the scan's outcome.
     #[must_use]
     pub fn with_hopper(mut self, url: Option<String>) -> Self {
@@ -243,6 +251,35 @@ impl ScanConfig {
     #[must_use]
     pub const fn level(&self) -> Option<u16> {
         self.level
+    }
+
+    /// Enable bloom-filter short-circuiting: `mode` selects how aggressively the
+    /// local known-good/known-bad filters are consulted, and `lookup` carries the
+    /// loaded filters. Unset, a config stays in [`crate::Mode::Slow`] (full scan).
+    #[must_use]
+    pub fn with_bloom(mut self, mode: crate::Mode, lookup: Lookup) -> Self {
+        self.mode = mode;
+        self.bloom = Some(Arc::new(lookup));
+        self
+    }
+
+    /// The scan execution mode (defaults to [`crate::Mode::Slow`]).
+    #[must_use]
+    pub const fn mode(&self) -> crate::Mode {
+        self.mode
+    }
+
+    /// The loaded bloom filters, or `None` in slow mode / when none are synced.
+    #[must_use]
+    pub(crate) fn bloom(&self) -> Option<&Lookup> {
+        self.bloom.as_deref()
+    }
+
+    /// A shared handle to the bloom filters, for the cleave skip predicate (which
+    /// must be `'static`). `None` when bloom is disabled.
+    #[must_use]
+    pub(crate) fn bloom_arc(&self) -> Option<Arc<Lookup>> {
+        self.bloom.clone()
     }
 }
 
@@ -1030,6 +1067,82 @@ fn format_eta(secs: f64) -> String {
     }
 }
 
+/// Apply a bloom-filter decision before any expensive analysis. Emits the
+/// verdict and returns `Some(summary)` when the artifact is short-circuited (a
+/// known-good skip, or — in fast mode — a bloom-only verdict); `None` to proceed.
+pub(crate) fn bloom_gate(
+    config: &ScanConfig,
+    label: &str,
+    decision: BloomDecision,
+) -> Option<ScanSummary> {
+    use crate::output::BloomVerdict;
+    let fast = config.mode() == Mode::Fast;
+    let format = config.format();
+    // Known-good/unscanned are benign-tier: print the per-file line only when
+    // benign output is requested, so a large directory scan isn't spammed. The
+    // aggregate tally always reports them in the summary regardless.
+    let show_quiet = format == OutputFormat::Json || config.filter().shows(&Classification::Benign);
+    // Tally for end-of-scan observability. `unscanned` only matters for Unknown.
+    crate::bloom_repo::record(decision, fast && decision == BloomDecision::Unknown);
+    match decision {
+        BloomDecision::Skip => {
+            if show_quiet {
+                crate::output::print_bloom_verdict(label, BloomVerdict::KnownGood, format);
+            }
+            Some(one_file_summary(0, 0, 1))
+        }
+        // Known-bad and conflicted are flags, not short-circuits: surface them and
+        // still run full analysis in every mode — the scan is the verdict.
+        BloomDecision::KnownBad => {
+            crate::output::print_bloom_verdict(label, BloomVerdict::KnownBad, format);
+            None
+        }
+        BloomDecision::Conflicted => {
+            // Build-time subtraction removes bad keys from good, so a conflict can
+            // only mean filter version skew or a producer bug — it should never
+            // happen. Always scan, but make the noise loud.
+            tracing::warn!(
+                label,
+                "bloom conflict: key is in BOTH the good and bad filters (should never happen) — scanning"
+            );
+            crate::output::print_bloom_verdict(label, BloomVerdict::Conflicted, format);
+            None
+        }
+        // Unknown is left unscanned only in bloom-only fast mode; otherwise scanned.
+        BloomDecision::Unknown => fast.then(|| {
+            if show_quiet {
+                crate::output::print_bloom_verdict(label, BloomVerdict::Unscanned, format);
+            }
+            one_file_summary(0, 0, 0)
+        }),
+    }
+}
+
+/// Build the cleave skip predicate from the active bloom filters: a file whose
+/// sha256 is known-good (or, in fast mode, simply unknown) is skipped before
+/// analysis. Known-bad and conflicted return `false` so they are still analyzed;
+/// every file's verdict line is emitted later in [`record_file_result`], which
+/// re-derives the decision from the report's sha. `None` when bloom is disabled.
+fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
+    let lookup = config.bloom_arc()?;
+    let fast = config.mode() == Mode::Fast;
+    Some(cleave::SkipPredicate(Arc::new(move |sha_hex: &str| {
+        let Some(digest) = crate::bloom::parse_sha256_hex(sha_hex) else {
+            return false;
+        };
+        match lookup.decide_sha256(&digest) {
+            BloomDecision::Skip => true,
+            BloomDecision::Unknown => fast,
+            BloomDecision::KnownBad | BloomDecision::Conflicted => false,
+        }
+    })))
+}
+
+/// A one-file [`ScanSummary`] for a bloom-decided artifact that was not analyzed.
+const fn one_file_summary(hostile: u32, suspicious: u32, benign: u32) -> ScanSummary {
+    ScanSummary { total_files: 1, hostile, suspicious, benign, errors: 0, duration_ms: 0 }
+}
+
 /// Run a scan against a file or directory tree.
 ///
 /// A file path is analyzed directly. A directory path is walked recursively via
@@ -1062,6 +1175,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
+        skip_predicate: bloom_skip_predicate(config),
         ..Default::default()
     };
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
@@ -1172,8 +1286,13 @@ pub fn run_bytes(
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
+    // Content-digest short-circuit happens inside cleave via the skip predicate,
+    // complementing the PURL gate in `pkg.rs`: it catches known *content* even
+    // when the package locator was not in the filter. `record_file_result` emits
+    // the verdict from the minimal report cleave returns on a skip.
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
+        skip_predicate: bloom_skip_predicate(config),
         ..Default::default()
     };
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
@@ -1268,6 +1387,25 @@ fn record_file_result(
     uploader: Option<&crate::upload::Uploader>,
     root_registry: Option<&fletch::Registry>,
 ) {
+    // Bloom verdict, re-derived from the root sha cleave computed. A file cleave
+    // skipped at our request (known-good, or fast-mode unknown) arrives as a
+    // minimal report and is short-circuited here; a known-bad/conflicted file was
+    // analyzed and is flagged here before its full verdict is rendered below.
+    if let Some(lookup) = config.bloom()
+        && let Ok(report) = &cleave_result
+        && let Some(digest) = crate::bloom::parse_sha256_hex(&report.target.sha256)
+        && let Some(summary) =
+            bloom_gate(config, &file_path.display().to_string(), lookup.decide_sha256(&digest))
+    {
+        if summary.benign > 0 {
+            tally.count(Classification::Benign);
+        }
+        if let Some(p) = progress {
+            p.increment();
+        }
+        return;
+    }
+
     let scan_result = cleave_result.and_then(|report| {
         process_report(
             file_path,
@@ -1477,6 +1615,7 @@ pub fn run_paths(
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
+        skip_predicate: bloom_skip_predicate(config),
         ..Default::default()
     };
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
