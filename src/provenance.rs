@@ -146,7 +146,9 @@ mod tests {
     #[test]
     fn reads_record_from_hopper_sidecar() {
         // The full sidecar shape: registry record nested under `registry`.
-        let json = format!(r#"{{"artifact":{{"sha256":"ab"}},"registry":{{"record":{RECORD},"sources":[]}}}}"#);
+        let json = format!(
+            r#"{{"artifact":{{"sha256":"ab"}},"registry":{{"record":{RECORD},"sources":[]}}}}"#
+        );
         let rec = registry_record(json.as_bytes()).expect("record present");
         assert_eq!(rec.ecosystem, "npm");
         assert_eq!(rec.name, "left-pad");
@@ -273,7 +275,13 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["artifact"]["filename"], "mal.bin");
-        assert!(v.get("registry").is_none(), "no registry slot for a local file");
-        assert!(v.get("package").is_none(), "no package slot for a local file");
+        assert!(
+            v.get("registry").is_none(),
+            "no registry slot for a local file"
+        );
+        assert!(
+            v.get("package").is_none(),
+            "no package slot for a local file"
+        );
     }
 }

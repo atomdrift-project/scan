@@ -1117,7 +1117,8 @@ fn main() -> Result<()> {
                 // Bloom filters are an optional fast path; a sync failure is non-fatal
                 // — the scan simply runs without the known-good/known-bad short-circuit.
                 if !models_only
-                    && let Err(e) = scan::bloom_update::update(&scan::bloom_repo::install_dir(), false)
+                    && let Err(e) =
+                        scan::bloom_update::update(&scan::bloom_repo::install_dir(), false)
                 {
                     eprintln!("Warning: bloom filter update failed (non-fatal): {e}");
                 }
@@ -1628,8 +1629,7 @@ mod tests {
 
     #[test]
     fn bare_paths_default_to_scan_shorthand() -> Result<()> {
-        let cli =
-            Cli::try_parse_from(["scan", "/tmp/a", "/tmp/b"]).context("parse should work")?;
+        let cli = Cli::try_parse_from(["scan", "/tmp/a", "/tmp/b"]).context("parse should work")?;
         assert_eq!(
             cli.paths,
             vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
@@ -1640,8 +1640,8 @@ mod tests {
 
     #[test]
     fn fs_subcommand_accepts_multiple_paths() -> Result<()> {
-        let cli = Cli::try_parse_from(["scan", "fs", "/tmp/a", "/tmp/b"])
-            .context("parse should work")?;
+        let cli =
+            Cli::try_parse_from(["scan", "fs", "/tmp/a", "/tmp/b"]).context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
             Commands::Path { paths, .. } => {
                 assert_eq!(
@@ -1685,7 +1685,10 @@ mod tests {
         for name in ["path", "fs", "scan"] {
             let cli = Cli::try_parse_from(["scan", name, "/tmp/a"])
                 .with_context(|| format!("parse of `{name}` should work"))?;
-            match cli.command.with_context(|| format!("path expected via `{name}`"))? {
+            match cli
+                .command
+                .with_context(|| format!("path expected via `{name}`"))?
+            {
                 Commands::Path { paths, .. } => {
                     assert_eq!(paths, vec![PathBuf::from("/tmp/a")])
                 }
@@ -1700,7 +1703,10 @@ mod tests {
         for name in ["purl", "pkg", "package", "pkgs"] {
             let cli = Cli::try_parse_from(["scan", name, "pkg:npm/left-pad@1.3.0"])
                 .with_context(|| format!("parse of `{name}` should work"))?;
-            match cli.command.with_context(|| format!("purl expected via `{name}`"))? {
+            match cli
+                .command
+                .with_context(|| format!("purl expected via `{name}`"))?
+            {
                 Commands::Purl { purl } => assert_eq!(purl, "pkg:npm/left-pad@1.3.0"),
                 other => anyhow::bail!("unexpected command for `{name}`: {other:?}"),
             }

@@ -120,7 +120,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         false, // validation corpus runs offline; no fetch log
                         false, // validation only consumes ML verdicts
                         false, // no manifest listing; validation reads findings only
-                        None, // validation fixtures are local files, not fetched packages
+                        None,  // validation fixtures are local files, not fetched packages
                     );
                     let classify_elapsed = classify_started.elapsed();
                     if analysis_elapsed > SLOW_FIXTURE_THRESHOLD

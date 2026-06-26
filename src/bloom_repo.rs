@@ -19,8 +19,26 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::bloom::{Filter, Kind, Tier, canonical_purl};
+
+/// Process-wide handle to the loaded filters, published by the scan config so
+/// decoupled subsystems (the dependency-fetch reporter) can consult the same
+/// verdicts without threading config through. Set once per run when bloom is
+/// enabled; later sets are ignored.
+static GLOBAL: OnceLock<Arc<Lookup>> = OnceLock::new();
+
+/// Publish the loaded filters process-wide (called from [`crate::engine::ScanConfig::with_bloom`]).
+pub fn set_global(lookup: Arc<Lookup>) {
+    let _ = GLOBAL.set(lookup);
+}
+
+/// The process-wide filters, if bloom was enabled this run.
+#[must_use]
+pub fn global() -> Option<Arc<Lookup>> {
+    GLOBAL.get().cloned()
+}
 
 /// What to do with a key before doing expensive work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,9 +110,13 @@ impl Lookup {
         let key = canonical_purl(purl);
         let bytes = key.as_bytes();
         resolve(
-            self.purl_bad.as_ref().is_some_and(|f| f.contains_key(bytes)),
+            self.purl_bad
+                .as_ref()
+                .is_some_and(|f| f.contains_key(bytes)),
             self.purl_bad.is_some(),
-            self.purl_good.as_ref().is_some_and(|f| f.contains_key(bytes)),
+            self.purl_good
+                .as_ref()
+                .is_some_and(|f| f.contains_key(bytes)),
         )
     }
 
@@ -103,9 +125,13 @@ impl Lookup {
     #[must_use]
     pub fn decide_sha256(&self, digest: &[u8; 32]) -> Decision {
         resolve(
-            self.sha256_bad.as_ref().is_some_and(|f| f.contains_digest(digest)),
+            self.sha256_bad
+                .as_ref()
+                .is_some_and(|f| f.contains_digest(digest)),
             self.sha256_bad.is_some(),
-            self.sha256_good.as_ref().is_some_and(|f| f.contains_digest(digest)),
+            self.sha256_good
+                .as_ref()
+                .is_some_and(|f| f.contains_digest(digest)),
         )
     }
 }
@@ -273,11 +299,20 @@ mod tests {
         publish(
             tmp.path(),
             vec![
-                Record { purl: Some("pkg:npm/good@1".into()), sha256: Some(good_sha) },
+                Record {
+                    purl: Some("pkg:npm/good@1".into()),
+                    sha256: Some(good_sha),
+                },
                 // also-bad: must be subtracted out of good by `generate`
-                Record { purl: Some("pkg:npm/evil@1".into()), sha256: Some(bad_sha) },
+                Record {
+                    purl: Some("pkg:npm/evil@1".into()),
+                    sha256: Some(bad_sha),
+                },
             ],
-            vec![Record { purl: Some("pkg:npm/evil@1".into()), sha256: Some(bad_sha) }],
+            vec![Record {
+                purl: Some("pkg:npm/evil@1".into()),
+                sha256: Some(bad_sha),
+            }],
         );
 
         let lk = Lookup::load_from(tmp.path());
@@ -300,7 +335,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let good_sha = sha(1);
         for f in generate(
-            vec![Record { purl: Some("pkg:npm/good@1".into()), sha256: Some(good_sha) }],
+            vec![Record {
+                purl: Some("pkg:npm/good@1".into()),
+                sha256: Some(good_sha),
+            }],
             Vec::new(),
             1e-9,
         ) {
@@ -331,11 +369,17 @@ mod tests {
         // trusted by its name.
         let tmp = tempfile::tempdir().expect("tempdir");
         let good = generate(
-            vec![Record { purl: Some("pkg:npm/x@1".into()), sha256: None }],
+            vec![Record {
+                purl: Some("pkg:npm/x@1".into()),
+                sha256: None,
+            }],
             Vec::new(),
             1e-9,
         );
-        let purl_good = good.iter().find(|f| f.tier() == Tier::Good).expect("good filter");
+        let purl_good = good
+            .iter()
+            .find(|f| f.tier() == Tier::Good)
+            .expect("good filter");
         std::fs::write(tmp.path().join("purl-bad.adbl"), purl_good.to_bytes()).expect("write");
 
         let lk = Lookup::load_from(tmp.path());

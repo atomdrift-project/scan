@@ -142,7 +142,10 @@ impl fmt::Display for LoadError {
             Self::Truncated => f.write_str("bloom filter truncated"),
             Self::BadMagic => f.write_str("bloom filter magic mismatch"),
             Self::UnsupportedVersion(v) => {
-                write!(f, "unsupported bloom format version {v} (expected {FORMAT_VERSION})")
+                write!(
+                    f,
+                    "unsupported bloom format version {v} (expected {FORMAT_VERSION})"
+                )
             }
             Self::Corrupt(what) => write!(f, "corrupt bloom header: {what}"),
         }
@@ -221,7 +224,9 @@ impl Filter {
     fn bit(&self, idx: usize) -> bool {
         let byte = idx >> 3;
         // byte < m_bits/8 == bits.len() by construction; guard rather than trust.
-        self.bits.get(byte).is_some_and(|b| b & (1u8 << (idx & 7)) != 0)
+        self.bits
+            .get(byte)
+            .is_some_and(|b| b & (1u8 << (idx & 7)) != 0)
     }
 
     /// Serialize to the on-disk form: [`HEADER_LEN`]-byte header + bit array.
@@ -274,7 +279,15 @@ impl Filter {
         if bits.len() != want_bytes {
             return Err(LoadError::Truncated);
         }
-        Ok(Self { kind, tier, k, m_bits, n, seed, bits: bits.to_vec() })
+        Ok(Self {
+            kind,
+            tier,
+            k,
+            m_bits,
+            n,
+            seed,
+            bits: bits.to_vec(),
+        })
     }
 }
 
@@ -323,7 +336,15 @@ impl Builder {
         let m_bits = (raw_bits.ceil() as u64).max(64).next_power_of_two();
         // k = (m/n)·ln 2, the count minimizing the false-positive rate.
         let k = (((m_bits as f64) / (n as f64) * LN2).round() as u32).clamp(1, MAX_K);
-        Self { kind, tier, k, m_bits, seed, n: 0, bits: vec![0u8; (m_bits / 8) as usize] }
+        Self {
+            kind,
+            tier,
+            k,
+            m_bits,
+            seed,
+            n: 0,
+            bits: vec![0u8; (m_bits / 8) as usize],
+        }
     }
 
     /// Insert a variable-length key (PURL, URL).
@@ -379,16 +400,25 @@ fn each_index(k: u32, m_bits: u64, seed: u64, digest: &[u8; 32], mut f: impl FnM
 const fn lane(d: &[u8; 32], i: usize) -> u64 {
     let s = i * 8;
     u64::from_le_bytes([
-        d[s], d[s + 1], d[s + 2], d[s + 3], d[s + 4], d[s + 5], d[s + 6], d[s + 7],
+        d[s],
+        d[s + 1],
+        d[s + 2],
+        d[s + 3],
+        d[s + 4],
+        d[s + 5],
+        d[s + 6],
+        d[s + 7],
     ])
 }
 
 fn rd_u16(b: &[u8], at: usize) -> u16 {
-    b.get(at..at + 2).map_or(0, |s| u16::from_le_bytes([s[0], s[1]]))
+    b.get(at..at + 2)
+        .map_or(0, |s| u16::from_le_bytes([s[0], s[1]]))
 }
 
 fn rd_u32(b: &[u8], at: usize) -> u32 {
-    b.get(at..at + 4).map_or(0, |s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    b.get(at..at + 4)
+        .map_or(0, |s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 fn rd_u64(b: &[u8], at: usize) -> u64 {
@@ -528,12 +558,7 @@ pub fn generate(
 }
 
 /// Build a string-keyed filter (PURL, URL) from a set of canonical keys.
-fn from_keys(
-    kind: Kind,
-    tier: Tier,
-    keys: &std::collections::HashSet<String>,
-    fp: f64,
-) -> Filter {
+fn from_keys(kind: Kind, tier: Tier, keys: &std::collections::HashSet<String>, fp: f64) -> Filter {
     let mut b = Builder::sized_for(kind, tier, keys.len() as u64, fp, 0);
     for k in keys {
         b.insert_key(k.as_bytes());
@@ -596,17 +621,27 @@ mod tests {
 
     #[test]
     fn no_false_negatives() {
-        let purls = ["pkg:npm/left-pad@1.3.0", "pkg:pypi/requests@2.31.0", "pkg:gem/rails@7.0.0"];
+        let purls = [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:pypi/requests@2.31.0",
+            "pkg:gem/rails@7.0.0",
+        ];
         let f = good_purl_filter(&purls, 1e-6);
         for p in purls {
-            assert!(f.contains_key(canonical_purl(p).as_bytes()), "{p} must be present");
+            assert!(
+                f.contains_key(canonical_purl(p).as_bytes()),
+                "{p} must be present"
+            );
         }
         assert_eq!(f.len(), 3);
     }
 
     #[test]
     fn canonicalization_lowercases_scheme_and_type_only() {
-        assert_eq!(canonical_purl("  PKG:NPM/Left-Pad@1.3.0 "), "pkg:npm/Left-Pad@1.3.0");
+        assert_eq!(
+            canonical_purl("  PKG:NPM/Left-Pad@1.3.0 "),
+            "pkg:npm/Left-Pad@1.3.0"
+        );
         assert_eq!(canonical_purl("pkg:PyPI/Requests"), "pkg:pypi/Requests");
     }
 
@@ -614,7 +649,9 @@ mod tests {
     fn false_positive_rate_is_bounded() {
         // 2000 present keys at p=1e-3; 20000 absent probes should yield well
         // under 1% hits (loose bound — deterministic keys, just guards sanity).
-        let present: Vec<String> = (0..2000).map(|i| format!("pkg:npm/pkg-{i}@1.0.0")).collect();
+        let present: Vec<String> = (0..2000)
+            .map(|i| format!("pkg:npm/pkg-{i}@1.0.0"))
+            .collect();
         let mut b = Builder::sized_for(Kind::Purl, Tier::Good, present.len() as u64, 1e-3, 0);
         for p in &present {
             b.insert_key(p.as_bytes());
@@ -642,7 +679,10 @@ mod tests {
         let mut bytes = good_purl_filter(&["pkg:npm/a@1"], 1e-6).to_bytes();
         bytes[4] = 0xFF; // corrupt the version field
         bytes[5] = 0xFF;
-        assert!(matches!(Filter::load(&bytes), Err(LoadError::UnsupportedVersion(_))));
+        assert!(matches!(
+            Filter::load(&bytes),
+            Err(LoadError::UnsupportedVersion(_))
+        ));
     }
 
     #[test]
@@ -651,7 +691,10 @@ mod tests {
         let mut corrupt = bytes.clone();
         corrupt[0] = b'X';
         assert!(matches!(Filter::load(&corrupt), Err(LoadError::BadMagic)));
-        assert!(matches!(Filter::load(&bytes[..HEADER_LEN - 1]), Err(LoadError::Truncated)));
+        assert!(matches!(
+            Filter::load(&bytes[..HEADER_LEN - 1]),
+            Err(LoadError::Truncated)
+        ));
     }
 
     #[test]
@@ -676,14 +719,20 @@ mod tests {
     #[test]
     fn artifact_stems_name_each_filter() {
         let stems: Vec<String> = generate(
-            [Record { purl: Some("pkg:npm/a@1".into()), sha256: Some(sha256(b"a")) }],
+            [Record {
+                purl: Some("pkg:npm/a@1".into()),
+                sha256: Some(sha256(b"a")),
+            }],
             std::iter::empty(),
             1e-6,
         )
         .iter()
         .map(Filter::artifact_stem)
         .collect();
-        assert_eq!(stems, ["purl-good", "purl-bad", "sha256-good", "sha256-bad"]);
+        assert_eq!(
+            stems,
+            ["purl-good", "purl-bad", "sha256-good", "sha256-bad"]
+        );
     }
 
     #[test]
@@ -693,14 +742,26 @@ mod tests {
         let revoked = sha256(b"revoked-artifact");
         let clean = sha256(b"clean-artifact");
         let good = [
-            Record { purl: Some("pkg:npm/evil@1".into()), sha256: Some(revoked) },
-            Record { purl: Some("pkg:npm/good@1".into()), sha256: Some(clean) },
+            Record {
+                purl: Some("pkg:npm/evil@1".into()),
+                sha256: Some(revoked),
+            },
+            Record {
+                purl: Some("pkg:npm/good@1".into()),
+                sha256: Some(clean),
+            },
         ];
-        let bad = [Record { purl: Some("pkg:npm/evil@1".into()), sha256: Some(revoked) }];
+        let bad = [Record {
+            purl: Some("pkg:npm/evil@1".into()),
+            sha256: Some(revoked),
+        }];
 
         let filters = generate(good, bad, 1e-9);
         let by = |k: Kind, t: Tier| {
-            filters.iter().find(|f| f.kind() == k && f.tier() == t).expect("filter present")
+            filters
+                .iter()
+                .find(|f| f.kind() == k && f.tier() == t)
+                .expect("filter present")
         };
 
         // PURL: revoked excluded from good, present in bad; clean stays good.

@@ -15,7 +15,10 @@ use clap::Parser;
 use scan::bloom_build::{read_pool, write_bundle};
 
 #[derive(Debug, Parser)]
-#[command(name = "scan-bloom-build", about = "Build known-good/known-bad bloom filters from a pool")]
+#[command(
+    name = "scan-bloom-build",
+    about = "Build known-good/known-bad bloom filters from a pool"
+)]
 struct Args {
     /// NDJSON pool file (`{purl?, sha256?, label}` per line); reads stdin if unset.
     #[arg(long = "in", value_name = "FILE")]
@@ -60,8 +63,15 @@ fn main() -> Result<()> {
     let manifest = write_bundle(&args.out, &filters, &args.date)?;
 
     for (stem, entry) in &manifest.filter {
-        eprintln!("  {stem}: {} elements → {} ({})", entry.n, entry.file, entry.sha256);
+        eprintln!(
+            "  {stem}: {} elements → {} ({})",
+            entry.n, entry.file, entry.sha256
+        );
     }
-    eprintln!("wrote {} filters + bloom.toml to {}", manifest.filter.len(), args.out.display());
+    eprintln!(
+        "wrote {} filters + bloom.toml to {}",
+        manifest.filter.len(),
+        args.out.display()
+    );
     Ok(())
 }

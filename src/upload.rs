@@ -367,7 +367,11 @@ fn reconcile_artifacts(
 /// a sample it already holds the bytes for. A `204 No Content` means missing →
 /// backfill it. Any other status, or a probe error, is treated as "present or
 /// unknown" → leave it, so a flaky probe never triggers a redundant upload.
-fn provenance_missing(client: &reqwest::blocking::Client, provenance_url: &str, sha256: &str) -> bool {
+fn provenance_missing(
+    client: &reqwest::blocking::Client,
+    provenance_url: &str,
+    sha256: &str,
+) -> bool {
     match client.head(format!("{provenance_url}/{sha256}")).send() {
         Ok(resp) => resp.status() == reqwest::StatusCode::NO_CONTENT,
         Err(e) => {
@@ -382,7 +386,11 @@ fn provenance_missing(client: &reqwest::blocking::Client, provenance_url: &str, 
 /// every artifact as missing and tries to upload (hopper's upsert is idempotent),
 /// which is the safe direction: we never skip a needed upload because the probe
 /// failed.
-fn post_known(client: &reqwest::blocking::Client, known_url: &str, shas: &[&str]) -> HashSet<String> {
+fn post_known(
+    client: &reqwest::blocking::Client,
+    known_url: &str,
+    shas: &[&str],
+) -> HashSet<String> {
     #[derive(Serialize)]
     struct KnownRequest<'a> {
         sha256: &'a [&'a str],
@@ -417,7 +425,9 @@ fn post_known(client: &reqwest::blocking::Client, known_url: &str, shas: &[&str]
 
 /// Build the multipart provenance part from an artifact's sidecar.
 fn provenance_part(art: &UploadArtifact) -> Option<reqwest::blocking::multipart::Part> {
-    match reqwest::blocking::multipart::Part::bytes(art.sidecar.clone()).mime_str("application/json") {
+    match reqwest::blocking::multipart::Part::bytes(art.sidecar.clone())
+        .mime_str("application/json")
+    {
         Ok(part) => Some(part),
         Err(e) => {
             tracing::warn!(sha256 = %art.sha256, error = %error_chain(&e), "upload: provenance part build failed");
@@ -477,12 +487,10 @@ fn upload_one(
 ) {
     use reqwest::blocking::multipart::{Form, Part};
     let ok = post_upload(client, upload_url, &art.sha256, "artifact", || {
-        Some(
-            Form::new().part("provenance", provenance_part(art)?).part(
-                "file",
-                Part::bytes(bytes.to_vec()).file_name(art.filename.clone()),
-            ),
-        )
+        Some(Form::new().part("provenance", provenance_part(art)?).part(
+            "file",
+            Part::bytes(bytes.to_vec()).file_name(art.filename.clone()),
+        ))
     });
     if ok {
         tracing::debug!(sha256 = %art.sha256, file = %art.filename, size = art.size, "upload: artifact stored on hopper");
@@ -492,11 +500,19 @@ fn upload_one(
 /// Backfill a dependency's registry provenance onto a sample hopper already holds
 /// the bytes for: the same multipart `/api/upload`, but with only the provenance
 /// part (no file). hopper attaches it without moving any bytes.
-fn upload_provenance_only(client: &reqwest::blocking::Client, upload_url: &str, art: &UploadArtifact) {
+fn upload_provenance_only(
+    client: &reqwest::blocking::Client,
+    upload_url: &str,
+    art: &UploadArtifact,
+) {
     use reqwest::blocking::multipart::Form;
-    let ok = post_upload(client, upload_url, &art.sha256, "provenance backfill", || {
-        Some(Form::new().part("provenance", provenance_part(art)?))
-    });
+    let ok = post_upload(
+        client,
+        upload_url,
+        &art.sha256,
+        "provenance backfill",
+        || Some(Form::new().part("provenance", provenance_part(art)?)),
+    );
     if ok {
         tracing::debug!(sha256 = %art.sha256, file = %art.filename, "upload: provenance backfilled on hopper");
     }

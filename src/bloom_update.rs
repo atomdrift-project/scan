@@ -52,7 +52,11 @@ pub fn update(dir: &Path, force: bool) -> Result<()> {
         return Ok(());
     }
     install(dir, &manifest)?;
-    eprintln!("Bloom filters updated to {} at {}", manifest.built, dir.display());
+    eprintln!(
+        "Bloom filters updated to {} at {}",
+        manifest.built,
+        dir.display()
+    );
     Ok(())
 }
 
@@ -67,7 +71,10 @@ pub fn check(dir: &Path) -> Result<()> {
             eprintln!("Bloom filters up to date: {built}");
         }
         Some(built) => {
-            eprintln!("Bloom filter update available: {} — currently {built}", manifest.built);
+            eprintln!(
+                "Bloom filter update available: {} — currently {built}",
+                manifest.built
+            );
         }
         None => eprintln!("Bloom filters not installed; available: {}", manifest.built),
     }
@@ -105,7 +112,11 @@ fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
 
         let got = format!("{:x}", Sha256::digest(&bytes));
         if got != entry.sha256 {
-            bail!("sha256 mismatch for {}: got {got}, manifest says {}", entry.file, entry.sha256);
+            bail!(
+                "sha256 mismatch for {}: got {got}, manifest says {}",
+                entry.file,
+                entry.sha256
+            );
         }
 
         // Validate before staging: it must load (FORMAT_VERSION gate) and its
@@ -113,7 +124,10 @@ fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
         let filter = Filter::load(&bytes).with_context(|| format!("validating {}", entry.file))?;
         let want = format!("{}.adbl", filter.artifact_stem());
         if want != entry.file {
-            bail!("bloom filter {} identifies as {want}; refusing to install", entry.file);
+            bail!(
+                "bloom filter {} identifies as {want}; refusing to install",
+                entry.file
+            );
         }
 
         std::fs::write(staging.join(&entry.file), &bytes)
@@ -150,5 +164,8 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
         .with_context(|| format!("GET {url}"))?;
-    Ok(resp.bytes().with_context(|| format!("reading {url}"))?.to_vec())
+    Ok(resp
+        .bytes()
+        .with_context(|| format!("reading {url}"))?
+        .to_vec())
 }

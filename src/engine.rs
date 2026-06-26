@@ -258,8 +258,12 @@ impl ScanConfig {
     /// loaded filters. Unset, a config stays in [`crate::Mode::Slow`] (full scan).
     #[must_use]
     pub fn with_bloom(mut self, mode: crate::Mode, lookup: Lookup) -> Self {
+        let lookup = Arc::new(lookup);
+        // Publish process-wide so the dependency-fetch reporter can label deps
+        // good/bad without threading config into the fetch subsystem.
+        crate::bloom_repo::set_global(Arc::clone(&lookup));
         self.mode = mode;
-        self.bloom = Some(Arc::new(lookup));
+        self.bloom = Some(lookup);
         self
     }
 
@@ -542,11 +546,23 @@ mod envelope_tests {
         // Root file + the single usable dependency; the other two edges drop out.
         assert_eq!(arts.len(), 2);
         assert_eq!(arts[0].sha256, "a".repeat(64), "root file is offered first");
-        assert!(matches!(arts[0].bytes, crate::upload::ArtifactBytes::File(_)));
-        assert!(!arts[0].backfill, "root file's thin sidecar is not backfilled");
+        assert!(matches!(
+            arts[0].bytes,
+            crate::upload::ArtifactBytes::File(_)
+        ));
+        assert!(
+            !arts[0].backfill,
+            "root file's thin sidecar is not backfilled"
+        );
         assert_eq!(arts[1].sha256, "c".repeat(64));
-        assert!(arts[1].backfill, "a dependency's registry provenance is backfillable");
-        assert_eq!(arts[1].filename, "x-1.tgz", "filename derived from the fetch URL");
+        assert!(
+            arts[1].backfill,
+            "a dependency's registry provenance is backfillable"
+        );
+        assert_eq!(
+            arts[1].filename, "x-1.tgz",
+            "filename derived from the fetch URL"
+        );
         assert!(
             matches!(&arts[1].bytes, crate::upload::ArtifactBytes::Cached { locator } if locator == "pkg:bogus/x@1"),
             "a dependency's bytes load lazily from the cache by locator",
@@ -1140,7 +1156,14 @@ fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
 
 /// A one-file [`ScanSummary`] for a bloom-decided artifact that was not analyzed.
 const fn one_file_summary(hostile: u32, suspicious: u32, benign: u32) -> ScanSummary {
-    ScanSummary { total_files: 1, hostile, suspicious, benign, errors: 0, duration_ms: 0 }
+    ScanSummary {
+        total_files: 1,
+        hostile,
+        suspicious,
+        benign,
+        errors: 0,
+        duration_ms: 0,
+    }
 }
 
 /// Run a scan against a file or directory tree.
@@ -1394,8 +1417,11 @@ fn record_file_result(
     if let Some(lookup) = config.bloom()
         && let Ok(report) = &cleave_result
         && let Some(digest) = crate::bloom::parse_sha256_hex(&report.target.sha256)
-        && let Some(summary) =
-            bloom_gate(config, &file_path.display().to_string(), lookup.decide_sha256(&digest))
+        && let Some(summary) = bloom_gate(
+            config,
+            &file_path.display().to_string(),
+            lookup.decide_sha256(&digest),
+        )
     {
         if summary.benign > 0 {
             tally.count(Classification::Benign);
@@ -1500,7 +1526,15 @@ fn collect_upload_artifacts(
         filename: root_name.clone(),
         bytes: ArtifactBytes::File(file_path.to_path_buf()),
         sidecar: crate::provenance::build_sidecar(
-            &root_name, sha256, size_bytes, collector, &now, "", "", None, &[],
+            &root_name,
+            sha256,
+            size_bytes,
+            collector,
+            &now,
+            "",
+            "",
+            None,
+            &[],
         ),
         // The root file's sidecar carries no registry/PURL, so there's nothing
         // worth backfilling onto a copy hopper already has.
@@ -1517,7 +1551,8 @@ fn collect_upload_artifacts(
             continue;
         }
         let (Some(content_sha), Some(locator)) = (
-            edge.get("content_sha256").and_then(serde_json::Value::as_str),
+            edge.get("content_sha256")
+                .and_then(serde_json::Value::as_str),
             edge.get("locator").and_then(serde_json::Value::as_str),
         ) else {
             continue;
@@ -1541,8 +1576,15 @@ fn collect_upload_artifacts(
             sha256: content_sha.to_string(),
             size: dep_size,
             sidecar: crate::provenance::build_sidecar(
-                &dep_name, content_sha, dep_size, collector, &now, url, locator,
-                registry.as_ref(), &sources,
+                &dep_name,
+                content_sha,
+                dep_size,
+                collector,
+                &now,
+                url,
+                locator,
+                registry.as_ref(),
+                &sources,
             ),
             filename: dep_name,
             bytes: ArtifactBytes::Cached {

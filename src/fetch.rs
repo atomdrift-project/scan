@@ -40,7 +40,7 @@ use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
     BlobCache, FetchBudget, FetchRecord, HttpFetch, Outcome, fetch_ref, fetch_references,
 };
-use fletch::{Reference, RefKind, RefLocator, Registry, find};
+use fletch::{RefKind, RefLocator, Reference, Registry, find};
 
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
@@ -105,14 +105,12 @@ pub fn set_total_budget(max_fetches: usize, max_bytes: u64) {
 /// zero so a charge never wraps. Cache hits and budget-skipped edges cost
 /// nothing (the caller filters them out before charging).
 fn charge_total_budget(fetches: usize, bytes: u64) {
-    let _ = TOTAL_FETCH_COUNT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(fetches))
-        });
-    let _ = TOTAL_FETCH_BYTES
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(bytes))
-        });
+    let _ = TOTAL_FETCH_COUNT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(fetches))
+    });
+    let _ = TOTAL_FETCH_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(bytes))
+    });
 }
 
 /// Parse a byte size with an optional 1024-based unit suffix — `K`, `M`, `G`, or
@@ -335,8 +333,12 @@ pub(crate) fn orchestrate(
         .iter()
         .flat_map(|(_, refs)| refs.iter().cloned())
         .collect();
+    // Surfaced at debug, not warn: this is only meaningful when a manifest is
+    // present to diff against. Scanning loose files (no manifest) flags every
+    // imperative import as "undeclared", so emitting it by default is noise.
+    // `--verbose` (scan=debug) still exposes it for investigation.
     for u in find::undeclared_packages(&all_refs) {
-        tracing::warn!(
+        tracing::debug!(
             package = %locator_key(u),
             source = %u.source,
             "undeclared dependency: imperatively acquired but not declared in manifest"
@@ -431,7 +433,10 @@ pub(crate) fn orchestrate(
             // Charge the per-execution budget for what this file fetched live.
             // Only live fetches count (cache hits are free, matching
             // `fetch_references`); a `BudgetExceeded` edge consumes nothing.
-            let spent = fetched.iter().filter(|r| fletch::fetch::counts_against_budget(r)).count();
+            let spent = fetched
+                .iter()
+                .filter(|r| fletch::fetch::counts_against_budget(r))
+                .count();
             let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
             charge_total_budget(spent, bytes);
 
@@ -650,7 +655,9 @@ pub fn report_registry(reg: &Registry, progress: bool) {
 /// stay silent. Colors mirror the scan progress bar's truecolor palette.
 fn report_fetch(rec: &FetchRecord) {
     // (glyph, label, r, g, b, detail) — detail replaces the size column when a
-    // fetch never delivered bytes (a failure or a skip).
+    // fetch never delivered bytes. A *fetched* dep the local bloom filters vouch
+    // for (or flag) is relabeled `bloom` instead of `live`/`cache` (green ✓ for
+    // known-good, red ✗ for known-bad); `skip`/`fail` rows are left as-is.
     let (glyph, label, r, g, b, detail) = match &rec.outcome {
         Outcome::PinMismatch => (
             '\u{2716}',
@@ -661,8 +668,15 @@ fn report_fetch(rec: &FetchRecord) {
             Some("hash mismatch".to_string()),
         ),
         Outcome::Ok if rec.stale => ('\u{25cf}', "stale", 230, 180, 80, None),
-        Outcome::Ok if rec.cached => ('\u{25cf}', "cache", 120, 200, 140, None),
-        Outcome::Ok => ('\u{2b07}', "live", 100, 180, 255, None),
+        Outcome::Ok => {
+            if let Some(verdict) = bloom_fetch_verdict(rec) {
+                verdict
+            } else if rec.cached {
+                ('\u{25cf}', "cache", 120, 200, 140, None)
+            } else {
+                ('\u{2b07}', "live", 100, 180, 255, None)
+            }
+        }
         Outcome::BudgetExceeded => (
             '\u{25cb}',
             "budget",
@@ -714,6 +728,44 @@ fn report_fetch(rec: &FetchRecord) {
     eprintln!(
         "    \x1b[38;2;{r};{g};{b}m{glyph} {label:<6}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {url}{redirect}"
     );
+}
+
+/// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
+/// `detail` replaces the size column when set.
+type FetchRow = (char, &'static str, i32, i32, i32, Option<String>);
+
+/// A bloom verdict for a fetched artifact, as a `report_fetch` row override:
+/// both known-good and known-bad render as the `bloom` label, distinguished by
+/// color/glyph (green ✓ = good/not deeply scanned, red ✗ = bad/conflicted —
+/// flagged). `None` when bloom is disabled or the artifact is in neither set.
+/// Checks the fetched content's sha256 and, for a dependency, its PURL; a bad
+/// hit on either wins over a good hit.
+fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
+    use crate::bloom_repo::Decision;
+    let lookup = crate::bloom_repo::global()?;
+
+    let sha = rec
+        .content_sha256
+        .as_deref()
+        .and_then(crate::bloom::parse_sha256_hex)
+        .map(|d| lookup.decide_sha256(&d));
+    let purl = rec
+        .locator
+        .starts_with("pkg:")
+        .then(|| lookup.decide_purl(&rec.locator));
+
+    let decisions = [sha, purl];
+    if decisions
+        .iter()
+        .flatten()
+        .any(|d| matches!(d, Decision::KnownBad | Decision::Conflicted))
+    {
+        return Some(('\u{2717}', "bloom", 255, 90, 90, None));
+    }
+    if decisions.iter().flatten().any(|d| *d == Decision::Skip) {
+        return Some(('\u{2713}', "bloom", 80, 200, 80, None));
+    }
+    None
 }
 
 /// The compact failure note for a failed fetch — the HTTP status when one was
@@ -807,7 +859,9 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
     // network — and misses that still need a lookup.
     let mut misses: Vec<usize> = Vec::new();
     {
-        let memo = registry_memo().read().unwrap_or_else(PoisonError::into_inner);
+        let memo = registry_memo()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         for i in (0..selected.len()).filter(|&i| selected[i].kind == RefKind::Dependency) {
             match memo.get(&locator_key(&selected[i])) {
                 // Stored un-aged; stamp the age signals from this scan's clock.
@@ -835,7 +889,10 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
                         // The raw, un-aged record (or `None` for an unresolved or
                         // unsupported package) — both worth memoizing so the
                         // lookup isn't re-attempted for every file that names it.
-                        local.push((i, fletch::registry(&selected[i].locator, &res.net, &res.cache)));
+                        local.push((
+                            i,
+                            fletch::registry(&selected[i].locator, &res.net, &res.cache),
+                        ));
                     }
                     local
                 })
@@ -996,10 +1053,7 @@ fn human_bytes(n: u64) -> String {
 }
 
 /// References to fetch, grouped by the sha256 of the file that declared them.
-fn collect_references(
-    report: &AnalysisReport,
-    root_path: &Path,
-) -> Vec<(String, Vec<Reference>)> {
+fn collect_references(report: &AnalysisReport, root_path: &Path) -> Vec<(String, Vec<Reference>)> {
     let mut groups: Vec<(String, Vec<Reference>)> = Vec::new();
     for file in &report.files {
         let Some(view) = &file.filefacts else {

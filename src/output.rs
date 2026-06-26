@@ -657,20 +657,26 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
 
     let p = palette();
     let (icon, name, reason) = match verdict {
-        BloomVerdict::KnownGood => {
-            (fg(p.benign, "\u{2713}"), fg(p.benign, "known-good"), "skipping scan")
-        }
-        BloomVerdict::KnownBad => {
-            (fg(p.hostile, "\u{2717}"), fg(p.hostile, "known-bad"), "flagged — scanning")
-        }
+        BloomVerdict::KnownGood => (
+            fg(p.benign, "\u{2713}"),
+            fg(p.benign, "known-good"),
+            "skipping scan",
+        ),
+        BloomVerdict::KnownBad => (
+            fg(p.hostile, "\u{2717}"),
+            fg(p.hostile, "known-bad"),
+            "flagged — scanning",
+        ),
         BloomVerdict::Conflicted => (
             fg(p.warning, "\u{26a0}"),
             fg(p.warning, "conflicted"),
             "in good and bad — scanning",
         ),
-        BloomVerdict::Unscanned => {
-            (fg(p.warning, "!"), fg(p.very_dim, "unscanned"), "not in known sets (fast mode)")
-        }
+        BloomVerdict::Unscanned => (
+            fg(p.warning, "!"),
+            fg(p.very_dim, "unscanned"),
+            "not in known sets (fast mode)",
+        ),
     };
     eprintln!(
         "  {icon}  {name} {}  {}",
@@ -702,7 +708,11 @@ pub fn print_summary(summary: &ScanSummary) {
             parts.push(fg(p.very_dim, &format!("{} unscanned", bloom.unscanned)));
         }
         let sep = format!("  {}  ", fg(p.dot_sep, "\u{00b7}"));
-        eprintln!("  {}  bloom  {}", fg(p.header_icon, "\u{25c6}"), parts.join(&sep));
+        eprintln!(
+            "  {}  bloom  {}",
+            fg(p.header_icon, "\u{25c6}"),
+            parts.join(&sep)
+        );
     }
 
     if summary.total_files == 0 {

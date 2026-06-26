@@ -92,7 +92,13 @@ pub fn read_pool(reader: impl BufRead) -> Result<(KeySets, PoolStats)> {
                 continue;
             }
         };
-        sets.insert(label, Record { purl: rec.purl, sha256: sha });
+        sets.insert(
+            label,
+            Record {
+                purl: rec.purl,
+                sha256: sha,
+            },
+        );
     }
     Ok((sets, stats))
 }
@@ -133,8 +139,7 @@ pub fn write_bundle(dir: &Path, filters: &[Filter], built: &str) -> Result<Manif
         let stem = filter.artifact_stem();
         let file = format!("{stem}.adbl");
         let bytes = filter.to_bytes();
-        std::fs::write(dir.join(&file), &bytes)
-            .with_context(|| format!("writing {file}"))?;
+        std::fs::write(dir.join(&file), &bytes).with_context(|| format!("writing {file}"))?;
         entries.insert(
             stem,
             Entry {
@@ -145,7 +150,11 @@ pub fn write_bundle(dir: &Path, filters: &[Filter], built: &str) -> Result<Manif
             },
         );
     }
-    let manifest = Manifest { schema: MANIFEST_SCHEMA, built: built.to_owned(), filter: entries };
+    let manifest = Manifest {
+        schema: MANIFEST_SCHEMA,
+        built: built.to_owned(),
+        filter: entries,
+    };
     let text = toml::to_string(&manifest).context("serializing bloom.toml")?;
     std::fs::write(dir.join("bloom.toml"), text).context("writing bloom.toml")?;
     Ok(manifest)
@@ -175,7 +184,7 @@ mod tests {
             "\n",
             r#"{"purl":"pkg:npm/evil@1","label":"bad"}"#,
             "\n",
-            "\n", // blank line ignored
+            "\n",                  // blank line ignored
             r#"{"label":"good"}"#, // no purl/sha → contributes nothing
             "\n",
             r#"{"sha256":"nothex","label":"bad"}"#, // bad sha, no purl → nothing, counted
