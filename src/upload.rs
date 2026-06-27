@@ -445,6 +445,7 @@ fn post_upload(
     upload_url: &str,
     sha256: &str,
     kind: &str,
+    provenance: &[u8],
     build_form: impl Fn() -> Option<reqwest::blocking::multipart::Form>,
 ) -> bool {
     for attempt in 0..MAX_ATTEMPTS {
@@ -463,7 +464,14 @@ fn post_upload(
                     && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
                     let body = resp.text().unwrap_or_default();
-                    tracing::warn!(sha256 = %sha256, kind, %status, body = %body, "upload: rejected by hopper; not retrying");
+                    tracing::warn!(
+                        sha256 = %sha256,
+                        kind,
+                        %status,
+                        body = %body,
+                        provenance = %String::from_utf8_lossy(provenance),
+                        "upload: rejected by hopper; not retrying"
+                    );
                     return false;
                 }
                 tracing::warn!(sha256 = %sha256, kind, %status, attempt, "upload: non-success response");
@@ -486,7 +494,7 @@ fn upload_one(
     bytes: &[u8],
 ) {
     use reqwest::blocking::multipart::{Form, Part};
-    let ok = post_upload(client, upload_url, &art.sha256, "artifact", || {
+    let ok = post_upload(client, upload_url, &art.sha256, "artifact", &art.sidecar, || {
         Some(Form::new().part("provenance", provenance_part(art)?).part(
             "file",
             Part::bytes(bytes.to_vec()).file_name(art.filename.clone()),
@@ -511,6 +519,7 @@ fn upload_provenance_only(
         upload_url,
         &art.sha256,
         "provenance backfill",
+        &art.sidecar,
         || Some(Form::new().part("provenance", provenance_part(art)?)),
     );
     if ok {

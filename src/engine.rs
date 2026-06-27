@@ -1617,6 +1617,17 @@ fn artifact_filename(url: &str, locator: &str) -> String {
         .replace(['@', ':'], "-")
 }
 
+/// SHA-256 (hex) of a file's contents, used to match a scanned file to its entry
+/// in a `--registry-map`. `None` on any I/O error — the file just scans without
+/// registry provenance.
+fn sha256_file_hex(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Scan a set of file and directory paths, classifying every file.
 ///
 /// Explicit files are analyzed together as one parallel batch (via
@@ -1634,7 +1645,7 @@ fn artifact_filename(url: &str, locator: &str) -> String {
 pub fn run_paths(
     paths: &[PathBuf],
     config: &ScanConfig,
-    root_registry: Option<&fletch::Registry>,
+    registry_map: Option<&std::collections::HashMap<String, fletch::Registry>>,
 ) -> Result<ScanSummary> {
     prefetch_cleave_resources();
 
@@ -1690,6 +1701,10 @@ pub fn run_paths(
 
     {
         let record = |file_path: &Path, result: Result<cleave::AnalysisReport>| {
+            // Per-file provenance: match this artifact's content sha to its registry
+            // record in the map. A file with no entry simply scans without it.
+            let root_registry =
+                registry_map.and_then(|m| sha256_file_hex(file_path).and_then(|sha| m.get(&sha)));
             record_file_result(
                 file_path,
                 result,

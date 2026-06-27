@@ -299,13 +299,14 @@ enum Commands {
         #[arg(long, visible_alias = "upload", value_name = "URL")]
         hopper: Option<String>,
 
-        /// Apply pre-collected registry metadata as the scan's root registry,
-        /// instead of fetching it live. Takes a provenance sidecar produced by
-        /// `fletch registry <purl>` (the `{registry:{record,…}}` document hopper
-        /// also stores), so an offline scan reasons over the same registry facts
-        /// a live `pkg`/`url` scan would. Applies to every path scanned.
+        /// Apply pre-collected registry metadata per scanned file, so an offline
+        /// scan reasons over the same registry facts a live `pkg`/`url` scan would
+        /// — without refetching, and even when the package has since been pulled.
+        /// Takes a JSON object mapping each file's sha256 to its registry record
+        /// (the `registry.record` slot of the sidecar hopper stores; the rest of
+        /// the provenance is ignored). A file absent from the map scans normally.
         #[arg(long, value_name = "FILE")]
-        registry: Option<PathBuf>,
+        registry_map: Option<PathBuf>,
     },
 
     /// Scan executables of all running processes
@@ -564,7 +565,7 @@ fn main() -> Result<()> {
                 Commands::Path {
                     paths: cli.paths.clone(),
                     hopper: None,
-                    registry: None,
+                    registry_map: None,
                 }
             } else {
                 Cli::parse_from(["scan", "--help"]);
@@ -832,7 +833,7 @@ fn main() -> Result<()> {
         Commands::Path {
             paths,
             hopper,
-            registry,
+            registry_map,
         } => {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
@@ -854,23 +855,31 @@ fn main() -> Result<()> {
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
             }
-            // `--registry <file>`: apply the pre-collected registry record as the
-            // root registry, so the scan reasons over the same facts a live scan
-            // fetches. A malformed/absent record is fatal here (unlike the
-            // worker's best-effort path): the operator named the file explicitly.
-            let root_registry = match &registry {
+            // `--registry-map <file>`: a JSON object {sha256: registry record}.
+            // Each scanned file is enriched with its own registry provenance,
+            // matched by content sha. Entries that don't parse to a record are
+            // skipped — registry provenance is best-effort, never required.
+            let registry_map = match &registry_map {
                 Some(path) => {
                     let bytes = std::fs::read(path).with_context(|| {
-                        format!("reading registry provenance {}", path.display())
+                        format!("reading registry map {}", path.display())
                     })?;
-                    let record = scan::provenance::registry_record(&bytes).with_context(|| {
-                        format!("no registry record in provenance {}", path.display())
-                    })?;
-                    Some(record)
+                    let raw: std::collections::HashMap<String, serde_json::Value> =
+                        serde_json::from_slice(&bytes).with_context(|| {
+                            format!("parsing registry map {}", path.display())
+                        })?;
+                    let mut map = std::collections::HashMap::with_capacity(raw.len());
+                    for (sha, value) in raw {
+                        let value_bytes = serde_json::to_vec(&value).unwrap_or_default();
+                        if let Some(record) = scan::provenance::registry_record(&value_bytes) {
+                            map.insert(sha, record);
+                        }
+                    }
+                    Some(map)
                 }
                 None => None,
             };
-            exit_for_summary(&run_scan_paths(&paths, &config, root_registry.as_ref())?);
+            exit_for_summary(&run_scan_paths(&paths, &config, registry_map.as_ref())?);
         }
         Commands::Sys => {
             let model_dir = resolve_model_dir()?;
@@ -1519,7 +1528,7 @@ fn exit_for_summary(summary: &scan::ScanSummary) {
 fn run_scan_paths(
     paths: &[PathBuf],
     config: &scan::ScanConfig,
-    root_registry: Option<&fletch::Registry>,
+    registry_map: Option<&std::collections::HashMap<String, fletch::Registry>>,
 ) -> Result<scan::ScanSummary> {
     // Warm YARA + capability mapper off the rayon pool before any analysis
     // spawns rayon work. Directory scans run on a dedicated rayon pool; if
@@ -1530,7 +1539,7 @@ fn run_scan_paths(
 
     // Explicit files are analyzed as one parallel batch and each directory is
     // streamed; run_paths shares one model load and verdict tally across all.
-    scan::engine::run_paths(paths, config, root_registry)
+    scan::engine::run_paths(paths, config, registry_map)
 }
 
 #[cfg(test)]

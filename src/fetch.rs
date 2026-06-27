@@ -389,23 +389,39 @@ pub(crate) fn orchestrate(
                 // is skipped — because the dependency aged out, or because the
                 // version was removed (no artifact to fetch).
                 let removed = reg.version_removed == Some(true);
-                tracing::info!(
-                    package = %locator_key(r),
-                    ecosystem = %reg.ecosystem,
-                    version = %reg.version,
-                    age_days = reg.age_days.unwrap_or(0),
-                    downloads = reg.downloads_recent.or(reg.downloads_total),
-                    reason = if removed { "version removed from registry" } else { "older than --max-dep-age" },
-                    "registry record materialized; artifact fetch skipped"
-                );
-                if progress {
-                    if !header_printed {
-                        eprintln!(
-                            "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
-                        );
-                        header_printed = true;
+                let common = tracing::field::display(locator_key(r));
+                // Age-outs are the common, expected case and would otherwise flood
+                // the progress block, so they stay at debug and print no skip line;
+                // version removals are rarer and worth surfacing.
+                if removed {
+                    tracing::info!(
+                        package = %common,
+                        ecosystem = %reg.ecosystem,
+                        version = %reg.version,
+                        age_days = reg.age_days.unwrap_or(0),
+                        downloads = reg.downloads_recent.or(reg.downloads_total),
+                        reason = "version removed from registry",
+                        "registry record materialized; artifact fetch skipped"
+                    );
+                    if progress {
+                        if !header_printed {
+                            eprintln!(
+                                "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
+                            );
+                            header_printed = true;
+                        }
+                        report_skip(r, reg, now);
                     }
-                    report_skip(r, reg, now);
+                } else {
+                    tracing::debug!(
+                        package = %common,
+                        ecosystem = %reg.ecosystem,
+                        version = %reg.version,
+                        age_days = reg.age_days.unwrap_or(0),
+                        downloads = reg.downloads_recent.or(reg.downloads_total),
+                        reason = "older than --max-dep-age",
+                        "registry record materialized; artifact fetch skipped"
+                    );
                 }
             }
             if selected.is_empty() {

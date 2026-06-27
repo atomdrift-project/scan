@@ -116,12 +116,17 @@ struct RegistryProvenance {
 }
 
 /// Recover the normalized registry record from a provenance document. Accepts
-/// either a hopper sidecar (the record nested under `registry`, as the worker
-/// receives from `/api/provenance/{sha256}`) or a bare `fletch registry`
-/// envelope (the `{record, sources}` document itself, as `--registry` may be
-/// handed straight from fletch's stdout). `None` when the document is malformed
-/// or carries no record — registry provenance enriches a scan but is never
-/// required, so absence is not an error.
+/// any of three shapes:
+/// - a hopper sidecar (record nested under `registry`, as the worker receives
+///   from `/api/provenance/{sha256}`),
+/// - a bare `fletch registry` envelope (`{record, sources}`, straight from
+///   fletch's stdout), or
+/// - a bare normalized [`Registry`] record, the per-sha value `--registry-map`
+///   carries (callers like gauntlet extract just `registry.record` to keep the
+///   map to the data filefacts actually parses).
+///
+/// `None` when the document is malformed or carries no record — registry
+/// provenance enriches a scan but is never required, so absence is not an error.
 #[must_use]
 pub fn registry_record(json: &[u8]) -> Option<Registry> {
     if let Ok(sidecar) = serde_json::from_slice::<Sidecar>(json)
@@ -129,9 +134,10 @@ pub fn registry_record(json: &[u8]) -> Option<Registry> {
     {
         return Some(provenance.record);
     }
-    serde_json::from_slice::<RegistryProvenance>(json)
-        .ok()
-        .map(|envelope| envelope.record)
+    if let Ok(envelope) = serde_json::from_slice::<RegistryProvenance>(json) {
+        return Some(envelope.record);
+    }
+    serde_json::from_slice::<Registry>(json).ok()
 }
 
 #[cfg(test)]
@@ -161,6 +167,15 @@ mod tests {
         let json = format!(r#"{{"record":{RECORD},"sources":[]}}"#);
         let rec = registry_record(json.as_bytes()).expect("record present");
         assert_eq!(rec.name, "left-pad");
+    }
+
+    #[test]
+    fn reads_bare_record() {
+        // A bare normalized record — the per-sha value gauntlet puts in a
+        // `--registry-map` after extracting just `registry.record`.
+        let rec = registry_record(RECORD.as_bytes()).expect("record present");
+        assert_eq!(rec.name, "left-pad");
+        assert_eq!(rec.version, "1.3.0");
     }
 
     #[test]
