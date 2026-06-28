@@ -1178,11 +1178,34 @@ fn main() -> Result<()> {
             rt.block_on(scan::worker::run(config))?;
         }
         Commands::Version => {
+            let bloom = scan::bloom_repo::installed_manifest();
             if cli.format == scan::OutputFormat::Json {
+                let bloom_json = bloom.as_ref().map(|m| {
+                    let filters: serde_json::Map<String, serde_json::Value> = m
+                        .filter
+                        .iter()
+                        .map(|(stem, e)| {
+                            (
+                                stem.clone(),
+                                serde_json::json!({
+                                    "n": e.n,
+                                    "format_version": e.format_version,
+                                    "sha256": e.sha256,
+                                }),
+                            )
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "built": m.built,
+                        "schema": m.schema,
+                        "filters": filters,
+                    })
+                });
                 let version = serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "models": scan::models_repo::version(),
                     "traits": cleave::traits_repo::version(),
+                    "bloom": bloom_json,
                 });
                 println!("{version}");
             } else {
@@ -1192,6 +1215,22 @@ fn main() -> Result<()> {
                 }
                 if let Some(v) = cleave::traits_repo::version() {
                     println!("  traits: {v}");
+                }
+                if let Some(m) = &bloom {
+                    // `built` is the timestamp; the format version comes off any
+                    // entry (all share it). Counts are listed one indented line down.
+                    match m.filter.values().next() {
+                        Some(e) => println!("  bloom: {} (v{})", m.built, e.format_version),
+                        None => println!("  bloom: {}", m.built),
+                    }
+                    let counts: Vec<String> = m
+                        .filter
+                        .iter()
+                        .map(|(stem, e)| format!("{stem} {}", e.n))
+                        .collect();
+                    if !counts.is_empty() {
+                        println!("    {}", counts.join(" · "));
+                    }
                 }
             }
         }
