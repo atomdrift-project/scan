@@ -130,9 +130,20 @@ fi
 
 bloom_ready=0
 if [ -d "${BLOOM_DIR}/.git" ]; then
+    log "Bloom checkout present at ${BLOOM_DIR}; normalizing to HEAD"
+    # A prior clone may have fetched objects but failed to materialize the working
+    # tree (e.g. tripping on stray files a pre-clone build left behind). Reset to
+    # HEAD so the tree is whole and clean before the cycle commits into it.
+    as_bloom git -C "${BLOOM_DIR}" reset --hard HEAD >/dev/null 2>&1 || true
+    as_bloom git -C "${BLOOM_DIR}" clean -fd >/dev/null 2>&1 || true
     bloom_ready=1
-    log "Bloom checkout present at ${BLOOM_DIR}"
 else
+    # A non-git directory here is stale build output (filters are rebuilt every
+    # cycle) and would make `git clone` trip on untracked files — clear it first.
+    if [ -e "${BLOOM_DIR}" ]; then
+        log "Clearing stale non-git ${BLOOM_DIR} before clone"
+        as_bloom rm -rf "${BLOOM_DIR}"
+    fi
     log "Cloning bloom repo into ${BLOOM_DIR} (${BLOOM_REMOTE})"
     if as_bloom git clone "${BLOOM_REMOTE}" "${BLOOM_DIR}"; then
         bloom_ready=1
@@ -144,7 +155,8 @@ else
 fi
 
 if [ "$bloom_ready" = 1 ]; then
-    # Commit identity for the unattended commits, and make sure origin points at
+    # Commit identity for the unattended commits — without it the cycle's git
+    # commit fails ("Please tell me who you are") — and make sure origin points at
     # the push remote even if the repo was seeded some other way.
     as_bloom git -C "${BLOOM_DIR}" config user.name  "Atomdrift Bloomer"
     as_bloom git -C "${BLOOM_DIR}" config user.email "bloomer@atomdrift"

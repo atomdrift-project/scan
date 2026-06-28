@@ -131,8 +131,8 @@ publish-models: release ## Compat-test azoth vs last (VERSIONS-1) litmus release
 # them to R2. The pool defaults to the local hopper replica (same DSN collimator
 # trains from; auth via ~/.pgpass) — see scripts/bloom_pool.sql for the tier
 # predicates. Override with POOL=<file.ndjson> to build from a captured export.
-# Filters and their manifest go to a format-versioned prefix (litmus/v<N>/), both
-# short-cached: the download flow compares per-file sha256 to decide what to pull,
+# Filters and their manifest go to a format-versioned prefix (litmus/bloom/v<N>/),
+# both short-cached: the download flow compares per-file sha256 to decide what to pull,
 # so artifacts are overwritten in place rather than parked under dated, immutable
 # paths. A format bump (FORMAT_VERSION) moves the whole prefix, leaving the old
 # one intact for clients still on it. No signing: the filters carry no
@@ -173,13 +173,13 @@ publish-bloom: ## Upload the already-built filters in $(BLOOM_REPO) to R2 under 
 	ver=$$(awk -F'= *' '/format_version/{print $$2; exit}' "$(BLOOM_REPO)/bloom.toml"); \
 	[ -n "$$built" ] || { echo "publish-bloom: no 'built' date in bloom.toml"; exit 1; }; \
 	[ -n "$$ver" ] || { echo "publish-bloom: no format_version in bloom.toml"; exit 1; }; \
-	echo "→ uploading filters built $$built to R2 (litmus/v$$ver/, short cache)"; \
-	rclone copy "$(BLOOM_REPO)" "$(R2_REMOTE)/$(R2_LITMUS)/v$$ver/" --include "*.adbl" \
+	echo "→ uploading filters built $$built to R2 (litmus/bloom/v$$ver/, short cache)"; \
+	rclone copy "$(BLOOM_REPO)" "$(R2_REMOTE)/$(R2_LITMUS)/bloom/v$$ver/" --include "*.adbl" \
 	  --header-upload "Cache-Control: public, max-age=300" --progress; \
 	echo "→ publishing manifest (short cache)"; \
-	rclone copyto "$(BLOOM_REPO)/bloom.toml" "$(R2_REMOTE)/$(R2_LITMUS)/v$$ver/bloom.toml" \
+	rclone copyto "$(BLOOM_REPO)/bloom.toml" "$(R2_REMOTE)/$(R2_LITMUS)/bloom/v$$ver/bloom.toml" \
 	  --header-upload "Cache-Control: public, max-age=60"; \
-	echo "✓ publish-bloom complete: built $$built → litmus/v$$ver/"
+	echo "✓ publish-bloom complete: built $$built → litmus/bloom/v$$ver/"
 
 # Unattended cycle for the hourly systemd timer (scripts/worker/bloomer-linux.sh):
 # rebuild a fresh 365-day filter set, commit+push the source-of-truth $(BLOOM_REPO),
@@ -190,12 +190,15 @@ publish-bloom: ## Upload the already-built filters in $(BLOOM_REPO) to R2 under 
 # manifest-pointer refresh. A push failure is logged but does not block the upload.
 # Safe to run by hand, too.
 bloom-cron: ## Hourly-timer cycle: build (BLOOM_CRON_MAX_AGE_DAYS, default 365) -> commit+push $(BLOOM_REPO) -> upload to R2
+	@git -C "$(BLOOM_REPO)" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+	  || { echo "bloom-cron: $(BLOOM_REPO) is not a git checkout — clone the bloom repo there first (don't let the timer build into a bare dir)"; exit 1; }
 	$(MAKE) build-bloom BLOOM_MAX_AGE_DAYS=$(BLOOM_CRON_MAX_AGE_DAYS)
 	@cd "$(BLOOM_REPO)" && { \
 	  if [ -n "$$(git status --porcelain)" ]; then \
 	    built=$$(awk -F'"' '/^built/{print $$2}' bloom.toml); \
 	    echo "→ committing $(BLOOM_REPO) (built $$built)"; \
-	    git add -A && git commit -q -m "bloom: $$built ($(BLOOM_CRON_MAX_AGE_DAYS)d window)"; \
+	    git add -A && git commit -q -m "bloom: $$built ($(BLOOM_CRON_MAX_AGE_DAYS)d window)" \
+	      || { echo "bloom-cron: commit failed — refusing to publish unrecorded filters (is user.name/email set in $(BLOOM_REPO)?)"; exit 1; }; \
 	  else \
 	    echo "→ $(BLOOM_REPO) unchanged since last cycle; nothing to commit"; \
 	  fi; \

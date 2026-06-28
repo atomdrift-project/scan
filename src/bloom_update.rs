@@ -20,10 +20,10 @@ use sha2::{Digest, Sha256};
 use crate::bloom::{FORMAT_VERSION, Filter};
 use crate::bloom_build::Manifest;
 
-/// Public update bucket base. Artifacts live under a format-versioned prefix
-/// (`<base>/v<FORMAT_VERSION>/bloom.toml`, `<base>/v<FORMAT_VERSION>/<file>`), so
-/// an incompatible format change publishes to a new prefix without disturbing
-/// the one older clients still read.
+/// Public update bucket base. Bloom artifacts live under a format-versioned
+/// prefix beneath `bloom/` (`<base>/bloom/v<FORMAT_VERSION>/bloom.toml`,
+/// `<base>/bloom/v<FORMAT_VERSION>/<file>`), so an incompatible format change
+/// publishes to a new prefix without disturbing the one older clients still read.
 const DEFAULT_BASE_URL: &str = "https://updates.atomdrift.org/litmus";
 
 /// Whole-request budget; bloom filters are small, but the SHA-256 one can be tens of MB.
@@ -33,11 +33,11 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// be compared against the remote manifest on refresh.
 const SIDECAR: &str = "bloom.toml";
 
-/// Path segment selecting the on-wire format this build speaks, e.g. `v1`. A
-/// format bump moves the whole namespace, so old and new clients never read each
-/// other's artifacts.
-fn version_segment() -> String {
-    format!("v{FORMAT_VERSION}")
+/// Path prefix for this build's bloom artifacts: namespaced under `bloom/` and
+/// selecting the on-wire format it speaks, e.g. `bloom/v1`. A format bump moves
+/// the whole prefix, so old and new clients never read each other's artifacts.
+fn bloom_prefix() -> String {
+    format!("bloom/v{FORMAT_VERSION}")
 }
 
 fn base_url() -> String {
@@ -107,7 +107,7 @@ pub fn check(dir: &Path) -> Result<()> {
 }
 
 fn fetch_manifest() -> Result<Manifest> {
-    let url = format!("{}/{}/bloom.toml", base_url(), version_segment());
+    let url = format!("{}/{}/bloom.toml", base_url(), bloom_prefix());
     let text = http_get(&url)?;
     let text = String::from_utf8(text).context("bloom manifest is not valid UTF-8")?;
     toml::from_str(&text).with_context(|| format!("parsing bloom manifest {url}"))
@@ -117,7 +117,7 @@ fn fetch_manifest() -> Result<Manifest> {
 /// in atomically (old aside, staging in, drop old; restore on failure).
 fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
     let base = base_url();
-    let ver = version_segment();
+    let prefix = bloom_prefix();
     let parent = dir.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
@@ -133,7 +133,7 @@ fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
                 entry.format_version
             );
         }
-        let url = format!("{base}/{ver}/{}", entry.file);
+        let url = format!("{base}/{prefix}/{}", entry.file);
         let bytes = http_get(&url)?;
 
         let got = format!("{:x}", Sha256::digest(&bytes));

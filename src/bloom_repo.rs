@@ -216,6 +216,16 @@ pub fn counts() -> BloomCounts {
     }
 }
 
+/// The installed bloom manifest — its `built` date, schema, and per-filter
+/// element counts/sha256 — read from the directory the loader resolves filters
+/// from (see [`bloom_dir`]). `None` when no bloom set is installed or the
+/// manifest is unreadable. Used by `scan version` to report the active filters.
+#[must_use]
+pub fn installed_manifest() -> Option<crate::bloom_build::Manifest> {
+    let text = std::fs::read_to_string(bloom_dir().join("bloom.toml")).ok()?;
+    toml::from_str(&text).ok()
+}
+
 /// Read and validate one `<kind>-<tier>.adbl` file. Returns `None` (with a log
 /// line) for anything that is missing, unreadable, malformed, or whose header
 /// does not match the expected kind/tier — never a guess.
