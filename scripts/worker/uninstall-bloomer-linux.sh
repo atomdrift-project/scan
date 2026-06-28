@@ -1,7 +1,7 @@
 #!/bin/sh
 # uninstall-bloomer-linux.sh - Stop and remove the scan-bloomer timer + service.
-# Leaves the `scan` user, the source checkouts, the bloom checkout, and all
-# credentials under /var/lib/atomdrift in place (remove manually for a fresh state).
+# Leaves the `bloom` user, the source checkouts, the bloom checkout, and all
+# credentials under /var/lib/bloom in place (remove manually for a fresh state).
 set -eu
 
 SERVICE_NAME=scan-bloomer
@@ -32,4 +32,4 @@ fi
 [ "$removed" -eq 1 ] && sudo systemctl daemon-reload
 
 log "Uninstall complete"
-log "Note: user 'scan' and /var/lib/atomdrift/{scan,scan-src,bloom} left intact (remove manually for a fresh state)."
+log "Note: user 'bloom' and /var/lib/bloom left intact (remove manually for a fresh state)."

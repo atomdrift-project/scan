@@ -307,11 +307,11 @@ deploy-worker:
 		*) echo "error: no deploy-worker target for $$(uname -s)"; exit 1 ;; \
 	esac
 
-# Install the hourly bloom build+publish timer (scan-bloomer.timer). Runs as the
-# same `scan` system user as the worker, from a provisioned source checkout under
-# /var/lib/atomdrift. The install script sets up the checkouts + Rust toolchain
-# and tells you which secrets to drop in (codeberg push key, rclone R2 remote,
-# ~/.pgpass for hopper). Systemd Linux only.
+# Install the hourly bloom build+publish timer (scan-bloomer.timer). Runs as a
+# dedicated `bloom` system user (isolated from the worker's `scan` user), from a
+# provisioned checkout under /var/lib/bloom. The install script sets up the
+# checkouts + Rust toolchain and tells you which secrets to drop in (codeberg
+# push key, rclone R2 remote, ~/.pgpass for hopper). Systemd Linux only.
 deploy-bloomer:
 	@case "$$(uname -s)" in \
 		Linux) if command -v systemctl >/dev/null 2>&1; then \
@@ -364,7 +364,7 @@ uninstall-worker:
 	esac
 
 # Stop and remove the hourly bloom timer (counterpart to deploy-bloomer). Leaves
-# the source checkouts and credentials under /var/lib/atomdrift in place.
+# the `bloom` user and its checkouts/credentials under /var/lib/bloom in place.
 uninstall-bloomer:
 	@case "$$(uname -s)" in \
 		Linux) ./scripts/worker/uninstall-bloomer-linux.sh ;; \
