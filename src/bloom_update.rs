@@ -1,7 +1,7 @@
 //! R2-backed download and install of the known-good / known-bad bloom filters.
 //!
 //! Mirrors [`crate::model_update`]: fetch `bloom.toml`, download each filter at
-//! `<base>/bloom/<built>/<file>`, verify its sha256, validate it loads (the
+//! `<base>/v<FORMAT_VERSION>/<file>`, verify its sha256, validate it loads (the
 //! [`FORMAT_VERSION`] gate fails closed on an unknown layout) and matches its
 //! declared identity, then atomically swap the whole set into place. Validation
 //! happens on the staged copy *before* the swap, so a broken or partial download
@@ -20,23 +20,48 @@ use sha2::{Digest, Sha256};
 use crate::bloom::{FORMAT_VERSION, Filter};
 use crate::bloom_build::Manifest;
 
-/// Public update bucket base (`<base>/bloom.toml`, `<base>/bloom/<date>/...`).
+/// Public update bucket base. Artifacts live under a format-versioned prefix
+/// (`<base>/v<FORMAT_VERSION>/bloom.toml`, `<base>/v<FORMAT_VERSION>/<file>`), so
+/// an incompatible format change publishes to a new prefix without disturbing
+/// the one older clients still read.
 const DEFAULT_BASE_URL: &str = "https://updates.atomdrift.org/litmus";
 
 /// Whole-request budget; bloom filters are small, but the SHA-256 one can be tens of MB.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Sidecar holding the installed manifest, so `built` can be compared on refresh.
+/// Sidecar holding the installed manifest, so the installed filters' sha256s can
+/// be compared against the remote manifest on refresh.
 const SIDECAR: &str = "bloom.toml";
+
+/// Path segment selecting the on-wire format this build speaks, e.g. `v1`. A
+/// format bump moves the whole namespace, so old and new clients never read each
+/// other's artifacts.
+fn version_segment() -> String {
+    format!("v{FORMAT_VERSION}")
+}
 
 fn base_url() -> String {
     std::env::var("SCAN_BLOOM_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned())
 }
 
-/// The `built` date of the installed set, read from the sidecar, if any.
-fn installed_built(dir: &Path) -> Option<String> {
+/// The installed manifest (sidecar), if present and parseable.
+fn installed_manifest(dir: &Path) -> Option<Manifest> {
     let text = std::fs::read_to_string(dir.join(SIDECAR)).ok()?;
-    toml::from_str::<Manifest>(&text).ok().map(|m| m.built)
+    toml::from_str(&text).ok()
+}
+
+/// True when every filter the remote offers is already installed with the same
+/// sha256, and the installed set holds no more than the remote. Content-based,
+/// so a same-day rebuild that changes bytes is still detected — unlike comparing
+/// the `built` date, which is coarse to the day and so blind to hourly rebuilds.
+fn is_current(installed: &Manifest, remote: &Manifest) -> bool {
+    remote.filter.len() == installed.filter.len()
+        && remote.filter.iter().all(|(stem, entry)| {
+            installed
+                .filter
+                .get(stem)
+                .is_some_and(|have| have.sha256 == entry.sha256)
+        })
 }
 
 /// Install or refresh the bloom filters. Skips the download when the installed
@@ -47,7 +72,7 @@ fn installed_built(dir: &Path) -> Option<String> {
 /// mismatches, a filter fails to load, or the atomic install fails.
 pub fn update(dir: &Path, force: bool) -> Result<()> {
     let manifest = fetch_manifest()?;
-    if !force && installed_built(dir).as_deref() == Some(manifest.built.as_str()) {
+    if !force && installed_manifest(dir).is_some_and(|installed| is_current(&installed, &manifest)) {
         eprintln!("Bloom filters already up to date: {}", manifest.built);
         return Ok(());
     }
@@ -66,14 +91,14 @@ pub fn update(dir: &Path, force: bool) -> Result<()> {
 /// Returns an error if the manifest cannot be fetched or parsed.
 pub fn check(dir: &Path) -> Result<()> {
     let manifest = fetch_manifest()?;
-    match installed_built(dir) {
-        Some(built) if built == manifest.built => {
-            eprintln!("Bloom filters up to date: {built}");
+    match installed_manifest(dir) {
+        Some(installed) if is_current(&installed, &manifest) => {
+            eprintln!("Bloom filters up to date: {}", installed.built);
         }
-        Some(built) => {
+        Some(installed) => {
             eprintln!(
-                "Bloom filter update available: {} — currently {built}",
-                manifest.built
+                "Bloom filter update available: {} — currently {}",
+                manifest.built, installed.built
             );
         }
         None => eprintln!("Bloom filters not installed; available: {}", manifest.built),
@@ -82,7 +107,7 @@ pub fn check(dir: &Path) -> Result<()> {
 }
 
 fn fetch_manifest() -> Result<Manifest> {
-    let url = format!("{}/bloom.toml", base_url());
+    let url = format!("{}/{}/bloom.toml", base_url(), version_segment());
     let text = http_get(&url)?;
     let text = String::from_utf8(text).context("bloom manifest is not valid UTF-8")?;
     toml::from_str(&text).with_context(|| format!("parsing bloom manifest {url}"))
@@ -92,6 +117,7 @@ fn fetch_manifest() -> Result<Manifest> {
 /// in atomically (old aside, staging in, drop old; restore on failure).
 fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
     let base = base_url();
+    let ver = version_segment();
     let parent = dir.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
@@ -107,7 +133,7 @@ fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
                 entry.format_version
             );
         }
-        let url = format!("{base}/bloom/{}/{}", manifest.built, entry.file);
+        let url = format!("{base}/{ver}/{}", entry.file);
         let bytes = http_get(&url)?;
 
         let got = format!("{:x}", Sha256::digest(&bytes));

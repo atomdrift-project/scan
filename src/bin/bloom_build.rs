@@ -11,8 +11,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use sha2::{Digest, Sha256};
 
-use scan::bloom_build::{read_pool, write_bundle};
+use scan::bloom_build::{read_pool, read_prev_manifest, verify_build, write_bundle};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,6 +39,24 @@ struct Args {
     fp: f64,
 }
 
+/// Ubiquitous system binaries that must never be catalogued bad. Hashed at build
+/// time — so the check sees the host's *actual* binaries rather than a list of
+/// digests that rot across distros — and asserted absent from `sha256-bad`.
+/// Missing ones are skipped; we can only vouch for what's present.
+const HOST_GOOD_BINS: &[&str] = &["/bin/ls", "/bin/sh", "/bin/cat", "/usr/bin/env"];
+
+/// `(path, sha256)` for each [`HOST_GOOD_BINS`] entry that exists on the host.
+fn host_good_digests() -> Vec<(String, [u8; 32])> {
+    HOST_GOOD_BINS
+        .iter()
+        .filter_map(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            Some(((*path).to_owned(), digest))
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -59,7 +78,15 @@ fn main() -> Result<()> {
 
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("creating {}", args.out.display()))?;
+    // Size the new build against the previous one (read before we overwrite it).
+    let prev = read_prev_manifest(&args.out);
     let filters = sets.into_filters(args.fp);
+
+    // Fail loud before writing, so a poisoned or hollow build never lands in the
+    // output dir (nor reaches `make publish-bloom`).
+    verify_build(&filters, prev.as_ref(), &host_good_digests())
+        .context("bloom safety check failed")?;
+
     let manifest = write_bundle(&args.out, &filters, &args.date)?;
 
     for (stem, entry) in &manifest.filter {

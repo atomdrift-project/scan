@@ -36,7 +36,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-bloomer uninstall-bloomer deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -131,9 +131,12 @@ publish-models: release ## Compat-test azoth vs last (VERSIONS-1) litmus release
 # them to R2. The pool defaults to the local hopper replica (same DSN collimator
 # trains from; auth via ~/.pgpass) — see scripts/bloom_pool.sql for the tier
 # predicates. Override with POOL=<file.ndjson> to build from a captured export.
-# Filters go to a dated, immutable prefix; the manifest is a short-cached pointer
-# the download flow resolves via its `built` date. No signing: the filters carry
-# no commit/authenticity claim, only a versioned layout and per-file sha256.
+# Filters and their manifest go to a format-versioned prefix (litmus/v<N>/), both
+# short-cached: the download flow compares per-file sha256 to decide what to pull,
+# so artifacts are overwritten in place rather than parked under dated, immutable
+# paths. A format bump (FORMAT_VERSION) moves the whole prefix, leaving the old
+# one intact for clients still on it. No signing: the filters carry no
+# commit/authenticity claim, only a versioned layout and per-file sha256.
 BLOOM_REPO ?= ../bloom
 BLOOM_DB ?= postgres://hopper@localhost:5432/hopper
 BLOOM_POOL_SQL ?= scripts/bloom_pool.sql
@@ -141,7 +144,10 @@ BLOOM_DATE ?= $(shell date -u +%F)
 # Only bless/flag samples analyzed within this many days, so the tables reflect
 # the current model/ruleset. 90 is a fair default; use 7 for quick test builds.
 BLOOM_MAX_AGE_DAYS ?= 90
-.PHONY: build-bloom publish-bloom
+# Window for the unattended hourly cycle (make bloom-cron / scan-bloomer.timer).
+# Wider than the interactive default so the published filters cover a full year.
+BLOOM_CRON_MAX_AGE_DAYS ?= 365
+.PHONY: build-bloom publish-bloom bloom-cron
 build-bloom: ## Build bloom filters from the local hopper replica (or POOL=<ndjson>) into $(BLOOM_REPO) — no upload
 	$(CARGO) build --release --bin scan-bloom-build
 	mkdir -p "$(BLOOM_REPO)"
@@ -158,20 +164,47 @@ build-bloom: ## Build bloom filters from the local hopper replica (or POOL=<ndjs
 	@echo "✓ filters written to $(BLOOM_REPO)"
 	@echo "  → review & commit $(BLOOM_REPO), then 'make publish-bloom' to release"
 
-# Pure upload — no build, no database. Reads the build date from the manifest so
-# the immutable artifact path matches what the download flow resolves.
-publish-bloom: ## Upload the already-built filters in $(BLOOM_REPO) to R2 (run build-bloom first)
+# Pure upload — no build, no database. Reads format_version from the manifest so
+# the artifacts land under the same litmus/v<N>/ prefix the client fetches.
+publish-bloom: ## Upload the already-built filters in $(BLOOM_REPO) to R2 under litmus/v<N>/ (run build-bloom first)
 	@command -v rclone >/dev/null || { echo "publish-bloom: rclone not found"; exit 1; }
 	@[ -f "$(BLOOM_REPO)/bloom.toml" ] || { echo "publish-bloom: no $(BLOOM_REPO)/bloom.toml — run 'make build-bloom' first"; exit 1; }
 	@built=$$(awk -F'"' '/^built/{print $$2}' "$(BLOOM_REPO)/bloom.toml"); \
+	ver=$$(awk -F'= *' '/format_version/{print $$2; exit}' "$(BLOOM_REPO)/bloom.toml"); \
 	[ -n "$$built" ] || { echo "publish-bloom: no 'built' date in bloom.toml"; exit 1; }; \
-	echo "→ uploading filters built $$built to R2 (dated, immutable)"; \
-	rclone copy "$(BLOOM_REPO)" "$(R2_REMOTE)/$(R2_LITMUS)/bloom/$$built/" --include "*.adbl" \
-	  --header-upload "Cache-Control: public, max-age=31536000, immutable" --progress; \
-	echo "→ publishing manifest pointer (short cache)"; \
-	rclone copyto "$(BLOOM_REPO)/bloom.toml" "$(R2_REMOTE)/$(R2_LITMUS)/bloom.toml" \
+	[ -n "$$ver" ] || { echo "publish-bloom: no format_version in bloom.toml"; exit 1; }; \
+	echo "→ uploading filters built $$built to R2 (litmus/v$$ver/, short cache)"; \
+	rclone copy "$(BLOOM_REPO)" "$(R2_REMOTE)/$(R2_LITMUS)/v$$ver/" --include "*.adbl" \
+	  --header-upload "Cache-Control: public, max-age=300" --progress; \
+	echo "→ publishing manifest (short cache)"; \
+	rclone copyto "$(BLOOM_REPO)/bloom.toml" "$(R2_REMOTE)/$(R2_LITMUS)/v$$ver/bloom.toml" \
 	  --header-upload "Cache-Control: public, max-age=60"; \
-	echo "✓ publish-bloom complete: $$built"
+	echo "✓ publish-bloom complete: built $$built → litmus/v$$ver/"
+
+# Unattended cycle for the hourly systemd timer (scripts/worker/bloomer-linux.sh):
+# rebuild a fresh 365-day filter set, commit+push the source-of-truth $(BLOOM_REPO),
+# then upload to R2. Commit is skipped when the rebuild is byte-identical, and the
+# push fires whenever the local branch is ahead of origin (so a transient push
+# failure self-heals next cycle). The R2 upload always runs and is idempotent
+# (rclone skips unchanged objects), so a no-op hour only costs the rebuild plus a
+# manifest-pointer refresh. A push failure is logged but does not block the upload.
+# Safe to run by hand, too.
+bloom-cron: ## Hourly-timer cycle: build (BLOOM_CRON_MAX_AGE_DAYS, default 365) -> commit+push $(BLOOM_REPO) -> upload to R2
+	$(MAKE) build-bloom BLOOM_MAX_AGE_DAYS=$(BLOOM_CRON_MAX_AGE_DAYS)
+	@cd "$(BLOOM_REPO)" && { \
+	  if [ -n "$$(git status --porcelain)" ]; then \
+	    built=$$(awk -F'"' '/^built/{print $$2}' bloom.toml); \
+	    echo "→ committing $(BLOOM_REPO) (built $$built)"; \
+	    git add -A && git commit -q -m "bloom: $$built ($(BLOOM_CRON_MAX_AGE_DAYS)d window)"; \
+	  else \
+	    echo "→ $(BLOOM_REPO) unchanged since last cycle; nothing to commit"; \
+	  fi; \
+	  if [ -n "$$(git rev-list @{u}.. 2>/dev/null)" ]; then \
+	    echo "→ pushing $(BLOOM_REPO) to origin"; \
+	    git push -q || echo "WARN: git push failed; local commit retained, will retry next cycle"; \
+	  fi; \
+	}
+	$(MAKE) publish-bloom
 
 # Fat LTO + single codegen unit. Multi-minute link, marginal runtime win
 # over the default release profile. Use for container/tarball builds.
@@ -242,7 +275,7 @@ tarball: release
 # outer invocation's `-j`/`--jobserver-*` flags plus command-line `URL=` into
 # the env, which tikv-jemalloc-sys's build.rs re-passes to its bundled `make`,
 # producing `*** No rule to make target '-j'` inside the jemalloc build.
-deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
+deploy-server deploy-worker deploy-jail-worker deploy-bloomer bloom-cron deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
 
 deploy: deploy-server
 
@@ -272,6 +305,21 @@ deploy-worker:
 		OpenBSD) ./scripts/worker/worker-openbsd.sh "$(URL)" ;; \
 		SunOS)   ./scripts/worker/worker-omnios.sh "$(URL)" ;; \
 		*) echo "error: no deploy-worker target for $$(uname -s)"; exit 1 ;; \
+	esac
+
+# Install the hourly bloom build+publish timer (scan-bloomer.timer). Runs as the
+# same `scan` system user as the worker, from a provisioned source checkout under
+# /var/lib/atomdrift. The install script sets up the checkouts + Rust toolchain
+# and tells you which secrets to drop in (codeberg push key, rclone R2 remote,
+# ~/.pgpass for hopper). Systemd Linux only.
+deploy-bloomer:
+	@case "$$(uname -s)" in \
+		Linux) if command -v systemctl >/dev/null 2>&1; then \
+		           ./scripts/worker/bloomer-linux.sh; \
+		         else \
+		           echo "error: deploy-bloomer needs a systemd Linux host"; exit 1; \
+		         fi ;; \
+		*) echo "error: no deploy-bloomer target for $$(uname -s) (systemd Linux only)"; exit 1 ;; \
 	esac
 
 # Jailed worker deploy: builds in a Bastille build jail and runs the rc.d
@@ -313,6 +361,14 @@ uninstall-worker:
 		         fi ;; \
 		OpenBSD) ./scripts/worker/uninstall-openbsd.sh ;; \
 		*) echo "error: no uninstall-worker target for $$(uname -s)"; exit 1 ;; \
+	esac
+
+# Stop and remove the hourly bloom timer (counterpart to deploy-bloomer). Leaves
+# the source checkouts and credentials under /var/lib/atomdrift in place.
+uninstall-bloomer:
+	@case "$$(uname -s)" in \
+		Linux) ./scripts/worker/uninstall-bloomer-linux.sh ;; \
+		*) echo "error: no uninstall-bloomer target for $$(uname -s) (systemd Linux only)"; exit 1 ;; \
 	esac
 
 # Remove the jailed worker service (counterpart to deploy-jail-worker).
