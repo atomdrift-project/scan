@@ -391,6 +391,13 @@ enum Commands {
         /// cloned automatically if the directory does not yet exist.
         #[arg(long)]
         traits_dir: Option<PathBuf>,
+
+        /// Renew every analyzed result (parent and members) on a hopper instance
+        /// by POSTing to <URL>/api/result as analyses complete — the warm-server
+        /// equivalent of `scan path --hopper`. Upload failures are logged, never
+        /// fatal. Reads $HOPPER_UPLOAD_TOKEN for authentication.
+        #[arg(long, visible_alias = "upload", value_name = "URL")]
+        hopper: Option<String>,
     },
 
     /// Run as a pull-based worker, polling a hopper instance for analysis jobs
@@ -965,6 +972,7 @@ fn main() -> Result<()> {
             workers,
             allow_cidr,
             traits_dir,
+            hopper,
         } => {
             if let Some(p) = traits_dir.as_ref() {
                 cleave::traits_repo::set_override_dir(Some(p.into()));
@@ -1005,7 +1013,11 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy);
+            .with_fetch(fetch_policy)
+            .with_hopper(hopper.clone());
+            if let Some(url) = hopper.as_deref() {
+                eprintln!("Renewing results on hopper at {url}");
+            }
             eprintln!("Starting Atomdrift Scan server on http://{bind} ...");
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

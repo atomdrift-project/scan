@@ -1212,6 +1212,9 @@ pub(super) async fn analyze_path(
         permit,
     );
 
+    // Keep a path clone for the hopper renewal (the analysis closure moves
+    // `path`); only when --hopper is configured, so the common case pays nothing.
+    let upload_path = state.uploader.as_ref().map(|_| path.clone());
     let cancel_flag = Arc::clone(&cancellation);
     let phase_state = Arc::clone(&state);
     let phase_tracker = phase_state
@@ -1286,7 +1289,25 @@ pub(super) async fn analyze_path(
                 probability = scan_result.probability,
                 "<-- 200 OK",
             );
-            let mut resp = Json(scan_result.into_envelope()).into_response();
+            // Renew the result on hopper when --hopper is set. Serialize the
+            // response body first so the (possibly large) envelope moves to the
+            // uploader without a clone; the renewal runs off the executor since
+            // collect_upload_artifacts reads sidecars from disk.
+            let sha256 = scan_result.sha256.clone();
+            let size = scan_result.size_bytes;
+            let envelope = scan_result.into_envelope();
+            let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
+            if let (Some(uploader), Some(path)) = (&state.uploader, upload_path) {
+                let uploader = Arc::clone(uploader);
+                tokio::task::spawn_blocking(move || {
+                    crate::engine::upload_scan_result(&uploader, &path, sha256, size, envelope);
+                });
+            }
+            let mut resp = (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
             resp
         }

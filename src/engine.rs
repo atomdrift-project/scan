@@ -1465,19 +1465,7 @@ fn record_file_result(
                 let sha256 = r.sha256.clone();
                 let size = r.size_bytes;
                 let envelope = r.into_envelope();
-                // Ensure hopper has the scanned file and any fetched dependency
-                // archives (with provenance) before renewing the verdict — only
-                // the ones it lacks actually move. Artifacts are queued first so a
-                // never-seen top-level file's row exists before its result lands.
-                let artifacts = collect_upload_artifacts(
-                    file_path,
-                    &sha256,
-                    size,
-                    &envelope.raw,
-                    upload_collector(),
-                );
-                uploader.submit_artifacts(artifacts);
-                uploader.submit(sha256, envelope);
+                upload_scan_result(uploader, file_path, sha256, size, envelope);
             }
         }
         Err(e) => {
@@ -1486,6 +1474,25 @@ fn record_file_result(
             tally.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Renew one scan result on hopper: ensure hopper has the scanned file and any
+/// fetched dependency archives (with provenance), then renew the verdict. Used
+/// by both the CLI `--hopper` path and the serve-mode `--hopper` upload. The
+/// artifacts are queued before the result so a never-seen top-level file's row
+/// exists before its verdict lands. Blocking (reads sidecars from disk); callers
+/// on an async runtime must run it off the executor.
+pub(crate) fn upload_scan_result(
+    uploader: &crate::upload::Uploader,
+    file_path: &Path,
+    sha256: String,
+    size_bytes: u64,
+    envelope: ScanResultEnvelope,
+) {
+    let artifacts =
+        collect_upload_artifacts(file_path, &sha256, size_bytes, &envelope.raw, upload_collector());
+    uploader.submit_artifacts(artifacts);
+    uploader.submit(sha256, envelope);
 }
 
 /// The `fetch.collector` identity stamped on every sidecar this process uploads,

@@ -60,6 +60,10 @@ pub struct ServerConfig {
     /// outbound fetches is an SSRF-shaped exposure (the transport's resolver
     /// guards internal IPs, but enabling it is an explicit operator decision).
     fetch: crate::fetch::FetchPolicy,
+    /// hopper master API root (`--hopper`); when set, every analyzed result —
+    /// parent and members — is renewed on hopper's `/api/result`. `None` disables
+    /// upload, leaving the server a pure analyze service.
+    hopper: Option<String>,
 }
 
 /// Default per-request analysis timeout: 5 minutes. Covers cold cleave scans
@@ -140,7 +144,22 @@ impl ServerConfig {
             analysis_timeout_secs: DEFAULT_ANALYSIS_TIMEOUT_SECS,
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
+            hopper: None,
         })
+    }
+
+    /// Attach a hopper master API root (`--hopper`); when set, the server renews
+    /// every analyzed result (parent and members) on hopper's `/api/result`.
+    #[must_use]
+    pub fn with_hopper(mut self, hopper: Option<String>) -> Self {
+        self.hopper = hopper.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// The configured hopper upload root, or `None` when `--hopper` was not set.
+    #[must_use]
+    pub fn hopper(&self) -> Option<&str> {
+        self.hopper.as_deref()
     }
 
     /// Attach an LLM interpretation config (`--interpret`); `None` disables it.
@@ -458,6 +477,10 @@ struct AppState {
     reload_lock: tokio::sync::Mutex<()>,
     overloaded_since: std::sync::Mutex<Option<Instant>>,
     in_flight: dashmap::DashMap<u64, InFlightRequest>,
+    /// Background hopper uploader (`--hopper`); `None` disables result renewal.
+    /// Shared across handlers; each analyzed result is queued to its own thread,
+    /// so uploads never block the analyze response.
+    uploader: Option<Arc<crate::upload::Uploader>>,
 }
 
 impl AppState {
@@ -512,6 +535,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         reload_lock: tokio::sync::Mutex::new(()),
         overloaded_since: std::sync::Mutex::new(None),
         in_flight: dashmap::DashMap::new(),
+        // Start the background uploader once when --hopper is set, so every
+        // analyzed result (parent and members) is renewed on hopper without
+        // blocking the analyze response.
+        uploader: config
+            .hopper()
+            .map(|url| Arc::new(crate::upload::Uploader::new(url, crate::upload::default_worker_name()))),
     });
 
     // Background task: load model + SHAP + YARA concurrently, then mark ready.
