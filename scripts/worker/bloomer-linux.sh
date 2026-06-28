@@ -50,6 +50,9 @@ TIMER_FILE=/etc/systemd/system/${SERVICE_NAME}.timer
 
 BLOOM_DB="${BLOOM_DB:-postgres://hopper@localhost:5432/hopper}"
 BLOOM_REMOTE="${BLOOM_REMOTE:-ssh://git@codeberg.org/atomdrift/bloom.git}"
+# scan-src is read-only (fetched, never pushed) → HTTP, no deploy key needed.
+# The bloom repo above stays SSH because the cycle pushes to it.
+SCAN_REMOTE="${SCAN_REMOTE:-https://codeberg.org/atomdrift/scan.git}"
 ON_CALENDAR="${ON_CALENDAR:-hourly}"
 RUN_NOW="${RUN_NOW:-}"
 
@@ -93,11 +96,19 @@ sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${SCAN_SRC}"
 
 # --- Source checkout --------------------------------------------------------
 
-# Seed scan-src from this repo's committed HEAD (no .git, no working-tree cruft),
-# owned by bloom. Extracting over the existing tree preserves target/ so warm
-# rebuilds stay incremental across redeploys.
-log "Syncing source checkout to ${SCAN_SRC} (this repo's HEAD)"
-git archive --format=tar HEAD | as_bloom tar -xf - -C "${SCAN_SRC}"
+# scan-src is a shallow read-only checkout of the canonical scan repo. The timer
+# fetches origin/main fresh before each build (ExecStartPre below), so deployed
+# code tracks the repo without a redeploy. Seed it once here (init+fetch over the
+# existing dir keeps any target/ build cache), then refresh to the current tip.
+log "Setting up scan source checkout at ${SCAN_SRC} (tracking ${SCAN_REMOTE})"
+if ! as_bloom git -C "${SCAN_SRC}" rev-parse --git-dir >/dev/null 2>&1; then
+    as_bloom git -C "${SCAN_SRC}" init -q -b main
+    as_bloom git -C "${SCAN_SRC}" remote add origin "${SCAN_REMOTE}"
+fi
+as_bloom git -C "${SCAN_SRC}" remote set-url origin "${SCAN_REMOTE}"
+as_bloom git -C "${SCAN_SRC}" fetch -q --depth=1 origin main \
+    || die "cannot fetch ${SCAN_REMOTE} as ${SERVICE_USER}"
+as_bloom git -C "${SCAN_SRC}" reset --hard -q FETCH_HEAD
 
 # --- Rust toolchain (bloom-owned) -------------------------------------------
 
@@ -205,6 +216,11 @@ Environment=BLOOM_REPO=${BLOOM_DIR}
 Environment=BLOOM_DB=${BLOOM_DB}
 # 365-day window for the published filters (see 'make bloom-cron').
 Environment=BLOOM_CRON_MAX_AGE_DAYS=365
+# Pull the latest scan source before each build so deployed code tracks
+# origin/main without a redeploy — a clone-once, fetch-each-cycle checkout, never
+# a re-clone. Best-effort ('-'): on fetch failure, build the code already on disk
+# rather than skip the whole cycle.
+ExecStartPre=-/bin/sh -c '/usr/bin/git -C ${SCAN_SRC} fetch -q --depth=1 origin main && /usr/bin/git -C ${SCAN_SRC} reset --hard -q FETCH_HEAD'
 ExecStart=${MAKE_BIN} bloom-cron
 
 # Yield to the worker: the rebuild + multi-million-row pool export is heavy.
