@@ -51,11 +51,11 @@ fn looks_like_traits_dir(path: &Path) -> bool {
 
 /// Install or refresh cleave traits from the R2 bundle, the same path
 /// `cleave update-rules` uses. Returns `true` when the installed commit changed.
-pub fn update(force: bool, _quiet: bool) -> Result<bool> {
+pub fn update(force: bool, quiet: bool) -> Result<bool> {
     prepare_runtime_env();
     let dir = cleave::traits_repo::install_target();
     let before = cleave::rule_update::installed(&dir).map(|i| i.commit);
-    cleave::rule_update::update(&dir, force)
+    cleave::rule_update::update(&dir, force, quiet)
         .map_err(|e| anyhow::anyhow!("traits update failed: {e}"))?;
     let after = cleave::rule_update::installed(&dir).map(|i| i.commit);
     Ok(before != after)

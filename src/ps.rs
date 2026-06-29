@@ -71,7 +71,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // Warn about permission-denied processes.
     if perm_denied > 0 && !is_root() {
         eprintln!(
-            "  \x1b[38;2;255;175;55m\u{26A0}\x1b[0m  \x1b[38;2;180;180;180mSkipping {} processes due to insufficient permissions — re-run as root for full coverage\x1b[0m\n",
+            " \x1b[38;2;255;175;55m\u{26A0}\x1b[0m  \x1b[38;2;180;180;180mSkipping {} processes due to insufficient permissions — re-run as root for full coverage\x1b[0m\n",
             perm_denied,
         );
     }
@@ -174,11 +174,10 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let total = u32::try_from(groups.len()).unwrap_or(u32::MAX);
 
     if is_terminal {
-        eprintln!(
-            "\n  \x1b[38;2;120;180;255m\u{25c6}\x1b[0m  {} unique binaries across {} processes\n",
-            total,
-            proc_result.entries.len(),
-        );
+        // Detection rules already resident in memory — no extra loading.
+        // `prefetch_shared_resources` above has fully built the YARA engine and
+        // capability mapper; the bloom signatures were loaded with the config.
+        output::print_banner(crate::engine::detection_rule_count(config));
     }
 
     // Load model and scan each unique binary.
@@ -340,10 +339,6 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let benign = benign.load(Ordering::Relaxed);
     let errors = errors.load(Ordering::Relaxed);
 
-    if let Some(p) = &progress {
-        p.finish();
-    }
-
     let summary = ScanSummary {
         total_files: total,
         hostile,
@@ -354,7 +349,19 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     };
 
     if is_terminal {
-        output::print_summary(&summary);
+        // Collapse the progress bar straight into the verdict: when a bar is
+        // live it sits on its own line below the banner, so clear it and write
+        // the one-line summary in its place. The finished scan then shows just
+        // the banner and this line — no intermediate "files in" line, no
+        // separator, no trailing blank.
+        let line = output::summary_status_line(&summary);
+        if let Some(p) = &progress {
+            p.quiesce(); // stop the heartbeat before we claim the bar's line
+            eprint!("\r\x1b[2K {line}\n");
+            let _ = std::io::stderr().flush();
+        } else {
+            eprintln!(" {line}");
+        }
     }
 
     Ok(summary)

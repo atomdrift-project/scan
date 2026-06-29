@@ -494,7 +494,7 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
         PULL_TIMEOUT,
         tokio::task::spawn_blocking(|| {
             let dir = crate::models_repo::install_target();
-            let models_err = match crate::model_update::update(&dir, false) {
+            let models_err = match crate::model_update::update(&dir, false, false) {
                 Ok(()) => None,
                 Err(e) => {
                     tracing::warn!("models update failed: {e}");

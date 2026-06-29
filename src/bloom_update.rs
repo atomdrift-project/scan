@@ -28,6 +28,10 @@ const DEFAULT_BASE_URL: &str = "https://updates.atomdrift.org/litmus";
 
 /// Whole-request budget; bloom filters are small, but the SHA-256 one can be tens of MB.
 const TIMEOUT: Duration = Duration::from_secs(120);
+/// Connect budget — fail fast when the bucket is unreachable so the default
+/// auto-update can't stall a scan on an offline host (the whole-request
+/// [`TIMEOUT`] still covers a slow but reachable download).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Sidecar holding the installed manifest, so the installed filters' sha256s can
 /// be compared against the remote manifest on refresh.
@@ -70,19 +74,29 @@ fn is_current(installed: &Manifest, remote: &Manifest) -> bool {
 /// # Errors
 /// Returns an error if the manifest or any filter cannot be fetched, a sha256
 /// mismatches, a filter fails to load, or the atomic install fails.
-pub fn update(dir: &Path, force: bool) -> Result<()> {
-    let manifest = fetch_manifest()?;
-    if !force && installed_manifest(dir).is_some_and(|installed| is_current(&installed, &manifest)) {
-        eprintln!("Bloom filters already up to date: {}", manifest.built);
-        return Ok(());
+pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<bool> {
+    // A quiet refresh of an already-present install is the auto-update path:
+    // fail fast if the bucket is unreachable. A first-ever download — or any
+    // explicit, non-quiet update — stays patient so a slow first fetch still
+    // completes.
+    let connect = (quiet && installed_manifest(dir).is_some()).then_some(CONNECT_TIMEOUT);
+    let manifest = fetch_manifest(connect)?;
+    if !force && installed_manifest(dir).is_some_and(|installed| is_current(&installed, &manifest))
+    {
+        if !quiet {
+            eprintln!("Bloom filters already up to date: {}", manifest.built);
+        }
+        return Ok(false);
     }
     install(dir, &manifest)?;
-    eprintln!(
-        "Bloom filters updated to {} at {}",
-        manifest.built,
-        dir.display()
-    );
-    Ok(())
+    if !quiet {
+        eprintln!(
+            "Bloom filters updated to {} at {}",
+            manifest.built,
+            dir.display()
+        );
+    }
+    Ok(true)
 }
 
 /// Report what would be installed without changing anything.
@@ -90,7 +104,7 @@ pub fn update(dir: &Path, force: bool) -> Result<()> {
 /// # Errors
 /// Returns an error if the manifest cannot be fetched or parsed.
 pub fn check(dir: &Path) -> Result<()> {
-    let manifest = fetch_manifest()?;
+    let manifest = fetch_manifest(None)?;
     match installed_manifest(dir) {
         Some(installed) if is_current(&installed, &manifest) => {
             eprintln!("Bloom filters up to date: {}", installed.built);
@@ -106,9 +120,9 @@ pub fn check(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn fetch_manifest() -> Result<Manifest> {
+fn fetch_manifest(connect: Option<Duration>) -> Result<Manifest> {
     let url = format!("{}/{}/bloom.toml", base_url(), bloom_prefix());
-    let text = http_get(&url)?;
+    let text = http_get(&url, connect)?;
     let text = String::from_utf8(text).context("bloom manifest is not valid UTF-8")?;
     toml::from_str(&text).with_context(|| format!("parsing bloom manifest {url}"))
 }
@@ -134,7 +148,9 @@ fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
             );
         }
         let url = format!("{base}/{prefix}/{}", entry.file);
-        let bytes = http_get(&url)?;
+        // Patient: the manifest fetch already reached the bucket, so the bundle
+        // download isn't where an offline host stalls.
+        let bytes = http_get(&url, None)?;
 
         let got = format!("{:x}", Sha256::digest(&bytes));
         if got != entry.sha256 {
@@ -178,12 +194,13 @@ fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn http_get(url: &str) -> Result<Vec<u8>> {
-    eprintln!("fetching {url}");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(TIMEOUT)
-        .build()
-        .context("building http client")?;
+fn http_get(url: &str, connect: Option<Duration>) -> Result<Vec<u8>> {
+    tracing::debug!("fetching {url}");
+    let mut builder = reqwest::blocking::Client::builder().timeout(TIMEOUT);
+    if let Some(connect) = connect {
+        builder = builder.connect_timeout(connect);
+    }
+    let client = builder.build().context("building http client")?;
     let resp = client
         .get(url)
         .send()

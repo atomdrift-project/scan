@@ -535,7 +535,7 @@ fn renew_resources_once(
     // the next successful renewal or a restart.
     let dir = crate::models_repo::install_target();
     let before = crate::model_update::installed(&dir).map(|i| i.commit);
-    let models_changed = match crate::model_update::update(&dir, false) {
+    let models_changed = match crate::model_update::update(&dir, false, false) {
         Ok(()) => before != crate::model_update::installed(&dir).map(|i| i.commit),
         Err(error) => {
             tracing::warn!(error = %error, "model renewal failed; treating models as unchanged");

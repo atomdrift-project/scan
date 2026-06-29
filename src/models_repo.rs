@@ -62,7 +62,7 @@ pub fn model_dir() -> Result<PathBuf> {
     }
 
     eprintln!("First run: downloading Atomdrift Scan models...");
-    crate::model_update::update(&data_dir, false)
+    crate::model_update::update(&data_dir, false, false)
         .with_context(|| format!("failed to install models to {}", data_dir.display()))?;
     Ok(data_dir)
 }
@@ -79,6 +79,42 @@ pub fn version() -> Option<String> {
 #[must_use]
 pub fn install_target() -> PathBuf {
     current_models_dir()
+}
+
+/// Feature dimensionality of the installed model: the number of inputs each
+/// classifier consumes, read straight from `feature_spec.json`'s
+/// `total_features` without loading any ONNX graph. `None` when no model is
+/// installed or the spec is unreadable. Used by `scan version`.
+#[must_use]
+pub fn feature_dimension() -> Option<usize> {
+    #[derive(serde::Deserialize)]
+    struct Dim {
+        total_features: usize,
+    }
+    let base = current_models_dir();
+    let spec = [base.join("general").join("feature_spec.json"), base.join("feature_spec.json")]
+        .into_iter()
+        .find(|p| p.is_file())?;
+    let text = std::fs::read_to_string(spec).ok()?;
+    serde_json::from_str::<Dim>(&text).ok().map(|d| d.total_features)
+}
+
+/// Number of ONNX models in the installed bundle — the ensemble's route models
+/// (`general` plus the per-filetype and per-filegroup specialists). `None` when
+/// no model is installed. Used by `scan version`.
+#[must_use]
+pub fn model_count() -> Option<usize> {
+    let base = current_models_dir();
+    if !base.is_dir() {
+        return None;
+    }
+    let n = walkdir::WalkDir::new(&base)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("onnx"))
+        .count();
+    (n > 0).then_some(n)
 }
 
 /// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/<bundle>`,

@@ -108,6 +108,11 @@ bytes = "1"
 hostname = "0.4"
 rayon = "1"
 ctrlc = "3"
+# Cheap structural pre-walk to count files before a directory scan, so the
+# progress bar has a denominator: cleave streams its own walk and reports the
+# total only after it finishes. Already in the lock graph via cleave; this just
+# promotes it to a direct dependency.
+walkdir = "2.5"
 
 tracing = "0.1"
 # Drop the `tracing-log` default feature: that bridge installs a global `log`
@@ -242,6 +247,14 @@ path = "src/bin/bloom_build.rs"
 # fix lands upstream (bytecodealliance/wasmtime#5499) and yara-x bumps past it.
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
+
+# Local cleave: adds `cleave::scan_paths`, which analyzes a caller-supplied file
+# list under the same filtered pipeline as `scan_directory`. scan does its own
+# `walkdir` pass to learn the file count upfront (for the progress bar + ETA) and
+# hands the list to cleave, so the tree is walked once instead of twice. ../cleave
+# is the rev scan locks to plus this additive change; its filefacts/stng revs
+# match scan's, so the shared types unify. Revert to the git rev once a cleave
+# release carries scan_paths.
 
 # Local cleave: scan consumes the per-file `filefacts.references` it surfaces
 # (FilefactsView) to drive fletch fetching, before that change is published.

@@ -3,9 +3,9 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::Mode;
 use crate::OutputFormat;
@@ -1026,39 +1026,100 @@ pub(crate) const SPINNER: &[char] = &[
     '\u{2810}', '\u{2800}',
 ];
 
-/// Progress state shared between threads.
-pub(crate) struct Progress {
+/// Heartbeat redraw cadence. A background thread redraws on this interval so
+/// the spinner keeps animating — and the long-tail notice can appear — even
+/// while no file completes (a single slow rizin analysis can stall for minutes).
+const PROGRESS_TICK: Duration = Duration::from_millis(125);
+
+/// Files-remaining threshold below which a stall counts as the "long tail".
+const TAIL_FILES: u32 = 4;
+
+/// How long the tail must sit without advancing before we reassure the user
+/// that the scan is grinding, not hung (milliseconds).
+const TAIL_STALL_MS: u128 = 150;
+
+/// The long-tail reassurance text (plain; colorized at render time).
+const TAIL_MESSAGE: &str =
+    "\u{2014} on the final long tail of difficult reverse engineering; please be patient\u{2026}";
+
+/// Build the dim, space-prefixed notice that fits within `budget` visible
+/// columns, truncating with an ellipsis. Empty when there isn't room for a
+/// meaningful slice (a very narrow terminal) — the bar alone still renders.
+fn fit_notice(msg: &str, budget: usize) -> String {
+    const MIN: usize = 12;
+    if budget < MIN {
+        return String::new();
+    }
+    let text = if msg.chars().count() <= budget {
+        msg.to_string()
+    } else {
+        let mut t: String = msg.chars().take(budget - 1).collect();
+        t.push('\u{2026}');
+        t
+    };
+    format!(" \x1b[38;2;120;120;120m{text}\x1b[0m")
+}
+
+/// Terminal width in columns, for capping the progress line. Falls back to 80
+/// when the width can't be queried (not a tty, or the ioctl fails).
+fn term_cols() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: TIOCGWINSZ fills a zero-initialised `winsize`; we trust the
+        // result only when the ioctl reports success and a non-zero width.
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                return ws.ws_col as usize;
+            }
+        }
+    }
+    80
+}
+
+/// Shared progress state. Lives behind an `Arc` so the heartbeat thread can hold
+/// a clone independent of the `Progress` handle the scan loop borrows.
+struct Inner {
     analyzed: AtomicU32,
     total: u32,
     start: Instant,
+    /// Elapsed millis at the most recent `increment`; lets `render` measure how
+    /// long the count has been frozen.
+    last_advance_ms: AtomicU64,
+    /// Spinner frame counter, advanced once per render so the spinner animates
+    /// on the heartbeat regardless of completions.
+    tick: AtomicU32,
+    /// Terminal width (columns), sampled once at construction. Caps the
+    /// long-tail notice so the bar line never wraps — a wrapped line couldn't be
+    /// erased in place by the `\r\x1b[2K` redraw/clear.
+    term_cols: usize,
+    /// Set when the scan is done: the heartbeat thread exits and no further
+    /// render runs, so a late redraw can never clobber the final summary line.
+    stopped: AtomicBool,
+    /// Serialises renders from the rayon workers and the heartbeat thread; their
+    /// `\r`-prefixed writes must never interleave.
+    draw_lock: Mutex<()>,
 }
 
-impl Progress {
-    pub(crate) fn new(total: u32) -> Self {
-        Self {
-            analyzed: AtomicU32::new(0),
-            total,
-            start: Instant::now(),
-        }
-    }
-
-    pub(crate) fn increment(&self) {
-        self.analyzed.fetch_add(1, Ordering::Relaxed);
-        self.draw();
-    }
-
-    /// Redraw progress line without incrementing (after printing a result).
-    pub(crate) fn redraw(&self) {
-        self.draw();
-    }
-
+impl Inner {
     fn draw(&self) {
-        let done = self.analyzed.load(Ordering::Relaxed);
-        let elapsed = self.start.elapsed().as_secs_f64();
-        let rate = done as f64 / elapsed.max(0.001);
-        let remaining = (self.total - done) as f64 / rate.max(0.001);
+        let _guard = self
+            .draw_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        self.render();
+    }
 
-        let frame = SPINNER[done as usize % SPINNER.len()];
+    fn render(&self) {
+        let done = self.analyzed.load(Ordering::Relaxed);
+        let elapsed = self.start.elapsed();
+        let rate = f64::from(done) / elapsed.as_secs_f64().max(0.001);
+        let eta = f64::from(self.total - done) / rate.max(0.001);
+
+        let frame = SPINNER[self.tick.fetch_add(1, Ordering::Relaxed) as usize % SPINNER.len()];
         let bar_w = 20;
         let filled = (done as usize * bar_w / self.total.max(1) as usize).min(bar_w);
         let bar: String = (0..bar_w)
@@ -1076,22 +1137,113 @@ impl Progress {
         let filled_str: String = bar.chars().take(filled + 1).collect();
         let dim_str: String = bar.chars().skip(filled + 1).collect();
 
+        let stats = format!("{done}/{}  {:.0}/s  {}", self.total, rate, format_eta(eta));
+
+        // Long-tail reassurance: when only a few files remain and the count has
+        // not moved for a while, the scan is almost certainly deep in a slow
+        // reverse-engineering pass, not hung. Appended to the bar line (not a
+        // separate line) so the bar's own clear erases it — the note shows while
+        // the tail is stalled and vanishes the instant a file completes or the
+        // scan ends. Capped to the terminal width so it can never wrap.
+        let left = self.total - done;
+        let stalled_ms = elapsed
+            .as_millis()
+            .saturating_sub(u128::from(self.last_advance_ms.load(Ordering::Relaxed)));
+        let note = if (1..=TAIL_FILES).contains(&left) && stalled_ms >= TAIL_STALL_MS {
+            // Fixed visible prefix: 1 indent + spinner + space + bar + 2 spaces.
+            let used = 25 + stats.chars().count();
+            fit_notice(TAIL_MESSAGE, self.term_cols.saturating_sub(used + 1))
+        } else {
+            String::new()
+        };
+
+        // `\x1b[K` erases to end of line — robustly clears a wider previous
+        // frame (a longer ETA, or the notice once it's gone) without padding.
         eprint!(
-            "\r  \x1b[38;2;100;180;255m{frame}\x1b[0m \x1b[38;2;80;160;220m{filled_str}\x1b[38;2;50;50;50m{dim_str}\x1b[0m  \x1b[38;2;160;160;160m{done}/{total}  {rate:.0}/s  {eta}\x1b[0m   ",
-            total = self.total,
-            eta = format_eta(remaining),
+            "\r \x1b[38;2;100;180;255m{frame}\x1b[0m \x1b[38;2;80;160;220m{filled_str}\x1b[38;2;50;50;50m{dim_str}\x1b[0m  \x1b[38;2;160;160;160m{stats}\x1b[0m{note}\x1b[K",
         );
         let _ = std::io::stderr().flush();
     }
 
+    /// Halt the heartbeat and wait out any in-flight render, so the caller can
+    /// write a final line the ticker can no longer overwrite.
+    fn quiesce(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        let _guard = self
+            .draw_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+/// Progress bar handle held by the scan loop. Dropping it (or calling `finish`
+/// / `quiesce`) stops the background heartbeat thread.
+pub(crate) struct Progress {
+    inner: Arc<Inner>,
+}
+
+impl Progress {
+    pub(crate) fn new(total: u32) -> Self {
+        let inner = Arc::new(Inner {
+            analyzed: AtomicU32::new(0),
+            total,
+            start: Instant::now(),
+            last_advance_ms: AtomicU64::new(0),
+            tick: AtomicU32::new(0),
+            term_cols: term_cols(),
+            stopped: AtomicBool::new(false),
+            draw_lock: Mutex::new(()),
+        });
+        // Detached heartbeat: it observes `stopped` and exits within one tick of
+        // `quiesce`/drop. A spawn failure just means no heartbeat — the per-file
+        // redraws still drive the bar.
+        let beat = Arc::clone(&inner);
+        let _ = std::thread::Builder::new()
+            .name("scan-progress".into())
+            .spawn(move || {
+                while !beat.stopped.load(Ordering::Relaxed) {
+                    std::thread::sleep(PROGRESS_TICK);
+                    beat.draw();
+                }
+            });
+        Self { inner }
+    }
+
+    pub(crate) fn increment(&self) {
+        self.inner.analyzed.fetch_add(1, Ordering::Relaxed);
+        let ms = u64::try_from(self.inner.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.inner.last_advance_ms.store(ms, Ordering::Relaxed);
+        self.inner.draw();
+    }
+
+    /// Redraw progress line without incrementing (after printing a result).
+    pub(crate) fn redraw(&self) {
+        self.inner.draw();
+    }
+
+    /// Stop the heartbeat without printing anything, for callers that render
+    /// their own final line in the bar's place (e.g. `ps`).
+    pub(crate) fn quiesce(&self) {
+        self.inner.quiesce();
+    }
+
+    /// Stop the heartbeat and erase the progress bar, leaving the cursor at the
+    /// start of its now-blank line so the caller can write the closing summary in
+    /// its place. The bar deliberately prints no completion line of its own — the
+    /// summary is the single end statement (one verdict, one duration), so a
+    /// separate "N files in Xs" line here would only repeat it.
     pub(crate) fn finish(&self) {
-        let elapsed = self.start.elapsed().as_secs_f64();
-        let done = self.analyzed.load(Ordering::Relaxed);
-        let rate = done as f64 / elapsed.max(0.001);
-        eprint!(
-            "\r\x1b[2K  \x1b[38;2;80;220;80m\u{2713}\x1b[0m  \x1b[38;2;160;160;160m{done} files in {elapsed:.1}s ({rate:.0}/s)\x1b[0m\n",
-        );
+        self.inner.quiesce();
+        eprint!("\r\x1b[2K");
         let _ = std::io::stderr().flush();
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        // Safety net: stop the heartbeat even on an early return or error that
+        // skipped `finish`/`quiesce`.
+        self.inner.stopped.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1191,10 +1343,53 @@ const fn one_file_summary(hostile: u32, suspicious: u32, benign: u32) -> ScanSum
     }
 }
 
+/// Enumerate the regular files under `dir` for a directory scan, mirroring the
+/// structural filters cleave applies during its own walk: skip `.git*` trees,
+/// keep only regular files, never follow symlinks. This reads no file contents —
+/// it is a cheap `readdir` pass whose purpose is to learn the file count (and
+/// the list) upfront, so the progress bar has a denominator before analysis
+/// begins. The list is handed to [`cleave::scan_paths`], which still applies its
+/// program-type and size filters per file, so a few of these may be analyzed
+/// away without a verdict (the bar tops out just under 100%, then the summary
+/// reports the true total).
+fn discover_files(dir: &Path) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !e.file_name().to_string_lossy().starts_with(".git"))
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect()
+}
+
+/// Total detection rules resident in memory, folding in `bloom_rules` bloom
+/// signatures: YAML traits + composite rules + YARA rules + `bloom_rules`.
+/// `cleave::version_info()` loads (or reuses) the shared resources. Split out so
+/// the auto-update checkmark — which knows its bloom count without a
+/// [`ScanConfig`] — reports the same figure as the banner.
+pub(crate) fn detection_rule_count_from(bloom_rules: u64) -> u64 {
+    let info = cleave::version_info();
+    info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64 + bloom_rules
+}
+
+/// Total detection rules resident in memory after resource load — YAML traits +
+/// composite rules + YARA rules + bloom signatures — for the scan banner. Reads
+/// already-loaded counts, so it adds no work. Shared by [`run`], [`run_paths`],
+/// and the `ps` subcommand so every banner reports the same figure.
+pub(crate) fn detection_rule_count(config: &ScanConfig) -> u64 {
+    let bloom_rules = config
+        .bloom()
+        .map_or(0, crate::bloom_repo::Lookup::rule_count);
+    detection_rule_count_from(bloom_rules)
+}
+
 /// Run a scan against a file or directory tree.
 ///
-/// A file path is analyzed directly. A directory path is walked recursively via
-/// `cleave`, with results streamed as they complete.
+/// A file path is analyzed directly. A directory path is walked once by
+/// [`discover_files`] to learn the file count upfront (for the progress bar and
+/// ETA), then the discovered list is analyzed in parallel via
+/// [`cleave::scan_paths`], with results streamed as they complete.
 ///
 /// # Errors
 /// Returns an error if the target path does not exist, model artifacts cannot
@@ -1260,28 +1455,26 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
         anyhow::bail!("path does not exist: {}", path.display());
     }
 
-    // Directory scan: delegate walking and parallel analysis to cleave, which
-    // loads CapabilityMapper and YARA once and streams results via callback.
-    let total_files: OnceLock<u32> = OnceLock::new();
+    // Directory scan: walk the tree ourselves first so the file count is known
+    // before any analysis starts — cleave's own walk streams and reports the
+    // total only once it finishes, leaving a progress bar with no denominator.
+    // The discovered list is handed to cleave::scan_paths, which applies the
+    // same filtering as scan_directory, so the tree is walked exactly once.
+    let files = discover_files(path);
+    let total = u32::try_from(files.len()).unwrap_or(u32::MAX);
     let tally = Tally::default();
     let stdout = Mutex::new(std::io::stdout());
-    let progress: OnceLock<Progress> = OnceLock::new();
+    let progress = (is_terminal && files.len() > 1).then(|| {
+        crate::output::print_banner(detection_rule_count(config));
+        Progress::new(total)
+    });
 
-    cleave::scan_directory(path, &cleave_opts, |event| match event {
-        cleave::ScanEvent::Start { total } => {
-            if let Some(total) = total {
-                let total32 = u32::try_from(total).unwrap_or(u32::MAX);
-                let _ = total_files.set(total32);
-                if is_terminal && total > 1 {
-                    crate::output::print_header(path, total);
-                    let _ = progress.set(Progress::new(total32));
-                }
-            }
-        }
-        cleave::ScanEvent::File {
+    cleave::scan_paths(files, &cleave_opts, |event| {
+        if let cleave::ScanEvent::File {
             path: ref file_path,
             result,
-        } => {
+        } = event
+        {
             record_file_result(
                 file_path,
                 *result,
@@ -1292,24 +1485,18 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                 cleave_opts.cancellation.as_ref(),
                 &tally,
                 &stdout,
-                progress.get(),
+                progress.as_ref(),
                 None,
                 None,
             );
         }
     })?;
 
-    if let Some(p) = progress.get() {
+    if let Some(p) = &progress {
         p.finish();
     }
 
-    // Every analyzed file is tallied, so the tally's sum is the total — but
-    // prefer cleave's upfront count when the walk reported one.
-    let mut summary = tally.summary(scan_start);
-    if let Some(&total) = total_files.get() {
-        summary.total_files = total;
-    }
-
+    let summary = tally.summary(scan_start);
     if is_terminal {
         crate::output::print_summary(&summary);
     }
@@ -1692,20 +1879,29 @@ pub fn run_paths(
     let tally = Tally::default();
     let stdout = Mutex::new(std::io::stdout());
 
-    // Partition the requested paths: explicit files become one parallel batch,
-    // each directory is walked separately, and anything else is an error.
+    // Partition the requested paths: explicit files become one unfiltered batch
+    // (a named file is always analyzed), each directory is walked upfront into
+    // its file list, and anything else is an error. Walking the directories here
+    // — rather than letting cleave stream them — lets us learn the total file
+    // count before analysis starts, so the progress bar has a denominator.
     let mut files = Vec::new();
-    let mut dirs = Vec::new();
+    let mut dir_files = Vec::new();
     for path in paths {
         if path.is_file() {
             files.push(path.clone());
         } else if path.is_dir() {
-            dirs.push(path.clone());
+            dir_files.extend(discover_files(path));
         } else {
             tracing::error!("path does not exist: {}", path.display());
             tally.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    let total = u32::try_from(files.len() + dir_files.len()).unwrap_or(u32::MAX);
+    let progress = (is_terminal && total > 1).then(|| {
+        crate::output::print_banner(detection_rule_count(config));
+        Progress::new(total)
+    });
 
     // `--hopper`: renew every result on hopper as it completes. The uploader
     // owns a background thread; dropping it (below, after the scan closures
@@ -1730,7 +1926,7 @@ pub fn run_paths(
                 Some(&cancellation),
                 &tally,
                 &stdout,
-                None,
+                progress.as_ref(),
                 uploader.as_ref(),
                 root_registry,
             );
@@ -1744,13 +1940,17 @@ pub fn run_paths(
             })?;
         }
 
-        for dir in &dirs {
-            cleave::scan_directory(dir, &cleave_opts, |event| {
+        if !dir_files.is_empty() {
+            cleave::scan_paths(dir_files, &cleave_opts, |event| {
                 if let cleave::ScanEvent::File { path, result } = event {
                     record(&path, *result);
                 }
             })?;
         }
+    }
+
+    if let Some(p) = &progress {
+        p.finish();
     }
     // `record` (and its borrow of `uploader`) is now out of scope; flush and
     // join the uploader before reporting the summary so every result is renewed.

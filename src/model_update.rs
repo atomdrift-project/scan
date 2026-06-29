@@ -27,6 +27,10 @@ const BASE_URL: &str = "https://updates.atomdrift.org/litmus";
 
 /// Whole-request budget — models are larger than trait bundles.
 const TIMEOUT: Duration = Duration::from_secs(120);
+/// Connect budget — fail fast when the bucket is unreachable so the default
+/// auto-update can't stall a scan on an offline host (the whole-request
+/// [`TIMEOUT`] still covers a slow but reachable download).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Sidecar recording what the R2 backend installed (no `.git` in the tree).
 const SIDECAR: &str = ".litmus-models.toml";
@@ -84,39 +88,51 @@ fn is_git_managed(dir: &Path) -> bool {
 }
 
 /// Install or refresh the model bundle compatible with this litmus release.
-pub fn update(dir: &Path, force: bool) -> Result<()> {
+pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<()> {
     if is_git_managed(dir) {
-        eprintln!(
-            "Models at {} are git-managed (a checkout or symlink to one); leaving them untouched.\nUse 'git pull' there to update, or remove the directory to switch to bundle updates.",
-            dir.display()
-        );
+        if !quiet {
+            eprintln!(
+                "Models at {} are git-managed (a checkout or symlink to one); leaving them untouched.\nUse 'git pull' there to update, or remove the directory to switch to bundle updates.",
+                dir.display()
+            );
+        }
         return Ok(());
     }
-    let manifest = fetch_manifest()?;
+    // A quiet refresh of an already-present bundle is the auto-update path: fail
+    // fast if the bucket is unreachable. A first-ever download — or any explicit,
+    // non-quiet update — stays patient so a slow first fetch still completes.
+    let connect = (quiet && installed(dir).is_some()).then_some(CONNECT_TIMEOUT);
+    let manifest = fetch_manifest(connect)?;
     let (key, source) = resolve(&manifest)?;
     let artifact = artifact_for(&manifest, &key)?;
 
     if !force && installed(dir).is_some_and(|i| i.commit.starts_with(&key)) {
-        eprintln!("Models already up to date: {} ({})", key, artifact.date);
-        warn_if_behind(&manifest);
+        if !quiet {
+            eprintln!("Models already up to date: {} ({})", key, artifact.date);
+            warn_if_behind(&manifest);
+        }
         return Ok(());
     }
 
-    eprintln!(
-        "Installing models {} ({}) for Atomdrift Scan {} [{}]...",
-        key,
-        artifact.date,
-        our_version(),
-        source
-    );
+    if !quiet {
+        eprintln!(
+            "Installing models {} ({}) for Atomdrift Scan {} [{}]...",
+            key,
+            artifact.date,
+            our_version(),
+            source
+        );
+    }
     install(dir, artifact, &source)?;
-    eprintln!(
-        "Models updated to {} ({}) at {}",
-        key,
-        artifact.date,
-        dir.display()
-    );
-    warn_if_behind(&manifest);
+    if !quiet {
+        eprintln!(
+            "Models updated to {} ({}) at {}",
+            key,
+            artifact.date,
+            dir.display()
+        );
+        warn_if_behind(&manifest);
+    }
     Ok(())
 }
 
@@ -129,7 +145,7 @@ pub fn check(dir: &Path) -> Result<()> {
         );
         return Ok(());
     }
-    let manifest = fetch_manifest()?;
+    let manifest = fetch_manifest(None)?;
     let (key, source) = resolve(&manifest)?;
     let artifact = artifact_for(&manifest, &key)?;
 
@@ -185,9 +201,9 @@ fn warn_if_behind(m: &Manifest) {
     }
 }
 
-fn fetch_manifest() -> Result<Manifest> {
+fn fetch_manifest(connect: Option<Duration>) -> Result<Manifest> {
     let url = format!("{BASE_URL}/versions.toml");
-    let text = http_get(&url)?;
+    let text = http_get(&url, connect)?;
     let text = String::from_utf8(text).context("manifest is not valid UTF-8")?;
     toml::from_str(&text).with_context(|| format!("parsing manifest {url}"))
 }
@@ -197,7 +213,8 @@ fn fetch_manifest() -> Result<Manifest> {
 /// broken bundle never replaces the live models.
 fn install(dir: &Path, artifact: &Artifact, source: &str) -> Result<()> {
     let url = format!("{BASE_URL}/{}", artifact.file);
-    let bytes = http_get(&url)?;
+    // Patient: the manifest fetch already reached the bucket.
+    let bytes = http_get(&url, None)?;
 
     let got = format!("{:x}", Sha256::digest(&bytes));
     if got != artifact.sha256 {
@@ -261,12 +278,13 @@ fn install(dir: &Path, artifact: &Artifact, source: &str) -> Result<()> {
     Ok(())
 }
 
-fn http_get(url: &str) -> Result<Vec<u8>> {
-    eprintln!("fetching {url}");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(TIMEOUT)
-        .build()
-        .context("building http client")?;
+fn http_get(url: &str, connect: Option<Duration>) -> Result<Vec<u8>> {
+    tracing::debug!("fetching {url}");
+    let mut builder = reqwest::blocking::Client::builder().timeout(TIMEOUT);
+    if let Some(connect) = connect {
+        builder = builder.connect_timeout(connect);
+    }
+    let client = builder.build().context("building http client")?;
     let resp = client
         .get(url)
         .send()

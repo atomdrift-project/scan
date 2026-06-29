@@ -443,12 +443,12 @@ pub fn print_ps_result(
     };
 
     eprintln!(
-        "  {blocks} {pct} {label}  {}{deleted_marker}  {pid_display}",
+        " {blocks} {pct} {label}  {}{deleted_marker}  {pid_display}",
         fg_bold(p.path_name, &result.path),
     );
 
     if let Some(llm) = &result.interpretation {
-        eprint!("    {}", crate::engine::format_llm_line(llm, true));
+        eprint!("   {}", crate::engine::format_llm_line(llm, true));
     }
     print_detail_lines(result, p);
     print_reasons(result, p);
@@ -469,7 +469,7 @@ fn print_detail_lines(result: &ScanResult, p: &Palette) {
     if !result.formula.is_empty() {
         meta.push(fg(p.formula, &result.formula));
     }
-    eprintln!("           {}", meta.join(&format!(" {dot} ")));
+    eprintln!("          {}", meta.join(&format!(" {dot} ")));
 
     // Line 3: findings (classification-colored)
     if !result.top_findings.is_empty() {
@@ -492,7 +492,7 @@ fn print_detail_lines(result: &ScanResult, p: &Palette) {
                 }
             })
             .collect();
-        eprintln!("           {}", findings.join(&format!(" {dot} ")));
+        eprintln!("          {}", findings.join(&format!(" {dot} ")));
     }
 }
 
@@ -506,7 +506,7 @@ fn print_reasons(result: &ScanResult, p: &Palette) {
             .map(|r| r.description.as_str())
             .collect();
         eprintln!(
-            "           {} {}",
+            "          {} {}",
             fg(p.arrow, "\u{2191}"),
             fg(p.reason, &reason_strs.join(", ")),
         );
@@ -539,13 +539,13 @@ fn format_level(level: Option<i32>) -> String {
 /// because isotonic saturation collapses it to 1.0 across the whole upper tail.
 fn print_extra(result: &ScanResult, p: &Palette) {
     eprintln!(
-        "           {} {}",
+        "          {} {}",
         fg(p.dim, "level:"),
         fg(p.dim, &format_level(result.level)),
     );
     if !result.model_scores.is_empty() {
         eprintln!(
-            "           {} {}",
+            "          {} {}",
             fg(p.dim, "models:"),
             fg(p.dim, &format_route_scores(&result.model_scores)),
         );
@@ -559,7 +559,7 @@ fn print_extra(result: &ScanResult, p: &Palette) {
             continue;
         }
         eprintln!(
-            "           {} {} {} {} {}",
+            "          {} {} {} {} {}",
             fg(p.dim, "embedded:"),
             fg(p.dim, &ef.path),
             fg(
@@ -577,35 +577,22 @@ fn print_extra(result: &ScanResult, p: &Palette) {
             .map(|s| format!("{}:{}", s.model, s.reason))
             .collect();
         eprintln!(
-            "           {} {}",
+            "          {} {}",
             fg(p.dim, "skipped:"),
             fg(p.dim, &skipped.join(" "))
         );
     }
     if !result.reasons.is_empty() {
-        eprintln!("           {}", fg(p.dim, "shap:"));
+        eprintln!("          {}", fg(p.dim, "shap:"));
         for r in &result.reasons {
             eprintln!(
-                "             {} {} {}",
+                "            {} {} {}",
                 fg(p.dim, &format!("{:>8.4}", r.importance)),
                 fg(p.dim, &format!("val={:<8.2}", r.value)),
                 fg(p.very_dim, &r.feature),
             );
         }
     }
-}
-
-/// Print the scan header.
-pub fn print_header(path: &std::path::Path, count: usize) {
-    let p = palette();
-    eprintln!();
-    eprintln!(
-        "  {}  {} files in {}",
-        fg(p.header_icon, "\u{25c6}"),
-        count,
-        fg(p.header_path, &path.display().to_string()),
-    );
-    eprintln!();
 }
 
 /// A bloom-filter verdict, surfaced before (or instead of) expensive analysis.
@@ -679,7 +666,7 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
         ),
     };
     eprintln!(
-        "  {icon}  {name} {}  {}",
+        " {icon}  {name} {}  {}",
         fg(p.very_dim, reason),
         fg(p.header_path, label),
     );
@@ -689,7 +676,7 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
 pub fn print_summary(summary: &ScanSummary) {
     let p = palette();
     let line = fg(p.summary_line, &"\u{2500}".repeat(52));
-    eprintln!("  {line}");
+    eprintln!(" {line}");
 
     // Bloom decision tally (only when filters were consulted this run).
     let bloom = crate::bloom_repo::counts();
@@ -709,11 +696,23 @@ pub fn print_summary(summary: &ScanSummary) {
         }
         let sep = format!("  {}  ", fg(p.dot_sep, "\u{00b7}"));
         eprintln!(
-            "  {}  bloom  {}",
+            " {}  bloom  {}",
             fg(p.header_icon, "\u{25c6}"),
             parts.join(&sep)
         );
     }
+
+    eprintln!(" {}", summary_status_line(summary));
+    eprintln!();
+}
+
+/// The one-line scan verdict — icon plus counts plus elapsed — without the
+/// leading indent, surrounding separator, or trailing blank that
+/// [`print_summary`] adds. Shared by the full filesystem-scan summary and
+/// `ps`'s compact finish, which overwrites its progress bar with this line.
+#[must_use]
+pub fn summary_status_line(summary: &ScanSummary) -> String {
+    let p = palette();
 
     if summary.total_files == 0 {
         let (icon, msg) = if summary.errors > 0 {
@@ -727,25 +726,21 @@ pub fn print_summary(summary: &ScanSummary) {
         } else {
             (fg(p.warning, "!"), "no scannable files found".to_string())
         };
-        eprintln!(
-            "  {}  {}  {}",
+        return format!(
+            "{}  {}  {}",
             icon,
             msg,
             fg(p.very_dim, &format_elapsed(summary.duration_ms)),
         );
-        eprintln!();
-        return;
     }
 
     if summary.hostile == 0 && summary.suspicious == 0 && summary.errors == 0 {
-        eprintln!(
-            "  {}  {} files scanned, all clean  {}",
+        return format!(
+            "{}  {} files scanned, all clean  {}",
             fg(p.benign, "\u{2713}"),
             summary.total_files,
             fg(p.very_dim, &format_elapsed(summary.duration_ms)),
         );
-        eprintln!();
-        return;
     }
 
     let mut parts = vec![format!("{} files", summary.total_files)];
@@ -765,8 +760,43 @@ pub fn print_summary(summary: &ScanSummary) {
     parts.push(fg(p.very_dim, &format_elapsed(summary.duration_ms)));
 
     let sep = format!("  {}  ", fg(p.dot_sep, "\u{00b7}"));
-    eprintln!("  {}", parts.join(&sep));
+    parts.join(&sep)
+}
+
+/// Print the scan banner shared by every scanning subcommand (`ps`, directory,
+/// multi-path): the atom mark, version, and the count of detection rules already
+/// resident in memory (YAML traits + composite rules + YARA + bloom signatures).
+/// `rules` is precomputed by the caller from resources the scan has *already*
+/// loaded, so this adds no work. The target being scanned is not named here — the
+/// file count is evident from the progress bar and the closing summary.
+pub fn print_banner(rules: u64) {
+    let p = palette();
     eprintln!();
+    eprintln!(
+        " \u{269b}\u{fe0f} {} {}",
+        fg_bold(
+            p.path_name,
+            &format!("Atomdrift Scan v{}", env!("CARGO_PKG_VERSION"))
+        ),
+        fg(
+            p.very_dim,
+            &format!("- {} rules loaded", with_commas(rules))
+        ),
+    );
+}
+
+/// Format an integer with `,` thousands separators (e.g. `1093027` → `1,093,027`).
+fn with_commas(n: u64) -> String {
+    let digits = n.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, c) in digits.char_indices() {
+        if i != 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn format_elapsed(ms: u64) -> String {
@@ -777,9 +807,157 @@ fn format_elapsed(ms: u64) -> String {
     }
 }
 
+/// One detection source in `scan version`: a named rule family with its headline
+/// metric, the content version that identifies it, and the upstream build time.
+#[derive(Debug)]
+pub struct SourceRow {
+    /// Family name shown in the first column (`blooms`, `atomics`, …).
+    pub label: &'static str,
+    /// Headline tally — a rule count, formatted with thousands separators when
+    /// [`Self::metric`] is `None`.
+    pub count: u64,
+    /// Pre-formatted metric that overrides `count` when set (e.g. ML models
+    /// shown as `"64 x 229"` — model count by feature dimensionality).
+    pub metric: Option<String>,
+    /// Short content identity — `v1`, a commit, or empty when none applies.
+    pub version: String,
+    /// Upstream build time (Unix seconds), if known: when the source was
+    /// *published*, not when it was fetched locally.
+    pub epoch: Option<i64>,
+}
+
+/// Render `scan version`: the scan banner with the grand total of rules, then one
+/// aligned row per detection source with its count, version, and upstream age.
+pub fn print_version(scan_version: &str, total_rules: u64, rows: &[SourceRow]) {
+    let p = palette();
+    let now = now_unix();
+
+    println!();
+    println!(
+        " \u{269b}\u{fe0f} {} {}",
+        fg_bold(p.path_name, &format!("Atomdrift Scan v{scan_version}")),
+        fg(p.very_dim, &format!("\u{2014} {} rules", with_commas(total_rules))),
+    );
+    println!();
+
+    let metrics: Vec<String> = rows
+        .iter()
+        .map(|r| r.metric.clone().unwrap_or_else(|| with_commas(r.count)))
+        .collect();
+    let label_w = rows.iter().map(|r| r.label.len()).max().unwrap_or(0);
+    let metric_w = metrics.iter().map(String::len).max().unwrap_or(0);
+    let version_w = rows.iter().map(|r| r.version.len()).max().unwrap_or(0);
+
+    for (r, metric) in rows.iter().zip(&metrics) {
+        let (date, age, freshness) = match r.epoch {
+            Some(e) => (fmt_date(e), fmt_age(now - e), freshness_color(now - e)),
+            None => ("\u{2014}".to_string(), String::new(), p.very_dim),
+        };
+        println!(
+            "   {}  {}  {}  {}  {}",
+            fg(p.dim, &format!("{:<label_w$}", r.label)),
+            fg(p.path_name, &format!("{metric:>metric_w$}")),
+            fg(p.very_dim, &format!("{:<version_w$}", r.version)),
+            fg(freshness, &format!("{date:<10}")),
+            fg(freshness, &age),
+        );
+    }
+    println!();
+}
+
+/// Current Unix time in whole seconds (UTC), or 0 if the clock predates the epoch.
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+/// Format an upstream Unix timestamp as a UTC `YYYY-MM-DD` date.
+fn fmt_date(epoch: i64) -> String {
+    let (y, m, d) = civil_from_days(epoch.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Render an age in seconds as a compact "just now / Nm / Nh / Nd ago" string.
+fn fmt_age(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        "just now".to_string()
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86_400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86_400)
+    }
+}
+
+/// Staleness color for a source's age: green within 48h, yellow within a week,
+/// red beyond. Reuses the classification palette so freshness reads the same way
+/// a verdict does.
+fn freshness_color(secs: i64) -> Rgb {
+    let p = palette();
+    match secs.max(0) {
+        ..=172_800 => p.benign,
+        172_801..=604_800 => p.suspicious,
+        _ => p.hostile,
+    }
+}
+
+/// Convert days since the Unix epoch to `(year, month, day)` in the proleptic
+/// Gregorian calendar (UTC). Howard Hinnant's `civil_from_days`.
+// Casts are bounded by the algorithm: `d` ∈ [1,31] and `m` ∈ [1,12].
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (y + i64::from(m <= 2), m, d)
+}
+
+/// Parse a `YYYY-MM-DD` date as a UTC-midnight Unix timestamp (seconds).
+/// Returns `None` for any malformed field. Inverse of [`civil_from_days`]
+/// (Howard Hinnant's `days_from_civil`).
+#[must_use]
+pub fn parse_ymd(s: &str) -> Option<i64> {
+    let mut parts = s.splitn(3, '-');
+    let y: i64 = parts.next()?.trim().parse().ok()?;
+    let m: i64 = parts.next()?.trim().parse().ok()?;
+    let d: i64 = parts.next()?.trim().parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = y - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    Some((era * 146_097 + doe - 719_468) * 86_400)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commas_group_by_threes() {
+        assert_eq!(with_commas(0), "0");
+        assert_eq!(with_commas(42), "42");
+        assert_eq!(with_commas(999), "999");
+        assert_eq!(with_commas(1_000), "1,000");
+        assert_eq!(with_commas(12_345), "12,345");
+        assert_eq!(with_commas(123_456), "123,456");
+        assert_eq!(with_commas(1_093_027), "1,093,027");
+    }
 
     #[test]
     fn display_probability_at_threshold() {
@@ -818,5 +996,43 @@ mod tests {
         let thr = 0.80_f32;
         assert!((display_probability(thr, thr) - 0.5).abs() < 1e-6);
         assert!(display_probability(0.79, thr) < 0.5);
+    }
+
+    #[test]
+    fn parse_ymd_known_dates() {
+        assert_eq!(parse_ymd("1970-01-01"), Some(0));
+        assert_eq!(parse_ymd("2026-06-29"), Some(1_782_691_200));
+        // Malformed input yields no timestamp rather than a wrong guess.
+        assert_eq!(parse_ymd("2026-13-01"), None);
+        assert_eq!(parse_ymd("not-a-date"), None);
+        assert_eq!(parse_ymd("2026-06"), None);
+    }
+
+    #[test]
+    fn date_round_trips_through_epoch() {
+        for date in ["1970-01-01", "2000-02-29", "2026-06-29", "2099-12-31"] {
+            let epoch = parse_ymd(date).expect("valid date");
+            assert_eq!(fmt_date(epoch), date);
+        }
+    }
+
+    #[test]
+    fn freshness_bands_map_to_verdict_colors() {
+        let p = palette();
+        let same = |a: Rgb, b: Rgb| a.0 == b.0 && a.1 == b.1 && a.2 == b.2;
+        assert!(same(freshness_color(0), p.benign));
+        assert!(same(freshness_color(172_800), p.benign)); // exactly 48h → still green
+        assert!(same(freshness_color(172_801), p.suspicious)); // just past 48h → yellow
+        assert!(same(freshness_color(604_800), p.suspicious)); // exactly a week → yellow
+        assert!(same(freshness_color(604_801), p.hostile)); // past a week → red
+    }
+
+    #[test]
+    fn age_formats_by_unit() {
+        assert_eq!(fmt_age(-5), "just now");
+        assert_eq!(fmt_age(30), "just now");
+        assert_eq!(fmt_age(90), "1m ago");
+        assert_eq!(fmt_age(3 * 3600), "3h ago");
+        assert_eq!(fmt_age(2 * 86_400 + 5 * 3600), "2d ago");
     }
 }

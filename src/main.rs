@@ -57,6 +57,11 @@ struct Cli {
     #[arg(short = 'u', long)]
     update: bool,
 
+    /// Disable the automatic rules/models refresh (on by default when the local
+    /// ruleset is over 24h stale). Also settable via `SCAN_NO_UPDATE`.
+    #[arg(long)]
+    no_update: bool,
+
     /// Force light-background color theme
     #[arg(long, conflicts_with = "dark")]
     light: bool,
@@ -778,20 +783,25 @@ fn main() -> Result<()> {
         scan::update_check::maybe_notify(false);
     }
 
-    if cli.update {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let dir = scan::models_repo::install_target();
-                if let Err(e) = scan::model_update::update(&dir, false) {
-                    eprintln!("Warning: model update failed: {e}");
-                }
-            });
-            s.spawn(|| {
-                if let Err(e) = scan::traits_repo::update(false, false) {
-                    eprintln!("Warning: traits update failed: {e}");
-                }
-            });
-        });
+    // Default-on refresh: bring rules + models (+ bloom) current when the local
+    // ruleset is over 24h stale — or immediately with `-u/--update` — unless
+    // `--no-update`/`SCAN_NO_UPDATE` disables it. Scanning commands only: the
+    // daemons refresh on restart, and `version`/`update-rules` manage updates
+    // themselves.
+    if matches!(
+        command,
+        Commands::Path { .. }
+            | Commands::Ps
+            | Commands::Sys
+            | Commands::Url { .. }
+            | Commands::Purl { .. }
+    ) {
+        scan::auto_update::refresh_if_stale(
+            cli.update,
+            cli.no_update,
+            effective_mode,
+            cli.format == scan::OutputFormat::Terminal,
+        );
     }
 
     // Resolve model directory lazily — update-rules and version don't need it,
@@ -1045,7 +1055,7 @@ fn main() -> Result<()> {
                     eprintln!("Warning: bloom filter check failed: {e}");
                 }
             } else {
-                if let Err(e) = scan::model_update::update(&dir, false) {
+                if let Err(e) = scan::model_update::update(&dir, false, false) {
                     eprintln!("Error updating models: {e}");
                     process::exit(1);
                 }
@@ -1057,7 +1067,7 @@ fn main() -> Result<()> {
                 // — the scan simply runs without the known-good/known-bad short-circuit.
                 if !models_only
                     && let Err(e) =
-                        scan::bloom_update::update(&scan::bloom_repo::install_dir(), false)
+                        scan::bloom_update::update(&scan::bloom_repo::install_dir(), false, false)
                 {
                     eprintln!("Warning: bloom filter update failed (non-fatal): {e}");
                 }
@@ -1128,7 +1138,7 @@ fn main() -> Result<()> {
                 std::thread::scope(|s| {
                     s.spawn(|| {
                         let dir = scan::models_repo::install_target();
-                        if let Err(e) = scan::model_update::update(&dir, false) {
+                        if let Err(e) = scan::model_update::update(&dir, false, false) {
                             eprintln!("Warning: model update failed: {e}");
                         }
                     });
@@ -1221,34 +1231,121 @@ fn main() -> Result<()> {
                 });
                 println!("{version}");
             } else {
-                println!("scan {}", env!("CARGO_PKG_VERSION"));
-                if let Some(v) = scan::models_repo::version() {
-                    println!("  models: {v}");
+                use scan::output::SourceRow;
+
+                // Counting traits/composites/YARA initialises the rule engines.
+                let info = cleave::version_info();
+
+                // Atomics, composites, and third-party YARA all ship in the
+                // traits repo, so they share one identity and build date. Prefer
+                // the installed bundle's sidecar (commit + committer date); for a
+                // dev checkout with no sidecar, read git HEAD directly.
+                let traits_dir = cleave::cache::traits_path();
+                let traits_installed = cleave::rule_update::installed(&traits_dir);
+                let traits_git = traits_installed.is_none().then(|| git_head(&traits_dir)).flatten();
+                let traits_version = traits_installed
+                    .as_ref()
+                    .map(|i| i.commit.chars().take(9).collect::<String>())
+                    .or_else(|| traits_git.as_ref().map(|(c, _)| c.clone()))
+                    .unwrap_or_default();
+                let traits_epoch = traits_installed
+                    .as_ref()
+                    .and_then(|i| scan::output::parse_ymd(&i.date))
+                    .or_else(|| traits_git.as_ref().map(|&(_, e)| e));
+
+                // Bloom: total element count and the manifest's build date.
+                let bloom_count: u64 = bloom.as_ref().map_or(0, |m| m.filter.values().map(|e| e.n).sum());
+                let bloom_version = bloom
+                    .as_ref()
+                    .and_then(|m| m.filter.values().next())
+                    .map(|e| format!("v{}", e.format_version))
+                    .unwrap_or_default();
+                let bloom_epoch = bloom.as_ref().and_then(|m| scan::output::parse_ymd(&m.built));
+
+                let total = info.trait_count as u64
+                    + info.composite_count as u64
+                    + info.yara_rules as u64
+                    + bloom_count;
+
+                let mut rows = Vec::new();
+                if bloom.is_some() {
+                    rows.push(SourceRow {
+                        label: "blooms",
+                        count: bloom_count,
+                        metric: None,
+                        version: bloom_version,
+                        epoch: bloom_epoch,
+                    });
                 }
-                if let Some(v) = cleave::traits_repo::version() {
-                    println!("  traits: {v}");
+                rows.push(SourceRow {
+                    label: "atomics",
+                    count: info.trait_count as u64,
+                    metric: None,
+                    version: traits_version.clone(),
+                    epoch: traits_epoch,
+                });
+                rows.push(SourceRow {
+                    label: "composites",
+                    count: info.composite_count as u64,
+                    metric: None,
+                    version: traits_version.clone(),
+                    epoch: traits_epoch,
+                });
+                rows.push(SourceRow {
+                    label: "third-party YARA",
+                    count: info.yara_rules as u64,
+                    metric: None,
+                    version: traits_version,
+                    epoch: traits_epoch,
+                });
+
+                // ML models: route-model count by feature dimensionality
+                // (e.g. `64 x 229`), plus the bundle's commit and build date.
+                if let Some(count) = scan::models_repo::model_count() {
+                    let model_installed =
+                        scan::model_update::installed(&scan::models_repo::install_target());
+                    let metric = scan::models_repo::feature_dimension()
+                        .map(|dim| format!("{count} x {dim}"));
+                    rows.push(SourceRow {
+                        label: "ML models",
+                        count: count as u64,
+                        metric,
+                        // Truncate to 9 chars to match the traits commit width.
+                        version: scan::models_repo::version()
+                            .map(|c| c.chars().take(9).collect())
+                            .unwrap_or_default(),
+                        epoch: model_installed.as_ref().and_then(|i| scan::output::parse_ymd(&i.date)),
+                    });
                 }
-                if let Some(m) = &bloom {
-                    // `built` is the timestamp; the format version comes off any
-                    // entry (all share it). Counts are listed one indented line down.
-                    match m.filter.values().next() {
-                        Some(e) => println!("  bloom: {} (v{})", m.built, e.format_version),
-                        None => println!("  bloom: {}", m.built),
-                    }
-                    let counts: Vec<String> = m
-                        .filter
-                        .iter()
-                        .map(|(stem, e)| format!("{stem} {}", e.n))
-                        .collect();
-                    if !counts.is_empty() {
-                        println!("    {}", counts.join(" · "));
-                    }
-                }
+
+                scan::output::print_version(env!("CARGO_PKG_VERSION"), total, &rows);
             }
         }
     }
 
     Ok(())
+}
+
+/// The abbreviated commit hash and committer date (Unix seconds) of `HEAD` in
+/// `dir`, when `dir` is a git checkout. Returns `None` if git is unavailable or
+/// `dir` is not a repository, in which case `scan version` omits that source's
+/// identity. This recovers the authentic upstream identity and date for a traits
+/// checkout that has no install sidecar.
+fn git_head(dir: &Path) -> Option<(String, i64)> {
+    let out = process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["show", "-s", "--format=%H %ct", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout).ok()?;
+    let mut fields = stdout.split_whitespace();
+    let commit: String = fields.next()?.chars().take(9).collect();
+    let epoch: i64 = fields.next()?.parse().ok()?;
+    Some((commit, epoch))
 }
 
 /// CPU count available to this process.

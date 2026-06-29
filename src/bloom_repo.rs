@@ -94,6 +94,23 @@ impl Lookup {
         me
     }
 
+    /// Total number of signatures across every loaded filter — the known-good
+    /// and known-bad PURLs and SHA-256s currently resident in memory. Summed
+    /// into the `ps` banner's rule tally.
+    #[must_use]
+    pub fn rule_count(&self) -> u64 {
+        [
+            &self.purl_good,
+            &self.purl_bad,
+            &self.sha256_good,
+            &self.sha256_bad,
+        ]
+        .into_iter()
+        .filter_map(Option::as_ref)
+        .map(Filter::len)
+        .sum()
+    }
+
     /// True when at least one filter is loaded — lets a caller skip the lookup
     /// entirely when nothing is synced.
     #[must_use]
