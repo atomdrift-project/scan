@@ -116,6 +116,7 @@ fn full_result_serializes_identically() {
             model: "claude-test".to_string(),
             error: None,
         }),
+        dependency_results: vec![],
     };
     assert_envelopes_identical(result, "full");
 }
@@ -150,6 +151,7 @@ fn minimal_result_serializes_identically() {
         skipped_models: vec![],
         rendered_context: String::new(),
         interpretation: None,
+        dependency_results: vec![],
     };
     assert_envelopes_identical(result, "minimal");
 }

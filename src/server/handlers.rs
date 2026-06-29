@@ -1074,6 +1074,7 @@ fn scan_result_from(
         embedded_files: cr.embedded_files,
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
+        dependency_results: cr.dependency_results,
     }
 }
 
@@ -1295,12 +1296,13 @@ pub(super) async fn analyze_path(
             // collect_upload_artifacts reads sidecars from disk.
             let sha256 = scan_result.sha256.clone();
             let size = scan_result.size_bytes;
+            let deps = std::mem::take(&mut scan_result.dependency_results);
             let envelope = scan_result.into_envelope();
             let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
             if let (Some(uploader), Some(path)) = (&state.uploader, upload_path) {
                 let uploader = Arc::clone(uploader);
                 tokio::task::spawn_blocking(move || {
-                    crate::engine::upload_scan_result(&uploader, &path, sha256, size, envelope);
+                    crate::engine::upload_scan_result(&uploader, &path, sha256, size, deps, envelope);
                 });
             }
             let mut resp = (

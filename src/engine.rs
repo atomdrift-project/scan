@@ -522,30 +522,15 @@ mod envelope_tests {
     use super::*;
 
     #[test]
-    fn collect_upload_artifacts_offers_root_and_ok_deps_only() {
-        // A report with three fetch edges: one usable, one unresolved (no bytes),
-        // one Ok-but-sha-less. Only the scanned file and the usable dep should be
-        // offered; members inside an archive never appear here at all.
-        // `pkg:bogus/*` resolves to no registry without any network call.
-        let raw = serde_json::json!({
-            "fetched": [
-                {"outcome": "ok", "content_sha256": "c".repeat(64),
-                 "locator": "pkg:bogus/x@1", "final_url": "https://example/x-1.tgz", "size": 99},
-                {"outcome": "unresolved", "locator": "pkg:bogus/y@1"},
-                {"outcome": "ok", "locator": "pkg:bogus/z@1"},
-            ]
-        });
-        let arts = collect_upload_artifacts(
-            Path::new("/tmp/proj.tgz"),
-            &"a".repeat(64),
-            10,
-            &raw,
-            "scan+test",
-        );
+    fn collect_upload_artifacts_offers_root_only() {
+        // Fetched dependencies are mirrored separately (bytes + provenance + their
+        // own verdict) via the uploader's dependency path, so this offers only the
+        // scanned file itself — a local artifact hopper may never have seen.
+        let arts =
+            collect_upload_artifacts(Path::new("/tmp/proj.tgz"), &"a".repeat(64), 10, "scan+test");
 
-        // Root file + the single usable dependency; the other two edges drop out.
-        assert_eq!(arts.len(), 2);
-        assert_eq!(arts[0].sha256, "a".repeat(64), "root file is offered first");
+        assert_eq!(arts.len(), 1, "only the scanned file is offered here");
+        assert_eq!(arts[0].sha256, "a".repeat(64));
         assert!(matches!(
             arts[0].bytes,
             crate::upload::ArtifactBytes::File(_)
@@ -554,18 +539,30 @@ mod envelope_tests {
             !arts[0].backfill,
             "root file's thin sidecar is not backfilled"
         );
-        assert_eq!(arts[1].sha256, "c".repeat(64));
-        assert!(
-            arts[1].backfill,
-            "a dependency's registry provenance is backfillable"
-        );
+        assert_eq!(arts[0].filename, "proj.tgz", "filename is the file's name");
+    }
+
+    #[test]
+    fn dep_envelope_carries_verdict_and_report() {
+        // A dependency's verdict envelope encodes its aggregate level as `ml.lvl`
+        // and passes its standalone report through as `raw`, exactly the shape a
+        // first-hand scan posts — so hopper records it identically.
+        let dep = DepResult {
+            sha256: "d".repeat(64),
+            locator: "pkg:npm/evil@1.0.0".to_string(),
+            url: "https://reg/evil-1.0.0.tgz".to_string(),
+            size: 1234,
+            level: Some(100),
+            probability: 0.97,
+            raw: serde_json::json!({"v": "8", "files": [{"sha": "d".repeat(64), "type": "npm"}]}),
+        };
+        let env = dep_envelope(dep, "model-9", "2026-06-28T00:00:00Z");
+        assert_eq!(env.ml.level, Some(100), "aggregate verdict rides in ml.lvl");
+        assert_eq!(env.ml.version, "model-9");
+        assert_eq!(env.ml.analyzed_at, "2026-06-28T00:00:00Z");
         assert_eq!(
-            arts[1].filename, "x-1.tgz",
-            "filename derived from the fetch URL"
-        );
-        assert!(
-            matches!(&arts[1].bytes, crate::upload::ArtifactBytes::Cached { locator } if locator == "pkg:bogus/x@1"),
-            "a dependency's bytes load lazily from the cache by locator",
+            env.raw["files"][0]["type"], "npm",
+            "the dependency's own report is the result raw, so hopper keeps its FileType",
         );
     }
 
@@ -595,6 +592,7 @@ mod envelope_tests {
             embedded_files: Vec::new(),
             rendered_context: String::new(),
             interpretation: None,
+            dependency_results: Vec::new(),
         }
     }
 
@@ -918,6 +916,33 @@ pub struct ScanResult {
     /// Serialized as the response `llm` section; `None` when interpretation was
     /// disabled or gated out.
     pub interpretation: Option<crate::interpret::Interpretation>,
+    /// Fetched dependencies to mirror into hopper as their own samples. Empty
+    /// unless the scan fetched dependencies; consumed by the upload paths and
+    /// never serialized into this result's own envelope.
+    pub dependency_results: Vec<DepResult>,
+}
+
+/// A fetched dependency to mirror into hopper as its own sample: the aggregate
+/// verdict scan computed for it during the parent analysis, plus its standalone
+/// compact cleave report. Provenance and bytes are recovered from the fetch blob
+/// cache at upload time (keyed by `locator`), so they never travel in the result.
+#[derive(Debug, Clone)]
+pub struct DepResult {
+    /// SHA-256 of the dependency's bytes — its identity and `/api/result` key.
+    pub sha256: String,
+    /// The reference locator (PURL/URL) the bytes were fetched from.
+    pub locator: String,
+    /// The URL the locator resolved to — drives the stored filename/type sniff.
+    pub url: String,
+    /// Size of the dependency's bytes, recorded in the provenance sidecar.
+    pub size: u64,
+    /// Aggregate verdict marker (`ml.lvl`): the dependency's container elevated by
+    /// its worst member, exactly as a first-hand scan of the same bytes resolves.
+    pub level: Option<i32>,
+    /// Probability the aggregate verdict was decided on.
+    pub probability: f32,
+    /// The dependency's own compact cleave report — the `raw` for its result.
+    pub raw: serde_json::Value,
 }
 
 /// A representative cleave finding surfaced alongside a classification.
@@ -1448,7 +1473,7 @@ fn record_file_result(
         p.increment();
     }
     match scan_result {
-        Ok(r) => {
+        Ok(mut r) => {
             tally.count(r.classification);
             if config.format() == OutputFormat::Json || config.filter().shows(&r.classification) {
                 emit_result(&r, config, progress.is_some(), stdout);
@@ -1464,8 +1489,9 @@ fn record_file_result(
             if let Some(uploader) = uploader {
                 let sha256 = r.sha256.clone();
                 let size = r.size_bytes;
+                let deps = std::mem::take(&mut r.dependency_results);
                 let envelope = r.into_envelope();
-                upload_scan_result(uploader, file_path, sha256, size, envelope);
+                upload_scan_result(uploader, file_path, sha256, size, deps, envelope);
             }
         }
         Err(e) => {
@@ -1487,12 +1513,55 @@ pub(crate) fn upload_scan_result(
     file_path: &Path,
     sha256: String,
     size_bytes: u64,
+    dependency_results: Vec<DepResult>,
     envelope: ScanResultEnvelope,
 ) {
-    let artifacts =
-        collect_upload_artifacts(file_path, &sha256, size_bytes, &envelope.raw, upload_collector());
+    let artifacts = collect_upload_artifacts(file_path, &sha256, size_bytes, upload_collector());
     uploader.submit_artifacts(artifacts);
+    // Each fetched dependency, mirrored into hopper as its own sample: bytes (only
+    // if missing) + provenance + the verdict scan computed for it. Queued before
+    // the root verdict so a dependency's row exists before its own verdict lands.
+    if !dependency_results.is_empty() {
+        uploader.submit_dependencies(
+            dependency_results,
+            envelope.ml.version.clone(),
+            envelope.ml.analyzed_at.clone(),
+        );
+    }
     uploader.submit(sha256, envelope);
+}
+
+/// Build the `/api/result` envelope for a fetched dependency: the standalone
+/// cleave report scan captured for it as `raw`, and the aggregate verdict it
+/// computed as the `ml` section — the same shape a first-hand scan of those bytes
+/// would post, so hopper records the dependency exactly as if it had been scanned
+/// directly. `version`/`analyzed_at` are the parent run's, identifying the build.
+#[must_use]
+pub(crate) fn dep_envelope(
+    dep: DepResult,
+    version: &str,
+    analyzed_at: &str,
+) -> ScanResultEnvelope {
+    let level = dep.level;
+    let ml_files = build_ml_files(&dep.raw, dep.probability, level, &[]);
+    ScanResultEnvelope {
+        ml: MlSection {
+            v: "7",
+            probability: dep.probability,
+            level,
+            conf: level_confidence(level),
+            model_scores: Vec::new(),
+            skipped_models: Vec::new(),
+            version: version.to_string(),
+            eng: ENGINE_VERSION,
+            analyzed_at: analyzed_at.to_string(),
+            files: ml_files,
+            pids: None,
+            deleted: None,
+        },
+        llm: None,
+        raw: dep.raw,
+    }
 }
 
 /// The `fetch.collector` identity stamped on every sidecar this process uploads,
@@ -1503,23 +1572,18 @@ fn upload_collector() -> &'static str {
     COLLECTOR.get_or_init(|| format!("scan+{}", crate::upload::default_worker_name()))
 }
 
-/// Collect the artifacts a `--upload` run should ensure hopper has: the scanned
-/// file itself, plus every fetched dependency archive (read from the report's
-/// fetch edges). Members *inside* an archive are deliberately never offered —
-/// hopper reconstructs those from the parent archive it already receives, so the
-/// negotiation stays one sha per standalone artifact. A fetched dependency's
-/// sidecar carries the registry record scan derived for it (re-read from the
-/// blob cache the fetch already populated — a cache hit, never a re-fetch).
+/// The scanned file itself, offered to hopper so a `--upload` run can store a
+/// locally-analyzed file hopper has never seen. Just the one artifact — fetched
+/// dependencies are mirrored separately (bytes, provenance, *and* verdict) by
+/// [`crate::upload::Uploader::submit_dependencies`], so they never ride here.
 fn collect_upload_artifacts(
     file_path: &Path,
     sha256: &str,
     size_bytes: u64,
-    raw: &serde_json::Value,
     collector: &str,
 ) -> Vec<crate::upload::UploadArtifact> {
     use crate::upload::{ArtifactBytes, UploadArtifact};
     let now = now_rfc3339();
-    let mut artifacts = Vec::new();
 
     // The scanned file: bytes from disk, no registry (a local, un-fetched artifact).
     let root_name = file_path
@@ -1527,7 +1591,7 @@ fn collect_upload_artifacts(
         .and_then(|n| n.to_str())
         .unwrap_or("file")
         .to_string();
-    artifacts.push(UploadArtifact {
+    vec![UploadArtifact {
         sha256: sha256.to_string(),
         size: size_bytes,
         filename: root_name.clone(),
@@ -1546,69 +1610,13 @@ fn collect_upload_artifacts(
         // The root file's sidecar carries no registry/PURL, so there's nothing
         // worth backfilling onto a copy hopper already has.
         backfill: false,
-    });
-
-    // Each successfully fetched dependency archive, from the report's fetch edges.
-    let Some(edges) = raw.get("fetched").and_then(serde_json::Value::as_array) else {
-        return artifacts;
-    };
-    for edge in edges {
-        // Only an `ok` fetch has retrievable bytes; the rest are recorded empty.
-        if edge.get("outcome").and_then(serde_json::Value::as_str) != Some("ok") {
-            continue;
-        }
-        let (Some(content_sha), Some(locator)) = (
-            edge.get("content_sha256")
-                .and_then(serde_json::Value::as_str),
-            edge.get("locator").and_then(serde_json::Value::as_str),
-        ) else {
-            continue;
-        };
-        let url = edge
-            .get("final_url")
-            .or_else(|| edge.get("resolved_url"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let dep_size = edge
-            .get("size")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let dep_name = artifact_filename(url, locator);
-        // The normalized record plus the raw provider documents it came from,
-        // both recovered from the warm cache the fetch already filled — no
-        // re-fetch. The raw rides along as hopper's re-parsing backup.
-        let (registry, sources) =
-            crate::fetch::registry_with_sources(&fletch::RefLocator::Purl(locator.to_string()));
-        artifacts.push(UploadArtifact {
-            sha256: content_sha.to_string(),
-            size: dep_size,
-            sidecar: crate::provenance::build_sidecar(
-                &dep_name,
-                content_sha,
-                dep_size,
-                collector,
-                &now,
-                url,
-                locator,
-                registry.as_ref(),
-                &sources,
-            ),
-            filename: dep_name,
-            bytes: ArtifactBytes::Cached {
-                locator: locator.to_string(),
-            },
-            // A dependency carries a registry record + PURL, worth backfilling
-            // onto a copy hopper holds the bytes for but has no provenance for.
-            backfill: true,
-        });
-    }
-    artifacts
+    }]
 }
 
 /// A filename for an uploaded artifact: the last path segment of the fetch URL
 /// (query/fragment stripped), falling back to the locator's tail with PURL
 /// punctuation flattened. hopper uses it for the stored filename and type sniff.
-fn artifact_filename(url: &str, locator: &str) -> String {
+pub(crate) fn artifact_filename(url: &str, locator: &str) -> String {
     let from_url = url
         .rsplit('/')
         .next()
@@ -1981,6 +1989,8 @@ pub(crate) struct ClassifiedReport {
     pub(crate) sha256: String,
     pub(crate) embedded_files: Vec<EmbeddedFile>,
     pub(crate) report_json: serde_json::Value,
+    /// Fetched dependencies to mirror into hopper as their own samples.
+    pub(crate) dependency_results: Vec<DepResult>,
     /// cleave's rendered context view (annotated hex/source block).
     pub(crate) rendered_context: String,
     /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
@@ -2160,7 +2170,8 @@ pub(crate) fn classify_report(
     // files[] and the per-file declared references) and before featurization, so
     // fetched content feeds the verdict like any other file. Off unless the
     // policy selects a kind. The returned edges are attached to report_json below.
-    let fetch_edges = crate::fetch::orchestrate(&mut report, root_path, fetch, fetch_progress);
+    let (fetch_edges, fetched_deps) =
+        crate::fetch::orchestrate(&mut report, root_path, fetch, fetch_progress);
     // One-shot `pkg:`/`url`: graft the root artifact's own registry metadata as a
     // child `registry` node and correlate the two with a `scope: package`
     // composite. The `--fetch` path does the equivalent per fetched dependency
@@ -2325,6 +2336,18 @@ pub(crate) fn classify_report(
     // (declaring sha, reference offset, dependency locator, confirmed class).
     let mut dep_backrefs: Vec<(String, Option<u64>, String, Classification)> = Vec::new();
 
+    // Attribute each fetched dependency's files to it so the embedded pass's
+    // per-node decisions roll up into the dependency's own aggregate verdict —
+    // its container elevated by its worst member, exactly as a first-hand scan of
+    // those bytes resolves. No extra model work: the decisions are the ones the
+    // loop already computes for the merged report.
+    let sha_to_dep: std::collections::HashMap<&str, usize> = fetched_deps
+        .iter()
+        .enumerate()
+        .flat_map(|(i, d)| d.member_shas.iter().map(move |s| (s.as_str(), i)))
+        .collect();
+    let mut dep_decisions: Vec<Option<Decision>> = vec![None; fetched_deps.len()];
+
     for ef in &embedded_entries {
         if let Some(c) = cancellation
             && c.load(Ordering::Relaxed)
@@ -2358,6 +2381,17 @@ pub(crate) fn classify_report(
             model.grid_max(),
             ef["path"].as_str().unwrap_or(label),
         );
+
+        // Roll this node's decision into the aggregate verdict of the fetched
+        // dependency it belongs to (the container or one of its members).
+        if let Some(sha) = ef["sha"].as_str()
+            && let Some(&di) = sha_to_dep.get(sha)
+            && dep_decisions[di]
+                .as_ref()
+                .is_none_or(|cur| decision_outranks(&ef_decision, cur))
+        {
+            dep_decisions[di] = Some(ef_decision);
+        }
 
         // A fetched dependency that classifies hostile/suspicious is pinned back
         // onto the file that declared it (request: the manifest names the bad
@@ -2546,6 +2580,32 @@ pub(crate) fn classify_report(
         append_unanalyzed_members(&mut report_json, &listed_members);
     }
 
+    // Mirror each fetched dependency into hopper as its own sample: its standalone
+    // report plus the aggregate verdict harvested above. A dependency the embedded
+    // pass never reached (e.g. truncated by the embedded-file cap) defaults to
+    // benign rather than inventing a verdict.
+    let dependency_results: Vec<DepResult> = fetched_deps
+        .into_iter()
+        .zip(dep_decisions)
+        .map(|(dep, decision)| {
+            let decision = decision.unwrap_or(Decision {
+                class: Classification::Benign,
+                probability: 0.0,
+                threshold: 0.0,
+                level: Some(-1),
+            });
+            DepResult {
+                sha256: dep.content_sha,
+                locator: dep.locator,
+                url: dep.url,
+                size: dep.size,
+                level: decision.level,
+                probability: decision.probability,
+                raw: dep.raw,
+            }
+        })
+        .collect();
+
     Ok(ClassifiedReport {
         classification: final_decision.class,
         probability: final_decision.probability,
@@ -2562,6 +2622,7 @@ pub(crate) fn classify_report(
         sha256,
         embedded_files,
         report_json,
+        dependency_results,
         rendered_context,
         interpretation,
     })
@@ -2775,6 +2836,7 @@ pub(crate) fn process_report(
         embedded_files: cr.embedded_files,
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
+        dependency_results: cr.dependency_results,
     })
 }
 

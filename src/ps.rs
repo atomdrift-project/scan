@@ -418,6 +418,7 @@ fn build_result(
         embedded_files: cr.embedded_files,
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
+        dependency_results: cr.dependency_results,
     })
 }
 

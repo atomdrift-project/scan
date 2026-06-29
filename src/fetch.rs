@@ -284,25 +284,51 @@ fn shared_resources() -> Option<&'static Resources> {
         .as_ref()
 }
 
+/// A fetched dependency captured for upload to hopper as its own sample. Carries
+/// the standalone analysis report cleave produced for the dependency's bytes (the
+/// same report a first-hand `pkg:`/`url` scan yields, stripped and compacted),
+/// plus the shas of every file in it — so the caller can harvest the dependency's
+/// aggregate verdict from the embedded-classification pass it already runs over
+/// the merged report, without re-running the model.
+pub(crate) struct FetchedDependency {
+    /// The reference locator (PURL or URL) the bytes were fetched from.
+    pub locator: String,
+    /// The URL the locator resolved to — drives the stored filename/type sniff.
+    pub url: String,
+    /// SHA-256 of the fetched bytes — the dependency's identity in hopper.
+    pub content_sha: String,
+    /// Size of the fetched bytes, recorded in the provenance sidecar.
+    pub size: u64,
+    /// The dependency's own compact cleave report (`raw` for its `/api/result`).
+    pub raw: serde_json::Value,
+    /// Every file sha in the report, so the caller can attribute the embedded
+    /// pass's per-node decisions back to this dependency.
+    pub member_shas: Vec<String>,
+}
+
 /// Discover, fetch, and graft, following references up to `policy.depth` hops.
 /// Mutates `report.files` in place with one node per fetched payload (and any
-/// extracted members) and returns the fetch edge log. A disabled policy, an
-/// unavailable cache/client, or zero references all yield an empty log.
+/// extracted members) and returns the fetch edge log plus the standalone report
+/// captured for each fetched dependency. A disabled policy, an unavailable
+/// cache/client, or zero references all yield empty logs.
 pub(crate) fn orchestrate(
     report: &mut AnalysisReport,
     root_path: &Path,
     policy: FetchPolicy,
     progress: bool,
-) -> Vec<FetchRecord> {
+) -> (Vec<FetchRecord>, Vec<FetchedDependency>) {
     if !policy.enabled() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let Some(res) = shared_resources() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     let opts = AnalysisOptions::default();
     let mut records = Vec::new();
+    // Standalone reports for each fetched dependency, captured before the payload
+    // is grafted into the merged report. Uploaded to hopper as their own samples.
+    let mut dependencies: Vec<FetchedDependency> = Vec::new();
     // Two budget tiers. Per scanned file: each file's references get a fresh
     // ceiling (`--fetch-max-file-fetches` live fetches, `--fetch-max-file-size`
     // bytes), so one file can't starve the rest. Per execution: a process-wide
@@ -484,6 +510,11 @@ pub(crate) fn orchestrate(
                     // package's registry metadata.
                     let artifact = payload.sub.as_ref().map(sub_findings).unwrap_or_default();
                     let artifact_sha = payload.content_sha.clone();
+                    // Capture the dependency's standalone report before merge_payload
+                    // consumes the sub-report into the merged tree.
+                    if let Some(dep) = capture_dependency(rec, &payload) {
+                        dependencies.push(dep);
+                    }
                     next.extend(merge_payload(report, rec, payload));
                     // `rec.locator` is the original filefacts locator (the PURL),
                     // the same key the registry findings were captured under.
@@ -499,7 +530,36 @@ pub(crate) fn orchestrate(
     if header_printed {
         report_summary(&records);
     }
-    records
+    (records, dependencies)
+}
+
+/// Capture a fetched payload's standalone report for upload as its own hopper
+/// sample. The report is the pristine one cleave produced for the dependency's
+/// own bytes (container at depth 0, correct member structure) — so it needs no
+/// rerooting, unlike reconstructing a subtree out of the merged parent report.
+/// Compacted from a borrow: no clone of the report, and no strip pass (the raw is
+/// never fed to a model here, and a single dependency never nears the body
+/// limit). Returns `None` when there is nothing to upload.
+fn capture_dependency(rec: &FetchRecord, analyzed: &Analyzed) -> Option<FetchedDependency> {
+    let sub = analyzed.sub.as_ref()?;
+    if analyzed.content_sha.is_empty() {
+        return None;
+    }
+    let member_shas: Vec<String> = sub.files.iter().map(|f| f.sha256.clone()).collect();
+    let compact = cleave::types::compact::compact_from_files(&sub.files);
+    let raw = serde_json::to_value(&compact).ok()?;
+    let url = rec
+        .final_url
+        .clone()
+        .unwrap_or_else(|| rec.resolved_url.clone());
+    Some(FetchedDependency {
+        locator: rec.locator.clone(),
+        url,
+        content_sha: analyzed.content_sha.clone(),
+        size: rec.size.unwrap_or(0),
+        raw,
+        member_shas,
+    })
 }
 
 /// Fetch a single external reference — a `pkg:` PURL or a URL — and return its

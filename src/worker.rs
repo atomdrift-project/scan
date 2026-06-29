@@ -1934,7 +1934,7 @@ async fn run_job(
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
     prefetched: std::result::Result<Option<bytes::Bytes>, PrefetchError>,
-) -> Result<(crate::engine::ScanResultEnvelope, i64), String> {
+) -> Result<(crate::engine::ScanResultEnvelope, Vec<crate::engine::DepResult>, i64), String> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     // `Arc<str>` so the watcher and the blocking closure share the basename
     // allocation instead of each cloning a fresh `String`.
@@ -2257,7 +2257,10 @@ async fn run_job(
     let elapsed_ms = crate::duration_ms(start.elapsed()) as i64;
 
     match result {
-        Ok(Ok(scan_result)) => Ok((scan_result.into_envelope(), elapsed_ms)),
+        Ok(Ok(mut scan_result)) => {
+            let deps = std::mem::take(&mut scan_result.dependency_results);
+            Ok((scan_result.into_envelope(), deps, elapsed_ms))
+        }
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(e) => Err(format!("task join error: {e}")),
     }
@@ -2269,10 +2272,16 @@ async fn post_result(
     url: &str,
     worker: &str,
     sha256: &str,
-    result: Result<(crate::engine::ScanResultEnvelope, i64), String>,
+    result: Result<(crate::engine::ScanResultEnvelope, Vec<crate::engine::DepResult>, i64), String>,
 ) {
+    // The hopper base URL, captured before `url` is shadowed by the result
+    // endpoint below — fetched dependencies are mirrored against the same base.
+    let base_url = url.to_string();
+    // Fetched dependencies to mirror into hopper after this result is stored,
+    // with the model version + analysis time their verdicts are stamped with.
+    let mut dep_sync: Option<(Vec<crate::engine::DepResult>, String, String)> = None;
     let payload = match result {
-        Ok((envelope, duration_ms)) => {
+        Ok((envelope, deps, duration_ms)) => {
             // v7 envelope no longer carries `class` on the wire; the verdict
             // is encoded in `lvl` (-1 = benign, anything else = hostile). The
             // suspicious band is consumer-side and not visible here.
@@ -2282,6 +2291,13 @@ async fn post_result(
                 "hostile"
             };
             tracing::info!(sha256 = %sha256, duration_ms, verdict, "analysis complete");
+            if !deps.is_empty() {
+                dep_sync = Some((
+                    deps,
+                    envelope.ml.version.clone(),
+                    envelope.ml.analyzed_at.clone(),
+                ));
+            }
             crate::upload::ResultPayload {
                 sha256: sha256.to_string(),
                 worker: worker.to_string(),
@@ -2336,6 +2352,20 @@ async fn post_result(
         match request.send().await {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!(sha256 = %sha256, elapsed_ms = crate::duration_ms(post_start.elapsed()), attempt, "result posted");
+                // The sample's row now exists on hopper; mirror its fetched
+                // dependencies (bytes if missing, provenance, and verdict) as their
+                // own samples. Best-effort and off the executor — never blocks or
+                // fails the result that preceded it.
+                if let Some((deps, version, analyzed_at)) = dep_sync.take() {
+                    sync_worker_dependencies(
+                        base_url.clone(),
+                        worker.to_string(),
+                        version,
+                        analyzed_at,
+                        deps,
+                    )
+                    .await;
+                }
                 return;
             }
             Ok(resp) => {
@@ -2370,6 +2400,48 @@ async fn post_result(
         elapsed_s = started.elapsed().as_secs(),
         "post result: giving up after retry budget exhausted",
     );
+}
+
+/// Mirror a posted result's fetched dependencies into hopper as their own
+/// samples, off the async executor. Each dependency's bytes come from the same
+/// blob cache the analysis fetched them into (uploaded only if hopper lacks
+/// them), paired with its provenance and the verdict scan already computed.
+/// Best-effort: a blob cache that won't open, or any upload failure, is logged
+/// inside the sync and never surfaced here.
+async fn sync_worker_dependencies(
+    base_url: String,
+    worker: String,
+    version: String,
+    analyzed_at: String,
+    deps: Vec<crate::engine::DepResult>,
+) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let cache = fletch::fetch::BlobCache::open().ok();
+        crate::upload::sync_result_dependencies(
+            dep_sync_client(),
+            &base_url,
+            &worker,
+            &version,
+            &analyzed_at,
+            cache.as_ref(),
+            deps,
+        );
+    })
+    .await;
+}
+
+/// The shared blocking HTTP client for dependency mirroring, built once. Separate
+/// from the worker's async client because the upload reconciliation is blocking
+/// (it streams files and loads cache blobs); a clone is cheap (the client is an
+/// `Arc` internally).
+fn dep_sync_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    })
 }
 
 fn body_excerpt(body: &str) -> String {

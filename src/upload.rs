@@ -184,6 +184,15 @@ enum Job {
     /// Ensure hopper has these artifacts' bytes+provenance, uploading only the
     /// ones it's missing.
     Artifacts(Vec<UploadArtifact>),
+    /// Mirror fetched dependencies into hopper as their own samples: bytes (only
+    /// if missing) + provenance, then the verdict scan computed for each.
+    Dependencies {
+        deps: Vec<crate::engine::DepResult>,
+        /// Model version and analysis time stamped on each dependency's verdict,
+        /// carried from the parent result so the `ml` section is self-describing.
+        version: String,
+        analyzed_at: String,
+    },
 }
 
 /// Background uploader that POSTs scan results to hopper without blocking the
@@ -207,7 +216,6 @@ impl Uploader {
         let result_url = format!("{base}/api/result");
         let known_url = format!("{base}/api/known");
         let upload_url = format!("{base}/api/upload");
-        let provenance_url = format!("{base}/api/provenance");
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -232,10 +240,27 @@ impl Uploader {
                                 &client,
                                 &known_url,
                                 &upload_url,
-                                &provenance_url,
                                 cache.as_ref(),
                                 &mut seen,
                                 artifacts,
+                            );
+                        }
+                        Job::Dependencies {
+                            deps,
+                            version,
+                            analyzed_at,
+                        } => {
+                            sync_dependencies(
+                                &client,
+                                &known_url,
+                                &upload_url,
+                                &result_url,
+                                &worker,
+                                &version,
+                                &analyzed_at,
+                                cache.as_ref(),
+                                &mut seen,
+                                deps,
                             );
                         }
                     }
@@ -282,6 +307,29 @@ impl Uploader {
             let _ = tx.send(Job::Artifacts(artifacts));
         }
     }
+
+    /// Queue fetched dependencies to mirror into hopper as their own samples:
+    /// bytes (only if hopper lacks them) + provenance, then each dependency's
+    /// verdict. Submit after the root [`submit_artifacts`] and before the root
+    /// [`submit`] so the dependencies' rows exist before any verdict — the root's
+    /// or their own — lands.
+    pub fn submit_dependencies(
+        &self,
+        deps: Vec<crate::engine::DepResult>,
+        version: String,
+        analyzed_at: String,
+    ) {
+        if deps.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Job::Dependencies {
+                deps,
+                version,
+                analyzed_at,
+            });
+        }
+    }
 }
 
 impl Drop for Uploader {
@@ -319,7 +367,6 @@ fn reconcile_artifacts(
     client: &reqwest::blocking::Client,
     known_url: &str,
     upload_url: &str,
-    provenance_url: &str,
     cache: Option<&fletch::fetch::BlobCache>,
     seen: &mut HashSet<String>,
     artifacts: Vec<UploadArtifact>,
@@ -341,10 +388,12 @@ fn reconcile_artifacts(
 
     for art in fresh {
         if known.contains(&art.sha256) {
-            // hopper has the bytes. For a dependency, still backfill its registry
-            // provenance when hopper is missing it — the bytes never move, only
-            // the small sidecar. The root file's thin sidecar isn't worth it.
-            if art.backfill && provenance_missing(client, provenance_url, &art.sha256) {
+            // hopper has the bytes. For a dependency, (re)send its provenance so
+            // hopper refreshes the registry snapshot — the bytes never move, only
+            // the small sidecar, and hopper preserves the original discovery
+            // wrapper, updating just the registry data. The root file carries no
+            // registry/PURL, so there is nothing to send for it.
+            if art.backfill {
                 upload_provenance_only(client, upload_url, &art);
             } else {
                 tracing::debug!(sha256 = %art.sha256, "upload: hopper already has artifact; skipping");
@@ -363,21 +412,115 @@ fn reconcile_artifacts(
     }
 }
 
-/// HEAD `/api/provenance/{sha}` to learn whether hopper is missing provenance for
-/// a sample it already holds the bytes for. A `204 No Content` means missing →
-/// backfill it. Any other status, or a probe error, is treated as "present or
-/// unknown" → leave it, so a flaky probe never triggers a redundant upload.
-fn provenance_missing(
+/// Mirror a result's fetched dependencies into a hopper instance from a caller
+/// that has no [`Uploader`] (the pull-based worker). Builds the endpoint URLs
+/// from `base_url`, dedups within this call, and reconciles bytes + provenance
+/// before posting each verdict. Best-effort: every failure is logged, never
+/// propagated, so a dependency sync never disturbs the result it followed.
+pub fn sync_result_dependencies(
     client: &reqwest::blocking::Client,
-    provenance_url: &str,
-    sha256: &str,
-) -> bool {
-    match client.head(format!("{provenance_url}/{sha256}")).send() {
-        Ok(resp) => resp.status() == reqwest::StatusCode::NO_CONTENT,
-        Err(e) => {
-            tracing::debug!(sha256 = %sha256, error = %error_chain(&e), "upload: provenance probe failed");
-            false
-        }
+    base_url: &str,
+    worker: &str,
+    version: &str,
+    analyzed_at: &str,
+    cache: Option<&fletch::fetch::BlobCache>,
+    deps: Vec<crate::engine::DepResult>,
+) {
+    if deps.is_empty() {
+        return;
+    }
+    let base = base_url.trim_end_matches('/');
+    let result_url = format!("{base}/api/result");
+    let known_url = format!("{base}/api/known");
+    let upload_url = format!("{base}/api/upload");
+    let mut seen = HashSet::new();
+    sync_dependencies(
+        client,
+        &known_url,
+        &upload_url,
+        &result_url,
+        worker,
+        version,
+        analyzed_at,
+        cache,
+        &mut seen,
+        deps,
+    );
+}
+
+/// Mirror fetched dependencies into hopper as their own samples. For each
+/// dependency not already handled this run: ensure hopper has its bytes (uploaded
+/// only when missing) and provenance, then POST the verdict scan already computed
+/// for it. Best-effort throughout — a failure logs and the next dependency
+/// proceeds, exactly like the artifact reconciliation it builds on.
+#[allow(clippy::too_many_arguments)]
+fn sync_dependencies(
+    client: &reqwest::blocking::Client,
+    known_url: &str,
+    upload_url: &str,
+    result_url: &str,
+    worker: &str,
+    version: &str,
+    analyzed_at: &str,
+    cache: Option<&fletch::fetch::BlobCache>,
+    seen: &mut HashSet<String>,
+    deps: Vec<crate::engine::DepResult>,
+) {
+    // Each dependency is reconciled and verdict-posted once per run; a dependency
+    // shared by many scanned files is handled the first time it is seen.
+    let fresh: Vec<crate::engine::DepResult> = deps
+        .into_iter()
+        .filter(|d| seen.insert(d.sha256.clone()))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    let collector = format!("scan+{worker}");
+    // Bytes + provenance first, so each dependency's row exists before its verdict
+    // UPDATE (hopper's `/api/result` no-ops on a missing row). The local seen set
+    // starts empty — the run-level dedup above already removed repeats.
+    let artifacts: Vec<UploadArtifact> = fresh
+        .iter()
+        .map(|d| dep_artifact(d, &collector, analyzed_at))
+        .collect();
+    let mut local_seen = HashSet::new();
+    reconcile_artifacts(client, known_url, upload_url, cache, &mut local_seen, artifacts);
+    // Then the verdict for each dependency, keyed by its content sha.
+    for dep in fresh {
+        let sha256 = dep.sha256.clone();
+        let envelope = crate::engine::dep_envelope(dep, version, analyzed_at);
+        post_one(client, result_url, worker, &sha256, envelope);
+    }
+}
+
+/// Build the upload artifact for a fetched dependency: its bytes load from the
+/// fetch blob cache by locator only if hopper turns out to need them, and its
+/// sidecar carries the registry record recovered from that same warm cache (a
+/// cache hit, never a re-fetch) plus the raw provider documents as hopper's
+/// re-parsing backup.
+fn dep_artifact(dep: &crate::engine::DepResult, collector: &str, now: &str) -> UploadArtifact {
+    let (registry, sources) =
+        crate::fetch::registry_with_sources(&fletch::RefLocator::Purl(dep.locator.clone()));
+    let filename = crate::engine::artifact_filename(&dep.url, &dep.locator);
+    UploadArtifact {
+        sha256: dep.sha256.clone(),
+        size: dep.size,
+        sidecar: crate::provenance::build_sidecar(
+            &filename,
+            &dep.sha256,
+            dep.size,
+            collector,
+            now,
+            &dep.url,
+            &dep.locator,
+            registry.as_ref(),
+            &sources,
+        ),
+        filename,
+        bytes: ArtifactBytes::Cached {
+            locator: dep.locator.clone(),
+        },
+        backfill: true,
     }
 }
 
@@ -624,5 +767,31 @@ mod tests {
         assert!(name.len() <= MAX_WORKER_NAME_LEN);
         // Mirrors hopper's `validWorkerName`: printable ASCII, no spaces.
         assert!(name.chars().all(|c| c.is_ascii_graphic()));
+    }
+
+    /// A dependency's upload artifact loads its bytes lazily from the fetch cache
+    /// (never eagerly), derives its stored filename from the resolved URL, and is
+    /// marked backfillable so its registry provenance lands even when hopper
+    /// already holds the bytes. `pkg:bogus/*` resolves to no registry offline.
+    #[test]
+    fn dep_artifact_loads_bytes_lazily_and_is_backfillable() {
+        let dep = crate::engine::DepResult {
+            sha256: "c".repeat(64),
+            locator: "pkg:bogus/x@1".to_string(),
+            url: "https://example/x-1.tgz".to_string(),
+            size: 99,
+            level: Some(-1),
+            probability: 0.0,
+            raw: serde_json::json!({}),
+        };
+        let art = dep_artifact(&dep, "scan+test", "2026-06-28T00:00:00Z");
+        assert_eq!(art.sha256, "c".repeat(64));
+        assert_eq!(art.size, 99);
+        assert_eq!(art.filename, "x-1.tgz", "filename derived from the fetch URL");
+        assert!(art.backfill, "a dependency's provenance is backfillable");
+        assert!(
+            matches!(&art.bytes, ArtifactBytes::Cached { locator } if locator == "pkg:bogus/x@1"),
+            "bytes load lazily from the cache by locator",
+        );
     }
 }
