@@ -400,7 +400,7 @@ pub(crate) fn orchestrate(
             // materialized so the package pass below can pair an artifact with
             // its own registry metadata (see `apply_package_composites`).
             let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
-            for (r, reg, skipped) in &registries {
+            for (r, reg, skip) in &registries {
                 if let Some(sub) = registry_node(reg, &opts) {
                     registry_findings
                         .entry(locator_key(r))
@@ -408,46 +408,55 @@ pub(crate) fn orchestrate(
                         .extend(sub_findings(&sub));
                     merge_registry(report, &source_sha, sub);
                 }
-                if !skipped {
-                    continue;
-                }
                 // The record is materialized either way; only the artifact fetch
-                // is skipped — because the dependency aged out, or because the
-                // version was removed (no artifact to fetch).
-                let removed = reg.version_removed == Some(true);
+                // is skipped. `None` = kept for fetch+scan.
+                let Some(reason) = skip else {
+                    continue;
+                };
                 let common = tracing::field::display(locator_key(r));
+                // A known-good skip is counted into the bloom tally so the summary
+                // reflects it alongside skipped known-good files.
+                if *reason == SkipReason::KnownGood {
+                    crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
+                }
                 // Age-outs are the common, expected case and would otherwise flood
                 // the progress block, so they stay at debug and print no skip line;
-                // version removals are rarer and worth surfacing.
-                if removed {
-                    tracing::info!(
+                // version removals and known-good skips are surfaced.
+                let log_reason = match reason {
+                    SkipReason::Removed => "version removed from registry",
+                    SkipReason::AgedOut => "older than --max-dep-age",
+                    SkipReason::KnownGood => "known-good (bloom); trust not stale",
+                };
+                match reason {
+                    SkipReason::AgedOut => tracing::debug!(
                         package = %common,
                         ecosystem = %reg.ecosystem,
                         version = %reg.version,
                         age_days = reg.age_days.unwrap_or(0),
                         downloads = reg.downloads_recent.or(reg.downloads_total),
-                        reason = "version removed from registry",
+                        reason = log_reason,
                         "registry record materialized; artifact fetch skipped"
-                    );
-                    if progress {
-                        if !header_printed {
-                            eprintln!(
-                                "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
-                            );
-                            header_printed = true;
+                    ),
+                    SkipReason::Removed | SkipReason::KnownGood => {
+                        tracing::info!(
+                            package = %common,
+                            ecosystem = %reg.ecosystem,
+                            version = %reg.version,
+                            age_days = reg.age_days.unwrap_or(0),
+                            downloads = reg.downloads_recent.or(reg.downloads_total),
+                            reason = log_reason,
+                            "registry record materialized; artifact fetch skipped"
+                        );
+                        if progress {
+                            if !header_printed {
+                                eprintln!(
+                                    "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
+                                );
+                                header_printed = true;
+                            }
+                            report_skip(r, reg, now, *reason);
                         }
-                        report_skip(r, reg, now);
                     }
-                } else {
-                    tracing::debug!(
-                        package = %common,
-                        ecosystem = %reg.ecosystem,
-                        version = %reg.version,
-                        age_days = reg.age_days.unwrap_or(0),
-                        downloads = reg.downloads_recent.or(reg.downloads_total),
-                        reason = "older than --max-dep-age",
-                        "registry record materialized; artifact fetch skipped"
-                    );
                 }
             }
             if selected.is_empty() {
@@ -811,11 +820,12 @@ fn report_fetch(rec: &FetchRecord) {
 type FetchRow = (char, &'static str, i32, i32, i32, Option<String>);
 
 /// A bloom verdict for a fetched artifact, as a `report_fetch` row override:
-/// both known-good and known-bad render as the `known` label, distinguished by
-/// color/glyph (green ✓ = good/not deeply scanned, red ✗ = bad/conflicted —
-/// flagged). `None` when bloom is disabled or the artifact is in neither set.
-/// Checks the fetched content's sha256 and, for a dependency, its PURL; a bad
-/// hit on either wins over a good hit.
+/// every known state renders as the `known` label, distinguished by glyph —
+/// 🚩 known-bad, 🏴 conflicted (both still scanned; the flag also rides the
+/// result header), green ✓ known-good (fetched here only because a pulled/fresh
+/// exception forced a re-scan). `None` when bloom is disabled or the artifact is
+/// in neither set. Checks the fetched content's sha256 and, for a dependency, its
+/// PURL; a conflict/bad hit on either wins over a good hit.
 fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
     use crate::bloom_repo::Decision;
     let lookup = crate::bloom_repo::global()?;
@@ -831,14 +841,14 @@ fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
         .then(|| lookup.decide_purl(&rec.locator));
 
     let decisions = [sha, purl];
-    if decisions
-        .iter()
-        .flatten()
-        .any(|d| matches!(d, Decision::KnownBad | Decision::Conflicted))
-    {
-        return Some(('\u{2717}', "known", 255, 90, 90, None));
+    let has = |want: Decision| decisions.iter().flatten().any(|d| *d == want);
+    if has(Decision::Conflicted) {
+        return Some(('\u{1f3f4}', "known", 230, 180, 80, None)); // 🏴
     }
-    if decisions.iter().flatten().any(|d| *d == Decision::Skip) {
+    if has(Decision::KnownBad) {
+        return Some(('\u{1f6a9}', "known", 235, 120, 120, None)); // 🚩
+    }
+    if has(Decision::Skip) {
         return Some(('\u{2713}', "known", 80, 200, 80, None));
     }
     None
@@ -859,22 +869,87 @@ fn failure_detail(rec: &FetchRecord, why: &str) -> String {
     )
 }
 
+/// Why a dependency's artifact fetch was skipped. The registry record is
+/// materialized (and trait-matched) in every case; only the byte fetch+scan is
+/// skipped. Drives how the skip is surfaced in the fetch progress block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// Older than `--max-dep-age`. The common, expected case — reported at debug
+    /// only, no progress line.
+    AgedOut,
+    /// The version was unpublished/yanked from the registry — no artifact to
+    /// fetch. Rare and worth surfacing.
+    Removed,
+    /// Matched the known-good bloom set by PURL — a trusted coordinate, so its
+    /// bytes are not re-fetched or re-scanned (see [`must_rescan`] for the
+    /// pulled/fresh exceptions that override this).
+    KnownGood,
+}
+
+/// Whether a dependency version has been withdrawn from its registry — an npm
+/// unpublish/yank (`version_removed`), a pypi/crates yank (recorded as a
+/// `deprecated` reason, which never sets `version_removed`), or an npm security
+/// takedown (`security_hold`). A withdrawn version's known-good vouch is suspect
+/// — it is often *removed because* it was found malicious — so it is re-scanned.
+fn dep_pulled(reg: &Registry) -> bool {
+    reg.version_removed == Some(true)
+        || reg.security_hold == Some(true)
+        || reg.deprecated.as_deref().is_some_and(|d| {
+            let d = d.to_ascii_lowercase();
+            d.contains("yank") || d.contains("withdrawn") || d.contains("unpublish")
+        })
+}
+
+/// Number of seconds in the freshness window: a version published this recently
+/// is re-scanned rather than trusted on a known-good vouch. Mirrors the local
+/// file recency window in [`crate::engine`].
+pub(crate) const FRESH_WINDOW_SECS: u64 = 48 * 3_600;
+
+/// Whether this version was published within the last 48h. A known-good bloom
+/// vouch is built ahead of time; for a freshly minted release the vouch may
+/// predate the bytes now being served, so re-scan rather than trust it.
+fn fresh_48h(reg: &Registry, now: u64) -> bool {
+    reg.age_secs(now).is_some_and(|age| age <= FRESH_WINDOW_SECS)
+}
+
+/// A known-good dependency is normally skipped; re-scan it anyway when its trust
+/// may be stale — the version was pulled/yanked, or published in the last 48h.
+pub(crate) fn must_rescan(reg: &Registry, now: u64) -> bool {
+    dep_pulled(reg) || fresh_48h(reg, now)
+}
+
+/// Whether a reference is a known-good package coordinate per the loaded bloom
+/// filters. Purl-keyed, so it vouches for the coordinate (not the exact bytes);
+/// callers pair it with [`must_rescan`] before trusting it enough to skip.
+fn bloom_known_good_purl(r: &Reference) -> bool {
+    let RefLocator::Purl(purl) = &r.locator else {
+        return false;
+    };
+    crate::bloom_repo::global()
+        .is_some_and(|lk| lk.decide_purl(purl) == crate::bloom_repo::Decision::Skip)
+}
+
+/// One dependency's age-gate outcome: the registry record (materialized as facts
+/// either way) paired with why its byte fetch was skipped — `None` when the
+/// dependency is kept for a full fetch+scan.
+type GatedDep = (Reference, Registry, Option<SkipReason>);
+
 /// Look up each declared dependency's registry metadata, stamp its relative
 /// age, and decide which to fetch. A dependency older than the policy's age
-/// ceiling is dropped before the expensive fetch+scan of its bytes; one whose
-/// age is unknown or under the ceiling is kept — fail open, so a registry hiccup
-/// or an unsupported ecosystem never silently hides a dependency from the scan.
-/// URLs and command-mentioned packages aren't gated: their risk isn't a function
-/// of a registry release date. Returns the refs to fetch plus, for *every*
-/// dependency that resolved a registry record, the `(ref, record, aged_out)`
-/// triple — the record is materialized as facts whether or not its bytes are
-/// fetched, and `aged_out` drives the skip report.
+/// ceiling — or one whose coordinate is known-good and whose trust isn't stale —
+/// is dropped before the expensive fetch+scan of its bytes; one whose age is
+/// unknown or under the ceiling is kept — fail open, so a registry hiccup or an
+/// unsupported ecosystem never silently hides a dependency from the scan. URLs
+/// and command-mentioned packages aren't gated: their risk isn't a function of a
+/// registry release date. Returns the refs to fetch plus, for *every* dependency
+/// that resolved a registry record, its [`GatedDep`] — the record is materialized
+/// whether or not its bytes are fetched, and the reason drives the skip report.
 fn age_gate(
     selected: Vec<Reference>,
     policy: &FetchPolicy,
     res: &Resources,
     now: u64,
-) -> (Vec<Reference>, Vec<(Reference, Registry, bool)>) {
+) -> (Vec<Reference>, Vec<GatedDep>) {
     // `None` ceiling (the `--max-dep-age 0` opt-out) gates nothing, but registry
     // records are still looked up and materialized.
     let max_age =
@@ -888,17 +963,24 @@ fn age_gate(
         match lookup {
             // A resolved record: gate on age, but materialize it either way. A
             // version the registry has already removed has no fetchable artifact,
-            // so skip the doomed fetch too (its signals still surface from the
-            // materialized record). The bool means "skipped from fetching".
+            // so skip the doomed fetch too. A known-good coordinate is skipped
+            // unless its trust may be stale (pulled/yanked or <48h old). In every
+            // skip case the materialized record's signals still surface.
             Some(reg) => {
-                let removed = reg.version_removed == Some(true);
-                let aged_out =
-                    max_age.is_some_and(|max| reg.age_secs(now).is_some_and(|age| age >= max));
-                let skipped = aged_out || removed;
-                if !skipped {
+                let reason = if reg.version_removed == Some(true) {
+                    Some(SkipReason::Removed)
+                } else if max_age.is_some_and(|max| reg.age_secs(now).is_some_and(|age| age >= max))
+                {
+                    Some(SkipReason::AgedOut)
+                } else if bloom_known_good_purl(&r) && !must_rescan(&reg, now) {
+                    Some(SkipReason::KnownGood)
+                } else {
+                    None
+                };
+                if reason.is_none() {
                     keep.push(r.clone());
                 }
-                registries.push((r, reg, skipped));
+                registries.push((r, reg, reason));
             }
             // A non-dependency, or a dependency whose record didn't resolve —
             // fetch it (fail open).
@@ -1052,10 +1134,12 @@ fn registry_doc_name(reg: &Registry) -> String {
     format!("{base}.registry.json")
 }
 
-/// Render one age-gated dependency to stderr in the fetch progress block: a
-/// muted "skip" line naming the package, its age in days, and the strongest
-/// reputation signal the registry gave (downloads, else votes/rating).
-fn report_skip(r: &Reference, reg: &Registry, now: u64) {
+/// Render one skipped dependency to stderr in the fetch progress block: the
+/// package, its age in days, and the strongest reputation signal the registry
+/// gave (downloads, else votes/rating). A known-good skip reads green with a ✓
+/// (trusted, not re-scanned); a removed version reads muted (no artifact to
+/// fetch). Aged-out deps never reach here — they stay at debug.
+fn report_skip(r: &Reference, reg: &Registry, now: u64, reason: SkipReason) {
     let age_days = reg.age_secs(now).unwrap_or(0) / 86_400;
     let signal = reg
         .downloads_recent
@@ -1069,14 +1153,21 @@ fn report_skip(r: &Reference, reg: &Registry, now: u64) {
     } else {
         format!("  \x1b[2m{signal}\x1b[0m")
     };
+    // (glyph, label, r, g, b) — green ✓ for a trusted known-good skip, muted for
+    // an unpublished/removed version.
+    let (glyph, label, cr, cg, cb) = match reason {
+        SkipReason::KnownGood => ('\u{2713}', "known-good", 80, 200, 80),
+        SkipReason::Removed => ('\u{00b7}', "removed", 120, 120, 120),
+        SkipReason::AgedOut => ('\u{00b7}', "skip", 120, 120, 120),
+    };
     eprintln!(
-        "    \x1b[38;2;120;120;120m\u{00b7} skip  \x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {}{detail}",
+        "    \x1b[38;2;{cr};{cg};{cb}m{glyph} {label:<10}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {}{detail}",
         locator_key(r)
     );
 }
 
 /// Wall-clock now as Unix seconds, saturating to `0` before the epoch.
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1431,6 +1522,63 @@ fn payload_name(rec: &FetchRecord) -> String {
 mod tests {
     use super::*;
     use fletch::RefKind;
+
+    #[test]
+    fn dep_pulled_covers_removed_yank_and_hold() {
+        let base = Registry::default();
+        assert!(!dep_pulled(&base));
+        assert!(dep_pulled(&Registry {
+            version_removed: Some(true),
+            ..Registry::default()
+        }));
+        assert!(dep_pulled(&Registry {
+            security_hold: Some(true),
+            ..Registry::default()
+        }));
+        // pypi/crates record a yank as a `deprecated` reason, never `version_removed`.
+        assert!(dep_pulled(&Registry {
+            deprecated: Some("Yanked: critical CVE".to_string()),
+            ..Registry::default()
+        }));
+        // An ordinary deprecation notice is not a withdrawal.
+        assert!(!dep_pulled(&Registry {
+            deprecated: Some("use v2 instead".to_string()),
+            ..Registry::default()
+        }));
+    }
+
+    #[test]
+    fn fresh_48h_and_must_rescan_track_publish_age() {
+        let now = 1_000_000_u64;
+        let fresh = Registry {
+            published_at: Some(now - 3_600), // 1h ago
+            ..Registry::default()
+        };
+        // 30h ago: inside the 48h window, but would be outside a 24h one.
+        let day_and_a_half = Registry {
+            published_at: Some(now - 30 * 3_600),
+            ..Registry::default()
+        };
+        let stale = Registry {
+            published_at: Some(now - 300_000), // ~3.5d ago
+            ..Registry::default()
+        };
+        assert!(fresh_48h(&fresh, now));
+        assert!(fresh_48h(&day_and_a_half, now));
+        assert!(!fresh_48h(&stale, now));
+        // A stale, unwithdrawn version needs no re-scan; a fresh one does, and a
+        // withdrawn one always does regardless of age.
+        assert!(!must_rescan(&stale, now));
+        assert!(must_rescan(&fresh, now));
+        assert!(must_rescan(
+            &Registry {
+                published_at: Some(now - 300_000),
+                version_removed: Some(true),
+                ..Registry::default()
+            },
+            now
+        ));
+    }
 
     fn url_ref(url: &str) -> Reference {
         Reference {

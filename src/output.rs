@@ -326,6 +326,7 @@ pub(crate) fn terminal_badge(
     probability: f32,
     threshold: f32,
     level: Option<i32>,
+    bloom: Option<BloomMark>,
 ) -> (String, usize) {
     let pct = level_confidence(level).map_or_else(
         || {
@@ -336,16 +337,21 @@ pub(crate) fn terminal_badge(
         },
         |conf| format!("{conf}%"),
     );
+    // The bloom flag rides between the verdict band and the filename (` 🚩`), so
+    // its glyph plus a leading separator space add to the badge's visible width —
+    // keeping the SHA-256 subtitle aligned under the filename.
+    let mark = bloom.map_or_else(String::new, |m| format!(" {}", m.glyph()));
+    let mark_w = bloom.map_or(0, |m| 1 + m.width());
     if !colored::control::SHOULD_COLORIZE.should_colorize() {
-        let width = pct.chars().count();
-        return (pct, width);
+        let width = pct.chars().count() + mark_w;
+        return (format!("{pct}{mark}"), width);
     }
     // Bold white on the band color, padded with a space either side — so the
     // visible width is the percentage plus the two padding spaces.
     let Rgb(r, g, b) = indicator_colors(probability, classification, threshold).2;
-    let width = pct.chars().count() + 2;
+    let width = pct.chars().count() + 2 + mark_w;
     (
-        format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {pct} \x1b[0m"),
+        format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {pct} \x1b[0m{mark}"),
         width,
     )
 }
@@ -622,6 +628,54 @@ impl BloomVerdict {
             Self::KnownBad => "known-bad",
             Self::Conflicted => "conflicted",
             Self::Unscanned => "unscanned",
+        }
+    }
+}
+
+/// The inline bloom status flag for a *scanned* file's terminal header — the
+/// small glyph that identifies why the file is notable to the bloom filters
+/// without otherwise changing how its result renders. Only the two flag states
+/// exist: known-good files are skipped (they never reach a scanned header) and
+/// unknown files carry no mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BloomMark {
+    /// Matched the known-bad set — 🚩.
+    KnownBad,
+    /// In both the good and bad sets — 🏴; treated as known-bad, still scanned.
+    Conflicted,
+}
+
+impl BloomMark {
+    /// The flag from a raw bloom decision. `None` for skip/unknown — those never
+    /// annotate a scanned result (known-good is short-circuited; unknown is
+    /// unremarkable).
+    #[must_use]
+    pub(crate) const fn from_decision(decision: crate::bloom_repo::Decision) -> Option<Self> {
+        match decision {
+            crate::bloom_repo::Decision::KnownBad => Some(Self::KnownBad),
+            crate::bloom_repo::Decision::Conflicted => Some(Self::Conflicted),
+            crate::bloom_repo::Decision::Skip | crate::bloom_repo::Decision::Unknown => None,
+        }
+    }
+
+    /// The glyph identifying this status: 🚩 known-bad, 🏴 conflicted.
+    const fn glyph(self) -> &'static str {
+        match self {
+            Self::KnownBad => "\u{1f6a9}",   // 🚩
+            Self::Conflicted => "\u{1f3f4}", // 🏴
+        }
+    }
+
+    /// Visible terminal columns the glyph occupies (both flag emoji are width-2).
+    const fn width(self) -> usize {
+        2
+    }
+
+    /// The machine token for the `--format tiny` verdict line.
+    pub(crate) const fn tiny_str(self) -> &'static str {
+        match self {
+            Self::KnownBad => "known-bad",
+            Self::Conflicted => "conflicted",
         }
     }
 }
@@ -945,8 +999,47 @@ pub fn parse_ymd(s: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bloom_mark_only_flags_scanned_states() {
+        use crate::bloom_repo::Decision;
+        // Skip (known-good) and Unknown are short-circuited / unremarkable — no
+        // mark ever rides a scanned result for them.
+        assert_eq!(BloomMark::from_decision(Decision::Skip), None);
+        assert_eq!(BloomMark::from_decision(Decision::Unknown), None);
+        assert_eq!(
+            BloomMark::from_decision(Decision::KnownBad),
+            Some(BloomMark::KnownBad)
+        );
+        assert_eq!(
+            BloomMark::from_decision(Decision::Conflicted),
+            Some(BloomMark::Conflicted)
+        );
+        assert_eq!(BloomMark::KnownBad.tiny_str(), "known-bad");
+        assert_eq!(BloomMark::Conflicted.tiny_str(), "conflicted");
+        assert_ne!(BloomMark::KnownBad.glyph(), BloomMark::Conflicted.glyph());
+    }
+
+    #[test]
+    fn terminal_badge_widens_to_fit_the_bloom_flag() {
+        // The reported width must grow by the glyph plus its leading space so the
+        // SHA-256 subtitle stays aligned under the filename; the glyph is embedded
+        // in the badge string either way.
+        let (plain, plain_w) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Some(0), None);
+        let (flagged, flagged_w) = terminal_badge(
+            &Classification::Hostile,
+            0.99,
+            0.65,
+            Some(0),
+            Some(BloomMark::KnownBad),
+        );
+        assert_eq!(flagged_w, plain_w + 1 + BloomMark::KnownBad.width());
+        assert!(flagged.contains(BloomMark::KnownBad.glyph()));
+        assert!(!plain.contains(BloomMark::KnownBad.glyph()));
+    }
 
     #[test]
     fn commas_group_by_threes() {

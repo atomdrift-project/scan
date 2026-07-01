@@ -117,6 +117,7 @@ fn full_result_serializes_identically() {
             error: None,
         }),
         dependency_results: vec![],
+        bloom_mark: None,
     };
     assert_envelopes_identical(result, "full");
 }
@@ -152,6 +153,7 @@ fn minimal_result_serializes_identically() {
         rendered_context: String::new(),
         interpretation: None,
         dependency_results: vec![],
+        bloom_mark: None,
     };
     assert_envelopes_identical(result, "minimal");
 }

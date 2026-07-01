@@ -313,7 +313,7 @@ impl Builder {
     /// rate. `seed` decorrelates placement across filters (use `0` by default).
     ///
     /// `target_fp` is clamped to `(0, 1)`; out-of-range values fall back to a
-    /// sane `1e-7`. `expected` is floored at 1 so the filter is never zero-bit.
+    /// sane `1e-9`. `expected` is floored at 1 so the filter is never zero-bit.
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
@@ -328,7 +328,7 @@ impl Builder {
         let p = if target_fp.is_finite() && target_fp > 0.0 && target_fp < 1.0 {
             target_fp
         } else {
-            1e-7
+            1e-9
         };
         const LN2: f64 = std::f64::consts::LN_2;
         // m = -n·ln p / (ln 2)², rounded up to a power of two for mask indexing.
@@ -441,12 +441,98 @@ fn sha256(key: &[u8]) -> [u8; 32] {
 /// lookups silently miss. The `pkg` scheme and package *type* are
 /// case-insensitive per the PURL spec, so they are lowercased; the remainder is
 /// left untouched, since case significance is type-specific.
+///
+/// It also folds the non-spec PURL spellings this project emitted before onto the
+/// spec/common-practice form the producer now generates, so an old and a new
+/// spelling of the same package compare equal: `pkg:chrome`→`chrome-extension`,
+/// `pkg:vscode`/`pkg:openvsx`→`vscode-extension` (Open VSX keeping its
+/// `repository_url` qualifier), and the bare distro types
+/// `pkg:debian`/`arch`/`fedora`/… → `deb`/`rpm`/`apk`/`alpm` with the distro as
+/// namespace. This mirrors `hopper`'s `pkgparse.CanonicalizePURL`; the two must
+/// stay in lockstep. The extension types are case-insensitive per spec, so their
+/// bodies are lowercased too; every other type keeps its body case.
 #[must_use]
 pub fn canonical_purl(raw: &str) -> String {
     let s = raw.trim();
-    match s.split_once('/') {
-        Some((scheme_type, rest)) => format!("{}/{rest}", scheme_type.to_ascii_lowercase()),
-        None => s.to_ascii_lowercase(),
+    let Some((scheme_type, rest)) = s.split_once('/') else {
+        return s.to_ascii_lowercase();
+    };
+    // The `pkg` scheme and type are case-insensitive.
+    let typ = scheme_type
+        .to_ascii_lowercase()
+        .strip_prefix("pkg:")
+        .unwrap_or_default()
+        .to_string();
+    // Split the remainder into the coordinate path and the @version/?qualifier
+    // tail so the type can be re-keyed without disturbing either.
+    let (path, tail) = match rest.find(['@', '?']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+
+    match typ.as_str() {
+        // Browser / editor extensions: case-insensitive bodies, ratified types.
+        "chrome" | "chrome-extension" => {
+            format!("pkg:chrome-extension/{}{tail}", last_purl_segment(path).to_ascii_lowercase())
+        }
+        "vscode" | "vscode-extension" => {
+            format!("pkg:vscode-extension/{}{tail}", path.to_ascii_lowercase())
+        }
+        "openvsx" => format!(
+            "pkg:vscode-extension/{}{}",
+            path.to_ascii_lowercase(),
+            add_purl_qualifier(tail, "repository_url=https://open-vsx.org")
+        ),
+        other => {
+            if let Some((spec, ns)) = distro_purl_spec(other) {
+                format!("pkg:{spec}/{ns}/{}{tail}", last_purl_segment(path))
+            } else {
+                // Language/registry and unrecognized types: canonical type, body
+                // case preserved (significance is type-specific).
+                format!("pkg:{typ}/{rest}")
+            }
+        }
+    }
+}
+
+/// The final `/`-separated segment (the app-store and distro types drop any
+/// vendor path, matching `fletch`'s resolver and `hopper`'s builder).
+fn last_purl_segment(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Map a legacy bare-distro PURL type onto the spec type and namespace.
+fn distro_purl_spec(typ: &str) -> Option<(&'static str, &'static str)> {
+    Some(match typ {
+        "debian" => ("deb", "debian"),
+        "ubuntu" => ("deb", "ubuntu"),
+        "fedora" => ("rpm", "fedora"),
+        "opensuse" => ("rpm", "opensuse"),
+        "rpmfusion" => ("rpm", "rpmfusion"),
+        "arch" => ("alpm", "arch"),
+        "aur" => ("alpm", "aur"),
+        "alpine" => ("apk", "alpine"),
+        "wolfi" => ("apk", "wolfi"),
+        _ => return None,
+    })
+}
+
+/// Merge one qualifier into a PURL `@version`/`?qualifiers` tail, leaving an
+/// already-present key untouched.
+fn add_purl_qualifier(tail: &str, qualifier: &str) -> String {
+    let key = qualifier.split('=').next().unwrap_or(qualifier);
+    match tail.split_once('?') {
+        None => format!("{tail}?{qualifier}"),
+        Some((ver, quals)) => {
+            if quals
+                .split('&')
+                .any(|q| q.split('=').next().is_some_and(|k| k.eq_ignore_ascii_case(key)))
+            {
+                tail.to_string()
+            } else {
+                format!("{ver}?{quals}&{qualifier}")
+            }
+        }
     }
 }
 
@@ -643,6 +729,30 @@ mod tests {
             "pkg:npm/Left-Pad@1.3.0"
         );
         assert_eq!(canonical_purl("pkg:PyPI/Requests"), "pkg:pypi/Requests");
+    }
+
+    #[test]
+    fn canonicalization_folds_legacy_spellings_onto_spec() {
+        // Legacy fletch spellings fold onto the spec/common-practice form, so a
+        // stored spec PURL and a scanned legacy PURL hit the same filter key.
+        let pairs = [
+            ("pkg:chrome/KhKimila", "pkg:chrome-extension/khkimila"),
+            ("pkg:chrome/KhKimila@25.7.1", "pkg:chrome-extension/khkimila@25.7.1"),
+            ("pkg:vscode/Saoudrizwan/Claude-Dev", "pkg:vscode-extension/saoudrizwan/claude-dev"),
+            (
+                "pkg:openvsx/jinryx/crontally@1.0.3",
+                "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https://open-vsx.org",
+            ),
+            ("pkg:debian/curl", "pkg:deb/debian/curl"),
+            ("pkg:arch/pacman@6.0", "pkg:alpm/arch/pacman@6.0"),
+            ("pkg:fedora/curl", "pkg:rpm/fedora/curl"),
+            ("pkg:alpine/musl", "pkg:apk/alpine/musl"),
+        ];
+        for (legacy, spec) in pairs {
+            assert_eq!(canonical_purl(legacy), spec, "fold {legacy}");
+            // Idempotent: the spec form canonicalizes to itself.
+            assert_eq!(canonical_purl(spec), spec, "idempotent {spec}");
+        }
     }
 
     #[test]

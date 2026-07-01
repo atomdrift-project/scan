@@ -379,6 +379,15 @@ fn build_result(
     group: &ProcessGroup,
     cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
+    // The bloom flag for a known-bad/conflicted process image, re-derived from the
+    // executable's sha256 (known-good is short-circuited before we ever scan, so it
+    // never reaches here). Drives the inline 🚩/🏴 in the terminal header.
+    let bloom_mark = config
+        .bloom()
+        .and_then(|lk| {
+            crate::bloom::parse_sha256_hex(&group.sha256).map(|d| lk.decide_sha256(&d))
+        })
+        .and_then(crate::output::BloomMark::from_decision);
     let cr = crate::engine::classify_report(
         &display_path.display().to_string(),
         report,
@@ -396,6 +405,7 @@ fn build_result(
         // `--show=all` with JSON: list every member of an archive-backed image.
         config.filter().is_all() && matches!(config.format(), OutputFormat::Json),
         None, // process images carry no fetched-package registry metadata
+        bloom_mark,
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
@@ -426,6 +436,7 @@ fn build_result(
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
         dependency_results: cr.dependency_results,
+        bloom_mark,
     })
 }
 

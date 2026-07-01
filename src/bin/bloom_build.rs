@@ -34,8 +34,10 @@ struct Args {
     date: String,
 
     /// Target false-positive rate. Sized for accidental collisions, not grind
-    /// resistance (which filter size cannot buy); ~1e-7 is plenty.
-    #[arg(long, default_value_t = 1e-7, value_name = "P")]
+    /// resistance (which filter size cannot buy). 1e-9 (1-in-a-billion) keeps a
+    /// good-set FP — which skips the full scan — vanishingly rare; at the current
+    /// ~1.8M-key corpus each SHA filter lands in the 16 MiB power-of-two bucket.
+    #[arg(long, default_value_t = 1e-9, value_name = "P")]
     fp: f64,
 }
 

@@ -26,20 +26,7 @@ pub fn run_url(url: &str, config: &ScanConfig) -> Result<ScanSummary> {
 /// Returns an error if the PURL cannot be resolved/fetched or cleave analysis
 /// fails.
 pub fn run_pkg(purl: &str, config: &ScanConfig) -> Result<ScanSummary> {
-    if let Some(summary) = decide_bloom(purl, config) {
-        return Ok(summary);
-    }
     run(RefLocator::Purl(purl.to_string()), config)
-}
-
-/// Consult the local known-good/known-bad bloom filters for a PURL before any
-/// fetch. Returns `Some(summary)` when the scan is short-circuited (a known-good
-/// skip, or — in fast mode — a bloom-only verdict); `None` to fetch and scan.
-/// The decision-to-output mapping is shared with the content-digest gate in
-/// [`crate::engine::bloom_gate`].
-fn decide_bloom(purl: &str, config: &ScanConfig) -> Option<ScanSummary> {
-    let lookup = config.bloom()?; // None in slow mode / when nothing is synced
-    crate::engine::bloom_gate(config, purl, lookup.decide_purl(purl))
 }
 
 fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
@@ -67,6 +54,24 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                 );
             }
             return crate::engine::run_bytes(&name, &name, bytes, config, None);
+        }
+    }
+    // Known-good/known-bad by package coordinate, consulted *after* the registry
+    // lookup so a known-good vouch can be overridden when the version was pulled
+    // or freshly published (its trust may predate the current bytes). A known-bad
+    // coordinate returns `None` here and falls through to a full fetch+scan — the
+    // content-digest gate in `run_bytes` flags it inline. Removed versions are
+    // already handled above (metadata-only scan).
+    if let RefLocator::Purl(purl) = &locator
+        && let Some(lookup) = config.bloom()
+    {
+        let rescan = registry
+            .as_ref()
+            .is_some_and(|reg| crate::fetch::must_rescan(reg, crate::fetch::unix_now()));
+        if !rescan
+            && let Some(summary) = crate::engine::bloom_gate(config, purl, lookup.decide_purl(purl))
+        {
+            return Ok(summary);
         }
     }
     match crate::fetch::fetch_one(locator, progress) {

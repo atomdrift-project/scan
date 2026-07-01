@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::Mode;
 use crate::OutputFormat;
@@ -522,6 +522,27 @@ mod envelope_tests {
     use super::*;
 
     #[test]
+    fn file_touched_within_flags_fresh_and_ignores_old_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x.txt");
+        std::fs::write(&f, b"hi").unwrap();
+        let now = SystemTime::now();
+        // Just-written file is within the window.
+        assert!(file_touched_within(&f, KNOWN_GOOD_RESCAN_SECS, now));
+        // Evaluated from a clock 10 days ahead, every timestamp is well outside
+        // the 48h window — the not-recent (skip-eligible) case.
+        let later = now + Duration::from_secs(10 * 86_400);
+        assert!(!file_touched_within(&f, KNOWN_GOOD_RESCAN_SECS, later));
+        // Unreadable metadata (e.g. a fetched artifact's synthetic path) is treated
+        // as not-recent, so the normal known-good skip still applies.
+        assert!(!file_touched_within(
+            &dir.path().join("does-not-exist"),
+            KNOWN_GOOD_RESCAN_SECS,
+            now
+        ));
+    }
+
+    #[test]
     fn collect_upload_artifacts_offers_root_only() {
         // Fetched dependencies are mirrored separately (bytes + provenance + their
         // own verdict) via the uploader's dependency path, so this offers only the
@@ -593,6 +614,7 @@ mod envelope_tests {
             rendered_context: String::new(),
             interpretation: None,
             dependency_results: Vec::new(),
+            bloom_mark: None,
         }
     }
 
@@ -920,6 +942,11 @@ pub struct ScanResult {
     /// unless the scan fetched dependencies; consumed by the upload paths and
     /// never serialized into this result's own envelope.
     pub dependency_results: Vec<DepResult>,
+    /// The bloom status flag for a known-bad/conflicted file: drives the inline
+    /// 🚩/🏴 mark in the terminal header and the `bloom=` token on the `--format
+    /// tiny` line. `None` for unremarkable files; a terminal-UI concern only, so
+    /// it is never serialized into the JSON envelope.
+    pub bloom_mark: Option<crate::output::BloomMark>,
 }
 
 /// A fetched dependency to mirror into hopper as its own sample: the aggregate
@@ -1284,21 +1311,19 @@ pub(crate) fn bloom_gate(
             }
             Some(one_file_summary(0, 0, 1))
         }
-        // Known-bad and conflicted are flags, not short-circuits: surface them and
-        // still run full analysis in every mode — the scan is the verdict.
-        BloomDecision::KnownBad => {
-            crate::output::print_bloom_verdict(label, BloomVerdict::KnownBad, format);
-            None
-        }
+        // Known-bad and conflicted are flags, not short-circuits: they run full
+        // analysis in every mode — the scan is the verdict — and the flag rides
+        // the normal result inline (see `BloomMark`), so no separate banner is
+        // printed here. The caller derives the mark from this same decision.
+        BloomDecision::KnownBad => None,
         BloomDecision::Conflicted => {
             // Build-time subtraction removes bad keys from good, so a conflict can
             // only mean filter version skew or a producer bug — it should never
-            // happen. Always scan, but make the noise loud.
+            // happen. Always scan, but make the noise loud (in the logs).
             tracing::warn!(
                 label,
                 "bloom conflict: key is in BOTH the good and bad filters (should never happen) — scanning"
             );
-            crate::output::print_bloom_verdict(label, BloomVerdict::Conflicted, format);
             None
         }
         // Unknown is left unscanned only in bloom-only fast mode; otherwise scanned.
@@ -1600,6 +1625,37 @@ impl Tally {
     }
 }
 
+/// Freshness window for the local known-good re-scan: a known-good file created,
+/// changed, or modified this recently is scanned on its own merits rather than
+/// skipped. Mirrors the dependency freshness window in [`crate::fetch`].
+const KNOWN_GOOD_RESCAN_SECS: u64 = crate::fetch::FRESH_WINDOW_SECS;
+
+/// Whether the file at `path` was created (btime), status-changed (ctime), or
+/// modified (mtime) within the last `window` seconds. A known-good file this
+/// fresh is re-scanned rather than trusted on its bloom vouch — recent activity,
+/// and a guard against a bloom false-positive on a freshly planted file. A
+/// timestamp in the future (clock skew) counts as recent; unreadable metadata
+/// (e.g. a fetched artifact's synthetic path) counts as not-recent.
+fn file_touched_within(path: &Path, window: u64, now: SystemTime) -> bool {
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    let recent = |t: SystemTime| now.duration_since(t).map_or(true, |d| d.as_secs() <= window);
+    // created()/modified() are unsupported on some platforms/filesystems.
+    if md.created().is_ok_and(recent) || md.modified().is_ok_and(recent) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ctime = md.ctime();
+        if ctime >= 0 && recent(UNIX_EPOCH + Duration::from_secs(ctime.unsigned_abs())) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Run the ML pipeline on one cleave result and record the verdict.
 ///
 /// The single home for every scan's per-file recording: [`run`]'s single-file
@@ -1626,22 +1682,49 @@ fn record_file_result(
     // skipped at our request (known-good, or fast-mode unknown) arrives as a
     // minimal report and is short-circuited here; a known-bad/conflicted file was
     // analyzed and is flagged here before its full verdict is rendered below.
-    if let Some(lookup) = config.bloom()
+    // The bloom flag for the (still-scanned) known-bad/conflicted result, derived
+    // from the same decision `bloom_gate` acts on. Known-good/unknown short-circuit
+    // above and never reach the scanned render, so they leave no mark.
+    let mut cleave_result = cleave_result;
+    let mut bloom_mark = None;
+    // Resolve the bloom decision (dropping the borrow of `cleave_result` before we
+    // may reanalyze it below).
+    let decision = if let Some(lookup) = config.bloom()
         && let Ok(report) = &cleave_result
         && let Some(digest) = crate::bloom::parse_sha256_hex(&report.target.sha256)
-        && let Some(summary) = bloom_gate(
-            config,
-            &file_path.display().to_string(),
-            lookup.decide_sha256(&digest),
-        )
     {
-        if summary.benign > 0 {
-            tally.count(Classification::Benign);
+        Some(lookup.decide_sha256(&digest))
+    } else {
+        None
+    };
+    if let Some(decision) = decision {
+        // A known-good file that was created/changed/modified within the last 48h
+        // is scanned on its own merits instead of skipped: cleave short-circuited
+        // it to a minimal report at our request, so re-run a full analysis (no skip
+        // predicate) before processing it as a normal scan.
+        if decision == BloomDecision::Skip
+            && file_touched_within(file_path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now())
+        {
+            let reopts = cleave::AnalysisOptions {
+                slow_rule_ms: config.slow_rule_ms(),
+                cancellation: cancellation.cloned(),
+                ..Default::default()
+            };
+            cleave_result = cleave::analyze_file(file_path, &reopts)
+                .with_context(|| format!("cleave re-analysis of {}", file_path.display()));
+        } else if let Some(summary) =
+            bloom_gate(config, &file_path.display().to_string(), decision)
+        {
+            if summary.benign > 0 {
+                tally.count(Classification::Benign);
+            }
+            if let Some(p) = progress {
+                p.increment();
+            }
+            return;
+        } else {
+            bloom_mark = crate::output::BloomMark::from_decision(decision);
         }
-        if let Some(p) = progress {
-            p.increment();
-        }
-        return;
     }
 
     let scan_result = cleave_result.and_then(|report| {
@@ -1654,6 +1737,7 @@ fn record_file_result(
             config,
             cancellation,
             root_registry,
+            bloom_mark,
         )
     });
     if let Some(p) = progress {
@@ -1662,7 +1746,13 @@ fn record_file_result(
     match scan_result {
         Ok(mut r) => {
             tally.count(r.classification);
-            if config.format() == OutputFormat::Json || config.filter().shows(&r.classification) {
+            // A bloom-flagged (known-bad/conflicted) file is always surfaced — its
+            // flag replaces the old unconditional banner, so the benign filter must
+            // not swallow a known-bad file the model happens to rate benign.
+            if config.format() == OutputFormat::Json
+                || r.bloom_mark.is_some()
+                || config.filter().shows(&r.classification)
+            {
                 emit_result(&r, config, progress.is_some(), stdout);
                 if let Some(p) = progress {
                     p.redraw();
@@ -2070,12 +2160,17 @@ pub(crate) fn write_extra_diagnostics(out: &mut dyn std::io::Write, r: &ScanResu
 /// level — then cleave's annotated context.
 pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
     let class = r.classification.to_string();
+    // The bloom flag rides the machine line as `bloom=known-bad|conflicted` — the
+    // machine-readable analog of the terminal 🚩/🏴 (the JSON envelope is untouched).
+    let bloom = r
+        .bloom_mark
+        .map_or_else(String::new, |m| format!(" bloom={}", m.tiny_str()));
     let verdict = if matches!(r.classification, Classification::Benign) {
-        format!("scan {class} confidence={:.3}\n", r.probability)
+        format!("scan {class} confidence={:.3}{bloom}\n", r.probability)
     } else {
         let fp_level = r.level.map_or_else(|| "-".to_string(), |n| format!("L{n}"));
         format!(
-            "scan {class} confidence={:.3} fp-level={fp_level}\n",
+            "scan {class} confidence={:.3} fp-level={fp_level}{bloom}\n",
             r.probability,
         )
     };
@@ -2129,6 +2224,7 @@ pub(crate) fn format_llm_line(llm: &crate::interpret::Interpretation, color: boo
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_terminal_context(
     report: &cleave::AnalysisReport,
     tiny_opts: &cleave::output::TinyOpts,
@@ -2137,12 +2233,14 @@ fn render_terminal_context(
     interpretation: Option<&crate::interpret::Interpretation>,
     sha256: &str,
     label: &str,
+    bloom_mark: Option<crate::output::BloomMark>,
 ) -> String {
     let (badge, badge_w) = crate::output::terminal_badge(
         &decision.class,
         decision.probability,
         decision.threshold,
         decision.level,
+        bloom_mark,
     );
     // The filename starts after the stamp and one separator space.
     let indent = badge_w + 1;
@@ -2336,6 +2434,9 @@ pub(crate) fn classify_report(
     // `scope: package` composite, mirroring what `fetch::orchestrate` does per
     // fetched dependency.
     root_registry: Option<&fletch::Registry>,
+    // The bloom status flag (🚩 known-bad / 🏴 conflicted), rendered inline in the
+    // terminal header. `None` for unflagged files.
+    bloom_mark: Option<crate::output::BloomMark>,
 ) -> Result<ClassifiedReport> {
     // Capture every archive member — including the ones cleave catalogues but
     // never analyzes (docs, data files, images: non-program members it skips by
@@ -2766,6 +2867,7 @@ pub(crate) fn classify_report(
             interpretation.as_ref(),
             &sha256,
             label,
+            bloom_mark,
         )
     } else {
         cleave::output::format_context(&report, tiny_opts)
@@ -2975,6 +3077,7 @@ pub(crate) fn process_report(
     config: &ScanConfig,
     cancellation: Option<&Arc<AtomicBool>>,
     root_registry: Option<&fletch::Registry>,
+    bloom_mark: Option<crate::output::BloomMark>,
 ) -> Result<ScanResult> {
     let path_display = path.display().to_string();
     let is_json = matches!(config.format(), OutputFormat::Json);
@@ -2999,6 +3102,7 @@ pub(crate) fn process_report(
         // no-finding ones cleave skipped analyzing.
         config.filter().is_all() && is_json,
         root_registry,
+        bloom_mark,
     )?;
 
     // Retain the raw cleave report for JSON output, and whenever uploading to
@@ -3037,6 +3141,7 @@ pub(crate) fn process_report(
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
         dependency_results: cr.dependency_results,
+        bloom_mark,
     })
 }
 
@@ -3102,6 +3207,7 @@ pub fn scan_bytes(
         model,
         shap,
         config,
+        None,
         None,
         None,
     )

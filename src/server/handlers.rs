@@ -1039,6 +1039,7 @@ fn finish_classify(
         // `--provenance`), so a hopper-sourced scan reasons over the same
         // registry facts a live `pkg`/`url` scan fetches — without refetching.
         root_registry,
+        None, // server returns JSON; the inline terminal bloom flag doesn't apply
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -1075,6 +1076,7 @@ fn scan_result_from(
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
         dependency_results: cr.dependency_results,
+        bloom_mark: None,
     }
 }
 
