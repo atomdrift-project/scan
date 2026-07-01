@@ -466,7 +466,7 @@ pub fn canonical_purl(raw: &str) -> String {
     // Split the remainder into the coordinate path and the @version/?qualifier
     // tail so the type can be re-keyed without disturbing either.
     let (path, tail) = match rest.find(['@', '?']) {
-        Some(i) => (&rest[..i], &rest[i..]),
+        Some(i) => rest.split_at(i),
         None => (rest, ""),
     };
 
