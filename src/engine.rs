@@ -1829,12 +1829,10 @@ fn record_file_result(
     root_registry: Option<&fletch::Registry>,
 ) {
     // Bloom verdict, re-derived from the root sha cleave computed. A file cleave
-    // skipped at our request (known-good, or fast-mode unknown) arrives as a
-    // minimal report and is short-circuited here; a known-bad/conflicted file was
-    // analyzed and is flagged here before its full verdict is rendered below.
-    // The bloom flag for the (still-scanned) known-bad/conflicted result, derived
-    // from the same decision `bloom_gate` acts on. Known-good/unknown short-circuit
-    // above and never reach the scanned render, so they leave no mark.
+    // skipped at our request (a stale known-good, or fast-mode unknown) arrives as
+    // a minimal report and is short-circuited here; a known-bad/conflicted file —
+    // or a fresh known-good scanned on its own merits — was analyzed and carries a
+    // provenance marker on its SHA-256 line, derived from the same decision.
     let mut bloom_mark = None;
     // Resolve the bloom decision from the sha cleave computed.
     let decision = if let Some(lookup) = config.bloom()
@@ -1848,24 +1846,25 @@ fn record_file_result(
     if let Some(decision) = decision {
         // A known-good file created/changed/modified within the last 48h is scanned
         // on its own merits: the skip predicate declined to skip it, so cleave has
-        // already produced a full report — fall through to the normal scan (no bloom
-        // mark, since `from_decision(Skip)` is `None`). A stale known-good (and, in
-        // fast mode, an unknown) arrived as a minimal report and is counted here
-        // without an ML pass.
+        // already produced a full report — fall through to the normal scan and mark
+        // it ✓ known-good. A stale known-good (and, in fast mode, an unknown)
+        // arrived as a minimal report and is counted here without an ML pass.
         let fresh_known_good = decision == BloomDecision::Skip
             && file_touched_within(file_path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now());
-        if !fresh_known_good {
-            if let Some(summary) = bloom_gate(config, &file_path.display().to_string(), decision) {
-                if summary.benign > 0 {
-                    tally.count(Classification::Benign);
-                }
-                if let Some(p) = progress {
-                    p.increment();
-                }
-                return;
+        if !fresh_known_good
+            && let Some(summary) = bloom_gate(config, &file_path.display().to_string(), decision)
+        {
+            if summary.benign > 0 {
+                tally.count(Classification::Benign);
             }
-            bloom_mark = crate::output::BloomMark::from_decision(decision);
+            if let Some(p) = progress {
+                p.increment();
+            }
+            return;
         }
+        // Known-bad/conflicted, or a fresh known-good — annotate the SHA-256 line.
+        // Non-fast unknown maps to `None` (unremarkable, matched neither set).
+        bloom_mark = crate::output::BloomMark::from_decision(decision);
     }
 
     let scan_result = cleave_result.and_then(|report| {
@@ -2382,12 +2381,13 @@ fn render_terminal_context(
         decision.probability,
         decision.threshold,
         decision.level,
-        bloom_mark,
     );
     // The filename starts after the stamp and one separator space.
     let indent = badge_w + 1;
     let trailer = crate::output::terminal_trailer(reasons, interpretation);
-    let subtitle = crate::output::terminal_subtitle(sha256, indent);
+    // The bloom provenance marker trails the SHA-256 line — the field the filters
+    // matched on — rather than the verdict badge.
+    let subtitle = crate::output::terminal_subtitle(sha256, indent, bloom_mark);
     let adorn = cleave::output::HeaderBadge {
         badge: Some(&badge),
         trailer: trailer.as_deref(),

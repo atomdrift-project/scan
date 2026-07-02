@@ -326,7 +326,6 @@ pub(crate) fn terminal_badge(
     probability: f32,
     threshold: f32,
     level: Option<i32>,
-    bloom: Option<BloomMark>,
 ) -> (String, usize) {
     let pct = level_confidence(level).map_or_else(
         || {
@@ -337,21 +336,16 @@ pub(crate) fn terminal_badge(
         },
         |conf| format!("{conf}%"),
     );
-    // The bloom flag rides between the verdict band and the filename (` 🚩`), so
-    // its glyph plus a leading separator space add to the badge's visible width —
-    // keeping the SHA-256 subtitle aligned under the filename.
-    let mark = bloom.map_or_else(String::new, |m| format!(" {}", m.glyph()));
-    let mark_w = bloom.map_or(0, |m| 1 + m.width());
     if !colored::control::SHOULD_COLORIZE.should_colorize() {
-        let width = pct.chars().count() + mark_w;
-        return (format!("{pct}{mark}"), width);
+        let width = pct.chars().count();
+        return (pct, width);
     }
     // Bold white on the band color, padded with a space either side — so the
     // visible width is the percentage plus the two padding spaces.
     let Rgb(r, g, b) = indicator_colors(probability, classification, threshold).2;
-    let width = pct.chars().count() + 2 + mark_w;
+    let width = pct.chars().count() + 2;
     (
-        format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {pct} \x1b[0m{mark}"),
+        format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {pct} \x1b[0m"),
         width,
     )
 }
@@ -396,8 +390,14 @@ pub(crate) fn terminal_trailer(
 }
 
 /// The line beneath the headline: the full SHA-256 (copy-able for lookups), no
-/// label, indented to align under the filename. `None` when absent.
-pub(crate) fn terminal_subtitle(sha256: &str, indent: usize) -> Option<String> {
+/// label, indented to align under the filename, optionally trailed by the bloom
+/// provenance marker — the marker rides here because the SHA-256 is what the
+/// filters matched on. `None` when absent.
+pub(crate) fn terminal_subtitle(
+    sha256: &str,
+    indent: usize,
+    bloom: Option<BloomMark>,
+) -> Option<String> {
     if sha256.is_empty() {
         return None;
     }
@@ -406,7 +406,8 @@ pub(crate) fn terminal_subtitle(sha256: &str, indent: usize) -> Option<String> {
     } else {
         sha256.to_string()
     };
-    Some(format!("{}{hash}", " ".repeat(indent)))
+    let mark = bloom.map_or_else(String::new, BloomMark::marker);
+    Some(format!("{}{hash}{mark}", " ".repeat(indent)))
 }
 
 /// Print a process scan result with PID annotations.
@@ -632,13 +633,16 @@ impl BloomVerdict {
     }
 }
 
-/// The inline bloom status flag for a *scanned* file's terminal header — the
-/// small glyph that identifies why the file is notable to the bloom filters
-/// without otherwise changing how its result renders. Only the two flag states
-/// exist: known-good files are skipped (they never reach a scanned header) and
-/// unknown files carry no mark.
+/// The inline bloom provenance marker for a *scanned* file — the glyph plus its
+/// label, anchored to the field that produced the match (the SHA-256 line for a
+/// content match, the coordinate line for a PURL match) so the "why" is legible.
+/// A file matched known-good yet still scanned (a fresh vouch inside the rescan
+/// window) carries the ✓ marker; unknown files carry none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BloomMark {
+    /// Matched the known-good set but was scanned anyway (a fresh vouch, inside
+    /// the rescan window) — ✓.
+    KnownGood,
     /// Matched the known-bad set — 🚩.
     KnownBad,
     /// In both the good and bad sets — 🏴; treated as known-bad, still scanned.
@@ -646,34 +650,54 @@ pub enum BloomMark {
 }
 
 impl BloomMark {
-    /// The flag from a raw bloom decision. `None` for skip/unknown — those never
-    /// annotate a scanned result (known-good is short-circuited; unknown is
-    /// unremarkable).
+    /// The marker from a raw bloom decision. `None` for unknown — an unremarkable
+    /// file that matched neither set carries no mark. Known-good maps to the ✓
+    /// marker; callers that short-circuit a non-fresh known-good simply never
+    /// reach this with `Skip`.
     #[must_use]
     pub(crate) const fn from_decision(decision: crate::bloom_repo::Decision) -> Option<Self> {
         match decision {
+            crate::bloom_repo::Decision::Skip => Some(Self::KnownGood),
             crate::bloom_repo::Decision::KnownBad => Some(Self::KnownBad),
             crate::bloom_repo::Decision::Conflicted => Some(Self::Conflicted),
-            crate::bloom_repo::Decision::Skip | crate::bloom_repo::Decision::Unknown => None,
+            crate::bloom_repo::Decision::Unknown => None,
         }
     }
 
-    /// The glyph identifying this status: 🚩 known-bad, 🏴 conflicted.
+    /// The glyph identifying this status: ✓ known-good, 🚩 known-bad, 🏴 conflicted.
     const fn glyph(self) -> &'static str {
         match self {
+            Self::KnownGood => "\u{2713}",   // ✓
             Self::KnownBad => "\u{1f6a9}",   // 🚩
             Self::Conflicted => "\u{1f3f4}", // 🏴
         }
     }
 
-    /// Visible terminal columns the glyph occupies (both flag emoji are width-2).
-    const fn width(self) -> usize {
-        2
+    /// The trust color for this marker's glyph and label.
+    fn color(self) -> Rgb {
+        let p = palette();
+        match self {
+            Self::KnownGood => p.benign,
+            Self::KnownBad => p.hostile,
+            Self::Conflicted => p.warning,
+        }
+    }
+
+    /// The provenance suffix appended to the SHA-256 (or PURL) line: two spaces,
+    /// then the glyph and label colored by trust. Plain when color is disabled.
+    fn marker(self) -> String {
+        let body = format!("{} {}", self.glyph(), self.tiny_str());
+        if colored::control::SHOULD_COLORIZE.should_colorize() {
+            format!("  {}", fg(self.color(), &body))
+        } else {
+            format!("  {body}")
+        }
     }
 
     /// The machine token for the `--format tiny` verdict line.
     pub(crate) const fn tiny_str(self) -> &'static str {
         match self {
+            Self::KnownGood => "known-good",
             Self::KnownBad => "known-bad",
             Self::Conflicted => "conflicted",
         }
@@ -1004,11 +1028,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bloom_mark_only_flags_scanned_states() {
+    fn bloom_mark_from_decision() {
         use crate::bloom_repo::Decision;
-        // Skip (known-good) and Unknown are short-circuited / unremarkable — no
-        // mark ever rides a scanned result for them.
-        assert_eq!(BloomMark::from_decision(Decision::Skip), None);
+        // Skip (known-good) now marks a scanned-anyway file ✓; Unknown is
+        // unremarkable (matched neither set) and carries no mark.
+        assert_eq!(
+            BloomMark::from_decision(Decision::Skip),
+            Some(BloomMark::KnownGood)
+        );
         assert_eq!(BloomMark::from_decision(Decision::Unknown), None);
         assert_eq!(
             BloomMark::from_decision(Decision::KnownBad),
@@ -1018,27 +1045,29 @@ mod tests {
             BloomMark::from_decision(Decision::Conflicted),
             Some(BloomMark::Conflicted)
         );
+        assert_eq!(BloomMark::KnownGood.tiny_str(), "known-good");
         assert_eq!(BloomMark::KnownBad.tiny_str(), "known-bad");
         assert_eq!(BloomMark::Conflicted.tiny_str(), "conflicted");
+        // Each state is visually distinct.
+        assert_ne!(BloomMark::KnownGood.glyph(), BloomMark::KnownBad.glyph());
         assert_ne!(BloomMark::KnownBad.glyph(), BloomMark::Conflicted.glyph());
     }
 
     #[test]
-    fn terminal_badge_widens_to_fit_the_bloom_flag() {
-        // The reported width must grow by the glyph plus its leading space so the
-        // SHA-256 subtitle stays aligned under the filename; the glyph is embedded
-        // in the badge string either way.
-        let (plain, plain_w) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Some(0), None);
-        let (flagged, flagged_w) = terminal_badge(
-            &Classification::Hostile,
-            0.99,
-            0.65,
-            Some(0),
-            Some(BloomMark::KnownBad),
-        );
-        assert_eq!(flagged_w, plain_w + 1 + BloomMark::KnownBad.width());
-        assert!(flagged.contains(BloomMark::KnownBad.glyph()));
+    fn subtitle_trails_the_bloom_marker() {
+        // The provenance marker rides the SHA-256 line, not the verdict badge: an
+        // unmarked subtitle is the bare hash; a marked one appends the glyph+label.
+        let plain = terminal_subtitle("deadbeef", 5, None).expect("subtitle");
+        let flagged =
+            terminal_subtitle("deadbeef", 5, Some(BloomMark::KnownBad)).expect("subtitle");
+        assert!(plain.contains("deadbeef"));
         assert!(!plain.contains(BloomMark::KnownBad.glyph()));
+        assert!(flagged.contains("deadbeef"));
+        assert!(flagged.contains(BloomMark::KnownBad.glyph()));
+        assert!(flagged.contains("known-bad"));
+        // The badge itself no longer carries any bloom glyph.
+        let (badge, _) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Some(0));
+        assert!(!badge.contains(BloomMark::KnownBad.glyph()));
     }
 
     #[test]
