@@ -24,7 +24,7 @@ URL="${1:-}"
 
 SERVICE_USER=scan
 SERVICE_NAME=scan-worker
-BINARY=scan
+BINARY=atomscan
 BIN_PATH=/usr/local/bin/${BINARY}
 STATE_HOME=/var/lib/atomdrift/scan
 UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service

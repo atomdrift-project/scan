@@ -23,10 +23,10 @@
 set -u
 
 SERVICE_NAME=scan-worker
-BINARY=scan
+BINARY=atomscan
 # Match the running worker, not this script or the make/ssh wrapper invoking it
 # ("make stop-worker"/"deploy-worker" contain no space, so they never match).
-PATTERN='scan worker'
+PATTERN='atomscan worker'
 LAUNCHD_LABEL=com.atomdrift.scan-worker
 
 log() { printf '==> %s\n' "$*"; }

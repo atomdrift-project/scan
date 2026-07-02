@@ -1336,6 +1336,27 @@ pub(crate) fn bloom_gate(
     }
 }
 
+/// The bloom short-circuit for a scan target, honoring the local known-good
+/// freshness override: a known-good file created, status-changed, or modified
+/// within the last 48h is scanned on its own merits rather than skipped on its
+/// bloom vouch. Returns `Some(summary)` when the target is short-circuited
+/// (counted, not scanned) and `None` when it must be scanned. Used by process
+/// scans, which decide before analysis; path scans inline the same override in
+/// [`record_file_result`], where cleave has already produced a minimal report by
+/// the time the decision is known and a fresh known-good is re-analyzed in place.
+pub(crate) fn bloom_gate_fresh(
+    config: &ScanConfig,
+    path: &Path,
+    decision: BloomDecision,
+) -> Option<ScanSummary> {
+    if decision == BloomDecision::Skip
+        && file_touched_within(path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now())
+    {
+        return None;
+    }
+    bloom_gate(config, &path.display().to_string(), decision)
+}
+
 /// Build the cleave skip predicate from the active bloom filters: a file whose
 /// sha256 is known-good (or, in fast mode, simply unknown) is skipped before
 /// analysis. Known-bad and conflicted return `false` so they are still analyzed;
@@ -1344,16 +1365,26 @@ pub(crate) fn bloom_gate(
 fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
     let lookup = config.bloom_arc()?;
     let fast = config.mode() == Mode::Fast;
-    Some(cleave::SkipPredicate(Arc::new(move |sha_hex: &str| {
-        let Some(digest) = crate::bloom::parse_sha256_hex(sha_hex) else {
-            return false;
-        };
-        match lookup.decide_sha256(&digest) {
-            BloomDecision::Skip => true,
-            BloomDecision::Unknown => fast,
-            BloomDecision::KnownBad | BloomDecision::Conflicted => false,
-        }
-    })))
+    Some(cleave::SkipPredicate(Arc::new(
+        move |sha_hex: &str, path: &Path| {
+            let Some(digest) = crate::bloom::parse_sha256_hex(sha_hex) else {
+                return false;
+            };
+            match lookup.decide_sha256(&digest) {
+                // Known-good is trusted and skipped, unless the file was created,
+                // status-changed, or modified within the last 48h — a fresh
+                // known-good is analyzed on its own merits (recent activity, and a
+                // guard against a bloom false-positive on a freshly planted file),
+                // so cleave analyzes it once here rather than skipping then
+                // re-analyzing in `record_file_result`.
+                BloomDecision::Skip => {
+                    !file_touched_within(path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now())
+                }
+                BloomDecision::Unknown => fast,
+                BloomDecision::KnownBad | BloomDecision::Conflicted => false,
+            }
+        },
+    )))
 }
 
 /// A one-file [`ScanSummary`] for a bloom-decided artifact that was not analyzed.
@@ -1685,10 +1716,8 @@ fn record_file_result(
     // The bloom flag for the (still-scanned) known-bad/conflicted result, derived
     // from the same decision `bloom_gate` acts on. Known-good/unknown short-circuit
     // above and never reach the scanned render, so they leave no mark.
-    let mut cleave_result = cleave_result;
     let mut bloom_mark = None;
-    // Resolve the bloom decision (dropping the borrow of `cleave_result` before we
-    // may reanalyze it below).
+    // Resolve the bloom decision from the sha cleave computed.
     let decision = if let Some(lookup) = config.bloom()
         && let Ok(report) = &cleave_result
         && let Some(digest) = crate::bloom::parse_sha256_hex(&report.target.sha256)
@@ -1698,31 +1727,24 @@ fn record_file_result(
         None
     };
     if let Some(decision) = decision {
-        // A known-good file that was created/changed/modified within the last 48h
-        // is scanned on its own merits instead of skipped: cleave short-circuited
-        // it to a minimal report at our request, so re-run a full analysis (no skip
-        // predicate) before processing it as a normal scan.
-        if decision == BloomDecision::Skip
-            && file_touched_within(file_path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now())
-        {
-            let reopts = cleave::AnalysisOptions {
-                slow_rule_ms: config.slow_rule_ms(),
-                cancellation: cancellation.cloned(),
-                ..Default::default()
-            };
-            cleave_result = cleave::analyze_file(file_path, &reopts)
-                .with_context(|| format!("cleave re-analysis of {}", file_path.display()));
-        } else if let Some(summary) =
-            bloom_gate(config, &file_path.display().to_string(), decision)
-        {
-            if summary.benign > 0 {
-                tally.count(Classification::Benign);
+        // A known-good file created/changed/modified within the last 48h is scanned
+        // on its own merits: the skip predicate declined to skip it, so cleave has
+        // already produced a full report — fall through to the normal scan (no bloom
+        // mark, since `from_decision(Skip)` is `None`). A stale known-good (and, in
+        // fast mode, an unknown) arrived as a minimal report and is counted here
+        // without an ML pass.
+        let fresh_known_good = decision == BloomDecision::Skip
+            && file_touched_within(file_path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now());
+        if !fresh_known_good {
+            if let Some(summary) = bloom_gate(config, &file_path.display().to_string(), decision) {
+                if summary.benign > 0 {
+                    tally.count(Classification::Benign);
+                }
+                if let Some(p) = progress {
+                    p.increment();
+                }
+                return;
             }
-            if let Some(p) = progress {
-                p.increment();
-            }
-            return;
-        } else {
             bloom_mark = crate::output::BloomMark::from_decision(decision);
         }
     }

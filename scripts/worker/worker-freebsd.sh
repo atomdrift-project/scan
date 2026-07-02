@@ -27,7 +27,7 @@ URL="${1:-}"
 WORKERS="${WORKERS:-}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 
-BINARY=scan
+BINARY=atomscan
 BIN_PATH=/usr/local/bin/${BINARY}
 RCD_FILE=/usr/local/etc/rc.d/scan-worker
 

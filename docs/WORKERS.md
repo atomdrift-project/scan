@@ -1,6 +1,6 @@
 # Atomdrift Scan Workers
 
-`scan worker` is the pull-based counterpart to `scan serve`. It
+`atomscan worker` is the pull-based counterpart to `atomscan serve`. It
 exposes no HTTP. It polls a [hopper](https://codeberg.org/atomdrift/hopper)
 instance for jobs, analyses each file, and posts the result back.
 
@@ -11,7 +11,7 @@ result carries.
 
 ## Running a worker
 
-    scan worker --url http://hopper-host:8081
+    atomscan worker --url http://hopper-host:8081
 
 `--url` is required. Everything else has a sensible default.
 

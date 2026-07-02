@@ -62,8 +62,8 @@ pipeline:
       set -eu
       # LOCAL_BUILD_CD_HERE  — scripts/build.sh replaces this with
       # `cd scan` for local builds (cleave is staged as a sibling).
-      cargo auditable build --profile release-lto --locked --bin scan
-      install -Dm755 target/release-lto/scan "${{targets.destdir}}/usr/bin/scan"
+      cargo auditable build --profile release-lto --locked --bin atomscan
+      install -Dm755 target/release-lto/atomscan "${{targets.destdir}}/usr/bin/atomscan"
 
   - uses: strip
 
@@ -108,12 +108,12 @@ test:
     - name: Version reports correctly
       runs: |
         set -euo pipefail
-        scan --version
-        scan --version | grep -q '1\.2\.1'
+        atomscan --version
+        atomscan --version | grep -q '1\.2\.1'
     - name: Help works
       runs: |
         set -euo pipefail
-        scan --help >/dev/null
+        atomscan --help >/dev/null
 
 update:
   enabled: true

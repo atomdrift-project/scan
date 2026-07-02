@@ -50,8 +50,8 @@ bssh "sudo -u scan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link
     || die "tests failed on build host"
 
 log "Transferring tarball from $BUILD to $RUN"
-bssh "sudo cat /home/scan/scan/out/scan.tgz" \
-    | rssh "sudo tee /tmp/scan.tgz >/dev/null"
+bssh "sudo cat /home/scan/scan/out/atomscan.tgz" \
+    | rssh "sudo tee /tmp/atomscan.tgz >/dev/null"
 
 log "Ensuring run user exists on $RUN"
 rssh "id -u scan >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -d /nonexistent -c 'Atomdrift Scan Worker' scan"
@@ -61,12 +61,9 @@ rssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         git ca-certificates p7zip-full upx rizin innoextract"
 
-log "Extracting tarball on $RUN"
-rssh "sudo rm -rf /usr/local/share/atomdrift/scan && \
-      sudo mkdir -p /usr/local/share/atomdrift/scan && \
-      sudo tar -xzf /tmp/scan.tgz -C /usr/local/share/atomdrift/scan && \
-      sudo rm -f /tmp/scan.tgz && \
-      sudo ln -sf /usr/local/share/atomdrift/scan/scan /usr/local/bin/scan"
+log "Installing binary on $RUN"
+rssh "sudo tar -xzf /tmp/atomscan.tgz -C /usr/local/bin && \
+      sudo rm -f /tmp/atomscan.tgz"
 
 log "Installing systemd unit on $RUN"
 rssh "sudo tee /etc/systemd/system/scan-worker.service >/dev/null" <<EOF
@@ -79,7 +76,7 @@ Wants=network-online.target
 Type=simple
 User=scan
 Group=scan
-ExecStart=/usr/local/share/atomdrift/scan/scan $worker_args
+ExecStart=/usr/local/bin/atomscan $worker_args
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:/var/log/scan-worker.log

@@ -48,7 +48,7 @@ significant_drop_tightening = "warn"
 [package]
 name = "atomdrift-scan"
 version = "2.2.0"
-default-run = "scan"
+default-run = "atomscan"
 edition = "2024"
 authors = ["The Atomdrift Project"]
 description = "ML-powered malware classification using cleave static analysis"
@@ -141,7 +141,7 @@ tikv-jemallocator = "0.7"
 
 [features]
 # Enables jemalloc heap profiling. Build with:
-#   cargo build --profile profiling --features jemalloc-prof --bin scan
+#   cargo build --profile profiling --features jemalloc-prof --bin atomscan
 # Run with (note the `_RJEM_` prefix — tikv-jemalloc renames MALLOC_CONF):
 #   _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_interval:28,prof_prefix:out/heap/jeprof" \
 #     ./out/scan.heap worker ...
@@ -220,13 +220,12 @@ workspace = true
 name = "scan"
 path = "src/lib.rs"
 
-# Atomdrift Scan — the product. The crates.io package is `atomdrift-scan`; both
-# the library (imported as `scan`) and the CLI binary build under the name
-# `scan`, matching the repo. `make install` installs the binary as `atomscan`
-# and adds a `scan` symlink only when no `scan` already exists on PATH — avast
-# ships its own `/usr/bin/scan`, so we never clobber it.
+# Atomdrift Scan — the product. The crates.io package is `atomdrift-scan` and the
+# library is imported as `scan`, but the CLI command is `atomscan`: a unique,
+# collision-free name (avast ships its own `/usr/bin/scan`). The product name
+# stays "Atomdrift Scan"; only the invocation is `atomscan`.
 [[bin]]
-name = "scan"
+name = "atomscan"
 path = "src/main.rs"
 
 # Mock hopper for self-contained worker benchmarks (see `make worker-benchmark`).
@@ -263,8 +262,12 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # profiling cross-repo changes, then update the git revision once cleave carries
 # the change.
 # Local cleave: adds AnalysisOptions::skip_predicate (the per-file known-good/bad
-# bloom short-circuit hook). ../cleave is at the same rev scan locks to, plus this
-# additive change. Revert to the git rev once a cleave release carries it.
+# bloom short-circuit hook) and widens its signature to `Fn(&str, &Path)` so the
+# predicate can consult filesystem metadata — a known-good file is skipped only
+# while it is unchanged, so a freshly-touched one is analyzed once on its own
+# merits instead of being skipped then re-analyzed. ../cleave is at the same rev
+# scan locks to, plus this additive change. Remove this patch and bump the git
+# rev once a cleave release carries it.
 
 # Local filefacts + fletch: scan drives fetching off the package.json
 # dependencies filefacts now emits and fletch's registry resolution of an

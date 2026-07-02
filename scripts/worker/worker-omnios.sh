@@ -39,7 +39,7 @@ SCAN_LOG_DIR=/var/log/atomdrift/scan
 # unpacks (innoextract, 7z, rizin) can exhaust swap and wedge the whole
 # zone — including /etc/svc/volatile, which then blocks svc.startd.
 SCAN_TMP_DIR=/var/atomdrift/scan/tmp
-SCAN_BIN=$SRC_PREFIX/bin/scan
+SCAN_BIN=$SRC_PREFIX/bin/atomscan
 SMF_MANIFEST=/lib/svc/manifest/site/scan-worker.xml
 SMF_FMRI=svc:/site/scan-worker:default
 
@@ -312,7 +312,7 @@ if [ "$scan_build_needed" -eq 1 ]; then
     # illumos install(1) is the old SunOS variant with incompatible flags;
     # use cp+chmod for portability. Stage to .new then rename for atomicity
     # (replacing a running binary while the SMF service is up is otherwise racy).
-    cp -f target/release/scan "$SCAN_BIN.new"
+    cp -f target/release/atomscan "$SCAN_BIN.new"
     chmod 755 "$SCAN_BIN.new"
     mv -f "$SCAN_BIN.new" "$SCAN_BIN"
     case "$SCAN_REV" in

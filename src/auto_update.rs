@@ -114,7 +114,7 @@ pub fn refresh_if_stale(force: bool, disabled: bool, mode: Mode, terminal: bool)
         print_checkmark(mode);
     } else if outcome.failed {
         eprint!(
-            "\r\x1b[2K \x1b[38;2;255;175;55m\u{26a0}\x1b[0m \x1b[38;2;160;160;160mauto-update timed out \u{2014} run `scan update-rules` to update\x1b[0m\n",
+            "\r\x1b[2K \x1b[38;2;255;175;55m\u{26a0}\x1b[0m \x1b[38;2;160;160;160mauto-update timed out \u{2014} run `atomscan update-rules` to update\x1b[0m\n",
         );
         let _ = std::io::stderr().flush();
     } else {

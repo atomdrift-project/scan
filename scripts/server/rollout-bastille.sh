@@ -62,8 +62,8 @@ doas bastille cmd "$BUILD" su -l scan -c "cd ~/scan && RUSTFLAGS='-C link-arg=-f
 
 log "Transferring tarball to run jail"
 BASTILLE_DIR="/usr/local/bastille/jails"
-doas cp "$BASTILLE_DIR/$BUILD/root/home/scan/scan/out/scan.tgz" \
-       "$BASTILLE_DIR/$RUN/root/tmp/scan.tgz"
+doas cp "$BASTILLE_DIR/$BUILD/root/home/scan/scan/out/atomscan.tgz" \
+       "$BASTILLE_DIR/$RUN/root/tmp/atomscan.tgz"
 
 # --- Run jail setup ---
 
@@ -74,15 +74,12 @@ doas bastille cmd "$RUN" id -u scan >/dev/null 2>&1 || \
 log "Installing runtime dependencies"
 doas bastille pkg "$RUN" install -y git 7-zip upx rizin innoextract
 
-log "Extracting tarball"
-doas bastille cmd "$RUN" rm -rf /usr/local/share/atomdrift/scan
-doas bastille cmd "$RUN" mkdir -p /usr/local/share/atomdrift/scan
-doas bastille cmd "$RUN" tar -xzf /tmp/scan.tgz -C /usr/local/share/atomdrift/scan
-doas bastille cmd "$RUN" rm -f /tmp/scan.tgz
-doas bastille cmd "$RUN" ln -sf /usr/local/share/atomdrift/scan/scan /usr/local/bin/scan
+log "Installing binary"
+doas bastille cmd "$RUN" tar -xzf /tmp/atomscan.tgz -C /usr/local/bin
+doas bastille cmd "$RUN" rm -f /tmp/atomscan.tgz
 
 log "Refreshing models and traits in run jail"
-doas bastille cmd "$RUN" su -l scan -c "scan update-rules" \
+doas bastille cmd "$RUN" su -l scan -c "atomscan update-rules" \
     || die "update-rules failed in run jail"
 
 log "Creating rc.d service"
@@ -106,7 +103,7 @@ load_rc_config $name
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/share/atomdrift/scan/scan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8"
+command_args="-c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8"
 
 run_rc_command "$1"
 EOF

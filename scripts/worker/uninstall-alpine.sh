@@ -6,7 +6,7 @@ die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
 log "Removing cron entry"
-(crontab -l 2>/dev/null | grep -v "scan worker" || true) | crontab -
+(crontab -l 2>/dev/null | grep -v "atomscan worker" || true) | crontab -
 
 log "Killing any remaining processes"
 pkill -x scan 2>/dev/null || true

@@ -2368,7 +2368,7 @@ fn load_bundle(
     if !spec_path.is_file() {
         if is_general {
             anyhow::bail!(
-                "model bundle is incomplete: missing {}. Run 'scan update-rules' to refresh the installed models.",
+                "model bundle is incomplete: missing {}. Run 'atomscan update-rules' to refresh the installed models.",
                 spec_path.display(),
             );
         }
@@ -3867,7 +3867,7 @@ mod tests {
         };
         let message = err.to_string();
         assert!(message.contains("model bundle is incomplete"));
-        assert!(message.contains("Run 'scan update-rules'"));
+        assert!(message.contains("Run 'atomscan update-rules'"));
         Ok(())
     }
 

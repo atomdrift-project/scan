@@ -1,7 +1,7 @@
 #!/bin/sh
 # Load the apko-built scan image and assert it works end-to-end:
-#  1. scan --version reports the expected version
-#  2. scan --help runs cleanly
+#  1. atomscan --version reports the expected version
+#  2. atomscan --help runs cleanly
 #  3. A scan against a known-clean binary succeeds with the bundled models
 #  4. Same scan with bogus SCAN_MODELS_DIR errors out (proves models
 #     are actually being consulted, not silently skipped)
@@ -53,16 +53,16 @@ report() {
   fi
 }
 
-echo "==> 1/4 scan --version reports $EXPECTED_VERSION"
+echo "==> 1/4 atomscan --version reports $EXPECTED_VERSION"
 out=$($NERDCTL run --rm "$IMAGE_REF" --version 2>&1 || true)
 echo "$out" | grep -q "$EXPECTED_VERSION"
 report $? "saw version: $out"
 
-echo "==> 2/4 scan --help runs"
+echo "==> 2/4 atomscan --help runs"
 $NERDCTL run --rm "$IMAGE_REF" --help >/dev/null 2>&1
 report $? "help exits 0"
 
-echo "==> 3/4 scan with bundled models succeeds (any verdict, not error)"
+echo "==> 3/4 atomscan with bundled models succeeds (any verdict, not error)"
 # `|| rc=$?` so set -e doesn't abort on scan's 1/2 verdict exits.
 rc=0
 $NERDCTL run --rm "$IMAGE_REF" /usr/bin/cleave >/tmp/scan-smoke.out 2>&1 || rc=$?

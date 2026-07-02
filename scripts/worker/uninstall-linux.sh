@@ -29,9 +29,9 @@ if crontab -l 2>/dev/null | grep -q "scan worker"; then
     (crontab -l 2>/dev/null | grep -v "scan worker" || true) | crontab -
 fi
 
-log "Killing any remaining scan worker processes"
-sudo pkill -f "scan worker" 2>/dev/null || true
-pkill -u "$(id -u)" -f "scan worker" 2>/dev/null || true
+log "Killing any remaining atomscan worker processes"
+sudo pkill -f "atomscan worker" 2>/dev/null || true
+pkill -u "$(id -u)" -f "atomscan worker" 2>/dev/null || true
 
 log "Uninstall complete"
 log "Note: service user 'scan' and /var/lib/atomdrift/scan left intact (remove manually for a fresh state)."

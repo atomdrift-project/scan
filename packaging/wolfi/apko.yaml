@@ -29,7 +29,7 @@ accounts:
   run-as: 65532
 
 entrypoint:
-  command: /usr/bin/scan
+  command: /usr/bin/atomscan
 
 environment:
   CLEAVE_TRAITS_DIR: /usr/share/cleave/traits

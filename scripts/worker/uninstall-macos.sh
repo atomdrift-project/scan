@@ -4,7 +4,7 @@ set -ex
 
 LABEL=com.atomdrift.scan-worker
 PLIST=/Library/LaunchDaemons/com.atomdrift.scan-worker.plist
-BINARY=scan
+BINARY=atomscan
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }

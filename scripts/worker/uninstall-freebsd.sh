@@ -31,5 +31,5 @@ $SUDO service ascan-worker stop 2>/dev/null || true
 $SUDO pkill -9 -F /var/run/ascan_worker.pid 2>/dev/null || true
 $SUDO rm -f /usr/local/etc/rc.d/ascan-worker
 
-log "Note: service user 'scan', ~scan, and /usr/local/bin/scan left intact."
+log "Note: service user 'scan', ~scan, and /usr/local/bin/atomscan left intact."
 log "Uninstall complete"

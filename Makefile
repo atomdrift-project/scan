@@ -1,9 +1,9 @@
 SHELL := /bin/sh
-BINARY = scan
-# Canonical name for the locally-installed binary. The build artifact is `scan`
-# (see Cargo.toml), but `make install` lands it as `atomscan` and adds a `scan`
-# symlink only when PATH has no `scan` already (avast ships /usr/bin/scan).
-INSTALL_NAME = atomscan
+# The CLI command is `atomscan` — the cargo bin, the build artifact, and the
+# installed binary all share this name. `scan` is not a safe global command name
+# (avast ships its own /usr/bin/scan), so we no longer install one. The product
+# name stays "Atomdrift Scan"; only the invocation is `atomscan`.
+BINARY = atomscan
 OUT_DIR = out
 BUILD ?= build
 SERVER_RUN ?= scan
@@ -232,47 +232,34 @@ install: release
 		mkdir -p "$$HOME/.cargo/bin"; \
 		bindir="$$HOME/.cargo/bin"; \
 	fi; \
-	dest="$$bindir/$(INSTALL_NAME)"; \
+	dest="$$bindir/$(BINARY)"; \
 	install -m 755 $(OUT_DIR)/$(BINARY) "$$dest.new" && mv -f "$$dest.new" "$$dest"; \
-	echo "✓ Installed to $$dest"; \
-	link="$$bindir/scan"; \
-	if [ -e "$$link" ] || [ -L "$$link" ]; then \
-		echo "• Left existing $$link untouched (not linking scan -> $(INSTALL_NAME))"; \
-	else \
-		ln -s "$(INSTALL_NAME)" "$$link" && echo "✓ Linked $$link -> $(INSTALL_NAME)"; \
-	fi; \
-	legacy="$$bindir/ascan"; \
-	if [ -f "$$legacy" ] && [ ! -L "$$legacy" ]; then \
-		rm -f "$$legacy" && ln -s "$(INSTALL_NAME)" "$$legacy" \
-			&& echo "✓ Migrated legacy $$legacy (old binary) -> $(INSTALL_NAME)"; \
-	fi
+	echo "✓ Installed to $$dest"
 
-# Remove a local `make install`: the `atomscan` binary plus the `scan`/`ascan`
-# symlinks, but ONLY when those point at `atomscan` — a foreign `scan` (avast)
-# or a real `ascan` binary is left untouched.
+# Remove a local `make install`: the `atomscan` binary, plus any stale `scan`/
+# `ascan` symlinks left by older installs that still point at `atomscan` — a
+# foreign `scan` (avast) or a real `ascan` binary is left untouched.
 uninstall:
 	@set -e; \
 	found=0; \
 	for bindir in "$$HOME/.cargo/bin" "$$HOME/bin" "$$HOME/.local/bin" /usr/local/bin; do \
 		[ -d "$$bindir" ] || continue; \
-		target="$$bindir/$(INSTALL_NAME)"; \
+		target="$$bindir/$(BINARY)"; \
 		{ [ -e "$$target" ] || [ -L "$$target" ]; } || continue; \
 		found=1; \
 		rm -f "$$target" && echo "✓ Removed $$target"; \
 		for alias in scan ascan; do \
 			link="$$bindir/$$alias"; \
-			if [ -L "$$link" ] && [ "$$(readlink "$$link")" = "$(INSTALL_NAME)" ]; then \
-				rm -f "$$link" && echo "✓ Removed $$link -> $(INSTALL_NAME)"; \
-			elif [ -e "$$link" ] || [ -L "$$link" ]; then \
-				echo "• Left $$link untouched (not our symlink)"; \
+			if [ -L "$$link" ] && [ "$$(readlink "$$link")" = "$(BINARY)" ]; then \
+				rm -f "$$link" && echo "✓ Removed stale $$link -> $(BINARY)"; \
 			fi; \
 		done; \
 	done; \
-	[ "$$found" = 1 ] || echo "Nothing to uninstall (no $(INSTALL_NAME) in known bindirs)"
+	[ "$$found" = 1 ] || echo "Nothing to uninstall (no $(BINARY) in known bindirs)"
 
 tarball: release
-	tar -czf $(OUT_DIR)/scan.tgz -C $(OUT_DIR) $(BINARY)
-	@echo "Tarball: $(OUT_DIR)/scan.tgz"
+	tar -czf $(OUT_DIR)/$(BINARY).tgz -C $(OUT_DIR) $(BINARY)
+	@echo "Tarball: $(OUT_DIR)/$(BINARY).tgz"
 
 # Clear MAKEFLAGS for deploy recipes: GNU Make would otherwise inject the
 # outer invocation's `-j`/`--jobserver-*` flags plus command-line `URL=` into

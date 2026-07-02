@@ -14,11 +14,11 @@ WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 
-BINARY=scan
+BINARY=atomscan
 INSTALL_DIR=/usr/local/share/atomdrift/scan
 MODELS_DIR=/usr/local/share/atomdrift/scan/models
 TRAITS_DIR=/usr/local/share/atomdrift/scan/traits
-BIN_LINK=/usr/local/bin/scan
+BIN_PATH=/usr/local/bin/atomscan
 PLIST=/Library/LaunchDaemons/com.atomdrift.scan-worker.plist
 LABEL=com.atomdrift.scan-worker
 SERVICE_USER=_scan
@@ -71,14 +71,10 @@ fi
 
 log "Installing binary"
 restart_needed=0
-if ! cmp -s "out/scan" "$INSTALL_DIR/$BINARY" 2>/dev/null; then
-    install -m 755 out/scan "$INSTALL_DIR/$BINARY"
-    codesign --force --sign - "$INSTALL_DIR/$BINARY"
+if ! cmp -s "out/$BINARY" "$BIN_PATH" 2>/dev/null; then
+    sudo install -m 755 "out/$BINARY" "$BIN_PATH"
+    sudo codesign --force --sign - "$BIN_PATH"
     restart_needed=1
-fi
-
-if [ ! -L "$BIN_LINK" ] || [ "$(readlink "$BIN_LINK")" != "$INSTALL_DIR/$BINARY" ]; then
-    sudo ln -sf "$INSTALL_DIR/$BINARY" "$BIN_LINK"
 fi
 
 if [ ! -f "$LOG" ]; then
@@ -102,7 +98,7 @@ cat > "$new_plist" <<EOF
     <string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$INSTALL_DIR/$BINARY</string>
+        <string>$BIN_PATH</string>
         <string>worker</string>
         <string>--url</string>
         <string>$URL</string>

@@ -19,7 +19,7 @@ LLM="${LLM:-http://10.9.8.149:8000/v1}"
 worker_args="worker --url $URL --interpret"
 [ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
 
-BINARY=scan
+BINARY=atomscan
 BIN_DIR="$HOME/bin"
 LOG="$HOME/.local/share/atomdrift/scan/scan-worker.log"
 
@@ -47,12 +47,12 @@ if ! cmp -s "target/release/$BINARY" "$BIN_DIR/$BINARY" 2>/dev/null; then
 fi
 
 log "Installing cron entry"
-cron_cmd="* * * * * pgrep -af 'scan worker' >/dev/null 2>&1 || { ulimit -d \$(ulimit -Hd); SCAN_LLM=$LLM nohup $BIN_DIR/$BINARY $worker_args < /dev/null >> $LOG 2>&1 & }"
-(crontab -l 2>/dev/null | grep -v "scan worker" || true; echo "$cron_cmd") | crontab -
+cron_cmd="* * * * * pgrep -af 'atomscan worker' >/dev/null 2>&1 || { ulimit -d \$(ulimit -Hd); SCAN_LLM=$LLM nohup $BIN_DIR/$BINARY $worker_args < /dev/null >> $LOG 2>&1 & }"
+(crontab -l 2>/dev/null | grep -v "atomscan worker" || true; echo "$cron_cmd") | crontab -
 
 if [ "$restart_needed" -eq 1 ]; then
-    log "Restarting scan worker"
-    pkill -f "scan worker" 2>/dev/null || true
+    log "Restarting atomscan worker"
+    pkill -f "atomscan worker" 2>/dev/null || true
     sleep 1
     SCAN_LLM="$LLM" nohup "$BIN_DIR/$BINARY" $worker_args < /dev/null >> "$LOG" 2>&1 &
 else

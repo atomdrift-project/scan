@@ -1,4 +1,4 @@
-//! Atomdrift Scan (`scan`) — ML-powered malware classification CLI.
+//! Atomdrift Scan (`atomscan`) — ML-powered malware classification CLI.
 
 #[cfg(all(
     unix,
@@ -40,7 +40,7 @@ enum Show {
 const DEFAULT_SLOW_RULE_MS: u64 = 4000;
 
 #[derive(Parser)]
-#[command(name = "scan")]
+#[command(name = "atomscan")]
 #[command(version)]
 #[command(about = "Atomdrift Scan — context-free malware detection (ML + static analysis)")]
 #[command(group(
