@@ -1243,9 +1243,23 @@ impl Progress {
         self.inner.draw();
     }
 
-    /// Redraw progress line without incrementing (after printing a result).
-    pub(crate) fn redraw(&self) {
-        self.inner.draw();
+    /// Erase the bar, run `print` (which writes a file's result to stdout), then
+    /// redraw the bar beneath it — all while holding the draw lock so the
+    /// heartbeat thread cannot repaint the bar between the erase and the write.
+    /// Without the leading erase the result is grafted onto the bar line the
+    /// last render left on screen (cursor parked at its end, no newline).
+    pub(crate) fn around_result(&self, print: impl FnOnce()) {
+        let inner = &self.inner;
+        let _guard = inner
+            .draw_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+        print();
+        if !inner.stopped.load(Ordering::Relaxed) {
+            inner.render();
+        }
     }
 
     /// Stop the heartbeat without printing anything, for callers that render
@@ -1775,9 +1789,10 @@ fn record_file_result(
                 || r.bloom_mark.is_some()
                 || config.filter().shows(&r.classification)
             {
-                emit_result(&r, config, progress.is_some(), stdout);
                 if let Some(p) = progress {
-                    p.redraw();
+                    p.around_result(|| emit_result(&r, config, true, stdout));
+                } else {
+                    emit_result(&r, config, false, stdout);
                 }
             }
             // Renew this result on hopper if `--hopper` was set. Done after

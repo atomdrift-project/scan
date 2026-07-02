@@ -310,16 +310,20 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                 if config.format() == OutputFormat::Json
                     || config.filter().shows(&result.classification)
                 {
-                    emit_result(
-                        &result,
-                        config,
-                        &group.pids,
-                        group.deleted,
-                        progress.is_some(),
-                        &stdout,
-                    );
+                    let print = || {
+                        emit_result(
+                            &result,
+                            config,
+                            &group.pids,
+                            group.deleted,
+                            progress.is_some(),
+                            &stdout,
+                        );
+                    };
                     if let Some(p) = &progress {
-                        p.redraw();
+                        p.around_result(print);
+                    } else {
+                        print();
                     }
                 }
             }
