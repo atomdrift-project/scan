@@ -200,20 +200,18 @@ const fn default_model_abi_version() -> u32 {
 
 /// Current suspicious ceiling (FP per 100M benigns) for level-sweep decisions.
 ///
-/// Set to L100 — the empirical precision elbow. A hopper analysis of the
-/// current model (2.2.0-rc.1, top-level analyzed samples) found firing levels
-/// collapse onto three points: L0 (hostile core, 99.6% precision), L100
-/// (6168 bad vs 591 good — 91% precision), and L250 (457 bad vs 1020 good —
-/// 31% precision). L250 and looser add more false positives than true
-/// positives, and admitting them costs ≥2.5× the FP budget for ~4% more bad
-/// recall. Capping here drops the loose tail (L250+) to benign, cutting good
-/// false positives ~63% and unknown "new" noise ~34% for a 4.4% bad-recall
-/// loss — nearly all of it the FP-swamped L250 bucket.
-///
-/// The earlier 20000 backstop (itself a widening from an even narrower L×4
-/// policy) kept very loose firings as informational suspicious verdicts; the
-/// recall plateau above L100 is flat, so that tail was almost pure noise.
-const SUSPICIOUS_LEVEL_CEILING: u16 = 100;
+/// Set to L3000 — a deliberate EXPERIMENTAL widening (2026-07) to surface as much
+/// of the weak-signal tail as suspicious as the calibration curve supports. On
+/// the current calibrate run hostile recall climbs smoothly to a peak at L4000
+/// then COLLAPSES ~8pp at L5000 (the benign quantile runs out of resolution), so
+/// L3000 is the loosest robustly-stable point, one notch below that fragile peak.
+/// Trialed AGAINST prior precision evidence: a hopper fired-level analysis (model
+/// 2.2.0-rc.1) put the precision elbow far lower, at L100 — L0 (99.6%), L100
+/// (6168 bad vs 591 good — 91%), L250 (457 bad vs 1020 good — 31%), with L250+
+/// adding more false positives than true positives. So L3000 knowingly re-admits
+/// a low-precision tail. RE-MEASURE the elbow on the current model before making
+/// this permanent; tighten back toward L100/L250 if the suspicious bucket floods.
+const SUSPICIOUS_LEVEL_CEILING: u16 = 3000;
 
 /// The suspicious LEVEL for a grid: `min(max_grid_level, 100)`.
 ///
@@ -1588,7 +1586,7 @@ struct LoadedBundle {
 /// `default_severity_level`. Keep it equal to collimator's current default so
 /// the fallback is sane; `make deploy` (collimator's azoth-deploy-final) fails
 /// if the staged bundle's level, collimator's const, and this const disagree.
-pub const DEFAULT_SEVERITY_LEVEL: u16 = 50;
+pub const DEFAULT_SEVERITY_LEVEL: u16 = 25;
 
 /// Ensemble-level config parsed from the top-level `config.json`. Every field
 /// is optional — an ensemble bundle with only `general/` populated and no
@@ -3923,37 +3921,52 @@ mod tests {
     fn load_severity_thresholds_derives_suspicious_in_level_space() -> Result<()> {
         // With no explicit `suspicious` block per level, the suspicious cutoff
         // comes from the level-table's HOSTILE threshold at the capped
-        // suspicious level `min(grid_max, 100)` — the L100 precision elbow.
-        // Anything firing looser than L100 lands below this threshold and reads
-        // benign. For this table the cap resolves to the L100 row (0.90).
+        // suspicious level `min(grid_max, SUSPICIOUS_LEVEL_CEILING)`. Anything
+        // firing looser than the ceiling lands below this threshold and reads
+        // benign. This table puts a row exactly at the ceiling (0.90) plus a
+        // looser row, so the cap clamps to the ceiling row (0.90) regardless of
+        // the ceiling's numeric value.
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),
-            r#"{
+            format!(
+                r#"{{
               "hostile": 0.90,
               "severity_levels": [
-                {"level": 50,   "hostile": {"threshold": 0.99}},
-                {"level": 100,  "hostile": {"threshold": 0.90}},
-                {"level": 1000, "hostile": {"threshold": 0.70}}
+                {{"level": 50,       "hostile": {{"threshold": 0.99}}}},
+                {{"level": {ceiling}, "hostile": {{"threshold": 0.90}}}},
+                {{"level": 25000,    "hostile": {{"threshold": 0.70}}}}
               ]
-            }"#,
+            }}"#,
+                ceiling = SUSPICIOUS_LEVEL_CEILING
+            ),
         )?;
 
         let l50 = load_severity_thresholds(dir.path(), 50)?.context("level 50")?;
         assert_eq!(l50.hostile, 0.99);
         assert_eq!(
             l50.suspicious, 0.90,
-            "L50 suspicious should be the L100 ceiling-row hostile threshold"
+            "suspicious should be the ceiling-row hostile threshold"
         );
 
         let l300 = load_severity_thresholds(dir.path(), 300);
-        // L300 is absent from this table so the loader returns None — but the
-        // ceiling rule is exercised via `capped_suspicious_level` directly below.
+        // L300 is absent from this table so the loader returns None — the
+        // ceiling clamp itself is exercised via `capped_suspicious_level` below.
         assert!(matches!(l300, Ok(None)));
-        assert_eq!(capped_suspicious_level(50), 50); // below ceiling: passes through
-        assert_eq!(capped_suspicious_level(100), 100); // at the ceiling
-        assert_eq!(capped_suspicious_level(1000), 100); // above ceiling: capped
-        assert_eq!(capped_suspicious_level(25_000), 100); // far above: still capped
+        // Below the ceiling passes through; at/above it clamps to the ceiling.
+        assert_eq!(
+            capped_suspicious_level(SUSPICIOUS_LEVEL_CEILING - 1),
+            SUSPICIOUS_LEVEL_CEILING - 1
+        );
+        assert_eq!(
+            capped_suspicious_level(SUSPICIOUS_LEVEL_CEILING),
+            SUSPICIOUS_LEVEL_CEILING
+        );
+        assert_eq!(
+            capped_suspicious_level(SUSPICIOUS_LEVEL_CEILING + 1),
+            SUSPICIOUS_LEVEL_CEILING
+        );
+        assert_eq!(capped_suspicious_level(25_000), SUSPICIOUS_LEVEL_CEILING);
         Ok(())
     }
 
@@ -4347,37 +4360,30 @@ mod tests {
         let grid_max = 25_000;
         assert_eq!(verdict_for_level(20, 50, grid_max), Classification::Hostile);
         assert_eq!(verdict_for_level(50, 50, grid_max), Classification::Hostile);
-        // The suspicious band now ends at the L100 ceiling (the precision elbow).
+        // The suspicious band ends at the SUSPICIOUS_LEVEL_CEILING cap.
         assert_eq!(
-            verdict_for_level(100, 50, grid_max),
-            Classification::Suspicious
+            verdict_for_level(SUSPICIOUS_LEVEL_CEILING, 50, grid_max),
+            Classification::Suspicious,
+            "at the ceiling is still suspicious"
         );
         assert_eq!(
-            verdict_for_level(101, 50, grid_max),
+            verdict_for_level(SUSPICIOUS_LEVEL_CEILING + 1, 50, grid_max),
             Classification::Benign,
-            "just past the L100 ceiling is benign"
-        );
-        assert_eq!(
-            verdict_for_level(250, 50, grid_max),
-            Classification::Benign,
-            "L250 is the FP-swamped bucket dropped by the L100 cap"
-        );
-        assert_eq!(
-            verdict_for_level(20_000, 50, grid_max),
-            Classification::Benign
+            "just past the suspicious ceiling is benign"
         );
         assert_eq!(
             verdict_for_level(25_000, 50, grid_max),
             Classification::Benign
         );
 
-        // Stricter deploy (-l 10): only levels <= 10 are hostile.
+        // Stricter deploy (-l 10): only levels <= 10 are hostile; the ceiling
+        // still bounds the top of the suspicious band.
         assert_eq!(
             verdict_for_level(20, 10, grid_max),
             Classification::Suspicious
         );
         assert_eq!(
-            verdict_for_level(100, 10, grid_max),
+            verdict_for_level(SUSPICIOUS_LEVEL_CEILING, 10, grid_max),
             Classification::Suspicious
         );
     }

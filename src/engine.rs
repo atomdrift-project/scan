@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::Mode;
@@ -1178,6 +1178,48 @@ struct Inner {
     draw_lock: Mutex<()>,
 }
 
+/// The active terminal progress bar, published so incidental stderr writers —
+/// chiefly the fetch progress block (`report_fetch`/`report_skip` and their
+/// header) — can print *above* the bar instead of grafting onto or racing its
+/// `\r`-parked line. Only the single-process terminal CLI ever installs a bar;
+/// server/JSON modes run none and leave this `None`. A `Weak` so a finished bar
+/// is never kept alive; [`print_above_bar`] upgrades it per call.
+static ACTIVE_BAR: Mutex<Option<Weak<Inner>>> = Mutex::new(None);
+
+/// Run `print` (which writes one or more *complete* newline-terminated lines to
+/// stderr) so its output lands cleanly above the progress bar rather than
+/// interleaving with it. When a live bar is active, the bar line is erased and
+/// `print` runs under the bar's `draw_lock`, so neither the heartbeat thread nor
+/// a parallel worker can repaint the bar between the erase and the write; the
+/// bar redraws itself on the next `increment`/heartbeat tick, beneath the lines
+/// just printed. With no active bar (server/JSON modes, or after the scan ends)
+/// the closure simply runs. Callers must not already hold `draw_lock`.
+pub(crate) fn print_above_bar(print: impl FnOnce()) {
+    // Upgrade to an owned Arc and drop the registry guard before touching
+    // draw_lock, so the two locks are never held at once (no ordering cycle).
+    let bar = ACTIVE_BAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(Weak::upgrade);
+    match bar {
+        Some(inner) => {
+            let _guard = inner
+                .draw_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Erase the bar only if it's still live; once stopped, `finish`
+            // already cleared the line and the cursor is at a fresh column 0.
+            if !inner.stopped.load(Ordering::Relaxed) {
+                eprint!("\r\x1b[2K");
+                let _ = std::io::stderr().flush();
+            }
+            print();
+        }
+        None => print(),
+    }
+}
+
 impl Inner {
     fn draw(&self) {
         let _guard = self
@@ -1271,6 +1313,12 @@ impl Progress {
             stopped: AtomicBool::new(false),
             draw_lock: Mutex::new(()),
         });
+        // Publish this bar so the fetch progress block can print above it (see
+        // `print_above_bar`). Overwrites any prior registration — the terminal
+        // CLI runs one bar at a time — and is cleared on drop.
+        *ACTIVE_BAR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&inner));
         // Detached heartbeat: it observes `stopped` and exits within one tick of
         // `quiesce`/drop. A spawn failure just means no heartbeat — the per-file
         // redraws still drive the bar.
@@ -1335,6 +1383,13 @@ impl Drop for Progress {
         // Safety net: stop the heartbeat even on an early return or error that
         // skipped `finish`/`quiesce`.
         self.inner.stopped.store(true, Ordering::Relaxed);
+        // Unpublish so a later `print_above_bar` doesn't try to erase a bar that
+        // no longer owns the terminal. A stale `Weak` would upgrade to `None`
+        // once `Inner` frees, but the heartbeat thread holds a clone until it
+        // observes `stopped`, so clear eagerly rather than rely on that timing.
+        *ACTIVE_BAR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
