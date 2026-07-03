@@ -2444,7 +2444,10 @@ fn dep_sync_client() -> &'static reqwest::blocking::Client {
     })
 }
 
-fn body_excerpt(body: &str) -> String {
+/// Collapse whitespace and cap a body/blob to a single short line for a log
+/// field, so a large payload can't bury the rest of the record. Shared with
+/// `upload` (provenance sidecars are large registry documents).
+pub(crate) fn body_excerpt(body: &str) -> String {
     const MAX: usize = 512;
     let compact = body.replace(['\r', '\n', '\t'], " ");
     let mut out: String = compact.chars().take(MAX).collect();

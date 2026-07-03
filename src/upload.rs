@@ -612,7 +612,7 @@ fn post_upload(
                         kind,
                         %status,
                         body = %body,
-                        provenance = %String::from_utf8_lossy(provenance),
+                        provenance = %crate::worker::body_excerpt(&String::from_utf8_lossy(provenance)),
                         "upload: rejected by hopper; not retrying"
                     );
                     return false;
