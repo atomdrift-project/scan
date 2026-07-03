@@ -358,34 +358,26 @@ pub(crate) fn terminal_trailer(
     interpretation: Option<&crate::interpret::Interpretation>,
 ) -> Option<String> {
     let color = colored::control::SHOULD_COLORIZE.should_colorize();
-    let (body, review) = if let Some(llm) = interpretation {
-        let body = llm.error.as_deref().map_or_else(
+    let body = if let Some(llm) = interpretation {
+        llm.error.as_deref().map_or_else(
             || llm.interpretation.clone(),
             |_| "interpretation unavailable".into(),
-        );
-        (body, llm.review)
+        )
     } else if reasons.is_empty() {
         return None;
     } else {
-        let joined = reasons
+        reasons
             .iter()
             .take(3)
             .map(|r| r.description.as_str())
             .collect::<Vec<_>>()
-            .join(", ");
-        (joined, false)
+            .join(", ")
     };
-    let flag = if review { "  \u{26a0} review" } else { "" };
     if color {
         let p = palette();
-        Some(format!(
-            "{} {}{}",
-            fg(p.dim, "\u{00b7}"),
-            fg(p.reason, &body),
-            flag
-        ))
+        Some(format!("{} {}", fg(p.dim, "\u{00b7}"), fg(p.reason, &body)))
     } else {
-        Some(format!("\u{00b7} {body}{flag}"))
+        Some(format!("\u{00b7} {body}"))
     }
 }
 

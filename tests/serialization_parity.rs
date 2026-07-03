@@ -112,7 +112,6 @@ fn full_result_serializes_identically() {
             outcome: Classification::Hostile,
             blended: 0.873_21,
             interpretation: "imports base64 and writes to sys.modules".to_string(),
-            review: false,
             model: "claude-test".to_string(),
             error: None,
         }),

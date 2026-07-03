@@ -641,47 +641,49 @@ mod envelope_tests {
     }
 
     #[test]
-    fn interpreted_escalation_levels_stay_within_their_class_band() {
+    fn interpreted_level_pins_to_the_single_band_boundaries() {
         use crate::model::{capped_suspicious_level, verdict_for_level};
+        use Classification::{Benign, Hostile, Suspicious};
 
-        let hostile_lvl = interpreted_level(Classification::Hostile);
-        let susp_lvl = interpreted_level(Classification::Suspicious);
-
-        // Both are real (non-benign) levels, and a hostile escalation sits
-        // strictly tighter than a suspicious one.
-        assert!(hostile_lvl >= 0 && susp_lvl >= 0);
-        assert!(
-            hostile_lvl < susp_lvl,
-            "a hostile escalation (L{hostile_lvl}) must be tighter than a suspicious one (L{susp_lvl})"
-        );
-
-        // A benign->suspicious escalation must never exceed the suspicious
-        // ceiling, or a consumer that reclassifies from `lvl` (e.g. hopper)
-        // would drop the escalated verdict to benign.
-        let ceiling = capped_suspicious_level(u16::MAX); // == SUSPICIOUS_LEVEL_CEILING
-        assert!(
-            (susp_lvl as u16) <= ceiling,
-            "suspicious escalation L{susp_lvl} must sit within the L{ceiling} ceiling"
-        );
-
-        // Across every deploy level we operate at — hopper's L4 critical line,
-        // the L5 hostile/suspicious boundary, collimator's L50 default — the
-        // synthetic level must reclassify into the class the LLM lifted it to:
-        // suspicious->hostile escalations stay inside the hostile spectrum, and
-        // benign->suspicious escalations stay inside the suspicious band.
-        let grid_max = 25_000;
-        for deploy in [4_u16, 5, 50] {
+        // There is exactly one hostile and one suspicious threshold on the grid,
+        // so an interpreted level is pinned to the loosest rung of the target
+        // band — derived from the model's live thresholds (active level +
+        // suspicious ceiling), never hardcoded, so it tracks the boundary even if
+        // we move the hostile level or the suspicious ceiling.
+        let grid_max = 30_000;
+        for deploy in [4_u16, 5, 25, 50] {
+            // Escalation to hostile lands on the active deploy level: the loosest
+            // rung still inside the hostile budget.
             assert_eq!(
-                verdict_for_level(hostile_lvl as u16, deploy, grid_max),
-                Classification::Hostile,
-                "hostile escalation must read hostile at deploy L{deploy}"
+                interpreted_level(Some(deploy), grid_max, Hostile),
+                Some(i32::from(deploy))
             );
+            // Hold/downgrade to suspicious lands on the suspicious ceiling.
             assert_eq!(
-                verdict_for_level(susp_lvl as u16, deploy, grid_max),
-                Classification::Suspicious,
-                "suspicious escalation must read suspicious at deploy L{deploy}"
+                interpreted_level(Some(deploy), grid_max, Suspicious),
+                Some(i32::from(capped_suspicious_level(grid_max)))
             );
+            // Each round-trips through the model's own classifier into exactly the
+            // class the LLM lifted it to — the guarantee that keeps a `lvl`-based
+            // consumer (e.g. hopper) from re-reading an escalation as the wrong class.
+            let hostile_lvl =
+                u16::try_from(interpreted_level(Some(deploy), grid_max, Hostile).unwrap()).unwrap();
+            let susp_lvl =
+                u16::try_from(interpreted_level(Some(deploy), grid_max, Suspicious).unwrap()).unwrap();
+            assert_eq!(verdict_for_level(hostile_lvl, deploy, grid_max), Hostile);
+            assert_eq!(verdict_for_level(susp_lvl, deploy, grid_max), Suspicious);
         }
+        // A grid tighter than the ceiling caps the suspicious rung at grid_max.
+        assert_eq!(
+            interpreted_level(Some(25), 2_000, Suspicious),
+            Some(i32::from(capped_suspicious_level(2_000)))
+        );
+        // Benign is the clean marker regardless of grid (even in manual mode).
+        assert_eq!(interpreted_level(Some(25), grid_max, Benign), Some(-1));
+        assert_eq!(interpreted_level(None, 0, Benign), Some(-1));
+        // Manual-threshold mode (no grid): no synthetic hostile/suspicious level.
+        assert_eq!(interpreted_level(None, 0, Hostile), None);
+        assert_eq!(interpreted_level(None, 0, Suspicious), None);
     }
 
     #[test]
@@ -908,21 +910,31 @@ pub const fn level_confidence(level: Option<i32>) -> Option<u8> {
     }
 }
 
-/// Synthetic false-positive level for an LLM-driven verdict, used when the blend
-/// shifts the class away from ML's. An escalation lands at the *weak edge* of the
-/// target class so it fits squarely inside it (one step tighter than the boundary
-/// for margin): hostile just inside the L5 hostile line (L4), suspicious just
-/// inside the L100 suspicious ceiling (L99), benign the clean marker. This keeps
-/// the synthetic level in-band for consumers that reclassify from `lvl` (e.g.
-/// hopper): L4 reads hostile, L99 reads suspicious under the L100 ceiling — where
-/// the old L100/L250 would have mis-read as suspicious / benign respectively.
-/// Maps through [`level_confidence`] to ≈95% / ≈85% / 0%; keep the two
-/// `*_ESCALATION_CONF` constants in `interpret.rs` in sync.
-const fn interpreted_level(outcome: Classification) -> i32 {
+/// False-positive level for an LLM-driven verdict, used when the blend shifts the
+/// class away from ML's. There is exactly one hostile threshold and one
+/// suspicious threshold on the grid, so the interpreted level is pinned to the
+/// *loosest rung of the target band* — the boundary the model itself uses:
+/// - **Hostile** → the active deploy level (`-l`): the weakest level still inside
+///   the hostile budget. Anything stricter is also hostile, so the band's max
+///   threshold is the honest place for an LLM escalation that ML didn't reach.
+/// - **Suspicious** → `capped_suspicious_level(grid_max)` = `min(grid_max, ceiling)`:
+///   the suspicious ceiling, the weakest suspicious rung.
+/// - **Benign** → `-1`, the clean marker.
+///
+/// Deriving from the model's `active_level` / `grid_max` keeps the interpreted
+/// level in lockstep with the model's real thresholds — the same values
+/// [`crate::model::verdict_for_level`] classifies against — so escalation and
+/// de-escalation land in the right band even if the hostile line or suspicious
+/// ceiling moves. Since `ml.conf` is [`level_confidence`] of the level, the
+/// displayed confidence tracks automatically. `active_level` is `None` in
+/// manual-threshold mode (no grid); hostile/suspicious then return `None`,
+/// matching how a genuine ML verdict serializes its level there.
+fn interpreted_level(active_level: Option<u16>, grid_max: u16, outcome: Classification) -> Option<i32> {
     match outcome {
-        Classification::Hostile => 4,
-        Classification::Suspicious => 99,
-        Classification::Benign => -1,
+        Classification::Benign => Some(-1),
+        Classification::Hostile => active_level.map(i32::from),
+        Classification::Suspicious => active_level
+            .map(|_| i32::from(crate::model::capped_suspicious_level(grid_max))),
     }
 }
 
@@ -2331,10 +2343,9 @@ pub(crate) fn format_llm_line(llm: &crate::interpret::Interpretation, color: boo
         if let Some(err) = &llm.error {
             return format!("llm error  {err}\n");
         }
-        let review = if llm.review { "  ⚠ review" } else { "" };
         let grade = llm.grade.map_or("?", crate::interpret::LlmGrade::as_str);
         return format!(
-            "llm {grade} → {} blended={:.3}{review}  {}\n",
+            "llm {grade} → {} blended={:.3}  {}\n",
             llm.outcome, llm.blended, llm.interpretation,
         );
     }
@@ -2351,14 +2362,9 @@ pub(crate) fn format_llm_line(llm: &crate::interpret::Interpretation, color: boo
         Classification::Benign => (95, 175, 95),
     };
     let outcome = llm.outcome.to_string().truecolor(r, g, b).bold();
-    let review = if llm.review {
-        "  ⚠ review".truecolor(255, 175, 0).to_string()
-    } else {
-        String::new()
-    };
     let grade = llm.grade.map_or("?", crate::interpret::LlmGrade::as_str);
     format!(
-        "llm {} → {outcome} blended={:.3}{review}  {}\n",
+        "llm {} → {outcome} blended={:.3}  {}\n",
         grade.bright_black(),
         llm.blended,
         llm.interpretation.bright_black(),
@@ -3015,7 +3021,6 @@ pub(crate) fn classify_report(
                 grade = grade.as_str(),
                 outcome = %interp.outcome,
                 conf = format!("{:.4}", interp.blended),
-                review = interp.review,
                 interpretation = %interp.interpretation,
                 "fetched LLM interpretation",
             );
@@ -3026,8 +3031,9 @@ pub(crate) fn classify_report(
     // Adopt the blended verdict as the effective one when the LLM out-read ML
     // (escalating a missed threat, or clearing an ML false positive). The `ml`
     // section reflects litmus's final answer; the LLM's raw grade + rationale
-    // stay in the `llm` section. A synthetic "interpreted" level surfaces an
-    // escalation (L4 hostile / L99 suspicious) or clears a benign (L-1).
+    // stay in the `llm` section. The interpreted level is pinned to the target
+    // band's loosest rung (see `interpreted_level`): the active hostile level for
+    // an escalation, the suspicious ceiling for a hold/downgrade, L-1 for benign.
     if let Some(interp) = &interpretation
         && interp.grade.is_some()
         && interp.outcome as u8 != final_decision.class as u8
@@ -3038,13 +3044,12 @@ pub(crate) fn classify_report(
             outcome = ?interp.outcome,
             grade = interp.grade.map_or("?", crate::interpret::LlmGrade::as_str),
             conf = format!("{:.4}", interp.blended),
-            review = interp.review,
             reason = %interp.interpretation,
             "LLM interpretation shifted the verdict",
         );
         final_decision.class = interp.outcome;
         final_decision.probability = interp.blended;
-        final_decision.level = Some(interpreted_level(interp.outcome));
+        final_decision.level = interpreted_level(model.active_level(), model.grid_max(), interp.outcome);
     }
 
     // Render cleave's context view now, while the typed (finalized) report is in

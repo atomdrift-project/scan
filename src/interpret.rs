@@ -137,8 +137,6 @@ pub struct Interpretation {
     pub blended: f32,
     /// One-sentence rationale from the model (empty on error).
     pub interpretation: String,
-    /// Set when ML and the LLM strongly disagree — surface for human review.
-    pub review: bool,
     /// Model name targeted by this pass.
     pub model: String,
     /// Failure reason when the call did not produce a verdict (connection,
@@ -158,7 +156,6 @@ impl Serialize for Interpretation {
         if !self.interpretation.is_empty() {
             m.serialize_entry("interpretation", &self.interpretation)?;
         }
-        m.serialize_entry("review", &self.review)?;
         m.serialize_entry("model", &self.model)?;
         if let Some(e) = &self.error {
             m.serialize_entry("error", e)?;
@@ -176,29 +173,27 @@ fn class_rank(c: Classification) -> u8 {
     }
 }
 
-/// Blended confidence for an LLM-driven escalation, by the grade it lifts to.
-/// These mirror `level_confidence(interpreted_level(outcome))`: an escalation
-/// lands at the weak edge of the target class — suspicious at the L99 ceiling
-/// (≈85%), hostile just inside the L4 hostile line (≈95%) — so the LLM's word
-/// is enough to cross the class boundary without inflating confidence past the
-/// minimum that class requires. Keep in sync with `engine::interpreted_level`.
-const SUSPICIOUS_ESCALATION_CONF: f32 = 0.85;
-const HOSTILE_ESCALATION_CONF: f32 = 0.95;
+/// Blended confidence (`ml.prob`) for an LLM-driven escalation, by the grade it
+/// lifts to — the LLM's conviction, standing in for ML's near-zero score. This is
+/// the probability signal only; the displayed level confidence (`ml.conf`) is
+/// derived separately from the interpreted level (see `engine::interpreted_level`).
+const SUSPICIOUS_ESCALATION_CONF: f32 = 0.80;
+const HOSTILE_ESCALATION_CONF: f32 = 0.85;
 
-/// Blend the ML verdict with the LLM grade into `(outcome, confidence, review)`.
+/// Blend the ML verdict with the LLM grade into `(outcome, confidence)`.
 ///
 /// The LLM read the actual behavior; ML is statistical. So either side can move
 /// the verdict, but *asymmetrically*:
-/// - **LLM more severe** → escalate to the LLM's class and flag for review: it
-///   saw badness ML missed (the mislabeled-bad case). Confidence is the LLM's
-///   conviction, not ML's near-zero score.
+/// - **LLM more severe** → escalate to the LLM's class: it saw badness ML missed
+///   (the mislabeled-bad case). Confidence is the LLM's conviction, not ML's
+///   near-zero score.
 /// - **They agree** → pull confidence toward certainty.
 /// - **LLM less severe** → it read the sample as cleaner, so clear a soft ML
 ///   flag toward the LLM (clearing an ML false positive — the mislabeled-good
 ///   case). The one guard: never let a text model fully talk down a *confident
 ///   ML hostile* — obfuscated malware can read clean — so hold it at suspicious
-///   for review rather than dropping to benign.
-fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade) -> (Classification, f32, bool) {
+///   rather than dropping to benign.
+fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade) -> (Classification, f32) {
     use std::cmp::Ordering;
     let p = ml_prob.clamp(0.0, 1.0);
     match class_rank(llm.classification()).cmp(&class_rank(ml)) {
@@ -208,16 +203,16 @@ fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade) -> (Classification, f3
             } else {
                 SUSPICIOUS_ESCALATION_CONF
             };
-            (llm.classification(), conf, true)
+            (llm.classification(), conf)
         }
-        Ordering::Equal => (ml, p + (1.0 - p) * 0.3, false),
+        Ordering::Equal => (ml, p + (1.0 - p) * 0.3),
         Ordering::Less => {
             if matches!(ml, Classification::Hostile) {
-                // Safety valve: hold a confident ML hostile at suspicious + review.
-                (Classification::Suspicious, p * 0.5, true)
+                // Safety valve: hold a confident ML hostile at suspicious.
+                (Classification::Suspicious, p * 0.5)
             } else {
                 // Clear an ML suspicious false positive toward the LLM's verdict.
-                (llm.classification(), p * 0.3, false)
+                (llm.classification(), p * 0.3)
             }
         }
     }
@@ -328,7 +323,6 @@ fn failure(
         outcome: ml_class,
         blended: ml_prob,
         interpretation: String::new(),
-        review: false,
         model: cfg.model.clone(),
         error: Some(error),
     }
@@ -388,13 +382,12 @@ fn blended(
     grade: LlmGrade,
     reason: String,
 ) -> Interpretation {
-    let (outcome, conf, review) = blend(ml_class, ml_prob, grade);
+    let (outcome, conf) = blend(ml_class, ml_prob, grade);
     Interpretation {
         grade: Some(grade),
         outcome,
         blended: conf,
         interpretation: reason,
-        review,
         model: cfg.model.clone(),
         error: None,
     }
@@ -836,40 +829,35 @@ mod tests {
 
     #[test]
     fn blend_agreement_boosts_confidence() {
-        let (out, conf, review) = blend(Classification::Hostile, 0.8, LlmGrade::Hostile);
+        let (out, conf) = blend(Classification::Hostile, 0.8, LlmGrade::Hostile);
         assert_eq!(out, Classification::Hostile);
         assert!((conf - (0.8 + 0.2 * 0.3)).abs() < 1e-6);
-        assert!(!review);
     }
 
     #[test]
-    fn blend_llm_more_severe_escalates_and_flags_review() {
+    fn blend_llm_more_severe_escalates() {
         // ML benign, LLM suspicious → escalate to suspicious (the mislabeled-bad
-        // rescue), at the LLM's conviction, flagged for review.
-        let (out, conf, review) = blend(Classification::Benign, 0.0, LlmGrade::Suspicious);
+        // rescue), at the LLM's conviction.
+        let (out, conf) = blend(Classification::Benign, 0.0, LlmGrade::Suspicious);
         assert_eq!(out, Classification::Suspicious);
         assert!((conf - SUSPICIOUS_ESCALATION_CONF).abs() < 1e-6);
-        assert!(review);
         // ML suspicious, LLM hostile → escalate to hostile.
-        let (out2, conf2, review2) = blend(Classification::Suspicious, 0.6, LlmGrade::Hostile);
+        let (out2, conf2) = blend(Classification::Suspicious, 0.6, LlmGrade::Hostile);
         assert_eq!(out2, Classification::Hostile);
         assert!((conf2 - HOSTILE_ESCALATION_CONF).abs() < 1e-6);
-        assert!(review2);
     }
 
     #[test]
     fn blend_llm_clears_ml_false_positive_but_holds_hostile() {
-        // ML suspicious (a false positive), LLM benign → cleared to benign, no
-        // review (the mislabeled-good case).
-        let (out, _, review) = blend(Classification::Suspicious, 0.7, LlmGrade::Benign);
+        // ML suspicious (a false positive), LLM benign → cleared to benign (the
+        // mislabeled-good case).
+        let (out, _) = blend(Classification::Suspicious, 0.7, LlmGrade::Benign);
         assert_eq!(out, Classification::Benign);
-        assert!(!review);
         // Safety valve: a confident ML hostile the LLM calls benign is held at
-        // suspicious for review, never dropped to benign.
-        let (out2, conf2, review2) = blend(Classification::Hostile, 0.9, LlmGrade::Benign);
+        // suspicious, never dropped to benign.
+        let (out2, conf2) = blend(Classification::Hostile, 0.9, LlmGrade::Benign);
         assert_eq!(out2, Classification::Suspicious);
         assert!((conf2 - 0.45).abs() < 1e-6);
-        assert!(review2);
     }
 
     #[test]
@@ -882,7 +870,7 @@ mod tests {
         let grades = [LlmGrade::Benign, LlmGrade::Suspicious, LlmGrade::Hostile];
         for ml in classes {
             for g in grades {
-                let (_, conf, _) = blend(ml, 0.5, g);
+                let (_, conf) = blend(ml, 0.5, g);
                 assert!((0.0..=1.0).contains(&conf));
             }
         }

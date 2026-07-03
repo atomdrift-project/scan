@@ -3758,6 +3758,14 @@ impl Model {
         self.grid_max
     }
 
+    /// Active deploy level (`-l`, FP per 100M benigns): the single hostile
+    /// threshold — a file is hostile iff its firing level is `<=` this. `None`
+    /// in manual-threshold mode and on single-bundle deployments with no grid.
+    #[must_use]
+    pub(crate) const fn active_level(&self) -> Option<u16> {
+        self.active_level
+    }
+
     /// Classification thresholds carried by this loaded model.
     #[must_use]
     pub const fn thresholds(&self) -> Thresholds {
