@@ -448,13 +448,15 @@ pub(crate) fn orchestrate(
                             "registry record materialized; artifact fetch skipped"
                         );
                         if progress {
-                            if !header_printed {
-                                eprintln!(
-                                    "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
-                                );
-                                header_printed = true;
-                            }
-                            report_skip(r, reg, now, *reason);
+                            crate::engine::print_above_bar(|| {
+                                if !header_printed {
+                                    eprintln!(
+                                        "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
+                                    );
+                                    header_printed = true;
+                                }
+                                report_skip(r, reg, now, *reason);
+                            });
                         }
                     }
                 }
@@ -495,15 +497,17 @@ pub(crate) fn orchestrate(
             // (cached or live) fetch returns, so the operator sees the full
             // edge list immediately rather than drip-fed behind each analysis.
             if progress {
-                for rec in &fetched {
-                    if !header_printed {
-                        eprintln!(
-                            "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
-                        );
-                        header_printed = true;
+                crate::engine::print_above_bar(|| {
+                    for rec in &fetched {
+                        if !header_printed {
+                            eprintln!(
+                                "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
+                            );
+                            header_printed = true;
+                        }
+                        report_fetch(rec);
                     }
-                    report_fetch(rec);
-                }
+                });
             }
 
             // Analyze the payloads concurrently (bounded), then merge each into
