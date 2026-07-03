@@ -133,7 +133,7 @@
 //! Collimator no longer emits a `suspicious` field in any of the JSONs it
 //! writes (`config.json`, `evaluation.json`, `route_policies.json`). Litmus
 //! derives it consumer-side as a **level-table lookup**: the suspicious
-//! threshold is the hostile threshold at level `min(max_grid_level, 20000)`
+//! threshold is the hostile threshold at level `min(max_grid_level, 100)`
 //! (the looser-budget row in the same `severity_levels[]` / `levels[]` table).
 //! Manual `--threshold-hostile <val>` (no `-l`) skips the derivation: the
 //! `Thresholds` struct carries `suspicious == hostile`, so `classify` only
@@ -199,17 +199,26 @@ const fn default_model_abi_version() -> u32 {
 }
 
 /// Current suspicious ceiling (FP per 100M benigns) for level-sweep decisions.
-const SUSPICIOUS_LEVEL_CEILING: u16 = 20_000;
+///
+/// Set to L100 — the empirical precision elbow. A hopper analysis of the
+/// current model (2.2.0-rc.1, top-level analyzed samples) found firing levels
+/// collapse onto three points: L0 (hostile core, 99.6% precision), L100
+/// (6168 bad vs 591 good — 91% precision), and L250 (457 bad vs 1020 good —
+/// 31% precision). L250 and looser add more false positives than true
+/// positives, and admitting them costs ≥2.5× the FP budget for ~4% more bad
+/// recall. Capping here drops the loose tail (L250+) to benign, cutting good
+/// false positives ~63% and unknown "new" noise ~34% for a 4.4% bad-recall
+/// loss — nearly all of it the FP-swamped L250 bucket.
+///
+/// The earlier 20000 backstop (itself a widening from an even narrower L×4
+/// policy) kept very loose firings as informational suspicious verdicts; the
+/// recall plateau above L100 is flat, so that tail was almost pure noise.
+const SUSPICIOUS_LEVEL_CEILING: u16 = 100;
 
-/// The suspicious LEVEL for a grid: `min(max_grid_level, 20000)`.
+/// The suspicious LEVEL for a grid: `min(max_grid_level, 100)`.
 ///
 /// Any file that fires at a level looser than the operator's selected hostile
 /// level — but not above the suspicious ceiling — is classified as suspicious.
-///
-/// The previous L×4 policy proved too narrow once we saw real recall curves:
-/// the recall plateau above the critical level is flat for almost every file
-/// type. Keep a high but finite ceiling so very loose levels can remain
-/// informational without becoming suspicious verdicts.
 #[must_use]
 pub(crate) fn capped_suspicious_level(max_grid_level: u16) -> u16 {
     max_grid_level.min(SUSPICIOUS_LEVEL_CEILING)
@@ -274,7 +283,7 @@ fn max_level(levels: &[SeverityLevel]) -> Option<u16> {
 /// Suspicious resolution order:
 /// 1. Explicit per-level `suspicious.threshold` (when collimator emits one).
 /// 2. Level-space lookup: the hostile threshold at level
-///    `min(max_level, 20000)`.
+///    `min(max_level, 100)`.
 /// 3. Hostile-only fallback (suspicious == hostile) when the suspicious row is
 ///    absent — typical when the bundle's grid is truncated.
 #[allow(clippy::cast_possible_truncation)]
@@ -1602,7 +1611,7 @@ struct EnsembleConfig {
     /// space, matching the general route's emitted probability.
     general_grid: Vec<(u16, f32)>,
     /// Largest level present in the `levels[]` grid. The suspicious cap is
-    /// `min(grid_max, 20000)`.
+    /// `min(grid_max, 100)`.
     grid_max: u16,
 }
 
@@ -2045,7 +2054,7 @@ fn load_route_policies(model_dir: &Path, level: u16) -> RoutePolicies {
         // The active-level policy drives the diagnostic per-route classification
         // in the `models[]` array. Its suspicious band is derived in level-space
         // via the suspicious-ceiling lookup: pull the hostile policy from level
-        // `min(max, 20000)`. An explicit `suspicious` block, when collimator
+        // `min(max, 100)`. An explicit `suspicious` block, when collimator
         // emits one, wins; the active level's hostile is the final fallback.
         let Some(level_entry) = route.levels.iter().find(|entry| entry.level == level) else {
             continue;
@@ -2151,7 +2160,7 @@ fn blend_policy_from_json(json: &BlendPolicyJson) -> Option<BlendPolicy> {
 /// hostile and suspicious thresholds for each route. When the JSON omits a
 /// `suspicious` block, suspicious is derived in level-space by
 /// reading the hostile threshold for the same route at level
-/// `min(max_grid_level, 20000)`.
+/// `min(max_grid_level, 100)`.
 #[allow(clippy::cast_possible_truncation)]
 fn thresholds_at_level(levels: &[LevelEntryJson], level: u16) -> HashMap<String, Thresholds> {
     let Some(entry) = levels.iter().find(|e| e.level == level) else {
@@ -2929,7 +2938,7 @@ fn sweep_policy_grid(grid: &[LevelPolicy], scores: &[RouteProbability]) -> Optio
 /// budget (`fired_level <= level`) and **suspicious** when it fires above that
 /// budget but within the derived suspicious ceiling. Beyond that ceiling is
 /// benign.
-fn verdict_for_level(fired_level: u16, level: u16, grid_max: u16) -> Classification {
+pub(crate) fn verdict_for_level(fired_level: u16, level: u16, grid_max: u16) -> Classification {
     if fired_level <= level {
         Classification::Hostile
     } else if fired_level <= capped_suspicious_level(grid_max) {
@@ -3077,7 +3086,7 @@ pub struct Model {
     /// General route's hostile threshold per level (ascending), for the
     /// no-policy verdict sweep. Empty on single-bundle / pre-grid deployments.
     general_grid: Vec<(u16, f32)>,
-    /// Largest grid level; suspicious cap = `min(grid_max, 20000)`.
+    /// Largest grid level; suspicious cap = `min(grid_max, 100)`.
     grid_max: u16,
 }
 
@@ -3702,7 +3711,7 @@ impl Model {
     /// identical regardless of the deploy `-l`, keeping the result
     /// cache-shareable. The active deploy level only positions the cutoffs:
     /// hostile when the swept level is <= the deploy level, suspicious when it
-    /// is <= min(grid_max, 20000), else benign. A file that fires at no grid
+    /// is <= min(grid_max, 100), else benign. A file that fires at no grid
     /// level is clean and reports `-1`.
     fn decide_swept(
         &self,
@@ -3912,11 +3921,11 @@ mod tests {
 
     #[test]
     fn load_severity_thresholds_derives_suspicious_in_level_space() -> Result<()> {
-        // With no explicit `suspicious` block per level, the suspicious
-        // cutoff comes from the level-table's HOSTILE threshold at the loosest
-        // (noisiest) grid level: anything that fires up there is "still firing
-        // above the operator's critical line" and should ring as suspicious.
-        // For this table that's the ceiling row's hostile (0.70).
+        // With no explicit `suspicious` block per level, the suspicious cutoff
+        // comes from the level-table's HOSTILE threshold at the capped
+        // suspicious level `min(grid_max, 100)` — the L100 precision elbow.
+        // Anything firing looser than L100 lands below this threshold and reads
+        // benign. For this table the cap resolves to the L100 row (0.90).
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),
@@ -3924,7 +3933,7 @@ mod tests {
               "hostile": 0.90,
               "severity_levels": [
                 {"level": 50,   "hostile": {"threshold": 0.99}},
-                {"level": 200,  "hostile": {"threshold": 0.90}},
+                {"level": 100,  "hostile": {"threshold": 0.90}},
                 {"level": 1000, "hostile": {"threshold": 0.70}}
               ]
             }"#,
@@ -3933,17 +3942,18 @@ mod tests {
         let l50 = load_severity_thresholds(dir.path(), 50)?.context("level 50")?;
         assert_eq!(l50.hostile, 0.99);
         assert_eq!(
-            l50.suspicious, 0.70,
-            "L50 suspicious should be the ceiling-row hostile threshold"
+            l50.suspicious, 0.90,
+            "L50 suspicious should be the L100 ceiling-row hostile threshold"
         );
 
         let l300 = load_severity_thresholds(dir.path(), 300);
         // L300 is absent from this table so the loader returns None — but the
         // ceiling rule is exercised via `capped_suspicious_level` directly below.
         assert!(matches!(l300, Ok(None)));
-        assert_eq!(capped_suspicious_level(1000), 1000); // below ceiling: passes through
-        assert_eq!(capped_suspicious_level(20_000), 20_000); // at the ceiling
-        assert_eq!(capped_suspicious_level(25_000), 20_000); // above ceiling: capped
+        assert_eq!(capped_suspicious_level(50), 50); // below ceiling: passes through
+        assert_eq!(capped_suspicious_level(100), 100); // at the ceiling
+        assert_eq!(capped_suspicious_level(1000), 100); // above ceiling: capped
+        assert_eq!(capped_suspicious_level(25_000), 100); // far above: still capped
         Ok(())
     }
 
@@ -4337,20 +4347,23 @@ mod tests {
         let grid_max = 25_000;
         assert_eq!(verdict_for_level(20, 50, grid_max), Classification::Hostile);
         assert_eq!(verdict_for_level(50, 50, grid_max), Classification::Hostile);
+        // The suspicious band now ends at the L100 ceiling (the precision elbow).
         assert_eq!(
             verdict_for_level(100, 50, grid_max),
             Classification::Suspicious
         );
         assert_eq!(
-            verdict_for_level(200, 50, grid_max),
-            Classification::Suspicious
+            verdict_for_level(101, 50, grid_max),
+            Classification::Benign,
+            "just past the L100 ceiling is benign"
+        );
+        assert_eq!(
+            verdict_for_level(250, 50, grid_max),
+            Classification::Benign,
+            "L250 is the FP-swamped bucket dropped by the L100 cap"
         );
         assert_eq!(
             verdict_for_level(20_000, 50, grid_max),
-            Classification::Suspicious
-        );
-        assert_eq!(
-            verdict_for_level(20_001, 50, grid_max),
             Classification::Benign
         );
         assert_eq!(
@@ -4364,7 +4377,7 @@ mod tests {
             Classification::Suspicious
         );
         assert_eq!(
-            verdict_for_level(50, 10, grid_max),
+            verdict_for_level(100, 10, grid_max),
             Classification::Suspicious
         );
     }

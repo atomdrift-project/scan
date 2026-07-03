@@ -177,9 +177,13 @@ fn class_rank(c: Classification) -> u8 {
 }
 
 /// Blended confidence for an LLM-driven escalation, by the grade it lifts to.
-/// These map to the synthetic L250 (≈80%) / L100 (≈85%) the headline adopts.
-const SUSPICIOUS_ESCALATION_CONF: f32 = 0.80;
-const HOSTILE_ESCALATION_CONF: f32 = 0.85;
+/// These mirror `level_confidence(interpreted_level(outcome))`: an escalation
+/// lands at the weak edge of the target class — suspicious at the L99 ceiling
+/// (≈85%), hostile just inside the L4 hostile line (≈95%) — so the LLM's word
+/// is enough to cross the class boundary without inflating confidence past the
+/// minimum that class requires. Keep in sync with `engine::interpreted_level`.
+const SUSPICIOUS_ESCALATION_CONF: f32 = 0.85;
+const HOSTILE_ESCALATION_CONF: f32 = 0.95;
 
 /// Blend the ML verdict with the LLM grade into `(outcome, confidence, review)`.
 ///

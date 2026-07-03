@@ -641,6 +641,50 @@ mod envelope_tests {
     }
 
     #[test]
+    fn interpreted_escalation_levels_stay_within_their_class_band() {
+        use crate::model::{capped_suspicious_level, verdict_for_level};
+
+        let hostile_lvl = interpreted_level(Classification::Hostile);
+        let susp_lvl = interpreted_level(Classification::Suspicious);
+
+        // Both are real (non-benign) levels, and a hostile escalation sits
+        // strictly tighter than a suspicious one.
+        assert!(hostile_lvl >= 0 && susp_lvl >= 0);
+        assert!(
+            hostile_lvl < susp_lvl,
+            "a hostile escalation (L{hostile_lvl}) must be tighter than a suspicious one (L{susp_lvl})"
+        );
+
+        // A benign->suspicious escalation must never exceed the suspicious
+        // ceiling, or a consumer that reclassifies from `lvl` (e.g. hopper)
+        // would drop the escalated verdict to benign.
+        let ceiling = capped_suspicious_level(u16::MAX); // == SUSPICIOUS_LEVEL_CEILING
+        assert!(
+            (susp_lvl as u16) <= ceiling,
+            "suspicious escalation L{susp_lvl} must sit within the L{ceiling} ceiling"
+        );
+
+        // Across every deploy level we operate at — hopper's L4 critical line,
+        // the L5 hostile/suspicious boundary, collimator's L50 default — the
+        // synthetic level must reclassify into the class the LLM lifted it to:
+        // suspicious->hostile escalations stay inside the hostile spectrum, and
+        // benign->suspicious escalations stay inside the suspicious band.
+        let grid_max = 25_000;
+        for deploy in [4_u16, 5, 50] {
+            assert_eq!(
+                verdict_for_level(hostile_lvl as u16, deploy, grid_max),
+                Classification::Hostile,
+                "hostile escalation must read hostile at deploy L{deploy}"
+            );
+            assert_eq!(
+                verdict_for_level(susp_lvl as u16, deploy, grid_max),
+                Classification::Suspicious,
+                "suspicious escalation must read suspicious at deploy L{deploy}"
+            );
+        }
+    }
+
+    #[test]
     fn envelope_serializes_lvl_and_drops_legacy_fields() {
         // `ml.lvl` is the model's level-independent marker, serialized verbatim
         // (`-1` for a file that never fires). The dropped v5 fields must not
@@ -865,13 +909,19 @@ pub const fn level_confidence(level: Option<i32>) -> Option<u8> {
 }
 
 /// Synthetic false-positive level for an LLM-driven verdict, used when the blend
-/// shifts the class away from ML's. Hostile gets the stronger (stricter) level,
-/// suspicious a loose review level, benign the clean marker — mapping through
-/// [`level_confidence`] to ≈85% / ≈80% / 0%.
+/// shifts the class away from ML's. An escalation lands at the *weak edge* of the
+/// target class so it fits squarely inside it (one step tighter than the boundary
+/// for margin): hostile just inside the L5 hostile line (L4), suspicious just
+/// inside the L100 suspicious ceiling (L99), benign the clean marker. This keeps
+/// the synthetic level in-band for consumers that reclassify from `lvl` (e.g.
+/// hopper): L4 reads hostile, L99 reads suspicious under the L100 ceiling — where
+/// the old L100/L250 would have mis-read as suspicious / benign respectively.
+/// Maps through [`level_confidence`] to ≈95% / ≈85% / 0%; keep the two
+/// `*_ESCALATION_CONF` constants in `interpret.rs` in sync.
 const fn interpreted_level(outcome: Classification) -> i32 {
     match outcome {
-        Classification::Hostile => 100,
-        Classification::Suspicious => 250,
+        Classification::Hostile => 4,
+        Classification::Suspicious => 99,
         Classification::Benign => -1,
     }
 }
@@ -2686,39 +2736,92 @@ pub(crate) fn classify_report(
         .collect();
     let mut dep_decisions: Vec<Option<Decision>> = vec![None; fetched_deps.len()];
 
-    for ef in &embedded_entries {
-        if let Some(c) = cancellation
-            && c.load(Ordering::Relaxed)
-        {
-            anyhow::bail!("analysis cancelled during embedded file processing");
-        }
+    // Feature-extract and model-score members in parallel: reports with
+    // thousands of embedded files (nested npm tarballs, fetched dependency
+    // trees) previously ran this loop serially on one rayon worker — on
+    // member-heavy archives that single-threaded model pass, not cleave's
+    // analysis, was the scan's wall-clock tail. Per-member work is pure
+    // (&Model is already shared across rayon workers by the outer scan);
+    // the fold below stays single-threaded and in entry order, so tie-break
+    // semantics (`decision_outranks` keeps the earliest on ties) and output
+    // ordering are byte-identical to the serial loop.
+    struct EmbeddedScored<'j> {
+        ef: &'j serde_json::Value,
+        decision: Decision,
+        model_scores: Vec<RouteScore>,
+        skipped_models: Vec<SkippedRoute>,
+    }
+    let scored: Vec<EmbeddedScored<'_>> = {
+        use rayon::prelude::*;
+        embedded_entries
+            .par_iter()
+            .map(|&ef| {
+                // Cancellation: skip the expensive work; the post-pass bail
+                // below surfaces the cancellation before results are used.
+                if let Some(c) = cancellation
+                    && c.load(Ordering::Relaxed)
+                {
+                    return EmbeddedScored {
+                        ef,
+                        decision: Decision {
+                            class: Classification::Benign,
+                            probability: 0.0,
+                            threshold: model.thresholds().suspicious,
+                            level: None,
+                        },
+                        model_scores: Vec::new(),
+                        skipped_models: Vec::new(),
+                    };
+                }
+                let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
+                let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
+                model.spec().standardize(&mut ef_features);
+                let ef_type = ef["type"].as_str().unwrap_or("unknown");
+                let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
+                    .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
+                    .unwrap_or((
+                        Decision {
+                            class: Classification::Benign,
+                            probability: 0.0,
+                            threshold: model.thresholds().suspicious,
+                            level: None,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                // Trait floor on the member's own findings — a sparse, severe
+                // dropper (the npm install-hook beacon lives in the embedded
+                // package.json) scores above the crit-4 fraction gate even when
+                // the container's findings dilute it; the floored member then
+                // elevates the container below.
+                apply_trait_floor(
+                    &mut ef_decision,
+                    ef,
+                    model.grid_max(),
+                    ef["path"].as_str().unwrap_or(label),
+                );
+                EmbeddedScored {
+                    ef,
+                    decision: ef_decision,
+                    model_scores: ef_model_scores,
+                    skipped_models: ef_skipped_models,
+                }
+            })
+            .collect()
+    };
+    if let Some(c) = cancellation
+        && c.load(Ordering::Relaxed)
+    {
+        anyhow::bail!("analysis cancelled during embedded file processing");
+    }
 
-        let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
-        let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
-        model.spec().standardize(&mut ef_features);
-        let ef_type = ef["type"].as_str().unwrap_or("unknown");
-        let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
-            .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
-            .unwrap_or((
-                Decision {
-                    class: Classification::Benign,
-                    probability: 0.0,
-                    threshold: model.thresholds().suspicious,
-                    level: None,
-                },
-                Vec::new(),
-                Vec::new(),
-            ));
-        // Trait floor on the member's own findings — a sparse, severe dropper
-        // (the npm install-hook beacon lives in the embedded package.json) scores
-        // above the crit-4 fraction gate even when the container's findings dilute
-        // it; the floored member then elevates the container below.
-        apply_trait_floor(
-            &mut ef_decision,
+    for item in scored {
+        let EmbeddedScored {
             ef,
-            model.grid_max(),
-            ef["path"].as_str().unwrap_or(label),
-        );
+            decision: ef_decision,
+            model_scores: ef_model_scores,
+            skipped_models: ef_skipped_models,
+        } = item;
 
         // Roll this node's decision into the aggregate verdict of the fetched
         // dependency it belongs to (the container or one of its members).
@@ -2869,7 +2972,7 @@ pub(crate) fn classify_report(
     // (escalating a missed threat, or clearing an ML false positive). The `ml`
     // section reflects litmus's final answer; the LLM's raw grade + rationale
     // stay in the `llm` section. A synthetic "interpreted" level surfaces an
-    // escalation (L100 hostile / L250 suspicious) or clears a benign (L-1).
+    // escalation (L4 hostile / L99 suspicious) or clears a benign (L-1).
     if let Some(interp) = &interpretation
         && interp.grade.is_some()
         && interp.outcome as u8 != final_decision.class as u8

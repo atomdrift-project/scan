@@ -598,13 +598,18 @@ fn main() -> Result<()> {
     if !is_serve {
         scan::fetch::set_total_budget(cli.fetch_max_total_fetches, cli.fetch_max_total_size);
     }
-    let filter = if cli.verbose {
-        tracing_subscriber::EnvFilter::new("scan=debug,cleave=debug")
-    } else if is_serve {
-        tracing_subscriber::EnvFilter::new("scan=info,cleave=warn")
-    } else {
-        tracing_subscriber::EnvFilter::new("scan=warn,cleave=error")
-    };
+    // RUST_LOG (when set) wins over the mode-derived defaults, so profiling
+    // runs can surface targeted modules (e.g. `cleave::mem_profile=info`)
+    // without paying for full `--verbose` debug output.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if cli.verbose {
+            tracing_subscriber::EnvFilter::new("scan=debug,cleave=debug")
+        } else if is_serve {
+            tracing_subscriber::EnvFilter::new("scan=info,cleave=warn")
+        } else {
+            tracing_subscriber::EnvFilter::new("scan=warn,cleave=error")
+        }
+    });
     let fmt = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_thread_names(true)

@@ -1342,8 +1342,18 @@ fn analyze_payloads(
         return Vec::new();
     }
     if rayon::current_thread_index().is_some() {
+        // On the shared rayon pool, fan the payloads out as rayon tasks
+        // instead of running them in-place serially. The serial fallback made
+        // dependency-heavy archives the scan's wall-clock tail: one worker
+        // ground through dozens of fetched tarball analyses while the rest of
+        // the pool sat idle (the pool-starvation concern that motivated the
+        // serial path applies to *joining OS threads* from a worker, not to
+        // nested rayon tasks — a worker blocked in this collect steals and
+        // runs other tasks, including these). Indexed collect preserves input
+        // order exactly like the serial map.
+        use rayon::prelude::*;
         return fetched
-            .iter()
+            .par_iter()
             .map(|rec| analyze_payload(rec, cache, opts))
             .collect();
     }
