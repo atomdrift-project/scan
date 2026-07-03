@@ -13,6 +13,14 @@ use serde::Deserialize;
 /// The sidecar schema version hopper validates against ([`hopper.SidecarSchemaVersion`]).
 const SCHEMA_VERSION: &str = "1.0";
 
+/// Cap on `registry.raw`, matching hopper's `MaxRawBytes` (256 KiB). An upstream
+/// document can be huge — a full npm packument carries every published version —
+/// and embedding it verbatim would push the provenance part past hopper's 1 MiB
+/// transport cap, where it is truncated into unparseable JSON and rejected. When
+/// `raw` overflows the cap we drop it and downgrade the record to "partial", the
+/// same trim hopper's `Sidecar.Finalize` performs on receipt.
+const MAX_RAW_BYTES: usize = 256 << 10;
+
 /// Build a hopper provenance sidecar JSON for an artifact about to be uploaded
 /// to `/api/upload`. Mirrors hopper's `Sidecar` Go struct field-for-field so the
 /// upload validator accepts it: `schema_version`, `artifact`, `fetch`, and —
@@ -59,16 +67,23 @@ pub fn build_sidecar(
         sidecar["package"] = package;
     }
     if let Some(reg) = registry {
+        // Drop an over-cap raw archive rather than ship an oversized part that
+        // hopper cannot parse; see [`MAX_RAW_BYTES`]. The normalized `record`
+        // is small and bounded, so the record scan reasons over is unaffected.
+        let raw = raw_sources(sources);
+        let over_cap = serde_json::to_vec(&raw).map_or(0, |b| b.len()) > MAX_RAW_BYTES;
         sidecar["registry"] = serde_json::json!({
             "source_id": reg.ecosystem,
             "ecosystem": reg.ecosystem,
             "format": "fletch.registry",
             "url": url,
             "at": now_rfc3339,
-            "status": "complete",
+            "status": if over_cap { "partial" } else { "complete" },
             "record": reg,
-            "raw": raw_sources(sources),
         });
+        if !over_cap {
+            sidecar["registry"]["raw"] = raw;
+        }
     }
     serde_json::to_vec(&sidecar).unwrap_or_default()
 }
@@ -252,6 +267,46 @@ mod tests {
         assert!(raw[0].get("body_b64").is_none());
         assert!(raw[1]["body_b64"].is_string());
         assert!(raw[1].get("body").is_none());
+    }
+
+    #[test]
+    fn build_sidecar_drops_over_cap_raw_and_downgrades_status() {
+        // A packument larger than MAX_RAW_BYTES must not ride along verbatim: it
+        // would push the provenance part past hopper's transport cap and be
+        // rejected. Drop raw, mark the record partial, keep the normalized record.
+        let reg = fletch::Registry {
+            ecosystem: "npm".into(),
+            name: "socket".into(),
+            version: "1.1.137".into(),
+            ..Default::default()
+        };
+        let huge = format!(r#"{{"name":"socket","blob":"{}"}}"#, "x".repeat(super::MAX_RAW_BYTES));
+        let sources = vec![fletch::fetch::RecordedSource {
+            url: "https://registry.npmjs.org/socket".to_string(),
+            status: 200,
+            content_type: Some("application/json".to_string()),
+            bytes: huge.into_bytes(),
+        }];
+        let json = super::build_sidecar(
+            "socket-1.1.137.tgz",
+            &"a".repeat(64),
+            5083868,
+            "scan+galadriel",
+            "2026-07-03T16:34:16Z",
+            "https://registry.npmjs.org/socket/-/socket-1.1.137.tgz",
+            "pkg:npm/socket@1.1.137",
+            Some(&reg),
+            &sources,
+        );
+
+        assert!(json.len() < super::MAX_RAW_BYTES, "oversized raw was not dropped");
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["registry"]["status"], "partial");
+        assert!(v["registry"].get("raw").is_none());
+        // The normalized record scan reasons over still round-trips.
+        let rec = registry_record(&json).expect("registry record present");
+        assert_eq!(rec.name, "socket");
+        assert_eq!(rec.version, "1.1.137");
     }
 
     #[test]
