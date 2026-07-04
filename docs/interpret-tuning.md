@@ -76,15 +76,34 @@ Labels: `hacks/interpret-tune/labels/hopper-triage.tsv` (batch 1, source-heavy) 
   reads as suspicious; dual-use hacktools (neutron, hcxdumptool) read as
   benign/suspicious; a decoy "FP-bait" binary reads as suspicious/hostile.
 
-## Two things the template does NOT change (set them per run)
+## The adjustment algorithm (gate + blend)
 
-1. **The gate.** `--interpret` only runs when ML `prob ≥ --interpret-min-prob`
-   (default 0.10). ML false-negatives sit *below* that (e.g. an unverified
-   download-exec at 0.01), so **triage/validation runs must pass
-   `--interpret-min-prob 0`** or the LLM never sees them.
-2. **vLLM nondeterminism.** Even at `temperature 0`, batched inference is not
-   bit-reproducible; a borderline file (neutron) can flip grade run-to-run. The
-   prompt-hash verdict cache pins the first verdict in production.
+Beyond the render template, three tuning points govern whether `--interpret`
+delivers the right verdict:
+
+1. **The gate — floor lowered to 0.01.** `--interpret` runs when ML
+   `prob ≥ --interpret-min-prob` OR cleave surfaced a suspicious/hostile finding
+   (the *elevated-finding bypass*). The LLM's whole value is rescuing samples ML
+   *under*-scored — measured false-negatives sit far below the old 0.10 floor (a
+   crypto clipper at 0.024, a git-push exfil at 0.039, an unverified download-exec
+   at 0.012) — so the default floor is **0.01** (`DEFAULT_MIN_PROB`). Note ML
+   probabilities on real malware bunch near 0 *and* near 1 with little in between,
+   so a low floor mostly adds LLM calls on genuinely-clean files (which the LLM
+   correctly clears), not accuracy risk.
+2. **Content-gated safety valve.** When ML says hostile and the LLM says benign,
+   the blend clears to benign **only if the render is readable source** (the LLM
+   read the actual code — clears ML false positives like a signed tool ML
+   mislabeled). If the render is opaque/packed bytes, it holds at suspicious +
+   review, since a text model can be fooled by obfuscation. See
+   `interpret::blend` / `render_mostly_readable`.
+3. **Synthetic level.** `engine::interpreted_level` lands an LLM escalation at L4
+   (hostile) / L99 (suspicious) — inside the current L25 / L3000 bands at the
+   default `-l 25`, and low enough that an LLM "hostile" stays hostile at stricter
+   deploy levels.
+
+**vLLM nondeterminism.** Even at `temperature 0`, batched inference is not
+bit-reproducible; a borderline file can flip grade run-to-run. The prompt-hash
+verdict cache pins the first verdict in production; score 3× when validating.
 
 ## Validating / tuning on a new batch
 

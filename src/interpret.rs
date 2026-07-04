@@ -25,10 +25,14 @@ use crate::model::Classification;
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
 /// Default model name (the dense Qwen the pipeline targets).
 pub const DEFAULT_MODEL: &str = "Qwen/Qwen3.6-27B";
-/// Default minimum ML probability for a sample to be sent to the LLM. Set just
-/// below the noise floor so anything with a real chance of not being benign is
-/// interpreted, while clearly-clean files skip the LLM call.
-pub const DEFAULT_MIN_PROB: f32 = 0.10;
+/// Default minimum ML probability for a sample to be sent to the LLM. Kept very
+/// low: the LLM's whole value is rescuing samples ML *under*-scored (measured ML
+/// false-negatives — a crypto clipper at 0.024, a git-push exfil at 0.039 — sit
+/// well below a 0.10 floor), so a low floor is what makes `--interpret` effective;
+/// only genuinely-clean files (prob below this) skip the call. Files ML scored low
+/// but cleave flagged suspicious/hostile are interpreted regardless (see the
+/// elevated-finding bypass in [`interpret`]).
+pub const DEFAULT_MIN_PROB: f32 = 0.01;
 /// Default per-request timeout, in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Default cap on concurrent in-flight LLM requests.
@@ -290,10 +294,22 @@ const HOSTILE_ESCALATION_CONF: f32 = 0.85;
 /// - **They agree** → pull confidence toward certainty.
 /// - **LLM less severe** → it read the sample as cleaner, so clear a soft ML
 ///   flag toward the LLM (clearing an ML false positive — the mislabeled-good
-///   case). The one guard: never let a text model fully talk down a *confident
-///   ML hostile* — obfuscated malware can read clean — so hold it at suspicious
-///   rather than dropping to benign.
-fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade) -> (Classification, f32) {
+///   case). The one guard is *content-gated*: a text model can be fooled into
+///   reading obfuscated malware as clean, so a confident ML hostile whose render
+///   is **opaque** (packed/binary — where a clean LLM read is untrustworthy) is
+///   held at suspicious rather than dropped to benign. But when the render is
+///   **readable source**, the LLM read the actual code, so its clear is trusted
+///   all the way to benign (clearing ML false positives like a legitimate signed
+///   tool ML mislabeled hostile).
+///
+/// `content_readable` is true when the render is mostly readable source rather
+/// than escaped bytes — see [`render_mostly_readable`].
+fn blend(
+    ml: Classification,
+    ml_prob: f32,
+    llm: LlmGrade,
+    content_readable: bool,
+) -> (Classification, f32) {
     use std::cmp::Ordering;
     let p = ml_prob.clamp(0.0, 1.0);
     match class_rank(llm.classification()).cmp(&class_rank(ml)) {
@@ -307,11 +323,13 @@ fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade) -> (Classification, f3
         }
         Ordering::Equal => (ml, p + (1.0 - p) * 0.3),
         Ordering::Less => {
-            if matches!(ml, Classification::Hostile) {
-                // Safety valve: hold a confident ML hostile at suspicious.
+            if matches!(ml, Classification::Hostile) && !content_readable {
+                // Safety valve: an ML-confident hostile with opaque content can't
+                // be cleared by a text model — hold at suspicious.
                 (Classification::Suspicious, p * 0.5)
             } else {
-                // Clear an ML suspicious false positive toward the LLM's verdict.
+                // Clear an ML false positive toward the LLM's verdict — trusted
+                // when the LLM read readable source, or when ML was only suspicious.
                 (llm.classification(), p * 0.3)
             }
         }
@@ -327,9 +345,21 @@ pub fn interpret(
     ml_class: Classification,
     ml_prob: f32,
 ) -> Option<Interpretation> {
-    if ml_prob < cfg.min_prob || context.trim().is_empty() {
+    if context.trim().is_empty() {
         return None;
     }
+    // Gate: interpret when ML is above the floor, OR when cleave surfaced an
+    // elevated (suspicious/hostile) finding that ML scored below it — that
+    // disagreement is exactly where a second opinion pays off, and it is how an
+    // ML-blind packed binary (prob ≈ 0 yet flagged by cleave) still reaches the
+    // LLM. Truly-clean files (no elevated finding, low ML prob) still skip.
+    if ml_prob < cfg.min_prob && !has_elevated_finding(context) {
+        return None;
+    }
+    // Whether the render is mostly readable source (vs. escaped bytes): gates the
+    // blend's safety valve so an ML false positive on readable source can be
+    // cleared to benign, while an opaque/packed one is only held at suspicious.
+    let content_readable = render_mostly_readable(context);
 
     // The LLM grade depends only on the prompt (model + system + analysis; the ML
     // verdict is deliberately excluded for an independent opinion), so it caches
@@ -370,7 +400,14 @@ pub fn interpret(
             v.grade,
             v.reason,
         );
-        return Some(blended(cfg, ml_class, ml_prob, grade, v.reason));
+        return Some(blended(
+            cfg,
+            ml_class,
+            ml_prob,
+            grade,
+            v.reason,
+            content_readable,
+        ));
     }
 
     // Health gate: only send work to a healthy endpoint. If it's currently down,
@@ -399,7 +436,14 @@ pub fn interpret(
                     },
                 );
             }
-            Some(blended(cfg, ml_class, ml_prob, grade, reason))
+            Some(blended(
+                cfg,
+                ml_class,
+                ml_prob,
+                grade,
+                reason,
+                content_readable,
+            ))
         }
         Err(e) => {
             // A transport failure marks the endpoint unhealthy so the next file
@@ -548,6 +592,34 @@ fn is_binary_render(line: &str) -> bool {
     printable * 100 < s.chars().count() * 75
 }
 
+/// Whether the render carries a suspicious- or hostile-severity finding (an `H`
+/// or `S` marker cleave injected). The interpret gate uses this to send an
+/// ML-blind sample — low ML probability but cleave-flagged — to the LLM anyway.
+fn has_elevated_finding(rendered: &str) -> bool {
+    rendered
+        .lines()
+        .filter_map(parse_annotation)
+        .any(|a| matches!(a.sev, 'H' | 'S'))
+}
+
+/// Whether the render is mostly readable source rather than escaped binary bytes
+/// — fewer than half of its context lines (non-annotation, non-blank) render as
+/// escaped bytes. A render with no context lines counts as readable (there is
+/// nothing opaque to distrust). Gates the blend's content-aware safety valve.
+fn render_mostly_readable(rendered: &str) -> bool {
+    let (mut binary, mut total) = (0usize, 0usize);
+    for line in rendered.lines() {
+        if line.trim().is_empty() || parse_annotation(line).is_some() {
+            continue;
+        }
+        total += 1;
+        if is_binary_render(line) {
+            binary += 1;
+        }
+    }
+    total == 0 || binary * 2 < total
+}
+
 /// The parts of a recognized cleave finding-annotation line.
 struct Annotation<'a> {
     /// Leading whitespace (member nesting indent), preserved verbatim.
@@ -646,8 +718,9 @@ fn blended(
     ml_prob: f32,
     grade: LlmGrade,
     reason: String,
+    content_readable: bool,
 ) -> Interpretation {
-    let (outcome, conf) = blend(ml_class, ml_prob, grade);
+    let (outcome, conf) = blend(ml_class, ml_prob, grade, content_readable);
     Interpretation {
         grade: Some(grade),
         outcome,
@@ -1098,7 +1171,7 @@ mod tests {
 
     #[test]
     fn blend_agreement_boosts_confidence() {
-        let (out, conf) = blend(Classification::Hostile, 0.8, LlmGrade::Hostile);
+        let (out, conf) = blend(Classification::Hostile, 0.8, LlmGrade::Hostile, true);
         assert_eq!(out, Classification::Hostile);
         assert!((conf - (0.8 + 0.2 * 0.3)).abs() < 1e-6);
     }
@@ -1107,30 +1180,34 @@ mod tests {
     fn blend_llm_more_severe_escalates() {
         // ML benign, LLM suspicious → escalate to suspicious (the mislabeled-bad
         // rescue), at the LLM's conviction.
-        let (out, conf) = blend(Classification::Benign, 0.0, LlmGrade::Suspicious);
+        let (out, conf) = blend(Classification::Benign, 0.0, LlmGrade::Suspicious, true);
         assert_eq!(out, Classification::Suspicious);
         assert!((conf - SUSPICIOUS_ESCALATION_CONF).abs() < 1e-6);
         // ML suspicious, LLM hostile → escalate to hostile.
-        let (out2, conf2) = blend(Classification::Suspicious, 0.6, LlmGrade::Hostile);
+        let (out2, conf2) = blend(Classification::Suspicious, 0.6, LlmGrade::Hostile, true);
         assert_eq!(out2, Classification::Hostile);
         assert!((conf2 - HOSTILE_ESCALATION_CONF).abs() < 1e-6);
     }
 
     #[test]
-    fn blend_llm_clears_ml_false_positive_but_holds_hostile() {
+    fn blend_llm_clears_ml_false_positive_but_holds_opaque_hostile() {
         // ML suspicious (a false positive), LLM benign → cleared to benign (the
-        // mislabeled-good case).
-        let (out, _) = blend(Classification::Suspicious, 0.7, LlmGrade::Benign);
+        // mislabeled-good case). Readability irrelevant when ML < hostile.
+        let (out, _) = blend(Classification::Suspicious, 0.7, LlmGrade::Benign, false);
         assert_eq!(out, Classification::Benign);
-        // Safety valve: a confident ML hostile the LLM calls benign is held at
-        // suspicious, never dropped to benign.
-        let (out2, conf2) = blend(Classification::Hostile, 0.9, LlmGrade::Benign);
+        // Safety valve: a confident ML hostile the LLM calls benign, whose render
+        // is OPAQUE, is held at suspicious — never dropped to benign.
+        let (out2, conf2) = blend(Classification::Hostile, 0.9, LlmGrade::Benign, false);
         assert_eq!(out2, Classification::Suspicious);
         assert!((conf2 - 0.45).abs() < 1e-6);
+        // But when the render is READABLE source, the LLM read the actual code, so
+        // its clear is trusted all the way to benign (clears an ML false positive).
+        let (out3, _) = blend(Classification::Hostile, 0.9, LlmGrade::Benign, true);
+        assert_eq!(out3, Classification::Benign);
     }
 
     #[test]
-    fn blend_covers_all_nine_combos_without_panicking() {
+    fn blend_covers_all_combos_without_panicking() {
         let classes = [
             Classification::Benign,
             Classification::Suspicious,
@@ -1139,10 +1216,26 @@ mod tests {
         let grades = [LlmGrade::Benign, LlmGrade::Suspicious, LlmGrade::Hostile];
         for ml in classes {
             for g in grades {
-                let (_, conf) = blend(ml, 0.5, g);
-                assert!((0.0..=1.0).contains(&conf));
+                for readable in [true, false] {
+                    let (_, conf) = blend(ml, 0.5, g, readable);
+                    assert!((0.0..=1.0).contains(&conf));
+                }
             }
         }
+    }
+
+    #[test]
+    fn gate_helpers_detect_elevated_and_readability() {
+        assert!(has_elevated_finding("// S 1:1 encrypted loader\n\\x00\\x01data\n"));
+        assert!(has_elevated_finding("// H malicious\ncode\n"));
+        assert!(!has_elevated_finding("// N 1:1 notable only\ncode();\n"));
+        // Mostly source → readable; mostly escaped bytes → not.
+        assert!(render_mostly_readable(
+            "hdr\tpe 1KB 2\n// N x\nlet a = fetch(url);\nreturn a;\n"
+        ));
+        assert!(!render_mostly_readable(
+            "hdr\tpe 1KB 2\n// N x\n\\x90\\x00\\x03\\xff\\x00garbagebytes\\x01\n\\xde\\xad\\xbe\\xef\\x00\\x11\\x22morebytes\n"
+        ));
     }
 
     #[test]

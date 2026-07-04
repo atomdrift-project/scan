@@ -3034,15 +3034,10 @@ pub(crate) fn classify_report(
         }
     }
     let interpretation = interpret.and_then(|cfg| {
-        if final_decision.probability < cfg.min_prob {
-            tracing::debug!(
-                path = %label,
-                probability = format!("{:.4}", final_decision.probability),
-                cutoff = format!("{:.4}", cfg.min_prob),
-                "below --interpret-min-prob cutoff; skipping LLM interpretation",
-            );
-            return None;
-        }
+        // The gate lives in `interpret::interpret`: it runs when ML clears the
+        // probability floor OR cleave surfaced a suspicious/hostile finding ML
+        // under-weighted (so an ML-blind packed binary still gets a second
+        // opinion); it returns `None` when gated out or on any failure.
         let interp = crate::interpret::interpret(
             cfg,
             llm_ctx.as_deref()?,
