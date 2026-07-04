@@ -3015,8 +3015,24 @@ pub(crate) fn classify_report(
 
     let top_findings = extract_top_findings_from_json(&report_json, &final_decision.class);
 
-    // LLM second opinion (root file only). Render the full cleave tiny context
-    // for the model regardless of the display density, then blend.
+    // LLM second opinion (root file only). Build the cleave tiny render once: it
+    // feeds the model (below) and, when `SCAN_INTERPRET_DUMP_DIR` is set, is
+    // written to `<dir>/<sha256>.render` — the raw (untransformed) render, so the
+    // interpret-template tuning harness (`hacks/interpret-tune`) can sweep every
+    // template offline from one scan, independent of whether `--interpret` is on.
+    let dump_dir = std::env::var_os("SCAN_INTERPRET_DUMP_DIR");
+    let llm_ctx = (interpret.is_some() || dump_dir.is_some()).then(|| {
+        crate::interpret::sanitize_context(&cleave::output::format_context(
+            &report,
+            &cleave::output::TinyOpts::tiny(),
+        ))
+    });
+    if let (Some(dir), Some(ctx)) = (dump_dir, llm_ctx.as_deref()) {
+        let dir = std::path::Path::new(&dir);
+        if std::fs::create_dir_all(dir).is_ok() {
+            let _ = std::fs::write(dir.join(format!("{sha256}.render")), ctx);
+        }
+    }
     let interpretation = interpret.and_then(|cfg| {
         if final_decision.probability < cfg.min_prob {
             tracing::debug!(
@@ -3027,13 +3043,9 @@ pub(crate) fn classify_report(
             );
             return None;
         }
-        let llm_ctx = crate::interpret::sanitize_context(&cleave::output::format_context(
-            &report,
-            &cleave::output::TinyOpts::tiny(),
-        ));
         let interp = crate::interpret::interpret(
             cfg,
-            &llm_ctx,
+            llm_ctx.as_deref()?,
             final_decision.class,
             final_decision.probability,
         )?;
