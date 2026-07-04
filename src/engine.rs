@@ -1118,7 +1118,8 @@ pub(crate) const SPINNER: &[char] = &[
 /// Heartbeat redraw cadence. A background thread redraws on this interval so
 /// the spinner keeps animating — and the long-tail notice can appear — even
 /// while no file completes (a single slow rizin analysis can stall for minutes).
-const PROGRESS_TICK: Duration = Duration::from_millis(125);
+/// Shared with [`crate::deptree`], whose live tree animates on the same cadence.
+pub(crate) const PROGRESS_TICK: Duration = Duration::from_millis(125);
 
 /// Files-remaining threshold below which a stall counts as the "long tail".
 const TAIL_FILES: u32 = 4;
@@ -1149,9 +1150,10 @@ fn fit_notice(msg: &str, budget: usize) -> String {
     format!(" \x1b[38;2;120;120;120m{text}\x1b[0m")
 }
 
-/// Terminal width in columns, for capping the progress line. Falls back to 80
-/// when the width can't be queried (not a tty, or the ioctl fails).
-fn term_cols() -> usize {
+/// Terminal size as `(cols, rows)`, for capping the progress line and bounding
+/// the live dependency tree. Falls back to `(80, 24)` when the size can't be
+/// queried (not a tty, or the ioctl fails).
+pub(crate) fn term_dims() -> (usize, usize) {
     #[cfg(unix)]
     {
         // SAFETY: TIOCGWINSZ fills a zero-initialised `winsize`; we trust the
@@ -1159,11 +1161,18 @@ fn term_cols() -> usize {
         unsafe {
             let mut ws: libc::winsize = std::mem::zeroed();
             if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-                return ws.ws_col as usize;
+                let rows = if ws.ws_row > 0 { ws.ws_row as usize } else { 24 };
+                return (ws.ws_col as usize, rows);
             }
         }
     }
-    80
+    (80, 24)
+}
+
+/// Terminal width in columns, for capping the progress line. Falls back to 80
+/// when the width can't be queried (not a tty, or the ioctl fails).
+fn term_cols() -> usize {
+    term_dims().0
 }
 
 /// Shared progress state. Lives behind an `Arc` so the heartbeat thread can hold
@@ -1197,6 +1206,20 @@ struct Inner {
 /// server/JSON modes run none and leave this `None`. A `Weak` so a finished bar
 /// is never kept alive; [`print_above_bar`] upgrades it per call.
 static ACTIVE_BAR: Mutex<Option<Weak<Inner>>> = Mutex::new(None);
+
+/// Whether an interactive scan progress bar currently owns the terminal. The
+/// live dependency tree ([`crate::deptree`]) defers to it: a multi-file scan's
+/// bar keeps the streamed fetch log (which coexists with the bar via
+/// [`print_above_bar`]), so only a single-artifact scan — where no bar is live —
+/// takes over stderr with an in-place tree.
+pub(crate) fn bar_active() -> bool {
+    ACTIVE_BAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .is_some()
+}
 
 /// Run `print` (which writes one or more *complete* newline-terminated lines to
 /// stderr) so its output lands cleanly above the progress bar rather than
@@ -3399,6 +3422,48 @@ pub fn scan_bytes(
         ..Default::default()
     };
     let report = cleave::analyze_bytes_owned(data, filename, &cleave_opts)
+        .with_context(|| format!("cleave analysis of {filename}"))?;
+    process_report(
+        std::path::Path::new(filename),
+        report,
+        ctx,
+        model,
+        shap,
+        config,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Scan a payload that already lives on disk, returning the same [`ScanResult`]
+/// as [`scan_bytes`]. cleave memory-maps the file, so peak resident memory stays
+/// bounded regardless of the payload's size — the entry point for large,
+/// streamed-to-disk responses that must not be buffered whole in RAM.
+///
+/// `read_path` is the on-disk file to analyze; `filename` is the logical name
+/// (e.g. the originating URL) echoed into the report and used for the label,
+/// exactly as in [`scan_bytes`]. `read_path`'s extension still drives cleave's
+/// type detection, so callers should give the temporary file a name that carries
+/// the payload's real extension.
+///
+/// # Errors
+/// Propagates cleave analysis failures and model inference errors.
+pub fn scan_file(
+    read_path: &Path,
+    filename: &str,
+    model: &Model,
+    ctx: &ExtractContext,
+    shap: Option<&ShapImportance>,
+    config: &ScanConfig,
+) -> Result<ScanResult> {
+    prefetch_cleave_resources();
+
+    let cleave_opts = cleave::AnalysisOptions {
+        slow_rule_ms: config.slow_rule_ms(),
+        ..Default::default()
+    };
+    let report = cleave::analyze_file(read_path, &cleave_opts)
         .with_context(|| format!("cleave analysis of {filename}"))?;
     process_report(
         std::path::Path::new(filename),

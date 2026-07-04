@@ -186,15 +186,26 @@ struct Cli {
     )]
     fetch_max_age: u32,
 
+    /// [EXPERIMENTAL] Fetch and scan native-binary dependencies for every
+    /// platform, not just the host's. By default an `<os>-<arch>` package
+    /// (biome, esbuild, swc, rollup, sharp…) is pulled only for the host
+    /// platform — the linux/windows variants never run here, so scanning them
+    /// multiplies the expensive binary analysis with no added coverage for this
+    /// host. Pass this to audit the binaries that ship for *other* platforms (a
+    /// CI image, a published release). Also settable via
+    /// `SCAN_FETCH_ALL_PLATFORMS`.
+    #[arg(long, global = true, env = "SCAN_FETCH_ALL_PLATFORMS")]
+    fetch_all_platforms: bool,
+
     /// [EXPERIMENTAL] Size cap for a single downloaded artifact. Accepts a unit
-    /// suffix (`40M`, `2G`, `512K`); a bare number is bytes. A response larger
+    /// suffix (`256M`, `2G`, `512K`); a bare number is bytes. A response larger
     /// than this is abandoned, so one artifact can't dominate a run. Also
     /// settable via `SCAN_FETCH_MAX_SIZE`.
     #[arg(
         long,
         global = true,
         value_name = "SIZE",
-        default_value = "40M",
+        default_value = "256M",
         value_parser = scan::fetch::parse_bytes,
         env = "SCAN_FETCH_MAX_SIZE"
     )]
@@ -541,6 +552,7 @@ fn main() -> Result<()> {
         policy.max_dep_age_days = cli.fetch_max_age;
         policy.max_file_fetches = cli.fetch_max_file_fetches;
         policy.max_file_bytes = cli.fetch_max_file_size;
+        policy.host_platform_only = !cli.fetch_all_platforms;
         policy
     };
     // The per-fetch size ceiling is enforced in the HTTP layer, so it's a

@@ -33,14 +33,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, PoisonError, RwLock};
 
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
-    BlobCache, FetchBudget, FetchRecord, HttpFetch, Outcome, fetch_ref, fetch_references,
+    BlobCache, FetchBudget, FetchRecord, HttpFetch, Outcome, fetch_ref, fetch_references_with,
 };
 use fletch::{RefKind, RefLocator, Reference, Registry, find};
+
+use crate::analysis_cache::AnalysisCache;
+use crate::deptree::{DepState, DepTree};
 
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
@@ -48,20 +51,22 @@ use fletch::{RefKind, RefLocator, Reference, Registry, find};
 pub const DEFAULT_FETCH_DEPTH: u8 = 2;
 
 /// Default age ceiling for fetching a declared dependency, in days. A version
-/// older than this has had a long window for community discovery, so the
-/// expensive fetch-and-scan is skipped by default; recent releases — where a
-/// supply-chain compromise is freshest and least-vetted — are still pulled.
-/// `0` disables the gate (every resolvable dependency is fetched).
-pub const DEFAULT_MAX_DEP_AGE_DAYS: u32 = 30;
+/// older than this has had a long window for community discovery, so only its
+/// registry metadata is looked up (a PURL lookup) and the expensive
+/// fetch-and-scan is skipped; recent releases — where a supply-chain compromise
+/// is freshest and least-vetted — are still pulled and fully scanned. Set to a
+/// week: past that, a malicious release has almost always been caught and
+/// yanked, and the byte scan's cost isn't worth it. `0` disables the gate.
+pub const DEFAULT_MAX_DEP_AGE_DAYS: u32 = 7;
 
 /// 1024-based size units, the basis for every `--fetch-max-*-size` ceiling.
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
 /// Default size ceiling for a single fetched artifact (`--fetch-max-size`) —
-/// mirrors fletch's [`fletch::fetch::DEFAULT_MAX_FETCH_BYTES`] (40 MiB). A
+/// mirrors fletch's [`fletch::fetch::DEFAULT_MAX_FETCH_BYTES`] (256 MiB). A
 /// response larger than this is abandoned, so one artifact can't dominate a run.
-pub const DEFAULT_MAX_FETCH_SIZE: u64 = 40 * MIB;
+pub const DEFAULT_MAX_FETCH_SIZE: u64 = 256 * MIB;
 
 /// Default ceiling on *live* fetches triggered by a single scanned file
 /// (`--fetch-max-file-fetches`). Cache hits don't count, so a warm re-run is
@@ -182,6 +187,17 @@ pub struct FetchPolicy {
     /// Ceiling on total bytes fetched on behalf of a single scanned file
     /// (`--fetch-max-file-size`). The sweep stops once retrieved bytes cross it.
     pub max_file_bytes: u64,
+    /// Skip fetching a *dependency* whose name pins it to a platform other than
+    /// the host — the `@scope/pkg-<os>-<arch>` native-binary packages (biome,
+    /// esbuild, swc, rollup, sharp…) that ship one prebuilt per platform. On a
+    /// darwin-arm64 host only the darwin-arm64 variant is pulled; the linux and
+    /// windows ones never run here, so scanning all of them multiplies the
+    /// expensive binary analysis with no added coverage for this host. `false`
+    /// pulls every platform (`--fetch-all-platforms`) — needed to audit the
+    /// binaries that will run on *other* hosts (a CI image, a shipped release).
+    /// Applies to fetched dependencies only; a directly-scanned artifact is
+    /// always analyzed.
+    pub host_platform_only: bool,
 }
 
 impl Default for FetchPolicy {
@@ -194,6 +210,7 @@ impl Default for FetchPolicy {
             max_dep_age_days: DEFAULT_MAX_DEP_AGE_DAYS,
             max_file_fetches: DEFAULT_MAX_FILE_FETCHES,
             max_file_bytes: DEFAULT_MAX_FILE_SIZE,
+            host_platform_only: true,
         }
     }
 }
@@ -249,6 +266,77 @@ impl std::str::FromStr for FetchPolicy {
         }
         Ok(policy)
     }
+}
+
+/// Recognised npm platform tokens (`process.platform` / `process.arch`), so a
+/// match keys on a genuine `<os>-<arch>` native-binary name rather than an
+/// incidental word. Kept to the pairs that ship prebuilt per-platform binaries.
+const NPM_OS: &[&str] = &[
+    "darwin", "linux", "win32", "freebsd", "openbsd", "netbsd", "sunos", "android", "aix",
+];
+const NPM_ARCH: &[&str] = &[
+    "x64", "arm64", "ia32", "arm", "ppc64", "s390x", "riscv64", "loong64", "mips64el",
+];
+
+/// The host's npm-style `(os, arch)` tokens, mapped from Rust's target
+/// constants. An unmapped target yields an empty token, which disables that
+/// half of the platform match — fail open, so a dependency is never skipped on a
+/// host we can't confidently name.
+fn host_platform() -> (&'static str, &'static str) {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        "solaris" | "illumos" => "sunos",
+        os @ ("linux" | "freebsd" | "openbsd" | "netbsd" | "android") => os,
+        _ => "",
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "ia32",
+        arch @ ("arm" | "ppc64" | "s390x" | "riscv64") => arch,
+        _ => "",
+    };
+    (os, arch)
+}
+
+/// Whether a dependency reference is a native-binary package pinned to a
+/// platform other than `host`. Matches the well-known `<os>-<arch>` (or
+/// `<arch>-<os>`) adjacent-segment convention native packages use —
+/// `cli-darwin-arm64`, `rollup-linux-x64-gnu`, `@img/sharp-win32-x64` — so a
+/// package that names no such pair is treated as portable and kept. Returns
+/// `false` when the host platform can't be named (fail open) or for non-PURL
+/// locators (a raw URL carries no package identity to place).
+fn off_host_platform(r: &Reference, host: (&str, &str)) -> bool {
+    let (host_os, host_arch) = host;
+    if host_os.is_empty() || host_arch.is_empty() {
+        return false;
+    }
+    let RefLocator::Purl(purl) = &r.locator else {
+        return false;
+    };
+    // Package name = the PURL body without its trailing `@version`; split into
+    // lowercase alphanumeric segments (`cli-darwin-arm64` → [cli, darwin, arm64],
+    // `%40biomejs` → [40, biomejs]).
+    let name = purl.rsplit_once('@').map_or(purl.as_str(), |(n, _)| n);
+    let segs: Vec<String> = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    // An adjacent os+arch pair (either order) marks a platform-specific package;
+    // skip it when either token disagrees with the host.
+    for w in segs.windows(2) {
+        let (os, arch) = if NPM_OS.contains(&w[0].as_str()) && NPM_ARCH.contains(&w[1].as_str()) {
+            (&w[0], &w[1])
+        } else if NPM_ARCH.contains(&w[0].as_str()) && NPM_OS.contains(&w[1].as_str()) {
+            (&w[1], &w[0])
+        } else {
+            continue;
+        };
+        return os != host_os || arch != host_arch;
+    }
+    false
 }
 
 /// The root sample's imperative hunt re-reads it from disk and re-parses it.
@@ -324,7 +412,15 @@ pub(crate) fn orchestrate(
         return (Vec::new(), Vec::new());
     };
 
-    let opts = AnalysisOptions::default();
+    // Analyze fetched payloads with the same bloom short-circuit the top-level
+    // scan uses, so a trusted binary shipped inside a dependency isn't needlessly
+    // re-disassembled; and memoize the whole analysis by content sha, so a warm
+    // re-run reuses it rather than repeating a minutes-long pass.
+    let opts = AnalysisOptions {
+        skip_predicate: dep_skip_predicate(),
+        ..AnalysisOptions::default()
+    };
+    let acache = crate::analysis_cache::AnalysisCache::open();
     let mut records = Vec::new();
     // Standalone reports for each fetched dependency, captured before the payload
     // is grafted into the merged report. Uploaded to hopper as their own samples.
@@ -342,13 +438,15 @@ pub(crate) fn orchestrate(
     // points back at an earlier stage can't cycle.
     let mut seen: HashSet<String> = HashSet::new();
 
+    // Where the fetch phase's progress goes: the live in-place dependency tree on
+    // an interactive single-artifact scan, the streamed log above any active
+    // scan bar otherwise, or nothing for machine output. Created once and shared
+    // across every hop, so transitive dependencies join the same view.
+    let reporter = Reporter::new(progress);
+
     // Hop 0's work-list: declared references from every file in the report plus
     // fletch's imperative discovery over the root sample's bytes. Each later hop
     // works from the references found *inside* the previous hop's payloads.
-    // Whether the "fetching external references" header has been emitted — it is
-    // printed lazily before the first fetched record so a run that fetches
-    // nothing (everything filtered out) stays silent.
-    let mut header_printed = false;
     let mut worklist = collect_references(report, root_path);
     // Phantom-dependency signal: a package imperatively installed or loaded
     // somewhere in this artifact but absent from its manifest's declared deps —
@@ -373,6 +471,9 @@ pub(crate) fn orchestrate(
     // One wall-clock reading for the whole run, so every dependency's age is
     // judged against the same instant.
     let now = unix_now();
+    // The host platform, for filtering off-host native-binary dependencies.
+    // Sampled once — it can't change mid-run.
+    let host = host_platform();
     for _hop in 0..policy.depth {
         if worklist.is_empty() {
             break;
@@ -385,7 +486,24 @@ pub(crate) fn orchestrate(
             // been fetched yet this run.
             let selected: Vec<Reference> = refs
                 .into_iter()
-                .filter(|r| policy.wants(r.kind) && seen.insert(locator_key(r)))
+                .filter(|r| policy.wants(r.kind))
+                // Drop native-binary dependencies built for another platform
+                // before they're ever fetched — the host variant is scanned, its
+                // linux/windows siblings never run here. Off unless the policy
+                // asks for it (`--fetch-all-platforms` audits every platform).
+                .filter(|r| {
+                    let off_host = policy.host_platform_only && off_host_platform(r, host);
+                    if off_host {
+                        tracing::debug!(
+                            package = %locator_key(r),
+                            host_os = host.0,
+                            host_arch = host.1,
+                            "dependency pinned to another platform; skipped (--fetch-all-platforms to include)"
+                        );
+                    }
+                    !off_host
+                })
+                .filter(|r| seen.insert(locator_key(r)))
                 .collect();
             if selected.is_empty() {
                 continue;
@@ -396,6 +514,12 @@ pub(crate) fn orchestrate(
             // are dropped before the expensive fetch+scan of their bytes. Skips
             // are reported, never silent.
             let (selected, registries) = age_gate(selected, &policy, res, now);
+            // Reveal the kept (to-fetch) set as pending, so the tree shows the
+            // dependencies it will actually scan up front. Aged-out deps are
+            // deliberately never announced — for a large npm graph they are the
+            // overwhelming majority and only a registry-metadata lookup runs on
+            // them, so listing them would bury the handful of live scans.
+            reporter.announce(&selected);
             // Registry findings keyed by locator, captured as each record is
             // materialized so the package pass below can pair an artifact with
             // its own registry metadata (see `apply_package_composites`).
@@ -419,14 +543,14 @@ pub(crate) fn orchestrate(
                 if *reason == SkipReason::KnownGood {
                     crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
                 }
-                // Age-outs are the common, expected case and would otherwise flood
-                // the progress block, so they stay at debug and print no skip line;
-                // version removals and known-good skips are surfaced.
                 let log_reason = match reason {
                     SkipReason::Removed => "version removed from registry",
                     SkipReason::AgedOut => "older than --max-dep-age",
                     SkipReason::KnownGood => "known-good (bloom); trust not stale",
                 };
+                // Age-outs are the common, expected case; they stay at debug so
+                // `--verbose` can still see them, while removals and known-good
+                // skips — the interesting decisions — are surfaced at info.
                 match reason {
                     SkipReason::AgedOut => tracing::debug!(
                         package = %common,
@@ -437,29 +561,20 @@ pub(crate) fn orchestrate(
                         reason = log_reason,
                         "registry record materialized; artifact fetch skipped"
                     ),
-                    SkipReason::Removed | SkipReason::KnownGood => {
-                        tracing::info!(
-                            package = %common,
-                            ecosystem = %reg.ecosystem,
-                            version = %reg.version,
-                            age_days = reg.age_days.unwrap_or(0),
-                            downloads = reg.downloads_recent.or(reg.downloads_total),
-                            reason = log_reason,
-                            "registry record materialized; artifact fetch skipped"
-                        );
-                        if progress {
-                            crate::engine::print_above_bar(|| {
-                                if !header_printed {
-                                    eprintln!(
-                                        "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
-                                    );
-                                    header_printed = true;
-                                }
-                                report_skip(r, reg, now, *reason);
-                            });
-                        }
-                    }
+                    SkipReason::Removed | SkipReason::KnownGood => tracing::info!(
+                        package = %common,
+                        ecosystem = %reg.ecosystem,
+                        version = %reg.version,
+                        age_days = reg.age_days.unwrap_or(0),
+                        downloads = reg.downloads_recent.or(reg.downloads_total),
+                        reason = log_reason,
+                        "registry record materialized; artifact fetch skipped"
+                    ),
                 }
+                // Settle the skipped row. The tree shows every reason (so no row
+                // is left hanging as pending); the stream keeps flooding-averse
+                // behaviour, printing only the surfaced removals/known-good skips.
+                reporter.skipped(r, reg, now, *reason);
             }
             if selected.is_empty() {
                 continue;
@@ -475,17 +590,25 @@ pub(crate) fn orchestrate(
                     .max_file_bytes
                     .min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
             };
-            let fetched = fetch_references(
+            // Mark the to-fetch set in flight, then fetch. The callback fires as
+            // each download lands (from a pool worker, so it's `Sync`), flipping
+            // that row to "analyzing" the moment its bytes arrive rather than when
+            // the whole concurrent batch returns — keyed on the original
+            // reference, since a versionless locator may be refined during fetch.
+            reporter.fetching(&selected);
+            let on_fetched = |r: &Reference, rec: &FetchRecord| reporter.landed(r, rec);
+            let fetched = fetch_references_with(
                 &selected,
                 &source_sha,
                 policy.urls,
                 &res.net,
                 &res.cache,
                 budget,
+                &on_fetched,
             );
             // Charge the per-execution budget for what this file fetched live.
-            // Only live fetches count (cache hits are free, matching
-            // `fetch_references`); a `BudgetExceeded` edge consumes nothing.
+            // Only live fetches count (cache hits are free); a `BudgetExceeded`
+            // edge consumes nothing.
             let spent = fetched
                 .iter()
                 .filter(|r| fletch::fetch::counts_against_budget(r))
@@ -493,28 +616,29 @@ pub(crate) fn orchestrate(
             let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
             charge_total_budget(spent, bytes);
 
-            // Report the fetch outcomes up front — they're known the moment the
-            // (cached or live) fetch returns, so the operator sees the full
-            // edge list immediately rather than drip-fed behind each analysis.
-            if progress {
-                crate::engine::print_above_bar(|| {
-                    for rec in &fetched {
-                        if !header_printed {
-                            eprintln!(
-                                "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
-                            );
-                            header_printed = true;
-                        }
-                        report_fetch(rec);
-                    }
-                });
+            // Authoritative pass over every returned edge: settle each row (the
+            // tree finalizes any budget-clipped edge the live callback never saw;
+            // re-settling a callback-landed row is idempotent) and print the
+            // streamed line. `selected` and `fetched` align one-to-one and in
+            // order — every selected reference is a fetch target, so fletch emits
+            // exactly one record per reference in declaration order.
+            for (r, rec) in selected.iter().zip(&fetched) {
+                reporter.landed(r, rec);
+                reporter.report(rec);
             }
 
             // Analyze the payloads concurrently (bounded), then merge each into
             // the report serially in fetch order so file ids stay deterministic.
             // The analysis — a full cleave pass per payload — is the real cost
-            // here; the fetch is near-free on a cache hit.
-            let analyzed = analyze_payloads(&fetched, &res.cache, &opts);
+            // here; the fetch is near-free on a cache hit. The callback settles
+            // each row from "analyzing" to its final glyph as its scan finishes.
+            let on_analyzed = |i: usize| {
+                if let (Some(r), Some(rec)) = (selected.get(i), fetched.get(i)) {
+                    reporter.analyzed(r, rec);
+                }
+            };
+            let analyzed =
+                analyze_payloads(&fetched, &res.cache, &opts, acache.as_ref(), &on_analyzed);
             for (rec, payload) in fetched.iter().zip(analyzed) {
                 if let Some(payload) = payload {
                     // Capture the artifact's findings and identity before
@@ -540,10 +664,212 @@ pub(crate) fn orchestrate(
         }
         worklist = next;
     }
-    if header_printed {
-        report_summary(&records);
-    }
+    reporter.finish(&records);
     (records, dependencies)
+}
+
+/// Where the fetch phase's progress is surfaced.
+///
+/// `Off` — machine output (JSON/tiny/server): nothing is printed; the edges ride
+/// the report. `Stream` — the append-only fetch log, printed above any active
+/// scan progress bar (a multi-file scan, a pipeline); reveals each reference
+/// lazily as it completes. `Tree` — the live, in-place dependency tree that
+/// takes over stderr for an interactive single-artifact scan (see
+/// [`crate::deptree`]), listing the whole known set up front and animating each
+/// row through its lifecycle.
+///
+/// The methods take `&self` (the stream's header latch is atomic) so the fetch
+/// completion callback — invoked concurrently from fletch's pool — can share one
+/// reporter with the sequential orchestration.
+enum Reporter {
+    Off,
+    Stream { header: AtomicBool },
+    Tree(DepTree),
+}
+
+impl Reporter {
+    /// Choose a channel: the live tree when it can own the terminal, else the
+    /// stream when progress is requested, else off.
+    fn new(progress: bool) -> Self {
+        if !progress {
+            return Self::Off;
+        }
+        DepTree::activate().map_or_else(
+            || Self::Stream {
+                header: AtomicBool::new(false),
+            },
+            Self::Tree,
+        )
+    }
+
+    /// Reveal a hop's references as pending (tree only) so the whole known set is
+    /// visible before any network work begins.
+    fn announce(&self, refs: &[Reference]) {
+        if let Self::Tree(tree) = self {
+            for r in refs {
+                tree.add(&locator_key(r), &dep_display_name(r));
+            }
+        }
+    }
+
+    /// Mark the to-fetch set in flight (tree only).
+    fn fetching(&self, refs: &[Reference]) {
+        if let Self::Tree(tree) = self {
+            for r in refs {
+                tree.set(&locator_key(r), DepState::Fetching);
+            }
+        }
+    }
+
+    /// A fetch landed: move its row to "analyzing" (bytes in hand, scan pending)
+    /// or settle it (skipped/failed/budget). Tree only — keyed on the original
+    /// reference, so a locator refined during fetch still matches the row. Called
+    /// live per completion and again authoritatively after the batch; both are
+    /// idempotent.
+    fn landed(&self, r: &Reference, rec: &FetchRecord) {
+        if let Self::Tree(tree) = self {
+            tree.set(&locator_key(r), landed_state(rec));
+        }
+    }
+
+    /// Print the streamed fetch line (stream only); the tree already moved this
+    /// row in [`Reporter::landed`].
+    fn report(&self, rec: &FetchRecord) {
+        if let Self::Stream { header } = self {
+            crate::engine::print_above_bar(|| {
+                fetch_header(header);
+                report_fetch(rec);
+            });
+        }
+    }
+
+    /// A payload finished analysis: settle its row to the final fetch glyph
+    /// (tree only).
+    fn analyzed(&self, r: &Reference, rec: &FetchRecord) {
+        if let Self::Tree(tree) = self {
+            tree.set(&locator_key(r), done_state(rec));
+        }
+    }
+
+    /// A dependency was skipped at the age gate. Only the *meaningful* skips —
+    /// a withdrawn version, or a known-good coordinate — are surfaced; an aged-out
+    /// dep (the common case, only a metadata lookup ran) is dropped entirely, in
+    /// both the stream and the tree. The tree wasn't told about aged-outs
+    /// (`announce` sees only the kept set), so it adds a row here for the skips it
+    /// does surface.
+    fn skipped(&self, r: &Reference, reg: &Registry, now: u64, reason: SkipReason) {
+        if matches!(reason, SkipReason::AgedOut) {
+            return;
+        }
+        match self {
+            Self::Off => {}
+            Self::Stream { header } => crate::engine::print_above_bar(|| {
+                fetch_header(header);
+                report_skip(r, reg, now, reason);
+            }),
+            Self::Tree(tree) => {
+                tree.add(&locator_key(r), &dep_display_name(r));
+                tree.set(&locator_key(r), skip_state(reg, now, reason));
+            }
+        }
+    }
+
+    /// Close out the phase: the stream prints its one-line tally (only if it ever
+    /// printed a row); the tree settles and prints the same tally beneath the
+    /// dependency rows.
+    fn finish(&self, records: &[FetchRecord]) {
+        match self {
+            Self::Off => {}
+            Self::Stream { header } => {
+                if header.load(Ordering::Relaxed) {
+                    report_summary(records);
+                }
+            }
+            Self::Tree(tree) => tree.finish(&summary_line(records)),
+        }
+    }
+}
+
+/// Emit the streamed log's lazy header once, before its first row.
+fn fetch_header(header: &AtomicBool) {
+    if !header.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
+        );
+    }
+}
+
+/// A compact, human display name for a reference: `name version` for a PURL
+/// (scope preserved, e.g. `@biomejs/cli-darwin-arm64 2.5.0`), or the URL with
+/// its scheme trimmed. This is what the tree shows in place of the full registry
+/// URL the streamed log prints.
+fn dep_display_name(r: &Reference) -> String {
+    match &r.locator {
+        RefLocator::Purl(p) => purl_display(p),
+        RefLocator::Url(u) | RefLocator::Path(u) => u
+            .strip_prefix("https://")
+            .or_else(|| u.strip_prefix("http://"))
+            .unwrap_or(u)
+            .to_string(),
+    }
+}
+
+/// Render a PURL as `name version`. `pkg:npm/%40scope/pkg@1.2.3` becomes
+/// `@scope/pkg 1.2.3`; a versionless coordinate shows just the name. Falls back
+/// to the raw PURL for anything that doesn't parse.
+fn purl_display(purl: &str) -> String {
+    let body = purl.strip_prefix("pkg:").unwrap_or(purl);
+    let Some((_ecosystem, rest)) = body.split_once('/') else {
+        return purl.to_string();
+    };
+    // The version follows the last '@'; a scope's '@' is `%40`-encoded, so a
+    // literal '@' only ever separates the version.
+    let (name, version) = rest.rsplit_once('@').unwrap_or((rest, ""));
+    let name = name.replace("%40", "@");
+    let version = version.split(['?', '#']).next().unwrap_or(version);
+    if version.is_empty() {
+        name
+    } else {
+        format!("{name} {version}")
+    }
+}
+
+/// The tree state for a fetch the moment it lands: "analyzing" when bytes are in
+/// hand and a scan will follow (an `Ok` or a pin mismatch — the mismatch settles
+/// to its own glyph once analyzed), else the settled fetch glyph.
+fn landed_state(rec: &FetchRecord) -> DepState {
+    if matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
+        DepState::Analyzing
+    } else {
+        done_state(rec)
+    }
+}
+
+/// The settled tree state for a fetch: the shared [`fetch_row`] glyph/colour,
+/// with the detail column (a size, or a failure note) as its trailing text.
+fn done_state(rec: &FetchRecord) -> DepState {
+    let (glyph, _label, r, g, b, detail) = fetch_row(rec);
+    DepState::Done {
+        glyph,
+        color: (r, g, b),
+        detail: detail.unwrap_or_else(|| rec.size.map_or(String::new(), human_bytes)),
+    }
+}
+
+/// The settled tree state for an age-gate skip, mirroring [`report_skip`]'s
+/// glyph and colour with a concise reason as the detail.
+fn skip_state(reg: &Registry, now: u64, reason: SkipReason) -> DepState {
+    let age_days = reg.age_secs(now).unwrap_or(0) / 86_400;
+    let (glyph, color, detail) = match reason {
+        SkipReason::KnownGood => ('\u{2713}', (80, 200, 80), "known-good".to_string()),
+        SkipReason::Removed => ('\u{00b7}', (120, 120, 120), "removed".to_string()),
+        SkipReason::AgedOut => ('\u{00b7}', (120, 120, 120), format!("{age_days}d old")),
+    };
+    DepState::Done {
+        glyph,
+        color,
+        detail,
+    }
 }
 
 /// Capture a fetched payload's standalone report for upload as its own hopper
@@ -743,11 +1069,39 @@ pub fn report_registry(reg: &Registry, progress: bool) {
 /// Only the interactive terminal path passes `progress`; JSON/server callers
 /// stay silent. Colors mirror the scan progress bar's truecolor palette.
 fn report_fetch(rec: &FetchRecord) {
-    // (glyph, label, r, g, b, detail) — detail replaces the size column when a
-    // fetch never delivered bytes. A *fetched* dep the local bloom filters vouch
-    // for (or flag) is relabeled `known` instead of `live`/`cache` (green ✓ for
-    // known-good, red ✗ for known-bad); `skip`/`fail` rows are left as-is.
-    let (glyph, label, r, g, b, detail) = match &rec.outcome {
+    let (glyph, label, r, g, b, detail) = fetch_row(rec);
+
+    // The actual URL fetched; fall back to the bare locator (PURL) when the
+    // reference never resolved to one.
+    let url = if rec.resolved_url.is_empty() {
+        rec.locator.as_str()
+    } else {
+        rec.resolved_url.as_str()
+    };
+    // A redirect lands the payload elsewhere — show where, dimmed.
+    let redirect = match &rec.final_url {
+        Some(f) if f != &rec.resolved_url => format!("  \x1b[2m\u{2192} {f}\x1b[0m"),
+        _ => String::new(),
+    };
+    let column = detail.unwrap_or_else(|| rec.size.map_or(String::new(), human_bytes));
+
+    eprintln!(
+        "    \x1b[38;2;{r};{g};{b}m{glyph} {label:<6}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {url}{redirect}"
+    );
+}
+
+/// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
+/// `detail` replaces the size column when set.
+type FetchRow = (char, &'static str, u8, u8, u8, Option<String>);
+
+/// The display row for a fetch outcome — glyph, label, truecolor, and the
+/// optional detail that replaces the size column when a fetch delivered no
+/// bytes. Shared by the streamed log ([`report_fetch`]) and the live tree, so a
+/// dependency reads the same either way: a *fetched* dep the local bloom filters
+/// vouch for (or flag) is relabeled `known` instead of `live`/`cache` (green ✓
+/// known-good, red ✗ known-bad); `skip`/`fail` rows are left as-is.
+fn fetch_row(rec: &FetchRecord) -> FetchRow {
+    match &rec.outcome {
         Outcome::PinMismatch => (
             '\u{2716}',
             "pin!",
@@ -798,30 +1152,8 @@ fn report_fetch(rec: &FetchRecord) {
             90,
             Some(failure_detail(rec, why)),
         ),
-    };
-
-    // The actual URL fetched; fall back to the bare locator (PURL) when the
-    // reference never resolved to one.
-    let url = if rec.resolved_url.is_empty() {
-        rec.locator.as_str()
-    } else {
-        rec.resolved_url.as_str()
-    };
-    // A redirect lands the payload elsewhere — show where, dimmed.
-    let redirect = match &rec.final_url {
-        Some(f) if f != &rec.resolved_url => format!("  \x1b[2m\u{2192} {f}\x1b[0m"),
-        _ => String::new(),
-    };
-    let column = detail.unwrap_or_else(|| rec.size.map_or(String::new(), human_bytes));
-
-    eprintln!(
-        "    \x1b[38;2;{r};{g};{b}m{glyph} {label:<6}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {url}{redirect}"
-    );
+    }
 }
-
-/// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
-/// `detail` replaces the size column when set.
-type FetchRow = (char, &'static str, i32, i32, i32, Option<String>);
 
 /// A bloom verdict for a fetched artifact, as a `report_fetch` row override:
 /// every known state renders as the `known` label, distinguished by glyph —
@@ -931,6 +1263,25 @@ fn bloom_known_good_purl(r: &Reference) -> bool {
     };
     crate::bloom_repo::global()
         .is_some_and(|lk| lk.decide_purl(purl) == crate::bloom_repo::Decision::Skip)
+}
+
+/// Skip predicate for fetched-dependency analysis: skip any member cleave is
+/// about to analyze whose sha256 the installed bloom filters vouch known-good —
+/// the same short-circuit the top-level scan applies, so a prebuilt native tool
+/// shipped inside a dependency isn't needlessly re-disassembled. Unlike the
+/// top-level predicate it applies no local-file freshness guard: a dependency's
+/// bytes are content-addressed (fetched by locator, sha-verified) and extracted
+/// to fresh temp files, so an mtime check would spuriously force analysis every
+/// run. Known-bad, conflicted, and unknown members are always analyzed. `None`
+/// when no bloom set is installed, leaving analysis unfiltered.
+fn dep_skip_predicate() -> Option<cleave::SkipPredicate> {
+    let lookup = crate::bloom_repo::global()?;
+    Some(cleave::SkipPredicate(std::sync::Arc::new(
+        move |sha_hex: &str, _path: &Path| {
+            crate::bloom::parse_sha256_hex(sha_hex)
+                .is_some_and(|d| lookup.decide_sha256(&d) == crate::bloom_repo::Decision::Skip)
+        },
+    )))
 }
 
 /// One dependency's age-gate outcome: the registry record (materialized as facts
@@ -1178,10 +1529,16 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Print the run's fetch summary to stderr (the streamed log's closing line).
+fn report_summary(records: &[FetchRecord]) {
+    eprintln!("{}", summary_line(records));
+}
+
 /// Tally the run's fetches into a one-line summary mirroring the progress bar's
 /// completion line: how many came live off the network vs. served from cache,
-/// how many failed, and the total bytes pulled.
-fn report_summary(records: &[FetchRecord]) {
+/// how many failed, and the total bytes pulled. Shared by the streamed log and
+/// the live tree, which prints it beneath the settled dependency rows.
+fn summary_line(records: &[FetchRecord]) -> String {
     let mut live = 0u32;
     let mut cached = 0u32;
     let mut failed = 0u32;
@@ -1200,10 +1557,10 @@ fn report_summary(records: &[FetchRecord]) {
         parts.push(format!("{failed} failed"));
     }
     parts.push(human_bytes(bytes));
-    eprintln!(
+    format!(
         "  \x1b[38;2;80;220;80m\u{2713}\x1b[0m  \x1b[38;2;160;160;160m{}\x1b[0m",
         parts.join("  \u{b7}  ")
-    );
+    )
 }
 
 /// Bytes in a compact human-readable form (`45.2 KB`), for the fetch log.
@@ -1302,16 +1659,6 @@ fn sub_findings(sub: &AnalysisReport) -> Vec<Finding> {
         .collect()
 }
 
-/// Concurrent analyses of fetched payloads per group. Kept deliberately low:
-/// analyzing a single archive is *already* rayon-parallel internally (one job
-/// fans its members across the shared pool), so running many payload analyses
-/// at once would oversubscribe that pool and thrash rather than speed up. Two
-/// overlaps the serial portions (I/O, setup, the container parse) of one
-/// analysis with another's member fan-out without contending for the whole CPU.
-/// A worker-style global admission scheme could safely go higher, but that is
-/// more machinery than this online side-channel warrants.
-const ANALYSIS_CONCURRENCY: usize = 2;
-
 /// How many registry-metadata lookups run at once in [`age_gate`]. Unlike the
 /// CPU-bound payload analysis, these are I/O-bound (small, cached HTTP GETs), so
 /// a higher fan-out turns a manifest's worth of serial round-trips into a few
@@ -1328,68 +1675,40 @@ struct Analyzed {
     next_from_bytes: Vec<(String, Vec<Reference>)>,
 }
 
-/// Analyze the bytes of fetched payloads, returning one slot per input record
-/// in the same order (`None` where there was nothing to analyze).
+/// Analyze the bytes of fetched payloads on cleave's shared rayon pool, one slot
+/// per input record in order (`None` where there was nothing to analyze).
 ///
-/// Off the rayon pool this is bounded by [`ANALYSIS_CONCURRENCY`] and run on
-/// plain OS threads, not the shared rayon pool each analysis itself uses. When
-/// called from a rayon worker, it runs sequentially in-place: joining OS threads
-/// from a rayon worker while those threads call back into cleave can starve the
-/// pool if every worker is doing the same thing.
+/// The payloads fan out as rayon tasks, so the whole pool works the batch: a
+/// dependency carrying a large native binary — a minutes-long, single-threaded
+/// disassembly that no amount of threads can split — runs *alongside* its
+/// siblings instead of being metered a couple at a time on a private pair of OS
+/// threads. Nesting is safe and is the point: each payload's own analysis is
+/// itself rayon-parallel, and a task that blocks awaiting its children steals
+/// and runs other pending work, so the machine stays saturated rather than
+/// idling behind one slow binary. Called from a plain thread the caller simply
+/// blocks on the pool; called from a worker it nests — either way `on_analyzed`
+/// fires as each payload settles, and the indexed collect preserves input order.
+///
+/// Concurrency is bounded by the pool width (work-stealing runs ~one payload per
+/// worker at a time), so at most that many payloads' bytes are resident at once
+/// — the batch size itself never dictates peak memory.
 fn analyze_payloads(
     fetched: &[FetchRecord],
     cache: &BlobCache,
     opts: &AnalysisOptions,
+    acache: Option<&AnalysisCache>,
+    on_analyzed: &(dyn Fn(usize) + Sync),
 ) -> Vec<Option<Analyzed>> {
-    let n = fetched.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    if rayon::current_thread_index().is_some() {
-        // On the shared rayon pool, fan the payloads out as rayon tasks
-        // instead of running them in-place serially. The serial fallback made
-        // dependency-heavy archives the scan's wall-clock tail: one worker
-        // ground through dozens of fetched tarball analyses while the rest of
-        // the pool sat idle (the pool-starvation concern that motivated the
-        // serial path applies to *joining OS threads* from a worker, not to
-        // nested rayon tasks — a worker blocked in this collect steals and
-        // runs other tasks, including these). Indexed collect preserves input
-        // order exactly like the serial map.
-        use rayon::prelude::*;
-        return fetched
-            .par_iter()
-            .map(|rec| analyze_payload(rec, cache, opts))
-            .collect();
-    }
-    let cursor = AtomicUsize::new(0);
-    let workers = ANALYSIS_CONCURRENCY.min(n);
-    let collected: Vec<Vec<(usize, Analyzed)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut local = Vec::new();
-                    loop {
-                        let i = cursor.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            break;
-                        }
-                        if let Some(a) = analyze_payload(&fetched[i], cache, opts) {
-                            local.push((i, a));
-                        }
-                    }
-                    local
-                })
-            })
-            .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
-    let mut slots: Vec<Option<Analyzed>> = (0..n).map(|_| None).collect();
-    for chunk in collected {
-        for (i, a) in chunk {
-            slots[i] = Some(a);
-        }
-    }
-    slots
+    use rayon::prelude::*;
+    fetched
+        .par_iter()
+        .enumerate()
+        .map(|(i, rec)| {
+            let a = analyze_payload(rec, cache, opts, acache);
+            on_analyzed(i);
+            a
+        })
+        .collect()
 }
 
 /// Analyze a fetched payload's bytes (the expensive, report-independent half of
@@ -1401,15 +1720,37 @@ fn analyze_payload(
     rec: &FetchRecord,
     cache: &BlobCache,
     opts: &AnalysisOptions,
+    acache: Option<&AnalysisCache>,
 ) -> Option<Analyzed> {
     // Scan whatever bytes we hold: a clean fetch or a pin mismatch (a mismatch
     // is exactly the case worth analyzing). Skipped/unresolved/failed have none.
     if !matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
         return None;
     }
+    let content_sha = rec.content_sha256.clone().unwrap_or_default();
+
+    // Warm-cache hit: reuse the prior analysis of these exact bytes, skipping the
+    // re-analysis (a minutes-long disassembly for a big native binary). Keyed by
+    // content sha under a ruleset-version namespace, so an entry is only ever one
+    // the current detector produced — a rules/engine change misses and re-scans.
+    if let Some(ac) = acache
+        && !content_sha.is_empty()
+        && let Some(hit) = ac.get(&content_sha)
+    {
+        tracing::debug!(
+            locator = %rec.locator,
+            content_sha = %content_sha,
+            "analysis cache hit; reusing prior result"
+        );
+        return Some(Analyzed {
+            sub: hit.sub,
+            content_sha,
+            next_from_bytes: hit.next,
+        });
+    }
+
     let bytes = cache.load(&rec.locator)?;
     let name = payload_name(rec);
-    let content_sha = rec.content_sha256.clone().unwrap_or_default();
 
     // Next-hop references discovered in the payload's own bytes — the full hunt,
     // so a stage-2 script's `curl | bash` (or an encoded URL) is followed.
@@ -1431,6 +1772,17 @@ fn analyze_payload(
             None
         }
     };
+
+    // Memoize for the next run's warm hit (best-effort; borrowed, so no clone of
+    // the report). Only cache a definite result — an analysis error might be a
+    // transient (a cache-evicted byte, an OOM), so leave it to re-run.
+    if let Some(ac) = acache
+        && !content_sha.is_empty()
+        && sub.is_some()
+    {
+        ac.put(&content_sha, &sub, &next_from_bytes);
+    }
+
     Some(Analyzed {
         sub,
         content_sha,
@@ -1604,6 +1956,56 @@ mod tests {
             pinned_hash: None,
             content_sha256: None,
         }
+    }
+
+    fn purl_ref(purl: &str) -> Reference {
+        Reference {
+            locator: RefLocator::Purl(purl.to_string()),
+            kind: RefKind::Dependency,
+            source: "test".to_string(),
+            evidence: purl.to_string(),
+            offset: 0,
+            pinned_hash: None,
+            content_sha256: None,
+        }
+    }
+
+    #[test]
+    fn off_host_platform_matches_native_binary_naming() {
+        let host = ("darwin", "arm64");
+        // The host variant is kept; other-platform siblings are skipped.
+        assert!(!off_host_platform(
+            &purl_ref("pkg:npm/%40biomejs/cli-darwin-arm64@2.5.0"),
+            host
+        ));
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/%40biomejs/cli-linux-x64-musl@2.5.0"),
+            host
+        ));
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/%40biomejs/cli-win32-arm64@2.5.0"),
+            host
+        ));
+        // Same OS, wrong arch is still off-host.
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/%40biomejs/cli-darwin-x64@2.5.0"),
+            host
+        ));
+        // `<arch>-<os>` order (esbuild-style) and other scopes.
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/%40esbuild/linux-x64@0.21.0"),
+            host
+        ));
+        // A portable package (no os+arch pair) is never platform-skipped.
+        assert!(!off_host_platform(&purl_ref("pkg:npm/left-pad@1.3.0"), host));
+        assert!(!off_host_platform(&purl_ref("pkg:npm/semver@7.5.0"), host));
+        // A raw URL carries no package identity to place.
+        assert!(!off_host_platform(&url_ref("https://example.com/x.tgz"), host));
+        // Fail open when the host platform can't be named.
+        assert!(!off_host_platform(
+            &purl_ref("pkg:npm/%40biomejs/cli-linux-x64@2.5.0"),
+            ("", "")
+        ));
     }
 
     #[test]
@@ -1830,7 +2232,7 @@ mod tests {
 
         // The CLI default strings must parse to the matching constants, so the
         // help text and the policy never drift apart.
-        assert_eq!(parse_bytes("40M"), Ok(DEFAULT_MAX_FETCH_SIZE));
+        assert_eq!(parse_bytes("256M"), Ok(DEFAULT_MAX_FETCH_SIZE));
         assert_eq!(parse_bytes("2G"), Ok(DEFAULT_MAX_FILE_SIZE));
         assert_eq!(parse_bytes("10G"), Ok(DEFAULT_MAX_TOTAL_SIZE));
     }

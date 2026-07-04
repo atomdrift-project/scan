@@ -280,5 +280,14 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # sync with this scan's API; my filefacts additions are backward-compatible, so
 # git cleave consumes the local filefacts fine. Remove once releases carry these.
 
+# Local fletch: adds `fetch::fetch_references_with`, the per-completion callback
+# the interactive dependency tree (`scan::deptree`) drives — each fetch flips its
+# row from "fetching" to "analyzing" the moment it lands, instead of the whole
+# batch flipping at once when `fetch_references` returns. ../fletch is the rev
+# scan locks to plus this additive change (and the already-merged url_to_purl);
+# its filefacts rev matches scan's, so the shared `ExternalRef`/`Reference` type
+# unifies. Remove this patch and bump the git rev once a fletch release carries
+# `fetch_references_with`.
+
 #[patch."https://codeberg.org/atomdrift/stng.git"]
 #stng = { path = "../stng" }
