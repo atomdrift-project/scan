@@ -125,10 +125,11 @@ struct Cli {
     #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_MIN_PROB, value_name = "P")]
     interpret_min_prob: f32,
 
-    /// What the LLM sees of cleave's findings: `pointer` (default; the bare
-    /// `# SEV LOC` marker, no prose — best triage agreement), `full` (cleave's
-    /// `# SEV LOC desc` annotation), `elevated` (pointers for hostile/suspicious
-    /// only), or `raw` (no annotations; the model reasons from source alone)
+    /// What the LLM sees of cleave's findings: `adaptive` (default; keep the prose
+    /// description on hex/binary findings where it is the only signal, drop it to a
+    /// bare `# SEV LOC` pointer on readable source), `pointer` (bare marker
+    /// everywhere), `full` (cleave's `# SEV LOC desc` everywhere), `elevated`
+    /// (pointers for hostile/suspicious only), or `raw` (no annotations)
     #[arg(long, global = true, default_value_t = scan::interpret::InterpretTemplate::default(), value_name = "MODE")]
     interpret_template: scan::interpret::InterpretTemplate,
 

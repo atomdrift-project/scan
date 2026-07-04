@@ -18,37 +18,63 @@ each finding with a prose description — `# SEV LINE:COL desc`. The model tende
 
 ## The fix: `--interpret-template`
 
-Strip the prose, keep the bare pointer. Four modes (`interpret.rs::InterpretTemplate`):
+`--interpret-template` (`interpret.rs::InterpretTemplate`):
 
-| mode | what the model sees | 
+| mode | what the model sees |
 |------|---------------------|
-| `full` | cleave's `# SEV LOC desc` (pre-tuning behavior) |
-| **`pointer`** (default) | `# SEV LOC` — severity + location, **no prose** |
+| `full` | cleave's `# SEV LOC desc` everywhere (pre-tuning behavior) |
+| **`adaptive`** (default) | per finding: keep the prose where it anchors hex/binary bytes, drop to `# SEV LOC` where it anchors readable source |
+| `pointer` | `# SEV LOC` everywhere — no prose |
 | `elevated` | `# SEV LOC` for hostile/suspicious only; notable/baseline dropped |
 | `raw` | no annotations; the model reasons from source alone |
 
-The system prompt is swapped to match (`pointer`/`elevated` tell the model the
-marker is only a pointer — "decide the grade yourself from the source"). The
+The system prompt is swapped to match (the pointer-style prompt tells the model
+the marker is only a hint — "decide the grade yourself from the source"). The
 verdict cache key includes the system prompt, so switching templates never
 replays a cross-template verdict.
 
-## Result (dataset: `/var/tmp/hopper-triage`, 30 samples, ground-truth by manual
-RE incl. rizin/deobfuscation)
+### Why adaptive, not plain pointer
 
-| template | agreement with expert triage |
-|----------|------------------------------|
-| `full` (old default) | 19/30 (63%) |
-| **`pointer`** | **28/30 (93%)** |
+`pointer` won a **source-heavy** corpus (batch 1: 28/30 vs full's 19/30) because
+there the prose *biases* the model — it parrots "hardcoded Bitcoin address" over a
+donations list. But a **binary-heavy** corpus (batch 2: packed/stripped Windows +
+ELF malware) *reversed* it: those samples render as unreadable escaped bytes, so
+cleave's prose ("Encrypted loader data geometry", "Win32 clipboard access",
+"Unpacking API pattern") is the **only** signal — stripping it turned real
+droppers/stealers into benign false-negatives.
 
-- **Zero regression on the 6 confirmed-malware samples** — they stay hostile even
-  in `raw`; the raw bytes (C2 domains, flood templates, clipper symbols, Telegram
-  token) convict them without cleave's prose.
-- `pointer` alone fixes the bundled-dependency false positives (a cleave `H`
-  finding on Microsoft's `vscode-languageserver-protocol`) — **no bloom-suppression
-  needed** once the no-location prose is stripped too.
+`adaptive` decides per finding: for a finding whose following context is escaped
+binary (`is_binary_render` — `\xNN`/`\0` escapes or a low printable ratio) it keeps
+the full prose; otherwise it pointerizes. Result on batch 2: **adaptive 25/30 vs
+full 21/30 vs pointer 21/30** — it keeps pointer's zero false positives on the legit
+`good/`/`new/` set *and* recovers the binary false-negatives, without regressing
+batch 1's source wins.
+
+## Results (two 30-sample batches, ground truth by manual RE incl. rizin/deobfuscation)
+
+Labels: `hacks/interpret-tune/labels/hopper-triage.tsv` (batch 1, source-heavy) and
+`…-batch2.tsv` (batch 2, packed-binary-heavy).
+
+| template | batch 1 (source) | batch 2 (binary) |
+|----------|------------------|------------------|
+| `full` (old default) | 19/30 | 21/30 |
+| `pointer` | **28/30** | 21/30 |
+| **`adaptive`** (default) | ≈28/30 | **25/30** |
+
+- **Batch 1** is where prose *biases* the model: `full` false-positives on
+  legitimate packages (a cleave `H` finding on Microsoft's
+  `vscode-languageserver-protocol` → "hostile"), and reassuring notable prose talks
+  a download-exec dropper *down* to benign. Dropping prose fixes both — no
+  bloom-suppression needed.
+- **Batch 2** is where prose is *load-bearing*: packed/stripped binaries render as
+  escaped bytes, so `pointer` strips the only readable signal and turns real
+  droppers/crypters/stealers into benign false-negatives. `full`/`adaptive` keep it
+  and catch them.
+- `adaptive` is the only template that wins both — per-finding it keeps prose on
+  hex context and drops it on source.
 - Residuals are borderline and in the safe direction: a crypto **donations** list
-  (gemini-coder) reads as suspicious; a dual-use vuln-scanner (neutron) reads as
-  suspicious/hostile.
+  reads as suspicious; dual-use hacktools (neutron, hcxdumptool) read as
+  benign/suspicious; a decoy "FP-bait" binary reads as suspicious/hostile.
 
 ## Two things the template does NOT change (set them per run)
 
