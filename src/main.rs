@@ -348,11 +348,12 @@ enum Commands {
         url: String,
     },
 
-    /// Fetch a package by PURL and scan it (e.g. pkg:npm/left-pad@1.3.0)
+    /// Fetch a package by PURL and scan it (e.g. npm/left-pad@1.3.0)
     #[command(aliases = ["pkg", "package", "pkgs"])]
     Purl {
-        /// Package URL to resolve, fetch, and scan. A versionless PURL
-        /// (`pkg:npm/foo`) resolves to the registry's current release.
+        /// Package URL to resolve, fetch, and scan. The `pkg:` scheme is
+        /// optional (`npm/foo` == `pkg:npm/foo`). A versionless PURL resolves
+        /// to the registry's current release.
         purl: String,
     },
 

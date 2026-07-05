@@ -22,11 +22,20 @@ pub fn run_url(url: &str, config: &ScanConfig) -> Result<ScanSummary> {
 
 /// Fetch and scan a package URL (PURL, e.g. `pkg:npm/left-pad@1.3.0`).
 ///
+/// The `pkg:` scheme is optional on the command line: a bare
+/// `npm/left-pad@1.3.0` is accepted and normalized to a full PURL, since the
+/// scheme is the same for every package and only adds typing.
+///
 /// # Errors
 /// Returns an error if the PURL cannot be resolved/fetched or cleave analysis
 /// fails.
 pub fn run_pkg(purl: &str, config: &ScanConfig) -> Result<ScanSummary> {
-    run(RefLocator::Purl(purl.to_string()), config)
+    let purl = if purl.starts_with("pkg:") {
+        purl.to_string()
+    } else {
+        format!("pkg:{purl}")
+    };
+    run(RefLocator::Purl(purl), config)
 }
 
 fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
