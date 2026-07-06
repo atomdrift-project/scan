@@ -1148,12 +1148,19 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let heartbeat_tools = available_tools.clone();
     let heartbeat_name = url_encode(&name);
 
-    let max_buffer_bytes: usize =
-        if cleave::memory_tracker::total_memory().unwrap_or(0) >= 16 * 1024 * 1024 * 1024 {
-            1024 * 1024 * 1024 // 1 GiB on systems with >= 16 GiB RAM
-        } else {
-            512 * 1024 * 1024 // 512 MiB otherwise
-        };
+    let big_worker = cleave::memory_tracker::total_memory().unwrap_or(0) >= 16 * 1024 * 1024 * 1024;
+    let max_buffer_bytes: usize = if big_worker {
+        1024 * 1024 * 1024 // 1 GiB on systems with >= 16 GiB RAM
+    } else {
+        512 * 1024 * 1024 // 512 MiB otherwise
+    };
+    // Largest file this worker will accept, advertised to hopper on /api/next so
+    // it only routes files this worker can analyze. cleave's extraction/YARA can
+    // use several times the file size in RAM, so a memory-constrained worker
+    // (<= 16 GiB) sticks to small files; larger workers take everything (0 = no
+    // cap). Hopper's filterCandidatesBySize honors this; `max_single_bytes` below
+    // enforces the same ceiling locally as a backstop for older hoppers.
+    let advertised_max_bytes: usize = if big_worker { 0 } else { 32 * 1024 * 1024 };
 
     // Background prefetch keeps `1.1 × slots` samples staged at all times so a
     // free worker slot never waits on a download. The prefetcher polls and
@@ -1208,8 +1215,13 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             encoded_name,
             available_tools,
             slots,
-            max_single_bytes: max_buffer_bytes / 2,
+            max_single_bytes: if advertised_max_bytes == 0 {
+                max_buffer_bytes / 2
+            } else {
+                advertised_max_bytes.min(max_buffer_bytes / 2)
+            },
             max_buffer_bytes,
+            advertised_max_bytes,
             poll_secs,
             target_depth,
             metrics: Arc::clone(&metrics),
@@ -1682,6 +1694,9 @@ struct Prefetcher {
     max_single_bytes: usize,
     /// Soft cap on total staged payload bytes.
     max_buffer_bytes: usize,
+    /// Largest file this worker accepts, sent to hopper as `max_bytes` so it
+    /// routes only files this worker can analyze. 0 = no cap (large workers).
+    advertised_max_bytes: usize,
     poll_secs: u64,
     /// Staged + in-flight sample target (`1.1 × slots`).
     target_depth: usize,
@@ -1718,6 +1733,9 @@ impl Prefetcher {
         }
         if let Some(load) = system_load_avg() {
             let _ = write!(url, "&load1={:.2}", load);
+        }
+        if self.advertised_max_bytes > 0 {
+            let _ = write!(url, "&max_bytes={}", self.advertised_max_bytes);
         }
         let _ = write!(url, "&tools=");
         url_encode_into(&self.available_tools, &mut url);
@@ -3049,6 +3067,7 @@ mod tests {
                 slots,
                 max_single_bytes: 1 << 20,
                 max_buffer_bytes: 1 << 30,
+                advertised_max_bytes: 0,
                 poll_secs: 1,
                 target_depth,
                 metrics: Arc::new(WorkerMetrics::new()),
