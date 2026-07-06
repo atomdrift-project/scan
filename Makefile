@@ -36,7 +36,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-bloomer uninstall-bloomer deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-bloomer uninstall-bloomer deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -74,6 +74,29 @@ release: check-cargo $(OUT_DIR)
 	cp target/release/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
+	fi
+
+# Kill any locally-running atomscan processes before a build so a busy worker
+# (or server) doesn't steal CPU from the compile. Wired into `worker` and
+# `deploy-worker`. Portable across Linux/macOS/FreeBSD via pkill/pgrep, matching
+# the exact process name (-x) so cargo/make/grep aren't caught. Friendly SIGTERM
+# first, then SIGKILL for anything still alive after ~5s. A missing pkill or no
+# matching process is not an error.
+kill-scan:
+	@if command -v pkill >/dev/null 2>&1; then \
+		if pkill -x $(BINARY) 2>/dev/null; then \
+			echo "kill-scan: sent SIGTERM to running $(BINARY); waiting for graceful exit..."; \
+			i=0; while pgrep -x $(BINARY) >/dev/null 2>&1 && [ $$i -lt 5 ]; do sleep 1; i=$$((i+1)); done; \
+			if pgrep -x $(BINARY) >/dev/null 2>&1; then \
+				echo "kill-scan: process still alive, sending SIGKILL"; \
+				pkill -9 -x $(BINARY) 2>/dev/null || true; \
+			fi; \
+			echo "kill-scan: cleared existing $(BINARY) process(es)"; \
+		else \
+			echo "kill-scan: no running $(BINARY) to stop"; \
+		fi; \
+	else \
+		echo "kill-scan: pkill not available; skipping"; \
 	fi
 
 # --- Model publishing (R2-backed, via cleave's manifest-gen) -----------------
@@ -276,7 +299,7 @@ deploy-server:
 		*) echo "error: server deployments are bastille-only; run from a FreeBSD host"; exit 1 ;; \
 	esac
 
-deploy-worker:
+deploy-worker: kill-scan
 	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker URL=<url> [BUILD=<host>] [WORKER_RUN=<host>]"; exit 1; }
 	git stash
 	git pull
@@ -411,7 +434,7 @@ benchmark-worker: release
 
 # Run a worker in the foreground for interactive use. The worker self-nices
 # to 10 by default; pass NICE=0 to disable.
-worker: release
+worker: kill-scan release
 	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>] [LLM=<endpoint>]"; exit 1; }
 	SCAN_LLM="$(LLM)" ./out/$(BINARY) worker --url "$(URL)" \
 		--interpret --interpret-min-prob $(INTERPRET_MIN_PROB) \
