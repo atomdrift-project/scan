@@ -841,8 +841,7 @@ fn main() -> Result<()> {
     let resolve_model_dir = || -> Result<PathBuf> {
         match &cli.model_dir {
             Some(d) => Ok(d.clone()),
-            None => scan::models_repo::model_dir()
-                .map_err(|e| anyhow::anyhow!("failed to resolve model directory: {e}")),
+            None => scan::models_repo::model_dir().context("failed to resolve model directory"),
         }
     };
     let threshold_overrides =
