@@ -105,8 +105,9 @@ struct Cli {
     extra: bool,
 
     /// Send non-trivial samples to a local LLM for a second opinion, blended
-    /// with the ML verdict (stored in the `llm` JSON section and shown inline)
-    #[arg(long, global = true)]
+    /// with the ML verdict (stored in the `llm` JSON section and shown inline).
+    /// Enable via env with `SCAN_INTERPRET=1` (endpoint from `SCAN_LLM`).
+    #[arg(long, global = true, env = "SCAN_INTERPRET")]
     interpret: bool,
 
     /// LLM endpoint or provider (env: SCAN_LLM)
@@ -330,7 +331,8 @@ enum Commands {
         /// Takes a JSON object mapping each file's sha256 to its registry record
         /// (the `registry.record` slot of the sidecar hopper stores; the rest of
         /// the provenance is ignored). A file absent from the map scans normally.
-        #[arg(long, value_name = "FILE")]
+        /// Also settable via the `SCAN_REGISTRY_MAP` env var.
+        #[arg(long, value_name = "FILE", env = "SCAN_REGISTRY_MAP")]
         registry_map: Option<PathBuf>,
     },
 
@@ -599,7 +601,10 @@ fn main() -> Result<()> {
                 Commands::Path {
                     paths: cli.paths.clone(),
                     hopper: None,
-                    registry_map: None,
+                    // Bare `scan <path>` bypasses clap's per-subcommand parsing, so
+                    // read the registry-map env var here too — this is the form
+                    // cyclotron's LLM agents run.
+                    registry_map: std::env::var_os("SCAN_REGISTRY_MAP").map(PathBuf::from),
                 }
             } else {
                 Cli::parse_from(["scan", "--help"]);
