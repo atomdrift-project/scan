@@ -47,7 +47,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.2.0"
+version = "2.3.0-beta.0"
 default-run = "atomscan"
 edition = "2024"
 authors = ["The Atomdrift Project"]
