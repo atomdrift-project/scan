@@ -19,13 +19,16 @@ result carries.
 | ---------------- | ---------------- | ------------------------------------------------------------------------ |
 | `--url`          | (required)       | Hopper base URL.                                                         |
 | `--name`         | hostname         | Worker identity reported to hopper.                                      |
-| `--workers`      | auto             | Concurrent analysis slots.                                               |
+| `--workers` (`-j`) | auto           | Concurrent analysis slots.                                               |
 | `--poll-secs`    | `2`              | Sleep between polls when the queue is empty.                             |
 | `--max-rss-gb`   | `0` (auto)       | RSS ceiling. Auto = 85 % of total system RAM. `-1` disables.             |
 | `--data-dir`     | none             | Local file root. When set, the worker reads files locally instead of fetching them; SHA-256 is verified before use. |
 | `--max-jobs`     | unlimited        | Exit after this many jobs. Useful for cron-style batches.                |
 | `--traits-dir`   | none             | Writable cleave traits directory. Cloned on first run if missing.        |
-| `--nice`         | `10`             | `nice(2)` value applied at startup. `0` leaves priority unchanged.       |
+| `--nice`         | `18`             | `nice(2)` value applied at startup. `0` leaves priority unchanged.       |
+| `--no-update`    | off              | Skip the startup model/traits `git pull`; run against on-disk rules.    |
+| `--no-validate`  | off              | Skip the strict startup trait-validation gate (dev/benchmark runs).      |
+| `--exit-if-empty`| off              | Exit cleanly once hopper reports no work and the prefetch queue drains.  |
 
 The same environment variables apply as for the server:
 `CLEAVE_TRAITS_DIR`, `CLEAVE_RAYON_THREADS`, `SCAN_MODELS_REPO`.
@@ -50,7 +53,7 @@ The same environment variables apply as for the server:
 
 The worker is designed to share a host with other work.
 
-- **Nice.** The default `--nice 10` keeps analysis bursts from
+- **Nice.** The default `--nice 18` keeps analysis bursts from
   starving interactive processes. Unprivileged callers can only raise
   the nice value, never lower it; pass `0` when profiling.
 - **RSS ceiling.** When current RSS exceeds the limit, the worker

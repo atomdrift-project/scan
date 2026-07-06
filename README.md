@@ -100,10 +100,7 @@ By default, atomscan is tuned for 50 false-positives per 100-million files, tune
 atomscan -l 0 /sbin/sulogin            # 0-fp scan against a file
 ```
 
-If you want a second opinion for added accuracy, AS recently added support for efficiently sending evidence to a local LLM for analysis using `--interpret`. It defaults to the local OpenAI endpoint at https://127.0.0.1:8000/v1 - we currently recommend vLLM with Qwen 3.6-27B as a model. Models down to 9B are likely sufficient as well. LLM scores are blended against the ML scores for a final adjusted outcome.
-
-If you only care about rules for a particular platform, say macos or JunOS; use `--platform` to mask everything else out. 
-Nothing is more annoying than seeing a Windows-specific alert on your ArchLinux CI pipeline.
+If you want a second opinion for added accuracy, AS recently added support for efficiently sending evidence to a local LLM for analysis using `--interpret`. It defaults to the local OpenAI-compatible endpoint at http://localhost:8000/v1 - we currently recommend vLLM with Qwen3.6-27B as a model. Models down to 9B are likely sufficient as well. LLM scores are blended against the ML scores for a final adjusted outcome.
 
 ## What AS groks.
 

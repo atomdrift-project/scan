@@ -27,19 +27,20 @@ obvious things. The tables below are the key.
 
 ## `ml` — `MlSection`
 
-`src/scan.rs`.
+`src/engine.rs`.
 
 | JSON          | Rust                      | Type                   | Meaning                                              |
 | ------------- | ------------------------- | ---------------------- | ---------------------------------------------------- |
 | `v`           | `v`                       | string                 | Envelope schema version. Currently `"7"`.            |
 | `prob`        | `probability`             | f32 in `[0, 1]`        | Probability the verdict was decided on.              |
-| `lvl`         | `l`                       | i32 or null            | Lowest-false-positive-level marker. See **The verdict encoding** below. |
+| `lvl`         | `level`                   | i32 or null            | Lowest-false-positive-level marker. See **The verdict encoding** below. |
 | `conf`        | `conf`                    | u8 percent or null     | Pessimistic display/export confidence derived from `lvl`; `null` when no level table applies. |
 | `mods`        | `model_scores`            | array of `RouteScore`  | Per-route ensemble scores. Omitted if empty.         |
 | `skip`        | `skipped_models`          | array of `SkippedRoute`| Routes that were applicable but unused.              |
 | `version`     | `version`                 | string                 | Model version: spec, ABI, hash prefix.               |
+| `eng`         | `eng`                     | string                 | Scan engine build (`CARGO_PKG_VERSION`) that produced this report. |
 | `analyzed_at` | `analyzed_at`             | string (RFC 3339, UTC) | Completion timestamp.                                |
-| `files`       | `fs`                      | array of `EmbeddedFile`| Per-file model summaries, including archive members. |
+| `files`       | `files`                   | array of file summaries| Per-file model summaries, including archive members. See **`ml.files[]` entry** below. |
 | `pids`        | `pids`                    | array of u32           | Running PIDs. Present only on process scans.         |
 | `deleted`     | `deleted`                 | bool                   | Whether the on-disk binary was deleted (process scan). |
 
@@ -151,7 +152,8 @@ specific member.
 | JSON    | Rust             | Type   | Meaning                                  |
 | ------- | ---------------- | ------ | ---------------------------------------- |
 | `rte`   | `model`          | string | Route name, e.g. `az`, `az/native`, `az/elf`. |
-| `prob`  | `probability`    | f32    | This route's probability.                |
+| `prob`  | `probability`    | f32    | This route's calibrated probability — the value thresholds live in and the verdict is decided on. |
+| `raw`   | `raw`            | f32    | Raw (pre-isotonic) score; surfaced for triage because the calibrated `prob` saturates its upper tail. |
 | `cls`   | `classification` | u8     | This route's classification.             |
 
 ## `SkippedRoute`
@@ -163,34 +165,24 @@ specific member.
 | `rte` | `model`  | string | Route name.                          |
 | `why` | `reason` | string | Why this route was not scored.       |
 
-## `EmbeddedFile`
+## `ml.files[]` entry
 
-`src/scan.rs`. One entry per top-level finding for display, plus one
-per archive member when the input is an archive.
+`src/engine.rs` (`build_ml_files`). One compact summary per analyzed
+file: the root file (`id = 0`), plus one per archive member when the
+input is an archive. Listing-only members — carried in the raw manifest
+for `--show=all` but never classified — are excluded here.
 
-| JSON              | Type                    | Meaning                                          |
-| ----------------- | ----------------------- | ------------------------------------------------ |
-| `path`            | string                  | Relative path inside the archive, after `!!`.    |
-| `file_type`       | string                  | Detected type.                                   |
-| `classification`  | u8                      | Per-member classification.                       |
-| `probability`     | f32                     | Per-member probability.                          |
-| `threshold`       | f32                     | Per-member deciding cutoff.                      |
-| `lvl`             | i32 or null             | Per-member lowest-firing-level marker (same encoding as `ml.lvl`). |
-| `conf`            | u8 percent or null      | Per-member confidence derived from `lvl`.        |
-| `model_scores`    | array of `RouteScore`   | Omitted if empty.                                |
-| `skipped_models`  | array of `SkippedRoute` | Omitted if empty.                                |
-| `formula`         | string                  | Molecular formula. Omitted if empty.             |
-| `top_findings`    | array of `TopFinding`   | Behaviours driving the classification.           |
+| JSON   | Type              | Meaning                                                           |
+| ------ | ----------------- | ----------------------------------------------------------------- |
+| `id`   | u64               | File id, matching the entry's `id` in the raw cleave manifest.    |
+| `type` | string            | Detected file type (empty string if unknown).                     |
+| `prob` | f32               | Per-file model probability. The root repeats `ml.prob`.           |
+| `lvl`  | i32 or null       | Per-file lowest-firing-level marker (same encoding as `ml.lvl`).  |
+| `conf` | u8 percent or null| Per-file confidence derived from `lvl`.                           |
 
-## `TopFinding`
-
-`src/scan.rs`.
-
-| JSON   | Type   | Meaning                                                 |
-| ------ | ------ | ------------------------------------------------------- |
-| `id`   | string | Trait id, e.g. `objectives/evasion/process::injection`. |
-| `crit` | u32    | Criticality ordinal. 0 = filtered, 5 = hostile.         |
-| `desc` | string | Human-readable description.                             |
+Per-file findings, molecular formulae, and route breakdowns are **not**
+duplicated here — they live in the `raw` cleave report, whose schema the
+[cleave repo](../../cleave/docs/JSON.md) owns.
 
 ## Errors
 
@@ -212,16 +204,17 @@ A hostile verdict produced at level 3:
         "lvl": 3,
         "conf": 97,
         "mods": [
-          { "rte": "az/native", "prob": 0.998, "cls": 2 },
-          { "rte": "az",        "prob": 0.71,  "cls": 1 }
+          { "rte": "az/native", "prob": 0.998, "raw": 0.94, "cls": 2 },
+          { "rte": "az",        "prob": 0.71,  "raw": 0.68, "cls": 1 }
         ],
         "skip": [
           { "rte": "az/elf", "why": "wrong-format" }
         ],
         "version": "spec=4 abi=1 hash=8f3a91",
+        "eng": "2.2.0",
         "analyzed_at": "2026-05-14T18:22:01Z",
         "files": [
-          { "id": 0, "prob": 0.998, "lvl": 3, "conf": 97 }
+          { "id": 0, "type": "elf", "prob": 0.998, "lvl": 3, "conf": 97 }
         ]
       },
       "raw": { "...": "full cleave AnalysisReport" }
@@ -236,9 +229,10 @@ A benign verdict (sentinel `lvl = -1`):
         "lvl": -1,
         "conf": 0,
         "version": "spec=4 abi=1 hash=8f3a91",
+        "eng": "2.2.0",
         "analyzed_at": "2026-05-14T18:22:01Z",
         "files": [
-          { "id": 0, "prob": 0.04, "lvl": -1, "conf": 0 }
+          { "id": 0, "type": "elf", "prob": 0.04, "lvl": -1, "conf": 0 }
         ]
       },
       "raw": { "...": "full cleave AnalysisReport" }
@@ -247,49 +241,3 @@ A benign verdict (sentinel `lvl = -1`):
 The hostile envelope above fired because `prob` (0.998) crossed the
 level-3 hostile cutoff. The `az/native` specialist route drove the
 decision; the general `az` route alone would have been suspicious.
-
-## Migration from v=6
-
-`v=6` introduced the level/confidence encoding but still used several
-one-letter field names. `v=7` keeps the same semantics and renames the
-wire keys for readability:
-
-- `ml.l` → `ml.lvl`
-- `ml.models` → `ml.mods`
-- `ml.fs` → `ml.files`
-- `RouteScore.m` / `SkippedRoute.m` → `rte`
-- `RouteScore.class` → `cls`
-
-Consumers should accept both v6 and v7 during migration. Producers emit
-v7.
-
-## Migration from v=5
-
-`v=5` carried `class` (0/1/2), `threshold` (the firing cutoff), and a
-separate `level` (the per-100M-benigns level or `null`). The
-invariant — `class = bucket(prob, threshold)` — meant the same fact
-was on the wire three times.
-
-`v=6` collapsed all three into `l`; `v=7` uses the clearer name `lvl`:
-
-- benign is `lvl = -1`,
-- hostile-with-known-level is `lvl = 0..=grid_max`,
-- hostile-with-manual-threshold is `lvl = null`.
-
-The deciding cutoff itself is no longer transmitted. Consumers that
-want to derive a Suspicious band do so against their own threshold;
-the envelope does not commit to one. Members of `ml.fs[]` follow the
-same shape in v6, and `ml.files[]` follows the v7 shape
-`{id, prob, lvl, conf}` — instead of the prior
-`{id, class, prob, threshold}`.
-
-## Migration from v=4
-
-`v=4` carried `thresholds: [suspicious, hostile]` (always the model's
-global pair) plus optional `oclass`/`oprob` from a finding-based
-upgrade heuristic. Both were misleading: the global thresholds did not
-necessarily produce `class` (per-filetype policies and learned blends
-have their own cutoffs), and the upgrade heuristic mutated the model's
-output without surfacing which cutoff applied. `v=5` removed the pair
-and the heuristic; `v=6` further collapses `class`/`threshold`/`level`
-into `l`, renamed to `lvl` in v7 as described above.

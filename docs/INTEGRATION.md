@@ -27,7 +27,10 @@ inline and changes the exit code. For most integrations, that exit code is
 the whole interface.
 
 To refresh the models before a scan, add `-u` (a failed update is
-non-fatal). To silence the periodic update notice, add `--no-update-check`.
+non-fatal); the models also auto-refresh when the local ruleset is over
+24h stale. Disable that automatic refresh with `--no-update` (or the
+`SCAN_NO_UPDATE` environment variable), and silence the once-a-day update
+notice with `SCAN_NO_UPDATE_CHECK`.
 
 ## Choose a path
 
@@ -71,15 +74,16 @@ abstract — you set a **false-positive level**: how many benign files you will
 tolerate being flagged, per 100 million, calibrated for each file type.
 
 ```bash
-atomscan -0 ./pkg/        # zero false positives — strictest, fewest alerts
-atomscan ./pkg/           # default: level 50 (~0.5 flagged per million benign)
-atomscan -9 ./pkg/        # most sensitive — catches more, cries wolf more
-atomscan -l 5000 ./pkg/   # any calibrated point on the 0–25000 grid
+atomscan -l 0 ./pkg/       # zero false positives — strictest, fewest alerts
+atomscan ./pkg/            # default: level 50 (~0.5 flagged per million benign)
+atomscan -l 5000 ./pkg/    # any calibrated point on the 0–25000 grid
+atomscan -l 25000 ./pkg/   # most sensitive — catches more, cries wolf more
 ```
 
 Choose by where a mistake hurts. A hard upload gate wants a strict level
-(`-0`, `-1`) so it almost never blocks a legitimate package. A triage queue
-feeding human reviewers can run `-9` and let people sort it out.
+(`-l 0`, `-l 1`) so it almost never blocks a legitimate package. A triage
+queue feeding human reviewers can run a high level like `-l 25000` and let
+people sort it out.
 
 If you would rather set the raw probability cutoffs yourself,
 `--threshold-hostile <0.0–1.0>` and `--threshold-suspicious <0.0–1.0>` do
@@ -88,9 +92,6 @@ both.
 
 Whichever you pick is fixed when the process starts. A running server picks
 up a new setting with `POST /_/reload` — no restart.
-
-To drop rules for platforms you do not ship, add `--platform linux` (or
-`macos`, etc.). No Windows alerts on an Arch pipeline.
 
 ## Output formats
 
@@ -111,7 +112,7 @@ within a major version.
 
 `--interpret` sends non-trivial samples to a **local** LLM and blends its
 read into the verdict (kept in the `llm` JSON section). It talks to an
-OpenAI-compatible endpoint at `http://127.0.0.1:8000/v1` by default — vLLM
+OpenAI-compatible endpoint at `http://localhost:8000/v1` by default — vLLM
 with a Qwen3-class model works well, and ~9B is enough. Nothing leaves your
 network.
 
@@ -120,18 +121,20 @@ atomscan --interpret ./pkg/
 ```
 
 Point it elsewhere with `--llm`, `--llm-model`, `--llm-key`. Control which
-samples qualify with `--interpret-min-prob` (default `0.1`).
+samples qualify with `--interpret-min-prob` (default `0.01`).
 
 ## Following references: `--fetch` (experimental)
 
 `--fetch` makes the scan active. It follows the external references a file
-points at — declared dependencies (`deps`) and bare or encoded URLs and IPs
-(`refs`) — fetches each one, analyzes it, and folds the result back in. With
-`--fetch-depth` it follows hops: a script that pulls a loader that runs a
-`curl | bash` dropper is caught as one chain.
+points at — declared dependencies (`deps`), packages named by install
+commands (`packages`), and bare or encoded URLs (`urls`) — fetches each one,
+analyzes it, and folds the result back in. Pass a comma-separated selection
+(`--fetch=deps,packages`) or a bare `--fetch` for `all`; an interactive scan
+defaults to `deps,packages`. With `--fetch-depth` it follows hops: a script
+that pulls a loader that runs a `curl | bash` dropper is caught as one chain.
 
 ```bash
-atomscan --fetch=deps ./pkg/             # follow declared dependencies
+atomscan --fetch=deps ./pkg/             # follow declared dependencies only
 atomscan --fetch --fetch-depth 3 ./pkg/  # follow everything, three hops deep
 ```
 

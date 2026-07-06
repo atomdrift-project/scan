@@ -171,9 +171,8 @@ The verdict mode is resolved as follows:
 1. **Level mode (default).** The model's per-level grid
    (`route_policies.json`, falling back to `config.json` `levels[]`)
    drives the per-file `lvl` sweep. The active level `N` sets the verdict
-   caps and comes from the severity-level flags `-0` … `-9` (round-decade
-   shorthand: L0, L10, ..., L90) or `-l <N>` / `--level <N>` for any
-   integer in `0`-`25000` (`src/main.rs`). The default deploy level is L50
+   caps and comes from `-l <N>` / `--level <N>` for any integer in
+   `0`-`25000` (`src/main.rs`). The default deploy level is L50
    (= 50 FP/100M = 0.5 FP/M). Higher `N` is more sensitive. Crucially, `N` only
    moves the caps — it does **not** change `lvl` or the serialized envelope.
 2. **Manual mode.** `--threshold-hostile` / `--threshold-suspicious`
