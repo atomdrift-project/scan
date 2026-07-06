@@ -27,6 +27,12 @@ LOG=/var/log/scan-worker.log
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
+# Privilege escalation: prefer doas, fall back to sudo.
+if   command -v doas >/dev/null 2>&1; then SUDO=doas
+elif command -v sudo >/dev/null 2>&1; then SUDO=sudo
+else die "need doas or sudo"
+fi
+
 for brew_candidate in /usr/local/bin/brew /opt/homebrew/bin/brew; do
     [ -x "$brew_candidate" ] && eval "$("$brew_candidate" shellenv)" && break
 done
@@ -46,40 +52,40 @@ if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     while dscl . -list /Users UniqueID | awk '{print $2}' | grep -qx "$uid"; do
         uid=$((uid + 1))
     done
-    sudo dscl . -create "/Users/$SERVICE_USER"
-    sudo dscl . -create "/Users/$SERVICE_USER" UserShell /usr/bin/false
-    sudo dscl . -create "/Users/$SERVICE_USER" RealName "Atomdrift Scan Worker"
-    sudo dscl . -create "/Users/$SERVICE_USER" UniqueID "$uid"
-    sudo dscl . -create "/Users/$SERVICE_USER" PrimaryGroupID 1
-    sudo dscl . -create "/Users/$SERVICE_USER" NFSHomeDirectory /var/empty
+    $SUDO dscl . -create "/Users/$SERVICE_USER"
+    $SUDO dscl . -create "/Users/$SERVICE_USER" UserShell /usr/bin/false
+    $SUDO dscl . -create "/Users/$SERVICE_USER" RealName "Atomdrift Scan Worker"
+    $SUDO dscl . -create "/Users/$SERVICE_USER" UniqueID "$uid"
+    $SUDO dscl . -create "/Users/$SERVICE_USER" PrimaryGroupID 1
+    $SUDO dscl . -create "/Users/$SERVICE_USER" NFSHomeDirectory /var/empty
 fi
 
 if [ ! -d "$INSTALL_DIR" ] || [ ! -w "$INSTALL_DIR" ]; then
-    sudo mkdir -p "$INSTALL_DIR"
-    sudo chown "$(id -un)" "$INSTALL_DIR"
+    $SUDO mkdir -p "$INSTALL_DIR"
+    $SUDO chown "$(id -un)" "$INSTALL_DIR"
 fi
 
 # Models and traits directories are owned by the service user so it can auto-clone/update.
 if [ ! -d "$MODELS_DIR" ]; then
-    sudo mkdir -p "$MODELS_DIR"
-    sudo chown "$SERVICE_USER" "$MODELS_DIR"
+    $SUDO mkdir -p "$MODELS_DIR"
+    $SUDO chown "$SERVICE_USER" "$MODELS_DIR"
 fi
 if [ ! -d "$TRAITS_DIR" ]; then
-    sudo mkdir -p "$TRAITS_DIR"
-    sudo chown "$SERVICE_USER" "$TRAITS_DIR"
+    $SUDO mkdir -p "$TRAITS_DIR"
+    $SUDO chown "$SERVICE_USER" "$TRAITS_DIR"
 fi
 
 log "Installing binary"
 restart_needed=0
 if ! cmp -s "out/$BINARY" "$BIN_PATH" 2>/dev/null; then
-    sudo install -m 755 "out/$BINARY" "$BIN_PATH"
-    sudo codesign --force --sign - "$BIN_PATH"
+    $SUDO install -m 755 "out/$BINARY" "$BIN_PATH"
+    $SUDO codesign --force --sign - "$BIN_PATH"
     restart_needed=1
 fi
 
 if [ ! -f "$LOG" ]; then
-    sudo touch "$LOG"
-    sudo chown "$SERVICE_USER" "$LOG"
+    $SUDO touch "$LOG"
+    $SUDO chown "$SERVICE_USER" "$LOG"
 fi
 
 log "Installing launchd plist"
@@ -129,9 +135,9 @@ ${workers_args}    </array>
 </plist>
 EOF
 if [ ! -f "$PLIST" ] || ! cmp -s "$new_plist" "$PLIST"; then
-    sudo cp "$new_plist" "$PLIST"
-    sudo chown root:wheel "$PLIST"
-    sudo chmod 644 "$PLIST"
+    $SUDO cp "$new_plist" "$PLIST"
+    $SUDO chown root:wheel "$PLIST"
+    $SUDO chmod 644 "$PLIST"
     restart_needed=1
 fi
 rm -f "$new_plist"
@@ -144,19 +150,19 @@ LEGACY_LABEL=com.atomdrift.litmus
 LEGACY_PLIST=/Library/LaunchDaemons/com.atomdrift.litmus.plist
 if [ -f "$LEGACY_PLIST" ]; then
     log "Removing legacy unsuffixed worker service ($LEGACY_LABEL)"
-    sudo launchctl bootout "system/$LEGACY_LABEL" 2>/dev/null || true
-    sudo rm -f "$LEGACY_PLIST"
+    $SUDO launchctl bootout "system/$LEGACY_LABEL" 2>/dev/null || true
+    $SUDO rm -f "$LEGACY_PLIST"
 fi
 
 service_loaded() {
-    sudo launchctl print "system/$LABEL" >/dev/null 2>&1
+    $SUDO launchctl print "system/$LABEL" >/dev/null 2>&1
 }
 
 if [ "$restart_needed" -eq 1 ] || ! service_loaded; then
     log "Restarting launchd service"
 
     if service_loaded; then
-        sudo launchctl bootout "system/$LABEL"
+        $SUDO launchctl bootout "system/$LABEL"
         i=0
         while service_loaded; do
             sleep 1
@@ -166,23 +172,23 @@ if [ "$restart_needed" -eq 1 ] || ! service_loaded; then
     fi
 
     i=0
-    while sudo pgrep -x "$BINARY" >/dev/null 2>&1; do
+    while $SUDO pgrep -x "$BINARY" >/dev/null 2>&1; do
         sleep 1
         i=$((i + 1))
         if [ "$i" -ge 10 ]; then
             log "Process did not exit cleanly; sending SIGKILL"
-            sudo pkill -9 -x "$BINARY" 2>/dev/null || true
+            $SUDO pkill -9 -x "$BINARY" 2>/dev/null || true
             sleep 1
             break
         fi
     done
 
-    sudo launchctl bootstrap system "$PLIST" || die "launchctl bootstrap failed"
+    $SUDO launchctl bootstrap system "$PLIST" || die "launchctl bootstrap failed"
 else
     log "Binary and plist unchanged, service already running, skipping restart"
 fi
 
 log "Service status:"
-sudo launchctl print "system/$LABEL" || die "service failed to start"
+$SUDO launchctl print "system/$LABEL" || die "service failed to start"
 
 log "Deployment complete"

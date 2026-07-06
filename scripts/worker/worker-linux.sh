@@ -46,8 +46,13 @@ trap '[ -n "$TMP_UNIT" ] && rm -f "$TMP_UNIT"' EXIT
 [ -f Makefile ]                      || die "run from the repository root"
 [ "$(uname -s)" = "Linux" ]          || die "this script is for Linux"
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found (systemd required)"
-command -v sudo      >/dev/null 2>&1 || die "sudo required"
 command -v rizin     >/dev/null 2>&1 || die "rizin not found — install from https://rizin.re first"
+
+# Privilege escalation: prefer doas, fall back to sudo.
+if   command -v doas >/dev/null 2>&1; then SUDO=doas
+elif command -v sudo >/dev/null 2>&1; then SUDO=sudo
+else die "need doas or sudo"
+fi
 
 # --- Packages ---------------------------------------------------------------
 #
@@ -98,7 +103,7 @@ SYNCED=0
 pkg_sync() {
     [ "$SYNCED" -eq 1 ] && return 0
     case "$PKG" in
-        apt)    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq ;;
+        apt)    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq ;;
         # dnf/yum/zypper refresh metadata on demand; pacman/xbps sync via -y/-S
         # in pkg_install below. Nothing extra to do here.
         *)      : ;;
@@ -108,14 +113,14 @@ pkg_sync() {
 
 pkg_install() {
     case "$PKG" in
-        apt)    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" ;;
-        dnf)    sudo dnf install -y --setopt=install_weak_deps=False "$@" ;;
-        yum)    sudo yum install -y "$@" ;;
-        zypper) sudo zypper --non-interactive install --no-recommends "$@" ;;
+        apt)    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" ;;
+        dnf)    $SUDO dnf install -y --setopt=install_weak_deps=False "$@" ;;
+        yum)    $SUDO yum install -y "$@" ;;
+        zypper) $SUDO zypper --non-interactive install --no-recommends "$@" ;;
         # --needed is idempotent; -y syncs the DB so a stale mirror snapshot
         # doesn't cause spurious 'target not found' failures.
-        pacman) sudo pacman -Sy --needed --noconfirm "$@" ;;
-        xbps)   sudo xbps-install -Sy "$@" ;;
+        pacman) $SUDO pacman -Sy --needed --noconfirm "$@" ;;
+        xbps)   $SUDO xbps-install -Sy "$@" ;;
     esac
 }
 
@@ -169,25 +174,25 @@ fi
 
 if ! getent passwd "${SERVICE_USER}" >/dev/null; then
     log "Creating service user '${SERVICE_USER}'"
-    sudo useradd --system --home-dir "${STATE_HOME}" --no-create-home \
+    $SUDO useradd --system --home-dir "${STATE_HOME}" --no-create-home \
                  --shell /usr/sbin/nologin \
                  --comment "Atomdrift Scan worker" "${SERVICE_USER}"
 fi
 
 # Pre-create state dir so an early failure doesn't leave us without one;
 # systemd re-asserts ownership/mode on each start via StateDirectory=.
-sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}"
+$SUDO install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}"
 
 # --- Binary -----------------------------------------------------------------
 
 binary_changed=0
-if sudo cmp -s "target/release/${BINARY}" "${BIN_PATH}" 2>/dev/null; then
+if $SUDO cmp -s "target/release/${BINARY}" "${BIN_PATH}" 2>/dev/null; then
     log "Binary unchanged"
 else
     log "Installing ${BIN_PATH}"
     # install(1) writes-then-renames; safe over a running exe (the kernel pins
     # the inode of the running process).
-    sudo install -m 0755 -o root -g root "target/release/${BINARY}" "${BIN_PATH}"
+    $SUDO install -m 0755 -o root -g root "target/release/${BINARY}" "${BIN_PATH}"
     binary_changed=1
 fi
 
@@ -281,11 +286,11 @@ WantedBy=multi-user.target
 EOF
 
 unit_changed=0
-if sudo cmp -s "$TMP_UNIT" "$UNIT_FILE" 2>/dev/null; then
+if $SUDO cmp -s "$TMP_UNIT" "$UNIT_FILE" 2>/dev/null; then
     log "Unit unchanged"
 else
     log "Writing ${UNIT_FILE}"
-    sudo install -m 0644 -o root -g root "$TMP_UNIT" "$UNIT_FILE"
+    $SUDO install -m 0644 -o root -g root "$TMP_UNIT" "$UNIT_FILE"
     unit_changed=1
 fi
 
@@ -300,20 +305,20 @@ fi
 
 # --- Activate ---------------------------------------------------------------
 
-[ "$unit_changed" -eq 1 ] && sudo systemctl daemon-reload
+[ "$unit_changed" -eq 1 ] && $SUDO systemctl daemon-reload
 
 # enable --now is idempotent and starts the service on first deploy.
-sudo systemctl enable --now "${SERVICE_NAME}.service" >/dev/null
+$SUDO systemctl enable --now "${SERVICE_NAME}.service" >/dev/null
 
 if [ "$binary_changed" -eq 1 ] || [ "$unit_changed" -eq 1 ]; then
     log "Restarting ${SERVICE_NAME}"
-    if ! sudo systemctl restart "${SERVICE_NAME}.service"; then
-        sudo systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+    if ! $SUDO systemctl restart "${SERVICE_NAME}.service"; then
+        $SUDO systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
         die "service failed to start; see: journalctl -u ${SERVICE_NAME} -n 50"
     fi
 else
     log "No changes; leaving service running"
 fi
 
-sudo systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+$SUDO systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 log "Deployment complete"

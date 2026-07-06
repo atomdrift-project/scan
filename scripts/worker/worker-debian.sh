@@ -3,7 +3,7 @@
 # Usage: ./worker-debian.sh [build-host] [run-host] <url>
 #
 # build-host / run-host are SSH targets (e.g. "user@host" or an ssh_config alias).
-# The same host may be passed for both. Remote user must have passwordless sudo.
+# The same host may be passed for both. Remote user must have passwordless doas or sudo.
 
 set -ex
 
@@ -28,45 +28,51 @@ rssh() { ssh -o BatchMode=yes "$RUN" "$@"; }
 bssh true || die "build host '$BUILD' not accessible"
 rssh true || die "run host '$RUN' not accessible"
 
+# Privilege escalation runs on the remote hosts, so pick each host's tool there:
+# prefer doas, fall back to sudo.
+remote_sudo='if command -v doas >/dev/null 2>&1; then echo doas; elif command -v sudo >/dev/null 2>&1; then echo sudo; fi'
+BSUDO=$(bssh "$remote_sudo"); [ -n "$BSUDO" ] || die "need doas or sudo on build host '$BUILD'"
+RSUDO=$(rssh "$remote_sudo"); [ -n "$RSUDO" ] || die "need doas or sudo on run host '$RUN'"
+
 log "Installing build dependencies on $BUILD"
-bssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+bssh "$BSUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+      $BSUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         cargo rustc git pkg-config build-essential clang lld sccache ca-certificates"
 
 log "Ensuring build user exists on $BUILD"
-bssh "id -u scan >/dev/null 2>&1 || sudo useradd -m -s /bin/sh -c 'Atomdrift Scan Build' scan"
+bssh "id -u scan >/dev/null 2>&1 || $BSUDO useradd -m -s /bin/sh -c 'Atomdrift Scan Build' scan"
 
 log "Syncing source to build host (excluding target/, out/, .git)"
-bssh "sudo -u scan mkdir -p /home/scan/scan"
+bssh "$BSUDO -u scan mkdir -p /home/scan/scan"
 tar -cf - --exclude=./target --exclude=./out --exclude=./.git . \
-    | bssh "sudo -u scan tar -xf - -C /home/scan/scan"
+    | bssh "$BSUDO -u scan tar -xf - -C /home/scan/scan"
 
 log "Building tarball on $BUILD"
-bssh "sudo -u scan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" make tarball'" \
+bssh "$BSUDO -u scan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" make tarball'" \
     || die "build failed on build host"
 
 log "Running tests on $BUILD"
-bssh "sudo -u scan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" cargo test --release -- --nocapture'" \
+bssh "$BSUDO -u scan sh -c 'cd ~/scan && RUSTC_WRAPPER=sccache RUSTFLAGS=\"-C link-arg=-fuse-ld=lld\" cargo test --release -- --nocapture'" \
     || die "tests failed on build host"
 
 log "Transferring tarball from $BUILD to $RUN"
-bssh "sudo cat /home/scan/scan/out/atomscan.tgz" \
-    | rssh "sudo tee /tmp/atomscan.tgz >/dev/null"
+bssh "$BSUDO cat /home/scan/scan/out/atomscan.tgz" \
+    | rssh "$RSUDO tee /tmp/atomscan.tgz >/dev/null"
 
 log "Ensuring run user exists on $RUN"
-rssh "id -u scan >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -d /nonexistent -c 'Atomdrift Scan Worker' scan"
+rssh "id -u scan >/dev/null 2>&1 || $RSUDO useradd -r -s /usr/sbin/nologin -d /nonexistent -c 'Atomdrift Scan Worker' scan"
 
 log "Installing runtime dependencies on $RUN"
-rssh "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+rssh "$RSUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+      $RSUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         git ca-certificates p7zip-full upx rizin innoextract"
 
 log "Installing binary on $RUN"
-rssh "sudo tar -xzf /tmp/atomscan.tgz -C /usr/local/bin && \
-      sudo rm -f /tmp/atomscan.tgz"
+rssh "$RSUDO tar -xzf /tmp/atomscan.tgz -C /usr/local/bin && \
+      $RSUDO rm -f /tmp/atomscan.tgz"
 
 log "Installing systemd unit on $RUN"
-rssh "sudo tee /etc/systemd/system/scan-worker.service >/dev/null" <<EOF
+rssh "$RSUDO tee /etc/systemd/system/scan-worker.service >/dev/null" <<EOF
 [Unit]
 Description=Atomdrift Scan worker
 After=network-online.target
@@ -101,14 +107,14 @@ WantedBy=multi-user.target
 EOF
 
 log "Preparing log file on $RUN"
-rssh "sudo touch /var/log/scan-worker.log && sudo chown scan:scan /var/log/scan-worker.log"
+rssh "$RSUDO touch /var/log/scan-worker.log && $RSUDO chown scan:scan /var/log/scan-worker.log"
 
 log "Enabling and restarting scan-worker service on $RUN"
-rssh "sudo systemctl daemon-reload && \
-      sudo systemctl enable scan-worker.service && \
-      sudo systemctl restart scan-worker.service"
+rssh "$RSUDO systemctl daemon-reload && \
+      $RSUDO systemctl enable scan-worker.service && \
+      $RSUDO systemctl restart scan-worker.service"
 
 log "Service status:"
-rssh "sudo systemctl --no-pager --full status scan-worker.service" || true
+rssh "$RSUDO systemctl --no-pager --full status scan-worker.service" || true
 
 log "Deployment complete"

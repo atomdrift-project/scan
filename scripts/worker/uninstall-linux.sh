@@ -8,20 +8,26 @@ UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
 log() { printf '==> %s\n' "$*"; }
 
+# Privilege escalation: prefer doas, fall back to sudo.
+if   command -v doas >/dev/null 2>&1; then SUDO=doas
+elif command -v sudo >/dev/null 2>&1; then SUDO=sudo
+else echo "error: need doas or sudo" >&2; exit 1
+fi
+
 if command -v systemctl >/dev/null 2>&1 && [ -f "$UNIT_FILE" ]; then
     log "Stopping and disabling ${SERVICE_NAME}"
-    sudo systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+    $SUDO systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
     log "Removing ${UNIT_FILE}"
-    sudo rm -f "$UNIT_FILE"
-    sudo systemctl daemon-reload
+    $SUDO rm -f "$UNIT_FILE"
+    $SUDO systemctl daemon-reload
 fi
 
 LEGACY_UNIT=/etc/systemd/system/ascan-worker.service
 if command -v systemctl >/dev/null 2>&1 && [ -f "$LEGACY_UNIT" ]; then
     log "Removing legacy ascan-worker service (pre-rename install)"
-    sudo systemctl disable --now ascan-worker.service 2>/dev/null || true
-    sudo rm -f "$LEGACY_UNIT"
-    sudo systemctl daemon-reload
+    $SUDO systemctl disable --now ascan-worker.service 2>/dev/null || true
+    $SUDO rm -f "$LEGACY_UNIT"
+    $SUDO systemctl daemon-reload
 fi
 
 if crontab -l 2>/dev/null | grep -q "scan worker"; then
@@ -30,7 +36,7 @@ if crontab -l 2>/dev/null | grep -q "scan worker"; then
 fi
 
 log "Killing any remaining atomscan worker processes"
-sudo pkill -f "atomscan worker" 2>/dev/null || true
+$SUDO pkill -f "atomscan worker" 2>/dev/null || true
 pkill -u "$(id -u)" -f "atomscan worker" 2>/dev/null || true
 
 log "Uninstall complete"

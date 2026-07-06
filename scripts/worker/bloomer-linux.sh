@@ -63,7 +63,7 @@ log() { printf '==> %s\n' "$*"; }
 # cargo/git/rclone/psql resolve their config and caches under $STATE_HOME.
 RUN_PATH="${CARGO_HOME_DIR}/bin:/usr/local/bin:/usr/bin:/bin"
 as_bloom() {
-    sudo -u "$SERVICE_USER" -H env -i \
+    $SUDO -u "$SERVICE_USER" env -i \
         HOME="$STATE_HOME" \
         CARGO_HOME="$CARGO_HOME_DIR" RUSTUP_HOME="$RUSTUP_HOME_DIR" \
         PATH="$RUN_PATH" \
@@ -75,15 +75,20 @@ as_bloom() {
 [ -f Makefile ]                      || die "run from the repository root"
 [ "$(uname -s)" = "Linux" ]          || die "this script is for Linux"
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found (systemd required)"
-command -v sudo      >/dev/null 2>&1 || die "sudo required"
 command -v git       >/dev/null 2>&1 || die "git required"
+
+# Privilege escalation: prefer doas, fall back to sudo.
+if   command -v doas >/dev/null 2>&1; then SUDO=doas
+elif command -v sudo >/dev/null 2>&1; then SUDO=sudo
+else die "need doas or sudo"
+fi
 MAKE_BIN=$(command -v make) || die "make not found"
 
 # --- Service user + dir layout ----------------------------------------------
 
 if ! getent passwd "${SERVICE_USER}" >/dev/null; then
     log "Creating service user '${SERVICE_USER}'"
-    sudo useradd --system --home-dir "${STATE_HOME}" --no-create-home \
+    $SUDO useradd --system --home-dir "${STATE_HOME}" --no-create-home \
                  --shell /usr/sbin/nologin \
                  --comment "Atomdrift bloom publisher" "${SERVICE_USER}"
 fi
@@ -91,8 +96,8 @@ fi
 # Pre-create the state tree. systemd re-asserts /var/lib/bloom via
 # StateDirectory=bloom on each start, but creating it now lets us seed the
 # checkouts and run a warm build before the first timer tick.
-sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}"
-sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${SCAN_SRC}"
+$SUDO install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}"
+$SUDO install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${SCAN_SRC}"
 
 # --- Source checkout --------------------------------------------------------
 
@@ -284,27 +289,27 @@ EOF
 units_changed=0
 for pair in "$TMP_SERVICE:$SERVICE_FILE" "$TMP_TIMER:$TIMER_FILE"; do
     src=${pair%%:*}; dst=${pair#*:}
-    if sudo cmp -s "$src" "$dst" 2>/dev/null; then
+    if $SUDO cmp -s "$src" "$dst" 2>/dev/null; then
         log "$(basename "$dst") unchanged"
     else
         log "Writing $dst"
-        sudo install -m 0644 -o root -g root "$src" "$dst"
+        $SUDO install -m 0644 -o root -g root "$src" "$dst"
         units_changed=1
     fi
 done
 
 # --- Activate ---------------------------------------------------------------
 
-[ "$units_changed" -eq 1 ] && sudo systemctl daemon-reload
+[ "$units_changed" -eq 1 ] && $SUDO systemctl daemon-reload
 
-sudo systemctl enable --now "${SERVICE_NAME}.timer" >/dev/null
+$SUDO systemctl enable --now "${SERVICE_NAME}.timer" >/dev/null
 log "Timer enabled:"
-sudo systemctl --no-pager list-timers "${SERVICE_NAME}.timer" || true
+$SUDO systemctl --no-pager list-timers "${SERVICE_NAME}.timer" || true
 
 if [ -n "$RUN_NOW" ]; then
     log "Running one cycle now (RUN_NOW=1)"
-    sudo systemctl start "${SERVICE_NAME}.service" || true
-    sudo systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+    $SUDO systemctl start "${SERVICE_NAME}.service" || true
+    $SUDO systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 fi
 
 # --- Credential readiness summary -------------------------------------------
@@ -343,6 +348,6 @@ echo
 if [ "$missing" -eq 0 ]; then
     log "Install complete. Watch a cycle:  journalctl -u ${SERVICE_NAME}.service -f"
 else
-    log "Install complete, but fix the [MISS] items above; test with:  sudo systemctl start ${SERVICE_NAME}.service"
+    log "Install complete, but fix the [MISS] items above; test with:  $SUDO systemctl start ${SERVICE_NAME}.service"
     log "then watch:  journalctl -u ${SERVICE_NAME}.service -e"
 fi
