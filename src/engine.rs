@@ -2812,7 +2812,7 @@ pub(crate) fn classify_report(
             })
             .collect();
     // (declaring sha, reference offset, dependency locator, confirmed class).
-    let mut dep_backrefs: Vec<(String, Option<u64>, String, Classification)> = Vec::new();
+    let mut dep_backrefs: Vec<(String, Option<u64>, String, String, Classification)> = Vec::new();
 
     // Attribute each fetched dependency's files to it so the embedded pass's
     // per-node decisions roll up into the dependency's own aggregate verdict —
@@ -2938,6 +2938,7 @@ pub(crate) fn classify_report(
                 src_sha.to_string(),
                 src_off,
                 locator.to_string(),
+                sha.to_string(),
                 ef_decision.class,
             ));
         }
@@ -3008,13 +3009,14 @@ pub(crate) fn classify_report(
     // citable trait naming the bad dependency, and prism's galaxy view can light
     // the offending edge. Display/attribution only; the verdict was already
     // elevated by the embedded pass above.
-    for (src_sha, src_off, locator, class) in &dep_backrefs {
+    for (src_sha, src_off, locator, dep_sha, class) in &dep_backrefs {
         inject_dependency_backref(
             &mut report_json,
             &report,
             src_sha,
             *src_off,
             locator,
+            dep_sha,
             *class,
         );
     }
@@ -3232,23 +3234,30 @@ fn append_unanalyzed_members(report_json: &mut serde_json::Value, members: &[Arc
     }
 }
 
-/// Pin a fetched dependency's verdict onto the file that declared it: push a
-/// synthetic trait onto the declaring file's compact entry, at the reference's
-/// byte span, naming the dependency and its class. The verdict was already
-/// elevated upstream; this is the citable back-reference (and the galaxy edge
-/// prism lights). The span length comes from the declared reference's evidence
-/// in the typed report; the offset is the reference site.
+/// Pin a fetched dependency's verdict onto the file that declared it — a synthetic
+/// trait at the reference's byte span naming the dependency (purl), its content sha,
+/// and its class — then roll that trait up every containing archive to the depth-0
+/// root, exactly as cleave propagates a member's own traits.
+///
+/// Without the roll-up the verdict lands only on the manifest (depth > 0), so
+/// depth-0-scoped consumers — a triage query's `max_crit`, a caller's `Detected()`
+/// heuristic — miss a package whose malice lives entirely in a fetched dependency
+/// (a benign wrapper around a hostile transitive dep). The declaring file cites the
+/// reference byte span; rolled-up ancestors carry the verdict without a cross-file
+/// span. Compact paths nest with `!!`, so an ancestor is any file whose path is a
+/// `!!`-boundary prefix of the declaring file's.
 fn inject_dependency_backref(
     report_json: &mut serde_json::Value,
     report: &cleave::AnalysisReport,
     source_sha: &str,
     source_offset: Option<u64>,
     locator: &str,
+    dep_sha: &str,
     class: Classification,
 ) {
-    let (crit, word) = match class {
-        Classification::Hostile => (5u8, "hostile"),
-        _ => (4u8, "suspicious"),
+    let (crit, sev) = match class {
+        Classification::Hostile => (5u8, "Malicious"),
+        _ => (4u8, "Suspicious"),
     };
     let off = source_offset.unwrap_or(0);
     let len = report
@@ -3258,28 +3267,37 @@ fn inject_dependency_backref(
         .and_then(|f| f.filefacts.as_ref())
         .and_then(|ff| ff.references.iter().find(|r| r.offset == off))
         .map_or(1, |r| u64::try_from(r.evidence.len()).unwrap_or(u64::MAX));
-    // Friendly name: drop the `pkg:npm/` prefix and decode the `%40` scope.
-    let dep = locator
-        .strip_prefix("pkg:npm/")
-        .unwrap_or(locator)
-        .replace("%40", "@");
-    let new_trait = serde_json::json!({
-        "id": "fetch/dependency-verdict",
-        "crit": crit,
-        "desc": format!("Fetched dependency {dep} classified {word}"),
-        "spans": [[off, len]],
-    });
+    let desc = format!("{sev} dependency: {locator} | {dep_sha}");
+
     let Some(files) = report_json.get_mut("files").and_then(|v| v.as_array_mut()) else {
         return;
     };
-    for f in files {
-        if f.get("sha").and_then(serde_json::Value::as_str) != Some(source_sha) {
+
+    // The declaring file's compact path locates every container above it.
+    let decl_path = files
+        .iter()
+        .find(|f| f.get("sha").and_then(serde_json::Value::as_str) == Some(source_sha))
+        .and_then(|f| f.get("path").and_then(serde_json::Value::as_str))
+        .map(str::to_owned);
+
+    for f in files.iter_mut() {
+        let is_decl = f.get("sha").and_then(serde_json::Value::as_str) == Some(source_sha);
+        let is_ancestor = decl_path.as_deref().is_some_and(|dp| {
+            f.get("path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|p| dp.starts_with(&format!("{p}!!")))
+        });
+        if !is_decl && !is_ancestor {
             continue;
         }
-        match f
-            .get_mut("traits")
-            .and_then(serde_json::Value::as_array_mut)
-        {
+        // The precise declaring file cites the reference byte span; a rolled-up
+        // ancestor carries the verdict without a (meaningless) cross-file span.
+        let new_trait = if is_decl {
+            serde_json::json!({"id": "fetch/dependency-verdict", "crit": crit, "desc": desc.clone(), "spans": [[off, len]]})
+        } else {
+            serde_json::json!({"id": "fetch/dependency-verdict", "crit": crit, "desc": desc.clone()})
+        };
+        match f.get_mut("traits").and_then(serde_json::Value::as_array_mut) {
             Some(traits) => traits.push(new_trait),
             None => {
                 if let Some(obj) = f.as_object_mut() {
@@ -3287,7 +3305,6 @@ fn inject_dependency_backref(
                 }
             }
         }
-        return;
     }
 }
 

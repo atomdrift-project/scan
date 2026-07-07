@@ -75,7 +75,7 @@ struct Cli {
     model_dir: Option<PathBuf>,
 
     /// Output format
-    #[arg(short, long, default_value = "terminal")]
+    #[arg(short, long, env = "SCAN_FORMAT", default_value = "terminal")]
     format: OutputFormat,
 
     /// Scan mode: `fast` (bloom matching only), `balanced` (bloom short-circuits,
