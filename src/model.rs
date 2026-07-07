@@ -2281,8 +2281,16 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
         )
     };
 
+    // Load seeds serially rather than with `into_par_iter`. This runs inside a
+    // specialist route's `OnceLock` initializer (`RouteStore::get`), which is
+    // itself reached from the rayon parallel classify. A nested rayon call here
+    // lets the initializing worker steal another classify task that needs the
+    // *same* route, re-enter the in-progress `OnceLock`, and deadlock forever on
+    // its wait semaphore — the intermittent multi-minute hang seen on `pkg`/`url`
+    // scans. A bundle is at most a few small ONNX seeds, so serial loading costs
+    // nothing measurable and removes the re-entrancy entirely.
     let loaded: Vec<Result<(PathBuf, InnerModel)>> = model_paths
-        .into_par_iter()
+        .into_iter()
         .map(|path| load_inner_model(&path).map(|inner| (path, inner)))
         .collect();
 

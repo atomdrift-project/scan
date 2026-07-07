@@ -1726,7 +1726,13 @@ pub fn run_bytes(
     config: &ScanConfig,
     root_registry: Option<&fletch::Registry>,
 ) -> Result<ScanSummary> {
-    prefetch_cleave_resources();
+    // Deliberately no `prefetch_cleave_resources()` here. This one-shot single-
+    // artifact path (`pkg:`/`url`) never fans out across rayon, and its analyses
+    // usually hit cleave's report cache — so the capability mapper's match
+    // indexes (a multi-hundred-ms regex build) are left to build lazily only if
+    // an analysis actually misses, and are skipped entirely on a warm scan. The
+    // lazy build then runs on this main thread, so there is no rayon re-entrancy
+    // to guard against. Directory/worker paths still prefetch (they do fan out).
 
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load(config.model_dir()).ok();

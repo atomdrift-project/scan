@@ -35,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, PoisonError, RwLock};
+use std::time::Duration;
 
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
@@ -91,6 +92,13 @@ pub const DEFAULT_MAX_TOTAL_SIZE: u64 = 10 * GIB;
 /// [`fletch::fetch::set_max_fetch_bytes`].
 pub use fletch::fetch::set_max_fetch_bytes;
 
+/// Override the process-wide mutable registry-metadata TTLs (re-exported from
+/// [`fletch`]). `None` keeps the tiered defaults (4h for a pinned version's
+/// packument, 1h for a `latest` lookup); a value collapses both to that
+/// lifetime. The immutable tier (a released version's file list) is never
+/// re-checked regardless. See [`fletch::fetch::set_registry_ttl`].
+pub use fletch::fetch::set_registry_ttl;
+
 /// Per-execution fetch budget — a running total shared by every [`orchestrate`]
 /// call in the process. Scans run concurrently, so it's atomic. Set once at
 /// startup via [`set_total_budget`] for one-shot runs; left at the unlimited
@@ -143,6 +151,33 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
         .map_err(|e| format!("invalid size {s:?}: {e} (examples: 40M, 2G, 10240)"))?;
     n.checked_mul(mult)
         .ok_or_else(|| format!("size {s:?} is too large"))
+}
+
+/// Parse a duration with an optional unit suffix — `s`, `m`, `h`, or `d`
+/// (case-insensitive); a bare number is seconds (`90` == `90s`). The words
+/// `never`/`inf`/`forever` mean "cache indefinitely" ([`Duration::MAX`]), for an
+/// offline/air-gapped run that must not revalidate. Powers `--registry-ttl`.
+///
+/// # Errors
+/// Returns a human-readable message when the number is missing, unparseable, or
+/// the result overflows.
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let lowered = s.trim().to_ascii_lowercase();
+    if matches!(lowered.as_str(), "never" | "inf" | "infinite" | "forever") {
+        return Ok(Duration::MAX);
+    }
+    let units = [('s', 1_u64), ('m', 60), ('h', 3600), ('d', 86_400)];
+    let (number, mult) = units
+        .iter()
+        .find_map(|&(suffix, mult)| lowered.strip_suffix(suffix).map(|n| (n, mult)))
+        .unwrap_or((lowered.as_str(), 1));
+    let n: u64 = number
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid duration {s:?}: {e} (examples: 90s, 30m, 4h, 2d, never)"))?;
+    n.checked_mul(mult)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("duration {s:?} is too large"))
 }
 
 /// What to fetch — a selection of reference *kinds*, parsed from the
@@ -420,7 +455,12 @@ pub(crate) fn orchestrate(
         skip_predicate: dep_skip_predicate(),
         ..AnalysisOptions::default()
     };
-    let acache = crate::analysis_cache::AnalysisCache::open();
+    // Opened lazily on the first payload actually analyzed. Opening it derives
+    // the ruleset-version namespace, which calls `cleave::version_info` — and that
+    // spins up the YARA engine just to count rules. A scan that fetches nothing
+    // (every reference age-gated or none present, the common `pkg:` case) must
+    // not pay that: `None` here means "not yet opened".
+    let mut acache: Option<Option<AnalysisCache>> = None;
     let mut records = Vec::new();
     // Standalone reports for each fetched dependency, captured before the payload
     // is grafted into the merged report. Uploaded to hopper as their own samples.
@@ -637,8 +677,10 @@ pub(crate) fn orchestrate(
                     reporter.analyzed(r, rec);
                 }
             };
-            let analyzed =
-                analyze_payloads(&fetched, &res.cache, &opts, acache.as_ref(), &on_analyzed);
+            let acache_ref = acache
+                .get_or_insert_with(crate::analysis_cache::AnalysisCache::open)
+                .as_ref();
+            let analyzed = analyze_payloads(&fetched, &res.cache, &opts, acache_ref, &on_analyzed);
             for (rec, payload) in fetched.iter().zip(analyzed) {
                 if let Some(payload) = payload {
                     // Capture the artifact's findings and identity before
@@ -1078,9 +1120,14 @@ fn report_fetch(rec: &FetchRecord) {
     } else {
         rec.resolved_url.as_str()
     };
-    // A redirect lands the payload elsewhere — show where, dimmed.
+    // A redirect lands the payload elsewhere — name the host, dimmed. Only the
+    // host: a release-asset redirect carries a time-limited SAS token and JWT in
+    // its query, which are noise on the line and a credential better kept out of
+    // terminals and logs.
     let redirect = match &rec.final_url {
-        Some(f) if f != &rec.resolved_url => format!("  \x1b[2m\u{2192} {f}\x1b[0m"),
+        Some(f) if f != &rec.resolved_url => {
+            format!("  \x1b[2m\u{2192} {}\x1b[0m", url_host(f))
+        }
         _ => String::new(),
     };
     let column = detail.unwrap_or_else(|| rec.size.map_or(String::new(), human_bytes));
@@ -1088,6 +1135,19 @@ fn report_fetch(rec: &FetchRecord) {
     eprintln!(
         "    \x1b[38;2;{r};{g};{b}m{glyph} {label:<6}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {url}{redirect}"
     );
+}
+
+/// The host of a URL — scheme, path, and query stripped — for a compact redirect
+/// note (`\u{2192} cdn.example.com`). Anything after the authority is dropped, so
+/// a signed CDN URL's SAS token / JWT never reaches the line.
+fn url_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Keep `host[:port]`, dropping any `userinfo@` prefix.
+    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
 }
 
 /// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
@@ -1552,7 +1612,16 @@ fn summary_line(records: &[FetchRecord]) -> String {
             Outcome::BudgetExceeded | Outcome::Unresolved | Outcome::Skipped => {}
         }
     }
-    let mut parts = vec![format!("{live} live"), format!("{cached} cached")];
+    // Only the counts that actually happened, so a warm run reads
+    // `2 cached  ·  160.5 MB` instead of padding a `0 live` nobody asked about.
+    // Bytes always show — the total pulled is the headline the tally exists for.
+    let mut parts = Vec::new();
+    if live > 0 {
+        parts.push(format!("{live} live"));
+    }
+    if cached > 0 {
+        parts.push(format!("{cached} cached"));
+    }
     if failed > 0 {
         parts.push(format!("{failed} failed"));
     }
@@ -1911,6 +1980,58 @@ mod tests {
             deprecated: Some("use v2 instead".to_string()),
             ..Registry::default()
         }));
+    }
+
+    #[test]
+    fn url_host_strips_scheme_path_and_query() {
+        // A signed release-asset redirect: only the host survives, the SAS
+        // token / JWT query never reaches the line.
+        assert_eq!(
+            url_host("https://release-assets.githubusercontent.com/x/y?sig=abc&jwt=xyz"),
+            "release-assets.githubusercontent.com"
+        );
+        assert_eq!(url_host("https://example.com"), "example.com");
+        // `userinfo@` is dropped; `host:port` is kept.
+        assert_eq!(url_host("http://user:pass@host.test:8080/x"), "host.test:8080");
+        // Not a URL: returned as-is.
+        assert_eq!(url_host("bareword"), "bareword");
+    }
+
+    #[test]
+    fn summary_line_omits_zero_counts() {
+        let record = |outcome: Outcome, cached: bool, size: Option<u64>| FetchRecord {
+            source_sha256: String::new(),
+            source_offset: None,
+            locator: "pkg:npm/x".to_string(),
+            resolved_url: String::new(),
+            final_url: None,
+            redirects: Vec::new(),
+            status: None,
+            headers: Vec::new(),
+            fetched_at: 0,
+            content_sha256: None,
+            size,
+            cached,
+            stale: false,
+            pin_verified: None,
+            outcome,
+        };
+        // Two cache hits, nothing live: the `0 live` is dropped, bytes stay.
+        let warm = vec![
+            record(Outcome::Ok, true, Some(512)),
+            record(Outcome::Ok, true, Some(512)),
+        ];
+        let line = summary_line(&warm);
+        assert!(line.contains("2 cached"), "{line}");
+        assert!(!line.contains("live"), "zero `live` must be omitted: {line}");
+        // A mixed run keeps both non-zero counts.
+        let mixed = vec![
+            record(Outcome::Ok, false, Some(0)),
+            record(Outcome::Ok, true, Some(0)),
+        ];
+        let line = summary_line(&mixed);
+        assert!(line.contains("1 live"), "{line}");
+        assert!(line.contains("1 cached"), "{line}");
     }
 
     #[test]

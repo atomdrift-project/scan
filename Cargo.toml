@@ -47,7 +47,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.3.0-beta.0"
+version = "2.2.1"
 default-run = "atomscan"
 edition = "2024"
 authors = ["The Atomdrift Project"]
@@ -291,3 +291,17 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 
 #[patch."https://codeberg.org/atomdrift/stng.git"]
 #stng = { path = "../stng" }
+
+# TEMPORARY: local cleave for traits-walk I/O profiling + fix. ../cleave HEAD is
+# one docs-only commit ahead of the pinned rev 38062951 (source-identical), so
+# this builds the same code plus the cache.rs walk-once/logging changes. Remove
+# and bump the git rev once cleave carries them.
+
+# Local fletch: `selected()` now fetches a declared dependency / commanded
+# package expressed as a raw URL (a PKGBUILD `source=()`) under the deps/packages
+# policy, instead of gating every URL locator behind the `urls` flag — a
+# URL-locator dependency was announced + marked "fetching" by scan's kind-based
+# selection but silently dropped by fletch's locator-based one, orphaning the row.
+# ../fletch is at the rev scan locks to plus this additive change; its filefacts
+# rev (37942aa) matches scan's, so the shared `Reference`/`RefKind` types unify.
+# Remove this patch and bump the git rev once a fletch release carries it.

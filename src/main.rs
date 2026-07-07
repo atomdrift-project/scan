@@ -206,6 +206,23 @@ struct Cli {
     #[arg(long, global = true, env = "SCAN_FETCH_ALL_PLATFORMS")]
     fetch_all_platforms: bool,
 
+    /// [EXPERIMENTAL] How long to trust cached *mutable* registry metadata before
+    /// revalidating. Accepts a unit suffix (`90s`, `30m`, `4h`, `2d`) — a bare
+    /// number is seconds; `never` caches indefinitely (offline/air-gapped). This
+    /// bounds the two mutable tiers: a pinned version's packument (whose yank
+    /// status can change after publish) and a `latest`/versionless lookup.
+    /// Unset keeps the defaults — 4h pinned, 1h unpinned. A released version's
+    /// immutable file list is never re-checked regardless. Also settable via
+    /// `SCAN_REGISTRY_TTL`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "DUR",
+        value_parser = scan::fetch::parse_duration,
+        env = "SCAN_REGISTRY_TTL"
+    )]
+    registry_ttl: Option<std::time::Duration>,
+
     /// [EXPERIMENTAL] Size cap for a single downloaded artifact. Accepts a unit
     /// suffix (`256M`, `2G`, `512K`); a bare number is bytes. A response larger
     /// than this is abandoned, so one artifact can't dominate a run. Also
@@ -571,6 +588,9 @@ fn main() -> Result<()> {
     // process-global rather than a per-policy field — set it once here and every
     // mode (interactive scan and worker alike) honors `--fetch-max-size`.
     scan::fetch::set_max_fetch_bytes(cli.fetch_max_size);
+    // Registry-metadata staleness bound: a process-global for the same reason,
+    // consulted by every registry lookup. `None` keeps the tiered defaults.
+    scan::fetch::set_registry_ttl(cli.registry_ttl);
     let scan_default = scan::fetch::FetchPolicy {
         deps: true,
         packages: true,

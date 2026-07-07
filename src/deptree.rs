@@ -435,7 +435,7 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
             detail,
         } => (*glyph, *color, detail.clone()),
     };
-    let name = truncate(&entry.name, namew);
+    let name = elide_middle(&entry.name, namew);
     let (r, g, b) = color;
     let detail_col = if detail.is_empty() {
         String::new()
@@ -464,6 +464,30 @@ fn truncate(name: &str, width: usize) -> String {
     }
     let mut out: String = name.chars().take(width.saturating_sub(1)).collect();
     out.push('\u{2026}');
+    out
+}
+
+/// Shorten a name to `width` display columns by eliding the *middle*, keeping a
+/// balanced head and tail around a central ellipsis. For a URL or a scoped
+/// package the tail (a filename, a version) is as telling as the head (a host, a
+/// scope), so a middle cut reads more than a trailing one:
+/// `github.com/be5inv…aCurlySlab-34.7.0.zip` says "a versioned zip from github"
+/// where a tail cut (`github.com/be5invis/Iosevka/relea…`) hides both.
+fn elide_middle(name: &str, width: usize) -> String {
+    let total = name.chars().count();
+    if total <= width {
+        return name.to_string();
+    }
+    if width <= 1 {
+        return "\u{2026}".to_string();
+    }
+    let keep = width - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let chars: Vec<char> = name.chars().collect();
+    let mut out: String = chars[..head].iter().collect();
+    out.push('\u{2026}');
+    out.extend(&chars[total - tail..]);
     out
 }
 
@@ -588,5 +612,19 @@ mod tests {
     #[test]
     fn strip_ansi_removes_color_codes() {
         assert_eq!(strip_ansi("\x1b[38;2;1;2;3mhi\x1b[0m"), "hi");
+    }
+
+    #[test]
+    fn elide_middle_keeps_head_and_tail() {
+        // Fits within the width: returned untouched.
+        assert_eq!(elide_middle("short", 10), "short");
+        // A long URL keeps its host prefix and its filename tail around the
+        // ellipsis, so the version and extension survive the cut.
+        let url = "github.com/be5invis/Iosevka/releases/download/v34.7.0/PkgTTF-IosevkaCurlySlab-34.7.0.zip";
+        let out = elide_middle(url, 34);
+        assert_eq!(out.chars().count(), 34, "elided name must fill exactly the column");
+        assert!(out.starts_with("github.com/"), "host prefix lost: {out}");
+        assert!(out.ends_with(".zip"), "filename tail lost: {out}");
+        assert!(out.contains('\u{2026}'), "no ellipsis marking the cut: {out}");
     }
 }
