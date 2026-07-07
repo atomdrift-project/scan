@@ -252,8 +252,6 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # trait that fired). ../cleave is at the exact rev scan locks (380629512b70) plus
 # that single additive output.rs change, so the filefacts/stng revs still unify.
 # Remove and bump the cleave git rev once a cleave release carries the annotation.
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
 
 # Local cleave: adds `cleave::scan_paths`, which analyzes a caller-supplied file
 # list under the same filtered pipeline as `scan_directory`. scan does its own
