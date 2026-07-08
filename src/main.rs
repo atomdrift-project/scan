@@ -546,7 +546,43 @@ fn threshold_overrides_for_model(
     }
 }
 
+/// `SCAN_NO_ANALYSIS_CACHE=1` — one switch that disables every cache of our
+/// own analysis across the stack: filefacts file metadata, stng extracted
+/// strings, cleave analysis results, and scan's analysis envelope + LLM
+/// verdicts. Download caches (fletch registry metadata) and rule-compilation
+/// caches (YARA, trait mapper) stay on — they hold inputs, not analysis.
+///
+/// Implemented by filling in each layer's own env var, so per-layer semantics
+/// stay defined in one place and child processes inherit the policy. Only
+/// unset vars are filled in: a per-layer var the operator set explicitly
+/// always wins over the umbrella.
+fn propagate_no_analysis_cache() {
+    let on = std::env::var("SCAN_NO_ANALYSIS_CACHE")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if !on {
+        return;
+    }
+    // CLEAVE_SKIP_CACHE=1 also drags cleave's YARA rule-compilation cache with
+    // it (legacy behavior); pin that cache back on — recompiling rules costs
+    // 4-18s per process and compiles rules, not sample analysis.
+    let defaults = [
+        ("FILEFACTS_CACHE", "0"),
+        ("STNG_STRING_CACHE", "0"),
+        ("CLEAVE_SKIP_CACHE", "1"),
+        ("CLEAVE_SKIP_YARA_CACHE", "0"),
+        ("SCAN_ANALYSIS_CACHE", "0"),
+    ];
+    for (key, value) in defaults {
+        if std::env::var_os(key).is_none() {
+            // SAFETY: called from the top of main before any thread is
+            // spawned, so no concurrent environment access can race this.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    propagate_no_analysis_cache();
     // Block SIGUSR1 process-wide before spawning any threads so they all inherit
     // the blocked mask; the dedicated sigusr1 thread below consumes it via sigwait.
     #[cfg(unix)]
