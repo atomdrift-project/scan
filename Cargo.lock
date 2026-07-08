@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "atomdrift-scan"
-version = "2.2.1"
+version = "2.3.0-beta.1"
 dependencies = [
  "anyhow",
  "axum",

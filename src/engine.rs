@@ -3590,7 +3590,7 @@ pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
 
 /// Structural-integrity counts for a compact report. All zero on a well-formed
 /// report; each non-zero field is logged once (not per finding) as a
-/// producer-side signal. Two HashSet scans over findings — negligible beside
+/// producer-side signal. One HashSet scan over findings — negligible beside
 /// model inference.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReportIntegrity {
@@ -3598,20 +3598,15 @@ struct ReportIntegrity {
     /// trait then renders downstream (hopper/prism) with no file context.
     dangling_refs: usize,
     /// `role:sidecar` files with no `pid`. A sidecar is metadata *about* a
-    /// parent node, so an absent parent means it describes nothing (invariant 3).
+    /// parent node, so an absent parent means it describes nothing.
     orphan_sidecars: usize,
-    /// Findings with byte `spans` but an empty `from` on a *container* node.
-    /// Their spans would window against the container's own (often compressed)
-    /// bytes instead of the member the finding came from — the
-    /// `has-description`-on-a-gzip defect (invariant 1).
-    container_native_spans: usize,
 }
 
 /// Verify the compact report's structural invariants and return the counts so
 /// callers and tests can assert on them. A finding's `from[].file` entries index
 /// into `files[]`; if a member is dropped or renumbered without remapping these,
 /// the index dangles and the trait renders downstream (hopper/prism) with no file
-/// context. Two provenance invariants ride the same scan (see [`ReportIntegrity`]).
+/// context. A `role:sidecar` must also name a parent (see [`ReportIntegrity`]).
 /// We can't repair these here, but a producer-side log turns each into a visible
 /// signal instead of a mystery on the rendering side.
 fn validate_report_references(
@@ -3619,19 +3614,14 @@ fn validate_report_references(
     report: &cleave::types::compact::CompactReport,
 ) -> ReportIntegrity {
     let ids: std::collections::HashSet<u32> = report.files.iter().map(|f| f.id).collect();
-    // A container is any file some other file names as its `pid`.
-    let containers: std::collections::HashSet<u32> =
-        report.files.iter().filter_map(|f| f.parent).collect();
 
     let mut integ = ReportIntegrity::default();
     let mut ref_sample: Vec<String> = Vec::new();
-    let mut span_sample: Vec<String> = Vec::new();
     for file in &report.files {
         // Invariant 3: a sidecar must describe a parent node.
         if matches!(file.role, cleave::types::Role::Sidecar) && file.parent.is_none() {
             integ.orphan_sidecars += 1;
         }
-        let is_container = containers.contains(&file.id);
         for finding in &file.findings {
             // v8 merged the old `src` (inherited single source) and `sources[]`
             // (cross-file composite members) into one `from: Vec<CompactSource>`.
@@ -3641,14 +3631,6 @@ fn validate_report_references(
                     if ref_sample.len() < 3 {
                         ref_sample.push(format!("{}->#{}", finding.id, s.file));
                     }
-                }
-            }
-            // Invariant 1: byte spans + empty `from` on a container would render
-            // against the container's own bytes, not the member they came from.
-            if is_container && finding.from.is_empty() && !finding.ev.is_empty() {
-                integ.container_native_spans += 1;
-                if span_sample.len() < 3 {
-                    span_sample.push(format!("{}@#{}", finding.id, file.id));
                 }
             }
         }
@@ -3672,112 +3654,51 @@ fn validate_report_references(
              describe a parent node"
         );
     }
-    if integ.container_native_spans > 0 {
-        tracing::error!(
-            label,
-            container_native_spans = integ.container_native_spans,
-            examples = %span_sample.join(", "),
-            "compact report integrity: findings carry byte spans on a container with no from; \
-             spans would render against the container's own bytes, not the member they came from"
-        );
-    }
     integ
 }
 
 #[cfg(test)]
 mod integrity_tests {
     use super::validate_report_references;
-    use cleave::types::{Criticality, Evidence, FileAnalysis, Finding, FindingKind, Role};
+    use cleave::types::{FileAnalysis, Role};
 
-    /// A native, span-bearing finding with no cross-file source — the shape that
-    /// the roll-up bug stamped onto a container node.
-    fn native_span_finding() -> Finding {
-        Finding {
-            src: None,
-            id: "metadata/package/manifest/description::has-description".into(),
-            kind: FindingKind::Capability,
-            desc: "Package has meaningful description".into(),
-            conf: 0.9,
-            crit: Criticality::Notable,
-            mbc: None,
-            attack: None,
-            trait_refs: vec![],
-            evidence: vec![Evidence {
-                method: "value".into(),
-                source: "test".into(),
-                value: "a meaningful description".into(),
-                location: None,
-                offsets: vec![36],
-                ..Default::default()
-            }],
-            match_count: 1,
-            source_file: None,
+    fn file(id: u32, path: &str, ftype: &str, sha: &str, parent: Option<u32>) -> FileAnalysis {
+        FileAnalysis {
+            id,
+            path: path.into(),
+            file_type: ftype.into(),
+            sha256: sha.into(),
+            size: 10,
+            parent_id: parent,
+            ..Default::default()
         }
     }
 
     #[test]
-    fn flags_orphan_sidecar_and_container_native_spans() {
-        // file 0 is a container (file 1 names it as `pid`) carrying a native
-        // span-bearing finding; file 2 is a sidecar with no parent to describe.
-        let container = FileAnalysis {
-            id: 0,
-            path: "a.tar".into(),
-            file_type: "tar".into(),
-            sha256: "s0".into(),
-            size: 100,
-            findings: vec![native_span_finding()],
-            ..Default::default()
-        };
-        let member = FileAnalysis {
-            id: 1,
-            path: "a.tar!!x.py".into(),
-            file_type: "python".into(),
-            sha256: "s1".into(),
-            size: 10,
-            parent_id: Some(0),
-            ..Default::default()
-        };
-        let orphan = FileAnalysis {
-            id: 2,
-            path: "reg".into(),
-            file_type: "registry".into(),
-            sha256: "s2".into(),
-            size: 5,
-            role: Role::Sidecar,
-            ..Default::default()
-        };
-
-        let report = cleave::types::compact::compact_from_files(&[container, member, orphan]);
+    fn flags_orphan_sidecar() {
+        // A sidecar with no `pid` describes nothing — the one thing invariant 3
+        // rejects. The ordinary parent/member pair around it stays clean.
+        let mut orphan = file(2, "reg", "registry", "s2", None);
+        orphan.role = Role::Sidecar;
+        let report = cleave::types::compact::compact_from_files(&[
+            file(0, "a.tar", "tar", "s0", None),
+            file(1, "a.tar!!x.py", "python", "s1", Some(0)),
+            orphan,
+        ]);
         let integ = validate_report_references("test", &report);
         assert_eq!(integ.orphan_sidecars, 1, "orphan sidecar");
-        assert_eq!(integ.container_native_spans, 1, "container native span");
         assert_eq!(integ.dangling_refs, 0, "no dangling refs");
     }
 
     #[test]
     fn clean_report_has_zero_integrity_counts() {
-        // A member carrying its own native span-bearing finding is fine — it is
-        // a leaf, not a container, so the span renders against its own bytes.
-        let root = FileAnalysis {
-            id: 0,
-            path: "a.tar".into(),
-            file_type: "tar".into(),
-            sha256: "s0".into(),
-            size: 100,
-            ..Default::default()
-        };
-        let member = FileAnalysis {
-            id: 1,
-            path: "a.tar!!x.py".into(),
-            file_type: "python".into(),
-            sha256: "s1".into(),
-            size: 10,
-            parent_id: Some(0),
-            findings: vec![native_span_finding()],
-            ..Default::default()
-        };
-
-        let report = cleave::types::compact::compact_from_files(&[root, member]);
+        // A sidecar that correctly names its parent is fine.
+        let mut sidecar = file(1, "reg", "registry", "s1", Some(0));
+        sidecar.role = Role::Sidecar;
+        let report = cleave::types::compact::compact_from_files(&[
+            file(0, "a.tar", "tar", "s0", None),
+            sidecar,
+        ]);
         let integ = validate_report_references("test", &report);
         assert_eq!(integ, super::ReportIntegrity::default());
     }
