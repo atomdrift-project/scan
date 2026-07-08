@@ -906,7 +906,10 @@ pub fn print_version(scan_version: &str, total_rules: u64, rows: &[SourceRow]) {
     println!(
         " \u{269b}\u{fe0f} {} {}",
         fg_bold(p.path_name, &format!("Atomdrift Scan v{scan_version}")),
-        fg(p.very_dim, &format!("\u{2014} {} rules", with_commas(total_rules))),
+        fg(
+            p.very_dim,
+            &format!("\u{2014} {} rules", with_commas(total_rules))
+        ),
     );
     println!();
 

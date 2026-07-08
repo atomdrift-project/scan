@@ -115,7 +115,10 @@ impl AnalysisCache {
 fn ruleset_version() -> String {
     let vi = cleave::version_info();
     let commit = cleave::rule_update::installed(&cleave::traits_repo::install_target())
-        .map_or_else(|| "none".to_string(), |i| i.commit.chars().take(12).collect());
+        .map_or_else(
+            || "none".to_string(),
+            |i| i.commit.chars().take(12).collect(),
+        );
     let bloom = crate::bloom_repo::installed_manifest()
         .map_or_else(|| "nobloom".to_string(), |m| sanitize(&m.built));
     format!(

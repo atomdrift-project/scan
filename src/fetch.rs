@@ -1147,7 +1147,9 @@ fn url_host(url: &str) -> &str {
         .next()
         .unwrap_or(after_scheme);
     // Keep `host[:port]`, dropping any `userinfo@` prefix.
-    authority.rsplit_once('@').map_or(authority, |(_, host)| host)
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
 }
 
 /// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
@@ -1305,7 +1307,8 @@ pub(crate) const FRESH_WINDOW_SECS: u64 = 48 * 3_600;
 /// vouch is built ahead of time; for a freshly minted release the vouch may
 /// predate the bytes now being served, so re-scan rather than trust it.
 fn fresh_48h(reg: &Registry, now: u64) -> bool {
-    reg.age_secs(now).is_some_and(|age| age <= FRESH_WINDOW_SECS)
+    reg.age_secs(now)
+        .is_some_and(|age| age <= FRESH_WINDOW_SECS)
 }
 
 /// A known-good dependency is normally skipped; re-scan it anyway when its trust
@@ -1519,6 +1522,13 @@ fn merge_registry(report: &mut AnalysisReport, parent_sha: &str, sub: AnalysisRe
         .map_or((0, 0), |f| (f.id, f.depth));
     let id_base = report.files.iter().map(|f| f.id).max().map_or(0, |m| m + 1);
     for mut file in sub.files {
+        // The registry document itself (the sub-report's root) is a sidecar:
+        // metadata about its parent package, analyzed from its own canonical
+        // JSON bytes so its findings feed ML, but not standalone content.
+        if file.parent_id.is_none() {
+            file.rel = cleave::types::Rel::Registry;
+            file.role = cleave::types::Role::Sidecar;
+        }
         file.id += id_base;
         file.parent_id = Some(file.parent_id.map_or(parent_id, |p| p + id_base));
         file.depth += parent_depth + 1;
@@ -1883,11 +1893,27 @@ fn merge_payload(
         .find(|f| f.sha256 == rec.source_sha256)
         .map_or((0, 0), |f| (f.id, f.depth));
     let id_base = report.files.iter().map(|f| f.id).max().map_or(0, |m| m + 1);
+    // The resolved download URL (falling back to the bare locator/PURL) this
+    // subtree came from, recorded on the graft root as `via`.
+    let via_str = if rec.resolved_url.is_empty() {
+        rec.locator.as_str()
+    } else {
+        rec.resolved_url.as_str()
+    };
+    let via = (!via_str.is_empty()).then(|| via_str.to_string());
     let first_new = report.files.len();
     for mut file in sub.files {
+        // The payload's own top node (the sub-report's root) is a fetched edge:
+        // pulled from `via`, not contained in its parent. Its exploded members
+        // stay ordinary members.
+        let is_sub_root = file.parent_id.is_none();
         file.id += id_base;
         file.parent_id = Some(file.parent_id.map_or(parent_id, |p| p + id_base));
         file.depth += parent_depth + 1;
+        if is_sub_root {
+            file.rel = cleave::types::Rel::Fetched;
+            file.via = via.clone();
+        }
         report.files.push(file);
     }
 
@@ -1992,7 +2018,10 @@ mod tests {
         );
         assert_eq!(url_host("https://example.com"), "example.com");
         // `userinfo@` is dropped; `host:port` is kept.
-        assert_eq!(url_host("http://user:pass@host.test:8080/x"), "host.test:8080");
+        assert_eq!(
+            url_host("http://user:pass@host.test:8080/x"),
+            "host.test:8080"
+        );
         // Not a URL: returned as-is.
         assert_eq!(url_host("bareword"), "bareword");
     }
@@ -2023,7 +2052,10 @@ mod tests {
         ];
         let line = summary_line(&warm);
         assert!(line.contains("2 cached"), "{line}");
-        assert!(!line.contains("live"), "zero `live` must be omitted: {line}");
+        assert!(
+            !line.contains("live"),
+            "zero `live` must be omitted: {line}"
+        );
         // A mixed run keeps both non-zero counts.
         let mixed = vec![
             record(Outcome::Ok, false, Some(0)),
@@ -2118,10 +2150,16 @@ mod tests {
             host
         ));
         // A portable package (no os+arch pair) is never platform-skipped.
-        assert!(!off_host_platform(&purl_ref("pkg:npm/left-pad@1.3.0"), host));
+        assert!(!off_host_platform(
+            &purl_ref("pkg:npm/left-pad@1.3.0"),
+            host
+        ));
         assert!(!off_host_platform(&purl_ref("pkg:npm/semver@7.5.0"), host));
         // A raw URL carries no package identity to place.
-        assert!(!off_host_platform(&url_ref("https://example.com/x.tgz"), host));
+        assert!(!off_host_platform(
+            &url_ref("https://example.com/x.tgz"),
+            host
+        ));
         // Fail open when the host platform can't be named.
         assert!(!off_host_platform(
             &purl_ref("pkg:npm/%40biomejs/cli-linux-x64@2.5.0"),

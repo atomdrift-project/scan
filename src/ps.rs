@@ -228,11 +228,8 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         // still analyzed below.
         if let Some(lookup) = config.bloom()
             && let Some(digest) = crate::bloom::parse_sha256_hex(&group.sha256)
-            && let Some(summary) = crate::engine::bloom_gate_fresh(
-                config,
-                &group.path,
-                lookup.decide_sha256(&digest),
-            )
+            && let Some(summary) =
+                crate::engine::bloom_gate_fresh(config, &group.path, lookup.decide_sha256(&digest))
         {
             benign.fetch_add(summary.benign, Ordering::Relaxed);
             if let Some(p) = &progress {
@@ -390,9 +387,7 @@ fn build_result(
     // never reaches here). Drives the inline 🚩/🏴 in the terminal header.
     let bloom_mark = config
         .bloom()
-        .and_then(|lk| {
-            crate::bloom::parse_sha256_hex(&group.sha256).map(|d| lk.decide_sha256(&d))
-        })
+        .and_then(|lk| crate::bloom::parse_sha256_hex(&group.sha256).map(|d| lk.decide_sha256(&d)))
         .and_then(crate::output::BloomMark::from_decision);
     let cr = crate::engine::classify_report(
         &display_path.display().to_string(),

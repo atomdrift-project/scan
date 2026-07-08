@@ -484,7 +484,14 @@ fn sync_dependencies(
         .map(|d| dep_artifact(d, &collector, analyzed_at))
         .collect();
     let mut local_seen = HashSet::new();
-    reconcile_artifacts(client, known_url, upload_url, cache, &mut local_seen, artifacts);
+    reconcile_artifacts(
+        client,
+        known_url,
+        upload_url,
+        cache,
+        &mut local_seen,
+        artifacts,
+    );
     // Then the verdict for each dependency, keyed by its content sha.
     for dep in fresh {
         let sha256 = dep.sha256.clone();
@@ -637,12 +644,19 @@ fn upload_one(
     bytes: &[u8],
 ) {
     use reqwest::blocking::multipart::{Form, Part};
-    let ok = post_upload(client, upload_url, &art.sha256, "artifact", &art.sidecar, || {
-        Some(Form::new().part("provenance", provenance_part(art)?).part(
-            "file",
-            Part::bytes(bytes.to_vec()).file_name(art.filename.clone()),
-        ))
-    });
+    let ok = post_upload(
+        client,
+        upload_url,
+        &art.sha256,
+        "artifact",
+        &art.sidecar,
+        || {
+            Some(Form::new().part("provenance", provenance_part(art)?).part(
+                "file",
+                Part::bytes(bytes.to_vec()).file_name(art.filename.clone()),
+            ))
+        },
+    );
     if ok {
         tracing::debug!(sha256 = %art.sha256, file = %art.filename, size = art.size, "upload: artifact stored on hopper");
     }
@@ -787,7 +801,10 @@ mod tests {
         let art = dep_artifact(&dep, "scan+test", "2026-06-28T00:00:00Z");
         assert_eq!(art.sha256, "c".repeat(64));
         assert_eq!(art.size, 99);
-        assert_eq!(art.filename, "x-1.tgz", "filename derived from the fetch URL");
+        assert_eq!(
+            art.filename, "x-1.tgz",
+            "filename derived from the fetch URL"
+        );
         assert!(art.backfill, "a dependency's provenance is backfillable");
         assert!(
             matches!(&art.bytes, ArtifactBytes::Cached { locator } if locator == "pkg:bogus/x@1"),

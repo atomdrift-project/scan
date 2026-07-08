@@ -538,9 +538,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         // Start the background uploader once when --hopper is set, so every
         // analyzed result (parent and members) is renewed on hopper without
         // blocking the analyze response.
-        uploader: config
-            .hopper()
-            .map(|url| Arc::new(crate::upload::Uploader::new(url, crate::upload::default_worker_name()))),
+        uploader: config.hopper().map(|url| {
+            Arc::new(crate::upload::Uploader::new(
+                url,
+                crate::upload::default_worker_name(),
+            ))
+        }),
     });
 
     // Background task: load model + SHAP + YARA concurrently, then mark ready.

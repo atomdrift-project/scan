@@ -594,7 +594,10 @@ mod tests {
         let rows = 12;
         let s = state(entries, rows);
         let lines = compose(&s, 0, false);
-        assert!(lines.len() <= rows - RESERVE_ROWS, "region exceeds viewport");
+        assert!(
+            lines.len() <= rows - RESERVE_ROWS,
+            "region exceeds viewport"
+        );
         let body = strip_ansi(&lines.join("\n"));
         assert!(body.contains("d50"), "active row d50 not surfaced");
         assert!(body.contains("d51"), "active row d51 not surfaced");
@@ -622,9 +625,16 @@ mod tests {
         // ellipsis, so the version and extension survive the cut.
         let url = "github.com/be5invis/Iosevka/releases/download/v34.7.0/PkgTTF-IosevkaCurlySlab-34.7.0.zip";
         let out = elide_middle(url, 34);
-        assert_eq!(out.chars().count(), 34, "elided name must fill exactly the column");
+        assert_eq!(
+            out.chars().count(),
+            34,
+            "elided name must fill exactly the column"
+        );
         assert!(out.starts_with("github.com/"), "host prefix lost: {out}");
         assert!(out.ends_with(".zip"), "filename tail lost: {out}");
-        assert!(out.contains('\u{2026}'), "no ellipsis marking the cut: {out}");
+        assert!(
+            out.contains('\u{2026}'),
+            "no ellipsis marking the cut: {out}"
+        );
     }
 }

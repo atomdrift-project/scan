@@ -473,7 +473,10 @@ pub fn canonical_purl(raw: &str) -> String {
     match typ.as_str() {
         // Browser / editor extensions: case-insensitive bodies, ratified types.
         "chrome" | "chrome-extension" => {
-            format!("pkg:chrome-extension/{}{tail}", last_purl_segment(path).to_ascii_lowercase())
+            format!(
+                "pkg:chrome-extension/{}{tail}",
+                last_purl_segment(path).to_ascii_lowercase()
+            )
         }
         "vscode" | "vscode-extension" => {
             format!("pkg:vscode-extension/{}{tail}", path.to_ascii_lowercase())
@@ -524,10 +527,11 @@ fn add_purl_qualifier(tail: &str, qualifier: &str) -> String {
     match tail.split_once('?') {
         None => format!("{tail}?{qualifier}"),
         Some((ver, quals)) => {
-            if quals
-                .split('&')
-                .any(|q| q.split('=').next().is_some_and(|k| k.eq_ignore_ascii_case(key)))
-            {
+            if quals.split('&').any(|q| {
+                q.split('=')
+                    .next()
+                    .is_some_and(|k| k.eq_ignore_ascii_case(key))
+            }) {
                 tail.to_string()
             } else {
                 format!("{ver}?{quals}&{qualifier}")
@@ -737,8 +741,14 @@ mod tests {
         // stored spec PURL and a scanned legacy PURL hit the same filter key.
         let pairs = [
             ("pkg:chrome/KhKimila", "pkg:chrome-extension/khkimila"),
-            ("pkg:chrome/KhKimila@25.7.1", "pkg:chrome-extension/khkimila@25.7.1"),
-            ("pkg:vscode/Saoudrizwan/Claude-Dev", "pkg:vscode-extension/saoudrizwan/claude-dev"),
+            (
+                "pkg:chrome/KhKimila@25.7.1",
+                "pkg:chrome-extension/khkimila@25.7.1",
+            ),
+            (
+                "pkg:vscode/Saoudrizwan/Claude-Dev",
+                "pkg:vscode-extension/saoudrizwan/claude-dev",
+            ),
             (
                 "pkg:openvsx/jinryx/crontally@1.0.3",
                 "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https://open-vsx.org",

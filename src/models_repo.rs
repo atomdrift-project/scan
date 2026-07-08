@@ -92,11 +92,16 @@ pub fn feature_dimension() -> Option<usize> {
         total_features: usize,
     }
     let base = current_models_dir();
-    let spec = [base.join("general").join("feature_spec.json"), base.join("feature_spec.json")]
-        .into_iter()
-        .find(|p| p.is_file())?;
+    let spec = [
+        base.join("general").join("feature_spec.json"),
+        base.join("feature_spec.json"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())?;
     let text = std::fs::read_to_string(spec).ok()?;
-    serde_json::from_str::<Dim>(&text).ok().map(|d| d.total_features)
+    serde_json::from_str::<Dim>(&text)
+        .ok()
+        .map(|d| d.total_features)
 }
 
 /// Number of ONNX models in the installed bundle — the ensemble's route models

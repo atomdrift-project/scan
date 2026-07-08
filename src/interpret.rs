@@ -144,9 +144,9 @@ const fn system_prompt(template: InterpretTemplate) -> &'static str {
         // Pointer/Elevated show only bare `# SEV LOC` pointers; Adaptive is mostly
         // that, additionally keeping cleave's prose on hex findings (the model
         // reads the description when it is present).
-        InterpretTemplate::Adaptive
-        | InterpretTemplate::Pointer
-        | InterpretTemplate::Elevated => POINTER_PROMPT,
+        InterpretTemplate::Adaptive | InterpretTemplate::Pointer | InterpretTemplate::Elevated => {
+            POINTER_PROMPT
+        }
         InterpretTemplate::Raw => RAW_PROMPT,
     }
 }
@@ -642,7 +642,9 @@ fn parse_annotation(line: &str) -> Option<Annotation<'_>> {
     let indent_len = line.len() - line.trim_start().len();
     let indent = line.get(..indent_len)?;
     let rest = line.get(indent_len..)?;
-    let marker = ["//", "--", "#"].into_iter().find(|m| rest.starts_with(m))?;
+    let marker = ["//", "--", "#"]
+        .into_iter()
+        .find(|m| rest.starts_with(m))?;
     // Exactly one space between the marker and the severity letter.
     let after = rest.get(marker.len()..)?.strip_prefix(' ')?;
     let mut chars = after.chars();
@@ -1226,7 +1228,9 @@ mod tests {
 
     #[test]
     fn gate_helpers_detect_elevated_and_readability() {
-        assert!(has_elevated_finding("// S 1:1 encrypted loader\n\\x00\\x01data\n"));
+        assert!(has_elevated_finding(
+            "// S 1:1 encrypted loader\n\\x00\\x01data\n"
+        ));
         assert!(has_elevated_finding("// H malicious\ncode\n"));
         assert!(!has_elevated_finding("// N 1:1 notable only\ncode();\n"));
         // Mostly source → readable; mostly escaped bytes → not.
@@ -1293,8 +1297,14 @@ mod tests {
         // source untouched.
         let render = "// N 22:21 fetch() API call\n  const res = await fetch(url);\n// H Anomalous package hides exfiltration\n";
         let out = apply_template(render, InterpretTemplate::Pointer);
-        assert!(out.contains("// N 22:21\n"), "loc marker kept, prose dropped");
-        assert!(out.contains("// H\n"), "location-less marker kept, prose dropped");
+        assert!(
+            out.contains("// N 22:21\n"),
+            "loc marker kept, prose dropped"
+        );
+        assert!(
+            out.contains("// H\n"),
+            "location-less marker kept, prose dropped"
+        );
         assert!(
             !out.contains("Anomalous package"),
             "prose description removed"
@@ -1304,7 +1314,8 @@ mod tests {
 
     #[test]
     fn template_raw_drops_all_annotations_but_elevated_keeps_hs() {
-        let render = "// N 1:1 notable\n// S 2:2 suspicious thing\n// H 3:3 hostile thing\ncode();\n";
+        let render =
+            "// N 1:1 notable\n// S 2:2 suspicious thing\n// H 3:3 hostile thing\ncode();\n";
         let raw = apply_template(render, InterpretTemplate::Raw);
         assert_eq!(raw, "code();\n", "raw drops every annotation");
         let elevated = apply_template(render, InterpretTemplate::Elevated);
@@ -1357,7 +1368,10 @@ mod tests {
                       // N SetWindowLongA ANSI window-style update API\n\
                       \\x99\\x02MessageBoxW\\0\\xaa\\x02OpenClipboard\\0\n";
         let out = apply_template(render, InterpretTemplate::Adaptive);
-        assert!(out.contains("// N OpenClipboard string reference"), "1st kept");
+        assert!(
+            out.contains("// N OpenClipboard string reference"),
+            "1st kept"
+        );
         assert!(
             out.contains("// N SetWindowLongA ANSI window-style update API"),
             "2nd (in the run) kept too",

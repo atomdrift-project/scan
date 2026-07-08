@@ -419,7 +419,10 @@ mod tests {
         let eicar = parse_sha256_hex(EICAR).unwrap();
         let filters = filters_from(&[(Label::Good, eicar)]);
         let err = verify_build(&filters, None, &[]).unwrap_err().to_string();
-        assert!(err.contains("canary") && err.contains("sha256-good"), "{err}");
+        assert!(
+            err.contains("canary") && err.contains("sha256-good"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -429,7 +432,10 @@ mod tests {
         let err = verify_build(&filters, None, &[("/bin/ls".to_owned(), d)])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("/bin/ls") && err.contains("sha256-bad"), "{err}");
+        assert!(
+            err.contains("/bin/ls") && err.contains("sha256-bad"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -441,7 +447,10 @@ mod tests {
         let err = verify_build(&filters, Some(&prev), &[])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("sha256-good") && err.contains("shrank"), "{err}");
+        assert!(
+            err.contains("sha256-good") && err.contains("shrank"),
+            "{err}"
+        );
     }
 
     #[test]

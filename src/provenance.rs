@@ -280,7 +280,10 @@ mod tests {
             version: "1.1.137".into(),
             ..Default::default()
         };
-        let huge = format!(r#"{{"name":"socket","blob":"{}"}}"#, "x".repeat(super::MAX_RAW_BYTES));
+        let huge = format!(
+            r#"{{"name":"socket","blob":"{}"}}"#,
+            "x".repeat(super::MAX_RAW_BYTES)
+        );
         let sources = vec![fletch::fetch::RecordedSource {
             url: "https://registry.npmjs.org/socket".to_string(),
             status: 200,
@@ -299,7 +302,10 @@ mod tests {
             &sources,
         );
 
-        assert!(json.len() < super::MAX_RAW_BYTES, "oversized raw was not dropped");
+        assert!(
+            json.len() < super::MAX_RAW_BYTES,
+            "oversized raw was not dropped"
+        );
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["registry"]["status"], "partial");
         assert!(v["registry"].get("raw").is_none());

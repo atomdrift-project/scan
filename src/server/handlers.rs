@@ -1304,7 +1304,9 @@ pub(super) async fn analyze_path(
             if let (Some(uploader), Some(path)) = (&state.uploader, upload_path) {
                 let uploader = Arc::clone(uploader);
                 tokio::task::spawn_blocking(move || {
-                    crate::engine::upload_scan_result(&uploader, &path, sha256, size, deps, envelope);
+                    crate::engine::upload_scan_result(
+                        &uploader, &path, sha256, size, deps, envelope,
+                    );
                 });
             }
             let mut resp = (

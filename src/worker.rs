@@ -1952,7 +1952,14 @@ async fn run_job(
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
     prefetched: std::result::Result<Option<bytes::Bytes>, PrefetchError>,
-) -> Result<(crate::engine::ScanResultEnvelope, Vec<crate::engine::DepResult>, i64), String> {
+) -> Result<
+    (
+        crate::engine::ScanResultEnvelope,
+        Vec<crate::engine::DepResult>,
+        i64,
+    ),
+    String,
+> {
     let analysis_id = NEXT_ANALYSIS_ID.fetch_add(1, Ordering::Relaxed);
     // `Arc<str>` so the watcher and the blocking closure share the basename
     // allocation instead of each cloning a fresh `String`.
@@ -2290,7 +2297,14 @@ async fn post_result(
     url: &str,
     worker: &str,
     sha256: &str,
-    result: Result<(crate::engine::ScanResultEnvelope, Vec<crate::engine::DepResult>, i64), String>,
+    result: Result<
+        (
+            crate::engine::ScanResultEnvelope,
+            Vec<crate::engine::DepResult>,
+            i64,
+        ),
+        String,
+    >,
 ) {
     // The hopper base URL, captured before `url` is shadowed by the result
     // endpoint below — fetched dependencies are mirrored against the same base.

@@ -669,7 +669,8 @@ mod envelope_tests {
             let hostile_lvl =
                 u16::try_from(interpreted_level(Some(deploy), grid_max, Hostile).unwrap()).unwrap();
             let susp_lvl =
-                u16::try_from(interpreted_level(Some(deploy), grid_max, Suspicious).unwrap()).unwrap();
+                u16::try_from(interpreted_level(Some(deploy), grid_max, Suspicious).unwrap())
+                    .unwrap();
             assert_eq!(verdict_for_level(hostile_lvl, deploy, grid_max), Hostile);
             assert_eq!(verdict_for_level(susp_lvl, deploy, grid_max), Suspicious);
         }
@@ -929,12 +930,17 @@ pub const fn level_confidence(level: Option<i32>) -> Option<u8> {
 /// displayed confidence tracks automatically. `active_level` is `None` in
 /// manual-threshold mode (no grid); hostile/suspicious then return `None`,
 /// matching how a genuine ML verdict serializes its level there.
-fn interpreted_level(active_level: Option<u16>, grid_max: u16, outcome: Classification) -> Option<i32> {
+fn interpreted_level(
+    active_level: Option<u16>,
+    grid_max: u16,
+    outcome: Classification,
+) -> Option<i32> {
     match outcome {
         Classification::Benign => Some(-1),
         Classification::Hostile => active_level.map(i32::from),
-        Classification::Suspicious => active_level
-            .map(|_| i32::from(crate::model::capped_suspicious_level(grid_max))),
+        Classification::Suspicious => {
+            active_level.map(|_| i32::from(crate::model::capped_suspicious_level(grid_max)))
+        }
     }
 }
 
@@ -1161,7 +1167,11 @@ pub(crate) fn term_dims() -> (usize, usize) {
         unsafe {
             let mut ws: libc::winsize = std::mem::zeroed();
             if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-                let rows = if ws.ws_row > 0 { ws.ws_row as usize } else { 24 };
+                let rows = if ws.ws_row > 0 {
+                    ws.ws_row as usize
+                } else {
+                    24
+                };
                 return (ws.ws_col as usize, rows);
             }
         }
@@ -1831,7 +1841,10 @@ fn file_touched_within(path: &Path, window: u64, now: SystemTime) -> bool {
     let Ok(md) = std::fs::metadata(path) else {
         return false;
     };
-    let recent = |t: SystemTime| now.duration_since(t).map_or(true, |d| d.as_secs() <= window);
+    let recent = |t: SystemTime| {
+        now.duration_since(t)
+            .map_or(true, |d| d.as_secs() <= window)
+    };
     // created()/modified() are unsupported on some platforms/filesystems.
     if md.created().is_ok_and(recent) || md.modified().is_ok_and(recent) {
         return true;
@@ -1996,11 +2009,7 @@ pub(crate) fn upload_scan_result(
 /// would post, so hopper records the dependency exactly as if it had been scanned
 /// directly. `version`/`analyzed_at` are the parent run's, identifying the build.
 #[must_use]
-pub(crate) fn dep_envelope(
-    dep: DepResult,
-    version: &str,
-    analyzed_at: &str,
-) -> ScanResultEnvelope {
+pub(crate) fn dep_envelope(dep: DepResult, version: &str, analyzed_at: &str) -> ScanResultEnvelope {
     let level = dep.level;
     let ml_files = build_ml_files(&dep.raw, dep.probability, level, &[]);
     ScanResultEnvelope {
@@ -2099,7 +2108,13 @@ fn sha256_file_hex(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).ok()?;
-    Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 /// Scan a set of file and directory paths, classifying every file.
@@ -3087,7 +3102,8 @@ pub(crate) fn classify_report(
         );
         final_decision.class = interp.outcome;
         final_decision.probability = interp.blended;
-        final_decision.level = interpreted_level(model.active_level(), model.grid_max(), interp.outcome);
+        final_decision.level =
+            interpreted_level(model.active_level(), model.grid_max(), interp.outcome);
     }
 
     // Render cleave's context view now, while the typed (finalized) report is in
@@ -3572,44 +3588,198 @@ pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
     }
 }
 
-/// Verify every cross-reference in the compact report resolves to an emitted
-/// file. A finding's `from[].file` entries index into `files[]`; if a member is
-/// ever dropped or renumbered without remapping
-/// these, the index dangles and the trait renders downstream (hopper/prism) with
-/// no file context — the silent defect that left older reports with orphaned
-/// composites. We can't repair it here, but a producer-side log turns it into a
-/// visible signal instead of a mystery on the rendering side. The check is a
-/// HashSet membership scan over findings — negligible beside model inference.
-fn validate_report_references(label: &str, report: &cleave::types::compact::CompactReport) {
+/// Structural-integrity counts for a compact report. All zero on a well-formed
+/// report; each non-zero field is logged once (not per finding) as a
+/// producer-side signal. Two HashSet scans over findings — negligible beside
+/// model inference.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReportIntegrity {
+    /// `from[].file` entries that don't resolve to an emitted file id — the
+    /// trait then renders downstream (hopper/prism) with no file context.
+    dangling_refs: usize,
+    /// `role:sidecar` files with no `pid`. A sidecar is metadata *about* a
+    /// parent node, so an absent parent means it describes nothing (invariant 3).
+    orphan_sidecars: usize,
+    /// Findings with byte `spans` but an empty `from` on a *container* node.
+    /// Their spans would window against the container's own (often compressed)
+    /// bytes instead of the member the finding came from — the
+    /// `has-description`-on-a-gzip defect (invariant 1).
+    container_native_spans: usize,
+}
+
+/// Verify the compact report's structural invariants and return the counts so
+/// callers and tests can assert on them. A finding's `from[].file` entries index
+/// into `files[]`; if a member is dropped or renumbered without remapping these,
+/// the index dangles and the trait renders downstream (hopper/prism) with no file
+/// context. Two provenance invariants ride the same scan (see [`ReportIntegrity`]).
+/// We can't repair these here, but a producer-side log turns each into a visible
+/// signal instead of a mystery on the rendering side.
+fn validate_report_references(
+    label: &str,
+    report: &cleave::types::compact::CompactReport,
+) -> ReportIntegrity {
     let ids: std::collections::HashSet<u32> = report.files.iter().map(|f| f.id).collect();
-    let mut dangling = 0usize;
-    let mut sample: Vec<String> = Vec::new();
-    let mut note = |trait_id: &str, missing: u32| {
-        dangling += 1;
-        if sample.len() < 3 {
-            sample.push(format!("{trait_id}->#{missing}"));
-        }
-    };
+    // A container is any file some other file names as its `pid`.
+    let containers: std::collections::HashSet<u32> =
+        report.files.iter().filter_map(|f| f.parent).collect();
+
+    let mut integ = ReportIntegrity::default();
+    let mut ref_sample: Vec<String> = Vec::new();
+    let mut span_sample: Vec<String> = Vec::new();
     for file in &report.files {
+        // Invariant 3: a sidecar must describe a parent node.
+        if matches!(file.role, cleave::types::Role::Sidecar) && file.parent.is_none() {
+            integ.orphan_sidecars += 1;
+        }
+        let is_container = containers.contains(&file.id);
         for finding in &file.findings {
             // v8 merged the old `src` (inherited single source) and `sources[]`
             // (cross-file composite members) into one `from: Vec<CompactSource>`.
             for s in &finding.from {
                 if !ids.contains(&s.file) {
-                    note(&finding.id, s.file);
+                    integ.dangling_refs += 1;
+                    if ref_sample.len() < 3 {
+                        ref_sample.push(format!("{}->#{}", finding.id, s.file));
+                    }
+                }
+            }
+            // Invariant 1: byte spans + empty `from` on a container would render
+            // against the container's own bytes, not the member they came from.
+            if is_container && finding.from.is_empty() && !finding.ev.is_empty() {
+                integ.container_native_spans += 1;
+                if span_sample.len() < 3 {
+                    span_sample.push(format!("{}@#{}", finding.id, file.id));
                 }
             }
         }
     }
-    if dangling > 0 {
+
+    if integ.dangling_refs > 0 {
         tracing::error!(
             label,
-            dangling,
+            dangling = integ.dangling_refs,
             files = report.files.len(),
-            examples = %sample.join(", "),
+            examples = %ref_sample.join(", "),
             "compact report integrity: cross-file references point at file ids not in files[]; \
              affected traits will render without file context downstream"
         );
+    }
+    if integ.orphan_sidecars > 0 {
+        tracing::error!(
+            label,
+            orphan_sidecars = integ.orphan_sidecars,
+            "compact report integrity: role:sidecar files without a pid; a sidecar must \
+             describe a parent node"
+        );
+    }
+    if integ.container_native_spans > 0 {
+        tracing::error!(
+            label,
+            container_native_spans = integ.container_native_spans,
+            examples = %span_sample.join(", "),
+            "compact report integrity: findings carry byte spans on a container with no from; \
+             spans would render against the container's own bytes, not the member they came from"
+        );
+    }
+    integ
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::validate_report_references;
+    use cleave::types::{Criticality, Evidence, FileAnalysis, Finding, FindingKind, Role};
+
+    /// A native, span-bearing finding with no cross-file source — the shape that
+    /// the roll-up bug stamped onto a container node.
+    fn native_span_finding() -> Finding {
+        Finding {
+            src: None,
+            id: "metadata/package/manifest/description::has-description".into(),
+            kind: FindingKind::Capability,
+            desc: "Package has meaningful description".into(),
+            conf: 0.9,
+            crit: Criticality::Notable,
+            mbc: None,
+            attack: None,
+            trait_refs: vec![],
+            evidence: vec![Evidence {
+                method: "value".into(),
+                source: "test".into(),
+                value: "a meaningful description".into(),
+                location: None,
+                offsets: vec![36],
+                ..Default::default()
+            }],
+            match_count: 1,
+            source_file: None,
+        }
+    }
+
+    #[test]
+    fn flags_orphan_sidecar_and_container_native_spans() {
+        // file 0 is a container (file 1 names it as `pid`) carrying a native
+        // span-bearing finding; file 2 is a sidecar with no parent to describe.
+        let container = FileAnalysis {
+            id: 0,
+            path: "a.tar".into(),
+            file_type: "tar".into(),
+            sha256: "s0".into(),
+            size: 100,
+            findings: vec![native_span_finding()],
+            ..Default::default()
+        };
+        let member = FileAnalysis {
+            id: 1,
+            path: "a.tar!!x.py".into(),
+            file_type: "python".into(),
+            sha256: "s1".into(),
+            size: 10,
+            parent_id: Some(0),
+            ..Default::default()
+        };
+        let orphan = FileAnalysis {
+            id: 2,
+            path: "reg".into(),
+            file_type: "registry".into(),
+            sha256: "s2".into(),
+            size: 5,
+            role: Role::Sidecar,
+            ..Default::default()
+        };
+
+        let report = cleave::types::compact::compact_from_files(&[container, member, orphan]);
+        let integ = validate_report_references("test", &report);
+        assert_eq!(integ.orphan_sidecars, 1, "orphan sidecar");
+        assert_eq!(integ.container_native_spans, 1, "container native span");
+        assert_eq!(integ.dangling_refs, 0, "no dangling refs");
+    }
+
+    #[test]
+    fn clean_report_has_zero_integrity_counts() {
+        // A member carrying its own native span-bearing finding is fine — it is
+        // a leaf, not a container, so the span renders against its own bytes.
+        let root = FileAnalysis {
+            id: 0,
+            path: "a.tar".into(),
+            file_type: "tar".into(),
+            sha256: "s0".into(),
+            size: 100,
+            ..Default::default()
+        };
+        let member = FileAnalysis {
+            id: 1,
+            path: "a.tar!!x.py".into(),
+            file_type: "python".into(),
+            sha256: "s1".into(),
+            size: 10,
+            parent_id: Some(0),
+            findings: vec![native_span_finding()],
+            ..Default::default()
+        };
+
+        let report = cleave::types::compact::compact_from_files(&[root, member]);
+        let integ = validate_report_references("test", &report);
+        assert_eq!(integ, super::ReportIntegrity::default());
     }
 }
 

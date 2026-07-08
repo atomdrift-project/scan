@@ -323,7 +323,6 @@ impl Cli {
             template: self.interpret_template,
         })
     }
-
 }
 
 #[derive(Debug, Subcommand)]
@@ -929,13 +928,11 @@ fn main() -> Result<()> {
             // skipped — registry provenance is best-effort, never required.
             let registry_map = match &registry_map {
                 Some(path) => {
-                    let bytes = std::fs::read(path).with_context(|| {
-                        format!("reading registry map {}", path.display())
-                    })?;
+                    let bytes = std::fs::read(path)
+                        .with_context(|| format!("reading registry map {}", path.display()))?;
                     let raw: std::collections::HashMap<String, serde_json::Value> =
-                        serde_json::from_slice(&bytes).with_context(|| {
-                            format!("parsing registry map {}", path.display())
-                        })?;
+                        serde_json::from_slice(&bytes)
+                            .with_context(|| format!("parsing registry map {}", path.display()))?;
                     let mut map = std::collections::HashMap::with_capacity(raw.len());
                     for (sha, value) in raw {
                         let value_bytes = serde_json::to_vec(&value).unwrap_or_default();
@@ -1293,7 +1290,10 @@ fn main() -> Result<()> {
                 // dev checkout with no sidecar, read git HEAD directly.
                 let traits_dir = cleave::cache::traits_path();
                 let traits_installed = cleave::rule_update::installed(&traits_dir);
-                let traits_git = traits_installed.is_none().then(|| git_head(&traits_dir)).flatten();
+                let traits_git = traits_installed
+                    .is_none()
+                    .then(|| git_head(&traits_dir))
+                    .flatten();
                 let traits_version = traits_installed
                     .as_ref()
                     .map(|i| i.commit.chars().take(9).collect::<String>())
@@ -1305,13 +1305,17 @@ fn main() -> Result<()> {
                     .or_else(|| traits_git.as_ref().map(|&(_, e)| e));
 
                 // Bloom: total element count and the manifest's build date.
-                let bloom_count: u64 = bloom.as_ref().map_or(0, |m| m.filter.values().map(|e| e.n).sum());
+                let bloom_count: u64 = bloom
+                    .as_ref()
+                    .map_or(0, |m| m.filter.values().map(|e| e.n).sum());
                 let bloom_version = bloom
                     .as_ref()
                     .and_then(|m| m.filter.values().next())
                     .map(|e| format!("v{}", e.format_version))
                     .unwrap_or_default();
-                let bloom_epoch = bloom.as_ref().and_then(|m| scan::output::parse_ymd(&m.built));
+                let bloom_epoch = bloom
+                    .as_ref()
+                    .and_then(|m| scan::output::parse_ymd(&m.built));
 
                 let total = info.trait_count as u64
                     + info.composite_count as u64
@@ -1365,7 +1369,9 @@ fn main() -> Result<()> {
                         version: scan::models_repo::version()
                             .map(|c| c.chars().take(9).collect())
                             .unwrap_or_default(),
-                        epoch: model_installed.as_ref().and_then(|i| scan::output::parse_ymd(&i.date)),
+                        epoch: model_installed
+                            .as_ref()
+                            .and_then(|i| scan::output::parse_ymd(&i.date)),
                     });
                 }
 
