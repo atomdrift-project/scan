@@ -506,7 +506,7 @@ fn sync_dependencies(
     // Then the verdict for each dependency, keyed by its content sha.
     for dep in fresh {
         let sha256 = dep.sha256.clone();
-        let envelope = crate::engine::dep_envelope(dep, version, analyzed_at);
+        let envelope = crate::engine::dep_envelope(&dep, version, analyzed_at);
         post_one(client, result_url, worker, &sha256, envelope);
     }
 }
@@ -807,7 +807,7 @@ mod tests {
             size: 99,
             level: Some(-1),
             probability: 0.0,
-            raw: serde_json::json!({}),
+            raw: "{}".to_string(),
         };
         let art = dep_artifact(&dep, "scan+test", "2026-06-28T00:00:00Z");
         assert_eq!(art.sha256, "c".repeat(64));

@@ -58,7 +58,10 @@ impl AnalysisCache {
         if std::env::var("SCAN_ANALYSIS_CACHE").is_ok_and(|v| v == "0" || v == "false") {
             return None;
         }
-        let base = dirs::cache_dir()?.join("atomdrift").join("scan").join("analysis");
+        let base = dirs::cache_dir()?
+            .join("atomdrift")
+            .join("scan")
+            .join("analysis");
         let version = ruleset_version();
         prune_stale_versions(&base, &version);
         let dir = base.join(version);

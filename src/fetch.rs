@@ -422,8 +422,13 @@ pub(crate) struct FetchedDependency {
     pub content_sha: String,
     /// Size of the fetched bytes, recorded in the provenance sidecar.
     pub size: u64,
-    /// The dependency's own compact cleave report (`raw` for its `/api/result`).
-    pub raw: serde_json::Value,
+    /// The dependency's own compact cleave report as **JSON text** (`raw` for
+    /// its `/api/result`). Text form on purpose: a `serde_json::Value` tree
+    /// costs 3-6x the text size, and up to eight jobs' dependencies are
+    /// co-resident in a worker from graft until their result POST — measured
+    /// ~800 MB of retained `Value`s on the realworld worker benchmark. The
+    /// envelope build parses it back transiently.
+    pub raw: String,
     /// Every file sha in the report, so the caller can attribute the embedded
     /// pass's per-node decisions back to this dependency.
     pub member_shas: Vec<String>,
@@ -928,7 +933,7 @@ fn capture_dependency(rec: &FetchRecord, analyzed: &Analyzed) -> Option<FetchedD
     }
     let member_shas: Vec<String> = sub.files.iter().map(|f| f.sha256.clone()).collect();
     let compact = cleave::types::compact::compact_from_files(&sub.files);
-    let raw = serde_json::to_value(&compact).ok()?;
+    let raw = serde_json::to_string(&compact).ok()?;
     let url = rec
         .final_url
         .clone()

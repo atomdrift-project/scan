@@ -13,6 +13,40 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Compile-time jemalloc tuning, read once at allocator initialization.
+///
+/// `narenas:16` caps the arena count (jemalloc's default is 4× CPUs — 64
+/// arenas on a 16-core box) at roughly one per core: measured 30–60 MB lower
+/// peak RSS on the reference archive scan at equal-or-better wall time
+/// (narenas:8 saved ~100 MB but cost ~4% wall to arena contention — wall is
+/// the priority). Runtime configuration still wins: `_RJEM_MALLOC_CONF` (and
+/// `/etc/malloc.conf`) override this string, so deployments can retune
+/// without rebuilding. Guarded by the same cfg as the allocator itself — on
+/// platforms where scan uses the system allocator this symbol is never read.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))
+))]
+mod jemalloc_conf {
+    /// A `Sync` wrapper so a raw `*const c_char` can live in a static;
+    /// jemalloc reads the pointer, it is never written after link time.
+    #[repr(transparent)]
+    struct SyncPtr(*const std::os::raw::c_char);
+    // SAFETY: the pointer targets a NUL-terminated 'static literal and is
+    // never mutated, so sharing it across threads is sound.
+    unsafe impl Sync for SyncPtr {}
+
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    static _rjem_malloc_conf: SyncPtr = SyncPtr(c"narenas:16".as_ptr());
+}
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use scan::OutputFormat;

@@ -575,9 +575,10 @@ mod envelope_tests {
             size: 1234,
             level: Some(100),
             probability: 0.97,
-            raw: serde_json::json!({"v": "8", "files": [{"sha": "d".repeat(64), "type": "npm"}]}),
+            raw: serde_json::json!({"v": "8", "files": [{"sha": "d".repeat(64), "type": "npm"}]})
+                .to_string(),
         };
-        let env = dep_envelope(dep, "model-9", "2026-06-28T00:00:00Z");
+        let env = dep_envelope(&dep, "model-9", "2026-06-28T00:00:00Z");
         assert_eq!(env.ml.level, Some(100), "aggregate verdict rides in ml.lvl");
         assert_eq!(env.ml.version, "model-9");
         assert_eq!(env.ml.analyzed_at, "2026-06-28T00:00:00Z");
@@ -1036,8 +1037,10 @@ pub struct DepResult {
     pub level: Option<i32>,
     /// Probability the aggregate verdict was decided on.
     pub probability: f32,
-    /// The dependency's own compact cleave report — the `raw` for its result.
-    pub raw: serde_json::Value,
+    /// The dependency's own compact cleave report as JSON text — the `raw`
+    /// for its result, parsed transiently at envelope build (see
+    /// `FetchedDependency::raw` for why text form).
+    pub raw: String,
 }
 
 /// A representative cleave finding surfaced alongside a classification.
@@ -2009,9 +2012,17 @@ pub(crate) fn upload_scan_result(
 /// would post, so hopper records the dependency exactly as if it had been scanned
 /// directly. `version`/`analyzed_at` are the parent run's, identifying the build.
 #[must_use]
-pub(crate) fn dep_envelope(dep: DepResult, version: &str, analyzed_at: &str) -> ScanResultEnvelope {
+pub(crate) fn dep_envelope(
+    dep: &DepResult,
+    version: &str,
+    analyzed_at: &str,
+) -> ScanResultEnvelope {
     let level = dep.level;
-    let ml_files = build_ml_files(&dep.raw, dep.probability, level, &[]);
+    // The report text becomes a `Value` only here, for the short-lived
+    // envelope being POSTed — not for the job-long retention window.
+    let raw: serde_json::Value =
+        serde_json::from_str(&dep.raw).unwrap_or_else(|_| serde_json::json!({}));
+    let ml_files = build_ml_files(&raw, dep.probability, level, &[]);
     ScanResultEnvelope {
         ml: MlSection {
             v: "7",
@@ -2028,7 +2039,7 @@ pub(crate) fn dep_envelope(dep: DepResult, version: &str, analyzed_at: &str) -> 
             deleted: None,
         },
         llm: None,
-        raw: dep.raw,
+        raw,
     }
 }
 
@@ -3313,7 +3324,10 @@ fn inject_dependency_backref(
         } else {
             serde_json::json!({"id": "fetch/dependency-verdict", "crit": crit, "desc": desc.clone()})
         };
-        match f.get_mut("traits").and_then(serde_json::Value::as_array_mut) {
+        match f
+            .get_mut("traits")
+            .and_then(serde_json::Value::as_array_mut)
+        {
             Some(traits) => traits.push(new_trait),
             None => {
                 if let Some(obj) = f.as_object_mut() {
