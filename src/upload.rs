@@ -36,6 +36,10 @@ const ZSTD_RESULT_LEVEL: i32 = 3;
 /// (each up to hundreds of KB) accumulate unbounded in memory.
 const UPLOAD_QUEUE_DEPTH: usize = 16;
 
+/// Cap on the uploader's reconciled-sha dedup set (~64-byte hex strings; the cap
+/// bounds it near 10 MB). See the clear in the uploader loop.
+const SEEN_SHAS_MAX: usize = 100_000;
+
 /// Attempts per result before giving up. Short, unlike the worker's 20-minute
 /// budget: a renew is idempotent and the operator can simply re-run.
 const MAX_ATTEMPTS: u32 = 3;
@@ -231,6 +235,13 @@ impl Uploader {
                 // files is negotiated and uploaded at most once.
                 let mut seen: HashSet<String> = HashSet::new();
                 for job in rx {
+                    // Bound the dedup set: a long-lived `serve --hopper` process
+                    // reconciles an unbounded stream of unique shas, and this set
+                    // otherwise grows forever. Clearing past the cap only costs a
+                    // redundant /known round-trip for shas negotiated earlier.
+                    if seen.len() >= SEEN_SHAS_MAX {
+                        seen.clear();
+                    }
                     match job {
                         Job::Result { sha256, envelope } => {
                             post_one(&client, &result_url, &worker, &sha256, *envelope);

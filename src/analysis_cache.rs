@@ -58,11 +58,10 @@ impl AnalysisCache {
         if std::env::var("SCAN_ANALYSIS_CACHE").is_ok_and(|v| v == "0" || v == "false") {
             return None;
         }
-        let dir = dirs::cache_dir()?
-            .join("atomdrift")
-            .join("scan")
-            .join("analysis")
-            .join(ruleset_version());
+        let base = dirs::cache_dir()?.join("atomdrift").join("scan").join("analysis");
+        let version = ruleset_version();
+        prune_stale_versions(&base, &version);
+        let dir = base.join(version);
         std::fs::create_dir_all(&dir).ok()?;
         Some(Self { dir })
     }
@@ -128,6 +127,24 @@ fn ruleset_version() -> String {
         vi.composite_count,
         vi.yara_rules,
     )
+}
+
+/// Delete cache directories for ruleset versions other than `current`. Every
+/// rules/engine/bloom update lands cached results in a fresh namespace, and the
+/// superseded directories were never reclaimed — unbounded disk growth across
+/// upgrades on long-lived hosts. Best-effort and silent, like the cache itself:
+/// a failed removal just retries on some future open.
+fn prune_stale_versions(base: &std::path::Path, current: &str) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_str() != Some(current)
+            && entry.file_type().is_ok_and(|t| t.is_dir())
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Fold anything but `[A-Za-z0-9._-]` to `-`, so a token is a safe path segment.
