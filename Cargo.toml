@@ -60,13 +60,11 @@ repository = "https://codeberg.org/atomdrift/scan"
 # feature), so cleave doesn't pull in tikv-jemalloc-{ctl,sys}. Litmus declares
 # its own #[global_allocator] in main.rs (cfg-gated to skip illumos/Solaris/the
 # BSDs that ship jemalloc natively), so we don't need cleave's copy.
-# cleave = { git = "https://codeberg.org/atomdrift/cleave.git", default-features = false }
-# TEMPORARY (memory experiments): local cleave for peak-RSS work — trait-regex
-# NFA deflation + lazy-DFA budget. A [patch] cannot be used here: ../cleave is
-# 2.3.0-beta.1 (prerelease) and cargo won't select a prerelease patch for the
-# git dep's `*` requirement. Restore the git line and drop this one when the
-# changes land in a cleave release. See MEMORY_EXPERIMENTS.md.
-cleave = { git = "https://codeberg.org/atomdrift/cleave.git" }
+# TEMPORARY (memory experiments round 2): local cleave for byte-budgeted
+# compiled-regex caches + trait-definition slimming. Restore the git line when
+# the cleave changes are pushed. See MEMORY_EXPERIMENTS.md.
+# cleave = { path = "../cleave", default-features = false }
+cleave = { git = "https://codeberg.org/atomdrift/cleave.git", default-features = false }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 fletch = { git = "https://codeberg.org/atomdrift/fletch.git" }
