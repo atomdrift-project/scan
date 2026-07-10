@@ -23,7 +23,7 @@
 //! (Kirsch–Mitzenmacher). A SHA-256 *is already* a uniform digest, so a
 //! [`Kind::Sha256`] key is sliced directly with no rehash. SHA-256 is identical
 //! across languages, so a producer in another language agrees bit-for-bit as
-//! long as it canonicalizes keys the same way (see [`canonical_purl`]).
+//! long as it canonicalizes keys the same way (see [`fletch::purl::identity`]).
 
 use std::collections::HashSet;
 use std::fmt;
@@ -434,119 +434,14 @@ fn sha256(key: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Normalize a PURL to the canonical string used as a filter key.
-///
-/// This is the shared contract between the producer (which builds the filter)
-/// and the scanner (which queries it): both **must** key on this exact form or
-/// lookups silently miss. The `pkg` scheme and package *type* are
-/// case-insensitive per the PURL spec, so they are lowercased; the remainder is
-/// left untouched, since case significance is type-specific.
-///
-/// It also folds the non-spec PURL spellings this project emitted before onto the
-/// spec/common-practice form the producer now generates, so an old and a new
-/// spelling of the same package compare equal: `pkg:chrome`→`chrome-extension`,
-/// `pkg:vscode`/`pkg:openvsx`→`vscode-extension` (Open VSX keeping its
-/// `repository_url` qualifier), and the bare distro types
-/// `pkg:debian`/`arch`/`fedora`/… → `deb`/`rpm`/`apk`/`alpm` with the distro as
-/// namespace. This mirrors `hopper`'s `pkgparse.CanonicalizePURL`; the two must
-/// stay in lockstep. The extension types are case-insensitive per spec, so their
-/// bodies are lowercased too; every other type keeps its body case.
-#[must_use]
-pub fn canonical_purl(raw: &str) -> String {
-    let s = raw.trim();
-    let Some((scheme_type, rest)) = s.split_once('/') else {
-        return s.to_ascii_lowercase();
-    };
-    // The `pkg` scheme and type are case-insensitive.
-    let typ = scheme_type
-        .to_ascii_lowercase()
-        .strip_prefix("pkg:")
-        .unwrap_or_default()
-        .to_string();
-    // Split the remainder into the coordinate path and the @version/?qualifier
-    // tail so the type can be re-keyed without disturbing either.
-    let (path, tail) = match rest.find(['@', '?']) {
-        Some(i) => rest.split_at(i),
-        None => (rest, ""),
-    };
-
-    match typ.as_str() {
-        // Browser / editor extensions: case-insensitive bodies, ratified types.
-        "chrome" | "chrome-extension" => {
-            format!(
-                "pkg:chrome-extension/{}{tail}",
-                last_purl_segment(path).to_ascii_lowercase()
-            )
-        }
-        "vscode" | "vscode-extension" => {
-            format!("pkg:vscode-extension/{}{tail}", path.to_ascii_lowercase())
-        }
-        "openvsx" => format!(
-            "pkg:vscode-extension/{}{}",
-            path.to_ascii_lowercase(),
-            add_purl_qualifier(tail, "repository_url=https://open-vsx.org")
-        ),
-        other => {
-            if let Some((spec, ns)) = distro_purl_spec(other) {
-                format!("pkg:{spec}/{ns}/{}{tail}", last_purl_segment(path))
-            } else {
-                // Language/registry and unrecognized types: canonical type, body
-                // case preserved (significance is type-specific).
-                format!("pkg:{typ}/{rest}")
-            }
-        }
-    }
-}
-
-/// The final `/`-separated segment (the app-store and distro types drop any
-/// vendor path, matching `fletch`'s resolver and `hopper`'s builder).
-fn last_purl_segment(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
-/// Map a legacy bare-distro PURL type onto the spec type and namespace.
-fn distro_purl_spec(typ: &str) -> Option<(&'static str, &'static str)> {
-    Some(match typ {
-        "debian" => ("deb", "debian"),
-        "ubuntu" => ("deb", "ubuntu"),
-        "fedora" => ("rpm", "fedora"),
-        "opensuse" => ("rpm", "opensuse"),
-        "rpmfusion" => ("rpm", "rpmfusion"),
-        "arch" => ("alpm", "arch"),
-        "aur" => ("alpm", "aur"),
-        "alpine" => ("apk", "alpine"),
-        "wolfi" => ("apk", "wolfi"),
-        _ => return None,
-    })
-}
-
-/// Merge one qualifier into a PURL `@version`/`?qualifiers` tail, leaving an
-/// already-present key untouched.
-fn add_purl_qualifier(tail: &str, qualifier: &str) -> String {
-    let key = qualifier.split('=').next().unwrap_or(qualifier);
-    match tail.split_once('?') {
-        None => format!("{tail}?{qualifier}"),
-        Some((ver, quals)) => {
-            if quals.split('&').any(|q| {
-                q.split('=')
-                    .next()
-                    .is_some_and(|k| k.eq_ignore_ascii_case(key))
-            }) {
-                tail.to_string()
-            } else {
-                format!("{ver}?{quals}&{qualifier}")
-            }
-        }
-    }
-}
-
 /// One artifact drawn from the good/bad pool. Either field may be absent: a
 /// fetched package carries both its PURL and tarball digest; a bare file upload
 /// carries only a digest. The pool adapter applies trust policy (what counts as
 /// good vs. bad) *before* building records — this layer only does set algebra.
 #[derive(Debug, Clone, Default)]
 pub struct Record {
-    /// Canonical or raw PURL; normalized via [`canonical_purl`] on ingest.
+    /// Canonical or raw PURL; keyed via [`fletch::purl::identity`] on ingest
+    /// (a record whose PURL can't normalize contributes no PURL key).
     pub purl: Option<String>,
     /// 32-byte artifact digest.
     pub sha256: Option<[u8; 32]>,
@@ -580,13 +475,18 @@ pub struct KeySets {
 impl KeySets {
     /// Insert one record under `label`. A record may carry a PURL, a digest, or
     /// both; each present key joins its set. Duplicates collapse (it's a set).
+    /// PURLs key by their identity form (see [`fletch::purl::identity`]): a
+    /// string that can't normalize contributes no key — a degenerate string
+    /// must never become a matchable filter bit — and artifact-selection
+    /// qualifiers (`arch`, `distro`, `kind`, …) are dropped so an
+    /// SBOM-stamped spelling and the pool's bare coordinate collide.
     pub fn insert(&mut self, label: Label, record: Record) {
         let (purls, shas) = match label {
             Label::Good => (&mut self.good_purl, &mut self.good_sha),
             Label::Bad => (&mut self.bad_purl, &mut self.bad_sha),
         };
-        if let Some(p) = record.purl {
-            purls.insert(canonical_purl(&p));
+        if let Some(key) = record.purl.and_then(|p| fletch::purl::identity(&p)) {
+            purls.insert(key);
         }
         if let Some(h) = record.sha256 {
             shas.insert(h);
@@ -704,7 +604,7 @@ mod tests {
     fn good_purl_filter(purls: &[&str], fp: f64) -> Filter {
         let mut b = Builder::sized_for(Kind::Purl, Tier::Good, purls.len() as u64, fp, 0);
         for p in purls {
-            b.insert_key(canonical_purl(p).as_bytes());
+            b.insert_key(fletch::purl::identity(p).expect("test purl").as_bytes());
         }
         b.build()
     }
@@ -719,50 +619,11 @@ mod tests {
         let f = good_purl_filter(&purls, 1e-6);
         for p in purls {
             assert!(
-                f.contains_key(canonical_purl(p).as_bytes()),
+                f.contains_key(fletch::purl::identity(p).expect("test purl").as_bytes()),
                 "{p} must be present"
             );
         }
         assert_eq!(f.len(), 3);
-    }
-
-    #[test]
-    fn canonicalization_lowercases_scheme_and_type_only() {
-        assert_eq!(
-            canonical_purl("  PKG:NPM/Left-Pad@1.3.0 "),
-            "pkg:npm/Left-Pad@1.3.0"
-        );
-        assert_eq!(canonical_purl("pkg:PyPI/Requests"), "pkg:pypi/Requests");
-    }
-
-    #[test]
-    fn canonicalization_folds_legacy_spellings_onto_spec() {
-        // Legacy fletch spellings fold onto the spec/common-practice form, so a
-        // stored spec PURL and a scanned legacy PURL hit the same filter key.
-        let pairs = [
-            ("pkg:chrome/KhKimila", "pkg:chrome-extension/khkimila"),
-            (
-                "pkg:chrome/KhKimila@25.7.1",
-                "pkg:chrome-extension/khkimila@25.7.1",
-            ),
-            (
-                "pkg:vscode/Saoudrizwan/Claude-Dev",
-                "pkg:vscode-extension/saoudrizwan/claude-dev",
-            ),
-            (
-                "pkg:openvsx/jinryx/crontally@1.0.3",
-                "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https://open-vsx.org",
-            ),
-            ("pkg:debian/curl", "pkg:deb/debian/curl"),
-            ("pkg:arch/pacman@6.0", "pkg:alpm/arch/pacman@6.0"),
-            ("pkg:fedora/curl", "pkg:rpm/fedora/curl"),
-            ("pkg:alpine/musl", "pkg:apk/alpine/musl"),
-        ];
-        for (legacy, spec) in pairs {
-            assert_eq!(canonical_purl(legacy), spec, "fold {legacy}");
-            // Idempotent: the spec form canonicalizes to itself.
-            assert_eq!(canonical_purl(spec), spec, "idempotent {spec}");
-        }
     }
 
     #[test]

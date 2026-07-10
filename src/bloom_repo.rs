@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::bloom::{Filter, Kind, Tier, canonical_purl};
+use crate::bloom::{Filter, Kind, Tier};
 
 /// Process-wide handle to the loaded filters, published by the scan config so
 /// decoupled subsystems (the dependency-fetch reporter) can consult the same
@@ -121,10 +121,17 @@ impl Lookup {
             || self.sha256_bad.is_some()
     }
 
-    /// Decide a package by its PURL, before fetching it.
+    /// Decide a package by its PURL, before fetching it. Keys use the identity
+    /// form (see [`fletch::purl::identity`]), matching the producer: a string
+    /// that can't normalize is [`Decision::Unknown`] — the producer never
+    /// inserted such a key, so probing the filters with a degenerate string
+    /// could only ever false-positive — and artifact-selection qualifiers
+    /// (`arch`, `distro`, `kind`, …) are dropped before the probe.
     #[must_use]
     pub fn decide_purl(&self, purl: &str) -> Decision {
-        let key = canonical_purl(purl);
+        let Some(key) = fletch::purl::identity(purl) else {
+            return Decision::Unknown;
+        };
         let bytes = key.as_bytes();
         resolve(
             self.purl_bad

@@ -64,6 +64,9 @@ cleave = { git = "https://codeberg.org/atomdrift/cleave.git",  default-features 
 # cleave = { git = "https://codeberg.org/atomdrift/cleave.git", default-features = false }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
+# Path dep while fletch::purl::{normalize,identity} is unpushed — scan's bloom
+# keys and CLI normalize through it. Flip back to the git dep once fletch is
+# pushed and `cargo update -p fletch` picks up the new API.
 fletch = { git = "https://codeberg.org/atomdrift/fletch.git" }
 proclist = { git = "https://codeberg.org/atomdrift/proclist.git" }
 # Direct handle on filefacts (already in the graph via cleave/fletch) so the

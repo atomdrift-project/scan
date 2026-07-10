@@ -15,6 +15,9 @@
 -- label. A versioned PURL is emitted only when both the version-less identity
 -- (purl_base) and a concrete version are known, so a good bless is pinned to the
 -- exact release the scanner will look up; otherwise the row contributes by sha256.
+-- The '@version' splices in *before* any '?qualifiers' the purl_base carries
+-- (purl-spec order — e.g. an older AUR purl_base ends in ?repository_url=…);
+-- a plain purl_base || '@' || version would misplace the version for those.
 --
 -- Freshness: only samples analyzed within `max_age_days` are included, so a
 -- bless reflects the current model/ruleset rather than a stale verdict. Override
@@ -32,8 +35,11 @@
 
 SELECT json_build_object(
          'purl', CASE
-                   WHEN purl_base <> '' AND version <> ''
-                   THEN purl_base || '@' || version
+                   WHEN purl_base = '' OR version = '' THEN NULL
+                   WHEN strpos(purl_base, '?') > 0
+                   THEN overlay(purl_base placing '@' || version || '?'
+                                from strpos(purl_base, '?') for 1)
+                   ELSE purl_base || '@' || version
                  END,
          'sha256', sha256,
          'label', label)

@@ -870,8 +870,11 @@ fn purl_display(purl: &str) -> String {
         return purl.to_string();
     };
     // The version follows the last '@'; a scope's '@' is `%40`-encoded, so a
-    // literal '@' only ever separates the version.
+    // literal '@' only ever separates the version. Qualifiers are dropped from
+    // both halves: spec order puts them after the version, and the non-spec
+    // ordering older exports emitted glues them onto the name.
     let (name, version) = rest.rsplit_once('@').unwrap_or((rest, ""));
+    let name = name.split(['?', '#']).next().unwrap_or(name);
     let name = name.replace("%40", "@");
     let version = version.split(['?', '#']).next().unwrap_or(version);
     if version.is_empty() {
@@ -2038,6 +2041,7 @@ mod tests {
             source_offset: None,
             kind: RefKind::Dependency,
             locator: "pkg:npm/x".to_string(),
+            kind: RefKind::Dependency,
             resolved_url: String::new(),
             final_url: None,
             redirects: Vec::new(),
@@ -2352,6 +2356,7 @@ mod tests {
             source_offset: None,
             kind: RefKind::Dependency,
             locator: "pkg:npm/x".to_string(),
+            kind: RefKind::Dependency,
             resolved_url: "https://reg.test/x/-/x-1.0.0.tgz".to_string(),
             final_url: None,
             redirects: Vec::new(),

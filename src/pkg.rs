@@ -24,16 +24,24 @@ pub fn run_url(url: &str, config: &ScanConfig) -> Result<ScanSummary> {
 ///
 /// The `pkg:` scheme is optional on the command line: a bare
 /// `npm/left-pad@1.3.0` is accepted and normalized to a full PURL, since the
-/// scheme is the same for every package and only adds typing.
+/// scheme is the same for every package and only adds typing. The whole
+/// argument is then normalized (see [`fletch::purl::normalize`]) so every
+/// spelling of a package — legacy types, the AUR's variants, a misordered
+/// qualifier tail — enters the pipeline as the one canonical form the registry
+/// lookup, bloom filters, fetcher, and provenance all key on.
 ///
 /// # Errors
-/// Returns an error if the PURL cannot be resolved/fetched or cleave analysis
-/// fails.
+/// Returns an error if the argument isn't a usable PURL, or the PURL cannot be
+/// resolved/fetched, or cleave analysis fails.
 pub fn run_pkg(purl: &str, config: &ScanConfig) -> Result<ScanSummary> {
-    let purl = if purl.starts_with("pkg:") {
-        purl.to_string()
+    let raw = purl.trim();
+    let prefixed = if raw.starts_with("pkg:") {
+        raw.to_string()
     } else {
-        format!("pkg:{purl}")
+        format!("pkg:{raw}")
+    };
+    let Some(purl) = fletch::purl::normalize(&prefixed) else {
+        anyhow::bail!("not a package URL: {raw} (expected pkg:<type>/<name>[@version])");
     };
     run(RefLocator::Purl(purl), config)
 }
