@@ -1808,7 +1808,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/fletch.git#e43890cf86eb8055831f579135ab2a88887e321a"
+source = "git+https://codeberg.org/atomdrift/fletch.git#f755d1d5b5f4b90e15df1fe32da62c0c0e558069"
 dependencies = [
  "anyhow",
  "base64",
