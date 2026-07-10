@@ -292,7 +292,7 @@ fn evaluate(
             );
             print_top_findings(&result.top_findings, "  ");
         }
-        for embedded in &result.embedded_files {
+        for embedded in result.embedded_files.values() {
             if embedded.classification != Classification::Benign {
                 any_nonbenign = true;
                 any_hostile |= embedded.classification == Classification::Hostile;

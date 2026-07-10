@@ -347,7 +347,7 @@ mod manifest_tests {
                 {"id": 2, "path": "app.zip!!README.md", "type": "markdown", "depth": 1, "risk": -1},
             ]
         });
-        let ml = build_ml_files(&report, 0.9, Some(100), &[]);
+        let ml = build_ml_files(&report, 0.9, Some(100), &MemberEvals::new());
         let ids: Vec<u64> = ml.iter().map(|f| f["id"].as_u64().unwrap()).collect();
         assert_eq!(
             ids,
@@ -374,6 +374,7 @@ mod manifest_tests {
         });
         let member = |id: u64, path: &str, prob: f32, level: i32| EmbeddedFile {
             id,
+            sha256: String::new(),
             path: path.to_string(),
             file_type: "unknown".to_string(),
             classification: Classification::Benign,
@@ -385,11 +386,11 @@ mod manifest_tests {
             formula: String::new(),
             top_findings: Vec::new(),
         };
-        let evaluated = vec![
-            member(1, "compatibility", 0.00001, -1),
-            member(2, "page", 0.00002, -1),
-            member(3, "page", 0.7, 3000),
-        ];
+        let evaluated = MemberEvals::from([
+            (1, member(1, "compatibility", 0.00001, -1)),
+            (2, member(2, "page", 0.00002, -1)),
+            (3, member(3, "page", 0.7, 3000)),
+        ]);
         let ml = build_ml_files(&report, 0.99, Some(0), &evaluated);
 
         assert!(
@@ -668,7 +669,7 @@ mod envelope_tests {
             file_type: "unknown".to_string(),
             size_bytes: 0,
             sha256: String::new(),
-            embedded_files: Vec::new(),
+            embedded_files: MemberEvals::new(),
             rendered_context: String::new(),
             interpretation: None,
             dependency_results: Vec::new(),
@@ -825,6 +826,7 @@ mod envelope_tests {
         }));
         let member = |id: u64, path: &str, level: Option<i32>, prob: f32| EmbeddedFile {
             id,
+            sha256: String::new(),
             path: path.to_string(),
             file_type: "unknown".to_string(),
             classification: Classification::Benign,
@@ -836,10 +838,10 @@ mod envelope_tests {
             formula: String::new(),
             top_findings: Vec::new(),
         };
-        r.embedded_files = vec![
-            member(1, "evil.sh", Some(2), 0.99),
-            member(2, "readme.txt", Some(-1), 0.01),
-        ];
+        r.embedded_files = MemberEvals::from([
+            (1, member(1, "evil.sh", Some(2), 0.99)),
+            (2, member(2, "readme.txt", Some(-1), 0.01)),
+        ]);
         let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         let files = json["ml"]["files"].as_array().expect("files array");
         assert_eq!(
@@ -1051,8 +1053,9 @@ pub struct ScanResult {
     pub size_bytes: u64,
     /// SHA-256 hex digest.
     pub sha256: String,
-    /// Per-file ML evaluations for archive members.
-    pub embedded_files: Vec<EmbeddedFile>,
+    /// Per-file ML evaluations for archive members, keyed by node id.
+    /// See [`MemberEvals`] — the single source of truth for member verdicts.
+    pub embedded_files: MemberEvals,
     /// Per-model route scores from the routed ensemble.
     pub model_scores: Vec<RouteScore>,
     /// Applicable model routes skipped by the routed ensemble.
@@ -1148,6 +1151,34 @@ impl From<&serde_json::Value> for TopFinding {
     }
 }
 
+/// Every member evaluation a scan produced, keyed by cleave node id — the
+/// single source of truth. `ml.files`, container elevation, dependency
+/// verdicts, and the diagnostics views all derive from this table. A node
+/// absent here was not evaluated; no consumer may invent a verdict for it
+/// (a member can occur in many containers, and hopper mirrors per-member
+/// entries into the member's own sample row).
+pub type MemberEvals = std::collections::BTreeMap<u64, EmbeddedFile>;
+
+/// The worst (highest-outranking) member evaluation, or `None` when no member
+/// was evaluated. Iteration is id order == report entry order, so ties keep
+/// the earliest member exactly as the old in-loop fold did.
+fn worst_member(evals: &MemberEvals) -> Option<Decision> {
+    evals.values().map(EmbeddedFile::decision).reduce(|best, d| {
+        if decision_outranks(&d, &best) { d } else { best }
+    })
+}
+
+/// The worst evaluation among the members whose content sha is in `shas` —
+/// a fetched dependency's aggregate verdict. `None` when none were evaluated.
+fn worst_for_shas(evals: &MemberEvals, shas: &[String]) -> Option<Decision> {
+    let shas: std::collections::HashSet<&str> = shas.iter().map(String::as_str).collect();
+    evals
+        .values()
+        .filter(|ef| shas.contains(ef.sha256.as_str()))
+        .map(EmbeddedFile::decision)
+        .reduce(|best, d| if decision_outranks(&d, &best) { d } else { best })
+}
+
 /// A file embedded within an archive or self-extracting executable.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddedFile {
@@ -1156,6 +1187,10 @@ pub struct EmbeddedFile {
     /// share a basename; fetched payloads collide across pages), so id is the
     /// only safe join key for `ml.files`.
     pub id: u64,
+    /// SHA-256 of this member's bytes — the content key sha-keyed consumers
+    /// (dependency roll-up, fetch backrefs) join on.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
     /// Relative path within the archive (portion after "!!" delimiter).
     pub path: String,
     /// Detected file type.
@@ -1180,6 +1215,27 @@ pub struct EmbeddedFile {
     pub formula: String,
     /// Top findings for this embedded file.
     pub top_findings: Vec<TopFinding>,
+}
+
+impl EmbeddedFile {
+    /// This member's verdict as a [`Decision`], for outranking comparisons.
+    fn decision(&self) -> Decision {
+        Decision {
+            class: self.classification,
+            probability: self.probability,
+            threshold: self.threshold,
+            level: self.level,
+        }
+    }
+
+    /// The `n` highest-probability evaluations, for diagnostics displays.
+    /// A view — the table itself is never sorted or truncated.
+    pub(crate) fn top_offenders(evals: &MemberEvals, n: usize) -> Vec<&EmbeddedFile> {
+        let mut v: Vec<&EmbeddedFile> = evals.values().collect();
+        v.sort_by(|a, b| b.probability.total_cmp(&a.probability));
+        v.truncate(n);
+        v
+    }
 }
 
 pub(crate) const SPINNER: &[char] = &[
@@ -2085,7 +2141,7 @@ pub(crate) fn dep_envelope(
     // envelope being POSTed — not for the job-long retention window.
     let raw: serde_json::Value =
         serde_json::from_str(&dep.raw).unwrap_or_else(|_| serde_json::json!({}));
-    let ml_files = build_ml_files(&raw, dep.probability, level, &[]);
+    let ml_files = build_ml_files(&raw, dep.probability, level, &MemberEvals::new());
     ScanResultEnvelope {
         ml: MlSection {
             v: "7",
@@ -2413,9 +2469,8 @@ pub(crate) fn write_extra_diagnostics(out: &mut dyn std::io::Write, r: &ScanResu
             );
         }
     }
-    // The list is sorted top-offenders-first and no longer truncated (every
-    // evaluation must survive for ml.files), so cap the diagnostic view here.
-    for ef in r.embedded_files.iter().take(10) {
+    // A top-10 view of the evaluation table; the table itself is complete.
+    for ef in EmbeddedFile::top_offenders(&r.embedded_files, 10) {
         if !ef.model_scores.is_empty() {
             let _ = writeln!(
                 out,
@@ -2553,7 +2608,7 @@ pub(crate) struct ClassifiedReport {
     pub(crate) file_type: String,
     pub(crate) size_bytes: u64,
     pub(crate) sha256: String,
-    pub(crate) embedded_files: Vec<EmbeddedFile>,
+    pub(crate) embedded_files: MemberEvals,
     pub(crate) report_json: serde_json::Value,
     /// Fetched dependencies to mirror into hopper as their own samples.
     pub(crate) dependency_results: Vec<DepResult>,
@@ -2879,13 +2934,10 @@ pub(crate) fn classify_report(
         None => embedded_iter.collect(),
     };
 
-    let mut embedded_files: Vec<EmbeddedFile> = Vec::with_capacity(embedded_entries.len());
-    let mut max_decision: Decision = decision;
-
     // Fetched payloads keyed by the sha of the content retrieved, with the
     // declaring file + the byte the reference sits at. When the embedded pass
     // classifies one of these hostile/suspicious, that verdict is pinned back
-    // onto the declaring manifest at the reference byte (below the loop).
+    // onto the declaring manifest at the reference byte (below the pass).
     let fetched_by_content: std::collections::HashMap<&str, (&str, Option<u64>, &str)> =
         fetch_edges
             .iter()
@@ -2902,65 +2954,24 @@ pub(crate) fn classify_report(
                 })
             })
             .collect();
-    // (declaring sha, reference offset, dependency locator, confirmed class).
-    let mut dep_backrefs: Vec<(String, Option<u64>, String, String, Classification)> = Vec::new();
-
-    // Attribute each fetched dependency's files to it so the embedded pass's
-    // per-node decisions roll up into the dependency's own aggregate verdict —
-    // its container elevated by its worst member, exactly as a first-hand scan of
-    // those bytes resolves. No extra model work: the decisions are the ones the
-    // loop already computes for the merged report.
-    let sha_to_dep: std::collections::HashMap<&str, usize> = fetched_deps
-        .iter()
-        .enumerate()
-        .flat_map(|(i, d)| d.member_shas.iter().map(move |s| (s.as_str(), i)))
-        .collect();
-    let mut dep_decisions: Vec<Option<Decision>> = vec![None; fetched_deps.len()];
 
     // Feature-extract and model-score members in parallel: reports with
     // thousands of embedded files (nested npm tarballs, fetched dependency
     // trees) previously ran this loop serially on one rayon worker — on
     // member-heavy archives that single-threaded model pass, not cleave's
     // analysis, was the scan's wall-clock tail. Per-member work is pure
-    // (&Model is already shared across rayon workers by the outer scan);
-    // the fold below stays single-threaded and in entry order, so tie-break
-    // semantics (`decision_outranks` keeps the earliest on ties) and output
-    // ordering are byte-identical to the serial loop.
-    struct EmbeddedScored<'j> {
-        ef: &'j serde_json::Value,
-        decision: Decision,
-        model_scores: Vec<RouteScore>,
-        skipped_models: Vec<SkippedRoute>,
-    }
-    let scored: Vec<EmbeddedScored<'_>> = {
+    // (&Model is already shared across rayon workers by the outer scan).
+    let scored: Vec<EmbeddedFile> = {
         use rayon::prelude::*;
         embedded_entries
             .par_iter()
             .map(|&ef| {
                 // Cancellation: skip the expensive work; the post-pass bail
                 // below surfaces the cancellation before results are used.
-                if let Some(c) = cancellation
-                    && c.load(Ordering::Relaxed)
+                let (ef_decision, ef_model_scores, ef_skipped_models) = if cancellation
+                    .is_some_and(|c| c.load(Ordering::Relaxed))
                 {
-                    return EmbeddedScored {
-                        ef,
-                        decision: Decision {
-                            class: Classification::Benign,
-                            probability: 0.0,
-                            threshold: model.thresholds().suspicious,
-                            level: None,
-                        },
-                        model_scores: Vec::new(),
-                        skipped_models: Vec::new(),
-                    };
-                }
-                let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
-                let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
-                model.spec().standardize(&mut ef_features);
-                let ef_type = ef["type"].as_str().unwrap_or("unknown");
-                let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
-                    .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
-                    .unwrap_or((
+                    (
                         Decision {
                             class: Classification::Benign,
                             probability: 0.0,
@@ -2969,23 +2980,67 @@ pub(crate) fn classify_report(
                         },
                         Vec::new(),
                         Vec::new(),
-                    ));
-                // Trait floor on the member's own findings — a sparse, severe
-                // dropper (the npm install-hook beacon lives in the embedded
-                // package.json) scores above the crit-4 fraction gate even when
-                // the container's findings dilute it; the floored member then
-                // elevates the container below.
-                apply_trait_floor(
-                    &mut ef_decision,
-                    ef,
-                    model.grid_max(),
-                    ef["path"].as_str().unwrap_or(label),
-                );
-                EmbeddedScored {
-                    ef,
-                    decision: ef_decision,
+                    )
+                } else {
+                    let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
+                    let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
+                    model.spec().standardize(&mut ef_features);
+                    let ef_type = ef["type"].as_str().unwrap_or("unknown");
+                    let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
+                        .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
+                        .unwrap_or((
+                            Decision {
+                                class: Classification::Benign,
+                                probability: 0.0,
+                                threshold: model.thresholds().suspicious,
+                                level: None,
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                        ));
+                    // Trait floor on the member's own findings — a sparse, severe
+                    // dropper (the npm install-hook beacon lives in the embedded
+                    // package.json) scores above the crit-4 fraction gate even when
+                    // the container's findings dilute it; the floored member then
+                    // elevates the container below.
+                    apply_trait_floor(
+                        &mut ef_decision,
+                        ef,
+                        model.grid_max(),
+                        ef["path"].as_str().unwrap_or(label),
+                    );
+                    (ef_decision, ef_model_scores, ef_skipped_models)
+                };
+
+                let full_path = ef["path"].as_str().unwrap_or("");
+                let rel_path = full_path
+                    .rsplit_once("!!")
+                    .map(|(_, r)| r)
+                    .unwrap_or(full_path)
+                    .to_string();
+                let ef_top_findings: Vec<TopFinding> =
+                    json_alias_array(ef, &["traits", "find", "ts"])
+                        .into_iter()
+                        .flatten()
+                        .filter(|ff| crit_ordinal(ff) >= 4)
+                        .take(3)
+                        .map(TopFinding::from)
+                        .collect();
+                EmbeddedFile {
+                    // u64::MAX when the node has no id: it then matches no report
+                    // node rather than falsely matching id 0 (the root).
+                    id: ef["id"].as_u64().unwrap_or(u64::MAX),
+                    sha256: ef["sha"].as_str().unwrap_or("").to_string(),
+                    path: rel_path,
+                    file_type: ef["type"].as_str().unwrap_or("unknown").to_string(),
+                    classification: ef_decision.class,
+                    probability: ef_decision.probability,
+                    threshold: ef_decision.threshold,
+                    level: ef_decision.level,
                     model_scores: ef_model_scores,
                     skipped_models: ef_skipped_models,
+                    formula: json_alias_str(ef, &["mol", "f"]).unwrap_or("").to_string(),
+                    top_findings: ef_top_findings,
                 }
             })
             .collect()
@@ -2996,94 +3051,54 @@ pub(crate) fn classify_report(
         anyhow::bail!("analysis cancelled during embedded file processing");
     }
 
-    for item in scored {
-        let EmbeddedScored {
-            ef,
-            decision: ef_decision,
-            model_scores: ef_model_scores,
-            skipped_models: ef_skipped_models,
-        } = item;
+    // The single source of truth for member verdicts: every evaluation, keyed
+    // by node id. ml.files, container elevation, dependency verdicts, and the
+    // diagnostics views all derive from this table; a node absent from it was
+    // not evaluated, and no consumer may invent a verdict for it. Ids ascend
+    // in report order, so BTreeMap iteration preserves entry order and the
+    // earliest-wins tie-break of `decision_outranks` folds below.
+    let mut member_evals = MemberEvals::new();
+    for ef in scored {
+        tracing::debug!(
+            parent = %label,
+            embedded_path = %ef.path,
+            probability = format!("{:.4}", ef.probability),
+            classification = ?ef.classification,
+            "classified embedded file",
+        );
+        member_evals.insert(ef.id, ef);
+    }
 
-        // Roll this node's decision into the aggregate verdict of the fetched
-        // dependency it belongs to (the container or one of its members).
-        if let Some(sha) = ef["sha"].as_str()
-            && let Some(&di) = sha_to_dep.get(sha)
-            && dep_decisions[di]
-                .as_ref()
-                .is_none_or(|cur| decision_outranks(&ef_decision, cur))
-        {
-            dep_decisions[di] = Some(ef_decision);
-        }
-
-        // A fetched dependency that classifies hostile/suspicious is pinned back
-        // onto the file that declared it (request: the manifest names the bad
-        // dependency at its byte). Keyed by content sha so it matches the
-        // retrieved payload node.
-        if matches!(
-            ef_decision.class,
-            Classification::Suspicious | Classification::Hostile
-        ) && let Some(sha) = ef["sha"].as_str()
-            && let Some(&(src_sha, src_off, locator)) = fetched_by_content.get(sha)
-        {
-            dep_backrefs.push((
+    // A fetched dependency that classifies hostile/suspicious is pinned back
+    // onto the file that declared it (request: the manifest names the bad
+    // dependency at its byte). Keyed by content sha so it matches the
+    // retrieved payload node.
+    // (declaring sha, reference offset, dependency locator, content sha, class).
+    let dep_backrefs: Vec<(String, Option<u64>, String, String, Classification)> = member_evals
+        .values()
+        .filter(|ef| {
+            matches!(
+                ef.classification,
+                Classification::Suspicious | Classification::Hostile
+            )
+        })
+        .filter_map(|ef| {
+            let &(src_sha, src_off, locator) = fetched_by_content.get(ef.sha256.as_str())?;
+            Some((
                 src_sha.to_string(),
                 src_off,
                 locator.to_string(),
-                sha.to_string(),
-                ef_decision.class,
-            ));
-        }
+                ef.sha256.clone(),
+                ef.classification,
+            ))
+        })
+        .collect();
 
-        let full_path = ef["path"].as_str().unwrap_or("");
-        let rel_path = full_path
-            .rsplit_once("!!")
-            .map(|(_, r)| r)
-            .unwrap_or(full_path)
-            .to_string();
-
-        let ef_top_findings: Vec<TopFinding> = json_alias_array(ef, &["traits", "find", "ts"])
-            .into_iter()
-            .flatten()
-            .filter(|ff| crit_ordinal(ff) >= 4)
-            .take(3)
-            .map(TopFinding::from)
-            .collect();
-
-        tracing::debug!(
-            parent = %label,
-            embedded_path = %rel_path,
-            probability = format!("{:.4}", ef_decision.probability),
-            classification = ?ef_decision.class,
-            "classified embedded file",
-        );
-
-        if decision_outranks(&ef_decision, &max_decision) {
-            max_decision = ef_decision;
-        }
-
-        embedded_files.push(EmbeddedFile {
-            // u64::MAX when the node has no id: it then matches no ml.files
-            // entry rather than falsely matching id 0 (the root).
-            id: ef["id"].as_u64().unwrap_or(u64::MAX),
-            path: rel_path,
-            file_type: ef["type"].as_str().unwrap_or("unknown").to_string(),
-            classification: ef_decision.class,
-            probability: ef_decision.probability,
-            threshold: ef_decision.threshold,
-            level: ef_decision.level,
-            model_scores: ef_model_scores,
-            skipped_models: ef_skipped_models,
-            formula: json_alias_str(ef, &["mol", "f"]).unwrap_or("").to_string(),
-            top_findings: ef_top_findings,
-        });
-    }
-
-    // Sort top offenders first for display, but keep EVERY evaluation: ml.files
-    // is built from this list, and a dropped entry used to make build_ml_files
-    // fall back to the root verdict — stamping a benign member (and, via
-    // hopper's member explosion, its own sample row) with its container's
-    // hostile grade. The list is already bounded by embedded_file_limit.
-    embedded_files.sort_by(|a, b| b.probability.total_cmp(&a.probability));
+    // Elevate the container by its worst member, exactly as before — derived
+    // from the table instead of tracked during the loop.
+    let max_decision = worst_member(&member_evals)
+        .filter(|worst| decision_outranks(worst, &decision))
+        .unwrap_or(decision);
 
     // If an embedded file's decision outranks the parent, elevate.
     let mut final_decision = if decision_outranks(&max_decision, &decision) {
@@ -3218,19 +3233,20 @@ pub(crate) fn classify_report(
     }
 
     // Mirror each fetched dependency into hopper as its own sample: its standalone
-    // report plus the aggregate verdict harvested above. A dependency the embedded
-    // pass never reached (e.g. truncated by the embedded-file cap) defaults to
-    // benign rather than inventing a verdict.
+    // report plus its aggregate verdict — the worst evaluation among its own
+    // files, exactly as a first-hand scan of those bytes resolves. A dependency
+    // the embedded pass never reached (e.g. truncated by the embedded-file cap)
+    // defaults to benign rather than inventing a verdict.
     let dependency_results: Vec<DepResult> = fetched_deps
         .into_iter()
-        .zip(dep_decisions)
-        .map(|(dep, decision)| {
-            let decision = decision.unwrap_or(Decision {
-                class: Classification::Benign,
-                probability: 0.0,
-                threshold: 0.0,
-                level: Some(-1),
-            });
+        .map(|dep| {
+            let decision =
+                worst_for_shas(&member_evals, &dep.member_shas).unwrap_or(Decision {
+                    class: Classification::Benign,
+                    probability: 0.0,
+                    threshold: 0.0,
+                    level: Some(-1),
+                });
             DepResult {
                 sha256: dep.content_sha,
                 locator: dep.locator,
@@ -3257,7 +3273,7 @@ pub(crate) fn classify_report(
         file_type,
         size_bytes,
         sha256,
-        embedded_files,
+        embedded_files: member_evals,
         report_json,
         dependency_results,
         rendered_context,
@@ -3838,13 +3854,11 @@ fn build_ml_files(
     report_json: &serde_json::Value,
     root_prob: f32,
     root_level: Option<i32>,
-    embedded_files: &[EmbeddedFile],
+    embedded_files: &MemberEvals,
 ) -> Vec<serde_json::Value> {
     let Some(report_files) = json_alias_array(report_json, &["files", "fs"]) else {
         return Vec::new();
     };
-    let by_id: std::collections::HashMap<u64, &EmbeddedFile> =
-        embedded_files.iter().map(|ef| (ef.id, ef)).collect();
 
     let mut out = Vec::with_capacity(report_files.len());
     for (idx, entry) in report_files.iter().enumerate() {
@@ -3866,7 +3880,7 @@ fn build_ml_files(
         let evaluation = if depth == 0 {
             Some((root_prob, root_level))
         } else {
-            by_id.get(&id).map(|ef| (ef.probability, ef.level))
+            embedded_files.get(&id).map(|ef| (ef.probability, ef.level))
         };
 
         match evaluation {

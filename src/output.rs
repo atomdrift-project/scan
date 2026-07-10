@@ -552,10 +552,8 @@ fn print_extra(result: &ScanResult, p: &Palette) {
     // Surface the routing of archive members. A container often inherits a
     // member's verdict (see `elevated archive classification`), so when the
     // container's own models disagree with the final grade, the responsible
-    // route lives here — not above. The list is sorted top-offenders-first
-    // and no longer truncated (ml.files needs every evaluation), so cap the
-    // display here.
-    for ef in result.embedded_files.iter().take(10) {
+    // route lives here — not above. A top-10 view of the evaluation table.
+    for ef in crate::engine::EmbeddedFile::top_offenders(&result.embedded_files, 10) {
         if ef.model_scores.is_empty() {
             continue;
         }
