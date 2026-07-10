@@ -2036,6 +2036,7 @@ mod tests {
         let record = |outcome: Outcome, cached: bool, size: Option<u64>| FetchRecord {
             source_sha256: String::new(),
             source_offset: None,
+            kind: RefKind::Dependency,
             locator: "pkg:npm/x".to_string(),
             resolved_url: String::new(),
             final_url: None,
@@ -2349,6 +2350,7 @@ mod tests {
         let mut rec = FetchRecord {
             source_sha256: String::new(),
             source_offset: None,
+            kind: RefKind::Dependency,
             locator: "pkg:npm/x".to_string(),
             resolved_url: "https://reg.test/x/-/x-1.0.0.tgz".to_string(),
             final_url: None,
