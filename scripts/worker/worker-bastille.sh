@@ -89,8 +89,10 @@ doas bastille cmd "$RUN" chmod 755 /usr/local/etc/rc.d/scan-worker
 
 log "Enabling and restarting scan-worker service"
 doas bastille sysrc "$RUN" scan_worker_enable=YES
-doas bastille service "$RUN" scan-worker stop 2>/dev/null || true
-doas bastille cmd "$RUN" pkill -9 -F /var/run/scan_worker.pid 2>/dev/null || true
+# The rc.d installed just above has a bounded stop (SIGTERM -> short drain ->
+# SIGKILL the daemon(8) tree), so this can't wedge on a busy worker and won't
+# orphan the child — no separate force-kill needed.
+doas bastille service "$RUN" scan-worker stop || true
 doas bastille service "$RUN" scan-worker start
 
 log "Deployment complete"

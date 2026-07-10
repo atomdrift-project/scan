@@ -785,10 +785,15 @@ impl std::fmt::Display for PrefetchError {
 }
 
 /// Upper bound on how long `run` will wait for in-flight analyses to drain
-/// after a shutdown signal before exiting anyway. Cleave cancellation is
-/// cooperative; a stuck rayon unpack can refuse to exit, and the operator
-/// should not have to `kill -9` just because one file is wedged.
-const SHUTDOWN_DRAIN_SECS: u64 = 60;
+/// after a shutdown signal before exiting anyway. Kept short so a redeploy is
+/// snappy: every service supervisor (FreeBSD rc.d, systemd `TimeoutStopSec`,
+/// launchd) SIGKILLs the process a few seconds after this as a backstop, so the
+/// worker must exit within their grace window or be force-killed mid-drain.
+/// Cleave cancellation is cooperative and a stuck rayon unpack can refuse to
+/// exit; whatever does not finish here is re-leased by hopper, so exiting early
+/// costs a re-scan, never a lost result. (Batch `--exit-if-empty` runs drain
+/// unbounded instead — a finite dataset must complete, not re-lease.)
+const SHUTDOWN_DRAIN_SECS: u64 = 15;
 
 /// Poll the shutdown flag at ≤500 ms granularity so a signal interrupts any
 /// sleep the main loop is parked in (no-work backoff, memory-pressure pause,

@@ -20,7 +20,10 @@ fi
 log "Disabling and stopping scan-worker service"
 $SUDO sysrc scan_worker_enable=NO >/dev/null 2>&1 || true
 $SUDO service scan-worker stop 2>/dev/null || true
-$SUDO pkill -9 -F /var/run/scan_worker.pid 2>/dev/null || true
+# Belt-and-suspenders: reap any worker the stop left behind. Target the child
+# by name, not `-F /var/run/scan_worker.pid` — that pidfile is the daemon(8)
+# supervisor, and SIGKILLing it leaves its atomscan child orphaned and running.
+$SUDO pkill -9 -x atomscan 2>/dev/null || true
 
 log "Removing rc.d script"
 $SUDO rm -f /usr/local/etc/rc.d/scan-worker

@@ -37,10 +37,22 @@ scan_worker_args() {
 # a hard crash loop (bad URL, missing model) backs off instead of pegging a
 # core. rc's `scan_worker_enable=YES` brings it back across reboots, so the
 # only way the worker stays down is an explicit `service scan-worker stop`.
+#
+# The generated script overrides rc.subr's default stop with a *bounded* one.
+# The default sends SIGTERM to the supervisor and then waits on it forever
+# (wait_for_pids), so a busy worker's drain — or a wedged rayon unpack — wedges
+# every redeploy until an operator `kill -9`s it by hand. This is FreeBSD-only
+# pain: the systemd (TimeoutStopSec) and launchd (worker-macos.sh) deploys
+# already SIGTERM-then-SIGKILL. scan_worker_stop below gives rc.d the same:
+# graceful SIGTERM, a short grace window, then a forced teardown that can never
+# orphan the child.
 scan_rcd_script() {
 	_lrs_bin="$1"
 	_lrs_worker_args="$2"
 	_lrs_llm="${3:-http://10.9.8.149:8000/v1}"
+	# Basename for the force-kill sweep in scan_worker_stop; matches pkill -x's
+	# comm comparison (e.g. /usr/local/bin/atomscan -> atomscan).
+	_lrs_binname=$(basename "$_lrs_bin")
 	cat <<EOF
 #!/bin/sh
 
@@ -59,6 +71,12 @@ load_rc_config \$name
 : \${scan_worker_logfile:="/var/log/scan-worker.log"}
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
 : \${scan_worker_llm:="$_lrs_llm"}
+# Seconds a graceful stop waits for the worker to drain in-flight analyses
+# before the whole daemon(8) tree is SIGKILLed. Bounds how long a redeploy or
+# reboot blocks; hopper re-leases anything that does not finish. Sized a few
+# seconds above the worker's own drain cap so a healthy worker exits cleanly on
+# its own and this force-kill is only reached when it is genuinely wedged.
+: \${scan_worker_stop_timeout:="20"}
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
@@ -73,6 +91,42 @@ malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,abort_c
 #           pidfile; \`service scan-worker stop\` signals it to tear the
 #           whole tree down.
 command_args="-c -f -r -R 5 -P \${pidfile} -o \${scan_worker_logfile} -u scan /usr/bin/env MALLOC_CONF=\${malloc_conf} SCAN_LLM=\${scan_worker_llm} $_lrs_bin $_lrs_worker_args"
+
+# Bounded, orphan-free stop (see the header comment for why the default won't
+# do). SIGTERM the daemon(8) supervisor — it forwards the signal to the worker,
+# which drains and exits, after which the supervisor removes \${pidfile} and
+# exits too. Wait at most \${scan_worker_stop_timeout}s for that, then force the
+# tree down: SIGKILL the supervisor first so -r cannot respawn, then SIGKILL any
+# worker child still standing (a SIGKILLed supervisor cannot reap its own
+# child). The pkill sweep is by exact name and jail-local, so it also cleans up
+# a child orphaned by an older rc.d that predates this stop.
+stop_cmd="scan_worker_stop"
+scan_worker_stop()
+{
+	_sup=\$(cat "\${pidfile}" 2>/dev/null)
+	case "\${_sup}" in
+	''|*[!0-9]*) _sup="" ;;
+	esac
+	if [ -z "\${_sup}" ] || ! kill -0 "\${_sup}" 2>/dev/null; then
+		echo "scan_worker not running."
+		rm -f "\${pidfile}"
+		return 0
+	fi
+	echo "Stopping scan_worker (pid \${_sup}); up to \${scan_worker_stop_timeout}s to drain."
+	kill -TERM "\${_sup}" 2>/dev/null
+	_waited=0
+	while kill -0 "\${_sup}" 2>/dev/null; do
+		[ "\${_waited}" -ge "\${scan_worker_stop_timeout}" ] && break
+		sleep 1
+		_waited=\$((_waited + 1))
+	done
+	if kill -0 "\${_sup}" 2>/dev/null; then
+		echo "scan_worker did not stop within \${scan_worker_stop_timeout}s; forcing SIGKILL."
+		kill -KILL "\${_sup}" 2>/dev/null
+		pkill -9 -x $_lrs_binname 2>/dev/null || true
+	fi
+	rm -f "\${pidfile}"
+}
 
 run_rc_command "\$1"
 EOF

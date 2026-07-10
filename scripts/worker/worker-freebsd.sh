@@ -134,9 +134,11 @@ $SUDO sysrc scan_worker_enable=YES >/dev/null
 
 if [ "$binary_changed" -eq 1 ] || [ "$rcd_changed" -eq 1 ]; then
 	log "Restarting scan-worker"
-	$SUDO service scan-worker stop 2>/dev/null || true
-	# Force-kill a worker stuck in rizin teardown so the restart is clean.
-	$SUDO pkill -9 -F /var/run/scan_worker.pid 2>/dev/null || true
+	# The rc.d stop is now bounded: it SIGTERMs the worker, waits out a short
+	# drain, then SIGKILLs the whole daemon(8) tree — so a busy or wedged worker
+	# can't stall the redeploy the way rc.subr's default (wait-forever) stop did,
+	# and no lingering child is left to kill -9 by hand.
+	$SUDO service scan-worker stop || true
 	$SUDO service scan-worker start || die "service failed to start; see /var/log/scan-worker.log"
 else
 	log "No changes; ensuring scan-worker is running"
