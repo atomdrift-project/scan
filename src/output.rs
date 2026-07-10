@@ -552,8 +552,10 @@ fn print_extra(result: &ScanResult, p: &Palette) {
     // Surface the routing of archive members. A container often inherits a
     // member's verdict (see `elevated archive classification`), so when the
     // container's own models disagree with the final grade, the responsible
-    // route lives here — not above.
-    for ef in &result.embedded_files {
+    // route lives here — not above. The list is sorted top-offenders-first
+    // and no longer truncated (ml.files needs every evaluation), so cap the
+    // display here.
+    for ef in result.embedded_files.iter().take(10) {
         if ef.model_scores.is_empty() {
             continue;
         }

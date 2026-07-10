@@ -357,6 +357,63 @@ mod manifest_tests {
     }
 
     #[test]
+    fn build_ml_files_never_stamps_members_with_root_verdict() {
+        // A hostile container with three members: one evaluated benign, one
+        // evaluated with the same basename as another node, one never
+        // evaluated. No member may inherit the root's verdict — hopper mirrors
+        // these entries into each member's own sample row, and a member can
+        // occur in many containers.
+        let report = serde_json::json!({
+            "files": [
+                {"id": 0, "path": "evil.elf", "type": "elf", "depth": 0},
+                {"id": 1, "path": "compatibility", "type": "unknown", "depth": 1},
+                {"id": 2, "path": "a!!page", "type": "unknown", "depth": 2},
+                {"id": 3, "path": "b!!page", "type": "unknown", "depth": 2},
+                {"id": 4, "path": "never-scored", "type": "unknown", "depth": 1},
+            ]
+        });
+        let member = |id: u64, path: &str, prob: f32, level: i32| EmbeddedFile {
+            id,
+            path: path.to_string(),
+            file_type: "unknown".to_string(),
+            classification: Classification::Benign,
+            probability: prob,
+            threshold: 0.8,
+            level: Some(level),
+            model_scores: Vec::new(),
+            skipped_models: Vec::new(),
+            formula: String::new(),
+            top_findings: Vec::new(),
+        };
+        let evaluated = vec![
+            member(1, "compatibility", 0.00001, -1),
+            member(2, "page", 0.00002, -1),
+            member(3, "page", 0.7, 3000),
+        ];
+        let ml = build_ml_files(&report, 0.99, Some(0), &evaluated);
+
+        assert!(
+            (ml[0]["prob"].as_f64().unwrap() - 0.99).abs() < 1e-6,
+            "root keeps its own"
+        );
+        assert!(
+            (ml[1]["prob"].as_f64().unwrap() - 0.00001).abs() < 1e-9,
+            "evaluated member reports its own probability, not the root's"
+        );
+        assert_eq!(ml[1]["lvl"].as_i64(), Some(-1));
+        // Same basename, different nodes: id keys the join, so each reports
+        // its own evaluation (the old path-suffix match returned the first).
+        assert!((ml[2]["prob"].as_f64().unwrap() - 0.00002).abs() < 1e-9);
+        assert_eq!(ml[3]["lvl"].as_i64(), Some(3000));
+        // Never evaluated: no verdict fields at all — absence, not inheritance.
+        assert_eq!(ml[4]["id"].as_u64(), Some(4));
+        assert!(
+            ml[4].get("prob").is_none() && ml[4].get("lvl").is_none() && ml[4].get("conf").is_none(),
+            "unevaluated member carries no fabricated verdict"
+        );
+    }
+
+    #[test]
     fn is_all_only_when_every_class_shown() {
         assert!(DisplayFilter::all().is_all());
         assert!(!DisplayFilter::alerts_only().is_all());
@@ -766,7 +823,8 @@ mod envelope_tests {
                 {"id": 2, "dp": 1, "path": "/tmp/x!!readme.txt", "type": "text"},
             ]
         }));
-        let member = |path: &str, level: Option<i32>, prob: f32| EmbeddedFile {
+        let member = |id: u64, path: &str, level: Option<i32>, prob: f32| EmbeddedFile {
+            id,
             path: path.to_string(),
             file_type: "unknown".to_string(),
             classification: Classification::Benign,
@@ -779,8 +837,8 @@ mod envelope_tests {
             top_findings: Vec::new(),
         };
         r.embedded_files = vec![
-            member("evil.sh", Some(2), 0.99),
-            member("readme.txt", Some(-1), 0.01),
+            member(1, "evil.sh", Some(2), 0.99),
+            member(2, "readme.txt", Some(-1), 0.01),
         ];
         let json = serde_json::to_value(r.to_envelope()).expect("serialize");
         let files = json["ml"]["files"].as_array().expect("files array");
@@ -1093,6 +1151,11 @@ impl From<&serde_json::Value> for TopFinding {
 /// A file embedded within an archive or self-extracting executable.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddedFile {
+    /// The cleave `files[].id` of this member — the stable key that ties this
+    /// evaluation back to its report node. Paths are not unique (many members
+    /// share a basename; fetched payloads collide across pages), so id is the
+    /// only safe join key for `ml.files`.
+    pub id: u64,
     /// Relative path within the archive (portion after "!!" delimiter).
     pub path: String,
     /// Detected file type.
@@ -2350,7 +2413,9 @@ pub(crate) fn write_extra_diagnostics(out: &mut dyn std::io::Write, r: &ScanResu
             );
         }
     }
-    for ef in &r.embedded_files {
+    // The list is sorted top-offenders-first and no longer truncated (every
+    // evaluation must survive for ml.files), so cap the diagnostic view here.
+    for ef in r.embedded_files.iter().take(10) {
         if !ef.model_scores.is_empty() {
             let _ = writeln!(
                 out,
@@ -2997,6 +3062,9 @@ pub(crate) fn classify_report(
         }
 
         embedded_files.push(EmbeddedFile {
+            // u64::MAX when the node has no id: it then matches no ml.files
+            // entry rather than falsely matching id 0 (the root).
+            id: ef["id"].as_u64().unwrap_or(u64::MAX),
             path: rel_path,
             file_type: ef["type"].as_str().unwrap_or("unknown").to_string(),
             classification: ef_decision.class,
@@ -3010,10 +3078,12 @@ pub(crate) fn classify_report(
         });
     }
 
+    // Sort top offenders first for display, but keep EVERY evaluation: ml.files
+    // is built from this list, and a dropped entry used to make build_ml_files
+    // fall back to the root verdict — stamping a benign member (and, via
+    // hopper's member explosion, its own sample row) with its container's
+    // hostile grade. The list is already bounded by embedded_file_limit.
     embedded_files.sort_by(|a, b| b.probability.total_cmp(&a.probability));
-    if embedded_file_limit.is_some() {
-        embedded_files.truncate(10);
-    }
 
     // If an embedded file's decision outranks the parent, elevate.
     let mut final_decision = if decision_outranks(&max_decision, &decision) {
@@ -3754,12 +3824,16 @@ fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
 
 /// Build per-file ML classification entries for the `ml.files` array.
 ///
-/// Each entry is `{id, type, prob, lvl, conf}` keyed by the cleave `files[].id` field. The root
-/// file (`dp=0`) carries the envelope's probability and `lvl`; embedded archive
-/// members are matched by path suffix and report their *own* probability and
-/// lowest-firing-level `lvl` — every row's `lvl` is therefore the level-independent
-/// marker for that specific file. A member with no recorded evaluation (e.g.
-/// truncated past the embedded-file cap) falls back to the root values.
+/// Each entry is `{id, type, prob, lvl, conf}` keyed by the cleave `files[].id`
+/// field. The root file (`dp=0`) carries the envelope's probability and `lvl`;
+/// embedded archive members are matched by id and report their *own*
+/// probability and lowest-firing-level `lvl` — every row's `lvl` is therefore
+/// the level-independent marker for that specific file. A member with no
+/// recorded evaluation (e.g. truncated past the embedded-file cap) emits only
+/// `{id, type}` — no verdict fields. It must NEVER inherit the root's verdict:
+/// a member can occur in many containers, and hopper mirrors these entries
+/// into the member's own sample row (`litmusResultForMember`), so a fabricated
+/// value becomes that file's global grade everywhere it appears.
 fn build_ml_files(
     report_json: &serde_json::Value,
     root_prob: f32,
@@ -3769,6 +3843,8 @@ fn build_ml_files(
     let Some(report_files) = json_alias_array(report_json, &["files", "fs"]) else {
         return Vec::new();
     };
+    let by_id: std::collections::HashMap<u64, &EmbeddedFile> =
+        embedded_files.iter().map(|ef| (ef.id, ef)).collect();
 
     let mut out = Vec::with_capacity(report_files.len());
     for (idx, entry) in report_files.iter().enumerate() {
@@ -3787,25 +3863,27 @@ fn build_ml_files(
             .unwrap_or(0);
         let file_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        let (prob, file_level) = if depth == 0 {
-            (root_prob, root_level)
+        let evaluation = if depth == 0 {
+            Some((root_prob, root_level))
         } else {
-            let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let suffix = path.rsplit_once("!!").map(|(_, r)| r).unwrap_or(path);
-            embedded_files
-                .iter()
-                .find(|ef| ef.path == suffix)
-                .map(|ef| (ef.probability, ef.level))
-                .unwrap_or((root_prob, root_level))
+            by_id.get(&id).map(|ef| (ef.probability, ef.level))
         };
 
-        out.push(serde_json::json!({
-            "id": id,
-            "type": file_type,
-            "prob": prob,
-            "lvl": file_level,
-            "conf": level_confidence(file_level),
-        }));
+        match evaluation {
+            Some((prob, file_level)) => out.push(serde_json::json!({
+                "id": id,
+                "type": file_type,
+                "prob": prob,
+                "lvl": file_level,
+                "conf": level_confidence(file_level),
+            })),
+            // No verdict fields: consumers (hopper's forMember) treat a
+            // prob-less entry as "not analyzed", which is the truth.
+            None => out.push(serde_json::json!({
+                "id": id,
+                "type": file_type,
+            })),
+        }
     }
     out
 }

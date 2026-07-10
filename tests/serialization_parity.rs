@@ -85,6 +85,7 @@ fn full_result_serializes_identically() {
         size_bytes: 13_189,
         sha256: "c7159256a21402fd4c650fbf906ad13c56f1f3ae818df3ba7385ae6f51db2585".to_string(),
         embedded_files: vec![EmbeddedFile {
+            id: 1,
             path: "a/_utilities.py".to_string(),
             file_type: "python".to_string(),
             classification: Classification::Suspicious,
