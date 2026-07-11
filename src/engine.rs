@@ -90,6 +90,7 @@ pub struct ScanConfig {
     extra: bool,
     level: Option<u16>,
     interpret: Option<crate::interpret::InterpretConfig>,
+    interpret_template: crate::interpret::InterpretTemplate,
     fetch: crate::fetch::FetchPolicy,
     hopper: Option<String>,
     mode: crate::Mode,
@@ -142,6 +143,7 @@ impl ScanConfig {
             extra,
             level: None,
             interpret: None,
+            interpret_template: crate::interpret::InterpretTemplate::default(),
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
             // Bloom short-circuiting is opt-in via `with_bloom`; an unconfigured
@@ -208,6 +210,25 @@ impl ScanConfig {
     #[must_use]
     pub fn interpret(&self) -> Option<&crate::interpret::InterpretConfig> {
         self.interpret.as_ref()
+    }
+
+    /// Set the `--interpret-template` render mode. Carried on the config (not
+    /// just inside [`Self::with_interpret`]'s config) so
+    /// [`crate::OutputFormat::Interpret`] can render the would-be LLM payload
+    /// without `--interpret` being enabled.
+    #[must_use]
+    pub const fn with_interpret_template(
+        mut self,
+        template: crate::interpret::InterpretTemplate,
+    ) -> Self {
+        self.interpret_template = template;
+        self
+    }
+
+    /// The `--interpret-template` render mode (default when never set).
+    #[must_use]
+    pub(crate) const fn interpret_template(&self) -> crate::interpret::InterpretTemplate {
+        self.interpret_template
     }
 
     /// Directory containing `model.json` and `feature_spec.json`.
@@ -2422,6 +2443,13 @@ fn emit_result(
             };
             write_tiny(&mut *out, r);
         }
+        // `--format interpret` is the LLM payload verbatim — no verdict line.
+        OutputFormat::Interpret => {
+            let Ok(mut out) = stdout.lock() else {
+                return;
+            };
+            let _ = out.write_all(r.rendered_context.as_bytes());
+        }
     }
 }
 
@@ -2430,7 +2458,7 @@ fn emit_result(
 /// render — same rich header and body — but capped at the top 3 traits (cleave
 /// shows all notable+), with litmus adding a verdict badge + subtitle on top.
 pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
-    if matches!(config.format(), OutputFormat::Tiny) {
+    if matches!(config.format(), OutputFormat::Tiny | OutputFormat::Interpret) {
         cleave::output::TinyOpts::tiny()
     } else {
         cleave::output::TinyOpts {
@@ -2746,6 +2774,10 @@ pub(crate) fn classify_report(
     embedded_file_limit: Option<usize>,
     tiny_opts: &cleave::output::TinyOpts,
     interpret: Option<&crate::interpret::InterpretConfig>,
+    // `Some(template)` renders `rendered_context` as the would-be LLM payload
+    // (`--format interpret`): the sanitized tiny render rewritten for the
+    // template. Independent of `interpret`, which controls actually querying.
+    llm_view: Option<crate::interpret::InterpretTemplate>,
     root_path: &Path,
     fetch: crate::fetch::FetchPolicy,
     fetch_progress: bool,
@@ -3140,7 +3172,7 @@ pub(crate) fn classify_report(
     // interpret-template tuning harness (`hacks/interpret-tune`) can sweep every
     // template offline from one scan, independent of whether `--interpret` is on.
     let dump_dir = std::env::var_os("SCAN_INTERPRET_DUMP_DIR");
-    let llm_ctx = (interpret.is_some() || dump_dir.is_some()).then(|| {
+    let llm_ctx = (interpret.is_some() || dump_dir.is_some() || llm_view.is_some()).then(|| {
         crate::interpret::sanitize_context(&cleave::output::format_context(
             &report,
             &cleave::output::TinyOpts::tiny(),
@@ -3208,6 +3240,16 @@ pub(crate) fn classify_report(
     // `--format tiny` uses cleave's machine render verbatim.
     let rendered_context = if !render_context {
         String::new()
+    } else if let Some(template) = llm_view {
+        // `--format interpret`: the payload `--interpret` would send, byte for
+        // byte — the same sanitized render the LLM path starts from (built
+        // above), rewritten for the active template exactly as `interpret()`
+        // does before querying.
+        llm_ctx
+            .as_deref()
+            .map_or_else(String::new, |ctx| {
+                crate::interpret::apply_template(ctx, template)
+            })
     } else if tiny_opts.header == cleave::output::HeaderStyle::Rich {
         render_terminal_context(
             &report,
@@ -3460,6 +3502,7 @@ pub(crate) fn process_report(
         Some(100),
         &tiny_opts_for(config),
         config.interpret(),
+        matches!(config.format(), OutputFormat::Interpret).then(|| config.interpret_template()),
         path,
         config.fetch_policy(),
         // Render the live-vs-cache fetch log only on the interactive terminal

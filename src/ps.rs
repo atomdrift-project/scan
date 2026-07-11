@@ -399,10 +399,15 @@ fn build_result(
         Some(100),
         &crate::engine::tiny_opts_for(config),
         config.interpret(),
+        matches!(config.format(), OutputFormat::Interpret)
+            .then(|| config.interpret_template()),
         display_path,
         config.fetch_policy(),
         false, // ps emits machine-readable output; no interactive fetch log
-        matches!(config.format(), OutputFormat::Tiny),
+        matches!(
+            config.format(),
+            OutputFormat::Tiny | OutputFormat::Interpret
+        ),
         // `--show=all` with JSON: list every member of an archive-backed image.
         config.filter().is_all() && matches!(config.format(), OutputFormat::Json),
         None, // process images carry no fetched-package registry metadata
@@ -470,6 +475,13 @@ fn emit_result(
                 return;
             };
             crate::engine::write_tiny(&mut *out, r);
+        }
+        // The LLM payload verbatim — no verdict line, no PID annotations.
+        OutputFormat::Interpret => {
+            let Ok(mut out) = stdout.lock() else {
+                return;
+            };
+            let _ = out.write_all(r.rendered_context.as_bytes());
         }
     }
 }

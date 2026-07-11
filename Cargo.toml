@@ -316,3 +316,13 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # ../fletch is at the rev scan locks to plus this additive change; its filefacts
 # rev (37942aa) matches scan's, so the shared `Reference`/`RefKind` types unify.
 # Remove this patch and bump the git rev once a fletch release carries it.
+
+# TEMPORARY local cleave: the tiny/LLM view's low-tier fill
+# (`TinyOpts::low_tier_fill`) — a top-scored file always shows its top-15 traits,
+# topping up with component/baseline when little or nothing notable fired, so a
+# benign binary still renders its functionality for the LLM instead of an empty
+# payload (which `--interpret` could never grade, and a mis-pooled file could
+# never recover from). ../cleave is the pinned rev (8ba8b60c) plus this change.
+# Remove and bump the git rev once cleave carries it.
+[patch."https://codeberg.org/atomdrift/cleave.git"]
+cleave = { path = "../cleave" }

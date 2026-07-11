@@ -985,6 +985,7 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
+            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy)
             .with_hopper(hopper);
             // Per-file SHA-256 known-good/known-bad short-circuit (explicit file
@@ -1030,6 +1031,7 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
+            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy);
             exit_for_summary(&scan::sys::run(&config)?);
         }
@@ -1047,6 +1049,7 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
+            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy);
             // Per-binary known-good/known-bad short-circuit (by executable sha256).
             if effective_mode != scan::Mode::Slow {
@@ -1068,6 +1071,7 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
+            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy);
             exit_for_summary(&scan::pkg::run_url(&url, &config)?);
         }
@@ -1085,6 +1089,7 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
+            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy);
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());

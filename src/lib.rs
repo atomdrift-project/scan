@@ -135,6 +135,10 @@ pub enum OutputFormat {
     /// line (gate, confidence, matched FP level) followed by cleave's annotated
     /// context. See [`crate::output::format_tiny`].
     Tiny,
+    /// The exact analysis text `--interpret` sends to the LLM: cleave's
+    /// sanitized tiny render rewritten for the active `--interpret-template`.
+    /// Rendered locally — no LLM is contacted, and no verdict line is added.
+    Interpret,
 }
 
 /// How aggressively a scan consults the local known-good / known-bad bloom
