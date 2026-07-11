@@ -500,35 +500,37 @@ mod trait_floor_tests {
     }
 
     #[test]
-    fn one_confident_crit5_escalates_to_grid_max_plus_1() {
+    fn one_confident_crit5_escalates_to_hostile_band() {
         let mut d = benign();
-        apply_trait_floor(&mut d, &report(5, 0.8, 1, 0), 100, "test");
-        assert_eq!(d.class, Classification::Suspicious);
-        assert_eq!(d.level, Some(101));
+        apply_trait_floor(&mut d, &report(5, 0.8, 1, 0), Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Hostile);
+        assert_eq!(d.probability, 0.8);
+        assert_eq!(d.level, Some(50));
     }
 
     #[test]
     fn low_confidence_crit5_is_ignored() {
         let mut d = benign();
         // c < 0.76 → not counted, stays benign.
-        apply_trait_floor(&mut d, &report(5, 0.5, 3, 0), 100, "test");
+        apply_trait_floor(&mut d, &report(5, 0.5, 3, 0), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
     #[test]
-    fn two_confident_crit4_above_fraction_escalates_to_grid_max_plus_2() {
+    fn two_confident_crit4_above_fraction_escalates_to_suspicious_band() {
         let mut d = benign();
         // 4 confident crit-4 out of 4 total → fraction 1.0 >= 0.05.
-        apply_trait_floor(&mut d, &report(4, 0.9, 4, 0), 100, "test");
+        apply_trait_floor(&mut d, &report(4, 0.9, 4, 0), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Suspicious);
-        assert_eq!(d.level, Some(102));
+        assert_eq!(d.probability, 0.9);
+        assert_eq!(d.level, Some(100));
     }
 
     #[test]
     fn confident_crit4_below_fraction_stays_benign() {
         let mut d = benign();
         // 2 confident crit-4 diluted by 200 baseline findings → fraction ~0.01.
-        apply_trait_floor(&mut d, &report(4, 0.9, 2, 200), 100, "test");
+        apply_trait_floor(&mut d, &report(4, 0.9, 2, 200), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
@@ -541,7 +543,7 @@ mod trait_floor_tests {
             {"crit": 4, "conf": 0.5},
             {"crit": 4, "conf": 0.6},
         ]});
-        apply_trait_floor(&mut d, &report, 100, "test");
+        apply_trait_floor(&mut d, &report, Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
@@ -550,7 +552,7 @@ mod trait_floor_tests {
         let mut d = benign();
         // `conf` omitted → DEFAULT_TRAIT_CONFIDENCE (0.5) < 0.76, so it never counts.
         let report = json!({"find": [{"crit": 5}, {"crit": 5}]});
-        apply_trait_floor(&mut d, &report, 100, "test");
+        apply_trait_floor(&mut d, &report, Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
@@ -559,7 +561,7 @@ mod trait_floor_tests {
         let mut d = benign();
         d.class = Classification::Hostile;
         d.level = Some(50);
-        apply_trait_floor(&mut d, &report(5, 0.9, 5, 0), 100, "test");
+        apply_trait_floor(&mut d, &report(5, 0.9, 5, 0), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
         assert_eq!(d.level, Some(50));
     }
@@ -568,9 +570,19 @@ mod trait_floor_tests {
     fn reads_findings_from_embedded_files_shape() {
         let mut d = benign();
         let report = json!({"files": [{"find": [{"crit": 5, "conf": 0.8}]}]});
-        apply_trait_floor(&mut d, &report, 100, "test");
-        assert_eq!(d.class, Classification::Suspicious);
-        assert_eq!(d.level, Some(101));
+        apply_trait_floor(&mut d, &report, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Hostile);
+        assert_eq!(d.level, Some(50));
+    }
+
+    #[test]
+    fn reads_findings_from_current_compact_traits_shape() {
+        let mut d = benign();
+        let report = json!({"files": [{"traits": [{"crit": 5, "conf": 0.98}]}]});
+        apply_trait_floor(&mut d, &report, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Hostile);
+        assert_eq!(d.probability, 0.98);
+        assert_eq!(d.level, Some(50));
     }
 }
 
@@ -1124,12 +1136,12 @@ pub struct TopFinding {
 const DEFAULT_TRAIT_CONFIDENCE: f32 = 0.5;
 
 /// The cleave findings array, taken from a single-file report (`find`/`ts`) or,
-/// failing that, the first file entry of a compact envelope (`files[0].find`).
+/// failing that, the first file entry of a compact envelope (`files[0].traits`).
 fn report_findings(report: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
-    json_alias_array(report, &["find", "ts"]).or_else(|| {
+    json_alias_array(report, &["traits", "find", "ts"]).or_else(|| {
         json_alias_array(report, &["files", "fs"])
             .and_then(|a| a.first())
-            .and_then(|f| json_alias_array(f, &["find", "ts"]))
+            .and_then(|f| json_alias_array(f, &["traits", "find", "ts"]))
     })
 }
 
@@ -2651,6 +2663,8 @@ const TRAIT_FLOOR_MIN_CONFIDENCE: f32 = 0.76;
 struct TraitFloorCounts {
     hostile: u32,
     suspicious: u32,
+    hostile_confidence: f32,
+    suspicious_confidence: f32,
     total: u32,
 }
 
@@ -2659,6 +2673,8 @@ fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
     let mut out = TraitFloorCounts {
         hostile: 0,
         suspicious: 0,
+        hostile_confidence: 0.0,
+        suspicious_confidence: 0.0,
         total: 0,
     };
     let Some(findings) = findings else {
@@ -2674,32 +2690,38 @@ fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
             continue;
         }
         match crit_ordinal(f) {
-            5 => out.hostile += 1,
-            4 => out.suspicious += 1,
+            5 => {
+                out.hostile += 1;
+                out.hostile_confidence = out.hostile_confidence.max(conf);
+            }
+            4 => {
+                out.suspicious += 1;
+                out.suspicious_confidence = out.suspicious_confidence.max(conf);
+            }
             _ => {}
         }
     }
     out
 }
 
-/// Trait floor: escalate a model-**Benign** verdict to **Suspicious** when cleave
-/// surfaced high-criticality evidence the model didn't act on, recorded as an
-/// off-grid synthetic level so the signal is preserved and its source is legible:
-///   - `>= 1` hostile (crit-5) trait → `grid_max + 1` (crit-5 is high precision: ~0% benign FP)
-///   - `>= 2` suspicious (crit-4) traits AND crit-4 fraction `>= TRAIT_FLOOR_CRIT4_FRACTION` → `grid_max + 2`
+/// Trait floor: override a model-**Benign** verdict when cleave surfaced
+/// high-criticality evidence the model did not act on:
+///   - one or more hostile (crit-5) traits → **Hostile**
+///   - two or more suspicious (crit-4) traits whose fraction clears
+///     `TRAIT_FLOOR_CRIT4_FRACTION` → **Suspicious**
 ///
 /// Only confident findings count (`c >= TRAIT_FLOOR_MIN_CONFIDENCE`); the crit-4
 /// fraction's denominator is the file's *total* finding count, so a sparse, severe
 /// dropper clears it while a busy benign binary with a couple of incidental
 /// crit-4s does not.
 ///
-/// Only raises Benign → Suspicious; never lowers a model verdict (a file the
-/// model already graded suspicious/hostile is left untouched). Synthetic levels
-/// sit above the model grid so the envelope records that this was a trait-floor
-/// escalation rather than an ordinary swept model level.
+/// Never lowers a model verdict. Override levels are pinned to the same band
+/// boundaries used by ordinary and interpreted verdicts, so a level-only
+/// downstream consumer cannot reinterpret the override as another class.
 fn apply_trait_floor(
     decision: &mut Decision,
     report: &serde_json::Value,
+    active_level: Option<u16>,
     grid_max: u16,
     label: &str,
 ) {
@@ -2708,8 +2730,9 @@ fn apply_trait_floor(
     }
     let counts = trait_floor_counts(report);
     if counts.hostile >= 1 {
-        decision.class = Classification::Suspicious;
-        decision.level = Some(i32::from(grid_max) + 1);
+        decision.class = Classification::Hostile;
+        decision.probability = counts.hostile_confidence;
+        decision.level = interpreted_level(active_level, grid_max, Classification::Hostile);
         // Loud by design: the model graded this benign yet cleave is confident it
         // carries a hostile (crit-5) trait. If the models are doing their job this
         // is extraordinary — every occurrence is a model gap worth investigating.
@@ -2717,8 +2740,9 @@ fn apply_trait_floor(
             path = %label,
             arm = "crit5",
             confident_hostile = counts.hostile,
-            synthetic_level = i32::from(grid_max) + 1,
-            "TRAIT FLOOR: model said benign but cleave found a confident hostile trait — escalated to suspicious",
+            trait_confidence = format!("{:.3}", counts.hostile_confidence),
+            level = ?decision.level,
+            "TRAIT FLOOR: model said benign but cleave found a confident hostile trait — escalated to hostile",
         );
         return;
     }
@@ -2727,7 +2751,8 @@ fn apply_trait_floor(
         && counts.suspicious as f32 / counts.total as f32 >= TRAIT_FLOOR_CRIT4_FRACTION
     {
         decision.class = Classification::Suspicious;
-        decision.level = Some(i32::from(grid_max) + 2);
+        decision.probability = counts.suspicious_confidence;
+        decision.level = interpreted_level(active_level, grid_max, Classification::Suspicious);
         tracing::warn!(
             path = %label,
             arm = "crit4_fraction",
@@ -2737,7 +2762,8 @@ fn apply_trait_floor(
                 "{:.3}",
                 counts.suspicious as f32 / counts.total as f32
             ),
-            synthetic_level = i32::from(grid_max) + 2,
+            trait_confidence = format!("{:.3}", counts.suspicious_confidence),
+            level = ?decision.level,
             "TRAIT FLOOR: model said benign but cleave found a sparse cluster of confident suspicious traits — escalated to suspicious",
         );
     }
@@ -2929,7 +2955,13 @@ pub(crate) fn classify_report(
     // Trait floor: a screaming cleave signal the model graded benign is escalated
     // to suspicious (off-grid synthetic level). Applied per-file so an archive
     // member's evidence elevates its container via decision_outranks below.
-    apply_trait_floor(&mut decision, &report_json, model.grid_max(), label);
+    apply_trait_floor(
+        &mut decision,
+        &report_json,
+        model.active_level(),
+        model.grid_max(),
+        label,
+    );
 
     // Extract embedded files (archive members at depth > 0), run each through
     // the model individually, and elevate the parent if any embedded file's
@@ -3022,6 +3054,7 @@ pub(crate) fn classify_report(
                     apply_trait_floor(
                         &mut ef_decision,
                         ef,
+                        model.active_level(),
                         model.grid_max(),
                         ef["path"].as_str().unwrap_or(label),
                     );
