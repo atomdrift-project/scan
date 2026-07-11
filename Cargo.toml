@@ -331,5 +331,3 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # match span) — `--format interpret` strips all annotations, so the gutter is
 # how a model addresses what it reads. Remove and bump the git rev once cleave
 # carries it.
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
