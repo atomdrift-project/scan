@@ -326,6 +326,3 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # Remove and bump the git rev once cleave carries it.
 
 # TEMPORARY verify: local cleave for the 96-byte ASCII-context widening.
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
-cleave-macros = { path = "../cleave/cleave-macros" }

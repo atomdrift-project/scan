@@ -829,7 +829,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cleave"
-version = "2.3.0-beta.1"
+version = "2.3.0"
 dependencies = [
  "aes 0.9.1",
  "aho-corasick",
@@ -1781,7 +1781,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.2.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#617540d2cc3432394a0c80f85ad38d967d5d506d"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#b11324f69924e22db4e1dc719b2b1d4159412b02"
 dependencies = [
  "aho-corasick",
  "cfb 0.10.0",
@@ -5000,7 +5000,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "1.7.1"
-source = "git+https://codeberg.org/atomdrift/stng.git#906b667da6d083173965c8c92398ce49c10cad86"
+source = "git+https://codeberg.org/atomdrift/stng.git#7a0d0e3b933115f1be2f839b7d4749a02ac1dd08"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5846,7 +5846,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#617540d2cc3432394a0c80f85ad38d967d5d506d"
+source = "git+https://codeberg.org/atomdrift/filefacts.git#b11324f69924e22db4e1dc719b2b1d4159412b02"
 dependencies = [
  "cc",
  "tree-sitter",
