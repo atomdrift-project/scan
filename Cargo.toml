@@ -324,10 +324,3 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # payload (which `--interpret` could never grade, and a mis-pooled file could
 # never recover from). ../cleave is the pinned rev (8ba8b60c) plus this change.
 # Remove and bump the git rev once cleave carries it.
-
-# TEMPORARY local cleave: the tiny/LLM view's binary windows render as
-# xxd-style gutter rows (`{offset:08x}: bytes`, 64 bytes/row) instead of a
-# single `…`-elided line, and carry 2x the context (48 bytes each side of the
-# match span) — `--format interpret` strips all annotations, so the gutter is
-# how a model addresses what it reads. Remove and bump the git rev once cleave
-# carries it.
