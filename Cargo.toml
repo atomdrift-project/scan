@@ -324,3 +324,8 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # payload (which `--interpret` could never grade, and a mis-pooled file could
 # never recover from). ../cleave is the pinned rev (8ba8b60c) plus this change.
 # Remove and bump the git rev once cleave carries it.
+
+# TEMPORARY verify: local cleave for the 96-byte ASCII-context widening.
+[patch."https://codeberg.org/atomdrift/cleave.git"]
+cleave = { path = "../cleave" }
+cleave-macros = { path = "../cleave/cleave-macros" }

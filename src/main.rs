@@ -162,16 +162,6 @@ struct Cli {
     #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_MIN_PROB, value_name = "P")]
     interpret_min_prob: f32,
 
-    /// What the live `--interpret` LLM query sees of cleave's findings:
-    /// `adaptive` (default; keep the prose description on hex/binary findings
-    /// where it is the only signal, drop it to a bare `# SEV LOC` pointer on
-    /// readable source), `pointer` (bare marker everywhere), `full` (cleave's
-    /// `# SEV LOC desc` everywhere), `elevated` (pointers for
-    /// hostile/suspicious only), or `raw` (no annotations). `--format
-    /// interpret` output always renders `raw`, regardless of this flag.
-    #[arg(long, global = true, default_value_t = scan::interpret::InterpretTemplate::default(), value_name = "MODE")]
-    interpret_template: scan::interpret::InterpretTemplate,
-
     /// Per-request LLM timeout, in seconds
     #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
     llm_timeout: u64,
@@ -358,7 +348,6 @@ impl Cli {
             min_prob: self.interpret_min_prob,
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
-            template: self.interpret_template,
         })
     }
 }

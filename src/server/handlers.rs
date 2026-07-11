@@ -1026,7 +1026,7 @@ fn finish_classify(
         Some(100),
         &cleave::output::TinyOpts::tiny(),
         resources.interpret.as_ref(),
-        None, // server returns JSON; the LLM-payload view is CLI-only
+        false, // server returns JSON; the LLM-payload view is CLI-only
         // The server analyzes uploaded bytes, not a disk file; the root
         // imperative hunt (which re-reads the path) is therefore skipped, but
         // declared references from the report are still fetched when the

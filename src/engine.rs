@@ -2757,11 +2757,11 @@ pub(crate) fn classify_report(
     embedded_file_limit: Option<usize>,
     tiny_opts: &cleave::output::TinyOpts,
     interpret: Option<&crate::interpret::InterpretConfig>,
-    // `Some(template)` renders `rendered_context` as an LLM payload
-    // (`--format interpret`, which always passes `Raw`): the sanitized tiny
-    // render rewritten for the template. Independent of `interpret`, which
-    // controls actually querying.
-    llm_view: Option<crate::interpret::InterpretTemplate>,
+    // `--format interpret`: render `rendered_context` as the LLM query payload —
+    // byte-for-byte the user message a live `--interpret` query sends (the
+    // sanitized tiny render), without the system prompt. Independent of
+    // `interpret`, which controls actually querying.
+    llm_view: bool,
     root_path: &Path,
     fetch: crate::fetch::FetchPolicy,
     fetch_progress: bool,
@@ -3153,10 +3153,10 @@ pub(crate) fn classify_report(
     // LLM second opinion (root file only). Build the cleave tiny render once: it
     // feeds the model (below) and, when `SCAN_INTERPRET_DUMP_DIR` is set, is
     // written to `<dir>/<sha256>.render` — the raw (untransformed) render, so the
-    // interpret-template tuning harness (`hacks/interpret-tune`) can sweep every
-    // template offline from one scan, independent of whether `--interpret` is on.
+    // prompt-tuning harness (`hacks/interpret-tune`) can sweep render variants
+    // offline from one scan, independent of whether `--interpret` is on.
     let dump_dir = std::env::var_os("SCAN_INTERPRET_DUMP_DIR");
-    let llm_ctx = (interpret.is_some() || dump_dir.is_some() || llm_view.is_some()).then(|| {
+    let llm_ctx = (interpret.is_some() || dump_dir.is_some() || llm_view).then(|| {
         crate::interpret::sanitize_context(&cleave::output::format_context(
             &report,
             &cleave::output::TinyOpts::tiny(),
@@ -3224,16 +3224,11 @@ pub(crate) fn classify_report(
     // `--format tiny` uses cleave's machine render verbatim.
     let rendered_context = if !render_context {
         String::new()
-    } else if let Some(template) = llm_view {
-        // `--format interpret`: the same sanitized render the LLM path starts
-        // from (built above), rewritten for the requested template — always
-        // `Raw` from the CLI, so a downstream model reads the file's own
-        // content without cleave's opinions biasing it.
-        llm_ctx
-            .as_deref()
-            .map_or_else(String::new, |ctx| {
-                crate::interpret::apply_template(ctx, template)
-            })
+    } else if llm_view {
+        // `--format interpret`: byte-for-byte the user message the live
+        // `--interpret` query sends (built above) — the sanitized render,
+        // annotations included — just without the system prompt.
+        llm_ctx.clone().unwrap_or_default()
     } else if tiny_opts.header == cleave::output::HeaderStyle::Rich {
         render_terminal_context(
             &report,
@@ -3486,12 +3481,11 @@ pub(crate) fn process_report(
         Some(100),
         &tiny_opts_for(config),
         config.interpret(),
-        // `--format interpret` always renders the unbiased Raw view — the file's
-        // own content only, every finding annotation stripped (binary windows
-        // carry offset gutters for addressing). `--interpret-template` shapes
-        // only the live `--interpret` query payload.
-        matches!(config.format(), OutputFormat::Interpret)
-            .then_some(crate::interpret::InterpretTemplate::Raw),
+        // `--format interpret` emits byte-for-byte what a live `--interpret`
+        // query sends as its user message — the sanitized render, annotations
+        // included — without the system prompt (which hedges the descriptions
+        // as fallible; a downstream consumer should frame them likewise).
+        matches!(config.format(), OutputFormat::Interpret),
         path,
         config.fetch_policy(),
         // Render the live-vs-cache fetch log only on the interactive terminal

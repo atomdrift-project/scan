@@ -404,10 +404,9 @@ fn build_result(
         Some(100),
         &crate::engine::tiny_opts_for(config),
         config.interpret(),
-        // Raw view, matching scan's `--format interpret`: content only, no
-        // finding annotations (see `process_report`).
-        matches!(config.format(), OutputFormat::Interpret)
-            .then_some(crate::interpret::InterpretTemplate::Raw),
+        // Matching scan's `--format interpret`: the live LLM query's user
+        // message, byte-for-byte, without the system prompt (see `process_report`).
+        matches!(config.format(), OutputFormat::Interpret),
         display_path,
         config.fetch_policy(),
         false, // ps emits machine-readable output; no interactive fetch log
