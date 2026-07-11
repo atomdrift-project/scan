@@ -304,8 +304,13 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                     Classification::Suspicious => suspicious.fetch_add(1, Ordering::Relaxed),
                     Classification::Benign => benign.fetch_add(1, Ordering::Relaxed),
                 };
-                if config.format() == OutputFormat::Json
-                    || config.filter().shows(&result.classification)
+                // JSON, tiny, and interpret are machine/LLM payload formats:
+                // they emit every scanned process — `--show` gates only the
+                // terminal view.
+                if matches!(
+                    config.format(),
+                    OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
+                ) || config.filter().shows(&result.classification)
                 {
                     let print = || {
                         emit_result(
@@ -399,8 +404,10 @@ fn build_result(
         Some(100),
         &crate::engine::tiny_opts_for(config),
         config.interpret(),
+        // Raw view, matching scan's `--format interpret`: content only, no
+        // finding annotations (see `process_report`).
         matches!(config.format(), OutputFormat::Interpret)
-            .then(|| config.interpret_template()),
+            .then_some(crate::interpret::InterpretTemplate::Raw),
         display_path,
         config.fetch_policy(),
         false, // ps emits machine-readable output; no interactive fetch log

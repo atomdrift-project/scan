@@ -90,7 +90,6 @@ pub struct ScanConfig {
     extra: bool,
     level: Option<u16>,
     interpret: Option<crate::interpret::InterpretConfig>,
-    interpret_template: crate::interpret::InterpretTemplate,
     fetch: crate::fetch::FetchPolicy,
     hopper: Option<String>,
     mode: crate::Mode,
@@ -143,7 +142,6 @@ impl ScanConfig {
             extra,
             level: None,
             interpret: None,
-            interpret_template: crate::interpret::InterpretTemplate::default(),
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
             // Bloom short-circuiting is opt-in via `with_bloom`; an unconfigured
@@ -210,25 +208,6 @@ impl ScanConfig {
     #[must_use]
     pub fn interpret(&self) -> Option<&crate::interpret::InterpretConfig> {
         self.interpret.as_ref()
-    }
-
-    /// Set the `--interpret-template` render mode. Carried on the config (not
-    /// just inside [`Self::with_interpret`]'s config) so
-    /// [`crate::OutputFormat::Interpret`] can render the would-be LLM payload
-    /// without `--interpret` being enabled.
-    #[must_use]
-    pub const fn with_interpret_template(
-        mut self,
-        template: crate::interpret::InterpretTemplate,
-    ) -> Self {
-        self.interpret_template = template;
-        self
-    }
-
-    /// The `--interpret-template` render mode (default when never set).
-    #[must_use]
-    pub(crate) const fn interpret_template(&self) -> crate::interpret::InterpretTemplate {
-        self.interpret_template
     }
 
     /// Directory containing `model.json` and `feature_spec.json`.
@@ -2086,8 +2065,12 @@ fn record_file_result(
             // A bloom-flagged (known-bad/conflicted) file is always surfaced — its
             // flag replaces the old unconditional banner, so the benign filter must
             // not swallow a known-bad file the model happens to rate benign.
-            if config.format() == OutputFormat::Json
-                || r.bloom_mark.is_some()
+            // JSON, tiny, and interpret are machine/LLM payload formats: they
+            // emit every scanned file — `--show` gates only the terminal view.
+            if matches!(
+                config.format(),
+                OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
+            ) || r.bloom_mark.is_some()
                 || config.filter().shows(&r.classification)
             {
                 if let Some(p) = progress {
@@ -2774,9 +2757,10 @@ pub(crate) fn classify_report(
     embedded_file_limit: Option<usize>,
     tiny_opts: &cleave::output::TinyOpts,
     interpret: Option<&crate::interpret::InterpretConfig>,
-    // `Some(template)` renders `rendered_context` as the would-be LLM payload
-    // (`--format interpret`): the sanitized tiny render rewritten for the
-    // template. Independent of `interpret`, which controls actually querying.
+    // `Some(template)` renders `rendered_context` as an LLM payload
+    // (`--format interpret`, which always passes `Raw`): the sanitized tiny
+    // render rewritten for the template. Independent of `interpret`, which
+    // controls actually querying.
     llm_view: Option<crate::interpret::InterpretTemplate>,
     root_path: &Path,
     fetch: crate::fetch::FetchPolicy,
@@ -3241,10 +3225,10 @@ pub(crate) fn classify_report(
     let rendered_context = if !render_context {
         String::new()
     } else if let Some(template) = llm_view {
-        // `--format interpret`: the payload `--interpret` would send, byte for
-        // byte — the same sanitized render the LLM path starts from (built
-        // above), rewritten for the active template exactly as `interpret()`
-        // does before querying.
+        // `--format interpret`: the same sanitized render the LLM path starts
+        // from (built above), rewritten for the requested template — always
+        // `Raw` from the CLI, so a downstream model reads the file's own
+        // content without cleave's opinions biasing it.
         llm_ctx
             .as_deref()
             .map_or_else(String::new, |ctx| {
@@ -3502,7 +3486,12 @@ pub(crate) fn process_report(
         Some(100),
         &tiny_opts_for(config),
         config.interpret(),
-        matches!(config.format(), OutputFormat::Interpret).then(|| config.interpret_template()),
+        // `--format interpret` always renders the unbiased Raw view — the file's
+        // own content only, every finding annotation stripped (binary windows
+        // carry offset gutters for addressing). `--interpret-template` shapes
+        // only the live `--interpret` query payload.
+        matches!(config.format(), OutputFormat::Interpret)
+            .then_some(crate::interpret::InterpretTemplate::Raw),
         path,
         config.fetch_policy(),
         // Render the live-vs-cache fetch log only on the interactive terminal

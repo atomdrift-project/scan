@@ -135,8 +135,10 @@ pub enum OutputFormat {
     /// line (gate, confidence, matched FP level) followed by cleave's annotated
     /// context. See [`crate::output::format_tiny`].
     Tiny,
-    /// The exact analysis text `--interpret` sends to the LLM: cleave's
-    /// sanitized tiny render rewritten for the active `--interpret-template`.
+    /// The unbiased LLM payload: cleave's sanitized tiny render with every
+    /// finding annotation stripped (the `raw` template), so a model reads only
+    /// the file's own source/bytes — binary windows carry xxd-style offset
+    /// gutters for addressing. Emits every scanned file regardless of `--show`.
     /// Rendered locally — no LLM is contacted, and no verdict line is added.
     Interpret,
 }

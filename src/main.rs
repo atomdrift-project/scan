@@ -130,7 +130,9 @@ struct Cli {
     #[arg(short = 'l', long, value_name = "N", value_parser = clap::value_parser!(u16).range(0..=25000), global = true)]
     level: Option<u16>,
 
-    /// Classifications to display: hostile, suspicious, sus, benign, all (comma-separated)
+    /// Classifications to display in the terminal view: hostile, suspicious,
+    /// sus, benign, all (comma-separated). The machine formats (json, tiny,
+    /// interpret) emit every scanned file regardless.
     #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
     show: Vec<Show>,
 
@@ -160,11 +162,13 @@ struct Cli {
     #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_MIN_PROB, value_name = "P")]
     interpret_min_prob: f32,
 
-    /// What the LLM sees of cleave's findings: `adaptive` (default; keep the prose
-    /// description on hex/binary findings where it is the only signal, drop it to a
-    /// bare `# SEV LOC` pointer on readable source), `pointer` (bare marker
-    /// everywhere), `full` (cleave's `# SEV LOC desc` everywhere), `elevated`
-    /// (pointers for hostile/suspicious only), or `raw` (no annotations)
+    /// What the live `--interpret` LLM query sees of cleave's findings:
+    /// `adaptive` (default; keep the prose description on hex/binary findings
+    /// where it is the only signal, drop it to a bare `# SEV LOC` pointer on
+    /// readable source), `pointer` (bare marker everywhere), `full` (cleave's
+    /// `# SEV LOC desc` everywhere), `elevated` (pointers for
+    /// hostile/suspicious only), or `raw` (no annotations). `--format
+    /// interpret` output always renders `raw`, regardless of this flag.
     #[arg(long, global = true, default_value_t = scan::interpret::InterpretTemplate::default(), value_name = "MODE")]
     interpret_template: scan::interpret::InterpretTemplate,
 
@@ -985,7 +989,6 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy)
             .with_hopper(hopper);
             // Per-file SHA-256 known-good/known-bad short-circuit (explicit file
@@ -1031,7 +1034,6 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy);
             exit_for_summary(&scan::sys::run(&config)?);
         }
@@ -1049,7 +1051,6 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy);
             // Per-binary known-good/known-bad short-circuit (by executable sha256).
             if effective_mode != scan::Mode::Slow {
@@ -1071,7 +1072,6 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy);
             exit_for_summary(&scan::pkg::run_url(&url, &config)?);
         }
@@ -1089,7 +1089,6 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_interpret_template(cli.interpret_template)
             .with_fetch(fetch_policy);
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
