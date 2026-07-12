@@ -743,15 +743,21 @@ fn prompt_hash(system: &str, model: &str, user: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// Cache file path for a prompt hash, or `None` when no cache dir is available.
-fn cache_path(hash: &str) -> Option<PathBuf> {
+/// Root of the interpret verdict cache (`…/atomdrift/scan/interpret`), or `None`
+/// when no OS cache dir is available. Used by [`crate::cache_cleanup`] to reclaim
+/// the store; entries live at `interpret/<hash>.json` directly below this root.
+pub(crate) fn cache_base() -> Option<PathBuf> {
     Some(
         dirs::cache_dir()?
             .join("atomdrift")
             .join("scan")
-            .join("interpret")
-            .join(format!("{hash}.json")),
+            .join("interpret"),
     )
+}
+
+/// Cache file path for a prompt hash, or `None` when no cache dir is available.
+fn cache_path(hash: &str) -> Option<PathBuf> {
+    Some(cache_base()?.join(format!("{hash}.json")))
 }
 
 fn cache_get(path: &Path) -> Option<CachedVerdict> {

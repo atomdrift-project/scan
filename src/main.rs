@@ -696,6 +696,10 @@ fn main() -> Result<()> {
     };
 
     let is_serve = matches!(command, Commands::Serve { .. } | Commands::Worker { .. });
+    // Reclaim stale/oversized caches (stng strings+r2, scan analysis+interpret,
+    // fletch blobs). One detached, self-gated sweep for a CLI run; a recurring
+    // loop for the never-exiting serve/worker daemons. Non-blocking either way.
+    scan::cache_cleanup::start(is_serve);
     // Long-lived server modes never short-circuit on bloom filters: every job is
     // analyzed on its own merits. Force slow mode there regardless of `--mode`.
     let effective_mode = if is_serve { scan::Mode::Slow } else { cli.mode };

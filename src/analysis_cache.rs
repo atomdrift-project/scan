@@ -49,6 +49,19 @@ pub(crate) struct AnalysisCache {
 /// (or different content) never write the same scratch path.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Root of the analysis cache (`…/atomdrift/scan/analysis`), above the
+/// per-ruleset-version subdirectory. `None` when the OS has no cache directory.
+/// Used by [`crate::cache_cleanup`] to reclaim the store; entries live at
+/// `analysis/<version>/<sha>.zst` (two levels below this root).
+pub(crate) fn cache_base() -> Option<PathBuf> {
+    Some(
+        dirs::cache_dir()?
+            .join("atomdrift")
+            .join("scan")
+            .join("analysis"),
+    )
+}
+
 impl AnalysisCache {
     /// Open (creating on first use) the cache directory for the active ruleset
     /// version. `None` when disabled via `SCAN_ANALYSIS_CACHE=0`, when the OS
@@ -58,10 +71,7 @@ impl AnalysisCache {
         if std::env::var("SCAN_ANALYSIS_CACHE").is_ok_and(|v| v == "0" || v == "false") {
             return None;
         }
-        let base = dirs::cache_dir()?
-            .join("atomdrift")
-            .join("scan")
-            .join("analysis");
+        let base = cache_base()?;
         let version = ruleset_version();
         prune_stale_versions(&base, &version);
         let dir = base.join(version);

@@ -35,6 +35,7 @@ pub mod bloom;
 pub mod bloom_build;
 pub mod bloom_repo;
 pub mod bloom_update;
+pub mod cache_cleanup;
 pub mod crash_dump;
 pub mod deptree;
 pub mod engine;

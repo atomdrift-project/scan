@@ -47,7 +47,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.3.0"
+version = "2.3.1-beta.0"
 default-run = "atomscan"
 edition = "2024"
 authors = ["The Atomdrift Project"]
@@ -73,6 +73,12 @@ proclist = { git = "https://codeberg.org/atomdrift/proclist.git" }
 # `ps` subcommand can tune rizin for low-latency live-process scanning:
 # native-arch-only, a tighter timeout, and a size gate on giant binaries.
 filefacts = { git = "https://codeberg.org/atomdrift/filefacts.git" }
+# Direct handle on stng (already in the graph via cleave/filefacts/fletch) so the
+# long-lived worker/server modes can reclaim stng's string/r2 caches in-process —
+# cleave only prunes them on directory scans, not the per-payload analysis a
+# daemon runs. Uses stng's own cache-root helpers, so a relocated
+# STNG_STRING_CACHE_DIR is still swept correctly.
+stng = { git = "https://codeberg.org/atomdrift/stng.git" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -299,9 +305,10 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # unifies. Remove this patch and bump the git rev once a fletch release carries
 # `fetch_references_with`.
 
-#[patch."https://codeberg.org/atomdrift/stng.git"]
-#stng = { path = "../stng" }
-
+# Local stng: carries the additive `cache_sweep` module (background cache
+# reclamation) that scan's daemon modes drive. ../stng is the exact rev scan
+# locks (7a0d0e3b) plus that additive change, so cleave/fletch/filefacts still
+# unify on it. Remove and bump the git rev once an stng release carries it.
 
 # TEMPORARY: local cleave for traits-walk I/O profiling + fix. ../cleave HEAD is
 # one docs-only commit ahead of the pinned rev 38062951 (source-identical), so
