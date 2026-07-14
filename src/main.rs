@@ -445,7 +445,8 @@ enum Commands {
         #[arg(long)]
         extract_dir: Option<String>,
 
-        /// Maximum concurrent analyses (defaults to max(1, num_cpus / 2))
+        /// Maximum concurrent analyses (defaults to the physical
+        /// performance-core count, min 2)
         #[arg(long)]
         workers: Option<usize>,
 
@@ -753,7 +754,7 @@ fn main() -> Result<()> {
     }
 
     const RAYON_FALLBACK_THREADS: usize = 4;
-    let detected_cores = detect_cpu_count();
+    let detected_cores = cleave::memory_tracker::cpu_count();
     let rayon_threads = std::env::var("CLEAVE_RAYON_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1472,34 +1473,16 @@ fn git_head(dir: &Path) -> Option<(String, i64)> {
     Some((commit, epoch))
 }
 
-/// CPU count available to this process.
-///
-/// `std::thread::available_parallelism()` returns `Err(Unsupported)` on
-/// illumos/Solaris, where it would otherwise silently collapse the rayon pool
-/// to a small fallback on a many-core host. Probe `sysconf` directly there.
-/// Returns `None` only when no source works, so callers can log a downgrade.
-///
-/// Kept local rather than using `cleave::memory_tracker::cpu_count` because the
-/// `cleave` dependency is pinned to a published git revision; this fix must take
-/// effect in the worker binary without waiting for that pin to advance.
-fn detect_cpu_count() -> Option<usize> {
-    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
-    {
-        // SAFETY: sysconf is a pure C function; `_SC_NPROCESSORS_ONLN` is a
-        // well-defined POSIX selector and a non-positive return is rejected.
-        let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-        if n > 0 {
-            return Some(n as usize);
-        }
-    }
-    std::thread::available_parallelism()
-        .ok()
-        .map(std::num::NonZero::get)
-}
-
-/// Default worker count: at least 2, and half the available CPU cores.
+/// Default worker count: at least 2, and the physical core count from
+/// `sysmem` (SMT siblings don't add analysis throughput; on Apple silicon
+/// this is the performance-core count via `hw.perflevel0.physicalcpu`).
+/// Platforms where `sysmem` has no physical-core signal fall back to half
+/// the logical CPUs — identical to the physical count on 2-way SMT.
 fn default_workers() -> usize {
-    let cores = detect_cpu_count().unwrap_or_else(|| {
+    if let Some(cores) = cleave::memory_tracker::physical_cpu_count() {
+        return std::cmp::max(2, cores);
+    }
+    let cores = cleave::memory_tracker::cpu_count().unwrap_or_else(|| {
         tracing::warn!(
             fallback = 4,
             "CPU count detection failed; defaulting worker basis to 4 cores",
