@@ -3122,8 +3122,7 @@ pub(crate) fn classify_report(
     // onto the file that declared it (request: the manifest names the bad
     // dependency at its byte). Keyed by content sha so it matches the
     // retrieved payload node.
-    // (declaring sha, reference offset, dependency locator, content sha, class).
-    let dep_backrefs: Vec<(String, Option<u64>, String, String, Classification)> = member_evals
+    let dep_backrefs: Vec<DepBackref> = member_evals
         .values()
         .filter(|ef| {
             matches!(
@@ -3133,13 +3132,14 @@ pub(crate) fn classify_report(
         })
         .filter_map(|ef| {
             let &(src_sha, src_off, locator) = fetched_by_content.get(ef.sha256.as_str())?;
-            Some((
-                src_sha.to_string(),
-                src_off,
-                locator.to_string(),
-                ef.sha256.clone(),
-                ef.classification,
-            ))
+            Some(DepBackref {
+                source_sha: src_sha.to_string(),
+                source_offset: src_off,
+                locator: locator.to_string(),
+                dep_sha: ef.sha256.clone(),
+                dep_type: ef.file_type.clone(),
+                class: ef.classification,
+            })
         })
         .collect();
 
@@ -3169,16 +3169,8 @@ pub(crate) fn classify_report(
     // citable trait naming the bad dependency, and prism's galaxy view can light
     // the offending edge. Display/attribution only; the verdict was already
     // elevated by the embedded pass above.
-    for (src_sha, src_off, locator, dep_sha, class) in &dep_backrefs {
-        inject_dependency_backref(
-            &mut report_json,
-            &report,
-            src_sha,
-            *src_off,
-            locator,
-            dep_sha,
-            *class,
-        );
+    for backref in &dep_backrefs {
+        inject_dependency_backref(&mut report_json, &report, backref);
     }
 
     let top_findings = extract_top_findings_from_json(&report_json, &final_decision.class);
@@ -3401,6 +3393,19 @@ fn append_unanalyzed_members(report_json: &mut serde_json::Value, members: &[Arc
     }
 }
 
+/// One confirmed hostile/suspicious fetched dependency, ready to pin back onto
+/// the file that declared it: the declaring file and reference byte, plus the
+/// dependency's identity — locator (PURL/URL), content sha, sniffed file type,
+/// and class.
+struct DepBackref {
+    source_sha: String,
+    source_offset: Option<u64>,
+    locator: String,
+    dep_sha: String,
+    dep_type: String,
+    class: Classification,
+}
+
 /// Pin a fetched dependency's verdict onto the file that declared it — a synthetic
 /// trait at the reference's byte span naming the dependency (purl), its content sha,
 /// and its class — then roll that trait up every containing archive to the depth-0
@@ -3413,28 +3418,38 @@ fn append_unanalyzed_members(report_json: &mut serde_json::Value, members: &[Arc
 /// reference byte span; rolled-up ancestors carry the verdict without a cross-file
 /// span. Compact paths nest with `!!`, so an ancestor is any file whose path is a
 /// `!!`-boundary prefix of the declaring file's.
+///
+/// The trait carries the dependency's identity twice: `desc` is prose for humans
+/// and the LLM context; `dep` ({locator, sha, type}) is the machine-readable copy
+/// that hopper forwards opaquely so prism can render a specific, clickable feed
+/// chip ("depends on hostile npm: zaboodle v1.49" → /file/{sha}) without parsing
+/// the sentence.
 fn inject_dependency_backref(
     report_json: &mut serde_json::Value,
     report: &cleave::AnalysisReport,
-    source_sha: &str,
-    source_offset: Option<u64>,
-    locator: &str,
-    dep_sha: &str,
-    class: Classification,
+    backref: &DepBackref,
 ) {
-    let (crit, sev) = match class {
+    let (crit, sev) = match backref.class {
         Classification::Hostile => (5u8, "Malicious"),
         _ => (4u8, "Suspicious"),
     };
-    let off = source_offset.unwrap_or(0);
+    let off = backref.source_offset.unwrap_or(0);
     let len = report
         .files
         .iter()
-        .find(|f| f.sha256 == source_sha)
+        .find(|f| f.sha256 == backref.source_sha)
         .and_then(|f| f.filefacts.as_ref())
         .and_then(|ff| ff.references.iter().find(|r| r.offset == off))
         .map_or(1, |r| u64::try_from(r.evidence.len()).unwrap_or(u64::MAX));
-    let desc = format!("{sev} dependency: {locator} | {dep_sha}");
+    let desc = format!(
+        "{sev} dependency: {} | {}",
+        backref.locator, backref.dep_sha
+    );
+    let dep = serde_json::json!({
+        "locator": backref.locator,
+        "sha": backref.dep_sha,
+        "type": backref.dep_type,
+    });
 
     let Some(files) = report_json.get_mut("files").and_then(|v| v.as_array_mut()) else {
         return;
@@ -3443,12 +3458,15 @@ fn inject_dependency_backref(
     // The declaring file's compact path locates every container above it.
     let decl_path = files
         .iter()
-        .find(|f| f.get("sha").and_then(serde_json::Value::as_str) == Some(source_sha))
+        .find(|f| {
+            f.get("sha").and_then(serde_json::Value::as_str) == Some(backref.source_sha.as_str())
+        })
         .and_then(|f| f.get("path").and_then(serde_json::Value::as_str))
         .map(str::to_owned);
 
     for f in files.iter_mut() {
-        let is_decl = f.get("sha").and_then(serde_json::Value::as_str) == Some(source_sha);
+        let is_decl =
+            f.get("sha").and_then(serde_json::Value::as_str) == Some(backref.source_sha.as_str());
         let is_ancestor = decl_path.as_deref().is_some_and(|dp| {
             f.get("path")
                 .and_then(serde_json::Value::as_str)
@@ -3460,9 +3478,9 @@ fn inject_dependency_backref(
         // The precise declaring file cites the reference byte span; a rolled-up
         // ancestor carries the verdict without a (meaningless) cross-file span.
         let new_trait = if is_decl {
-            serde_json::json!({"id": "fetch/dependency-verdict", "crit": crit, "desc": desc.clone(), "spans": [[off, len]]})
+            serde_json::json!({"id": "fetch/dependency-verdict", "crit": crit, "desc": desc.clone(), "dep": dep.clone(), "spans": [[off, len]]})
         } else {
-            serde_json::json!({"id": "fetch/dependency-verdict", "crit": crit, "desc": desc.clone()})
+            serde_json::json!({"id": "fetch/dependency-verdict", "crit": crit, "desc": desc.clone(), "dep": dep.clone()})
         };
         match f
             .get_mut("traits")
@@ -3475,6 +3493,124 @@ fn inject_dependency_backref(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod dep_backref_tests {
+    use super::*;
+
+    /// The injector only reads `report.files` to size the reference span (and
+    /// falls back to a 1-byte span when the declaring file isn't there), so an
+    /// empty report exercises everything but the span length.
+    fn empty_report() -> cleave::AnalysisReport {
+        serde_json::from_value(serde_json::json!({"version": "3"})).unwrap()
+    }
+
+    fn backref(class: Classification) -> DepBackref {
+        DepBackref {
+            source_sha: "s".repeat(64),
+            source_offset: Some(42),
+            locator: "pkg:npm/zaboodle@1.49".to_string(),
+            dep_sha: "d".repeat(64),
+            dep_type: "javascript".to_string(),
+            class,
+        }
+    }
+
+    /// Compact report: a depth-0 archive containing the declaring manifest and
+    /// an unrelated sibling.
+    fn compact_fixture() -> serde_json::Value {
+        serde_json::json!({"files": [
+            {"sha": "r".repeat(64), "path": "pkg.tgz", "traits": [{"id": "existing/trait", "crit": 1}]},
+            {"sha": "s".repeat(64), "path": "pkg.tgz!!package.json"},
+            {"sha": "o".repeat(64), "path": "pkg.tgz!!README.md"},
+        ]})
+    }
+
+    #[test]
+    fn declarer_gets_span_and_structured_dep() {
+        let mut report_json = compact_fixture();
+        inject_dependency_backref(
+            &mut report_json,
+            &empty_report(),
+            &backref(Classification::Hostile),
+        );
+
+        let t = &report_json["files"][1]["traits"][0];
+        assert_eq!(t["id"], "fetch/dependency-verdict");
+        assert_eq!(t["crit"], 5, "hostile dependency pins at crit 5");
+        assert_eq!(
+            t["desc"],
+            format!(
+                "Malicious dependency: pkg:npm/zaboodle@1.49 | {}",
+                "d".repeat(64)
+            ),
+            "desc stays prose for the traits tab and LLM context",
+        );
+        assert_eq!(t["dep"]["locator"], "pkg:npm/zaboodle@1.49");
+        assert_eq!(t["dep"]["sha"], "d".repeat(64));
+        assert_eq!(t["dep"]["type"], "javascript");
+        assert_eq!(t["spans"][0][0], 42, "declaring file cites the reference byte");
+    }
+
+    #[test]
+    fn ancestor_carries_dep_without_span_and_siblings_stay_clean() {
+        let mut report_json = compact_fixture();
+        inject_dependency_backref(
+            &mut report_json,
+            &empty_report(),
+            &backref(Classification::Hostile),
+        );
+
+        let root_traits = report_json["files"][0]["traits"].as_array().unwrap();
+        assert_eq!(root_traits.len(), 2, "rolled up alongside existing traits");
+        let rt = &root_traits[1];
+        assert_eq!(rt["id"], "fetch/dependency-verdict");
+        assert_eq!(rt["dep"]["sha"], "d".repeat(64), "dep identity rolls up intact");
+        assert!(
+            rt.get("spans").is_none(),
+            "a rolled-up ancestor carries no cross-file span",
+        );
+        assert!(
+            report_json["files"][2].get("traits").is_none(),
+            "unrelated sibling is untouched",
+        );
+    }
+
+    #[test]
+    fn suspicious_dependency_pins_at_crit_4() {
+        let mut report_json = compact_fixture();
+        inject_dependency_backref(
+            &mut report_json,
+            &empty_report(),
+            &backref(Classification::Suspicious),
+        );
+
+        let t = &report_json["files"][1]["traits"][0];
+        assert_eq!(t["crit"], 4);
+        assert_eq!(
+            t["desc"],
+            format!(
+                "Suspicious dependency: pkg:npm/zaboodle@1.49 | {}",
+                "d".repeat(64)
+            ),
+        );
+        assert_eq!(t["dep"]["type"], "javascript", "dep rides on suspicious too");
+    }
+
+    #[test]
+    fn url_locator_flows_through_verbatim() {
+        let mut report_json = compact_fixture();
+        let mut b = backref(Classification::Hostile);
+        b.locator = "http://x.y.z/x.exe".to_string();
+        b.dep_type = "pe".to_string();
+        inject_dependency_backref(&mut report_json, &empty_report(), &b);
+
+        let t = &report_json["files"][1]["traits"][0];
+        assert_eq!(t["dep"]["locator"], "http://x.y.z/x.exe");
+        assert_eq!(t["dep"]["type"], "pe");
     }
 }
 
