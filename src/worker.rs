@@ -757,14 +757,175 @@ struct ClaimJob {
 /// A job with its file data pre-downloaded (or marked for local access).
 struct PrefetchedJob {
     job: ClaimJob,
-    /// `Ok(None)` = use local file, `Ok(Some(bytes))` = downloaded,
+    /// `Ok(data)` = payload staged (in memory, spooled to disk, or local),
     /// `Err(Transient)` = download failed (fall back to direct download),
     /// `Err(Skipped)` = job rejected without attempting download (e.g. oversized);
     /// do not retry, post the error result directly.
-    data: std::result::Result<Option<bytes::Bytes>, PrefetchError>,
+    data: std::result::Result<PrefetchData, PrefetchError>,
     /// Local-queue id assigned by the prefetcher when the job is staged; passed
     /// to `WorkerMetrics::complete` once analysis finishes. 0 until staged.
     queue_id: u64,
+}
+
+/// Absolute per-job size cap, advertised to hopper as `max_bytes` so it never
+/// hands out files no worker will analyze, and enforced locally as a backstop
+/// for older hoppers. Anything at or below this is analyzable on any worker —
+/// even a 16 GiB sample on an 8 GiB host — because oversized payloads stream to
+/// the disk spool and take the file-path analysis route (mmap + on-disk archive
+/// extraction) instead of being buffered in RAM. Hopper matches the rejection
+/// message ("exceeds per-job" → skip='oversized'), so keep them in sync.
+const MAX_JOB_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Where a staged job's payload lives until analysis.
+enum PrefetchData {
+    /// The file exists under `--data`; analyze it in place, nothing staged.
+    Local,
+    /// Downloaded into memory (small files); counted against the RAM buffer.
+    Memory(bytes::Bytes),
+    /// Streamed to a spool file on disk (files too big for the RAM buffer);
+    /// counted against the disk spool budget until the payload drops.
+    Spooled(SpooledPayload),
+}
+
+impl PrefetchData {
+    /// Bytes this payload holds in RAM while staged (spooled and local payloads
+    /// cost no buffer memory).
+    fn staged_mem_bytes(&self) -> usize {
+        match self {
+            Self::Memory(b) => b.len(),
+            Self::Local | Self::Spooled(_) => 0,
+        }
+    }
+}
+
+/// A payload streamed to disk. Dropping it deletes the spool file and releases
+/// its reservation from the spool budget.
+struct SpooledPayload {
+    /// Deletes the file on drop. Declared before `spool` so the file is gone
+    /// before the budget reopens.
+    path: tempfile::TempPath,
+    size: u64,
+    spool: Arc<SpoolState>,
+}
+
+impl Drop for SpooledPayload {
+    fn drop(&mut self) {
+        self.spool.release(self.size);
+    }
+}
+
+/// Disk spool for payloads too large to stage in the RAM buffer. Files between
+/// `mem_threshold_bytes` and [`MAX_JOB_BYTES`] are streamed here and analyzed
+/// via the file-path route (cleave memory-maps large files), so a 16 GiB sample
+/// never has to fit in RAM.
+#[derive(Debug)]
+struct SpoolState {
+    dir: PathBuf,
+    /// Total bytes of concurrently-staged spool files allowed on disk.
+    budget_bytes: u64,
+    used: AtomicU64,
+    /// Payloads at or below this stage in RAM; larger ones spool to disk.
+    mem_threshold_bytes: usize,
+    /// Free space the spool leaves on its filesystem beyond the file itself —
+    /// cleave's archive extraction can write up to its 7 GiB guard on top of
+    /// the spooled payload.
+    disk_headroom_bytes: u64,
+}
+
+impl SpoolState {
+    const DEFAULT_DISK_HEADROOM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+    fn new(mem_threshold_bytes: usize) -> Self {
+        let dir = std::env::var_os("SCAN_SPOOL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("scan-spool"));
+        let budget_bytes = std::env::var("SCAN_SPOOL_BUDGET_GB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|gb| *gb > 0)
+            .map_or(32 * 1024 * 1024 * 1024, |gb| gb * 1024 * 1024 * 1024);
+        Self {
+            dir,
+            budget_bytes,
+            used: AtomicU64::new(0),
+            mem_threshold_bytes,
+            disk_headroom_bytes: Self::DEFAULT_DISK_HEADROOM_BYTES,
+        }
+    }
+
+    /// Reserve `size` bytes of spool space, or explain why not. Admission is
+    /// gated on the concurrent-spool budget and on live free disk space; like
+    /// the memory gate, an idle spool always admits one payload so a tight
+    /// budget cannot starve large files forever.
+    fn try_reserve(&self, size: u64) -> Result<(), String> {
+        let used = self.used.load(Ordering::Acquire);
+        if used > 0 && used.saturating_add(size) > self.budget_bytes {
+            return Err(format!(
+                "spool budget full ({used} of {} bytes in use)",
+                self.budget_bytes
+            ));
+        }
+        if let Some(free) = free_disk_bytes(&self.dir)
+            && free < size.saturating_add(self.disk_headroom_bytes)
+        {
+            return Err(format!(
+                "insufficient free disk for spool: {free} bytes free, need {size} + {} headroom",
+                self.disk_headroom_bytes
+            ));
+        }
+        self.used.fetch_add(size, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn release(&self, size: u64) {
+        self.used.fetch_sub(size, Ordering::AcqRel);
+    }
+
+    /// Create the spool directory and clear leftovers from crashed runs.
+    /// Best-effort: only files older than a day are removed, so concurrent
+    /// worker processes on the same host cannot delete each other's live
+    /// spools.
+    fn prepare(&self) {
+        if let Err(e) = std::fs::create_dir_all(&self.dir) {
+            tracing::warn!(dir = %self.dir.display(), error = %e, "cannot create spool dir");
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let cutoff = Duration::from_secs(24 * 60 * 60);
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > cutoff);
+            if stale && std::fs::remove_file(entry.path()).is_ok() {
+                tracing::info!(path = %entry.path().display(), "removed stale spool file");
+            }
+        }
+    }
+}
+
+/// Free bytes on the filesystem holding `path`, or `None` when unavailable.
+#[cfg(unix)]
+fn free_disk_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid NUL-terminated path and stat is a valid
+    // out-pointer for the duration of the call.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)] // f_bavail/f_frsize widths vary by platform
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_disk_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 /// Why a prefetch did not produce bytes.
@@ -1160,12 +1321,15 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         512 * 1024 * 1024 // 512 MiB otherwise
     };
     // Largest file this worker will accept, advertised to hopper on /api/next so
-    // it only routes files this worker can analyze. cleave's extraction/YARA can
-    // use several times the file size in RAM, so a memory-constrained worker
-    // (<= 16 GiB) sticks to small files; larger workers take everything (0 = no
-    // cap). Hopper's filterCandidatesBySize honors this; `max_single_bytes` below
-    // enforces the same ceiling locally as a backstop for older hoppers.
-    let advertised_max_bytes: usize = if big_worker { 0 } else { 32 * 1024 * 1024 };
+    // it never routes files no worker can analyze. Every worker takes up to
+    // MAX_JOB_BYTES regardless of RAM: payloads above `max_single_bytes` (half
+    // the RAM buffer) stream to the disk spool and are analyzed via the
+    // file-path route, where cleave memory-maps the sample and extracts archives
+    // to disk, and the memory-admission gate serialises anything whose estimate
+    // exceeds the ceiling. Hopper's filterCandidatesBySize honors this;
+    // `prefetch_one` enforces the same ceiling locally as a backstop for older
+    // hoppers.
+    let advertised_max_bytes: usize = usize::try_from(MAX_JOB_BYTES).unwrap_or(usize::MAX);
 
     // Background prefetch keeps `1.1 × slots` samples staged at all times so a
     // free worker slot never waits on a download. The prefetcher polls and
@@ -1212,6 +1376,21 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // task (reader) so a check-in can report why the worker is/isn't claiming.
     let poll_state = Arc::new(PollState::default());
 
+    // Disk spool for payloads too large for the RAM buffer. Prepared once here
+    // (creates the dir, sweeps stale files from crashed runs) and shared by the
+    // prefetcher and the direct-download fallback in `run_job`. Prepared before
+    // the prefetcher starts so the first spooled download never races the
+    // directory creation; the one-time sweep is cheap enough to block startup.
+    let spool = Arc::new(SpoolState::new(max_buffer_bytes / 2));
+    spool.prepare();
+    tracing::info!(
+        spool_dir = %spool.dir.display(),
+        spool_budget_gb = spool.budget_bytes / (1024 * 1024 * 1024),
+        mem_threshold_mb = spool.mem_threshold_bytes / (1024 * 1024),
+        max_job_gb = MAX_JOB_BYTES / (1024 * 1024 * 1024),
+        "large payloads spool to disk (SCAN_SPOOL_DIR / SCAN_SPOOL_BUDGET_GB)",
+    );
+
     tokio::spawn(
         Prefetcher {
             client: client.clone(),
@@ -1220,11 +1399,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             encoded_name,
             available_tools,
             slots,
-            max_single_bytes: if advertised_max_bytes == 0 {
-                max_buffer_bytes / 2
-            } else {
-                advertised_max_bytes.min(max_buffer_bytes / 2)
-            },
+            spool: Arc::clone(&spool),
             max_buffer_bytes,
             advertised_max_bytes,
             poll_secs,
@@ -1572,10 +1747,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             shutdown.store(true, Ordering::Relaxed);
             break;
         };
-        let staged_bytes = pj
-            .data
-            .as_ref()
-            .map_or(0, |d| d.as_ref().map_or(0, bytes::Bytes::len));
+        let staged_bytes = pj.data.as_ref().map_or(0, PrefetchData::staged_mem_bytes);
         queued_bytes.fetch_sub(staged_bytes, Ordering::Release);
         outstanding.fetch_sub(1, Ordering::Release);
 
@@ -1614,6 +1786,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let local_index = local_index.clone();
         let completed = Arc::clone(&completed);
         let metrics = Arc::clone(&metrics);
+        let spool = Arc::clone(&spool);
 
         tokio::spawn(async move {
             let result = run_job(
@@ -1623,6 +1796,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 &pj.job,
                 &resources,
                 slow_rule_ms,
+                &spool,
                 pj.data,
             )
             .await;
@@ -1694,13 +1868,13 @@ struct Prefetcher {
     encoded_name: String,
     available_tools: String,
     slots: usize,
-    /// Per-job download cap; oversized jobs are reported as errors rather than
-    /// downloaded, so one huge payload can't blow the buffer budget.
-    max_single_bytes: usize,
-    /// Soft cap on total staged payload bytes.
+    /// Disk spool: payloads above its memory threshold stream to disk instead
+    /// of the RAM buffer; jobs above [`MAX_JOB_BYTES`] are rejected outright.
+    spool: Arc<SpoolState>,
+    /// Soft cap on total staged payload bytes held in RAM.
     max_buffer_bytes: usize,
-    /// Largest file this worker accepts, sent to hopper as `max_bytes` so it
-    /// routes only files this worker can analyze. 0 = no cap (large workers).
+    /// Largest file this worker accepts ([`MAX_JOB_BYTES`]), sent to hopper as
+    /// `max_bytes` so it routes only files this worker can analyze.
     advertised_max_bytes: usize,
     poll_secs: u64,
     /// Staged + in-flight sample target (`1.1 × slots`).
@@ -1816,18 +1990,16 @@ impl Prefetcher {
                         let client = self.client.clone();
                         let base_url = Arc::clone(&self.base_url);
                         let data_dir = self.data_dir.clone();
-                        let max_single_bytes = self.max_single_bytes;
+                        let spool = Arc::clone(&self.spool);
                         set.spawn(async move {
-                            prefetch_one(client, base_url, data_dir, max_single_bytes, job).await
+                            prefetch_one(client, base_url, data_dir, spool, job).await
                         });
                     }
                     while let Some(res) = set.join_next().await {
                         match res {
                             Ok(mut pj) => {
-                                let bytes = pj
-                                    .data
-                                    .as_ref()
-                                    .map_or(0, |d| d.as_ref().map_or(0, bytes::Bytes::len));
+                                let bytes =
+                                    pj.data.as_ref().map_or(0, PrefetchData::staged_mem_bytes);
                                 queued_bytes.fetch_add(bytes, Ordering::Release);
                                 // Enters the local queue now; tracked until the
                                 // dispatch loop finishes analysing it.
@@ -1899,27 +2071,40 @@ async fn claim_jobs(client: &reqwest::Client, poll_url: &str) -> Result<Option<V
 }
 
 /// Download one claimed job's payload (or mark it for local access / rejection).
-/// Oversized jobs are skipped without a download, local files are used in place,
-/// and transient download failures fall through to `run_job`'s direct-download
-/// retry.
+/// Local files are used in place regardless of size, jobs above
+/// [`MAX_JOB_BYTES`] are skipped without a download, payloads too large for the
+/// RAM buffer stream to the disk spool, and transient download failures fall
+/// through to `run_job`'s direct-download retry.
 async fn prefetch_one(
     client: reqwest::Client,
     base_url: Arc<str>,
     data_dir: Option<PathBuf>,
-    max_single_bytes: usize,
+    spool: Arc<SpoolState>,
     job: ClaimJob,
 ) -> PrefetchedJob {
-    if u64::try_from(job.size_bytes).is_ok_and(|s| s > max_single_bytes as u64) {
+    // Local files need no download or staging, so no size check applies.
+    let local_path = data_dir.as_deref().map(|d| d.join(&job.path));
+    if matches!(local_path, Some(ref p) if p.exists()) {
+        return PrefetchedJob {
+            job,
+            data: Ok(PrefetchData::Local),
+            queue_id: 0,
+        };
+    }
+
+    let size = u64::try_from(job.size_bytes).unwrap_or(0);
+    if size > MAX_JOB_BYTES {
         tracing::warn!(
             sha256 = %job.sha256,
             path = %job.path,
             size_bytes = job.size_bytes,
-            max_single_bytes,
+            max_job_bytes = MAX_JOB_BYTES,
             "skipping oversized job; reporting error to hopper",
         );
+        // "exceeds per-job" is matched by hopper's classifyResultError and
+        // marks the sample skip='oversized' permanently.
         let err = PrefetchError::Skipped(format!(
-            "file size {} exceeds per-job prefetch cap of {} bytes",
-            job.size_bytes, max_single_bytes,
+            "file size {size} exceeds per-job cap of {MAX_JOB_BYTES} bytes",
         ));
         return PrefetchedJob {
             job,
@@ -1928,20 +2113,47 @@ async fn prefetch_one(
         };
     }
 
-    let local_path = data_dir.as_deref().map(|d| d.join(&job.path));
-    let use_local = matches!(local_path, Some(ref p) if p.exists());
-    let data = if use_local {
-        Ok(None)
-    } else {
-        match download_bytes(&client, &base_url, &job.sha256, &job.path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) => Err(PrefetchError::Transient(e)),
-        }
-    };
+    let data = fetch_payload(&client, &base_url, &spool, &job)
+        .await
+        .map_err(PrefetchError::Transient);
     PrefetchedJob {
         job,
         data,
         queue_id: 0,
+    }
+}
+
+/// Download a job's payload the size-appropriate way: into memory below the
+/// spool threshold, streamed to a spool file above it. Shared by the prefetcher
+/// and `run_job`'s direct-download fallback so both routes stay RAM-safe.
+async fn fetch_payload(
+    client: &reqwest::Client,
+    base_url: &str,
+    spool: &Arc<SpoolState>,
+    job: &ClaimJob,
+) -> Result<PrefetchData, String> {
+    let size = u64::try_from(job.size_bytes).unwrap_or(0);
+    if size <= spool.mem_threshold_bytes as u64 {
+        return download_bytes(client, base_url, &job.sha256, &job.path)
+            .await
+            .map(PrefetchData::Memory);
+    }
+    spool.try_reserve(size).map_err(|reason| {
+        format!(
+            "cannot spool {size}-byte payload for {}: {reason}",
+            job.sha256
+        )
+    })?;
+    match download_to_spool(client, base_url, spool, &job.sha256, &job.path).await {
+        Ok(path) => Ok(PrefetchData::Spooled(SpooledPayload {
+            path,
+            size,
+            spool: Arc::clone(spool),
+        })),
+        Err(e) => {
+            spool.release(size);
+            Err(e)
+        }
     }
 }
 
@@ -1956,7 +2168,8 @@ async fn run_job(
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
-    prefetched: std::result::Result<Option<bytes::Bytes>, PrefetchError>,
+    spool: &Arc<SpoolState>,
+    prefetched: std::result::Result<PrefetchData, PrefetchError>,
 ) -> Result<
     (
         crate::engine::ScanResultEnvelope,
@@ -2013,16 +2226,18 @@ async fn run_job(
         (None, None) => false,
     };
 
-    // Use prefetched bytes, or fall back to downloading if prefetch failed.
-    let downloaded: Option<bytes::Bytes> = if use_local {
+    // Use the prefetched payload, or fall back to downloading if prefetch
+    // failed. The fallback goes through `fetch_payload`, so a payload too big
+    // for the RAM buffer re-spools to disk instead of being buffered.
+    let payload: Option<PrefetchData> = if use_local {
         None
     } else {
         match prefetched {
-            Ok(Some(bytes)) => {
-                tracing::debug!(sha256 = %job.sha256, file = %label, size = bytes.len(), "using prefetched data");
-                Some(bytes)
+            Ok(PrefetchData::Local) => None, // prefetch saw a local file that the index can't resolve
+            Ok(data) => {
+                tracing::debug!(sha256 = %job.sha256, file = %label, size = job.size_bytes, "using prefetched data");
+                Some(data)
             }
-            Ok(None) => None, // shouldn't happen for remote jobs, but handle gracefully
             Err(PrefetchError::Skipped(msg)) => {
                 // Prefetch layer decided not to download this job (e.g. oversized);
                 // fail the analysis immediately rather than retrying the fetch.
@@ -2030,8 +2245,7 @@ async fn run_job(
             }
             Err(PrefetchError::Transient(e)) => {
                 tracing::warn!(sha256 = %job.sha256, file = %label, error = %e, "prefetch failed, downloading directly");
-                let bytes = download_bytes(client, base_url, &job.sha256, &job.path).await?;
-                Some(bytes)
+                Some(fetch_payload(client, base_url, spool, job).await?)
             }
         }
     };
@@ -2076,11 +2290,16 @@ async fn run_job(
     let label_for_blocking = Arc::clone(&label);
     // Pre-clone for the blocking closure before the watcher captures its copy.
     let sha_short2 = Arc::clone(&sha_short);
-    let input_source = if use_local { "local" } else { "downloaded" };
-    let input_size = if use_local {
-        u64::try_from(job.size_bytes).unwrap_or(0)
-    } else {
-        downloaded.as_ref().map_or(0, |bytes| bytes.len() as u64)
+    let input_source = match &payload {
+        _ if use_local => "local",
+        Some(PrefetchData::Memory(_)) => "downloaded",
+        Some(PrefetchData::Spooled(_)) => "spooled",
+        _ => "local",
+    };
+    let input_size = match &payload {
+        Some(PrefetchData::Memory(bytes)) if !use_local => bytes.len() as u64,
+        Some(PrefetchData::Spooled(spooled)) if !use_local => spooled.size,
+        _ => u64::try_from(job.size_bytes).unwrap_or(0),
     };
 
     // Background phase watcher — logs transitions with timing, and emits a
@@ -2238,8 +2457,12 @@ async fn run_job(
         // set we want. See `crate::crash_dump`.
         let _inflight =
             crate::crash_dump::register(analysis_id, thread_id, &sha_short2, &label_for_blocking);
-        let result = if let Some(data) = downloaded {
-            classify_bytes(
+        // Spooled payloads take the same file-path route as local files, so a
+        // multi-GiB sample is memory-mapped rather than held in RAM. The
+        // spooled payload is moved into this closure and dropped when it
+        // returns, deleting the spool file and releasing its budget.
+        let result = match (payload, local.as_ref()) {
+            (Some(PrefetchData::Memory(data)), _) => classify_bytes(
                 data,
                 &label_for_blocking,
                 &resources,
@@ -2247,9 +2470,18 @@ async fn run_job(
                 Some(&cancel2),
                 Some(&phase),
                 root_registry.as_ref(),
-            )
-        } else if let Some(path) = local.as_ref() {
-            classify_file(
+            ),
+            (Some(PrefetchData::Spooled(spooled)), _) => classify_file(
+                &spooled.path,
+                &label_for_blocking,
+                &resources,
+                slow_rule_ms,
+                None,
+                Some(&cancel2),
+                Some(&phase),
+                root_registry.as_ref(),
+            ),
+            (_, Some(path)) => classify_file(
                 path,
                 &label_for_blocking,
                 &resources,
@@ -2258,11 +2490,10 @@ async fn run_job(
                 Some(&cancel2),
                 Some(&phase),
                 root_registry.as_ref(),
-            )
-        } else {
-            Err(anyhow::anyhow!(
+            ),
+            (None | Some(PrefetchData::Local), None) => Err(anyhow::anyhow!(
                 "no downloaded bytes and no local path for {label_for_blocking}"
-            ))
+            )),
         };
         let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let inflight_blocking = BLOCKING_STARTED_TOTAL
@@ -2503,13 +2734,93 @@ async fn download_bytes(
     sha256: &str,
     path: &str,
 ) -> Result<bytes::Bytes, String> {
+    let start = Instant::now();
+    let (resp, route) = download_response(client, base_url, sha256, path).await?;
+    let url = resp.url().to_string();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("download body failed: path={path} sha256={sha256} url={url}: {e}"))?;
+    tracing::info!(
+        sha256 = %sha256,
+        file = %path,
+        bytes = bytes.len(),
+        elapsed_ms = crate::duration_ms(start.elapsed()),
+        "download complete via {route}",
+    );
+    Ok(bytes)
+}
+
+/// Stream a payload to a new spool file instead of buffering it in RAM, so a
+/// multi-GiB sample downloads with a constant memory footprint. Returns the
+/// temp path; the file is deleted when the path drops. The caller reserves and
+/// releases spool budget.
+async fn download_to_spool(
+    client: &reqwest::Client,
+    base_url: &str,
+    spool: &SpoolState,
+    sha256: &str,
+    path: &str,
+) -> Result<tempfile::TempPath, String> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let start = Instant::now();
+    let (mut resp, route) = download_response(client, base_url, sha256, path).await?;
+    let url = resp.url().to_string();
+
+    let temp = tempfile::Builder::new()
+        .prefix(sha256.get(..16).unwrap_or(sha256))
+        .tempfile_in(&spool.dir)
+        .map_err(|e| format!("cannot create spool file in {}: {e}", spool.dir.display()))?;
+    let mut file = tokio::fs::File::from_std(
+        temp.as_file()
+            .try_clone()
+            .map_err(|e| format!("cannot clone spool file handle: {e}"))?,
+    );
+
+    let mut written: u64 = 0;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("download body failed: path={path} sha256={sha256} url={url}: {e}"))?
+    {
+        written += chunk.len() as u64;
+        if written > MAX_JOB_BYTES {
+            return Err(format!(
+                "download exceeded per-job cap of {MAX_JOB_BYTES} bytes: path={path} sha256={sha256}",
+            ));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("spool write failed: sha256={sha256}: {e}"))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("spool flush failed: sha256={sha256}: {e}"))?;
+    tracing::info!(
+        sha256 = %sha256,
+        file = %path,
+        bytes = written,
+        elapsed_ms = crate::duration_ms(start.elapsed()),
+        "download spooled to disk via {route}",
+    );
+    Ok(temp.into_temp_path())
+}
+
+/// Open a download stream for a sample, trying the cheap path-based endpoint
+/// first and falling back to the by-hash API. Returns the successful response
+/// (headers read, body not yet consumed) and the route label for logs.
+async fn download_response(
+    client: &reqwest::Client,
+    base_url: &str,
+    sha256: &str,
+    path: &str,
+) -> Result<(reqwest::Response, &'static str), String> {
     if path.is_empty() || path == "." {
         return Err(format!(
             "download {sha256}: empty path from hopper, cannot fetch"
         ));
     }
-
-    let start = Instant::now();
 
     // Use path-based endpoint (static file serving, no DB query on hopper side).
     // Encode each path segment to handle filenames with spaces or special chars.
@@ -2533,17 +2844,7 @@ async fn download_bytes(
         })?;
 
     if resp.status().is_success() {
-        let bytes = resp.bytes().await.map_err(|e| {
-            format!("download body failed: path={path} sha256={sha256} url={data_url}: {e}")
-        })?;
-        tracing::info!(
-            sha256 = %sha256,
-            file = %path,
-            bytes = bytes.len(),
-            elapsed_ms = crate::duration_ms(start.elapsed()),
-            "download complete via /data/",
-        );
-        return Ok(bytes);
+        return Ok((resp, "/data/"));
     }
     let data_status = resp.status();
     let data_body = resp
@@ -2572,17 +2873,7 @@ async fn download_bytes(
             "download failed: path={path} sha256={sha256}; /data/ url={data_url} status={data_status} body={data_body}; /api/file/ url={api_url} status={api_status} body={api_body}",
         ));
     }
-    let bytes = resp.bytes().await.map_err(|e| {
-        format!("download fallback body failed: path={path} sha256={sha256} url={api_url}: {e}")
-    })?;
-    tracing::info!(
-        sha256 = %sha256,
-        file = %path,
-        bytes = bytes.len(),
-        elapsed_ms = crate::duration_ms(start.elapsed()),
-        "download complete via /api/file/ (fallback)",
-    );
-    Ok(bytes)
+    Ok((resp, "/api/file/ (fallback)"))
 }
 
 /// Fetch the registry-metadata provenance hopper holds for `sha256`, returning
@@ -3021,6 +3312,125 @@ mod tests {
         cond()
     }
 
+    fn claim_job(sha: &str, path: &str, size_bytes: i64) -> ClaimJob {
+        ClaimJob {
+            sha256: sha.to_string(),
+            path: path.to_string(),
+            size_bytes,
+            file_type: "data".to_string(),
+            has_provenance: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_one_rejects_jobs_over_max_job_bytes() {
+        // Rejected before any download, so the unreachable base_url is never hit.
+        let job = claim_job("cafe", "samples/huge.bin", (MAX_JOB_BYTES + 1) as i64);
+        let pj = prefetch_one(
+            reqwest::Client::new(),
+            Arc::from("http://127.0.0.1:1"),
+            None,
+            test_spool(1 << 20),
+            job,
+        )
+        .await;
+        match pj.data {
+            Err(PrefetchError::Skipped(msg)) => {
+                // Hopper's classifyResultError matches this phrase to mark the
+                // sample skip='oversized' — keep them in sync.
+                assert!(msg.contains("exceeds per-job"), "message was: {msg}");
+            }
+            _ => panic!("job over MAX_JOB_BYTES must be skipped"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_one_uses_local_file_regardless_of_size() {
+        // A local file needs no download or staging, so even a job bigger than
+        // MAX_JOB_BYTES analyzes in place instead of being rejected.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.bin"), b"data").unwrap();
+        let job = claim_job("beef", "big.bin", (MAX_JOB_BYTES + 1) as i64);
+        let pj = prefetch_one(
+            reqwest::Client::new(),
+            Arc::from("http://127.0.0.1:1"),
+            Some(dir.path().to_path_buf()),
+            test_spool(1 << 20),
+            job,
+        )
+        .await;
+        assert!(matches!(pj.data, Ok(PrefetchData::Local)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prefetch_one_spools_large_payload_to_disk() {
+        const PAYLOAD: &[u8] = b"a payload too big for the ram buffer";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Some(target) = read_target(&mut stream).await else {
+                        return;
+                    };
+                    if target.starts_with("/data/") {
+                        respond(&mut stream, "200 OK", PAYLOAD).await;
+                    } else {
+                        respond(&mut stream, "404 Not Found", b"").await;
+                    }
+                });
+            }
+        });
+
+        // A 4-byte memory threshold forces the spool route.
+        let spool = test_spool(4);
+        let job = claim_job("f00d", "samples/big.bin", PAYLOAD.len() as i64);
+        let pj = prefetch_one(
+            reqwest::Client::new(),
+            Arc::from(format!("http://127.0.0.1:{port}").as_str()),
+            None,
+            Arc::clone(&spool),
+            job,
+        )
+        .await;
+
+        let data = pj.data.unwrap_or_else(|e| panic!("prefetch failed: {e}"));
+        // Spooled payloads must not count against the RAM buffer.
+        assert_eq!(data.staged_mem_bytes(), 0);
+        let PrefetchData::Spooled(payload) = data else {
+            panic!("payload above the memory threshold must spool to disk");
+        };
+        assert_eq!(std::fs::read(&payload.path).unwrap(), PAYLOAD);
+        assert_eq!(spool.used.load(Ordering::Acquire), PAYLOAD.len() as u64);
+
+        // Dropping the payload deletes the spool file and releases the budget.
+        let spool_path = payload.path.to_path_buf();
+        drop(payload);
+        assert!(!spool_path.exists());
+        assert_eq!(spool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn spool_budget_admits_when_idle_and_gates_when_busy() {
+        let spool = SpoolState {
+            dir: std::env::temp_dir(),
+            budget_bytes: 100,
+            used: AtomicU64::new(0),
+            mem_threshold_bytes: 0,
+            disk_headroom_bytes: 0,
+        };
+        // Idle spool admits even a payload beyond the budget (forward progress).
+        assert!(spool.try_reserve(1000).is_ok());
+        // Busy spool rejects anything that would exceed the budget...
+        assert!(spool.try_reserve(1).is_err());
+        // ...and reopens once the in-flight payload releases.
+        spool.release(1000);
+        assert!(spool.try_reserve(50).is_ok());
+        assert!(spool.try_reserve(50).is_ok());
+        assert!(spool.try_reserve(1).is_err());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prefetcher_fills_to_target_backpressures_and_refills() {
         const PAYLOAD: &[u8] = b"payload";
@@ -3084,9 +3494,9 @@ mod tests {
                 encoded_name: "test".to_string(),
                 available_tools: String::new(),
                 slots,
-                max_single_bytes: 1 << 20,
+                spool: test_spool(1 << 20),
                 max_buffer_bytes: 1 << 30,
-                advertised_max_bytes: 0,
+                advertised_max_bytes: usize::try_from(MAX_JOB_BYTES).unwrap_or(usize::MAX),
                 poll_secs: 1,
                 target_depth,
                 metrics: Arc::new(WorkerMetrics::new()),
@@ -3124,11 +3534,12 @@ mod tests {
         //    refills back to target, polling the hopper again.
         for _ in 0..slots {
             let pj = rx.recv().await.unwrap();
-            assert_eq!(
-                pj.data.unwrap().as_deref(),
-                Some(PAYLOAD),
-                "payload mismatch"
-            );
+            match pj.data.unwrap() {
+                PrefetchData::Memory(bytes) => assert_eq!(&bytes[..], PAYLOAD, "payload mismatch"),
+                PrefetchData::Local | PrefetchData::Spooled(_) => {
+                    panic!("small payload should stage in memory")
+                }
+            }
             queued_bytes.fetch_sub(PAYLOAD.len(), Ordering::Release);
             outstanding.fetch_sub(1, Ordering::Release);
         }
@@ -3161,9 +3572,21 @@ mod tests {
                 file_type: "data".to_string(),
                 has_provenance: false,
             },
-            data: Ok(None),
+            data: Ok(PrefetchData::Local),
             queue_id: 0,
         }
+    }
+
+    /// A spool over the system temp dir with an effectively unlimited budget
+    /// and no free-disk requirement, so tests don't depend on host disk state.
+    fn test_spool(mem_threshold_bytes: usize) -> Arc<SpoolState> {
+        Arc::new(SpoolState {
+            dir: std::env::temp_dir(),
+            budget_bytes: u64::MAX,
+            used: AtomicU64::new(0),
+            mem_threshold_bytes,
+            disk_headroom_bytes: 0,
+        })
     }
 
     #[tokio::test]

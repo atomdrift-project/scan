@@ -1095,7 +1095,10 @@ mod tests {
         assert_eq!(parse_annotation("-- B"), Some('B'));
         // …while real source comments that superficially resemble the shape do
         // not (lower-case word, no space after a capital, prose after a colon).
-        assert_eq!(parse_annotation("// Suspicious behavior handled here"), None);
+        assert_eq!(
+            parse_annotation("// Suspicious behavior handled here"),
+            None
+        );
         assert_eq!(parse_annotation("# Note: N is the count"), None);
         assert_eq!(parse_annotation("-- hostile is a variable"), None);
         assert_eq!(parse_annotation("code();"), None);

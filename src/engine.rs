@@ -409,7 +409,9 @@ mod manifest_tests {
         // Never evaluated: no verdict fields at all — absence, not inheritance.
         assert_eq!(ml[4]["id"].as_u64(), Some(4));
         assert!(
-            ml[4].get("prob").is_none() && ml[4].get("lvl").is_none() && ml[4].get("conf").is_none(),
+            ml[4].get("prob").is_none()
+                && ml[4].get("lvl").is_none()
+                && ml[4].get("conf").is_none(),
             "unevaluated member carries no fabricated verdict"
         );
     }
@@ -1175,9 +1177,16 @@ pub type MemberEvals = std::collections::BTreeMap<u64, EmbeddedFile>;
 /// was evaluated. Iteration is id order == report entry order, so ties keep
 /// the earliest member exactly as the old in-loop fold did.
 fn worst_member(evals: &MemberEvals) -> Option<Decision> {
-    evals.values().map(EmbeddedFile::decision).reduce(|best, d| {
-        if decision_outranks(&d, &best) { d } else { best }
-    })
+    evals
+        .values()
+        .map(EmbeddedFile::decision)
+        .reduce(|best, d| {
+            if decision_outranks(&d, &best) {
+                d
+            } else {
+                best
+            }
+        })
 }
 
 /// The worst evaluation among the members whose content sha is in `shas` —
@@ -1188,7 +1197,13 @@ fn worst_for_shas(evals: &MemberEvals, shas: &[String]) -> Option<Decision> {
         .values()
         .filter(|ef| shas.contains(ef.sha256.as_str()))
         .map(EmbeddedFile::decision)
-        .reduce(|best, d| if decision_outranks(&d, &best) { d } else { best })
+        .reduce(|best, d| {
+            if decision_outranks(&d, &best) {
+                d
+            } else {
+                best
+            }
+        })
 }
 
 /// A file embedded within an archive or self-extracting executable.
@@ -2453,7 +2468,10 @@ fn emit_result(
 /// render — same rich header and body — but capped at the top 3 traits (cleave
 /// shows all notable+), with litmus adding a verdict badge + subtitle on top.
 pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
-    if matches!(config.format(), OutputFormat::Tiny | OutputFormat::Interpret) {
+    if matches!(
+        config.format(),
+        OutputFormat::Tiny | OutputFormat::Interpret
+    ) {
         cleave::output::TinyOpts::tiny()
     } else {
         cleave::output::TinyOpts {
@@ -3016,27 +3034,9 @@ pub(crate) fn classify_report(
             .map(|&ef| {
                 // Cancellation: skip the expensive work; the post-pass bail
                 // below surfaces the cancellation before results are used.
-                let (ef_decision, ef_model_scores, ef_skipped_models) = if cancellation
-                    .is_some_and(|c| c.load(Ordering::Relaxed))
-                {
-                    (
-                        Decision {
-                            class: Classification::Benign,
-                            probability: 0.0,
-                            threshold: model.thresholds().suspicious,
-                            level: None,
-                        },
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                } else {
-                    let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
-                    let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
-                    model.spec().standardize(&mut ef_features);
-                    let ef_type = ef["type"].as_str().unwrap_or("unknown");
-                    let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
-                        .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
-                        .unwrap_or((
+                let (ef_decision, ef_model_scores, ef_skipped_models) =
+                    if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                        (
                             Decision {
                                 class: Classification::Benign,
                                 probability: 0.0,
@@ -3045,21 +3045,38 @@ pub(crate) fn classify_report(
                             },
                             Vec::new(),
                             Vec::new(),
-                        ));
-                    // Trait floor on the member's own findings — a sparse, severe
-                    // dropper (the npm install-hook beacon lives in the embedded
-                    // package.json) scores above the crit-4 fraction gate even when
-                    // the container's findings dilute it; the floored member then
-                    // elevates the container below.
-                    apply_trait_floor(
-                        &mut ef_decision,
-                        ef,
-                        model.active_level(),
-                        model.grid_max(),
-                        ef["path"].as_str().unwrap_or(label),
-                    );
-                    (ef_decision, ef_model_scores, ef_skipped_models)
-                };
+                        )
+                    } else {
+                        let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
+                        let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
+                        model.spec().standardize(&mut ef_features);
+                        let ef_type = ef["type"].as_str().unwrap_or("unknown");
+                        let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
+                            .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
+                            .unwrap_or((
+                                Decision {
+                                    class: Classification::Benign,
+                                    probability: 0.0,
+                                    threshold: model.thresholds().suspicious,
+                                    level: None,
+                                },
+                                Vec::new(),
+                                Vec::new(),
+                            ));
+                        // Trait floor on the member's own findings — a sparse, severe
+                        // dropper (the npm install-hook beacon lives in the embedded
+                        // package.json) scores above the crit-4 fraction gate even when
+                        // the container's findings dilute it; the floored member then
+                        // elevates the container below.
+                        apply_trait_floor(
+                            &mut ef_decision,
+                            ef,
+                            model.active_level(),
+                            model.grid_max(),
+                            ef["path"].as_str().unwrap_or(label),
+                        );
+                        (ef_decision, ef_model_scores, ef_skipped_models)
+                    };
 
                 let full_path = ef["path"].as_str().unwrap_or("");
                 let rel_path = full_path
@@ -3182,10 +3199,18 @@ pub(crate) fn classify_report(
     // offline from one scan, independent of whether `--interpret` is on.
     let dump_dir = std::env::var_os("SCAN_INTERPRET_DUMP_DIR");
     let llm_ctx = (interpret.is_some() || dump_dir.is_some() || llm_view).then(|| {
-        crate::interpret::sanitize_context(&cleave::output::format_context(
-            &report,
-            &cleave::output::TinyOpts::tiny(),
-        ))
+        let mut rendered =
+            cleave::output::format_context(&report, &cleave::output::TinyOpts::tiny());
+        // Appendix mapping each grafted dependency node to the external
+        // reference it was fetched from (locator, declaring file, verdict,
+        // elevated findings). Without it the dependency's synthetic paths
+        // above read as archive members, and a dependency-driven elevation is
+        // inexplicable to the model. Appended before sanitize so `!!` paths
+        // normalize the same way as the main render.
+        if let Some(deps) = render_dependency_context(&fetch_edges, &member_evals, &report) {
+            rendered.push_str(&deps);
+        }
+        crate::interpret::sanitize_context(&rendered)
     });
     if let (Some(dir), Some(ctx)) = (dump_dir, llm_ctx.as_deref()) {
         let dir = std::path::Path::new(&dir);
@@ -3286,13 +3311,12 @@ pub(crate) fn classify_report(
     let dependency_results: Vec<DepResult> = fetched_deps
         .into_iter()
         .map(|dep| {
-            let decision =
-                worst_for_shas(&member_evals, &dep.member_shas).unwrap_or(Decision {
-                    class: Classification::Benign,
-                    probability: 0.0,
-                    threshold: 0.0,
-                    level: Some(-1),
-                });
+            let decision = worst_for_shas(&member_evals, &dep.member_shas).unwrap_or(Decision {
+                class: Classification::Benign,
+                probability: 0.0,
+                threshold: 0.0,
+                level: Some(-1),
+            });
             DepResult {
                 sha256: dep.content_sha,
                 locator: dep.locator,
@@ -3496,6 +3520,136 @@ fn inject_dependency_backref(
     }
 }
 
+/// Cap on elevated-finding lines rendered per fetched dependency in the LLM
+/// context appendix; a dependency with more still shows its worst, and the
+/// omission is stated so the model never mistakes the cut for completeness.
+const MAX_DEP_FINDING_LINES: usize = 12;
+
+/// Render the fetched-dependencies appendix for the LLM interpret context.
+///
+/// Fetched payloads are grafted into the report under synthetic paths (a UUID
+/// or purl), so in the main render they are indistinguishable from the
+/// sample's own archive members — and the `fetch/dependency-verdict` trait
+/// that elevates the sample is injected into the compact JSON *after* the
+/// render, so the context never explains a dependency-driven verdict. This
+/// appendix is that explanation, kept clearly separate from the archive-member
+/// view: one block per fetched reference naming its locator (URL/PURL), how
+/// the sample referenced it (binding kind + declaring file + byte offset),
+/// the model's classification of the fetched bytes, and the suspicious+
+/// findings on the dependency's own files (in the render's `# SEV` annotation
+/// grammar, so the interpret gates parse them like any other finding).
+/// `None` when nothing was fetched.
+fn render_dependency_context(
+    fetch_edges: &[fletch::fetch::FetchRecord],
+    member_evals: &MemberEvals,
+    report: &cleave::AnalysisReport,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    // Only edges that landed bytes have a grafted node to describe.
+    let landed: Vec<_> = fetch_edges
+        .iter()
+        .filter(|r| r.content_sha256.is_some())
+        .collect();
+    if landed.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    out.push_str(
+        "\n== FETCHED DEPENDENCIES ==\n\
+         The scan followed references declared by this sample and retrieved the content below.\n\
+         Each payload was analyzed and appears above under a synthetic path — these files are\n\
+         EXTERNAL retrieved content, not members of the sample's own archive. A hostile or\n\
+         suspicious dependency elevates the sample's verdict (fetch/dependency-verdict).\n",
+    );
+    for rec in landed {
+        let content_sha = rec.content_sha256.as_deref().unwrap_or_default();
+        let root = report.files.iter().find(|f| f.sha256 == content_sha);
+        let eval = member_evals.values().find(|ef| ef.sha256 == content_sha);
+        let _ = writeln!(out, "\ndependency: {}", rec.locator);
+        if !rec.resolved_url.is_empty() && rec.resolved_url != rec.locator {
+            let _ = writeln!(out, "  resolved url: {}", rec.resolved_url);
+        }
+        let source = report
+            .files
+            .iter()
+            .find(|f| f.sha256 == rec.source_sha256)
+            .map_or("<unknown file>", |f| f.path.as_str());
+        let _ = write!(
+            out,
+            "  referenced: {} in {source}",
+            ref_kind_phrase(&rec.kind)
+        );
+        if let Some(off) = rec.source_offset {
+            let _ = write!(out, " @ byte {off}");
+        }
+        out.push('\n');
+        let _ = writeln!(out, "  content sha256: {content_sha}");
+        if let Some(root) = root {
+            let _ = writeln!(out, "  analyzed above as: {}", root.path);
+        }
+        if let Some(ef) = eval {
+            let class = match ef.classification {
+                Classification::Hostile => "hostile",
+                Classification::Suspicious => "suspicious",
+                Classification::Benign => "benign",
+            };
+            let _ = writeln!(out, "  classification: {class} (p={:.2})", ef.probability);
+        }
+        let Some(root) = root else { continue };
+        // The dependency's own elevated findings: the root node plus every
+        // member below it, deduped by id, worst first.
+        let member_prefix = format!("{}!!", root.path);
+        let mut elevated: Vec<(&cleave::FileAnalysis, &cleave::Finding)> = report
+            .files
+            .iter()
+            .filter(|f| f.path == root.path || f.path.starts_with(&member_prefix))
+            .flat_map(|f| f.findings.iter().map(move |fd| (f, fd)))
+            .filter(|(_, fd)| fd.crit >= cleave::Criticality::Suspicious)
+            .collect();
+        elevated.sort_by_key(|(_, fd)| std::cmp::Reverse(fd.crit));
+        let mut seen = std::collections::HashSet::new();
+        elevated.retain(|(_, fd)| seen.insert(fd.id.as_str()));
+        if elevated.is_empty() {
+            continue;
+        }
+        out.push_str("  elevated findings on this dependency's files:\n");
+        let total = elevated.len();
+        for (f, fd) in elevated.into_iter().take(MAX_DEP_FINDING_LINES) {
+            let sev = if fd.crit >= cleave::Criticality::Hostile {
+                'H'
+            } else {
+                'S'
+            };
+            let _ = write!(out, "  # {sev} {}", fd.id);
+            if !fd.desc.is_empty() {
+                let _ = write!(out, " — {}", fd.desc);
+            }
+            let _ = writeln!(out, " [{}]", f.path);
+        }
+        if total > MAX_DEP_FINDING_LINES {
+            let _ = writeln!(
+                out,
+                "  … {} more elevated findings omitted",
+                total - MAX_DEP_FINDING_LINES
+            );
+        }
+    }
+    Some(out)
+}
+
+/// How a fetch edge's declaring reference binds the sample to the dependency,
+/// as prose for the LLM context.
+fn ref_kind_phrase(kind: &fletch::RefKind) -> &'static str {
+    match kind {
+        fletch::RefKind::Dependency => "declared as a dependency",
+        fletch::RefKind::Command => "named by an install command",
+        fletch::RefKind::UrlFetch => "fetched from a URL",
+        fletch::RefKind::Repository => "named as the source repository",
+        fletch::RefKind::Local => "a local reference",
+        _ => "referenced",
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod dep_backref_tests {
@@ -3552,7 +3706,10 @@ mod dep_backref_tests {
         assert_eq!(t["dep"]["locator"], "pkg:npm/zaboodle@1.49");
         assert_eq!(t["dep"]["sha"], "d".repeat(64));
         assert_eq!(t["dep"]["type"], "javascript");
-        assert_eq!(t["spans"][0][0], 42, "declaring file cites the reference byte");
+        assert_eq!(
+            t["spans"][0][0], 42,
+            "declaring file cites the reference byte"
+        );
     }
 
     #[test]
@@ -3568,7 +3725,11 @@ mod dep_backref_tests {
         assert_eq!(root_traits.len(), 2, "rolled up alongside existing traits");
         let rt = &root_traits[1];
         assert_eq!(rt["id"], "fetch/dependency-verdict");
-        assert_eq!(rt["dep"]["sha"], "d".repeat(64), "dep identity rolls up intact");
+        assert_eq!(
+            rt["dep"]["sha"],
+            "d".repeat(64),
+            "dep identity rolls up intact"
+        );
         assert!(
             rt.get("spans").is_none(),
             "a rolled-up ancestor carries no cross-file span",
@@ -3597,7 +3758,10 @@ mod dep_backref_tests {
                 "d".repeat(64)
             ),
         );
-        assert_eq!(t["dep"]["type"], "javascript", "dep rides on suspicious too");
+        assert_eq!(
+            t["dep"]["type"], "javascript",
+            "dep rides on suspicious too"
+        );
     }
 
     #[test]
@@ -3611,6 +3775,130 @@ mod dep_backref_tests {
         let t = &report_json["files"][1]["traits"][0];
         assert_eq!(t["dep"]["locator"], "http://x.y.z/x.exe");
         assert_eq!(t["dep"]["type"], "pe");
+    }
+
+    /// A report shaped like a real fetched-dependency scan: the sample's
+    /// manifest declared a reference, and the fetched payload was grafted
+    /// under a synthetic path with a member of its own.
+    fn dep_render_fixture() -> (
+        Vec<fletch::fetch::FetchRecord>,
+        MemberEvals,
+        cleave::AnalysisReport,
+    ) {
+        let mk_file =
+            |sha: &str, path: &str, findings: Vec<cleave::Finding>| cleave::FileAnalysis {
+                sha256: sha.to_string(),
+                path: path.to_string(),
+                findings,
+                ..cleave::FileAnalysis::default()
+            };
+        let finding = |id: &str, desc: &str, crit: cleave::Criticality| cleave::Finding {
+            id: id.to_string(),
+            desc: desc.to_string(),
+            crit,
+            ..cleave::Finding::default()
+        };
+        let mut report = empty_report();
+        report.files = vec![
+            mk_file("r".repeat(64).as_str(), "pkg.src.tar.gz", vec![]),
+            mk_file("s".repeat(64).as_str(), "pkg.src.tar.gz!!.SRCINFO", vec![]),
+            mk_file(
+                "d".repeat(64).as_str(),
+                "d420381f-dep",
+                vec![finding(
+                    "objectives/persistence/x::implant",
+                    "drops an implant",
+                    cleave::Criticality::Hostile,
+                )],
+            ),
+            mk_file(
+                "m".repeat(64).as_str(),
+                "d420381f-dep!!configure",
+                vec![
+                    finding(
+                        "micro-behaviors/net/y::beacon",
+                        "beacons out",
+                        cleave::Criticality::Suspicious,
+                    ),
+                    finding(
+                        "meta/z::noise",
+                        "notable only",
+                        cleave::Criticality::Notable,
+                    ),
+                ],
+            ),
+        ];
+        let edge: fletch::fetch::FetchRecord = serde_json::from_value(serde_json::json!({
+            "source_sha256": "s".repeat(64),
+            "source_offset": 132,
+            "kind": "dependency",
+            "locator": "https://example.com/dep-1.0.tar.gz",
+            "content_sha256": "d".repeat(64),
+            "fetched_at": 1,
+            "cached": false,
+            "outcome": "ok",
+        }))
+        .unwrap();
+        let mut evals = MemberEvals::new();
+        evals.insert(
+            3,
+            EmbeddedFile {
+                id: 3,
+                sha256: "d".repeat(64),
+                path: "d420381f-dep".to_string(),
+                file_type: "archive".to_string(),
+                classification: Classification::Hostile,
+                probability: 0.97,
+                threshold: 0.5,
+                level: None,
+                model_scores: Vec::new(),
+                skipped_models: Vec::new(),
+                formula: String::new(),
+                top_findings: Vec::new(),
+            },
+        );
+        (vec![edge], evals, report)
+    }
+
+    /// The appendix names the locator, the declaring file + reference kind +
+    /// byte offset, the fetched bytes' classification, and the dependency's
+    /// suspicious+ findings in the `# SEV` annotation grammar — while notable
+    /// findings and the sample's own files stay out of it.
+    #[test]
+    fn dependency_context_names_locator_reference_and_elevated_findings() {
+        let (edges, evals, report) = dep_render_fixture();
+        let ctx = render_dependency_context(&edges, &evals, &report).unwrap();
+        for want in [
+            "== FETCHED DEPENDENCIES ==",
+            "dependency: https://example.com/dep-1.0.tar.gz",
+            "referenced: declared as a dependency in pkg.src.tar.gz!!.SRCINFO @ byte 132",
+            "analyzed above as: d420381f-dep",
+            "classification: hostile (p=0.97)",
+            "# H objectives/persistence/x::implant — drops an implant [d420381f-dep]",
+            "# S micro-behaviors/net/y::beacon — beacons out [d420381f-dep!!configure]",
+        ] {
+            assert!(ctx.contains(want), "missing {want:?} in:\n{ctx}");
+        }
+        assert!(
+            !ctx.contains("meta/z::noise"),
+            "notable findings must stay out of the appendix:\n{ctx}"
+        );
+        // The interpret gate must see the appendix's elevated markers.
+        assert!(
+            crate::interpret::sanitize_context(&ctx)
+                .lines()
+                .any(|l| l.trim_start().starts_with("# H "))
+        );
+    }
+
+    /// No landed fetches → no appendix; an edge whose fetch failed (no
+    /// content sha) contributes nothing.
+    #[test]
+    fn dependency_context_absent_without_landed_fetches() {
+        let (mut edges, evals, report) = dep_render_fixture();
+        assert!(render_dependency_context(&[], &evals, &report).is_none());
+        edges[0].content_sha256 = None;
+        assert!(render_dependency_context(&edges, &evals, &report).is_none());
     }
 }
 
