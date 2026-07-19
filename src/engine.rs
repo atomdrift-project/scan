@@ -2631,9 +2631,24 @@ fn render_terminal_context(
     }
 }
 
+/// Wall-clock of each post-analysis phase inside `classify_report`, in
+/// milliseconds. Static analysis (cleave/filefacts) runs *before* this and is not
+/// included — subtract `total_ms` from the caller's whole-invocation elapsed to
+/// isolate it. Logged per root file on the CLI path (see `process_report`) so a
+/// slow scan is self-diagnosing: which phase ate the wall clock (usually the LLM
+/// `interpret_ms` when an endpoint is contended, or `fetch_ms` on a wide `--fetch`).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PhaseTimings {
+    pub(crate) fetch_ms: u64,
+    pub(crate) interpret_ms: u64,
+    pub(crate) render_ms: u64,
+    pub(crate) total_ms: u64,
+}
+
 /// Intermediate classification result from the model pipeline.
 /// Produced by `classify_report`, consumed when building a `ScanResult`.
 pub(crate) struct ClassifiedReport {
+    pub(crate) phase_ms: PhaseTimings,
     pub(crate) classification: Classification,
     pub(crate) probability: f32,
     pub(crate) threshold: f32,
@@ -2826,6 +2841,10 @@ pub(crate) fn classify_report(
     // default) — before `finalize()` clears `archive_contents`. With `--show=all`
     // JSON output these are surfaced as listing-only entries below so the manifest
     // is complete; otherwise the snapshot stays empty and nothing changes.
+    // Phase stopwatches for the per-file timing line (see PhaseTimings). total
+    // spans this whole function (post-analysis: fetch → ML → interpret → render);
+    // each phase is timed at its call site below.
+    let classify_start = Instant::now();
     let listed_members: Vec<ArchiveMemberStub> = if list_all_members {
         report
             .archive_contents
@@ -2854,8 +2873,10 @@ pub(crate) fn classify_report(
     // files[] and the per-file declared references) and before featurization, so
     // fetched content feeds the verdict like any other file. Off unless the
     // policy selects a kind. The returned edges are attached to report_json below.
+    let fetch_start = Instant::now();
     let (fetch_edges, fetched_deps) =
         crate::fetch::orchestrate(&mut report, root_path, fetch, fetch_progress);
+    let fetch_ms = crate::duration_ms(fetch_start.elapsed());
     // One-shot `pkg:`/`url`: graft the root artifact's own registry metadata as a
     // child `registry` node and correlate the two with a `scope: package`
     // composite. The `--fetch` path does the equivalent per fetched dependency
@@ -3218,6 +3239,7 @@ pub(crate) fn classify_report(
             let _ = std::fs::write(dir.join(format!("{sha256}.render")), ctx);
         }
     }
+    let interpret_start = Instant::now();
     let interpretation = interpret.and_then(|cfg| {
         // The gate lives in `interpret::interpret`: it runs when ML clears the
         // probability floor OR cleave surfaced a suspicious/hostile finding ML
@@ -3242,6 +3264,9 @@ pub(crate) fn classify_report(
         }
         Some(interp)
     });
+    // Dominant suspect for a slow contended run: the LLM round-trip (queue wait +
+    // generation) against a shared endpoint. Zero when `--interpret` is off or gated.
+    let interpret_ms = crate::duration_ms(interpret_start.elapsed());
 
     // Adopt the blended verdict as the effective one when the LLM out-read ML
     // (escalating a missed threat, or clearing an ML false positive). The `ml`
@@ -3253,7 +3278,11 @@ pub(crate) fn classify_report(
         && interp.grade.is_some()
         && interp.outcome as u8 != final_decision.class as u8
     {
-        tracing::warn!(
+        // INFO, not WARN: an LLM override of the ML verdict is normal operation,
+        // not a fault. (It also kept surfacing as the last stderr line a caller
+        // grabbed when a slow run was externally killed, making a benign shift look
+        // like a crash cause.)
+        tracing::info!(
             path = %label,
             ml = ?final_decision.class,
             outcome = ?interp.outcome,
@@ -3272,6 +3301,7 @@ pub(crate) fn classify_report(
     // scope and the verdict (incl. any interpretation) is known. The terminal
     // view extends cleave's rich render with litmus's verdict badge + subtitle;
     // `--format tiny` uses cleave's machine render verbatim.
+    let render_start = Instant::now();
     let rendered_context = if !render_context {
         String::new()
     } else if llm_view {
@@ -3293,6 +3323,7 @@ pub(crate) fn classify_report(
     } else {
         cleave::output::format_context(&report, tiny_opts)
     };
+    let render_ms = crate::duration_ms(render_start.elapsed());
 
     // Surface the archive members cleave catalogued but never analyzed, so a
     // `--show=all` JSON manifest lists every file (path/type/size) — not just the
@@ -3330,6 +3361,12 @@ pub(crate) fn classify_report(
         .collect();
 
     Ok(ClassifiedReport {
+        phase_ms: PhaseTimings {
+            fetch_ms,
+            interpret_ms,
+            render_ms,
+            total_ms: crate::duration_ms(classify_start.elapsed()),
+        },
         classification: final_decision.class,
         probability: final_decision.probability,
         threshold: final_decision.threshold,
@@ -3956,6 +3993,24 @@ pub(crate) fn process_report(
         root_registry,
         bloom_mark,
     )?;
+
+    // Per-file phase timing (CLI path only — serve logs its own per-sample line).
+    // Makes a slow scan self-diagnosing: total_ms is the post-analysis wall clock,
+    // and the phase split says where it went. Subtract total_ms from the caller's
+    // whole-invocation elapsed (e.g. gauntlet's per-sample time) to get the static
+    // cleave/filefacts share, which is measured upstream of here.
+    let pm = cr.phase_ms;
+    tracing::info!(
+        path = %path_display,
+        sha256 = %cr.sha256,
+        file_type = %cr.file_type,
+        class = ?cr.classification,
+        fetch_ms = pm.fetch_ms,
+        interpret_ms = pm.interpret_ms,
+        render_ms = pm.render_ms,
+        total_ms = pm.total_ms,
+        "scan phases complete",
+    );
 
     // Retain the raw cleave report for JSON output, and whenever uploading to
     // hopper — the renewed result must carry the full report (so hopper stores it
