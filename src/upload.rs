@@ -503,11 +503,22 @@ fn sync_dependencies(
         &mut local_seen,
         artifacts,
     );
-    // Then the verdict for each dependency, keyed by its content sha.
+    // Then the verdict for each dependency that has one, keyed by its content
+    // sha. A dependency the embedded pass never reached carries none: its bytes
+    // and provenance went up above, so hopper holds the artifact and can analyze
+    // it, but scan posts no verdict it did not compute. Logged rather than
+    // dropped silently — an unevaluated dependency is a coverage gap worth
+    // seeing, not a routine skip.
     for dep in fresh {
-        let sha256 = dep.sha256.clone();
-        let envelope = crate::engine::dep_envelope(&dep, version, analyzed_at);
-        post_one(client, result_url, worker, &sha256, envelope);
+        let Some(envelope) = crate::engine::dep_envelope(&dep, version, analyzed_at) else {
+            tracing::info!(
+                sha256 = %dep.sha256,
+                locator = %dep.locator,
+                "upload: dependency not evaluated; stored for analysis without a verdict"
+            );
+            continue;
+        };
+        post_one(client, result_url, worker, &dep.sha256, envelope);
     }
 }
 
@@ -798,6 +809,10 @@ mod tests {
     /// (never eagerly), derives its stored filename from the resolved URL, and is
     /// marked backfillable so its registry provenance lands even when hopper
     /// already holds the bytes. `pkg:bogus/*` resolves to no registry offline.
+    ///
+    /// Built here from an *unevaluated* dependency: the artifact is independent
+    /// of the verdict, so bytes and provenance reach hopper even when scan has
+    /// no verdict to post for them.
     #[test]
     fn dep_artifact_loads_bytes_lazily_and_is_backfillable() {
         let dep = crate::engine::DepResult {
@@ -805,8 +820,7 @@ mod tests {
             locator: "pkg:bogus/x@1".to_string(),
             url: "https://example/x-1.tgz".to_string(),
             size: 99,
-            level: Some(-1),
-            probability: 0.0,
+            verdict: None,
             raw: "{}".to_string(),
         };
         let art = dep_artifact(&dep, "scan+test", "2026-06-28T00:00:00Z");

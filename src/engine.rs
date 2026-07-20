@@ -635,28 +635,55 @@ mod envelope_tests {
         assert_eq!(arts[0].filename, "proj.tgz", "filename is the file's name");
     }
 
-    #[test]
-    fn dep_envelope_carries_verdict_and_report() {
-        // A dependency's verdict envelope encodes its aggregate level as `ml.lvl`
-        // and passes its standalone report through as `raw`, exactly the shape a
-        // first-hand scan posts — so hopper records it identically.
-        let dep = DepResult {
+    /// A dependency carrying the verdict scan computed for it.
+    fn evaluated_dep() -> DepResult {
+        DepResult {
             sha256: "d".repeat(64),
             locator: "pkg:npm/evil@1.0.0".to_string(),
             url: "https://reg/evil-1.0.0.tgz".to_string(),
             size: 1234,
-            level: Some(100),
-            probability: 0.97,
+            verdict: Some(Decision {
+                class: Classification::Hostile,
+                probability: 0.97,
+                threshold: 0.65,
+                level: Some(100),
+            }),
             raw: serde_json::json!({"v": "8", "files": [{"sha": "d".repeat(64), "type": "npm"}]})
                 .to_string(),
-        };
-        let env = dep_envelope(&dep, "model-9", "2026-06-28T00:00:00Z");
+        }
+    }
+
+    #[test]
+    fn dep_envelope_carries_verdict_and_report() {
+        // A dependency's verdict envelope encodes its aggregate level as `ml.lvl`
+        // and passes its standalone report through as `raw`, so hopper keeps the
+        // dependency's own analysis rather than a slice of its parent's.
+        let env = dep_envelope(&evaluated_dep(), "model-9", "2026-06-28T00:00:00Z")
+            .expect("a dependency with a verdict yields an envelope");
         assert_eq!(env.ml.level, Some(100), "aggregate verdict rides in ml.lvl");
+        assert_eq!(env.ml.probability, 0.97);
         assert_eq!(env.ml.version, "model-9");
         assert_eq!(env.ml.analyzed_at, "2026-06-28T00:00:00Z");
         assert_eq!(
             env.raw["files"][0]["type"], "npm",
             "the dependency's own report is the result raw, so hopper keeps its FileType",
+        );
+    }
+
+    #[test]
+    fn dep_envelope_absent_without_a_verdict() {
+        // A dependency the embedded pass never reached has no verdict, so there is
+        // no result to post. Inventing a benign one would be indistinguishable
+        // from a real evaluation — and would bless the package in the known-good
+        // bloom filter, suppressing every future fetch of it. The bytes and
+        // provenance still upload, so hopper holds the artifact and can analyze it.
+        let dep = DepResult {
+            verdict: None,
+            ..evaluated_dep()
+        };
+        assert!(
+            dep_envelope(&dep, "model-9", "2026-06-28T00:00:00Z").is_none(),
+            "an unevaluated dependency posts no verdict",
         );
     }
 
@@ -1107,11 +1134,14 @@ pub struct DepResult {
     pub url: String,
     /// Size of the dependency's bytes, recorded in the provenance sidecar.
     pub size: u64,
-    /// Aggregate verdict marker (`ml.lvl`): the dependency's container elevated by
-    /// its worst member, exactly as a first-hand scan of the same bytes resolves.
-    pub level: Option<i32>,
-    /// Probability the aggregate verdict was decided on.
-    pub probability: f32,
+    /// The dependency's aggregate verdict: its container elevated by its worst
+    /// member, exactly as a first-hand scan of the same bytes resolves. `None`
+    /// when the embedded pass never reached it — its bytes and provenance are
+    /// still stored, so hopper can analyze it, but scan posts no verdict it did
+    /// not compute. A fabricated one would be indistinguishable from a real
+    /// evaluation, and a fabricated *benign* would bless the package in the
+    /// known-good bloom filter, suppressing every future fetch of it.
+    pub verdict: Option<Decision>,
     /// The dependency's own compact cleave report as JSON text — the `raw`
     /// for its result, parsed transiently at envelope build (see
     /// `FetchedDependency::raw` for why text form).
@@ -2161,22 +2191,26 @@ pub(crate) fn upload_scan_result(
 /// computed as the `ml` section — the same shape a first-hand scan of those bytes
 /// would post, so hopper records the dependency exactly as if it had been scanned
 /// directly. `version`/`analyzed_at` are the parent run's, identifying the build.
+///
+/// `None` when the dependency carries no verdict (see [`DepResult::verdict`]) —
+/// there is nothing to post, and scan does not invent one.
 #[must_use]
 pub(crate) fn dep_envelope(
     dep: &DepResult,
     version: &str,
     analyzed_at: &str,
-) -> ScanResultEnvelope {
-    let level = dep.level;
+) -> Option<ScanResultEnvelope> {
+    let verdict = dep.verdict?;
+    let level = verdict.level;
     // The report text becomes a `Value` only here, for the short-lived
     // envelope being POSTed — not for the job-long retention window.
     let raw: serde_json::Value =
         serde_json::from_str(&dep.raw).unwrap_or_else(|_| serde_json::json!({}));
-    let ml_files = build_ml_files(&raw, dep.probability, level, &MemberEvals::new());
-    ScanResultEnvelope {
+    let ml_files = build_ml_files(&raw, verdict.probability, level, &MemberEvals::new());
+    Some(ScanResultEnvelope {
         ml: MlSection {
             v: "7",
-            probability: dep.probability,
+            probability: verdict.probability,
             level,
             conf: level_confidence(level),
             model_scores: Vec::new(),
@@ -2190,7 +2224,7 @@ pub(crate) fn dep_envelope(
         },
         llm: None,
         raw,
-    }
+    })
 }
 
 /// The `fetch.collector` identity stamped on every sidecar this process uploads,
@@ -3338,25 +3372,16 @@ pub(crate) fn classify_report(
     // report plus its aggregate verdict — the worst evaluation among its own
     // files, exactly as a first-hand scan of those bytes resolves. A dependency
     // the embedded pass never reached (e.g. truncated by the embedded-file cap)
-    // defaults to benign rather than inventing a verdict.
+    // carries no verdict; see `DepResult::verdict`.
     let dependency_results: Vec<DepResult> = fetched_deps
         .into_iter()
-        .map(|dep| {
-            let decision = worst_for_shas(&member_evals, &dep.member_shas).unwrap_or(Decision {
-                class: Classification::Benign,
-                probability: 0.0,
-                threshold: 0.0,
-                level: Some(-1),
-            });
-            DepResult {
-                sha256: dep.content_sha,
-                locator: dep.locator,
-                url: dep.url,
-                size: dep.size,
-                level: decision.level,
-                probability: decision.probability,
-                raw: dep.raw,
-            }
+        .map(|dep| DepResult {
+            sha256: dep.content_sha,
+            locator: dep.locator,
+            url: dep.url,
+            size: dep.size,
+            verdict: worst_for_shas(&member_evals, &dep.member_shas),
+            raw: dep.raw,
         })
         .collect();
 
