@@ -401,7 +401,7 @@ fn build_result(
         model,
         shap,
         cancellation,
-        Some(100),
+        Some(crate::engine::EMBEDDED_FILE_LIMIT),
         &crate::engine::tiny_opts_for(config),
         config.interpret(),
         // Matching scan's `--format interpret`: the live LLM query's user

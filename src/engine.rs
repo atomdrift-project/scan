@@ -648,6 +648,7 @@ mod envelope_tests {
                 threshold: 0.65,
                 level: Some(100),
             }),
+            members: MemberEvals::new(),
             raw: serde_json::json!({"v": "8", "files": [{"sha": "d".repeat(64), "type": "npm"}]})
                 .to_string(),
         }
@@ -687,7 +688,7 @@ mod envelope_tests {
         );
     }
 
-    fn base_result() -> ScanResult {
+    pub(super) fn base_result() -> ScanResult {
         ScanResult {
             v: "7",
             classification: Classification::Benign,
@@ -1142,6 +1143,15 @@ pub struct DepResult {
     /// evaluation, and a fabricated *benign* would bless the package in the
     /// known-good bloom filter, suppressing every future fetch of it.
     pub verdict: Option<Decision>,
+    /// This dependency's own per-member evaluations, keyed by node id — the same
+    /// table a first-hand scan carries in `ScanResult::embedded_files`, and what
+    /// `ml.files` is built from.
+    ///
+    /// Without it every member of a dependency reached hopper with no verdict at
+    /// all, while the members of a directly-scanned package got theirs. Bounded
+    /// by EMBEDDED_FILE_LIMIT, so the retained size is capped per dependency
+    /// rather than growing with the report.
+    pub members: MemberEvals,
     /// The dependency's own compact cleave report as JSON text — the `raw`
     /// for its result, parsed transiently at envelope build (see
     /// `FetchedDependency::raw` for why text form).
@@ -1209,23 +1219,6 @@ pub type MemberEvals = std::collections::BTreeMap<u64, EmbeddedFile>;
 fn worst_member(evals: &MemberEvals) -> Option<Decision> {
     evals
         .values()
-        .map(EmbeddedFile::decision)
-        .reduce(|best, d| {
-            if decision_outranks(&d, &best) {
-                d
-            } else {
-                best
-            }
-        })
-}
-
-/// The worst evaluation among the members whose content sha is in `shas` —
-/// a fetched dependency's aggregate verdict. `None` when none were evaluated.
-fn worst_for_shas(evals: &MemberEvals, shas: &[String]) -> Option<Decision> {
-    let shas: std::collections::HashSet<&str> = shas.iter().map(String::as_str).collect();
-    evals
-        .values()
-        .filter(|ef| shas.contains(ef.sha256.as_str()))
         .map(EmbeddedFile::decision)
         .reduce(|best, d| {
             if decision_outranks(&d, &best) {
@@ -2186,6 +2179,192 @@ pub(crate) fn upload_scan_result(
     uploader.submit(sha256, envelope);
 }
 
+/// Feature-extract and model-score a report's embedded files — the archive
+/// members at depth > 0 — returning one evaluation per entry.
+///
+/// Extracted so a fetched dependency can be graded on its own report rather
+/// than as a tail region of the report it was grafted into. Sharing the parent's
+/// pass meant sharing its embedded-file budget, and a dependency past the cap
+/// came back with no evaluation at all.
+///
+/// Per-member work is pure and runs in parallel: reports with thousands of
+/// embedded files (nested npm tarballs, fetched dependency trees) previously ran
+/// this serially on one rayon worker, and on member-heavy archives that pass —
+/// not cleave's analysis — was the scan's wall-clock tail.
+fn score_embedded_files(
+    entries: &[&serde_json::Value],
+    label: &str,
+    needs: crate::features::RawNeeds,
+    ctx: &ExtractContext,
+    model: &Model,
+    cancellation: Option<&Arc<AtomicBool>>,
+) -> Vec<EmbeddedFile> {
+    use rayon::prelude::*;
+    entries
+        .par_iter()
+        .map(|&ef| {
+            // Cancellation: skip the expensive work; the post-pass bail
+            // below surfaces the cancellation before results are used.
+            let (ef_decision, ef_model_scores, ef_skipped_models) =
+                if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    (
+                        Decision {
+                            class: Classification::Benign,
+                            probability: 0.0,
+                            threshold: model.thresholds().suspicious,
+                            level: None,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                } else {
+                    let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
+                    let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
+                    model.spec().standardize(&mut ef_features);
+                    let ef_type = ef["type"].as_str().unwrap_or("unknown");
+                    let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
+                        .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
+                        .unwrap_or((
+                            Decision {
+                                class: Classification::Benign,
+                                probability: 0.0,
+                                threshold: model.thresholds().suspicious,
+                                level: None,
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                        ));
+                    // Trait floor on the member's own findings — a sparse, severe
+                    // dropper (the npm install-hook beacon lives in the embedded
+                    // package.json) scores above the crit-4 fraction gate even when
+                    // the container's findings dilute it; the floored member then
+                    // elevates the container below.
+                    apply_trait_floor(
+                        &mut ef_decision,
+                        ef,
+                        model.active_level(),
+                        model.grid_max(),
+                        ef["path"].as_str().unwrap_or(label),
+                    );
+                    (ef_decision, ef_model_scores, ef_skipped_models)
+                };
+
+            let full_path = ef["path"].as_str().unwrap_or("");
+            let rel_path = full_path
+                .rsplit_once("!!")
+                .map(|(_, r)| r)
+                .unwrap_or(full_path)
+                .to_string();
+            let ef_top_findings: Vec<TopFinding> = json_alias_array(ef, &["traits", "find", "ts"])
+                .into_iter()
+                .flatten()
+                .filter(|ff| crit_ordinal(ff) >= 4)
+                .take(3)
+                .map(TopFinding::from)
+                .collect();
+            EmbeddedFile {
+                // u64::MAX when the node has no id: it then matches no report
+                // node rather than falsely matching id 0 (the root).
+                id: ef["id"].as_u64().unwrap_or(u64::MAX),
+                sha256: ef["sha"].as_str().unwrap_or("").to_string(),
+                path: rel_path,
+                file_type: ef["type"].as_str().unwrap_or("unknown").to_string(),
+                classification: ef_decision.class,
+                probability: ef_decision.probability,
+                threshold: ef_decision.threshold,
+                level: ef_decision.level,
+                model_scores: ef_model_scores,
+                skipped_models: ef_skipped_models,
+                formula: json_alias_str(ef, &["mol", "f"]).unwrap_or("").to_string(),
+                top_findings: ef_top_findings,
+            }
+        })
+        .collect()
+}
+
+/// How many embedded files one report contributes to the model pass. Bounds the
+/// per-report work on an archive with thousands of members.
+///
+/// Per report, not per scan: a fetched dependency is graded on its own report and
+/// gets its own budget. Sharing the parent's — the whole merged tree competing
+/// for one allowance, dependencies appended last — meant a large package's
+/// dependencies fell off the end and came back ungraded.
+pub(crate) const EMBEDDED_FILE_LIMIT: usize = 100;
+
+/// Grade a fetched dependency on its own standalone report: the container's own
+/// verdict, elevated by its worst member. That is exactly how a first-hand scan
+/// of the same bytes resolves, which is the point — a dependency is an artifact
+/// someone else's manifest happened to name, not a region of the report it was
+/// grafted into.
+///
+/// It was previously graded by attributing the parent's embedded pass back to it,
+/// which made its verdict depend on where it landed in the parent's file list and
+/// whether the shared budget reached that far.
+///
+/// The report is parsed here and dropped on return: only the verdict outlives the
+/// call, so grading a dependency costs a transient parse rather than a retained
+/// tree — the same trade `dep_envelope` makes when it builds the POST body.
+///
+/// `None` when the report will not parse or the feature vector does not match the
+/// model; the caller reports no verdict rather than inventing one.
+fn classify_dependency(
+    raw: &str,
+    label: &str,
+    ctx: &ExtractContext,
+    model: &Model,
+    cancellation: Option<&Arc<AtomicBool>>,
+) -> Option<(Decision, MemberEvals)> {
+    let report_json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let needs = ctx.raw_needs().union(crate::features::RawNeeds::all());
+
+    // The container's own verdict. No own_shas filtering: this report is the one
+    // cleave produced for the dependency's bytes alone, before anything was
+    // grafted onto it, so every file in it is the dependency's own.
+    let parsed = crate::features::ParsedReport::from_report(&report_json, needs);
+    let mut features = ctx.extract_from_parsed(&parsed);
+    if features.len() != model.spec().total_features() {
+        return None;
+    }
+    model.spec().standardize(&mut features);
+    let pf = json_alias_array(&report_json, &["files", "fs"])
+        .and_then(|a| a.first())
+        .unwrap_or(&report_json);
+    let file_type = pf["type"].as_str().unwrap_or("unknown");
+    let (mut decision, _, _) = model
+        .predict_for_report_detailed(file_type, &features, &parsed)
+        .ok()?;
+    apply_trait_floor(
+        &mut decision,
+        &report_json,
+        model.active_level(),
+        model.grid_max(),
+        label,
+    );
+
+    // Its own members, on its own budget, elevating it as they would any
+    // container.
+    let entries: Vec<&serde_json::Value> = json_alias_array(&report_json, &["files", "fs"])
+        .into_iter()
+        .flatten()
+        .filter(|f| {
+            json_alias(f, &["depth", "dp"])
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+        })
+        .take(EMBEDDED_FILE_LIMIT)
+        .collect();
+    let mut members = MemberEvals::new();
+    for ef in score_embedded_files(&entries, label, needs, ctx, model, cancellation) {
+        let member = ef.decision();
+        if decision_outranks(&member, &decision) {
+            decision = member;
+        }
+        members.insert(ef.id, ef);
+    }
+    Some((decision, members))
+}
+
 /// Build the `/api/result` envelope for a fetched dependency: the standalone
 /// cleave report scan captured for it as `raw`, and the aggregate verdict it
 /// computed as the `ml` section — the same shape a first-hand scan of those bytes
@@ -2206,7 +2385,7 @@ pub(crate) fn dep_envelope(
     // envelope being POSTed — not for the job-long retention window.
     let raw: serde_json::Value =
         serde_json::from_str(&dep.raw).unwrap_or_else(|_| serde_json::json!({}));
-    let ml_files = build_ml_files(&raw, verdict.probability, level, &MemberEvals::new());
+    let ml_files = build_ml_files(&raw, verdict.probability, level, &dep.members);
     Some(ScanResultEnvelope {
         ml: MlSection {
             v: "7",
@@ -3082,90 +3261,8 @@ pub(crate) fn classify_report(
     // member-heavy archives that single-threaded model pass, not cleave's
     // analysis, was the scan's wall-clock tail. Per-member work is pure
     // (&Model is already shared across rayon workers by the outer scan).
-    let scored: Vec<EmbeddedFile> = {
-        use rayon::prelude::*;
-        embedded_entries
-            .par_iter()
-            .map(|&ef| {
-                // Cancellation: skip the expensive work; the post-pass bail
-                // below surfaces the cancellation before results are used.
-                let (ef_decision, ef_model_scores, ef_skipped_models) =
-                    if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                        (
-                            Decision {
-                                class: Classification::Benign,
-                                probability: 0.0,
-                                threshold: model.thresholds().suspicious,
-                                level: None,
-                            },
-                            Vec::new(),
-                            Vec::new(),
-                        )
-                    } else {
-                        let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
-                        let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
-                        model.spec().standardize(&mut ef_features);
-                        let ef_type = ef["type"].as_str().unwrap_or("unknown");
-                        let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
-                            .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
-                            .unwrap_or((
-                                Decision {
-                                    class: Classification::Benign,
-                                    probability: 0.0,
-                                    threshold: model.thresholds().suspicious,
-                                    level: None,
-                                },
-                                Vec::new(),
-                                Vec::new(),
-                            ));
-                        // Trait floor on the member's own findings — a sparse, severe
-                        // dropper (the npm install-hook beacon lives in the embedded
-                        // package.json) scores above the crit-4 fraction gate even when
-                        // the container's findings dilute it; the floored member then
-                        // elevates the container below.
-                        apply_trait_floor(
-                            &mut ef_decision,
-                            ef,
-                            model.active_level(),
-                            model.grid_max(),
-                            ef["path"].as_str().unwrap_or(label),
-                        );
-                        (ef_decision, ef_model_scores, ef_skipped_models)
-                    };
-
-                let full_path = ef["path"].as_str().unwrap_or("");
-                let rel_path = full_path
-                    .rsplit_once("!!")
-                    .map(|(_, r)| r)
-                    .unwrap_or(full_path)
-                    .to_string();
-                let ef_top_findings: Vec<TopFinding> =
-                    json_alias_array(ef, &["traits", "find", "ts"])
-                        .into_iter()
-                        .flatten()
-                        .filter(|ff| crit_ordinal(ff) >= 4)
-                        .take(3)
-                        .map(TopFinding::from)
-                        .collect();
-                EmbeddedFile {
-                    // u64::MAX when the node has no id: it then matches no report
-                    // node rather than falsely matching id 0 (the root).
-                    id: ef["id"].as_u64().unwrap_or(u64::MAX),
-                    sha256: ef["sha"].as_str().unwrap_or("").to_string(),
-                    path: rel_path,
-                    file_type: ef["type"].as_str().unwrap_or("unknown").to_string(),
-                    classification: ef_decision.class,
-                    probability: ef_decision.probability,
-                    threshold: ef_decision.threshold,
-                    level: ef_decision.level,
-                    model_scores: ef_model_scores,
-                    skipped_models: ef_skipped_models,
-                    formula: json_alias_str(ef, &["mol", "f"]).unwrap_or("").to_string(),
-                    top_findings: ef_top_findings,
-                }
-            })
-            .collect()
-    };
+    let scored: Vec<EmbeddedFile> =
+        score_embedded_files(&embedded_entries, label, needs, ctx, model, cancellation);
     if let Some(c) = cancellation
         && c.load(Ordering::Relaxed)
     {
@@ -3247,6 +3344,31 @@ pub(crate) fn classify_report(
 
     let top_findings = extract_top_findings_from_json(&report_json, &final_decision.class);
 
+    // Mirror each fetched dependency into hopper as its own sample: its standalone
+    // report plus the verdict scan computed for it. Graded on its own report by
+    // classify_dependency, not attributed back from this report's embedded pass —
+    // so its verdict is what a first-hand scan of those bytes produces, rather
+    // than a function of where it landed in the merged file list.
+    let dependency_results: Vec<DepResult> = fetched_deps
+        .into_iter()
+        .map(|dep| {
+            let graded = classify_dependency(&dep.raw, &dep.locator, ctx, model, cancellation);
+            let (verdict, members) = match graded {
+                Some((v, m)) => (Some(v), m),
+                None => (None, MemberEvals::new()),
+            };
+            DepResult {
+                verdict,
+                members,
+                sha256: dep.content_sha,
+                locator: dep.locator,
+                url: dep.url,
+                size: dep.size,
+                raw: dep.raw,
+            }
+        })
+        .collect();
+
     // LLM second opinion (root file only). Build the cleave tiny render once: it
     // feeds the model (below) and, when `SCAN_INTERPRET_DUMP_DIR` is set, is
     // written to `<dir>/<sha256>.render` — the raw (untransformed) render, so the
@@ -3262,7 +3384,7 @@ pub(crate) fn classify_report(
         // above read as archive members, and a dependency-driven elevation is
         // inexplicable to the model. Appended before sanitize so `!!` paths
         // normalize the same way as the main render.
-        if let Some(deps) = render_dependency_context(&fetch_edges, &member_evals, &report) {
+        if let Some(deps) = render_dependency_context(&fetch_edges, &dependency_results, &report) {
             rendered.push_str(&deps);
         }
         crate::interpret::sanitize_context(&rendered)
@@ -3336,7 +3458,7 @@ pub(crate) fn classify_report(
     // view extends cleave's rich render with litmus's verdict badge + subtitle;
     // `--format tiny` uses cleave's machine render verbatim.
     let render_start = Instant::now();
-    let rendered_context = if !render_context {
+    let mut rendered_context = if !render_context {
         String::new()
     } else if llm_view {
         // `--format interpret`: byte-for-byte the user message the live
@@ -3357,6 +3479,22 @@ pub(crate) fn classify_report(
     } else {
         cleave::output::format_context(&report, tiny_opts)
     };
+    // The dependency appendix goes to every text format, not just the LLM view.
+    // It is the only place a render states that a verdict was inherited from
+    // something the sample merely pointed at — naming each dependency, the
+    // locator it came from, its own classification, and its elevated findings.
+    // Terminal and tiny were left to infer all of that from grafted nodes, which
+    // is what made `--format tiny` and `--format interpret` produce the same body
+    // with only one of them explaining itself.
+    //
+    // llm_view already has it: built into llm_ctx above, before sanitize, so the
+    // bytes sent to the model stay exactly what that path renders.
+    if render_context
+        && !llm_view
+        && let Some(deps) = render_dependency_context(&fetch_edges, &dependency_results, &report)
+    {
+        rendered_context.push_str(&deps);
+    }
     let render_ms = crate::duration_ms(render_start.elapsed());
 
     // Surface the archive members cleave catalogued but never analyzed, so a
@@ -3367,23 +3505,6 @@ pub(crate) fn classify_report(
     if !listed_members.is_empty() {
         append_unanalyzed_members(&mut report_json, &listed_members);
     }
-
-    // Mirror each fetched dependency into hopper as its own sample: its standalone
-    // report plus its aggregate verdict — the worst evaluation among its own
-    // files, exactly as a first-hand scan of those bytes resolves. A dependency
-    // the embedded pass never reached (e.g. truncated by the embedded-file cap)
-    // carries no verdict; see `DepResult::verdict`.
-    let dependency_results: Vec<DepResult> = fetched_deps
-        .into_iter()
-        .map(|dep| DepResult {
-            sha256: dep.content_sha,
-            locator: dep.locator,
-            url: dep.url,
-            size: dep.size,
-            verdict: worst_for_shas(&member_evals, &dep.member_shas),
-            raw: dep.raw,
-        })
-        .collect();
 
     Ok(ClassifiedReport {
         phase_ms: PhaseTimings {
@@ -3603,7 +3724,7 @@ const MAX_DEP_FINDING_LINES: usize = 12;
 /// `None` when nothing was fetched.
 fn render_dependency_context(
     fetch_edges: &[fletch::fetch::FetchRecord],
-    member_evals: &MemberEvals,
+    deps: &[DepResult],
     report: &cleave::AnalysisReport,
 ) -> Option<String> {
     use std::fmt::Write as _;
@@ -3619,14 +3740,20 @@ fn render_dependency_context(
     out.push_str(
         "\n== FETCHED DEPENDENCIES ==\n\
          The scan followed references declared by this sample and retrieved the content below.\n\
-         Each payload was analyzed and appears above under a synthetic path — these files are\n\
+         Each payload was analyzed and appears above under its locator — these files are\n\
          EXTERNAL retrieved content, not members of the sample's own archive. A hostile or\n\
          suspicious dependency elevates the sample's verdict (fetch/dependency-verdict).\n",
     );
     for rec in landed {
         let content_sha = rec.content_sha256.as_deref().unwrap_or_default();
         let root = report.files.iter().find(|f| f.sha256 == content_sha);
-        let eval = member_evals.values().find(|ef| ef.sha256 == content_sha);
+        // The verdict scan computed for this dependency, from the same graded
+        // results it uploads. Reading it from the parent's embedded pass instead
+        // made the render disagree with the record: that pass is bounded by the
+        // parent's budget and ordered by the merged file list, so a dependency it
+        // never reached printed no classification at all — the appendix read as
+        // if the dependency were unremarkable.
+        let graded = deps.iter().find(|d| d.sha256 == content_sha);
         let _ = writeln!(out, "\ndependency: {}", rec.locator);
         if !rec.resolved_url.is_empty() && rec.resolved_url != rec.locator {
             let _ = writeln!(out, "  resolved url: {}", rec.resolved_url);
@@ -3649,13 +3776,19 @@ fn render_dependency_context(
         if let Some(root) = root {
             let _ = writeln!(out, "  analyzed above as: {}", root.path);
         }
-        if let Some(ef) = eval {
-            let class = match ef.classification {
-                Classification::Hostile => "hostile",
-                Classification::Suspicious => "suspicious",
-                Classification::Benign => "benign",
-            };
-            let _ = writeln!(out, "  classification: {class} (p={:.2})", ef.probability);
+        match graded.and_then(|d| d.verdict) {
+            Some(v) => {
+                let class = match v.class {
+                    Classification::Hostile => "hostile",
+                    Classification::Suspicious => "suspicious",
+                    Classification::Benign => "benign",
+                };
+                let _ = writeln!(out, "  classification: {class} (p={:.2})", v.probability);
+            }
+            // Say so rather than printing nothing: an ungraded dependency and an
+            // unremarkable one are different, and only one of them is a coverage
+            // gap worth chasing.
+            None => out.push_str("  classification: not evaluated\n"),
         }
         let Some(root) = root else { continue };
         // The dependency's own elevated findings: the root node plus every
@@ -3709,6 +3842,267 @@ fn ref_kind_phrase(kind: &fletch::RefKind) -> &'static str {
         fletch::RefKind::Repository => "named as the source repository",
         fletch::RefKind::Local => "a local reference",
         _ => "referenced",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod dependency_grading_tests {
+    use super::*;
+
+    /// Grading needs a real model to score against. Point SCAN_MODELS_DIR at a
+    /// bundle to run these; without one there is nothing to exercise, so they
+    /// skip rather than fail. Mirrors the SCAN_ONNX_BUNDLE convention in
+    /// tests/backend_dispatch.rs.
+    fn model_bundle() -> Option<std::path::PathBuf> {
+        let p = std::env::var("SCAN_MODELS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/home/t/azoth/filetypes/npm"));
+        (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
+    }
+
+    /// One dependency node, plus `members` javascript members beneath it.
+    fn dep_report(members: usize, member_traits: &str) -> String {
+        let files: Vec<serde_json::Value> = std::iter::once(serde_json::json!({
+            "id": 0, "sha": "d".repeat(64), "type": "npm", "dp": 0, "path": "evil-1.0.0.tgz"
+        }))
+        .chain((0..members).map(|i| {
+            let mut f = serde_json::json!({
+                "id": i + 1, "sha": format!("{:064x}", i), "type": "javascript",
+                "dp": 1, "path": format!("evil-1.0.0.tgz!!lib/{i}.js"),
+            });
+            if !member_traits.is_empty() {
+                f["traits"] = serde_json::from_str(member_traits).unwrap();
+            }
+            f
+        }))
+        .collect();
+        serde_json::json!({"v": "8", "files": files}).to_string()
+    }
+
+    /// The regression this whole path exists for: a dependency is graded from its
+    /// own report, so it comes back with a verdict. It used to be graded by
+    /// attributing the parent's embedded pass back to it, and one that fell
+    /// outside the parent's shared budget got no evaluation at all — which was
+    /// then uploaded as a confident benign.
+    #[test]
+    fn grades_a_dependency_on_its_own_report() {
+        let Some(dir) = model_bundle() else {
+            eprintln!("skipping: no model bundle (set SCAN_MODELS_DIR)");
+            return;
+        };
+        let model = Model::load(&dir, None, None).expect("load model bundle");
+        let ctx = ExtractContext::new(model.spec());
+
+        // Far more members than one report's budget: previously the tail of a
+        // merged report went ungraded, now the budget is this report's own.
+        let raw = dep_report(EMBEDDED_FILE_LIMIT * 2, "");
+        let verdict = classify_dependency(&raw, "pkg:npm/evil@1.0.0", &ctx, &model, None);
+        assert!(
+            verdict.is_some(),
+            "a well-formed dependency report must produce a verdict, never silence",
+        );
+    }
+
+    /// A report that will not parse yields no verdict. The caller then uploads the
+    /// bytes and posts nothing, leaving hopper to grade it — rather than inventing
+    /// a benign that would be indistinguishable from a real evaluation.
+    #[test]
+    fn declines_to_grade_an_unparseable_report() {
+        let Some(dir) = model_bundle() else {
+            eprintln!("skipping: no model bundle (set SCAN_MODELS_DIR)");
+            return;
+        };
+        let model = Model::load(&dir, None, None).expect("load model bundle");
+        let ctx = ExtractContext::new(model.spec());
+        assert!(
+            classify_dependency("{not json", "pkg:npm/x@1", &ctx, &model, None).is_none(),
+            "an unparseable report must yield no verdict",
+        );
+    }
+
+    /// Members elevate their container: a dependency whose members carry confident
+    /// hostile findings must not rank below the same dependency with clean ones.
+    /// Relative, not absolute — the thresholds are the model's business.
+    #[test]
+    fn severe_members_do_not_rank_below_clean_ones() {
+        let Some(dir) = model_bundle() else {
+            eprintln!("skipping: no model bundle (set SCAN_MODELS_DIR)");
+            return;
+        };
+        let model = Model::load(&dir, None, None).expect("load model bundle");
+        let ctx = ExtractContext::new(model.spec());
+
+        let (clean, _) = classify_dependency(&dep_report(3, ""), "pkg:npm/a@1", &ctx, &model, None)
+            .expect("clean report grades");
+        let (severe, _) = classify_dependency(
+            &dep_report(3, r#"[{"crit":5,"conf":1.0},{"crit":5,"conf":0.98}]"#),
+            "pkg:npm/b@1",
+            &ctx,
+            &model,
+            None,
+        )
+        .expect("severe report grades");
+
+        assert!(
+            !decision_outranks(&clean, &severe),
+            "clean members outranked hostile ones: clean={:?} severe={:?}",
+            clean.class,
+            severe.class,
+        );
+    }
+
+    /// The dependency backref is a conclusion about *another* artifact, pinned
+    /// onto the file that named it. It must never reach featurization: a
+    /// synthetic crit-5 trait describing someone else's bytes, fed as a feature
+    /// of these ones, teaches the model that declaring dependencies is itself
+    /// malicious.
+    ///
+    /// Nothing in the types enforces that — it holds only because the injection
+    /// sits after the feature pass in classify_report. This pins the ordering so
+    /// a future edit that moves either one fails here instead of silently
+    /// contaminating training data. Delete this test only by making the
+    /// distinction explicit in the trait itself.
+    #[test]
+    fn dependency_backref_is_injected_after_featurization() {
+        let src = include_str!("engine.rs");
+        let featurize = src
+            .find("let parsed = crate::features::ParsedReport::from_report(&root_json, needs);")
+            .expect("root featurization call");
+        let inject = src
+            .find("inject_dependency_backref(&mut report_json, &report, backref);")
+            .expect("backref injection call");
+        assert!(
+            featurize < inject,
+            "dependency backrefs are injected before featurization — the model would \
+             train on synthetic traits describing other artifacts",
+        );
+    }
+
+    /// The acceptance test for the whole dependency path: what hopper stores for
+    /// a fetched dependency must be the same *shape* as what it stores when the
+    /// same bytes are scanned directly with `scan purl`. Anything a first-hand
+    /// scan fills and the dependency path leaves empty is a field hopper, the
+    /// bloom pool, and prism silently lose for every dependency.
+    ///
+    /// Shape, not values: the two paths legitimately differ in what they measure
+    /// (a dependency borrows the parent run's model version and timestamp, and
+    /// carries no LLM interpretation — the interpret pass runs on the root only).
+    /// Those are asserted as *known* differences, so adding a new one has to be
+    /// deliberate rather than accidental.
+    #[test]
+    fn dependency_envelope_matches_a_direct_scan() {
+        let Some(dir) = model_bundle() else {
+            eprintln!("skipping: no model bundle (set SCAN_MODELS_DIR)");
+            return;
+        };
+        let model = Model::load(&dir, None, None).expect("load model bundle");
+        let ctx = ExtractContext::new(model.spec());
+
+        let raw = dep_report(3, r#"[{"crit":5,"conf":1.0}]"#);
+        let (verdict, members) =
+            classify_dependency(&raw, "pkg:npm/evil@1.0.0", &ctx, &model, None)
+                .expect("dependency grades");
+
+        let dep = DepResult {
+            sha256: "d".repeat(64),
+            locator: "pkg:npm/evil@1.0.0".to_string(),
+            url: "https://reg.test/evil-1.0.0.tgz".to_string(),
+            size: 1234,
+            verdict: Some(verdict),
+            members,
+            raw: raw.clone(),
+        };
+        let dep_env = dep_envelope(&dep, "model-9", "2026-06-28T00:00:00Z")
+            .expect("a graded dependency yields an envelope");
+
+        // The same bytes as a first-hand scan would produce them.
+        let direct = ScanResult {
+            v: "7",
+            classification: verdict.class,
+            probability: verdict.probability,
+            threshold: verdict.threshold,
+            level: verdict.level,
+            version: "model-9".to_string(),
+            analyzed_at: "2026-06-28T00:00:00Z".to_string(),
+            cleave: Some(serde_json::from_str(&raw).expect("report parses")),
+            embedded_files: dep.members.clone(),
+            ..crate::engine::envelope_tests::base_result()
+        };
+        let direct_env = direct.to_envelope();
+
+        assert_eq!(
+            dep_env.ml.level, direct_env.ml.level,
+            "verdict marker must match a direct scan",
+        );
+        assert_eq!(
+            dep_env.ml.probability, direct_env.ml.probability,
+            "probability must match a direct scan",
+        );
+        assert_eq!(
+            dep_env.ml.conf, direct_env.ml.conf,
+            "confidence must match a direct scan",
+        );
+        assert_eq!(
+            dep_env.raw, direct_env.raw,
+            "the stored report must be the dependency's own, unmodified",
+        );
+
+        // The regression this test exists for: ml.files carried no verdicts for a
+        // dependency's members, because the envelope was built with an empty eval
+        // table. hopper mirrors these into each member's own sample row, so every
+        // member of every dependency was stored ungraded.
+        assert_eq!(
+            dep_env.ml.files, direct_env.ml.files,
+            "per-member verdicts must match a direct scan",
+        );
+        assert!(
+            dep_env.ml.files.iter().any(|f| f.get("prob").is_some()),
+            "at least one member must carry a verdict: {:?}",
+            dep_env.ml.files,
+        );
+
+        // Known, deliberate differences. A dependency borrows the parent run's
+        // identity because it was graded by that run, and the interpret pass runs
+        // on the root only.
+        assert!(
+            dep_env.llm.is_none(),
+            "dependencies carry no interpretation"
+        );
+        assert_eq!(dep_env.ml.version, direct_env.ml.version);
+        assert_eq!(dep_env.ml.analyzed_at, direct_env.ml.analyzed_at);
+    }
+
+    /// A dependency's own budget is per report, so a report far larger than the
+    /// limit still contributes exactly the limit — rather than whatever was left
+    /// after the parent's members had taken theirs.
+    #[test]
+    fn embedded_budget_is_per_report() {
+        let members: Vec<serde_json::Value> = (0..EMBEDDED_FILE_LIMIT * 3)
+            .map(|i| serde_json::json!({"id": i + 1, "sha": "m".repeat(64), "type": "javascript", "dp": 1}))
+            .collect();
+        let report = serde_json::json!({
+            "v": "8",
+            "files": std::iter::once(serde_json::json!({"id": 0, "sha": "d".repeat(64), "type": "npm", "dp": 0}))
+                .chain(members)
+                .collect::<Vec<_>>(),
+        });
+        let entries: Vec<&serde_json::Value> = json_alias_array(&report, &["files", "fs"])
+            .into_iter()
+            .flatten()
+            .filter(|f| {
+                json_alias(f, &["depth", "dp"])
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+            })
+            .take(EMBEDDED_FILE_LIMIT)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            EMBEDDED_FILE_LIMIT,
+            "a dependency grades its own members up to its own limit",
+        );
     }
 }
 
@@ -3844,7 +4238,7 @@ mod dep_backref_tests {
     /// under a synthetic path with a member of its own.
     fn dep_render_fixture() -> (
         Vec<fletch::fetch::FetchRecord>,
-        MemberEvals,
+        Vec<DepResult>,
         cleave::AnalysisReport,
     ) {
         let mk_file =
@@ -3901,25 +4295,24 @@ mod dep_backref_tests {
             "outcome": "ok",
         }))
         .unwrap();
-        let mut evals = MemberEvals::new();
-        evals.insert(
-            3,
-            EmbeddedFile {
-                id: 3,
-                sha256: "d".repeat(64),
-                path: "d420381f-dep".to_string(),
-                file_type: "archive".to_string(),
-                classification: Classification::Hostile,
+        // The graded dependency, as classify_dependency produced it — the same
+        // results the upload path posts, so the render and the record cannot
+        // disagree.
+        let deps = vec![DepResult {
+            sha256: "d".repeat(64),
+            locator: "https://example.com/dep-1.0.tar.gz".to_string(),
+            url: "https://example.com/dep-1.0.tar.gz".to_string(),
+            size: 0,
+            verdict: Some(Decision {
+                class: Classification::Hostile,
                 probability: 0.97,
                 threshold: 0.5,
                 level: None,
-                model_scores: Vec::new(),
-                skipped_models: Vec::new(),
-                formula: String::new(),
-                top_findings: Vec::new(),
-            },
-        );
-        (vec![edge], evals, report)
+            }),
+            members: MemberEvals::new(),
+            raw: "{}".to_string(),
+        }];
+        (vec![edge], deps, report)
     }
 
     /// The appendix names the locator, the declaring file + reference kind +
@@ -3928,8 +4321,8 @@ mod dep_backref_tests {
     /// findings and the sample's own files stay out of it.
     #[test]
     fn dependency_context_names_locator_reference_and_elevated_findings() {
-        let (edges, evals, report) = dep_render_fixture();
-        let ctx = render_dependency_context(&edges, &evals, &report).unwrap();
+        let (edges, deps, report) = dep_render_fixture();
+        let ctx = render_dependency_context(&edges, &deps, &report).unwrap();
         for want in [
             "== FETCHED DEPENDENCIES ==",
             "dependency: https://example.com/dep-1.0.tar.gz",
@@ -3953,14 +4346,31 @@ mod dep_backref_tests {
         );
     }
 
+    /// A dependency scan could not grade says so, rather than printing nothing.
+    /// The appendix used to read its verdict from the parent's embedded pass,
+    /// which is bounded by the parent's budget — so a dependency that pass never
+    /// reached silently lost its classification line and read as unremarkable.
+    /// Now the render and the uploaded record share one source, so the only way
+    /// to omit a verdict is for there genuinely not to be one.
+    #[test]
+    fn dependency_context_says_when_a_dependency_was_not_graded() {
+        let (edges, mut deps, report) = dep_render_fixture();
+        deps[0].verdict = None;
+        let ctx = render_dependency_context(&edges, &deps, &report).unwrap();
+        assert!(
+            ctx.contains("classification: not evaluated"),
+            "an ungraded dependency must be named as such, got: {ctx:?}",
+        );
+    }
+
     /// No landed fetches → no appendix; an edge whose fetch failed (no
     /// content sha) contributes nothing.
     #[test]
     fn dependency_context_absent_without_landed_fetches() {
-        let (mut edges, evals, report) = dep_render_fixture();
-        assert!(render_dependency_context(&[], &evals, &report).is_none());
+        let (mut edges, deps, report) = dep_render_fixture();
+        assert!(render_dependency_context(&[], &deps, &report).is_none());
         edges[0].content_sha256 = None;
-        assert!(render_dependency_context(&edges, &evals, &report).is_none());
+        assert!(render_dependency_context(&edges, &deps, &report).is_none());
     }
 }
 
@@ -3997,7 +4407,7 @@ pub(crate) fn process_report(
         model,
         shap,
         cancellation,
-        Some(100),
+        Some(EMBEDDED_FILE_LIMIT),
         &tiny_opts_for(config),
         config.interpret(),
         // `--format interpret` emits byte-for-byte what a live `--interpret`

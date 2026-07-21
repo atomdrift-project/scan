@@ -1023,7 +1023,7 @@ fn finish_classify(
         &resources.model,
         resources.shap.as_ref(),
         cancellation,
-        Some(100),
+        Some(crate::engine::EMBEDDED_FILE_LIMIT),
         &cleave::output::TinyOpts::tiny(),
         resources.interpret.as_ref(),
         false, // server returns JSON; the LLM-payload view is CLI-only

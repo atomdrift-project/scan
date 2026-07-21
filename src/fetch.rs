@@ -429,9 +429,6 @@ pub(crate) struct FetchedDependency {
     /// ~800 MB of retained `Value`s on the realworld worker benchmark. The
     /// envelope build parses it back transiently.
     pub raw: String,
-    /// Every file sha in the report, so the caller can attribute the embedded
-    /// pass's per-node decisions back to this dependency.
-    pub member_shas: Vec<String>,
 }
 
 /// Discover, fetch, and graft, following references up to `policy.depth` hops.
@@ -934,7 +931,6 @@ fn capture_dependency(rec: &FetchRecord, analyzed: &Analyzed) -> Option<FetchedD
     if analyzed.content_sha.is_empty() {
         return None;
     }
-    let member_shas: Vec<String> = sub.files.iter().map(|f| f.sha256.clone()).collect();
     let compact = cleave::types::compact::compact_from_files(&sub.files);
     let raw = serde_json::to_string(&compact).ok()?;
     let url = rec
@@ -947,7 +943,6 @@ fn capture_dependency(rec: &FetchRecord, analyzed: &Analyzed) -> Option<FetchedD
         content_sha: analyzed.content_sha.clone(),
         size: rec.size.unwrap_or(0),
         raw,
-        member_shas,
     })
 }
 
@@ -1909,6 +1904,27 @@ fn merge_payload(
         rec.resolved_url.as_str()
     };
     let via = (!via_str.is_empty()).then(|| via_str.to_string());
+    // Name the subtree for what it is. cleave named these from payload_name — the
+    // URL's basename, which it needs for extension type detection but which says
+    // nothing about origin. In the merged report that left a fetched dependency
+    // indistinguishable from an archive member, and put two dependencies whose
+    // URLs end in the same basename (index.js, package.tgz, download) under one
+    // path, so anything keyed on path merged them.
+    //
+    // The locator is unique per dependency and is what a reader recognizes.
+    // Rewritten across the whole subtree, not just its root, so members stay
+    // attached to it — the appendix and every other per-path lookup walk a
+    // "<root>!!" prefix. Merged report only: the standalone report captured for
+    // hopper was taken before this and keeps cleave's own naming.
+    let old_root = sub
+        .files
+        .iter()
+        .find(|f| f.parent_id.is_none())
+        .map(|f| f.path.clone());
+    let rename = old_root
+        .filter(|old| !old.is_empty() && !rec.locator.is_empty())
+        .map(|old| (format!("{old}!!"), old, rec.locator.clone()));
+
     let first_new = report.files.len();
     for mut file in sub.files {
         // The payload's own top node (the sub-report's root) is a fetched edge:
@@ -1918,6 +1934,13 @@ fn merge_payload(
         file.id += id_base;
         file.parent_id = Some(file.parent_id.map_or(parent_id, |p| p + id_base));
         file.depth += parent_depth + 1;
+        if let Some((old_prefix, old, locator)) = &rename {
+            if file.path == *old {
+                file.path.clone_from(locator);
+            } else if let Some(rest) = file.path.strip_prefix(old_prefix.as_str()) {
+                file.path = format!("{locator}!!{rest}");
+            }
+        }
         if is_sub_root {
             file.rel = cleave::types::Rel::Fetched;
             file.via = via.clone();
@@ -2345,6 +2368,79 @@ mod tests {
         assert_eq!(
             empty,
             vec![("rootsha".to_string(), vec![url_ref("https://c.test/z")])]
+        );
+    }
+
+    /// A fetched subtree is renamed to its locator — root and members alike — so
+    /// the merged report says where the bytes came from, and so two dependencies
+    /// whose URLs end in the same basename stay distinct. Anything keyed on path
+    /// (the dependency appendix walks a "<root>!!" prefix) merged them before.
+    #[test]
+    fn merge_payload_renames_the_subtree_to_its_locator() {
+        let sub_report = |name: &str| -> AnalysisReport {
+            serde_json::from_value(serde_json::json!({
+                "version": "3",
+                "files": [
+                    {"id": 0, "path": name, "depth": 0, "file_type": "npm",
+                     "sha256": "d".repeat(64), "size": 64u64},
+                    {"id": 1, "parent_id": 0, "path": format!("{name}!!lib/a.js"), "depth": 1,
+                     "file_type": "javascript", "sha256": "e".repeat(64), "size": 32u64},
+                ],
+            }))
+            .expect("sub report")
+        };
+        let rec_for = |locator: &str, url: &str| FetchRecord {
+            source_sha256: String::new(),
+            source_offset: None,
+            kind: RefKind::Dependency,
+            locator: locator.to_string(),
+            resolved_url: url.to_string(),
+            final_url: None,
+            redirects: Vec::new(),
+            status: None,
+            headers: Vec::new(),
+            fetched_at: 0,
+            content_sha256: Some("d".repeat(64)),
+            size: None,
+            cached: false,
+            stale: false,
+            pin_verified: None,
+            outcome: Outcome::Ok,
+        };
+
+        let mut report: AnalysisReport =
+            serde_json::from_value(serde_json::json!({"version": "3", "files": []}))
+                .expect("root report");
+
+        // Two dependencies whose URLs share a basename — the collision case.
+        for (locator, url) in [
+            ("pkg:npm/alpha@1.0.0", "https://a.test/index.js"),
+            ("pkg:npm/beta@2.0.0", "https://b.test/index.js"),
+        ] {
+            merge_payload(
+                &mut report,
+                &rec_for(locator, url),
+                Analyzed {
+                    sub: Some(sub_report("index.js")),
+                    content_sha: "d".repeat(64),
+                    next_from_bytes: Vec::new(),
+                },
+            );
+        }
+
+        let paths: Vec<&str> = report.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            paths.contains(&"pkg:npm/alpha@1.0.0") && paths.contains(&"pkg:npm/beta@2.0.0"),
+            "each dependency root is named by its locator: {paths:?}",
+        );
+        assert!(
+            paths.contains(&"pkg:npm/alpha@1.0.0!!lib/a.js")
+                && paths.contains(&"pkg:npm/beta@2.0.0!!lib/a.js"),
+            "members follow their root, so prefix lookups still reach them: {paths:?}",
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("index.js")),
+            "no node keeps the URL basename that made the two collide: {paths:?}",
         );
     }
 

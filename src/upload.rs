@@ -821,6 +821,7 @@ mod tests {
             url: "https://example/x-1.tgz".to_string(),
             size: 99,
             verdict: None,
+            members: crate::engine::MemberEvals::new(),
             raw: "{}".to_string(),
         };
         let art = dep_artifact(&dep, "scan+test", "2026-06-28T00:00:00Z");
