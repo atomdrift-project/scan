@@ -1676,7 +1676,7 @@ fn collect_references(report: &AnalysisReport, root_path: &Path) -> Vec<(String,
         // Module-load calls from the member's retained AST symbols — the
         // facts-only import vector, so `require("undeclared-pkg")` inside an
         // archive member is hunted without re-extracting its discarded bytes.
-        refs.extend(find::import_calls(&view.symbols));
+        refs.extend(find::import_calls(&file.file_type, &view.symbols));
         if refs.is_empty() {
             continue;
         }

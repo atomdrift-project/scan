@@ -226,6 +226,19 @@ impl MemoryAdmission {
         self.ceiling_bytes
     }
 
+    /// The sha256 of every analysis currently in flight. Reported on the worker
+    /// heartbeat so hopper can renew these claims' leases: a multi-hour scan
+    /// must not have its claim expire and be re-issued to another worker.
+    pub fn in_flight_shas(&self) -> Vec<Arc<str>> {
+        #[allow(clippy::expect_used)]
+        self.inflight
+            .lock()
+            .expect("admission registry mutex poisoned")
+            .iter()
+            .map(|j| Arc::clone(&j.sha256))
+            .collect()
+    }
+
     /// is the hopper-reported size, recorded only for the per-slot diagnostics.
     pub async fn admit(
         self: &Arc<Self>,

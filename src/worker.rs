@@ -1698,6 +1698,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     last_want: poll_state.last_want.load(Ordering::Acquire),
                     last_claim: poll_state.last_claim.load(Ordering::Acquire),
                     buffer_room: poll_state.buffer_room.load(Ordering::Acquire),
+                    active_shas: admission.in_flight_shas(),
                     metrics: metrics.snapshot(),
                 };
                 let url = heartbeat_url(&base_url, &encoded_name, &available_tools, &report);
@@ -2974,6 +2975,9 @@ struct HeartbeatReport {
     last_want: usize,
     last_claim: usize,
     buffer_room: usize,
+    /// sha256 of every in-flight analysis, so hopper renews their claim leases
+    /// and a multi-hour scan is not re-claimed mid-flight.
+    active_shas: Vec<Arc<str>>,
     metrics: MetricsSnapshot,
 }
 
@@ -2994,6 +2998,17 @@ fn heartbeat_url(
         report.queue,
         env!("CARGO_PKG_VERSION"),
     );
+    // In-progress sha256s (hex, comma-separated) so hopper renews their claim
+    // leases. Bounded by slot count, so the query stays short.
+    if !report.active_shas.is_empty() {
+        let joined = report
+            .active_shas
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect::<Vec<&str>>()
+            .join(",");
+        let _ = write!(url, "&active_shas={joined}");
+    }
     // 5-char prefix matches hopper's litmusTraitsVersion() truncation so the
     // dashboard's stale-traits comparison can string-equal the two.
     if let Some(traits) = cleave::traits_repo::version() {
