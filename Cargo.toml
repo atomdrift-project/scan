@@ -1,5 +1,7 @@
 [workspace]
-resolver = "2"
+# resolver 3 is MSRV-aware: it will not select a dependency version whose
+# rust-version exceeds ours, so `cargo update` stays buildable on 1.94.
+resolver = "3"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -50,6 +52,9 @@ name = "atomdrift-scan"
 version = "2.3.1-beta.0"
 default-run = "atomscan"
 edition = "2024"
+# Build on any rustc within ~2 releases of current stable. Drives the
+# MSRV-aware resolver above; raise deliberately, not by accident.
+rust-version = "1.94"
 authors = ["The Atomdrift Project"]
 description = "ML-powered malware classification using cleave static analysis"
 license = "Apache-2.0"
