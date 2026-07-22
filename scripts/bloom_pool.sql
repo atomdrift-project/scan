@@ -11,10 +11,12 @@
 --   good = explicitly labelled good with NO hostile finding   (max_crit < 5)
 --   bad  = labelled bad AND carrying a suspicious-or-hostile finding (max_crit >= 4)
 --
--- Only top-level samples (parent = ''): archive members carry no independent
--- label. A versioned PURL is emitted only when both the version-less identity
--- (purl_base) and a concrete version are known, so a good bless is pinned to the
--- exact release the scanner will look up; otherwise the row contributes by sha256.
+-- Include top-level samples (parent = '') plus executable samples large enough
+-- to be useful as standalone SHA256 bloom keys. Archive members otherwise carry
+-- no independent label. A versioned PURL is emitted only when both the
+-- version-less identity (purl_base) and a concrete version are known, so a good
+-- bless is pinned to the exact release the scanner will look up; otherwise the
+-- row contributes by sha256.
 -- The '@version' splices in *before* any '?qualifiers' the purl_base carries
 -- (purl-spec order — e.g. an older AUR purl_base ends in ?repository_url=…);
 -- a plain purl_base || '@' || version would misplace the version for those.
@@ -44,7 +46,8 @@ SELECT json_build_object(
          'sha256', sha256,
          'label', label)
 FROM samples
-WHERE parent = ''
+WHERE (parent = ''
+    OR (file_type IN ('elf', 'macho', 'pe') AND size_bytes > 25 * 1024))
   AND analyzed_at >= now() - make_interval(days => :max_age_days)
   AND ( (label = 'good' AND max_crit < 5)
      OR (label = 'bad'  AND max_crit >= 4) );
