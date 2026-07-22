@@ -69,10 +69,16 @@ const GIB: u64 = 1024 * MIB;
 /// response larger than this is abandoned, so one artifact can't dominate a run.
 pub const DEFAULT_MAX_FETCH_SIZE: u64 = 256 * MIB;
 
-/// Default ceiling on *live* fetches triggered by a single scanned file
+/// Default ceiling on *live* non-URL fetches triggered by a single scanned file
 /// (`--fetch-max-file-fetches`). Cache hits don't count, so a warm re-run is
-/// never throttled; this bounds the fan-out one crafted file can trigger.
+/// never throttled; this bounds the dependency/package fan-out one crafted file
+/// can trigger.
 pub const DEFAULT_MAX_FILE_FETCHES: usize = 100;
+
+/// Default ceiling on *live* opportunistic URL fetches triggered by a single
+/// scanned file (`--fetch-max-urls`). Cache hits don't count, so a warm re-run
+/// is never throttled.
+pub const DEFAULT_MAX_URL_FETCHES: usize = 4;
 
 /// Default ceiling on total bytes fetched on behalf of a single scanned file
 /// (`--fetch-max-file-size`).
@@ -124,6 +130,17 @@ fn charge_total_budget(fetches: usize, bytes: u64) {
     let _ = TOTAL_FETCH_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_sub(bytes))
     });
+}
+
+/// Count the live network work represented by a batch. Cache hits and
+/// budget-clipped edges are intentionally free of both process-wide budgets.
+fn live_fetch_usage(records: &[FetchRecord]) -> (usize, u64) {
+    records
+        .iter()
+        .filter(|record| fletch::fetch::counts_against_budget(record))
+        .fold((0, 0), |(fetches, bytes), record| {
+            (fetches + 1, bytes.saturating_add(record.size.unwrap_or(0)))
+        })
 }
 
 /// Parse a byte size with an optional 1024-based unit suffix — `K`, `M`, `G`, or
@@ -216,9 +233,14 @@ pub struct FetchPolicy {
     pub max_dep_age_days: u32,
     /// Ceiling on *live* fetches triggered by a single scanned file
     /// (`--fetch-max-file-fetches`). Cache hits are always served and never
-    /// counted, so this caps only the cold-cache network fan-out, never a warm
-    /// re-run. `0` disables fetching entirely.
+    /// counted, so this caps only the cold-cache dependency/package fan-out,
+    /// never a warm re-run. `0` disables these fetches entirely.
     pub max_file_fetches: usize,
+    /// Ceiling on *live* opportunistic raw-URL fetches triggered by a single
+    /// scanned file (`--fetch-max-urls`). Cache hits are always served and
+    /// never counted. `0` disables opportunistic URL fetching while leaving
+    /// declared dependencies and command-mentioned packages unaffected.
+    pub max_url_fetches: usize,
     /// Ceiling on total bytes fetched on behalf of a single scanned file
     /// (`--fetch-max-file-size`). The sweep stops once retrieved bytes cross it.
     pub max_file_bytes: u64,
@@ -244,6 +266,7 @@ impl Default for FetchPolicy {
             depth: DEFAULT_FETCH_DEPTH,
             max_dep_age_days: DEFAULT_MAX_DEP_AGE_DAYS,
             max_file_fetches: DEFAULT_MAX_FILE_FETCHES,
+            max_url_fetches: DEFAULT_MAX_URL_FETCHES,
             max_file_bytes: DEFAULT_MAX_FILE_SIZE,
             host_platform_only: true,
         }
@@ -621,17 +644,15 @@ pub(crate) fn orchestrate(
             if selected.is_empty() {
                 continue;
             }
-            // This file's ceiling, clamped to what the per-execution budget still
-            // allows. The total budget is a process global, so concurrent scans
-            // share one running total.
-            let budget = FetchBudget {
-                max_count: policy
-                    .max_file_fetches
-                    .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
-                max_bytes: policy
-                    .max_file_bytes
-                    .min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
-            };
+            // URL fetches have a deliberately smaller independent fan-out cap
+            // than declared dependencies and command-mentioned packages. Split
+            // the groups so fletch's per-call count budget can enforce both
+            // ceilings without making one category consume the other's slots.
+            let (url_selected, dep_selected): (Vec<Reference>, Vec<Reference>) = selected
+                .iter()
+                .cloned()
+                .partition(|r| r.kind == RefKind::UrlFetch);
+
             // Mark the to-fetch set in flight, then fetch. The callback fires as
             // each download lands (from a pool worker, so it's `Sync`), flipping
             // that row to "analyzing" the moment its bytes arrive rather than when
@@ -639,24 +660,71 @@ pub(crate) fn orchestrate(
             // reference, since a versionless locator may be refined during fetch.
             reporter.fetching(&selected);
             let on_fetched = |r: &Reference, rec: &FetchRecord| reporter.landed(r, rec);
-            let fetched = fetch_references_with(
-                &selected,
+            let mut file_bytes_remaining = policy.max_file_bytes;
+
+            // Dependencies/packages get the larger cap. Charge this group before
+            // starting URLs so the process-wide budget is also respected between
+            // the two independent fletch calls.
+            let dep_budget = FetchBudget {
+                max_count: policy
+                    .max_file_fetches
+                    .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
+                max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
+            };
+            let dep_fetched = fetch_references_with(
+                &dep_selected,
                 &source_sha,
-                policy.urls,
+                false,
                 &res.net,
                 &res.cache,
-                budget,
+                dep_budget,
                 &on_fetched,
             );
-            // Charge the per-execution budget for what this file fetched live.
-            // Only live fetches count (cache hits are free); a `BudgetExceeded`
-            // edge consumes nothing.
-            let spent = fetched
-                .iter()
-                .filter(|r| fletch::fetch::counts_against_budget(r))
-                .count();
-            let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
-            charge_total_budget(spent, bytes);
+            let (dep_spent, dep_bytes) = live_fetch_usage(&dep_fetched);
+            charge_total_budget(dep_spent, dep_bytes);
+            file_bytes_remaining = file_bytes_remaining.saturating_sub(dep_bytes);
+
+            // Opportunistic raw URLs get their own, smaller cap. A URL that is
+            // expressed as a declared dependency or command-mentioned package
+            // was kept in `dep_selected` and therefore follows the 100 cap.
+            let url_budget = FetchBudget {
+                max_count: policy
+                    .max_url_fetches
+                    .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
+                max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
+            };
+            let url_fetched = fetch_references_with(
+                &url_selected,
+                &source_sha,
+                true,
+                &res.net,
+                &res.cache,
+                url_budget,
+                &on_fetched,
+            );
+            let (url_spent, url_bytes) = live_fetch_usage(&url_fetched);
+            charge_total_budget(url_spent, url_bytes);
+
+            // Reassemble in the original declaration order. Each fletch call
+            // preserves order within its category, and the two iterators restore
+            // the order expected by the analysis/grafting pass below.
+            let mut dep_iter = dep_fetched.into_iter();
+            let mut url_iter = url_fetched.into_iter();
+            let mut fetched = Vec::with_capacity(selected.len());
+            for r in &selected {
+                if r.kind == RefKind::UrlFetch {
+                    if let Some(record) = url_iter.next() {
+                        fetched.push(record);
+                    }
+                } else if let Some(record) = dep_iter.next() {
+                    fetched.push(record);
+                }
+            }
+            debug_assert_eq!(
+                fetched.len(),
+                selected.len(),
+                "grouped fetch results must align with selected refs"
+            );
 
             // Authoritative pass over every returned edge: settle each row (the
             // tree finalizes any budget-clipped edge the live callback never saw;
@@ -2239,6 +2307,14 @@ mod tests {
         assert_eq!(
             "deps".parse::<FetchPolicy>().unwrap().depth,
             DEFAULT_FETCH_DEPTH
+        );
+        assert_eq!(
+            FetchPolicy::default().max_file_fetches,
+            DEFAULT_MAX_FILE_FETCHES
+        );
+        assert_eq!(
+            FetchPolicy::default().max_url_fetches,
+            DEFAULT_MAX_URL_FETCHES
         );
         assert!("".parse::<FetchPolicy>().is_err());
         assert!("sigs".parse::<FetchPolicy>().is_err());

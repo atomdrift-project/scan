@@ -177,12 +177,11 @@ struct Cli {
     ///                by a build/lifecycle script rather than pinned;
     ///   `urls`     — raw URLs with no package identity (curl/wget targets,
     ///                staged downloads), the largest exposure.
-    /// `all` (or a bare `--fetch`) selects every kind. When omitted, an
-    /// interactive scan defaults to `deps,packages` (the references bound to the
-    /// artifact, not raw URLs); a worker defaults to `all`. Also settable per
-    /// deployment via the `SCAN_FETCH` env var (e.g. `SCAN_FETCH=urls,packages`
-    /// or `SCAN_FETCH=all`), which overrides the default in both modes. An online
-    /// step performed after the offline analysis.
+    /// `all` (or a bare `--fetch`) selects every kind. When omitted, all three
+    /// kinds are fetched by default. Also settable per deployment via the
+    /// `SCAN_FETCH` env var (e.g. `SCAN_FETCH=urls,packages` or `SCAN_FETCH=all`),
+    /// which overrides the default. An online step performed after the offline
+    /// analysis.
     #[arg(
         long,
         global = true,
@@ -265,11 +264,11 @@ struct Cli {
     )]
     fetch_max_size: u64,
 
-    /// [EXPERIMENTAL] Maximum number of *live* fetches triggered by a single
-    /// scanned file. Cache hits are always served and never counted, so a warm
-    /// re-run is never throttled. References past the cap are recorded as
-    /// budget-exceeded, never silently dropped. Also settable via
-    /// `SCAN_FETCH_MAX_FILE_FETCHES`.
+    /// [EXPERIMENTAL] Maximum number of *live* dependency/package fetches
+    /// triggered by a single scanned file. This is 100 by default. Cache hits
+    /// are always served and never counted, so a warm re-run is never throttled.
+    /// References past the cap are recorded as budget-exceeded, never silently
+    /// dropped. Also settable via `SCAN_FETCH_MAX_FILE_FETCHES`.
     #[arg(
         long,
         global = true,
@@ -278,6 +277,20 @@ struct Cli {
         env = "SCAN_FETCH_MAX_FILE_FETCHES"
     )]
     fetch_max_file_fetches: usize,
+
+    /// [EXPERIMENTAL] Maximum number of *live* opportunistic raw-URL fetches
+    /// triggered by a single scanned file. This is 4 by default. URL references
+    /// declared as dependencies or command-mentioned packages use the larger
+    /// `--fetch-max-file-fetches` cap instead. Also settable via
+    /// `SCAN_FETCH_MAX_URLS`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        default_value_t = scan::fetch::DEFAULT_MAX_URL_FETCHES,
+        env = "SCAN_FETCH_MAX_URLS"
+    )]
+    fetch_max_urls: usize,
 
     /// [EXPERIMENTAL] Maximum total bytes fetched on behalf of a single scanned
     /// file. Accepts a unit suffix (`2G`); a bare number is bytes. Also settable
@@ -349,6 +362,18 @@ impl Cli {
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
         })
+    }
+}
+
+/// The binary's online default. Keep [`FetchPolicy::default`] offline for the
+/// library API; callers that opt into fetching through the CLI get the explicit
+/// `all` policy here.
+fn default_cli_fetch_policy() -> scan::fetch::FetchPolicy {
+    scan::fetch::FetchPolicy {
+        urls: true,
+        packages: true,
+        deps: true,
+        ..scan::fetch::FetchPolicy::default()
     }
 }
 
@@ -635,14 +660,13 @@ fn main() -> Result<()> {
     // The kind selection comes from `--fetch`; the hop count from `--fetch-depth`,
     // the dependency age ceiling from `--fetch-max-age`, and the per-file ceilings
     // from `--fetch-max-file-*` (each its own flag/env). When `--fetch`/`SCAN_FETCH`
-    // is unset the default depends on run mode: an interactive scan fetches
-    // declared dependencies and install-command packages (the references bound to
-    // the artifact) but not raw URLs, while a worker fetches every kind. An
-    // explicit selection is honored verbatim in both; the knobs always apply.
+    // is unset, the binary defaults to `all` in every mode. An explicit selection
+    // is honored verbatim in both; the knobs always apply.
     let with_knobs = |mut policy: scan::fetch::FetchPolicy| {
         policy.depth = cli.fetch_depth;
         policy.max_dep_age_days = cli.fetch_max_age;
         policy.max_file_fetches = cli.fetch_max_file_fetches;
+        policy.max_url_fetches = cli.fetch_max_urls;
         policy.max_file_bytes = cli.fetch_max_file_size;
         policy.host_platform_only = !cli.fetch_all_platforms;
         policy
@@ -654,19 +678,8 @@ fn main() -> Result<()> {
     // Registry-metadata staleness bound: a process-global for the same reason,
     // consulted by every registry lookup. `None` keeps the tiered defaults.
     scan::fetch::set_registry_ttl(cli.registry_ttl);
-    let scan_default = scan::fetch::FetchPolicy {
-        deps: true,
-        packages: true,
-        ..scan::fetch::FetchPolicy::default()
-    };
-    let worker_default = scan::fetch::FetchPolicy {
-        urls: true,
-        packages: true,
-        deps: true,
-        ..scan::fetch::FetchPolicy::default()
-    };
-    let fetch_policy = with_knobs(cli.fetch.unwrap_or(scan_default));
-    let worker_fetch_policy = with_knobs(cli.fetch.unwrap_or(worker_default));
+    let fetch_policy = with_knobs(cli.fetch.unwrap_or_else(default_cli_fetch_policy));
+    let worker_fetch_policy = fetch_policy;
     if let Some(cfg) = &interpret_cfg {
         tracing::info!(
             endpoint = %cfg.base_url,
@@ -1801,13 +1814,34 @@ fn run_scan_paths(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        Cli, Commands, GIB, MaxRssPolicy, resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
+        Cli, Commands, GIB, MaxRssPolicy, default_cli_fetch_policy, resolve_process_max_rss_bytes,
+        resolve_worker_max_rss_gb,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
     use std::net::SocketAddr;
     use std::num::NonZeroU64;
     use std::path::PathBuf;
+
+    #[test]
+    fn fetch_defaults_to_all_with_separate_url_and_dependency_caps() -> Result<()> {
+        let cli = Cli::try_parse_from(["scan", "/tmp/a"]).context("parse should work")?;
+        assert!(
+            cli.fetch.is_none(),
+            "absence of --fetch is resolved at startup"
+        );
+
+        let policy = default_cli_fetch_policy();
+        assert!(policy.urls && policy.packages && policy.deps);
+        assert_eq!(
+            policy.max_file_fetches,
+            scan::fetch::DEFAULT_MAX_FILE_FETCHES
+        );
+        assert_eq!(policy.max_file_fetches, 100);
+        assert_eq!(policy.max_url_fetches, scan::fetch::DEFAULT_MAX_URL_FETCHES);
+        assert_eq!(policy.max_url_fetches, 4);
+        Ok(())
+    }
 
     #[test]
     fn bare_paths_default_to_scan_shorthand() -> Result<()> {
