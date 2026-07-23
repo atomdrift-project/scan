@@ -1,6 +1,11 @@
 #!/bin/sh
 # rollout-bastille.sh - Deploy Atomdrift Scan using separate build and run jails
 # Usage: ./rollout-bastille.sh [build-jail] [run-jail]
+#
+# Prerequisites:
+#   - "interpret" must have an entry in /etc/hosts on this host, pointing at the
+#     OpenAI-compatible LLM endpoint (vLLM) that --interpret sends samples to.
+#     The entry is copied into the run jail, which has no resolver of its own.
 
 set -ex
 set -o pipefail
@@ -82,6 +87,23 @@ log "Refreshing models and traits in run jail"
 doas bastille cmd "$RUN" su -l scan -c "atomscan update-rules" \
     || die "update-rules failed in run jail"
 
+# --- Resolve the interpret (LLM) hostname ---
+# --interpret posts to an OpenAI-compatible endpoint at http://interpret:8000/v1.
+# The run jail has no resolver, so "interpret" only resolves via its /etc/hosts;
+# copy the deploy host's entry in. Missing is non-fatal: atomscan still serves,
+# and the LLM second opinion is simply skipped when the endpoint is unreachable.
+INTERPRET_HOST="${INTERPRET_HOST:-interpret}"
+INTERPRET_LINE=$(awk -v h="$INTERPRET_HOST" '$0 ~ "[[:space:]]" h "([[:space:]]|$)" {print; exit}' /etc/hosts)
+if [ -z "$INTERPRET_LINE" ]; then
+    log "WARNING: $INTERPRET_HOST not found in /etc/hosts — --interpret will have no endpoint to reach"
+else
+    log "Using $INTERPRET_HOST: $INTERPRET_LINE"
+    if ! doas bastille cmd "$RUN" awk -v h="$INTERPRET_HOST" '$0 ~ "[[:space:]]" h "([[:space:]]|$)" {found=1} END{exit !found}' /etc/hosts 2>/dev/null; then
+        doas bastille cmd "$RUN" sh -c "echo '$INTERPRET_LINE' >> /etc/hosts"
+        log "Added $INTERPRET_HOST to jail /etc/hosts"
+    fi
+fi
+
 log "Creating rc.d service"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
 doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/scan >/dev/null <<'EOF'
@@ -103,7 +125,11 @@ load_rc_config $name
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8"
+# --interpret adds a local-LLM second opinion, blended with the ML verdict and
+# kept in the envelope's `llm` section. --llm points at the vLLM endpoint on the
+# "interpret" host; the model defaults to atomscan's DEFAULT_MODEL, which is what
+# that endpoint serves.
+command_args="-c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --interpret --llm http://interpret:8000/v1"
 
 run_rc_command "$1"
 EOF
