@@ -270,8 +270,6 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # bump the git rev once cleave carries the change. Keyed by the git URL, not
 # crates-io: cleave is a git dependency, and a crates-io patch is silently
 # unused against a git source ("patch ... was not used in the crate graph").
-[patch."https://codeberg.org/atomdrift/cleave.git"]
-cleave = { path = "../cleave" }
 
 # TEMPORARY local cleave: carries the tiny-format trait-id annotation
 # (`# SEV LOC desc (id)`, so an LLM reading tiny output can name and locate the
