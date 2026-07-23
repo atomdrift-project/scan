@@ -69,14 +69,14 @@ flowchart LR
 For Linux and macOS users using Homebrew:
 
 ```bash
-brew tap atomdrift/tap https://codeberg.org/atomdrift/homebrew-tap.git
+brew tap atomdrift/tap https://github.com/atomdrift-project/homebrew-tap.git
 brew install atomdrift-scan
 ```
 
 For everyone else, source compiles are trivial:
 
 ```bash
-git clone https://codeberg.org/atomdrift/scan.git
+git clone https://github.com/atomdrift-project/scan.git
 cd scan
 make install
 ```
@@ -135,9 +135,9 @@ Yes, we got creative with generating synthetic malware just to prove coverage on
 
 ## Related
 
-- [cleave](https://codeberg.org/atomdrift/cleave) — the capability analyzer underneath
-- [azoth](https://codeberg.org/atomdrift/azoth) — model weights, thresholds, and feature spec
-- [hopper](https://codeberg.org/atomdrift/hopper) — distributed work queue
+- [cleave](https://github.com/atomdrift-project/cleave) — the capability analyzer underneath
+- [azoth](https://github.com/atomdrift-project/azoth) — model weights, thresholds, and feature spec
+- [hopper](https://github.com/atomdrift-project/hopper) — distributed work queue
 - [Atomdrift Lab](https://lab.atomdrift.org/) — submit samples for free analysis
 
 ## License

@@ -158,13 +158,13 @@ grep -q '^filefacts = { path = "_filefacts" }$' "$STAGE_DIR/cleave/Cargo.toml" \
   || { echo "error: cleave Cargo.toml filefacts rewrite failed" >&2; exit 1; }
 
 # Append [patch] to scan's Cargo.toml so cargo uses the staged cleave
-# instead of fetching from codeberg. Idempotent: only append if missing.
-if ! grep -q '^\[patch\."https://codeberg.org/atomdrift/cleave.git"\]' "$STAGE_DIR/scan/Cargo.toml"; then
+# instead of fetching from GitHub. Idempotent: only append if missing.
+if ! grep -q '^\[patch\."https://github.com/atomdrift-project/cleave.git"\]' "$STAGE_DIR/scan/Cargo.toml"; then
   cat >> "$STAGE_DIR/scan/Cargo.toml" <<'PATCH'
 
 # Appended by packaging/wolfi/scripts/build.sh — points cargo at the
 # locally-staged cleave tree (which has _filefacts vendored).
-[patch."https://codeberg.org/atomdrift/cleave.git"]
+[patch."https://github.com/atomdrift-project/cleave.git"]
 cleave = { path = "../cleave" }
 PATCH
 fi

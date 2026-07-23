@@ -325,7 +325,7 @@ deploy-worker: kill-scan
 # Install the hourly bloom build+publish timer (scan-bloomer.timer). Runs as a
 # dedicated `bloom` system user (isolated from the worker's `scan` user), from a
 # provisioned checkout under /var/lib/bloom. The install script sets up the
-# checkouts + Rust toolchain and tells you which secrets to drop in (codeberg
+# checkouts + Rust toolchain and tells you which secrets to drop in (GitHub
 # push key, rclone R2 remote, ~/.pgpass for hopper). Systemd Linux only.
 deploy-bloomer:
 	@case "$$(uname -s)" in \

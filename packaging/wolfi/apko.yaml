@@ -41,7 +41,7 @@ archs:
   - x86_64
 
 annotations:
-  org.opencontainers.image.source: https://codeberg.org/atomdrift/scan
+  org.opencontainers.image.source: https://github.com/atomdrift-project/scan
   org.opencontainers.image.title: scan
   org.opencontainers.image.description: ML-powered malware classification using cleave static analysis
   org.opencontainers.image.licenses: Apache-2.0

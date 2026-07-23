@@ -80,8 +80,8 @@ The local build needs both repos checked out next to scan:
 
 ```
 .../atomdrift/
-  cleave/       (codeberg.org/atomdrift/cleave)
-  filefacts/    (codeberg.org/atomdrift/filefacts)
+  cleave/       (github.com/atomdrift-project/cleave)
+  filefacts/    (github.com/atomdrift-project/filefacts)
   scan/       (this repo)
 ```
 
@@ -92,7 +92,7 @@ path dep.
 ## How the local build differs from upstream Wolfi
 
 `melange.yaml` declares a `git-checkout` step that pulls scan from
-codeberg at a pinned tag — what upstream CI runs. Locally, `build.sh`:
+GitHub at a pinned tag — what upstream CI runs. Locally, `build.sh`:
 
 1. **Strips the git-checkout step** (via `LOCAL_BUILD_STRIP_BEGIN/END`
    markers) so melange's `--source-dir` wins.
@@ -101,9 +101,9 @@ codeberg at a pinned tag — what upstream CI runs. Locally, `build.sh`:
 3. **Vendors filefacts** as `cleave/_filefacts/` and rewrites cleave's
    `Cargo.toml` to point there (same recipe as cleave's own packaging).
 4. **Appends a `[patch]` block** to scan's `Cargo.toml` so cargo uses
-   the staged cleave instead of fetching from codeberg:
+   the staged cleave instead of fetching from GitHub:
    ```toml
-   [patch."https://codeberg.org/atomdrift/cleave.git"]
+   [patch."https://github.com/atomdrift-project/cleave.git"]
    cleave = { path = "../cleave" }
    ```
 5. **Substitutes `cd scan`** for the `# LOCAL_BUILD_CD_HERE` marker
@@ -138,7 +138,7 @@ needs both fixed first.
 ## Submitting upstream
 
 1. Resolve both blockers above.
-2. Tag a scan release (`vX.Y.Z` on codeberg).
+2. Tag a scan release (`vX.Y.Z` on GitHub).
 3. Update `melange.yaml`:
    - `package.version` → new version (drop the `v` prefix).
    - `expected-commit` in the first `git-checkout` → the tag's commit SHA.
@@ -167,7 +167,7 @@ needs both fixed first.
 
 ## Models
 
-`scan-models` bundles a pinned snapshot of [azoth](https://codeberg.org/atomdrift/azoth)
+`scan-models` bundles a pinned snapshot of [azoth](https://github.com/atomdrift-project/azoth)
 into the apk at build time, with `SCAN_MODELS_DIR` set in the apko
 config so the image never tries to clone at runtime. If you want fresh
 models, bump the `expected-commit` in `melange.yaml` and rebuild — the
@@ -237,7 +237,7 @@ the inclusion proof, and confirms the signature matches the image digest.
 
 ## Troubleshooting
 
-- **`error: missing .../cleave`** — `git clone ssh://git@codeberg.org/atomdrift/cleave.git ../cleave`.
+- **`error: missing .../cleave`** — `git clone ssh://git@github.com/atomdrift-project/cleave.git ../cleave`.
 - **First build is very slow (~13 min)** — expected; cargo cold-builds
   cleave + filefacts + scan inside the sandbox with fat LTO. Stamp
   skip makes subsequent runs instant.

@@ -11,11 +11,11 @@ check, an ingestion worker.
 
 ```bash
 # install (Linux/macOS via Homebrew)
-brew tap atomdrift/tap https://codeberg.org/atomdrift/homebrew-tap.git
+brew tap atomdrift/tap https://github.com/atomdrift-project/homebrew-tap.git
 brew install atomdrift-scan
 
 # or build from source — needs Rust 1.96+
-git clone https://codeberg.org/atomdrift/scan.git && cd scan && make install
+git clone https://github.com/atomdrift-project/scan.git && cd scan && make install
 
 # scan a file, a directory, or an archive (archives unpack automatically)
 atomscan suspicious_package.tar.gz
@@ -42,7 +42,7 @@ about how you parse results changes.
 | ------------ | -------------------------------------------------------- | ----------------------------------------------- | ---------------------------------- |
 | **CLI**      | One-shot or batch, up to ~5 scans/min.                   | Reloads the model on every run.                 | `atomscan --help`                 |
 | **HTTP server** | Sustained traffic past ~5 scans/min.                 | You run a long-lived process.                   | [SERVER_API.md](SERVER_API.md)     |
-| **Worker**   | Distributed ingestion: workers pull jobs from a [hopper](https://codeberg.org/atomdrift/hopper) queue. | You run a hopper for them to poll. | [WORKERS.md](WORKERS.md)           |
+| **Worker**   | Distributed ingestion: workers pull jobs from a [hopper](https://github.com/atomdrift-project/hopper) queue. | You run a hopper for them to poll. | [WORKERS.md](WORKERS.md)           |
 | **Rust library** | You are already in Rust and want in-process calls. | More setup, weaker API stability. See [Library](#library). | source — `classify_file`, `classify_bytes` |
 
 A registry gating uploads on ingest should start with the **CLI** and grow
@@ -147,7 +147,7 @@ suits you better.
 
 The in-process Rust API is the most direct path and the least stable. Until
 1.0, minor releases may break it, so **pin a commit** of
-`codeberg.org/atomdrift/scan`. Two things it asks of you: give `main` an
+`github.com/atomdrift-project/scan`. Two things it asks of you: give `main` an
 8 MB rayon stack, and call `kill_all_rizin_groups()` at shutdown so
 disassembler subprocesses do not leak. It returns the same JSON envelope as
 every other path.

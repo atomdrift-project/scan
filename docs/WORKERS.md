@@ -1,7 +1,7 @@
 # Atomdrift Scan Workers
 
 `atomscan worker` is the pull-based counterpart to `atomscan serve`. It
-exposes no HTTP. It polls a [hopper](https://codeberg.org/atomdrift/hopper)
+exposes no HTTP. It polls a [hopper](https://github.com/atomdrift-project/hopper)
 instance for jobs, analyses each file, and posts the result back.
 
 The classifier, thresholds, and response shape are identical to the

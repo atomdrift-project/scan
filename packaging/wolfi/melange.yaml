@@ -52,7 +52,7 @@ pipeline:
   # local builds so melange's --source-dir wins. Upstream keeps it.
   - uses: git-checkout
     with:
-      repository: https://codeberg.org/atomdrift/scan
+      repository: https://github.com/atomdrift-project/scan
       tag: v${{package.version}}
       expected-commit: b10074a9d13dc91e5134a8f6e9e79811e77285fc
   # LOCAL_BUILD_STRIP_END
@@ -76,10 +76,10 @@ subpackages:
     pipeline:
       # LOCAL_BUILD_STRIP_BEGIN  — scripts/build.sh removes this step
       # and replaces the marker below with a copy from the host-staged
-      # azoth sibling, so local builds don't depend on codeberg uptime.
+      # azoth sibling, so local builds don't depend on GitHub uptime.
       - uses: git-checkout
         with:
-          repository: https://codeberg.org/atomdrift/azoth
+          repository: https://github.com/atomdrift-project/azoth
           branch: main
           expected-commit: 058e2d57e6d07fcb1363338c543354f13120fddd
           destination: models-src

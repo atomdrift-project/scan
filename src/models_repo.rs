@@ -21,7 +21,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-const DEFAULT_MODELS_REPO_URL: &str = "https://codeberg.org/atomdrift/azoth.git";
+const DEFAULT_MODELS_REPO_URL: &str = "https://github.com/atomdrift-project/azoth.git";
 
 /// Files that must be present in a complete bundle. The model file is checked
 /// separately because it may live at the top level or under `models/`.
@@ -202,11 +202,11 @@ mod tests {
     #[test]
     fn bundle_name_from_url_handles_common_shapes() {
         assert_eq!(
-            bundle_name_from_url("https://codeberg.org/atomdrift/azoth.git").as_deref(),
+            bundle_name_from_url("https://github.com/atomdrift-project/azoth.git").as_deref(),
             Some("azoth")
         );
         assert_eq!(
-            bundle_name_from_url("https://codeberg.org/atomdrift/azoth-pe.git/").as_deref(),
+            bundle_name_from_url("https://github.com/atomdrift-project/azoth-pe.git/").as_deref(),
             Some("azoth-pe")
         );
         assert_eq!(

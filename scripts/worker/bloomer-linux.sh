@@ -7,7 +7,7 @@
 # -> scan-bloomer.service, Type=oneshot) running `make bloom-cron`.
 #
 # It runs as a DEDICATED `bloom` system user — separate from the worker's `scan`
-# user — so the publishing credentials (codeberg push key, R2 token, DB password)
+# user — so the publishing credentials (github push key, R2 token, DB password)
 # are isolated from the worker and vice versa. Everything lives under one state
 # tree, /var/lib/bloom:
 #
@@ -16,14 +16,14 @@
 #   /var/lib/bloom/scan-src   scan source checkout (WorkingDirectory): the
 #                             Makefile + scripts/bloom_pool.sql the cycle runs
 #   /var/lib/bloom/repo       bloom repo checkout (BLOOM_REPO), committed and
-#                             pushed to codeberg each cycle
+#                             pushed to github each cycle
 #
 # Re-runnable: idempotent. Re-running refreshes the source checkout to the
 # committed HEAD of this repo, re-asserts the units, and reloads the timer.
 #
 # Secrets it CANNOT create for you (it checks and reports what is missing, but
 # still installs the timer so you can drop them in afterwards):
-#   ~bloom/.ssh/<key>                 codeberg key allowed to push atomdrift/bloom
+#   ~bloom/.ssh/<key>                 github key allowed to push atomdrift-project/bloom
 #   ~bloom/.config/rclone/rclone.conf  rclone remote backing $(R2_REMOTE) (R2)
 #   ~bloom/.pgpass                    password for BLOOM_DB, chmod 600
 #
@@ -31,7 +31,7 @@
 #
 # Environment overrides:
 #   BLOOM_DB     hopper DSN the cycle exports from   (default: postgres://hopper@localhost:5432/hopper)
-#   BLOOM_REMOTE git URL of the bloom repo to clone  (default: ssh://git@codeberg.org/atomdrift/bloom.git)
+#   BLOOM_REMOTE git URL of the bloom repo to clone  (default: ssh://git@github.com/atomdrift-project/bloom.git)
 #   ON_CALENDAR  systemd OnCalendar= cadence          (default: hourly)
 #   RUN_NOW=1    kick one cycle immediately after install (otherwise wait for the timer)
 
@@ -49,10 +49,10 @@ SERVICE_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 TIMER_FILE=/etc/systemd/system/${SERVICE_NAME}.timer
 
 BLOOM_DB="${BLOOM_DB:-postgres://hopper@localhost:5432/hopper}"
-BLOOM_REMOTE="${BLOOM_REMOTE:-ssh://git@codeberg.org/atomdrift/bloom.git}"
+BLOOM_REMOTE="${BLOOM_REMOTE:-ssh://git@github.com/atomdrift-project/bloom.git}"
 # scan-src is read-only (fetched, never pushed) → HTTP, no deploy key needed.
 # The bloom repo above stays SSH because the cycle pushes to it.
-SCAN_REMOTE="${SCAN_REMOTE:-https://codeberg.org/atomdrift/scan.git}"
+SCAN_REMOTE="${SCAN_REMOTE:-https://github.com/atomdrift-project/scan.git}"
 ON_CALENDAR="${ON_CALENDAR:-hourly}"
 RUN_NOW="${RUN_NOW:-}"
 
@@ -129,15 +129,15 @@ fi
 
 # --- SSH known_hosts for the push -------------------------------------------
 
-# Pin codeberg's host keys so the non-interactive `git push` never blocks on a
+# Pin github's host keys so the non-interactive `git push` never blocks on a
 # host-key prompt. (The deploy key itself is a secret you provide; see below.)
-codeberg_host=$(printf '%s\n' "$BLOOM_REMOTE" | sed -n 's#^[a-z+]*://\(git@\)\?\([^/:]*\).*#\2#p')
-codeberg_host="${codeberg_host:-codeberg.org}"
+github_host=$(printf '%s\n' "$BLOOM_REMOTE" | sed -n 's#^[a-z+]*://\(git@\)\?\([^/:]*\).*#\2#p')
+github_host="${github_host:-github.com}"
 if command -v ssh-keyscan >/dev/null 2>&1; then
     as_bloom install -d -m 0700 "${STATE_HOME}/.ssh"
-    if ! as_bloom sh -c "grep -q '${codeberg_host}' ~/.ssh/known_hosts 2>/dev/null"; then
-        log "Pinning ${codeberg_host} host keys in ~bloom/.ssh/known_hosts"
-        ssh-keyscan -t rsa,ecdsa,ed25519 "${codeberg_host}" 2>/dev/null \
+    if ! as_bloom sh -c "grep -q '${github_host}' ~/.ssh/known_hosts 2>/dev/null"; then
+        log "Pinning ${github_host} host keys in ~bloom/.ssh/known_hosts"
+        ssh-keyscan -t rsa,ecdsa,ed25519 "${github_host}" 2>/dev/null \
             | as_bloom sh -c "cat >> ~/.ssh/known_hosts" || true
     fi
 fi
@@ -165,7 +165,7 @@ else
         bloom_ready=1
     else
         log "WARNING: could not clone ${BLOOM_REMOTE} as ${SERVICE_USER}."
-        log "  Add a codeberg deploy key with push access in ${STATE_HOME}/.ssh,"
+        log "  Add a github deploy key with push access in ${STATE_HOME}/.ssh,"
         log "  then re-run this script (or clone ${BLOOM_DIR} by hand)."
     fi
 fi
@@ -196,7 +196,7 @@ trap 'rm -f "$TMP_SERVICE" "$TMP_TIMER"' EXIT
 cat >"$TMP_SERVICE" <<EOF
 [Unit]
 Description=Atomdrift bloom filter build + publish (rebuild -> commit+push -> R2)
-Documentation=https://codeberg.org/atomdrift/scan
+Documentation=https://github.com/atomdrift-project/scan
 After=network-online.target
 Wants=network-online.target
 
@@ -272,7 +272,7 @@ EOF
 cat >"$TMP_TIMER" <<EOF
 [Unit]
 Description=Hourly Atomdrift bloom build + publish
-Documentation=https://codeberg.org/atomdrift/scan
+Documentation=https://github.com/atomdrift-project/scan
 
 [Timer]
 OnCalendar=${ON_CALENDAR}
@@ -321,7 +321,7 @@ missing=0
 if [ "$bloom_ready" = 1 ]; then
     printf '    [ ok ] bloom checkout + push remote: %s\n' "${BLOOM_DIR}"
 else
-    printf '    [MISS] bloom checkout: clone failed; add a codeberg push key in %s/.ssh\n' "${STATE_HOME}"
+    printf '    [MISS] bloom checkout: clone failed; add a github push key in %s/.ssh\n' "${STATE_HOME}"
     missing=1
 fi
 

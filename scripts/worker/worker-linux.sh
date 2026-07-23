@@ -212,7 +212,7 @@ TMP_UNIT=$(mktemp -t scan-worker.service.XXXXXX)
 cat >"$TMP_UNIT" <<EOF
 [Unit]
 Description=Atomdrift Scan worker (analyses samples claimed from hopper)
-Documentation=https://codeberg.org/atomdrift/scan
+Documentation=https://github.com/atomdrift-project/scan
 After=network-online.target
 Wants=network-online.target
 
