@@ -17,7 +17,10 @@ DATASET ?= slow
 WORKER_REMOTE := $(if $(strip \
     $(filter command line environment,$(origin BUILD)) \
     $(filter command line environment,$(origin WORKER_RUN))),1,)
-BENCHMARK_ROOT ?= /Users/t/data/benchmark
+# $(HOME)/data/benchmark on every platform — the hardcoded /Users/t path meant
+# every benchmark/profile target aborted with "benchmark path not found" on the
+# Linux box the nightly gauntlet actually runs on.
+BENCHMARK_ROOT ?= $(HOME)/data/benchmark
 BENCHMARK_PATH ?= $(BENCHMARK_ROOT)/$(DATASET)
 SCAN_THREADS ?=
 MAX_JOBS ?= 25
@@ -35,7 +38,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-bloomer uninstall-bloomer deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-bloomer uninstall-bloomer deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -509,6 +512,118 @@ profile-slow:
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
 	samply record --save-only --duration 20 -o /tmp/litmus-$(DATASET)-profile.json.gz -- \
 		env CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" CLEAVE_SKIP_YARA_CACHE=0 ./target/profiling/$(BINARY) -f json "$(BENCHMARK_PATH)"
+
+# ----- archive-mode benchmark ---------------------------------------------
+# An archive scan folds every inner file into ONE aggregated result, and that
+# aggregation — not per-file analysis — is what makes a large archive
+# pathological. Measured 2026-07-23 on definitelytyped (63,107 files): 2,865 s
+# as an archive vs 337 s for the identical files as a loose directory tree,
+# 8.5x, with 19.5 GB peak RSS and a 420 MiB output record. That is how a single
+# sample blows through the nightly gauntlet's 20-minute per-scanner cap.
+#
+# ARCHIVE_DATASET picks the size. typed-4k / typed-16k are file-count subsets of
+# the same corpus, for the edit-measure loop; typed is the full regression case
+# and takes tens of minutes. Because the subsets share a corpus and file mix,
+# comparing them isolates how cost grows with inner-file count.
+ARCHIVE_DATASET ?= typed-4k
+ARCHIVE_PATH    ?= $(BENCHMARK_ROOT)/$(ARCHIVE_DATASET)
+# Appended to, never truncated: a before/after row per run, tagged with the
+# cleave rev, is the whole point — a single number can't show a regression.
+ARCHIVE_RESULTS ?= $(OUT_DIR)/bench-archive.tsv
+# Rows are labeled with the cleave rev under test (plus -dirty for uncommitted
+# src edits) — the whole point of the history is before/after across cleave
+# changes, and an unlabeled row can't be attributed to anything.
+ARCHIVE_LABEL   ?= $(shell git -C ../cleave rev-parse --short HEAD 2>/dev/null || echo local)$(shell git -C ../cleave diff --quiet -- src crates 2>/dev/null || echo -dirty)
+# Best-of-N. This box runs hopper/cyclotron/forager alongside, and wall time
+# under that load varies 4x run to run; contention only ever ADDS time, so the
+# minimum is the closest thing to an uncontended measurement available here.
+ARCHIVE_RUNS    ?= 3
+# CLEAVE_SKIP_CACHE=1 forces the full per-file analysis every run — without it a
+# warm analysis cache turns a 400 s scan into 14 s and the benchmark silently
+# measures cache hits. CLEAVE_SKIP_YARA_CACHE=0 keeps the compiled rule set (it
+# is not what we're measuring, and recompiling costs 4-18 s of pure noise).
+# SCAN_FETCH=none keeps the scan offline: fetching defaults to ON, and a
+# benchmark that fetches measures the network (and drifts run to run — the
+# fetched-node set differed by ~400 entries between two otherwise identical
+# runs, which broke detection comparison). Matches sampled-benchmark/profile-slow.
+ARCHIVE_ENV = CLEAVE_SKIP_CACHE=1 CLEAVE_SKIP_YARA_CACHE=0 SCAN_FETCH=none CLEAVE_SCAN_THREADS="$(SCAN_THREADS)"
+
+bench-archive: release ## Time+RSS+output an archive-mode scan, best of ARCHIVE_RUNS (ARCHIVE_DATASET=typed-4k|typed-16k|typed)
+	@[ -e "$(ARCHIVE_PATH)" ] || { echo "error: archive dataset not found: $(ARCHIVE_PATH)"; exit 1; }
+	@mkdir -p $(OUT_DIR)
+	@[ -s "$(ARCHIVE_RESULTS)" ] || printf 'dataset\tlabel\twall_s\tmaxrss_mib\tout_mib\tuser_s\n' > $(ARCHIVE_RESULTS)
+	@rm -f $(OUT_DIR)/.bench-archive.runs
+	@i=1; while [ $$i -le $(ARCHIVE_RUNS) ]; do \
+		printf '  run %d/%d ... ' $$i $(ARCHIVE_RUNS); \
+		/usr/bin/time -f '%e\t%M\t%U' -a -o $(OUT_DIR)/.bench-archive.runs \
+			env $(ARCHIVE_ENV) \
+			./out/$(BINARY) -f json --show all "$(ARCHIVE_PATH)" > $(OUT_DIR)/bench-archive-$(ARCHIVE_DATASET).json; \
+		status=$$?; \
+		: '# exit 1/2 = hostile/suspicious found, expected on a real corpus; 3+ is a scan error'; \
+		[ $$status -le 2 ] || { echo "scan failed: exit $$status"; exit $$status; }; \
+		tail -1 $(OUT_DIR)/.bench-archive.runs | cut -f1 | sed 's/$$/s/'; \
+		i=$$((i+1)); \
+	done
+	@awk -v d='$(ARCHIVE_DATASET)' -v l='$(ARCHIVE_LABEL)' \
+		-v o="$$(wc -c < $(OUT_DIR)/bench-archive-$(ARCHIVE_DATASET).json)" \
+		-F'\t' 'NR==1||$$1<w{w=$$1;r=$$2;u=$$3} END{printf "%s\t%s\t%.1f\t%.0f\t%.1f\t%.0f\n", d, l, w, r/1024, o/1048576, u}' \
+		$(OUT_DIR)/.bench-archive.runs | tee -a $(ARCHIVE_RESULTS)
+	@echo "✓ history: $(ARCHIVE_RESULTS)  (column 3 is best-of-$(ARCHIVE_RUNS) wall seconds; lower is better)"
+
+bench-archive-scaling: ## Run bench-archive across every typed-* subset, to show how cost grows with file count
+	@for d in typed-4k typed-16k; do $(MAKE) --no-print-directory bench-archive ARCHIVE_DATASET=$$d; done
+	@column -t $(ARCHIVE_RESULTS)
+
+# ----- the typed parity goal (2026-07-23) ----------------------------------
+# typed = the full definitelytyped zip (63,107 inner files) scanned as an
+# archive; typed-extract = the identical files as a loose tree. Baseline:
+# 2,865 s vs 337 s — the archive fold, not per-file analysis, is the gap, and
+# it is how one sample blows the gauntlet's 20-minute cap. The goal:
+#   typed wall  <= 1.05x typed-extract wall
+#   typed RSS   <= 1.15x its own baseline; detection unchanged
+#   typed-extract wall/RSS/detection not regressed
+bench-typed: ## Benchmark the full typed archive (one run; it's the slow case)
+	@$(MAKE) --no-print-directory bench-archive ARCHIVE_DATASET=typed ARCHIVE_RUNS=$(or $(RUNS),1)
+
+bench-typed-extract: ## Benchmark the same corpus as loose files (the parity target)
+	@$(MAKE) --no-print-directory bench-archive ARCHIVE_DATASET=typed-extract ARCHIVE_RUNS=$(or $(RUNS),2)
+
+bench-typed-goal: ## Judge the newest typed/typed-extract rows against the 5% parity goal
+	@awk -F'\t' '$$1=="typed"{t=$$3;tm=$$4} $$1=="typed-extract"{e=$$3;em=$$4} END{ \
+		if (!t || !e) { print "bench-typed-goal: need a typed and a typed-extract row in $(ARCHIVE_RESULTS)"; exit 2 }; \
+		printf "typed=%.0fs (%.0f MiB)  typed-extract=%.0fs (%.0f MiB)  ratio=%.2fx  goal<=1.05x  %s\n", \
+			t, tm, e, em, t/e, (t <= 1.05*e) ? "PASS" : "FAIL"; \
+		exit (t <= 1.05*e) ? 0 : 1 }' $(ARCHIVE_RESULTS)
+
+baseline-typed-detection: ## Snapshot current verdicts as the detection baseline
+	@for d in typed typed-extract; do \
+		[ -s $(OUT_DIR)/bench-archive-$$d.json ] || { echo "run bench-typed / bench-typed-extract first ($$d missing)"; exit 1; }; \
+		cp $(OUT_DIR)/bench-archive-$$d.json $(OUT_DIR)/baseline-$$d.json; \
+		echo "✓ baseline: $(OUT_DIR)/baseline-$$d.json"; \
+	done
+
+check-typed-detection: ## Diff current verdicts against the snapshot (a change is a failure)
+	@for d in typed typed-extract; do \
+		echo "--- $$d ---"; \
+		python3 scripts/detect-diff.py $(OUT_DIR)/baseline-$$d.json $(OUT_DIR)/bench-archive-$$d.json || exit 1; \
+	done
+
+profile-archive: ## perf-record an archive-mode scan and print the top symbols
+	@command -v perf >/dev/null 2>&1 || { echo "Error: perf not installed"; exit 1; }
+	$(CARGO) build --profile profiling
+	@[ -e "$(ARCHIVE_PATH)" ] || { echo "error: archive dataset not found: $(ARCHIVE_PATH)"; exit 1; }
+	@mkdir -p $(OUT_DIR)
+	@# Flat sampling, no call graph: these are release builds without frame
+	@# pointers, so dwarf unwinding yields empty stacks anyway (verified) while
+	@# costing ~25x the perf.data size. The flat symbol list is what identifies
+	@# the hot leaf, which is what this target is for.
+	perf record -F 299 -o $(OUT_DIR)/archive.perf.data -- \
+		env $(ARCHIVE_ENV) \
+		./target/profiling/$(BINARY) -f json --show all "$(ARCHIVE_PATH)" > /dev/null
+	@echo "--- top symbols ($(ARCHIVE_DATASET)) ---"
+	@perf report -i $(OUT_DIR)/archive.perf.data --stdio --no-children -F overhead,sym 2>/dev/null \
+		| grep -E '^ +[0-9]+\.[0-9]+%' | head -30
+	@echo "✓ profile: $(OUT_DIR)/archive.perf.data"
 
 # ----- cleave-tuna integration --------------------------------------------
 # Standardized targets that cleave-tuna drives. The naming mirrors cleave's

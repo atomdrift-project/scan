@@ -301,7 +301,14 @@ impl std::str::FromStr for FetchPolicy {
     /// `all` selects every kind. Empty entries are ignored; an unknown kind or an
     /// empty selection is an error so a typo is never silently a no-op.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        const VALID: &str = "valid: all, urls, packages, deps";
+        const VALID: &str = "valid: all, urls, packages, deps, none";
+        // `none` disables fetching outright — the only fully-offline switch,
+        // since an absent --fetch resolves to all-on at startup. Benchmarks
+        // need it (network wait and run-to-run fetch drift poison both wall
+        // clock and output comparison), and so does any air-gapped scan.
+        if s.trim() == "none" {
+            return Ok(Self::default());
+        }
         let mut policy = Self::default();
         for kind in s.split(',') {
             match kind.trim() {

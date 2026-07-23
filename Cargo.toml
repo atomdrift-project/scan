@@ -262,6 +262,17 @@ path = "src/bin/bloom_build.rs"
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
 
+# TEMPORARY local cleave: archive-mode aggregation cost. `make bench-archive`
+# measures it and `make profile-archive` shows where it goes — both need cleave
+# rebuilt in the loop, so scan has to see ../cleave rather than the git rev.
+# ../cleave HEAD is exactly the rev scan locks (37d50ed2), so with no local edits
+# this builds identical code and the filefacts/stng revs still unify. Remove and
+# bump the git rev once cleave carries the change. Keyed by the git URL, not
+# crates-io: cleave is a git dependency, and a crates-io patch is silently
+# unused against a git source ("patch ... was not used in the crate graph").
+[patch."https://codeberg.org/atomdrift/cleave.git"]
+cleave = { path = "../cleave" }
+
 # TEMPORARY local cleave: carries the tiny-format trait-id annotation
 # (`# SEV LOC desc (id)`, so an LLM reading tiny output can name and locate the
 # trait that fired). ../cleave is at the exact rev scan locks (380629512b70) plus

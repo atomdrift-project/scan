@@ -177,10 +177,11 @@ struct Cli {
     ///                by a build/lifecycle script rather than pinned;
     ///   `urls`     — raw URLs with no package identity (curl/wget targets,
     ///                staged downloads), the largest exposure.
-    /// `all` (or a bare `--fetch`) selects every kind. When omitted, all three
-    /// kinds are fetched by default. Also settable per deployment via the
-    /// `SCAN_FETCH` env var (e.g. `SCAN_FETCH=urls,packages` or `SCAN_FETCH=all`),
-    /// which overrides the default. An online step performed after the offline
+    /// `all` (or a bare `--fetch`) selects every kind; `none` disables fetching
+    /// entirely (a fully offline scan). When omitted, all three kinds are
+    /// fetched by default. Also settable per deployment via the `SCAN_FETCH`
+    /// env var (e.g. `SCAN_FETCH=urls,packages` or `SCAN_FETCH=none`), which
+    /// overrides the default. An online step performed after the offline
     /// analysis.
     #[arg(
         long,
