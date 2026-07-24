@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "atomdrift-scan"
-version = "2.4.0-beta.1"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3059,6 +3059,7 @@ dependencies = [
 name = "malecule"
 version = "0.1.0"
 source = "git+https://github.com/atomdrift-project/cleave.git#d3dbbf221eb5d2f7db969d617248d18c9b87c9e8"
+source = "git+https://codeberg.org/atomdrift/cleave.git#d3dbbf221eb5d2f7db969d617248d18c9b87c9e8"
 dependencies = [
  "rustc-hash 2.1.3",
  "serde",
@@ -3853,9 +3854,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.220"
+version = "2.1.221"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de177021aa731f88221b3ae411cb89d70f66e51487c26ef9c9f65fc7250c22e8"
+checksum = "131e7bc39f71eb433f96399150b9e6729908dab3640467a3e90d5c5a77831568"
 dependencies = [
  "psl-types",
 ]

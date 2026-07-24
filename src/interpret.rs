@@ -1077,14 +1077,20 @@ mod tests {
     fn param_billions_reads_size_tokens() {
         // Plain sizes, case-insensitive, with the version number ignored.
         assert_eq!(param_billions("Qwen/Qwen3.6-27B"), Some(27.0));
-        assert_eq!(param_billions("meta-llama/Llama-3.1-70B-Instruct"), Some(70.0));
+        assert_eq!(
+            param_billions("meta-llama/Llama-3.1-70B-Instruct"),
+            Some(70.0)
+        );
         assert_eq!(param_billions("mistralai/Mistral-7B-v0.1"), Some(7.0));
         assert_eq!(param_billions("Llama-2-13b-chat"), Some(13.0));
         assert_eq!(param_billions("Yi-1.5-34B"), Some(34.0));
         // Fractional size.
         assert_eq!(param_billions("some-1.5B-model"), Some(1.5));
         // MoE `NxM` multiplies out.
-        assert_eq!(param_billions("mistralai/Mixtral-8x7B-Instruct"), Some(56.0));
+        assert_eq!(
+            param_billions("mistralai/Mixtral-8x7B-Instruct"),
+            Some(56.0)
+        );
         // No size token → None (falls back to listing order).
         assert_eq!(param_billions("gpt-4"), None);
         assert_eq!(param_billions("microsoft/phi-3-mini-4k-instruct"), None);
