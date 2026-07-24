@@ -23,7 +23,10 @@ use crate::model::Classification;
 /// Default OpenAI-compatible endpoint — a local server (override with `--llm`
 /// or `SCAN_LLM`).
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
-/// Default model name (the dense Qwen the pipeline targets).
+/// Last-resort model name, used only when no model is pinned and endpoint
+/// discovery ([`discover_model`]) turns up nothing. Names the dense Qwen the
+/// pipeline targets, so a server that ignores the request `model` (llama.cpp) or
+/// happens to serve this one still works.
 pub const DEFAULT_MODEL: &str = "Qwen/Qwen3.6-27B";
 /// Default minimum ML probability for a sample to be sent to the LLM. Kept very
 /// low: the LLM's whole value is rescuing samples ML *under*-scored (measured ML
@@ -543,6 +546,18 @@ struct ChatMessage<'a> {
     content: &'a str,
 }
 
+/// The `GET {base}/models` listing (OpenAI shape: `{"data": [{"id": …}]}`).
+#[derive(serde::Deserialize)]
+struct ModelList {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
 #[derive(serde::Deserialize)]
 struct ChatResponse {
     #[serde(default)]
@@ -715,6 +730,101 @@ fn probe_endpoint(cfg: &InterpretConfig) -> bool {
         req = req.bearer_auth(key);
     }
     req.send().is_ok_and(|r| r.status().is_success())
+}
+
+/// Discover the model to grade with by listing `{base}/models` (the standard
+/// OpenAI endpoint): pick the served model whose id implies the most parameters
+/// (`…-32B` over `…-8B`; MoE `8x7B` counted as 56B), keeping the first-listed on
+/// a tie and falling back to the first entry when no id encodes a size. The
+/// choice is logged at INFO. Returns `None` when the endpoint is unreachable or
+/// lists nothing, so the caller keeps its pinned or last-resort model. Skipped
+/// entirely when the user pins `--llm-model`.
+#[must_use]
+pub fn discover_model(base_url: &str, api_key: Option<&str>) -> Option<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HEALTH_PROBE_TIMEOUT)
+        .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut req = client.get(&url);
+    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let list: ModelList = resp.json().ok()?;
+    // Only replace on a strictly larger inferred size, so equal-size models keep
+    // the endpoint's listing order (first wins).
+    let mut best: Option<(f64, String)> = None;
+    for entry in list.data {
+        let size = param_billions(&entry.id).unwrap_or(-1.0);
+        if best.as_ref().is_none_or(|(b, _)| size > *b) {
+            best = Some((size, entry.id));
+        }
+    }
+    let chosen = best.map(|(_, id)| id)?;
+    tracing::info!(model = %chosen, endpoint = %base_url, "selected LLM model");
+    Some(chosen)
+}
+
+/// Infer a model's parameter count in billions from its id, for choosing the
+/// largest of several served models. Reads size tokens like `27B`, `8b`, or MoE
+/// `8x7B` (→ 56); a bare `1.5B` counts as 1.5. Version numbers not followed by a
+/// `b` suffix (the `3.6` in `Qwen3.6-27B`) are ignored. `None` when the id
+/// encodes no size (`gpt-4`, `phi-3-mini`).
+fn param_billions(id: &str) -> Option<f64> {
+    let bytes = id.as_bytes();
+    let mut best: Option<f64> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let (mut value, mut j) = parse_decimal(bytes, i);
+        // MoE `NxM` — the expert count times the per-expert size.
+        if matches!(bytes.get(j), Some(b'x' | b'X'))
+            && bytes.get(j + 1).is_some_and(u8::is_ascii_digit)
+        {
+            let (second, k) = parse_decimal(bytes, j + 1);
+            value *= second;
+            j = k;
+        }
+        // Read it as a size only with a `b`/`B` suffix on a word boundary.
+        if matches!(bytes.get(j), Some(b'b' | b'B'))
+            && bytes.get(j + 1).is_none_or(|c| !c.is_ascii_alphanumeric())
+        {
+            best = Some(best.map_or(value, |b| b.max(value)));
+            i = j + 1;
+        } else {
+            i = j;
+        }
+    }
+    best
+}
+
+/// Parse the decimal starting at `start` (digits, with an optional single `.`
+/// fraction). Returns the value and the index just past it. The caller
+/// guarantees `bytes[start]` is a digit, so `end > start`.
+fn parse_decimal(bytes: &[u8], start: usize) -> (f64, usize) {
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+    }
+    let value = std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    (value, end)
 }
 
 // ── verdict cache ───────────────────────────────────────────────────────────
@@ -962,6 +1072,23 @@ impl Health {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn param_billions_reads_size_tokens() {
+        // Plain sizes, case-insensitive, with the version number ignored.
+        assert_eq!(param_billions("Qwen/Qwen3.6-27B"), Some(27.0));
+        assert_eq!(param_billions("meta-llama/Llama-3.1-70B-Instruct"), Some(70.0));
+        assert_eq!(param_billions("mistralai/Mistral-7B-v0.1"), Some(7.0));
+        assert_eq!(param_billions("Llama-2-13b-chat"), Some(13.0));
+        assert_eq!(param_billions("Yi-1.5-34B"), Some(34.0));
+        // Fractional size.
+        assert_eq!(param_billions("some-1.5B-model"), Some(1.5));
+        // MoE `NxM` multiplies out.
+        assert_eq!(param_billions("mistralai/Mixtral-8x7B-Instruct"), Some(56.0));
+        // No size token → None (falls back to listing order).
+        assert_eq!(param_billions("gpt-4"), None);
+        assert_eq!(param_billions("microsoft/phi-3-mini-4k-instruct"), None);
+    }
 
     #[test]
     fn blend_agreement_boosts_confidence() {

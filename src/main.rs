@@ -140,17 +140,27 @@ struct Cli {
     #[arg(long, hide = true)]
     extra: bool,
 
-    /// Send non-trivial samples to a local LLM for a second opinion, blended
-    /// with the ML verdict (stored in the `llm` JSON section and shown inline).
-    /// Enable via env with `SCAN_INTERPRET=1` (endpoint from `SCAN_LLM`).
-    #[arg(long, global = true, env = "SCAN_INTERPRET")]
+    /// [deprecated] Legacy on-switch for LLM interpretation; superseded by
+    /// `--llm`. Kept for compatibility (env: SCAN_INTERPRET).
+    #[arg(long, global = true, env = "SCAN_INTERPRET", hide = true)]
     interpret: bool,
 
-    /// LLM endpoint or provider (env: SCAN_LLM)
-    #[arg(long, global = true, value_name = "LLM")]
+    /// [optional] Enable additional LLM interpretation of analyzed samples: a
+    /// second opinion blended with the ML verdict (stored in the `llm` JSON
+    /// section and shown inline). Given with no value, uses a local model (an
+    /// OpenAI-compatible endpoint at http://localhost:8000/v1). TARGET may also
+    /// be an explicit OpenAI-compatible base URL. (env: SCAN_LLM)
+    #[arg(
+        long,
+        global = true,
+        value_name = "TARGET",
+        num_args = 0..=1,
+        default_missing_value = "local",
+    )]
     llm: Option<String>,
 
-    /// LLM model name (env: SCAN_LLM_MODEL)
+    /// LLM model name, e.g. Qwen/Qwen3.6-27B. Defaults to the largest model the
+    /// endpoint serves (env: SCAN_LLM_MODEL)
     #[arg(long, global = true, value_name = "NAME")]
     llm_model: Option<String>,
 
@@ -159,8 +169,14 @@ struct Cli {
     llm_key: Option<String>,
 
     /// Minimum ML probability for a sample to be sent to the LLM
-    #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_MIN_PROB, value_name = "P")]
-    interpret_min_prob: f32,
+    #[arg(
+        long,
+        global = true,
+        alias = "interpret-min-prob",
+        default_value_t = scan::interpret::DEFAULT_MIN_PROB,
+        value_name = "P",
+    )]
+    llm_min_prob: f32,
 
     /// Per-request LLM timeout, in seconds
     #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
@@ -341,25 +357,40 @@ struct Cli {
 }
 
 impl Cli {
-    /// Build the LLM interpretation config from `--interpret` and the `--llm*`
-    /// flags, falling back to env vars. `None` when `--interpret` is not set.
+    /// Build the LLM interpretation config from `--llm` (or the legacy
+    /// `--interpret`) and the `--llm-*` flags, falling back to env vars. `None`
+    /// when interpretation is not requested.
     fn interpret_config(&self) -> Option<scan::interpret::InterpretConfig> {
-        if !self.interpret {
-            return None;
-        }
         use scan::interpret::{DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY, DEFAULT_MODEL};
         let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
             flag.clone()
                 .or_else(|| std::env::var(key).ok())
                 .filter(|s| !s.is_empty())
         };
+        // `--llm [TARGET]` / SCAN_LLM (the bare flag defaults TARGET to `local`)
+        // or the legacy `--interpret` flag turns the pass on.
+        let target = from_env(&self.llm, "SCAN_LLM");
+        if target.is_none() && !self.interpret {
+            return None;
+        }
+        // Resolve the target to a base URL: `local` (also the bare-flag default)
+        // maps to the local endpoint; anything else is an OpenAI-compatible base
+        // URL. Future named providers (e.g. gemini) slot in here.
+        let base_url = match target.as_deref() {
+            None | Some("local") => DEFAULT_BASE_URL.to_string(),
+            Some(url) => url.to_string(),
+        };
+        let api_key = from_env(&self.llm_key, "SCAN_LLM_KEY");
+        // A pinned model wins; otherwise discover the endpoint's largest served
+        // model; otherwise fall back to the last-resort default.
+        let model = from_env(&self.llm_model, "SCAN_LLM_MODEL")
+            .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         Some(scan::interpret::InterpretConfig {
-            base_url: from_env(&self.llm, "SCAN_LLM")
-                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            model: from_env(&self.llm_model, "SCAN_LLM_MODEL")
-                .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            api_key: from_env(&self.llm_key, "SCAN_LLM_KEY"),
-            min_prob: self.interpret_min_prob,
+            base_url,
+            model,
+            api_key,
+            min_prob: self.llm_min_prob,
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
         })
