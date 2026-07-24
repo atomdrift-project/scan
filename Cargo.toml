@@ -262,6 +262,18 @@ path = "src/bin/bloom_build.rs"
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
 
+# Cleave still names the former Codeberg remotes, while Scan and Fletch consume
+# the GitHub remotes. Patch those source identities to the same current crates
+# so report facts have one concrete type throughout the dependency graph.
+[patch."https://codeberg.org/atomdrift/filefacts.git"]
+filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
+
+[patch."https://codeberg.org/atomdrift/stng.git"]
+stng = { git = "https://github.com/atomdrift-project/stng.git" }
+
+[patch."https://github.com/tstromberg/dmgwiz.git"]
+dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
+
 # TEMPORARY local cleave: archive-mode aggregation cost. `make bench-archive`
 # measures it and `make profile-archive` shows where it goes — both need cleave
 # rebuilt in the loop, so scan has to see ../cleave rather than the git rev.
