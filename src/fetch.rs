@@ -754,6 +754,28 @@ pub(crate) fn orchestrate(
                     reporter.analyzed(r, rec);
                 }
             };
+            // Benchmark escape hatch: stop after the network phase, before the
+            // (far more expensive) analysis of what was pulled. Fetch tuning —
+            // depth, kind selection, age gating, concurrency — is about what we
+            // retrieve, and re-analyzing every payload to measure that turns a
+            // sub-minute experiment into a long one. Reports what was fetched so
+            // a run is still comparable, then exits non-analyzing.
+            if std::env::var("SCAN_FETCH_ONLY").as_deref() == Ok("1") {
+                let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
+                tracing::info!(
+                    refs_selected = selected.len(),
+                    payloads_fetched = fetched.iter().filter(|r| r.size.is_some()).count(),
+                    fetched_bytes = bytes,
+                    "SCAN_FETCH_ONLY: stopping before payload analysis"
+                );
+                println!(
+                    "fetch-only: selected={} fetched={} bytes={}",
+                    selected.len(),
+                    fetched.iter().filter(|r| r.size.is_some()).count(),
+                    bytes
+                );
+                return;
+            }
             let acache_ref = acache
                 .get_or_insert_with(crate::analysis_cache::AnalysisCache::open)
                 .as_ref();
