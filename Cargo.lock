@@ -831,7 +831,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cleave"
 version = "2.4.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#31650acfc3fcd1c189003a9da2087530e93a95c6"
+source = "git+https://github.com/atomdrift-project/cleave.git#f058aad7dbf4297e1182979cdd5d8b32984b99ff"
 dependencies = [
  "aes 0.9.1",
  "aho-corasick",
@@ -914,7 +914,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#31650acfc3fcd1c189003a9da2087530e93a95c6"
+source = "git+https://github.com/atomdrift-project/cleave.git#f058aad7dbf4297e1182979cdd5d8b32984b99ff"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -970,7 +970,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1574,7 +1574,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1682,9 +1682,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.16.0"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
+checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "elliptic-curve"
@@ -1741,7 +1741,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3038,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#31650acfc3fcd1c189003a9da2087530e93a95c6"
+source = "git+https://github.com/atomdrift-project/cleave.git#f058aad7dbf4297e1182979cdd5d8b32984b99ff"
 
 [[package]]
 name = "lzxd"
@@ -3058,7 +3058,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#31650acfc3fcd1c189003a9da2087530e93a95c6"
+source = "git+https://github.com/atomdrift-project/cleave.git#f058aad7dbf4297e1182979cdd5d8b32984b99ff"
 dependencies = [
  "rustc-hash 2.1.3",
  "serde",
@@ -3261,7 +3261,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3853,9 +3853,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.221"
+version = "2.1.222"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "131e7bc39f71eb433f96399150b9e6729908dab3640467a3e90d5c5a77831568"
+checksum = "33fa2bb454bd1a4e046f36c4e8b60f034143ce14d09cfbf4608a65619e9f8611"
 dependencies = [
  "psl-types",
 ]
@@ -3900,7 +3900,7 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#31650acfc3fcd1c189003a9da2087530e93a95c6"
+source = "git+https://github.com/atomdrift-project/cleave.git#f058aad7dbf4297e1182979cdd5d8b32984b99ff"
 dependencies = [
  "flate2",
  "memchr",
@@ -3995,7 +3995,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4456,7 +4456,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4514,7 +4514,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4583,7 +4583,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#31650acfc3fcd1c189003a9da2087530e93a95c6"
+source = "git+https://github.com/atomdrift-project/cleave.git#f058aad7dbf4297e1182979cdd5d8b32984b99ff"
 dependencies = [
  "thiserror 2.0.19",
 ]
@@ -5153,7 +5153,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#31650acfc3fcd1c189003a9da2087530e93a95c6"
+source = "git+https://github.com/atomdrift-project/cleave.git#f058aad7dbf4297e1182979cdd5d8b32984b99ff"
 
 [[package]]
 name = "tap"
@@ -5185,10 +5185,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5233,7 +5233,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6662,7 +6662,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7014,7 +7014,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#31650acfc3fcd1c189003a9da2087530e93a95c6"
+source = "git+https://github.com/atomdrift-project/cleave.git#f058aad7dbf4297e1182979cdd5d8b32984b99ff"
 
 [[package]]
 name = "yara-x"
