@@ -73,6 +73,18 @@ enum Show {
 /// flag, now a fixed advisory default.
 const DEFAULT_SLOW_RULE_MS: u64 = 4000;
 
+/// Dependency age ceiling for `worker` mode: `0` — no gate, fetch every
+/// resolvable dependency.
+///
+/// An interactive scan gates at [`scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS`] because
+/// a fresh release is where a supply-chain compromise shows up and the operator is
+/// waiting. A worker is the opposite trade: it runs unattended to populate the
+/// shared corpus, and every dependency it resolves lands in hopper carrying a
+/// package coordinate — the raw material known-good bloom coverage is built from.
+/// Gating those out means the cache never learns the long tail that real scans
+/// keep re-resolving.
+const WORKER_MAX_DEP_AGE_DAYS: u32 = 0;
+
 #[derive(Parser)]
 #[command(name = "atomscan")]
 #[command(version)]
@@ -230,14 +242,14 @@ struct Cli {
     /// disables the gate (fetch every resolvable dependency). A dependency whose
     /// age can't be determined is always fetched. Also settable via
     /// `SCAN_FETCH_MAX_AGE`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "DAYS",
-        default_value_t = scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
-        env = "SCAN_FETCH_MAX_AGE"
-    )]
-    fetch_max_age: u32,
+    ///
+    /// Unset, the ceiling depends on the mode: an interactive scan wants a
+    /// fresh-risk window ([`scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS`]), while a
+    /// worker is a cache-population role and takes every resolvable dependency
+    /// ([`WORKER_MAX_DEP_AGE_DAYS`]). Optional rather than defaulted so an
+    /// explicit `--fetch-max-age` still wins in both.
+    #[arg(long, global = true, value_name = "DAYS", env = "SCAN_FETCH_MAX_AGE")]
+    fetch_max_age: Option<u32>,
 
     /// [EXPERIMENTAL] Fetch and scan native-binary dependencies for every
     /// platform, not just the host's. By default an `<os>-<arch>` package
@@ -694,9 +706,9 @@ fn main() -> Result<()> {
     // from `--fetch-max-file-*` (each its own flag/env). When `--fetch`/`SCAN_FETCH`
     // is unset, the binary defaults to `all` in every mode. An explicit selection
     // is honored verbatim in both; the knobs always apply.
-    let with_knobs = |mut policy: scan::fetch::FetchPolicy| {
+    let with_knobs = |mut policy: scan::fetch::FetchPolicy, default_max_age: u32| {
         policy.depth = cli.fetch_depth;
-        policy.max_dep_age_days = cli.fetch_max_age;
+        policy.max_dep_age_days = cli.fetch_max_age.unwrap_or(default_max_age);
         policy.max_file_fetches = cli.fetch_max_file_fetches;
         policy.max_url_fetches = cli.fetch_max_urls;
         policy.max_file_bytes = cli.fetch_max_file_size;
@@ -710,8 +722,19 @@ fn main() -> Result<()> {
     // Registry-metadata staleness bound: a process-global for the same reason,
     // consulted by every registry lookup. `None` keeps the tiered defaults.
     scan::fetch::set_registry_ttl(cli.registry_ttl);
-    let fetch_policy = with_knobs(cli.fetch.unwrap_or_else(default_cli_fetch_policy));
-    let worker_fetch_policy = fetch_policy;
+    let fetch_policy = with_knobs(
+        cli.fetch.unwrap_or_else(default_cli_fetch_policy),
+        scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
+    );
+    // A worker exists to populate the shared corpus, not to answer one question
+    // quickly: every resolvable dependency it pulls becomes a hopper sample with a
+    // package coordinate, which is what later grows known-good bloom coverage. The
+    // fresh-risk window that keeps an interactive scan fast is exactly the wrong
+    // default there — it discards the long tail the cache most wants.
+    let worker_fetch_policy = with_knobs(
+        cli.fetch.unwrap_or_else(default_cli_fetch_policy),
+        WORKER_MAX_DEP_AGE_DAYS,
+    );
     if let Some(cfg) = &interpret_cfg {
         tracing::info!(
             endpoint = %cfg.base_url,
