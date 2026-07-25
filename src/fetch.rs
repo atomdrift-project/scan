@@ -596,8 +596,34 @@ pub(crate) fn orchestrate(
             // materialized so the package pass below can pair an artifact with
             // its own registry metadata (see `apply_package_composites`).
             let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
-            for (r, reg, skip) in &registries {
-                if let Some(sub) = registry_node(reg, &opts) {
+            // Materialize every record concurrently, then merge serially below.
+            //
+            // Each `registry_node` is an independent cleave analysis of one small
+            // JSON document, and a lockfile-heavy scan produces hundreds of them
+            // — 851 on a 55-package corpus, at ~23 ms each, which was ~20 s of a
+            // 33 s run spent one-at-a-time while 127 cores idled. The merge stays
+            // serial and in `registries` order because `merge_registry` assigns
+            // report ids from a running max; parallelizing that would make ids
+            // (and therefore output) depend on completion order.
+            // A registry record is canonical JSON we serialized ourselves; its
+            // signal is entirely `registry.*` value facts and no YARA rule
+            // targets it. Disabling YARA here removed ~1400s of system time per
+            // scan — the engine's per-analysis setup, paid hundreds of times.
+            // Built once per batch, not per record: cloning `AnalysisOptions`
+            // inside the loop cost more user time than the YARA saving returned.
+            let registry_opts = AnalysisOptions {
+                disable_yara: true,
+                ..opts.clone()
+            };
+            let subs: Vec<Option<AnalysisReport>> = {
+                use rayon::prelude::*;
+                registries
+                    .par_iter()
+                    .map(|(_, reg, _)| registry_node(reg, &registry_opts))
+                    .collect()
+            };
+            for ((r, reg, skip), sub) in registries.iter().zip(subs) {
+                if let Some(sub) = sub {
                     registry_findings
                         .entry(locator_key(r))
                         .or_default()
@@ -1684,37 +1710,42 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
         return out;
     }
 
-    let cursor = AtomicUsize::new(0);
-    let workers = REGISTRY_LOOKUP_CONCURRENCY.min(misses.len());
-    let collected: Vec<Vec<(usize, Option<Registry>)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut local = Vec::new();
-                    loop {
-                        let t = cursor.fetch_add(1, Ordering::Relaxed);
-                        let Some(&i) = misses.get(t) else {
-                            break;
-                        };
-                        // The raw, un-aged record (or `None` for an unresolved or
-                        // unsupported package) — both worth memoizing so the
-                        // lookup isn't re-attempted for every file that names it.
-                        local.push((
-                            i,
-                            fletch::registry(&selected[i].locator, &res.net, &res.cache),
-                        ));
-                    }
-                    local
-                })
+    // Run the lookups on the existing rayon pool rather than spawning a fresh
+    // batch of OS threads.
+    //
+    // `std::thread::scope` here created `REGISTRY_LOOKUP_CONCURRENCY` threads per
+    // batch, and a directory scan reaches this once per scanned root (times each
+    // `--fetch-depth` hop). Every spawn and exit takes the address space's
+    // `mmap_lock` to map and unmap a stack, and with the whole rayon pool already
+    // resident that serializes into `native_queued_spin_lock_slowpath` — measured
+    // at 65% of all samples, with the fetch path burning ~1350s of system time
+    // against ~13s for the same scan offline. Rayon's workers already exist, so
+    // this is the same fan-out with no thread churn.
+    //
+    // The lookups are also not the I/O-bound work the old fan-out assumed: nearly
+    // all are blob-cache hits that parse JSON and map an ecosystem, i.e. CPU. A
+    // separate experiment raising the old constant 8 -> 64 made the scan *slower*
+    // (40s vs 33s) for exactly that reason.
+    let collected: Vec<(usize, Option<Registry>)> = {
+        use rayon::prelude::*;
+        misses
+            .par_iter()
+            .map(|&i| {
+                // The raw, un-aged record (or `None` for an unresolved or
+                // unsupported package) — both worth memoizing so the lookup isn't
+                // re-attempted for every file that names it.
+                (
+                    i,
+                    fletch::registry(&selected[i].locator, &res.net, &res.cache),
+                )
             })
-            .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
+            .collect()
+    };
 
     // Stamp the aged copy for this scan into each result slot, keeping the raw
     // record to memoize.
     let mut writes: Vec<(String, Option<Registry>)> = Vec::with_capacity(misses.len());
-    for (i, reg) in collected.into_iter().flatten() {
+    for (i, reg) in collected {
         out[i] = reg.clone().map(|reg| reg.with_age(now));
         writes.push((locator_key(&selected[i]), reg));
     }
@@ -1971,12 +2002,6 @@ fn sub_findings(sub: &AnalysisReport) -> Vec<Finding> {
         .flat_map(|f| f.findings.iter().cloned())
         .collect()
 }
-
-/// How many registry-metadata lookups run at once in [`age_gate`]. Unlike the
-/// CPU-bound payload analysis, these are I/O-bound (small, cached HTTP GETs), so
-/// a higher fan-out turns a manifest's worth of serial round-trips into a few
-/// parallel batches without taxing the CPU — while staying polite to registries.
-const REGISTRY_LOOKUP_CONCURRENCY: usize = 8;
 
 /// The product of analyzing one fetched payload: the finalized sub-report to
 /// graft (absent if the payload couldn't be analyzed) and the next-hop
