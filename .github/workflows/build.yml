@@ -1,0 +1,407 @@
+# Reusable build matrix — the single definition of "what platforms we ship and
+# how". Called by ci.yml (thin LTO, ad-hoc macOS signature) and by release.yml
+# (fat LTO, Developer ID signature + notarization). Keeping one matrix means CI
+# and release can't drift into building different things.
+#
+# See ci.yml for the hardening rationale that applies to both callers.
+
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: >-
+          Cargo profile: `release` (thin LTO, everyday CI) or `release-lto`
+          (fat LTO + one codegen unit, distribution builds).
+        type: string
+        default: release
+      sign:
+        description: >-
+          Sign the macOS binaries with the Developer ID identity and notarize
+          them. Requires the MACOS_* secrets; falls back to an ad-hoc signature
+          when false.
+        type: boolean
+        default: false
+    secrets:
+      MACOS_CERT_P12:
+        description: Base64-encoded .p12 holding the Developer ID Application cert + key.
+        required: false
+      MACOS_CERT_PASSWORD:
+        description: Password the .p12 was exported with.
+        required: false
+      MACOS_SIGN_IDENTITY:
+        description: 'Identity to sign with, e.g. "Developer ID Application: Name (TEAMID)".'
+        required: false
+      MACOS_NOTARY_KEY:
+        description: Base64-encoded App Store Connect API key (.p8).
+        required: false
+      MACOS_NOTARY_KEY_ID:
+        description: App Store Connect key ID.
+        required: false
+      MACOS_NOTARY_ISSUER:
+        description: App Store Connect issuer UUID.
+        required: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  SCAN_NO_UPDATE: "1"
+
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc floor comes from the runner: 22.04 is glibc 2.35. Bumping to
+          # ubuntu-24.04 raises it to 2.39 and silently drops older distros.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            native: true
+            test: true
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            native: true
+
+          - target: aarch64-apple-darwin
+            os: macos-15
+            native: true
+            test: true
+
+          # Cross-built on the arm64 runner: the macOS SDK carries both slices,
+          # and GitHub is retiring the Intel runners. Build-only — Rosetta is
+          # not guaranteed on the arm64 image, so we can't smoke it here.
+          - target: x86_64-apple-darwin
+            os: macos-15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 708 crates, a ~139 MB binary, and several C deps: the stock runner
+      # image leaves ~25 GB free on / and this build will use a good chunk.
+      - name: Reclaim runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$TARGET"
+          rustc --version --verbose
+
+      - name: Cache cargo home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Registry + git checkouts only, never target/. The five git deps are
+          # large and re-cloned on every miss; target/ dirs for this graph run
+          # to tens of GB and would blow the 10 GB per-repo cache budget.
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-${{ matrix.target }}-
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: cargo build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
+
+      # `--lib` only, mirroring `make test-unit`. The integration tests in
+      # tests/ each link their own copy of a very large binary; enabling them
+      # here needs a look at wall-clock and disk first. The model-dependent
+      # tests are already #[ignore]d.
+      - name: Test
+        if: matrix.test
+        run: cargo test --locked --lib
+
+      # --- macOS signing ------------------------------------------------------
+      # Unsigned path: an ad-hoc signature, matching what `make release` does on
+      # Darwin. Good enough for CI artifacts, useless for distribution.
+      - name: Ad-hoc codesign
+        if: ${{ runner.os == 'macOS' && !inputs.sign }}
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: codesign --force --sign - "target/$TARGET/$PROFILE/atomscan"
+
+      # Signed path: import the Developer ID cert into a throwaway keychain
+      # that exists only for this job. Never touch the runner's login keychain,
+      # and never leave the .p12 on disk.
+      - name: Import Developer ID certificate
+        if: ${{ runner.os == 'macOS' && inputs.sign }}
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/atomdrift-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "SIGNING_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 1800 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Without this, codesign blocks on an interactive keychain prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      # Hardened runtime is mandatory for notarization, and hardened runtime
+      # blocks JIT by default — which would kill us, because yara-x runs its
+      # compiled rules through wasmtime/cranelift at load time. Hence the
+      # allow-jit entitlement in .github/macos-entitlements.plist.
+      - name: Sign with Developer ID
+        if: ${{ runner.os == 'macOS' && inputs.sign }}
+        env:
+          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -eu
+          BIN="target/$TARGET/$PROFILE/atomscan"
+          codesign --force --timestamp --options runtime \
+            --entitlements .github/macos-entitlements.plist \
+            --sign "$IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          codesign --display --entitlements - "$BIN"
+
+      - name: Notarize
+        if: ${{ runner.os == 'macOS' && inputs.sign }}
+        env:
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -eu
+          BIN="target/$TARGET/$PROFILE/atomscan"
+          printf '%s' "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          /usr/bin/ditto -c -k "$BIN" "$RUNNER_TEMP/atomscan.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/atomscan.zip" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER" \
+            --wait --timeout 30m
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/atomscan.zip"
+          # A bare Mach-O can't be stapled — `stapler` only handles bundles,
+          # .dmg and .pkg — so Gatekeeper resolves the ticket online the first
+          # time a downloaded copy runs. Ship a signed .pkg if you ever need
+          # offline-verifiable direct downloads.
+
+      - name: Remove signing keychain
+        if: ${{ always() && runner.os == 'macOS' && inputs.sign }}
+        run: |
+          set -eu
+          [ -n "${SIGNING_KEYCHAIN:-}" ] || exit 0
+          security delete-keychain "$SIGNING_KEYCHAIN" || true
+      # ------------------------------------------------------------------------
+
+      - name: Smoke test
+        if: matrix.native
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -x
+          file "target/$TARGET/$PROFILE/atomscan"
+          "./target/$TARGET/$PROFILE/atomscan" --version
+          "./target/$TARGET/$PROFILE/atomscan" --help >/dev/null
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: tar -czf "atomscan-$TARGET.tar.gz" -C "target/$TARGET/$PROFILE" atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-${{ matrix.target }}
+          path: atomscan-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # Native build in a KVM-accelerated VM, which is the only way to actually run
+  # the test suite on FreeBSD. Uses the OS's packaged rust, so it also tells us
+  # when ports rust drifts below our MSRV.
+  freebsd:
+    name: x86_64-unknown-freebsd
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
+        with:
+          usesh: true
+          # Pinned, not left to the action's default (currently 15.1): building
+          # on the older major keeps the artifact runnable on 14.x *and* 15.x,
+          # and an image that changes under us is an unreviewed dependency.
+          release: "14.3"
+          # Runner is 4 vCPU / 16 GB; leave the host a couple of GB. The link
+          # step for a binary this size is the memory high-water mark.
+          cpu: "4"
+          mem: "12288"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          # cmake is for aws-lc-sys, which has no prebuilt path off the tier-1
+          # platforms and falls back to a CMake build.
+          prepare: |
+            pkg install -y rust cmake pkgconf git
+          run: |
+            set -eux
+            rustc --version
+            # Keep target/ out of the synced workspace: the action rsyncs the
+            # workspace back to the host at the end, and a full target/ is tens
+            # of GB. Only the finished binary gets copied in.
+            export CARGO_TARGET_DIR=/tmp/target
+            cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
+            "/tmp/target/$BUILD_PROFILE/atomscan" --version
+            cp "/tmp/target/$BUILD_PROFILE/atomscan" ./atomscan
+            # Non-fatal during bring-up: this is the first time the suite has
+            # run on FreeBSD in CI, and we want the artifact either way. Make
+            # it fatal once we know it's green.
+            cargo test --locked --lib || echo "::warning::FreeBSD unit tests failed"
+        env:
+          BUILD_PROFILE: ${{ inputs.profile }}
+
+      - name: Package
+        run: tar -czf atomscan-x86_64-unknown-freebsd.tar.gz atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-x86_64-unknown-freebsd
+          path: atomscan-x86_64-unknown-freebsd.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # Targets needing a cross toolchain the runner image doesn't ship.
+  #
+  # musl lives here rather than in `native` because Ubuntu's musl-tools provides
+  # only musl-gcc (C). unrar_sys builds C++ and asks for x86_64-linux-musl-g++,
+  # and Debian/Ubuntu package no musl g++ at all. cross-rs's musl image is
+  # musl-cross-make with C++ support (`cpp = true` in its targets.toml).
+  #
+  # Supply-chain caveat: `cross` pulls ghcr.io/cross-rs/<target>:<version>, a
+  # third-party container image, pinned here by version tag. Pin it by digest in
+  # a Cross.toml before this feeds a published release.
+  #
+  # If an image turns out to be missing something (aws-lc-sys wants cmake for
+  # platforms it has no prebuilt path for), the alternative is cargo-zigbuild:
+  # zig cc/c++ covers musl including libc++, and runs directly on the runner
+  # where cmake already exists.
+  cross:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Portable Linux artifact: no glibc floor at all. jemalloc still
+          # applies here (Cargo.toml only excludes the BSDs and illumos), so
+          # this doesn't inherit musl-malloc's allocator performance.
+          - target: x86_64-unknown-linux-musl
+            smoke: true
+
+          # x86_64-unknown-illumos slots back in here once tree-sitter is
+          # repaired: its src/portable/endian.h has no __sun branch and fails
+          # with "platform not supported" — illumos spells those macros in
+          # <sys/byteorder.h>, not <endian.h>. Everything up to that point
+          # cross-built fine, including the C and C++ deps.
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reclaim runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Cache cargo home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cross
+          key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-${{ matrix.target }}-
+
+      # 0.2.5 is the current crates.io release and dates from 2023; if it no
+      # longer builds on current stable, or an image turns out to be too old,
+      # switch to `--git https://github.com/cross-rs/cross`.
+      - name: Install cross
+        run: |
+          command -v cross >/dev/null || cargo install cross --locked --version 0.2.5
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: cross build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
+
+      - name: Inspect
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: file "target/$TARGET/$PROFILE/atomscan"
+
+      # A static musl binary runs on the runner as-is, so this is a real smoke
+      # test rather than a `file` sanity check. Targets that can't execute here
+      # (illumos, when it returns) just leave `smoke` unset.
+      - name: Smoke test
+        if: matrix.smoke
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -x
+          "./target/$TARGET/$PROFILE/atomscan" --version
+          "./target/$TARGET/$PROFILE/atomscan" --help >/dev/null
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: tar -czf "atomscan-$TARGET.tar.gz" -C "target/$TARGET/$PROFILE" atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-${{ matrix.target }}
+          path: atomscan-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14

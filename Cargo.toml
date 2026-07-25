@@ -274,6 +274,17 @@ stng = { git = "https://github.com/atomdrift-project/stng.git" }
 [patch."https://github.com/tstromberg/dmgwiz.git"]
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 
+# TEMPORARY local fletch: gives a pinned version on an immutable registry
+# (crates.io / Go proxy / Maven Central) a 90-day metadata TTL instead of 4h.
+# The 4h tier exists to catch a post-publish mutation those registries forbid, so
+# on a lockfile-heavy scan it re-fetches hundreds of packuments that cannot have
+# changed. NOTE: ../fletch is one commit ("update deps") BEHIND the rev scan
+# locks, so this build's dependency graph differs slightly from the locked one —
+# fine for measurement, rebase before merging. Remove and bump the fletch rev
+# once a release carries the change.
+[patch."https://github.com/atomdrift-project/fletch.git"]
+fletch = { path = "../fletch" }
+
 # TEMPORARY local cleave: archive-mode aggregation cost. `make bench-archive`
 # measures it and `make profile-archive` shows where it goes — both need cleave
 # rebuilt in the loop, so scan has to see ../cleave rather than the git rev.

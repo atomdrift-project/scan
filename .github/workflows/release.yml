@@ -1,0 +1,153 @@
+# Publish a release. Fires automatically on a `v*` tag; `workflow_dispatch`
+# from a tag ref does the same thing by hand.
+#
+#     git tag -s v2.4.0 -m "Atomdrift Scan 2.4.0"
+#     git push origin v2.4.0
+#
+# This workflow is deliberately separate from ci.yml because it is the only one
+# holding dangerous permissions — `contents: write` to publish, `id-token` and
+# `attestations: write` to sign provenance, and the macOS Developer ID secrets.
+# None of that is reachable from a pull_request trigger: tags on this repo can
+# only be pushed by someone who already has write access.
+#
+# To require a human before anything is published, create a `release`
+# environment (Settings -> Environments) with a required reviewer and add
+# `environment: release` to the publish job. The build still runs; only the
+# upload waits.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel a half-published release.
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify tag
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A tag can be pushed without ever passing through PR CI, so the release
+      # path repeats the guard rather than trusting that someone ran it.
+      - name: Reject local path overrides
+        run: |
+          if grep -nE '^[[:space:]]*[^#].*path[[:space:]]*=[[:space:]]*"\.\.' Cargo.toml; then
+            echo "::error file=Cargo.toml::local path override committed - refusing to release"
+            exit 1
+          fi
+
+      - name: Tag matches Cargo.toml version
+        id: version
+        run: |
+          set -eu
+          case "$GITHUB_REF" in
+            refs/tags/*) TAG="${GITHUB_REF#refs/tags/}" ;;
+            *)
+              echo "::error::release must run from a tag ref (got $GITHUB_REF)"
+              exit 1
+              ;;
+          esac
+          VERSION="${TAG#v}"
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "releasing $TAG (version $VERSION)"
+
+  build:
+    name: build
+    needs: verify
+    uses: ./.github/workflows/build.yml
+    with:
+      # Fat LTO + one codegen unit. Multi-minute links, and worth it for a
+      # binary people download rather than rebuild.
+      profile: release-lto
+      sign: true
+    # Explicit, not `secrets: inherit` — the called workflow gets exactly these
+    # six and nothing else.
+    secrets:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+
+  publish:
+    name: publish
+    needs: [verify, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    # Add `environment: release` here to gate the upload on a human approval.
+    permissions:
+      contents: write      # create the release, upload assets
+      id-token: write      # OIDC identity for provenance signing
+      attestations: write  # record the provenance attestation
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: ${{ needs.verify.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: atomscan-*
+          merge-multiple: true
+          path: dist
+
+      # Artifacts are named by target; releases are named by version + target.
+      # Any platform whose job failed is simply absent — a broken experimental
+      # target doesn't block shipping the ones that built.
+      - name: Assemble
+        run: |
+          set -eu
+          cd dist
+          for f in atomscan-*.tar.gz; do
+            target="${f#atomscan-}"
+            target="${target%.tar.gz}"
+            mv "$f" "atomscan-$VERSION-$target.tar.gz"
+          done
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # Signed, verifiable statement that these exact bytes came out of this
+      # workflow at this commit. Consumers check it with:
+      #   gh attestation verify atomscan-<version>-<target>.tar.gz \
+      #     --repo atomdrift-project/scan
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*.tar.gz
+
+      # `gh` ships on the runner, so publishing needs no third-party action in
+      # the one job that holds `contents: write`. Add `--draft` if you'd rather
+      # review before it goes live.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Atomdrift Scan $VERSION" \
+            --generate-notes \
+            --verify-tag \
+            dist/*.tar.gz dist/SHA256SUMS
