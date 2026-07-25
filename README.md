@@ -2,10 +2,10 @@
 
 Atomdrift Scan is an embeddable open-source malware scanner, tuned for open-source ecosystems, designed to catch supply-chain attacks no matter the file format: ELF, Ruby, Python, Shell, PHP, C, Go, PE, whatever (we process 95+ different filetypes!)
 
-AS is designed to replace proprietary scanners such as socket.dev, ReversingLabs, and Aikido, as well as legacy open-source
-scanners such as ClamAV and malcontent. To fight fire with fire, AS is based on efficient and deterministic local AI models - designed to run on any hardware or operating system. Unlike most scanners that rely on pattern mattching, it dissects each file - through active reverse engineering using tools like rizin and tree-sitter. Atomdrift decomposes each file into a tree of atoms, and from there looks for "malecule" shapes to derive probability.
+Atomscan is designed to replace proprietary scanners such as socket.dev, ReversingLabs, and Aikido, as well as legacy open-source
+scanners such as ClamAV and malcontent. To fight fire with fire, Atomscan is based on efficient and deterministic local AI models - designed to run on any hardware or operating system. Unlike most scanners that rely on pattern mattching, it dissects each file - through active reverse engineering using tools like rizin and tree-sitter. Atomdrift decomposes each file into a tree of atoms, and from there looks for "malecule" shapes to derive probability.
 
-Unlike most scanners, AS allows you to set your acceptable false-positive level, based on predicted occurrence over 100 million samples based on the specific filetype involved. Paranoid about your CI pipeline? use `atomscan -l5000 <files>`; don't want to bombard the SOC with alerts? use `atomscan -l0` (the default is L50, or 50-per-100 million).
+Unlike most scanners, Atomscan allows you to set your acceptable false-positive level, based on predicted occurrence over 100 million samples based on the specific filetype involved. Paranoid about your CI pipeline? use `atomscan -l5000 <files>`; don't want to bombard the SOC with alerts? use `atomscan -l0` (the default is L50, or 50-per-100 million).
 
 We're Apache 2.0 licensed, and in active development on the following architectures - chances are if you are on something else, it should still work (if not, PR's welcome).
 
@@ -26,7 +26,7 @@ Atomdrift's core values are: privacy-first, local-first, efficiency, and transpa
 Atomdrift Scan is a multi-stage analyzer bringing together the best that open-source has to offer for reverse-engineering
 binaries and source code. 
 
-AS is able to cover as much ground as it does by expressing the AI model in terms of a YAML-based expert system with over 75,000 rules, analyzing using a large ensemble of LightGBM ML models. AS also supports the use of local GPU-based analysis via OpenAI-compatible endpoints [vLLM, for example] for additional accuracy and interpretation, but that's entirely optional.
+Over **4.2 million rules** stand behind every scan, continuously strengthened by a self-reinforcement learning system. At its core is a YAML-based expert system of over 92,000 rules, analyzed with a large ensemble of LightGBM ML models. Atomscan also supports the use of local GPU-based analysis via OpenAI-compatible endpoints [vLLM, for example] for additional accuracy and interpretation, but that's entirely optional.
 
 ```mermaid
 flowchart LR
@@ -40,11 +40,11 @@ flowchart LR
         RIZIN[rizin<br/>disassemble]
     end
 
-    CLEAVE -->|AnalysisReport<br/>75k rules → MBC + ATT&CK| FF[filefacts<br/>feature extraction]
+    CLEAVE -->|AnalysisReport<br/>92k rules → MBC + ATT&CK| FF[filefacts<br/>feature extraction]
     FF -->|standardized<br/>feature vector| SCAN[scan<br/>ONNX inference]
     AZOTH[(azoth<br/>GBT ensemble)] -.loads.-> SCAN
     SCAN -->|Decision + SHAP reasons| OUT{{verdict<br/>hostile · suspicious · benign}}
-    SCAN -.->|prob ≥ gate| INTERPRET[--interpret<br/>local LLM blend]
+    SCAN -.->|prob ≥ gate| INTERPRET[--llm<br/>local LLM blend]
     INTERPRET -.-> OUT
 
     click CLEAVE "https://atomdrift.org/cleave" _blank
@@ -59,7 +59,7 @@ flowchart LR
 
 ## Dependencies
 
-* Rust 1.96 or higher
+* Rust 1.94 or higher
 * [upx](https://upx.github.io/) [optional, recommended for binary analysis]
 * [rizin](https://rizin.re/) [optional, recommended for binary reverse-analysis]
 * [innoextract](https://github.com/dscharrer/innoextract) [optional, recommended for PE archive analysis]
@@ -100,9 +100,9 @@ By default, atomscan is tuned for 50 false-positives per 100-million files, tune
 atomscan -l 0 /sbin/sulogin            # 0-fp scan against a file
 ```
 
-If you want a second opinion for added accuracy, AS recently added support for efficiently sending evidence to a local LLM for analysis using `--interpret`. It defaults to the local OpenAI-compatible endpoint at http://localhost:8000/v1 - we currently recommend vLLM with Qwen3.6-27B as a model. Models down to 9B are likely sufficient as well. LLM scores are blended against the ML scores for a final adjusted outcome.
+If you want a second opinion for added accuracy, Atomscan supports efficiently sending evidence to a local LLM for analysis using `--llm`. It defaults to the local OpenAI-compatible endpoint at http://localhost:8000/v1 - we currently recommend vLLM with Qwen3.6-27B as a model. Models down to 9B are likely sufficient as well. LLM scores are blended against the ML scores for a final adjusted outcome.
 
-## What AS groks.
+## What Atomscan groks.
 
 **95 file types** across binaries, source, packages, and documents — **25 platforms** from desktop OSes to network appliances. 
 
