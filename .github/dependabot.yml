@@ -1,0 +1,20 @@
+# Actions in .github/workflows are pinned to commit SHAs so a moved tag can't
+# swap the code we run. That only stays safe if the pins get refreshed, which
+# is what this does — Dependabot rewrites the SHA and updates the trailing
+# version comment.
+#
+# Cargo is deliberately not listed: our dependency graph is pinned through
+# Cargo.lock with five git deps tracking branches, and Dependabot would open
+# noise it can't resolve. Dependency freshness there is handled by an explicit
+# `cargo update` pass.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]

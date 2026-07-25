@@ -610,15 +610,13 @@ pub(crate) fn orchestrate(
                     continue;
                 };
                 let common = tracing::field::display(locator_key(r));
-                // A known-good skip is counted into the bloom tally so the summary
-                // reflects it alongside skipped known-good files.
                 if *reason == SkipReason::KnownGood {
                     crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
                 }
                 let log_reason = match reason {
                     SkipReason::Removed => "version removed from registry",
                     SkipReason::AgedOut => "older than --max-dep-age",
-                    SkipReason::KnownGood => "known-good (bloom); trust not stale",
+                    SkipReason::KnownGood => "known-good (bloom, resolved version)",
                 };
                 // Age-outs are the common, expected case; they stay at debug so
                 // `--verbose` can still see them, while removals and known-good
@@ -1383,9 +1381,11 @@ enum SkipReason {
     /// The version was unpublished/yanked from the registry — no artifact to
     /// fetch. Rare and worth surfacing.
     Removed,
-    /// Matched the known-good bloom set by PURL — a trusted coordinate, so its
-    /// bytes are not re-fetched or re-scanned (see [`must_rescan`] for the
-    /// pulled/fresh exceptions that override this).
+    /// The *resolved* coordinate is vouched by the known-good bloom, and its
+    /// trust is not stale. Reached only by references whose declared locator
+    /// carried no version (a manifest range), which the pre-lookup probe in
+    /// [`age_gate`] cannot match; pinned coordinates are filtered before the
+    /// lookup instead.
     KnownGood,
 }
 
@@ -1423,8 +1423,53 @@ pub(crate) fn must_rescan(reg: &Registry, now: u64) -> bool {
 }
 
 /// Whether a reference is a known-good package coordinate per the loaded bloom
-/// filters. Purl-keyed, so it vouches for the coordinate (not the exact bytes);
-/// callers pair it with [`must_rescan`] before trusting it enough to skip.
+/// filters. Purl-keyed, so it vouches for the coordinate, not the exact bytes.
+///
+/// Used by [`age_gate`] as a pre-lookup filter: a vouched coordinate skips both
+/// the registry round-trip and the artifact fetch. That means the yank check
+/// [`must_rescan`] performs is *not* applied there — it needs a registry record
+/// this path deliberately never fetches. The trade is intentional: a vouched
+/// coordinate is not worth a network round-trip to re-confirm.
+/// The reference's coordinate with the registry's resolved version attached, or
+/// `None` when it isn't a PURL or nothing resolved.
+///
+/// A manifest declares a *range* (`"axios": "^1.6.0"`), so an npm reference's
+/// locator usually carries no version at all — and the bloom is keyed on exact
+/// `name@version`, so probing the declared form can only ever miss. Measured on a
+/// 55-package corpus: 22 of 25 npm references arrived version-less, i.e. the
+/// known-good check was structurally dead for npm. Lockfile ecosystems (cargo,
+/// golang) pin exact versions and are unaffected.
+///
+/// The version is appended to the declared locator rather than rebuilt from
+/// `reg.ecosystem`, so the PURL type and namespace stay exactly as the reference
+/// resolver produced them. A scoped npm name percent-encodes its `@`
+/// (`pkg:npm/%40scope/name`), so a bare `@` in the body can only be a version.
+fn resolved_purl(r: &Reference, reg: &Registry) -> Option<String> {
+    let RefLocator::Purl(purl) = &r.locator else {
+        return None;
+    };
+    if reg.version.is_empty() {
+        return None;
+    }
+    let body = purl.strip_prefix("pkg:")?;
+    if body.contains('@') {
+        return Some(purl.clone());
+    }
+    Some(format!("{purl}@{}", reg.version))
+}
+
+/// Whether the *resolved* coordinate is vouched known-good. The post-lookup
+/// counterpart to [`bloom_known_good_purl`]: it costs nothing extra (the record
+/// is already in hand) and catches the range-declared references the pre-lookup
+/// probe cannot. Pairs with [`must_rescan`], which the pre-lookup path has to
+/// forgo — here the record exists, so a yanked version is still caught.
+fn bloom_known_good_resolved(r: &Reference, reg: &Registry) -> bool {
+    resolved_purl(r, reg).is_some_and(|purl| {
+        crate::bloom_repo::global()
+            .is_some_and(|lk| lk.decide_purl(&purl) == crate::bloom_repo::Decision::Skip)
+    })
+}
+
 fn bloom_known_good_purl(r: &Reference) -> bool {
     let RefLocator::Purl(purl) = &r.locator else {
         return false;
@@ -1477,6 +1522,28 @@ fn age_gate(
     // records are still looked up and materialized.
     let max_age =
         (policy.max_dep_age_days > 0).then(|| u64::from(policy.max_dep_age_days) * 86_400);
+    // Vouched coordinates never reach the network. The bloom probe is a local
+    // filter test on the PURL, so asking it *before* `lookup_registries` turns a
+    // known-good dependency from "one registry round-trip, then skip" into "no
+    // I/O at all" — the single largest saving available on a lockfile-heavy scan,
+    // where a `Cargo.lock` alone can declare 700 coordinates.
+    //
+    // Two things are given up, deliberately. The artifact is not re-scanned even
+    // if the version was later yanked (`must_rescan` needs the record we no
+    // longer fetch) — an accepted trade: a known-good coordinate is not worth
+    // re-fetching. And no `*.registry.json` node is materialized for it, so its
+    // registry metadata contributes no findings. Both apply *only* to
+    // bloom-vouched coordinates; everything else keeps the full path below.
+    let (selected, vouched): (Vec<Reference>, Vec<Reference>) = selected
+        .into_iter()
+        .partition(|r| !bloom_known_good_purl(r));
+    for r in &vouched {
+        crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
+        tracing::debug!(
+            package = %locator_key(r),
+            "known-good coordinate (bloom); registry lookup and fetch both skipped"
+        );
+    }
     // The network round-trips run concurrently up front; the gate decision below
     // is then pure, so it stays deterministic in `selected` order.
     let lookups = lookup_registries(&selected, res, now);
@@ -1486,16 +1553,16 @@ fn age_gate(
         match lookup {
             // A resolved record: gate on age, but materialize it either way. A
             // version the registry has already removed has no fetchable artifact,
-            // so skip the doomed fetch too. A known-good coordinate is skipped
-            // unless its trust may be stale (pulled/yanked or <48h old). In every
-            // skip case the materialized record's signals still surface.
+            // so skip the doomed fetch too. In every skip case the materialized
+            // record's signals still surface. (Known-good coordinates never get
+            // here — they were filtered out above, before the lookup.)
             Some(reg) => {
                 let reason = if reg.version_removed == Some(true) {
                     Some(SkipReason::Removed)
                 } else if max_age.is_some_and(|max| reg.age_secs(now).is_some_and(|age| age >= max))
                 {
                     Some(SkipReason::AgedOut)
-                } else if bloom_known_good_purl(&r) && !must_rescan(&reg, now) {
+                } else if bloom_known_good_resolved(&r, &reg) && !must_rescan(&reg, now) {
                     Some(SkipReason::KnownGood)
                 } else {
                     None
@@ -2198,6 +2265,67 @@ mod tests {
         let line = summary_line(&mixed);
         assert!(line.contains("1 live"), "{line}");
         assert!(line.contains("1 cached"), "{line}");
+    }
+
+    #[test]
+    fn resolved_purl_pairs_registry_version_onto_range_declarations() {
+        let dep = |locator: &str| Reference {
+            locator: RefLocator::Purl(locator.to_string()),
+            kind: RefKind::Dependency,
+            source: String::new(),
+            evidence: String::new(),
+            offset: 0,
+            pinned_hash: None,
+            content_sha256: None,
+        };
+        let at = |v: &str| Registry {
+            version: v.to_string(),
+            ..Registry::default()
+        };
+
+        // The npm case this exists for: a manifest range leaves the locator
+        // version-less, so the bloom (keyed `name@version`) could never match it.
+        assert_eq!(
+            resolved_purl(&dep("pkg:npm/axios"), &at("1.6.8")).as_deref(),
+            Some("pkg:npm/axios@1.6.8")
+        );
+        // A scoped npm name percent-encodes its `@`, so the scope must not be
+        // mistaken for a version already being present.
+        assert_eq!(
+            resolved_purl(&dep("pkg:npm/%40scope/pkg"), &at("2.0.0")).as_deref(),
+            Some("pkg:npm/%40scope/pkg@2.0.0")
+        );
+        // Lockfile ecosystems already pin a version — returned untouched, and
+        // notably NOT re-suffixed with the registry's version.
+        assert_eq!(
+            resolved_purl(&dep("pkg:cargo/serde@1.0.219"), &at("1.0.220")).as_deref(),
+            Some("pkg:cargo/serde@1.0.219")
+        );
+        assert_eq!(
+            resolved_purl(
+                &dep("pkg:golang/github.com/stretchr/testify@v1.9.0"),
+                &at("v1.9.1")
+            )
+            .as_deref(),
+            Some("pkg:golang/github.com/stretchr/testify@v1.9.0")
+        );
+        // Nothing resolved, or not a PURL: no coordinate to probe.
+        assert_eq!(resolved_purl(&dep("pkg:npm/axios"), &at("")), None);
+        assert_eq!(
+            resolved_purl(
+                &Reference {
+                    locator: RefLocator::Url("https://example.test/x.tgz".into()),
+                    kind: RefKind::UrlFetch,
+                    source: String::new(),
+                    evidence: String::new(),
+                    offset: 0,
+                    pinned_hash: None,
+                    content_sha256: None,
+                },
+                &at("1.0.0")
+            ),
+            None
+        );
     }
 
     #[test]

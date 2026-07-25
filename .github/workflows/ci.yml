@@ -1,0 +1,336 @@
+# Lint, test, and build the `atomscan` release binary for every platform we ship.
+#
+# Hardening notes — this workflow is itself a supply-chain target:
+#
+#   * Every action is pinned to a full commit SHA. Tags are mutable; a
+#     compromised upstream can move `v4` at any time. .github/dependabot.yml
+#     proposes the bumps so pinning doesn't mean going stale.
+#   * `permissions: {}` at the top level. Each job opts in to exactly what it
+#     needs; nothing here needs more than `contents: read`.
+#   * `persist-credentials: false` on every checkout, so the job token is never
+#     written into .git/config where a build script (we run hundreds) could
+#     read it back out.
+#   * Trigger is `pull_request`, never `pull_request_target`: fork PRs run with
+#     a read-only token and no access to secrets. This workflow uses no secrets
+#     and no self-hosted runners, so a hostile PR gets nothing but CPU.
+#   * Every cargo invocation is `--locked`. Without it a drifting git dep or a
+#     compromised registry could swap a dependency out from under a release
+#     build, and Cargo.lock is the only thing pinning cleave/fletch/filefacts/
+#     stng/proclist to reviewed revisions.
+#
+# Smoke tests are deliberately `--version`/`--help` only: a real scan
+# bootstraps the model bundle over the network on first run (see
+# src/models_repo.rs), which we don't want CI depending on.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  SCAN_NO_UPDATE: "1"
+
+jobs:
+  # Cheapest job, highest value. This repo routinely carries temporary
+  # `[patch]` entries pointing at ../cleave while a cross-repo change is in
+  # flight (see the comment block at the bottom of Cargo.toml). Shipping one
+  # would build a release nobody else can reproduce. Mirrors scripts/pre-commit.
+  guard:
+    name: guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reject local path overrides
+        # Same regex as scripts/pre-commit, including the `[^#]` guard that
+        # keeps commented-out patches (Cargo.toml keeps a running log of them)
+        # from tripping it. Keep the two in sync.
+        run: |
+          if grep -nE '^[[:space:]]*[^#].*path[[:space:]]*=[[:space:]]*"\.\.' Cargo.toml; then
+            echo "::error file=Cargo.toml::local path override committed - push the dep and pin a git rev instead"
+            exit 1
+          fi
+
+      - name: Cache cargo home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Registry + git checkouts only, never target/. The five git deps are
+          # large and re-cloned on every miss; target/ dirs for this graph run
+          # to tens of GB and would blow the 10 GB per-repo cache budget.
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-home-guard-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-guard-${{ runner.os }}-
+
+      - run: cargo fmt --all --check
+
+      # Matches `make lint` exactly, so a clean local run means a clean CI run.
+      - run: cargo clippy --locked -- -D warnings
+
+      # A `--locked` build fails outright on a stale lockfile, but this catches
+      # the subtler case of a lockfile that resolves but wasn't committed.
+      - name: Cargo.lock unchanged
+        run: git diff --exit-code Cargo.lock
+
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    # Rung 1 of the platform ladder (musl) is still being debugged; a red X
+    # there shouldn't block a PR. Drop the flag once it's reliably green.
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc floor comes from the runner: 22.04 is glibc 2.35. Bumping to
+          # ubuntu-24.04 raises it to 2.39 and silently drops older distros.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            native: true
+            test: true
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            native: true
+
+          # Portable Linux artifact: no glibc floor at all. jemalloc still
+          # applies here (Cargo.toml only excludes the BSDs and illumos), so
+          # this doesn't inherit musl-malloc's allocator performance.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            apt: musl-tools
+            native: true
+            experimental: true
+
+          - target: aarch64-apple-darwin
+            os: macos-15
+            native: true
+            test: true
+
+          # Cross-built on the arm64 runner: the macOS SDK carries both slices,
+          # and GitHub is retiring the Intel runners. Build-only — Rosetta is
+          # not guaranteed on the arm64 image, so we can't smoke it here.
+          - target: x86_64-apple-darwin
+            os: macos-15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 708 crates, a ~139 MB binary, and several C deps: the stock runner
+      # image leaves ~25 GB free on / and this build will use a good chunk.
+      - name: Reclaim runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install build packages
+        if: matrix.apt != ''
+        env:
+          APT_PACKAGES: ${{ matrix.apt }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Install target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$TARGET"
+          rustc --version --verbose
+
+      - name: Cache cargo home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-${{ matrix.target }}-
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET" --bin atomscan
+
+      # `--lib` only, mirroring `make test-unit`. The integration tests in
+      # tests/ each link their own copy of a very large binary; enabling them
+      # here needs a look at wall-clock and disk first. The model-dependent
+      # tests are already #[ignore]d.
+      - name: Test
+        if: matrix.test
+        run: cargo test --locked --lib
+
+      # Matches what `make release` does on Darwin. Ad-hoc signature only; a
+      # Developer ID identity + notarization belongs in the release workflow.
+      - name: Ad-hoc codesign
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: codesign --force --sign - "target/$TARGET/release/atomscan"
+
+      - name: Smoke test
+        if: matrix.native
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -x
+          file "target/$TARGET/release/atomscan"
+          "./target/$TARGET/release/atomscan" --version
+          "./target/$TARGET/release/atomscan" --help >/dev/null
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: tar -czf "atomscan-$TARGET.tar.gz" -C "target/$TARGET/release" atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-${{ matrix.target }}
+          path: atomscan-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # Rung 2. Native build in a KVM-accelerated VM, which is the only way to
+  # actually run the test suite on FreeBSD. Uses the OS's packaged rust, so it
+  # also tells us when ports rust drifts below our MSRV.
+  freebsd:
+    name: x86_64-unknown-freebsd
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
+        with:
+          usesh: true
+          # Pinned, not left to the action's default (currently 15.1): building
+          # on the older major keeps the artifact runnable on 14.x *and* 15.x,
+          # and an image that changes under us is an unreviewed dependency.
+          release: "14.3"
+          # Runner is 4 vCPU / 16 GB; leave the host a couple of GB. The link
+          # step for a binary this size is the memory high-water mark.
+          cpu: "4"
+          mem: "12288"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE"
+          # cmake is for aws-lc-sys, which has no prebuilt path off the tier-1
+          # platforms and falls back to a CMake build.
+          prepare: |
+            pkg install -y rust cmake pkgconf git
+          run: |
+            set -eux
+            rustc --version
+            # Keep target/ out of the synced workspace: the action rsyncs the
+            # workspace back to the host at the end, and a full target/ is tens
+            # of GB. Only the finished binary gets copied in.
+            export CARGO_TARGET_DIR=/tmp/target
+            cargo build --locked --release --bin atomscan
+            /tmp/target/release/atomscan --version
+            cp /tmp/target/release/atomscan ./atomscan
+            # Non-fatal during bring-up: this is the first time the suite has
+            # run on FreeBSD in CI, and we want the artifact either way. Make
+            # it fatal once we know it's green.
+            cargo test --locked --lib || echo "::warning::FreeBSD unit tests failed"
+
+      - name: Package
+        run: tar -czf atomscan-x86_64-unknown-freebsd.tar.gz atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-x86_64-unknown-freebsd
+          path: atomscan-x86_64-unknown-freebsd.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # Rung 3. Cross-compiled from Linux — roughly an order of magnitude faster
+  # than building inside an OmniOS VM, and it sidesteps pkgsrc rust lagging our
+  # MSRV. No smoke test yet: running the result needs a vmactions/omnios-vm
+  # step, which is the natural follow-up once this compiles at all.
+  #
+  # Supply-chain caveat: `cross` pulls ghcr.io/cross-rs/<target>:<version>, a
+  # third-party container image. It's pinned by version tag here; pin it by
+  # digest in a Cross.toml before this feeds a published release.
+  #
+  # Expected failure mode is aws-lc-sys (C + generated asm, reached via
+  # jsonwebtoken -> oci-client -> fletch). If it can't cross-build here, the
+  # fix is to move jsonwebtoken and rustls onto ring, which is already in the
+  # dependency graph.
+  illumos:
+    name: x86_64-unknown-illumos
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reclaim runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Cache cargo home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cross
+          key: cargo-home-illumos-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-illumos-
+
+      # 0.2.5 is the current crates.io release and dates from 2023; if it no
+      # longer builds on current stable, or its illumos image turns out to be
+      # too old, switch to `--git https://github.com/cross-rs/cross`.
+      - name: Install cross
+        run: |
+          command -v cross >/dev/null || cargo install cross --locked --version 0.2.5
+
+      - name: Build
+        run: cross build --locked --release --target x86_64-unknown-illumos --bin atomscan
+
+      - name: Inspect
+        run: file target/x86_64-unknown-illumos/release/atomscan
+
+      - name: Package
+        run: tar -czf atomscan-x86_64-unknown-illumos.tar.gz -C target/x86_64-unknown-illumos/release atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-x86_64-unknown-illumos
+          path: atomscan-x86_64-unknown-illumos.tar.gz
+          if-no-files-found: error
+          retention-days: 14
