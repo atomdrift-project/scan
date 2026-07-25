@@ -774,7 +774,12 @@ pub(crate) fn orchestrate(
                     fetched.iter().filter(|r| r.size.is_some()).count(),
                     bytes
                 );
-                return;
+                // Keep this batch's edges in the result and tear the reporter
+                // down as the normal path does, so a fetch-only run still
+                // reports the full set of references it pulled.
+                records.extend(fetched);
+                reporter.finish(&records);
+                return (records, dependencies);
             }
             let acache_ref = acache
                 .get_or_insert_with(crate::analysis_cache::AnalysisCache::open)
