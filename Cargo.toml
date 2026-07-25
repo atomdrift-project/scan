@@ -282,8 +282,6 @@ dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 # locks, so this build's dependency graph differs slightly from the locked one —
 # fine for measurement, rebase before merging. Remove and bump the fletch rev
 # once a release carries the change.
-[patch."https://github.com/atomdrift-project/fletch.git"]
-fletch = { path = "../fletch" }
 
 # TEMPORARY local cleave: archive-mode aggregation cost. `make bench-archive`
 # measures it and `make profile-archive` shows where it goes — both need cleave

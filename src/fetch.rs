@@ -1422,6 +1422,48 @@ pub(crate) fn must_rescan(reg: &Registry, now: u64) -> bool {
     dep_pulled(reg) || fresh_48h(reg, now)
 }
 
+/// The publish timestamp a Go pseudo-version carries in its own version string,
+/// as seconds since the epoch.
+///
+/// The module proxy mints a pseudo-version for a commit with no semver tag:
+/// `v0.0.0-20260528132821-f66b8cdce5b3`, or `v1.2.3-0.20260528132821-abc…` when
+/// it follows a release. The middle field is a UTC `yyyymmddhhmmss` stamp of the
+/// commit — the same date the registry would report, already in hand. Parsing it
+/// locally lets the age gate reject an old module with no round-trip at all; a
+/// `go.sum` alone can declare hundreds.
+///
+/// `None` for a tagged version (`v1.9.0`), a malformed stamp, or an
+/// out-of-range field — anything not confidently datable falls through to the
+/// registry lookup rather than being guessed at, so this can only ever save
+/// work, never invent an age.
+fn go_pseudo_version_published(purl: &str) -> Option<u64> {
+    let (_, tail) = purl.strip_prefix("pkg:golang/")?.split_once('@')?;
+    // Split on both separators: the bare form joins the stamp with dashes
+    // (`v0.0.0-<stamp>-<hash>`), while the post-release form reaches it through
+    // a dotted pre-release segment (`v1.2.3-0.<stamp>-<hash>`). The version's own
+    // numeric fields are far too short to be mistaken for a 14-digit stamp, and
+    // a Go commit hash is 12 hex chars.
+    let stamp = tail
+        .split(['-', '.'])
+        .find(|f| f.len() == 14 && f.bytes().all(|b| b.is_ascii_digit()))?;
+    let n = |a: usize, b: usize| stamp.get(a..b)?.parse::<u32>().ok();
+    let (y, mo, d) = (n(0, 4)?, n(4, 6)?, n(6, 8)?);
+    let (h, mi, s) = (n(8, 10)?, n(10, 12)?, n(12, 14)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        return None;
+    }
+    // Days from the civil epoch — Howard Hinnant's `days_from_civil`, which is
+    // exact for the proleptic Gregorian calendar and needs no date crate.
+    let y = i64::from(y) - i64::from(mo <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = i64::from(mo) + if mo > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + i64::from(h) * 3_600 + i64::from(mi) * 60 + i64::from(s)).ok()
+}
+
 /// Whether a reference is a known-good package coordinate per the loaded bloom
 /// filters. Purl-keyed, so it vouches for the coordinate, not the exact bytes.
 ///
@@ -1537,6 +1579,26 @@ fn age_gate(
     let (selected, vouched): (Vec<Reference>, Vec<Reference>) = selected
         .into_iter()
         .partition(|r| !bloom_known_good_purl(r));
+    // Second local filter: a Go pseudo-version states its own commit date, so an
+    // old module can be aged out without asking the proxy. Only applies when a
+    // ceiling is set — with `--fetch-max-age 0` (worker mode) nothing ages out,
+    // so there is nothing to short-circuit.
+    let (selected, self_dated): (Vec<Reference>, Vec<Reference>) =
+        selected.into_iter().partition(|r| {
+            let RefLocator::Purl(purl) = &r.locator else {
+                return true;
+            };
+            !max_age.is_some_and(|max| {
+                go_pseudo_version_published(purl)
+                    .is_some_and(|published| now.saturating_sub(published) >= max)
+            })
+        });
+    for r in &self_dated {
+        tracing::debug!(
+            package = %locator_key(r),
+            "go pseudo-version dates itself past --max-dep-age; registry lookup skipped"
+        );
+    }
     for r in &vouched {
         crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
         tracing::debug!(
@@ -2265,6 +2327,100 @@ mod tests {
         let line = summary_line(&mixed);
         assert!(line.contains("1 live"), "{line}");
         assert!(line.contains("1 cached"), "{line}");
+    }
+
+    #[test]
+    fn go_pseudo_versions_date_themselves_without_a_lookup() {
+        // Fixed points spanning the civil-days arithmetic: the epoch itself, a
+        // century/leap-rule boundary, a leap day, and both year edges. These
+        // catch an off-by-one era or an early month roll, which self-consistent
+        // round-tripping would not.
+        for (stamp, want) in [
+            ("19700101000000", 0),
+            ("20000101000000", 946_684_800), // 2000-01-01, leap-century
+            ("20240229120000", 1_709_208_000), // leap day
+            ("20251231235959", 1_767_225_599), // last second of a year
+            ("20260101000000", 1_767_225_600), // first second of the next
+        ] {
+            assert_eq!(
+                go_pseudo_version_published(&format!("pkg:golang/x/y@v0.0.0-{stamp}-abc")),
+                Some(want),
+                "{stamp}"
+            );
+        }
+
+        // Real coordinates from the benchmark corpus, in both spellings the Go
+        // proxy mints: the bare `v0.0.0-` form and the `vX.Y.Z-0.` form that
+        // follows a release tag.
+        assert_eq!(
+            go_pseudo_version_published(
+                "pkg:golang/github.com/deckhouse/deckhouse@v0.0.0-20260528132821-f66b8cdce5b3"
+            ),
+            Some(1_779_974_901),
+        );
+        assert_eq!(
+            go_pseudo_version_published(
+                "pkg:golang/cloud.google.com/go@v0.20.1-0.20260528200609-1134b3699ee5"
+            ),
+            Some(1_779_998_769),
+        );
+        // A module path containing digits and dots must not confuse the stamp
+        // hunt, and neither must a 14-digit-looking commit hash prefix.
+        assert_eq!(
+            go_pseudo_version_published(
+                "pkg:golang/gopkg.in/yaml.v3@v0.0.0-20260720151329-12345678901234"
+            ),
+            Some(1_784_560_409),
+        );
+
+        // Anything not confidently datable falls through to the registry rather
+        // than being guessed at — a wrong age here silently skips a fetch.
+        for undatable in [
+            "pkg:golang/github.com/stretchr/testify@v1.9.0", // tagged release
+            "pkg:golang/x/y@v0.0.0-2026052813282-abc",       // 13 digits
+            "pkg:golang/x/y@v0.0.0-202605281328210-abc",     // 15 digits
+            "pkg:golang/x/y@v0.0.0-20261328132821-abc",      // month 13
+            "pkg:golang/x/y@v0.0.0-20260028132821-abc",      // month 0
+            "pkg:golang/x/y@v0.0.0-20260532132821-abc",      // day 32
+            "pkg:golang/x/y@v0.0.0-20260500132821-abc",      // day 0
+            "pkg:golang/x/y@v0.0.0-20260528243821-abc",      // hour 24
+            "pkg:golang/x/y@v0.0.0-20260528136021-abc",      // minute 60
+            "pkg:golang/x/y",                                // no version at all
+            "pkg:cargo/serde@1.0.219",                       // wrong ecosystem
+            "pkg:npm/axios@1.6.8",                           // wrong ecosystem
+            "not-a-purl",
+        ] {
+            assert_eq!(
+                go_pseudo_version_published(undatable),
+                None,
+                "{undatable} must not be dated locally"
+            );
+        }
+    }
+
+    #[test]
+    fn go_pseudo_version_age_decides_the_gate_the_same_way_a_registry_would() {
+        // The gate compares `now - published >= max_age`. Pin that the local date
+        // drives the same decision the registry record would, on both sides of
+        // the boundary — this is the behaviour, not just the parse.
+        let published = go_pseudo_version_published(
+            "pkg:golang/github.com/deckhouse/deckhouse@v0.0.0-20260528132821-f66b8cdce5b3",
+        )
+        .expect("datable");
+        let week = 7 * 86_400;
+
+        // A month later: comfortably past a 7-day ceiling.
+        let now = published + 30 * 86_400;
+        assert!(now.saturating_sub(published) >= week);
+        // A day later: inside the window, so it must still be fetched.
+        let now = published + 86_400;
+        assert!(now.saturating_sub(published) < week);
+        // Exactly at the boundary counts as aged out, matching `age_secs >= max`.
+        let now = published + week;
+        assert!(now.saturating_sub(published) >= week);
+        // A clock behind the stamp must not underflow into "ancient".
+        let now = published - 86_400;
+        assert_eq!(now.saturating_sub(published), 0);
     }
 
     #[test]
