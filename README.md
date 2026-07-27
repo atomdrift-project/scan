@@ -70,7 +70,7 @@ For Linux and macOS users using Homebrew:
 
 ```bash
 brew tap atomdrift/tap https://github.com/atomdrift-project/homebrew-tap.git
-brew install atomdrift-scan
+brew install atomdrift/tap/scan
 ```
 
 For everyone else, source compiles are trivial:
