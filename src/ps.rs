@@ -404,18 +404,22 @@ fn build_result(
         Some(crate::engine::EMBEDDED_FILE_LIMIT),
         &crate::engine::tiny_opts_for(config),
         config.interpret(),
-        // Matching scan's `--format interpret`: the live LLM query's user
-        // message, byte-for-byte, without the system prompt (see `process_report`).
-        matches!(config.format(), OutputFormat::Interpret),
         display_path,
         config.fetch_policy(),
-        false, // ps emits machine-readable output; no interactive fetch log
-        matches!(
-            config.format(),
-            OutputFormat::Tiny | OutputFormat::Interpret
-        ),
-        // `--show=all` with JSON: list every member of an archive-backed image.
-        config.filter().is_all() && matches!(config.format(), OutputFormat::Json),
+        crate::engine::OutputNeeds {
+            // Matching scan's `--format interpret`: the live LLM query's user
+            // message, byte-for-byte, without the system prompt.
+            llm_view: matches!(config.format(), OutputFormat::Interpret),
+            fetch_progress: false, // machine-readable output; no live fetch log
+            render_context: matches!(
+                config.format(),
+                OutputFormat::Tiny | OutputFormat::Interpret
+            ),
+            // `--show=all` with JSON: list every member of an archive-backed image.
+            list_all_members: config.filter().is_all()
+                && matches!(config.format(), OutputFormat::Json),
+            deps_for_upload: false, // ps has no hopper renewal
+        },
         None, // process images carry no fetched-package registry metadata
         None, // process images have no package acquisition fetch record
         bloom_mark,

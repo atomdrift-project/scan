@@ -2462,6 +2462,8 @@ async fn run_job(
         // multi-GiB sample is memory-mapped rather than held in RAM. The
         // spooled payload is moved into this closure and dropped when it
         // returns, deleting the spool file and releasing its budget.
+        // The worker's whole job is posting results (dependencies included)
+        // back to hopper, so dependency capture is always on.
         let result = match (payload, local.as_ref()) {
             (Some(PrefetchData::Memory(data)), _) => classify_bytes(
                 data,
@@ -2471,6 +2473,7 @@ async fn run_job(
                 Some(&cancel2),
                 Some(&phase),
                 root_registry.as_ref(),
+                true,
             ),
             (Some(PrefetchData::Spooled(spooled)), _) => classify_file(
                 &spooled.path,
@@ -2481,6 +2484,7 @@ async fn run_job(
                 Some(&cancel2),
                 Some(&phase),
                 root_registry.as_ref(),
+                true,
             ),
             (_, Some(path)) => classify_file(
                 path,
@@ -2491,6 +2495,7 @@ async fn run_job(
                 Some(&cancel2),
                 Some(&phase),
                 root_registry.as_ref(),
+                true,
             ),
             (None | Some(PrefetchData::Local), None) => Err(anyhow::anyhow!(
                 "no downloaded bytes and no local path for {label_for_blocking}"

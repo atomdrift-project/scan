@@ -114,16 +114,15 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         None,
                         None,
                         &cleave::output::TinyOpts::tiny(),
-                        None,  // validation corpus never calls the LLM
-                        false, // validation only consumes ML verdicts; no LLM-payload view
+                        None, // validation corpus never calls the LLM
                         &path,
                         crate::fetch::FetchPolicy::default(),
-                        false, // validation corpus runs offline; no fetch log
-                        false, // validation only consumes ML verdicts
-                        false, // no manifest listing; validation reads findings only
-                        None,  // validation fixtures are local files, not fetched packages
-                        None,  // local validation fixtures have no acquisition fetch record
-                        None,  // validation consumes ML verdicts only; no bloom flag
+                        // Validation consumes ML verdicts only — no renders,
+                        // no manifest listing, no dependency uploads.
+                        engine::OutputNeeds::default(),
+                        None, // validation fixtures are local files, not fetched packages
+                        None, // local validation fixtures have no acquisition fetch record
+                        None, // validation consumes ML verdicts only; no bloom flag
                     );
                     let classify_elapsed = classify_started.elapsed();
                     if analysis_elapsed > SLOW_FIXTURE_THRESHOLD

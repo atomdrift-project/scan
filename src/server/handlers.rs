@@ -850,6 +850,9 @@ pub(super) async fn analyze(
             Some(&cancel_flag),
             phase_tracker.as_ref(),
             None, // interactive upload carries no fetch-time registry provenance
+            // /analyze returns the envelope and discards the result — only
+            // /analyze-path renews results (and their dependencies) on hopper.
+            false,
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -945,6 +948,7 @@ pub(crate) fn classify_file(
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
+    deps_for_upload: bool,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
@@ -962,7 +966,15 @@ pub(crate) fn classify_file(
     };
     let report =
         cleave::analyze_file(path, &opts).with_context(|| format!("cleave analysis of {label}"))?;
-    finish_classify(label, report, resources, cancellation, phase, root_registry)
+    finish_classify(
+        label,
+        report,
+        resources,
+        cancellation,
+        phase,
+        root_registry,
+        deps_for_upload,
+    )
 }
 
 /// Like [`classify_file`] but operates on in-memory data, avoiding disk I/O.
@@ -979,6 +991,7 @@ pub(crate) fn classify_bytes(
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
+    deps_for_upload: bool,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
@@ -993,11 +1006,21 @@ pub(crate) fn classify_bytes(
     };
     let report = cleave::analyze_bytes_shared(data, label, &opts)
         .with_context(|| format!("cleave analysis of {label}"))?;
-    finish_classify(label, report, resources, cancellation, phase, root_registry)
+    finish_classify(
+        label,
+        report,
+        resources,
+        cancellation,
+        phase,
+        root_registry,
+        deps_for_upload,
+    )
 }
 
 /// Shared tail of [`classify_file`]/[`classify_bytes`]: honor a late cancellation,
 /// run feature extraction + model inference, and assemble the [`ScanResult`].
+/// `deps_for_upload` marks callers that renew results on hopper and therefore
+/// need per-dependency standalone reports captured (worker, `--hopper` server).
 fn finish_classify(
     label: &str,
     report: cleave::AnalysisReport,
@@ -1005,6 +1028,7 @@ fn finish_classify(
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
+    deps_for_upload: bool,
 ) -> anyhow::Result<ScanResult> {
     // If the timeout fired while cleave was running, bail now rather than
     // burning CPU on feature extraction and model inference for a result
@@ -1026,16 +1050,19 @@ fn finish_classify(
         Some(crate::engine::EMBEDDED_FILE_LIMIT),
         &cleave::output::TinyOpts::tiny(),
         resources.interpret.as_ref(),
-        false, // server returns JSON; the LLM-payload view is CLI-only
         // The server analyzes uploaded bytes, not a disk file; the root
         // imperative hunt (which re-reads the path) is therefore skipped, but
         // declared references from the report are still fetched when the
         // operator enabled it. `label` is a best-effort path for that hunt.
         std::path::Path::new(label),
         resources.fetch,
-        false, // server returns JSON; the fetch log would corrupt structured logs
-        false, // JSON envelope does not include the rendered terminal context
-        false, // server reports analyzed files only; no full-manifest listing
+        // Server output is the JSON envelope: no renders, no fetch log, no
+        // manifest listing. Dependency results are captured only for callers
+        // that renew results on hopper (worker, `serve --hopper`).
+        crate::engine::OutputNeeds {
+            deps_for_upload,
+            ..Default::default()
+        },
         // Registry metadata collected at fetch time (worker provenance /
         // `--registry-map`), so a hopper-sourced scan reasons over the same
         // registry facts a live `pkg`/`url` scan fetches — without refetching.
@@ -1220,6 +1247,7 @@ pub(super) async fn analyze_path(
     // Keep a path clone for the hopper renewal (the analysis closure moves
     // `path`); only when --hopper is configured, so the common case pays nothing.
     let upload_path = state.uploader.as_ref().map(|_| path.clone());
+    let deps_for_upload = upload_path.is_some();
     let cancel_flag = Arc::clone(&cancellation);
     let phase_state = Arc::clone(&state);
     let phase_tracker = phase_state
@@ -1238,7 +1266,8 @@ pub(super) async fn analyze_path(
             extract_dir.as_deref(),
             Some(&cancel_flag),
             phase_tracker.as_ref(),
-            None, // interactive upload carries no fetch-time registry provenance
+            None,            // interactive upload carries no fetch-time registry provenance
+            deps_for_upload, // dependencies ride the hopper renewal below
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();

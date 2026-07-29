@@ -16,14 +16,19 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Compile-time jemalloc tuning, read once at allocator initialization.
 ///
-/// `narenas:16` caps the arena count (jemalloc's default is 4× CPUs — 64
-/// arenas on a 16-core box) at roughly one per core: measured 30–60 MB lower
-/// peak RSS on the reference archive scan at equal-or-better wall time
-/// (narenas:8 saved ~100 MB but cost ~4% wall to arena contention — wall is
-/// the priority). Runtime configuration still wins: `_RJEM_MALLOC_CONF` (and
-/// `/etc/malloc.conf`) override this string, so deployments can retune
-/// without rebuilding. Guarded by the same cfg as the allocator itself — on
-/// platforms where scan uses the system allocator this symbol is never read.
+/// Four arenas are enough for the bounded analysis pool and avoid multiplying
+/// dirty extents across jemalloc's CPU-scaled default. One-second dirty-page
+/// decay returns transient archive/report allocations promptly; muzzy pages
+/// have already been purged, so retaining them buys this workload nothing.
+/// The background purger keeps long-lived servers honest between requests.
+/// Together these settings cut the guanyang server screen from roughly 4 GiB
+/// to 3 GiB without changing its detection-level fingerprint or inducing the
+/// regex recompilation seen with undersized application caches.
+///
+/// Runtime configuration still wins: `_RJEM_MALLOC_CONF` (and
+/// `/etc/malloc.conf`) override this string, so deployments can retune without
+/// rebuilding. Guarded by the same cfg as the allocator itself — on platforms
+/// where scan uses the system allocator this symbol is never read.
 #[cfg(all(
     unix,
     not(any(
@@ -46,7 +51,8 @@ mod jemalloc_conf {
 
     #[allow(non_upper_case_globals)]
     #[unsafe(no_mangle)]
-    static _rjem_malloc_conf: SyncPtr = SyncPtr(c"narenas:16".as_ptr());
+    static _rjem_malloc_conf: SyncPtr =
+        SyncPtr(c"narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true".as_ptr());
 }
 
 use anyhow::{Context, Result};
@@ -542,6 +548,16 @@ enum Commands {
         /// fatal. Reads $HOPPER_UPLOAD_TOKEN for authentication.
         #[arg(long, visible_alias = "upload", value_name = "URL")]
         hopper: Option<String>,
+
+        /// Per-request analysis timeout in seconds; 0 disables. Raise when
+        /// `--fetch` is on and dependency analysis can exceed the default.
+        #[arg(
+            long,
+            default_value_t = scan::server::DEFAULT_ANALYSIS_TIMEOUT_SECS,
+            value_name = "SECS",
+            env = "SCAN_ANALYSIS_TIMEOUT"
+        )]
+        analysis_timeout: u64,
     },
 
     /// Run as a pull-based worker, polling a hopper instance for analysis jobs
@@ -1164,6 +1180,7 @@ fn main() -> Result<()> {
             allow_cidr,
             traits_dir,
             hopper,
+            analysis_timeout,
         } => {
             if let Some(p) = traits_dir.as_ref() {
                 cleave::traits_repo::set_override_dir(Some(p.into()));
@@ -1205,7 +1222,8 @@ fn main() -> Result<()> {
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy)
-            .with_hopper(hopper.clone());
+            .with_hopper(hopper.clone())
+            .with_analysis_timeout(analysis_timeout);
             if let Some(url) = hopper.as_deref() {
                 eprintln!("Renewing results on hopper at {url}");
             }

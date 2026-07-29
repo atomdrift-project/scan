@@ -480,11 +480,19 @@ pub(crate) struct DependencyRegistry {
 /// extracted members) and returns the fetch edge log plus the standalone report
 /// captured for each fetched dependency. A disabled policy, an unavailable
 /// cache/client, or zero references all yield empty logs.
+///
+/// `capture_deps` controls whether each fetched dependency's standalone report
+/// is serialized and returned as a [`FetchedDependency`]. Those captures exist
+/// only for hopper uploads and the dependency appendix of text/LLM renders — a
+/// plain JSON scan with no upload target drops them unread, so skipping the
+/// capture (and the downstream re-parse + per-dep model pass it feeds) is pure
+/// saved work. Grafting, verdicts, and fetch edges are unaffected.
 pub(crate) fn orchestrate(
     report: &mut AnalysisReport,
     root_path: &Path,
     policy: FetchPolicy,
     progress: bool,
+    capture_deps: bool,
 ) -> (
     Vec<FetchRecord>,
     Vec<FetchedDependency>,
@@ -862,8 +870,9 @@ pub(crate) fn orchestrate(
                     let artifact = payload.sub.as_ref().map(sub_findings).unwrap_or_default();
                     let artifact_sha = payload.content_sha.clone();
                     // Capture the dependency's standalone report before merge_payload
-                    // consumes the sub-report into the merged tree.
-                    if let Some(dep) = capture_dependency(rec, &payload) {
+                    // consumes the sub-report into the merged tree — only when a
+                    // consumer (hopper upload, dependency appendix) will read it.
+                    if capture_deps && let Some(dep) = capture_dependency(rec, &payload) {
                         dependencies.push(dep);
                     }
                     next.extend(merge_payload(report, rec, payload));
@@ -2000,6 +2009,14 @@ fn human_bytes(n: u64) -> String {
 
 /// References to fetch, grouped by the sha256 of the file that declared them.
 fn collect_references(report: &AnalysisReport, root_path: &Path) -> Vec<(String, Vec<Reference>)> {
+    // Members under a vendored node_modules tree have already been analyzed.
+    // Fetching each of their `require("x")` targets again grafted a newer
+    // registry release onto the report and repeated work over bytes that came
+    // with the sample. Keep hunting absent imports, but resolve local packages
+    // first from the package.json members already present in this report.
+    let local_npm = LocalNpmPackages::from_report(report);
+    let mut local_imports_skipped = 0usize;
+    let mut vendored_imports_skipped = 0usize;
     let mut groups: Vec<(String, Vec<Reference>)> = Vec::new();
     for file in &report.files {
         let Some(view) = &file.filefacts else {
@@ -2012,11 +2029,56 @@ fn collect_references(report: &AnalysisReport, root_path: &Path) -> Vec<(String,
         // Module-load calls from the member's retained AST symbols — the
         // facts-only import vector, so `require("undeclared-pkg")` inside an
         // archive member is hunted without re-extracting its discarded bytes.
-        refs.extend(find::import_calls(&file.file_type, &view.symbols));
+        refs.extend(
+            find::import_calls(&file.file_type, &view.symbols)
+                .into_iter()
+                .filter(|reference| {
+                    let Some(package) = npm_import_name(reference) else {
+                        return true;
+                    };
+                    // `node_modules` is the installed dependency graph captured
+                    // in the artifact. If one of those files imports a package
+                    // absent from that graph, Node fails or takes the module's
+                    // own fallback path; it does not download today's registry
+                    // release. Declared package.json dependencies are collected
+                    // separately, so suppress only inferred import-call hunts.
+                    if is_vendored_node_module(&file.path) {
+                        vendored_imports_skipped += 1;
+                        tracing::debug!(
+                            source = %file.path,
+                            package,
+                            "import originates in vendored node_modules; external fetch avoided"
+                        );
+                        return false;
+                    }
+                    let present = local_npm.resolves(&file.path, &package);
+                    if present {
+                        local_imports_skipped += 1;
+                        tracing::debug!(
+                            source = %file.path,
+                            package,
+                            "import resolves to vendored node_modules; skipping external fetch"
+                        );
+                    }
+                    !present
+                }),
+        );
         if refs.is_empty() {
             continue;
         }
         groups.push((file.sha256.clone(), refs));
+    }
+    if local_imports_skipped > 0 {
+        tracing::info!(
+            local_imports_skipped,
+            "vendored imports already present in report; external refetch avoided"
+        );
+    }
+    if vendored_imports_skipped > 0 {
+        tracing::info!(
+            vendored_imports_skipped,
+            "imports from captured node_modules kept inside artifact boundary"
+        );
     }
 
     // The root sample's imperative hunt (curl|sh, `npm install` in a RUN, a URL
@@ -2036,6 +2098,87 @@ fn collect_references(report: &AnalysisReport, root_path: &Path) -> Vec<(String,
         }
     }
     groups
+}
+
+fn is_vendored_node_module(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|component| component == "node_modules")
+}
+
+/// Package roots physically present under `node_modules`, keyed by their full
+/// virtual path. Only roots with an analyzed package.json enter the index, so
+/// an incidental path component named node_modules is not enough.
+#[derive(Default)]
+struct LocalNpmPackages {
+    roots: HashSet<String>,
+}
+
+impl LocalNpmPackages {
+    fn from_report(report: &AnalysisReport) -> Self {
+        let roots = report
+            .files
+            .iter()
+            .filter_map(|file| npm_package_root(&file.path))
+            .collect();
+        Self { roots }
+    }
+
+    /// Mirror Node's package-level lookup: walk upward from the importing
+    /// file, looking for `node_modules/<package>`. Exports and subpaths do not
+    /// matter here because fletch retrieves whole packages.
+    fn resolves(&self, source_path: &str, package: &str) -> bool {
+        let normalized = source_path.replace('\\', "/");
+        let Some((mut dir, _)) = normalized.rsplit_once('/') else {
+            return false;
+        };
+        loop {
+            if self
+                .roots
+                .contains(&format!("{dir}/node_modules/{package}"))
+            {
+                return true;
+            }
+            let Some((parent, _)) = dir.rsplit_once('/') else {
+                return false;
+            };
+            dir = parent;
+        }
+    }
+}
+
+/// Return the virtual package root for an analyzed node_modules/package.json.
+fn npm_package_root(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let root = normalized.strip_suffix("/package.json")?;
+    let (_, package) = root.rsplit_once("/node_modules/")?;
+    let mut parts = package.split('/');
+    let first = parts.next()?;
+    let valid = if let Some(scope) = first.strip_prefix('@') {
+        let name = parts.next().unwrap_or_default();
+        !scope.is_empty() && !name.is_empty() && parts.next().is_none()
+    } else {
+        !first.is_empty() && parts.next().is_none()
+    };
+    valid.then(|| root.to_string())
+}
+
+/// Extract the npm package name from a reference produced by
+/// `find::import_calls`. Such PURLs are normally versionless; tolerating a
+/// version keeps this correct if fletch later learns one from the symbol.
+fn npm_import_name(reference: &Reference) -> Option<String> {
+    let RefLocator::Purl(purl) = &reference.locator else {
+        return None;
+    };
+    let coordinate = purl.strip_prefix("pkg:npm/")?.split('?').next()?;
+    let encoded_name = coordinate
+        .rsplit_once('@')
+        .map_or(coordinate, |(name, _)| name);
+    Some(
+        encoded_name
+            .replace("%40", "@")
+            .replace("%2F", "/")
+            .replace("%2f", "/"),
+    )
 }
 
 /// Merge the root's hunted references into its group (creating it if the root
@@ -2840,6 +2983,88 @@ mod tests {
         assert!(
             !undeclared.iter().any(|u| u.contains("mobx")),
             "declared dep must not be flagged: {undeclared:?}"
+        );
+    }
+
+    #[test]
+    fn member_import_does_not_refetch_a_locally_resolvable_npm_package() {
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [
+                { "id": 0, "path": "bundle/node_modules/express/package.json", "depth": 1,
+                  "file_type": "package.json", "sha256": "a".repeat(64), "size": 80u64 },
+                { "id": 1, "path": "bundle/node_modules/@scope/tool/package.json", "depth": 1,
+                  "file_type": "package.json", "sha256": "b".repeat(64), "size": 80u64 },
+                { "id": 2, "path": "bundle/lib/index.js", "depth": 1,
+                  "file_type": "javascript", "sha256": "c".repeat(64), "size": 200u64,
+                  "filefacts": { "symbols": [
+                      {"kind": "call", "target": "require",
+                       "args": [{"shape": "string", "value": "express"}]},
+                      {"kind": "call", "target": "require",
+                       "args": [{"shape": "string", "value": "@scope/tool/subpath"}]},
+                      {"kind": "call", "target": "require",
+                       "args": [{"shape": "string", "value": "not-vendored"}]}
+                  ] } }
+            ]
+        }))
+        .expect("report deserializes");
+
+        let groups = collect_references(&report, std::path::Path::new("/nonexistent"));
+        let locs: Vec<String> = groups
+            .iter()
+            .flat_map(|(_, refs)| refs.iter().map(locator_key))
+            .collect();
+        assert_eq!(
+            locs,
+            vec!["pkg:npm/not-vendored"],
+            "only an import absent from the ancestor node_modules is external"
+        );
+    }
+
+    #[test]
+    fn sibling_node_modules_does_not_suppress_an_external_import() {
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [
+                { "id": 0, "path": "one/node_modules/express/package.json", "depth": 1,
+                  "file_type": "package.json", "sha256": "a".repeat(64), "size": 80u64 },
+                { "id": 1, "path": "two/index.js", "depth": 1,
+                  "file_type": "javascript", "sha256": "b".repeat(64), "size": 200u64,
+                  "filefacts": { "symbols": [
+                      {"kind": "call", "target": "require",
+                       "args": [{"shape": "string", "value": "express"}]}
+                  ] } }
+            ]
+        }))
+        .expect("report deserializes");
+
+        let groups = collect_references(&report, std::path::Path::new("/nonexistent"));
+        let locs: Vec<String> = groups
+            .iter()
+            .flat_map(|(_, refs)| refs.iter().map(locator_key))
+            .collect();
+        assert_eq!(locs, vec!["pkg:npm/express"]);
+    }
+
+    #[test]
+    fn vendored_member_does_not_download_a_missing_import() {
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [
+                { "id": 0, "path": "bundle/node_modules/qs/test/parse.js", "depth": 1,
+                  "file_type": "javascript", "sha256": "a".repeat(64), "size": 200u64,
+                  "filefacts": { "symbols": [
+                      {"kind": "call", "target": "require",
+                       "args": [{"shape": "string", "value": "test-only-package"}]}
+                  ] } }
+            ]
+        }))
+        .expect("report deserializes");
+
+        let groups = collect_references(&report, std::path::Path::new("/nonexistent"));
+        assert!(
+            groups.is_empty(),
+            "an absent import inside the captured install tree is not a network fetch"
         );
     }
 

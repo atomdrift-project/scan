@@ -3,6 +3,12 @@
 # rust-version exceeds ours, so `cargo update` stays buildable on 1.94.
 resolver = "3"
 
+[patch."https://github.com/atomdrift-project/cleave.git"]
+# Experiment dependency: the sibling checkout starts at Cargo.lock's exact
+# cleave revision. Keep scan testing the lifetime fixes there until they are
+# pushed, then remove this patch and update the lockfile.
+cleave = { path = "../cleave" }
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }

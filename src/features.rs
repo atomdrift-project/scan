@@ -1948,6 +1948,22 @@ impl ParsedReport {
         Self::from_files(&[file], Some(file), needs)
     }
 
+    /// Parse a caller-filtered subset of a report's file entries — e.g. the
+    /// sample's own files with grafted fetch payloads excluded. Borrows the
+    /// entries straight out of the report JSON, so filtering costs no clone of
+    /// the (potentially huge) merged tree. The primary file is resolved within
+    /// the subset by the same rule as [`Self::from_report`]: the first entry at
+    /// depth 0.
+    pub(crate) fn from_filtered_files(files: &[&serde_json::Value], needs: RawNeeds) -> Self {
+        let primary = files.iter().copied().find(|file| {
+            json_alias(file, &["depth", "dp"])
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                == 0
+        });
+        Self::from_files(files, primary, needs)
+    }
+
     fn from_files(
         raw_files: &[&serde_json::Value],
         primary_file: Option<&serde_json::Value>,

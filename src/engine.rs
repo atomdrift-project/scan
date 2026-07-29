@@ -3080,6 +3080,29 @@ fn apply_trait_floor(
     }
 }
 
+/// Which optional output surfaces the caller will read. `classify_report`
+/// skips building anything no consumer looks at. The default is none of them —
+/// the bare JSON-verdict shape (server and validation).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OutputNeeds {
+    /// Render `rendered_context` as the LLM query payload (`--format
+    /// interpret`): byte-for-byte the user message a live `--interpret` query
+    /// sends (the sanitized tiny render), without the system prompt.
+    /// Independent of `interpret`, which controls actually querying.
+    pub llm_view: bool,
+    /// Show the live fetch log / dependency tree (interactive terminal only).
+    pub fetch_progress: bool,
+    /// Build the rendered terminal/tiny context body.
+    pub render_context: bool,
+    /// List never-analyzed archive members (`--show=all` JSON manifest).
+    pub list_all_members: bool,
+    /// Capture and grade each fetched dependency's standalone report
+    /// (`dependency_results`) for hopper renewal. Without this — or one of the
+    /// render/LLM surfaces above — a scan drops them unread, so the capture
+    /// and the per-dependency model pass are skipped entirely.
+    pub deps_for_upload: bool,
+}
+
 /// Run the full cleave-finalize + model inference pipeline on a report.
 /// This is the single authoritative inference path used by scan, ps, and the server.
 #[allow(clippy::needless_pass_by_value)] // Arc clones at call sites are negligible; ownership simplifies callers.
@@ -3094,16 +3117,9 @@ pub(crate) fn classify_report(
     embedded_file_limit: Option<usize>,
     tiny_opts: &cleave::output::TinyOpts,
     interpret: Option<&crate::interpret::InterpretConfig>,
-    // `--format interpret`: render `rendered_context` as the LLM query payload —
-    // byte-for-byte the user message a live `--interpret` query sends (the
-    // sanitized tiny render), without the system prompt. Independent of
-    // `interpret`, which controls actually querying.
-    llm_view: bool,
     root_path: &Path,
     fetch: crate::fetch::FetchPolicy,
-    fetch_progress: bool,
-    render_context: bool,
-    list_all_members: bool,
+    needs: OutputNeeds,
     // The root artifact's own registry metadata, for the one-shot `pkg:`/`url`
     // path. `None` for ordinary scans. Grafted as a child `registry` node (so it
     // trains like any other file) and correlated with the artifact via a
@@ -3118,6 +3134,13 @@ pub(crate) fn classify_report(
     // terminal header. `None` for unflagged files.
     bloom_mark: Option<crate::output::BloomMark>,
 ) -> Result<ClassifiedReport> {
+    let OutputNeeds {
+        llm_view,
+        fetch_progress,
+        render_context,
+        list_all_members,
+        deps_for_upload,
+    } = needs;
     // Capture every archive member — including the ones cleave catalogues but
     // never analyzes (docs, data files, images: non-program members it skips by
     // default) — before `finalize()` clears `archive_contents`. With `--show=all`
@@ -3155,9 +3178,22 @@ pub(crate) fn classify_report(
     // files[] and the per-file declared references) and before featurization, so
     // fetched content feeds the verdict like any other file. Off unless the
     // policy selects a kind. The returned edges are attached to report_json below.
+    //
+    // Standalone per-dependency captures (and the classify_dependency grading
+    // below) exist for hopper uploads, the LLM query payload, and the rendered
+    // dependency appendix. When none of those consumers is active — a plain
+    // JSON scan with no upload target — skip the capture up front.
+    let dump_dir = std::env::var_os("SCAN_INTERPRET_DUMP_DIR");
+    let need_dep_results =
+        deps_for_upload || interpret.is_some() || llm_view || render_context || dump_dir.is_some();
     let fetch_start = Instant::now();
-    let (fetch_edges, fetched_deps, dependency_registries) =
-        crate::fetch::orchestrate(&mut report, root_path, fetch, fetch_progress);
+    let (fetch_edges, fetched_deps, dependency_registries) = crate::fetch::orchestrate(
+        &mut report,
+        root_path,
+        fetch,
+        fetch_progress,
+        need_dep_results,
+    );
     let fetch_ms = crate::duration_ms(fetch_start.elapsed());
     // One-shot `pkg:`/`url`: graft the root artifact's own registry metadata as a
     // child `registry` node and correlate the two with a `scope: package`
@@ -3182,6 +3218,30 @@ pub(crate) fn classify_report(
     // the raw report posted to hopper (large archive reports otherwise blow past
     // its body limit) and is the report the model is now featurized from.
     report.strip_unmatched_traits();
+    // Dependency backrefs need only the cited reference's span length. Capture
+    // that scalar now instead of keeping every file's filefacts graph alive
+    // through JSON conversion and the per-member model pass.
+    let fetch_ref_lengths: std::collections::HashMap<(&str, u64), u64> = fetch_edges
+        .iter()
+        .filter_map(|edge| {
+            let off = edge.source_offset?;
+            let len = report
+                .files
+                .iter()
+                .find(|file| file.sha256 == edge.source_sha256)
+                .and_then(|file| file.filefacts.as_ref())
+                .and_then(|facts| {
+                    facts
+                        .references
+                        .iter()
+                        .find(|reference| reference.offset == off)
+                })
+                .map_or(1, |reference| {
+                    u64::try_from(reference.evidence.len()).unwrap_or(u64::MAX)
+                });
+            Some(((edge.source_sha256.as_str(), off), len))
+        })
+        .collect();
     let compact = cleave::types::compact::compact_from_files(&report.files);
     validate_report_references(label, &compact);
     let formula = compact
@@ -3191,6 +3251,16 @@ pub(crate) fn classify_report(
         .unwrap_or_default();
 
     let mut report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
+    drop(compact);
+    // Text/LLM renderers consume the typed report. Plain JSON does not: compact
+    // conversion has already retained precisely the traits, metrics, symbols,
+    // references, and context it emits. Release the much wider cleave graph
+    // before featurizing thousands of compact member nodes.
+    let keep_typed_report = render_context || interpret.is_some() || llm_view || dump_dir.is_some();
+    if !keep_typed_report {
+        let target = report.target.clone();
+        report = cleave::AnalysisReport::new(target);
+    }
     // Attach the fetch edge log at report level (`source_sha256 → content_sha256`
     // per reference). Report-level, not per-file: a fetch is a per-event
     // observation, so it never falsely dedups when content is exploded by hash.
@@ -3211,23 +3281,24 @@ pub(crate) fn classify_report(
     // fetched this is the whole report; otherwise drop the grafted payloads so
     // they can't dilute the aggregate (they still classify individually via the
     // embedded path on the full `report_json`, where a hostile one elevates).
-    let root_json = if fetch_edges.is_empty() {
-        std::borrow::Cow::Borrowed(&report_json)
+    let parsed = if fetch_edges.is_empty() {
+        crate::features::ParsedReport::from_report(&report_json, needs)
     } else {
-        let mut rj = report_json.clone();
-        if let Some(files) = rj
-            .get_mut("files")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            files.retain(|f| {
+        // Borrow the own-file entries straight out of `report_json` — the
+        // grafted payloads are filtered by reference, not by deep-cloning the
+        // whole merged tree and retaining (which on a dependency-heavy report
+        // copied thousands of file nodes only to drop them).
+        let own_files: Vec<&serde_json::Value> = json_alias_array(&report_json, &["files", "fs"])
+            .into_iter()
+            .flatten()
+            .filter(|f| {
                 f.get("sha")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|s| own_shas.contains(s))
-            });
-        }
-        std::borrow::Cow::Owned(rj)
+            })
+            .collect();
+        crate::features::ParsedReport::from_filtered_files(&own_files, needs)
     };
-    let parsed = crate::features::ParsedReport::from_report(&root_json, needs);
     let mut raw_features = ctx.extract_from_parsed(&parsed);
     let nonzero = raw_features.iter().filter(|&&v| v != 0.0).count();
     let expected = model.spec().total_features();
@@ -3313,16 +3384,25 @@ pub(crate) fn classify_report(
     // declaring file + the byte the reference sits at. When the embedded pass
     // classifies one of these hostile/suspicious, that verdict is pinned back
     // onto the declaring manifest at the reference byte (below the pass).
-    let fetched_by_content: std::collections::HashMap<&str, (&str, Option<u64>, &str)> =
+    let fetched_by_content: std::collections::HashMap<&str, (&str, Option<u64>, u64, &str)> =
         fetch_edges
             .iter()
             .filter_map(|r| {
                 r.content_sha256.as_deref().map(|c| {
+                    let source_len = r
+                        .source_offset
+                        .and_then(|off| {
+                            fetch_ref_lengths
+                                .get(&(r.source_sha256.as_str(), off))
+                                .copied()
+                        })
+                        .unwrap_or(1);
                     (
                         c,
                         (
                             r.source_sha256.as_str(),
                             r.source_offset,
+                            source_len,
                             r.locator.as_str(),
                         ),
                     )
@@ -3375,10 +3455,12 @@ pub(crate) fn classify_report(
             )
         })
         .filter_map(|ef| {
-            let &(src_sha, src_off, locator) = fetched_by_content.get(ef.sha256.as_str())?;
+            let &(src_sha, src_off, source_len, locator) =
+                fetched_by_content.get(ef.sha256.as_str())?;
             Some(DepBackref {
                 source_sha: src_sha.to_string(),
                 source_offset: src_off,
+                source_len,
                 locator: locator.to_string(),
                 dep_sha: ef.sha256.clone(),
                 dep_type: ef.file_type.clone(),
@@ -3414,7 +3496,7 @@ pub(crate) fn classify_report(
     // the offending edge. Display/attribution only; the verdict was already
     // elevated by the embedded pass above.
     for backref in &dep_backrefs {
-        inject_dependency_backref(&mut report_json, &report, backref);
+        inject_dependency_backref(&mut report_json, backref);
     }
 
     let top_findings = extract_top_findings_from_json(&report_json, &final_decision.class);
@@ -3460,7 +3542,6 @@ pub(crate) fn classify_report(
     // written to `<dir>/<sha256>.render` — the raw (untransformed) render, so the
     // prompt-tuning harness (`hacks/interpret-tune`) can sweep render variants
     // offline from one scan, independent of whether `--interpret` is on.
-    let dump_dir = std::env::var_os("SCAN_INTERPRET_DUMP_DIR");
     let llm_ctx = (interpret.is_some() || dump_dir.is_some() || llm_view).then(|| {
         let rendered = render_interpret_context(
             label,
@@ -3721,6 +3802,7 @@ fn append_unanalyzed_members(report_json: &mut serde_json::Value, members: &[Arc
 struct DepBackref {
     source_sha: String,
     source_offset: Option<u64>,
+    source_len: u64,
     locator: String,
     dep_sha: String,
     dep_type: String,
@@ -3745,23 +3827,13 @@ struct DepBackref {
 /// that hopper forwards opaquely so prism can render a specific, clickable feed
 /// chip ("depends on hostile npm: zaboodle v1.49" → /file/{sha}) without parsing
 /// the sentence.
-fn inject_dependency_backref(
-    report_json: &mut serde_json::Value,
-    report: &cleave::AnalysisReport,
-    backref: &DepBackref,
-) {
+fn inject_dependency_backref(report_json: &mut serde_json::Value, backref: &DepBackref) {
     let (crit, sev) = match backref.class {
         Classification::Hostile => (5u8, "Malicious"),
         _ => (4u8, "Suspicious"),
     };
     let off = backref.source_offset.unwrap_or(0);
-    let len = report
-        .files
-        .iter()
-        .find(|f| f.sha256 == backref.source_sha)
-        .and_then(|f| f.filefacts.as_ref())
-        .and_then(|ff| ff.references.iter().find(|r| r.offset == off))
-        .map_or(1, |r| u64::try_from(r.evidence.len()).unwrap_or(u64::MAX));
+    let len = backref.source_len;
     let desc = format!(
         "{sev} dependency: {} | {}",
         backref.locator, backref.dep_sha
@@ -4809,10 +4881,10 @@ mod dependency_grading_tests {
     fn dependency_backref_is_injected_after_featurization() {
         let src = include_str!("engine.rs");
         let featurize = src
-            .find("let parsed = crate::features::ParsedReport::from_report(&root_json, needs);")
+            .find("let parsed = if fetch_edges.is_empty() {")
             .expect("root featurization call");
         let inject = src
-            .find("inject_dependency_backref(&mut report_json, &report, backref);")
+            .find("inject_dependency_backref(&mut report_json, backref);")
             .expect("backref injection call");
         assert!(
             featurize < inject,
@@ -4954,9 +5026,6 @@ mod dependency_grading_tests {
 mod dep_backref_tests {
     use super::*;
 
-    /// The injector only reads `report.files` to size the reference span (and
-    /// falls back to a 1-byte span when the declaring file isn't there), so an
-    /// empty report exercises everything but the span length.
     fn empty_report() -> cleave::AnalysisReport {
         serde_json::from_value(serde_json::json!({"version": "3"})).unwrap()
     }
@@ -4965,6 +5034,7 @@ mod dep_backref_tests {
         DepBackref {
             source_sha: "s".repeat(64),
             source_offset: Some(42),
+            source_len: 9,
             locator: "pkg:npm/zaboodle@1.49".to_string(),
             dep_sha: "d".repeat(64),
             dep_type: "javascript".to_string(),
@@ -4985,11 +5055,7 @@ mod dep_backref_tests {
     #[test]
     fn declarer_gets_span_and_structured_dep() {
         let mut report_json = compact_fixture();
-        inject_dependency_backref(
-            &mut report_json,
-            &empty_report(),
-            &backref(Classification::Hostile),
-        );
+        inject_dependency_backref(&mut report_json, &backref(Classification::Hostile));
 
         let t = &report_json["files"][1]["traits"][0];
         assert_eq!(t["id"], "fetch/dependency-verdict");
@@ -5009,16 +5075,16 @@ mod dep_backref_tests {
             t["spans"][0][0], 42,
             "declaring file cites the reference byte"
         );
+        assert_eq!(
+            t["spans"][0][1], 9,
+            "span length survives typed-report drop"
+        );
     }
 
     #[test]
     fn ancestor_carries_dep_without_span_and_siblings_stay_clean() {
         let mut report_json = compact_fixture();
-        inject_dependency_backref(
-            &mut report_json,
-            &empty_report(),
-            &backref(Classification::Hostile),
-        );
+        inject_dependency_backref(&mut report_json, &backref(Classification::Hostile));
 
         let root_traits = report_json["files"][0]["traits"].as_array().unwrap();
         assert_eq!(root_traits.len(), 2, "rolled up alongside existing traits");
@@ -5042,11 +5108,7 @@ mod dep_backref_tests {
     #[test]
     fn suspicious_dependency_pins_at_crit_4() {
         let mut report_json = compact_fixture();
-        inject_dependency_backref(
-            &mut report_json,
-            &empty_report(),
-            &backref(Classification::Suspicious),
-        );
+        inject_dependency_backref(&mut report_json, &backref(Classification::Suspicious));
 
         let t = &report_json["files"][1]["traits"][0];
         assert_eq!(t["crit"], 4);
@@ -5069,7 +5131,7 @@ mod dep_backref_tests {
         let mut b = backref(Classification::Hostile);
         b.locator = "http://x.y.z/x.exe".to_string();
         b.dep_type = "pe".to_string();
-        inject_dependency_backref(&mut report_json, &empty_report(), &b);
+        inject_dependency_backref(&mut report_json, &b);
 
         let t = &report_json["files"][1]["traits"][0];
         assert_eq!(t["dep"]["locator"], "http://x.y.z/x.exe");
@@ -5543,21 +5605,20 @@ pub(crate) fn process_report(
         Some(EMBEDDED_FILE_LIMIT),
         &tiny_opts_for(config),
         config.interpret(),
-        // `--format interpret` emits byte-for-byte what a live `--interpret`
-        // query sends as its user message — the sanitized render, annotations
-        // included — without the system prompt (which hedges the descriptions
-        // as fallible; a downstream consumer should frame them likewise).
-        matches!(config.format(), OutputFormat::Interpret),
         path,
         config.fetch_policy(),
-        // Render the live-vs-cache fetch log only on the interactive terminal
-        // path; JSON and tiny output stay machine-clean (the edges ride along in
-        // the JSON `fetched` array regardless).
-        matches!(config.format(), OutputFormat::Terminal),
-        !is_json,
-        // `--show=all` with JSON output: list every archive member, even the
-        // no-finding ones cleave skipped analyzing.
-        config.filter().is_all() && is_json,
+        OutputNeeds {
+            llm_view: matches!(config.format(), OutputFormat::Interpret),
+            // The live fetch log renders only on the interactive terminal path;
+            // JSON and tiny stay machine-clean (the edges ride along in the
+            // JSON `fetched` array regardless).
+            fetch_progress: matches!(config.format(), OutputFormat::Terminal),
+            render_context: !is_json,
+            // `--show=all` with JSON output: list every archive member, even
+            // the no-finding ones cleave skipped analyzing.
+            list_all_members: config.filter().is_all() && is_json,
+            deps_for_upload: config.hopper().is_some(),
+        },
         root_registry,
         root_fetch,
         bloom_mark,

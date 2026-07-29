@@ -38,7 +38,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
 
 all: build
 
@@ -345,7 +345,7 @@ worker-benchmark: release ## Benchmark the worker model over a local dataset via
 	echo "✓ summary: $(BENCH_SUMMARY)"
 
 profile-worker:
-	$(CARGO) build --profile profiling
+	$(CARGO) build --profile profiling --bin $(BINARY)
 	@[ -n "$(URL)" ] || { echo "Usage: make profile-worker URL=<hopper-url>"; exit 1; }
 	samply record -o /tmp/litmus-worker-profile.json.gz -- \
 		./target/profiling/$(BINARY) worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
@@ -353,7 +353,7 @@ profile-worker:
 		2>&1 | tee /tmp/litmus-worker-benchmark.log
 
 profile-slow:
-	$(CARGO) build --profile profiling
+	$(CARGO) build --profile profiling --bin $(BINARY)
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
 	samply record --save-only --duration 20 -o /tmp/litmus-$(DATASET)-profile.json.gz -- \
 		env CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" CLEAVE_SKIP_YARA_CACHE=0 ./target/profiling/$(BINARY) -f json "$(BENCHMARK_PATH)"
@@ -455,7 +455,7 @@ check-typed-detection: ## Diff current verdicts against the snapshot (a change i
 
 profile-archive: ## perf-record an archive-mode scan and print the top symbols
 	@command -v perf >/dev/null 2>&1 || { echo "Error: perf not installed"; exit 1; }
-	$(CARGO) build --profile profiling
+	$(CARGO) build --profile profiling --bin $(BINARY)
 	@[ -e "$(ARCHIVE_PATH)" ] || { echo "error: archive dataset not found: $(ARCHIVE_PATH)"; exit 1; }
 	@mkdir -p $(OUT_DIR)
 	@# Flat sampling, no call graph: these are release builds without frame
@@ -482,7 +482,7 @@ TUNA_DATASET     ?= 200MB
 TUNA_BENCH_PATH  ?= $(BENCHMARK_ROOT)/$(TUNA_DATASET)
 
 bench-build: $(OUT_DIR) ## Build benchmark binary (profiling profile, release + debug syms)
-	$(CARGO) build --profile profiling
+	$(CARGO) build --profile profiling --bin $(BINARY)
 	cp $(CARGO_TARGET)/profiling/$(BINARY) $(OUT_DIR)/$(BINARY).bench
 	@if [ "$$(uname)" = "Darwin" ]; then codesign -s - -f $(OUT_DIR)/$(BINARY).bench; fi
 	@echo "✓ Benchmark binary: $(OUT_DIR)/$(BINARY).bench"
@@ -496,7 +496,7 @@ sampled-benchmark: bench-build ## Benchmark with samply CPU profiling
 	@echo "✓ Profile: $(OUT_DIR)/bench.profile.json.gz  Logs: $(OUT_DIR)/bench.err"
 
 heap-build: $(OUT_DIR) ## Build with jemalloc heap profiling support
-	$(CARGO) build --profile profiling --features jemalloc-prof
+	$(CARGO) build --profile profiling --features jemalloc-prof --bin $(BINARY)
 	cp $(CARGO_TARGET)/profiling/$(BINARY) $(OUT_DIR)/$(BINARY).heap
 	@if [ "$$(uname)" = "Darwin" ]; then codesign -s - -f $(OUT_DIR)/$(BINARY).heap; fi
 	@echo "✓ Heap-profiling binary: $(OUT_DIR)/$(BINARY).heap"
@@ -509,6 +509,35 @@ heap-benchmark: heap-build ## Benchmark with jemalloc heap profiling
 		>$(OUT_DIR)/bench.out 2>$(OUT_DIR)/bench.err
 	@echo "✓ Heap profiles: $(OUT_DIR)/heap/jeprof.*.heap"
 	@echo "  Analyze with: jeprof --text $(OUT_DIR)/$(BINARY).heap $(OUT_DIR)/heap/jeprof.*.heap"
+
+# Long-lived server benchmark. Unlike the CLI profiling targets above, this
+# exercises the production /analyze path, fans the whole dataset out at once,
+# enables every fetch kind, and leaves the process alive long enough to sample
+# both VmHWM and post-batch RSS. Analysis caches are disabled across scan,
+# cleave, filefacts, and stng; fetch/registry blob caches stay warm so this
+# measures analysis rather than the network. Outputs include one response per
+# sample plus a deterministic ML fingerprint for parity checks.
+SERVER_BENCH_DATASET ?= realworld-small
+SERVER_BENCH_PATH    ?= $(BENCHMARK_ROOT)/$(SERVER_BENCH_DATASET)
+SERVER_BENCH_OUT     ?= $(OUT_DIR)/server-bench
+SERVER_BENCH_PORT    ?= 49997
+SERVER_BENCH_WORKERS ?= 20
+
+server-benchmark: bench-build ## Benchmark real /analyze requests in server mode with --fetch=all
+	@[ -e "$(SERVER_BENCH_PATH)" ] || { echo "error: dataset not found: $(SERVER_BENCH_PATH)"; exit 1; }
+	SCAN_NO_ANALYSIS_CACHE=1 SCAN_FETCH=all SCAN_NO_UPDATE_CHECK=1 \
+		scripts/bench-serve.sh "$(OUT_DIR)/$(BINARY).bench" "$(SERVER_BENCH_PATH)" \
+		"$(SERVER_BENCH_OUT)" "$(SERVER_BENCH_PORT)" "$(SERVER_BENCH_WORKERS)"
+
+server-heap-benchmark: heap-build ## Heap-profile the server-mode --fetch=all benchmark
+	@[ -e "$(SERVER_BENCH_PATH)" ] || { echo "error: dataset not found: $(SERVER_BENCH_PATH)"; exit 1; }
+	@rm -rf "$(OUT_DIR)/server-heap" && mkdir -p "$(OUT_DIR)/server-heap"
+	SCAN_NO_ANALYSIS_CACHE=1 SCAN_FETCH=all SCAN_NO_UPDATE_CHECK=1 \
+	_RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_interval:30,prof_prefix:$(OUT_DIR)/server-heap/jeprof" \
+		scripts/bench-serve.sh "$(OUT_DIR)/$(BINARY).heap" "$(SERVER_BENCH_PATH)" \
+		"$(SERVER_BENCH_OUT)" "$(SERVER_BENCH_PORT)" "$(SERVER_BENCH_WORKERS)"
+	@echo "✓ Heap profiles: $(OUT_DIR)/server-heap/jeprof.*.heap"
+	@echo "  Analyze with: jeprof --text $(OUT_DIR)/$(BINARY).heap <profile.heap>"
 
 # cleave-tuna: LLM-driven CPU+memory autoresearch loop. See ../cleave-tuna/README.md.
 TUNA_REPO            ?= ../cleave-tuna

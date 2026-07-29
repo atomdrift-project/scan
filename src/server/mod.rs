@@ -66,10 +66,12 @@ pub struct ServerConfig {
     hopper: Option<String>,
 }
 
-/// Default per-request analysis timeout: 5 minutes. Covers cold cleave scans
-/// of reasonable archives while preventing a pathological input from pinning
-/// a slot indefinitely. Override with [`ServerConfig::with_analysis_timeout`].
-pub const DEFAULT_ANALYSIS_TIMEOUT_SECS: u64 = 300;
+/// Default per-request analysis timeout: 20 minutes. Covers cold cleave scans
+/// of large archives — and fetch-enabled scans whose dependency analysis can
+/// far outlast the sample's own — while still preventing a pathological input
+/// from pinning a slot forever. Override with `--analysis-timeout` /
+/// [`ServerConfig::with_analysis_timeout`].
+pub const DEFAULT_ANALYSIS_TIMEOUT_SECS: u64 = 1200;
 
 impl ServerConfig {
     /// Create a server configuration.
@@ -194,6 +196,14 @@ impl ServerConfig {
     #[must_use]
     pub const fn with_level(mut self, level: Option<u16>) -> Self {
         self.level = level;
+        self
+    }
+
+    /// Set the per-request analysis timeout in seconds (`--analysis-timeout`).
+    /// 0 disables the timeout. Defaults to [`DEFAULT_ANALYSIS_TIMEOUT_SECS`].
+    #[must_use]
+    pub const fn with_analysis_timeout(mut self, secs: u64) -> Self {
+        self.analysis_timeout_secs = secs;
         self
     }
 
@@ -666,10 +676,18 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     }
 
     // Watchdog: periodically log about stuck in-flight requests. Signals cooperative
-    // cancellation to tasks running longer than 10 minutes so cleave can bail out of
-    // slow YARA rules, but never terminates the process — that is left to the operator.
+    // cancellation to tasks running past the cancel threshold so cleave can bail out
+    // of slow YARA rules, but never terminates the process — that is left to the
+    // operator. The threshold follows the configured analysis timeout: at least the
+    // historical 10 minutes, and always past `--analysis-timeout` itself (the request
+    // has already 504'd by then; this reaps the orphaned blocking thread). A timeout
+    // of 0 is an explicit operator opt-out of time limits, so the watchdog only logs.
     {
         let watchdog = Arc::clone(&state);
+        let cancel_after_secs = match config.analysis_timeout_secs() {
+            0 => None,
+            t => Some(t.max(600)),
+        };
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -689,7 +707,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     let elapsed_secs = now.duration_since(entry.started_at).as_secs();
                     let phase = entry.phase.get();
                     let tid = entry.thread_id.load(Ordering::Relaxed);
-                    if elapsed_secs >= 600 {
+                    if cancel_after_secs.is_some_and(|t| elapsed_secs >= t) {
                         // Signal cooperative cancellation for very long tasks so
                         // cleave can exit slow YARA rules cleanly.
                         entry.cancellation.store(true, Ordering::Release);
@@ -701,7 +719,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                             thread_id = tid,
                             stuck_orphans = stuck,
                             active_tasks = active,
-                            "watchdog: task running ≥10 min — cancellation signalled",
+                            "watchdog: task past cancel threshold — cancellation signalled",
                         );
                     } else if elapsed_secs >= 120 {
                         tracing::warn!(
