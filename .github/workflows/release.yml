@@ -179,7 +179,9 @@ jobs:
             x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
             aarch64-apple-darwin x86_64-apple-darwin
             x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-            x86_64-unknown-freebsd
+            s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu
+            powerpc64le-unknown-linux-gnu loongarch64-unknown-linux-gnu
+            x86_64-unknown-freebsd x86_64-unknown-dragonfly
             x86_64-unknown-openbsd x86_64-unknown-netbsd
         run: |
           set -eu
