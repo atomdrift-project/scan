@@ -1,7 +1,7 @@
 # Reusable build matrix — the single definition of "what platforms we ship and
 # how". Called by ci.yml (thin LTO, ad-hoc macOS signature) and by release.yml
-# (fat LTO, Developer ID signature + notarization). Keeping one matrix means CI
-# and release can't drift into building different things.
+# (fat LTO, plus whatever signing the `sign`/`notarize` inputs ask for). Keeping
+# one matrix means CI and release can't drift into building different things.
 #
 # See ci.yml for the hardening rationale that applies to both callers.
 
@@ -18,9 +18,18 @@ on:
         default: release
       sign:
         description: >-
-          Sign the macOS binaries with the Developer ID identity and notarize
-          them. Requires the MACOS_* secrets; falls back to an ad-hoc signature
-          when false.
+          Sign the macOS binaries with the Developer ID identity. Requires the
+          MACOS_CERT_* and MACOS_SIGN_IDENTITY secrets; falls back to an ad-hoc
+          signature when false.
+        type: boolean
+        default: false
+      notarize:
+        description: >-
+          Submit the signed binaries to Apple's notary service. Implies `sign`
+          and needs the MACOS_NOTARY_* secrets. Off by default: notarization is
+          the slowest and most failure-prone step here, and an unnotarized
+          build is still perfectly runnable locally — it only costs a Gatekeeper
+          prompt on machines that downloaded it.
         type: boolean
         default: false
     secrets:
@@ -151,6 +160,12 @@ jobs:
           CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: |
           set -eu
+          # Fail with something readable instead of letting `security import`
+          # choke on a zero-byte .p12, which is what an unset secret produces.
+          if [ -z "$CERT_P12" ]; then
+            echo "::error::sign=true but MACOS_CERT_P12 is not set - configure the signing secrets or call this workflow with sign=false"
+            exit 1
+          fi
           KEYCHAIN="$RUNNER_TEMP/atomdrift-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           echo "SIGNING_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
@@ -167,6 +182,10 @@ jobs:
           # Without this, codesign blocks on an interactive keychain prompt.
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Prepend ours to the existing user keychain list. The word splitting
+          # is deliberate — each existing keychain has to land as its own
+          # argument — and the paths come from `security` itself, not us.
+          # shellcheck disable=SC2046
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           security find-identity -v -p codesigning "$KEYCHAIN"
 
@@ -190,7 +209,7 @@ jobs:
           codesign --display --entitlements - "$BIN"
 
       - name: Notarize
-        if: ${{ runner.os == 'macOS' && inputs.sign }}
+        if: ${{ runner.os == 'macOS' && inputs.sign && inputs.notarize }}
         env:
           NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
           NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}

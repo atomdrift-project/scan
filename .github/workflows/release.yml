@@ -1,8 +1,21 @@
-# Publish a release. Fires automatically on a `v*` tag; `workflow_dispatch`
-# from a tag ref does the same thing by hand.
+# Publish a release. Fires automatically on a `v*` tag:
 #
 #     git tag -s v2.4.0 -m "Atomdrift Scan 2.4.0"
 #     git push origin v2.4.0
+#
+# It also dry-runs on demand from any ref, which is how you iterate on this
+# pipeline without burning tags:
+#
+#     gh workflow run release.yml --ref my-branch
+#
+# A dry run does everything a real one does — fat-LTO builds, whatever signing
+# the inputs below ask for, packaging, checksums — and stops short of attesting
+# or creating the release, leaving the assembled set as a downloadable artifact.
+# That matters because the release-only surface (the `release-lto` profile, the
+# signing path, this file's packaging steps) is precisely what ci.yml never
+# exercises, so it is where the failures live. Note that `workflow_dispatch`
+# reads the workflow definition from the ref you dispatch: fixes have to be on
+# that branch, not just on main.
 #
 # This workflow is deliberately separate from ci.yml because it is the only one
 # holding dangerous permissions — `contents: write` to publish, `id-token` and
@@ -21,6 +34,13 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: >-
+          Create the GitHub release. Off (the default) is a dry run. Requires a
+          tag ref; a tag push always publishes without needing this.
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -39,6 +59,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,26 +74,46 @@ jobs:
             exit 1
           fi
 
-      - name: Tag matches Cargo.toml version
+      # A tag push always publishes; a dispatch only does so when asked. On a
+      # tag push the `inputs` context is empty, so the first operand carries it.
+      - name: Resolve version
         id: version
+        env:
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
         run: |
           set -eu
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           case "$GITHUB_REF" in
-            refs/tags/*) TAG="${GITHUB_REF#refs/tags/}" ;;
+            refs/tags/*)
+              TAG="${GITHUB_REF#refs/tags/}"
+              VERSION="${TAG#v}"
+              if [ "$VERSION" != "$CARGO_VERSION" ]; then
+                echo "::error::tag $TAG does not match Cargo.toml version $CARGO_VERSION"
+                exit 1
+              fi
+              ;;
             *)
-              echo "::error::release must run from a tag ref (got $GITHUB_REF)"
-              exit 1
+              # Dry runs are the whole point of allowing a branch ref here, but
+              # publishing off one would create a release nobody can reproduce
+              # from a tag.
+              if [ "$PUBLISH" = "true" ]; then
+                echo "::error::publishing requires a tag ref (got $GITHUB_REF)"
+                exit 1
+              fi
+              TAG=""
+              VERSION="$CARGO_VERSION"
               ;;
           esac
-          VERSION="${TAG#v}"
-          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::tag $TAG does not match Cargo.toml version $CARGO_VERSION"
-            exit 1
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "publish=$PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$PUBLISH" = "true" ]; then
+            echo "releasing $TAG (version $VERSION)"
+          else
+            echo "dry run at $GITHUB_REF (version $VERSION) - nothing will be published"
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "releasing $TAG (version $VERSION)"
 
   build:
     name: build
@@ -86,9 +127,16 @@ jobs:
       # Fat LTO + one codegen unit. Multi-minute links, and worth it for a
       # binary people download rather than rebuild.
       profile: release-lto
-      sign: true
+      # Both off until the Developer ID secrets exist — with none configured,
+      # `sign: true` fails every macOS job on an empty .p12. Until then macOS
+      # binaries carry an ad-hoc signature and downloaders see a Gatekeeper
+      # prompt. Flip `sign` once the MACOS_CERT_* secrets are set, then
+      # `notarize` once the MACOS_NOTARY_* ones are.
+      sign: false
+      notarize: false
     # Explicit, not `secrets: inherit` — the called workflow gets exactly these
-    # six and nothing else.
+    # six and nothing else. Passed even while signing is off so that turning it
+    # on is a one-line change.
     secrets:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -117,9 +165,34 @@ jobs:
           merge-multiple: true
           path: dist
 
+      # `freebsd` and `cross` are continue-on-error, so a run goes green while
+      # quietly shipping fewer platforms than it should. Deliberately a warning
+      # rather than a failure — a broken experimental target shouldn't block the
+      # ones that built — but the gap gets named instead of being invisible.
+      - name: Inventory targets
+        env:
+          # Keep in sync with build.yml's matrices.
+          EXPECTED: >-
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+            aarch64-apple-darwin x86_64-apple-darwin
+            x86_64-unknown-linux-musl x86_64-unknown-freebsd
+        run: |
+          set -eu
+          missing=""
+          for t in $EXPECTED; do
+            if [ -f "dist/atomscan-$t.tar.gz" ]; then
+              echo "  ok      $t"
+            else
+              echo "  MISSING $t"
+              missing="$missing $t"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::release is missing targets:$missing"
+            echo "Missing targets:$missing" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Artifacts are named by target; releases are named by version + target.
-      # Any platform whose job failed is simply absent — a broken experimental
-      # target doesn't block shipping the ones that built.
       - name: Assemble
         run: |
           set -eu
@@ -137,6 +210,7 @@ jobs:
       #   gh attestation verify atomscan-<version>-<target>.tar.gz \
       #     --repo atomdrift-project/scan
       - name: Attest provenance
+        if: ${{ needs.verify.outputs.publish == 'true' }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: dist/*.tar.gz
@@ -145,6 +219,7 @@ jobs:
       # the one job that holds `contents: write`. Add `--draft` if you'd rather
       # review before it goes live.
       - name: Publish release
+        if: ${{ needs.verify.outputs.publish == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -155,3 +230,14 @@ jobs:
             --generate-notes \
             --verify-tag \
             dist/*.tar.gz dist/SHA256SUMS
+
+      # Everything above ran except the two steps that leave a trace. Keep the
+      # assembled set downloadable so a dry run is inspectable, not just green.
+      - name: Upload dry-run artifacts
+        if: ${{ needs.verify.outputs.publish != 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dry-run
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
