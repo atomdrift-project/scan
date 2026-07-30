@@ -461,6 +461,20 @@ pub(crate) struct FetchedDependency {
     pub raw: String,
 }
 
+/// Registry provenance materialized while walking a dependency graph.
+///
+/// This is separate from [`FetchedDependency`] because a dependency can have
+/// notable registry findings even when its artifact is age-gated or removed and
+/// therefore never fetched. `file_id` ties the record to the exact sidecar node
+/// cleave analyzed, including composite-source attribution.
+#[derive(Debug, Clone)]
+pub(crate) struct DependencyRegistry {
+    pub locator: String,
+    pub provenance: crate::provenance::RegistryProvenance,
+    pub file_id: u32,
+    pub artifact_skip: Option<&'static str>,
+}
+
 /// Discover, fetch, and graft, following references up to `policy.depth` hops.
 /// Mutates `report.files` in place with one node per fetched payload (and any
 /// extracted members) and returns the fetch edge log plus the standalone report
@@ -471,12 +485,16 @@ pub(crate) fn orchestrate(
     root_path: &Path,
     policy: FetchPolicy,
     progress: bool,
-) -> (Vec<FetchRecord>, Vec<FetchedDependency>) {
+) -> (
+    Vec<FetchRecord>,
+    Vec<FetchedDependency>,
+    Vec<DependencyRegistry>,
+) {
     if !policy.enabled() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let Some(res) = shared_resources() else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
 
     // Analyze fetched payloads with the same bloom short-circuit the top-level
@@ -497,6 +515,7 @@ pub(crate) fn orchestrate(
     // Standalone reports for each fetched dependency, captured before the payload
     // is grafted into the merged report. Uploaded to hopper as their own samples.
     let mut dependencies: Vec<FetchedDependency> = Vec::new();
+    let mut dependency_registries: Vec<DependencyRegistry> = Vec::new();
     // Two budget tiers. Per scanned file: each file's references get a fresh
     // ceiling (`--fetch-max-file-fetches` live fetches, `--fetch-max-file-size`
     // bytes), so one file can't starve the rest. Per execution: a process-wide
@@ -619,16 +638,41 @@ pub(crate) fn orchestrate(
                 use rayon::prelude::*;
                 registries
                     .par_iter()
-                    .map(|(_, reg, _)| registry_node(reg, &registry_opts))
+                    .map(|(_, provenance, _)| registry_node(&provenance.record, &registry_opts))
                     .collect()
             };
-            for ((r, reg, skip), sub) in registries.iter().zip(subs) {
+            for ((r, provenance, skip), sub) in registries.iter().zip(subs) {
+                let reg = &provenance.record;
                 if let Some(sub) = sub {
+                    let findings = sub_findings(&sub);
+                    // A skipped dependency has no artifact upload and only
+                    // appears in provenance output when its registry node is
+                    // notable. Drop its raw provider document immediately when
+                    // neither condition applies; lockfiles can contain hundreds
+                    // of ordinary aged-out records.
+                    let retain_provenance = skip.is_none()
+                        || findings
+                            .iter()
+                            .any(|finding| finding.crit >= cleave::Criticality::Notable);
                     registry_findings
                         .entry(locator_key(r))
                         .or_default()
-                        .extend(sub_findings(&sub));
-                    merge_registry(report, &source_sha, sub);
+                        .extend(findings);
+                    if let Some(file_id) = merge_registry(report, &source_sha, sub)
+                        && retain_provenance
+                    {
+                        let artifact_skip = skip.map(|reason| match reason {
+                            SkipReason::Removed => "version removed",
+                            SkipReason::AgedOut => "older than fetch age limit",
+                            SkipReason::KnownGood => "known-good coordinate",
+                        });
+                        dependency_registries.push(DependencyRegistry {
+                            locator: locator_key(r),
+                            provenance: provenance.clone(),
+                            file_id,
+                            artifact_skip,
+                        });
+                    }
                 }
                 // The record is materialized either way; only the artifact fetch
                 // is skipped. `None` = kept for fetch+scan.
@@ -803,7 +847,7 @@ pub(crate) fn orchestrate(
                 // reports the full set of references it pulled.
                 records.extend(fetched);
                 reporter.finish(&records);
-                return (records, dependencies);
+                return (records, dependencies, dependency_registries);
             }
             let acache_ref = acache
                 .get_or_insert_with(crate::analysis_cache::AnalysisCache::open)
@@ -835,7 +879,7 @@ pub(crate) fn orchestrate(
         worklist = next;
     }
     reporter.finish(&records);
-    (records, dependencies)
+    (records, dependencies, dependency_registries)
 }
 
 /// Where the fetch phase's progress is surfaced.
@@ -1122,16 +1166,6 @@ pub fn fetch_one(
     Ok((bytes, name, rec))
 }
 
-/// Look up the normalized registry metadata for a one-shot `pkg`/`url` target,
-/// using the shared fetch resources, with its relative age stamped. `None` for a
-/// raw URL, an unsupported ecosystem, or an unreachable registry — the metadata
-/// document is cached, so a later fetch of the same package pays nothing for it.
-#[must_use]
-pub fn registry(locator: &RefLocator) -> Option<Registry> {
-    let res = shared_resources()?;
-    fletch::registry(locator, &res.net, &res.cache).map(|reg| reg.with_age(unix_now()))
-}
-
 /// Serialize a registry record to its `*.registry.json` document — its synthetic
 /// name and bytes — so the one-shot `pkg:`/`url` path can scan the registry
 /// metadata directly when the artifact itself can't be fetched (e.g. the version
@@ -1141,10 +1175,9 @@ pub fn registry_document(reg: &Registry) -> Option<(String, Vec<u8>)> {
     Some((registry_doc_name(reg), serde_json::to_vec(reg).ok()?))
 }
 
-/// Like [`registry`], but also returns the raw provider documents the lookup
-/// read — recovered from the cache the scan already populated, so it costs no
-/// extra fetch. Used by `--upload` to archive the raw registry snapshot in hopper
-/// alongside the normalized record, the same re-parsing backup forager stores.
+/// Look up normalized registry metadata plus the provider documents it came
+/// from, with relative age stamped. Used by one-shot packages and memo-hit
+/// dependency scans; fletch's blob cache prevents a network refetch.
 #[must_use]
 pub fn registry_with_sources(
     locator: &RefLocator,
@@ -1180,7 +1213,7 @@ pub(crate) fn graft_root_registry(report: &mut AnalysisReport, reg: &Registry) {
     // the registry node's findings — the two halves of the package pass.
     let artifact = sub_findings(report);
     let registry = sub_findings(&sub);
-    merge_registry(report, &root_sha, sub);
+    let _ = merge_registry(report, &root_sha, sub);
     apply_package_composites(report, &root_sha, &artifact, &registry, &opts);
 }
 
@@ -1565,10 +1598,16 @@ fn dep_skip_predicate() -> Option<cleave::SkipPredicate> {
     )))
 }
 
-/// One dependency's age-gate outcome: the registry record (materialized as facts
-/// either way) paired with why its byte fetch was skipped — `None` when the
-/// dependency is kept for a full fetch+scan.
-type GatedDep = (Reference, Registry, Option<SkipReason>);
+/// One dependency's age-gate outcome: its normalized record plus the raw
+/// provider snapshot it came from, paired with why its byte fetch was skipped —
+/// `None` when the dependency is kept for a full fetch+scan.
+type GatedDep = (
+    Reference,
+    crate::provenance::RegistryProvenance,
+    Option<SkipReason>,
+);
+type RegistryLookup = (Registry, Vec<fletch::fetch::RecordedSource>);
+type IndexedRegistryLookup = (usize, Option<RegistryLookup>);
 
 /// Look up each declared dependency's registry metadata, stamp its relative
 /// age, and decide which to fetch. A dependency older than the policy's age
@@ -1644,13 +1683,14 @@ fn age_gate(
             // so skip the doomed fetch too. In every skip case the materialized
             // record's signals still surface. (Known-good coordinates never get
             // here — they were filtered out above, before the lookup.)
-            Some(reg) => {
+            Some(provenance) => {
+                let reg = &provenance.record;
                 let reason = if reg.version_removed == Some(true) {
                     Some(SkipReason::Removed)
                 } else if max_age.is_some_and(|max| reg.age_secs(now).is_some_and(|age| age >= max))
                 {
                     Some(SkipReason::AgedOut)
-                } else if bloom_known_good_resolved(&r, &reg) && !must_rescan(&reg, now) {
+                } else if bloom_known_good_resolved(&r, reg) && !must_rescan(reg, now) {
                     Some(SkipReason::KnownGood)
                 } else {
                     None
@@ -1658,7 +1698,7 @@ fn age_gate(
                 if reason.is_none() {
                     keep.push(r.clone());
                 }
-                registries.push((r, reg, reason));
+                registries.push((r, provenance, reason));
             }
             // A non-dependency, or a dependency whose record didn't resolve —
             // fetch it (fail open).
@@ -1681,15 +1721,20 @@ fn registry_memo() -> &'static RwLock<HashMap<String, Option<Registry>>> {
     MEMO.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Look up each declared dependency's registry record, returning one slot per
-/// input ref in `selected` order. A non-dependency ref, or one whose record
-/// can't be resolved, yields `None`. Memoized hits ([`registry_memo`]) are served
-/// from memory; the remaining misses are resolved concurrently, bounded by
-/// [`REGISTRY_LOOKUP_CONCURRENCY`] on plain OS threads, then folded back into the
-/// memo. Each lookup is keyed by a distinct locator, so the shared cache sees no
-/// write contention.
-fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<Option<Registry>> {
-    let mut out: Vec<Option<Registry>> = selected.iter().map(|_| None).collect();
+/// Look up each declared dependency's registry record and raw provider snapshot,
+/// returning one slot per input ref in `selected` order. A non-dependency ref,
+/// or one whose record can't be resolved, yields `None`.
+///
+/// Fresh misses use `registry_with_sources` once, so the normalized record and
+/// provenance come from one lookup. The process memo deliberately retains only
+/// the small record; memo hits recover raw bytes from fletch's blob cache rather
+/// than pinning every packument in a long-lived daemon's heap.
+fn lookup_registries(
+    selected: &[Reference],
+    res: &Resources,
+    now: u64,
+) -> Vec<Option<crate::provenance::RegistryProvenance>> {
+    let mut records: Vec<Option<Registry>> = selected.iter().map(|_| None).collect();
 
     // Split dependency refs into memo hits — served from memory, no disk or
     // network — and misses that still need a lookup.
@@ -1701,13 +1746,10 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
         for i in (0..selected.len()).filter(|&i| selected[i].kind == RefKind::Dependency) {
             match memo.get(&locator_key(&selected[i])) {
                 // Stored un-aged; stamp the age signals from this scan's clock.
-                Some(hit) => out[i] = hit.clone().map(|reg| reg.with_age(now)),
+                Some(hit) => records[i] = hit.clone().map(|reg| reg.with_age(now)),
                 None => misses.push(i),
             }
         }
-    }
-    if misses.is_empty() {
-        return out;
     }
 
     // Run the lookups on the existing rayon pool rather than spawning a fresh
@@ -1726,7 +1768,7 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
     // all are blob-cache hits that parse JSON and map an ecosystem, i.e. CPU. A
     // separate experiment raising the old constant 8 -> 64 made the scan *slower*
     // (40s vs 33s) for exactly that reason.
-    let collected: Vec<(usize, Option<Registry>)> = {
+    let collected: Vec<IndexedRegistryLookup> = {
         use rayon::prelude::*;
         misses
             .par_iter()
@@ -1734,10 +1776,11 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
                 // The raw, un-aged record (or `None` for an unresolved or
                 // unsupported package) — both worth memoizing so the lookup isn't
                 // re-attempted for every file that names it.
-                (
-                    i,
-                    fletch::registry(&selected[i].locator, &res.net, &res.cache),
-                )
+                (i, {
+                    let (record, sources) =
+                        fletch::registry_with_sources(&selected[i].locator, &res.net, &res.cache);
+                    record.map(|record| (record, sources))
+                })
             })
             .collect()
     };
@@ -1745,16 +1788,40 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
     // Stamp the aged copy for this scan into each result slot, keeping the raw
     // record to memoize.
     let mut writes: Vec<(String, Option<Registry>)> = Vec::with_capacity(misses.len());
-    for (i, reg) in collected {
-        out[i] = reg.clone().map(|reg| reg.with_age(now));
-        writes.push((locator_key(&selected[i]), reg));
+    let mut fresh_sources = HashMap::with_capacity(collected.len());
+    for (i, lookup) in collected {
+        match lookup {
+            Some((record, sources)) => {
+                records[i] = Some(record.clone().with_age(now));
+                fresh_sources.insert(i, sources);
+                writes.push((locator_key(&selected[i]), Some(record)));
+            }
+            None => writes.push((locator_key(&selected[i]), None)),
+        }
     }
     // One short critical section: nothing but the batch insert runs under the lock.
     registry_memo()
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .extend(writes);
-    out
+
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(i, record)| {
+            let record = record?;
+            let sources = fresh_sources.remove(&i).unwrap_or_else(|| {
+                // Memo hit: the provider documents remain in fletch's bounded
+                // blob cache, not in the unbounded process memo.
+                let (_, sources) =
+                    fletch::registry_with_sources(&selected[i].locator, &res.net, &res.cache);
+                sources
+            });
+            Some(crate::provenance::RegistryProvenance::from_record_sources(
+                record, &sources,
+            ))
+        })
+        .collect()
 }
 
 /// Serialize a registry record to its `*.registry.json` document and analyze it
@@ -1779,13 +1846,18 @@ fn registry_node(reg: &Registry, opts: &AnalysisOptions) -> Option<AnalysisRepor
 /// dependency (its sha256), mirroring [`merge_payload`]'s id/depth re-basing.
 /// The node carries only facts — a registry document references nothing to
 /// fetch — so no next-hop work-list is produced.
-fn merge_registry(report: &mut AnalysisReport, parent_sha: &str, sub: AnalysisReport) {
+fn merge_registry(
+    report: &mut AnalysisReport,
+    parent_sha: &str,
+    sub: AnalysisReport,
+) -> Option<u32> {
     let (parent_id, parent_depth) = report
         .files
         .iter()
         .find(|f| f.sha256 == parent_sha)
         .map_or((0, 0), |f| (f.id, f.depth));
     let id_base = report.files.iter().map(|f| f.id).max().map_or(0, |m| m + 1);
+    let mut root_id = None;
     for mut file in sub.files {
         // The registry document itself (the sub-report's root) is a sidecar:
         // metadata about its parent package, analyzed from its own canonical
@@ -1793,12 +1865,14 @@ fn merge_registry(report: &mut AnalysisReport, parent_sha: &str, sub: AnalysisRe
         if file.parent_id.is_none() {
             file.rel = cleave::types::Rel::Registry;
             file.role = cleave::types::Role::Sidecar;
+            root_id = Some(file.id + id_base);
         }
         file.id += id_base;
         file.parent_id = Some(file.parent_id.map_or(parent_id, |p| p + id_base));
         file.depth += parent_depth + 1;
         report.files.push(file);
     }
+    root_id
 }
 
 /// The synthetic filename for a registry document: `<name>@<version>.registry

@@ -619,8 +619,13 @@ mod envelope_tests {
         // Fetched dependencies are mirrored separately (bytes + provenance + their
         // own verdict) via the uploader's dependency path, so this offers only the
         // scanned file itself — a local artifact hopper may never have seen.
-        let arts =
-            collect_upload_artifacts(Path::new("/tmp/proj.tgz"), &"a".repeat(64), 10, "scan+test");
+        let arts = collect_upload_artifacts(
+            Path::new("/tmp/proj.tgz"),
+            &"a".repeat(64),
+            10,
+            "scan+test",
+            None,
+        );
 
         assert_eq!(arts.len(), 1, "only the scanned file is offered here");
         assert_eq!(arts[0].sha256, "a".repeat(64));
@@ -635,6 +640,24 @@ mod envelope_tests {
         assert_eq!(arts[0].filename, "proj.tgz", "filename is the file's name");
     }
 
+    #[test]
+    fn collect_upload_artifacts_backfills_preserved_root_provenance() {
+        let provenance = crate::provenance::registry_provenance(
+            br#"{"record":{"ecosystem":"npm","name":"proj","version":"1.0.0"},"sources":[{"url":"https://registry.example/proj","status":200,"body":{"provider_only":42}}]}"#,
+        )
+        .unwrap();
+        let arts = collect_upload_artifacts(
+            Path::new("/tmp/proj.tgz"),
+            &"a".repeat(64),
+            10,
+            "scan+test",
+            Some(&provenance),
+        );
+        let sidecar: serde_json::Value = serde_json::from_slice(&arts[0].sidecar).unwrap();
+        assert!(arts[0].backfill);
+        assert_eq!(sidecar["registry"]["raw"][0]["body"]["provider_only"], 42);
+    }
+
     /// A dependency carrying the verdict scan computed for it.
     fn evaluated_dep() -> DepResult {
         DepResult {
@@ -642,6 +665,7 @@ mod envelope_tests {
             locator: "pkg:npm/evil@1.0.0".to_string(),
             url: "https://reg/evil-1.0.0.tgz".to_string(),
             size: 1234,
+            provenance: None,
             verdict: Some(Decision {
                 class: Classification::Hostile,
                 probability: 0.97,
@@ -1123,8 +1147,9 @@ pub struct ScanResult {
 
 /// A fetched dependency to mirror into hopper as its own sample: the aggregate
 /// verdict scan computed for it during the parent analysis, plus its standalone
-/// compact cleave report. Provenance and bytes are recovered from the fetch blob
-/// cache at upload time (keyed by `locator`), so they never travel in the result.
+/// compact cleave report and the registry provenance captured during analysis.
+/// Only artifact bytes are recovered lazily from the fetch blob cache at upload
+/// time.
 #[derive(Debug, Clone)]
 pub struct DepResult {
     /// SHA-256 of the dependency's bytes — its identity and `/api/result` key.
@@ -1135,6 +1160,10 @@ pub struct DepResult {
     pub url: String,
     /// Size of the dependency's bytes, recorded in the provenance sidecar.
     pub size: u64,
+    /// The exact registry snapshot used during analysis. `None` for URL fetches,
+    /// unsupported registries, or failed lookups. Cloning is cheap because the
+    /// opaque document is refcounted compact bytes.
+    pub provenance: Option<crate::provenance::RegistryProvenance>,
     /// The dependency's aggregate verdict: its container elevated by its worst
     /// member, exactly as a first-hand scan of the same bytes resolves. `None`
     /// when the embedded pass never reached it — its bytes and provenance are
@@ -1835,6 +1864,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             None,
             None,
             None,
+            None,
         );
         let summary = tally.summary(scan_start);
         if is_terminal {
@@ -1880,6 +1910,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                 progress.as_ref(),
                 None,
                 None,
+                None,
             );
         }
     })?;
@@ -1906,7 +1937,8 @@ pub fn run_bytes(
     name: &str,
     bytes: Vec<u8>,
     config: &ScanConfig,
-    root_registry: Option<&fletch::Registry>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
+    root_fetch: Option<&fletch::fetch::FetchRecord>,
 ) -> Result<ScanSummary> {
     // Deliberately no `prefetch_cleave_resources()` here. This one-shot single-
     // artifact path (`pkg:`/`url`) never fans out across rayon, and its analyses
@@ -1948,6 +1980,7 @@ pub fn run_bytes(
         None,
         None,
         root_registry,
+        root_fetch,
     );
 
     let summary = tally.summary(scan_start);
@@ -2052,7 +2085,8 @@ fn record_file_result(
     stdout: &Mutex<std::io::Stdout>,
     progress: Option<&Progress>,
     uploader: Option<&crate::upload::Uploader>,
-    root_registry: Option<&fletch::Registry>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
+    root_fetch: Option<&fletch::fetch::FetchRecord>,
 ) {
     // Bloom verdict, re-derived from the root sha cleave computed. A file cleave
     // skipped at our request (a stale known-good, or fast-mode unknown) arrives as
@@ -2103,6 +2137,7 @@ fn record_file_result(
             config,
             cancellation,
             root_registry,
+            root_fetch,
             bloom_mark,
         )
     });
@@ -2139,7 +2174,15 @@ fn record_file_result(
                 let size = r.size_bytes;
                 let deps = std::mem::take(&mut r.dependency_results);
                 let envelope = r.into_envelope();
-                upload_scan_result(uploader, file_path, sha256, size, deps, envelope);
+                upload_scan_result(
+                    uploader,
+                    file_path,
+                    sha256,
+                    size,
+                    root_registry,
+                    deps,
+                    envelope,
+                );
             }
         }
         Err(e) => {
@@ -2161,10 +2204,17 @@ pub(crate) fn upload_scan_result(
     file_path: &Path,
     sha256: String,
     size_bytes: u64,
+    root_provenance: Option<&crate::provenance::RegistryProvenance>,
     dependency_results: Vec<DepResult>,
     envelope: ScanResultEnvelope,
 ) {
-    let artifacts = collect_upload_artifacts(file_path, &sha256, size_bytes, upload_collector());
+    let artifacts = collect_upload_artifacts(
+        file_path,
+        &sha256,
+        size_bytes,
+        upload_collector(),
+        root_provenance,
+    );
     uploader.submit_artifacts(artifacts);
     // Each fetched dependency, mirrored into hopper as its own sample: bytes (only
     // if missing) + provenance + the verdict scan computed for it. Queued before
@@ -2423,6 +2473,7 @@ fn collect_upload_artifacts(
     sha256: &str,
     size_bytes: u64,
     collector: &str,
+    root_provenance: Option<&crate::provenance::RegistryProvenance>,
 ) -> Vec<crate::upload::UploadArtifact> {
     use crate::upload::{ArtifactBytes, UploadArtifact};
     let now = now_rfc3339();
@@ -2433,25 +2484,38 @@ fn collect_upload_artifacts(
         .and_then(|n| n.to_str())
         .unwrap_or("file")
         .to_string();
+    let (sidecar, backfill) = if let Some(provenance) = root_provenance {
+        (
+            crate::provenance::build_sidecar_from_provenance(
+                &root_name, sha256, size_bytes, collector, &now, "", "", provenance,
+            ),
+            true,
+        )
+    } else {
+        (
+            crate::provenance::build_sidecar(
+                &root_name,
+                sha256,
+                size_bytes,
+                collector,
+                &now,
+                "",
+                "",
+                None,
+                &[],
+            ),
+            false,
+        )
+    };
     vec![UploadArtifact {
         sha256: sha256.to_string(),
         size: size_bytes,
         filename: root_name.clone(),
         bytes: ArtifactBytes::File(file_path.to_path_buf()),
-        sidecar: crate::provenance::build_sidecar(
-            &root_name,
-            sha256,
-            size_bytes,
-            collector,
-            &now,
-            "",
-            "",
-            None,
-            &[],
-        ),
-        // The root file's sidecar carries no registry/PURL, so there's nothing
-        // worth backfilling onto a copy hopper already has.
-        backfill: false,
+        sidecar,
+        // A map-backed root can carry registry data worth adding to a sample
+        // hopper already has; a plain local file's thin sidecar cannot.
+        backfill,
     }]
 }
 
@@ -2508,7 +2572,7 @@ fn sha256_file_hex(path: &Path) -> Option<String> {
 pub fn run_paths(
     paths: &[PathBuf],
     config: &ScanConfig,
-    registry_map: Option<&std::collections::HashMap<String, fletch::Registry>>,
+    registry_map: Option<&std::collections::HashMap<String, crate::provenance::RegistryProvenance>>,
 ) -> Result<ScanSummary> {
     prefetch_cleave_resources();
 
@@ -2590,6 +2654,7 @@ pub fn run_paths(
                 progress.as_ref(),
                 uploader.as_ref(),
                 root_registry,
+                None,
             );
         };
 
@@ -3044,7 +3109,11 @@ pub(crate) fn classify_report(
     // trains like any other file) and correlated with the artifact via a
     // `scope: package` composite, mirroring what `fetch::orchestrate` does per
     // fetched dependency.
-    root_registry: Option<&fletch::Registry>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
+    // Acquisition provenance for a one-shot `pkg:`/`url` root. Ordinary local
+    // scans have no fetch record; their path + content digest still identify
+    // their origin in interpret output.
+    root_fetch: Option<&fletch::fetch::FetchRecord>,
     // The bloom status flag (🚩 known-bad / 🏴 conflicted), rendered inline in the
     // terminal header. `None` for unflagged files.
     bloom_mark: Option<crate::output::BloomMark>,
@@ -3087,7 +3156,7 @@ pub(crate) fn classify_report(
     // fetched content feeds the verdict like any other file. Off unless the
     // policy selects a kind. The returned edges are attached to report_json below.
     let fetch_start = Instant::now();
-    let (fetch_edges, fetched_deps) =
+    let (fetch_edges, fetched_deps, dependency_registries) =
         crate::fetch::orchestrate(&mut report, root_path, fetch, fetch_progress);
     let fetch_ms = crate::duration_ms(fetch_start.elapsed());
     // One-shot `pkg:`/`url`: graft the root artifact's own registry metadata as a
@@ -3097,8 +3166,14 @@ pub(crate) fn classify_report(
     // after `orchestrate` (so the registry node sits outside the sample's own
     // `own_shas` aggregate, like other grafted content) and before `strip` (so a
     // package composite's `trait_refs` keep their building-block traits).
-    if let Some(reg) = root_registry {
-        crate::fetch::graft_root_registry(&mut report, reg);
+    // A metadata-only `pkg` fallback analyzes the `*.registry.json` document as
+    // the root itself. Preserve its provenance for interpret, but do not graft a
+    // duplicate copy beneath it. Ordinary package artifacts and map/worker
+    // inputs still receive the registry sidecar node.
+    if let Some(reg) = root_registry
+        && root_needs_registry_graft(&report)
+    {
+        crate::fetch::graft_root_registry(&mut report, &reg.record);
     }
     // Drop component/baseline traits no composite fired on before the report is
     // summarized, featurized, and posted. finalize() has already inherited and
@@ -3349,6 +3424,13 @@ pub(crate) fn classify_report(
     // classify_dependency, not attributed back from this report's embedded pass —
     // so its verdict is what a first-hand scan of those bytes produces, rather
     // than a function of where it landed in the merged file list.
+    let provenance_by_locator: std::collections::HashMap<
+        &str,
+        &crate::provenance::RegistryProvenance,
+    > = dependency_registries
+        .iter()
+        .map(|registry| (registry.locator.as_str(), &registry.provenance))
+        .collect();
     let dependency_results: Vec<DepResult> = fetched_deps
         .into_iter()
         .map(|dep| {
@@ -3357,6 +3439,9 @@ pub(crate) fn classify_report(
                 Some((v, m)) => (Some(v), m),
                 None => (None, MemberEvals::new()),
             };
+            let provenance = provenance_by_locator
+                .get(dep.locator.as_str())
+                .map(|provenance| (**provenance).clone());
             DepResult {
                 verdict,
                 members,
@@ -3364,6 +3449,7 @@ pub(crate) fn classify_report(
                 locator: dep.locator,
                 url: dep.url,
                 size: dep.size,
+                provenance,
                 raw: dep.raw,
             }
         })
@@ -3376,17 +3462,16 @@ pub(crate) fn classify_report(
     // offline from one scan, independent of whether `--interpret` is on.
     let dump_dir = std::env::var_os("SCAN_INTERPRET_DUMP_DIR");
     let llm_ctx = (interpret.is_some() || dump_dir.is_some() || llm_view).then(|| {
-        let mut rendered =
-            cleave::output::format_context(&report, &cleave::output::TinyOpts::tiny());
-        // Appendix mapping each grafted dependency node to the external
-        // reference it was fetched from (locator, declaring file, verdict,
-        // elevated findings). Without it the dependency's synthetic paths
-        // above read as archive members, and a dependency-driven elevation is
-        // inexplicable to the model. Appended before sanitize so `!!` paths
-        // normalize the same way as the main render.
-        if let Some(deps) = render_dependency_context(&fetch_edges, &dependency_results, &report) {
-            rendered.push_str(&deps);
-        }
+        let rendered = render_interpret_context(
+            label,
+            &sha256,
+            root_fetch,
+            root_registry,
+            &fetch_edges,
+            &dependency_results,
+            &dependency_registries,
+            &report,
+        );
         crate::interpret::sanitize_context(&rendered)
     });
     if let (Some(dir), Some(ctx)) = (dump_dir, llm_ctx.as_deref()) {
@@ -3466,8 +3551,16 @@ pub(crate) fn classify_report(
         // annotations included — just without the system prompt.
         llm_ctx.clone().unwrap_or_default()
     } else if tiny_opts.header == cleave::output::HeaderStyle::Rich {
-        render_terminal_context(
-            &report,
+        let registry_ids: std::collections::HashSet<u32> =
+            dependency_registries.iter().map(|r| r.file_id).collect();
+        let by_id: std::collections::HashMap<u32, &cleave::FileAnalysis> =
+            report.files.iter().map(|f| (f.id, f)).collect();
+        let mut primary = report.clone();
+        primary.files.retain(|file| {
+            fetched_root_id(file, &by_id).is_none() && !registry_ids.contains(&file.id)
+        });
+        let mut rendered = render_terminal_context(
+            &primary,
             tiny_opts,
             &final_decision,
             &reasons,
@@ -3475,7 +3568,17 @@ pub(crate) fn classify_report(
             &sha256,
             label,
             bloom_mark,
-        )
+        );
+        if let Some(fetched) = render_terminal_fetch_context(
+            &fetch_edges,
+            &dependency_results,
+            &dependency_registries,
+            &report,
+            tiny_opts,
+        ) {
+            rendered.push_str(&fetched);
+        }
+        rendered
     } else {
         cleave::output::format_context(&report, tiny_opts)
     };
@@ -3491,6 +3594,7 @@ pub(crate) fn classify_report(
     // bytes sent to the model stay exactly what that path renders.
     if render_context
         && !llm_view
+        && tiny_opts.header != cleave::output::HeaderStyle::Rich
         && let Some(deps) = render_dependency_context(&fetch_edges, &dependency_results, &report)
     {
         rendered_context.push_str(&deps);
@@ -3532,6 +3636,16 @@ pub(crate) fn classify_report(
         rendered_context,
         interpretation,
     })
+}
+
+/// Whether registry metadata is external context that needs grafting beneath
+/// the root. A metadata-only package fallback already analyzes the registry
+/// document as its root and must not receive a duplicate sidecar node.
+fn root_needs_registry_graft(report: &cleave::AnalysisReport) -> bool {
+    !report
+        .files
+        .first()
+        .is_some_and(|file| file.file_type == "registry")
 }
 
 /// A minimal archive-member record captured before `finalize()` discards
@@ -3707,6 +3821,734 @@ fn inject_dependency_backref(
 /// context appendix; a dependency with more still shows its worst, and the
 /// omission is stated so the model never mistakes the cut for completeness.
 const MAX_DEP_FINDING_LINES: usize = 12;
+
+/// Raw provider documents smaller than this stay verbatim in interpret
+/// provenance. Larger registry responses (notably npm packuments) are projected
+/// structurally around the requested version instead of byte-truncated, keeping
+/// valid JSON and the provider-only fields an LLM may need.
+const MAX_INTERPRET_RAW_REGISTRY_BYTES: usize = 4 * 1024;
+
+/// Render the package-aware user message used by `--interpret` and
+/// `--format interpret`.
+///
+/// Cleave's merged report contains the primary artifact, fetched artifacts, and
+/// registry sidecars in one flat file list. Rendering that list directly makes
+/// fetched packages look like archive members and puts their traits before the
+/// appendix that explains where they came from. Build one subject block at a
+/// time instead: compact provenance first, then only that package's cleave
+/// context. Dependencies are omitted unless suspicious/hostile or a notable+
+/// match is tied to their registry provenance (directly or through composite
+/// sources).
+#[allow(clippy::too_many_arguments)]
+fn render_interpret_context(
+    label: &str,
+    sha256: &str,
+    root_fetch: Option<&fletch::fetch::FetchRecord>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
+    fetch_edges: &[fletch::fetch::FetchRecord],
+    deps: &[DepResult],
+    registries: &[crate::fetch::DependencyRegistry],
+    report: &cleave::AnalysisReport,
+) -> String {
+    use std::fmt::Write as _;
+
+    let by_id: std::collections::HashMap<u32, &cleave::FileAnalysis> =
+        report.files.iter().map(|f| (f.id, f)).collect();
+    let mut fetched_root_by_file = std::collections::HashMap::new();
+    for file in &report.files {
+        if let Some(root) = fetched_root_id(file, &by_id) {
+            fetched_root_by_file.insert(file.id, root);
+        }
+    }
+    let registry_ids: std::collections::HashSet<u32> =
+        registries.iter().map(|r| r.file_id).collect();
+
+    // Provider bodies can recur when several package subjects came from the
+    // same registry document. Inline the first and make every later occurrence
+    // a digest reference.
+    let mut raw_seen = std::collections::HashSet::new();
+    let mut out = String::new();
+
+    let mut primary = report.clone();
+    primary
+        .files
+        .retain(|f| !fetched_root_by_file.contains_key(&f.id) && !registry_ids.contains(&f.id));
+    let primary_context =
+        cleave::output::format_context(&primary, &cleave::output::TinyOpts::tiny());
+    let _ = writeln!(out, "== PRIMARY {label} ==");
+    let primary_provenance =
+        primary_provenance(label, sha256, root_fetch, root_registry, &mut raw_seen);
+    let _ = writeln!(
+        out,
+        "provenance={}",
+        serde_json::to_string(&primary_provenance).unwrap_or_else(|_| "{}".to_string())
+    );
+    out.push_str(&primary_context);
+
+    let mut shown_registry_ids = std::collections::HashSet::new();
+    let mut visited_roots = std::collections::HashSet::new();
+    let mut candidate_count = 0_usize;
+    let mut shown_count = 0_usize;
+    for rec in fetch_edges.iter().filter(|r| r.content_sha256.is_some()) {
+        let content_sha = rec.content_sha256.as_deref().unwrap_or_default();
+        let Some(root) = report
+            .files
+            .iter()
+            .find(|f| f.sha256 == content_sha && f.rel == cleave::types::Rel::Fetched)
+        else {
+            continue;
+        };
+        if !visited_roots.insert(root.id) {
+            continue;
+        }
+        candidate_count += 1;
+        let graded = deps.iter().find(|d| d.sha256 == content_sha);
+        let registry = registries.iter().find(|r| r.locator == rec.locator);
+        let member_ids: std::collections::HashSet<u32> = fetched_root_by_file
+            .iter()
+            .filter_map(|(&file, &fetched_root)| (fetched_root == root.id).then_some(file))
+            .collect();
+        let severe_finding = report
+            .files
+            .iter()
+            .filter(|f| member_ids.contains(&f.id))
+            .flat_map(|f| &f.findings)
+            .any(|f| f.crit >= cleave::Criticality::Suspicious);
+        let severe_verdict = graded.and_then(|d| d.verdict).is_some_and(|v| {
+            matches!(
+                v.class,
+                Classification::Suspicious | Classification::Hostile
+            )
+        });
+        let provenance_hit = registry.is_some_and(|registry| {
+            provenance_has_notable_match(report, &member_ids, registry.file_id)
+        });
+        if !severe_finding && !severe_verdict && !provenance_hit {
+            continue;
+        }
+        shown_count += 1;
+
+        let class = match graded.and_then(|d| d.verdict).map(|v| v.class) {
+            Some(Classification::Hostile) => "hostile",
+            Some(Classification::Suspicious) => "suspicious",
+            Some(Classification::Benign) => "benign",
+            None => "not-evaluated",
+        };
+        let subject = if rec.kind == fletch::RefKind::Dependency {
+            "DEP"
+        } else {
+            "FETCH"
+        };
+        let _ = writeln!(out, "\n== {subject} {} class={class} ==", rec.locator);
+        let provenance = dependency_provenance(rec, registry, report, &mut raw_seen);
+        let _ = writeln!(
+            out,
+            "provenance={}",
+            serde_json::to_string(&provenance).unwrap_or_else(|_| "{}".to_string())
+        );
+
+        let mut view = report.clone();
+        view.files
+            .retain(|f| member_ids.contains(&f.id) || registry.is_some_and(|r| r.file_id == f.id));
+        out.push_str(&cleave::output::format_context(
+            &view,
+            &cleave::output::TinyOpts::tiny(),
+        ));
+        if let Some(registry) = registry {
+            shown_registry_ids.insert(registry.file_id);
+        }
+    }
+
+    // A removed or age-gated dependency may have no artifact subtree at all.
+    // Its atomic provenance finding is still evidence and gets its own subject.
+    for registry in registries {
+        if shown_registry_ids.contains(&registry.file_id) {
+            continue;
+        }
+        if fetch_edges
+            .iter()
+            .any(|edge| edge.locator == registry.locator && edge.content_sha256.is_some())
+        {
+            continue;
+        }
+        candidate_count += 1;
+        let member_ids = std::collections::HashSet::new();
+        if !provenance_has_notable_match(report, &member_ids, registry.file_id) {
+            continue;
+        }
+        shown_registry_ids.insert(registry.file_id);
+        shown_count += 1;
+        let status = registry.artifact_skip.unwrap_or("registry-only");
+        let _ = writeln!(out, "\n== DEP {} artifact={status} ==", registry.locator);
+        let provenance =
+            render_registry_provenance(&registry.locator, &registry.provenance, &mut raw_seen);
+        let _ = writeln!(
+            out,
+            "provenance={}",
+            serde_json::to_string(&provenance).unwrap_or_else(|_| "{}".to_string())
+        );
+        let mut view = report.clone();
+        view.files.retain(|f| f.id == registry.file_id);
+        out.push_str(&cleave::output::format_context(
+            &view,
+            &cleave::output::TinyOpts::tiny(),
+        ));
+    }
+
+    let omitted = candidate_count.saturating_sub(shown_count);
+    if omitted > 0 {
+        let _ = writeln!(out, "\ndeps_omitted={omitted}");
+    }
+    out
+}
+
+fn fetched_root_id<'a>(
+    file: &'a cleave::FileAnalysis,
+    by_id: &std::collections::HashMap<u32, &'a cleave::FileAnalysis>,
+) -> Option<u32> {
+    let mut current = file;
+    for _ in 0..=by_id.len() {
+        if current.rel == cleave::types::Rel::Fetched {
+            return Some(current.id);
+        }
+        current = *by_id.get(&current.parent_id?)?;
+    }
+    None
+}
+
+/// True for a notable+ atomic match on the registry node, or a notable+
+/// composite on the dependency artifact whose resolved sources include it.
+fn provenance_has_notable_match(
+    report: &cleave::AnalysisReport,
+    artifact_ids: &std::collections::HashSet<u32>,
+    registry_id: u32,
+) -> bool {
+    report.files.iter().any(|file| {
+        if file.id == registry_id
+            && file
+                .findings
+                .iter()
+                .any(|f| f.crit >= cleave::Criticality::Notable)
+        {
+            return true;
+        }
+        artifact_ids.contains(&file.id)
+            && file.findings.iter().any(|finding| {
+                finding.crit >= cleave::Criticality::Notable
+                    && file
+                        .composite_sources
+                        .get(&finding.id)
+                        .is_some_and(|sources| sources.iter().any(|s| s.file == registry_id))
+            })
+    })
+}
+
+fn primary_provenance(
+    label: &str,
+    sha256: &str,
+    fetch: Option<&fletch::fetch::FetchRecord>,
+    registry: Option<&crate::provenance::RegistryProvenance>,
+    raw_seen: &mut std::collections::HashSet<String>,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Some(fetch) = fetch {
+        out.insert("fetch".to_string(), compact_fetch_record(fetch, None));
+    } else {
+        out.insert(
+            "artifact".to_string(),
+            serde_json::json!({"path": label, "sha256": sha256}),
+        );
+    }
+    if let Some(registry) = registry {
+        let locator = fetch.map_or("", |f| f.locator.as_str());
+        out.insert(
+            "registry".to_string(),
+            render_registry_provenance(locator, registry, raw_seen),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+fn dependency_provenance(
+    fetch: &fletch::fetch::FetchRecord,
+    registry: Option<&crate::fetch::DependencyRegistry>,
+    report: &cleave::AnalysisReport,
+    raw_seen: &mut std::collections::HashSet<String>,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "fetch".to_string(),
+        compact_fetch_record(fetch, Some(report)),
+    );
+    if let Some(registry) = registry {
+        out.insert(
+            "registry".to_string(),
+            render_registry_provenance(&registry.locator, &registry.provenance, raw_seen),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Fetch provenance minus response headers and declaring-file hashes. Those are
+/// high-volume and either irrelevant to interpretation or already rendered as
+/// source paths; URLs, redirects, timing, cache/pin state, and content identity
+/// remain.
+fn compact_fetch_record(
+    fetch: &fletch::fetch::FetchRecord,
+    report: Option<&cleave::AnalysisReport>,
+) -> serde_json::Value {
+    let Ok(mut value) = serde_json::to_value(fetch) else {
+        return serde_json::Value::Null;
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("headers");
+        obj.remove("source_sha256");
+        if let Some(source_path) = report.and_then(|report| {
+            report
+                .files
+                .iter()
+                .find(|file| file.sha256 == fetch.source_sha256)
+                .map(|file| file.path.as_str())
+        }) {
+            obj.insert(
+                "source_path".to_string(),
+                serde_json::Value::String(source_path.to_string()),
+            );
+        }
+    }
+    value
+}
+
+fn render_registry_provenance(
+    _locator: &str,
+    provenance: &crate::provenance::RegistryProvenance,
+    raw_seen: &mut std::collections::HashSet<String>,
+) -> serde_json::Value {
+    let registry = &provenance.record;
+    let mut out = serde_json::Map::new();
+    out.insert("record".to_string(), sparse_registry_record(registry));
+    if let Some(raw) = provenance.raw() {
+        out.insert(
+            "raw".to_string(),
+            compact_registry_raw(&raw, registry, raw_seen),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+fn sparse_registry_record(registry: &fletch::Registry) -> serde_json::Value {
+    let mut value = serde_json::to_value(registry).unwrap_or(serde_json::Value::Null);
+    remove_empty_json(&mut value);
+    value
+}
+
+fn remove_empty_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for child in obj.values_mut() {
+                remove_empty_json(child);
+            }
+            obj.retain(|_, value| {
+                !value.is_null()
+                    && !matches!(value, serde_json::Value::String(s) if s.is_empty())
+                    && !matches!(value, serde_json::Value::Array(a) if a.is_empty())
+                    && !matches!(value, serde_json::Value::Object(o) if o.is_empty())
+            });
+        }
+        serde_json::Value::Array(array) => {
+            for child in array.iter_mut() {
+                remove_empty_json(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compact_registry_raw(
+    raw: &serde_json::Value,
+    registry: &fletch::Registry,
+    raw_seen: &mut std::collections::HashSet<String>,
+) -> serde_json::Value {
+    if let Some(sources) = raw.as_array() {
+        return serde_json::Value::Array(
+            sources
+                .iter()
+                .map(|source| compact_registry_source(source, registry, raw_seen))
+                .collect(),
+        );
+    }
+    compact_registry_source(raw, registry, raw_seen)
+}
+
+fn compact_registry_source(
+    source: &serde_json::Value,
+    registry: &fletch::Registry,
+    raw_seen: &mut std::collections::HashSet<String>,
+) -> serde_json::Value {
+    use sha2::{Digest as _, Sha256};
+
+    let body = source.get("body").unwrap_or(source);
+    let body_bytes = serde_json::to_vec(body).unwrap_or_default();
+    let digest = format!("{:x}", Sha256::digest(&body_bytes));
+    let duplicate = !raw_seen.insert(digest.clone());
+    let mut out = serde_json::Map::new();
+    for key in ["url", "status", "content_type"] {
+        if let Some(value) = source.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    out.insert("sha256".to_string(), serde_json::json!(digest));
+    if duplicate {
+        out.insert("deduplicated".to_string(), serde_json::Value::Bool(true));
+        return serde_json::Value::Object(out);
+    }
+
+    if source.get("body_b64").is_some() {
+        out.insert(
+            "body_b64".to_string(),
+            serde_json::json!("<preserved in provenance>"),
+        );
+        out.insert(
+            "original_bytes".to_string(),
+            serde_json::json!(body_bytes.len()),
+        );
+    } else if body_bytes.len() <= MAX_INTERPRET_RAW_REGISTRY_BYTES {
+        out.insert("body".to_string(), body.clone());
+    } else {
+        out.insert(
+            "body_projection".to_string(),
+            focus_registry_json(body, &registry.version, 0),
+        );
+        out.insert(
+            "original_bytes".to_string(),
+            serde_json::json!(body_bytes.len()),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Preserve provider-specific data while bounding huge maps/arrays. Version
+/// maps retain the requested release; ordinary objects keep their first useful
+/// fields, and long text is visibly abbreviated.
+fn focus_registry_json(
+    value: &serde_json::Value,
+    version: &str,
+    depth: usize,
+) -> serde_json::Value {
+    if depth >= 5 {
+        return serde_json::json!("…");
+    }
+    match value {
+        serde_json::Value::Object(obj) => {
+            let mut out = serde_json::Map::new();
+            let version_map = !version.is_empty() && obj.contains_key(version);
+            // Stable semantic priority first, then a few provider-specific keys
+            // so projection does not collapse back to only normalized fields.
+            for key in [
+                version,
+                "name",
+                "id",
+                "version",
+                "info",
+                "crate",
+                "package",
+                "dist-tags",
+                "time",
+                "versions",
+                "releases",
+                "urls",
+                "scripts",
+                "dist",
+                "_npmUser",
+                "maintainers",
+                "author",
+                "description",
+                "repository",
+                "homepage",
+                "deprecated",
+                "unpublished",
+                "modified",
+                "created",
+            ] {
+                if out.len() >= 12 {
+                    break;
+                }
+                if !key.is_empty()
+                    && let Some(child) = obj.get(key)
+                {
+                    out.insert(
+                        key.to_string(),
+                        focus_registry_json(child, version, depth + 1),
+                    );
+                }
+            }
+            if !version_map {
+                for (key, child) in obj {
+                    if out.len() >= 12 {
+                        break;
+                    }
+                    if !out.contains_key(key) {
+                        out.insert(key.clone(), focus_registry_json(child, version, depth + 1));
+                    }
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(array) => {
+            let mut selected: Vec<&serde_json::Value> = array
+                .iter()
+                .filter(|item| {
+                    item.as_object().is_some_and(|obj| {
+                        ["version", "num", "name"]
+                            .iter()
+                            .any(|key| obj.get(*key).and_then(|v| v.as_str()) == Some(version))
+                    })
+                })
+                .collect();
+            if selected.is_empty() {
+                selected.extend(array.iter().take(4));
+            }
+            serde_json::Value::Array(
+                selected
+                    .into_iter()
+                    .take(4)
+                    .map(|child| focus_registry_json(child, version, depth + 1))
+                    .collect(),
+            )
+        }
+        serde_json::Value::String(text) if text.len() > 384 => {
+            let mut end = 384;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            serde_json::Value::String(format!("{}…", text.get(..end).unwrap_or(text)))
+        }
+        _ => value.clone(),
+    }
+}
+
+/// Human-facing counterpart to [`render_interpret_context`]. It uses the same
+/// subject selection and keeps provenance before traits, but prints only
+/// processed acquisition/registry fields. Raw provider JSON remains exclusive
+/// to the compact interpret payload.
+fn render_terminal_fetch_context(
+    fetch_edges: &[fletch::fetch::FetchRecord],
+    deps: &[DepResult],
+    registries: &[crate::fetch::DependencyRegistry],
+    report: &cleave::AnalysisReport,
+    opts: &cleave::output::TinyOpts,
+) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let by_id: std::collections::HashMap<u32, &cleave::FileAnalysis> =
+        report.files.iter().map(|f| (f.id, f)).collect();
+    let fetched_root_by_file: std::collections::HashMap<u32, u32> = report
+        .files
+        .iter()
+        .filter_map(|file| fetched_root_id(file, &by_id).map(|root| (file.id, root)))
+        .collect();
+    let mut visited_roots = std::collections::HashSet::new();
+    let mut shown_registry_ids = std::collections::HashSet::new();
+    let mut candidate_count = 0_usize;
+    let mut shown_count = 0_usize;
+    let mut out = String::new();
+
+    for rec in fetch_edges.iter().filter(|r| r.content_sha256.is_some()) {
+        let content_sha = rec.content_sha256.as_deref().unwrap_or_default();
+        let Some(root) = report
+            .files
+            .iter()
+            .find(|f| f.sha256 == content_sha && f.rel == cleave::types::Rel::Fetched)
+        else {
+            continue;
+        };
+        if !visited_roots.insert(root.id) {
+            continue;
+        }
+        candidate_count += 1;
+        let graded = deps.iter().find(|d| d.sha256 == content_sha);
+        let registry = registries.iter().find(|r| r.locator == rec.locator);
+        let member_ids: std::collections::HashSet<u32> = fetched_root_by_file
+            .iter()
+            .filter_map(|(&file, &fetched_root)| (fetched_root == root.id).then_some(file))
+            .collect();
+        let severe_finding = report
+            .files
+            .iter()
+            .filter(|file| member_ids.contains(&file.id))
+            .flat_map(|file| &file.findings)
+            .any(|finding| finding.crit >= cleave::Criticality::Suspicious);
+        let severe_verdict = graded.and_then(|d| d.verdict).is_some_and(|verdict| {
+            matches!(
+                verdict.class,
+                Classification::Suspicious | Classification::Hostile
+            )
+        });
+        let provenance_hit = registry.is_some_and(|registry| {
+            provenance_has_notable_match(report, &member_ids, registry.file_id)
+        });
+        if !severe_finding && !severe_verdict && !provenance_hit {
+            continue;
+        }
+        shown_count += 1;
+
+        let subject = if rec.kind == fletch::RefKind::Dependency {
+            "dependency"
+        } else {
+            "URL fetch"
+        };
+        match graded.and_then(|d| d.verdict) {
+            Some(verdict) => {
+                let class = verdict.class.to_string().to_ascii_lowercase();
+                let _ = writeln!(
+                    out,
+                    "\n  ↳ {:.0}% {} · {class} {subject}",
+                    verdict.probability * 100.0,
+                    rec.locator
+                );
+            }
+            None => {
+                let _ = writeln!(out, "\n  ↳ {} · {subject} · not evaluated", rec.locator);
+            }
+        }
+        write_terminal_fetch_provenance(&mut out, rec, report);
+        let mut signals = Vec::new();
+        if rec.pin_verified == Some(false) {
+            signals.push("checksum mismatch");
+        }
+        if let Some(registry) = registry {
+            write_terminal_registry_provenance(&mut out, registry, &mut signals);
+            shown_registry_ids.insert(registry.file_id);
+        } else if !signals.is_empty() {
+            let _ = writeln!(out, "      signals    {}", signals.join(" · "));
+        }
+
+        let mut view = report.clone();
+        view.files.retain(|file| {
+            member_ids.contains(&file.id) || registry.is_some_and(|r| r.file_id == file.id)
+        });
+        out.push_str(&cleave::output::format_context(&view, opts));
+    }
+
+    for registry in registries {
+        if shown_registry_ids.contains(&registry.file_id)
+            || fetch_edges
+                .iter()
+                .any(|edge| edge.locator == registry.locator && edge.content_sha256.is_some())
+        {
+            continue;
+        }
+        candidate_count += 1;
+        if !provenance_has_notable_match(
+            report,
+            &std::collections::HashSet::new(),
+            registry.file_id,
+        ) {
+            continue;
+        }
+        shown_count += 1;
+        let status = registry.artifact_skip.unwrap_or("registry only");
+        let _ = writeln!(out, "\n  ↳ {} · {status}", registry.locator);
+        let mut signals = Vec::new();
+        write_terminal_registry_provenance(&mut out, registry, &mut signals);
+        let mut view = report.clone();
+        view.files.retain(|file| file.id == registry.file_id);
+        out.push_str(&cleave::output::format_context(&view, opts));
+    }
+
+    let omitted = candidate_count.saturating_sub(shown_count);
+    if omitted > 0 {
+        let _ = writeln!(out, "\n  {omitted} unremarkable fetched artifacts omitted");
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn write_terminal_fetch_provenance(
+    out: &mut String,
+    rec: &fletch::fetch::FetchRecord,
+    report: &cleave::AnalysisReport,
+) {
+    use std::fmt::Write as _;
+
+    let source = report
+        .files
+        .iter()
+        .find(|file| file.sha256 == rec.source_sha256)
+        .map_or("<unknown>", |file| file.path.as_str());
+    let _ = write!(out, "      from       {source}");
+    if let Some(offset) = rec.source_offset {
+        let _ = write!(out, " @ byte {offset}");
+    }
+    out.push('\n');
+    if !rec.resolved_url.is_empty() && rec.resolved_url != rec.locator {
+        let _ = writeln!(out, "      resolved   {}", rec.resolved_url);
+    }
+    if let Some(final_url) = rec
+        .final_url
+        .as_deref()
+        .filter(|url| *url != rec.resolved_url && *url != rec.locator)
+    {
+        let _ = writeln!(out, "      final      {final_url}");
+    }
+    if let Some(content_sha256) = &rec.content_sha256 {
+        let _ = writeln!(out, "      sha256     {content_sha256}");
+    }
+}
+
+fn write_terminal_registry_provenance(
+    out: &mut String,
+    registry: &crate::fetch::DependencyRegistry,
+    signals: &mut Vec<&'static str>,
+) {
+    use std::fmt::Write as _;
+
+    let record = &registry.provenance.record;
+    let mut summary = Vec::new();
+    if let Some(age) = record.age_days {
+        summary.push(format!("{age}d old"));
+    }
+    if let Some(downloads) = record.downloads_recent.or(record.downloads_total) {
+        summary.push(format!("{downloads} downloads"));
+    }
+    if let Some(maintainers) = record.maintainers {
+        let noun = if maintainers == 1 {
+            "maintainer"
+        } else {
+            "maintainers"
+        };
+        summary.push(format!("{maintainers} {noun}"));
+    }
+    if !summary.is_empty() {
+        let _ = writeln!(out, "      registry   {}", summary.join(" · "));
+    }
+    if record.version_removed == Some(true) {
+        signals.push("version removed");
+    }
+    if record.security_hold == Some(true) {
+        signals.push("security hold");
+    }
+    if record.publisher_in_maintainers == Some(false) {
+        signals.push("publisher not in maintainers");
+    }
+    if record.publisher_verified == Some(false) {
+        signals.push("publisher unverified");
+    }
+    if record.has_install_script == Some(true) {
+        signals.push("install script");
+    }
+    if let Some(deprecated) = record.deprecated.as_deref() {
+        let _ = writeln!(out, "      deprecated {deprecated}");
+    }
+    if !signals.is_empty() {
+        let _ = writeln!(out, "      signals    {}", signals.join(" · "));
+    }
+    if let Some(repository) = record.repository.as_deref() {
+        let _ = writeln!(out, "      upstream   {repository}");
+    }
+    for url in registry.provenance.source_urls() {
+        let _ = writeln!(out, "      metadata   {url}");
+    }
+}
 
 /// Render the fetched-dependencies appendix for the LLM interpret context.
 ///
@@ -4009,6 +4851,7 @@ mod dependency_grading_tests {
             locator: "pkg:npm/evil@1.0.0".to_string(),
             url: "https://reg.test/evil-1.0.0.tgz".to_string(),
             size: 1234,
+            provenance: None,
             verdict: Some(verdict),
             members,
             raw: raw.clone(),
@@ -4303,6 +5146,7 @@ mod dep_backref_tests {
             locator: "https://example.com/dep-1.0.tar.gz".to_string(),
             url: "https://example.com/dep-1.0.tar.gz".to_string(),
             size: 0,
+            provenance: None,
             verdict: Some(Decision {
                 class: Classification::Hostile,
                 probability: 0.97,
@@ -4372,6 +5216,294 @@ mod dep_backref_tests {
         edges[0].content_sha256 = None;
         assert!(render_dependency_context(&edges, &deps, &report).is_none());
     }
+
+    #[test]
+    fn interpret_context_puts_provenance_before_each_packages_traits() {
+        let finding = |id: &str, desc: &str, crit: cleave::Criticality| cleave::Finding {
+            id: id.to_string(),
+            desc: desc.to_string(),
+            crit,
+            ..cleave::Finding::default()
+        };
+        let mut root = cleave::FileAnalysis {
+            id: 0,
+            path: "root.tgz".to_string(),
+            sha256: "r".repeat(64),
+            ..cleave::FileAnalysis::default()
+        };
+        root.findings.push(finding(
+            "root/notable",
+            "primary package finding",
+            cleave::Criticality::Notable,
+        ));
+        let mut dep = cleave::FileAnalysis {
+            id: 1,
+            parent_id: Some(0),
+            depth: 1,
+            rel: cleave::types::Rel::Fetched,
+            path: "dep.tgz".to_string(),
+            sha256: "d".repeat(64),
+            ..cleave::FileAnalysis::default()
+        };
+        dep.findings.push(finding(
+            "dep/hostile",
+            "dependency package finding",
+            cleave::Criticality::Hostile,
+        ));
+        let mut registry_file = cleave::FileAnalysis {
+            id: 2,
+            parent_id: Some(0),
+            depth: 1,
+            rel: cleave::types::Rel::Registry,
+            role: cleave::types::Role::Sidecar,
+            path: "dep@1.registry.json".to_string(),
+            sha256: "g".repeat(64),
+            ..cleave::FileAnalysis::default()
+        };
+        registry_file.findings.push(finding(
+            "registry/new",
+            "new package",
+            cleave::Criticality::Notable,
+        ));
+        let mut report = empty_report();
+        report.files = vec![root, dep, registry_file];
+        let edge: fletch::fetch::FetchRecord = serde_json::from_value(serde_json::json!({
+            "source_sha256": "r".repeat(64),
+            "kind": "dependency",
+            "locator": "pkg:test/dep@1",
+            "resolved_url": "https://example.test/dep.tgz",
+            "content_sha256": "d".repeat(64),
+            "fetched_at": 1,
+            "cached": true,
+            "outcome": "ok",
+        }))
+        .unwrap();
+        let deps = vec![DepResult {
+            sha256: "d".repeat(64),
+            locator: "pkg:test/dep@1".to_string(),
+            url: "https://example.test/dep.tgz".to_string(),
+            size: 0,
+            provenance: None,
+            verdict: Some(Decision {
+                class: Classification::Hostile,
+                probability: 0.97,
+                threshold: 0.5,
+                level: None,
+            }),
+            members: MemberEvals::new(),
+            raw: "{}".to_string(),
+        }];
+        let registries = vec![crate::fetch::DependencyRegistry {
+            locator: "pkg:test/dep@1".to_string(),
+            provenance: crate::provenance::RegistryProvenance::from_record_sources(
+                fletch::Registry {
+                    ecosystem: "test".to_string(),
+                    name: "dep".to_string(),
+                    version: "1".to_string(),
+                    ..fletch::Registry::default()
+                },
+                &[fletch::fetch::RecordedSource {
+                    url: "https://registry.example/dep".to_string(),
+                    status: 200,
+                    content_type: Some("application/json".to_string()),
+                    bytes: br#"{"provider_only":{"kept":true}}"#.to_vec(),
+                }],
+            ),
+            file_id: 2,
+            artifact_skip: None,
+        }];
+        let edges = vec![edge];
+
+        let ctx = render_interpret_context(
+            "root.tgz",
+            &"r".repeat(64),
+            None,
+            None,
+            &edges,
+            &deps,
+            &registries,
+            &report,
+        );
+        let primary_provenance = ctx.find("provenance=").unwrap();
+        let primary_trait = ctx.find("primary package finding").unwrap();
+        let dep_header = ctx.find("== DEP pkg:test/dep@1").unwrap();
+        let dep_provenance =
+            ctx.get(dep_header..).unwrap().find("provenance=").unwrap() + dep_header;
+        let dep_trait = ctx.find("dependency package finding").unwrap();
+        assert!(primary_provenance < primary_trait);
+        assert!(primary_trait < dep_header);
+        assert!(dep_provenance < dep_trait);
+        assert_eq!(ctx.matches("dependency package finding").count(), 1);
+        assert!(ctx.contains(r#""record":{"ecosystem":"test","name":"dep","version":"1"}"#));
+        assert!(
+            ctx.contains(r#""provider_only":{"kept":true}"#),
+            "interpret projection must derive from preserved raw provenance: {ctx}"
+        );
+        assert!(ctx.contains(r#""source_path":"root.tgz""#));
+        assert!(
+            !ctx.contains(":null"),
+            "sparse records must omit nulls: {ctx}"
+        );
+
+        let terminal = render_terminal_fetch_context(
+            &edges,
+            &deps,
+            &registries,
+            &report,
+            &cleave::output::TinyOpts::terminal(),
+        )
+        .expect("hostile dependency is shown");
+        let provenance = terminal.find("      from       root.tgz").unwrap();
+        let finding = terminal.find("dependency package finding").unwrap();
+        assert!(provenance < finding);
+        assert_eq!(terminal.matches("pkg:test/dep@1").count(), 1);
+        assert!(
+            terminal.contains(&"d".repeat(64)),
+            "hash must stay complete"
+        );
+        assert!(!terminal.contains("transfer"));
+        assert!(!terminal.contains("cache:"));
+        assert!(terminal.contains("metadata   https://registry.example/dep"));
+    }
+
+    #[test]
+    fn metadata_only_root_keeps_provenance_without_a_duplicate_graft() {
+        let mut report = empty_report();
+        report.files = vec![cleave::FileAnalysis {
+            id: 0,
+            path: "removed@1.registry.json".to_string(),
+            file_type: "registry".to_string(),
+            sha256: "a".repeat(64),
+            ..cleave::FileAnalysis::default()
+        }];
+        assert!(
+            !root_needs_registry_graft(&report),
+            "the registry document is already the analyzed root"
+        );
+        let provenance = crate::provenance::RegistryProvenance::from_record_sources(
+            fletch::Registry {
+                ecosystem: "test".to_string(),
+                name: "removed".to_string(),
+                version: "1".to_string(),
+                version_removed: Some(true),
+                ..fletch::Registry::default()
+            },
+            &[fletch::fetch::RecordedSource {
+                url: "https://registry.example/removed".to_string(),
+                status: 200,
+                content_type: Some("application/json".to_string()),
+                bytes: br#"{"provider_only":{"kept":true}}"#.to_vec(),
+            }],
+        );
+        let ctx = render_interpret_context(
+            "removed@1.registry.json",
+            &"a".repeat(64),
+            None,
+            Some(&provenance),
+            &[],
+            &[],
+            &[],
+            &report,
+        );
+        assert!(ctx.contains(r#""provider_only":{"kept":true}"#));
+        assert_eq!(ctx.matches("== PRIMARY").count(), 1);
+
+        report.files[0].file_type = "npm".to_string();
+        assert!(root_needs_registry_graft(&report));
+    }
+
+    #[test]
+    fn notable_composite_with_registry_source_selects_dependency_provenance() {
+        let registry_id = 9;
+        let mut artifact = cleave::FileAnalysis {
+            id: 4,
+            ..cleave::FileAnalysis::default()
+        };
+        artifact.findings.push(cleave::Finding {
+            id: "package/composite".to_string(),
+            crit: cleave::Criticality::Notable,
+            ..cleave::Finding::default()
+        });
+        let mut artifact_json = serde_json::to_value(&artifact).unwrap();
+        artifact_json["composite_sources"] = serde_json::json!({
+            "package/composite": [{"file": registry_id}]
+        });
+        let artifact: cleave::FileAnalysis = serde_json::from_value(artifact_json).unwrap();
+        let registry = cleave::FileAnalysis {
+            id: registry_id,
+            rel: cleave::types::Rel::Registry,
+            role: cleave::types::Role::Sidecar,
+            ..cleave::FileAnalysis::default()
+        };
+        let mut report = empty_report();
+        report.files = vec![artifact, registry];
+        assert!(provenance_has_notable_match(
+            &report,
+            &[4].into_iter().collect(),
+            registry_id,
+        ));
+    }
+
+    #[test]
+    fn large_raw_registry_json_is_version_focused_and_valid() {
+        let body = serde_json::json!({
+            "name": "dep",
+            "versions": (0..100)
+                .map(|n| (format!("1.0.{n}"), serde_json::json!({"version": format!("1.0.{n}")})))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+            "provider_extra": (0..100)
+                .map(|n| (format!("field_{n}"), serde_json::Value::String("x".repeat(2_000))))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        });
+        let projected = focus_registry_json(&body, "1.0.42", 0);
+        assert_eq!(projected["versions"]["1.0.42"]["version"], "1.0.42");
+        assert!(
+            projected["versions"].as_object().unwrap().len() < 10,
+            "large version maps should not flood interpret context"
+        );
+        let encoded = serde_json::to_vec(&projected).expect("projection remains valid JSON");
+        assert!(
+            encoded.len() < 8 * 1024,
+            "projection should stay comfortably bounded, got {} bytes",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn terminal_url_fetch_omits_duplicate_urls_and_never_shortens_sha256() {
+        let sha = "a".repeat(64);
+        let mut rec: fletch::fetch::FetchRecord = serde_json::from_value(serde_json::json!({
+            "source_sha256": "r".repeat(64),
+            "source_offset": 42,
+            "kind": "url_fetch",
+            "locator": "https://example.test/stage.sh",
+            "resolved_url": "https://example.test/stage.sh",
+            "final_url": "https://example.test/stage.sh",
+            "content_sha256": sha,
+            "fetched_at": 1,
+            "cached": false,
+            "outcome": "ok",
+        }))
+        .unwrap();
+        let mut report = empty_report();
+        report.files = vec![cleave::FileAnalysis {
+            id: 0,
+            path: "dropper.sh".to_string(),
+            sha256: "r".repeat(64),
+            ..cleave::FileAnalysis::default()
+        }];
+        let mut out = String::new();
+        write_terminal_fetch_provenance(&mut out, &rec, &report);
+        assert!(out.contains("from       dropper.sh @ byte 42"));
+        assert!(out.contains(&format!("sha256     {sha}")));
+        assert!(!out.contains("resolved"));
+        assert!(!out.contains("final"));
+
+        rec.final_url = Some("https://cdn.example.test/stage.sh".to_string());
+        out.clear();
+        write_terminal_fetch_provenance(&mut out, &rec, &report);
+        assert!(out.contains("final      https://cdn.example.test/stage.sh"));
+    }
 }
 
 /// Returns `true` when `candidate` should replace `current` as the dominant
@@ -4395,7 +5527,8 @@ pub(crate) fn process_report(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
     cancellation: Option<&Arc<AtomicBool>>,
-    root_registry: Option<&fletch::Registry>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
+    root_fetch: Option<&fletch::fetch::FetchRecord>,
     bloom_mark: Option<crate::output::BloomMark>,
 ) -> Result<ScanResult> {
     let path_display = path.display().to_string();
@@ -4426,6 +5559,7 @@ pub(crate) fn process_report(
         // no-finding ones cleave skipped analyzing.
         config.filter().is_all() && is_json,
         root_registry,
+        root_fetch,
         bloom_mark,
     )?;
 
@@ -4552,6 +5686,7 @@ pub fn scan_bytes(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -4591,6 +5726,7 @@ pub fn scan_file(
         model,
         shap,
         config,
+        None,
         None,
         None,
         None,

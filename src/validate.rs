@@ -122,6 +122,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         false, // validation only consumes ML verdicts
                         false, // no manifest listing; validation reads findings only
                         None,  // validation fixtures are local files, not fetched packages
+                        None,  // local validation fixtures have no acquisition fetch record
                         None,  // validation consumes ML verdicts only; no bloom flag
                     );
                     let classify_elapsed = classify_started.elapsed();

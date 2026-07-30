@@ -168,9 +168,9 @@ pub struct UploadArtifact {
     /// Pre-serialized hopper `Sidecar` JSON (see [`crate::provenance::build_sidecar`]).
     pub sidecar: Vec<u8>,
     /// Whether this artifact's provenance is worth backfilling onto a sample
-    /// hopper already has the bytes for — true for a fetched dependency (the
-    /// sidecar carries a registry record + PURL), false for the scanned root file
-    /// (whose sidecar is just artifact + fetch identity).
+    /// hopper already has the bytes for — true for fetched dependencies and
+    /// map-backed roots carrying registry data, false for a plain local root
+    /// whose sidecar contains only artifact + fetch identity.
     pub backfill: bool,
 }
 
@@ -402,8 +402,8 @@ fn reconcile_artifacts(
             // hopper has the bytes. For a dependency, (re)send its provenance so
             // hopper refreshes the registry snapshot — the bytes never move, only
             // the small sidecar, and hopper preserves the original discovery
-            // wrapper, updating just the registry data. The root file carries no
-            // registry/PURL, so there is nothing to send for it.
+            // wrapper, updating just the registry data. Plain local roots set
+            // `backfill` false; map-backed roots preserve and refresh theirs.
             if art.backfill {
                 upload_provenance_only(client, upload_url, &art);
             } else {
@@ -522,29 +522,44 @@ fn sync_dependencies(
     }
 }
 
-/// Build the upload artifact for a fetched dependency: its bytes load from the
-/// fetch blob cache by locator only if hopper turns out to need them, and its
-/// sidecar carries the registry record recovered from that same warm cache (a
-/// cache hit, never a re-fetch) plus the raw provider documents as hopper's
-/// re-parsing backup.
+/// Build the upload artifact for a fetched dependency. Its bytes load from the
+/// fetch blob cache only if hopper needs them; its sidecar uses the exact
+/// registry snapshot already captured and analyzed, with no registry/cache
+/// lookup on the upload path.
 fn dep_artifact(dep: &crate::engine::DepResult, collector: &str, now: &str) -> UploadArtifact {
-    let (registry, sources) =
-        crate::fetch::registry_with_sources(&fletch::RefLocator::Purl(dep.locator.clone()));
     let filename = crate::engine::artifact_filename(&dep.url, &dep.locator);
-    UploadArtifact {
-        sha256: dep.sha256.clone(),
-        size: dep.size,
-        sidecar: crate::provenance::build_sidecar(
+    let purl = dep
+        .locator
+        .starts_with("pkg:")
+        .then_some(dep.locator.as_str());
+    let sidecar = if let Some(provenance) = &dep.provenance {
+        crate::provenance::build_sidecar_from_provenance(
             &filename,
             &dep.sha256,
             dep.size,
             collector,
             now,
             &dep.url,
-            &dep.locator,
-            registry.as_ref(),
-            &sources,
-        ),
+            purl.unwrap_or_default(),
+            provenance,
+        )
+    } else {
+        crate::provenance::build_sidecar(
+            &filename,
+            &dep.sha256,
+            dep.size,
+            collector,
+            now,
+            &dep.url,
+            purl.unwrap_or_default(),
+            None,
+            &[],
+        )
+    };
+    UploadArtifact {
+        sha256: dep.sha256.clone(),
+        size: dep.size,
+        sidecar,
         filename,
         bytes: ArtifactBytes::Cached {
             locator: dep.locator.clone(),
@@ -807,8 +822,9 @@ mod tests {
 
     /// A dependency's upload artifact loads its bytes lazily from the fetch cache
     /// (never eagerly), derives its stored filename from the resolved URL, and is
-    /// marked backfillable so its registry provenance lands even when hopper
-    /// already holds the bytes. `pkg:bogus/*` resolves to no registry offline.
+    /// marked backfillable so its captured registry provenance lands even when
+    /// hopper already holds the bytes. The test uses an unsupported PURL to prove
+    /// artifact construction does not perform a registry lookup.
     ///
     /// Built here from an *unevaluated* dependency: the artifact is independent
     /// of the verdict, so bytes and provenance reach hopper even when scan has
@@ -820,6 +836,20 @@ mod tests {
             locator: "pkg:bogus/x@1".to_string(),
             url: "https://example/x-1.tgz".to_string(),
             size: 99,
+            provenance: Some(crate::provenance::RegistryProvenance::from_record_sources(
+                fletch::Registry {
+                    ecosystem: "bogus".to_string(),
+                    name: "x".to_string(),
+                    version: "1".to_string(),
+                    ..fletch::Registry::default()
+                },
+                &[fletch::fetch::RecordedSource {
+                    url: "https://registry.example/x".to_string(),
+                    status: 200,
+                    content_type: Some("application/json".to_string()),
+                    bytes: br#"{"provider_only":42}"#.to_vec(),
+                }],
+            )),
             verdict: None,
             members: crate::engine::MemberEvals::new(),
             raw: "{}".to_string(),
@@ -832,6 +862,11 @@ mod tests {
             "filename derived from the fetch URL"
         );
         assert!(art.backfill, "a dependency's provenance is backfillable");
+        let sidecar: serde_json::Value = serde_json::from_slice(&art.sidecar).unwrap();
+        assert_eq!(
+            sidecar["registry"]["raw"][0]["body"]["provider_only"], 42,
+            "upload uses the captured provider snapshot"
+        );
         assert!(
             matches!(&art.bytes, ArtifactBytes::Cached { locator } if locator == "pkg:bogus/x@1"),
             "bytes load lazily from the cache by locator",

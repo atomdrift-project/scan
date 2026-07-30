@@ -440,9 +440,10 @@ enum Commands {
         /// Apply pre-collected registry metadata per scanned file, so an offline
         /// scan reasons over the same registry facts a live `pkg`/`url` scan would
         /// — without refetching, and even when the package has since been pulled.
-        /// Takes a JSON object mapping each file's sha256 to its registry record
-        /// (the `registry.record` slot of the sidecar hopper stores; the rest of
-        /// the provenance is ignored). A file absent from the map scans normally.
+        /// Takes a JSON object mapping each file's sha256 to its complete hopper
+        /// sidecar, a `{record,sources}` fletch envelope, or a legacy bare
+        /// registry record. Complete inputs retain their raw provider data.
+        /// A file absent from the map scans normally.
         /// Also settable via the `SCAN_REGISTRY_MAP` env var.
         #[arg(long, value_name = "FILE", env = "SCAN_REGISTRY_MAP")]
         registry_map: Option<PathBuf>,
@@ -1058,25 +1059,19 @@ fn main() -> Result<()> {
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
             }
-            // `--registry-map <file>`: a JSON object {sha256: registry record}.
-            // Each scanned file is enriched with its own registry provenance,
-            // matched by content sha. Entries that don't parse to a record are
-            // skipped — registry provenance is best-effort, never required.
+            // `--registry-map <file>`: a JSON object {sha256: provenance}.
+            // Preserve each complete value and derive the normalized record
+            // beside it, so map-backed scans have the same provider data as
+            // live and worker scans. Entries without a record are skipped —
+            // registry provenance is best-effort, never required.
             let registry_map = match &registry_map {
                 Some(path) => {
                     let bytes = std::fs::read(path)
                         .with_context(|| format!("reading registry map {}", path.display()))?;
-                    let raw: std::collections::HashMap<String, serde_json::Value> =
-                        serde_json::from_slice(&bytes)
-                            .with_context(|| format!("parsing registry map {}", path.display()))?;
-                    let mut map = std::collections::HashMap::with_capacity(raw.len());
-                    for (sha, value) in raw {
-                        let value_bytes = serde_json::to_vec(&value).unwrap_or_default();
-                        if let Some(record) = scan::provenance::registry_record(&value_bytes) {
-                            map.insert(sha, record);
-                        }
-                    }
-                    Some(map)
+                    Some(
+                        scan::provenance::registry_map(&bytes)
+                            .with_context(|| format!("parsing registry map {}", path.display()))?,
+                    )
                 }
                 None => None,
             };
@@ -1851,7 +1846,7 @@ fn exit_for_summary(summary: &scan::ScanSummary) {
 fn run_scan_paths(
     paths: &[PathBuf],
     config: &scan::ScanConfig,
-    registry_map: Option<&std::collections::HashMap<String, fletch::Registry>>,
+    registry_map: Option<&std::collections::HashMap<String, scan::provenance::RegistryProvenance>>,
 ) -> Result<scan::ScanSummary> {
     // Warm YARA + capability mapper off the rayon pool before any analysis
     // spawns rayon work. Directory scans run on a dedicated rayon pool; if

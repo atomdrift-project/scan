@@ -55,7 +55,10 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
     // any other file — rather than scanned as a disconnected side report, so a
     // `scope: package` composite can correlate the registry's account with the
     // artifact's own behavior.
-    let registry = crate::fetch::registry(&locator);
+    let (registry, registry_sources) = crate::fetch::registry_with_sources(&locator);
+    let registry_provenance = registry.clone().map(|record| {
+        crate::provenance::RegistryProvenance::from_record_sources(record, &registry_sources)
+    });
     if let Some(reg) = &registry {
         crate::fetch::report_registry(reg, progress);
         // The registry lookup we just did (the packument we need for the record
@@ -70,7 +73,14 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                     "\n  \x1b[38;2;230;180;80m\u{26a0}\x1b[0m  \x1b[38;2;160;160;160mversion unpublished — scanning registry metadata only\x1b[0m"
                 );
             }
-            return crate::engine::run_bytes(&name, &name, bytes, config, None);
+            return crate::engine::run_bytes(
+                &name,
+                &name,
+                bytes,
+                config,
+                registry_provenance.as_ref(),
+                None,
+            );
         }
     }
     // Known-good/known-bad by package coordinate, consulted *after* the registry
@@ -100,7 +110,14 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
             } else {
                 rec.resolved_url.clone()
             };
-            crate::engine::run_bytes(&label, &name, bytes, config, registry.as_ref())
+            crate::engine::run_bytes(
+                &label,
+                &name,
+                bytes,
+                config,
+                registry_provenance.as_ref(),
+                Some(&rec),
+            )
         }
         // The artifact couldn't be fetched — most often because the version was
         // unpublished/removed (the metadata still resolves). Rather than fail the
@@ -115,7 +132,14 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                         "\n  \x1b[38;2;230;180;80m\u{26a0}\x1b[0m  \x1b[38;2;160;160;160martifact unavailable — scanning registry metadata only\x1b[0m"
                     );
                 }
-                crate::engine::run_bytes(&name, &name, bytes, config, None)
+                crate::engine::run_bytes(
+                    &name,
+                    &name,
+                    bytes,
+                    config,
+                    registry_provenance.as_ref(),
+                    None,
+                )
             }
             None => Err(e),
         },

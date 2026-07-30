@@ -2256,7 +2256,7 @@ async fn run_job(
     // deprecation) a live `pkg`/`url` scan fetches — without a refetch. Only
     // attempted when hopper flagged the sample as carrying it; best-effort, so a
     // miss never fails the scan. Consumed as stamped at collection time.
-    let root_registry: Option<fletch::Registry> = if job.has_provenance {
+    let root_registry: Option<crate::provenance::RegistryProvenance> = if job.has_provenance {
         download_provenance(client, base_url, &job.sha256).await
     } else {
         None
@@ -2877,16 +2877,17 @@ async fn download_response(
     Ok((resp, "/api/file/ (fallback)"))
 }
 
-/// Fetch the registry-metadata provenance hopper holds for `sha256`, returning
-/// its normalized [`fletch::Registry`] record. Best-effort by design: an absent
-/// record (HTTP 204), an unreachable hopper, or a malformed body all yield
-/// `None` — registry provenance enriches a scan but must never fail one, exactly
-/// as a live scan fails open when a registry lookup can't be made.
+/// Fetch the registry-metadata provenance hopper holds for `sha256`, preserving
+/// the complete JSON document alongside its normalized registry record.
+/// Best-effort by design: an absent record (HTTP 204), an unreachable hopper,
+/// or a malformed body all yield `None` — registry provenance enriches a scan
+/// but must never fail one, exactly as a live scan fails open when a registry
+/// lookup can't be made.
 async fn download_provenance(
     client: &reqwest::Client,
     base_url: &str,
     sha256: &str,
-) -> Option<fletch::Registry> {
+) -> Option<crate::provenance::RegistryProvenance> {
     let url = format!("{base_url}/api/provenance/{sha256}");
     let resp = match client.get(&url).send().await {
         Ok(resp) => resp,
@@ -2910,8 +2911,11 @@ async fn download_provenance(
     if body.is_empty() {
         return None;
     }
-    let record = crate::provenance::registry_record(&body);
-    if let Some(reg) = &record {
+    // `resp.bytes()` already owns a refcounted buffer; move it into provenance
+    // so the complete hopper document survives without another full-size copy.
+    let provenance = crate::provenance::RegistryProvenance::from_bytes(body);
+    if let Some(provenance) = &provenance {
+        let reg = &provenance.record;
         tracing::debug!(
             sha256 = %sha256,
             ecosystem = %reg.ecosystem,
@@ -2920,7 +2924,7 @@ async fn download_provenance(
             "registry provenance applied",
         );
     }
-    record
+    provenance
 }
 
 /// Exponential backoff with jitter for hopper outage recovery.
@@ -3306,6 +3310,35 @@ mod tests {
         let _ = stream.write_all(head.as_bytes()).await;
         let _ = stream.write_all(body).await;
         let _ = stream.flush().await;
+    }
+
+    #[tokio::test]
+    async fn hopper_provenance_response_reaches_analysis_losslessly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock hopper");
+        let addr = listener.local_addr().expect("mock hopper address");
+        let body = br#"{"schema_version":"1.0","artifact":{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"fetch":{"collector":"forager","category":"bad","at":"2026-07-30T00:00:00Z"},"registry":{"record":{"ecosystem":"npm","name":"left-pad","version":"1.3.0"},"raw":{"provider_only":{"kept":true}}}}"#;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept provenance request");
+            let target = read_target(&mut stream).await.expect("request target");
+            assert_eq!(
+                target,
+                "/api/provenance/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            );
+            respond(&mut stream, "200 OK", body).await;
+        });
+
+        let provenance = download_provenance(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await
+        .expect("worker applies provenance");
+        assert_eq!(provenance.record.name, "left-pad");
+        assert_eq!(provenance.raw().unwrap()["provider_only"]["kept"], true);
+        server.await.expect("mock hopper task");
     }
 
     fn parse_count(target: &str) -> usize {

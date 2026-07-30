@@ -417,6 +417,7 @@ fn build_result(
         // `--show=all` with JSON: list every member of an archive-backed image.
         config.filter().is_all() && matches!(config.format(), OutputFormat::Json),
         None, // process images carry no fetched-package registry metadata
+        None, // process images have no package acquisition fetch record
         bloom_mark,
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);

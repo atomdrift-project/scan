@@ -944,7 +944,7 @@ pub(crate) fn classify_file(
     extract_dir: Option<&std::path::Path>,
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
-    root_registry: Option<&fletch::Registry>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
@@ -978,7 +978,7 @@ pub(crate) fn classify_bytes(
     slow_rule_ms: u64,
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
-    root_registry: Option<&fletch::Registry>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
@@ -1004,7 +1004,7 @@ fn finish_classify(
     resources: &super::ModelResources,
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
-    root_registry: Option<&fletch::Registry>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
 ) -> anyhow::Result<ScanResult> {
     // If the timeout fired while cleave was running, bail now rather than
     // burning CPU on feature extraction and model inference for a result
@@ -1036,10 +1036,11 @@ fn finish_classify(
         false, // server returns JSON; the fetch log would corrupt structured logs
         false, // JSON envelope does not include the rendered terminal context
         false, // server reports analyzed files only; no full-manifest listing
-        // Registry metadata collected at fetch time (worker provenance / CLI
-        // `--provenance`), so a hopper-sourced scan reasons over the same
+        // Registry metadata collected at fetch time (worker provenance /
+        // `--registry-map`), so a hopper-sourced scan reasons over the same
         // registry facts a live `pkg`/`url` scan fetches — without refetching.
         root_registry,
+        None, // uploaded bytes have no scan-side acquisition fetch record
         None, // server returns JSON; the inline terminal bloom flag doesn't apply
     )?;
 
@@ -1306,7 +1307,7 @@ pub(super) async fn analyze_path(
                 let uploader = Arc::clone(uploader);
                 tokio::task::spawn_blocking(move || {
                     crate::engine::upload_scan_result(
-                        &uploader, &path, sha256, size, deps, envelope,
+                        &uploader, &path, sha256, size, None, deps, envelope,
                     );
                 });
             }

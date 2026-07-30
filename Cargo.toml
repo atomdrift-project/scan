@@ -86,7 +86,7 @@ filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
 stng = { git = "https://github.com/atomdrift-project/stng.git" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # Compresses result POST bodies to hopper. Cleave reports are large, highly
 # repetitive JSON; zstd cuts them 3-5x on the wire. Already present transitively
 # in the lock graph, so this only promotes it to a direct dependency.
