@@ -3,3 +3,5 @@
 *.pdb
 **/mutants.out*/
 out/
+__pycache__/
+*.py[cod]
