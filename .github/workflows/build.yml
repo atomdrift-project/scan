@@ -292,10 +292,16 @@ jobs:
         uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
         with:
           usesh: true
-          # Pinned, not left to the action's default (currently 15.1): building
-          # on the older major keeps the artifact runnable on 14.x *and* 15.x,
-          # and an image that changes under us is an unreviewed dependency.
-          release: "14.3"
+          # Newest image the builder publishes, pinned explicitly rather than
+          # left to the action's default, since an image that changes under us
+          # is an unreviewed dependency.
+          #
+          # Tradeoff: this was 14.3 so the artifact stayed runnable on 14.x as
+          # well as 15.x — FreeBSD binaries run forward across majors, not
+          # backward. Building on 15.0 means 15.x only. Drop back to 14.3 if
+          # 14.x reach matters more than a current ports rust (which is also
+          # what keeps this job's MSRV headroom).
+          release: "15.0"
           # Runner is 4 vCPU / 16 GB; leave the host a couple of GB. The link
           # step for a binary this size is the memory high-water mark.
           cpu: "4"
@@ -359,10 +365,13 @@ jobs:
         uses: vmactions/openbsd-vm@c941015845c0f0c429676840963dc63b226d4f69 # v1.4.5
         with:
           usesh: true
-          # One behind the 7.8 latest. Note OpenBSD makes no cross-release ABI
-          # promise — unlike the FreeBSD pin, this artifact is effectively
-          # 7.7-only and the pin needs bumping every six months.
-          release: "7.7"
+          # Newest image available. OpenBSD makes no cross-release ABI promise,
+          # so there is no reach argument for staying back — the artifact is
+          # effectively single-release either way, and this pin needs bumping
+          # every six months. 7.7's ports rust was 1.86, well under this
+          # crate's 1.94 MSRV, which is what failed here before; 7.8 is the
+          # only chance of a toolchain new enough to build at all.
+          release: "7.8"
           cpu: "4"
           mem: "12288"
           envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
