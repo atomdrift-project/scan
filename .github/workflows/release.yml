@@ -78,6 +78,10 @@ jobs:
     name: build
     needs: verify
     uses: ./.github/workflows/build.yml
+    # Ceiling for build.yml's jobs — see the same note in ci.yml. Checkout is
+    # all they need; the release token stays in `publish`.
+    permissions:
+      contents: read
     with:
       # Fat LTO + one codegen unit. Multi-minute links, and worth it for a
       # binary people download rather than rebuild.

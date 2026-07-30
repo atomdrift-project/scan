@@ -99,6 +99,12 @@ jobs:
   build:
     name: build
     uses: ./.github/workflows/build.yml
+    # A caller job sets the ceiling for the workflow it calls: with
+    # `permissions: {}` up top and nothing declared here, build.yml's jobs are
+    # capped at `contents: none` and the run is rejected before it starts.
+    # Must stay >= the permissions build.yml's own jobs request.
+    permissions:
+      contents: read
     with:
       profile: release
     # No secrets passed. CI never touches the signing identity.
