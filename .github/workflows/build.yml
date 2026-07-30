@@ -457,8 +457,13 @@ jobs:
   # macros in <sys/byteorder.h>. Everything up to that point cross-built fine
   # when this was last attempted, C and C++ deps included, so the job should
   # reach the same wall and hand us a current error to work from.
+  # Artifact deliberately NOT named atomscan-x86_64-unknown-illumos: the cross
+  # job builds that same target and owns the release-bound name, and
+  # upload-artifact rejects a duplicate name within a run. This one is a
+  # native-environment check, so its artifact stays outside the `atomscan-*`
+  # pattern release.yml downloads.
   omnios:
-    name: x86_64-unknown-illumos
+    name: x86_64-unknown-illumos (omnios)
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -505,12 +510,12 @@ jobs:
           BUILD_PROFILE: ${{ inputs.profile }}
 
       - name: Package
-        run: tar -czf atomscan-x86_64-unknown-illumos.tar.gz atomscan
+        run: tar -czf omnios-native-atomscan.tar.gz atomscan
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: atomscan-x86_64-unknown-illumos
-          path: atomscan-x86_64-unknown-illumos.tar.gz
+          name: omnios-native-atomscan
+          path: omnios-native-atomscan.tar.gz
           if-no-files-found: error
           retention-days: 14
 
