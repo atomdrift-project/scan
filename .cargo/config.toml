@@ -1,0 +1,15 @@
+# illumos links C++ objects without a C++ runtime.
+#
+# unrar_sys and a few other deps compile C++, and rustc invokes the linker with
+# `-nodefaultlibs`, supplying the C runtime itself (`-lc -lssp -lgcc_s` …) but
+# never `-lstdc++`. On the tier-1 targets that is fine because the cc crate
+# tells rustc to link the C++ runtime; on x86_64-unknown-illumos it does not,
+# so the final link fails with hundreds of undefined references to
+# `operator delete(void*)` and `__cxa_begin_catch` out of libunrar_sys.
+#
+# `link-arg` appends to the end of the link line, which is exactly where a
+# static archive has to sit for traditional ld to resolve symbols referenced by
+# the objects preceding it. Scoped to the one target, so nothing else is
+# affected. Remove if cross-rs's illumos image ever grows a default C++ link.
+[target.x86_64-unknown-illumos]
+rustflags = ["-C", "link-arg=-lstdc++"]
