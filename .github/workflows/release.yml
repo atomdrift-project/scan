@@ -171,11 +171,16 @@ jobs:
       # ones that built — but the gap gets named instead of being invisible.
       - name: Inventory targets
         env:
-          # Keep in sync with build.yml's matrices.
+          # Keep in sync with build.yml's matrices. x86_64-pc-windows-msvc is
+          # deliberately absent: that job exists to generate diagnostics, not
+          # an artifact, and listing it would warn on every single release.
+          # Add it here the day it builds.
           EXPECTED: >-
             x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
             aarch64-apple-darwin x86_64-apple-darwin
-            x86_64-unknown-linux-musl x86_64-unknown-freebsd
+            x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+            x86_64-unknown-freebsd aarch64-unknown-freebsd
+            x86_64-unknown-openbsd x86_64-unknown-netbsd
         run: |
           set -eu
           missing=""

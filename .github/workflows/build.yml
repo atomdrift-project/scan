@@ -268,12 +268,31 @@ jobs:
   # the test suite on FreeBSD. Uses the OS's packaged rust, so it also tells us
   # when ports rust drifts below our MSRV.
   freebsd:
-    name: x86_64-unknown-freebsd
-    runs-on: ubuntu-22.04
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     permissions:
       contents: read
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Host image is just the VM host here — the compile happens inside the
+          # guest against FreeBSD's libc — so the glibc-floor reasoning that
+          # pins `native` to 22.04 does not apply. Newer host, newer KVM stack.
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-24.04
+            arch: x86_64
+
+          # The guest arch has to match the host or qemu falls back to TCG
+          # emulation, and this build already takes ~46 min KVM-accelerated —
+          # emulated it would never fit the 150 min cap. Hence the arm64 runner.
+          # Unproven: whether GitHub's arm64 image exposes /dev/kvm the way the
+          # x86_64 one does. If it doesn't, this job is the thing that tells us.
+          - target: aarch64-unknown-freebsd
+            os: ubuntu-24.04-arm
+            arch: aarch64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -287,6 +306,7 @@ jobs:
           # on the older major keeps the artifact runnable on 14.x *and* 15.x,
           # and an image that changes under us is an unreviewed dependency.
           release: "14.3"
+          arch: ${{ matrix.arch }}
           # Runner is 4 vCPU / 16 GB; leave the host a couple of GB. The link
           # step for a binary this size is the memory high-water mark.
           cpu: "4"
@@ -314,12 +334,188 @@ jobs:
           BUILD_PROFILE: ${{ inputs.profile }}
 
       - name: Package
-        run: tar -czf atomscan-x86_64-unknown-freebsd.tar.gz atomscan
+        env:
+          TARGET: ${{ matrix.target }}
+        run: tar -czf "atomscan-$TARGET.tar.gz" atomscan
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: atomscan-x86_64-unknown-freebsd
-          path: atomscan-x86_64-unknown-freebsd.tar.gz
+          name: atomscan-${{ matrix.target }}
+          path: atomscan-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # Same VM pattern as freebsd, and src/ is already OpenBSD-aware: lib.rs,
+  # main.rs, thread_dump.rs and server/handlers.rs all carry openbsd arms, and
+  # the jemalloc exclusion in Cargo.toml documents OpenBSD's version-string
+  # format breaking tikv-jemalloc-sys's configure.
+  #
+  # The open question is not whether it builds, it is whether it *runs*.
+  # OpenBSD kills processes that map W|X pages outside a `wxallowed` mount, and
+  # yara-x compiles its rules to WebAssembly and JITs them through
+  # wasmtime/cranelift — the same JIT that forced the allow-jit entitlement on
+  # macOS. Rules are only compiled on an actual scan, so `--version` proves
+  # nothing here; the unit tests below are what would surface it.
+  openbsd:
+    name: x86_64-unknown-openbsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build in OpenBSD VM
+        uses: vmactions/openbsd-vm@c941015845c0f0c429676840963dc63b226d4f69 # v1.4.5
+        with:
+          usesh: true
+          # One behind the 7.8 latest. Note OpenBSD makes no cross-release ABI
+          # promise — unlike the FreeBSD pin, this artifact is effectively
+          # 7.7-only and the pin needs bumping every six months.
+          release: "7.7"
+          cpu: "4"
+          mem: "12288"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          prepare: |
+            pkg_add -I rust cmake git
+          run: |
+            set -eux
+            # OpenBSD's default login class caps datasize well below what
+            # rustc needs to link a binary this size; without this the build
+            # dies in the linker rather than on anything meaningful.
+            ulimit -d "$(ulimit -Hd)" || true
+            rustc --version
+            export CARGO_TARGET_DIR=/tmp/target
+            cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
+            "/tmp/target/$BUILD_PROFILE/atomscan" --version
+            cp "/tmp/target/$BUILD_PROFILE/atomscan" ./atomscan
+            # This is the W^X canary — see the note above the job.
+            cargo test --locked --lib || echo "::warning::OpenBSD unit tests failed"
+        env:
+          BUILD_PROFILE: ${{ inputs.profile }}
+
+      - name: Package
+        run: tar -czf atomscan-x86_64-unknown-openbsd.tar.gz atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-x86_64-unknown-openbsd
+          path: atomscan-x86_64-unknown-openbsd.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # NetBSD rounds out the BSDs. src/fetch.rs already knows the platform string,
+  # and NetBSD's backwards-compat story is strong enough that a 10.x artifact
+  # should stay runnable. pkgsrc rust is the same deal as FreeBSD ports rust.
+  netbsd:
+    name: x86_64-unknown-netbsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build in NetBSD VM
+        uses: vmactions/netbsd-vm@e7ac71b97abbe8437cec8859a5acf72dfa6a8be0 # v1.4.5
+        with:
+          usesh: true
+          release: "10.1"
+          cpu: "4"
+          mem: "12288"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          prepare: |
+            /usr/sbin/pkg_add rust cmake git pkg-config
+          run: |
+            set -eux
+            rustc --version
+            export CARGO_TARGET_DIR=/tmp/target
+            cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
+            "/tmp/target/$BUILD_PROFILE/atomscan" --version
+            cp "/tmp/target/$BUILD_PROFILE/atomscan" ./atomscan
+            cargo test --locked --lib || echo "::warning::NetBSD unit tests failed"
+        env:
+          BUILD_PROFILE: ${{ inputs.profile }}
+
+      - name: Package
+        run: tar -czf atomscan-x86_64-unknown-netbsd.tar.gz atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-x86_64-unknown-netbsd
+          path: atomscan-x86_64-unknown-netbsd.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # Deliberately expected to fail — this job exists to produce a log, not an
+  # artifact. src/ has zero cfg(windows) arms against 10 cfg(unix) ones, libc
+  # and backtrace are [target.'cfg(unix)'.dependencies], and the dep graph is
+  # unproven on MSVC (unrar_sys is C++, aws-lc-sys wants nasm, proclist does
+  # process enumeration). Read the first error, fix or file it, repeat. Nothing
+  # speculative is installed here: a fix-it-in-advance step would just move the
+  # failure somewhere less informative.
+  #
+  # `shell: bash` throughout because every other run block in this file is sh,
+  # and git bash ships on the Windows image.
+  windows:
+    name: x86_64-pc-windows-msvc
+    runs-on: windows-2022
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install target
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version --verbose
+
+      - name: Cache cargo home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-home-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-windows-
+
+      - name: Build
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: cargo build --locked --profile "$PROFILE" --target x86_64-pc-windows-msvc --bin atomscan
+
+      - name: Smoke test
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -x
+          "./target/x86_64-pc-windows-msvc/$PROFILE/atomscan.exe" --version
+          "./target/x86_64-pc-windows-msvc/$PROFILE/atomscan.exe" --help >/dev/null
+
+      - name: Package
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: tar -czf atomscan-x86_64-pc-windows-msvc.tar.gz -C "target/x86_64-pc-windows-msvc/$PROFILE" atomscan.exe
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-x86_64-pc-windows-msvc
+          path: atomscan-x86_64-pc-windows-msvc.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -340,7 +536,9 @@ jobs:
   # where cmake already exists.
   cross:
     name: ${{ matrix.target }}
-    runs-on: ubuntu-22.04
+    # Container builds, so the host's glibc never reaches the artifact — same
+    # reasoning as the freebsd job, and unlike `native`.
+    runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
       contents: read
@@ -354,6 +552,10 @@ jobs:
           # this doesn't inherit musl-malloc's allocator performance.
           - target: x86_64-unknown-linux-musl
             smoke: true
+
+          # Same artifact for arm64. No smoke test: the runner is x86_64, so
+          # there is nothing here that can execute it.
+          - target: aarch64-unknown-linux-musl
 
           # x86_64-unknown-illumos slots back in here once tree-sitter is
           # repaired: its src/portable/endian.h has no __sun branch and fails
