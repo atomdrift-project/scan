@@ -267,32 +267,22 @@ jobs:
   # Native build in a KVM-accelerated VM, which is the only way to actually run
   # the test suite on FreeBSD. Uses the OS's packaged rust, so it also tells us
   # when ports rust drifts below our MSRV.
+  # aarch64-unknown-freebsd was tried here on ubuntu-24.04-arm and removed:
+  # that image does not give the guest KVM, so qemu falls back to TCG. The
+  # x86_64 build takes ~46 min accelerated; emulated, the arm64 one was still
+  # compiling at 2h16m against the 150 min cap. Don't re-add it without a host
+  # that can actually accelerate an aarch64 guest — raising the timeout just
+  # buys a 4-6 hour job for one target.
   freebsd:
-    name: ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    name: x86_64-unknown-freebsd
+    # Host image is only the VM host here — the compile happens inside the
+    # guest against FreeBSD's libc — so the glibc-floor reasoning that pins
+    # `native` to 22.04 does not apply. Newer host, newer KVM stack.
+    runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
       contents: read
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Host image is just the VM host here — the compile happens inside the
-          # guest against FreeBSD's libc — so the glibc-floor reasoning that
-          # pins `native` to 22.04 does not apply. Newer host, newer KVM stack.
-          - target: x86_64-unknown-freebsd
-            os: ubuntu-24.04
-            arch: x86_64
-
-          # The guest arch has to match the host or qemu falls back to TCG
-          # emulation, and this build already takes ~46 min KVM-accelerated —
-          # emulated it would never fit the 150 min cap. Hence the arm64 runner.
-          # Unproven: whether GitHub's arm64 image exposes /dev/kvm the way the
-          # x86_64 one does. If it doesn't, this job is the thing that tells us.
-          - target: aarch64-unknown-freebsd
-            os: ubuntu-24.04-arm
-            arch: aarch64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -306,7 +296,6 @@ jobs:
           # on the older major keeps the artifact runnable on 14.x *and* 15.x,
           # and an image that changes under us is an unreviewed dependency.
           release: "14.3"
-          arch: ${{ matrix.arch }}
           # Runner is 4 vCPU / 16 GB; leave the host a couple of GB. The link
           # step for a binary this size is the memory high-water mark.
           cpu: "4"
@@ -334,14 +323,12 @@ jobs:
           BUILD_PROFILE: ${{ inputs.profile }}
 
       - name: Package
-        env:
-          TARGET: ${{ matrix.target }}
-        run: tar -czf "atomscan-$TARGET.tar.gz" atomscan
+        run: tar -czf atomscan-x86_64-unknown-freebsd.tar.gz atomscan
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: atomscan-${{ matrix.target }}
-          path: atomscan-${{ matrix.target }}.tar.gz
+          name: atomscan-x86_64-unknown-freebsd
+          path: atomscan-x86_64-unknown-freebsd.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -388,10 +375,21 @@ jobs:
             # dies in the linker rather than on anything meaningful.
             ulimit -d "$(ulimit -Hd)" || true
             rustc --version
-            export CARGO_TARGET_DIR=/tmp/target
+            # OpenBSD's default disklabel carves the disk into many small
+            # partitions, and the one holding /root — where CARGO_HOME lives —
+            # is far too small: unpacking aws-lc-sys alone exhausted it with
+            # ENOSPC. Put both the registry and target/ on whichever mount
+            # actually has room rather than hardcoding a guess, since the
+            # layout can shift under us on an image bump. df stays in the log
+            # because it is the first thing worth reading if this recurs.
+            df -h
+            BIG="$(df -k | awk 'NR > 1 && $4 > max { max = $4; mp = $NF } END { print mp }')"
+            echo "cargo scratch on $BIG"
+            export CARGO_HOME="$BIG/cargo"
+            export CARGO_TARGET_DIR="$BIG/target"
             cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
-            "/tmp/target/$BUILD_PROFILE/atomscan" --version
-            cp "/tmp/target/$BUILD_PROFILE/atomscan" ./atomscan
+            "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" --version
+            cp "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" ./atomscan
             # This is the W^X canary — see the note above the job.
             cargo test --locked --lib || echo "::warning::OpenBSD unit tests failed"
         env:
@@ -450,6 +448,69 @@ jobs:
         with:
           name: atomscan-x86_64-unknown-netbsd
           path: atomscan-x86_64-unknown-netbsd.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # illumos, by way of OmniOS. Expected to fail, and that is the point: the
+  # known blocker is tree-sitter's src/portable/endian.h, which has no __sun
+  # branch and bails with "platform not supported" — illumos spells those
+  # macros in <sys/byteorder.h>. Everything up to that point cross-built fine
+  # when this was last attempted, C and C++ deps included, so the job should
+  # reach the same wall and hand us a current error to work from.
+  omnios:
+    name: x86_64-unknown-illumos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build in OmniOS VM
+        uses: vmactions/omnios-vm@027e3ec08fed6fb740ab5f300c2605f9de02997a # v1.3.4
+        with:
+          usesh: true
+          # Newest image the builder publishes. Unlike the FreeBSD pin, newer
+          # is the safer choice here: the risk is OmniOS's packaged rust being
+          # too old for this crate graph, not ABI reach.
+          release: "r151058"
+          cpu: "4"
+          mem: "12288"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          prepare: |
+            pkg publisher
+            # Package names under OmniOS's publishers are unverified. Print
+            # every candidate first so a single run tells us all the correct
+            # names, rather than learning one per failed iteration.
+            for p in rust cmake gcc git pkg-config; do
+              echo "--- candidates matching $p"
+              pkg list -a "*$p*" 2>&1 | head -20 || true
+            done
+            # git is not optional: five of our dependencies are git deps.
+            pkg install ooce/developer/rust developer/build/cmake developer/versioning/git
+          run: |
+            set -eux
+            rustc --version
+            # /tmp on illumos is swap-backed tmpfs, so a target/ this size
+            # would be charged against RAM. /var/tmp is real disk.
+            export CARGO_TARGET_DIR=/var/tmp/target
+            cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
+            "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" --version
+            cp "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" ./atomscan
+            cargo test --locked --lib || echo "::warning::OmniOS unit tests failed"
+        env:
+          BUILD_PROFILE: ${{ inputs.profile }}
+
+      - name: Package
+        run: tar -czf atomscan-x86_64-unknown-illumos.tar.gz atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-x86_64-unknown-illumos
+          path: atomscan-x86_64-unknown-illumos.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -557,11 +618,12 @@ jobs:
           # there is nothing here that can execute it.
           - target: aarch64-unknown-linux-musl
 
-          # x86_64-unknown-illumos slots back in here once tree-sitter is
-          # repaired: its src/portable/endian.h has no __sun branch and fails
-          # with "platform not supported" — illumos spells those macros in
-          # <sys/byteorder.h>, not <endian.h>. Everything up to that point
-          # cross-built fine, including the C and C++ deps.
+          # Back after the tree-sitter endian.h fix (see the [patch.crates-io]
+          # note in Cargo.toml). This is the cheapest verification we have that
+          # the fix works: it reproduces the exact failure recorded in CI run
+          # 30161197323 in a container, in minutes, without a VM. Build-only —
+          # nothing here can execute an illumos binary.
+          - target: x86_64-unknown-illumos
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

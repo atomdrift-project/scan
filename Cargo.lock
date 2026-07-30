@@ -970,7 +970,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1574,7 +1574,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1741,7 +1741,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1784,7 +1784,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.3.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#97cfaca64dc6726740ab694805f45b3a6426cd6c"
+source = "git+https://github.com/atomdrift-project/filefacts.git#10b2cad158b03931661fc0f72cc36eb587694291"
 dependencies = [
  "aho-corasick",
  "cfb 0.10.0",
@@ -1897,7 +1897,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "1.0.0"
-source = "git+https://github.com/atomdrift-project/fletch.git#e23bc204b6c8905cc559c44b7ab72b702856e4eb"
+source = "git+https://github.com/atomdrift-project/fletch.git#f2177c365ba3b0a69918f7d4ba53ab6a3afbaa36"
 dependencies = [
  "anyhow",
  "base64",
@@ -1911,7 +1911,7 @@ dependencies = [
  "roxmltree",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tar",
  "thiserror 2.0.19",
  "tokio",
@@ -3261,7 +3261,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3995,7 +3995,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4456,7 +4456,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4514,7 +4514,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4832,7 +4832,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
- "sha2-asm",
 ]
 
 [[package]]
@@ -4844,15 +4843,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "digest 0.11.3",
-]
-
-[[package]]
-name = "sha2-asm"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
-dependencies = [
- "cc",
 ]
 
 [[package]]
@@ -5007,7 +4997,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "1.8.0"
-source = "git+https://github.com/atomdrift-project/stng.git#638160c0dc0c502f2c5b12f127ae424b49040832"
+source = "git+https://github.com/atomdrift-project/stng.git#129fba07774e57de2ff593c08218a37e8778ceb6"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5019,12 +5009,14 @@ dependencies = [
  "goblin",
  "hex",
  "iced-x86",
+ "idna",
  "memchr",
+ "psl",
  "rayon",
  "regex",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "terminal_size",
  "tikv-jemallocator",
  "tracing",
@@ -5188,7 +5180,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5233,7 +5225,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5865,7 +5857,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#97cfaca64dc6726740ab694805f45b3a6426cd6c"
+source = "git+https://github.com/atomdrift-project/filefacts.git#10b2cad158b03931661fc0f72cc36eb587694291"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -6662,7 +6654,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7357,3 +7349,13 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "tree-sitter"
+version = "0.27.0"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#5b21a777ada8ac7d3b448b3e4aebfe827d020a70"
+
+[[patch.unused]]
+name = "tree-sitter-language"
+version = "0.1.8"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#5b21a777ada8ac7d3b448b3e4aebfe827d020a70"

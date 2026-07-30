@@ -146,12 +146,16 @@ libc = "0.2"
 backtrace = "0.3"
 
 # Use jemalloc on unix systems where it isn't already the system allocator.
-# FreeBSD/DragonFlyBSD ship jemalloc as the default; bundling a second copy
-# causes TSD assertion failures in jails. OpenBSD's jemalloc version string
-# format is incompatible with tikv-jemalloc-sys's configure script. illumos
-# and Solaris ship libumem (a comparable arena allocator) and tikv-jemalloc-sys
-# bundles a pre-illumos config.sub that fails to recognize the host triple.
-[target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))'.dependencies]
+# FreeBSD/DragonFlyBSD/NetBSD ship jemalloc as the default (NetBSD's libc
+# malloc is jemalloc-derived); bundling a second copy causes TSD assertion
+# failures in jails, and on NetBSD tikv-jemalloc-sys's configure script fails
+# outright. OpenBSD's jemalloc version string format is incompatible with that
+# same configure script. illumos and Solaris ship libumem (a comparable arena
+# allocator) and tikv-jemalloc-sys bundles a pre-illumos config.sub that fails
+# to recognize the host triple.
+#
+# Keep this list in lockstep with the two cfg blocks at the top of src/main.rs.
+[target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))'.dependencies]
 tikv-jemallocator = "0.7"
 
 [features]
@@ -261,6 +265,23 @@ path = "src/bin/bloom_build.rs"
 # fix lands upstream (bytecodealliance/wasmtime#5499) and yara-x bumps past it.
 [patch.crates-io]
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
+
+# illumos support for tree-sitter's vendored endian.h. Its only illumos arm
+# tests __illumos__, which illumos-gcc predefines but cross-rs's
+# x86_64-unknown-illumos-gcc does not, so the build hits "#error platform not
+# supported" at endian.h:238 (see the failed x86_64-unknown-illumos job in CI
+# run 30161197323). The fork adds a __sun arm over <sys/byteorder.h>; __sun is
+# predefined by every compiler targeting illumos or Solaris.
+#
+# Both crates must come from the fork together: the fork's tree-sitter uses its
+# in-tree tree-sitter-language, and `links = "tree-sitter-language"` permits
+# only one copy in the graph. The fork is 0.27.0 and unpublished — crates.io
+# tops out at 0.26.11 — so this patch is load-bearing for resolution, not only
+# for the fix, and cleave/filefacts carry an identical block for their own
+# standalone builds. Remove all three once the PR lands upstream and a release
+# carries it.
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 
 # Cleave still names the former Codeberg remotes, while Scan and Fletch consume
 # the GitHub remotes. Patch those source identities to the same current crates

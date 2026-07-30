@@ -5,6 +5,7 @@
     not(any(
         target_os = "freebsd",
         target_os = "dragonfly",
+        target_os = "netbsd",
         target_os = "openbsd",
         target_os = "illumos",
         target_os = "solaris",
@@ -28,6 +29,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
     not(any(
         target_os = "freebsd",
         target_os = "dragonfly",
+        target_os = "netbsd",
         target_os = "openbsd",
         target_os = "illumos",
         target_os = "solaris",
