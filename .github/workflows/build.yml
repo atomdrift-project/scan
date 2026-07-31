@@ -622,6 +622,16 @@ jobs:
               developer/versioning/git \
               developer/pkg-config \
               developer/gcc14
+            # illumos does not overcommit: fork() reserves backing store for
+            # the child's whole address space, so forking the linker out of a
+            # multi-GB rustc during fat LTO fails with ENOMEM ("Not enough
+            # space", os error 12) while RAM is still free. The cross-compiled
+            # illumos build does not hit this because it forks on Linux, which
+            # does overcommit. Back the reservation with swap; it is reserved,
+            # not necessarily written, so this costs disk rather than time.
+            mkfile 8g /var/tmp/swapfile
+            swap -a /var/tmp/swapfile
+            swap -l
           run: |
             set -eux
             rustc --version
