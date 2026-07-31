@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::Mode;
 use crate::OutputFormat;
@@ -2058,7 +2058,7 @@ fn file_touched_within(path: &Path, window: u64, now: SystemTime) -> bool {
     {
         use std::os::unix::fs::MetadataExt;
         let ctime = md.ctime();
-        if ctime >= 0 && recent(UNIX_EPOCH + Duration::from_secs(ctime.unsigned_abs())) {
+        if ctime >= 0 && recent(std::time::UNIX_EPOCH + Duration::from_secs(ctime.unsigned_abs())) {
             return true;
         }
     }

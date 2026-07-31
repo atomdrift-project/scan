@@ -1009,6 +1009,7 @@ fn install_shutdown_handler(shutdown: Arc<AtomicBool>) {
 /// `setpriority` failure is logged but never fatal — an unprivileged process
 /// cannot lower its nice value, and we'd rather run at the inherited priority
 /// than refuse to start.
+#[cfg(unix)]
 fn apply_nice(nice: i32) {
     if nice == 0 {
         return;
@@ -1021,6 +1022,21 @@ fn apply_nice(nice: i32) {
     } else {
         let err = std::io::Error::last_os_error();
         tracing::warn!(nice, error = %err, "setpriority failed; continuing at inherited priority");
+    }
+}
+
+/// Non-unix stub: `setpriority` is POSIX and has no direct Windows analogue —
+/// the nearest equivalent, `SetPriorityClass`, works on coarse priority classes
+/// rather than a nice value, so mapping one onto the other would be a guess.
+/// Same posture as the unix path on failure: log and run at inherited priority
+/// rather than refuse to start.
+#[cfg(not(unix))]
+fn apply_nice(nice: i32) {
+    if nice != 0 {
+        tracing::warn!(
+            nice,
+            "nice values are unsupported on this platform; continuing at inherited priority"
+        );
     }
 }
 

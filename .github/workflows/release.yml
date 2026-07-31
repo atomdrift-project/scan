@@ -172,17 +172,19 @@ jobs:
       - name: Inventory targets
         env:
           # Keep in sync with build.yml's matrices. x86_64-pc-windows-msvc and
-          # x86_64-unknown-illumos are deliberately absent: those jobs exist to
+          # x86_64-pc-solaris are deliberately absent: those jobs exist to
           # generate diagnostics, not artifacts, and listing them would warn on
-          # every single release. Add each the day it builds.
+          # every single release. Add each the day it builds — as illumos was
+          # once it went green.
           EXPECTED: >-
             x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
             aarch64-apple-darwin x86_64-apple-darwin
             x86_64-unknown-linux-musl aarch64-unknown-linux-musl
             s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu
-            powerpc64le-unknown-linux-gnu loongarch64-unknown-linux-gnu
+            powerpc64le-unknown-linux-gnu
             x86_64-unknown-freebsd x86_64-unknown-dragonfly
             x86_64-unknown-openbsd x86_64-unknown-netbsd
+            x86_64-unknown-illumos
         run: |
           set -eu
           missing=""

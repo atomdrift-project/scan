@@ -542,17 +542,24 @@ jobs:
           mem: "12288"
           envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
           prepare: |
-            pkg publisher || true
-            # Whether Oracle ships rust in IPS is unverified. Print candidates
-            # so one run resolves every name, instead of one per iteration.
-            for p in rust cargo cmake git pkg-config; do
-              echo "--- candidates matching $p"
-              pkg list -a "*$p*" 2>&1 | head -20 || true
-            done
-            pkg install --accept rust cmake developer/versioning/git || true
+            set -eux
+            # Confirmed by the enumeration in run 30598384692: Oracle's IPS
+            # ships no rust at all. rust-lang does publish an official
+            # x86_64-pc-solaris standalone build, which is what we use.
+            # cmake is for aws-lc-sys; git because five deps are git deps.
+            pkg install --accept developer/build/cmake developer/versioning/git || true
+            RUST_VERSION=1.97.1
+            TARBALL="rust-${RUST_VERSION}-x86_64-pc-solaris.tar.gz"
+            # Solaris tar cannot decompress; pipe through gzip explicitly.
+            curl -fsSLO "https://static.rust-lang.org/dist/${TARBALL}"
+            gzip -dc "${TARBALL}" | tar xf -
+            "./rust-${RUST_VERSION}-x86_64-pc-solaris/install.sh" --prefix=/usr/local --disable-ldconfig
+            rm -rf "rust-${RUST_VERSION}-x86_64-pc-solaris" "${TARBALL}"
           run: |
             set -eux
-            command -v cargo || { echo "::error::no cargo on Solaris - see the candidate listing above"; exit 1; }
+            PATH="/usr/local/bin:$PATH"
+            export PATH
+            command -v cargo || { echo "::error::rust install did not put cargo on PATH"; exit 1; }
             rustc --version
             # /tmp is swap-backed tmpfs on Solaris, same as illumos.
             export CARGO_TARGET_DIR=/var/tmp/target
@@ -618,6 +625,17 @@ jobs:
           run: |
             set -eux
             rustc --version
+            # rustc invokes `gcc` as the linker, but OmniOS installs its gcc
+            # packages under a versioned prefix that is not on the default
+            # PATH, so the link step fails with "could not exec the linker".
+            # Search rather than hardcode: the prefix moves with the package
+            # version, and the listing is what to read if a bump breaks this.
+            for d in /opt/gcc-*/bin /opt/ooce/gcc-*/bin /usr/gcc/*/bin; do
+              [ -x "$d/gcc" ] && PATH="$d:$PATH"
+            done
+            export PATH
+            command -v gcc || { echo "::error::no gcc on PATH"; ls -d /opt/* /usr/gcc/* 2>/dev/null; exit 1; }
+            gcc --version | head -1
             # /tmp on illumos is swap-backed tmpfs, so a target/ this size
             # would be charged against RAM. /var/tmp is real disk.
             export CARGO_TARGET_DIR=/var/tmp/target
@@ -760,7 +778,6 @@ jobs:
 
           - target: powerpc64le-unknown-linux-gnu
 
-          - target: loongarch64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -784,14 +801,22 @@ jobs:
       # 0.2.5 is the current crates.io release and dates from 2023; if it no
       # longer builds on current stable, or an image turns out to be too old,
       # switch to `--git https://github.com/cross-rs/cross`.
+      # loongarch64-unknown-linux-gnu was tried here and removed: cross 0.2.5
+      # cannot provide a std for it ("can't find crate for `std`"), while the
+      # s390x/powerpc64le/riscv64gc/illumos images in the same release are
+      # fine. Re-add together with a switch to `cross --git`, not before.
       - name: Install cross
         run: |
           command -v cross >/dev/null || cargo install cross --locked --version 0.2.5
 
+      # See Cross.toml for why these two targets need -include cstddef and why
+      # it is scoped rather than global. Cross.toml passes them through.
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
+          CXXFLAGS_s390x_unknown_linux_gnu: "-include cstddef"
+          CXXFLAGS_powerpc64le_unknown_linux_gnu: "-include cstddef"
         run: cross build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
 
       - name: Inspect

@@ -1,6 +1,7 @@
 //! Terminal and JSON output formatting with litmus-colored confidence indicators.
 //! Supports both dark and light terminal backgrounds via auto-detection.
 
+use std::io::IsTerminal;
 use std::sync::{LazyLock, RwLock};
 
 use crate::OutputFormat;
@@ -121,8 +122,7 @@ pub fn detect_theme() -> Theme {
     } else if
     // Terminal queries must only be attempted on a real TTY. Without one,
     // the read blocks indefinitely or the kernel sends SIGTTIN.
-    // SAFETY: isatty() is a trivial syscall with no preconditions.
-    unsafe { libc::isatty(libc::STDERR_FILENO) != 1 } {
+    !std::io::stderr().is_terminal() {
         Theme::Dark
     } else {
         match terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default()) {

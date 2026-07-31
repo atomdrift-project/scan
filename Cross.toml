@@ -1,0 +1,17 @@
+# cross starts each build container with a clean environment apart from a small
+# built-in allowlist, so anything cc-rs needs has to be named here explicitly.
+#
+# The vendored unrar sources in unrar_sys use `ptrdiff_t` in cmddata.cpp without
+# including <cstddef>. Older libstdc++ pulled it in transitively; the newer GCC
+# in the s390x and powerpc64le images does not, so those two builds fail with
+# "'ptrdiff_t' was not declared in this scope". Force the include for just those
+# targets rather than globally — the musl, illumos and riscv64gc images compile
+# the same file without it, and there is no reason to perturb builds that work.
+#
+# cc-rs only applies CXXFLAGS to C++ compilation, so this cannot leak into the
+# C sources in the same crates.
+[build.env]
+passthrough = [
+    "CXXFLAGS_s390x_unknown_linux_gnu",
+    "CXXFLAGS_powerpc64le_unknown_linux_gnu",
+]
