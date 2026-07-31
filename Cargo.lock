@@ -5803,7 +5803,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.27.0"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#893888984441231c7e167b8d69b94342ce7d6e6a"
+source = "git+https://github.com/tree-sitter/tree-sitter?rev=963b5a5a971021359cf091a63d4f1286bc319643#963b5a5a971021359cf091a63d4f1286bc319643"
 dependencies = [
  "cc",
  "regex",
@@ -5925,7 +5925,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#893888984441231c7e167b8d69b94342ce7d6e6a"
+source = "git+https://github.com/tree-sitter/tree-sitter?rev=963b5a5a971021359cf091a63d4f1286bc319643#963b5a5a971021359cf091a63d4f1286bc319643"
 
 [[package]]
 name = "tree-sitter-lua"
