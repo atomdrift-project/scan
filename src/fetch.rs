@@ -333,15 +333,42 @@ impl std::str::FromStr for FetchPolicy {
     }
 }
 
-/// Recognised npm platform tokens (`process.platform` / `process.arch`), so a
+/// Canonicalize an OS name segment to its npm token (`process.platform`).
+/// Accepts the npm spelling plus the Rust/Go target spellings that appear in
+/// cargo platform crates (`windows_x86_64_gnu`) and Go module paths, so a
 /// match keys on a genuine `<os>-<arch>` native-binary name rather than an
-/// incidental word. Kept to the pairs that ship prebuilt per-platform binaries.
-const NPM_OS: &[&str] = &[
-    "darwin", "linux", "win32", "freebsd", "openbsd", "netbsd", "sunos", "android", "aix",
-];
-const NPM_ARCH: &[&str] = &[
-    "x64", "arm64", "ia32", "arm", "ppc64", "s390x", "riscv64", "loong64", "mips64el",
-];
+/// incidental word. `None` for anything that names no OS.
+fn canonical_os(seg: &str) -> Option<&'static str> {
+    Some(match seg {
+        "darwin" | "macos" => "darwin",
+        "win32" | "windows" => "win32",
+        "sunos" | "solaris" | "illumos" => "sunos",
+        "linux" => "linux",
+        "freebsd" => "freebsd",
+        "openbsd" => "openbsd",
+        "netbsd" => "netbsd",
+        "android" => "android",
+        "aix" => "aix",
+        _ => return None,
+    })
+}
+
+/// Canonicalize a CPU-architecture segment to its npm token (`process.arch`).
+/// Same vocabulary rule as [`canonical_os`].
+fn canonical_arch(seg: &str) -> Option<&'static str> {
+    Some(match seg {
+        "x64" | "x8664" | "amd64" => "x64",
+        "arm64" | "aarch64" => "arm64",
+        "ia32" | "i686" | "i386" | "x86" => "ia32",
+        "arm" => "arm",
+        "ppc64" => "ppc64",
+        "s390x" => "s390x",
+        "riscv64" => "riscv64",
+        "loong64" => "loong64",
+        "mips64el" => "mips64el",
+        _ => return None,
+    })
+}
 
 /// The host's npm-style `(os, arch)` tokens, mapped from Rust's target
 /// constants. An unmapped target yields an empty token, which disables that
@@ -384,20 +411,30 @@ fn off_host_platform(r: &Reference, host: (&str, &str)) -> bool {
     // lowercase alphanumeric segments (`cli-darwin-arm64` → [cli, darwin, arm64],
     // `%40biomejs` → [40, biomejs]).
     let name = purl.rsplit_once('@').map_or(purl.as_str(), |(n, _)| n);
-    let segs: Vec<String> = name
+    let mut segs: Vec<String> = name
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|s| !s.is_empty())
         .map(str::to_ascii_lowercase)
         .collect();
+    // `x86_64` splits at its underscore; re-join the pair so cargo/Go names
+    // (`windows_x86_64_gnu`, `linux_x86_64`) carry one arch token.
+    let mut i = 0;
+    while i + 1 < segs.len() {
+        if segs[i] == "x86" && segs[i + 1] == "64" {
+            segs[i] = "x8664".to_string();
+            segs.remove(i + 1);
+        }
+        i += 1;
+    }
     // An adjacent os+arch pair (either order) marks a platform-specific package;
     // skip it when either token disagrees with the host.
     for w in segs.windows(2) {
-        let (os, arch) = if NPM_OS.contains(&w[0].as_str()) && NPM_ARCH.contains(&w[1].as_str()) {
-            (&w[0], &w[1])
-        } else if NPM_ARCH.contains(&w[0].as_str()) && NPM_OS.contains(&w[1].as_str()) {
-            (&w[1], &w[0])
-        } else {
-            continue;
+        let (os, arch) = match (canonical_os(&w[0]), canonical_arch(&w[1])) {
+            (Some(os), Some(arch)) => (os, arch),
+            _ => match (canonical_arch(&w[0]), canonical_os(&w[1])) {
+                (Some(arch), Some(os)) => (os, arch),
+                _ => continue,
+            },
         };
         return os != host_os || arch != host_arch;
     }
@@ -573,317 +610,463 @@ pub(crate) fn orchestrate(
     // The host platform, for filtering off-host native-binary dependencies.
     // Sampled once — it can't change mid-run.
     let host = host_platform();
+    // Newest-version gate: only the most recent version of a package in the
+    // dependency tree is fetched and analyzed. Deep ungated trees pin dozens
+    // of releases of the same packages (syn ×27, libc ×21 on the mx crate
+    // benchmark — 48% of its tree was older duplicates); analyzing every
+    // pinned release repeats near-identical work without detection value the
+    // newest release doesn't provide. Versionless references are exempt (they
+    // already resolve to the latest release), and the kept version is monotone
+    // across hops: once a release is scanned, an older sibling discovered in a
+    // later hop never resurrects the package.
+    let mut newest_seen: HashMap<String, String> = HashMap::new();
     for _hop in 0..policy.depth {
         if worklist.is_empty() {
             break;
         }
-        let mut next = Vec::new();
-        for (source_sha, refs) in std::mem::take(&mut worklist) {
-            // Keep only the kinds this policy selected — by RefKind, so a
-            // command-mentioned package (`packages`) is distinct from a declared
-            // dependency (`deps`) even though both are PURLs — and that haven't
-            // been fetched yet this run.
-            let selected: Vec<Reference> = refs
-                .into_iter()
-                .filter(|r| policy.wants(r.kind))
-                // Drop native-binary dependencies built for another platform
-                // before they're ever fetched — the host variant is scanned, its
-                // linux/windows siblings never run here. Off unless the policy
-                // asks for it (`--fetch-all-platforms` audits every platform).
-                .filter(|r| {
-                    let off_host = policy.host_platform_only && off_host_platform(r, host);
-                    if off_host {
-                        tracing::debug!(
-                            package = %locator_key(r),
-                            host_os = host.0,
-                            host_arch = host.1,
-                            "dependency pinned to another platform; skipped (--fetch-all-platforms to include)"
-                        );
-                    }
-                    !off_host
-                })
-                .filter(|r| seen.insert(locator_key(r)))
-                .collect();
-            if selected.is_empty() {
-                continue;
-            }
-            // Look up each declared dependency's registry metadata first. Every
-            // resolved record is materialized as a `*.registry.json` node so its
-            // facts are trait-matched, and releases older than the age ceiling
-            // are dropped before the expensive fetch+scan of their bytes. Skips
-            // are reported, never silent.
-            let (selected, registries) = age_gate(selected, &policy, res, now);
-            // Reveal the kept (to-fetch) set as pending, so the tree shows the
-            // dependencies it will actually scan up front. Aged-out deps are
-            // deliberately never announced — for a large npm graph they are the
-            // overwhelming majority and only a registry-metadata lookup runs on
-            // them, so listing them would bury the handful of live scans.
-            reporter.announce(&selected);
-            // Registry findings keyed by locator, captured as each record is
-            // materialized so the package pass below can pair an artifact with
-            // its own registry metadata (see `apply_package_composites`).
-            let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
-            // Materialize every record concurrently, then merge serially below.
-            //
-            // Each `registry_node` is an independent cleave analysis of one small
-            // JSON document, and a lockfile-heavy scan produces hundreds of them
-            // — 851 on a 55-package corpus, at ~23 ms each, which was ~20 s of a
-            // 33 s run spent one-at-a-time while 127 cores idled. The merge stays
-            // serial and in `registries` order because `merge_registry` assigns
-            // report ids from a running max; parallelizing that would make ids
-            // (and therefore output) depend on completion order.
-            // A registry record is canonical JSON we serialized ourselves; its
-            // signal is entirely `registry.*` value facts and no YARA rule
-            // targets it. Disabling YARA here removed ~1400s of system time per
-            // scan — the engine's per-analysis setup, paid hundreds of times.
-            // Built once per batch, not per record: cloning `AnalysisOptions`
-            // inside the loop cost more user time than the YARA saving returned.
-            let registry_opts = AnalysisOptions {
-                disable_yara: true,
-                ..opts.clone()
-            };
-            let subs: Vec<Option<AnalysisReport>> = {
-                use rayon::prelude::*;
-                registries
-                    .par_iter()
-                    .map(|(_, provenance, _)| registry_node(&provenance.record, &registry_opts))
-                    .collect()
-            };
-            for ((r, provenance, skip), sub) in registries.iter().zip(subs) {
-                let reg = &provenance.record;
-                if let Some(sub) = sub {
-                    let findings = sub_findings(&sub);
-                    // A skipped dependency has no artifact upload and only
-                    // appears in provenance output when its registry node is
-                    // notable. Drop its raw provider document immediately when
-                    // neither condition applies; lockfiles can contain hundreds
-                    // of ordinary aged-out records.
-                    let retain_provenance = skip.is_none()
-                        || findings
-                            .iter()
-                            .any(|finding| finding.crit >= cleave::Criticality::Notable);
-                    registry_findings
-                        .entry(locator_key(r))
-                        .or_default()
-                        .extend(findings);
-                    if let Some(file_id) = merge_registry(report, &source_sha, sub)
-                        && retain_provenance
-                    {
-                        let artifact_skip = skip.map(|reason| match reason {
-                            SkipReason::Removed => "version removed",
-                            SkipReason::AgedOut => "older than fetch age limit",
-                            SkipReason::KnownGood => "known-good coordinate",
-                        });
-                        dependency_registries.push(DependencyRegistry {
-                            locator: locator_key(r),
-                            provenance: provenance.clone(),
-                            file_id,
-                            artifact_skip,
-                        });
-                    }
+        // Pre-scan the whole hop so the winner is hop-wide, not
+        // first-group-wins: every fetchable versioned reference bids, and the
+        // running cross-hop maximum only rises.
+        for (_, refs) in &worklist {
+            for r in refs {
+                if !policy.wants(r.kind) {
+                    continue;
                 }
-                // The record is materialized either way; only the artifact fetch
-                // is skipped. `None` = kept for fetch+scan.
-                let Some(reason) = skip else {
+                let locator = locator_key(r);
+                let Some((key, version)) = versioned_purl(&locator) else {
                     continue;
                 };
-                let common = tracing::field::display(locator_key(r));
-                if *reason == SkipReason::KnownGood {
-                    crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
+                match newest_seen.get(key) {
+                    Some(best) if lenient_version_cmp(version, best) != std::cmp::Ordering::Greater => {}
+                    _ => {
+                        newest_seen.insert(key.to_string(), version.to_string());
+                    }
                 }
-                let log_reason = match reason {
-                    SkipReason::Removed => "version removed from registry",
-                    SkipReason::AgedOut => "older than --max-dep-age",
-                    SkipReason::KnownGood => "known-good (bloom, resolved version)",
+            }
+        }
+        let dropped_old_versions = std::cell::Cell::new(0usize);
+        let mut next = Vec::new();
+        // The declaring-file groups in a hop are independent until their serial
+        // merge, but a deep tree yields many small groups — one per previous-hop
+        // payload — and analyzing one group at a time strands most of a large
+        // machine on the tail. Groups are therefore processed in batches:
+        // selection, gating, and fetching stay serial in group order (`seen`
+        // dedup and budget charges keep their exact order), registry-record and
+        // payload analysis fan out across the whole batch, and merging replays
+        // serially in group order — report ids, and therefore output, are
+        // identical to the one-group-at-a-time code this replaces.
+        struct GroupWork {
+            source_sha: String,
+            selected: Vec<Reference>,
+            registries: Vec<GatedDep>,
+            fetched: Vec<FetchRecord>,
+        }
+        // Caps the payloads held un-merged at once: enough to keep every core
+        // busy across many small groups without holding a whole hop's analyzed
+        // reports in memory.
+        const BATCH_PAYLOAD_TARGET: usize = 256;
+        // A registry record is canonical JSON we serialized ourselves; its
+        // signal is entirely `registry.*` value facts and no YARA rule targets
+        // it. Disabling YARA here removed ~1400s of system time per scan — the
+        // engine's per-analysis setup, paid hundreds of times. Built once per
+        // hop: cloning `AnalysisOptions` per record cost more user time than
+        // the YARA saving returned.
+        let registry_opts = AnalysisOptions {
+            disable_yara: true,
+            ..opts.clone()
+        };
+        let mut groups = std::mem::take(&mut worklist).into_iter().peekable();
+        while groups.peek().is_some() {
+            let mut batch: Vec<GroupWork> = Vec::new();
+            let mut batch_payloads = 0usize;
+            while batch_payloads < BATCH_PAYLOAD_TARGET {
+                let Some((source_sha, refs)) = groups.next() else {
+                    break;
                 };
-                // Age-outs are the common, expected case; they stay at debug so
-                // `--verbose` can still see them, while removals and known-good
-                // skips — the interesting decisions — are surfaced at info.
-                match reason {
-                    SkipReason::AgedOut => tracing::debug!(
-                        package = %common,
-                        ecosystem = %reg.ecosystem,
-                        version = %reg.version,
-                        age_days = reg.age_days.unwrap_or(0),
-                        downloads = reg.downloads_recent.or(reg.downloads_total),
-                        reason = log_reason,
-                        "registry record materialized; artifact fetch skipped"
-                    ),
-                    SkipReason::Removed | SkipReason::KnownGood => tracing::info!(
-                        package = %common,
-                        ecosystem = %reg.ecosystem,
-                        version = %reg.version,
-                        age_days = reg.age_days.unwrap_or(0),
-                        downloads = reg.downloads_recent.or(reg.downloads_total),
-                        reason = log_reason,
-                        "registry record materialized; artifact fetch skipped"
-                    ),
+                // Keep only the kinds this policy selected — by RefKind, so a
+                // command-mentioned package (`packages`) is distinct from a declared
+                // dependency (`deps`) even though both are PURLs — and that haven't
+                // been fetched yet this run.
+                let selected: Vec<Reference> = refs
+                    .into_iter()
+                    .filter(|r| policy.wants(r.kind))
+                    // Drop native-binary dependencies built for another platform
+                    // before they're ever fetched — the host variant is scanned, its
+                    // linux/windows siblings never run here. Off unless the policy
+                    // asks for it (`--fetch-all-platforms` audits every platform).
+                    .filter(|r| {
+                        let off_host = policy.host_platform_only && off_host_platform(r, host);
+                        if off_host {
+                            tracing::debug!(
+                                package = %locator_key(r),
+                                host_os = host.0,
+                                host_arch = host.1,
+                                "dependency pinned to another platform; skipped (--fetch-all-platforms to include)"
+                            );
+                        }
+                        !off_host
+                    })
+                    // Older-version duplicates are skipped entirely — no
+                    // registry-record materialization, no fetch (operator
+                    // policy 2, 2026-07-30). Never silent: each skip logs at
+                    // debug, the hop logs one count at info.
+                    .filter(|r| {
+                        let locator = locator_key(r);
+                        let Some((key, version)) = versioned_purl(&locator) else {
+                            return true;
+                        };
+                        let newest = match newest_seen.get(key) {
+                            Some(best)
+                                if lenient_version_cmp(version, best)
+                                    == std::cmp::Ordering::Less =>
+                            {
+                                false
+                            }
+                            _ => true,
+                        };
+                        if !newest {
+                            dropped_old_versions.set(dropped_old_versions.get() + 1);
+                            tracing::debug!(
+                                package = %locator,
+                                newest = %newest_seen[key],
+                                "older version of an already-kept package; skipped (newest-version policy)"
+                            );
+                        }
+                        newest
+                    })
+                    .filter(|r| seen.insert(locator_key(r)))
+                    .collect();
+                if selected.is_empty() {
+                    continue;
                 }
-                // Settle the skipped row. The tree shows every reason (so no row
-                // is left hanging as pending); the stream keeps flooding-averse
-                // behaviour, printing only the surfaced removals/known-good skips.
-                reporter.skipped(r, reg, now, *reason);
-            }
-            if selected.is_empty() {
-                continue;
-            }
-            // URL fetches have a deliberately smaller independent fan-out cap
-            // than declared dependencies and command-mentioned packages. Split
-            // the groups so fletch's per-call count budget can enforce both
-            // ceilings without making one category consume the other's slots.
-            let (url_selected, dep_selected): (Vec<Reference>, Vec<Reference>) = selected
-                .iter()
-                .cloned()
-                .partition(|r| r.kind == RefKind::UrlFetch);
+                // Look up each declared dependency's registry metadata first. Every
+                // resolved record is materialized as a `*.registry.json` node so its
+                // facts are trait-matched, and releases older than the age ceiling
+                // are dropped before the expensive fetch+scan of their bytes. Skips
+                // are reported, never silent.
+                let (selected, registries) = age_gate(selected, &policy, res, now);
+                // Reveal the kept (to-fetch) set as pending, so the tree shows the
+                // dependencies it will actually scan up front. Aged-out deps are
+                // deliberately never announced — for a large npm graph they are the
+                // overwhelming majority and only a registry-metadata lookup runs on
+                // them, so listing them would bury the handful of live scans.
+                reporter.announce(&selected);
+                if selected.is_empty() {
+                    // Nothing to fetch; the group still merges its registry
+                    // records below.
+                    batch.push(GroupWork {
+                        source_sha,
+                        selected,
+                        registries,
+                        fetched: Vec::new(),
+                    });
+                    continue;
+                }
+                // URL fetches have a deliberately smaller independent fan-out cap
+                // than declared dependencies and command-mentioned packages. Split
+                // the groups so fletch's per-call count budget can enforce both
+                // ceilings without making one category consume the other's slots.
+                let (url_selected, dep_selected): (Vec<Reference>, Vec<Reference>) = selected
+                    .iter()
+                    .cloned()
+                    .partition(|r| r.kind == RefKind::UrlFetch);
 
-            // Mark the to-fetch set in flight, then fetch. The callback fires as
-            // each download lands (from a pool worker, so it's `Sync`), flipping
-            // that row to "analyzing" the moment its bytes arrive rather than when
-            // the whole concurrent batch returns — keyed on the original
-            // reference, since a versionless locator may be refined during fetch.
-            reporter.fetching(&selected);
-            let on_fetched = |r: &Reference, rec: &FetchRecord| reporter.landed(r, rec);
-            let mut file_bytes_remaining = policy.max_file_bytes;
+                // Mark the to-fetch set in flight, then fetch. The callback fires as
+                // each download lands (from a pool worker, so it's `Sync`), flipping
+                // that row to "analyzing" the moment its bytes arrive rather than when
+                // the whole concurrent batch returns — keyed on the original
+                // reference, since a versionless locator may be refined during fetch.
+                reporter.fetching(&selected);
+                let on_fetched = |r: &Reference, rec: &FetchRecord| reporter.landed(r, rec);
+                let mut file_bytes_remaining = policy.max_file_bytes;
 
-            // Dependencies/packages get the larger cap. Charge this group before
-            // starting URLs so the process-wide budget is also respected between
-            // the two independent fletch calls.
-            let dep_budget = FetchBudget {
-                max_count: policy
-                    .max_file_fetches
-                    .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
-                max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
-            };
-            let dep_fetched = fetch_references_with(
-                &dep_selected,
-                &source_sha,
-                false,
-                &res.net,
-                &res.cache,
-                dep_budget,
-                &on_fetched,
-            );
-            let (dep_spent, dep_bytes) = live_fetch_usage(&dep_fetched);
-            charge_total_budget(dep_spent, dep_bytes);
-            file_bytes_remaining = file_bytes_remaining.saturating_sub(dep_bytes);
+                // Dependencies/packages get the larger cap. Charge this group before
+                // starting URLs so the process-wide budget is also respected between
+                // the two independent fletch calls.
+                let dep_budget = FetchBudget {
+                    max_count: policy
+                        .max_file_fetches
+                        .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
+                    max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
+                };
+                let dep_fetched = fetch_references_with(
+                    &dep_selected,
+                    &source_sha,
+                    false,
+                    &res.net,
+                    &res.cache,
+                    dep_budget,
+                    &on_fetched,
+                );
+                let (dep_spent, dep_bytes) = live_fetch_usage(&dep_fetched);
+                charge_total_budget(dep_spent, dep_bytes);
+                file_bytes_remaining = file_bytes_remaining.saturating_sub(dep_bytes);
 
-            // Opportunistic raw URLs get their own, smaller cap. A URL that is
-            // expressed as a declared dependency or command-mentioned package
-            // was kept in `dep_selected` and therefore follows the 100 cap.
-            let url_budget = FetchBudget {
-                max_count: policy
-                    .max_url_fetches
-                    .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
-                max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
-            };
-            let url_fetched = fetch_references_with(
-                &url_selected,
-                &source_sha,
-                true,
-                &res.net,
-                &res.cache,
-                url_budget,
-                &on_fetched,
-            );
-            let (url_spent, url_bytes) = live_fetch_usage(&url_fetched);
-            charge_total_budget(url_spent, url_bytes);
+                // Opportunistic raw URLs get their own, smaller cap. A URL that is
+                // expressed as a declared dependency or command-mentioned package
+                // was kept in `dep_selected` and therefore follows the 100 cap.
+                let url_budget = FetchBudget {
+                    max_count: policy
+                        .max_url_fetches
+                        .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
+                    max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
+                };
+                let url_fetched = fetch_references_with(
+                    &url_selected,
+                    &source_sha,
+                    true,
+                    &res.net,
+                    &res.cache,
+                    url_budget,
+                    &on_fetched,
+                );
+                let (url_spent, url_bytes) = live_fetch_usage(&url_fetched);
+                charge_total_budget(url_spent, url_bytes);
 
-            // Reassemble in the original declaration order. Each fletch call
-            // preserves order within its category, and the two iterators restore
-            // the order expected by the analysis/grafting pass below.
-            let mut dep_iter = dep_fetched.into_iter();
-            let mut url_iter = url_fetched.into_iter();
-            let mut fetched = Vec::with_capacity(selected.len());
-            for r in &selected {
-                if r.kind == RefKind::UrlFetch {
-                    if let Some(record) = url_iter.next() {
+                // Reassemble in the original declaration order. Each fletch call
+                // preserves order within its category, and the two iterators restore
+                // the order expected by the analysis/grafting pass below.
+                let mut dep_iter = dep_fetched.into_iter();
+                let mut url_iter = url_fetched.into_iter();
+                let mut fetched = Vec::with_capacity(selected.len());
+                for r in &selected {
+                    if r.kind == RefKind::UrlFetch {
+                        if let Some(record) = url_iter.next() {
+                            fetched.push(record);
+                        }
+                    } else if let Some(record) = dep_iter.next() {
                         fetched.push(record);
                     }
-                } else if let Some(record) = dep_iter.next() {
-                    fetched.push(record);
                 }
-            }
-            debug_assert_eq!(
-                fetched.len(),
-                selected.len(),
-                "grouped fetch results must align with selected refs"
-            );
-
-            // Authoritative pass over every returned edge: settle each row (the
-            // tree finalizes any budget-clipped edge the live callback never saw;
-            // re-settling a callback-landed row is idempotent) and print the
-            // streamed line. `selected` and `fetched` align one-to-one and in
-            // order — every selected reference is a fetch target, so fletch emits
-            // exactly one record per reference in declaration order.
-            for (r, rec) in selected.iter().zip(&fetched) {
-                reporter.landed(r, rec);
-                reporter.report(rec);
-            }
-
-            // Analyze the payloads concurrently (bounded), then merge each into
-            // the report serially in fetch order so file ids stay deterministic.
-            // The analysis — a full cleave pass per payload — is the real cost
-            // here; the fetch is near-free on a cache hit. The callback settles
-            // each row from "analyzing" to its final glyph as its scan finishes.
-            let on_analyzed = |i: usize| {
-                if let (Some(r), Some(rec)) = (selected.get(i), fetched.get(i)) {
-                    reporter.analyzed(r, rec);
-                }
-            };
-            // Benchmark escape hatch: stop after the network phase, before the
-            // (far more expensive) analysis of what was pulled. Fetch tuning —
-            // depth, kind selection, age gating, concurrency — is about what we
-            // retrieve, and re-analyzing every payload to measure that turns a
-            // sub-minute experiment into a long one. Reports what was fetched so
-            // a run is still comparable, then exits non-analyzing.
-            if std::env::var("SCAN_FETCH_ONLY").as_deref() == Ok("1") {
-                let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
-                tracing::info!(
-                    refs_selected = selected.len(),
-                    payloads_fetched = fetched.iter().filter(|r| r.size.is_some()).count(),
-                    fetched_bytes = bytes,
-                    "SCAN_FETCH_ONLY: stopping before payload analysis"
-                );
-                println!(
-                    "fetch-only: selected={} fetched={} bytes={}",
+                debug_assert_eq!(
+                    fetched.len(),
                     selected.len(),
-                    fetched.iter().filter(|r| r.size.is_some()).count(),
-                    bytes
+                    "grouped fetch results must align with selected refs"
                 );
-                // Keep this batch's edges in the result and tear the reporter
-                // down as the normal path does, so a fetch-only run still
-                // reports the full set of references it pulled.
-                records.extend(fetched);
-                reporter.finish(&records);
-                return (records, dependencies, dependency_registries);
+
+                // Authoritative pass over every returned edge: settle each row (the
+                // tree finalizes any budget-clipped edge the live callback never saw;
+                // re-settling a callback-landed row is idempotent) and print the
+                // streamed line. `selected` and `fetched` align one-to-one and in
+                // order — every selected reference is a fetch target, so fletch emits
+                // exactly one record per reference in declaration order.
+                for (r, rec) in selected.iter().zip(&fetched) {
+                    reporter.landed(r, rec);
+                    reporter.report(rec);
+                }
+
+                // Benchmark escape hatch: stop after the network phase, before the
+                // (far more expensive) analysis of what was pulled. Fetch tuning —
+                // depth, kind selection, age gating, concurrency — is about what we
+                // retrieve, and re-analyzing every payload to measure that turns a
+                // sub-minute experiment into a long one. Reports what was fetched so
+                // a run is still comparable, then exits non-analyzing. Earlier
+                // groups in this batch contribute their edges too; their registry
+                // nodes — exactly the analysis this mode skips — do not merge.
+                if std::env::var("SCAN_FETCH_ONLY").as_deref() == Ok("1") {
+                    let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
+                    tracing::info!(
+                        refs_selected = selected.len(),
+                        payloads_fetched = fetched.iter().filter(|r| r.size.is_some()).count(),
+                        fetched_bytes = bytes,
+                        "SCAN_FETCH_ONLY: stopping before payload analysis"
+                    );
+                    println!(
+                        "fetch-only: selected={} fetched={} bytes={}",
+                        selected.len(),
+                        fetched.iter().filter(|r| r.size.is_some()).count(),
+                        bytes
+                    );
+                    for g in batch {
+                        records.extend(g.fetched);
+                    }
+                    records.extend(fetched);
+                    reporter.finish(&records);
+                    return (records, dependencies, dependency_registries);
+                }
+                batch_payloads += fetched
+                    .iter()
+                    .filter(|r| matches!(r.outcome, Outcome::Ok | Outcome::PinMismatch))
+                    .count();
+                batch.push(GroupWork {
+                    source_sha,
+                    selected,
+                    registries,
+                    fetched,
+                });
             }
+
+            // Analyze the batch. Registry records and fetched payloads are both
+            // report-independent (`registry_node` and `analyze_payload` are pure
+            // with respect to the report), so they fan out together across every
+            // group in the batch. Each `registry_node` is an independent cleave
+            // analysis of one small JSON document at ~23 ms; a payload is a full
+            // cleave pass. The callback settles each payload row from
+            // "analyzing" to its final glyph as its scan finishes.
             let acache_ref = acache
                 .get_or_insert_with(crate::analysis_cache::AnalysisCache::open)
                 .as_ref();
-            let analyzed = analyze_payloads(&fetched, &res.cache, &opts, acache_ref, &on_analyzed);
-            for (rec, payload) in fetched.iter().zip(analyzed) {
-                if let Some(payload) = payload {
-                    // Capture the artifact's findings and identity before
-                    // `merge_payload` consumes the sub-report, then graft any
-                    // package-scoped composite that correlates them with this
-                    // package's registry metadata.
-                    let artifact = payload.sub.as_ref().map(sub_findings).unwrap_or_default();
-                    let artifact_sha = payload.content_sha.clone();
-                    // Capture the dependency's standalone report before merge_payload
-                    // consumes the sub-report into the merged tree — only when a
-                    // consumer (hopper upload, dependency appendix) will read it.
-                    if capture_deps && let Some(dep) = capture_dependency(rec, &payload) {
-                        dependencies.push(dep);
+            let (registry_subs, analyzed): (
+                Vec<Vec<Option<AnalysisReport>>>,
+                Vec<Vec<Option<Analyzed>>>,
+            ) = {
+                use rayon::prelude::*;
+                rayon::join(
+                    || {
+                        batch
+                            .par_iter()
+                            .map(|g| {
+                                g.registries
+                                    .par_iter()
+                                    .map(|(_, provenance, _)| {
+                                        registry_node(&provenance.record, &registry_opts)
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    },
+                    || {
+                        batch
+                            .par_iter()
+                            .map(|g| {
+                                let on_analyzed = |i: usize| {
+                                    if let (Some(r), Some(rec)) =
+                                        (g.selected.get(i), g.fetched.get(i))
+                                    {
+                                        reporter.analyzed(r, rec);
+                                    }
+                                };
+                                analyze_payloads(
+                                    &g.fetched,
+                                    &res.cache,
+                                    &opts,
+                                    acache_ref,
+                                    &on_analyzed,
+                                )
+                            })
+                            .collect()
+                    },
+                )
+            };
+
+            // Merge serially — groups in order, registry records before payloads
+            // within a group, both in materialization order — because
+            // `merge_registry`/`merge_payload` assign report ids from a running
+            // max; parallelizing the merge would make ids (and therefore output)
+            // depend on completion order.
+            for (g, (subs, payloads)) in batch
+                .into_iter()
+                .zip(registry_subs.into_iter().zip(analyzed.into_iter()))
+            {
+                // Registry findings keyed by locator, captured as each record is
+                // merged so the package pass below can pair an artifact with
+                // its own registry metadata (see `apply_package_composites`).
+                let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
+                for ((r, provenance, skip), sub) in g.registries.iter().zip(subs) {
+                    let reg = &provenance.record;
+                    if let Some(sub) = sub {
+                        let findings = sub_findings(&sub);
+                        // A skipped dependency has no artifact upload and only
+                        // appears in provenance output when its registry node is
+                        // notable. Drop its raw provider document immediately when
+                        // neither condition applies; lockfiles can contain hundreds
+                        // of ordinary aged-out records.
+                        let retain_provenance = skip.is_none()
+                            || findings
+                                .iter()
+                                .any(|finding| finding.crit >= cleave::Criticality::Notable);
+                        registry_findings
+                            .entry(locator_key(r))
+                            .or_default()
+                            .extend(findings);
+                        if let Some(file_id) = merge_registry(report, &g.source_sha, sub)
+                            && retain_provenance
+                        {
+                            let artifact_skip = skip.map(|reason| match reason {
+                                SkipReason::Removed => "version removed",
+                                SkipReason::AgedOut => "older than fetch age limit",
+                                SkipReason::KnownGood => "known-good coordinate",
+                            });
+                            dependency_registries.push(DependencyRegistry {
+                                locator: locator_key(r),
+                                provenance: provenance.clone(),
+                                file_id,
+                                artifact_skip,
+                            });
+                        }
                     }
-                    next.extend(merge_payload(report, rec, payload));
-                    // `rec.locator` is the original filefacts locator (the PURL),
-                    // the same key the registry findings were captured under.
-                    if let Some(reg) = registry_findings.get(rec.locator.as_str()) {
-                        apply_package_composites(report, &artifact_sha, &artifact, reg, &opts);
+                    // The record is materialized either way; only the artifact fetch
+                    // is skipped. `None` = kept for fetch+scan.
+                    let Some(reason) = skip else {
+                        continue;
+                    };
+                    let common = tracing::field::display(locator_key(r));
+                    if *reason == SkipReason::KnownGood {
+                        crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
+                    }
+                    let log_reason = match reason {
+                        SkipReason::Removed => "version removed from registry",
+                        SkipReason::AgedOut => "older than --max-dep-age",
+                        SkipReason::KnownGood => "known-good (bloom, resolved version)",
+                    };
+                    // Age-outs are the common, expected case; they stay at debug so
+                    // `--verbose` can still see them, while removals and known-good
+                    // skips — the interesting decisions — are surfaced at info.
+                    match reason {
+                        SkipReason::AgedOut => tracing::debug!(
+                            package = %common,
+                            ecosystem = %reg.ecosystem,
+                            version = %reg.version,
+                            age_days = reg.age_days.unwrap_or(0),
+                            downloads = reg.downloads_recent.or(reg.downloads_total),
+                            reason = log_reason,
+                            "registry record materialized; artifact fetch skipped"
+                        ),
+                        SkipReason::Removed | SkipReason::KnownGood => tracing::info!(
+                            package = %common,
+                            ecosystem = %reg.ecosystem,
+                            version = %reg.version,
+                            age_days = reg.age_days.unwrap_or(0),
+                            downloads = reg.downloads_recent.or(reg.downloads_total),
+                            reason = log_reason,
+                            "registry record materialized; artifact fetch skipped"
+                        ),
+                    }
+                    // Settle the skipped row. The tree shows every reason (so no row
+                    // is left hanging as pending); the stream keeps flooding-averse
+                    // behaviour, printing only the surfaced removals/known-good skips.
+                    reporter.skipped(r, reg, now, *reason);
+                }
+                for (rec, payload) in g.fetched.iter().zip(payloads) {
+                    if let Some(payload) = payload {
+                        // Capture the artifact's findings and identity before
+                        // `merge_payload` consumes the sub-report, then graft any
+                        // package-scoped composite that correlates them with this
+                        // package's registry metadata.
+                        let artifact = payload.sub.as_ref().map(sub_findings).unwrap_or_default();
+                        let artifact_sha = payload.content_sha.clone();
+                        // Capture the dependency's standalone report before merge_payload
+                        // consumes the sub-report into the merged tree — only when a
+                        // consumer (hopper upload, dependency appendix) will read it.
+                        if capture_deps && let Some(dep) = capture_dependency(rec, &payload) {
+                            dependencies.push(dep);
+                        }
+                        next.extend(merge_payload(report, rec, payload));
+                        // `rec.locator` is the original filefacts locator (the PURL),
+                        // the same key the registry findings were captured under.
+                        if let Some(reg) = registry_findings.get(rec.locator.as_str()) {
+                            apply_package_composites(report, &artifact_sha, &artifact, reg, &opts);
+                        }
                     }
                 }
+                records.extend(g.fetched);
             }
-            records.extend(fetched);
+        }
+        if dropped_old_versions.get() > 0 {
+            tracing::info!(
+                skipped = dropped_old_versions.get(),
+                "older package versions skipped this hop (newest-version policy)"
+            );
         }
         worklist = next;
     }
@@ -1628,6 +1811,59 @@ type IndexedRegistryLookup = (usize, Option<RegistryLookup>);
 /// registry release date. Returns the refs to fetch plus, for *every* dependency
 /// that resolved a registry record, its [`GatedDep`] — the record is materialized
 /// whether or not its bytes are fetched, and the reason drives the skip report.
+/// Split a locator into `(package key, version)` when it carries an explicit
+/// version. The key is everything before the last `@`, so npm scoped names
+/// (`pkg:npm/@scope/name@1.2.3`) keep their leading `@`. A candidate version
+/// must start with an ASCII digit — git refs, tags, and a scoped name with no
+/// version at all (`pkg:npm/@scope/name`) are not versions and exempt the
+/// reference from the newest-version gate.
+fn versioned_purl(locator: &str) -> Option<(&str, &str)> {
+    let (key, version) = locator.rsplit_once('@')?;
+    if key.is_empty() || !version.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((key, version))
+}
+
+/// Lenient, numeric-aware version ordering: the string splits into components
+/// at `.`, `-`, `_`, and `+`; each component compares by its leading integer
+/// first (`3` > `rc1`? — a fully numeric component outranks a text-led one, so
+/// `1.2.3` > `1.2.rc1`), then by remaining text. More components with an equal
+/// prefix is newer (`1.2.1` > `1.2`). This orders real registry releases of
+/// one package — semver, pep440-ish, and date-like schemes — without
+/// validating any of them.
+fn lenient_version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn component_cmp(x: &str, y: &str) -> Ordering {
+        let digits = |s: &str| s.chars().take_while(char::is_ascii_digit).count();
+        let (nx, rx) = x.split_at(digits(x));
+        let (ny, ry) = y.split_at(digits(y));
+        match (nx.is_empty(), ny.is_empty()) {
+            (false, true) => return Ordering::Greater,
+            (true, false) => return Ordering::Less,
+            (true, true) => return x.cmp(y),
+            (false, false) => {}
+        }
+        let num = match (nx.parse::<u64>(), ny.parse::<u64>()) {
+            (Ok(vx), Ok(vy)) => vx.cmp(&vy),
+            // A digit run longer than u64 still orders consistently as text.
+            _ => nx.cmp(ny),
+        };
+        num.then_with(|| rx.cmp(ry))
+    }
+    let (ca, cb): (Vec<&str>, Vec<&str>) = (
+        a.split(['.', '-', '_', '+']).collect(),
+        b.split(['.', '-', '_', '+']).collect(),
+    );
+    for (x, y) in ca.iter().zip(cb.iter()) {
+        let ord = component_cmp(x, y);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    ca.len().cmp(&cb.len())
+}
+
 fn age_gate(
     selected: Vec<Reference>,
     policy: &FetchPolicy,
@@ -2825,6 +3061,80 @@ mod tests {
             &purl_ref("pkg:npm/%40biomejs/cli-linux-x64@2.5.0"),
             ("", "")
         ));
+    }
+
+    #[test]
+    fn off_host_platform_matches_cargo_target_naming() {
+        // Rust target spellings: `windows`/`i686`/`x86_64`/`aarch64`. The
+        // windows-rs platform crates ship multi-megabyte import libraries that
+        // no Linux host will ever link; they are the cargo analogue of npm's
+        // `cli-win32-x64`.
+        let host = ("linux", "x64");
+        assert!(off_host_platform(
+            &purl_ref("pkg:cargo/windows_i686_gnu@0.52.0"),
+            host
+        ));
+        assert!(off_host_platform(
+            &purl_ref("pkg:cargo/windows_x86_64_gnu@0.53.0"),
+            host
+        ));
+        assert!(off_host_platform(
+            &purl_ref("pkg:cargo/windows_x86_64_gnullvm@0.52.4"),
+            host
+        ));
+        assert!(off_host_platform(
+            &purl_ref("pkg:cargo/windows_aarch64_msvc@0.48.5"),
+            host
+        ));
+        // A same-OS other-arch name still ages out on arch alone.
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/app-linux-aarch64@1.0.0"),
+            host
+        ));
+        // The host's own spelling variants are kept.
+        assert!(!off_host_platform(
+            &purl_ref("pkg:npm/app-linux-x86_64@1.0.0"),
+            host
+        ));
+        // Portable cargo crates carry no os+arch pair.
+        assert!(!off_host_platform(&purl_ref("pkg:cargo/windows@0.52.0"), host));
+        assert!(!off_host_platform(
+            &purl_ref("pkg:cargo/windows-sys@0.52.0"),
+            host
+        ));
+        assert!(!off_host_platform(&purl_ref("pkg:cargo/serde@1.0.0"), host));
+    }
+
+    #[test]
+    fn versioned_purl_splits_and_exempts() {
+        assert_eq!(
+            versioned_purl("pkg:cargo/syn@2.0.104"),
+            Some(("pkg:cargo/syn", "2.0.104"))
+        );
+        // npm scoped names keep their leading @ in the key.
+        assert_eq!(
+            versioned_purl("pkg:npm/@babel/core@7.24.0"),
+            Some(("pkg:npm/@babel/core", "7.24.0"))
+        );
+        // No version, or a non-numeric ref, exempts the reference.
+        assert_eq!(versioned_purl("pkg:npm/@scope/name"), None);
+        assert_eq!(versioned_purl("pkg:cargo/serde"), None);
+        assert_eq!(versioned_purl("pkg:generic/x@deadbeef"), None);
+    }
+
+    #[test]
+    fn lenient_version_cmp_orders_release_schemes() {
+        use std::cmp::Ordering::*;
+        let cmp = lenient_version_cmp;
+        assert_eq!(cmp("2.0.104", "2.0.9"), Greater);
+        assert_eq!(cmp("1.2", "1.2.1"), Less);
+        assert_eq!(cmp("0.52.0", "0.48.5"), Greater);
+        assert_eq!(cmp("1.0.0", "1.0.0"), Equal);
+        // pep440-ish and date-like schemes still order sensibly.
+        assert_eq!(cmp("0.1.5rc1", "0.1.4"), Greater);
+        assert_eq!(cmp("20260528.18.2", "20260101.1.1"), Greater);
+        // Numeric outranks a text suffix at the same position.
+        assert_eq!(cmp("1.2.3", "1.2.rc1"), Greater);
     }
 
     #[test]
