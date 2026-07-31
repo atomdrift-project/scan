@@ -137,6 +137,10 @@ pub struct BenchHopper {
     results: Arc<AtomicUsize>,
     timings: Mutex<Timings>,
     dump: Option<Arc<Mutex<File>>>,
+    /// Directory each decompressed result body is written to as `<sha>.json`,
+    /// for detection-fingerprint comparison between worker runs. Overwrites are
+    /// fine: posts are idempotent, so identical shas carry identical bodies.
+    dump_bodies: Option<PathBuf>,
     /// Summary JSON destination, rewritten after every result post so the file
     /// is always current no matter when the harness stops this process.
     summary: Option<PathBuf>,
@@ -176,6 +180,7 @@ impl BenchHopper {
     pub fn build(
         dataset: &Path,
         dump: Option<PathBuf>,
+        dump_bodies: Option<PathBuf>,
         order: Order,
         summary: Option<PathBuf>,
     ) -> io::Result<Self> {
@@ -207,6 +212,9 @@ impl BenchHopper {
             ))),
             None => None,
         };
+        if let Some(dir) = &dump_bodies {
+            std::fs::create_dir_all(dir)?;
+        }
 
         let timings = Mutex::new(Timings {
             claimed: vec![None; jobs.len()],
@@ -222,6 +230,7 @@ impl BenchHopper {
             results: Arc::new(AtomicUsize::new(0)),
             timings,
             dump,
+            dump_bodies,
             summary,
         })
     }
@@ -337,14 +346,18 @@ impl BenchHopper {
 
     fn serve_result(&self, stream: &mut TcpStream, body: &[u8]) -> io::Result<()> {
         self.results.fetch_add(1, Ordering::Relaxed);
-        let sha = result_sample_sha256(body);
+        // The worker zstd-compresses result bodies (raw JSON on fallback).
+        let json = zstd::decode_all(body).unwrap_or_else(|_| body.to_vec());
+        let sha = first_sha256(&json).unwrap_or_else(|| "unknown".to_string());
         if let Some(dump) = &self.dump {
-            // The worker zstd-compresses result bodies (raw JSON on fallback).
             // Record one clean line per result — the sample's top-level sha256 —
             // so completeness = distinct lines, not unparseable binary blobs.
             if let Ok(mut f) = dump.lock() {
                 let _ = writeln!(f, "{sha}");
             }
+        }
+        if let Some(dir) = &self.dump_bodies {
+            let _ = std::fs::write(dir.join(format!("{sha}.json")), &json);
         }
         self.record_result(&sha);
         if let Some(path) = &self.summary {
@@ -561,14 +574,9 @@ fn order_jobs(jobs: &mut [Job], order: Order) {
 
 /// Extract the result's top-level sample sha256 for the manifest line,
 /// decompressing the (zstd) post body first and falling back gracefully.
-fn result_sample_sha256(body: &[u8]) -> String {
-    let json = zstd::decode_all(body).unwrap_or_else(|_| body.to_vec());
-    // The first `"sha256":"<64 hex>"` is the ResultPayload's top-level hash; the
-    // embedded cleave report's per-member hashes appear later in the body.
-    first_sha256(&json).unwrap_or_else(|| "unknown".to_string())
-}
-
-/// Find the first `"sha256":"<64 lowercase hex>"` value in a JSON byte slice.
+/// Find the first `"sha256":"<64 lowercase hex>"` value in a JSON byte slice —
+/// the ResultPayload's top-level hash; the embedded cleave report's per-member
+/// hashes appear later in the body.
 fn first_sha256(json: &[u8]) -> Option<String> {
     let key = b"\"sha256\"";
     let key_pos = json.windows(key.len()).position(|w| w == key)?;
@@ -781,6 +789,19 @@ mod tests {
         (status, resp[split + 4..].to_vec())
     }
 
+    fn post_result(port: u16, body: &[u8]) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            stream,
+            "POST /api/result HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).unwrap();
+    }
+
     #[test]
     fn serves_jobs_then_drains_and_serves_data() {
         let dir = std::env::temp_dir().join(format!("bench_hopper_test_{}", std::process::id()));
@@ -788,7 +809,7 @@ mod tests {
         write_file(&dir, "a.txt", b"hello");
         write_file(&dir, "sub/b dir.txt", b"world!!");
 
-        let hopper = BenchHopper::build(&dir, None, Order::Fifo, None).unwrap();
+        let hopper = BenchHopper::build(&dir, None, None, Order::Fifo, None).unwrap();
         assert_eq!(hopper.jobs.len(), 2);
         let handle = hopper.serve(0).unwrap();
         let port = handle.port;
@@ -827,13 +848,30 @@ mod tests {
     }
 
     #[test]
-    fn result_sample_sha256_decompresses_zstd() {
+    fn result_bodies_decompress_and_dump() {
         let h = "c".repeat(64);
         let json = format!("{{\"sha256\":\"{h}\",\"worker\":\"w\"}}");
         let compressed = zstd::encode_all(json.as_bytes(), 3).unwrap();
-        assert_eq!(result_sample_sha256(&compressed), h);
-        // Raw (uncompressed-fallback) bodies also work.
-        assert_eq!(result_sample_sha256(json.as_bytes()), h);
+
+        let dir = std::env::temp_dir().join(format!("bench-hopper-bodies-{}", std::process::id()));
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("f.txt"), b"x").unwrap();
+        let bodies = dir.join("bodies");
+        let hopper =
+            BenchHopper::build(&data, None, Some(bodies.clone()), Order::Fifo, None).unwrap();
+        let port = hopper.serve(0).unwrap().port;
+
+        // Compressed and raw (uncompressed-fallback) bodies both land as
+        // decompressed `<sha>.json`.
+        post_result(port, &compressed);
+        let dumped = std::fs::read(bodies.join(format!("{h}.json"))).unwrap();
+        assert_eq!(dumped, json.as_bytes());
+        post_result(port, json.as_bytes());
+        let dumped = std::fs::read(bodies.join(format!("{h}.json"))).unwrap();
+        assert_eq!(dumped, json.as_bytes());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -938,7 +976,7 @@ mod tests {
         write_file(&dir, "x.bin", b"abc");
         write_file(&dir, "y.bin", b"defgh");
 
-        let hopper = BenchHopper::build(&dir, None, Order::Fifo, None).unwrap();
+        let hopper = BenchHopper::build(&dir, None, None, Order::Fifo, None).unwrap();
         let shas: Vec<String> = hopper.jobs.iter().map(|j| j.sha256.clone()).collect();
         let handle = hopper.serve(0).unwrap();
         let port = handle.port;
@@ -947,16 +985,7 @@ mod tests {
         let (status, _) = get(port, "/api/next?count=10");
         assert!(status.contains("200"), "status: {status}");
         let body = format!("{{\"sha256\":\"{}\",\"worker\":\"w\"}}", shas[0]);
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        write!(
-            stream,
-            "POST /api/result HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
-        let mut resp = Vec::new();
-        stream.read_to_end(&mut resp).unwrap();
+        post_result(port, body.as_bytes());
 
         let summary = handle.summary_json();
         assert!(summary.contains("\"jobs\": 2"), "summary: {summary}");

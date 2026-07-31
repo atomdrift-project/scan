@@ -35,6 +35,11 @@ struct Args {
     #[arg(long)]
     dump: Option<PathBuf>,
 
+    /// Write every decompressed result body to this directory as `<sha>.json`,
+    /// for detection-fingerprint comparison between worker runs.
+    #[arg(long)]
+    dump_bodies: Option<PathBuf>,
+
     /// Job handout order: fifo, shuffle[:seed], big-first, or small-first.
     /// big-first reproduces the small-job-starvation worst case.
     #[arg(long, default_value = "fifo")]
@@ -56,7 +61,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let hopper = match BenchHopper::build(&args.dataset, args.dump, args.order, args.summary) {
+    let hopper = match BenchHopper::build(
+        &args.dataset,
+        args.dump,
+        args.dump_bodies,
+        args.order,
+        args.summary,
+    ) {
         Ok(h) => h,
         Err(e) => {
             eprintln!(
