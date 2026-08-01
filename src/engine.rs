@@ -1967,6 +1967,15 @@ pub fn run_bytes(
 
     let report = cleave::analyze_bytes_owned(bytes, name, &cleave_opts)
         .with_context(|| format!("cleave analysis of {label}"));
+    // `--hopper` on `url`/`purl`: a fetched artifact is the never-before-seen
+    // case, so the uploader matters more here than on a local path scan —
+    // `record_file_result` routes through `upload_scan_result`, which offers the
+    // bytes+sidecar over `/api/known` before the verdict POST, and hopper drops
+    // a result for a SHA it never ingested. Dropped at the end of the function,
+    // which flushes and joins the background thread before we return.
+    let uploader = config
+        .hopper()
+        .map(|url| crate::upload::Uploader::new(url, crate::upload::default_worker_name()));
     record_file_result(
         Path::new(label),
         report,
@@ -1978,10 +1987,11 @@ pub fn run_bytes(
         &tally,
         &stdout,
         None,
-        None,
+        uploader.as_ref(),
         root_registry,
         root_fetch,
     );
+    drop(uploader);
 
     let summary = tally.summary(scan_start);
     if is_terminal {

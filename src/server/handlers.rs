@@ -1714,6 +1714,7 @@ fn read_thread_info_freebsd() -> serde_json::Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::classify_analysis_error;
     use axum::http::StatusCode;

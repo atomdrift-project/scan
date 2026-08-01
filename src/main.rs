@@ -439,10 +439,17 @@ enum Commands {
         paths: Vec<PathBuf>,
 
         /// Renew each result on a hopper instance by POSTing its envelope to
-        /// `<URL>/api/result`. Assumes the SHA256 was already ingested by
-        /// hopper; this refreshes the stored verdict with the local build's
-        /// traits and model. Upload failures are logged, never fatal.
-        #[arg(long, visible_alias = "upload", value_name = "URL")]
+        /// `<URL>/api/result`. A SHA hopper has not ingested is negotiated over
+        /// `/api/known` and uploaded bytes-and-provenance first, so a
+        /// never-before-seen sample lands as its own row instead of being
+        /// dropped as an unknown-SHA no-op. Upload failures are logged, never
+        /// fatal. Also settable via the `SCAN_HOPPER` env var.
+        #[arg(
+            long,
+            visible_alias = "upload",
+            value_name = "URL",
+            env = "SCAN_HOPPER"
+        )]
         hopper: Option<String>,
 
         /// Apply pre-collected registry metadata per scanned file, so an offline
@@ -469,6 +476,19 @@ enum Commands {
     Url {
         /// URL to fetch and scan (e.g. https://host/path/file)
         url: String,
+
+        /// Push the fetched artifact to a hopper instance: bytes and provenance
+        /// when hopper does not already have the SHA, then the verdict. A
+        /// fetched URL is exactly the never-before-seen case, so this is the
+        /// flag that gets a freshly-discovered sample into the corpus.
+        /// Also settable via the `SCAN_HOPPER` env var.
+        #[arg(
+            long,
+            visible_alias = "upload",
+            value_name = "URL",
+            env = "SCAN_HOPPER"
+        )]
+        hopper: Option<String>,
     },
 
     /// Fetch a package by PURL and scan it (e.g. npm/left-pad@1.3.0)
@@ -478,6 +498,20 @@ enum Commands {
         /// optional (`npm/foo` == `pkg:npm/foo`). A versionless PURL resolves
         /// to the registry's current release.
         purl: String,
+
+        /// Push the fetched package to a hopper instance: bytes and provenance
+        /// when hopper does not already have the SHA, then the verdict. The
+        /// registry record resolved for the package rides along as the
+        /// sidecar's `registry` node, so the uploaded sample carries the same
+        /// provenance a forager-collected one would.
+        /// Also settable via the `SCAN_HOPPER` env var.
+        #[arg(
+            long,
+            visible_alias = "upload",
+            value_name = "URL",
+            env = "SCAN_HOPPER"
+        )]
+        hopper: Option<String>,
     },
 
     /// Update models (and optionally cleave traits)
@@ -546,7 +580,13 @@ enum Commands {
         /// by POSTing to <URL>/api/result as analyses complete — the warm-server
         /// equivalent of `scan path --hopper`. Upload failures are logged, never
         /// fatal. Reads $HOPPER_UPLOAD_TOKEN for authentication.
-        #[arg(long, visible_alias = "upload", value_name = "URL")]
+        /// Also settable via the `SCAN_HOPPER` env var.
+        #[arg(
+            long,
+            visible_alias = "upload",
+            value_name = "URL",
+            env = "SCAN_HOPPER"
+        )]
         hopper: Option<String>,
 
         /// Per-request analysis timeout in seconds; 0 disables. Raise when
@@ -1133,7 +1173,7 @@ fn main() -> Result<()> {
             }
             exit_for_summary(&scan::ps::run(&config)?);
         }
-        Commands::Url { url } => {
+        Commands::Url { url, hopper } => {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
@@ -1147,10 +1187,11 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy);
+            .with_fetch(fetch_policy)
+            .with_hopper(hopper);
             exit_for_summary(&scan::pkg::run_url(&url, &config)?);
         }
-        Commands::Purl { purl } => {
+        Commands::Purl { purl, hopper } => {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
@@ -1164,7 +1205,8 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy);
+            .with_fetch(fetch_policy)
+            .with_hopper(hopper);
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
             }
@@ -1966,6 +2008,28 @@ mod tests {
     }
 
     #[test]
+    fn url_and_purl_accept_hopper_flag() -> Result<()> {
+        let cli = Cli::try_parse_from(["scan", "url", "https://h/f.tgz", "--hopper", "http://x:8081"])
+            .context("parse should work")?;
+        match cli.command.context("url subcommand expected")? {
+            Commands::Url { url, hopper } => {
+                assert_eq!(url, "https://h/f.tgz");
+                assert_eq!(hopper.as_deref(), Some("http://x:8081"));
+            }
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["scan", "purl", "npm/left-pad", "--upload", "http://x:8081"])
+            .context("parse should work")?;
+        match cli.command.context("purl subcommand expected")? {
+            Commands::Purl { hopper, .. } => {
+                assert_eq!(hopper.as_deref(), Some("http://x:8081"));
+            }
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fs_without_hopper_defaults_to_none() -> Result<()> {
         let cli = Cli::try_parse_from(["scan", "fs", "/tmp/a"]).context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
@@ -2002,7 +2066,7 @@ mod tests {
                 .command
                 .with_context(|| format!("purl expected via `{name}`"))?
             {
-                Commands::Purl { purl } => assert_eq!(purl, "pkg:npm/left-pad@1.3.0"),
+                Commands::Purl { purl, .. } => assert_eq!(purl, "pkg:npm/left-pad@1.3.0"),
                 other => anyhow::bail!("unexpected command for `{name}`: {other:?}"),
             }
         }
