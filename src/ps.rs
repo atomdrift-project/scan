@@ -423,6 +423,7 @@ fn build_result(
         None, // process images carry no fetched-package registry metadata
         None, // process images have no package acquisition fetch record
         bloom_mark,
+        None,
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 

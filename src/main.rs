@@ -1304,6 +1304,15 @@ fn main() -> Result<()> {
             if let Some(p) = traits_dir.as_ref() {
                 cleave::traits_repo::set_override_dir(Some(p.into()));
             }
+            // Claimed jobs are always analyzed in full (worker mode forces
+            // `Mode::Slow`, and `ScanConfig` never gets `with_bloom`), but the
+            // *dependency* gate in `fetch::age_gate` consults the process-wide
+            // bloom handle: a fetched dep whose resolved coordinate is vouched
+            // known-good (and not vetoed by the known-bad channel) skips its
+            // artifact fetch+scan, keeping only the registry-metadata node.
+            // Publishing the filters here enables that skip without touching
+            // the job-level always-scan guarantee.
+            scan::bloom_repo::set_global(std::sync::Arc::new(scan::bloom_repo::Lookup::load()));
             let workers = workers.unwrap_or_else(default_workers);
             let name = name.unwrap_or_else(|| {
                 hostname::get()

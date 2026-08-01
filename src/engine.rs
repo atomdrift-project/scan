@@ -3133,6 +3133,11 @@ pub(crate) fn classify_report(
     // The bloom status flag (🚩 known-bad / 🏴 conflicted), rendered inline in the
     // terminal header. `None` for unflagged files.
     bloom_mark: Option<crate::output::BloomMark>,
+    // Live stage tracker for the worker/server census. Without the split set
+    // here, the whole of classify_report reported as "features+model" — and
+    // dependency fetch+analysis, the expensive half, was repeatedly
+    // misattributed to featurization during triage.
+    phase: Option<&cleave::PhaseTracker>,
 ) -> Result<ClassifiedReport> {
     let OutputNeeds {
         llm_view,
@@ -3186,6 +3191,9 @@ pub(crate) fn classify_report(
     let dump_dir = std::env::var_os("SCAN_INTERPRET_DUMP_DIR");
     let need_dep_results =
         deps_for_upload || interpret.is_some() || llm_view || render_context || dump_dir.is_some();
+    if let Some(p) = phase {
+        p.set("fetch+graft");
+    }
     let fetch_start = Instant::now();
     let (fetch_edges, fetched_deps, dependency_registries) = crate::fetch::orchestrate(
         &mut report,
@@ -3195,6 +3203,9 @@ pub(crate) fn classify_report(
         need_dep_results,
     );
     let fetch_ms = crate::duration_ms(fetch_start.elapsed());
+    if let Some(p) = phase {
+        p.set("features+model");
+    }
     // One-shot `pkg:`/`url`: graft the root artifact's own registry metadata as a
     // child `registry` node and correlate the two with a `scope: package`
     // composite. The `--fetch` path does the equivalent per fetched dependency
@@ -3524,6 +3535,16 @@ pub(crate) fn classify_report(
             let provenance = provenance_by_locator
                 .get(dep.locator.as_str())
                 .map(|provenance| (**provenance).clone());
+            // Same retention rubric as the root report: grading above consumed
+            // the complete standalone report; the stored/mirrored body keeps
+            // only the nodes someone will read again.
+            let raw = match serde_json::from_str::<serde_json::Value>(&dep.raw) {
+                Ok(mut value) => {
+                    apply_report_retention(&mut value);
+                    serde_json::to_string(&value).unwrap_or(dep.raw)
+                }
+                Err(_) => dep.raw,
+            };
             DepResult {
                 verdict,
                 members,
@@ -3532,7 +3553,7 @@ pub(crate) fn classify_report(
                 url: dep.url,
                 size: dep.size,
                 provenance,
-                raw: dep.raw,
+                raw,
             }
         })
         .collect();
@@ -3682,6 +3703,16 @@ pub(crate) fn classify_report(
     }
     let render_ms = crate::duration_ms(render_start.elapsed());
 
+    // Retention rubric: everything above — featurization, the model, the
+    // embedded pass, renders — consumed the complete report; what remains is
+    // what gets stored (hopper bodies, JSON output). Sub-signal member nodes
+    // are the bulk of that weight and nobody reads them again, so they are
+    // dropped here (see `apply_report_retention`). A `--show=all` manifest
+    // request is an explicit ask for the complete listing, so it opts out.
+    if !list_all_members {
+        apply_report_retention(&mut report_json);
+    }
+
     // Surface the archive members cleave catalogued but never analyzed, so a
     // `--show=all` JSON manifest lists every file (path/type/size) — not just the
     // ones that produced findings. Appended last, after featurization and the
@@ -3742,6 +3773,90 @@ struct ArchiveMemberStub {
     sha256: String,
     /// Uncompressed size in bytes.
     size_bytes: u64,
+}
+
+/// Post-classification retention rubric (operator policy, 2026-08-01): a
+/// stored report keeps a member node only when someone will plausibly read it
+/// again. A node survives when it is
+///
+/// 1. the root (depth 0 / id 0),
+/// 2. among the top 3 nodes by `risk` in this report,
+/// 3. carrying its own crit ≥ 3 (notable+) trait,
+/// 4. cited by any crit ≥ 3 finding's `from` list (composite contributors), or
+/// 5. provenance skeleton: a `registry` record or a fetch-edge placeholder
+///    (empty type) — dependency provenance sidecars reference these by
+///    `file_id`, so they must not dangle.
+///
+/// Everything else is removed outright — no stub rows. On the benchmark
+/// corpus that is ~77% of nodes and ~56% of stored report bytes, almost all
+/// of it `facts`/`ctx` that only trait evaluation and featurization (both
+/// already complete) ever consume. Collimator's retraining featurizer reads
+/// `facts` from the nodes that remain. `SCAN_KEEP_ALL_MEMBERS=1` disables
+/// the rubric for debugging or corpus captures.
+pub(crate) fn apply_report_retention(report_json: &mut serde_json::Value) {
+    if std::env::var("SCAN_KEEP_ALL_MEMBERS").as_deref() == Ok("1") {
+        return;
+    }
+    let Some(files) = report_json.get_mut("files").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let crit_of = |t: &serde_json::Value| t.get("crit").and_then(serde_json::Value::as_i64);
+    // Contributors cited by any notable+ finding, across all nodes.
+    let mut cited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for f in files.iter() {
+        for t in f
+            .get("traits")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if crit_of(t).unwrap_or(0) >= 3 {
+                for r in t
+                    .get("from")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(id) = r.get("file").and_then(serde_json::Value::as_u64) {
+                        cited.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    // Top 3 by risk (ties keep earlier nodes — stable sort on a stable list).
+    let mut by_risk: Vec<(u64, i64)> = files
+        .iter()
+        .filter_map(|f| {
+            Some((
+                f.get("id").and_then(serde_json::Value::as_u64)?,
+                f.get("risk")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+            ))
+        })
+        .collect();
+    by_risk.sort_by_key(|&(_, risk)| std::cmp::Reverse(risk));
+    let top3: std::collections::HashSet<u64> = by_risk.iter().take(3).map(|&(id, _)| id).collect();
+    files.retain(|f| {
+        let id = f.get("id").and_then(serde_json::Value::as_u64);
+        let depth = f
+            .get("depth")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let ty = f
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        depth == 0
+            || id == Some(0)
+            || id.is_some_and(|id| top3.contains(&id) || cited.contains(&id))
+            || ty.is_empty()
+            || ty == "registry"
+            || f.get("traits")
+                .and_then(|v| v.as_array())
+                .is_some_and(|ts| ts.iter().any(|t| crit_of(t).unwrap_or(0) >= 3))
+    });
 }
 
 /// Append the archive members cleave never analyzed to `report_json["files"]` as
@@ -5053,6 +5168,52 @@ mod dep_backref_tests {
     }
 
     #[test]
+    fn retention_rubric_keeps_only_readable_nodes() {
+        let mut report = serde_json::json!({"files": [
+            // Root: kept (depth 0 / id 0) even with no traits.
+            {"id": 0, "depth": 0, "type": "npm", "risk": 1},
+            // Own notable trait: kept.
+            {"id": 1, "depth": 1, "type": "javascript",
+             "traits": [{"id": "a", "crit": 3}]},
+            // Cited by a notable composite on another node: kept.
+            {"id": 2, "depth": 1, "type": "markdown",
+             "traits": [{"id": "b", "crit": 1}]},
+            // The citing node (notable, with from): kept.
+            {"id": 3, "depth": 1, "type": "javascript",
+             "traits": [{"id": "c", "crit": 4, "from": [{"file": 2}]}]},
+            // Provenance skeleton: kept.
+            {"id": 4, "depth": 2, "type": "registry"},
+            {"id": 5, "depth": 2, "type": "", "rel": "fetched"},
+            // High risk: kept via top-3 (risks 9 > root's 1).
+            {"id": 6, "depth": 1, "type": "text", "risk": 9},
+            // Sub-notable, uncited, low-risk: dropped.
+            {"id": 7, "depth": 1, "type": "markdown",
+             "traits": [{"id": "d", "crit": 2}]},
+            {"id": 8, "depth": 2, "type": "text"},
+        ]});
+        apply_report_retention(&mut report);
+        let ids: Vec<u64> = report["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_u64().unwrap())
+            .collect();
+        assert!(
+            ids.contains(&0) && ids.contains(&1) && ids.contains(&2) && ids.contains(&3),
+            "root, notable, cited contributor, and citing node survive: {ids:?}"
+        );
+        assert!(
+            ids.contains(&4) && ids.contains(&5),
+            "registry and fetch-placeholder provenance skeleton survive: {ids:?}"
+        );
+        assert!(ids.contains(&6), "top-risk node survives: {ids:?}");
+        assert!(
+            !ids.contains(&7) && !ids.contains(&8),
+            "sub-notable uncited nodes are dropped outright: {ids:?}"
+        );
+    }
+
+    #[test]
     fn declarer_gets_span_and_structured_dep() {
         let mut report_json = compact_fixture();
         inject_dependency_backref(&mut report_json, &backref(Classification::Hostile));
@@ -5622,6 +5783,7 @@ pub(crate) fn process_report(
         root_registry,
         root_fetch,
         bloom_mark,
+        None,
     )?;
 
     // Per-file phase timing (CLI path only — serve logs its own per-sample line).

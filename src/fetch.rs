@@ -344,6 +344,11 @@ fn canonical_os(seg: &str) -> Option<&'static str> {
         "win32" | "windows" => "win32",
         "sunos" | "solaris" | "illumos" => "sunos",
         "linux" => "linux",
+        // musl is its own platform: sharp/libvips ship separate `linuxmusl`
+        // prebuilts, and neither libc's binaries load on the other's host.
+        "linuxmusl" | "musllinux" => "linuxmusl",
+        // StackBlitz-style wasm sandbox builds; never a scan host.
+        "webcontainers" | "wasi" => "webcontainers",
         "freebsd" => "freebsd",
         "openbsd" => "openbsd",
         "netbsd" => "netbsd",
@@ -366,6 +371,9 @@ fn canonical_arch(seg: &str) -> Option<&'static str> {
         "riscv64" => "riscv64",
         "loong64" => "loong64",
         "mips64el" => "mips64el",
+        // Wasm sandbox builds pair with an os token (`freebsd-wasm32`,
+        // `webcontainers-wasm32`) and never match a real host arch.
+        "wasm32" | "wasm64" => "wasm32",
         _ => return None,
     })
 }
@@ -379,6 +387,10 @@ fn host_platform() -> (&'static str, &'static str) {
         "macos" => "darwin",
         "windows" => "win32",
         "solaris" | "illumos" => "sunos",
+        // A musl build (Alpine workers) is its own platform: glibc prebuilts
+        // don't load there and musl prebuilts don't load on glibc hosts, and
+        // native packages ship separate `linuxmusl` variants (sharp/libvips).
+        "linux" if cfg!(target_env = "musl") => "linuxmusl",
         os @ ("linux" | "freebsd" | "openbsd" | "netbsd" | "android") => os,
         _ => "",
     };
@@ -637,7 +649,8 @@ pub(crate) fn orchestrate(
                     continue;
                 };
                 match newest_seen.get(key) {
-                    Some(best) if lenient_version_cmp(version, best) != std::cmp::Ordering::Greater => {}
+                    Some(best)
+                        if lenient_version_cmp(version, best) != std::cmp::Ordering::Greater => {}
                     _ => {
                         newest_seen.insert(key.to_string(), version.to_string());
                     }
@@ -715,15 +728,11 @@ pub(crate) fn orchestrate(
                         let Some((key, version)) = versioned_purl(&locator) else {
                             return true;
                         };
-                        let newest = match newest_seen.get(key) {
-                            Some(best)
-                                if lenient_version_cmp(version, best)
-                                    == std::cmp::Ordering::Less =>
-                            {
-                                false
-                            }
-                            _ => true,
-                        };
+                        let newest = !matches!(
+                            newest_seen.get(key),
+                            Some(best) if lenient_version_cmp(version, best)
+                                == std::cmp::Ordering::Less
+                        );
                         if !newest {
                             dropped_old_versions.set(dropped_old_versions.get() + 1);
                             tracing::debug!(
@@ -906,10 +915,10 @@ pub(crate) fn orchestrate(
             let acache_ref = acache
                 .get_or_insert_with(crate::analysis_cache::AnalysisCache::open)
                 .as_ref();
-            let (registry_subs, analyzed): (
-                Vec<Vec<Option<AnalysisReport>>>,
-                Vec<Vec<Option<Analyzed>>>,
-            ) = {
+            // Per-group results, aligned with `batch`.
+            type BatchRegistrySubs = Vec<Vec<Option<AnalysisReport>>>;
+            type BatchAnalyzed = Vec<Vec<Option<Analyzed>>>;
+            let (registry_subs, analyzed): (BatchRegistrySubs, BatchAnalyzed) = {
                 use rayon::prelude::*;
                 rayon::join(
                     || {
@@ -956,7 +965,7 @@ pub(crate) fn orchestrate(
             // depend on completion order.
             for (g, (subs, payloads)) in batch
                 .into_iter()
-                .zip(registry_subs.into_iter().zip(analyzed.into_iter()))
+                .zip(registry_subs.into_iter().zip(analyzed))
             {
                 // Registry findings keyed by locator, captured as each record is
                 // merged so the package pass below can pair an artifact with
@@ -3096,8 +3105,45 @@ mod tests {
             &purl_ref("pkg:npm/app-linux-x86_64@1.0.0"),
             host
         ));
+        // musl variants are a different platform from a glibc host, wasm
+        // sandbox builds never match a real host, and both directions of the
+        // sharp/libvips naming are recognized.
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/@img/sharp-libvips-linuxmusl-x64@1.3.2"),
+            host
+        ));
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/@img/sharp-linuxmusl-arm64@0.35.3"),
+            host
+        ));
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/@img/sharp-freebsd-wasm32@0.35.3"),
+            host
+        ));
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/@img/sharp-webcontainers-wasm32@0.35.3"),
+            host
+        ));
+        // ...while the host's real variant stays fetchable.
+        assert!(!off_host_platform(
+            &purl_ref("pkg:npm/@img/sharp-libvips-linux-x64@1.3.2"),
+            host
+        ));
+        // A musl host keeps its own variants and skips the glibc one.
+        let musl_host = ("linuxmusl", "x64");
+        assert!(!off_host_platform(
+            &purl_ref("pkg:npm/@img/sharp-linuxmusl-x64@0.35.3"),
+            musl_host
+        ));
+        assert!(off_host_platform(
+            &purl_ref("pkg:npm/@img/sharp-linux-x64@0.35.3"),
+            musl_host
+        ));
         // Portable cargo crates carry no os+arch pair.
-        assert!(!off_host_platform(&purl_ref("pkg:cargo/windows@0.52.0"), host));
+        assert!(!off_host_platform(
+            &purl_ref("pkg:cargo/windows@0.52.0"),
+            host
+        ));
         assert!(!off_host_platform(
             &purl_ref("pkg:cargo/windows-sys@0.52.0"),
             host

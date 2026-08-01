@@ -1037,9 +1037,8 @@ fn finish_classify(
         anyhow::bail!("analysis cancelled");
     }
 
-    if let Some(p) = phase {
-        p.set("features+model");
-    }
+    // classify_report stages its own census labels from here: "fetch+graft"
+    // through dependency fetch+analysis, then "features+model".
     let cr = crate::engine::classify_report(
         label,
         report,
@@ -1069,6 +1068,7 @@ fn finish_classify(
         root_registry,
         None, // uploaded bytes have no scan-side acquisition fetch record
         None, // server returns JSON; the inline terminal bloom flag doesn't apply
+        phase,
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -1114,13 +1114,24 @@ fn scan_result_from(
 #[derive(serde::Deserialize)]
 pub(super) struct AnalyzePathRequest {
     path: String,
+    /// Optional registry provenance for this file, in any shape
+    /// [`crate::provenance::registry_provenance`] accepts (a hopper sidecar, a
+    /// bare fletch envelope, or a normalized record). This is the server-side
+    /// equivalent of the CLI's `--registry-map` entry for the same sha: it lets
+    /// a caller that already holds the facts — promoter fetches them from
+    /// hopper — hand them over instead of making the scan refetch or go without.
+    /// Absent or unparseable means the scan simply runs without registry facts,
+    /// exactly as it did before this field existed.
+    #[serde(default)]
+    registry: Option<Box<serde_json::value::RawValue>>,
 }
 
 /// POST /analyze-path — analyze a file by its on-disk path.
 ///
-/// Accepts `{"path": "/full/path/to/file"}`. The path must be under one of
-/// the directories specified by `--allowed-dirs`. Returns the same
-/// `{"ml": {...}, "raw": {...}}` envelope as `/analyze`.
+/// Accepts `{"path": "/full/path/to/file", "registry": {...}}` (registry
+/// optional). The path must be under one of the directories specified by
+/// `--allowed-dirs`. Returns the same `{"ml": {...}, "raw": {...}}` envelope as
+/// `/analyze`.
 pub(super) async fn analyze_path(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AnalyzePathRequest>,
@@ -1254,6 +1265,23 @@ pub(super) async fn analyze_path(
         .in_flight
         .get(&request_id)
         .map(|r| r.phase.clone());
+
+    // Registry provenance the caller supplied for this file, parsed before the
+    // analysis thread starts so a malformed document costs nothing downstream.
+    // Provenance enriches a scan but is never required, so an unparseable
+    // document degrades to a warning and a registry-less scan rather than a 400.
+    let root_registry = req.registry.as_ref().and_then(|raw| {
+        let provenance = crate::provenance::registry_provenance(raw.get().as_bytes());
+        if provenance.is_none() {
+            tracing::warn!(
+                id = request_id,
+                path = %req.path,
+                "analyze-path registry provenance carries no record; scanning without it",
+            );
+        }
+        provenance
+    });
+
     let handle = tokio::task::spawn_blocking(move || {
         if let Some(req) = phase_state.in_flight.get(&request_id) {
             req.thread_id.store(current_thread_id(), Ordering::Relaxed);
@@ -1266,8 +1294,8 @@ pub(super) async fn analyze_path(
             extract_dir.as_deref(),
             Some(&cancel_flag),
             phase_tracker.as_ref(),
-            None,            // interactive upload carries no fetch-time registry provenance
-            deps_for_upload, // dependencies ride the hopper renewal below
+            root_registry.as_ref(), // caller-supplied, the server-side `--registry-map` equivalent
+            deps_for_upload,        // dependencies ride the hopper renewal below
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -1709,5 +1737,39 @@ mod tests {
     fn classify_unexpected_failure_as_500() {
         let (status, _) = classify_analysis_error("model evaluation failed");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A request without `registry` still parses — the field is optional, so
+    /// callers predating it (and files with no hopper record) are unaffected.
+    #[test]
+    fn analyze_path_registry_is_optional() {
+        let req: super::AnalyzePathRequest =
+            serde_json::from_str(r#"{"path":"/tmp/x/a.tgz"}"#).expect("parses without registry");
+        assert_eq!(req.path, "/tmp/x/a.tgz");
+        assert!(req.registry.is_none());
+    }
+
+    /// A supplied record round-trips through the same provenance parser the
+    /// CLI's `--registry-map` entries use, so both scan paths accept the exact
+    /// document hopper hands promoter.
+    #[test]
+    fn analyze_path_registry_parses_as_provenance() {
+        let body = r#"{"path":"/tmp/x/a.tgz","registry":{"ecosystem":"npm","name":"left-pad","version":"1.3.0"}}"#;
+        let req: super::AnalyzePathRequest = serde_json::from_str(body).expect("parses");
+        let raw = req.registry.expect("registry present");
+        let provenance = crate::provenance::registry_provenance(raw.get().as_bytes())
+            .expect("a bare normalized record is one of the accepted shapes");
+        assert_eq!(provenance.record.name, "left-pad");
+    }
+
+    /// Provenance enriches a scan but is never required, so a document that
+    /// carries no recoverable record degrades to `None` (scan without registry
+    /// facts) rather than failing the request.
+    #[test]
+    fn analyze_path_unparseable_registry_degrades_to_none() {
+        let body = r#"{"path":"/tmp/x/a.tgz","registry":[1,2,3]}"#;
+        let req: super::AnalyzePathRequest = serde_json::from_str(body).expect("parses");
+        let raw = req.registry.expect("registry present");
+        assert!(crate::provenance::registry_provenance(raw.get().as_bytes()).is_none());
     }
 }

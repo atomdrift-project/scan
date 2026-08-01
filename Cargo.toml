@@ -333,6 +333,10 @@ dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 # NOTE: cleave intentionally stays on git. Use a temporary local patch while
 # profiling cross-repo changes, then update the git revision once cleave carries
 # the change.
+# Local cleave: RAM-scaled regex-store default budgets (validation patch;
+# remove once cleave publishes the change and the git rev is bumped).
+[patch."https://github.com/atomdrift-project/cleave.git"]
+cleave = { path = "../cleave" }
 # Local cleave: adds AnalysisOptions::skip_predicate (the per-file known-good/bad
 # bloom short-circuit hook) and widens its signature to `Fn(&str, &Path)` so the
 # predicate can consult filesystem metadata — a known-good file is skipped only
