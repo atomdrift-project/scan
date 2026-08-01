@@ -9,7 +9,7 @@ use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -95,87 +95,146 @@ struct LocalFileIndex {
     hash_cache: Box<[OnceLock<CachedFileHash>]>,
 }
 
+/// Resolve `requested_path` against `root` using nothing but the filesystem:
+/// try the path as given (and, for an absolute path, its canonical form in case
+/// the prefix is symlinked), then confirm size and SHA-256 before trusting the
+/// match.
+///
+/// This is the whole data-serving path. Any sample still sitting where hopper
+/// says it does resolves here, which is the overwhelmingly common case and
+/// needs no index at all. `LocalFileIndex` exists only to catch the remainder —
+/// samples that have moved out from under their recorded path — so it is a
+/// best-effort accelerator layered on top of this, never a prerequisite for it.
+fn resolve_on_disk(
+    root: &Path,
+    requested_path: &str,
+    expected: &[u8; 32],
+    size_bytes: i64,
+) -> Option<PathBuf> {
+    let requested = Path::new(requested_path);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if requested.is_relative() {
+        candidates.push(root.join(requested));
+    } else if requested.is_absolute() {
+        candidates.push(requested.to_path_buf());
+        if let Ok(resolved) = requested.canonicalize()
+            && resolved != requested
+        {
+            candidates.push(resolved);
+        }
+    }
+
+    let expected_size = u64::try_from(size_bytes).ok();
+    for candidate in &candidates {
+        let meta = match fs::metadata(candidate) {
+            Ok(m) if m.is_file() => m,
+            _ => continue,
+        };
+        if expected_size.is_some_and(|sz| meta.len() != sz) {
+            continue;
+        }
+        if let Ok(digest) = sha256_file(candidate)
+            && digest == *expected
+        {
+            tracing::debug!(
+                path = %candidate.display(),
+                "resolved local file by path and sha256 verification",
+            );
+            return Some(candidate.clone());
+        }
+    }
+
+    None
+}
+
 impl LocalFileIndex {
+    /// Directories walked between progress lines. The walk is the longest
+    /// single step in worker startup on a large corpus; without a periodic
+    /// line there is no way to tell "still indexing" from "hung" from a log.
+    const PROGRESS_EVERY_DIRS: usize = 25_000;
+
+    /// Threads used for the startup walk. `read_dir` and the per-file `stat`
+    /// are both I/O-bound, so this is queue depth for the storage device
+    /// rather than CPU parallelism — one thread leaves any device with real
+    /// seek latency almost entirely idle, which is what made a 3.5 M-file
+    /// corpus on a spindle take longer to index than hopper's wedge timeout.
+    fn walk_threads() -> usize {
+        std::env::var("SCAN_INDEX_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(16)
+    }
+
     // Returns Result for forward-compatibility: individual dir-entry failures
     // are currently logged and skipped, but a future cap on I/O errors, a
     // permission-denied signal, or a root-missing fail-fast policy would want
     // to bubble up here.
-    #[allow(clippy::unnecessary_wraps)]
     fn build(root: PathBuf) -> Result<Self> {
-        let mut files: Vec<IndexedLocalFile> = Vec::new();
+        let started = Instant::now();
+        let threads = Self::walk_threads();
+        tracing::info!(root = %root.display(), threads, "indexing local samples");
+
+        // A private pool, not the global one: these threads block on I/O for
+        // as long as the walk runs, and the global pool is where cleave runs
+        // analysis. Borrowing it here would park every in-flight job behind
+        // the walk.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("sample-index-{i}"))
+            .build()
+            .context("building sample index thread pool")?;
+
+        let batches: Mutex<Vec<Vec<IndexedLocalFile>>> = Mutex::new(Vec::new());
+        let dirs_walked = AtomicUsize::new(0);
+        pool.scope(|scope| {
+            Self::walk_dir(&root, scope, &batches, &dirs_walked, started);
+        });
+
+        let mut files: Vec<IndexedLocalFile> = batches
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .into_iter()
+            .flatten()
+            .collect();
+
+        // `FileId` is `u32`; drop the tail rather than silently truncating an
+        // id if a single data dir somehow exceeds 4 B files.
+        if files.len() > FileId::MAX as usize {
+            tracing::warn!(
+                root = %root.display(),
+                found = files.len(),
+                limit = FileId::MAX,
+                "local data index exceeds FileId capacity; ignoring remaining files",
+            );
+            files.truncate(FileId::MAX as usize);
+        }
+
+        // Built serially from the merged file list. `FileId` is an opaque
+        // handle and every lookup re-verifies size and content hash, so the
+        // order the parallel walk happened to produce carries no meaning.
         let mut by_name: HashMap<LocalNameKey, Vec<FileId>> = HashMap::new();
-        let mut stack = vec![root.clone()];
-
-        while let Some(dir) = stack.pop() {
-            let entries = match fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    tracing::warn!(path = %dir.display(), error = %e, "failed to read local data directory entry");
-                    continue;
-                }
+        for (idx, file) in files.iter().enumerate() {
+            let Some(basename) = file.path.file_name().and_then(|n| n.to_str()) else {
+                continue;
             };
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        tracing::warn!(path = %dir.display(), error = %e, "failed to enumerate local data directory entry");
-                        continue;
-                    }
-                };
-                let path = entry.path();
-                let file_type = match entry.file_type() {
-                    Ok(ft) => ft,
-                    Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "failed to read local file type");
-                        continue;
-                    }
-                };
-                if file_type.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if !file_type.is_file() {
-                    continue;
-                }
-
-                let size = match entry.metadata() {
-                    Ok(meta) => meta.len(),
-                    Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "failed to read local file metadata");
-                        continue;
-                    }
-                };
-                let Some(basename) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                let parent_name = path
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                // `FileId` is `u32`; bail out cleanly if a single data dir
-                // somehow exceeds 4 B files rather than silently truncating.
-                let Ok(file_id) = FileId::try_from(files.len()) else {
-                    tracing::warn!(
-                        root = %root.display(),
-                        limit = FileId::MAX,
-                        "local data index exceeds FileId capacity; ignoring remaining files",
-                    );
-                    break;
-                };
-
-                let basename = basename.to_string();
-                files.push(IndexedLocalFile { path, size });
-                by_name
-                    .entry(LocalNameKey {
-                        parent_name,
-                        basename,
-                    })
-                    .or_default()
-                    .push(file_id);
-            }
+            let parent_name = file
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            // Bounded by the truncate above.
+            #[allow(clippy::cast_possible_truncation)]
+            let file_id = idx as FileId;
+            by_name
+                .entry(LocalNameKey {
+                    parent_name,
+                    basename: basename.to_string(),
+                })
+                .or_default()
+                .push(file_id);
         }
 
         let indexed_files = files.len();
@@ -184,6 +243,8 @@ impl LocalFileIndex {
             root = %root.display(),
             indexed_files,
             distinct_names,
+            dirs_walked = dirs_walked.load(Ordering::Relaxed),
+            elapsed_s = started.elapsed().as_secs(),
             "built local sample index"
         );
 
@@ -199,6 +260,82 @@ impl LocalFileIndex {
             verified_by_sha256: dashmap::DashMap::with_hasher(Sha256IdentityBuildHasher::default()),
             hash_cache,
         })
+    }
+
+    /// Index one directory, spawning a sibling task per subdirectory found.
+    /// Files are collected per directory and merged in one shot, so the shared
+    /// lock is taken once per directory rather than once per file.
+    ///
+    /// Symlinks are not followed: `file_type` reports them as neither dir nor
+    /// file, so they are skipped and the walk cannot cycle.
+    fn walk_dir<'scope>(
+        dir: &Path,
+        scope: &rayon::Scope<'scope>,
+        batches: &'scope Mutex<Vec<Vec<IndexedLocalFile>>>,
+        dirs_walked: &'scope AtomicUsize,
+        started: Instant,
+    ) {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), error = %e, "failed to read local data directory entry");
+                return;
+            }
+        };
+
+        let mut found: Vec<IndexedLocalFile> = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(path = %dir.display(), error = %e, "failed to enumerate local data directory entry");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            // Served from the readdir buffer's `d_type` on Linux, so this
+            // costs no syscall; only the size below needs a stat.
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to read local file type");
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                scope.spawn(move |scope| {
+                    Self::walk_dir(&path, scope, batches, dirs_walked, started);
+                });
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let size = match entry.metadata() {
+                Ok(meta) => meta.len(),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to read local file metadata");
+                    continue;
+                }
+            };
+            found.push(IndexedLocalFile { path, size });
+        }
+
+        if !found.is_empty() {
+            batches
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(found);
+        }
+
+        let walked = dirs_walked.fetch_add(1, Ordering::Relaxed) + 1;
+        if walked.is_multiple_of(Self::PROGRESS_EVERY_DIRS) {
+            tracing::info!(
+                dirs_walked = walked,
+                elapsed_s = started.elapsed().as_secs(),
+                "indexing local samples",
+            );
+        }
     }
 
     fn resolve(
@@ -282,42 +419,8 @@ impl LocalFileIndex {
         }
 
         // Index miss — the file may have been added after the index was built
-        // (e.g. newly harvested). Try the direct path on disk, verifying by
-        // SHA-256 before trusting it. For absolute paths, also try
-        // canonicalize() in case the path uses a symlinked prefix.
-        let mut disk_candidates: Vec<PathBuf> = Vec::new();
-        if requested.is_relative() {
-            disk_candidates.push(self.root.join(requested));
-        } else if requested.is_absolute() {
-            disk_candidates.push(requested.to_path_buf());
-            if let Ok(resolved) = requested.canonicalize()
-                && resolved != requested
-            {
-                disk_candidates.push(resolved);
-            }
-        }
-        let expected_size = u64::try_from(size_bytes).ok();
-        for candidate in &disk_candidates {
-            let meta = match fs::metadata(candidate) {
-                Ok(m) if m.is_file() => m,
-                _ => continue,
-            };
-            if expected_size.is_some_and(|sz| meta.len() != sz) {
-                continue;
-            }
-            if let Ok(digest) = sha256_file(candidate)
-                && digest == expected
-            {
-                tracing::info!(
-                    sha256,
-                    path = %candidate.display(),
-                    "resolved file outside index by sha256 verification",
-                );
-                return Ok(Some(candidate.clone()));
-            }
-        }
-
-        Ok(None)
+        // (e.g. newly harvested), or never have moved in the first place.
+        Ok(resolve_on_disk(&self.root, requested_path, &expected, size_bytes))
     }
 
     fn file_id_for_path(&self, path: &Path) -> Option<FileId> {
@@ -1311,12 +1414,35 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // analysis; an atomic bump is far cheaper than a String reallocation.
     let base_url: Arc<str> = Arc::from(config.hopper_url.trim_end_matches('/'));
     let data_dir = config.data_dir.clone();
-    let local_index = data_dir
-        .clone()
-        .map(LocalFileIndex::build)
-        .transpose()
-        .context("building local data index")?
-        .map(Arc::new);
+    // Built off the startup path, on its own thread. The walk scales with the
+    // corpus while hopper's liveness watchdog starts its clock the moment this
+    // process spawns — blocking here is precisely how a worker gets killed for
+    // being "wedged" before it has ever polled for work. Until the index
+    // lands, jobs resolve as if no data dir were configured: the payload is
+    // fetched from hopper, which is correct, merely slower than reading it off
+    // local disk. `OnceLock` gives the dispatch path a lock-free read of a
+    // value that is published exactly once.
+    let local_index: Arc<OnceLock<LocalFileIndex>> = Arc::new(OnceLock::new());
+    if let Some(root) = data_dir.clone() {
+        let slot = Arc::clone(&local_index);
+        std::thread::Builder::new()
+            .name("sample-index".to_string())
+            .spawn(move || match LocalFileIndex::build(root) {
+                Ok(index) => {
+                    if slot.set(index).is_err() {
+                        tracing::error!("local sample index published twice");
+                    }
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "building local sample index failed; jobs will fetch payloads from hopper",
+                ),
+            })
+            .context("spawning local sample index builder")?;
+    }
+    // Shared with every dispatched job so local resolution works from the
+    // first poll, whether or not the index has landed yet.
+    let data_root: Option<Arc<Path>> = data_dir.clone().map(Arc::<Path>::from);
     let poll_secs = config.poll_secs;
     let slow_rule_ms = config.slow_rule_ms;
     let max_jobs = config.max_jobs;
@@ -1828,7 +1954,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
         let url = Arc::clone(&base_url);
         let name = Arc::clone(&name);
-        let local_index = local_index.clone();
+        let local_index = Arc::clone(&local_index);
+        let data_root = data_root.clone();
         let completed = Arc::clone(&completed);
         let metrics = Arc::clone(&metrics);
         let spool = Arc::clone(&spool);
@@ -1837,7 +1964,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             let result = run_job(
                 &client,
                 &url,
-                local_index.as_deref(),
+                local_index.get(),
+                data_root.as_deref(),
                 &pj.job,
                 &resources,
                 slow_rule_ms,
@@ -2203,13 +2331,18 @@ async fn fetch_payload(
 }
 
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
-/// Resolves the job against the local data index if provided. If the file
-/// isn't accessible locally (or SHA256 doesn't match), downloads from hopper.
+///
+/// Resolution order for the sample bytes: the local index when it is available,
+/// otherwise `data_root` on its own via [`resolve_on_disk`], and failing both a
+/// download from hopper. The index is an optional accelerator — it finds
+/// samples whose recorded path has drifted — so its absence costs recall on
+/// moved files, never the ability to read a sample that is where it should be.
 #[allow(clippy::too_many_arguments)]
 async fn run_job(
     client: &reqwest::Client,
     base_url: &str,
     local_index: Option<&LocalFileIndex>,
+    data_root: Option<&Path>,
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
     slow_rule_ms: u64,
@@ -2233,13 +2366,24 @@ async fn run_job(
 
     // Try local file first; fall back to downloading bytes from hopper.
     // Exact-path hits are attempted first, then final-dir+basename+size lookup.
-    let local_path = match local_index {
-        Some(index) => index
+    //
+    // With no index — not built yet, or none configured — the filesystem alone
+    // still resolves every sample that sits where hopper says it does. Gating
+    // that on the index would mean downloading payloads we already have on
+    // local disk for as long as the background walk takes to finish.
+    let local_path = match (local_index, data_root) {
+        (Some(index), _) => index
             .resolve(&job.path, &job.sha256, job.size_bytes)
             .map_err(|e| e.to_string())?,
-        None => None,
+        (None, Some(root)) => {
+            let Some(expected) = sha256_from_hex(&job.sha256) else {
+                return Err(format!("expected 64-char hex sha256, got {:?}", job.sha256));
+            };
+            resolve_on_disk(root, &job.path, &expected, job.size_bytes)
+        }
+        (None, None) => None,
     };
-    let use_local = match (local_index, local_path.as_ref()) {
+    let use_local = match (data_root, local_path.as_ref()) {
         (_, Some(p)) => {
             tracing::debug!(
                 sha256 = %job.sha256,
@@ -2250,7 +2394,7 @@ async fn run_job(
             );
             true
         }
-        (Some(index), None) => {
+        (Some(root), None) => {
             let parent = Path::new(&job.path)
                 .parent()
                 .and_then(Path::file_name)
@@ -2259,12 +2403,13 @@ async fn run_job(
             tracing::warn!(
                 sha256 = %job.sha256,
                 requested_path = %job.path,
-                data_root = %index.root.display(),
+                data_root = %root.display(),
                 parent_dir = %parent,
                 basename = %label,
                 file_type = %job.file_type,
                 size = job.size_bytes,
-                "local file not found under --data after exact-path and final-dir+basename+size lookup; downloading from hopper"
+                indexed = local_index.is_some(),
+                "local file not found under --data; downloading from hopper"
             );
             false
         }
@@ -3176,6 +3321,97 @@ mod tests {
             .expect("resolve path");
 
         assert_eq!(resolved.as_deref(), Some(root.path().join(rel).as_path()));
+    }
+
+    /// The walk fans out one task per subdirectory and merges per-directory
+    /// batches at the end, so `FileId` assignment crosses both directory and
+    /// thread boundaries. Cover it with a tree wide and deep enough that the
+    /// spawns genuinely interleave.
+    #[test]
+    fn local_index_finds_every_file_in_a_deep_wide_tree() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let mut expected = Vec::new();
+        for branch in 0..8 {
+            let mut rel = PathBuf::from(format!("branch{branch}"));
+            for depth in 0..4 {
+                rel = rel.join(format!("level{depth}"));
+                let bytes = format!("sample-{branch}-{depth}").into_bytes();
+                let file = rel.join(format!("s{branch}{depth}.bin"));
+                write_file(&root.path().join(&file), &bytes);
+                expected.push((file, bytes));
+            }
+        }
+
+        let index = LocalFileIndex::build(root.path().to_path_buf()).expect("build index");
+        assert_eq!(index.files.len(), expected.len());
+
+        for (rel, bytes) in expected {
+            let resolved = index
+                .resolve(
+                    rel.to_str().expect("utf8 rel path"),
+                    &sha256_hex(&bytes),
+                    i64::try_from(bytes.len()).expect("len fits"),
+                )
+                .expect("resolve path");
+            assert_eq!(resolved.as_deref(), Some(root.path().join(&rel).as_path()));
+        }
+    }
+
+    /// The index-free path is what actually serves data — before the index has
+    /// been built, and on workers that never build one. Cover both path shapes
+    /// and confirm the digest is what gates the match, not the path.
+    #[test]
+    fn resolve_on_disk_serves_samples_without_an_index() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let rel = Path::new("good/repos/sample.bin");
+        let bytes = b"no-index-needed";
+        let stored = root.path().join(rel);
+        write_file(&stored, bytes);
+
+        let expected = sha256_from_hex(&sha256_hex(bytes)).expect("decode sha256");
+        let size = i64::try_from(bytes.len()).expect("len fits");
+
+        // Relative path, joined onto the data root.
+        assert_eq!(
+            resolve_on_disk(root.path(), rel.to_str().expect("utf8 rel"), &expected, size)
+                .as_deref(),
+            Some(stored.as_path()),
+        );
+        // Absolute path, taken as given.
+        assert_eq!(
+            resolve_on_disk(
+                root.path(),
+                stored.to_str().expect("utf8 abs"),
+                &expected,
+                size,
+            )
+            .as_deref(),
+            Some(stored.as_path()),
+        );
+        // A file whose content doesn't match the digest is never served.
+        let wrong = sha256_from_hex(&sha256_hex(b"different bytes")).expect("decode sha256");
+        assert!(
+            resolve_on_disk(root.path(), rel.to_str().expect("utf8 rel"), &wrong, size).is_none()
+        );
+    }
+
+    /// A symlinked directory must not be descended into. The serial walk got
+    /// this for free by never following links; the parallel one has to keep
+    /// that property or a cycle would spawn tasks forever.
+    #[cfg(unix)]
+    #[test]
+    fn local_index_walk_does_not_follow_directory_symlinks() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let bytes = b"only-real-file";
+        write_file(&root.path().join("real/sample.bin"), bytes);
+        // A link back to the root would cycle if the walk followed it.
+        std::os::unix::fs::symlink(root.path(), root.path().join("real/loop"))
+            .expect("create symlink");
+
+        let index = LocalFileIndex::build(root.path().to_path_buf()).expect("build index");
+
+        assert_eq!(index.files.len(), 1);
+        assert_eq!(index.files[0].path, root.path().join("real/sample.bin"));
     }
 
     #[test]
