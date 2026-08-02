@@ -2198,9 +2198,71 @@ fn record_file_result(
         Err(e) => {
             let msg = crate::tools::enrich_error(&e).unwrap_or_else(|| format!("{e:#}"));
             tracing::error!("error analyzing {}: {}", file_path.display(), msg);
+            // A failed file still gets a line on stdout under `--format json`, so a
+            // consumer reading the NDJSON sees *that* it failed and why, instead of
+            // inferring it from a record that never arrives. This does not make the
+            // failure anything other than a failure: the tally below still counts it,
+            // the process still exits 3, and nothing is handed to hopper — an error
+            // envelope carries an empty file type, which hopper reads as a delete.
+            //
+            // `raw.files` is deliberately empty, and that is load-bearing for
+            // compatibility. Readers that predate this record skip a fileless entry
+            // and report the sample as having produced no result — which is exactly
+            // right. A record carrying a file entry would instead be scored, and an
+            // absent `ml.lvl` decodes to 0 in a JSON reader that defaults its
+            // numbers, which reads as *hostile*. Keep the list empty.
+            if matches!(config.format(), OutputFormat::Json) {
+                emit_error_record(file_path, &msg, stdout);
+            }
             tally.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// The `err` section of an error record: the file that failed, and why.
+#[derive(Debug, serde::Serialize)]
+struct ErrSection<'a> {
+    path: &'a str,
+    msg: &'a str,
+    /// Scan engine build that produced this record, mirroring [`MlSectionRef::eng`]
+    /// so an error line is attributable to a build like a successful one is.
+    eng: &'static str,
+}
+
+/// An error line: `{"err": {...}, "raw": {"files": []}}`.
+///
+/// Shaped to sit in the same NDJSON stream as [`ScanResultEnvelopeRef`] without
+/// being mistaken for one. See the call site for why `raw.files` must stay empty.
+#[derive(Debug, serde::Serialize)]
+struct ErrorRecord<'a> {
+    err: ErrSection<'a>,
+    raw: EmptyRaw,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EmptyRaw {
+    files: [(); 0],
+}
+
+fn emit_error_record(file_path: &Path, msg: &str, stdout: &Mutex<std::io::Stdout>) {
+    let path = file_path.display().to_string();
+    let record = ErrorRecord {
+        err: ErrSection {
+            path: &path,
+            msg,
+            eng: ENGINE_VERSION,
+        },
+        raw: EmptyRaw { files: [] },
+    };
+    let Ok(mut out) = stdout.lock() else {
+        return;
+    };
+    if serde_json::to_writer(&mut *out, &record).is_err() {
+        // Nothing further to do: the failure is already logged to stderr and
+        // counted, and this line is the redundant copy.
+        return;
+    }
+    let _ = out.write_all(b"\n");
 }
 
 /// Renew one scan result on hopper: ensure hopper has the scanned file and any
