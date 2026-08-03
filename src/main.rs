@@ -674,6 +674,41 @@ enum Commands {
     Version,
 }
 
+/// Warn when `MALLOC_CONF` asks FreeBSD's in-libc jemalloc for a background
+/// purge thread, which permanently breaks allocation.
+///
+/// FreeBSD builds libc's jemalloc without `JEMALLOC_BACKGROUND_THREAD` (libc
+/// cannot depend on libthr), so `background_thread_boot0()` fails. It is called
+/// from `malloc_init_hard()` *after* `malloc_init_state` has been set to
+/// `malloc_init_recursible`, so init returns early and never reaches
+/// `malloc_init_initialized`. `malloc_initialized()` is then false for the life
+/// of the process: every allocation re-enters `malloc_init_hard()` and
+/// serializes on the global `init_lock`, collapsing a many-core box to roughly
+/// one allocating thread. jemalloc treats this as unsupported-not-invalid, so
+/// `abort_conf:true` does not catch it and nothing is written to stderr — the
+/// only symptom is throughput death, which is why this check exists.
+///
+/// Warn rather than fail: the setting is harmless (merely ignored) on the
+/// platforms that link the bundled jemalloc, and an operator override should
+/// never be able to refuse to boot a worker.
+fn warn_on_broken_freebsd_malloc_conf() {
+    if !cfg!(target_os = "freebsd") {
+        return;
+    }
+    let conf = std::env::var("MALLOC_CONF").unwrap_or_default();
+    // Only `background_thread:true` breaks init; an explicit `:false` is fine.
+    if !conf.contains("background_thread:true") {
+        return;
+    }
+    tracing::warn!(
+        malloc_conf = %conf,
+        "MALLOC_CONF sets background_thread:true, which FreeBSD's in-libc jemalloc does not \
+         support: malloc initialization aborts partway and every allocation then serializes on \
+         jemalloc's global init_lock. Expect near-total throughput collapse and analyses that \
+         never finish. Remove background_thread from MALLOC_CONF.",
+    );
+}
+
 fn threshold_overrides_for_model(
     threshold_suspicious: Option<f32>,
     threshold_hostile: Option<f32>,
@@ -879,6 +914,8 @@ fn main() -> Result<()> {
     if matches!(command, Commands::Validate { .. } | Commands::Worker { .. }) {
         unsafe { std::env::set_var("CLEAVE_VALIDATE_SOFT", "1") };
     }
+
+    warn_on_broken_freebsd_malloc_conf();
 
     const RAYON_FALLBACK_THREADS: usize = 4;
     let detected_cores = cleave::memory_tracker::cpu_count();

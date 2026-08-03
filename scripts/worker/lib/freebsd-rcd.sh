@@ -85,7 +85,20 @@ command="/usr/sbin/daemon"
 # under bursty analysis workloads where RSS would otherwise drift upward.
 # Set via /usr/bin/env so it survives daemon(8)'s user switch and any
 # login.conf environment filtering.
-malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true,abort_conf:true"
+#
+# Do NOT add background_thread:true here. FreeBSD's in-libc jemalloc is built
+# without JEMALLOC_BACKGROUND_THREAD (libc cannot depend on libthr), so
+# background_thread_boot0() fails — and it is called from malloc_init_hard()
+# *after* malloc_init_state has already been set to malloc_init_recursible.
+# Init then returns early and the state never reaches malloc_init_initialized,
+# so malloc_initialized() is false forever and EVERY allocation in the process
+# re-enters malloc_init_hard() and serializes on the global init_lock. It is
+# not a config error, so abort_conf:true does not catch it and nothing is
+# logged; the process just runs with a single-threaded malloc.
+# Measured on uruk-hai 2026-08-03 (128 cores, --workers 96): with the option,
+# cpu_cores_busy 14-28/128 and the worker wedged with all 96 slots occupied and
+# zero completions for 14h27m; without it, 126/128 and steady completions.
+malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,abort_conf:true"
 # -r -R 5 : supervise the worker and restart it forever (5s back-off) after
 #           any exit, so an OOM kill or panic self-heals. -P is the supervisor
 #           pidfile; \`service scan-worker stop\` signals it to tear the
