@@ -65,8 +65,11 @@ repository = "https://github.com/atomdrift-project/scan"
 # feature), so cleave doesn't pull in tikv-jemalloc-{ctl,sys}. Litmus declares
 # its own #[global_allocator] in main.rs (cfg-gated to skip illumos/Solaris/the
 # BSDs that ship jemalloc natively), so we don't need cleave's copy.
-cleave = { git = "https://github.com/atomdrift-project/cleave.git",  default-features = false }
-# cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
+# Path dep while the gauntlet startup-cost work is local; flip back to the git
+# dep once cleave's changes are pushed. (Direct path dep, not [patch] — cargo
+# silently ignores prerelease path patches.)
+#cleave = { path = "../cleave", default-features = false }
+cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 # Path dep while fletch::purl::{normalize,identity} is unpushed — scan's bloom

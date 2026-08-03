@@ -5875,6 +5875,9 @@ pub(crate) fn process_report(
         total_ms = pm.total_ms,
         "scan phases complete",
     );
+    // Engine-internal attribution (per-phase thread-time, regex store churn)
+    // for slow-scan diagnosis; one line per stat at info.
+    cleave::log_scan_stats();
 
     // Retain the raw cleave report for JSON output, and whenever uploading to
     // hopper — the renewed result must carry the full report (so hopper stores it
