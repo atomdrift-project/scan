@@ -629,9 +629,15 @@ jobs:
             # illumos build does not hit this because it forks on Linux, which
             # does overcommit. Back the reservation with swap; it is reserved,
             # not necessarily written, so this costs disk rather than time.
-            mkfile 8g /var/tmp/swapfile
-            swap -a /var/tmp/swapfile
-            swap -l
+            # Full paths: mkfile and swap live in /usr/sbin, which the
+            # prepare shell's PATH does not necessarily include — without them
+            # mkfile silently does not run and `swap -a` fails with
+            # "size is invalid" on a file that was never created. df first so a
+            # genuine disk shortage is distinguishable from that.
+            df -h /var/tmp
+            /usr/sbin/mkfile 4g /var/tmp/swapfile
+            /usr/sbin/swap -a /var/tmp/swapfile
+            /usr/sbin/swap -l
           run: |
             set -eux
             rustc --version
