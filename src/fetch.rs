@@ -568,10 +568,10 @@ fn looks_like_dropper_download_url(url: &str) -> bool {
     if authority_end == 0 {
         return false;
     }
-    let path = &rest[authority_end..]
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default();
+    let Some(path_and_suffix) = rest.get(authority_end..) else {
+        return false;
+    };
+    let path = path_and_suffix.split(['?', '#']).next().unwrap_or_default();
     let components: Vec<&str> = path
         .split('/')
         .filter(|component| !component.is_empty())

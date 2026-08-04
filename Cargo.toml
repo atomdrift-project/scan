@@ -49,7 +49,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.5.0-beta.0"
+version = "2.5.0"
 default-run = "atomscan"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable. Drives the
@@ -68,8 +68,7 @@ repository = "https://github.com/atomdrift-project/scan"
 # Path dep while the gauntlet startup-cost work is local; flip back to the git
 # dep once cleave's changes are pushed. (Direct path dep, not [patch] — cargo
 # silently ignores prerelease path patches.)
-cleave = { path = "../cleave", default-features = false }
-#cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
+cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 # Path dep while fletch::purl::{normalize,identity} is unpushed — scan's bloom
@@ -291,9 +290,3 @@ tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 
 # Add TEMPORARY local overrides below:
-
-
-# TEMPORARY (validation only): redirect every filefacts consumer to a local
-# copy of the pinned tree carrying the rizin thread-local fix. Remove after.
-[patch."https://github.com/atomdrift-project/filefacts.git"]
-filefacts = { path = "/private/tmp/claude-501/-Users-t-dev-atomdrift-scan/e6ef4f79-beda-4e4a-bf24-4f5010d7032c/scratchpad/ff-pinned" }

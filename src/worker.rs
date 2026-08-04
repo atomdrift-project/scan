@@ -420,7 +420,12 @@ impl LocalFileIndex {
 
         // Index miss — the file may have been added after the index was built
         // (e.g. newly harvested), or never have moved in the first place.
-        Ok(resolve_on_disk(&self.root, requested_path, &expected, size_bytes))
+        Ok(resolve_on_disk(
+            &self.root,
+            requested_path,
+            &expected,
+            size_bytes,
+        ))
     }
 
     fn file_id_for_path(&self, path: &Path) -> Option<FileId> {
@@ -3373,8 +3378,13 @@ mod tests {
 
         // Relative path, joined onto the data root.
         assert_eq!(
-            resolve_on_disk(root.path(), rel.to_str().expect("utf8 rel"), &expected, size)
-                .as_deref(),
+            resolve_on_disk(
+                root.path(),
+                rel.to_str().expect("utf8 rel"),
+                &expected,
+                size
+            )
+            .as_deref(),
             Some(stored.as_path()),
         );
         // Absolute path, taken as given.
