@@ -3909,7 +3909,7 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#9b739e39dd647fda62fb93f680a018662c3af705"
+source = "git+https://github.com/atomdrift-project/cleave.git#672f9405847354d265dcee5d32dd577fea92cec6"
 dependencies = [
  "flate2",
  "memchr",
