@@ -48,39 +48,60 @@
 /// is dead weight (and usually a typo), which `exceptions_apply_to_a_listed_domain`
 /// enforces.
 const THIRD_PARTY: &[&str] = &[
-    "addons.mozilla.org",        // user-submitted browser extensions
-    "apps.nextcloud.com",        // third-party Nextcloud apps
-    "aur.archlinux.org",         // Arch User Repository: unvetted PKGBUILDs
-    "build.opensuse.org",        // Open Build Service: user-built packages
-    "bugzilla.mozilla.org",      // user-attached files on bug reports
-    "cran.r-project.org",        // user-published R packages
-    "exchange.adobe.com",        // third-party Adobe plugins
-    "extensions.gnome.org",      // user-submitted Shell extensions
-    "files.slack.com",           // user-uploaded workspace files
-    "gitlab.alpinelinux.org",    // user-hosted repositories
-    "gitlab.freedesktop.org",    // user-hosted repositories
-    "gitlab.gnome.org",          // user-hosted repositories
-    "hackage.haskell.org",       // user-published Haskell packages
-    "hub.docker.com",            // user-published container images
-    "invent.kde.org",            // user-hosted repositories
-    "issues.apache.org",         // user-attached files on issues
-    "marketplace.atlassian.com", // third-party Atlassian apps
-    "marketplace.qt.io",         // third-party Qt components
-    "pear.php.net",              // user-published PHP packages
-    "pecl.php.net",              // user-published PHP extensions
-    "people.apache.org",         // committer-controlled personal directories
-    "people.debian.org",         // developer-controlled personal directories
-    "pkg.julialang.org",         // user-published Julia packages
-    "plugins.jenkins.io",        // third-party Jenkins plugins
-    "plugins.jetbrains.com",     // third-party IDE plugins
-    "proxy.golang.org",          // user-published Go modules
-    "repo.maven.apache.org",     // Maven Central: user-published artifacts
-    "splunkbase.splunk.com",     // third-party Splunk apps
-    "storage.cloud.google.com",  // Cloud Storage objects
-    "store.kde.org",             // user-submitted themes and widgets
-    "sum.golang.org",            // Go checksum database
-    "updates.jenkins.io",        // third-party Jenkins plugins
-    "upload.wikimedia.org",      // user-uploaded media
+    "addons.mozilla.org",          // user-submitted browser extensions
+    "appexchange.salesforce.com",  // third-party Salesforce applications
+    "apps.nextcloud.com",          // third-party Nextcloud apps
+    "appsource.microsoft.com",     // third-party Microsoft business applications
+    "aur.archlinux.org",           // Arch User Repository: unvetted PKGBUILDs
+    "bugs.documentfoundation.org", // user-attached files on bug reports
+    "bugs.freedesktop.org",        // user-attached files on bug reports
+    "bugs.kde.org",                // user-attached files on bug reports
+    "bugs.wireshark.org",          // user-attached files on bug reports
+    "bugzilla.kernel.org",         // user-attached files on bug reports
+    "bugzilla.mozilla.org",        // user-attached files on bug reports
+    "build.opensuse.org",          // Open Build Service: user-built packages
+    "cran.r-project.org",          // user-published R packages
+    "exchange.adobe.com",          // third-party Adobe plugins
+    "extensions.blender.org",      // user-submitted Blender extensions
+    "extensions.gnome.org",        // user-submitted Shell extensions
+    "extensions.libreoffice.org",  // user-submitted LibreOffice extensions
+    "files.slack.com",             // user-uploaded workspace files
+    "forge.puppet.com",            // user-published Puppet modules
+    "forgeapi.puppet.com",         // user-published Puppet module archives
+    "galaxy.ansible.com",          // user-published Ansible collections
+    "gitlab.alpinelinux.org",      // user-hosted repositories
+    "gitlab.freedesktop.org",      // user-hosted repositories
+    "gitlab.gnome.org",            // user-hosted repositories
+    "hackage.haskell.org",         // user-published Haskell packages
+    "hub.docker.com",              // user-published container images
+    "invent.kde.org",              // user-hosted repositories
+    "issues.apache.org",           // user-attached files on issues
+    "marketplace.atlassian.com",   // third-party Atlassian apps
+    "marketplace.eclipse.org",     // third-party Eclipse solutions
+    "marketplace.qt.io",           // third-party Qt components
+    "pear.php.net",                // user-published PHP packages
+    "pecl.php.net",                // user-published PHP extensions
+    "people.apache.org",           // committer-controlled personal directories
+    "people.debian.org",           // developer-controlled personal directories
+    "people.freebsd.org",          // committer-controlled personal directories
+    "people.freedesktop.org",      // developer-controlled personal directories
+    "people.gnome.org",            // developer-controlled personal directories
+    "pkg.julialang.org",           // user-published Julia packages
+    "play.vuejs.org",              // user-authored playgrounds
+    "plugins.jenkins.io",          // third-party Jenkins plugins
+    "plugins.jetbrains.com",       // third-party IDE plugins
+    "plugins.jquery.com",          // user-published jQuery plugins
+    "proxy.golang.org",            // user-published Go modules
+    "registry.terraform.io",       // user-published providers and modules
+    "repo.maven.apache.org",       // Maven Central: user-published artifacts
+    "savannah.gnu.org",            // project and user-hosted code repositories
+    "splunkbase.splunk.com",       // third-party Splunk apps
+    "storage.cloud.google.com",    // Cloud Storage objects
+    "store.kde.org",               // user-submitted themes and widgets
+    "sum.golang.org",              // Go checksum database
+    "supermarket.chef.io",         // user-published Chef cookbooks
+    "updates.jenkins.io",          // third-party Jenkins plugins
+    "wiki.creativecommons.org",    // user-authored pages and uploads
 ];
 
 /// Domains whose whole DNS tree is one publisher serving its own content.
@@ -96,19 +117,28 @@ const PUBLISHER: &[&str] = &[
     "3gpp.org",
     "ansi.org",
     "asyncapi.com",
+    "c2pa.org",
+    "cncf.io",
+    "commonmark.org",
+    "creativecommons.org",
     "cve.org",
+    "cyclonedx.org",
+    "dns.google",
     "dublincore.org",
     "ecma-international.org",
     "etsi.org",
     "first.org",
     "graphql.org",
+    "gtld-servers.net",
     "iana.org",
     "icann.org",
     "iec.ch",
     "ieee.org",
     "ietf.org",
+    "ipv4only.arpa",
     "iso.org",
     "itu.int",
+    "json-ld.org",
     "json-schema.org",
     "jsonapi.org",
     "khronos.org",
@@ -118,20 +148,29 @@ const PUBLISHER: &[&str] = &[
     "oauth.net",
     "omg.org",
     "openapis.org",
-    "openid.net",
+    "opencontainers.org",
     "opengroup.org",
+    "openid.net",
     "opensource.org",
+    "openssf.org",
     "owasp.org",
     "publicsuffix.org",
     "relaxng.org",
+    "resolver.arpa",
     "rfc-editor.org",
+    "root-servers.net",
     "schema.org",
     "semver.org",
+    "sigstore.dev",
+    "slsa.dev",
     "spdx.org",
     "swagger.io",
+    "toml.io",
     "unicode.org",
     "w3.org",
+    "whatwg.org",
     "xmlsoap.org",
+    "yaml.org",
     // ---- Certificate authorities: the CRL/OCSP URLs in every signature ---
     "actalis.it",
     "amazontrust.com",
@@ -150,11 +189,13 @@ const PUBLISHER: &[&str] = &[
     "godaddy.com",
     "identrust.com",
     "isrg.org",
+    "lencr.org",
     "letsencrypt.org",
     "pki.goog",
     "quovadisglobal.com",
     "rapidssl.com",
     "sectigo.com",
+    "ssl.com",
     "starfieldtech.com",
     "swisssign.com",
     "symantec.com",
@@ -163,9 +204,23 @@ const PUBLISHER: &[&str] = &[
     "usertrust.com",
     "verisign.com",
     "verisign.net",
+    // ---- Public institutions and government ------------------------------
+    "cdc.gov",
+    "epa.gov",
+    "europa.eu",
+    "fda.gov",
+    "nih.gov",
+    "state.gov",
+    "un.org",
+    "unesco.org",
+    "usda.gov",
+    "whitehouse.gov",
+    "who.int",
+    "worldbank.org",
     // ---- Operating systems and distributions ------------------------------
     "almalinux.org",
     "alpinelinux.org",
+    "android.com",
     "apple.com",
     "archlinux.org",
     "armbian.com",
@@ -203,6 +258,7 @@ const PUBLISHER: &[&str] = &[
     "raspberrypi.com",
     "raspberrypi.org",
     "reactos.org",
+    "redhat.com",
     "rockylinux.org",
     "slackware.com",
     "suse.com",
@@ -278,8 +334,8 @@ const PUBLISHER: &[&str] = &[
     "gleam.run",
     "go.dev",
     "golang.org",
-    "gradle.org",
     "graalvm.org",
+    "gradle.org",
     "groovy-lang.org",
     "haskell.org",
     "isocpp.org",
@@ -315,6 +371,23 @@ const PUBLISHER: &[&str] = &[
     "wasmtime.dev",
     "webassembly.org",
     "ziglang.org",
+    // ---- Web frameworks and developer references -------------------------
+    "ampproject.org",
+    "angular.dev",
+    "babeljs.io",
+    "dot.net",
+    "electronjs.org",
+    "eslint.org",
+    "getbootstrap.com",
+    "getcomposer.org",
+    "grpc.io",
+    "jquery.com",
+    "prettier.io",
+    "protobuf.dev",
+    "react.dev",
+    "vite.dev",
+    "vuejs.org",
+    "webpack.js.org",
     // ---- Foundations and core open-source projects ------------------------
     "apache.org",
     "blender.org",
@@ -377,7 +450,6 @@ const PUBLISHER: &[&str] = &[
     "qemu.org",
     "quad9.net",
     "samba.org",
-    "sourceware.org",
     "squid-cache.org",
     "strongswan.org",
     "sublimetext.com",
@@ -388,11 +460,11 @@ const PUBLISHER: &[&str] = &[
     "uclibc.org",
     "varnish-cache.org",
     "videolan.org",
-    "vim.org",
     "virtualbox.org",
     "webmproject.org",
     "wireguard.com",
     "wireshark.org",
+    "www.openoffice.org",
     "wxwidgets.org",
     "x.org",
     "xfce.org",
@@ -487,6 +559,7 @@ const PUBLISHER: &[&str] = &[
     "veeam.com",
     "vmware.com",
     "workday.com",
+    "www.alibabacloud.com",
     // ---- Security vendors and research ------------------------------------
     "bitdefender.com",
     "checkpoint.com",
@@ -499,8 +572,8 @@ const PUBLISHER: &[&str] = &[
     "kaspersky.com",
     "malwarebytes.com",
     "nist.gov",
-    "onelogin.com",
     "okta.com",
+    "onelogin.com",
     "paloaltonetworks.com",
     "pingidentity.com",
     "qualys.com",
@@ -531,22 +604,36 @@ const PUBLISHER: &[&str] = &[
     // ---- API providers: AI and machine learning ---------------------------
     "ai.google.dev",
     "anthropic.com",
+    "api-docs.deepseek.com",
+    "api.deepseek.com",
+    "api.moonshot.ai",
+    "api.z.ai",
     "assemblyai.com",
     "cohere.ai",
     "cohere.com",
+    "dashscope-intl.aliyuncs.com",
+    "dashscope-us.aliyuncs.com",
+    "dashscope.aliyuncs.com",
     "deepgram.com",
     "deepmind.com",
+    "docs.z.ai",
     "elevenlabs.io",
     "fireworks.ai",
+    "generativelanguage.googleapis.com",
     "groq.com",
     "langchain.com",
     "llamaindex.ai",
+    "maas.aliyuncs.com",
     "milvus.io",
     "mistral.ai",
+    "openai.azure.com",
     "openai.com",
+    "openrouter.ai",
     "perplexity.ai",
     "pinecone.io",
+    "platform.kimi.ai",
     "qdrant.tech",
+    "qianfan.baidubce.com",
     "runwayml.com",
     "stability.ai",
     "together.ai",
@@ -555,7 +642,9 @@ const PUBLISHER: &[&str] = &[
     "x.ai",
     // ---- API providers: geo, comms, payments, and data --------------------
     "alphavantage.co",
+    "api.spotify.com",
     "brevo.com",
+    "developer.spotify.com",
     "esri.com",
     "exchangerate-api.com",
     "finnhub.io",
@@ -570,7 +659,6 @@ const PUBLISHER: &[&str] = &[
     "maxmind.com",
     "nasa.gov",
     "nasdaq.com",
-    "openstreetmap.org",
     "paypal.com",
     "plaid.com",
     "polygon.io",
@@ -579,6 +667,7 @@ const PUBLISHER: &[&str] = &[
     "sendgrid.com",
     "squareup.com",
     "stripe.com",
+    "tencentcloudapi.com",
     "timeanddate.com",
     "tomtom.com",
     "twilio.com",
@@ -586,10 +675,6 @@ const PUBLISHER: &[&str] = &[
     // ---- Documentation and reference --------------------------------------
     "devdocs.io",
     "linux.die.net",
-    "stackexchange.com",
-    "stackoverflow.com",
-    "wikimedia.org",
-    "wikipedia.org",
     // ---- Reserved names that never resolve (RFC 2606, RFC 6761) -----------
     "example.com",
     "example.edu",
@@ -727,6 +812,59 @@ mod tests {
         assert!(!publisher_controlled(
             "https://addons.mozilla.org/firefox/downloads/file/1/x.xpi"
         ));
+    }
+
+    #[test]
+    fn global_publisher_and_api_domains_are_recognized() {
+        for url in [
+            "https://root-servers.net/",
+            "https://dns.google/resolve?name=example.com",
+            "https://www.who.int/health-topics/",
+            "https://www.openoffice.org/download/",
+            "https://api.spotify.com/v1/tracks/example",
+            "https://developer.spotify.com/documentation/web-api/",
+            "https://www.alibabacloud.com/help/en/model-studio/",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+            "https://workspace.ap-southeast-1.maas.aliyuncs.com/api/v1/models",
+            "https://api.deepseek.com/v1/models",
+            "https://api-docs.deepseek.com/quick_start/pricing/",
+            "https://api.z.ai/api/paas/v4/models",
+            "https://docs.z.ai/api-reference/introduction",
+            "https://api.moonshot.ai/v1/models",
+            "https://platform.kimi.ai/docs/api/overview",
+            "https://openrouter.ai/api/v1/models",
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            "https://example.openai.azure.com/openai/models",
+            "https://qianfan.baidubce.com/v2/models",
+            "https://hunyuan.tencentcloudapi.com/",
+        ] {
+            assert!(publisher_controlled(url), "not filtered: {url}");
+        }
+    }
+
+    #[test]
+    fn mixed_publishers_and_hosted_content_are_not_allowlisted() {
+        for url in [
+            "https://people.freebsd.org/~user/stage2.bin",
+            "https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/artifacts/x.tar.gz",
+            "https://supermarket.chef.io/cookbook-versions/1/download",
+            "https://forgeapi.puppet.com/v3/files/user-module-1.0.0.tar.gz",
+            "https://registry.terraform.io/v1/providers/user/provider/versions",
+            "https://extensions.blender.org/add-ons/example/",
+            "https://extensions.libreoffice.org/assets/downloads/example.oxt",
+            "https://bugzilla.kernel.org/attachment.cgi?id=1",
+            "https://bugs.documentfoundation.org/attachment.cgi?id=1",
+            "https://download.savannah.gnu.org/releases/project/stage2.tar.gz",
+            "https://wiki.creativecommons.org/images/example.bin",
+            "https://play.vuejs.org/#example",
+            "https://www.vim.org/scripts/download_script.php?src_id=1",
+            "https://en.wikipedia.org/w/index.php?title=X&action=raw",
+            "https://api.openstreetmap.org/api/0.6/changeset/1",
+            "https://stackoverflow.com/questions/1/example",
+            "https://sourceware.org/pub/example/stage2.tar.gz",
+        ] {
+            assert!(!publisher_controlled(url), "wrongly filtered: {url}");
+        }
     }
 
     #[test]
