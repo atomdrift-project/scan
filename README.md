@@ -1,79 +1,56 @@
 # Atomdrift Scan
 
-Atomdrift Scan is an embeddable open-source malware scanner, tuned for open-source ecosystems, designed to catch supply-chain attacks no matter the file format: ELF, Ruby, Python, Shell, PHP, C, Go, PE, whatever (we process 95+ different filetypes!)
+[![CI](https://github.com/atomdrift-project/scan/actions/workflows/ci.yml/badge.svg)](https://github.com/atomdrift-project/scan/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/atomdrift-project/scan)](https://github.com/atomdrift-project/scan/releases/latest)
+[![License](https://img.shields.io/github/license/atomdrift-project/scan)](LICENSE)
 
-Atomscan is designed to replace proprietary scanners such as socket.dev, ReversingLabs, and Aikido, as well as legacy open-source
-scanners such as ClamAV and malcontent. To fight fire with fire, Atomscan is based on efficient and deterministic local AI models - designed to run on any hardware or operating system. Unlike most scanners that rely on pattern mattching, it dissects each file - through active reverse engineering using tools like rizin and tree-sitter. Atomdrift decomposes each file into a tree of atoms, and from there looks for "malecule" shapes to derive probability.
+Atomdrift Scan is an open-source malware and supply-chain scanner for files,
+directories, archives, packages, URLs, and running processes. The `atomscan`
+CLI combines static analysis with local, CPU-based ML to classify code as
+**benign**, **suspicious**, or **hostile**.
 
-Unlike most scanners, Atomscan allows you to set your acceptable false-positive level, based on predicted occurrence over 100 million samples based on the specific filetype involved. Paranoid about your CI pipeline? use `atomscan -l5000 <files>`; don't want to bombard the SOC with alerts? use `atomscan -l0` (the default is L50, or 50-per-100 million).
-
-We're Apache 2.0 licensed, and in active development on the following architectures - chances are if you are on something else, it should still work (if not, PR's welcome).
-
-* Linux [x86-64]
-* macOS [arm64]
-* FreeBSD [arm64, x86-64]
-* OpenBSD [x86-64]
-* OmniOS/illumos [x86-64]
-
-Atomdrift's core values are: privacy-first, local-first, efficiency, and transparency.
+No cloud scanner, API key, GPU, or sample upload is required. Analysis and
+model inference run on your machine. Given the same input and installed
+bundles, results are deterministic and suitable for a developer workstation,
+CI gate, or self-hosted scanning service.
 
 <p align="center">
   <img src="media/screenshot.png" alt="Atomdrift Scan terminal output" width="760">
 </p>
 
-## How it works
+## Why Atomdrift Scan?
 
-Atomdrift Scan is a multi-stage analyzer bringing together the best that open-source has to offer for reverse-engineering
-binaries and source code. 
-
-Over **4.2 million rules** stand behind every scan, continuously strengthened by a self-reinforcement learning system. At its core is a YAML-based expert system of over 92,000 rules, analyzed with a large ensemble of LightGBM ML models. Atomscan also supports the use of local GPU-based analysis via OpenAI-compatible endpoints [vLLM, for example] for additional accuracy and interpretation, but that's entirely optional.
-
-```mermaid
-flowchart LR
-    IN([file · dir · process]) --> CLEAVE
-
-    subgraph CLEAVE[cleave — capability extraction]
-        direction TB
-        UPX[upx<br/>unpack]
-        TS[tree-sitter<br/>parse scripts]
-        YARA[YARA<br/>pattern match]
-        RIZIN[rizin<br/>disassemble]
-    end
-
-    CLEAVE -->|AnalysisReport<br/>92k rules → MBC + ATT&CK| FF[filefacts<br/>feature extraction]
-    FF -->|standardized<br/>feature vector| SCAN[scan<br/>ONNX inference]
-    AZOTH[(azoth<br/>GBT ensemble)] -.loads.-> SCAN
-    SCAN -->|Decision + SHAP reasons| OUT{{verdict<br/>hostile · suspicious · benign}}
-    SCAN -.->|prob ≥ gate| INTERPRET[--llm<br/>local LLM blend]
-    INTERPRET -.-> OUT
-
-    click CLEAVE "https://atomdrift.org/cleave" _blank
-    click FF "https://atomdrift.org/filefacts" _blank
-    click AZOTH "https://atomdrift.org/azoth" _blank
-    click SCAN "https://atomdrift.org/scan" _blank
-    click UPX "https://upx.github.io/" _blank
-    click TS "https://tree-sitter.github.io/tree-sitter/" _blank
-    click YARA "https://virustotal.github.io/yara-x/" _blank
-    click RIZIN "https://rizin.re/" _blank
-```
-
-## Dependencies
-
-* Rust 1.94 or higher
-* [upx](https://upx.github.io/) [optional, recommended for binary analysis]
-* [rizin](https://rizin.re/) [optional, recommended for binary reverse-analysis]
-* [innoextract](https://github.com/dscharrer/innoextract) [optional, recommended for PE archive analysis]
+- **Designed for software supply chains.** Inspect source, binaries, package
+  manifests, lockfiles, archives, and the external artifacts they reference.
+- **Broad, format-aware analysis.** Recognizes more than 100 code, package,
+  archive, document, and binary formats instead of treating every file as an
+  opaque byte stream.
+- **Private and self-hostable.** Samples are not uploaded by default; the scan
+  engine and ONNX models run locally.
+- **A policy you can tune.** Set an operating level in expected false positives
+  per 100 million benign files, rather than guessing at a generic “sensitivity.”
+- **Built for automation.** Stable exit codes, NDJSON output, an HTTP server,
+  and distributed workers cover everything from a pre-commit check to a scan
+  farm.
+- **Explainable results.** Findings include the capabilities and behaviors that
+  contributed to a verdict, not only a score.
 
 ## Install
 
-For Linux and macOS users using Homebrew:
+### Homebrew on macOS or Linux
 
 ```bash
-brew tap atomdrift/tap https://github.com/atomdrift-project/homebrew-tap.git
 brew install atomdrift/tap/scan
 ```
 
-For everyone else, source compiles are trivial:
+The Homebrew formula builds Atomdrift Scan from source and installs the
+recommended `rizin` and `upx` analysis tools. The first build can take a while
+because the Rust analysis stack is large.
+
+### Build from source
+
+Source builds require Git, Make, a C/C++ toolchain, and Rust 1.94 or newer.
+Install [Rust with rustup](https://rustup.rs/), then run:
 
 ```bash
 git clone https://github.com/atomdrift-project/scan.git
@@ -81,65 +58,179 @@ cd scan
 make install
 ```
 
-`make install` builds and installs the CLI as **`atomscan`** — a unique,
-collision-free command name (avast ships its own `/usr/bin/scan`, so `scan`
-alone isn't safe as a global command). All examples below use `atomscan`. Run
-`make uninstall` to remove it; that also cleans up any stale `scan`/`ascan`
-symlinks left by older installs.
+`make install` creates an optimized build and installs the command as
+`atomscan`, normally under `~/.cargo/bin`. Ensure that directory is on your
+`PATH`. Run `make uninstall` from the checkout to remove it.
 
-## Usage
+For deeper binary analysis, also install
+[rizin](https://rizin.re/) and [upx](https://upx.github.io/).
+[innoextract](https://github.com/dscharrer/innoextract) is optional and adds
+Inno Setup extraction.
 
-```bash
-atomscan path /bin/                     # recursive; archives unpacked
-atomscan ps                             # classify running processes
-```
+### First run
 
-By default, atomscan is tuned for 50 false-positives per 100-million files, tune it for your use case using -l <X-per-100M>. To be ultra conservative and avoid any likelihood of false-positive, use:
+Verify the installation and scan a package:
 
 ```bash
-atomscan -l 0 /sbin/sulogin            # 0-fp scan against a file
+atomscan --version
+atomscan suspicious-package.tgz
 ```
 
-If you want a second opinion for added accuracy, Atomscan supports efficiently sending evidence to a local LLM for analysis using `--llm`. It defaults to the local OpenAI-compatible endpoint at http://localhost:8000/v1 - we currently recommend vLLM with Qwen3.6-27B as a model. Models down to 9B are likely sufficient as well. LLM scores are blended against the ML scores for a final adjusted outcome.
+The first scan downloads the open model, rule, and bloom-filter bundles. Later
+scans refresh bundles when they are more than 24 hours old.
 
-## What Atomscan groks.
+## Quick start
 
-**95 file types** across binaries, source, packages, and documents — **25 platforms** from desktop OSes to network appliances. 
+```bash
+# Scan a file, directory, or archive. Directories are recursive and archives
+# are unpacked automatically.
+atomscan ./project
+atomscan release.tgz
 
-### File types
+# Fetch a package from its registry and scan it.
+atomscan purl npm/left-pad@1.3.0
+
+# Fetch and scan a URL.
+atomscan url https://example.com/download
+
+# Scan running process executables, or triage the wider host.
+atomscan ps
+atomscan sys
+
+# Emit one JSON object per scanned file.
+atomscan -f json ./project
+```
+
+A scan exits `0` when everything is benign, `1` when anything is hostile, `2`
+when something is suspicious but nothing is hostile, and `3` on analysis
+errors. This makes a basic CI gate straightforward:
+
+```bash
+atomscan ./artifact
+```
+
+### Network and privacy behavior
+
+Files are analyzed locally and are not uploaded unless you explicitly
+configure a hopper with `--hopper`. Be aware that the CLI does make outbound
+requests by default:
+
+- the first run downloads models, rules, and bloom filters;
+- stale bundles are refreshed automatically; and
+- references found in scanned files—including declared dependencies, package
+  install commands, and download URLs—are fetched and scanned recursively.
+
+After the initial bundles are installed, disable the separate release notice as
+well for a fully offline scan:
+
+```bash
+SCAN_NO_UPDATE_CHECK=1 atomscan --no-update --fetch=none ./project
+```
+
+Use `--fetch=deps`, `--fetch=packages`, or `--fetch=urls` to limit active
+reference scanning. See `atomscan --help` for depth, age, size, and count limits.
+
+## Tune the false-positive level
+
+`-l N` selects a calibrated operating point expressed as expected false
+positives per 100 million benign files. Higher levels find more but are noisier;
+lower levels are better suited to hard blocking gates.
+
+```bash
+atomscan -l 0 ./artifact       # strictest: minimize false positives
+atomscan ./artifact            # use the installed model bundle's default
+atomscan -l 5000 ./artifact    # more sensitive, with more alerts
+```
+
+Raw `--threshold-hostile` and `--threshold-suspicious` overrides are available
+for users who want to manage probability thresholds directly. They cannot be
+combined with `-l`.
+
+## How it works
+
+Atomdrift Scan uses several local analysis stages:
+
+1. [cleave](https://github.com/atomdrift-project/cleave) unpacks containers and
+   extracts capabilities from binaries and source with tools including Rizin,
+   tree-sitter, YARA, and UPX.
+2. The report is converted into a standardized feature vector.
+3. [azoth](https://github.com/atomdrift-project/azoth) ONNX model ensembles
+   select a route for the file type and produce a probability and explanation.
+4. The configured false-positive level turns that result into a benign,
+   suspicious, or hostile verdict.
+
+```mermaid
+flowchart LR
+    IN([file · directory · archive<br/>package · URL · process]) --> BLOOM{known-good /<br/>known-bad filters}
+    BLOOM -->|no decisive match| CLEAVE[cleave<br/>unpack, parse, disassemble, match]
+    CLEAVE --> FEATURES[feature vector]
+    FEATURES --> MODEL[azoth<br/>ONNX ensemble]
+    MODEL --> OUT{{benign · suspicious · hostile}}
+    BLOOM -->|decisive match| OUT
+    MODEL -. optional .-> LLM[local LLM second opinion]
+    LLM -. blended verdict .-> OUT
+```
+
+Run `atomscan version` to see the exact rule, bloom-filter, and model inventory
+installed on your machine.
+
+### Optional local LLM
+
+`--llm` sends evidence—not the original file—to an OpenAI-compatible endpoint
+for a second opinion and blends the result with the ML verdict. With no target,
+it uses `http://localhost:8000/v1`; vLLM is one compatible server.
+
+```bash
+atomscan --llm ./project
+atomscan --llm http://model-host:8000/v1 --llm-model my-model ./project
+```
+
+This feature is optional. The default scanner needs neither an LLM nor a GPU.
+
+## Coverage
+
+The scanner recognizes more than 100 file and container types. Representative
+coverage includes:
 
 | Category | Formats |
-|----------|---------|
-| **Binaries** | Mach-O, ELF, PE, Java `.class`, Python `.pyc`, BEAM |
-| **Source** | Python, JavaScript, TypeScript, Go, Rust, Java, C, C#, Ruby, PHP, Perl, Lua, Swift, Objective-C, Kotlin, Scala, Groovy, Zig, Elixir, Clojure, Shell, PowerShell, Batch, VBScript, AppleScript |
-| **Build & config** | package.json, Cargo.toml, pyproject.toml, composer.json, binding.gyp, GitHub Actions, systemd units, `.desktop`, Makefile, Dockerfile, JSON, XML |
-| **Archives** | ZIP, TAR (gz/bz2/xz/zst), 7-Zip, RAR, CAB, ASAR, gzip/bzip2/xz/zstd |
-| **Packages** | deb, rpm, APK, npm, wheel, egg, gem, crate, conda, NuGet, `.ipa`, `.crx`, `.xpi`, `.vsix`, macOS/FreeBS/Arch `.pkg` |
-| **Documents** | OLE2, OOXML, OpenDocument, PDF, RTF, Markdown, HTML, plist |
-| **Images & other** | JPEG, PNG, `.lnk`, CHM, Python pickle |
+| --- | --- |
+| **Binaries and bytecode** | Mach-O, ELF, PE, WebAssembly, Android DEX, Java `.class`, Python `.pyc`, BEAM |
+| **Source** | Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, C#, Ruby, PHP, Perl, Lua, Swift, Objective-C, Kotlin, Scala, Groovy, Zig, Elixir, Clojure, Shell, PowerShell, Batch, VBScript, AppleScript, JCL |
+| **Build, manifest, and lock files** | package.json, package-lock.json, Cargo.toml, Cargo.lock, pyproject.toml, requirements.txt, Poetry, Pipenv, Composer, Yarn, pnpm, Go modules, binding.gyp, GitHub Actions, systemd units, Makefile, Dockerfile |
+| **Archives and disk images** | ZIP, TAR, gzip, bzip2, XZ, zstd, 7-Zip, RAR, CAB, ASAR, DMG, ISO |
+| **Packages and containers** | deb, rpm, APK, npm, wheel, egg, sdist, gem, crate, conda, NuGet, IPA, CRX, XPI, VSIX, OCI/Docker images, FreeBSD, Arch, Void, and Gentoo packages |
+| **Documents and data** | OLE2, OOXML, OpenDocument, PDF, RTF, Markdown, HTML, XML, SVG, plist, JPEG, PNG, LNK, CHM, Python pickle |
 
-Binaries are automatically reverse-engineered using Rizin, Source automatically reverse-engineered using Treesitter.
+The rule set includes platform-specific behaviors for Linux, macOS, Windows,
+Android, iOS, the BSDs, AIX, Solaris, QNX, z/OS, ESXi, OpenWrt, VxWorks,
+RouterOS, FortiOS, PAN-OS, IOS-XE, Junos, NetScaler, and Ivanti appliances.
 
-### Platforms
-
-We currently have specific rules for detecting malware for the following operating systems:
-
-`Linux` · `macOS` · `Windows` · `Android` · `iOS` · `FreeBSD` · `OpenBSD` · `NetBSD` · `DragonFly BSD` · `AIX` · `Solaris` · `QNX` · `z/OS` · `ESXi` · `OpenWrt` · `VxWorks` · `RouterOS` · `FortiOS` · `PAN-OS` · `IOS-XE` · `Junos` · `NetScaler` · `Ivanti`
-
-Yes, we got creative with generating synthetic malware just to prove coverage on the more exotic language/platform combinations, just in case.
+The build matrix covers Linux, macOS, FreeBSD, OpenBSD, NetBSD, DragonFly BSD,
+and illumos across several CPU architectures. Test depth varies by target; see
+the [build workflow](.github/workflows/build.yml) for the current matrix.
 
 ## Documentation
 
-- [Integration guide](docs/INTEGRATION.md) — pick CLI, server, or worker for your volume
-- [JSON report schema](docs/JSON.md) · [Server API](docs/SERVER_API.md) · [Workers](docs/WORKERS.md)
+- [Integration guide](docs/INTEGRATION.md) — CLI, server, worker, exit codes,
+  and deployment choices
+- [JSON report schema](docs/JSON.md) — machine-readable output fields
+- [Server API](docs/SERVER_API.md) — long-running HTTP service
+- [Workers](docs/WORKERS.md) — distributed scanning with hopper
+- [Dependency behavior](docs/DEPENDENCIES.md) — fetched dependency graph and
+  provenance
 
-## Related
+## Related projects
 
-- [cleave](https://github.com/atomdrift-project/cleave) — the capability analyzer underneath
-- [azoth](https://github.com/atomdrift-project/azoth) — model weights, thresholds, and feature spec
+- [cleave](https://github.com/atomdrift-project/cleave) — capability extraction
+  and static analysis
+- [azoth](https://github.com/atomdrift-project/azoth) — model weights,
+  thresholds, and feature specification
 - [hopper](https://github.com/atomdrift-project/hopper) — distributed work queue
-- [Atomdrift Lab](https://lab.atomdrift.org/) — submit samples for free analysis
+- [Atomdrift Lab](https://lab.atomdrift.org/) — free sample analysis
+
+Issues and pull requests are welcome in the
+[GitHub repository](https://github.com/atomdrift-project/scan).
 
 ## License
 
-Apache-2.0 - because why the fuck not?
+Atomdrift Scan is available under the [Apache License 2.0](LICENSE).
