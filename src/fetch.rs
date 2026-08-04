@@ -487,6 +487,141 @@ fn shared_resources() -> Option<&'static Resources> {
         .as_ref()
 }
 
+/// URL suffixes that are normally pages, API responses, or other site
+/// resources rather than a payload a dropper would retrieve.
+const NON_PAYLOAD_URL_EXTENSIONS: &[&str] = &[
+    "asp",
+    "aspx",
+    "atom",
+    "avif",
+    "bmp",
+    "cfm",
+    "cgi",
+    "css",
+    "csv",
+    "dtd",
+    "gif",
+    "htm",
+    "html",
+    "ico",
+    "jpeg",
+    "jpg",
+    "json",
+    "log",
+    "md",
+    "pdf",
+    "php",
+    "png",
+    "rss",
+    "svg",
+    "txt",
+    "webmanifest",
+    "webp",
+    "xml",
+    "xhtml",
+    "yaml",
+    "yml",
+];
+
+/// Path components that make a URL explicitly file/download-shaped. These
+/// allow extensionless payload names and file routes on otherwise API-shaped
+/// hosts, while a bare `/download` still fails the basename check.
+const DOWNLOAD_URL_PATH_COMPONENTS: &[&str] = &[
+    "archive",
+    "archives",
+    "attachment",
+    "attachments",
+    "blob",
+    "download",
+    "downloads",
+    "file",
+    "files",
+    "raw",
+    "release",
+    "releases",
+    "resolve",
+];
+
+/// Path components that are strong signs of an API or service endpoint.
+const API_URL_PATH_COMPONENTS: &[&str] = &[
+    "api", "graphql", "health", "lookup", "metrics", "oauth", "query", "rpc", "search", "status",
+    "token",
+];
+
+/// Whether a discovered URL looks enough like a dropper download to spend a
+/// network request on it.
+///
+/// This is deliberately a shape check, not a content or reputation check:
+/// direct scans still fetch exactly what the operator names, and a URL with a
+/// plausible payload basename remains eligible even when its host is unknown.
+fn looks_like_dropper_download_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+
+    // Stop at the first path/query/fragment delimiter. A URL with no path is
+    // a site or API root, not a downloadable file.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if authority_end == 0 {
+        return false;
+    }
+    let path = &rest[authority_end..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let Some(filename) = components.last().copied() else {
+        return false;
+    };
+    if filename == "." || filename == ".." {
+        return false;
+    }
+
+    let filename_lower = filename.to_ascii_lowercase();
+    let has_dot = filename_lower.contains('.');
+    let extension = filename_lower
+        .rsplit_once('.')
+        .and_then(|(stem, extension)| {
+            (!stem.is_empty() && !extension.is_empty()).then_some(extension)
+        });
+    let has_payload_extension = extension.is_some_and(|extension| {
+        extension.len() <= 12
+            && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            && !NON_PAYLOAD_URL_EXTENSIONS.contains(&extension)
+    });
+    let explicit_download_path = components.iter().any(|component| {
+        DOWNLOAD_URL_PATH_COMPONENTS.contains(&component.to_ascii_lowercase().as_str())
+    });
+    let extensionless_download = !has_dot && explicit_download_path && components.len() >= 2;
+
+    // A basename with a plausible extension is enough; an extensionless name
+    // needs an explicit file/download route and at least one component before
+    // the basename (`/download` itself is still just an endpoint).
+    if !has_payload_extension && !extensionless_download {
+        return false;
+    }
+
+    // An API host or endpoint with a file-shaped response is still allowed
+    // when the URL says it is fetching a file. This keeps routes such as
+    // `/releases/download/...`, `/raw/...`, and Telegram-style `/file/...`
+    // eligible while dropping `/api/v1/models`, `/graphql`, and similar
+    // service calls (which already fail the basename test in most cases).
+    let api_host = hosts::host_of(url)
+        .split('.')
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case("api"));
+    let api_path = components.iter().any(|component| {
+        API_URL_PATH_COMPONENTS.contains(&component.to_ascii_lowercase().as_str())
+    });
+    !(api_host || api_path) || explicit_download_path
+}
+
 /// A fetched dependency captured for upload to hopper as its own sample. Carries
 /// the standalone analysis report cleave produced for the dependency's bytes (the
 /// same report a first-hand `pkg:`/`url` scan yields, stripped and compacted),
@@ -704,13 +839,14 @@ pub(crate) fn orchestrate(
                 let selected: Vec<Reference> = refs
                     .into_iter()
                     .filter(|r| policy.wants(r.kind))
-                    // Drop publisher-controlled URLs and the exact
-                    // documentation/update URLs observed in stock /bin
-                    // binaries. They cost a round trip each and cannot yield
-                    // a sample. Applied per hop so a payload's own
-                    // boilerplate is filtered too, and only to *discovered*
-                    // references: `scan url <url>` fetches whatever the
-                    // operator names (see `crate::hosts`).
+                    // Drop publisher-controlled URLs, obvious site/API
+                    // endpoints, and the exact documentation/update URLs
+                    // observed in stock /bin binaries. They cost a round trip
+                    // each and are unlikely to yield a dropper payload.
+                    // Applied per hop so a payload's own boilerplate is
+                    // filtered too, and only to *discovered* references:
+                    // `scan url <url>` fetches whatever the operator names
+                    // (see `crate::hosts`).
                     .filter(|r| {
                         let RefLocator::Url(url) = &r.locator else {
                             return true;
@@ -723,8 +859,17 @@ pub(crate) fn orchestrate(
                                 source = %r.source,
                                 "known boilerplate URL; fetch skipped"
                             );
+                            return false;
                         }
-                        !boilerplate
+                        if r.kind == RefKind::UrlFetch && !looks_like_dropper_download_url(url) {
+                            tracing::debug!(
+                                url = %url,
+                                source = %r.source,
+                                "URL does not look like a dropper download; fetch skipped"
+                            );
+                            return false;
+                        }
+                        true
                     })
                     // Drop native-binary dependencies built for another platform
                     // before they're ever fetched — the host variant is scanned, its
@@ -3015,6 +3160,45 @@ mod tests {
             offset: 0,
             pinned_hash: None,
             content_sha256: None,
+        }
+    }
+
+    #[test]
+    fn discovered_url_filter_keeps_download_shapes_and_drops_sites_and_endpoints() {
+        for url in [
+            "https://downloads.example.test/stage-2.sh",
+            "https://cdn.example.test/releases/download/v1/payload",
+            "https://api.telegram.org/file/bot123/documents/payload.exe",
+            "https://huggingface.co/o/m/resolve/main/payload.bin",
+            "https://example.test/archive/payload.tar.gz?sig=abc",
+            "https://example.test/payload.js",
+        ] {
+            assert!(
+                looks_like_dropper_download_url(url),
+                "download-shaped URL was rejected: {url}"
+            );
+        }
+
+        for url in [
+            "https://example.test",
+            "https://example.test/",
+            "https://example.test/docs/",
+            "https://example.test/download",
+            "https://example.test/download?file=stage.sh",
+            "https://api.example.test/v1/models",
+            "https://example.test/api/v1/query",
+            "https://example.test/graphql",
+            "https://example.test/index.html",
+            "https://example.test/result.json",
+            "https://example.test/submit.php?id=1",
+            "https://example.test/download/index.html",
+            "https://example.test/file%2Ezip",
+            "ftp://example.test/stage-2.sh",
+        ] {
+            assert!(
+                !looks_like_dropper_download_url(url),
+                "site/API-shaped URL was kept: {url}"
+            );
         }
     }
 
