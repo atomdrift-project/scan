@@ -45,6 +45,7 @@ use fletch::{RefKind, RefLocator, Reference, Registry, find};
 
 use crate::analysis_cache::AnalysisCache;
 use crate::deptree::{DepState, DepTree};
+use crate::hosts;
 
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
@@ -703,6 +704,27 @@ pub(crate) fn orchestrate(
                 let selected: Vec<Reference> = refs
                     .into_iter()
                     .filter(|r| policy.wants(r.kind))
+                    // Drop URLs whose host serves only its own publisher's
+                    // content — a license link, an XML namespace, the CRL and
+                    // OCSP endpoints every signed binary carries. They cost a
+                    // round trip each and cannot yield a sample. Applied per hop
+                    // so a payload's own boilerplate is filtered too, and only to
+                    // *discovered* references: `scan url <url>` fetches whatever
+                    // the operator names (see `crate::hosts`).
+                    .filter(|r| {
+                        let RefLocator::Url(url) = &r.locator else {
+                            return true;
+                        };
+                        let boilerplate = hosts::publisher_controlled(url);
+                        if boilerplate {
+                            tracing::debug!(
+                                url = %url,
+                                source = %r.source,
+                                "reference host serves only its own publisher's content; fetch skipped"
+                            );
+                        }
+                        !boilerplate
+                    })
                     // Drop native-binary dependencies built for another platform
                     // before they're ever fetched — the host variant is scanned, its
                     // linux/windows siblings never run here. Off unless the policy
@@ -1489,7 +1511,7 @@ fn report_fetch(rec: &FetchRecord) {
     // terminals and logs.
     let redirect = match &rec.final_url {
         Some(f) if f != &rec.resolved_url => {
-            format!("  \x1b[2m\u{2192} {}\x1b[0m", url_host(f))
+            format!("  \x1b[2m\u{2192} {}\x1b[0m", hosts::host_of(f))
         }
         _ => String::new(),
     };
@@ -1498,21 +1520,6 @@ fn report_fetch(rec: &FetchRecord) {
     eprintln!(
         "    \x1b[38;2;{r};{g};{b}m{glyph} {label:<6}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {url}{redirect}"
     );
-}
-
-/// The host of a URL — scheme, path, and query stripped — for a compact redirect
-/// note (`\u{2192} cdn.example.com`). Anything after the authority is dropped, so
-/// a signed CDN URL's SAS token / JWT never reaches the line.
-fn url_host(url: &str) -> &str {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    // Keep `host[:port]`, dropping any `userinfo@` prefix.
-    authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host)
 }
 
 /// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
@@ -2755,24 +2762,6 @@ mod tests {
             deprecated: Some("use v2 instead".to_string()),
             ..Registry::default()
         }));
-    }
-
-    #[test]
-    fn url_host_strips_scheme_path_and_query() {
-        // A signed release-asset redirect: only the host survives, the SAS
-        // token / JWT query never reaches the line.
-        assert_eq!(
-            url_host("https://release-assets.githubusercontent.com/x/y?sig=abc&jwt=xyz"),
-            "release-assets.githubusercontent.com"
-        );
-        assert_eq!(url_host("https://example.com"), "example.com");
-        // `userinfo@` is dropped; `host:port` is kept.
-        assert_eq!(
-            url_host("http://user:pass@host.test:8080/x"),
-            "host.test:8080"
-        );
-        // Not a URL: returned as-is.
-        assert_eq!(url_host("bareword"), "bareword");
     }
 
     #[test]

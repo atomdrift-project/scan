@@ -42,6 +42,7 @@ pub mod engine;
 pub mod explain;
 pub mod features;
 pub mod fetch;
+pub mod hosts;
 pub mod inflight;
 pub mod interpret;
 pub mod model;

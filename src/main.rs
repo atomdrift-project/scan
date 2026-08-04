@@ -49,10 +49,22 @@ mod jemalloc_conf {
     // never mutated, so sharing it across threads is sound.
     unsafe impl Sync for SyncPtr {}
 
+    /// jemalloc only compiles `JEMALLOC_BACKGROUND_THREAD` for non-Mach-O ABIs
+    /// (`configure.ac`: `abi != macho`), so on Apple targets `have_background_thread`
+    /// is false and `background_thread_boot0` answers a request for one by
+    /// writing `<jemalloc>: option background_thread currently supports pthread
+    /// only` to stderr — before `main`, above every scan, and impossible to
+    /// suppress from Rust. Ask only where the purger exists; the arena and decay
+    /// tuning is the same either way.
+    #[cfg(target_vendor = "apple")]
+    const CONF: &std::ffi::CStr = c"narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0";
+    #[cfg(not(target_vendor = "apple"))]
+    const CONF: &std::ffi::CStr =
+        c"narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true";
+
     #[allow(non_upper_case_globals)]
     #[unsafe(no_mangle)]
-    static _rjem_malloc_conf: SyncPtr =
-        SyncPtr(c"narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true".as_ptr());
+    static _rjem_malloc_conf: SyncPtr = SyncPtr(CONF.as_ptr());
 }
 
 use anyhow::{Context, Result};
@@ -2046,8 +2058,14 @@ mod tests {
 
     #[test]
     fn url_and_purl_accept_hopper_flag() -> Result<()> {
-        let cli = Cli::try_parse_from(["scan", "url", "https://h/f.tgz", "--hopper", "http://x:8081"])
-            .context("parse should work")?;
+        let cli = Cli::try_parse_from([
+            "scan",
+            "url",
+            "https://h/f.tgz",
+            "--hopper",
+            "http://x:8081",
+        ])
+        .context("parse should work")?;
         match cli.command.context("url subcommand expected")? {
             Commands::Url { url, hopper } => {
                 assert_eq!(url, "https://h/f.tgz");
@@ -2055,8 +2073,9 @@ mod tests {
             }
             other => anyhow::bail!("unexpected command: {other:?}"),
         }
-        let cli = Cli::try_parse_from(["scan", "purl", "npm/left-pad", "--upload", "http://x:8081"])
-            .context("parse should work")?;
+        let cli =
+            Cli::try_parse_from(["scan", "purl", "npm/left-pad", "--upload", "http://x:8081"])
+                .context("parse should work")?;
         match cli.command.context("purl subcommand expected")? {
             Commands::Purl { hopper, .. } => {
                 assert_eq!(hopper.as_deref(), Some("http://x:8081"));
