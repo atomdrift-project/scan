@@ -704,23 +704,24 @@ pub(crate) fn orchestrate(
                 let selected: Vec<Reference> = refs
                     .into_iter()
                     .filter(|r| policy.wants(r.kind))
-                    // Drop URLs whose host serves only its own publisher's
-                    // content — a license link, an XML namespace, the CRL and
-                    // OCSP endpoints every signed binary carries. They cost a
-                    // round trip each and cannot yield a sample. Applied per hop
-                    // so a payload's own boilerplate is filtered too, and only to
-                    // *discovered* references: `scan url <url>` fetches whatever
-                    // the operator names (see `crate::hosts`).
+                    // Drop publisher-controlled URLs and the exact
+                    // documentation/update URLs observed in stock /bin
+                    // binaries. They cost a round trip each and cannot yield
+                    // a sample. Applied per hop so a payload's own
+                    // boilerplate is filtered too, and only to *discovered*
+                    // references: `scan url <url>` fetches whatever the
+                    // operator names (see `crate::hosts`).
                     .filter(|r| {
                         let RefLocator::Url(url) = &r.locator else {
                             return true;
                         };
-                        let boilerplate = hosts::publisher_controlled(url);
+                        let boilerplate = hosts::publisher_controlled(url)
+                            || hosts::discovery_exception(url);
                         if boilerplate {
                             tracing::debug!(
                                 url = %url,
                                 source = %r.source,
-                                "reference host serves only its own publisher's content; fetch skipped"
+                                "known boilerplate URL; fetch skipped"
                             );
                         }
                         !boilerplate
