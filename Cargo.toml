@@ -68,8 +68,8 @@ repository = "https://github.com/atomdrift-project/scan"
 # Path dep while the gauntlet startup-cost work is local; flip back to the git
 # dep once cleave's changes are pushed. (Direct path dep, not [patch] — cargo
 # silently ignores prerelease path patches.)
-#cleave = { path = "../cleave", default-features = false }
-cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
+cleave = { path = "../cleave", default-features = false }
+#cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 # Path dep while fletch::purl::{normalize,identity} is unpushed — scan's bloom
@@ -286,17 +286,14 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
 
-# Cleave still names the former Codeberg remotes, while Scan and Fletch consume
-# the GitHub remotes. Patch those source identities to the same current crates
-# so report facts have one concrete type throughout the dependency graph.
-[patch."https://codeberg.org/atomdrift/filefacts.git"]
-filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
-
-[patch."https://codeberg.org/atomdrift/stng.git"]
-stng = { git = "https://github.com/atomdrift-project/stng.git" }
 
 [patch."https://github.com/tstromberg/dmgwiz.git"]
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 
 # Add TEMPORARY local overrides below:
 
+
+# TEMPORARY (validation only): redirect every filefacts consumer to a local
+# copy of the pinned tree carrying the rizin thread-local fix. Remove after.
+[patch."https://github.com/atomdrift-project/filefacts.git"]
+filefacts = { path = "/private/tmp/claude-501/-Users-t-dev-atomdrift-scan/e6ef4f79-beda-4e4a-bf24-4f5010d7032c/scratchpad/ff-pinned" }
