@@ -185,6 +185,9 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 1800 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user | tr -d '"')"
+          echo "ORIGINAL_DEFAULT_KEYCHAIN=$ORIGINAL_DEFAULT_KEYCHAIN" >> "$GITHUB_ENV"
+          security default-keychain -d user -s "$KEYCHAIN"
 
           # The current certificate uses Apple's Developer ID G1
           # intermediate. Import its pinned public certificate explicitly;
@@ -224,6 +227,7 @@ jobs:
           # argument — and the paths come from `security` itself, not us.
           # shellcheck disable=SC2046
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security find-identity -p codesigning "$KEYCHAIN" || true
       # Hardened runtime is mandatory for notarization, and hardened runtime
       # blocks JIT by default — which would kill us, because yara-x runs its
       # compiled rules through wasmtime/cranelift at load time. Hence the
@@ -270,6 +274,9 @@ jobs:
         if: ${{ always() && runner.os == 'macOS' && inputs.sign }}
         run: |
           set -eu
+          if [ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
+            security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" || true
+          fi
           if [ -n "${SIGNING_KEYCHAIN:-}" ]; then
             security delete-keychain "$SIGNING_KEYCHAIN" || true
           fi

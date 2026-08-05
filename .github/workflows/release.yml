@@ -206,6 +206,9 @@ jobs:
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 900 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
+          original_default_keychain="$(security default-keychain -d user | tr -d '"')"
+          echo "PREFLIGHT_DEFAULT_KEYCHAIN=$original_default_keychain" >> "$GITHUB_ENV"
+          security default-keychain -d user -s "$keychain"
 
           # This identity was issued by Apple's Developer ID G1 intermediate,
           # which current clean runners do not necessarily carry. Fetch the
@@ -241,6 +244,7 @@ jobs:
           # and private key from our temporary keychain.
           # shellcheck disable=SC2046
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security find-identity -p codesigning "$keychain" || true
 
           cp /usr/bin/true "$probe"
           codesign --force --timestamp --options runtime \
@@ -258,6 +262,9 @@ jobs:
         if: ${{ always() }}
         shell: bash
         run: |
+          if [ -n "${PREFLIGHT_DEFAULT_KEYCHAIN:-}" ]; then
+            security default-keychain -d user -s "$PREFLIGHT_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+          fi
           security delete-keychain "$RUNNER_TEMP/atomdrift-signing-preflight.keychain-db" >/dev/null 2>&1 || true
           rm -f \
             "$RUNNER_TEMP/atomdrift-signing-preflight.p12" \
