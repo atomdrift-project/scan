@@ -174,7 +174,6 @@ jobs:
         env:
           CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
           NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
           NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
@@ -189,7 +188,6 @@ jobs:
           }
           require_secret MACOS_CERT_P12 "$CERT_P12"
           require_secret MACOS_CERT_PASSWORD "$CERT_PASSWORD"
-          require_secret MACOS_SIGN_IDENTITY "$SIGN_IDENTITY"
           require_secret MACOS_NOTARY_KEY "$NOTARY_KEY"
           require_secret MACOS_NOTARY_KEY_ID "$NOTARY_KEY_ID"
           require_secret MACOS_NOTARY_ISSUER "$NOTARY_ISSUER"
@@ -232,11 +230,17 @@ jobs:
           # shellcheck disable=SC2046
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
 
-          # The selector may be either a certificate name or SHA-1 hash. Let
-          # codesign resolve it and provide the authoritative diagnostic.
+          sign_identity="$(security find-certificate \
+            -c "Developer ID Application:" -Z "$keychain" | \
+            awk '/SHA-1 hash:/ { print $3; exit }')"
+          if [ -z "$sign_identity" ]; then
+            echo "::error::The .p12 does not contain a Developer ID Application certificate"
+            exit 1
+          fi
+
           cp /usr/bin/true "$probe"
           codesign --force --timestamp --options runtime \
-            --keychain "$keychain" --sign "$SIGN_IDENTITY" "$probe"
+            --keychain "$keychain" --sign "$sign_identity" "$probe"
           codesign --verify --strict --verbose=2 "$probe"
           codesign --display --verbose=2 "$probe"
 
@@ -280,11 +284,10 @@ jobs:
       sign: true
       notarize: true
     # Explicit, not `secrets: inherit` — the called workflow gets exactly these
-    # six and nothing else.
+    # five and nothing else.
     secrets:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
       MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
       MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
       MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}

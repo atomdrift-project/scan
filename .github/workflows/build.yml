@@ -32,8 +32,7 @@ on:
       sign:
         description: >-
           Sign the macOS binaries with the Developer ID identity. Requires the
-          MACOS_CERT_* and MACOS_SIGN_IDENTITY secrets; falls back to an ad-hoc
-          signature when false.
+          MACOS_CERT_* secrets; falls back to an ad-hoc signature when false.
         type: boolean
         default: false
       notarize:
@@ -51,9 +50,6 @@ on:
         required: false
       MACOS_CERT_PASSWORD:
         description: Password the .p12 was exported with.
-        required: false
-      MACOS_SIGN_IDENTITY:
-        description: 'Identity to sign with, e.g. "Developer ID Application: Name (TEAMID)".'
         required: false
       MACOS_NOTARY_KEY:
         description: Base64-encoded App Store Connect API key (.p8).
@@ -205,6 +201,15 @@ jobs:
           printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
             -T /usr/bin/codesign -T /usr/bin/security
+
+          SIGNING_IDENTITY="$(security find-certificate \
+            -c "Developer ID Application:" -Z "$KEYCHAIN" | \
+            awk '/SHA-1 hash:/ { print $3; exit }')"
+          if [ -z "$SIGNING_IDENTITY" ]; then
+            echo "::error::The .p12 does not contain a Developer ID Application certificate"
+            exit 1
+          fi
+          echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
           rm -f "$RUNNER_TEMP/cert.p12" "$INTERMEDIATE"
 
           # Without this, codesign blocks on an interactive keychain prompt.
@@ -222,7 +227,6 @@ jobs:
       - name: Sign with Developer ID
         if: ${{ runner.os == 'macOS' && inputs.sign }}
         env:
-          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
         run: |
@@ -231,7 +235,7 @@ jobs:
           codesign --force --timestamp --options runtime \
             --entitlements .github/macos-entitlements.plist \
             --keychain "$SIGNING_KEYCHAIN" \
-            --sign "$IDENTITY" "$BIN"
+            --sign "$SIGNING_IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
           codesign --display --entitlements - "$BIN"
 
