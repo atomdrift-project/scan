@@ -180,7 +180,8 @@ jobs:
           KEYCHAIN="$RUNNER_TEMP/atomdrift-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           echo "SIGNING_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
-          INTERMEDIATE="$RUNNER_TEMP/DeveloperIDCA.cer"
+          INTERMEDIATE_G1="$RUNNER_TEMP/DeveloperIDCA-G1.cer"
+          INTERMEDIATE_G2="$RUNNER_TEMP/DeveloperIDCA-G2.cer"
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 1800 "$KEYCHAIN"
@@ -189,15 +190,23 @@ jobs:
           echo "ORIGINAL_DEFAULT_KEYCHAIN=$ORIGINAL_DEFAULT_KEYCHAIN" >> "$GITHUB_ENV"
           security default-keychain -d user -s "$KEYCHAIN"
 
-          # The current certificate uses Apple's Developer ID G1
-          # intermediate. Import its pinned public certificate explicitly;
-          # clean current runners may no longer have this 2027 chain cached.
+          # Import both Apple Developer ID intermediates so certificate
+          # rotation between the legacy G1 and current G2 chains is painless.
+          # Pin the exact DER bytes because these files affect release trust.
           curl --fail --silent --show-error --location \
             https://www.apple.com/certificateauthority/DeveloperIDCA.cer \
-            --output "$INTERMEDIATE"
-          INTERMEDIATE_SHA="$(shasum -a 256 "$INTERMEDIATE" | awk '{print $1}')"
-          if [ "$INTERMEDIATE_SHA" != 7afc9d01a62f03a2de9637936d4afe68090d2de18d03f29c88cfb0b1ba63587f ]; then
+            --output "$INTERMEDIATE_G1"
+          curl --fail --silent --show-error --location \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
+            --output "$INTERMEDIATE_G2"
+          INTERMEDIATE_G1_SHA="$(shasum -a 256 "$INTERMEDIATE_G1" | awk '{print $1}')"
+          INTERMEDIATE_G2_SHA="$(shasum -a 256 "$INTERMEDIATE_G2" | awk '{print $1}')"
+          if [ "$INTERMEDIATE_G1_SHA" != 7afc9d01a62f03a2de9637936d4afe68090d2de18d03f29c88cfb0b1ba63587f ]; then
             echo "::error::Apple Developer ID G1 intermediate checksum mismatch"
+            exit 1
+          fi
+          if [ "$INTERMEDIATE_G2_SHA" != f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a ]; then
+            echo "::error::Apple Developer ID G2 intermediate checksum mismatch"
             exit 1
           fi
           printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
@@ -216,8 +225,9 @@ jobs:
           fi
           echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
 
-          security import "$INTERMEDIATE" -k "$KEYCHAIN"
-          rm -f "$RUNNER_TEMP/cert.p12" "$INTERMEDIATE"
+          security import "$INTERMEDIATE_G1" -k "$KEYCHAIN"
+          security import "$INTERMEDIATE_G2" -k "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/cert.p12" "$INTERMEDIATE_G1" "$INTERMEDIATE_G2"
 
           # Without this, codesign blocks on an interactive keychain prompt.
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
@@ -282,7 +292,8 @@ jobs:
           fi
           rm -f \
             "$RUNNER_TEMP/cert.p12" \
-            "$RUNNER_TEMP/DeveloperIDCA.cer" \
+            "$RUNNER_TEMP/DeveloperIDCA-G1.cer" \
+            "$RUNNER_TEMP/DeveloperIDCA-G2.cer" \
             "$RUNNER_TEMP/notary.p8" \
             "$RUNNER_TEMP/atomscan.zip"
       # ------------------------------------------------------------------------
