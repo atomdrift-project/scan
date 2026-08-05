@@ -8,10 +8,16 @@
 # targets rather than globally — the musl, illumos and riscv64gc images compile
 # the same file without it, and there is no reason to perturb builds that work.
 #
-# cc-rs only applies CXXFLAGS to C++ compilation, so this cannot leak into the
+# cc-rs only applies CXXFLAGS to C++ compilation, so these cannot leak into the
 # C sources in the same crates.
+#
+# illumos hides the LE_16/BE_16 macros from <sys/byteorder.h> in strict C99
+# mode unless extensions are enabled. tree-sitter's portable endian header
+# uses those macros, so enable the illumos extension namespace for that target
+# rather than allowing the unresolved macro calls to reach the linker.
 [build.env]
 passthrough = [
     "CXXFLAGS_s390x_unknown_linux_gnu",
     "CXXFLAGS_powerpc64le_unknown_linux_gnu",
+    "CFLAGS_x86_64_unknown_illumos",
 ]

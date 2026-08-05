@@ -568,6 +568,15 @@ jobs:
             gzip -dc "${TARBALL}" | tar xf -
             "./rust-${RUST_VERSION}-x86_64-pc-solaris/install.sh" --prefix=/usr/local --disable-ldconfig
             rm -rf "rust-${RUST_VERSION}-x86_64-pc-solaris" "${TARBALL}"
+            # Solaris, like illumos, reserves backing store for the full
+            # address space of both processes during fork(). The final fat-LTO
+            # rustc process is large enough that spawning gcc otherwise fails
+            # with ENOMEM. The VM image has a 199G rpool, so give the fork a
+            # dedicated ZFS-backed swap volume.
+            /usr/sbin/zpool list rpool
+            /usr/sbin/zfs create -V 32G rpool/ci-swap
+            /usr/sbin/swap -a /dev/zvol/dsk/rpool/ci-swap
+            /usr/sbin/swap -l
           run: |
             set -eux
             PATH="/usr/local/bin:$PATH"
@@ -646,9 +655,11 @@ jobs:
             # The root filesystem (including /var/tmp) is ZFS, which does not
             # support regular files as swap. A mkfile-created swapfile fails
             # with "size is invalid". Add a ZFS volume instead; the image's
-            # root pool is named rpool.
+            # root pool is named rpool. The earlier 4G volume was still too
+            # small for the final fat-LTO rustc process in release run
+            # 30966163861, while the image reports 194G free in rpool.
             /usr/sbin/zpool list rpool
-            /usr/sbin/zfs create -V 4G rpool/ci-swap
+            /usr/sbin/zfs create -V 32G rpool/ci-swap
             /usr/sbin/swap -a /dev/zvol/dsk/rpool/ci-swap
             /usr/sbin/swap -l
           run: |
@@ -685,23 +696,16 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Deliberately expected to fail — this job exists to produce a log, not an
-  # artifact. src/ has zero cfg(windows) arms against 10 cfg(unix) ones, libc
-  # and backtrace are [target.'cfg(unix)'.dependencies], and the dep graph is
-  # unproven on MSVC (unrar_sys is C++, aws-lc-sys wants nasm, proclist does
-  # process enumeration). Read the first error, fix or file it, repeat. Nothing
-  # speculative is installed here: a fix-it-in-advance step would just move the
-  # failure somewhere less informative.
-  #
-  # `shell: bash` throughout because every other run block in this file is sh,
-  # and git bash ships on the Windows image.
+  # Native Windows release artifact, including execution smoke tests. The full
+  # MSVC build first went green in release run 30966163861, so this is now a
+  # required target rather than a diagnostic. `shell: bash` throughout because
+  # every other run block in this file is sh, and git bash ships on the image.
   windows:
     name: x86_64-pc-windows-msvc
     runs-on: windows-2022
     timeout-minutes: 150
     permissions:
       contents: read
-    continue-on-error: true
     defaults:
       run:
         shell: bash
@@ -840,14 +844,26 @@ jobs:
         run: |
           command -v cross >/dev/null || cargo install cross --locked --version 0.2.5
 
-      # See Cross.toml for why these two targets need -include cstddef and why
-      # it is scoped rather than global. Cross.toml passes them through.
+      # A manually dispatched release can intentionally build an older tag
+      # with the current workflow. Supply newly required build settings even
+      # when that tag's Cross.toml predates them.
+      - name: Prepare cross compatibility config
+        run: |
+          if ! grep -q 'CFLAGS_x86_64_unknown_illumos' Cross.toml; then
+            cp Cross.toml "$RUNNER_TEMP/atomscan-cross.toml"
+            sed -i '/^]$/i\    "CFLAGS_x86_64_unknown_illumos",' "$RUNNER_TEMP/atomscan-cross.toml"
+            echo "CROSS_CONFIG=$RUNNER_TEMP/atomscan-cross.toml" >> "$GITHUB_ENV"
+          fi
+
+      # See Cross.toml for why these targets need compiler flags and why each
+      # is scoped rather than global. Cross.toml passes them through.
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
           CXXFLAGS_s390x_unknown_linux_gnu: "-include cstddef"
           CXXFLAGS_powerpc64le_unknown_linux_gnu: "-include cstddef"
+          CFLAGS_x86_64_unknown_illumos: "-D__EXTENSIONS__"
         run: cross build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
 
       - name: Inspect
