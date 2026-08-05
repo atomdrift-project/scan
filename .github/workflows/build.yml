@@ -597,6 +597,9 @@ jobs:
             rustc --version
             # /tmp is swap-backed tmpfs on Solaris, same as illumos.
             export CARGO_TARGET_DIR=/var/tmp/target
+            # unrar_sys builds C++, but cc-rs cannot infer Solaris's C++
+            # standard library from the target name. Tell it to link libstdc++.
+            export CXXSTDLIB=stdc++
             cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
             "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" --version
             cp "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" ./atomscan
