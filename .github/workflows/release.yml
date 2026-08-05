@@ -232,15 +232,8 @@ jobs:
           # shellcheck disable=SC2046
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
 
-          # `security find-identity -v` can reject an otherwise usable identity
-          # while evaluating trust, obscuring the useful codesign diagnostic.
-          # First confirm the requested leaf exists, then make codesign prove
-          # that its private key and certificate chain are actually usable.
-          security find-certificate -c "$SIGN_IDENTITY" "$keychain" >/dev/null || {
-            echo "::error::MACOS_SIGN_IDENTITY does not match a certificate in the imported .p12"
-            exit 1
-          }
-
+          # The selector may be either a certificate name or SHA-1 hash. Let
+          # codesign resolve it and provide the authoritative diagnostic.
           cp /usr/bin/true "$probe"
           codesign --force --timestamp --options runtime \
             --keychain "$keychain" --sign "$SIGN_IDENTITY" "$probe"
