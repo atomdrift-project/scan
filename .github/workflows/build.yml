@@ -571,9 +571,14 @@ jobs:
           usesh: true
           envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
           prepare: |
-            pkgman install -y rust_bin cmake git
+            # R1/beta5 ships OpenSSL 3.0, while Cargo in rust_bin 1.94.1 was
+            # linked against SSL_get0_group_name@OPENSSL_3.2.0. rust_bin's
+            # dependency only says libssl >= 3, so package resolution does not
+            # otherwise upgrade the satisfied-but-too-old base library.
+            pkgman install -y openssl3 rust_bin cmake git
           run: |
             set -eux
+            openssl version
             rustc --version --verbose
             cargo --version --verbose
             df -h . /tmp

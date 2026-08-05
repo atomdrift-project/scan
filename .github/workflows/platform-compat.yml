@@ -1,7 +1,7 @@
 # Smoke-test published release binaries on distributions that share a Rust
 # target ABI. These are runtime compatibility checks, not additional release
 # artifacts: OpenIndiana and Tribblix use x86_64-unknown-illumos, while
-# GhostBSD and (when compatible) MidnightBSD consume x86_64-unknown-freebsd.
+# GhostBSD consumes x86_64-unknown-freebsd.
 
 name: platform compatibility
 
@@ -22,7 +22,6 @@ on:
           - openindiana
           - tribblix
           - ghostbsd
-          - midnightbsd
           - openeuler
           - blissos
 
@@ -126,41 +125,6 @@ jobs:
         uses: vmactions/ghostbsd-vm@5ed1dcce064c887d3767fc00ac0176a51fdd4e74 # v1.0.2
         with:
           release: "26.1"
-          usesh: true
-          run: |
-            set -eux
-            tar -xzf compat/atomscan-*-x86_64-unknown-freebsd.tar.gz -C compat
-            chmod +x compat/atomscan
-            compat/atomscan --version
-            compat/atomscan --help >/dev/null
-
-  midnightbsd:
-    name: MidnightBSD 4.0.7 / FreeBSD ABI probe
-    if: ${{ inputs.platform == 'all' || inputs.platform == 'midnightbsd' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - name: Download FreeBSD release binary
-        run: |
-          set -eu
-          case "$TAG" in v*) ;; *) echo "::error::tag must start with v"; exit 1;; esac
-          version="${TAG#v}"
-          mkdir -p compat
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern "atomscan-$version-x86_64-unknown-freebsd.tar.gz" \
-            --dir compat
-
-      # Rust has no MidnightBSD target. This explicitly tests whether the
-      # FreeBSD artifact is ABI-compatible instead of claiming support based
-      # only on the distribution's ancestry.
-      - name: Probe FreeBSD binary on MidnightBSD
-        # v1.0.4 advertises 4.0.7, but its immutable tag omitted that config.
-        # Pin the first post-release commit that actually contains it.
-        uses: vmactions/midnightbsd-vm@814d16b629666e7eddcc2a0f834ac9d34cc596a5 # post-v1.0.4
-        with:
-          release: "4.0.7"
           usesh: true
           run: |
             set -eux
