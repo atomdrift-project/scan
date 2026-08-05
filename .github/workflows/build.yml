@@ -10,6 +10,13 @@ name: build
 on:
   workflow_call:
     inputs:
+      ref:
+        description: >-
+          Git ref to check out. Empty uses the caller's commit; release recovery
+          can supply an existing tag while using the repaired workflow from the
+          default branch.
+        type: string
+        default: ""
       profile:
         description: >-
           Cargo profile: `release` (thin LTO, everyday CI) or `release-lto`
@@ -97,6 +104,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       # 708 crates, a ~139 MB binary, and several C deps: the stock runner
       # image leaves ~25 GB free on / and this build will use a good chunk.
@@ -287,6 +295,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in FreeBSD VM
         uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
@@ -360,6 +369,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in OpenBSD VM
         uses: vmactions/openbsd-vm@c941015845c0f0c429676840963dc63b226d4f69 # v1.4.5
@@ -428,6 +438,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in NetBSD VM
         uses: vmactions/netbsd-vm@e7ac71b97abbe8437cec8859a5acf72dfa6a8be0 # v1.4.5
@@ -481,6 +492,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in DragonFlyBSD VM
         uses: vmactions/dragonflybsd-vm@bc8ccbaa091ce3624c93f2dc328ae48129b07580 # v1.3.1
@@ -533,6 +545,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in Solaris VM
         uses: vmactions/solaris-vm@315163f088b66e55bbcc45928bd224d4973b2312 # v1.3.8
@@ -595,6 +608,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in OmniOS VM
         uses: vmactions/omnios-vm@027e3ec08fed6fb740ab5f300c2605f9de02997a # v1.3.4
@@ -629,14 +643,13 @@ jobs:
             # illumos build does not hit this because it forks on Linux, which
             # does overcommit. Back the reservation with swap; it is reserved,
             # not necessarily written, so this costs disk rather than time.
-            # Full paths: mkfile and swap live in /usr/sbin, which the
-            # prepare shell's PATH does not necessarily include — without them
-            # mkfile silently does not run and `swap -a` fails with
-            # "size is invalid" on a file that was never created. df first so a
-            # genuine disk shortage is distinguishable from that.
-            df -h /var/tmp
-            /usr/sbin/mkfile 4g /var/tmp/swapfile
-            /usr/sbin/swap -a /var/tmp/swapfile
+            # The root filesystem (including /var/tmp) is ZFS, which does not
+            # support regular files as swap. A mkfile-created swapfile fails
+            # with "size is invalid". Add a ZFS volume instead; the image's
+            # root pool is named rpool.
+            /usr/sbin/zpool list rpool
+            /usr/sbin/zfs create -V 4G rpool/ci-swap
+            /usr/sbin/swap -a /dev/zvol/dsk/rpool/ci-swap
             /usr/sbin/swap -l
           run: |
             set -eux
@@ -696,6 +709,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install target
         run: |
@@ -799,6 +813,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Reclaim runner disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL

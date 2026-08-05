@@ -8,14 +8,18 @@
 #
 #     gh workflow run release.yml --ref my-branch
 #
+# To build and publish an existing tag with the latest workflow definition:
+#
+#     gh workflow run release.yml --ref main -f tag=v2.5.0 -f publish=true
+#
 # A dry run does everything a real one does — fat-LTO builds, whatever signing
 # the inputs below ask for, packaging, checksums — and stops short of attesting
 # or creating the release, leaving the assembled set as a downloadable artifact.
 # That matters because the release-only surface (the `release-lto` profile, the
 # signing path, this file's packaging steps) is precisely what ci.yml never
-# exercises, so it is where the failures live. Note that `workflow_dispatch`
-# reads the workflow definition from the ref you dispatch: fixes have to be on
-# that branch, not just on main.
+# exercises, so it is where the failures live. `workflow_dispatch` reads the
+# workflow definition from the ref you dispatch. The optional `tag` input lets
+# a repaired definition on main check out and publish an older tagged tree.
 #
 # This workflow is deliberately separate from ci.yml because it is the only one
 # holding dangerous permissions — `contents: write` to publish, `id-token` and
@@ -35,17 +39,26 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
+      tag:
+        description: >-
+          Existing v* tag to build. This recovery path lets a repaired workflow
+          on the default branch publish artifacts for a release whose tag
+          already exists.
+        type: string
+        default: ""
       publish:
         description: >-
-          Create the GitHub release. Off (the default) is a dry run. Requires a
-          tag ref; a tag push always publishes without needing this.
+          Create or populate the GitHub release. Off (the default) is a dry run.
+          Requires a tag ref or the tag input; a tag push always publishes.
         type: boolean
         default: false
 
 permissions: {}
 
 concurrency:
-  group: release-${{ github.ref }}
+  # A recovery dispatch comes from main, but it must serialize with any other
+  # run for the requested tag. Different releases can proceed independently.
+  group: release-${{ inputs.tag || github.ref_name }}
   # Never cancel a half-published release.
   cancel-in-progress: false
 
@@ -64,6 +77,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
 
       # A tag can be pushed without ever passing through PR CI, so the release
       # path repeats the guard rather than trusting that someone ran it.
@@ -80,30 +94,41 @@ jobs:
         id: version
         env:
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          REQUESTED_TAG: ${{ inputs.tag || '' }}
         run: |
           set -eu
           CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           case "$GITHUB_REF" in
             refs/tags/*)
               TAG="${GITHUB_REF#refs/tags/}"
-              VERSION="${TAG#v}"
-              if [ "$VERSION" != "$CARGO_VERSION" ]; then
-                echo "::error::tag $TAG does not match Cargo.toml version $CARGO_VERSION"
-                exit 1
-              fi
               ;;
             *)
-              # Dry runs are the whole point of allowing a branch ref here, but
-              # publishing off one would create a release nobody can reproduce
-              # from a tag.
-              if [ "$PUBLISH" = "true" ]; then
-                echo "::error::publishing requires a tag ref (got $GITHUB_REF)"
-                exit 1
-              fi
-              TAG=""
-              VERSION="$CARGO_VERSION"
+              TAG="$REQUESTED_TAG"
               ;;
           esac
+          if [ -n "$TAG" ]; then
+            case "$TAG" in
+              v*) ;;
+              *)
+                echo "::error::release tag must start with v (got $TAG)"
+                exit 1
+                ;;
+            esac
+            VERSION="${TAG#v}"
+            if [ "$VERSION" != "$CARGO_VERSION" ]; then
+              echo "::error::tag $TAG does not match Cargo.toml version $CARGO_VERSION"
+              exit 1
+            fi
+          else
+            # Dry runs are the whole point of allowing a branch ref here, but
+            # publishing off one would create a release nobody can reproduce
+            # from a tag.
+            if [ "$PUBLISH" = "true" ]; then
+              echo "::error::publishing requires a tag ref or the tag input (got $GITHUB_REF)"
+              exit 1
+            fi
+            VERSION="$CARGO_VERSION"
+          fi
           {
             echo "tag=$TAG"
             echo "version=$VERSION"
@@ -124,6 +149,10 @@ jobs:
     permissions:
       contents: read
     with:
+      # Normally empty for a branch dry run. A tag push and the manual recovery
+      # input both make every matrix job build the tagged source, even though
+      # the reusable workflow definition itself may come from a newer commit.
+      ref: ${{ needs.verify.outputs.tag }}
       # Fat LTO + one codegen unit. Multi-minute links, and worth it for a
       # binary people download rather than rebuild.
       profile: release-lto
@@ -218,8 +247,12 @@ jobs:
       # workflow at this commit. Consumers check it with:
       #   gh attestation verify atomscan-<version>-<target>.tar.gz \
       #     --repo atomdrift-project/scan
+      # A recovery dispatch runs the repaired workflow from main while checking
+      # out the requested tag. In that case github.sha identifies the workflow
+      # commit, not the tagged source, so emitting the automatic attestation
+      # would be misleading. Tag-push releases retain provenance attestation.
       - name: Attest provenance
-        if: ${{ needs.verify.outputs.publish == 'true' }}
+        if: ${{ needs.verify.outputs.publish == 'true' && startsWith(github.ref, 'refs/tags/') }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: dist/*.tar.gz
@@ -233,12 +266,39 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Atomdrift Scan $VERSION" \
-            --generate-notes \
-            --verify-tag \
-            dist/*.tar.gz dist/SHA256SUMS
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists; uploading only missing assets"
+            existing_assets="$(
+              gh release view "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json assets \
+                --jq '.assets[].name'
+            )"
+            missing_assets=()
+            for asset in dist/*.tar.gz dist/SHA256SUMS; do
+              name="${asset##*/}"
+              if printf '%s\n' "$existing_assets" | grep -Fqx -- "$name"; then
+                echo "  exists  $name"
+              else
+                echo "  upload  $name"
+                missing_assets+=("$asset")
+              fi
+            done
+            if [ "${#missing_assets[@]}" -gt 0 ]; then
+              gh release upload "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                "${missing_assets[@]}"
+            else
+              echo "all release assets already exist"
+            fi
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Atomdrift Scan $VERSION" \
+              --generate-notes \
+              --verify-tag \
+              dist/*.tar.gz dist/SHA256SUMS
+          fi
 
       # Everything above ran except the two steps that leave a trace. Keep the
       # assembled set downloadable so a dry run is inspectable, not just green.
