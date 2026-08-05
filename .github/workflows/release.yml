@@ -275,7 +275,7 @@ jobs:
                 --jq '.assets[].name'
             )"
             missing_assets=()
-            for asset in dist/*.tar.gz dist/SHA256SUMS; do
+            for asset in dist/*.tar.gz; do
               name="${asset##*/}"
               if printf '%s\n' "$existing_assets" | grep -Fqx -- "$name"; then
                 echo "  exists  $name"
@@ -291,6 +291,23 @@ jobs:
             else
               echo "all release assets already exist"
             fi
+
+            # SHA256SUMS describes the release's actual assets, not merely the
+            # files rebuilt by this retry. Rebuilt archives are not guaranteed
+            # byte-for-byte identical, so derive the aggregate from GitHub's
+            # server-side digests after missing archives have been uploaded.
+            # It is generated metadata and must be refreshed when the release
+            # grows; immutable platform archives above are never clobbered.
+            gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[] | select(.name | startswith("atomscan-")) | select(.name | endswith(".tar.gz")) | select(.digest != null and .digest != "") | "\(.digest | sub("^sha256:"; ""))  \(.name)"' \
+              | LC_ALL=C sort > dist/SHA256SUMS
+            cat dist/SHA256SUMS
+            gh release upload "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber \
+              dist/SHA256SUMS
           else
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
