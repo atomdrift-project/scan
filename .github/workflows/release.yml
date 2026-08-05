@@ -232,10 +232,12 @@ jobs:
           # shellcheck disable=SC2046
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
 
-          identities="$(security find-identity -v -p codesigning)"
-          printf '%s\n' "$identities"
-          printf '%s\n' "$identities" | grep -F -- "\"$SIGN_IDENTITY\"" >/dev/null || {
-            echo "::error::MACOS_SIGN_IDENTITY does not match the imported .p12"
+          # `security find-identity -v` can reject an otherwise usable identity
+          # while evaluating trust, obscuring the useful codesign diagnostic.
+          # First confirm the requested leaf exists, then make codesign prove
+          # that its private key and certificate chain are actually usable.
+          security find-certificate -c "$SIGN_IDENTITY" "$keychain" >/dev/null || {
+            echo "::error::MACOS_SIGN_IDENTITY does not match a certificate in the imported .p12"
             exit 1
           }
 
@@ -243,6 +245,7 @@ jobs:
           codesign --force --timestamp --options runtime \
             --keychain "$keychain" --sign "$SIGN_IDENTITY" "$probe"
           codesign --verify --strict --verbose=2 "$probe"
+          codesign --display --verbose=2 "$probe"
 
           xcrun notarytool history \
             --key "$notary_key" \

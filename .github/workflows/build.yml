@@ -173,6 +173,7 @@ jobs:
         env:
           CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -eu
           # Fail with something readable instead of letting `security import`
@@ -215,7 +216,10 @@ jobs:
           # argument — and the paths come from `security` itself, not us.
           # shellcheck disable=SC2046
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          security find-identity -v -p codesigning
+          security find-certificate -c "$IDENTITY" "$KEYCHAIN" >/dev/null || {
+            echo "::error::MACOS_SIGN_IDENTITY does not match a certificate in the imported .p12"
+            exit 1
+          }
 
       # Hardened runtime is mandatory for notarization, and hardened runtime
       # blocks JIT by default — which would kill us, because yara-x runs its
@@ -232,6 +236,7 @@ jobs:
           BIN="target/$TARGET/$PROFILE/atomscan"
           codesign --force --timestamp --options runtime \
             --entitlements .github/macos-entitlements.plist \
+            --keychain "$SIGNING_KEYCHAIN" \
             --sign "$IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
           codesign --display --entitlements - "$BIN"
