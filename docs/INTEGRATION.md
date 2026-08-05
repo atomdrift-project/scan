@@ -11,8 +11,7 @@ check, an ingestion worker.
 
 ```bash
 # install (Linux/macOS via Homebrew)
-brew tap atomdrift/tap https://github.com/atomdrift-project/homebrew-tap.git
-brew install atomdrift-scan
+brew install atomdrift-project/tap/scan
 
 # or build from source — needs Rust 1.96+
 git clone https://github.com/atomdrift-project/scan.git && cd scan && make install

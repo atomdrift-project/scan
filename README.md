@@ -76,8 +76,7 @@ Studio C++ build tools; the script names any of them it cannot find.
 ### Homebrew on macOS or Linux
 
 ```bash
-brew tap atomdrift/tap https://github.com/atomdrift-project/homebrew-tap.git
-brew install atomdrift/tap/scan
+brew install atomdrift-project/tap/scan
 ```
 
 The Homebrew formula builds Atomdrift Scan from source and installs the
