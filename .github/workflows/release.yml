@@ -159,9 +159,90 @@ jobs:
             echo "dry run at $GITHUB_REF (version $VERSION) - nothing will be published"
           fi
 
+  # Check both Apple credential sets before starting the expensive release
+  # matrix. This job deliberately checks out no repository code: the signing
+  # key only enters a short-lived keychain used for a tiny probe signature.
+  signing-preflight:
+    name: signing preflight
+    needs: verify
+    runs-on: macos-15
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Validate Developer ID and notarization credentials
+        shell: bash
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+
+          require_secret() {
+            if [ -z "$2" ]; then
+              echo "::error::$1 is not configured"
+              return 1
+            fi
+          }
+          require_secret MACOS_CERT_P12 "$CERT_P12"
+          require_secret MACOS_CERT_PASSWORD "$CERT_PASSWORD"
+          require_secret MACOS_SIGN_IDENTITY "$SIGN_IDENTITY"
+          require_secret MACOS_NOTARY_KEY "$NOTARY_KEY"
+          require_secret MACOS_NOTARY_KEY_ID "$NOTARY_KEY_ID"
+          require_secret MACOS_NOTARY_ISSUER "$NOTARY_ISSUER"
+
+          keychain="$RUNNER_TEMP/atomdrift-signing-preflight.keychain-db"
+          cert="$RUNNER_TEMP/atomdrift-signing-preflight.p12"
+          notary_key="$RUNNER_TEMP/atomdrift-notary-preflight.p8"
+          probe="$RUNNER_TEMP/atomdrift-signing-probe"
+          keychain_password="$(openssl rand -base64 24)"
+
+          printf '%s' "$CERT_P12" | base64 --decode > "$cert"
+          printf '%s' "$NOTARY_KEY" | base64 --decode > "$notary_key"
+          chmod 600 "$cert" "$notary_key"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$cert" -k "$keychain" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" >/dev/null
+
+          identities="$(security find-identity -v -p codesigning "$keychain")"
+          printf '%s\n' "$identities"
+          printf '%s\n' "$identities" | grep -F -- "\"$SIGN_IDENTITY\"" >/dev/null || {
+            echo "::error::MACOS_SIGN_IDENTITY does not match the imported .p12"
+            exit 1
+          }
+
+          cp /usr/bin/true "$probe"
+          codesign --force --timestamp --options runtime \
+            --keychain "$keychain" --sign "$SIGN_IDENTITY" "$probe"
+          codesign --verify --strict --verbose=2 "$probe"
+
+          xcrun notarytool history \
+            --key "$notary_key" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER" \
+            --output-format json >/dev/null
+
+      - name: Remove preflight credentials
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/atomdrift-signing-preflight.keychain-db" >/dev/null 2>&1 || true
+          rm -f \
+            "$RUNNER_TEMP/atomdrift-signing-preflight.p12" \
+            "$RUNNER_TEMP/atomdrift-notary-preflight.p8" \
+            "$RUNNER_TEMP/atomdrift-signing-probe"
+
   build:
     name: build
-    needs: verify
+    needs: [verify, signing-preflight]
     uses: ./.github/workflows/build.yml
     # Ceiling for build.yml's jobs — see the same note in ci.yml. Checkout is
     # all they need; the release token stays in `publish`.
@@ -176,16 +257,13 @@ jobs:
       # Fat LTO + one codegen unit. Multi-minute links, and worth it for a
       # binary people download rather than rebuild.
       profile: release-lto
-      # Both off until the Developer ID secrets exist — with none configured,
-      # `sign: true` fails every macOS job on an empty .p12. Until then macOS
-      # binaries carry an ad-hoc signature and downloaders see a Gatekeeper
-      # prompt. Flip `sign` once the MACOS_CERT_* secrets are set, then
-      # `notarize` once the MACOS_NOTARY_* ones are.
-      sign: false
-      notarize: false
+      # Release binaries are Developer ID signed and submitted to Apple's
+      # notary service. The preflight above validates both credential sets
+      # before this expensive matrix starts.
+      sign: true
+      notarize: true
     # Explicit, not `secrets: inherit` — the called workflow gets exactly these
-    # six and nothing else. Passed even while signing is off so that turning it
-    # on is a one-line change.
+    # six and nothing else.
     secrets:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
