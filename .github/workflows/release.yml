@@ -212,7 +212,13 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$keychain_password" "$keychain" >/dev/null
 
-          identities="$(security find-identity -v -p codesigning "$keychain")"
+          # Keep the runner's login keychain in the search list so Security can
+          # complete Apple's certificate chain while taking the leaf identity
+          # and private key from our temporary keychain.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+          identities="$(security find-identity -v -p codesigning)"
           printf '%s\n' "$identities"
           printf '%s\n' "$identities" | grep -F -- "\"$SIGN_IDENTITY\"" >/dev/null || {
             echo "::error::MACOS_SIGN_IDENTITY does not match the imported .p12"

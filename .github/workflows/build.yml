@@ -202,7 +202,7 @@ jobs:
           # argument — and the paths come from `security` itself, not us.
           # shellcheck disable=SC2046
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          security find-identity -v -p codesigning "$KEYCHAIN"
+          security find-identity -v -p codesigning
 
       # Hardened runtime is mandatory for notarization, and hardened runtime
       # blocks JIT by default — which would kill us, because yara-x runs its
