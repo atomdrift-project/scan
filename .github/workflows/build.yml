@@ -238,7 +238,6 @@ jobs:
           BIN="target/$TARGET/$PROFILE/atomscan"
           codesign --force --timestamp --options runtime \
             --entitlements .github/macos-entitlements.plist \
-            --keychain "$SIGNING_KEYCHAIN" \
             --sign "$SIGNING_IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
           codesign --display --entitlements - "$BIN"

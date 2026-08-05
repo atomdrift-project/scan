@@ -244,7 +244,7 @@ jobs:
 
           cp /usr/bin/true "$probe"
           codesign --force --timestamp --options runtime \
-            --keychain "$keychain" --sign "$sign_identity" "$probe"
+            --sign "$sign_identity" "$probe"
           codesign --verify --strict --verbose=2 "$probe"
           codesign --display --verbose=2 "$probe"
 
