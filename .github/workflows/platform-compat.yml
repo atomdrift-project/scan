@@ -13,6 +13,16 @@ on:
         type: string
         required: true
         default: v2.5.0
+      platform:
+        description: Run all probes or retry one platform.
+        type: choice
+        default: all
+        options:
+          - all
+          - openindiana
+          - tribblix
+          - ghostbsd
+          - midnightbsd
 
 permissions: {}
 
@@ -23,6 +33,7 @@ env:
 jobs:
   openindiana:
     name: OpenIndiana 202604 / x86_64-unknown-illumos
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'openindiana' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -62,6 +73,7 @@ jobs:
 
   tribblix:
     name: Tribblix 0m40 / x86_64-unknown-illumos
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'tribblix' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -92,6 +104,7 @@ jobs:
 
   ghostbsd:
     name: GhostBSD 26.1 / x86_64-unknown-freebsd
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'ghostbsd' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -121,6 +134,7 @@ jobs:
 
   midnightbsd:
     name: MidnightBSD 4.0.7 / FreeBSD ABI probe
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'midnightbsd' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
