@@ -43,6 +43,15 @@ jobs:
         with:
           release: "202604"
           usesh: true
+          # The minimal VM omits GCC's shared runtimes, while cross-rs's
+          # illumos image links libgcc_s and libstdc++ dynamically. Install the
+          # default-runtime compatibility links a normal OI development host
+          # receives with GCC.
+          prepare: |
+            pkg install \
+              system/library/gcc-10-runtime \
+              system/library/g++-10-runtime \
+              system/library/gcc-10-compat-links
           run: |
             set -eux
             cd compat
@@ -131,7 +140,9 @@ jobs:
       # FreeBSD artifact is ABI-compatible instead of claiming support based
       # only on the distribution's ancestry.
       - name: Probe FreeBSD binary on MidnightBSD
-        uses: vmactions/midnightbsd-vm@1629088a95a63a7273cf57603b13e5e247417549 # v1.0.4
+        # v1.0.4 advertises 4.0.7, but its immutable tag omitted that config.
+        # Pin the first post-release commit that actually contains it.
+        uses: vmactions/midnightbsd-vm@814d16b629666e7eddcc2a0f834ac9d34cc596a5 # post-v1.0.4
         with:
           release: "4.0.7"
           usesh: true

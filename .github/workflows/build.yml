@@ -401,7 +401,12 @@ jobs:
             # OpenBSD's default login class caps datasize well below what
             # rustc needs to link a binary this size; without this the build
             # dies in the linker rather than on anything meaningful.
-            ulimit -d "$(ulimit -Hd)" || true
+            # The image's root login class has a 4 GiB hard data limit even
+            # though the VM has 12 GiB. LLVM needs more than that for this
+            # graph's final fat-LTO link. This shell runs as root, which may
+            # raise its own hard limit up to the kernel maximum.
+            ulimit -d unlimited
+            echo "datasize soft=$(ulimit -Sd) hard=$(ulimit -Hd)"
             rustc --version
             # OpenBSD's default disklabel carves the disk into many small
             # partitions, and the one holding /root — where CARGO_HOME lives —

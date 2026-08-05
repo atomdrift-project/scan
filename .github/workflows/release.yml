@@ -252,6 +252,13 @@ jobs:
           if [ -n "$missing" ]; then
             echo "::warning::release is missing targets:$missing"
             echo "Missing targets:$missing" >> "$GITHUB_STEP_SUMMARY"
+            # A broad release may publish the platforms that succeeded, but a
+            # targeted retry has one job: produce the requested artifact. Fail
+            # here with that useful diagnosis instead of falling through to an
+            # opaque `cd dist` error when download-artifact found nothing.
+            if [ -n "$REQUESTED_TARGET" ]; then
+              exit 1
+            fi
           fi
 
       # Artifacts are named by target; releases are named by version + target.
