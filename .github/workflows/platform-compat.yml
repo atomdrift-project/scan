@@ -1,0 +1,143 @@
+# Smoke-test published release binaries on distributions that share a Rust
+# target ABI. These are runtime compatibility checks, not additional release
+# artifacts: OpenIndiana and Tribblix use x86_64-unknown-illumos, while
+# GhostBSD and (when compatible) MidnightBSD consume x86_64-unknown-freebsd.
+
+name: platform compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published v* release tag to test.
+        type: string
+        required: true
+        default: v2.5.0
+
+permissions: {}
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  openindiana:
+    name: OpenIndiana 202604 / x86_64-unknown-illumos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Download illumos release binary
+        run: |
+          set -eu
+          case "$TAG" in v*) ;; *) echo "::error::tag must start with v"; exit 1;; esac
+          version="${TAG#v}"
+          mkdir -p compat
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "atomscan-$version-x86_64-unknown-illumos.tar.gz" \
+            --dir compat
+
+      - name: Smoke test on OpenIndiana
+        uses: vmactions/openindiana-vm@52f16d4534fe3edd9d9621621c238398d4d2a698 # v1.1.5
+        with:
+          release: "202604"
+          usesh: true
+          run: |
+            set -eux
+            cd compat
+            gzip -dc atomscan-*-x86_64-unknown-illumos.tar.gz | tar xf -
+            chmod +x atomscan
+            ./atomscan --version
+            ./atomscan --help >/dev/null
+
+  tribblix:
+    name: Tribblix 0m40 / x86_64-unknown-illumos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Download illumos release binary
+        run: |
+          set -eu
+          case "$TAG" in v*) ;; *) echo "::error::tag must start with v"; exit 1;; esac
+          version="${TAG#v}"
+          mkdir -p compat
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "atomscan-$version-x86_64-unknown-illumos.tar.gz" \
+            --dir compat
+
+      - name: Smoke test on Tribblix
+        uses: vmactions/tribblix-vm@4a486df18403c7ceeeab5fcb82fa47ff2116d35a # v1.0.3
+        with:
+          release: "0m40"
+          usesh: true
+          run: |
+            set -eux
+            cd compat
+            gzip -dc atomscan-*-x86_64-unknown-illumos.tar.gz | tar xf -
+            chmod +x atomscan
+            ./atomscan --version
+            ./atomscan --help >/dev/null
+
+  ghostbsd:
+    name: GhostBSD 26.1 / x86_64-unknown-freebsd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Download FreeBSD release binary
+        run: |
+          set -eu
+          case "$TAG" in v*) ;; *) echo "::error::tag must start with v"; exit 1;; esac
+          version="${TAG#v}"
+          mkdir -p compat
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "atomscan-$version-x86_64-unknown-freebsd.tar.gz" \
+            --dir compat
+
+      - name: Smoke test on GhostBSD
+        uses: vmactions/ghostbsd-vm@5ed1dcce064c887d3767fc00ac0176a51fdd4e74 # v1.0.2
+        with:
+          release: "26.1"
+          usesh: true
+          run: |
+            set -eux
+            tar -xzf compat/atomscan-*-x86_64-unknown-freebsd.tar.gz -C compat
+            chmod +x compat/atomscan
+            compat/atomscan --version
+            compat/atomscan --help >/dev/null
+
+  midnightbsd:
+    name: MidnightBSD 4.0.7 / FreeBSD ABI probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Download FreeBSD release binary
+        run: |
+          set -eu
+          case "$TAG" in v*) ;; *) echo "::error::tag must start with v"; exit 1;; esac
+          version="${TAG#v}"
+          mkdir -p compat
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "atomscan-$version-x86_64-unknown-freebsd.tar.gz" \
+            --dir compat
+
+      # Rust has no MidnightBSD target. This explicitly tests whether the
+      # FreeBSD artifact is ABI-compatible instead of claiming support based
+      # only on the distribution's ancestry.
+      - name: Probe FreeBSD binary on MidnightBSD
+        uses: vmactions/midnightbsd-vm@1629088a95a63a7273cf57603b13e5e247417549 # v1.0.4
+        with:
+          release: "4.0.7"
+          usesh: true
+          run: |
+            set -eux
+            tar -xzf compat/atomscan-*-x86_64-unknown-freebsd.tar.gz -C compat
+            chmod +x compat/atomscan
+            compat/atomscan --version
+            compat/atomscan --help >/dev/null
