@@ -12,6 +12,11 @@
 #
 #     gh workflow run release.yml --ref main -f tag=v2.5.0 -f publish=true
 #
+# To retry one missing target without rebuilding unrelated platforms:
+#
+#     gh workflow run release.yml --ref main -f tag=v2.5.0 -f publish=true \
+#       -f target=x86_64-unknown-openbsd
+#
 # A dry run does everything a real one does — fat-LTO builds, whatever signing
 # the inputs below ask for, packaging, checksums — and stops short of attesting
 # or creating the release, leaving the assembled set as a downloadable artifact.
@@ -44,6 +49,12 @@ on:
           Existing v* tag to build. This recovery path lets a repaired workflow
           on the default branch publish artifacts for a release whose tag
           already exists.
+        type: string
+        default: ""
+      target:
+        description: >-
+          Rebuild only one missing target. Empty builds the complete release
+          matrix; matrix-backed targets rebuild their matrix group.
         type: string
         default: ""
       publish:
@@ -95,8 +106,16 @@ jobs:
         env:
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
           REQUESTED_TAG: ${{ inputs.tag || '' }}
+          REQUESTED_TARGET: ${{ inputs.target || '' }}
         run: |
           set -eu
+          case "$REQUESTED_TARGET" in
+            ""|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin|x86_64-unknown-freebsd|x86_64-unknown-openbsd|x86_64-unknown-netbsd|x86_64-unknown-dragonfly|x86_64-pc-solaris|omnios-native|x86_64-pc-windows-msvc|x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|x86_64-unknown-illumos|s390x-unknown-linux-gnu|riscv64gc-unknown-linux-gnu|powerpc64le-unknown-linux-gnu) ;;
+            *)
+              echo "::error::unknown release target: $REQUESTED_TARGET"
+              exit 1
+              ;;
+          esac
           CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           case "$GITHUB_REF" in
             refs/tags/*)
@@ -153,6 +172,7 @@ jobs:
       # input both make every matrix job build the tagged source, even though
       # the reusable workflow definition itself may come from a newer commit.
       ref: ${{ needs.verify.outputs.tag }}
+      target: ${{ inputs.target || '' }}
       # Fat LTO + one codegen unit. Multi-minute links, and worth it for a
       # binary people download rather than rebuild.
       profile: release-lto
@@ -214,10 +234,14 @@ jobs:
             x86_64-unknown-openbsd x86_64-unknown-netbsd
             x86_64-unknown-illumos x86_64-pc-solaris
             x86_64-pc-windows-msvc
+          REQUESTED_TARGET: ${{ inputs.target || '' }}
         run: |
           set -eu
           missing=""
           for t in $EXPECTED; do
+            if [ -n "$REQUESTED_TARGET" ] && [ "$t" != "$REQUESTED_TARGET" ]; then
+              continue
+            fi
             if [ -f "dist/atomscan-$t.tar.gz" ]; then
               echo "  ok      $t"
             else

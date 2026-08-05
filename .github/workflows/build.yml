@@ -17,6 +17,12 @@ on:
           default branch.
         type: string
         default: ""
+      target:
+        description: >-
+          Build only this target during a release recovery. Empty builds the
+          complete matrix. Matrix-backed targets run their whole matrix group.
+        type: string
+        default: ""
       profile:
         description: >-
           Cargo profile: `release` (thin LTO, everyday CI) or `release-lto`
@@ -70,6 +76,7 @@ env:
 jobs:
   native:
     name: ${{ matrix.target }}
+    if: ${{ inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin ', format(' {0} ', inputs.target)) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     permissions:
@@ -283,6 +290,7 @@ jobs:
   # buys a 4-6 hour job for one target.
   freebsd:
     name: x86_64-unknown-freebsd
+    if: ${{ inputs.target == '' || inputs.target == 'x86_64-unknown-freebsd' }}
     # Host image is only the VM host here — the compile happens inside the
     # guest against FreeBSD's libc — so the glibc-floor reasoning that pins
     # `native` to 22.04 does not apply. Newer host, newer KVM stack.
@@ -360,6 +368,7 @@ jobs:
   # nothing here; the unit tests below are what would surface it.
   openbsd:
     name: x86_64-unknown-openbsd
+    if: ${{ inputs.target == '' || inputs.target == 'x86_64-unknown-openbsd' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -378,10 +387,10 @@ jobs:
           # Newest image available. OpenBSD makes no cross-release ABI promise,
           # so there is no reach argument for staying back — the artifact is
           # effectively single-release either way, and this pin needs bumping
-          # every six months. 7.7's ports rust was 1.86, well under this
-          # crate's 1.94 MSRV, which is what failed here before; 7.8 is the
-          # only chance of a toolchain new enough to build at all.
-          release: "7.8"
+          # every six months. 7.8's ports rust was 1.90, below this crate's
+          # 1.94 MSRV. OpenBSD 7.9 ships rust 1.94.1, making it the first image
+          # new enough to build this release.
+          release: "7.9"
           cpu: "4"
           mem: "12288"
           envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
@@ -429,6 +438,7 @@ jobs:
   # should stay runnable. pkgsrc rust is the same deal as FreeBSD ports rust.
   netbsd:
     name: x86_64-unknown-netbsd
+    if: ${{ inputs.target == '' || inputs.target == 'x86_64-unknown-netbsd' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -483,6 +493,7 @@ jobs:
   # it. Tier 3 in rustc, hence the native build against ports rust.
   dragonfly:
     name: x86_64-unknown-dragonfly
+    if: ${{ inputs.target == '' || inputs.target == 'x86_64-unknown-dragonfly' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -536,6 +547,7 @@ jobs:
   # Same research shape the OmniOS job used to resolve its package names.
   solaris:
     name: x86_64-pc-solaris
+    if: ${{ inputs.target == '' || inputs.target == 'x86_64-pc-solaris' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -608,6 +620,7 @@ jobs:
   # pattern release.yml downloads.
   omnios:
     name: x86_64-unknown-illumos (omnios)
+    if: ${{ inputs.target == '' || inputs.target == 'omnios-native' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -702,6 +715,7 @@ jobs:
   # every other run block in this file is sh, and git bash ships on the image.
   windows:
     name: x86_64-pc-windows-msvc
+    if: ${{ inputs.target == '' || inputs.target == 'x86_64-pc-windows-msvc' }}
     runs-on: windows-2022
     timeout-minutes: 150
     permissions:
@@ -773,6 +787,7 @@ jobs:
   # where cmake already exists.
   cross:
     name: ${{ matrix.target }}
+    if: ${{ inputs.target == '' || contains(' x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-unknown-illumos s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu powerpc64le-unknown-linux-gnu ', format(' {0} ', inputs.target)) }}
     # Container builds, so the host's glibc never reaches the artifact — same
     # reasoning as the freebsd job, and unlike `native`.
     runs-on: ubuntu-24.04
