@@ -184,15 +184,28 @@ jobs:
           KEYCHAIN="$RUNNER_TEMP/atomdrift-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           echo "SIGNING_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          INTERMEDIATE="$RUNNER_TEMP/DeveloperIDCA.cer"
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 1800 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
+          # The current certificate uses Apple's Developer ID G1
+          # intermediate. Import its pinned public certificate explicitly;
+          # clean current runners may no longer have this 2027 chain cached.
+          curl --fail --silent --show-error --location \
+            https://www.apple.com/certificateauthority/DeveloperIDCA.cer \
+            --output "$INTERMEDIATE"
+          INTERMEDIATE_SHA="$(shasum -a 256 "$INTERMEDIATE" | awk '{print $1}')"
+          if [ "$INTERMEDIATE_SHA" != 7afc9d01a62f03a2de9637936d4afe68090d2de18d03f29c88cfb0b1ba63587f ]; then
+            echo "::error::Apple Developer ID G1 intermediate checksum mismatch"
+            exit 1
+          fi
+          security import "$INTERMEDIATE" -k "$KEYCHAIN"
           printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
             -T /usr/bin/codesign -T /usr/bin/security
-          rm -f "$RUNNER_TEMP/cert.p12"
+          rm -f "$RUNNER_TEMP/cert.p12" "$INTERMEDIATE"
 
           # Without this, codesign blocks on an interactive keychain prompt.
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
@@ -251,8 +264,14 @@ jobs:
         if: ${{ always() && runner.os == 'macOS' && inputs.sign }}
         run: |
           set -eu
-          [ -n "${SIGNING_KEYCHAIN:-}" ] || exit 0
-          security delete-keychain "$SIGNING_KEYCHAIN" || true
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" || true
+          fi
+          rm -f \
+            "$RUNNER_TEMP/cert.p12" \
+            "$RUNNER_TEMP/DeveloperIDCA.cer" \
+            "$RUNNER_TEMP/notary.p8" \
+            "$RUNNER_TEMP/atomscan.zip"
       # ------------------------------------------------------------------------
 
       - name: Smoke test
