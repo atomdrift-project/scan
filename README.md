@@ -37,9 +37,46 @@ CI gate, or self-hosted scanning service.
 
 ## Install
 
+### macOS, Linux, BSD, and illumos
+
+```bash
+curl -fsSL https://install.atomdrift.org | sh
+```
+
+The installer works out your platform, downloads the matching release binary,
+verifies its SHA-256 checksum and — when the GitHub CLI is available — its
+signed build provenance, then installs it into a directory on your `PATH`. On
+macOS it hands the job to Homebrew when Homebrew is present. A platform with no
+published binary falls back to a source build. Re-run it to upgrade; an install
+that is already current is left alone.
+
+Options go after `sh -s --`:
+
+```bash
+curl -fsSL https://install.atomdrift.org | sh -s -- --dir ~/bin --method binary
+curl -fsSL https://install.atomdrift.org | sh -s -- --version 2.5.0
+```
+
+`--method binary` skips Homebrew and takes the prebuilt binary, `--no-tools`
+skips the optional analysis tool check, and `--help` lists the rest. Piping a
+script into a shell is worth being uneasy about, so read it first if you would
+rather: that URL serves [install.sh](install.sh) unchanged.
+
+### Windows
+
+```powershell
+irm https://install.atomdrift.org/ps1 | iex
+```
+
+Installs into `%LOCALAPPDATA%\Programs\atomscan\bin` and puts it on your user
+`PATH`, with no administrator rights required. Windows binaries are not
+published yet, so this builds from source and needs Git, Rust, and the Visual
+Studio C++ build tools; the script names any of them it cannot find.
+
 ### Homebrew on macOS or Linux
 
 ```bash
+brew tap atomdrift/tap https://github.com/atomdrift-project/homebrew-tap.git
 brew install atomdrift/tap/scan
 ```
 
