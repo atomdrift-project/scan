@@ -177,7 +177,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Download Linux GNU release binary
+      - name: Download and unpack Linux GNU release binary
         run: |
           set -eu
           case "$TAG" in v*) ;; *) echo "::error::tag must start with v"; exit 1;; esac
@@ -186,6 +186,8 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern "atomscan-$version-x86_64-unknown-linux-gnu.tar.gz" \
             --dir compat
+          tar -xzf compat/atomscan-*-x86_64-unknown-linux-gnu.tar.gz -C compat
+          chmod +x compat/atomscan
 
       - name: Smoke test on openEuler
         uses: vmactions/openeuler-vm@694e5d6637c08e6ed139a0403bae8041d5651e20 # v1.0.0
@@ -194,8 +196,6 @@ jobs:
           usesh: true
           run: |
             set -eux
-            tar -xzf compat/atomscan-*-x86_64-unknown-linux-gnu.tar.gz -C compat
-            chmod +x compat/atomscan
             compat/atomscan --version
             compat/atomscan --help >/dev/null
 
