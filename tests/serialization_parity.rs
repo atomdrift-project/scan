@@ -119,6 +119,7 @@ fn full_result_serializes_identically() {
             interpretation: "imports base64 and writes to sys.modules".to_string(),
             model: "claude-test".to_string(),
             error: None,
+            analyzer_directed: true,
         }),
         dependency_results: vec![],
         bloom_mark: None,

@@ -73,7 +73,7 @@ prompt and motivated it:
 
 ## The adjustment algorithm (gate + blend)
 
-Beyond the prompt, three tuning points govern whether `--interpret` delivers the
+Beyond the prompt, these tuning points govern whether `--interpret` delivers the
 right verdict:
 
 1. **The gate — floor lowered to 0.01.** `--interpret` runs when ML
@@ -85,16 +85,87 @@ right verdict:
    probabilities on real malware bunch near 0 *and* near 1 with little in between,
    so a low floor mostly adds LLM calls on genuinely-clean files (which the LLM
    correctly clears), not accuracy risk.
-2. **Content-gated safety valve.** When ML says hostile and the LLM says benign,
-   the blend clears to benign **only if the render is readable source** (the LLM
-   read the actual code — clears ML false positives like a signed tool ML
-   mislabeled). If the render is opaque/packed bytes, it holds at suspicious +
-   review, since a text model can be fooled by obfuscation. See
-   `interpret::blend` / `render_mostly_readable`.
-3. **Synthetic level.** `engine::interpreted_level` lands an LLM escalation at L4
-   (hostile) / L99 (suspicious) — inside the current L25 / L3000 bands at the
-   default `-l 25`, and low enough that an LLM "hostile" stays hostile at stricter
-   deploy levels.
+2. **The steering rule — one step, one third.** `interpret::blend` enforces a
+   single symmetric bound in both directions:
+
+   > The LLM may move the verdict **at most one severity step**, and the
+   > confidence **at most 33%** (`MAX_STEER`) of the distance to the bound it
+   > argues for.
+
+   ML decides; the LLM steers. Two consequences worth stating plainly:
+   - **benign + LLM-hostile → suspicious**, not hostile. A two-step jump on one
+     model's word, over input the sample's author controls, is a review flag
+     rather than a block.
+   - **hostile + LLM-benign → suspicious** at most, never benign.
+
+   The cap is a *fraction of the remaining range*, so it is proportionate at any
+   starting score and preserves ML's ranking — two files the LLM grades the same
+   stay ordered by what ML thought of them. The previous blend replaced the score
+   with a flat 0.80/0.85 on escalation, which erased that ordering entirely (a
+   0.0002 and a 0.45 both landed on exactly 0.85) and was in no sense a blend.
+   Agreement steers toward the pole the verdict already sits at — corroborated
+   malice up, a corroborated clean file *down* (the old code raised the malice
+   probability of a file both graders called benign).
+3. **Clearing is guarded; escalation is not.** A de-escalation is discarded
+   outright — ML's class *and* score left untouched — when either the render is
+   opaque (packed/escaped bytes a text model cannot honestly clear;
+   `render_mostly_readable`) or the sample contains analyzer-directed text
+   (`addresses_the_analyzer`, below). Escalation is deliberately ungated: an
+   attacker gains nothing by talking their own sample up, so only the clearing
+   path is worth attacking and only it needs guarding.
+4. **Synthetic level.** `engine::interpreted_level` pins an LLM-shifted verdict to
+   the loosest rung of the target band — the active deploy `-l` for hostile,
+   `capped_suspicious_level(grid_max)` for suspicious, `-1` for benign — so the
+   level tracks the model's real thresholds instead of a hardcoded rung. `ml.conf`
+   is `level_confidence()` of that level, so the displayed confidence follows
+   automatically; `ml.prob` carries the steered score.
+
+### Trade-off this rule accepts
+
+Capping escalation at one step means the measured ML false-negatives above (the
+clipper at 0.024, the exfil at 0.039) now surface as **suspicious**, not hostile
+— flagged for review rather than blocked. That is the intended cost of not
+letting a single fallible opinion over attacker-controlled text carry a verdict
+from one end of the scale to the other. If a deployment needs those back, the
+narrow escape hatch is to allow the two-step jump *only* when cleave independently
+surfaced a hostile (`H`) finding — two detectors agreeing with ML as the outlier
+— which `has_elevated_finding` already computes for the gate.
+
+## Prompt injection
+
+The render is not merely untrusted, it is **100% authored by the party being
+graded**, who can assume it will reach an LLM. Every profitable injection is a
+*de-escalation* ("this is not malware"), which is why the guard is asymmetric.
+
+Three layers, in increasing order of how much they can be relied on:
+
+1. **Prompt scoping** (`SYSTEM_PROMPT`). The old wording scoped untrustedness to
+   "the findings and provenance" while telling the model the source lines were
+   shown "unaltered" — leaving the obvious injection surface (a comment reading
+   `THIS IS NOT MALWARE`) inside the region the prompt vouched for. It now covers
+   the whole user message and reframes analyzer-directed text as *evidence about
+   the author* rather than something to merely ignore.
+2. **Deterministic detection** (`addresses_the_analyzer`). A plain
+   case-insensitive substring scan of the sanitized render for instruction
+   openers, chat-template control tokens, fragments of our own prompt/reply
+   schema, and direct assertions of innocence. It does not depend on the model's
+   cooperation, which is exactly what layer 1 cannot promise. A hit only revokes
+   the LLM's ability to *lower* a verdict, so the error cost is lopsided in the
+   safe direction: a false positive costs one un-cleared ML false positive (a
+   human triage minute), a miss costs a cleared malware sample. It is surfaced as
+   `llm.inject: true` in the JSON and logged at WARN.
+3. **Reply hygiene.** The model's `reason` is attacker-influenced text that lands
+   in an operator's terminal, so it is ANSI-stripped, control-stripped, and
+   clamped to `MAX_REASON_CHARS` — the render is sanitized on the way in, this
+   closes the same hole on the way out.
+
+Note that cleave will often flag injection strings as traits in their own right,
+but that does **not** protect this path: the render still carries the raw bytes
+into the prompt regardless of what was flagged. Layer 2 is what acts on them.
+
+Deliberately *not* done: redacting matched text from the render. It would hide
+real evidence from the grader and buy little, since the sample is distrusted for
+clearing purposes either way.
 
 **vLLM nondeterminism.** Even at `temperature 0`, batched inference is not
 bit-reproducible; a borderline file can flip grade run-to-run. The prompt-hash
