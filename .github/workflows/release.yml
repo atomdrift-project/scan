@@ -76,7 +76,7 @@ concurrency:
 jobs:
   verify:
     name: verify tag
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -165,7 +165,7 @@ jobs:
   signing-preflight:
     name: signing preflight
     needs: verify
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 10
     permissions: {}
     steps:
@@ -207,7 +207,8 @@ jobs:
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 900 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
-          original_default_keychain="$(security default-keychain -d user | tr -d '"')"
+          original_default_keychain="$(security default-keychain -d user | \
+            sed -e 's/^[[:space:]\"]*//' -e 's/[[:space:]\"]*$//')"
           echo "PREFLIGHT_DEFAULT_KEYCHAIN=$original_default_keychain" >> "$GITHUB_ENV"
           security default-keychain -d user -s "$keychain"
 
@@ -305,6 +306,7 @@ jobs:
       # before this expensive matrix starts.
       sign: true
       notarize: true
+      require-notarization: ${{ needs.verify.outputs.publish == 'true' }}
     # Explicit, not `secrets: inherit` — the called workflow gets exactly these
     # five and nothing else.
     secrets:
@@ -317,7 +319,7 @@ jobs:
   publish:
     name: publish
     needs: [verify, build]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # Add `environment: release` here to gate the upload on a human approval.
     permissions:
