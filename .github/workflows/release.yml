@@ -138,6 +138,11 @@ jobs:
               echo "::error::tag $TAG does not match Cargo.toml version $CARGO_VERSION"
               exit 1
             fi
+            if [ "$PUBLISH" = "true" ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && \
+              [ "$GITHUB_REF" != refs/heads/main ]; then
+              echo "::error::release recovery must run from refs/heads/main so its signing identity is predictable"
+              exit 1
+            fi
           else
             # Dry runs are the whole point of allowing a branch ref here, but
             # publishing off one would create a release nobody can reproduce
@@ -411,6 +416,13 @@ jobs:
         with:
           subject-path: dist/*.tar.gz
 
+      # GitHub artifact attestations above are already Sigstore-backed, but
+      # consumers need `gh` to retrieve them. A standard bundle beside the
+      # release makes the same trust model usable with standalone `cosign`.
+      - name: Install Cosign
+        if: ${{ needs.verify.outputs.publish == 'true' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
       # `gh` ships on the runner, so publishing needs no third-party action in
       # the one job that holds `contents: write`. Add `--draft` if you'd rather
       # review before it goes live.
@@ -446,30 +458,58 @@ jobs:
               echo "all release assets already exist"
             fi
 
-            # SHA256SUMS describes the release's actual assets, not merely the
-            # files rebuilt by this retry. Rebuilt archives are not guaranteed
-            # byte-for-byte identical, so derive the aggregate from GitHub's
-            # server-side digests after missing archives have been uploaded.
-            # It is generated metadata and must be refreshed when the release
-            # grows; immutable platform archives above are never clobbered.
-            gh release view "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json assets \
-              --jq '.assets[] | select(.name | startswith("atomscan-")) | select(.name | endswith(".tar.gz")) | select(.digest != null and .digest != "") | "\(.digest | sub("^sha256:"; ""))  \(.name)"' \
-              | LC_ALL=C sort > dist/SHA256SUMS
-            cat dist/SHA256SUMS
-            gh release upload "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --clobber \
-              dist/SHA256SUMS
           else
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --title "Atomdrift Scan $VERSION" \
               --generate-notes \
               --verify-tag \
-              dist/*.tar.gz dist/SHA256SUMS
+              dist/*.tar.gz
           fi
+
+          # SHA256SUMS describes the release's actual immutable archives, not
+          # merely the files rebuilt by a recovery run. Derive it from GitHub's
+          # server-side digests after every missing archive has been uploaded.
+          digest_attempt=1
+          while :; do
+            gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[] | select(.name | startswith("atomscan-")) | select(.name | endswith(".tar.gz")) | select(.digest != null and .digest != "") | "\(.digest | sub("^sha256:"; ""))  \(.name)"' \
+              | LC_ALL=C sort > dist/SHA256SUMS
+            archive_count="$(gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '[.assets[] | select(.name | startswith("atomscan-")) | select(.name | endswith(".tar.gz"))] | length')"
+            digest_count="$(awk 'END { print NR + 0 }' dist/SHA256SUMS)"
+            if [ "$archive_count" -gt 0 ] && [ "$digest_count" -eq "$archive_count" ]; then
+              break
+            fi
+            if [ "$digest_attempt" -ge 6 ]; then
+              echo "::error::GitHub did not report SHA-256 digests for every release archive ($digest_count/$archive_count)"
+              exit 1
+            fi
+            echo "waiting for GitHub release digests ($digest_count/$archive_count)"
+            sleep 5
+            digest_attempt=$((digest_attempt + 1))
+          done
+          cat dist/SHA256SUMS
+
+          # Keyless GitHub OIDC identity. The bundle carries the signature,
+          # short-lived certificate, and transparency-log inclusion proof.
+          cosign sign-blob --yes \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            dist/SHA256SUMS
+          cosign verify-blob dist/SHA256SUMS \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+          gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sigstore.json
 
       # Everything above ran except the two steps that leave a trace. Keep the
       # assembled set downloadable so a dry run is inspectable, not just green.
