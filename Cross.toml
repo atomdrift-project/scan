@@ -21,3 +21,34 @@ passthrough = [
     "CXXFLAGS_powerpc64le_unknown_linux_gnu",
     "CFLAGS_x86_64_unknown_illumos",
 ]
+
+# Cross's 0.2.5 images are immutable here even though the CLI must come from a
+# newer revision for LoongArch std provisioning. The LoongArch images are from
+# Cross main at the reviewed CLI revision and are pinned by manifest digest as
+# well. Updating any image is therefore a visible supply-chain change.
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"
+
+[target.arm-unknown-linux-musleabihf]
+image = "ghcr.io/cross-rs/arm-unknown-linux-musleabihf@sha256:283b8271593b7f2504d8b84f6f01e0a3e005802b784d90f357e1ce283a7554f9"
+
+[target.armv7-unknown-linux-musleabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf@sha256:b4f481f30ceca34730a5723f717396d762d94f6eddd7e1cf7c7862d1377ff98c"
+
+[target.loongarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/loongarch64-unknown-linux-musl@sha256:cbc13a13c3c482b80f15978cf944f82e513654a306b36b3562623b10a0049d31"
+
+[target.x86_64-unknown-illumos]
+image = "ghcr.io/cross-rs/x86_64-unknown-illumos@sha256:206f71ec47b79bfff85f7f28162bcdb01eb42dcc7e0a3c00bd10569fe12de823"
+
+[target.s390x-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/s390x-unknown-linux-gnu@sha256:0d8edc92c39158abe211fddfc9617bf5b7865c2ae0f58873f9cf0c58bb315271"
+
+[target.riscv64gc-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu@sha256:67ee97dd4719390d299edfcf39f226360ccfb1539e08b078ec187d4848415794"
+
+[target.powerpc64le-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/powerpc64le-unknown-linux-gnu@sha256:de5114adcd786f6a41eb07379459aaae94de73670303e202ea3603d250c19091"

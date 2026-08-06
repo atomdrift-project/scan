@@ -73,6 +73,7 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  CROSS_REV: 55f847251389c5406df85579191c0eac412fab3a
   RUST_BACKTRACE: "1"
   SCAN_NO_UPDATE: "1"
 
@@ -1084,7 +1085,7 @@ jobs:
   # where cmake already exists.
   cross:
     name: ${{ matrix.target }}
-    if: ${{ inputs.target == '' || contains(' x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-unknown-illumos s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu powerpc64le-unknown-linux-gnu ', format(' {0} ', inputs.target)) }}
+    if: ${{ inputs.target == '' || contains(' x86_64-unknown-linux-musl aarch64-unknown-linux-musl arm-unknown-linux-musleabihf armv7-unknown-linux-musleabihf loongarch64-unknown-linux-musl x86_64-unknown-illumos s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu powerpc64le-unknown-linux-gnu ', format(' {0} ', inputs.target)) }}
     # Container builds, so the host's glibc never reaches the artifact — same
     # reasoning as the freebsd job, and unlike `native`.
     runs-on: ubuntu-24.04
@@ -1106,6 +1107,25 @@ jobs:
           # there is nothing here that can execute it.
           - target: aarch64-unknown-linux-musl
 
+          # Static ARMv6 hard-float covers Raspberry Pi 1/Zero-class Linux
+          # systems without inheriting the build container's libc. Wasmtime
+          # uses its portable Pulley backend because Cranelift has no ARM32
+          # backend. QEMU verifies that the resulting CLI starts correctly.
+          - target: arm-unknown-linux-musleabihf
+            emulated_smoke: true
+
+          # ARMv7-A is still common in routers, cameras, NAS appliances and
+          # industrial gateways. The static artifact works on glibc, musl and
+          # uClibc userlands that use the standard hard-float ABI.
+          - target: armv7-unknown-linux-musleabihf
+            emulated_smoke: true
+
+          # LoongArch64 is an edge/server target rather than a constrained MCU
+          # target. Its Rust and Cross support are Tier 2 and QEMU-capable; use
+          # musl so the artifact has no glibc 2.36 floor.
+          - target: loongarch64-unknown-linux-musl
+            emulated_smoke: true
+
           # Back after the tree-sitter endian.h fix (see the [patch.crates-io]
           # note in Cargo.toml). This is the cheapest verification we have that
           # the fix works: it reproduces the exact failure recorded in CI run
@@ -1119,6 +1139,7 @@ jobs:
           # multi-byte fields, and nothing else in this matrix would catch a
           # byte-order bug. Build-only, like every entry here.
           - target: s390x-unknown-linux-gnu
+            emulated_smoke: true
 
           - target: riscv64gc-unknown-linux-gnu
 
@@ -1142,19 +1163,19 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ~/.cargo/bin/cross
-          key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-home-${{ matrix.target }}-${{ env.CROSS_REV }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-${{ matrix.target }}-
 
-      # 0.2.5 is the current crates.io release and dates from 2023; if it no
-      # longer builds on current stable, or an image turns out to be too old,
-      # switch to `--git https://github.com/cross-rs/cross`.
-      # loongarch64-unknown-linux-gnu was tried here and removed: cross 0.2.5
-      # cannot provide a std for it ("can't find crate for `std`"), while the
-      # s390x/powerpc64le/riscv64gc/illumos images in the same release are
-      # fine. Re-add together with a switch to `cross --git`, not before.
+      # Cross 0.2.5 cannot provision LoongArch's Rust std. Use a reviewed Cross
+      # revision that supports it, and keep the container images themselves
+      # pinned by digest in Cross.toml. The version check prevents an older
+      # cached 0.2.5 binary from silently winning.
       - name: Install cross
         run: |
-          command -v cross >/dev/null || cargo install cross --locked --version 0.2.5
+          if ! cross --version 2>/dev/null | grep -q "${CROSS_REV:0:7}"; then
+            cargo install cross --locked --force \
+              --git https://github.com/cross-rs/cross --rev "$CROSS_REV"
+          fi
 
       # A manually dispatched release can intentionally build an older tag
       # with the current workflow. Supply newly required build settings even
@@ -1196,6 +1217,19 @@ jobs:
           set -x
           "./target/$TARGET/$PROFILE/atomscan" --version
           "./target/$TARGET/$PROFILE/atomscan" --help >/dev/null
+
+      # Cross supplies QEMU and the target sysroot for these architectures.
+      # Running through `cross run` checks the loader, ISA and startup path;
+      # `file` alone would only prove that the linker emitted some ELF bytes.
+      - name: Emulated smoke test
+        if: matrix.emulated_smoke
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -x
+          cross run --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan -- --version
+          cross run --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan -- --help >/dev/null
 
       - name: Package
         env:
