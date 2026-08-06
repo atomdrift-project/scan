@@ -3116,10 +3116,11 @@ fn apply_trait_floor(
         decision.class = Classification::Hostile;
         decision.probability = counts.hostile_confidence;
         decision.level = interpreted_level(active_level, grid_max, Classification::Hostile);
-        // Loud by design: the model graded this benign yet cleave is confident it
-        // carries a hostile (crit-5) trait. If the models are doing their job this
-        // is extraordinary — every occurrence is a model gap worth investigating.
-        tracing::warn!(
+        // The model graded this benign yet cleave is confident it carries a
+        // hostile (crit-5) trait — a model gap worth investigating. INFO keeps
+        // it visible in serve/worker mode (scan=info) without spamming default
+        // CLI runs (scan=warn).
+        tracing::info!(
             path = %label,
             arm = "crit5",
             confident_hostile = counts.hostile,
@@ -3136,7 +3137,7 @@ fn apply_trait_floor(
         decision.class = Classification::Suspicious;
         decision.probability = counts.suspicious_confidence;
         decision.level = interpreted_level(active_level, grid_max, Classification::Suspicious);
-        tracing::warn!(
+        tracing::info!(
             path = %label,
             arm = "crit4_fraction",
             confident_suspicious = counts.suspicious,
@@ -3665,6 +3666,13 @@ pub(crate) fn classify_report(
             llm_ctx.as_deref()?,
             final_decision.class,
             final_decision.probability,
+            // Where ML placed this file on the calibrated FP axis, which is what
+            // bounds how far the LLM may move the band (see `interpret::blend`).
+            crate::interpret::LevelContext {
+                fired: final_decision.level,
+                active: model.active_level(),
+                grid_max: model.grid_max(),
+            },
         )?;
         if let Some(grade) = interp.grade {
             tracing::info!(

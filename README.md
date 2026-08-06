@@ -64,7 +64,7 @@ atomscan url https://example.com/download
 atomscan ps
 atomscan sys
 
-# Emit one JSON object per scanned file.
+# JSON output for programmatic access
 atomscan -f json ./project
 ```
 
@@ -75,7 +75,14 @@ Exit codes make CI integration trivial:
 - `2`: suspicious sample detected
 - `3` or more: analysis error
 
-## How does it work?
+## How it works
+
+![Diagram](media/diagram.png "Atomdrift Scan Diagram")
+
+1. [stng](https://github.com/atomdrift-project/stng) extracts content, even if obfuscated
+2. [cleave](https://github.com/atomdrift-project/cleave) unpacks containers and extracts capabilities
+3. The report is converted into a standardized feature vector, standardized across file types.
+4. [azoth](https://github.com/atomdrift-project/azoth) LightGBM model ensembles score the sample.
 
 ### Networking and privacy
 
@@ -97,30 +104,6 @@ NOTE: For file formats where we don't have 100 million samples, the observed fal
 Raw `--threshold-hostile` and `--threshold-suspicious` overrides are available
 for users who want to micromanage probability thresholds directly, but these numbers are not guaranteed to be stable, and these flags cannot be combined with `-l`.
 
-## How it works
-
-Atomdrift Scan uses several local analysis stages:
-
-1. [cleave](https://github.com/atomdrift-project/cleave) unpacks containers and
-   extracts capabilities from binaries and source with tools including Rizin,
-   tree-sitter, YARA, and UPX.
-2. The report is converted into a standardized feature vector.
-3. [azoth](https://github.com/atomdrift-project/azoth) ONNX model ensembles
-   select a route for the file type and produce a probability and explanation.
-4. The configured false-positive level turns that result into a benign,
-   suspicious, or hostile verdict.
-
-```mermaid
-flowchart LR
-    IN([file · directory · archive<br/>package · URL · process]) --> BLOOM{known-good /<br/>known-bad filters}
-    BLOOM -->|no decisive match| CLEAVE[cleave<br/>unpack, parse, disassemble, match]
-    CLEAVE --> FEATURES[feature vector]
-    FEATURES --> MODEL[azoth<br/>ONNX ensemble]
-    MODEL --> OUT{{benign · suspicious · hostile}}
-    BLOOM -->|decisive match| OUT
-    MODEL -. optional .-> LLM[local LLM second opinion]
-    LLM -. blended verdict .-> OUT
-```
 
 ### Optional local LLM (interpretation)
 
