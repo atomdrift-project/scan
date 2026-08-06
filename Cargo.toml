@@ -68,7 +68,7 @@ repository = "https://github.com/atomdrift-project/scan"
 # Path dep while the gauntlet startup-cost work is local; flip back to the git
 # dep once cleave's changes are pushed. (Direct path dep, not [patch] — cargo
 # silently ignores prerelease path patches.)
-cleave = { path = "../cleave", default-features = false }
+cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 # Path dep while fletch::purl::{normalize,identity} is unpushed — scan's bloom
@@ -79,13 +79,13 @@ proclist = { git = "https://github.com/atomdrift-project/proclist.git" }
 # Direct handle on filefacts (already in the graph via cleave/fletch) so the
 # `ps` subcommand can tune rizin for low-latency live-process scanning:
 # native-arch-only, a tighter timeout, and a size gate on giant binaries.
-filefacts = { path = "../filefacts" }
+filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
 # Direct handle on stng (already in the graph via cleave/filefacts/fletch) so the
 # long-lived worker/server modes can reclaim stng's string/r2 caches in-process —
 # cleave only prunes them on directory scans, not the per-payload analysis a
 # daemon runs. Uses stng's own cache-root helpers, so a relocated
 # STNG_STRING_CACHE_DIR is still swept correctly.
-stng = { path = "../stng" }
+stng = { git = "https://github.com/atomdrift-project/stng.git" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
