@@ -4,7 +4,7 @@
 [![Latest release](https://img.shields.io/github/v/release/atomdrift-project/scan)](https://github.com/atomdrift-project/scan/releases/latest)
 [![License](https://img.shields.io/github/license/atomdrift-project/scan)](LICENSE)
 
-Atomdrift Scan is a modern ML malware scanner designed to detect 0-day attacks against the software supply-chain. 
+Atomdrift Scan is a modern ML-based malware scanner designed to detect 0-day attacks against the software supply-chain. 
 
 It's designed to be deterministic, fast, and flexible, and embeddable in any workflow or security tool you have in mind, and can operate against files, archives, URLs, PURLs, or processes. 
 
