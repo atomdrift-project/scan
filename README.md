@@ -4,114 +4,53 @@
 [![Latest release](https://img.shields.io/github/v/release/atomdrift-project/scan)](https://github.com/atomdrift-project/scan/releases/latest)
 [![License](https://img.shields.io/github/license/atomdrift-project/scan)](LICENSE)
 
-Atomdrift Scan is an open-source malware and supply-chain scanner for files,
-directories, archives, packages, URLs, and running processes. The `atomscan`
-CLI combines static analysis with local, CPU-based ML to classify code as
-**benign**, **suspicious**, or **hostile**.
+Atomdrift Scan is a modern ML malware scanner designed to detect 0-day attacks against the software supply-chain. 
 
-No cloud scanner, API key, GPU, or sample upload is required. Analysis and
-model inference run on your machine. Given the same input and installed
-bundles, results are deterministic and suitable for a developer workstation,
-CI gate, or self-hosted scanning service.
+It's designed to be deterministic, fast, and flexible, and embeddable in any workflow or security tool you have in mind, and can operate against files, archives, URLs, PURLs, or processes. 
+
+As of August 2026, Atomdrift Scan has a [82% 0-day detection rate](https://atomdrift.org/compare/), +18% ahead of any other scanner: commercial or open.
 
 <p align="center">
   <img src="media/screenshot.png" alt="Atomdrift Scan terminal output" width="760">
 </p>
 
-## Why Atomdrift Scan?
+How does Atomdrift get such great results? First, Atomdrift covers more ground than any other single malware scanner:
 
-- **Designed for software supply chains.** Inspect source, binaries, package
-  manifests, lockfiles, archives, and the external artifacts they reference.
-- **Broad, format-aware analysis.** Recognizes more than 100 code, package,
-  archive, document, and binary formats instead of treating every file as an
-  opaque byte stream.
-- **Private and self-hostable.** Samples are not uploaded by default; the scan
-  engine and ONNX models run locally.
-- **A policy you can tune.** Set an operating level in expected false positives
-  per 100 million benign files, rather than guessing at a generic “sensitivity.”
-- **Built for automation.** Stable exit codes, NDJSON output, an HTTP server,
-  and distributed workers cover everything from a pre-commit check to a scan
-  farm.
-- **Explainable results.** Findings include the capabilities and behaviors that
-  contributed to a verdict, not only a score.
+- 100+ supported file formats: from C source to ELF to PDF
+- 100,000+ detection rules covering malware on every platform from AIX to iOS to Windows
+- 4,000,000+ hashes for known good/badware
+- Integrated AST analysis using [tree-sitter](https://tree-sitter.github.io/)
+- Automated binary reverse engineering via [rizin](https://rizin.re/)
+
+Most importantly, rules are constantly refreshed using reinforcement learning against new samples, blogs, and technical articles, resulting in ~1000 updated rules daily.
 
 ## Install
 
-### macOS, Linux, BSD, Solaris, illumos, and Android
+If you are an a UNIX-flavored host (macOS, Linux, BSD, Solaris, illumos, Android):
 
 ```bash
 curl -fsSL https://install.atomdrift.org/scan.sh | sh
 ```
 
-The installer works out your platform, downloads the matching release binary,
-verifies its SHA-256 checksum and — when the GitHub CLI is available — its
-signed build provenance, then installs it into a directory on your `PATH`. On
-macOS and Linux it hands the job to Homebrew when Homebrew is present, so the
-package manager owns upgrades, `PATH`, and dependencies. A platform with no
-published binary falls back to a source build. Re-run it to upgrade; an install
-that is already current is left alone.
-
-Options go after `sh -s --`:
-
-```bash
-curl -fsSL https://install.atomdrift.org/scan.sh | sh -s -- --dir ~/bin --method binary
-curl -fsSL https://install.atomdrift.org/scan.sh | sh -s -- --version 2.5.0
-```
-
-`--method binary` skips Homebrew and takes the prebuilt binary, `--no-tools`
-skips the optional analysis tool check, and `--help` lists the rest. Piping a
-script into a shell is worth being uneasy about, so read the
-[canonical shell installer](https://github.com/atomdrift-project/installer/blob/main/scan.sh)
-first if you would rather.
-
-### Windows
+If you are on Windows:
 
 ```powershell
 irm https://install.atomdrift.org/scan.ps1 | iex
 ```
 
-Installs into `%LOCALAPPDATA%\Programs\atomscan\bin` and puts it on your user
-`PATH`, with no administrator rights required. Windows binaries are not
-published yet, so this builds from source and needs Git, Rust, and the Visual
-Studio C++ build tools; the script names any of them it cannot find.
+Or, if you have [Rust](https://rust-lang.org/) installed and just want to build it from source:
 
-### Build from source
-
-Source builds require Git, Make, a C/C++ toolchain, and Rust 1.94 or newer.
-Install [Rust with rustup](https://rustup.rs/), then run:
-
-```bash
-git clone https://github.com/atomdrift-project/scan.git
-cd scan
+```shell
 make install
 ```
 
-`make install` creates an optimized build and installs the command as
-`atomscan`, normally under `~/.cargo/bin`. Ensure that directory is on your
-`PATH`. Run `make uninstall` from the checkout to remove it.
+If deeper binary analysis is required, you should also install
+[rizin](https://rizin.re/), [upx](https://upx.github.io/), and [innoextract](https://github.com/dscharrer/innoextract).
 
-For deeper binary analysis, also install
-[rizin](https://rizin.re/) and [upx](https://upx.github.io/).
-[innoextract](https://github.com/dscharrer/innoextract) is optional and adds
-Inno Setup extraction.
-
-### First run
-
-Verify the installation and scan a package:
+## Usage
 
 ```bash
-atomscan --version
-atomscan suspicious-package.tgz
-```
-
-The first scan downloads the open model, rule, and bloom-filter bundles. Later
-scans refresh bundles when they are more than 24 hours old.
-
-## Quick start
-
-```bash
-# Scan a file, directory, or archive. Directories are recursive and archives
-# are unpacked automatically.
+# Scan a file, directory, or archive recusively:
 atomscan ./project
 atomscan release.tgz
 
@@ -121,7 +60,7 @@ atomscan purl npm/left-pad@1.3.0
 # Fetch and scan a URL.
 atomscan url https://example.com/download
 
-# Scan running process executables, or triage the wider host.
+# EXPERIMENTAL: Scan running process executables, or triage the wider host
 atomscan ps
 atomscan sys
 
@@ -129,50 +68,35 @@ atomscan sys
 atomscan -f json ./project
 ```
 
-A scan exits `0` when everything is benign, `1` when anything is hostile, `2`
-when something is suspicious but nothing is hostile, and `3` on analysis
-errors. This makes a basic CI gate straightforward:
+Exit codes make CI integration trivial:
 
-```bash
-atomscan ./artifact
-```
+- `0`: all samples are benign
+- `1`: hostile sample detected
+- `2`: suspicious sample detected
+- `3` or more: analysis error
 
-### Network and privacy behavior
+## How does it work?
 
-Files are analyzed locally and are not uploaded unless you explicitly
-configure a hopper with `--hopper`. Be aware that the CLI does make outbound
-requests by default:
+### Networking and privacy
 
-- the first run downloads models, rules, and bloom filters;
-- stale bundles are refreshed automatically; and
-- references found in scanned files—including declared dependencies, package
-  install commands, and download URLs—are fetched and scanned recursively.
+atomscan will never send telemetry data. It will however reach out to the Internet for 2 reasons:
 
-After the initial bundles are installed, disable the separate release notice as
-well for a fully offline scan:
-
-```bash
-SCAN_NO_UPDATE_CHECK=1 atomscan --no-update --fetch=none ./project
-```
-
-Use `--fetch=deps`, `--fetch=packages`, or `--fetch=urls` to limit active
-reference scanning. See `atomscan --help` for depth, age, size, and count limits.
+- **rule updates**: every 24h, can be disabled using `--no-update` or `SCAN_NO_UPDATE_CHECK=1`
+- **dependency fetching**: to detect if a benign package depends on downloading a compromised package or  payload. Set `--fetch=none` to prevent this.
 
 ## Tune the false-positive level
 
-`-l N` selects a calibrated operating point expressed as expected false
-positives per 100 million benign files. Higher levels find more but are noisier;
-lower levels are better suited to hard blocking gates.
+Unlike other malware scanners, Atomdrift allows you to adjust sensitivity in terms of an acceptable false-positive level using the `-l` flag:
 
-```bash
-atomscan -l 0 ./artifact       # strictest: minimize false positives
-atomscan ./artifact            # use the installed model bundle's default
-atomscan -l 5000 ./artifact    # more sensitive, with more alerts
-```
+* `-l0`: tight, sets the confidence cutoff to a point where no false-positives have been observed.
+* `-l25`: the default shipping point: 25 false-positives per 100 million files.
+* `-l1000`: loose, roughly 1 false positive per 100,000 files.
+
+NOTE: For file formats where we don't have 100 million samples, the observed false-positive rate may be up to 5-6X the requested level. YMMV.
+
 
 Raw `--threshold-hostile` and `--threshold-suspicious` overrides are available
-for users who want to manage probability thresholds directly. They cannot be
-combined with `-l`.
+for users who want to micromanage probability thresholds directly, but these numbers are not guaranteed to be stable, and these flags cannot be combined with `-l`.
 
 ## How it works
 
@@ -199,14 +123,14 @@ flowchart LR
     LLM -. blended verdict .-> OUT
 ```
 
-Run `atomscan version` to see the exact rule, bloom-filter, and model inventory
-installed on your machine.
-
 ### Optional local LLM
 
-`--llm` sends evidence—not the original file—to an OpenAI-compatible endpoint
-for a second opinion and blends the result with the ML verdict. With no target,
-it uses `http://localhost:8000/v1`; vLLM is one compatible server.
+For additional interpretation, users can provide access to an LLM via the `--llm` flag. This flag serves two purposes:
+
+* Provides a large-language model text interpretation of the results
+* Steer edge cases based on agreement/disagreement with the ML model.
+
+By default, it sends the interpreted evidence (not the original file) to `http://localhost:8000/v1` - meant to be used with a local service like Ollama or vLLM; but it can also be setup to use a remote service like Claude, ChatGPT, or DeepSeek.
 
 ```bash
 atomscan --llm ./project
@@ -233,8 +157,7 @@ The rule set includes platform-specific behaviors for Linux, macOS, Windows,
 Android, iOS, the BSDs, AIX, Solaris, QNX, z/OS, ESXi, OpenWrt, VxWorks,
 RouterOS, FortiOS, PAN-OS, IOS-XE, Junos, NetScaler, and Ivanti appliances.
 
-The default build matrix covers Linux, macOS, FreeBSD, OpenBSD, NetBSD,
-illumos, Solaris, and Windows across several CPU architectures. Test depth
+The default build matrix covers Linux, macOS, FreeBSD, OpenBSD, NetBSD, illumos, Solaris, and Windows across several CPU architectures. Test depth
 varies by target; see the [build workflow](.github/workflows/build.yml) for the
 current matrix.
 
