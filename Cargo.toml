@@ -297,11 +297,11 @@ dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 # each one — a release built with these in place would silently pin whatever is
 # on this disk. Verify afterwards that Cargo.lock shows a `source = "git+…"`
 # line for all three; a path patch leaves that line absent.
-#[patch."https://github.com/atomdrift-project/cleave.git"]
-#cleave = { path = "../cleave" }
+[patch."https://github.com/atomdrift-project/cleave.git"]
+cleave = { path = "../cleave" }
 
-#[patch."https://github.com/atomdrift-project/stng.git"]
-#stng = { path = "../stng" }
+[patch."https://github.com/atomdrift-project/stng.git"]
+stng = { path = "../stng" }
 
-#[patch."https://github.com/atomdrift-project/filefacts.git"]
-#filefacts = { path = "../filefacts" }
+[patch."https://github.com/atomdrift-project/filefacts.git"]
+filefacts = { path = "../filefacts" }
