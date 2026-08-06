@@ -2815,8 +2815,9 @@ fn emit_result(
 
 /// The cleave context density litmus renders at. `--format tiny` uses cleave's
 /// full tiny (machine/LLM). The terminal view is cut from cleave's own terminal
-/// render — same rich header and body — but capped at the top 3 traits (cleave
-/// shows all notable+), with litmus adding a verdict badge + subtitle on top.
+/// render — same rich header and body — but focused: at most 5 traits per file,
+/// and once anything suspicious+ fired, only those traits and the component
+/// legs their composites reference. litmus adds a verdict badge + subtitle.
 pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
     if matches!(
         config.format(),
@@ -2825,7 +2826,21 @@ pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
         cleave::output::TinyOpts::tiny()
     } else {
         cleave::output::TinyOpts {
-            top_n: 3,
+            // The five most important traits, full stop: `always_crit: None`
+            // means even hostile findings compete for the cap (ranked by
+            // crit × conf), rather than bypassing it.
+            top_n: 5,
+            always_crit: None,
+            // Focus on suspicious+ (plus their composite legs) whenever any
+            // fired; a merged capture window renders only selected rows, and a
+            // suspicious+ hit keeps one trailing row/line of context — the
+            // continuation tends to carry the payoff. Unremarkable files fall
+            // back to their notable top-5.
+            focus_crit: Some(cleave::Criticality::Suspicious),
+            // Card layout: litmus prints the artifact header (verdict rule,
+            // 📦 name, ✨ interpretation, 🧬 hash); cleave renders only the
+            // headerless body with `📄` member headers and gutterless rows.
+            card: true,
             // Only the hit lines/rows — no surrounding context, no `⋯` gap
             // markers, no padding rows in the hex view.
             context_lines: Some(1),
@@ -2948,37 +2963,74 @@ fn render_terminal_context(
     label: &str,
     bloom_mark: Option<crate::output::BloomMark>,
 ) -> String {
-    let (badge, badge_w) = crate::output::terminal_badge(
-        &decision.class,
-        decision.probability,
-        decision.threshold,
-        decision.level,
-    );
-    // The filename starts after the stamp and one separator space.
-    let indent = badge_w + 1;
-    let trailer = crate::output::terminal_trailer(reasons, interpretation);
-    // The bloom provenance marker trails the SHA-256 line — the field the filters
-    // matched on — rather than the verdict badge.
-    let subtitle = crate::output::terminal_subtitle(sha256, indent, bloom_mark);
-    let adorn = cleave::output::HeaderBadge {
-        badge: Some(&badge),
-        trailer: trailer.as_deref(),
-        subtitle: subtitle.as_deref(),
-    };
-    let body = cleave::output::format_context_badged(report, tiny_opts, adorn);
-    if body.is_empty() {
-        // No notable+ traits to anchor a header on: still surface the verdict
-        // headline so a flagged file is never silent.
-        let trail = trailer.map(|t| format!(" {t}")).unwrap_or_default();
-        let mut head = format!("{badge} {label}{trail}\n");
-        if let Some(sub) = &subtitle {
-            head.push_str(sub);
-            head.push('\n');
-        }
-        head
+    // The card frame, top-down: verdict rule → what (📦 name · TYPE · size) →
+    // why (✨ interpretation, --llm only) → identity (🧬/🚩 hash), a blank
+    // line, then cleave's headerless body (📄 member blocks). Plain (piped)
+    // output keeps the same information as unframed grep-able lines.
+    let root = report.files.first();
+    let file_type = root.map(|f| f.file_type.as_str()).unwrap_or_default();
+    let size = root.map_or(0, |f| f.size);
+    let is_container = report.files.iter().any(|f| f.depth > 0);
+    let color = colored::control::SHOULD_COLORIZE.should_colorize();
+
+    // Each card *leads* with its blank separator (setting it off from the
+    // banner or the previous card) and ends flush — the footer brings its own
+    // spacing — so a clean scan's quiet summary still hugs the banner.
+    let mut head = String::from("\n");
+    if color {
+        head.push_str(&crate::output::terminal_rule(
+            &decision.class,
+            decision.probability,
+            decision.threshold,
+            decision.level,
+            cleave::output::terminal_width(),
+        ));
+        head.push('\n');
     } else {
-        body
+        let (stamp, _) = crate::output::terminal_badge(
+            &decision.class,
+            decision.probability,
+            decision.threshold,
+            decision.level,
+        );
+        head.push_str(&stamp);
+        head.push(' ');
     }
+    head.push_str(&crate::output::terminal_artifact_line(
+        label,
+        file_type,
+        size,
+        is_container,
+    ));
+    head.push('\n');
+    if let Some(interp) = crate::output::terminal_interpretation(interpretation, 1) {
+        head.push_str(&interp);
+        head.push('\n');
+    } else if let Some(trailer) = crate::output::terminal_trailer(reasons) {
+        // Without an LLM the SHAP reasons take the "why" slot, dim.
+        head.push(' ');
+        head.push_str(&trailer);
+        head.push('\n');
+    }
+    if let Some(hash) = crate::output::terminal_hash_line(sha256, bloom_mark) {
+        head.push_str(&hash);
+        head.push('\n');
+    }
+
+    let body = cleave::output::format_context_badged(
+        report,
+        tiny_opts,
+        cleave::output::HeaderBadge::default(),
+    );
+    if !body.trim().is_empty() {
+        head.push('\n');
+        head.push_str(&body);
+    }
+    // Flush ending: the next card (or the footer) supplies the separator.
+    while head.ends_with("\n\n") {
+        head.pop();
+    }
+    head
 }
 
 /// Wall-clock of each post-analysis phase inside `classify_report`, in
@@ -3327,6 +3379,23 @@ pub(crate) fn classify_report(
         })
         .collect();
     let compact = cleave::types::compact::compact_from_files(&report.files);
+    // Text/LLM renderers consume the typed report. Plain JSON does not: compact
+    // conversion has already retained precisely the traits, metrics, symbols,
+    // references, and context it emits. Release the much wider cleave graph
+    // before featurizing thousands of compact member nodes.
+    //
+    // Released *here*, before the `Value` below, and not after it: `compact` is
+    // fully owned (`CompactReport` borrows nothing), so from this point the
+    // cleave graph is dead weight — and on a member-heavy sample it is the
+    // single largest live allocation in the process. Freeing it after the
+    // `to_value` instead made the report, the compact copy, and the JSON DOM
+    // all peak together (MiniMax: a ~3 GB step at the very end of an already
+    // 12.8 GB run, for a report whose serialized form is 490 MB).
+    let keep_typed_report = render_context || interpret.is_some() || llm_view || dump_dir.is_some();
+    if !keep_typed_report {
+        let target = report.target.clone();
+        report = cleave::AnalysisReport::new(target);
+    }
     validate_report_references(label, &compact);
     let formula = compact
         .files
@@ -3336,15 +3405,6 @@ pub(crate) fn classify_report(
 
     let mut report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
     drop(compact);
-    // Text/LLM renderers consume the typed report. Plain JSON does not: compact
-    // conversion has already retained precisely the traits, metrics, symbols,
-    // references, and context it emits. Release the much wider cleave graph
-    // before featurizing thousands of compact member nodes.
-    let keep_typed_report = render_context || interpret.is_some() || llm_view || dump_dir.is_some();
-    if !keep_typed_report {
-        let target = report.target.clone();
-        report = cleave::AnalysisReport::new(target);
-    }
     // Attach the fetch edge log at report level (`source_sha256 → content_sha256`
     // per reference). Report-level, not per-file: a fetch is a per-event
     // observation, so it never falsely dedups when content is exploded by hash.

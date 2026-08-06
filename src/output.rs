@@ -307,6 +307,20 @@ fn colored_conf_or_pct(
     }
 }
 
+/// Fixed per-class anchor color: red hostile, yellow suspicious, green benign.
+/// The verdict stamp and card rules use this — the word names the verdict, so
+/// the hue must match it exactly; confidence nuance lives in the percentage.
+/// (The band-interior litmus gradient survives only in `ps`'s wordless
+/// two-block indicator, where hue is the sole carrier.)
+fn class_color(classification: &Classification) -> Rgb {
+    let p = palette();
+    match classification {
+        Classification::Hostile => p.hostile,
+        Classification::Suspicious => p.suspicious,
+        Classification::Benign => p.benign,
+    }
+}
+
 /// Classification label colored to match the band.
 fn colored_label(classification: &Classification, p: &Palette) -> String {
     match classification {
@@ -316,17 +330,22 @@ fn colored_label(classification: &Classification, p: &Palette) -> String {
     }
 }
 
-/// litmus's verdict stamp that leads cleave's headline: the band percentage on
-/// a filled, classification-colored background — ` 100% ` (red hostile, orange
-/// suspicious, green benign) — so the color alone carries the verdict and the
-/// word is unnecessary. Plain `100%` when color is disabled (piped). Returns the
-/// stamp and its visible width (for aligning lines beneath it).
+/// litmus's verdict stamp that leads cleave's headline: the verdict word and
+/// band percentage on a filled, classification-colored background —
+/// ` HOSTILE 100% ` (red), ` SUSPECT  62% ` (orange), ` BENIGN    3% `
+/// (green) — so the verdict reads in both the color and the word. Every stamp
+/// is the same [`BADGE_WIDTH`] columns (7-char word slot, right-aligned
+/// percentage), so verdicts line up down a scan listing. Plain
+/// `HOSTILE[100%]` when color is disabled (piped). Returns the stamp and its
+/// visible width (for aligning lines beneath it).
 pub(crate) fn terminal_badge(
     classification: &Classification,
     probability: f32,
     threshold: f32,
     level: Option<i32>,
 ) -> (String, usize) {
+    // ` ` + 7-char word + ` ` + 4-char percentage + ` `.
+    const BADGE_WIDTH: usize = 14;
     let pct = level_confidence(level).map_or_else(
         || {
             format!(
@@ -336,44 +355,41 @@ pub(crate) fn terminal_badge(
         },
         |conf| format!("{conf}%"),
     );
+    let word = match classification {
+        Classification::Hostile => "HOSTILE",
+        Classification::Suspicious => "SUSPECT",
+        Classification::Benign => "BENIGN",
+    };
     if !colored::control::SHOULD_COLORIZE.should_colorize() {
-        let width = pct.chars().count();
-        return (pct, width);
+        let stamp = format!("{word}[{pct}]");
+        let width = stamp.chars().count();
+        return (stamp, width);
     }
-    // Bold white on the band color, padded with a space either side — so the
-    // visible width is the percentage plus the two padding spaces.
-    let Rgb(r, g, b) = indicator_colors(probability, classification, threshold).2;
-    let width = pct.chars().count() + 2;
+    // Bold white on the class anchor color (fixed red/yellow/green — the word
+    // names the verdict, so the hue must agree with it; the percentage carries
+    // the confidence), fixed-width so every stamp is the same size block.
+    let Rgb(r, g, b) = class_color(classification);
     (
-        format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {pct} \x1b[0m"),
-        width,
+        format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {word:<7} {pct:>4} \x1b[0m"),
+        BADGE_WIDTH,
     )
 }
 
-/// The one-line summary that trails the file type on the headline: `· <text>`.
-/// `--interpret` data supersedes the model's own reasoning when present;
-/// otherwise the SHAP reasons. `None` when neither exists.
-pub(crate) fn terminal_trailer(
-    reasons: &[crate::explain::Reason],
-    interpretation: Option<&crate::interpret::Interpretation>,
-) -> Option<String> {
-    let color = colored::control::SHOULD_COLORIZE.should_colorize();
-    let body = if let Some(llm) = interpretation {
-        llm.error.as_deref().map_or_else(
-            || llm.interpretation.clone(),
-            |_| "interpretation unavailable".into(),
-        )
-    } else if reasons.is_empty() {
+/// The one-line summary that trails the file type on the headline: `· <text>`
+/// built from the SHAP reasons. `None` when there are none. When an LLM
+/// interpretation exists it supersedes this entirely — rendered prominent on
+/// its own line by [`terminal_interpretation`] instead of dim on the headline.
+pub(crate) fn terminal_trailer(reasons: &[crate::explain::Reason]) -> Option<String> {
+    if reasons.is_empty() {
         return None;
-    } else {
-        reasons
-            .iter()
-            .take(3)
-            .map(|r| r.description.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    if color {
+    }
+    let body = reasons
+        .iter()
+        .take(3)
+        .map(|r| r.description.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
         let p = palette();
         Some(format!("{} {}", fg(p.dim, "\u{00b7}"), fg(p.reason, &body)))
     } else {
@@ -381,25 +397,127 @@ pub(crate) fn terminal_trailer(
     }
 }
 
-/// The line beneath the headline: the full SHA-256 (copy-able for lookups), no
-/// label, indented to align under the filename, optionally trailed by the bloom
-/// provenance marker — the marker rides here because the SHA-256 is what the
-/// filters matched on. `None` when absent.
-pub(crate) fn terminal_subtitle(
-    sha256: &str,
+/// The LLM interpretation as its own headline-grade line, sitting directly
+/// above the SHA-256: `✨ <one-line interpretation>` in bold foreground (white
+/// on dark terminals), the sparkle marking it as model-generated. A failed
+/// interpretation renders dim instead — an error is not a finding. `None` when
+/// no interpretation ran.
+pub(crate) fn terminal_interpretation(
+    interpretation: Option<&crate::interpret::Interpretation>,
     indent: usize,
-    bloom: Option<BloomMark>,
 ) -> Option<String> {
+    let llm = interpretation?;
+    let pad = " ".repeat(indent);
+    let color = colored::control::SHOULD_COLORIZE.should_colorize();
+    if llm.error.is_some() {
+        let text = "\u{2728} interpretation unavailable";
+        return Some(if color {
+            format!("{pad}{}", fg(palette().very_dim, text))
+        } else {
+            format!("{pad}{text}")
+        });
+    }
+    Some(if color {
+        format!(
+            "{pad}\u{2728} {}",
+            fg_bold(palette().path_name, &llm.interpretation)
+        )
+    } else {
+        format!("{pad}\u{2728} {}", llm.interpretation)
+    })
+}
+
+/// The card's identity line: a glyph, then the full SHA-256 (copy-able for
+/// lookups) in the dimmest ink on screen. The glyph carries the bloom verdict —
+/// 🧬 ordinarily, 🚩 known-bad, 🏴 conflicted — because the SHA-256 is what the
+/// filters matched on; a known-good-but-rescanned file keeps 🧬 with a green ✓
+/// trailer. Plain mode keeps the old text marker (grep-able). `None` when the
+/// hash is absent.
+pub(crate) fn terminal_hash_line(sha256: &str, bloom: Option<BloomMark>) -> Option<String> {
     if sha256.is_empty() {
         return None;
     }
-    let hash = if colored::control::SHOULD_COLORIZE.should_colorize() {
-        fg(palette().dim, sha256)
-    } else {
-        sha256.to_string()
+    if !colored::control::SHOULD_COLORIZE.should_colorize() {
+        let mark = bloom.map_or_else(String::new, BloomMark::marker);
+        return Some(format!("{sha256}{mark}"));
+    }
+    let p = palette();
+    let (glyph, trailer) = match bloom {
+        Some(BloomMark::KnownBad) => ("\u{1f6a9}", String::new()),   // 🚩
+        Some(BloomMark::Conflicted) => ("\u{1f3f4}", String::new()), // 🏴
+        Some(BloomMark::KnownGood) => {
+            ("\u{1f9ec}", format!("  {}", fg(p.benign, "\u{2713}")))
+        }
+        None => ("\u{1f9ec}", String::new()), // 🧬
     };
-    let mark = bloom.map_or_else(String::new, BloomMark::marker);
-    Some(format!("{}{hash}{mark}", " ".repeat(indent)))
+    Some(format!(" {glyph} {}{trailer}", fg(p.very_dim, sha256)))
+}
+
+/// Human-compact byte size for headers: `352B`, `5.4KB`, `1.2MB`. Empty for 0
+/// so callers can skip the segment entirely.
+pub(crate) fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    match bytes {
+        0 => String::new(),
+        b if b >= GB => format!("{:.1}GB", b as f64 / GB as f64),
+        b if b >= MB => format!("{:.1}MB", b as f64 / MB as f64),
+        b if b >= KB => format!("{:.1}KB", b as f64 / KB as f64),
+        b => format!("{b}B"),
+    }
+}
+
+/// The card-opening rule: ` ━━ <stamp> ━━━…`, heavy strokes in the band color
+/// running the terminal width, with the fixed-width verdict stamp embedded near
+/// the left edge. Color-mode only — plain output frames nothing.
+pub(crate) fn terminal_rule(
+    classification: &Classification,
+    probability: f32,
+    threshold: f32,
+    level: Option<i32>,
+    width: usize,
+) -> String {
+    let (stamp, stamp_w) = terminal_badge(classification, probability, threshold, level);
+    let accent = class_color(classification);
+    // ` ` + `━━` + ` ` + stamp + ` ` + fill, with a 1-col right margin.
+    let fill = width.saturating_sub(stamp_w + 7).max(2);
+    format!(
+        " {} {stamp} {}",
+        fg(accent, "\u{2501}\u{2501}"),
+        fg(accent, &"\u{2501}".repeat(fill)),
+    )
+}
+
+/// The card's artifact line: ` 📦 name · TYPE · size` (📄 for a standalone,
+/// member-less file) — bright name, dim metadata. Plain mode drops the glyph
+/// so piped output stays grep-able text.
+pub(crate) fn terminal_artifact_line(
+    label: &str,
+    file_type: &str,
+    size: u64,
+    container: bool,
+) -> String {
+    let glyph = if container {
+        "\u{1f4e6}" // 📦
+    } else {
+        "\u{1f4c4}" // 📄
+    };
+    let mut meta = file_type.to_uppercase();
+    let size = human_size(size);
+    if !size.is_empty() {
+        meta.push_str(&format!(" \u{00b7} {size}"));
+    }
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
+        let p = palette();
+        format!(
+            " {glyph} {} {}",
+            fg_bold(p.path_name, label),
+            fg(p.dim, &format!("\u{00b7} {meta}")),
+        )
+    } else {
+        format!("{label} \u{00b7} {meta}")
+    }
 }
 
 /// Print a process scan result with PID annotations.
@@ -742,14 +860,84 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
     );
 }
 
-/// Print scan summary.
+/// Print scan summary. A flagged scan closes its card sequence with a heavy
+/// rule in the worst verdict's color, the counts embedded in the rule (bloom
+/// hits folded in). A clean scan keeps the quiet thin rule and ✓ line — the
+/// frame inherits the color of what it contains, and a clean run contains no
+/// color.
 pub fn print_summary(summary: &ScanSummary) {
     let p = palette();
+    let flagged = summary.hostile > 0 || summary.suspicious > 0;
+    let color = colored::control::SHOULD_COLORIZE.should_colorize();
+    let bloom = crate::bloom_repo::counts();
+
+    if flagged && color {
+        // Cards end flush; the footer leads with its own separating blank.
+        eprintln!();
+        let accent = if summary.hostile > 0 {
+            p.hostile
+        } else {
+            p.suspicious
+        };
+        // Colored segments paired with their plain text, so the rule fill can
+        // be sized from real visible width.
+        let mut parts: Vec<(String, String)> = Vec::new();
+        let plain = |s: &str| (s.to_string(), s.to_string());
+        parts.push(plain(&format!(
+            "{} file{}",
+            summary.total_files,
+            if summary.total_files == 1 { "" } else { "s" }
+        )));
+        if summary.hostile > 0 {
+            let s = format!("{} hostile", summary.hostile);
+            parts.push((fg(p.hostile, &s), s));
+        }
+        if summary.suspicious > 0 {
+            let s = format!("{} suspicious", summary.suspicious);
+            parts.push((fg(p.suspicious, &s), s));
+        }
+        if summary.errors > 0 {
+            let s = format!("{} errors", summary.errors);
+            parts.push((fg(p.header_path, &s), s));
+        }
+        {
+            let s = format!("{} clean", summary.benign);
+            parts.push((fg(p.very_dim, &s), s));
+        }
+        if bloom.flagged > 0 {
+            let s = format!("{} known-bad", bloom.flagged);
+            parts.push((fg(p.hostile, &s), s));
+        }
+        if bloom.conflicted > 0 {
+            let s = format!("{} conflicted", bloom.conflicted);
+            parts.push((fg(p.warning, &s), s));
+        }
+        {
+            let s = format_elapsed(summary.duration_ms);
+            parts.push((fg(p.very_dim, &s), s));
+        }
+        let sep_colored = format!(" {} ", fg(p.dot_sep, "\u{00b7}"));
+        let colored_line: Vec<String> = parts.iter().map(|(c, _)| c.clone()).collect();
+        let plain_len: usize = parts.iter().map(|(_, s)| s.chars().count()).sum::<usize>()
+            + (parts.len() - 1) * 3;
+        // ` ` + `━━` + ` ` + content + ` ` + fill, 1-col right margin.
+        let fill = cleave::output::terminal_width()
+            .saturating_sub(plain_len + 6)
+            .max(2);
+        eprintln!(
+            " {} {} {}",
+            fg(accent, "\u{2501}\u{2501}"),
+            colored_line.join(&sep_colored),
+            fg(accent, &"\u{2501}".repeat(fill)),
+        );
+        eprintln!();
+        return;
+    }
+
     let line = fg(p.summary_line, &"\u{2500}".repeat(52));
     eprintln!(" {line}");
 
     // Bloom decision tally (only when filters were consulted this run).
-    let bloom = crate::bloom_repo::counts();
     if !bloom.is_empty() {
         let mut parts = Vec::new();
         if bloom.skipped > 0 {
@@ -813,7 +1001,11 @@ pub fn summary_status_line(summary: &ScanSummary) -> String {
         );
     }
 
-    let mut parts = vec![format!("{} files", summary.total_files)];
+    let mut parts = vec![format!(
+        "{} file{}",
+        summary.total_files,
+        if summary.total_files == 1 { "" } else { "s" }
+    )];
     if summary.hostile > 0 {
         parts.push(fg(p.hostile, &format!("{} hostile", summary.hostile)));
     }
@@ -850,7 +1042,7 @@ pub fn print_banner(rules: u64) {
         ),
         fg(
             p.very_dim,
-            &format!("- {} rules loaded", with_commas(rules))
+            &format!("\u{00b7} {} rules", with_commas(rules))
         ),
     );
 }
@@ -1049,20 +1241,29 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_trails_the_bloom_marker() {
-        // The provenance marker rides the SHA-256 line, not the verdict badge: an
-        // unmarked subtitle is the bare hash; a marked one appends the glyph+label.
-        let plain = terminal_subtitle("deadbeef", 5, None).expect("subtitle");
-        let flagged =
-            terminal_subtitle("deadbeef", 5, Some(BloomMark::KnownBad)).expect("subtitle");
+    fn hash_line_carries_the_bloom_glyph() {
+        // The bloom verdict rides the hash line's glyph slot — 🚩 supplants 🧬
+        // for a known-bad file — never the verdict badge. (These tests run
+        // uncolored, so the line uses the plain text-marker form.)
+        let plain = terminal_hash_line("deadbeef", None).expect("hash line");
+        let flagged = terminal_hash_line("deadbeef", Some(BloomMark::KnownBad)).expect("hash line");
         assert!(plain.contains("deadbeef"));
         assert!(!plain.contains(BloomMark::KnownBad.glyph()));
         assert!(flagged.contains("deadbeef"));
         assert!(flagged.contains(BloomMark::KnownBad.glyph()));
-        assert!(flagged.contains("known-bad"));
-        // The badge itself no longer carries any bloom glyph.
+        // An absent hash renders nothing.
+        assert!(terminal_hash_line("", Some(BloomMark::KnownBad)).is_none());
+        // The badge itself carries no bloom glyph.
         let (badge, _) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Some(0));
         assert!(!badge.contains(BloomMark::KnownBad.glyph()));
+    }
+
+    #[test]
+    fn human_size_compact_units() {
+        assert_eq!(human_size(0), "");
+        assert_eq!(human_size(352), "352B");
+        assert_eq!(human_size(5 * 1024 + 400), "5.4KB");
+        assert_eq!(human_size(44 * 1024 * 1024 / 10 * 10), "44.0MB");
     }
 
     #[test]
