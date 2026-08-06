@@ -233,9 +233,10 @@ The rule set includes platform-specific behaviors for Linux, macOS, Windows,
 Android, iOS, the BSDs, AIX, Solaris, QNX, z/OS, ESXi, OpenWrt, VxWorks,
 RouterOS, FortiOS, PAN-OS, IOS-XE, Junos, NetScaler, and Ivanti appliances.
 
-The build matrix covers Linux, macOS, FreeBSD, OpenBSD, NetBSD, DragonFly BSD,
-and illumos across several CPU architectures. Test depth varies by target; see
-the [build workflow](.github/workflows/build.yml) for the current matrix.
+The default build matrix covers Linux, macOS, FreeBSD, OpenBSD, NetBSD,
+illumos, Solaris, and Windows across several CPU architectures. Test depth
+varies by target; see the [build workflow](.github/workflows/build.yml) for the
+current matrix.
 
 ## Documentation
 

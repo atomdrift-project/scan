@@ -110,7 +110,7 @@ jobs:
         run: |
           set -eu
           case "$REQUESTED_TARGET" in
-            ""|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin|x86_64-unknown-freebsd|x86_64-unknown-openbsd|x86_64-unknown-netbsd|x86_64-unknown-dragonfly|x86_64-unknown-haiku|x86_64-unknown-hurd-gnu|x86_64-pc-solaris|omnios-native|x86_64-pc-windows-msvc|x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|arm-unknown-linux-musleabihf|armv7-unknown-linux-musleabihf|loongarch64-unknown-linux-musl|x86_64-unknown-illumos|s390x-unknown-linux-gnu|riscv64gc-unknown-linux-gnu|powerpc64le-unknown-linux-gnu) ;;
+            ""|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin|x86_64-unknown-freebsd|x86_64-unknown-openbsd|x86_64-unknown-netbsd|x86_64-pc-solaris|omnios-native|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc|x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|arm-unknown-linux-musleabihf|armv7-unknown-linux-musleabihf|loongarch64-unknown-linux-musl|x86_64-unknown-illumos|s390x-unknown-linux-gnu|riscv64gc-unknown-linux-gnu|powerpc64le-unknown-linux-gnu) ;;
             *)
               echo "::error::unknown release target: $REQUESTED_TARGET"
               exit 1
@@ -347,10 +347,11 @@ jobs:
       # ones that built — but the gap gets named instead of being invisible.
       - name: Inventory targets
         env:
-          # Keep in sync with build.yml's matrices. Windows became a required
-          # release target after its native build and smoke tests first passed
-          # in run 30966163861. Solaris is release-bound now that its native
-          # build can complete the fat-LTO link with ZFS-backed swap.
+          # Keep in sync with build.yml's matrices. Windows x86-64 became a
+          # required release target after its native build and smoke tests first
+          # passed in run 30966163861. Windows ARM64 is native-built and smoked on
+          # GitHub's Windows 11 ARM runner. Solaris is release-bound now that
+          # its native build can complete the fat-LTO link with ZFS-backed swap.
           EXPECTED: >-
             x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
             aarch64-apple-darwin x86_64-apple-darwin
@@ -359,11 +360,10 @@ jobs:
             loongarch64-unknown-linux-musl
             s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu
             powerpc64le-unknown-linux-gnu
-            x86_64-unknown-freebsd x86_64-unknown-dragonfly
-            x86_64-unknown-openbsd x86_64-unknown-netbsd
-            x86_64-unknown-haiku x86_64-unknown-hurd-gnu
+            x86_64-unknown-freebsd x86_64-unknown-openbsd
+            x86_64-unknown-netbsd
             x86_64-unknown-illumos x86_64-pc-solaris
-            x86_64-pc-windows-msvc
+            x86_64-pc-windows-msvc aarch64-pc-windows-msvc
           REQUESTED_TARGET: ${{ inputs.target || '' }}
         run: |
           set -eu

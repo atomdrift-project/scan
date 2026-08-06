@@ -654,19 +654,14 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # illumos, by way of OmniOS. Expected to fail, and that is the point: the
-  # known blocker is tree-sitter's src/portable/endian.h, which has no __sun
-  # branch and bails with "platform not supported" — illumos spells those
-  # macros in <sys/byteorder.h>. Everything up to that point cross-built fine
-  # when this was last attempted, C and C++ deps included, so the job should
-  # reach the same wall and hand us a current error to work from.
-  # DragonFlyBSD is the closest sibling to a target that already works: it uses
-  # FreeBSD's pkg, and Cargo.toml has excluded it from jemalloc alongside
-  # FreeBSD since long before this job existed, so the code already anticipates
-  # it. Tier 3 in rustc, hence the native build against ports rust.
+  # DragonFlyBSD is a diagnostic target, not part of normal CI or releases.
+  # Rust supports it only at Tier 3, and the newest vmactions/DPorts environment
+  # currently provides rustc 1.85.1 while Scan requires 1.94. Keep the job
+  # available for an explicit compatibility probe when the OS toolchain catches
+  # up, without spending runner time or producing a known-missing release asset.
   dragonfly:
     name: x86_64-unknown-dragonfly
-    if: ${{ inputs.target == '' || inputs.target == 'x86_64-unknown-dragonfly' }}
+    if: ${{ inputs.target == 'x86_64-unknown-dragonfly' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -684,8 +679,8 @@ jobs:
           usesh: true
           # This is the newest image vmactions publishes. DragonFly's official
           # DPorts tree currently stops at rustc 1.85.1, below our 1.94 MSRV;
-          # continue-on-error keeps the job as an honest compatibility canary
-          # until the OS package catches up.
+          # The explicit job remains an honest compatibility canary until the
+          # OS package catches up.
           release: "6.4.2"
           cpu: "4"
           mem: "12288"
@@ -1007,17 +1002,21 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Native Windows release artifact, including execution smoke tests. The full
-  # MSVC build first went green in release run 30966163861, so this is now a
-  # required target rather than a diagnostic. `shell: bash` throughout because
-  # every other run block in this file is sh, and git bash ships on the image.
+  # Native Windows x86-64 and ARM64 release artifacts, both execution-smoked.
+  # GitHub's Windows 11 ARM image ships native Rust, Visual Studio's ARM64 C++
+  # tools and the Windows SDK, so native CI covers the C/C++ dependency graph
+  # without relying on a cross-link that cannot execute its result.
   windows:
-    name: x86_64-pc-windows-msvc
-    if: ${{ inputs.target == '' || inputs.target == 'x86_64-pc-windows-msvc' }}
-    runs-on: windows-2025
+    name: ${{ matrix.target }}
+    if: ${{ inputs.target == '' || contains(' x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target)) }}
+    runs-on: ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'windows-11-arm' || 'windows-2025' }}
     timeout-minutes: 150
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.target != '' && format('["{0}"]', inputs.target) || '["x86_64-pc-windows-msvc","aarch64-pc-windows-msvc"]') }}
     defaults:
       run:
         shell: bash
@@ -1028,9 +1027,12 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Install target
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
+          rustup target add "$TARGET"
           rustc --version --verbose
 
       - name: Cache cargo home
@@ -1040,31 +1042,40 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: cargo-home-windows-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-home-windows-
+          key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-${{ matrix.target }}-
 
       - name: Build
         env:
+          TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
-        run: cargo build --locked --profile "$PROFILE" --target x86_64-pc-windows-msvc --bin atomscan
+        run: cargo build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
+
+      - name: Inspect
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: file "target/$TARGET/$PROFILE/atomscan.exe"
 
       - name: Smoke test
         env:
+          TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
         run: |
           set -x
-          "./target/x86_64-pc-windows-msvc/$PROFILE/atomscan.exe" --version
-          "./target/x86_64-pc-windows-msvc/$PROFILE/atomscan.exe" --help >/dev/null
+          "./target/$TARGET/$PROFILE/atomscan.exe" --version
+          "./target/$TARGET/$PROFILE/atomscan.exe" --help >/dev/null
 
       - name: Package
         env:
+          TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
-        run: tar -czf atomscan-x86_64-pc-windows-msvc.tar.gz -C "target/x86_64-pc-windows-msvc/$PROFILE" atomscan.exe
+        run: tar -czf "atomscan-$TARGET.tar.gz" -C "target/$TARGET/$PROFILE" atomscan.exe
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: atomscan-x86_64-pc-windows-msvc
-          path: atomscan-x86_64-pc-windows-msvc.tar.gz
+          name: atomscan-${{ matrix.target }}
+          path: atomscan-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -1226,6 +1237,11 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
+          # Keep these identical to the Build step. Cargo fingerprints build
+          # script environment, so omitting them makes `cross run` rebuild
+          # unrar_sys and lose the target-specific <cstddef> workaround.
+          CXXFLAGS_s390x_unknown_linux_gnu: "-include cstddef"
+          CXXFLAGS_powerpc64le_unknown_linux_gnu: "-include cstddef"
         run: |
           set -x
           cross run --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan -- --version
