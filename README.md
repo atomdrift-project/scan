@@ -94,7 +94,6 @@ Unlike other malware scanners, Atomdrift allows you to adjust sensitivity in ter
 
 NOTE: For file formats where we don't have 100 million samples, the observed false-positive rate may be up to 5-6X the requested level. YMMV.
 
-
 Raw `--threshold-hostile` and `--threshold-suspicious` overrides are available
 for users who want to micromanage probability thresholds directly, but these numbers are not guaranteed to be stable, and these flags cannot be combined with `-l`.
 
@@ -123,21 +122,19 @@ flowchart LR
     LLM -. blended verdict .-> OUT
 ```
 
-### Optional local LLM
+### Optional local LLM (interpretation)
 
 For additional interpretation, users can provide access to an LLM via the `--llm` flag. This flag serves two purposes:
 
 * Provides a large-language model text interpretation of the results
-* Steer edge cases based on agreement/disagreement with the ML model.
+* Steer edge cases based on agreement/disagreement with the ML model ( p to 33%)
 
-By default, it sends the interpreted evidence (not the original file) to `http://localhost:8000/v1` - meant to be used with a local service like Ollama or vLLM; but it can also be setup to use a remote service like Claude, ChatGPT, or DeepSeek.
+By default, atomscan sends the interpreted evidence (not the original file) to `http://localhost:8000/v1` - to be used with a local service like Ollama or vLLM; but it can also be setup to use a remote service like Claude, ChatGPT, or DeepSeek.
 
 ```bash
 atomscan --llm ./project
 atomscan --llm http://model-host:8000/v1 --llm-model my-model ./project
 ```
-
-This feature is optional. The default scanner needs neither an LLM nor a GPU.
 
 ## Coverage
 
@@ -180,9 +177,8 @@ current matrix.
 - [hopper](https://github.com/atomdrift-project/hopper) — distributed work queue
 - [Atomdrift Lab](https://lab.atomdrift.org/) — free sample analysis
 
-Issues and pull requests are welcome in the
-[GitHub repository](https://github.com/atomdrift-project/scan).
-
 ## License
 
 Atomdrift Scan is available under the [Apache License 2.0](LICENSE).
+
+All contributions welcome!
