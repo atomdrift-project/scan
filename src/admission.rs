@@ -29,7 +29,7 @@
 //! happen on the per-job tokio tasks and only ever *decrease* the reservation,
 //! so they cannot cause over-commit.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,16 +39,16 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MIB: u64 = 1024 * 1024;
 
 /// Assumed peak resident footprint of a small, non-archive analysis.
-const DEFAULT_FLAT_ESTIMATE_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_FLAT_ESTIMATE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Minimum reservation for archive-shaped jobs. Archives decompress and each
 /// source member can spawn a tree-sitter parse tree, so their true peak is often
 /// far above on-disk size.
-const MIN_ARCHIVE_ESTIMATE_BYTES: usize = 1536 * 1024 * 1024;
+const MIN_ARCHIVE_ESTIMATE_BYTES: u64 = 1536 * 1024 * 1024;
 
 /// Upper bound for the size-scaled archive estimate. Jobs larger than the
 /// ceiling still run via the one-job forward-progress hatch.
-const MAX_ARCHIVE_ESTIMATE_BYTES: usize = 10 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ESTIMATE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// On-disk archive bytes are a weak lower bound for in-memory member state; this
 /// multiplier is intentionally pessimistic for large bundles while still letting
@@ -59,7 +59,7 @@ const ARCHIVE_ESTIMATE_MULTIPLIER: u64 = 64;
 /// even if no release wakes us).
 const REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
-fn env_usize(key: &str) -> Option<usize> {
+fn env_u64(key: &str) -> Option<u64> {
     std::env::var(key).ok()?.parse().ok()
 }
 
@@ -78,16 +78,14 @@ fn live_used() -> Option<u64> {
     }
 }
 
-fn dynamic_estimate_bytes(path: &str, file_type: &str, on_disk_bytes: i64) -> usize {
+fn dynamic_estimate_bytes(path: &str, file_type: &str, on_disk_bytes: i64) -> u64 {
     let bytes = u64::try_from(on_disk_bytes).unwrap_or(0);
     if looks_like_archive(path, file_type) {
         let scaled = bytes
             .saturating_mul(ARCHIVE_ESTIMATE_MULTIPLIER)
-            .saturating_add(MIN_ARCHIVE_ESTIMATE_BYTES as u64)
-            .min(MAX_ARCHIVE_ESTIMATE_BYTES as u64);
-        usize::try_from(scaled)
-            .unwrap_or(usize::MAX)
-            .max(MIN_ARCHIVE_ESTIMATE_BYTES)
+            .saturating_add(MIN_ARCHIVE_ESTIMATE_BYTES)
+            .min(MAX_ARCHIVE_ESTIMATE_BYTES);
+        scaled.max(MIN_ARCHIVE_ESTIMATE_BYTES)
     } else {
         DEFAULT_FLAT_ESTIMATE_BYTES
     }
@@ -147,7 +145,7 @@ struct Inflight {
     path: Arc<str>,
     file_type: Arc<str>,
     on_disk_bytes: u64,
-    est_bytes: usize,
+    est_bytes: u64,
     admitted: Instant,
 }
 
@@ -160,9 +158,9 @@ pub struct MemoryAdmission {
     ceiling_bytes: u64,
     /// Optional fixed reservation override. When absent, reservations are
     /// estimated from the job path/type/size.
-    fixed_est_bytes: Option<usize>,
+    fixed_est_bytes: Option<u64>,
     /// Sum of in-flight reservations.
-    reserved: AtomicUsize,
+    reserved: AtomicU64,
     next_id: AtomicU64,
     inflight: Mutex<Vec<Inflight>>,
     /// Woken whenever a reservation is released.
@@ -176,7 +174,7 @@ impl MemoryAdmission {
     /// auto = 85% of RAM); `0` disables proactive throttling so an operator who
     /// opts out, or an unsupported platform, degrades to slot-limited dispatch.
     pub fn new(ceiling_bytes: u64) -> Arc<Self> {
-        let fixed_est_bytes = env_usize("SCAN_PER_SLOT_ESTIMATE_MB")
+        let fixed_est_bytes = env_u64("SCAN_PER_SLOT_ESTIMATE_MB")
             .and_then(|mb| mb.checked_mul(1024 * 1024))
             .filter(|b| *b > 0);
 
@@ -203,7 +201,7 @@ impl MemoryAdmission {
         Arc::new(Self {
             ceiling_bytes,
             fixed_est_bytes,
-            reserved: AtomicUsize::new(0),
+            reserved: AtomicU64::new(0),
             next_id: AtomicU64::new(0),
             inflight: Mutex::new(Vec::new()),
             released: Notify::new(),
@@ -216,7 +214,7 @@ impl MemoryAdmission {
     /// Current sum of in-flight memory reservations, in bytes. Surfaced on the
     /// worker heartbeat so hopper can see how close to the ceiling a worker is
     /// running (and thus whether memory admission is about to pause intake).
-    pub fn reserved_bytes(&self) -> usize {
+    pub fn reserved_bytes(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)
     }
 
@@ -284,7 +282,7 @@ impl MemoryAdmission {
 
     /// Estimate a job's peak footprint for predictive admission. Operators can
     /// force the historical flat estimate with `SCAN_PER_SLOT_ESTIMATE_MB`.
-    fn estimate_bytes(&self, path: &str, file_type: &str, on_disk_bytes: i64) -> usize {
+    fn estimate_bytes(&self, path: &str, file_type: &str, on_disk_bytes: i64) -> u64 {
         if let Some(est) = self.fixed_est_bytes {
             return est;
         }
@@ -297,7 +295,7 @@ impl MemoryAdmission {
     /// whose allocator has retained RSS after earlier jobs.
     ///
     /// Single caller per loop iteration; releases only decrease `reserved`.
-    fn try_reserve(&self, est: usize) -> bool {
+    fn try_reserve(&self, est: u64) -> bool {
         // Disabled: dispatch is bounded by slot count alone.
         if self.ceiling_bytes == 0 {
             self.reserved.fetch_add(est, Ordering::AcqRel);
@@ -316,19 +314,20 @@ impl MemoryAdmission {
         }
 
         // Predictive: committed reservations must leave room for this job.
-        if (reserved as u64).saturating_add(est as u64) > self.ceiling_bytes {
+        if reserved.saturating_add(est) > self.ceiling_bytes {
             return false;
         }
 
         // Reactive: live usage must leave room for this job, catching
         // estimates that ran low and pressure from other processes.
         if let Some(used) = used
-            && used.saturating_add(est as u64) > self.ceiling_bytes
+            && used.saturating_add(est) > self.ceiling_bytes
         {
             return false;
         }
 
-        self.reserved.store(reserved + est, Ordering::Release);
+        self.reserved
+            .store(reserved.saturating_add(est), Ordering::Release);
         true
     }
 
@@ -339,7 +338,7 @@ impl MemoryAdmission {
         path: Arc<str>,
         file_type: Arc<str>,
         on_disk_bytes: i64,
-        est_bytes: usize,
+        est_bytes: u64,
     ) -> AdmissionGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::expect_used)]
@@ -362,7 +361,7 @@ impl MemoryAdmission {
         }
     }
 
-    fn release(&self, id: u64, est: usize) {
+    fn release(&self, id: u64, est: u64) {
         self.reserved.fetch_sub(est, Ordering::AcqRel);
         #[allow(clippy::expect_used)]
         self.inflight
@@ -428,7 +427,7 @@ impl MemoryAdmission {
 pub struct AdmissionGuard {
     admission: Arc<MemoryAdmission>,
     id: u64,
-    est: usize,
+    est: u64,
 }
 
 impl Drop for AdmissionGuard {
@@ -444,7 +443,7 @@ impl Drop for AdmissionGuard {
 mod tests {
     use super::*;
 
-    const GB: usize = 1024 * 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
 
     fn no_used() -> Option<u64> {
         None
@@ -454,20 +453,20 @@ mod tests {
     /// 9 GB live usage — leaves < 1.5 GB below a 10 GB ceiling.
     #[allow(clippy::unnecessary_wraps)]
     fn used_9gb() -> Option<u64> {
-        Some(9 * GB as u64)
+        Some(9 * GB)
     }
 
     /// 11 GB live usage — already past a 10 GB ceiling.
     #[allow(clippy::unnecessary_wraps)]
     fn used_11gb() -> Option<u64> {
-        Some(11 * GB as u64)
+        Some(11 * GB)
     }
 
-    fn gate(ceiling: usize, est: usize, used_fn: fn() -> Option<u64>) -> Arc<MemoryAdmission> {
+    fn gate(ceiling: u64, est: u64, used_fn: fn() -> Option<u64>) -> Arc<MemoryAdmission> {
         Arc::new(MemoryAdmission {
-            ceiling_bytes: ceiling as u64,
+            ceiling_bytes: ceiling,
             fixed_est_bytes: Some(est),
-            reserved: AtomicUsize::new(0),
+            reserved: AtomicU64::new(0),
             next_id: AtomicU64::new(0),
             inflight: Mutex::new(Vec::new()),
             released: Notify::new(),
@@ -523,7 +522,7 @@ mod tests {
             assert!(admitted < 100, "predictive cap never engaged");
         }
         assert_eq!(admitted, 6);
-        assert!((g.reserved.load(Ordering::Acquire) as u64) + est as u64 > g.ceiling_bytes);
+        assert!(g.reserved.load(Ordering::Acquire) + est > g.ceiling_bytes);
     }
 
     #[test]
@@ -548,5 +547,17 @@ mod tests {
             dynamic_estimate_bytes("plain.js", "javascript", 10 * 1024 * 1024),
             DEFAULT_FLAT_ESTIMATE_BYTES,
         );
+    }
+
+    #[test]
+    fn reservations_can_exceed_the_32_bit_address_range() {
+        let est = 5 * GB;
+        let g = gate(10 * GB, est, no_used);
+
+        assert!(est > u64::from(u32::MAX));
+        assert!(g.try_reserve(est));
+        assert!(g.try_reserve(est));
+        assert!(!g.try_reserve(1));
+        assert_eq!(g.reserved.load(Ordering::Acquire), 10 * GB);
     }
 }

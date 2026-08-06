@@ -1856,7 +1856,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     slots,
                     active: slots.saturating_sub(semaphore.available_permits()),
                     queue: outstanding.load(Ordering::Acquire),
-                    mem_reserved_mb: admission.reserved_bytes() as u64 / MIB,
+                    mem_reserved_mb: admission.reserved_bytes() / MIB,
                     mem_ceiling_mb: admission.ceiling_bytes() / MIB,
                     poll_age_s: metrics
                         .start
