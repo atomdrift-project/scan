@@ -253,7 +253,9 @@ jobs:
       # Hardened runtime is mandatory for notarization, and hardened runtime
       # blocks JIT by default — which would kill us, because yara-x runs its
       # compiled rules through wasmtime/cranelift at load time. Hence the
-      # allow-jit entitlement in .github/macos-entitlements.plist.
+      # entitlements in .github/macos-entitlements.plist, which needs both
+      # allow-jit and allow-unsigned-executable-memory; see that file for why
+      # allow-jit alone shipped a v2.5.0 that died on every scan.
       - name: Sign with Developer ID
         if: ${{ runner.os == 'macOS' && inputs.sign }}
         env:
@@ -433,6 +435,16 @@ jobs:
           file "target/$TARGET/$PROFILE/atomscan"
           "./target/$TARGET/$PROFILE/atomscan" --version
           "./target/$TARGET/$PROFILE/atomscan" --help >/dev/null
+          # --version and --help never compile a ruleset, so they never touch
+          # the wasmtime/cranelift JIT. That blind spot is exactly how v2.5.0
+          # shipped macOS binaries that were SIGKILLed ("Code Signature
+          # Invalid") the moment they scanned anything. Scan a real file, after
+          # signing, so a bad entitlement set fails the build instead of the
+          # user. --fetch=none keeps it offline; the rules update it does need
+          # takes seconds. The same reasoning is why the openbsd job below runs
+          # tests rather than trusting --version.
+          printf '#!/bin/sh\necho hello\n' > "$RUNNER_TEMP/smoke.sh"
+          "./target/$TARGET/$PROFILE/atomscan" --fetch=none "$RUNNER_TEMP/smoke.sh"
 
       - name: Package
         env:
@@ -450,12 +462,8 @@ jobs:
   # Native build in a KVM-accelerated VM, which is the only way to actually run
   # the test suite on FreeBSD. Uses the OS's packaged rust, so it also tells us
   # when ports rust drifts below our MSRV.
-  # aarch64-unknown-freebsd was tried here on ubuntu-24.04-arm and removed:
-  # that image does not give the guest KVM, so qemu falls back to TCG. The
-  # x86_64 build takes ~46 min accelerated; emulated, the arm64 one was still
-  # compiling at 2h16m against the 150 min cap. Don't re-add it without a host
-  # that can actually accelerate an aarch64 guest — raising the timeout just
-  # buys a 4-6 hour job for one target.
+  # aarch64 lives in the dispatch-only freebsd-arm64 job below; see its comment
+  # for why it is not part of the always-on matrix.
   freebsd:
     name: x86_64-unknown-freebsd
     if: ${{ inputs.target == '' || inputs.target == 'x86_64-unknown-freebsd' }}
@@ -520,6 +528,79 @@ jobs:
         with:
           name: atomscan-x86_64-unknown-freebsd
           path: atomscan-x86_64-unknown-freebsd.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # aarch64 FreeBSD, dispatch-only (same opt-in pattern as dragonfly/haiku):
+  #
+  #     gh workflow run release.yml --ref main -f target=aarch64-unknown-freebsd
+  #
+  # No GitHub-hosted runner can hardware-accelerate an aarch64 guest — the
+  # arm64 runner images expose no KVM, and x86_64 KVM cannot run a foreign
+  # ISA — so this is pure qemu TCG emulation, an order of magnitude slower
+  # than the x86_64 job's ~46 min. An always-on attempt on ubuntu-24.04-arm
+  # was removed after still compiling at 2h16m against the 150 min cap.
+  # This retry differs in two ways: vmactions documents `arch: aarch64` on
+  # the ordinary x86_64 image as the *faster* host ("it's not recommended to
+  # use ubuntu-24.04-arm as runner, it's much more slower"), and the timeout
+  # sits at the 6 h runner ceiling. Opt-in keeps that cost out of every CI
+  # run and release; if a probe run lands comfortably under the cap, adding
+  # the target to this job's `if:` default set and release.yml's EXPECTED
+  # list promotes it. A green run's atomscan-* artifact name makes it
+  # immediately release-eligible, same as the haiku note below.
+  freebsd-arm64:
+    name: aarch64-unknown-freebsd
+    if: ${{ inputs.target == 'aarch64-unknown-freebsd' }}
+    runs-on: ubuntu-24.04
+    # Hosted-runner jobs are killed at 360 minutes regardless of this value;
+    # 350 leaves room for packaging and upload after a slow build.
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Build in FreeBSD aarch64 VM
+        uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
+        with:
+          usesh: true
+          # Same pin and the same 15.x-only reach tradeoff as the x86_64 job.
+          release: "15.1"
+          arch: aarch64
+          cpu: "4"
+          mem: "12288"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          prepare: |
+            pkg install -y rust cmake pkgconf git
+          run: |
+            set -eux
+            rustc --version
+            # Keep target/ out of the synced workspace, same as the x86_64 job.
+            export CARGO_TARGET_DIR=/tmp/target
+            cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
+            "/tmp/target/$BUILD_PROFILE/atomscan" --version
+            # No `cargo test` here: linking the test binaries under TCG would
+            # burn hours of the budget, and the x86_64 job already runs the
+            # suite against FreeBSD's libc. Scan one real file instead — that
+            # compiles the ruleset through the wasmtime/cranelift aarch64 JIT,
+            # which `--version` never touches (the v2.5.0 macOS lesson).
+            printf '#!/bin/sh\necho hello\n' > /tmp/smoke.sh
+            "/tmp/target/$BUILD_PROFILE/atomscan" --fetch=none /tmp/smoke.sh
+            cp "/tmp/target/$BUILD_PROFILE/atomscan" ./atomscan
+        env:
+          BUILD_PROFILE: ${{ inputs.profile }}
+
+      - name: Package
+        run: tar -czf atomscan-aarch64-unknown-freebsd.tar.gz atomscan
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atomscan-aarch64-unknown-freebsd
+          path: atomscan-aarch64-unknown-freebsd.tar.gz
           if-no-files-found: error
           retention-days: 14
 
