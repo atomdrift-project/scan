@@ -110,7 +110,7 @@ jobs:
         run: |
           set -eu
           case "$REQUESTED_TARGET" in
-            ""|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin|x86_64-unknown-freebsd|x86_64-unknown-openbsd|x86_64-unknown-netbsd|x86_64-pc-solaris|omnios-native|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc|x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|arm-unknown-linux-musleabihf|armv7-unknown-linux-musleabihf|loongarch64-unknown-linux-musl|x86_64-unknown-illumos|s390x-unknown-linux-gnu|riscv64gc-unknown-linux-gnu|powerpc64le-unknown-linux-gnu) ;;
+            ""|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin|x86_64-unknown-freebsd|aarch64-unknown-freebsd|x86_64-unknown-openbsd|x86_64-unknown-netbsd|x86_64-pc-solaris|omnios-native|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc|x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|arm-unknown-linux-musleabihf|armv7-unknown-linux-musleabihf|loongarch64-unknown-linux-musl|x86_64-unknown-illumos|s390x-unknown-linux-gnu|riscv64gc-unknown-linux-gnu|powerpc64le-unknown-linux-gnu) ;;
             *)
               echo "::error::unknown release target: $REQUESTED_TARGET"
               exit 1
