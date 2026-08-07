@@ -1841,7 +1841,7 @@ impl FeatureCursor {
 /// The finding fields retained for cross-file aggregation: ID dedup and
 /// ATT&CK/MBC code rollups. Keeping just these avoids cloning the whole
 /// finding JSON subtree for every file.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct RawFinding {
     id: String,
     conf: f64,
@@ -1851,7 +1851,7 @@ struct RawFinding {
 }
 
 /// Pre-calculated data for a single file entry in a report.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct FileSummary {
     path: String,
     parent: String,
@@ -1988,10 +1988,19 @@ impl ParsedReport {
         } else {
             file_summaries
         };
+        Self::from_summaries(
+            summaries,
+            canonical_fields_from_primary_file(primary_file),
+        )
+    }
+
+    /// Assemble from per-file summaries plus the primary file's canonical
+    /// fields. The aggregate half of the featurizer, shared by the JSON and
+    /// typed entry points so only the per-file read differs between them.
+    fn from_summaries(summaries: Vec<FileSummary>, canonical: (String, String, i64)) -> Self {
         let combined = summarize_report_summaries(&summaries);
         let merged_metrics = merge_metric_summaries(&summaries);
-        let (formula_str, elements_str, sample_score) =
-            canonical_fields_from_primary_file(primary_file);
+        let (formula_str, elements_str, sample_score) = canonical;
         Self {
             summaries,
             combined,
@@ -2001,6 +2010,50 @@ impl ParsedReport {
             sample_score,
         }
     }
+
+    /// Featurize a **typed** compact report — the entry point that lets
+    /// `classify_report` skip building a `serde_json::Value` of the whole
+    /// report (MEMORY_EXPERIMENTS.md, N2 step 4).
+    ///
+    /// Mirrors [`Self::from_report`] exactly: same primary-file rule (first
+    /// entry at depth 0), same empty-report fallback, same aggregate pass.
+    #[allow(dead_code)] // wired into classify_report by N2 step 4
+    pub(crate) fn from_compact_report(
+        report: &cleave::types::CompactReport,
+        needs: RawNeeds,
+    ) -> Self {
+        let file_summaries: Vec<FileSummary> = if report.files.len() < 8 {
+            report
+                .files
+                .iter()
+                .map(|f| FileSummary::from_compact(f, needs))
+                .collect()
+        } else {
+            report
+                .files
+                .par_iter()
+                .map(|f| FileSummary::from_compact(f, needs))
+                .collect()
+        };
+        let summaries = if file_summaries.is_empty() {
+            vec![FileSummary::default()]
+        } else {
+            file_summaries
+        };
+        let primary = report.files.iter().find(|f| f.depth == 0);
+        let canonical = primary.map_or_else(
+            || (String::new(), String::new(), 0),
+            |f| {
+                let formula = f.formula.clone().unwrap_or_default();
+                let elements: String = formula
+                    .chars()
+                    .filter(|c| !('\u{2080}'..='\u{2089}').contains(c))
+                    .collect();
+                (formula, elements, i64::from(f.risk))
+            },
+        );
+        Self::from_summaries(summaries, canonical)
+    }
 }
 
 impl FileSummary {
@@ -2009,7 +2062,9 @@ impl FileSummary {
             json_alias_array(file_entry, &["traits", "find", "ts"])
                 .map(|a| a.iter().collect())
                 .unwrap_or_default();
-        let findings = summarize_findings(&findings_raw);
+        let finding_views: Vec<FindingView<'_>> =
+            findings_raw.iter().copied().map(FindingView::from_json).collect();
+        let findings = summarize_findings(&finding_views);
 
         let size_bytes = json_alias(file_entry, &["size", "sz"])
             .and_then(serde_json::Value::as_f64)
@@ -2057,27 +2112,7 @@ impl FileSummary {
             .and_then(|f| json_alias(f, &["metrics", "met", "m"]))
             .filter(|v| v.is_object())
             .or_else(|| file_entry.get("ms"));
-        let metrics: HashMap<String, HashMap<String, f64>> = metrics_source
-            .and_then(|v| v.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(group, fields)| {
-                        let group_map = fields
-                            .as_object()?
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                // Handle numbers, booleans (true→1.0), and skip strings/nulls.
-                                let val = v
-                                    .as_f64()
-                                    .or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 }))?;
-                                Some((k.clone(), val))
-                            })
-                            .collect();
-                        Some((group.clone(), group_map))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let metrics = numeric_metrics(metrics_source);
 
         let overall_entropy = metrics
             .get("binary")
@@ -2096,11 +2131,7 @@ impl FileSummary {
         let imports: HashSet<String> = imports_array
             .into_iter()
             .flatten()
-            .filter_map(|imp| {
-                imp.as_str()
-                    .or_else(|| imp.get("n").and_then(|v| v.as_str()))
-            })
-            .map(str::to_string)
+            .flat_map(import_symbol_tokens)
             .collect();
 
         let raw_findings: Vec<RawFinding> = findings_raw
@@ -2216,7 +2247,140 @@ impl FileSummary {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+impl FileSummary {
+    // Wired into `classify_report` by N2 step 4, which is what actually
+    // removes the JSON DOM; until then this is exercised only by
+    // `reader_equivalence_tests`.
+    #[allow(dead_code)]
+    /// Build a summary from the **typed** compact report instead of a
+    /// `serde_json::Value` tree — the read that lets `classify_report` skip
+    /// materializing a multi-GB DOM (MEMORY_EXPERIMENTS.md, N2).
+    ///
+    /// This must reproduce [`FileSummary::new`] exactly for a current-schema
+    /// report, including where that reader finds nothing: the compact schema
+    /// carries no `p`, `mt`, `val`/`k` or `str`/`ss` equivalents, so `parent`,
+    /// `mtime`, `raw_values` and `raw_strings` are empty on both paths, and
+    /// `has_imports_key` (which probes only the retired `fact`/`ff`/`is` keys)
+    /// is false on both. `typed_and_dom_readers_agree` pins that equality —
+    /// a divergence here would move ML output silently rather than fail.
+    fn from_compact(file: &cleave::types::CompactFile, needs: RawNeeds) -> Self {
+        let finding_views: Vec<FindingView<'_>> =
+            file.findings.iter().map(FindingView::from_compact).collect();
+        let findings = summarize_findings(&finding_views);
+
+        let size_bytes = file.size as f64;
+        let size_kb = (size_bytes / 1024.0).max(1.0) as f32;
+        let denom = findings.filtered_finding_count.max(1) as f32;
+        let max_crit = findings.sample_paths.values().copied().max().unwrap_or(0);
+
+        let risk = FileRiskStats {
+            suspicious_ratio: findings.suspicious_finding_count as f32 / denom,
+            hostile_ratio: findings.hostile_finding_count as f32 / denom,
+            suspicious_findings: findings.suspicious_finding_count,
+            hostile_findings: findings.hostile_finding_count,
+            suspicious_density: findings.suspicious_finding_count as f32 / size_kb,
+            hostile_density: findings.hostile_finding_count as f32 / size_kb,
+            suspicious_category_breadth: findings.suspicious_category_breadth,
+            hostile_category_breadth: findings.hostile_category_breadth,
+            max_crit,
+        };
+
+        let mut unique_3level_paths: Vec<String> = finding_views
+            .iter()
+            .filter(|f| f.conf >= MIN_CONFIDENCE && f.crit >= 3)
+            .map(|f| f.id.split("::").next().unwrap_or(f.id).to_string())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        unique_3level_paths.sort();
+
+        let metrics_value = file.facts.metrics.as_ref().map(|m| &m.0).filter(|v| v.is_object());
+        let metrics = numeric_metrics(metrics_value);
+        let overall_entropy = metrics
+            .get("binary")
+            .and_then(|m| m.get("overall_entropy"))
+            .copied()
+            .unwrap_or(0.0);
+
+        // Same tokens the JSON reader derives from the `[library, name]`
+        // tuples, built without going through JSON.
+        let imports: HashSet<String> = file
+            .facts
+            .imports
+            .iter()
+            .flat_map(|imp| import_tokens_from_parts(&imp.library, &imp.name))
+            .collect();
+
+        let raw_findings: Vec<RawFinding> = file
+            .findings
+            .iter()
+            .map(|f| RawFinding {
+                id: f.id.clone(),
+                conf: wire_confidence(f.confidence),
+                crit: u32::from(f.criticality),
+                atk: f.attack.clone(),
+                mbc: f.mbc.clone(),
+            })
+            .collect();
+
+        let raw_metrics = if needs.kv {
+            metrics_value.cloned().unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
+
+        // The symbol family still reads these as JSON; convert only the
+        // subtrees whose feature family is active on this route.
+        let (raw_imports, raw_exports, raw_functions, raw_call_targets, raw_member_chains) =
+            if needs.symbol {
+                (
+                    to_value_vec(&file.facts.imports),
+                    to_value_vec(&file.facts.exports),
+                    to_value_vec(&file.facts.functions),
+                    to_value_vec(&file.facts.targets),
+                    to_value_vec(&file.facts.members),
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
+
+        Self {
+            path: file.path.clone(),
+            // No `p` / `mt` / `val` / `str` equivalents in the compact schema.
+            parent: String::new(),
+            file_type: file.file_type.clone(),
+            size_bytes,
+            mtime: None,
+            overall_entropy,
+            metrics,
+            raw_metrics,
+            raw_values: serde_json::Value::Null,
+            raw_strings: Vec::new(),
+            findings,
+            risk,
+            unique_3level_paths,
+            imports,
+            raw_imports,
+            raw_exports,
+            raw_functions,
+            raw_call_targets,
+            raw_member_chains,
+            raw_findings,
+            has_imports_key: false,
+        }
+    }
+}
+
+/// Serialize a typed facts list into the JSON shape the symbol features read.
+#[allow(dead_code)] // see FileSummary::from_compact
+fn to_value_vec<T: serde::Serialize>(items: &[T]) -> Vec<serde_json::Value> {
+    items
+        .iter()
+        .filter_map(|i| serde_json::to_value(i).ok())
+        .collect()
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
 struct FindingSummary {
     sample_paths: HashMap<String, u32>,
     path_confidences: HashMap<String, f64>,
@@ -2238,27 +2402,167 @@ struct FindingSummary {
     has_yara: bool,
 }
 
-fn summarize_findings(findings: &[&serde_json::Value]) -> FindingSummary {
+/// Flatten a metrics object into `{group: {field: number}}`, keeping numbers
+/// and booleans (`true` → 1.0) and dropping strings/nulls. Shared by both
+/// report readers so the numeric view of metrics cannot differ between them.
+fn numeric_metrics(source: Option<&serde_json::Value>) -> HashMap<String, HashMap<String, f64>> {
+    source
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(group, fields)| {
+                    let group_map = fields
+                        .as_object()?
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            let val = v
+                                .as_f64()
+                                .or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 }))?;
+                            Some((k.clone(), val))
+                        })
+                        .collect();
+                    Some((group.clone(), group_map))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[allow(dead_code)] // see FileSummary::from_compact
+/// The confidence a *reader* sees for a finding, which is not always the
+/// confidence cleave computed.
+///
+/// The compact encoder omits `conf` when it equals its `DEFAULT_CONF` of 0.5
+/// (or is 0.0), while both readers — this one and collimator's
+/// `_float(finding_conf(f), 1.0)` — default a *missing* `conf` to **1.0**.
+/// So a finding cleave scored at 0.5 is read downstream as 1.0, which matters:
+/// `MIN_CONFIDENCE` is 0.65, so it flips the finding from excluded to
+/// included.
+///
+/// That is a defect in the encoder (the omitted-value default should agree
+/// with the readers), but it is the behaviour every deployed model was
+/// trained and calibrated against, so the typed reader reproduces it rather
+/// than quietly diverging. Fixing it belongs with a retrain — see
+/// MEMORY_EXPERIMENTS.md.
+fn wire_confidence(confidence: f32) -> f64 {
+    const DEFAULT_CONF: f32 = 0.5;
+    if (confidence - DEFAULT_CONF).abs() < f32::EPSILON || confidence == 0.0 {
+        1.0
+    } else {
+        f64::from(confidence)
+    }
+}
+
+/// The tokens a `(library, name)` import pair contributes: the bare name and
+/// the `lib!name` form, each subject to collimator's per-token `len >= 2`
+/// gate. Shared by the JSON and typed readers so they cannot disagree.
+fn import_tokens_from_parts(lib: &str, name: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(2);
+    if name.len() >= 2 {
+        out.push(name.to_string());
+    }
+    let combined = if !lib.is_empty() && !name.is_empty() {
+        format!("{lib}!{name}")
+    } else if name.is_empty() {
+        lib.to_string()
+    } else {
+        name.to_string()
+    };
+    if combined.len() >= 2 && !out.contains(&combined) {
+        out.push(combined);
+    }
+    out
+}
+
+/// Symbol tokens one import entry contributes, mirroring collimator's
+/// `_file_symbols` — the reference implementation, since it is what produced
+/// the features the model was *trained* on.
+///
+/// Cleave emits imports as a positional tuple, `["kernel32","VirtualAlloc"]`.
+/// The previous reader here tried `as_str()` then `.get("n")`, both of which
+/// are `None` for a JSON array, so **every** import was dropped and the
+/// `gap:{crypto,network,process}` features could never fire at inference —
+/// while collimator, which does handle the tuple form, computed them from
+/// real imports during training. That is train/inference skew, not merely a
+/// dead feature. See MEMORY_EXPERIMENTS.md.
+///
+/// The older string and `{"n": …}` object shapes are still accepted so
+/// reports emitted by earlier cleave versions keep scoring the same way.
+fn import_symbol_tokens(entry: &serde_json::Value) -> Vec<String> {
+    // Tuple form: bare name *and* `lib!name`, exactly as collimator adds both.
+    if let Some(parts) = entry.as_array() {
+        let field = |i: usize| parts.get(i).and_then(serde_json::Value::as_str).unwrap_or("");
+        return import_tokens_from_parts(field(0), field(1));
+    }
+    let token = entry.as_str().or_else(|| {
+        ["n", "name", "symbol"]
+            .iter()
+            .find_map(|k| entry.get(*k).and_then(serde_json::Value::as_str))
+    });
+    token
+        .filter(|t| t.len() >= 2)
+        .map(|t| vec![t.to_string()])
+        .unwrap_or_default()
+}
+
+/// The whole of a finding that scoring reads: its id, confidence and
+/// criticality ordinal. Both report representations project into this before
+/// summarizing, so the DOM reader and the typed reader cannot drift into
+/// scoring the same report differently — a divergence that would move ML
+/// output silently rather than fail. See MEMORY_EXPERIMENTS.md (N2).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FindingView<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) conf: f64,
+    pub(crate) crit: u32,
+}
+
+impl<'a> FindingView<'a> {
+    /// Project a compact-JSON finding. Defaults match the historical reader:
+    /// a missing id is empty (and skipped), a missing confidence is 1.0.
+    fn from_json(finding: &'a serde_json::Value) -> Self {
+        Self {
+            id: json_alias_str(finding, &["id", "i"]).unwrap_or(""),
+            conf: json_alias(finding, &["conf", "c"])
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1.0),
+            crit: crit_ordinal(finding),
+        }
+    }
+
+    #[allow(dead_code)] // see FileSummary::from_compact
+    /// Project a typed compact finding. `criticality` is already the same
+    /// 0-5 ordinal the JSON `crit` field carries; confidence goes through
+    /// [`wire_confidence`] so this reads a report exactly as the JSON reader
+    /// does.
+    pub(crate) fn from_compact(finding: &'a cleave::types::CompactTrait) -> Self {
+        Self {
+            id: &finding.id,
+            conf: wire_confidence(finding.confidence),
+            crit: u32::from(finding.criticality),
+        }
+    }
+}
+
+fn summarize_findings(findings: &[FindingView<'_>]) -> FindingSummary {
     let mut summary = FindingSummary::default();
     let mut notable_ids: HashSet<&str> = HashSet::new();
     let mut suspicious_ids: HashSet<&str> = HashSet::new();
     let mut hostile_ids: HashSet<&str> = HashSet::new();
 
     for finding in findings {
-        let fid = json_alias_str(finding, &["id", "i"]).unwrap_or("");
+        let fid = finding.id;
         if fid.is_empty() {
             continue;
         }
-        let conf = json_alias(finding, &["conf", "c"])
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(1.0);
+        let conf = finding.conf;
         if conf < MIN_CONFIDENCE {
             continue;
         }
 
         summary.filtered_finding_count += 1;
         summary.finding_confidences.push(conf);
-        let crit_ord = crit_ordinal(finding);
+        let crit_ord = finding.crit;
 
         if crit_ord >= 3 {
             summary.notable_finding_count += 1;
@@ -2422,7 +2726,7 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
     combined
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct FileRiskStats {
     suspicious_ratio: f32,
     hostile_ratio: f32,
@@ -4115,6 +4419,149 @@ fn write_suspicious_ngram_counts(combined: &FindingSummary, w: &mut FeatureWrite
         "agg:suspicious_trigram_count",
         (n_tri as f64).ln_1p() as f32,
     );
+}
+
+#[cfg(test)]
+mod reader_equivalence_tests {
+    use super::{FileSummary, RawNeeds};
+    use cleave::types::{CompactFile, CompactReport, compact_from_files};
+
+    /// Build a report with the shapes that actually vary: findings at several
+    /// criticalities and confidences, imports, metrics, a nested member.
+    fn sample_report() -> CompactReport {
+        use cleave::types::{Criticality, FindingKind};
+        let mut files = Vec::new();
+        for (id, path, crit, conf) in [
+            (0u32, "pkg.zip", Criticality::Notable, 0.9_f32),
+            (1, "pkg.zip!!lib/net.py", Criticality::Suspicious, 0.7),
+            (2, "pkg.zip!!lib/quiet.py", Criticality::Baseline, 0.5),
+        ] {
+            let mut fa = cleave::FileAnalysis {
+                id,
+                path: path.to_string(),
+                file_type: "python".to_string(),
+                sha256: format!("{id:064}"),
+                size: 2048 * u64::from(id + 1),
+                ..Default::default()
+            };
+            let mut f = cleave::types::Finding::new(
+                "objectives/execution/shell::sh".into(),
+                FindingKind::Capability,
+                "spawns a shell".into(),
+                conf,
+            );
+            f.crit = crit;
+            f.attack = Some("T1059".into());
+            fa.findings.push(f);
+            if id > 0 {
+                fa.depth = 1;
+                fa.parent_id = Some(0);
+            }
+            files.push(fa);
+        }
+        compact_from_files(&files)
+    }
+
+    /// The typed reader and the JSON reader must produce identical
+    /// `FileSummary`s for the same report. This is the guarantee that lets
+    /// `classify_report` drop the `serde_json::Value` DOM without it becoming
+    /// an ML change: a drift between the two would alter features silently
+    /// rather than fail, so it is asserted rather than reviewed.
+    #[test]
+    fn typed_and_dom_readers_agree() {
+        let report = sample_report();
+        let as_json = serde_json::to_value(&report).expect("encode");
+        let dom_files = as_json["files"].as_array().expect("files array");
+        assert_eq!(dom_files.len(), report.files.len());
+
+        for needs in [RawNeeds::default(), RawNeeds::all()] {
+            for (typed, dom) in report.files.iter().zip(dom_files) {
+                let from_typed = FileSummary::from_compact(typed, needs);
+                let from_dom = FileSummary::new(dom, needs);
+                assert_eq!(
+                    from_typed, from_dom,
+                    "readers disagree on {} (needs kv={} symbol={})",
+                    typed.path, needs.kv, needs.symbol
+                );
+            }
+        }
+    }
+
+    /// A file carrying imports and metrics is the case most likely to drift,
+    /// since those live in the hand-encoded `facts` block.
+    #[test]
+    fn readers_agree_on_imports_and_metrics() {
+        let mut fa = cleave::FileAnalysis {
+            id: 0,
+            path: "app.exe".to_string(),
+            file_type: "pe".to_string(),
+            sha256: "d".repeat(64),
+            size: 65536,
+            ..Default::default()
+        };
+        fa.imports = vec![cleave::types::Import {
+            symbol: "CreateProcessW".to_string(),
+            library: Some("kernel32.dll".to_string()),
+            ..Default::default()
+        }];
+        let report = compact_from_files(&[fa]);
+        let as_json = serde_json::to_value(&report).expect("encode");
+        let dom: &serde_json::Value = &as_json["files"][0];
+        let typed: &CompactFile = &report.files[0];
+        let needs = RawNeeds::all();
+        assert_eq!(
+            FileSummary::from_compact(typed, needs),
+            FileSummary::new(dom, needs)
+        );
+    }
+}
+
+#[cfg(test)]
+mod import_token_tests {
+    use super::import_symbol_tokens;
+    use serde_json::json;
+
+    /// The shape cleave actually emits. Before the fix these produced nothing,
+    /// which zeroed `gap:*` at inference while training saw real values.
+    #[test]
+    fn tuple_form_yields_bare_name_and_lib_qualified() {
+        let t = import_symbol_tokens(&json!(["kernel32", "CreateProcessW"]));
+        assert!(t.contains(&"CreateProcessW".to_string()));
+        assert!(t.contains(&"kernel32!CreateProcessW".to_string()));
+    }
+
+    /// LOGIC_GAPS matches bare names (`socket`, `CreateProcess`), so the bare
+    /// name must be present for a gap feature to fire at all.
+    #[test]
+    fn bare_name_is_what_logic_gaps_match_on() {
+        assert!(import_symbol_tokens(&json!(["libc", "socket"])).contains(&"socket".to_string()));
+    }
+
+    /// Reports from older cleave versions must keep scoring identically.
+    #[test]
+    fn legacy_string_and_object_forms_still_read() {
+        assert_eq!(import_symbol_tokens(&json!("hashlib")), vec!["hashlib"]);
+        assert_eq!(import_symbol_tokens(&json!({"n": "urllib"})), vec!["urllib"]);
+        assert_eq!(import_symbol_tokens(&json!({"name": "requests"})), vec!["requests"]);
+    }
+
+    /// The `len >= 2` gate is applied per token, exactly as collimator applies
+    /// it: a one-character *name* is dropped on its own but still contributes
+    /// the qualified `lib!name` token, which does pass. Matching collimator
+    /// here is the whole point — it defines the features the model was trained
+    /// on, so "more sensible" behaviour would be a mismatch.
+    #[test]
+    fn length_gate_is_per_token_not_per_entry() {
+        assert_eq!(import_symbol_tokens(&json!(["x", "a"])), vec!["x!a"]);
+        assert!(import_symbol_tokens(&json!(null)).is_empty());
+        assert!(import_symbol_tokens(&json!({"other": "v"})).is_empty());
+    }
+
+    /// An ordinal-only import has no name; the library alone is the token.
+    #[test]
+    fn library_only_entry_falls_back_to_library() {
+        assert_eq!(import_symbol_tokens(&json!(["ws2_32"])), vec!["ws2_32"]);
+    }
 }
 
 #[cfg(test)]
