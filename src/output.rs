@@ -443,11 +443,9 @@ pub(crate) fn terminal_hash_line(sha256: &str, bloom: Option<BloomMark>) -> Opti
     }
     let p = palette();
     let (glyph, trailer) = match bloom {
-        Some(BloomMark::KnownBad) => ("\u{1f6a9}", String::new()),   // 🚩
+        Some(BloomMark::KnownBad) => ("\u{1f6a9}", String::new()), // 🚩
         Some(BloomMark::Conflicted) => ("\u{1f3f4}", String::new()), // 🏴
-        Some(BloomMark::KnownGood) => {
-            ("\u{1f9ec}", format!("  {}", fg(p.benign, "\u{2713}")))
-        }
+        Some(BloomMark::KnownGood) => ("\u{1f9ec}", format!("  {}", fg(p.benign, "\u{2713}"))),
         None => ("\u{1f9ec}", String::new()), // 🧬
     };
     Some(format!(" {glyph} {}{trailer}", fg(p.very_dim, sha256)))
@@ -918,8 +916,8 @@ pub fn print_summary(summary: &ScanSummary) {
         }
         let sep_colored = format!(" {} ", fg(p.dot_sep, "\u{00b7}"));
         let colored_line: Vec<String> = parts.iter().map(|(c, _)| c.clone()).collect();
-        let plain_len: usize = parts.iter().map(|(_, s)| s.chars().count()).sum::<usize>()
-            + (parts.len() - 1) * 3;
+        let plain_len: usize =
+            parts.iter().map(|(_, s)| s.chars().count()).sum::<usize>() + (parts.len() - 1) * 3;
         // ` ` + `━━` + ` ` + content + ` ` + fill, 1-col right margin.
         let fill = cleave::output::terminal_width()
             .saturating_sub(plain_len + 6)

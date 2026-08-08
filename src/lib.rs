@@ -103,28 +103,6 @@ pub(crate) fn system_load_avg() -> Option<f64> {
     }
 }
 
-/// First JSON value present under any of `names`, in order. Used throughout
-/// report parsing to accept both cleave's verbose and compact field spellings.
-pub(crate) fn json_alias<'a>(
-    value: &'a serde_json::Value,
-    names: &[&str],
-) -> Option<&'a serde_json::Value> {
-    names.iter().find_map(|name| value.get(*name))
-}
-
-/// [`json_alias`] resolved to an array.
-pub(crate) fn json_alias_array<'a>(
-    value: &'a serde_json::Value,
-    names: &[&str],
-) -> Option<&'a Vec<serde_json::Value>> {
-    json_alias(value, names).and_then(serde_json::Value::as_array)
-}
-
-/// [`json_alias`] resolved to a string.
-pub(crate) fn json_alias_str<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
-    json_alias(value, names).and_then(serde_json::Value::as_str)
-}
-
 /// Output format for scan results.
 #[derive(Debug, Clone, Copy, Default, PartialEq, clap::ValueEnum)]
 pub enum OutputFormat {

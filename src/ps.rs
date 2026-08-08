@@ -198,6 +198,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         eprintln!("\nInterrupted — finishing current process…");
         ctrlc_flag.store(true, Ordering::Relaxed);
     });
+    cleave::set_compact_member_retention(true); // compact projection only
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
@@ -427,7 +428,7 @@ fn build_result(
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
-    let cleave = if is_json { Some(cr.report_json) } else { None };
+    let cleave = if is_json { Some(cr.report) } else { None };
 
     Ok(ScanResult {
         v: "7",

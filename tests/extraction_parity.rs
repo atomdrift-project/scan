@@ -32,7 +32,7 @@ struct ExtractionFixture {
 
 #[derive(serde::Deserialize)]
 struct ExtractionSample {
-    report: serde_json::Value,
+    report: cleave::types::CompactReport,
     expected_features: Vec<f32>,
     #[serde(default)]
     expected_standardized: Option<Vec<f32>>,

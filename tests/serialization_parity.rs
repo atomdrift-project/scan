@@ -66,14 +66,17 @@ fn full_result_serializes_identically() {
         level: Some(50),
         version: "model-abc123".to_string(),
         analyzed_at: "2026-06-17T15:01:22Z".to_string(),
-        cleave: Some(serde_json::json!({
-            "v": 8,
-            "files": [
-                { "id": 0, "dp": 0, "type": "whl", "path": "pkg.whl", "risk": 3 },
-                { "id": 1, "dp": 1, "type": "python", "path": "pkg.whl!!a/__init__.py", "risk": 1 },
-                { "id": 2, "dp": 1, "type": "python", "path": "pkg.whl!!a/_utilities.py", "risk": 3 }
-            ]
-        })),
+        cleave: Some(
+            serde_json::from_value(serde_json::json!({
+                "v": "8",
+                "files": [
+                    { "id": 0, "depth": 0, "type": "whl", "sha": "r", "size": 13189, "path": "pkg.whl", "risk": 3 },
+                    { "id": 1, "depth": 1, "type": "python", "sha": "a", "size": 10, "path": "pkg.whl!!a/__init__.py", "risk": 1 },
+                    { "id": 2, "depth": 1, "type": "python", "sha": "b", "size": 20, "path": "pkg.whl!!a/_utilities.py", "risk": 3 }
+                ]
+            }))
+            .expect("fixture is a valid compact report"),
+        ),
         pids: Some(vec![123, 456]),
         deleted: Some(true),
         path: "pkg.whl".to_string(),
