@@ -694,6 +694,7 @@ pub(crate) fn orchestrate(
     // scan uses, so a trusted binary shipped inside a dependency isn't needlessly
     // re-disassembled; and memoize the whole analysis by content sha, so a warm
     // re-run reuses it rather than repeating a minutes-long pass.
+    cleave::set_compact_member_retention(true); // compact projection only
     let opts = AnalysisOptions {
         skip_predicate: dep_skip_predicate(),
         ..AnalysisOptions::default()
@@ -820,6 +821,7 @@ pub(crate) fn orchestrate(
         // engine's per-analysis setup, paid hundreds of times. Built once per
         // hop: cloning `AnalysisOptions` per record cost more user time than
         // the YARA saving returned.
+        cleave::set_compact_member_retention(true); // compact projection only
         let registry_opts = AnalysisOptions {
             disable_yara: true,
             ..opts.clone()

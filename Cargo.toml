@@ -49,7 +49,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.5.0"
+version = "2.6.0"
 default-run = "atomscan"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable. Drives the
@@ -290,18 +290,3 @@ tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 
 # Add TEMPORARY local overrides below:
-
-# RELEASE BLOCKER: these three point at local working trees so the 2026-08-06
-# wall-clock work (see PERF_EXPERIMENTS.md) could be benchmarked as one unit.
-# Push cleave/stng/filefacts, then DELETE this whole block and `cargo update -p`
-# each one — a release built with these in place would silently pin whatever is
-# on this disk. Verify afterwards that Cargo.lock shows a `source = "git+…"`
-# line for all three; a path patch leaves that line absent.
-[patch."https://github.com/atomdrift-project/cleave.git"]
-cleave = { path = "../cleave" }
-
-[patch."https://github.com/atomdrift-project/stng.git"]
-stng = { path = "../stng" }
-
-[patch."https://github.com/atomdrift-project/filefacts.git"]
-filefacts = { path = "../filefacts" }

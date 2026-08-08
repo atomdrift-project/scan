@@ -11,9 +11,8 @@ use crate::Mode;
 use crate::OutputFormat;
 use crate::bloom_repo::{Decision as BloomDecision, Lookup};
 use crate::explain::ShapImportance;
-use crate::features::{ExtractContext, crit_ordinal};
+use crate::features::ExtractContext;
 use crate::model::{Classification, Decision, Model, RouteScore, SkippedRoute, Thresholds};
-use crate::{json_alias, json_alias_array, json_alias_str};
 
 pub use crate::explain::Reason;
 
@@ -292,6 +291,12 @@ impl ScanConfig {
 mod manifest_tests {
     use super::*;
 
+    /// Decode a wire-shaped fixture into the typed report the pipeline carries,
+    /// so these tests exercise the same reader production does.
+    fn report(v: serde_json::Value) -> cleave::types::CompactReport {
+        serde_json::from_value(v).unwrap()
+    }
+
     fn stub(path: &str, ty: &str, sha: &str, size: u64) -> ArchiveMemberStub {
         ArchiveMemberStub {
             path: path.to_string(),
@@ -304,12 +309,12 @@ mod manifest_tests {
     #[test]
     fn appends_unanalyzed_members_skipping_already_analyzed() {
         // files[0] is the root archive; files[1] an analyzed member with a sha.
-        let mut report = serde_json::json!({
+        let mut report = report(serde_json::json!({
             "files": [
                 {"id": 0, "path": "app.zip", "type": "zip", "sha": "root", "size": 4096},
                 {"id": 1, "path": "app.zip!!evil.sh", "type": "shell", "sha": "aaa", "size": 200, "risk": 9},
             ]
-        });
+        }));
         let members = vec![
             // Already analyzed (matches sha "aaa") — must be skipped, no duplicate.
             stub("evil.sh", "shell", "aaa", 200),
@@ -320,33 +325,36 @@ mod manifest_tests {
         ];
         append_unanalyzed_members(&mut report, &members);
 
-        let files = report["files"].as_array().unwrap();
+        let files = &report.files;
         assert_eq!(files.len(), 4, "two listing-only members appended");
 
         let readme = &files[2];
-        assert_eq!(readme["id"], 2);
-        assert_eq!(readme["path"], "app.zip!!README.md");
-        assert_eq!(readme["type"], "markdown");
-        assert_eq!(readme["size"], 1024);
-        assert_eq!(readme["depth"], 1);
-        assert_eq!(readme["risk"], -1, "sentinel marks the member unanalyzed");
+        assert_eq!(readme.id, 2);
+        assert_eq!(readme.path, "app.zip!!README.md");
+        assert_eq!(readme.file_type, "markdown");
+        assert_eq!(readme.size, 1024);
+        assert_eq!(readme.depth, 1);
+        assert_eq!(
+            readme.risk, UNANALYZED_MEMBER_RISK,
+            "sentinel marks the member unanalyzed"
+        );
 
         let logo = &files[3];
-        assert_eq!(logo["path"], "app.zip!!inner.tar!!logo.png");
-        assert_eq!(logo["depth"], 2);
-        assert_eq!(logo["risk"], -1);
+        assert_eq!(logo.path, "app.zip!!inner.tar!!logo.png");
+        assert_eq!(logo.depth, 2);
+        assert_eq!(logo.risk, UNANALYZED_MEMBER_RISK);
     }
 
     #[test]
     fn build_ml_files_drops_listing_only_members() {
         // A root file, an analyzed member, and a listing-only member (risk -1).
-        let report = serde_json::json!({
+        let report = report(serde_json::json!({
             "files": [
-                {"id": 0, "path": "app.zip", "type": "zip", "depth": 0},
-                {"id": 1, "path": "app.zip!!evil.sh", "type": "shell", "depth": 1, "risk": 9},
-                {"id": 2, "path": "app.zip!!README.md", "type": "markdown", "depth": 1, "risk": -1},
+                {"id": 0, "path": "app.zip", "type": "zip", "sha": "r", "size": 4096, "depth": 0},
+                {"id": 1, "path": "app.zip!!evil.sh", "type": "shell", "sha": "a", "size": 200, "depth": 1, "risk": 9},
+                {"id": 2, "path": "app.zip!!README.md", "type": "markdown", "sha": "b", "size": 1024, "depth": 1, "risk": -1},
             ]
-        });
+        }));
         let ml = build_ml_files(&report, 0.9, Some(100), &MemberEvals::new());
         let ids: Vec<u64> = ml.iter().map(|f| f["id"].as_u64().unwrap()).collect();
         assert_eq!(
@@ -363,15 +371,15 @@ mod manifest_tests {
         // evaluated. No member may inherit the root's verdict — hopper mirrors
         // these entries into each member's own sample row, and a member can
         // occur in many containers.
-        let report = serde_json::json!({
+        let report = report(serde_json::json!({
             "files": [
-                {"id": 0, "path": "evil.elf", "type": "elf", "depth": 0},
-                {"id": 1, "path": "compatibility", "type": "unknown", "depth": 1},
-                {"id": 2, "path": "a!!page", "type": "unknown", "depth": 2},
-                {"id": 3, "path": "b!!page", "type": "unknown", "depth": 2},
-                {"id": 4, "path": "never-scored", "type": "unknown", "depth": 1},
+                {"id": 0, "path": "evil.elf", "type": "elf", "sha": "0", "size": 9, "depth": 0},
+                {"id": 1, "path": "compatibility", "type": "unknown", "sha": "1", "size": 1, "depth": 1},
+                {"id": 2, "path": "a!!page", "type": "unknown", "sha": "2", "size": 1, "depth": 2},
+                {"id": 3, "path": "b!!page", "type": "unknown", "sha": "3", "size": 1, "depth": 2},
+                {"id": 4, "path": "never-scored", "type": "unknown", "sha": "4", "size": 1, "depth": 1},
             ]
-        });
+        }));
         let member = |id: u64, path: &str, prob: f32, level: i32| EmbeddedFile {
             id,
             sha256: String::new(),
@@ -480,7 +488,6 @@ mod config_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod trait_floor_tests {
     use super::*;
-    use serde_json::json;
 
     fn benign() -> Decision {
         Decision {
@@ -491,20 +498,28 @@ mod trait_floor_tests {
         }
     }
 
-    /// A report with `n` findings at crit `crit`/confidence `conf`, padded with
-    /// `pad` baseline (crit-0) findings so the total/fraction can be controlled.
-    fn report(crit: u64, conf: f64, n: usize, pad: usize) -> serde_json::Value {
-        let mut ts: Vec<serde_json::Value> = (0..n)
-            .map(|_| json!({"crit": crit, "conf": conf}))
-            .collect();
-        ts.extend((0..pad).map(|_| json!({"crit": 0, "conf": 0.9})));
-        json!({ "find": ts })
+    fn finding(crit: u8, conf: f32) -> cleave::types::CompactTrait {
+        cleave::types::CompactTrait {
+            criticality: crit,
+            confidence: conf,
+            ..cleave::types::CompactTrait::default()
+        }
+    }
+
+    /// `n` findings at crit `crit`/confidence `conf`, padded with `pad`
+    /// baseline (crit-0) findings so the total — and so the crit-4 fraction —
+    /// can be controlled.
+    fn findings(crit: u8, conf: f32, n: usize, pad: usize) -> Vec<cleave::types::CompactTrait> {
+        let mut ts: Vec<cleave::types::CompactTrait> =
+            (0..n).map(|_| finding(crit, conf)).collect();
+        ts.extend((0..pad).map(|_| finding(0, 0.9)));
+        ts
     }
 
     #[test]
     fn one_confident_crit5_escalates_to_hostile_band() {
         let mut d = benign();
-        apply_trait_floor(&mut d, &report(5, 0.8, 1, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &findings(5, 0.8, 1, 0), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
         assert_eq!(d.probability, 0.8);
         assert_eq!(d.level, Some(50));
@@ -514,7 +529,7 @@ mod trait_floor_tests {
     fn low_confidence_crit5_is_ignored() {
         let mut d = benign();
         // c < 0.76 → not counted, stays benign.
-        apply_trait_floor(&mut d, &report(5, 0.5, 3, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &findings(5, 0.5, 3, 0), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
@@ -522,7 +537,7 @@ mod trait_floor_tests {
     fn two_confident_crit4_above_fraction_escalates_to_suspicious_band() {
         let mut d = benign();
         // 4 confident crit-4 out of 4 total → fraction 1.0 >= 0.05.
-        apply_trait_floor(&mut d, &report(4, 0.9, 4, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &findings(4, 0.9, 4, 0), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Suspicious);
         assert_eq!(d.probability, 0.9);
         assert_eq!(d.level, Some(100));
@@ -532,7 +547,7 @@ mod trait_floor_tests {
     fn confident_crit4_below_fraction_stays_benign() {
         let mut d = benign();
         // 2 confident crit-4 diluted by 200 baseline findings → fraction ~0.01.
-        apply_trait_floor(&mut d, &report(4, 0.9, 2, 200), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &findings(4, 0.9, 2, 200), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
@@ -540,21 +555,28 @@ mod trait_floor_tests {
     fn low_confidence_crit4_does_not_count_toward_pair() {
         let mut d = benign();
         // Only one confident crit-4; the other two are below threshold.
-        let report = json!({"find": [
-            {"crit": 4, "conf": 0.9},
-            {"crit": 4, "conf": 0.5},
-            {"crit": 4, "conf": 0.6},
-        ]});
-        apply_trait_floor(&mut d, &report, Some(50), 100, "test");
+        let ts = vec![finding(4, 0.9), finding(4, 0.5), finding(4, 0.6)];
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
+    /// cleave now always writes `conf`, but reports from builds that omitted it
+    /// still decode — as 0.0, "no confidence recorded", which is below the 0.76
+    /// gate. So an unscored crit-5 in an old report never trips the floor on
+    /// its own.
     #[test]
-    fn missing_confidence_defaults_below_threshold() {
+    fn confidence_omitted_by_an_older_build_decodes_below_threshold() {
         let mut d = benign();
-        // `conf` omitted → DEFAULT_TRAIT_CONFIDENCE (0.5) < 0.76, so it never counts.
-        let report = json!({"find": [{"crit": 5}, {"crit": 5}]});
-        apply_trait_floor(&mut d, &report, Some(50), 100, "test");
+        let ts: Vec<cleave::types::CompactTrait> = serde_json::from_value(serde_json::json!([
+            {"id": "a", "crit": 5},
+            {"id": "b", "crit": 5},
+        ]))
+        .unwrap();
+        assert_eq!(
+            ts[0].confidence, 0.0,
+            "an omitted conf records no confidence"
+        );
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
@@ -563,25 +585,22 @@ mod trait_floor_tests {
         let mut d = benign();
         d.class = Classification::Hostile;
         d.level = Some(50);
-        apply_trait_floor(&mut d, &report(5, 0.9, 5, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &findings(5, 0.9, 5, 0), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
         assert_eq!(d.level, Some(50));
     }
 
     #[test]
-    fn reads_findings_from_embedded_files_shape() {
+    fn floors_on_the_root_files_own_findings() {
+        // `root_findings` is what the classify path passes: a report's findings
+        // live on files[0], never at report level.
         let mut d = benign();
-        let report = json!({"files": [{"find": [{"crit": 5, "conf": 0.8}]}]});
-        apply_trait_floor(&mut d, &report, Some(50), 100, "test");
-        assert_eq!(d.class, Classification::Hostile);
-        assert_eq!(d.level, Some(50));
-    }
-
-    #[test]
-    fn reads_findings_from_current_compact_traits_shape() {
-        let mut d = benign();
-        let report = json!({"files": [{"traits": [{"crit": 5, "conf": 0.98}]}]});
-        apply_trait_floor(&mut d, &report, Some(50), 100, "test");
+        let report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
+            "files": [{"id": 0, "path": "x", "type": "elf", "sha": "s", "size": 1,
+                       "traits": [{"id": "t", "crit": 5, "conf": 0.98}]}]
+        }))
+        .unwrap();
+        apply_trait_floor(&mut d, root_findings(&report), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
         assert_eq!(d.probability, 0.98);
         assert_eq!(d.level, Some(50));
@@ -673,8 +692,10 @@ mod envelope_tests {
                 level: Some(100),
             }),
             members: MemberEvals::new(),
-            raw: serde_json::json!({"v": "8", "files": [{"sha": "d".repeat(64), "type": "npm"}]})
-                .to_string(),
+            raw: serde_json::json!({"v": "8", "files": [
+                {"id": 0, "path": "evil-1.0.0.tgz", "size": 1234, "sha": "d".repeat(64), "type": "npm"}
+            ]})
+            .to_string(),
         }
     }
 
@@ -690,7 +711,8 @@ mod envelope_tests {
         assert_eq!(env.ml.version, "model-9");
         assert_eq!(env.ml.analyzed_at, "2026-06-28T00:00:00Z");
         assert_eq!(
-            env.raw["files"][0]["type"], "npm",
+            env.raw.files.first().map(|f| f.file_type.as_str()),
+            Some("npm"),
             "the dependency's own report is the result raw, so hopper keeps its FileType",
         );
     }
@@ -883,13 +905,16 @@ mod envelope_tests {
         let mut r = base_result();
         r.level = Some(20);
         r.probability = 0.97;
-        r.cleave = Some(serde_json::json!({
-            "files": [
-                {"id": 0, "dp": 0, "path": "/tmp/x", "type": "zip"},
-                {"id": 1, "dp": 1, "path": "/tmp/x!!evil.sh", "type": "shell"},
-                {"id": 2, "dp": 1, "path": "/tmp/x!!readme.txt", "type": "text"},
-            ]
-        }));
+        r.cleave = Some(
+            serde_json::from_value(serde_json::json!({
+                "files": [
+                    {"id": 0, "size": 1, "depth": 0, "sha": "a", "path": "/tmp/x", "type": "zip"},
+                    {"id": 1, "size": 1, "depth": 1, "sha": "b", "path": "/tmp/x!!evil.sh", "type": "shell"},
+                    {"id": 2, "size": 1, "depth": 1, "sha": "c", "path": "/tmp/x!!readme.txt", "type": "text"},
+                ]
+            }))
+            .unwrap(),
+        );
         let member = |id: u64, path: &str, level: Option<i32>, prob: f32| EmbeddedFile {
             id,
             sha256: String::new(),
@@ -953,7 +978,7 @@ pub struct ScanSummary {
 }
 
 /// Finding counts by criticality level from cleave.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq)]
 pub struct FindingCounts {
     /// Hostile-criticality findings.
     pub hostile: u32,
@@ -1098,7 +1123,7 @@ pub struct ScanResult {
     /// UTC timestamp of when this analysis was performed (RFC 3339).
     pub analyzed_at: String,
     /// Full cleave report (unmutated).
-    pub cleave: Option<serde_json::Value>,
+    pub cleave: Option<cleave::types::CompactReport>,
     /// PIDs running this binary (process scan only).
     pub pids: Option<Vec<u32>>,
     /// Whether the binary was deleted from disk (process scan only).
@@ -1202,34 +1227,19 @@ pub struct TopFinding {
     pub desc: String,
 }
 
-/// Default cleave trait confidence when the JSON `conf`/`c` field is omitted.
-/// Mirrors `DEFAULT_CONF` in `cleave::types::compact`.
-const DEFAULT_TRAIT_CONFIDENCE: f32 = 0.5;
-
-/// The cleave findings array, taken from a single-file report (`find`/`ts`) or,
-/// failing that, the first file entry of a compact envelope (`files[0].traits`).
-fn report_findings(report: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
-    json_alias_array(report, &["traits", "find", "ts"]).or_else(|| {
-        json_alias_array(report, &["files", "fs"])
-            .and_then(|a| a.first())
-            .and_then(|f| json_alias_array(f, &["traits", "find", "ts"]))
-    })
+/// The findings of a report's root file — the ones that describe the artifact
+/// scan was asked about, as opposed to its members.
+fn root_findings(report: &cleave::types::CompactReport) -> &[cleave::types::CompactTrait] {
+    report.files.first().map_or(&[], |f| &f.findings)
 }
 
-impl From<&serde_json::Value> for TopFinding {
-    fn from(f: &serde_json::Value) -> Self {
-        // Cleave omits `conf` when it equals the 0.5 default. The
-        // float values are bucketed to two decimals so the f64→f32 down-cast
-        // is exact for every value the analyzer actually emits.
-        #[allow(clippy::cast_possible_truncation)]
-        let conf = json_alias(f, &["conf", "c"])
-            .and_then(serde_json::Value::as_f64)
-            .map_or(DEFAULT_TRAIT_CONFIDENCE, |x| x as f32);
+impl From<&cleave::types::CompactTrait> for TopFinding {
+    fn from(f: &cleave::types::CompactTrait) -> Self {
         Self {
-            id: json_alias_str(f, &["id", "i"]).unwrap_or("").to_string(),
-            crit: crit_ordinal(f),
-            conf,
-            desc: json_alias_str(f, &["desc", "d"]).unwrap_or("").to_string(),
+            id: f.id.clone(),
+            crit: u32::from(f.criticality),
+            conf: f.confidence,
+            desc: f.description.clone(),
         }
     }
 }
@@ -1836,6 +1846,9 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
         eprintln!("\nInterrupted — finishing current file…");
         ctrlc_flag.store(true, Ordering::Relaxed);
     });
+    // scan consumes only the compact projection of member nodes; let cleave
+    // drop fold-time fields that exist solely for the full v3 schema.
+    cleave::set_compact_member_retention(true);
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
@@ -1955,6 +1968,7 @@ pub fn run_bytes(
     // complementing the PURL gate in `pkg.rs`: it catches known *content* even
     // when the package locator was not in the filter. `record_file_result` emits
     // the verdict from the minimal report cleave returns on a skip.
+    cleave::set_compact_member_retention(true); // compact projection only
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         skip_predicate: bloom_skip_predicate(config),
@@ -2314,7 +2328,7 @@ pub(crate) fn upload_scan_result(
 /// this serially on one rayon worker, and on member-heavy archives that pass —
 /// not cleave's analysis — was the scan's wall-clock tail.
 fn score_embedded_files(
-    entries: &[&serde_json::Value],
+    entries: &[&cleave::types::CompactFile],
     label: &str,
     needs: crate::features::RawNeeds,
     ctx: &ExtractContext,
@@ -2340,12 +2354,11 @@ fn score_embedded_files(
                         Vec::new(),
                     )
                 } else {
-                    let ef_parsed = crate::features::ParsedReport::from_file(ef, needs);
+                    let ef_parsed = crate::features::ParsedReport::from_compact_file(ef, needs);
                     let mut ef_features = ctx.extract_from_parsed(&ef_parsed);
                     model.spec().standardize(&mut ef_features);
-                    let ef_type = ef["type"].as_str().unwrap_or("unknown");
                     let (mut ef_decision, ef_model_scores, ef_skipped_models) = model
-                        .predict_for_file_detailed(ef_type, &ef_features, &ef_parsed)
+                        .predict_for_file_detailed(&ef.file_type, &ef_features, &ef_parsed)
                         .unwrap_or((
                             Decision {
                                 class: Classification::Benign,
@@ -2363,41 +2376,38 @@ fn score_embedded_files(
                     // elevates the container below.
                     apply_trait_floor(
                         &mut ef_decision,
-                        ef,
+                        &ef.findings,
                         model.active_level(),
                         model.grid_max(),
-                        ef["path"].as_str().unwrap_or(label),
+                        if ef.path.is_empty() { label } else { &ef.path },
                     );
                     (ef_decision, ef_model_scores, ef_skipped_models)
                 };
 
-            let full_path = ef["path"].as_str().unwrap_or("");
-            let rel_path = full_path
+            let rel_path = ef
+                .path
                 .rsplit_once("!!")
-                .map(|(_, r)| r)
-                .unwrap_or(full_path)
+                .map_or(ef.path.as_str(), |(_, r)| r)
                 .to_string();
-            let ef_top_findings: Vec<TopFinding> = json_alias_array(ef, &["traits", "find", "ts"])
-                .into_iter()
-                .flatten()
-                .filter(|ff| crit_ordinal(ff) >= 4)
+            let ef_top_findings: Vec<TopFinding> = ef
+                .findings
+                .iter()
+                .filter(|ff| ff.criticality >= 4)
                 .take(3)
                 .map(TopFinding::from)
                 .collect();
             EmbeddedFile {
-                // u64::MAX when the node has no id: it then matches no report
-                // node rather than falsely matching id 0 (the root).
-                id: ef["id"].as_u64().unwrap_or(u64::MAX),
-                sha256: ef["sha"].as_str().unwrap_or("").to_string(),
+                id: u64::from(ef.id),
+                sha256: ef.sha.clone(),
                 path: rel_path,
-                file_type: ef["type"].as_str().unwrap_or("unknown").to_string(),
+                file_type: ef.file_type.clone(),
                 classification: ef_decision.class,
                 probability: ef_decision.probability,
                 threshold: ef_decision.threshold,
                 level: ef_decision.level,
                 model_scores: ef_model_scores,
                 skipped_models: ef_skipped_models,
-                formula: json_alias_str(ef, &["mol", "f"]).unwrap_or("").to_string(),
+                formula: ef.formula.clone().unwrap_or_default(),
                 top_findings: ef_top_findings,
             }
         })
@@ -2436,28 +2446,28 @@ fn classify_dependency(
     model: &Model,
     cancellation: Option<&Arc<AtomicBool>>,
 ) -> Option<(Decision, MemberEvals)> {
-    let report_json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let report: cleave::types::CompactReport = serde_json::from_str(raw).ok()?;
     let needs = ctx.raw_needs().union(crate::features::RawNeeds::all());
 
     // The container's own verdict. No own_shas filtering: this report is the one
     // cleave produced for the dependency's bytes alone, before anything was
     // grafted onto it, so every file in it is the dependency's own.
-    let parsed = crate::features::ParsedReport::from_report(&report_json, needs);
+    let parsed = crate::features::ParsedReport::from_compact_report(&report, needs, None);
     let mut features = ctx.extract_from_parsed(&parsed);
     if features.len() != model.spec().total_features() {
         return None;
     }
     model.spec().standardize(&mut features);
-    let pf = json_alias_array(&report_json, &["files", "fs"])
-        .and_then(|a| a.first())
-        .unwrap_or(&report_json);
-    let file_type = pf["type"].as_str().unwrap_or("unknown");
+    let file_type = report
+        .files
+        .first()
+        .map_or("unknown", |f| f.file_type.as_str());
     let (mut decision, _, _) = model
         .predict_for_report_detailed(file_type, &features, &parsed)
         .ok()?;
     apply_trait_floor(
         &mut decision,
-        &report_json,
+        root_findings(&report),
         model.active_level(),
         model.grid_max(),
         label,
@@ -2465,15 +2475,10 @@ fn classify_dependency(
 
     // Its own members, on its own budget, elevating it as they would any
     // container.
-    let entries: Vec<&serde_json::Value> = json_alias_array(&report_json, &["files", "fs"])
-        .into_iter()
-        .flatten()
-        .filter(|f| {
-            json_alias(f, &["depth", "dp"])
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                > 0
-        })
+    let entries: Vec<&cleave::types::CompactFile> = report
+        .files
+        .iter()
+        .filter(|f| f.depth > 0)
         .take(EMBEDDED_FILE_LIMIT)
         .collect();
     let mut members = MemberEvals::new();
@@ -2503,10 +2508,9 @@ pub(crate) fn dep_envelope(
 ) -> Option<ScanResultEnvelope> {
     let verdict = dep.verdict?;
     let level = verdict.level;
-    // The report text becomes a `Value` only here, for the short-lived
-    // envelope being POSTed — not for the job-long retention window.
-    let raw: serde_json::Value =
-        serde_json::from_str(&dep.raw).unwrap_or_else(|_| serde_json::json!({}));
+    // The report text is decoded only here, for the short-lived envelope being
+    // POSTed — not for the job-long retention window.
+    let raw: cleave::types::CompactReport = serde_json::from_str(&dep.raw).unwrap_or_default();
     let ml_files = build_ml_files(&raw, verdict.probability, level, &dep.members);
     Some(ScanResultEnvelope {
         ml: MlSection {
@@ -2664,6 +2668,7 @@ pub fn run_paths(
         ctrlc_flag.store(true, Ordering::Relaxed);
     });
 
+    cleave::set_compact_member_retention(true); // compact projection only
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
@@ -3067,7 +3072,7 @@ pub(crate) struct ClassifiedReport {
     pub(crate) size_bytes: u64,
     pub(crate) sha256: String,
     pub(crate) embedded_files: MemberEvals,
-    pub(crate) report_json: serde_json::Value,
+    pub(crate) report: cleave::types::CompactReport,
     /// Fetched dependencies to mirror into hopper as their own samples.
     pub(crate) dependency_results: Vec<DepResult>,
     /// cleave's rendered context view (annotated hex/source block).
@@ -3103,8 +3108,7 @@ struct TraitFloorCounts {
     total: u32,
 }
 
-fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
-    let findings = report_findings(report);
+fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCounts {
     let mut out = TraitFloorCounts {
         hostile: 0,
         suspicious: 0,
@@ -3112,19 +3116,13 @@ fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
         suspicious_confidence: 0.0,
         total: 0,
     };
-    let Some(findings) = findings else {
-        return out;
-    };
     for f in findings {
         out.total += 1;
-        #[allow(clippy::cast_possible_truncation)]
-        let conf = json_alias(f, &["conf", "c"])
-            .and_then(serde_json::Value::as_f64)
-            .map_or(DEFAULT_TRAIT_CONFIDENCE, |x| x as f32);
+        let conf = f.confidence;
         if conf < TRAIT_FLOOR_MIN_CONFIDENCE {
             continue;
         }
-        match crit_ordinal(f) {
+        match f.criticality {
             5 => {
                 out.hostile += 1;
                 out.hostile_confidence = out.hostile_confidence.max(conf);
@@ -3155,7 +3153,7 @@ fn trait_floor_counts(report: &serde_json::Value) -> TraitFloorCounts {
 /// downstream consumer cannot reinterpret the override as another class.
 fn apply_trait_floor(
     decision: &mut Decision,
-    report: &serde_json::Value,
+    findings: &[cleave::types::CompactTrait],
     active_level: Option<u16>,
     grid_max: u16,
     label: &str,
@@ -3163,7 +3161,7 @@ fn apply_trait_floor(
     if decision.class != Classification::Benign {
         return;
     }
-    let counts = trait_floor_counts(report);
+    let counts = trait_floor_counts(findings);
     if counts.hostile >= 1 {
         decision.class = Classification::Hostile;
         decision.probability = counts.hostile_confidence;
@@ -3378,7 +3376,7 @@ pub(crate) fn classify_report(
             Some(((edge.source_sha256.as_str(), off), len))
         })
         .collect();
-    let compact = cleave::types::compact::compact_from_files(&report.files);
+    let mut compact = cleave::types::compact::compact_from_files(&report.files);
     // Text/LLM renderers consume the typed report. Plain JSON does not: compact
     // conversion has already retained precisely the traits, metrics, symbols,
     // references, and context it emits. Release the much wider cleave graph
@@ -3403,18 +3401,14 @@ pub(crate) fn classify_report(
         .and_then(|file| file.formula.clone())
         .unwrap_or_default();
 
-    let mut report_json = serde_json::to_value(&compact).context("serializing cleave report")?;
-    drop(compact);
     // Attach the fetch edge log at report level (`source_sha256 → content_sha256`
     // per reference). Report-level, not per-file: a fetch is a per-event
     // observation, so it never falsely dedups when content is exploded by hash.
-    if !fetch_edges.is_empty()
-        && let Some(obj) = report_json.as_object_mut()
-    {
-        obj.insert(
-            "fetched".to_string(),
-            serde_json::to_value(&fetch_edges).unwrap_or_default(),
-        );
+    if !fetch_edges.is_empty() {
+        compact.fetched = fetch_edges
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap_or_default())
+            .collect();
     }
     // Parse the report once with every optional raw subtree any specialist may
     // read, then share it across the root and embedded-file scoring passes.
@@ -3424,25 +3418,12 @@ pub(crate) fn classify_report(
     // The sample's own decision featurizes its own files only. With nothing
     // fetched this is the whole report; otherwise drop the grafted payloads so
     // they can't dilute the aggregate (they still classify individually via the
-    // embedded path on the full `report_json`, where a hostile one elevates).
-    let parsed = if fetch_edges.is_empty() {
-        crate::features::ParsedReport::from_report(&report_json, needs)
-    } else {
-        // Borrow the own-file entries straight out of `report_json` — the
-        // grafted payloads are filtered by reference, not by deep-cloning the
-        // whole merged tree and retaining (which on a dependency-heavy report
-        // copied thousands of file nodes only to drop them).
-        let own_files: Vec<&serde_json::Value> = json_alias_array(&report_json, &["files", "fs"])
-            .into_iter()
-            .flatten()
-            .filter(|f| {
-                f.get("sha")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|s| own_shas.contains(s))
-            })
-            .collect();
-        crate::features::ParsedReport::from_filtered_files(&own_files, needs)
-    };
+    // embedded pass over the full report, where a hostile one elevates).
+    let parsed = crate::features::ParsedReport::from_compact_report(
+        &compact,
+        needs,
+        (!fetch_edges.is_empty()).then_some(&own_shas),
+    );
     let mut raw_features = ctx.extract_from_parsed(&parsed);
     let nonzero = raw_features.iter().filter(|&&v| v != 0.0).count();
     let expected = model.spec().total_features();
@@ -3464,19 +3445,15 @@ pub(crate) fn classify_report(
     // The cleave file_type drives ensemble routing; pull it from the top-level
     // file in the report. Single-bundle deployments ignore it via predict_for's
     // fast path.
-    let pf = json_alias_array(&report_json, &["files", "fs"])
-        .and_then(|a| a.first())
-        .unwrap_or(&report_json);
-    let file_type = pf["type"].as_str().unwrap_or("unknown").to_string();
-    let size_bytes = json_alias(pf, &["size", "sz"])
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let sha256 = pf["sha"].as_str().unwrap_or("").to_string();
+    let pf = compact.files.first();
+    let file_type = pf.map_or_else(|| "unknown".to_string(), |f| f.file_type.clone());
+    let size_bytes = pf.map_or(0, |f| f.size);
+    let sha256 = pf.map(|f| f.sha.clone()).unwrap_or_default();
 
     let (mut decision, model_scores, skipped_models) =
         model.predict_for_report_detailed(&file_type, &raw_features, &parsed)?;
 
-    let finding_counts = count_findings_from_json(&report_json);
+    let finding_counts = count_findings(&compact);
 
     tracing::debug!(
         path = %label,
@@ -3499,7 +3476,7 @@ pub(crate) fn classify_report(
     // member's evidence elevates its container via decision_outranks below.
     apply_trait_floor(
         &mut decision,
-        &report_json,
+        root_findings(&compact),
         model.active_level(),
         model.grid_max(),
         label,
@@ -3510,16 +3487,8 @@ pub(crate) fn classify_report(
     // decision outranks it. Ordinary scans cap embedded work to prevent
     // resource exhaustion; validation passes None so every Cleave-produced
     // embedded file is checked.
-    let embedded_iter = json_alias_array(&report_json, &["files", "fs"])
-        .into_iter()
-        .flatten()
-        .filter(|f| {
-            json_alias(f, &["depth", "dp"])
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                > 0
-        });
-    let embedded_entries: Vec<&serde_json::Value> = match embedded_file_limit {
+    let embedded_iter = compact.files.iter().filter(|f| f.depth > 0);
+    let embedded_entries: Vec<&cleave::types::CompactFile> = match embedded_file_limit {
         Some(limit) => embedded_iter.take(limit).collect(),
         None => embedded_iter.collect(),
     };
@@ -3640,10 +3609,10 @@ pub(crate) fn classify_report(
     // the offending edge. Display/attribution only; the verdict was already
     // elevated by the embedded pass above.
     for backref in &dep_backrefs {
-        inject_dependency_backref(&mut report_json, backref);
+        inject_dependency_backref(&mut compact, backref);
     }
 
-    let top_findings = extract_top_findings_from_json(&report_json, &final_decision.class);
+    let top_findings = extract_top_findings(root_findings(&compact), &final_decision.class);
 
     // Mirror each fetched dependency into hopper as its own sample: its standalone
     // report plus the verdict scan computed for it. Graded on its own report by
@@ -3671,10 +3640,10 @@ pub(crate) fn classify_report(
             // Same retention rubric as the root report: grading above consumed
             // the complete standalone report; the stored/mirrored body keeps
             // only the nodes someone will read again.
-            let raw = match serde_json::from_str::<serde_json::Value>(&dep.raw) {
-                Ok(mut value) => {
-                    apply_report_retention(&mut value);
-                    serde_json::to_string(&value).unwrap_or(dep.raw)
+            let raw = match serde_json::from_str::<cleave::types::CompactReport>(&dep.raw) {
+                Ok(mut report) => {
+                    apply_report_retention(&mut report);
+                    serde_json::to_string(&report).unwrap_or(dep.raw)
                 }
                 Err(_) => dep.raw,
             };
@@ -3850,7 +3819,7 @@ pub(crate) fn classify_report(
     // dropped here (see `apply_report_retention`). A `--show=all` manifest
     // request is an explicit ask for the complete listing, so it opts out.
     if !list_all_members {
-        apply_report_retention(&mut report_json);
+        apply_report_retention(&mut compact);
     }
 
     // Surface the archive members cleave catalogued but never analyzed, so a
@@ -3859,7 +3828,7 @@ pub(crate) fn classify_report(
     // embedded-file pass have consumed `report_json`, so the listing never feeds
     // the model. Empty unless `--show=all` requested the manifest.
     if !listed_members.is_empty() {
-        append_unanalyzed_members(&mut report_json, &listed_members);
+        append_unanalyzed_members(&mut compact, &listed_members);
     }
 
     Ok(ClassifiedReport {
@@ -3883,7 +3852,7 @@ pub(crate) fn classify_report(
         size_bytes,
         sha256,
         embedded_files: member_evals,
-        report_json,
+        report: compact,
         dependency_results,
         rendered_context,
         interpretation,
@@ -3933,71 +3902,42 @@ struct ArchiveMemberStub {
 /// already complete) ever consume. Collimator's retraining featurizer reads
 /// `facts` from the nodes that remain. `SCAN_KEEP_ALL_MEMBERS=1` disables
 /// the rubric for debugging or corpus captures.
-pub(crate) fn apply_report_retention(report_json: &mut serde_json::Value) {
+pub(crate) fn apply_report_retention(report: &mut cleave::types::CompactReport) {
     if std::env::var("SCAN_KEEP_ALL_MEMBERS").as_deref() == Ok("1") {
         return;
     }
-    let Some(files) = report_json.get_mut("files").and_then(|v| v.as_array_mut()) else {
-        return;
-    };
-    let crit_of = |t: &serde_json::Value| t.get("crit").and_then(serde_json::Value::as_i64);
+    let files = &mut report.files;
+
     // Contributors cited by any notable+ finding, across all nodes.
-    let mut cited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut cited: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for f in files.iter() {
-        for t in f
-            .get("traits")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-        {
-            if crit_of(t).unwrap_or(0) >= 3 {
-                for r in t
-                    .get("from")
-                    .and_then(|v| v.as_array())
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(id) = r.get("file").and_then(serde_json::Value::as_u64) {
-                        cited.insert(id);
-                    }
-                }
+        for t in f.findings.iter().filter(|t| t.criticality >= 3) {
+            for r in &t.from {
+                cited.insert(r.file);
             }
         }
     }
     // Top 3 by risk (ties keep earlier nodes — stable sort on a stable list).
-    let mut by_risk: Vec<(u64, i64)> = files
-        .iter()
-        .filter_map(|f| {
-            Some((
-                f.get("id").and_then(serde_json::Value::as_u64)?,
-                f.get("risk")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0),
-            ))
-        })
-        .collect();
+    let mut by_risk: Vec<(u32, i64)> = files.iter().map(|f| (f.id, f.risk)).collect();
     by_risk.sort_by_key(|&(_, risk)| std::cmp::Reverse(risk));
-    let top3: std::collections::HashSet<u64> = by_risk.iter().take(3).map(|&(id, _)| id).collect();
+    let top3: std::collections::HashSet<u32> = by_risk.iter().take(3).map(|&(id, _)| id).collect();
+
     files.retain(|f| {
-        let id = f.get("id").and_then(serde_json::Value::as_u64);
-        let depth = f
-            .get("depth")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let ty = f
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        depth == 0
-            || id == Some(0)
-            || id.is_some_and(|id| top3.contains(&id) || cited.contains(&id))
-            || ty.is_empty()
-            || ty == "registry"
-            || f.get("traits")
-                .and_then(|v| v.as_array())
-                .is_some_and(|ts| ts.iter().any(|t| crit_of(t).unwrap_or(0) >= 3))
+        f.depth == 0
+            || f.id == 0
+            || top3.contains(&f.id)
+            || cited.contains(&f.id)
+            || f.file_type.is_empty()
+            || f.file_type == "registry"
+            || f.findings.iter().any(|t| t.criticality >= 3)
     });
 }
+
+/// Sentinel `risk` for an archive member scan listed but never analyzed. Keeps
+/// an unanalyzed listing (-1) distinguishable from an analyzed member that
+/// simply produced no traits (0), so no consumer mistakes silence for a clean
+/// result.
+pub(crate) const UNANALYZED_MEMBER_RISK: i64 = -1;
 
 /// Append the archive members cleave never analyzed to `report_json["files"]` as
 /// listing-only entries (`id`/`path`/`type`/`sha`/`size`/`depth`). Members that
@@ -4006,46 +3946,31 @@ pub(crate) fn apply_report_retention(report_json: &mut serde_json::Value) {
 /// unanalyzed listing (-1) apart from an analyzed member that simply produced no
 /// traits (0); [`build_ml_files`] reads the same sentinel to keep these out of
 /// the classified `ml.files` array.
-fn append_unanalyzed_members(report_json: &mut serde_json::Value, members: &[ArchiveMemberStub]) {
-    let Some(files) = report_json
-        .get_mut("files")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return;
-    };
-    let mut seen: std::collections::HashSet<String> = files
-        .iter()
-        .filter_map(|f| f.get("sha").and_then(|v| v.as_str()).map(str::to_owned))
-        .collect();
+fn append_unanalyzed_members(
+    report: &mut cleave::types::CompactReport,
+    members: &[ArchiveMemberStub],
+) {
+    let files = &mut report.files;
+    let mut seen: std::collections::HashSet<String> = files.iter().map(|f| f.sha.clone()).collect();
     // Compact paths join nesting levels with `!!` under the root file's path;
     // `archive_contents` paths are archive-relative with single `!`. Re-root and
     // normalize so the listing entries match their analyzed siblings.
-    let root_path = files
-        .first()
-        .and_then(|f| f.get("path"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let mut next_id = files
-        .iter()
-        .filter_map(|f| f.get("id").and_then(serde_json::Value::as_u64))
-        .max()
-        .map_or(0, |m| m + 1);
+    let root_path = files.first().map(|f| f.path.clone()).unwrap_or_default();
+    let mut next_id = files.iter().map(|f| f.id).max().map_or(0, |m| m + 1);
     for m in members {
         if m.sha256.is_empty() || !seen.insert(m.sha256.clone()) {
             continue;
         }
-        let path = format!("{root_path}!!{}", m.path.replace('!', "!!"));
-        let depth = m.path.matches('!').count() as u64 + 1;
-        files.push(serde_json::json!({
-            "id": next_id,
-            "path": path,
-            "type": m.file_type,
-            "sha": m.sha256,
-            "size": m.size_bytes,
-            "depth": depth,
-            "risk": -1,
-        }));
+        files.push(cleave::types::CompactFile {
+            id: next_id,
+            path: format!("{root_path}!!{}", m.path.replace('!', "!!")),
+            file_type: m.file_type.clone(),
+            sha: m.sha256.clone(),
+            size: m.size_bytes,
+            risk: UNANALYZED_MEMBER_RISK,
+            depth: u32::try_from(m.path.matches('!').count() + 1).unwrap_or(u32::MAX),
+            ..cleave::types::CompactFile::default()
+        });
         next_id += 1;
     }
 }
@@ -4082,67 +4007,54 @@ struct DepBackref {
 /// that hopper forwards opaquely so prism can render a specific, clickable feed
 /// chip ("depends on hostile npm: zaboodle v1.49" → /file/{sha}) without parsing
 /// the sentence.
-fn inject_dependency_backref(report_json: &mut serde_json::Value, backref: &DepBackref) {
+fn inject_dependency_backref(report: &mut cleave::types::CompactReport, backref: &DepBackref) {
     let (crit, sev) = match backref.class {
         Classification::Hostile => (5u8, "Malicious"),
         _ => (4u8, "Suspicious"),
     };
-    let off = backref.source_offset.unwrap_or(0);
-    let len = backref.source_len;
     let desc = format!(
         "{sev} dependency: {} | {}",
         backref.locator, backref.dep_sha
     );
-    let dep = serde_json::json!({
-        "locator": backref.locator,
-        "sha": backref.dep_sha,
-        "type": backref.dep_type,
-    });
-
-    let Some(files) = report_json.get_mut("files").and_then(|v| v.as_array_mut()) else {
-        return;
+    let dep = cleave::types::CompactDep {
+        locator: backref.locator.clone(),
+        sha: backref.dep_sha.clone(),
+        file_type: backref.dep_type.clone(),
     };
+    let span = [backref.source_offset.unwrap_or(0), backref.source_len];
 
     // The declaring file's compact path locates every container above it.
-    let decl_path = files
+    let decl_path = report
+        .files
         .iter()
-        .find(|f| {
-            f.get("sha").and_then(serde_json::Value::as_str) == Some(backref.source_sha.as_str())
-        })
-        .and_then(|f| f.get("path").and_then(serde_json::Value::as_str))
-        .map(str::to_owned);
+        .find(|f| f.sha == backref.source_sha)
+        .map(|f| f.path.clone());
 
-    for f in files.iter_mut() {
-        let is_decl =
-            f.get("sha").and_then(serde_json::Value::as_str) == Some(backref.source_sha.as_str());
-        let is_ancestor = decl_path.as_deref().is_some_and(|dp| {
-            f.get("path")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|p| dp.starts_with(&format!("{p}!!")))
-        });
+    for f in &mut report.files {
+        let is_decl = f.sha == backref.source_sha;
+        let is_ancestor = decl_path
+            .as_deref()
+            .is_some_and(|dp| dp.starts_with(&format!("{}!!", f.path)));
         if !is_decl && !is_ancestor {
             continue;
         }
-        // The precise declaring file cites the reference byte span; a rolled-up
-        // ancestor carries the verdict without a (meaningless) cross-file span.
-        let new_trait = if is_decl {
-            serde_json::json!({"id": "fetch/dependency-verdict", "crit": crit, "desc": desc.clone(), "dep": dep.clone(), "spans": [[off, len]]})
-        } else {
-            serde_json::json!({"id": "fetch/dependency-verdict", "crit": crit, "desc": desc.clone(), "dep": dep.clone()})
-        };
-        match f
-            .get_mut("traits")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            Some(traits) => traits.push(new_trait),
-            None => {
-                if let Some(obj) = f.as_object_mut() {
-                    obj.insert("traits".to_string(), serde_json::json!([new_trait]));
-                }
-            }
-        }
+        f.findings.push(cleave::types::CompactTrait {
+            id: DEP_VERDICT_TRAIT_ID.to_string(),
+            criticality: crit,
+            description: desc.clone(),
+            dep: Some(dep.clone()),
+            // The precise declaring file cites the reference byte span; a
+            // rolled-up ancestor carries the verdict without a (meaningless)
+            // cross-file span.
+            ev: if is_decl { vec![span] } else { Vec::new() },
+            ..cleave::types::CompactTrait::default()
+        });
     }
 }
+
+/// Trait id for the synthetic finding [`inject_dependency_backref`] pins onto a
+/// manifest that declared a hostile or suspicious dependency.
+const DEP_VERDICT_TRAIT_ID: &str = "fetch/dependency-verdict";
 
 /// Cap on elevated-finding lines rendered per fetched dependency in the LLM
 /// context appendix; a dependency with more still shows its worst, and the
@@ -5214,7 +5126,8 @@ mod dependency_grading_tests {
             "confidence must match a direct scan",
         );
         assert_eq!(
-            dep_env.raw, direct_env.raw,
+            serde_json::to_value(&dep_env.raw).unwrap(),
+            serde_json::to_value(&direct_env.raw).unwrap(),
             "the stored report must be the dependency's own, unmodified",
         );
 
@@ -5249,23 +5162,19 @@ mod dependency_grading_tests {
     #[test]
     fn embedded_budget_is_per_report() {
         let members: Vec<serde_json::Value> = (0..EMBEDDED_FILE_LIMIT * 3)
-            .map(|i| serde_json::json!({"id": i + 1, "sha": "m".repeat(64), "type": "javascript", "dp": 1}))
+            .map(|i| serde_json::json!({"id": i + 1, "path": format!("m{i}.js"), "sha": "m".repeat(64), "type": "javascript", "size": 1, "depth": 1}))
             .collect();
-        let report = serde_json::json!({
+        let report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
             "v": "8",
-            "files": std::iter::once(serde_json::json!({"id": 0, "sha": "d".repeat(64), "type": "npm", "dp": 0}))
+            "files": std::iter::once(serde_json::json!({"id": 0, "path": "d.tgz", "sha": "d".repeat(64), "type": "npm", "size": 1, "depth": 0}))
                 .chain(members)
                 .collect::<Vec<_>>(),
-        });
-        let entries: Vec<&serde_json::Value> = json_alias_array(&report, &["files", "fs"])
-            .into_iter()
-            .flatten()
-            .filter(|f| {
-                json_alias(f, &["depth", "dp"])
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0)
-                    > 0
-            })
+        }))
+        .unwrap();
+        let entries: Vec<&cleave::types::CompactFile> = report
+            .files
+            .iter()
+            .filter(|f| f.depth > 0)
             .take(EMBEDDED_FILE_LIMIT)
             .collect();
         assert_eq!(
@@ -5299,45 +5208,140 @@ mod dep_backref_tests {
 
     /// Compact report: a depth-0 archive containing the declaring manifest and
     /// an unrelated sibling.
-    fn compact_fixture() -> serde_json::Value {
-        serde_json::json!({"files": [
-            {"sha": "r".repeat(64), "path": "pkg.tgz", "traits": [{"id": "existing/trait", "crit": 1}]},
-            {"sha": "s".repeat(64), "path": "pkg.tgz!!package.json"},
-            {"sha": "o".repeat(64), "path": "pkg.tgz!!README.md"},
-        ]})
+    /// Retention decides what ships in the stored report, so this pins the
+    /// rubric directly: root kept, top-3-by-risk kept, notable+ kept, and an
+    /// ordinary quiet member dropped.
+    #[test]
+    fn retention_keeps_only_readable_nodes_from_a_real_report() {
+        use cleave::types::{Criticality, FindingKind};
+
+        let mut files = Vec::new();
+        for (id, depth, risk, crit) in [
+            (0u32, 0u32, 0u32, Criticality::Baseline),
+            (1, 1, 99, Criticality::Baseline),
+            (2, 1, 0, Criticality::Baseline),
+            (3, 1, 0, Criticality::Notable),
+            (4, 1, 0, Criticality::Baseline),
+        ] {
+            let mut fa = cleave::FileAnalysis {
+                id,
+                path: format!("m{id}.py"),
+                file_type: "python".to_string(),
+                sha256: format!("{id:064}"),
+                size: 100,
+                depth,
+                score: risk,
+                ..Default::default()
+            };
+            let mut f = cleave::types::Finding::new(
+                "objectives/execution/shell::sh".into(),
+                FindingKind::Capability,
+                String::new(),
+                0.9,
+            );
+            f.crit = crit;
+            fa.findings.push(f);
+            files.push(fa);
+        }
+        let mut report = cleave::types::compact_from_files(&files);
+        apply_report_retention(&mut report);
+
+        let kept: Vec<u32> = report.files.iter().map(|f| f.id).collect();
+        // 0: root. 1: top-3 by risk. 3: carries a notable finding.
+        // 2 and 4 are quiet, low-risk members — nobody reads them again.
+        assert_eq!(kept, vec![0, 1, 2, 3], "retention kept the wrong set");
+    }
+
+    /// `count_findings` reports the root file's own findings, bucketed by
+    /// criticality — with everything below notable folding into `baseline`.
+    #[test]
+    fn finding_counts_bucket_every_criticality() {
+        use cleave::types::{Criticality, FindingKind};
+        let mut fa = cleave::FileAnalysis {
+            id: 0,
+            path: "a.py".to_string(),
+            file_type: "python".to_string(),
+            sha256: "a".repeat(64),
+            size: 10,
+            ..Default::default()
+        };
+        for (i, crit) in [
+            Criticality::Hostile,
+            Criticality::Suspicious,
+            Criticality::Notable,
+            Criticality::Baseline,
+            Criticality::Component,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut f = cleave::types::Finding::new(
+                format!("objectives/x/y::t{i}"),
+                FindingKind::Capability,
+                String::new(),
+                0.9,
+            );
+            f.crit = crit;
+            fa.findings.push(f);
+        }
+        let report = cleave::types::compact_from_files(&[fa]);
+        assert_eq!(
+            count_findings(&report),
+            FindingCounts {
+                hostile: 1,
+                suspicious: 1,
+                notable: 1,
+                // Baseline and Component both fall through to `baseline`.
+                baseline: 2,
+            }
+        );
+    }
+
+    /// A container, the manifest that declared the dependency, and an unrelated
+    /// sibling — the shape `inject_dependency_backref` walks.
+    fn compact_fixture() -> cleave::types::CompactReport {
+        serde_json::from_value(serde_json::json!({"files": [
+            {"id": 0, "size": 1, "type": "npm", "sha": "r".repeat(64), "path": "pkg.tgz",
+             "traits": [{"id": "existing/trait", "crit": 1}]},
+            {"id": 1, "size": 1, "depth": 1, "type": "json", "sha": "s".repeat(64), "path": "pkg.tgz!!package.json"},
+            {"id": 2, "size": 1, "depth": 1, "type": "markdown", "sha": "o".repeat(64), "path": "pkg.tgz!!README.md"},
+        ]}))
+        .unwrap()
+    }
+
+    /// The wire form of a report, which is what the backref assertions are
+    /// about: prism and hopper read these keys.
+    fn wire(report: &cleave::types::CompactReport) -> serde_json::Value {
+        serde_json::to_value(report).unwrap()
     }
 
     #[test]
     fn retention_rubric_keeps_only_readable_nodes() {
-        let mut report = serde_json::json!({"files": [
+        let mut report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({"files": [
             // Root: kept (depth 0 / id 0) even with no traits.
-            {"id": 0, "depth": 0, "type": "npm", "risk": 1},
+            {"id": 0, "path": "p.tgz", "sha": "0", "size": 1, "depth": 0, "type": "npm", "risk": 1},
             // Own notable trait: kept.
-            {"id": 1, "depth": 1, "type": "javascript",
+            {"id": 1, "path": "p.tgz!!a.js", "sha": "1", "size": 1, "depth": 1, "type": "javascript",
              "traits": [{"id": "a", "crit": 3}]},
             // Cited by a notable composite on another node: kept.
-            {"id": 2, "depth": 1, "type": "markdown",
+            {"id": 2, "path": "p.tgz!!b.md", "sha": "2", "size": 1, "depth": 1, "type": "markdown",
              "traits": [{"id": "b", "crit": 1}]},
             // The citing node (notable, with from): kept.
-            {"id": 3, "depth": 1, "type": "javascript",
+            {"id": 3, "path": "p.tgz!!c.js", "sha": "3", "size": 1, "depth": 1, "type": "javascript",
              "traits": [{"id": "c", "crit": 4, "from": [{"file": 2}]}]},
             // Provenance skeleton: kept.
-            {"id": 4, "depth": 2, "type": "registry"},
-            {"id": 5, "depth": 2, "type": "", "rel": "fetched"},
+            {"id": 4, "path": "p.tgz!!reg", "sha": "4", "size": 1, "depth": 2, "type": "registry"},
+            {"id": 5, "path": "p.tgz!!edge", "sha": "5", "size": 1, "depth": 2, "type": "", "rel": "fetched"},
             // High risk: kept via top-3 (risks 9 > root's 1).
-            {"id": 6, "depth": 1, "type": "text", "risk": 9},
+            {"id": 6, "path": "p.tgz!!e.txt", "sha": "6", "size": 1, "depth": 1, "type": "text", "risk": 9},
             // Sub-notable, uncited, low-risk: dropped.
-            {"id": 7, "depth": 1, "type": "markdown",
+            {"id": 7, "path": "p.tgz!!f.md", "sha": "7", "size": 1, "depth": 1, "type": "markdown",
              "traits": [{"id": "d", "crit": 2}]},
-            {"id": 8, "depth": 2, "type": "text"},
-        ]});
+            {"id": 8, "path": "p.tgz!!g.txt", "sha": "8", "size": 1, "depth": 2, "type": "text"},
+        ]}))
+        .unwrap();
         apply_report_retention(&mut report);
-        let ids: Vec<u64> = report["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["id"].as_u64().unwrap())
-            .collect();
+        let ids: Vec<u32> = report.files.iter().map(|f| f.id).collect();
         assert!(
             ids.contains(&0) && ids.contains(&1) && ids.contains(&2) && ids.contains(&3),
             "root, notable, cited contributor, and citing node survive: {ids:?}"
@@ -5355,8 +5359,9 @@ mod dep_backref_tests {
 
     #[test]
     fn declarer_gets_span_and_structured_dep() {
-        let mut report_json = compact_fixture();
-        inject_dependency_backref(&mut report_json, &backref(Classification::Hostile));
+        let mut report = compact_fixture();
+        inject_dependency_backref(&mut report, &backref(Classification::Hostile));
+        let report_json = wire(&report);
 
         let t = &report_json["files"][1]["traits"][0];
         assert_eq!(t["id"], "fetch/dependency-verdict");
@@ -5384,8 +5389,9 @@ mod dep_backref_tests {
 
     #[test]
     fn ancestor_carries_dep_without_span_and_siblings_stay_clean() {
-        let mut report_json = compact_fixture();
-        inject_dependency_backref(&mut report_json, &backref(Classification::Hostile));
+        let mut report = compact_fixture();
+        inject_dependency_backref(&mut report, &backref(Classification::Hostile));
+        let report_json = wire(&report);
 
         let root_traits = report_json["files"][0]["traits"].as_array().unwrap();
         assert_eq!(root_traits.len(), 2, "rolled up alongside existing traits");
@@ -5408,8 +5414,9 @@ mod dep_backref_tests {
 
     #[test]
     fn suspicious_dependency_pins_at_crit_4() {
-        let mut report_json = compact_fixture();
-        inject_dependency_backref(&mut report_json, &backref(Classification::Suspicious));
+        let mut report = compact_fixture();
+        inject_dependency_backref(&mut report, &backref(Classification::Suspicious));
+        let report_json = wire(&report);
 
         let t = &report_json["files"][1]["traits"][0];
         assert_eq!(t["crit"], 4);
@@ -5428,11 +5435,12 @@ mod dep_backref_tests {
 
     #[test]
     fn url_locator_flows_through_verbatim() {
-        let mut report_json = compact_fixture();
+        let mut report = compact_fixture();
         let mut b = backref(Classification::Hostile);
         b.locator = "http://x.y.z/x.exe".to_string();
         b.dep_type = "pe".to_string();
-        inject_dependency_backref(&mut report_json, &b);
+        inject_dependency_backref(&mut report, &b);
+        let report_json = wire(&report);
 
         let t = &report_json["files"][1]["traits"][0];
         assert_eq!(t["dep"]["locator"], "http://x.y.z/x.exe");
@@ -5953,7 +5961,7 @@ pub(crate) fn process_report(
     // content reconciliation in `record_file_result`. Without this, a terminal
     // `--upload` would post a verdict with an empty report.
     let cleave = if is_json || config.hopper().is_some() {
-        Some(cr.report_json)
+        Some(cr.report)
     } else {
         None
     };
@@ -5987,19 +5995,16 @@ pub(crate) fn process_report(
     })
 }
 
-/// Count cleave findings by criticality level from either a top-level report or
-/// the primary file entry inside that report.
+/// Count a report's findings by criticality — the root file's own findings,
+/// which are the ones that describe the artifact scan was asked about.
 #[must_use]
-pub fn count_findings_from_json(report: &serde_json::Value) -> FindingCounts {
-    let findings = report_findings(report);
-
-    let Some(findings) = findings else {
+pub fn count_findings(report: &cleave::types::CompactReport) -> FindingCounts {
+    let Some(first) = report.files.first() else {
         return FindingCounts::default();
     };
-
     let mut counts = FindingCounts::default();
-    for f in findings {
-        match crit_ordinal(f) {
+    for f in &first.findings {
+        match f.criticality {
             5 => counts.hostile += 1,
             4 => counts.suspicious += 1,
             3 => counts.notable += 1,
@@ -6036,6 +6041,7 @@ pub fn scan_bytes(
 ) -> Result<ScanResult> {
     prefetch_cleave_resources();
 
+    cleave::set_compact_member_retention(true); // compact projection only
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
@@ -6079,6 +6085,7 @@ pub fn scan_file(
 ) -> Result<ScanResult> {
     prefetch_cleave_resources();
 
+    cleave::set_compact_member_retention(true); // compact projection only
     let cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
@@ -6108,20 +6115,18 @@ fn prefetch_cleave_resources() {
 
 /// Extract a small set of human-facing findings relevant to the classification.
 #[must_use]
-pub fn extract_top_findings_from_json(
-    report: &serde_json::Value,
+pub fn extract_top_findings(
+    findings: &[cleave::types::CompactTrait],
     classification: &Classification,
 ) -> Vec<TopFinding> {
-    let findings = report_findings(report).map(Vec::as_slice).unwrap_or(&[]);
-
-    let min_crit: u32 = match classification {
+    let min_crit: u8 = match classification {
         Classification::Hostile => 5,
         Classification::Suspicious | Classification::Benign => 4,
     };
 
     let mut relevant: Vec<TopFinding> = findings
         .iter()
-        .filter(|f| crit_ordinal(f) >= min_crit)
+        .filter(|f| f.criticality >= min_crit)
         .map(TopFinding::from)
         .collect();
 
@@ -6129,7 +6134,7 @@ pub fn extract_top_findings_from_json(
     if relevant.is_empty() && min_crit == 5 {
         relevant = findings
             .iter()
-            .filter(|f| crit_ordinal(f) >= 4)
+            .filter(|f| f.criticality >= 4)
             .map(TopFinding::from)
             .collect();
     }
@@ -6326,33 +6331,21 @@ fn skipped_routes_empty(routes: &[crate::model::SkippedRoute]) -> bool {
 /// into the member's own sample row (`litmusResultForMember`), so a fabricated
 /// value becomes that file's global grade everywhere it appears.
 fn build_ml_files(
-    report_json: &serde_json::Value,
+    report: &cleave::types::CompactReport,
     root_prob: f32,
     root_level: Option<i32>,
     embedded_files: &MemberEvals,
 ) -> Vec<serde_json::Value> {
-    let Some(report_files) = json_alias_array(report_json, &["files", "fs"]) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::with_capacity(report_files.len());
-    for (idx, entry) in report_files.iter().enumerate() {
+    let mut out = Vec::with_capacity(report.files.len());
+    for entry in &report.files {
         // Listing-only members (added for `--show=all`) were never analyzed, so
-        // they carry no ML verdict; their sentinel `risk` of -1 keeps them out of
-        // the classified `ml.files` while they remain in the raw `files` manifest.
-        if entry.get("risk").and_then(serde_json::Value::as_i64) == Some(-1) {
+        // they carry no ML verdict; their sentinel risk keeps them out of the
+        // classified `ml.files` while they remain in the raw `files` manifest.
+        if entry.risk == UNANALYZED_MEMBER_RISK {
             continue;
         }
-        let id = entry
-            .get("id")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(idx as u64);
-        let depth = json_alias(entry, &["depth", "dp"])
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let file_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-        let evaluation = if depth == 0 {
+        let id = u64::from(entry.id);
+        let evaluation = if entry.depth == 0 {
             Some((root_prob, root_level))
         } else {
             embedded_files.get(&id).map(|ef| (ef.probability, ef.level))
@@ -6361,7 +6354,7 @@ fn build_ml_files(
         match evaluation {
             Some((prob, file_level)) => out.push(serde_json::json!({
                 "id": id,
-                "type": file_type,
+                "type": entry.file_type,
                 "prob": prob,
                 "lvl": file_level,
                 "conf": level_confidence(file_level),
@@ -6370,7 +6363,7 @@ fn build_ml_files(
             // prob-less entry as "not analyzed", which is the truth.
             None => out.push(serde_json::json!({
                 "id": id,
-                "type": file_type,
+                "type": entry.file_type,
             })),
         }
     }
@@ -6386,7 +6379,7 @@ pub struct ScanResultEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<crate::interpret::Interpretation>,
     /// Raw cleave analysis report.
-    pub raw: serde_json::Value,
+    pub raw: cleave::types::CompactReport,
 }
 
 /// This scan binary's build version, stamped into every `ml` envelope so a
@@ -6439,7 +6432,7 @@ pub struct ScanResultEnvelopeRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<&'a crate::interpret::Interpretation>,
     /// Raw cleave analysis report (borrowed).
-    pub raw: &'a serde_json::Value,
+    pub raw: &'a cleave::types::CompactReport,
 }
 
 /// Borrowed counterpart of [`MlSection`].
@@ -6477,7 +6470,7 @@ impl ScanResult {
     /// for archive analyses); the move variant avoids that entirely.
     #[must_use]
     pub fn to_envelope(&self) -> ScanResultEnvelope {
-        let raw = self.cleave.clone().unwrap_or(serde_json::json!({}));
+        let raw = self.cleave.clone().unwrap_or_default();
         let level = self.level;
         let ml_files = build_ml_files(&raw, self.probability, level, &self.embedded_files);
         ScanResultEnvelope {
@@ -6506,7 +6499,7 @@ impl ScanResult {
     /// envelope.
     #[must_use]
     pub fn into_envelope(self) -> ScanResultEnvelope {
-        let raw = self.cleave.unwrap_or(serde_json::json!({}));
+        let raw = self.cleave.unwrap_or_default();
         let level = self.level;
         let ml_files = build_ml_files(&raw, self.probability, level, &self.embedded_files);
         ScanResultEnvelope {
@@ -6535,10 +6528,10 @@ impl ScanResult {
     /// [`Self::into_envelope`] when the caller can give up ownership.
     #[must_use]
     pub fn envelope_ref(&self) -> ScanResultEnvelopeRef<'_> {
-        static EMPTY_RAW: OnceLock<serde_json::Value> = OnceLock::new();
-        let raw: &serde_json::Value = match &self.cleave {
+        static EMPTY_RAW: OnceLock<cleave::types::CompactReport> = OnceLock::new();
+        let raw: &cleave::types::CompactReport = match &self.cleave {
             Some(v) => v,
-            None => EMPTY_RAW.get_or_init(|| serde_json::json!({})),
+            None => EMPTY_RAW.get_or_init(cleave::types::CompactReport::default),
         };
         let level = self.level;
         let ml_files = build_ml_files(raw, self.probability, level, &self.embedded_files);

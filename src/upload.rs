@@ -90,7 +90,7 @@ pub(crate) fn encode_result_body(
         // mirrors the envelope litmus emits when there is no cleave report, so
         // the dropped-raw form stays a structurally valid envelope.
         if let Some(envelope) = payload.envelope.as_mut() {
-            envelope.raw = serde_json::json!({});
+            envelope.raw = cleave::types::CompactReport::default();
         }
         serialize(&payload, sha256)?
     } else {

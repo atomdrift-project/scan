@@ -76,6 +76,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     // invalidate stale reports without forcing every pre-commit run to rescan
     // the whole cleave fixture tree.
     cleave::cache::set_skip_cache_override(Some(false));
+    cleave::set_compact_member_retention(true); // compact projection only
     let options = cleave::AnalysisOptions {
         disable_yara: true,
         disable_radare2: true,

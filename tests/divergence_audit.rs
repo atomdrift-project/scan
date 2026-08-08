@@ -14,7 +14,7 @@ struct Fixture {
 
 #[derive(serde::Deserialize)]
 struct Sample {
-    report: serde_json::Value,
+    report: cleave::types::CompactReport,
     expected_features: Vec<f32>,
 }
 

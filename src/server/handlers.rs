@@ -1088,7 +1088,7 @@ fn scan_result_from(
         level: cr.level,
         version: crate::engine::model_version_string(resources.model.info()),
         analyzed_at: crate::engine::now_rfc3339(),
-        cleave: Some(cr.report_json),
+        cleave: Some(cr.report),
         pids: None,
         deleted: None,
         path: label.to_string(),
@@ -1319,28 +1319,16 @@ pub(super) async fn analyze_path(
     match result {
         AnalysisOutcome::Ok(Ok(scan_result)) => {
             let mut scan_result = *scan_result;
-            // Inject extracted_path into the raw cleave JSON so cyclotron
-            // knows where archive members were extracted on disk.
+            // Record where archive members were extracted on disk, so cyclotron
+            // can open them.
             if let (Some(extract_dir), Some(raw)) = (&state.extract_dir, &mut scan_result.cleave)
-                && let Some(raw_files) = raw
-                    .get("files")
-                    .or_else(|| raw.get("fs"))
-                    .and_then(|f| f.as_array())
-                && let Some(first) = raw_files
-                    .first()
-                    .and_then(|f| f.get("sha"))
-                    .and_then(|s| s.as_str())
+                && let Some(first) = raw.files.first().map(|f| f.sha.as_str())
             {
                 // SHA hex is ASCII; byte slice is always a valid UTF-8 boundary.
                 let short = first.get(..first.len().min(6)).unwrap_or(first);
                 let dir = extract_dir.join(short);
-                if dir.is_dir()
-                    && let Some(o) = raw.as_object_mut()
-                {
-                    o.insert(
-                        "extracted_path".to_string(),
-                        serde_json::Value::String(dir.to_string_lossy().into_owned()),
-                    );
+                if dir.is_dir() {
+                    raw.extracted_path = Some(dir.to_string_lossy().into_owned());
                 }
             }
 
