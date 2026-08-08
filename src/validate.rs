@@ -284,12 +284,13 @@ fn evaluate(
             any_nonbenign = true;
             any_hostile |= result.classification == Classification::Hostile;
             eprintln!(
-                "WARN {}: grade={} level={} probability={:.4} decision_threshold={:.4} active_thresholds suspicious={:.4} hostile={:.4}",
+                "WARN {}: grade={} level={} probability={} decision_threshold={} margin_logit={:+.3} ensemble_thresholds suspicious={} hostile={}",
                 path.display(),
                 result.classification,
                 format_level(result.level),
                 result.probability,
                 result.threshold,
+                logit_margin(result.probability, result.threshold),
                 thresholds.suspicious,
                 thresholds.hostile,
             );
@@ -300,13 +301,14 @@ fn evaluate(
                 any_nonbenign = true;
                 any_hostile |= embedded.classification == Classification::Hostile;
                 eprintln!(
-                    "WARN {}!!{}: grade={} level={} probability={:.4} decision_threshold={:.4} active_thresholds suspicious={:.4} hostile={:.4}",
+                    "WARN {}!!{}: grade={} level={} probability={} decision_threshold={} margin_logit={:+.3} ensemble_thresholds suspicious={} hostile={}",
                     path.display(),
                     embedded.path,
                     embedded.classification,
                     format_level(embedded.level),
                     embedded.probability,
                     embedded.threshold,
+                    logit_margin(embedded.probability, embedded.threshold),
                     thresholds.suspicious,
                     thresholds.hostile,
                 );
@@ -331,6 +333,33 @@ fn evaluate(
     Ok((passed, total, hostile_fps, suspicious_fps))
 }
 
+/// Decision margin in log-odds: `logit(probability) - logit(threshold)`.
+/// Positive means the file crossed its threshold and fired.
+///
+/// Fixed-decimal probabilities cannot express these decisions. Both ends of the
+/// range are degenerate under `{:.4}`: a malformed bundle once decided an
+/// OpenDocument file at probability 1.031e-05 against a threshold of
+/// 8.072e-06, printing `probability=0.0000 decision_threshold=0.0000`, and the
+/// far commoner case of a threshold at 0.99954 against a score of 0.99955
+/// prints both as `0.9995`. Either way the WARN line shows a verdict with no
+/// visible cause, on the one line an operator has to work from.
+///
+/// Log-odds is the scale the thresholds are actually built in — collimator
+/// fits its whole per-level threshold curve in logit space — so equal steps
+/// here are equal steps of evidence, and one signed number says both which way
+/// the decision went and by how much. The raw probability and threshold are
+/// still printed alongside, at full precision.
+fn logit_margin(probability: f32, threshold: f32) -> f64 {
+    // f32 probabilities saturate at both ends; clamp inside the representable
+    // open interval so a saturated score yields a large finite margin rather
+    // than an infinity.
+    fn logit(p: f64) -> f64 {
+        let p = p.clamp(1e-45, 1.0 - f64::from(f32::EPSILON));
+        (p / (1.0 - p)).ln()
+    }
+    logit(f64::from(probability)) - logit(f64::from(threshold))
+}
+
 fn format_level(level: Option<i32>) -> String {
     match level {
         Some(-1) => "clean".to_string(),
@@ -348,5 +377,37 @@ fn print_top_findings(findings: &[engine::TopFinding], indent: &str) {
 fn print_embedded_findings(file: &EmbeddedFile, indent: &str) {
     for finding in &file.top_findings {
         eprintln!("{indent}l{} {}  {}", finding.crit, finding.id, finding.desc);
+    }
+}
+
+#[cfg(test)]
+mod logit_margin_tests {
+    use super::logit_margin;
+
+    /// The 2026-08-04 OpenDocument misgrade. Under `{:.4}` the probability and
+    /// its threshold both printed as `0.0000`; the margin says it fired, and
+    /// by how little.
+    #[test]
+    fn separates_a_decision_at_the_bottom_of_the_range() {
+        let margin = logit_margin(1.031_160_4e-5, 8.072_087e-6);
+        assert!(margin > 0.0, "file crossed its threshold: {margin}");
+        assert!((margin - 0.245).abs() < 0.01, "{margin}");
+    }
+
+    /// The commoner case, and the one plain `{:.4}` also loses: a threshold at
+    /// 0.99954 against a score just under it, both printing as `0.9995`.
+    #[test]
+    fn separates_a_decision_at_the_top_of_the_range() {
+        let margin = logit_margin(0.999_541_5, 0.999_545_6);
+        assert!(margin < 0.0, "file stayed under its threshold: {margin}");
+        assert!(margin.abs() < 0.05, "a near-miss is a small margin: {margin}");
+    }
+
+    /// A saturated f32 score must not produce an infinity.
+    #[test]
+    fn saturated_scores_stay_finite() {
+        assert!(logit_margin(1.0, 0.5).is_finite());
+        assert!(logit_margin(0.0, 0.5).is_finite());
+        assert!(logit_margin(1.0, 1.0).is_finite());
     }
 }
