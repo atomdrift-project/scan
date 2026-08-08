@@ -10,8 +10,9 @@
 //! later scan of the same bytes reuses them instead of re-running cleave.
 //!
 //! Correctness over speed: the cache is namespaced by a *ruleset version* token
-//! (scan release, installed traits commit, trait/composite/YARA counts, and the
-//! bloom set the skip-predicate consults). Any change to what the detector would
+//! (scan release, installed traits commit, trait/composite/YARA counts, the
+//! bloom set the skip-predicate consults, and the installed model bundle, whose
+//! output the cached verdict is). Any change to what the detector would
 //! find lands in a different namespace, so a stale result can never mask a
 //! detection a newer ruleset adds — a version bump simply misses and re-analyzes.
 //! A hit is only ever a result the *current* detector already produced. Set
@@ -119,11 +120,20 @@ impl AnalysisCache {
     }
 }
 
-/// A token identifying the analysis-producing detector, so a rules or engine
-/// update invalidates cached results. Folds in the scan release, the installed
-/// traits commit, cleave's trait/composite/YARA counts, and the installed bloom
-/// set (which the dependency skip-predicate consults) — any of these changing
-/// the analysis lands cached results in a fresh namespace.
+/// A token identifying the analysis-producing detector, so a rules, model, or
+/// engine update invalidates cached results. Folds in the scan release, the
+/// installed traits commit, cleave's trait/composite/YARA counts, the installed
+/// bloom set (which the dependency skip-predicate consults), and the installed
+/// model bundle — any of these changing the analysis lands cached results in a
+/// fresh namespace.
+///
+/// The model belongs here for the same reason the rules do: a cached entry
+/// holds the *verdict*, and the verdict is the model's output. Until
+/// 2026-08-07 it was absent, so a model auto-update reused the previous
+/// bundle's namespace and every already-seen file kept the verdict the old
+/// bundle gave it. That is how the 2026-08-04 route-policy defect (benign
+/// OpenDocument files graded hostile at every deploy level) would have
+/// outlived the corrected bundle that fixed it.
 fn ruleset_version() -> String {
     let vi = cleave::version_info();
     let commit = cleave::rule_update::installed(&cleave::traits_repo::install_target())
@@ -134,12 +144,36 @@ fn ruleset_version() -> String {
     let bloom = crate::bloom_repo::installed_manifest()
         .map_or_else(|| "nobloom".to_string(), |m| sanitize(&m.built));
     format!(
-        "{}-{commit}-t{}-c{}-y{}-{bloom}",
+        "{}-{commit}-t{}-c{}-y{}-{bloom}-m{}",
         env!("CARGO_PKG_VERSION"),
         vi.trait_count,
         vi.composite_count,
         vi.yara_rules,
+        model_version(),
     )
+}
+
+/// Identity of the installed model bundle, for [`ruleset_version`].
+///
+/// Prefers the updater's sidecar commit. A dev tree — the `~/azoth` symlink a
+/// local `make azoth-deploy` writes — has no sidecar, and that is exactly the
+/// setup where bundles change most often, so fall back to a stamp of
+/// `config.json`'s size and mtime. Either way a redeployed bundle moves the
+/// token. `nomodel` when nothing is installed.
+fn model_version() -> String {
+    if let Some(commit) = crate::models_repo::version() {
+        return sanitize(&commit);
+    }
+    let config = crate::models_repo::install_target().join("config.json");
+    let Ok(meta) = std::fs::metadata(&config) else {
+        return "nomodel".to_string();
+    };
+    let stamp = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    format!("{}.{stamp}", meta.len())
 }
 
 /// Delete cache directories for ruleset versions other than `current`. Every
@@ -171,4 +205,34 @@ fn sanitize(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cache key holds verdicts, and verdicts are the model's output — a
+    /// bundle swap must land them in a fresh namespace. Guards against the
+    /// model token being dropped from the key again.
+    #[test]
+    fn ruleset_version_carries_the_model_token() {
+        let version = ruleset_version();
+        let token = model_version();
+        assert!(
+            version.ends_with(&format!("-m{token}")),
+            "ruleset_version {version} must carry model token {token}",
+        );
+    }
+
+    #[test]
+    fn model_version_is_stable_and_path_safe() {
+        assert_eq!(model_version(), model_version());
+        assert!(
+            model_version()
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+            "model token must be a safe path segment: {}",
+            model_version(),
+        );
+    }
 }
