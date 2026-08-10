@@ -156,9 +156,25 @@ backtrace = "0.3"
 # allocator) and tikv-jemalloc-sys bundles a pre-illumos config.sub that fails
 # to recognize the host triple.
 #
-# Keep this list in lockstep with the two cfg blocks at the top of src/main.rs.
+# Keep this list in lockstep with the three cfg blocks in src/main.rs: the
+# `#[global_allocator]` static, `mod jemalloc_conf`, and the startup call to
+# `route_tree_sitter_through_jemalloc` in `main`.
 [target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))'.dependencies]
 tikv-jemallocator = "0.7"
+# Already in the graph beneath tikv-jemallocator; named directly only for its
+# malloc/calloc/realloc/free declarations, which carry the correct C signatures
+# and the `_rjem_` link_name prefix its own build script decides on. Declaring
+# them by hand instead would hardcode that prefix and duplicate the signatures.
+tikv-jemalloc-sys = "0.7"
+# Direct handle on tree-sitter (already in the graph via filefacts) purely to
+# call `set_allocator` at startup: tree-sitter's C core otherwise allocates
+# through the system malloc, invisible to jemalloc's budgets and — measured
+# via vmmap on the gauntlet peak — leaving ~0.8 GB of freed-but-retained
+# empty small-zone pages on macOS. Routing it through jemalloc puts parse
+# trees under the same decay policies as everything else. The version must
+# stay in lockstep with filefacts's; `links = "tree-sitter-language"` makes
+# any divergence a loud resolve error rather than a silent dual copy.
+tree-sitter = "0.27"
 
 [features]
 # Enables jemalloc heap profiling. Build with:
@@ -289,4 +305,4 @@ tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev
 [patch."https://github.com/tstromberg/dmgwiz.git"]
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 
-# Add TEMPORARY local overrides below:
+

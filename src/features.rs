@@ -4040,9 +4040,9 @@ mod reader_equivalence_tests {
                 ..Default::default()
             };
             let mut f = cleave::types::Finding::new(
-                "objectives/execution/shell::sh".into(),
+                "objectives/execution/shell::sh".to_string(),
                 FindingKind::Capability,
-                "spawns a shell".into(),
+                "spawns a shell".to_string(),
                 conf,
             );
             f.crit = crit;
