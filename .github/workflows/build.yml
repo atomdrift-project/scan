@@ -482,7 +482,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in FreeBSD VM
-        uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
+        uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093 # v1.5.3
         with:
           usesh: true
           # Newest stable image the builder publishes, pinned explicitly rather than
@@ -574,7 +574,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in FreeBSD aarch64 VM
-        uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
+        uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093 # v1.5.3
         with:
           usesh: true
           # Same pin and the same 15.x-only reach tradeoff as the x86_64 job.
