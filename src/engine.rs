@@ -644,6 +644,7 @@ mod envelope_tests {
             10,
             "scan+test",
             None,
+            None,
         );
 
         assert_eq!(arts.len(), 1, "only the scanned file is offered here");
@@ -671,6 +672,7 @@ mod envelope_tests {
             10,
             "scan+test",
             Some(&provenance),
+            None,
         );
         let sidecar: serde_json::Value = serde_json::from_slice(&arts[0].sidecar).unwrap();
         assert!(arts[0].backfill);
@@ -2204,6 +2206,7 @@ fn record_file_result(
                     sha256,
                     size,
                     root_registry,
+                    root_fetch,
                     deps,
                     envelope,
                 );
@@ -2285,12 +2288,14 @@ fn emit_error_record(file_path: &Path, msg: &str, stdout: &Mutex<std::io::Stdout
 /// artifacts are queued before the result so a never-seen top-level file's row
 /// exists before its verdict lands. Blocking (reads sidecars from disk); callers
 /// on an async runtime must run it off the executor.
+#[allow(clippy::too_many_arguments)] // a flat hand-off of one result's parts; a struct would only indirect it
 pub(crate) fn upload_scan_result(
     uploader: &crate::upload::Uploader,
     file_path: &Path,
     sha256: String,
     size_bytes: u64,
     root_provenance: Option<&crate::provenance::RegistryProvenance>,
+    root_fetch: Option<&fletch::fetch::FetchRecord>,
     dependency_results: Vec<DepResult>,
     envelope: ScanResultEnvelope,
 ) {
@@ -2300,6 +2305,7 @@ pub(crate) fn upload_scan_result(
         size_bytes,
         upload_collector(),
         root_provenance,
+        root_fetch,
     );
     uploader.submit_artifacts(artifacts);
     // Each fetched dependency, mirrored into hopper as its own sample: bytes (only
@@ -2550,68 +2556,269 @@ fn collect_upload_artifacts(
     size_bytes: u64,
     collector: &str,
     root_provenance: Option<&crate::provenance::RegistryProvenance>,
+    root_fetch: Option<&fletch::fetch::FetchRecord>,
 ) -> Vec<crate::upload::UploadArtifact> {
     use crate::upload::{ArtifactBytes, UploadArtifact};
     let now = now_rfc3339();
 
-    // The scanned file: bytes from disk, no registry (a local, un-fetched artifact).
-    let root_name = file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file")
-        .to_string();
-    let (sidecar, backfill) = if let Some(provenance) = root_provenance {
-        (
-            crate::provenance::build_sidecar_from_provenance(
-                &root_name, sha256, size_bytes, collector, &now, "", "", provenance,
-            ),
-            true,
+    // For a fetched root (`scan url|purl`), `file_path` is the display locator,
+    // not a readable file: it takes its name from the fetch URL, its bytes from
+    // fletch's blob cache (where the fetch stored them), that URL for the
+    // sidecar's fetch slot, and — when the locator is a PURL — the package slot
+    // hopper projects into its queryable purl_base column. A local `scan path`
+    // root reads from disk and claims none of the rest.
+    let (root_name, bytes, url, purl) = match root_fetch {
+        Some(rec) => {
+            let url = rec.final_url.as_deref().unwrap_or(&rec.resolved_url);
+            let purl = if rec.locator.starts_with("pkg:") {
+                rec.locator.as_str()
+            } else {
+                ""
+            };
+            (
+                artifact_filename(url, &rec.locator),
+                ArtifactBytes::Cached {
+                    locator: rec.locator.clone(),
+                },
+                url,
+                purl,
+            )
+        }
+        None => (
+            file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string(),
+            ArtifactBytes::File(file_path.to_path_buf()),
+            "",
+            "",
+        ),
+    };
+    let sidecar = if let Some(provenance) = root_provenance {
+        crate::provenance::build_sidecar_from_provenance(
+            &root_name, sha256, size_bytes, collector, &now, url, purl, provenance,
         )
     } else {
-        (
-            crate::provenance::build_sidecar(
-                &root_name,
-                sha256,
-                size_bytes,
-                collector,
-                &now,
-                "",
-                "",
-                None,
-                &[],
-            ),
-            false,
+        crate::provenance::build_sidecar(
+            &root_name,
+            sha256,
+            size_bytes,
+            collector,
+            &now,
+            url,
+            purl,
+            None,
+            &[],
         )
     };
     vec![UploadArtifact {
         sha256: sha256.to_string(),
         size: size_bytes,
-        filename: root_name.clone(),
-        bytes: ArtifactBytes::File(file_path.to_path_buf()),
+        filename: root_name,
+        bytes,
         sidecar,
-        // A map-backed root can carry registry data worth adding to a sample
-        // hopper already has; a plain local file's thin sidecar cannot.
-        backfill,
+        // Registry data or a PURL identity is worth backfilling onto a sample
+        // hopper already has; a plain local file's thin sidecar is not.
+        backfill: root_provenance.is_some() || !purl.is_empty(),
     }]
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod upload_artifact_tests {
+    use super::collect_upload_artifacts;
+    use crate::upload::ArtifactBytes;
+    use std::path::Path;
+
+    fn fetch_record(locator: &str, resolved: &str) -> fletch::fetch::FetchRecord {
+        serde_json::from_value(serde_json::json!({
+            "locator": locator,
+            "resolved_url": resolved,
+            "fetched_at": 0,
+            "cached": false,
+            "outcome": "ok",
+        }))
+        .expect("minimal FetchRecord")
+    }
+
+    #[test]
+    fn fetched_purl_root_carries_package_identity() {
+        let rec = fetch_record(
+            "pkg:npm/lodash@4.17.21",
+            "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+        );
+        let arts = collect_upload_artifacts(
+            Path::new("pkg:npm/lodash@4.17.21"),
+            "aa11",
+            42,
+            "scan+test",
+            None,
+            Some(&rec),
+        );
+        let art = &arts[0];
+        assert!(art.backfill, "a PURL identity is worth backfilling");
+        assert_eq!(
+            art.filename, "lodash-4.17.21.tgz",
+            "named from the fetch URL"
+        );
+        assert!(
+            matches!(&art.bytes, ArtifactBytes::Cached { locator } if locator == "pkg:npm/lodash@4.17.21"),
+            "fetched root loads from the blob cache, not the display label"
+        );
+        let sidecar: serde_json::Value = serde_json::from_slice(&art.sidecar).unwrap();
+        assert_eq!(sidecar["package"]["purl"], "pkg:npm/lodash@4.17.21");
+        assert_eq!(
+            sidecar["fetch"]["url"],
+            "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"
+        );
+        assert_eq!(sidecar["artifact"]["filename"], "lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn fetched_url_root_has_no_package_slot() {
+        let rec = fetch_record(
+            "https://example.com/tool.zip",
+            "https://example.com/tool.zip",
+        );
+        let arts = collect_upload_artifacts(
+            Path::new("https://example.com/tool.zip"),
+            "bb22",
+            7,
+            "scan+test",
+            None,
+            Some(&rec),
+        );
+        let art = &arts[0];
+        assert!(
+            !art.backfill,
+            "a bare URL fetch carries no registry identity"
+        );
+        assert_eq!(art.filename, "tool.zip");
+        let sidecar: serde_json::Value = serde_json::from_slice(&art.sidecar).unwrap();
+        assert!(
+            sidecar.get("package").is_none(),
+            "no PURL, no package claim"
+        );
+        assert_eq!(sidecar["fetch"]["url"], "https://example.com/tool.zip");
+    }
+
+    #[test]
+    fn hostile_redirect_targets_cannot_shape_the_stored_filename() {
+        use super::{MAX_ARTIFACT_FILENAME, artifact_filename};
+
+        // A redirect picks the final URL, so every one of these is reachable by
+        // an attacker who controls (or compromises) the server we fetch from.
+        for (url, expect) in [
+            // Encoded separators a consumer might decode back into a path.
+            ("https://e.com/..%2f..%2fetc%2fpasswd", "_2f.._2fetc_2fpasswd"),
+            // Windows separators in the final segment.
+            ("https://e.com/a\\..\\..\\system32\\x.dll", "x.dll"),
+            // Bare path components.
+            ("https://e.com/..", "artifact"),
+            ("https://e.com/.", "artifact"),
+            // A right-to-left override disguising the real extension.
+            ("https://e.com/invoice\u{202e}gpj.exe", "invoice_gpj.exe"),
+            // Control characters that would forge a log line.
+            ("https://e.com/a\nb\rc", "a_b_c"),
+            // Leading dash reads as a flag; leading dot hides the file.
+            ("https://e.com/-rf", "rf"),
+            ("https://e.com/.ssh", "ssh"),
+            // Ordinary names are untouched.
+            ("https://e.com/lodash-4.17.21.tgz", "lodash-4.17.21.tgz"),
+            ("https://e.com/x_1+2~3.tar.gz", "x_1+2~3.tar.gz"),
+        ] {
+            assert_eq!(artifact_filename(url, "pkg:npm/x@1"), expect, "url {url:?}");
+        }
+
+        // Length is bounded regardless of what the server sends.
+        let long = format!("https://e.com/{}", "a".repeat(4096));
+        assert_eq!(artifact_filename(&long, "").len(), MAX_ARTIFACT_FILENAME);
+
+        // A hostile locator gets the same treatment when no URL resolved.
+        assert_eq!(artifact_filename("", "pkg:npm/../../etc@1"), "etc-1");
+    }
+
+    #[test]
+    fn local_root_keeps_thin_sidecar_and_disk_bytes() {
+        let arts = collect_upload_artifacts(
+            Path::new("/tmp/sample.exe"),
+            "cc33",
+            1,
+            "scan+test",
+            None,
+            None,
+        );
+        let art = &arts[0];
+        assert!(!art.backfill);
+        assert_eq!(art.filename, "sample.exe");
+        assert!(matches!(&art.bytes, ArtifactBytes::File(p) if p == Path::new("/tmp/sample.exe")));
+        let sidecar: serde_json::Value = serde_json::from_slice(&art.sidecar).unwrap();
+        assert!(sidecar.get("package").is_none());
+        assert_eq!(sidecar["fetch"]["url"], "");
+    }
+}
+
+/// Longest stored filename we will emit. Well under the 255-byte cap every
+/// mainstream filesystem imposes, leaving a consumer room for its own prefix.
+const MAX_ARTIFACT_FILENAME: usize = 128;
 
 /// A filename for an uploaded artifact: the last path segment of the fetch URL
 /// (query/fragment stripped), falling back to the locator's tail with PURL
 /// punctuation flattened. hopper uses it for the stored filename and type sniff.
+///
+/// Both inputs are hostile. A redirect chooses `url`'s final segment, and a
+/// locator can come from references discovered inside the sample, so the result
+/// is [sanitized](sanitize_artifact_filename) before it leaves this process.
 pub(crate) fn artifact_filename(url: &str, locator: &str) -> String {
+    // Split on the Windows separator too: a consumer that resolves `a\..\..\b`
+    // as a path must not be handed one.
     let from_url = url
-        .rsplit('/')
+        .rsplit(['/', '\\'])
         .next()
         .map(|seg| seg.split(['?', '#']).next().unwrap_or(seg))
         .filter(|seg| !seg.is_empty());
-    if let Some(name) = from_url {
-        return name.to_string();
+    let raw = match from_url {
+        Some(name) => std::borrow::Cow::Borrowed(name),
+        None => std::borrow::Cow::Owned(
+            locator
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(locator)
+                .replace(['@', ':'], "-"),
+        ),
+    };
+    sanitize_artifact_filename(&raw)
+}
+
+/// Reduce an untrusted path segment to a name that is inert everywhere it
+/// lands: hopper's stored filename, a `Content-Disposition` field, a log line,
+/// and an analyst's screen.
+///
+/// An allowlist rather than a denylist, because the interesting attacks are the
+/// ones we would forget to enumerate: `%2f` that a consumer later decodes into
+/// a separator, a `U+202E` right-to-left override that makes a `.exe` render as
+/// a `.png` to the analyst reading the verdict, a control character that forges
+/// a log line, a 64 KiB segment. Everything outside `[A-Za-z0-9.-_+~]` → `_`.
+///
+/// Leading dots and dashes go too: they produce hidden files, the `.`/`..` path
+/// components, and flag-like arguments. Registry filenames are ASCII in
+/// practice, so this is lossless for real packages.
+fn sanitize_artifact_filename(raw: &str) -> String {
+    let safe: String = raw
+        .chars()
+        .take(MAX_ARTIFACT_FILENAME)
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' | '+' | '~' => c,
+            _ => '_',
+        })
+        .collect();
+    match safe.trim_start_matches(['.', '-']) {
+        // Nothing survived: a segment of only dots/dashes, or empty to begin
+        // with. Name it rather than emit "" for a consumer to interpret.
+        "" => "artifact".to_string(),
+        trimmed => trimmed.to_string(),
     }
-    locator
-        .rsplit('/')
-        .next()
-        .unwrap_or(locator)
-        .replace(['@', ':'], "-")
 }
 
 /// SHA-256 (hex) of a file's contents, used to match a scanned file to its entry
@@ -3896,12 +4103,31 @@ struct ArchiveMemberStub {
 ///    (empty type) — dependency provenance sidecars reference these by
 ///    `file_id`, so they must not dangle.
 ///
+/// A node failing every rule but carrying identity claims (`ident`: a PE
+/// version resource, a bundle manifest, a signer) is stripped, not dropped:
+/// its analysis payload — `facts`/`ctx`/`traits`, the bytes retention exists
+/// to shed — is cleared, and the listing skeleton plus `ident` survives in a
+/// few hundred bytes. hopper projects those claims into queryable identity
+/// columns, and a member dropped here never becomes a hopper row at all.
+/// Capped at [`MAX_IDENTITY_ONLY_NODES`] — it is the one rule whose survivor
+/// count an attacker controls directly.
+///
 /// Everything else is removed outright — no stub rows. On the benchmark
 /// corpus that is ~77% of nodes and ~56% of stored report bytes, almost all
 /// of it `facts`/`ctx` that only trait evaluation and featurization (both
 /// already complete) ever consume. Collimator's retraining featurizer reads
 /// `facts` from the nodes that remain. `SCAN_KEEP_ALL_MEMBERS=1` disables
 /// the rubric for debugging or corpus captures.
+/// Ceiling on identity-only survivors, the one retention rule an attacker can
+/// drive per-member: `ident` comes from the sample itself (a PE version
+/// resource, a bundle manifest), so an archive of a million near-identical
+/// tiny signed-looking members — which compresses to almost nothing — would
+/// otherwise turn a rubric meant to *shed* stored bytes into an amplifier.
+/// Every other rule is bounded by interestingness (top-3, cited-by-finding,
+/// notable trait). Far above any real installer; only a hostile archive or a
+/// pathological corpus sample reaches it.
+const MAX_IDENTITY_ONLY_NODES: usize = 4096;
+
 pub(crate) fn apply_report_retention(report: &mut cleave::types::CompactReport) {
     if std::env::var("SCAN_KEEP_ALL_MEMBERS").as_deref() == Ok("1") {
         return;
@@ -3922,15 +4148,39 @@ pub(crate) fn apply_report_retention(report: &mut cleave::types::CompactReport) 
     by_risk.sort_by_key(|&(_, risk)| std::cmp::Reverse(risk));
     let top3: std::collections::HashSet<u32> = by_risk.iter().take(3).map(|&(id, _)| id).collect();
 
-    files.retain(|f| {
-        f.depth == 0
+    let mut identity_only = 0usize;
+    files.retain_mut(|f| {
+        if f.depth == 0
             || f.id == 0
             || top3.contains(&f.id)
             || cited.contains(&f.id)
             || f.file_type.is_empty()
             || f.file_type == "registry"
             || f.findings.iter().any(|t| t.criticality >= 3)
+        {
+            return true;
+        }
+        if f.identity.as_ref().is_some_and(|i| !i.is_empty()) {
+            identity_only += 1;
+            if identity_only > MAX_IDENTITY_ONLY_NODES {
+                return false;
+            }
+            f.formula = None;
+            f.findings = Vec::new();
+            f.refs = Vec::new();
+            f.context = Vec::new();
+            f.facts = cleave::types::CompactFacts::default();
+            return true;
+        }
+        false
     });
+    if identity_only > MAX_IDENTITY_ONLY_NODES {
+        tracing::warn!(
+            kept = MAX_IDENTITY_ONLY_NODES,
+            dropped = identity_only - MAX_IDENTITY_ONLY_NODES,
+            "report retention: identity-only members over cap; report truncated"
+        );
+    }
 }
 
 /// Sentinel `risk` for an archive member scan listed but never analyzed. Keeps
@@ -4276,7 +4526,7 @@ fn provenance_has_notable_match(
                 finding.crit >= cleave::Criticality::Notable
                     && file
                         .composite_sources
-                        .get(&finding.id)
+                        .get(finding.id.as_str())
                         .is_some_and(|sources| sources.iter().any(|s| s.file == registry_id))
             })
     })
@@ -5194,6 +5444,19 @@ mod dep_backref_tests {
         serde_json::from_value(serde_json::json!({"version": "3"})).unwrap()
     }
 
+    /// A capability finding at a chosen criticality — the only shape these
+    /// rendering tests need.
+    fn finding(id: &str, desc: &str, crit: cleave::Criticality) -> cleave::Finding {
+        let mut f = cleave::Finding::new(
+            id.to_string(),
+            cleave::types::FindingKind::Capability,
+            desc.to_string(),
+            cleave::Finding::default().conf,
+        );
+        f.crit = crit;
+        f
+    }
+
     fn backref(class: Classification) -> DepBackref {
         DepBackref {
             source_sha: "s".repeat(64),
@@ -5234,7 +5497,7 @@ mod dep_backref_tests {
                 ..Default::default()
             };
             let mut f = cleave::types::Finding::new(
-                "objectives/execution/shell::sh".into(),
+                "objectives/execution/shell::sh".to_string(),
                 FindingKind::Capability,
                 String::new(),
                 0.9,
@@ -5338,6 +5601,12 @@ mod dep_backref_tests {
             {"id": 7, "path": "p.tgz!!f.md", "sha": "7", "size": 1, "depth": 1, "type": "markdown",
              "traits": [{"id": "d", "crit": 2}]},
             {"id": 8, "path": "p.tgz!!g.txt", "sha": "8", "size": 1, "depth": 2, "type": "text"},
+            // Equally quiet, but carrying identity claims: stripped, not dropped.
+            {"id": 9, "path": "p.tgz!!tool.exe", "sha": "9", "size": 1, "depth": 1, "type": "pe",
+             "mol": "C2H4", "traits": [{"id": "e", "crit": 2}],
+             "ident": {"name": {"value": "tool", "source": "pe.version.product_name", "verified": false},
+                       "version": {"value": "1.2.3", "source": "pe.version.file_version", "verified": false},
+                       "trust": "unsigned"}},
         ]}))
         .unwrap();
         apply_report_retention(&mut report);
@@ -5351,9 +5620,71 @@ mod dep_backref_tests {
             "registry and fetch-placeholder provenance skeleton survive: {ids:?}"
         );
         assert!(ids.contains(&6), "top-risk node survives: {ids:?}");
+        let exe = report
+            .files
+            .iter()
+            .find(|f| f.id == 9)
+            .expect("identity-bearing member survives as a listing entry");
+        assert!(
+            exe.findings.is_empty() && exe.formula.is_none(),
+            "stripped member sheds its analysis payload"
+        );
+        assert!(
+            exe.identity.as_ref().is_some_and(|i| !i.is_empty()),
+            "stripped member keeps its identity claims"
+        );
         assert!(
             !ids.contains(&7) && !ids.contains(&8),
             "sub-notable uncited nodes are dropped outright: {ids:?}"
+        );
+    }
+
+    /// A hostile archive can carry unlimited quiet members that each claim an
+    /// identity, so the one attacker-driven retention rule has to stop.
+    #[test]
+    fn identity_only_retention_is_capped() {
+        let members: Vec<serde_json::Value> = (1..=super::MAX_IDENTITY_ONLY_NODES + 500)
+            .map(|i| {
+                serde_json::json!({
+                    "id": i, "path": format!("p.tgz!!m{i}.exe"), "sha": format!("{i}"),
+                    "size": 1, "depth": 1, "type": "pe",
+                    "ident": {
+                        "name": {"value": "tool", "source": "pe.version.product_name",
+                                 "verified": false},
+                        "trust": "unsigned"
+                    }
+                })
+            })
+            .collect();
+        let mut report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": std::iter::once(serde_json::json!(
+                {"id": 0, "path": "p.tgz", "sha": "0", "size": 1, "depth": 0, "type": "zip"}))
+                .chain(members)
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap();
+
+        apply_report_retention(&mut report);
+
+        // Three nodes survive on rules the identity budget never sees: the root
+        // (rule 1) and ids 1-2, which win top-3-by-risk because every risk ties
+        // and the sort is stable. The other 4096 are the identity budget spent
+        // in full — the remaining 500 members are dropped.
+        assert_eq!(
+            report.files.len(),
+            super::MAX_IDENTITY_ONLY_NODES + 3,
+            "identity-only survivors stop at the cap"
+        );
+        assert!(
+            report.files.iter().any(|f| f.id == 0),
+            "the root is kept by rule 1, not by the identity budget"
+        );
+        let highest_kept =
+            u32::try_from(super::MAX_IDENTITY_ONLY_NODES + 2).expect("cap fits in an id");
+        assert!(
+            report.files.iter().all(|f| f.id <= highest_kept),
+            "the cap keeps a deterministic prefix, not an arbitrary subset"
         );
     }
 
@@ -5462,12 +5793,6 @@ mod dep_backref_tests {
                 findings,
                 ..cleave::FileAnalysis::default()
             };
-        let finding = |id: &str, desc: &str, crit: cleave::Criticality| cleave::Finding {
-            id: id.to_string(),
-            desc: desc.to_string(),
-            crit,
-            ..cleave::Finding::default()
-        };
         let mut report = empty_report();
         report.files = vec![
             mk_file("r".repeat(64).as_str(), "pkg.src.tar.gz", vec![]),
@@ -5590,12 +5915,6 @@ mod dep_backref_tests {
 
     #[test]
     fn interpret_context_puts_provenance_before_each_packages_traits() {
-        let finding = |id: &str, desc: &str, crit: cleave::Criticality| cleave::Finding {
-            id: id.to_string(),
-            desc: desc.to_string(),
-            crit,
-            ..cleave::Finding::default()
-        };
         let mut root = cleave::FileAnalysis {
             id: 0,
             path: "root.tgz".to_string(),
@@ -5790,11 +6109,11 @@ mod dep_backref_tests {
             id: 4,
             ..cleave::FileAnalysis::default()
         };
-        artifact.findings.push(cleave::Finding {
-            id: "package/composite".to_string(),
-            crit: cleave::Criticality::Notable,
-            ..cleave::Finding::default()
-        });
+        artifact.findings.push(finding(
+            "package/composite",
+            "",
+            cleave::Criticality::Notable,
+        ));
         let mut artifact_json = serde_json::to_value(&artifact).unwrap();
         artifact_json["composite_sources"] = serde_json::json!({
             "package/composite": [{"file": registry_id}]

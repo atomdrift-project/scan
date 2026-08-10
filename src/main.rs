@@ -65,6 +65,42 @@ mod jemalloc_conf {
     #[allow(non_upper_case_globals)]
     #[unsafe(no_mangle)]
     static _rjem_malloc_conf: SyncPtr = SyncPtr(CONF.as_ptr());
+
+    /// Route tree-sitter's C-core allocations through jemalloc. Its parse
+    /// trees otherwise go to the system malloc — outside every jemalloc
+    /// budget, decay policy, and heap profile this codebase relies on, and
+    /// on macOS the default small-object zone retains freed pages
+    /// (measured: ~0.8 GB of empty retained MALLOC_SMALL at the gauntlet
+    /// peak).
+    ///
+    /// Installs via the tree-sitter crate's [`tree_sitter::set_allocator`]
+    /// rather than raw `ts_set_allocator`: the crate keeps an internal free-fn
+    /// for C strings it releases (query errors, etc.), and bypassing the
+    /// wrapper would free jemalloc pointers with libc `free`. The four entry
+    /// points come from `tikv-jemalloc-sys`, the same crate `tikv-jemallocator`
+    /// binds, so their signatures and symbol prefix track the jemalloc actually
+    /// linked in rather than a hand-copied guess.
+    ///
+    /// # Safety
+    ///
+    /// Inherits [`tree_sitter::set_allocator`]'s contract, whose unmet clauses
+    /// are the caller's to discharge: no tree-sitter API may have been called
+    /// yet, no tree-sitter object may be live, and no other thread may be in
+    /// tree-sitter concurrently. In practice: call once, first thing in `main`.
+    pub(super) unsafe fn route_tree_sitter_through_jemalloc() {
+        // SAFETY: jemalloc's malloc/calloc/realloc/free are one allocator
+        // family, never return null for non-zero sizes, and satisfy libc
+        // malloc alignment. The ordering and thread-exclusivity clauses are
+        // this function's own documented precondition.
+        unsafe {
+            tree_sitter::set_allocator(Some(tree_sitter::Allocator {
+                malloc: tikv_jemalloc_sys::malloc,
+                calloc: tikv_jemalloc_sys::calloc,
+                realloc: tikv_jemalloc_sys::realloc,
+                free: tikv_jemalloc_sys::free,
+            }));
+        }
+    }
 }
 
 use anyhow::{Context, Result};
@@ -237,7 +273,12 @@ struct Cli {
         value_name = "KINDS",
         num_args = 0..=1,
         require_equals = true,
-        default_missing_value = "all",
+        // A bare `--fetch` selects the artifact's own reachable code, not CI:
+        // `--fetch=all` (or `--fetch=ci`) is the explicit opt-in for GitHub
+        // Actions, which run only in CI and never reach an installed artifact.
+        // Keep in lockstep with `default_cli_fetch_policy`, which resolves an
+        // absent `--fetch` to the same kinds.
+        default_missing_value = "urls,packages,deps",
         env = "SCAN_FETCH"
     )]
     fetch: Option<scan::fetch::FetchPolicy>,
@@ -429,9 +470,13 @@ impl Cli {
     }
 }
 
-/// The binary's online default. Keep [`FetchPolicy::default`] offline for the
-/// library API; callers that opt into fetching through the CLI get the explicit
-/// `all` policy here.
+/// The binary's online default: everything the artifact itself reaches, but not
+/// CI — GitHub Actions run only on a runner and never land in an installed
+/// artifact, so auditing them is an explicit `--fetch=ci`/`--fetch=all` opt-in.
+/// Keep [`FetchPolicy::default`] offline for the library API.
+///
+/// Must agree with the `default_missing_value` on `Cli::fetch`, so a bare
+/// `--fetch` and an absent one select the same kinds.
 fn default_cli_fetch_policy() -> scan::fetch::FetchPolicy {
     scan::fetch::FetchPolicy {
         urls: true,
@@ -785,6 +830,22 @@ fn propagate_no_analysis_cache() {
 }
 
 fn main() -> Result<()> {
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+        ))
+    ))]
+    // SAFETY: the first statement of `main` — no tree-sitter API has run, no
+    // tree-sitter object is live, and no threads have been spawned yet.
+    unsafe {
+        jemalloc_conf::route_tree_sitter_through_jemalloc()
+    };
     propagate_no_analysis_cache();
     // Block SIGUSR1 process-wide before spawning any threads so they all inherit
     // the blocked mask; the dedicated sigusr1 thread below consumes it via sigwait.
@@ -2003,6 +2064,19 @@ mod tests {
 
         let policy = default_cli_fetch_policy();
         assert!(policy.urls && policy.packages && policy.deps);
+        assert!(
+            !policy.ci,
+            "CI actions never reach an installed artifact; auditing them is opt-in"
+        );
+        // A bare `--fetch` must select exactly what an absent one resolves to.
+        let bare = Cli::try_parse_from(["scan", "--fetch", "/tmp/a"])
+            .context("bare --fetch should parse")?
+            .fetch
+            .context("bare --fetch has a default_missing_value")?;
+        assert_eq!(
+            (bare.urls, bare.packages, bare.deps, bare.ci),
+            (policy.urls, policy.packages, policy.deps, policy.ci),
+        );
         assert_eq!(
             policy.max_file_fetches,
             scan::fetch::DEFAULT_MAX_FILE_FETCHES

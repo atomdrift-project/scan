@@ -548,6 +548,15 @@ jobs:
   # the target to this job's `if:` default set and release.yml's EXPECTED
   # list promotes it. A green run's atomscan-* artifact name makes it
   # immediately release-eligible, same as the haiku note below.
+  #
+  # Probe result (run 31234808876, 2026-08-08, release-lto): still does not
+  # fit. VM boot + pkg install took 30 min, the dependency graph alone took
+  # 5h10m under TCG, and the cap killed the job ten minutes into compiling
+  # the final crate — before the fat-LTO link, the single longest step, even
+  # began. Extrapolating, the full build wants 8h+. No LTO profile choice
+  # closes a gap that size; this needs hardware acceleration (a self-hosted
+  # arm64 bare-metal runner, or GitHub shipping KVM on its arm64 images).
+  # The job stays as a cheap dispatch-only canary for when that changes.
   freebsd-arm64:
     name: aarch64-unknown-freebsd
     if: ${{ inputs.target == 'aarch64-unknown-freebsd' }}

@@ -851,11 +851,42 @@ impl CallError {
     }
 }
 
-/// POST the prebuilt user message to the endpoint and parse `{grade, reason}`.
+/// POST the prebuilt user message with scan's grading prompt and parse
+/// `{grade, reason}`.
 fn request(
     cfg: &InterpretConfig,
     user: &str,
 ) -> std::result::Result<(LlmGrade, String), CallError> {
+    let content = chat_raw(cfg, SYSTEM_PROMPT, user, MAX_TOKENS)?;
+    parse_grade_reason(&content)
+        .ok_or_else(|| CallError::BadReply(anyhow!("no parseable grade in reply: {content:?}")))
+}
+
+/// Send a `system` + `user` prompt to the configured endpoint and return the
+/// model's reply text. This is the shared transport used by scan's grader and
+/// by external callers (e.g. isomer's diff interpreter) that reuse scan's
+/// client, health/HTML handling, and model config with a *different* prompt.
+///
+/// # Errors
+/// Propagates transport failures (unreachable, timeout, 5xx) and bad replies
+/// (4xx, HTML page, undecodable body) as a flat [`anyhow::Error`].
+pub fn chat(
+    cfg: &InterpretConfig,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> anyhow::Result<String> {
+    chat_raw(cfg, system, user, max_tokens).map_err(CallError::into_inner)
+}
+
+/// POST a system+user prompt and return the model's reply text, classifying
+/// failures for the caller's health accounting.
+fn chat_raw(
+    cfg: &InterpretConfig,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> std::result::Result<String, CallError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(cfg.timeout)
         .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
@@ -863,7 +894,6 @@ fn request(
         .context("building LLM HTTP client")
         .map_err(CallError::Transport)?;
 
-    let system = SYSTEM_PROMPT;
     let body = ChatRequest {
         model: &cfg.model,
         messages: [
@@ -877,7 +907,7 @@ fn request(
             },
         ],
         temperature: 0.0,
-        max_tokens: MAX_TOKENS,
+        max_tokens,
         stream: false,
         chat_template_kwargs: ChatTemplateKwargs {
             enable_thinking: false,
@@ -947,9 +977,7 @@ fn request(
         .map(|c| c.message.text())
         .unwrap_or_default();
     tracing::debug!(model = %cfg.model, "LLM response\n{content}");
-
-    parse_grade_reason(&content)
-        .ok_or_else(|| CallError::BadReply(anyhow!("no parseable grade in reply: {content:?}")))
+    Ok(content)
 }
 
 /// Lightweight health probe: `GET {base}/models` (the standard OpenAI listing,

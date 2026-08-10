@@ -308,6 +308,7 @@ dependencies = [
  "tar",
  "tempfile",
  "terminal-colorsaurus",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
  "toml 0.8.23",
@@ -316,6 +317,7 @@ dependencies = [
  "tracing-subscriber",
  "tract-linalg",
  "tract-onnx",
+ "tree-sitter",
  "walkdir",
  "zstd",
 ]

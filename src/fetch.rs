@@ -223,6 +223,12 @@ pub struct FetchPolicy {
     /// Fetch strict declared dependencies ([`RefKind::Dependency`]) — manifest
     /// and lockfile entries.
     pub deps: bool,
+    /// Fetch third-party code declared in a **CI** context — GitHub Actions
+    /// `uses:` steps. These are `Dependency`-kind references like any other, but
+    /// they run only in CI and never reach an installed artifact, so they are
+    /// off by default (a routine `deps` fetch skips them) and enabled only when
+    /// auditing CI itself: `--fetch=all`, `--fetch=ci`, or isomer `ci`.
+    pub ci: bool,
     /// How many hops to follow: `1` fetches the references found in the root,
     /// `2` also follows references found *inside* those payloads, and so on.
     pub depth: u8,
@@ -264,6 +270,7 @@ impl Default for FetchPolicy {
             urls: false,
             packages: false,
             deps: false,
+            ci: false,
             depth: DEFAULT_FETCH_DEPTH,
             max_dep_age_days: DEFAULT_MAX_DEP_AGE_DAYS,
             max_file_fetches: DEFAULT_MAX_FILE_FETCHES,
@@ -278,7 +285,7 @@ impl FetchPolicy {
     /// True when at least one kind is selected — the master switch.
     #[must_use]
     pub(crate) const fn enabled(&self) -> bool {
-        self.urls || self.packages || self.deps
+        self.urls || self.packages || self.deps || self.ci
     }
 
     /// Whether `kind` is selected by this policy. References whose kind is
@@ -302,7 +309,7 @@ impl std::str::FromStr for FetchPolicy {
     /// `all` selects every kind. Empty entries are ignored; an unknown kind or an
     /// empty selection is an error so a typo is never silently a no-op.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        const VALID: &str = "valid: all, urls, packages, deps, none";
+        const VALID: &str = "valid: all, urls, packages, deps, ci, none";
         // `none` disables fetching outright — the only fully-offline switch,
         // since an absent --fetch resolves to all-on at startup. Benchmarks
         // need it (network wait and run-to-run fetch drift poison both wall
@@ -318,10 +325,18 @@ impl std::str::FromStr for FetchPolicy {
                     policy.urls = true;
                     policy.packages = true;
                     policy.deps = true;
+                    policy.ci = true;
                 }
                 "urls" => policy.urls = true,
                 "packages" => policy.packages = true,
                 "deps" => policy.deps = true,
+                // A CI action is a declared dependency, so fetching it needs
+                // dependency fetching on; `ci` adds the CI *context* on top of
+                // `deps` rather than being a separate kind.
+                "ci" => {
+                    policy.deps = true;
+                    policy.ci = true;
+                }
                 other => {
                     return Err(format!("unknown fetch kind {other:?} ({VALID})"));
                 }
@@ -732,7 +747,15 @@ pub(crate) fn orchestrate(
     // Hop 0's work-list: declared references from every file in the report plus
     // fletch's imperative discovery over the root sample's bytes. Each later hop
     // works from the references found *inside* the previous hop's payloads.
-    let mut worklist = collect_references(report, root_path);
+    let mut worklist = collect_references(
+        report,
+        root_path,
+        if policy.ci {
+            CiRefs::Include
+        } else {
+            CiRefs::Skip
+        },
+    );
     // Phantom-dependency signal: a package imperatively installed or loaded
     // somewhere in this artifact but absent from its manifest's declared deps —
     // a covertly-installed companion or a dependency-confusion target. Computed
@@ -2407,8 +2430,29 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
+/// A file whose references execute only in CI, never in an installed artifact
+/// — a GitHub Actions workflow or composite `action.yml`. Its `uses:` actions
+/// and `run:` fetches are third-party code, but they run on the CI runner, so a
+/// routine dependency fetch skips them; `--fetch=all`/`--fetch=ci` opts in.
+fn is_ci_context(file_type: &str) -> bool {
+    file_type == "github_actions"
+}
+
+/// Whether [`collect_references`] follows references that only ever execute in
+/// CI. Auditing an artifact and auditing the pipeline that built it are
+/// different questions, and the caller always knows which one it is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CiRefs {
+    Skip,
+    Include,
+}
+
 /// References to fetch, grouped by the sha256 of the file that declared them.
-fn collect_references(report: &AnalysisReport, root_path: &Path) -> Vec<(String, Vec<Reference>)> {
+fn collect_references(
+    report: &AnalysisReport,
+    root_path: &Path,
+    ci: CiRefs,
+) -> Vec<(String, Vec<Reference>)> {
     // Members under a vendored node_modules tree have already been analyzed.
     // Fetching each of their `require("x")` targets again grafted a newer
     // registry release onto the report and repeated work over bytes that came
@@ -2419,6 +2463,14 @@ fn collect_references(report: &AnalysisReport, root_path: &Path) -> Vec<(String,
     let mut vendored_imports_skipped = 0usize;
     let mut groups: Vec<(String, Vec<Reference>)> = Vec::new();
     for file in &report.files {
+        // A GitHub Actions workflow is a CI-only context: its `uses:` actions
+        // execute in CI, never in an installed artifact. Skip the whole member
+        // unless CI auditing was requested (`--fetch=all`, `--fetch=ci`). The
+        // root of a single-file workflow scan is a member here like any other,
+        // so this one gate covers it too.
+        if ci == CiRefs::Skip && is_ci_context(&file.file_type) {
+            continue;
+        }
         let Some(view) = &file.filefacts else {
             continue;
         };
@@ -2484,8 +2536,12 @@ fn collect_references(report: &AnalysisReport, root_path: &Path) -> Vec<(String,
     // The root sample's imperative hunt (curl|sh, `npm install` in a RUN, a URL
     // in a shell variable) needs its raw text, which the report doesn't carry —
     // read it back from disk for small text-ish roots and merge, deduping
-    // against the declared references already collected for the root.
+    // against the declared references already collected for the root. The hunt
+    // reads bytes the loop above never opened, so it repeats that loop's CI
+    // gate — a workflow's raw text re-discovers the `uses:` actions just
+    // skipped.
     if let Some(root) = report.files.first()
+        && (ci == CiRefs::Include || !is_ci_context(&root.file_type))
         && root.size <= ROOT_HUNT_MAX_BYTES
         && let Ok(bytes) = std::fs::read(root_path)
     {
@@ -3384,17 +3440,26 @@ mod tests {
                 ..FetchPolicy::default()
             })
         );
-        // `all` is shorthand for every kind.
+        // `all` is shorthand for every kind, CI included.
         assert_eq!(
             "all".parse(),
             Ok(FetchPolicy {
                 urls: true,
                 packages: true,
                 deps: true,
+                ci: true,
                 ..FetchPolicy::default()
             })
         );
-        assert_eq!("all".parse::<FetchPolicy>(), "urls,packages,deps".parse());
+        assert_eq!("all".parse::<FetchPolicy>(), "urls,packages,deps,ci".parse());
+        // A routine `deps` fetch leaves CI off — GitHub Actions run only in CI
+        // and never reach an installed artifact; `ci` (or `all`) opts in.
+        assert!(!"deps".parse::<FetchPolicy>().unwrap().ci);
+        assert!(!"urls,packages,deps".parse::<FetchPolicy>().unwrap().ci);
+        // `ci` turns on the CI context *and* dependency fetching, since a CI
+        // action is a declared dependency.
+        let ci = "ci".parse::<FetchPolicy>().unwrap();
+        assert!(ci.ci && ci.deps);
         // Parsing leaves depth at its default — the CLI sets it separately.
         assert_eq!(
             "deps".parse::<FetchPolicy>().unwrap().depth,
@@ -3460,7 +3525,7 @@ mod tests {
         }))
         .expect("minimal report deserializes");
 
-        let groups = collect_references(&report, &df);
+        let groups = collect_references(&report, &df, CiRefs::Skip);
         assert_eq!(groups.len(), 1);
         let (gsha, refs) = &groups[0];
         assert_eq!(gsha, &sha);
@@ -3502,7 +3567,7 @@ mod tests {
         .expect("report deserializes");
 
         // No on-disk root text hunt — a missing path just skips it.
-        let groups = collect_references(&report, std::path::Path::new("/nonexistent"));
+        let groups = collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         let all: Vec<Reference> = groups.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
         let undeclared: Vec<String> = find::undeclared_packages(&all)
             .iter()
@@ -3541,7 +3606,7 @@ mod tests {
         }))
         .expect("report deserializes");
 
-        let groups = collect_references(&report, std::path::Path::new("/nonexistent"));
+        let groups = collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         let locs: Vec<String> = groups
             .iter()
             .flat_map(|(_, refs)| refs.iter().map(locator_key))
@@ -3570,7 +3635,7 @@ mod tests {
         }))
         .expect("report deserializes");
 
-        let groups = collect_references(&report, std::path::Path::new("/nonexistent"));
+        let groups = collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         let locs: Vec<String> = groups
             .iter()
             .flat_map(|(_, refs)| refs.iter().map(locator_key))
@@ -3593,7 +3658,7 @@ mod tests {
         }))
         .expect("report deserializes");
 
-        let groups = collect_references(&report, std::path::Path::new("/nonexistent"));
+        let groups = collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         assert!(
             groups.is_empty(),
             "an absent import inside the captured install tree is not a network fetch"

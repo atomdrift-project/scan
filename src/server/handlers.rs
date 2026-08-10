@@ -1352,7 +1352,7 @@ pub(super) async fn analyze_path(
                 let uploader = Arc::clone(uploader);
                 tokio::task::spawn_blocking(move || {
                     crate::engine::upload_scan_result(
-                        &uploader, &path, sha256, size, None, deps, envelope,
+                        &uploader, &path, sha256, size, None, None, deps, envelope,
                     );
                 });
             }
