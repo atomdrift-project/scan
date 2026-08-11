@@ -929,9 +929,18 @@ fn chat_raw(
         .with_context(|| format!("posting to {url}"))
         .map_err(CallError::Transport)?;
     // 5xx is the endpoint's problem (unhealthy); 4xx is ours (bad request/auth).
+    // The body is the whole diagnosis on a 4xx — an over-budget prompt, an
+    // unknown model name and a rejected key all arrive as a bare 400/404/401,
+    // and dropping it leaves nothing to act on — a log line reading only "LLM
+    // endpoint returned 400 Bad Request" does not say which of those happened,
+    // and the endpoint had already explained itself in the body.
     let status = resp.status();
     if !status.is_success() {
-        let e = anyhow!("LLM endpoint returned {status}");
+        let raw = resp.text().unwrap_or_default();
+        let e = anyhow!(
+            "LLM endpoint returned {status}: {:?}",
+            body_snippet(raw.trim())
+        );
         return Err(if status.is_server_error() {
             CallError::Transport(e)
         } else {
