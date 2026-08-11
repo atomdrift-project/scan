@@ -1,5 +1,23 @@
 //! Atomdrift Scan (`atomscan`) — ML-powered malware classification CLI.
 
+/// jemalloc, plus the compile-time tuning it reads at initialization.
+///
+/// Allocator and configuration share one `cfg` so they cannot drift apart: a
+/// build that swaps in the system allocator must not leave a `_rjem_malloc_conf`
+/// symbol behind, and one that uses jemalloc must never be left unconfigured.
+/// On the excluded targets this crate uses the system allocator; on FreeBSD that
+/// *is* jemalloc, but it reads the unprefixed `MALLOC_CONF` / `/etc/malloc.conf`,
+/// so this symbol would not reach it anyway.
+///
+/// The string lives in cleave (`cleave::JEMALLOC_CONF`) so every binary running
+/// cleave's analysis gets the same allocator behaviour; see that constant for
+/// what each option buys and the measurements behind them.
+///
+/// Runtime configuration still wins: jemalloc applies its compiled-in string
+/// first, then `/etc/malloc.conf`, then the environment, with later sources
+/// overriding earlier ones per key. The environment variable is
+/// `_RJEM_MALLOC_CONF` — `tikv-jemallocator` builds jemalloc with the `_rjem_`
+/// prefix, so plain `MALLOC_CONF` is silently ignored.
 #[cfg(all(
     unix,
     not(any(
@@ -11,60 +29,21 @@
         target_os = "solaris",
     ))
 ))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+mod jemalloc {
+    #[global_allocator]
+    static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// Compile-time jemalloc tuning, read once at allocator initialization.
-///
-/// Four arenas are enough for the bounded analysis pool and avoid multiplying
-/// dirty extents across jemalloc's CPU-scaled default. One-second dirty-page
-/// decay returns transient archive/report allocations promptly; muzzy pages
-/// have already been purged, so retaining them buys this workload nothing.
-/// The background purger keeps long-lived servers honest between requests.
-/// Together these settings cut the guanyang server screen from roughly 4 GiB
-/// to 3 GiB without changing its detection-level fingerprint or inducing the
-/// regex recompilation seen with undersized application caches.
-///
-/// Runtime configuration still wins: `_RJEM_MALLOC_CONF` (and
-/// `/etc/malloc.conf`) override this string, so deployments can retune without
-/// rebuilding. Guarded by the same cfg as the allocator itself — on platforms
-/// where scan uses the system allocator this symbol is never read.
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "illumos",
-        target_os = "solaris",
-    ))
-))]
-mod jemalloc_conf {
     /// A `Sync` wrapper so a raw `*const c_char` can live in a static;
     /// jemalloc reads the pointer, it is never written after link time.
     #[repr(transparent)]
     struct SyncPtr(*const std::os::raw::c_char);
-    // SAFETY: the pointer targets a NUL-terminated 'static literal and is
-    // never mutated, so sharing it across threads is sound.
+    // SAFETY: the pointer targets a NUL-terminated 'static CStr and is never
+    // mutated, so sharing it across threads is sound.
     unsafe impl Sync for SyncPtr {}
-
-    /// jemalloc only compiles `JEMALLOC_BACKGROUND_THREAD` for non-Mach-O ABIs
-    /// (`configure.ac`: `abi != macho`), so on Apple targets `have_background_thread`
-    /// is false and `background_thread_boot0` answers a request for one by
-    /// writing `<jemalloc>: option background_thread currently supports pthread
-    /// only` to stderr — before `main`, above every scan, and impossible to
-    /// suppress from Rust. Ask only where the purger exists; the arena and decay
-    /// tuning is the same either way.
-    #[cfg(target_vendor = "apple")]
-    const CONF: &std::ffi::CStr = c"narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0";
-    #[cfg(not(target_vendor = "apple"))]
-    const CONF: &std::ffi::CStr =
-        c"narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true";
 
     #[allow(non_upper_case_globals)]
     #[unsafe(no_mangle)]
-    static _rjem_malloc_conf: SyncPtr = SyncPtr(CONF.as_ptr());
+    static _rjem_malloc_conf: SyncPtr = SyncPtr(cleave::JEMALLOC_CONF.as_ptr());
 
     /// Route tree-sitter's C-core allocations through jemalloc. Its parse
     /// trees otherwise go to the system malloc — outside every jemalloc
@@ -844,7 +823,7 @@ fn main() -> Result<()> {
     // SAFETY: the first statement of `main` — no tree-sitter API has run, no
     // tree-sitter object is live, and no threads have been spawned yet.
     unsafe {
-        jemalloc_conf::route_tree_sitter_through_jemalloc()
+        jemalloc::route_tree_sitter_through_jemalloc()
     };
     propagate_no_analysis_cache();
     // Block SIGUSR1 process-wide before spawning any threads so they all inherit
