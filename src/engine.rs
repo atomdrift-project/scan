@@ -4317,6 +4317,47 @@ const MAX_DEP_FINDING_LINES: usize = 12;
 /// valid JSON and the provider-only fields an LLM may need.
 const MAX_INTERPRET_RAW_REGISTRY_BYTES: usize = 4 * 1024;
 
+/// Dependency subjects rendered for the LLM, worst first.
+///
+/// Every subject that clears the gate costs a provenance line plus a cleave
+/// context block — around 4 KB each. A container image dependency-closure
+/// produces hundreds: the render of `library/kibana:9.4.0` ran to 1.21 MB, of
+/// which 983 KB (81%) was 257 dependency subjects, and the endpoint rejected the
+/// whole prompt with a 400 for exceeding its context window. The artifact's own
+/// contents were only 211 KB. Two subjects keep the evidence that changes a
+/// verdict — a hostile or suspicious dependency — while the rest are accounted
+/// for by `deps_omitted`, which the model already sees.
+const MAX_INTERPRET_DEP_SUBJECTS: usize = 2;
+
+/// Sort key for [`MAX_INTERPRET_DEP_SUBJECTS`], most risk first.
+///
+/// A dependency is ranked by the verdict scan already computed for it, on the
+/// same envelope every other verdict in this system uses: `level` is the lowest
+/// false-positive budget (FP per 100M benigns) at which its hostile decision
+/// still fires, so a *lower* level is the more confident call and `-1` never
+/// fires at any level. Probability breaks ties within a level.
+///
+/// Dependencies the embedded pass never graded carry no decision to rank
+/// (`DepResult::verdict` is `None` by design rather than fabricated), so a
+/// suspicious-or-worse member trait is the only risk signal they have, and a
+/// subject admitted on registry provenance alone has none.
+fn dep_subject_risk(verdict: Option<Decision>, severe_finding: bool) -> (u8, i32, u32) {
+    // A probability is finite and non-negative, and IEEE-754 orders such floats
+    // identically to their bit patterns — an exact tiebreaker without a lossy
+    // cast, and one that keeps the whole key `Ord`.
+    let prob_key = |d: Decision| d.probability.max(0.0).to_bits();
+    match verdict {
+        // Negated so a level of 0 (fires even at the strictest budget) outranks
+        // a level of 3000 (fires only when 3000 FP per 100M is acceptable).
+        Some(d) if d.level.is_some_and(|l| l >= 0) => {
+            (3, -d.level.unwrap_or_default(), prob_key(d))
+        }
+        _ if severe_finding => (2, 0, 0),
+        Some(d) => (1, 0, prob_key(d)),
+        None => (0, 0, 0),
+    }
+}
+
 /// Render the package-aware user message used by `--interpret` and
 /// `--format interpret`.
 ///
@@ -4377,7 +4418,9 @@ fn render_interpret_context(
     let mut shown_registry_ids = std::collections::HashSet::new();
     let mut visited_roots = std::collections::HashSet::new();
     let mut candidate_count = 0_usize;
-    let mut shown_count = 0_usize;
+    // Subjects are buffered rather than appended, so the worst
+    // `MAX_INTERPRET_DEP_SUBJECTS` can be chosen once both loops have run.
+    let mut subjects: Vec<((u8, i32, u32), String)> = Vec::new();
     for rec in fetch_edges.iter().filter(|r| r.content_sha256.is_some()) {
         let content_sha = rec.content_sha256.as_deref().unwrap_or_default();
         let Some(root) = report
@@ -4415,8 +4458,8 @@ fn render_interpret_context(
         if !severe_finding && !severe_verdict && !provenance_hit {
             continue;
         }
-        shown_count += 1;
 
+        let mut out = String::new();
         let class = match graded.and_then(|d| d.verdict).map(|v| v.class) {
             Some(Classification::Hostile) => "hostile",
             Some(Classification::Suspicious) => "suspicious",
@@ -4446,6 +4489,10 @@ fn render_interpret_context(
         if let Some(registry) = registry {
             shown_registry_ids.insert(registry.file_id);
         }
+        subjects.push((
+            dep_subject_risk(graded.and_then(|d| d.verdict), severe_finding),
+            out,
+        ));
     }
 
     // A removed or age-gated dependency may have no artifact subtree at all.
@@ -4466,7 +4513,7 @@ fn render_interpret_context(
             continue;
         }
         shown_registry_ids.insert(registry.file_id);
-        shown_count += 1;
+        let mut out = String::new();
         let status = registry.artifact_skip.unwrap_or("registry-only");
         let _ = writeln!(out, "\n== DEP {} artifact={status} ==", registry.locator);
         let provenance =
@@ -4482,6 +4529,17 @@ fn render_interpret_context(
             &view,
             &cleave::output::TinyOpts::tiny(),
         ));
+        // No artifact was analyzed, so there is no verdict and no member trait.
+        subjects.push((dep_subject_risk(None, false), out));
+    }
+
+    // Worst first, and a stable sort so equal-risk subjects keep discovery
+    // order. Only the top few are spent on: the render is one prompt, and an
+    // over-budget prompt is refused whole rather than truncated by the endpoint.
+    subjects.sort_by_key(|(risk, _)| std::cmp::Reverse(*risk));
+    let shown_count = subjects.len().min(MAX_INTERPRET_DEP_SUBJECTS);
+    for (_, block) in subjects.iter().take(MAX_INTERPRET_DEP_SUBJECTS) {
+        out.push_str(block);
     }
 
     let omitted = candidate_count.saturating_sub(shown_count);
@@ -5173,6 +5231,55 @@ fn ref_kind_phrase(kind: &fletch::RefKind) -> &'static str {
         fletch::RefKind::Repository => "named as the source repository",
         fletch::RefKind::Local => "a local reference",
         _ => "referenced",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod dep_subject_risk_tests {
+    use super::*;
+
+    fn decision(level: i32, probability: f32) -> Decision {
+        Decision {
+            class: Classification::Hostile,
+            probability,
+            threshold: 0.5,
+            level: Some(level),
+        }
+    }
+
+    /// The whole point of the ordering: `level` is a false-positive budget, so
+    /// the dependency that fires at the *strictest* budget is the riskiest.
+    #[test]
+    fn lower_level_outranks_higher_level() {
+        assert!(
+            dep_subject_risk(Some(decision(0, 0.99)), false)
+                > dep_subject_risk(Some(decision(3000, 0.99)), false)
+        );
+    }
+
+    #[test]
+    fn probability_breaks_ties_within_a_level() {
+        assert!(
+            dep_subject_risk(Some(decision(25, 0.97)), false)
+                > dep_subject_risk(Some(decision(25, 0.96)), false)
+        );
+    }
+
+    /// A level of -1 never fires, so a graded-clean dependency must rank below
+    /// an ungraded one carrying a suspicious-or-worse member trait.
+    #[test]
+    fn clean_verdict_ranks_below_a_severe_finding() {
+        assert!(
+            dep_subject_risk(None, true) > dep_subject_risk(Some(decision(-1, 0.01)), false)
+        );
+    }
+
+    /// Registry-provenance-only subjects have no risk signal at all.
+    #[test]
+    fn ungraded_and_unremarkable_ranks_last() {
+        assert!(dep_subject_risk(Some(decision(-1, 0.01)), false) > dep_subject_risk(None, false));
+        assert!(dep_subject_risk(None, true) > dep_subject_risk(None, false));
     }
 }
 
