@@ -5633,25 +5633,8 @@ mod dependency_grading_tests {
                 .collect::<Vec<_>>(),
         }))
         .unwrap();
-<<<<<<< HEAD
         let entries: Vec<&cleave::types::CompactFile> = embedded_entries(&report).collect();
-||||||| parent of 2232ebc (code cleanup)
-        let entries: Vec<&cleave::types::CompactFile> = report
-            .files
-            .iter()
-            .filter(|f| f.depth > 0)
-            .take(EMBEDDED_FILE_LIMIT)
-            .collect();
-=======
-        let entries = report
-            .files
-            .iter()
-            .filter(|f| f.depth > 0)
-            .take(EMBEDDED_FILE_LIMIT)
-            .count();
->>>>>>> 2232ebc (code cleanup)
         assert_eq!(
-<<<<<<< HEAD
             entries.len(),
             count,
             "every embedded node must be selected regardless of its position",
@@ -5659,14 +5642,6 @@ mod dependency_grading_tests {
         assert_eq!(
             usize::try_from(entries.last().expect("tail member").id).unwrap(),
             count
-||||||| parent of 2232ebc (code cleanup)
-            entries.len(),
-            EMBEDDED_FILE_LIMIT,
-            "a dependency grades its own members up to its own limit",
-=======
-            entries, EMBEDDED_FILE_LIMIT,
-            "a dependency grades its own members up to its own limit",
->>>>>>> 2232ebc (code cleanup)
         );
     }
 }
