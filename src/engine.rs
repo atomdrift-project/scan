@@ -3212,6 +3212,7 @@ pub(crate) fn format_llm_line(llm: &crate::interpret::Interpretation, color: boo
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn render_terminal_context(
     report: &cleave::AnalysisReport,
     tiny_opts: &cleave::output::TinyOpts,
@@ -3221,6 +3222,7 @@ fn render_terminal_context(
     sha256: &str,
     label: &str,
     bloom_mark: Option<crate::output::BloomMark>,
+    member_evals: &MemberEvals,
 ) -> String {
     // The card frame, top-down: verdict rule → what (📦 name · TYPE · size) →
     // why (✨ interpretation, --llm only) → identity (🧬/🚩 hash), a blank
@@ -3230,6 +3232,26 @@ fn render_terminal_context(
     let file_type = root.map(|f| f.file_type.as_str()).unwrap_or_default();
     let size = root.map_or(0, |f| f.size);
     let is_container = report.files.iter().any(|f| f.depth > 0);
+
+    // A grab-bag archive (several independent packages zipped together) reads
+    // far better as a stack of per-package verdict cards than as one inherited
+    // verdict over a flat member list. When the archive holds two or more
+    // packages that independently scored suspicious+, switch to that layout.
+    if is_container
+        && let Some(cards) = render_archive_cards(
+            report,
+            tiny_opts,
+            decision,
+            interpretation,
+            sha256,
+            label,
+            bloom_mark,
+            member_evals,
+        )
+    {
+        return cards;
+    }
+
     let color = colored::control::SHOULD_COLORIZE.should_colorize();
 
     // Each card *leads* with its blank separator (setting it off from the
@@ -3290,6 +3312,367 @@ fn render_terminal_context(
         head.pop();
     }
     head
+}
+
+/// The delimiter cleave inserts between archive layers in a file path
+/// (`root.zip!!member.tgz!!inner/file`). Directory separators *within* one
+/// archive stay `/`; only a nested-archive boundary is `!!`.
+const ARCHIVE_DELIMITER: &str = "!!";
+
+/// The id of the depth-1 ancestor of `file` — the top-level package it belongs
+/// to inside the root archive — or `None` for the root itself. `parent_id` is
+/// unreliable here (it is dropped for non-container members during compaction),
+/// so membership is decided by path: a file belongs to the depth-1 package whose
+/// path is the longest archive-prefix of its own.
+fn top_package_id(file: &cleave::FileAnalysis, roots: &[(u32, &str)]) -> Option<u32> {
+    if file.depth == 0 {
+        return None;
+    }
+    if file.depth == 1 {
+        return Some(file.id);
+    }
+    roots
+        .iter()
+        .filter(|(_, root)| {
+            file.path.len() > root.len()
+                && file.path.starts_with(root)
+                && file.path[root.len()..].starts_with(ARCHIVE_DELIMITER)
+        })
+        .max_by_key(|(_, root)| root.len())
+        .map(|(id, _)| *id)
+}
+
+/// Render a multi-package archive as a stack of independent verdict cards.
+///
+/// A "grab-bag" archive — several unrelated packages zipped together — is badly
+/// served by one inherited verdict over a flat member list: it collapses N
+/// distinct malicious packages into a single `HOSTILE` line and buries which
+/// file is which. Instead each top-level package inside the archive that scored
+/// suspicious+ on its own is framed as its own card (verdict stamp, package
+/// name, its findings), clearly nested under the archive banner. The archive's
+/// own card is added only when it carries a non-inherited hostile finding of its
+/// own, or outscores every package it contains.
+///
+/// `None` (fall back to the single-card render) when the archive holds fewer
+/// than two independently-notable packages — an ordinary single-package scan is
+/// better as the one classic card.
+#[allow(clippy::too_many_arguments)]
+fn render_archive_cards(
+    report: &cleave::AnalysisReport,
+    tiny_opts: &cleave::output::TinyOpts,
+    decision: &Decision,
+    interpretation: Option<&crate::interpret::Interpretation>,
+    sha256: &str,
+    label: &str,
+    bloom_mark: Option<crate::output::BloomMark>,
+    member_evals: &MemberEvals,
+) -> Option<String> {
+    let by_id: std::collections::HashMap<u32, &cleave::FileAnalysis> =
+        report.files.iter().map(|f| (f.id, f)).collect();
+
+    // Group every file under its top-level package (its depth-1 ancestor).
+    let roots: Vec<(u32, &str)> = report
+        .files
+        .iter()
+        .filter(|f| f.depth == 1)
+        .map(|f| (f.id, f.path.as_str()))
+        .collect();
+    let mut members_of: std::collections::BTreeMap<u32, Vec<u32>> =
+        std::collections::BTreeMap::new();
+    for file in &report.files {
+        if let Some(pkg) = top_package_id(file, &roots) {
+            members_of.entry(pkg).or_default().push(file.id);
+        }
+    }
+    if members_of.is_empty() {
+        return None;
+    }
+
+    // Each package's verdict is the worst independent verdict among its files —
+    // exactly how a first-hand scan of that package alone would resolve.
+    struct Package {
+        id: u32,
+        decision: Decision,
+        members: Vec<u32>,
+    }
+    let mut packages: Vec<Package> = members_of
+        .into_iter()
+        .filter_map(|(pkg, members)| {
+            let decision = members
+                .iter()
+                .filter_map(|id| member_evals.get(&u64::from(*id)).map(EmbeddedFile::decision))
+                .reduce(|best, d| if decision_outranks(&d, &best) { d } else { best })?;
+            Some(Package {
+                id: pkg,
+                decision,
+                members,
+            })
+        })
+        .collect();
+
+    // Banner tally over every package; the cards below spell out only the
+    // suspicious+ ones.
+    let (mut hostile, mut suspicious, mut clean) = (0, 0, 0);
+    for pkg in &packages {
+        match pkg.decision.class {
+            Classification::Hostile => hostile += 1,
+            Classification::Suspicious => suspicious += 1,
+            Classification::Benign => clean += 1,
+        }
+    }
+
+    // Worst first, so the reader meets the most dangerous package immediately.
+    packages.sort_by(|a, b| {
+        if decision_outranks(&a.decision, &b.decision) {
+            std::cmp::Ordering::Less
+        } else if decision_outranks(&b.decision, &a.decision) {
+            std::cmp::Ordering::Greater
+        } else {
+            a.id.cmp(&b.id)
+        }
+    });
+    let notable: Vec<&Package> = packages
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.decision.class,
+                Classification::Suspicious | Classification::Hostile
+            )
+        })
+        .collect();
+
+    // Does a root finding belong to the archive itself? It must be non-inherited
+    // (native to the container — no `src` child pointing into a member) *and*
+    // native to nothing below it: a trait that also fired natively on some member
+    // (a package's own atomic trait re-evaluated at container scope, or a
+    // composite native to one package's container node) is that member's story,
+    // already told by its card. What survives is genuinely the archive's own — an
+    // atomic match on the container's own bytes, or a composite that spans
+    // packages and so is native to no single one. This mirrors cleave's own
+    // "native deeper down belongs to the member" rule.
+    let member_native: std::collections::HashSet<&str> = report
+        .files
+        .iter()
+        .filter(|f| f.depth > 0)
+        .flat_map(|f| {
+            f.findings
+                .iter()
+                .filter(|x| x.src.is_none())
+                .map(|x| x.id.as_str())
+        })
+        .collect();
+    let root_id = report.files.first().map(|f| f.id);
+    let is_archive_own =
+        |f: &cleave::Finding| f.src.is_none() && !member_native.contains(f.id.as_str());
+    let archive_card = report.files.first().is_some_and(|root| {
+        root.findings
+            .iter()
+            .any(|f| f.crit >= cleave::Criticality::Hostile && is_archive_own(f))
+    });
+
+    // Fall back to the single classic card unless this is genuinely a grab-bag
+    // (two or more independently-notable packages).
+    if notable.len() < 2 {
+        return None;
+    }
+
+    let color = colored::control::SHOULD_COLORIZE.should_colorize();
+    let root = report.files.first();
+    let file_type = root.map(|f| f.file_type.as_str()).unwrap_or_default();
+    let size = root.map_or(0, |f| f.size);
+
+    // ── Banner: verdict rule → 📦 name · TYPE · size → inside tally → hash ──
+    let mut out = String::from("\n");
+    if color {
+        out.push_str(&crate::output::terminal_rule(
+            &decision.class,
+            decision.probability,
+            decision.threshold,
+            decision.level,
+            cleave::output::terminal_width(),
+        ));
+        out.push('\n');
+    } else {
+        let (stamp, _) = crate::output::terminal_badge(
+            &decision.class,
+            decision.probability,
+            decision.threshold,
+            decision.level,
+        );
+        out.push_str(&stamp);
+        out.push(' ');
+    }
+    out.push_str(&crate::output::terminal_artifact_line(
+        label, file_type, size, true,
+    ));
+    out.push('\n');
+    if let Some(interp) = crate::output::terminal_interpretation(interpretation, 1) {
+        out.push_str(&interp);
+        out.push('\n');
+    }
+    let inside = crate::output::terminal_inside_summary(hostile, suspicious, clean);
+    if !inside.is_empty() {
+        out.push_str(&inside);
+        out.push('\n');
+    }
+    if let Some(hash) = crate::output::terminal_hash_line(sha256, bloom_mark) {
+        out.push_str(&hash);
+        out.push('\n');
+    }
+
+    // ── One card per notable package, worst first ──
+    let render_card = |pkg: &Package| -> String {
+        let file = by_id.get(&pkg.id);
+        let name = file.map_or_else(String::new, |f| package_display_path(&f.path));
+        let ptype = file.map(|f| f.file_type.as_str()).unwrap_or_default();
+        let psize = file.map_or(0, |f| f.size);
+        let member_ids: std::collections::HashSet<u32> = pkg.members.iter().copied().collect();
+        let why = package_headline(&member_ids, report);
+
+        let mut view = report.clone();
+        view.files.retain(|f| member_ids.contains(&f.id));
+        let body = cleave::output::format_context_badged(
+            &view,
+            tiny_opts,
+            cleave::output::HeaderBadge::default(),
+        );
+        // Two cleanups so the card doesn't repeat what its header already says:
+        //  - drop the package's own `📄 <name>` member line (the card header names
+        //    it; its findings still render beneath),
+        //  - strip the package path prefix from member lines, so a card headed
+        //    `vexium-kit-10.0.2.tgz` shows `package/index.js`, not the full path.
+        let self_header = format!("{name} \u{00b7}");
+        let body: String = body
+            .lines()
+            .filter(|line| {
+                let visible = crate::deptree::strip_ansi(line);
+                !(visible.trim_start().starts_with('\u{1f4c4}') && visible.contains(&self_header))
+            })
+            .map(|line| {
+                if name.is_empty() {
+                    line.to_string()
+                } else {
+                    line.replace(&format!("{name}/"), "")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::output::terminal_card(
+            &pkg.decision.class,
+            pkg.decision.probability,
+            pkg.decision.threshold,
+            pkg.decision.level,
+            &name,
+            ptype,
+            psize,
+            why.as_deref(),
+            body.trim_end_matches('\n'),
+        )
+    };
+
+    // The archive's own card leads when it earned one — its own hostility is the
+    // headline, the packages it carried are the detail.
+    if archive_card && let Some((rid, root)) = root_id.zip(report.files.first()) {
+        // The archive's own findings, and the member files their cross-package
+        // trails point at — the members must stay in the view so those `↳` legs
+        // resolve to real paths, but only the root's findings block is kept.
+        let own: std::collections::HashSet<&str> = root
+            .findings
+            .iter()
+            .filter(|f| is_archive_own(f))
+            .map(|f| f.id.as_str())
+            .collect();
+        let referenced: std::collections::HashSet<u32> = own
+            .iter()
+            .filter_map(|id| root.composite_sources.get(*id))
+            .flatten()
+            .map(|s| s.file)
+            .collect();
+        let mut view = report.clone();
+        view.files.retain(|f| f.id == rid || referenced.contains(&f.id));
+        if let Some(v) = view.files.iter_mut().find(|f| f.id == rid) {
+            v.findings.retain(|f| own.contains(f.id.as_str()));
+        }
+        // Keep only the root's block: its findings render first, before any
+        // member's `📄` header (the members are present only to resolve trails).
+        let full = cleave::output::format_context_badged(
+            &view,
+            tiny_opts,
+            cleave::output::HeaderBadge::default(),
+        );
+        let body: String = full
+            .lines()
+            .take_while(|line| {
+                !crate::deptree::strip_ansi(line)
+                    .trim_start()
+                    .starts_with('\u{1f4c4}')
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !body.trim().is_empty() {
+            out.push('\n');
+            out.push_str(&crate::output::terminal_card(
+                &decision.class,
+                decision.probability,
+                decision.threshold,
+                decision.level,
+                label,
+                file_type,
+                size,
+                None,
+                body.trim_end_matches('\n'),
+            ));
+        }
+    }
+
+    for pkg in &notable {
+        out.push('\n');
+        out.push_str(&render_card(pkg));
+    }
+
+    // Note the quiet packages we didn't spell out, so the tally above is honest.
+    let omitted = packages.len().saturating_sub(notable.len());
+    if omitted > 0 {
+        let plural = if omitted == 1 { "package" } else { "packages" };
+        if color {
+            let dim = "\x1b[38;2;100;100;100m";
+            out.push_str(&format!(
+                "\n {dim}{omitted} clean {plural} not shown\x1b[0m\n"
+            ));
+        } else {
+            out.push_str(&format!("\n {omitted} clean {plural} not shown\n"));
+        }
+    }
+
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    Some(out)
+}
+
+/// The path of a package relative to the root archive: everything after the
+/// first archive delimiter, deeper nesting shown as `/`. `demo.zip!!a.tgz` →
+/// `a.tgz`; a bare root path is returned as-is.
+fn package_display_path(path: &str) -> String {
+    path.split_once("!!")
+        .map_or_else(|| path.to_string(), |(_, m)| m.replace("!!", "/"))
+}
+
+/// A one-line headline for a package card: the description of its
+/// highest-criticality finding with human-readable text. `None` when no member
+/// carries a described finding (the card's own findings then speak for it).
+fn package_headline(
+    member_ids: &std::collections::HashSet<u32>,
+    report: &cleave::AnalysisReport,
+) -> Option<String> {
+    report
+        .files
+        .iter()
+        .filter(|f| member_ids.contains(&f.id))
+        .flat_map(|f| &f.findings)
+        .filter(|f| !f.desc.is_empty())
+        .max_by_key(|f| f.crit)
+        .map(|f| f.desc.to_string())
 }
 
 /// Wall-clock of each post-analysis phase inside `classify_report`, in
@@ -4029,6 +4412,7 @@ pub(crate) fn classify_report(
             &sha256,
             label,
             bloom_mark,
+            &member_evals,
         );
         if let Some(fetched) = render_terminal_fetch_context(
             &fetch_edges,
@@ -4958,22 +5342,20 @@ fn render_terminal_fetch_context(
             .iter()
             .filter_map(|(&file, &fetched_root)| (fetched_root == root.id).then_some(file))
             .collect();
-        let severe_finding = report
+        // Only hostile dependencies earn a provenance block: a benign-but-old or
+        // merely-notable dependency is exactly the noise that buried the real
+        // ones. Hostility is a hostile verdict on the fetched bytes, or a hostile
+        // finding on one of its members.
+        let hostile_finding = report
             .files
             .iter()
             .filter(|file| member_ids.contains(&file.id))
             .flat_map(|file| &file.findings)
-            .any(|finding| finding.crit >= cleave::Criticality::Suspicious);
-        let severe_verdict = graded.and_then(|d| d.verdict).is_some_and(|verdict| {
-            matches!(
-                verdict.class,
-                Classification::Suspicious | Classification::Hostile
-            )
-        });
-        let provenance_hit = registry.is_some_and(|registry| {
-            provenance_has_notable_match(report, &member_ids, registry.file_id)
-        });
-        if !severe_finding && !severe_verdict && !provenance_hit {
+            .any(|finding| finding.crit >= cleave::Criticality::Hostile);
+        let hostile_verdict = graded
+            .and_then(|d| d.verdict)
+            .is_some_and(|verdict| verdict.class == Classification::Hostile);
+        if !hostile_finding && !hostile_verdict {
             continue;
         }
         shown_count += 1;
@@ -5025,11 +5407,14 @@ fn render_terminal_fetch_context(
             continue;
         }
         candidate_count += 1;
-        if !provenance_has_notable_match(
-            report,
-            &std::collections::HashSet::new(),
-            registry.file_id,
-        ) {
+        // A registry-only entry (no bytes fetched, so no verdict) is shown only
+        // when the registry itself flags it hostile — a pulled version or a
+        // security hold. "Older than fetch age limit" and other benign states are
+        // not findings; they were the bulk of the old noise.
+        let record = &registry.provenance.record;
+        let hostile_signal =
+            record.version_removed == Some(true) || record.security_hold == Some(true);
+        if !hostile_signal {
             continue;
         }
         shown_count += 1;
