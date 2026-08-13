@@ -402,7 +402,6 @@ fn build_result(
         model,
         shap,
         cancellation,
-        Some(crate::engine::EMBEDDED_FILE_LIMIT),
         &crate::engine::tiny_opts_for(config),
         config.interpret(),
         display_path,

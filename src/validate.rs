@@ -113,7 +113,6 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         &model,
                         None,
                         None,
-                        None,
                         &cleave::output::TinyOpts::tiny(),
                         None, // validation corpus never calls the LLM
                         &path,
@@ -400,7 +399,10 @@ mod logit_margin_tests {
     fn separates_a_decision_at_the_top_of_the_range() {
         let margin = logit_margin(0.999_541_5, 0.999_545_6);
         assert!(margin < 0.0, "file stayed under its threshold: {margin}");
-        assert!(margin.abs() < 0.05, "a near-miss is a small margin: {margin}");
+        assert!(
+            margin.abs() < 0.05,
+            "a near-miss is a small margin: {margin}"
+        );
     }
 
     /// A saturated f32 score must not produce an infinity.

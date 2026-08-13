@@ -1239,14 +1239,22 @@ pub(crate) fn orchestrate(
                     // behaviour, printing only the surfaced removals/known-good skips.
                     reporter.skipped(r, reg, now, *reason);
                 }
-                for (rec, payload) in g.fetched.iter().zip(payloads) {
-                    if let Some(payload) = payload {
-                        // Capture the artifact's findings and identity before
-                        // `merge_payload` consumes the sub-report, then graft any
-                        // package-scoped composite that correlates them with this
-                        // package's registry metadata.
-                        let artifact = payload.sub.as_ref().map(sub_findings).unwrap_or_default();
-                        let artifact_sha = payload.content_sha.clone();
+                for (selected_ref, (rec, payload)) in
+                    g.selected.iter().zip(g.fetched.iter().zip(payloads))
+                {
+                    if let Some(mut payload) = payload {
+                        // Run registry-aware package composites on the dependency's
+                        // standalone report before either consumer takes it. This
+                        // lets the dependency grader see the same finding that the
+                        // merged parent's embedded-file pass sees, so a suspicious
+                        // or hostile dependency can be pinned back to its declaring
+                        // manifest. Running this after `merge_payload` left the
+                        // standalone capture blind to registry/package composites.
+                        prepare_dependency_report(
+                            &mut payload,
+                            registry_findings_for_reference(&registry_findings, selected_ref),
+                            &opts,
+                        );
                         // Capture the dependency's standalone report before merge_payload
                         // consumes the sub-report into the merged tree — only when a
                         // consumer (hopper upload, dependency appendix) will read it.
@@ -1254,11 +1262,6 @@ pub(crate) fn orchestrate(
                             dependencies.push(dep);
                         }
                         next.extend(merge_payload(report, rec, payload));
-                        // `rec.locator` is the original filefacts locator (the PURL),
-                        // the same key the registry findings were captured under.
-                        if let Some(reg) = registry_findings.get(rec.locator.as_str()) {
-                            apply_package_composites(report, &artifact_sha, &artifact, reg, &opts);
-                        }
                     }
                 }
                 records.extend(g.fetched);
@@ -2925,6 +2928,47 @@ fn apply_package_composites(
     }
 }
 
+/// Enrich a fetched dependency's standalone report with package-scoped
+/// registry composites before it is captured or merged into its parent.
+fn prepare_dependency_report(
+    payload: &mut Analyzed,
+    registry_findings: Option<&[Finding]>,
+    opts: &AnalysisOptions,
+) {
+    prepare_dependency_report_with(payload, registry_findings, opts, apply_package_composites);
+}
+
+/// Return the registry findings paired with the original declared reference.
+/// A fetch may canonicalize a versionless/ranged PURL to the concrete version
+/// it downloaded, so joining on `FetchRecord::locator` loses exactly the
+/// registry transitions (including security holders) this pass must correlate.
+fn registry_findings_for_reference<'a>(
+    findings: &'a HashMap<String, Vec<Finding>>,
+    reference: &Reference,
+) -> Option<&'a [Finding]> {
+    findings.get(&locator_key(reference)).map(Vec::as_slice)
+}
+
+/// Injectable core of [`prepare_dependency_report`]. Keeping the mutation in a
+/// small function makes the ordering contract testable without network access
+/// or depending on the machine's installed trait bundle.
+fn prepare_dependency_report_with(
+    payload: &mut Analyzed,
+    registry_findings: Option<&[Finding]>,
+    opts: &AnalysisOptions,
+    graft: impl FnOnce(&mut AnalysisReport, &str, &[Finding], &[Finding], &AnalysisOptions),
+) {
+    let Some(registry) = registry_findings else {
+        return;
+    };
+    let artifact = payload.sub.as_ref().map(sub_findings).unwrap_or_default();
+    let artifact_sha = payload.content_sha.clone();
+    let Some(sub) = payload.sub.as_mut() else {
+        return;
+    };
+    graft(sub, &artifact_sha, &artifact, registry, opts);
+}
+
 /// A filename for a fetched payload: the final URL's basename, else the
 /// content hash. Drives cleave's extension-based type detection.
 fn payload_name(rec: &FetchRecord) -> String {
@@ -2966,6 +3010,202 @@ mod tests {
             deprecated: Some("use v2 instead".to_string()),
             ..Registry::default()
         }));
+    }
+
+    fn test_finding(id: &str, crit: cleave::Criticality) -> Finding {
+        let mut finding = Finding::new(
+            id.to_string(),
+            cleave::types::FindingKind::Capability,
+            id.to_string(),
+            1.0,
+        );
+        finding.crit = crit;
+        finding
+    }
+
+    fn fetched_payload_with_finding(id: &str) -> Analyzed {
+        let mut report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [{
+                "id": 0,
+                "path": "holder.tgz",
+                "depth": 0,
+                "file_type": "npm",
+                "sha256": "d".repeat(64),
+                "size": 399u64
+            }]
+        }))
+        .expect("dependency report");
+        report.files[0]
+            .findings
+            .push(test_finding(id, cleave::Criticality::Notable));
+        Analyzed {
+            sub: Some(report),
+            content_sha: "d".repeat(64),
+            next_from_bytes: Vec::new(),
+        }
+    }
+
+    fn fetched_record() -> FetchRecord {
+        FetchRecord {
+            source_sha256: "s".repeat(64),
+            source_offset: Some(17),
+            kind: RefKind::Dependency,
+            locator: "pkg:npm/held@0.0.1-security".to_string(),
+            resolved_url: "https://registry.test/held-0.0.1-security.tgz".to_string(),
+            final_url: None,
+            redirects: Vec::new(),
+            status: Some(200),
+            headers: Vec::new(),
+            fetched_at: 0,
+            content_sha256: Some("d".repeat(64)),
+            size: Some(399),
+            cached: true,
+            stale: false,
+            pin_verified: None,
+            outcome: Outcome::Ok,
+        }
+    }
+
+    /// Regression for the fetched-package ordering bug: registry/package
+    /// composites used to be grafted only after `capture_dependency` consumed
+    /// its snapshot, so Hopper graded the dependency as clean and the parent
+    /// never received a dependency-verdict back-reference.
+    #[test]
+    fn registry_composite_reaches_standalone_capture_and_merged_dependency() {
+        let mut payload = fetched_payload_with_finding("artifact/seed");
+        let registry = vec![test_finding(
+            "metadata/registry::registry-security-hold-record",
+            cleave::Criticality::Suspicious,
+        )];
+        let expected_composite =
+            "objectives/supply-chain::registry-security-withdrawn-package-coordinate";
+
+        prepare_dependency_report_with(
+            &mut payload,
+            Some(&registry),
+            &AnalysisOptions::default(),
+            |report, artifact_sha, artifact, registry, _opts| {
+                assert_eq!(artifact_sha, "d".repeat(64));
+                assert!(artifact.iter().any(|f| f.id == "artifact/seed"));
+                assert!(
+                    registry
+                        .iter()
+                        .any(|f| { f.id == "metadata/registry::registry-security-hold-record" })
+                );
+                report
+                    .files
+                    .iter_mut()
+                    .find(|file| file.sha256 == artifact_sha)
+                    .expect("artifact node")
+                    .findings
+                    .push(test_finding(
+                        expected_composite,
+                        cleave::Criticality::Hostile,
+                    ));
+            },
+        );
+
+        let rec = fetched_record();
+        let captured = capture_dependency(&rec, &payload).expect("standalone capture");
+        let captured: cleave::types::CompactReport =
+            serde_json::from_str(&captured.raw).expect("captured report parses");
+        assert!(
+            captured.files[0]
+                .findings
+                .iter()
+                .any(|f| f.id == expected_composite && f.criticality == 5),
+            "the standalone report graded for Hopper must contain the hostile registry composite"
+        );
+
+        let mut parent: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [{
+                "id": 0,
+                "path": "package.json",
+                "depth": 0,
+                "file_type": "package_json",
+                "sha256": "s".repeat(64),
+                "size": 100u64
+            }]
+        }))
+        .expect("parent report");
+        merge_payload(&mut parent, &rec, payload);
+        let fetched = parent
+            .files
+            .iter()
+            .find(|file| file.sha256 == "d".repeat(64))
+            .expect("merged dependency root");
+        assert_eq!(fetched.rel, cleave::types::Rel::Fetched);
+        assert!(
+            fetched
+                .findings
+                .iter()
+                .any(|f| f.id == expected_composite && f.crit == cleave::Criticality::Hostile),
+            "the embedded-file grader must see the same hostile registry composite"
+        );
+    }
+
+    /// Registry correlation is opt-in per fetched edge. A dependency without a
+    /// registry record must be captured unchanged and must not invoke the
+    /// package-composite pass with unrelated metadata.
+    #[test]
+    fn missing_registry_does_not_mutate_fetched_dependency() {
+        let mut payload = fetched_payload_with_finding("artifact/seed");
+        prepare_dependency_report_with(
+            &mut payload,
+            None,
+            &AnalysisOptions::default(),
+            |_report, _sha, _artifact, _registry, _opts| {
+                panic!("package composite pass must not run without matching registry metadata")
+            },
+        );
+
+        let captured = capture_dependency(&fetched_record(), &payload).expect("capture");
+        let captured: cleave::types::CompactReport =
+            serde_json::from_str(&captured.raw).expect("captured report parses");
+        assert_eq!(captured.files[0].findings.len(), 1);
+        assert_eq!(captured.files[0].findings[0].id, "artifact/seed");
+    }
+
+    /// npm resolves a versionless or ranged declaration to a concrete holder
+    /// release. Registry metadata remains keyed by the declaration; the fetch
+    /// record carries the resolved coordinate. The package pass must join on
+    /// the former or a security-holder transition disappears.
+    #[test]
+    fn registry_join_survives_versionless_purl_resolution() {
+        let declared = Reference {
+            locator: RefLocator::Purl("pkg:npm/held".to_string()),
+            kind: RefKind::Dependency,
+            source: "package.json".to_string(),
+            evidence: "held".to_string(),
+            offset: 17,
+            pinned_hash: None,
+            content_sha256: None,
+        };
+        let fetched = fetched_record();
+        assert_eq!(fetched.locator, "pkg:npm/held@0.0.1-security");
+        assert_ne!(locator_key(&declared), fetched.locator);
+
+        let mut by_declared_locator = HashMap::new();
+        by_declared_locator.insert(
+            locator_key(&declared),
+            vec![test_finding(
+                "metadata/registry::registry-security-hold-record",
+                cleave::Criticality::Suspicious,
+            )],
+        );
+        let paired = registry_findings_for_reference(&by_declared_locator, &declared)
+            .expect("versionless declaration retains its registry sidecar");
+        assert_eq!(paired.len(), 1);
+        assert_eq!(
+            paired[0].id,
+            "metadata/registry::registry-security-hold-record"
+        );
+        assert!(
+            by_declared_locator.get(&fetched.locator).is_none(),
+            "control: joining on the resolved fetch locator would drop the sidecar"
+        );
     }
 
     #[test]
@@ -3451,7 +3691,10 @@ mod tests {
                 ..FetchPolicy::default()
             })
         );
-        assert_eq!("all".parse::<FetchPolicy>(), "urls,packages,deps,ci".parse());
+        assert_eq!(
+            "all".parse::<FetchPolicy>(),
+            "urls,packages,deps,ci".parse()
+        );
         // A routine `deps` fetch leaves CI off — GitHub Actions run only in CI
         // and never reach an installed artifact; `ci` (or `all`) opts in.
         assert!(!"deps".parse::<FetchPolicy>().unwrap().ci);
@@ -3567,7 +3810,8 @@ mod tests {
         .expect("report deserializes");
 
         // No on-disk root text hunt — a missing path just skips it.
-        let groups = collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
+        let groups =
+            collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         let all: Vec<Reference> = groups.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
         let undeclared: Vec<String> = find::undeclared_packages(&all)
             .iter()
@@ -3606,7 +3850,8 @@ mod tests {
         }))
         .expect("report deserializes");
 
-        let groups = collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
+        let groups =
+            collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         let locs: Vec<String> = groups
             .iter()
             .flat_map(|(_, refs)| refs.iter().map(locator_key))
@@ -3635,7 +3880,8 @@ mod tests {
         }))
         .expect("report deserializes");
 
-        let groups = collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
+        let groups =
+            collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         let locs: Vec<String> = groups
             .iter()
             .flat_map(|(_, refs)| refs.iter().map(locator_key))
@@ -3658,7 +3904,8 @@ mod tests {
         }))
         .expect("report deserializes");
 
-        let groups = collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
+        let groups =
+            collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         assert!(
             groups.is_empty(),
             "an absent import inside the captured install tree is not a network fetch"
