@@ -1046,7 +1046,6 @@ fn finish_classify(
         &resources.model,
         resources.shap.as_ref(),
         cancellation,
-        Some(crate::engine::EMBEDDED_FILE_LIMIT),
         &cleave::output::TinyOpts::tiny(),
         resources.interpret.as_ref(),
         // The server analyzes uploaded bytes, not a disk file; the root

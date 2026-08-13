@@ -1204,9 +1204,7 @@ pub struct DepResult {
     /// `ml.files` is built from.
     ///
     /// Without it every member of a dependency reached hopper with no verdict at
-    /// all, while the members of a directly-scanned package got theirs. Bounded
-    /// by EMBEDDED_FILE_LIMIT, so the retained size is capped per dependency
-    /// rather than growing with the report.
+    /// all, while the members of a directly-scanned package got theirs.
     pub members: MemberEvals,
     /// The dependency's own compact cleave report as JSON text — the `raw`
     /// for its result, parsed transiently at envelope build (see
@@ -2325,9 +2323,7 @@ pub(crate) fn upload_scan_result(
 /// members at depth > 0 — returning one evaluation per entry.
 ///
 /// Extracted so a fetched dependency can be graded on its own report rather
-/// than as a tail region of the report it was grafted into. Sharing the parent's
-/// pass meant sharing its embedded-file budget, and a dependency past the cap
-/// came back with no evaluation at all.
+/// than deriving its standalone verdict from the parent report.
 ///
 /// Per-member work is pure and runs in parallel: reports with thousands of
 /// embedded files (nested npm tarballs, fetched dependency trees) previously ran
@@ -2420,14 +2416,16 @@ fn score_embedded_files(
         .collect()
 }
 
-/// How many embedded files one report contributes to the model pass. Bounds the
-/// per-report work on an archive with thousands of members.
+/// Every analyzed embedded node receives an individual model verdict.
 ///
-/// Per report, not per scan: a fetched dependency is graded on its own report and
-/// gets its own budget. Sharing the parent's — the whole merged tree competing
-/// for one allowance, dependencies appended last — meant a large package's
-/// dependencies fell off the end and came back ungraded.
-pub(crate) const EMBEDDED_FILE_LIMIT: usize = 100;
+/// This deliberately has no count limit: selecting only an archive prefix makes
+/// malware detection depend on member ordering and lets a hostile tail member,
+/// fetched dependency, or registry security sidecar evade container elevation.
+fn embedded_entries(
+    report: &cleave::types::CompactReport,
+) -> impl Iterator<Item = &cleave::types::CompactFile> {
+    report.files.iter().filter(|file| file.depth > 0)
+}
 
 /// Grade a fetched dependency on its own standalone report: the container's own
 /// verdict, elevated by its worst member. That is exactly how a first-hand scan
@@ -2479,14 +2477,8 @@ fn classify_dependency(
         label,
     );
 
-    // Its own members, on its own budget, elevating it as they would any
-    // container.
-    let entries: Vec<&cleave::types::CompactFile> = report
-        .files
-        .iter()
-        .filter(|f| f.depth > 0)
-        .take(EMBEDDED_FILE_LIMIT)
-        .collect();
+    // Every member elevates the dependency as it would in a first-hand scan.
+    let entries: Vec<&cleave::types::CompactFile> = embedded_entries(&report).collect();
     let mut members = MemberEvals::new();
     for ef in score_embedded_files(&entries, label, needs, ctx, model, cancellation) {
         let member = ef.decision();
@@ -2711,7 +2703,10 @@ mod upload_artifact_tests {
         // an attacker who controls (or compromises) the server we fetch from.
         for (url, expect) in [
             // Encoded separators a consumer might decode back into a path.
-            ("https://e.com/..%2f..%2fetc%2fpasswd", "_2f.._2fetc_2fpasswd"),
+            (
+                "https://e.com/..%2f..%2fetc%2fpasswd",
+                "_2f.._2fetc_2fpasswd",
+            ),
             // Windows separators in the final segment.
             ("https://e.com/a\\..\\..\\system32\\x.dll", "x.dll"),
             // Bare path components.
@@ -3444,7 +3439,6 @@ pub(crate) fn classify_report(
     model: &Model,
     shap: Option<&ShapImportance>,
     cancellation: Option<&Arc<AtomicBool>>,
-    embedded_file_limit: Option<usize>,
     tiny_opts: &cleave::output::TinyOpts,
     interpret: Option<&crate::interpret::InterpretConfig>,
     root_path: &Path,
@@ -3689,16 +3683,11 @@ pub(crate) fn classify_report(
         label,
     );
 
-    // Extract embedded files (archive members at depth > 0), run each through
-    // the model individually, and elevate the parent if any embedded file's
-    // decision outranks it. Ordinary scans cap embedded work to prevent
-    // resource exhaustion; validation passes None so every Cleave-produced
-    // embedded file is checked.
-    let embedded_iter = compact.files.iter().filter(|f| f.depth > 0);
-    let embedded_entries: Vec<&cleave::types::CompactFile> = match embedded_file_limit {
-        Some(limit) => embedded_iter.take(limit).collect(),
-        None => embedded_iter.collect(),
-    };
+    // Extract every embedded file (archive members at depth > 0), run each
+    // through the model individually, and elevate the parent if any embedded
+    // file's decision outranks it. A count cap here would make the result depend
+    // on archive ordering and permit a hostile tail member to evade elevation.
+    let embedded_entries: Vec<&cleave::types::CompactFile> = embedded_entries(&compact).collect();
 
     // Fetched payloads keyed by the sha of the content retrieved, with the
     // declaring file + the byte the reference sits at. When the embedded pass
@@ -5270,9 +5259,7 @@ mod dep_subject_risk_tests {
     /// an ungraded one carrying a suspicious-or-worse member trait.
     #[test]
     fn clean_verdict_ranks_below_a_severe_finding() {
-        assert!(
-            dep_subject_risk(None, true) > dep_subject_risk(Some(decision(-1, 0.01)), false)
-        );
+        assert!(dep_subject_risk(None, true) > dep_subject_risk(Some(decision(-1, 0.01)), false));
     }
 
     /// Registry-provenance-only subjects have no risk signal at all.
@@ -5287,6 +5274,10 @@ mod dep_subject_risk_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod dependency_grading_tests {
     use super::*;
+
+    /// The former production cutoff. Tests deliberately put evidence beyond it
+    /// so reintroducing a prefix-only grading policy cannot pass unnoticed.
+    const FORMER_EMBEDDED_FILE_LIMIT: usize = 100;
 
     /// Grading needs a real model to score against. Point SCAN_MODELS_DIR at a
     /// bundle to run these; without one there is nothing to exercise, so they
@@ -5318,13 +5309,10 @@ mod dependency_grading_tests {
         serde_json::json!({"v": "8", "files": files}).to_string()
     }
 
-    /// The regression this whole path exists for: a dependency is graded from its
-    /// own report, so it comes back with a verdict. It used to be graded by
-    /// attributing the parent's embedded pass back to it, and one that fell
-    /// outside the parent's shared budget got no evaluation at all — which was
-    /// then uploaded as a confident benign.
+    /// A dependency is graded from its own report and every member receives a
+    /// verdict, including members beyond the former production cutoff.
     #[test]
-    fn grades_a_dependency_on_its_own_report() {
+    fn grades_every_dependency_member() {
         let Some(dir) = model_bundle() else {
             eprintln!("skipping: no model bundle (set SCAN_MODELS_DIR)");
             return;
@@ -5332,13 +5320,80 @@ mod dependency_grading_tests {
         let model = Model::load(&dir, None, None).expect("load model bundle");
         let ctx = ExtractContext::new(model.spec());
 
-        // Far more members than one report's budget: previously the tail of a
-        // merged report went ungraded, now the budget is this report's own.
-        let raw = dep_report(EMBEDDED_FILE_LIMIT * 2, "");
-        let verdict = classify_dependency(&raw, "pkg:npm/evil@1.0.0", &ctx, &model, None);
+        let count = FORMER_EMBEDDED_FILE_LIMIT * 2;
+        let raw = dep_report(count, "");
+        let (_verdict, members) =
+            classify_dependency(&raw, "pkg:npm/evil@1.0.0", &ctx, &model, None)
+                .expect("a well-formed dependency report must produce a verdict");
+        assert_eq!(
+            members.len(),
+            count,
+            "every dependency member must be graded"
+        );
+        let tail_id = u64::try_from(count).expect("test member count fits u64");
         assert!(
-            verdict.is_some(),
-            "a well-formed dependency report must produce a verdict, never silence",
+            members.contains_key(&tail_id),
+            "the final member, beyond the former cutoff, must have a verdict"
+        );
+    }
+
+    /// Exact regression for a large dependency closure: the security-held
+    /// dependency sidecar comes after hundreds of ordinary dependency nodes.
+    /// It must receive a verdict and become the member that elevates the parent.
+    #[test]
+    fn security_held_dependency_at_high_index_elevates_parent() {
+        let Some(dir) = model_bundle() else {
+            eprintln!("skipping: no model bundle (set SCAN_MODELS_DIR)");
+            return;
+        };
+        let model = Model::load(&dir, None, None).expect("load model bundle");
+        let ctx = ExtractContext::new(model.spec());
+
+        // Mirrors the observed Polymarket topology: async-mutex-lock's hostile
+        // registry sidecar was node 347, well beyond the former 100-node cap.
+        let tail_id = 347u32;
+        let files: Vec<serde_json::Value> = std::iter::once(serde_json::json!({
+            "id": 0, "path": "parent.tgz", "sha": "p".repeat(64),
+            "type": "npm", "size": 1, "depth": 0
+        }))
+        .chain((1..tail_id).map(|id| serde_json::json!({
+            "id": id, "path": format!("ordinary-dependency-{id}.registry.json"),
+            "sha": format!("{id:064x}"), "type": "registry", "size": 1,
+            "depth": 2, "rel": "registry"
+        })))
+        .chain(std::iter::once(serde_json::json!({
+            "id": tail_id,
+            "path": "async-mutex-lock@5.3.1.registry.json",
+            "sha": "a".repeat(64), "type": "registry", "size": 768,
+            "depth": 2, "rel": "registry",
+            "traits": [{
+                "id": "objectives/supply-chain/impersonation/registry/publish::registry-takedown-security-hold",
+                "crit": 5, "conf": 0.99,
+                "desc": "Registry takedown marks package malicious"
+            }]
+        })))
+        .collect();
+        let report: cleave::types::CompactReport =
+            serde_json::from_value(serde_json::json!({"v": "8", "files": files}))
+                .expect("compact parent report");
+
+        let entries: Vec<&cleave::types::CompactFile> = embedded_entries(&report).collect();
+        let needs = ctx.raw_needs().union(crate::features::RawNeeds::all());
+        let evals: MemberEvals =
+            score_embedded_files(&entries, "parent.tgz", needs, &ctx, &model, None)
+                .into_iter()
+                .map(|member| (member.id, member))
+                .collect();
+
+        assert_eq!(evals.len(), usize::try_from(tail_id).unwrap());
+        let tail = evals
+            .get(&u64::from(tail_id))
+            .expect("high-index security-held dependency must be graded");
+        assert_eq!(tail.classification, Classification::Hostile);
+        assert_eq!(
+            worst_member(&evals).expect("worst member").class,
+            Classification::Hostile,
+            "the high-index dependency must elevate its benign parent"
         );
     }
 
@@ -5513,12 +5568,12 @@ mod dependency_grading_tests {
         assert_eq!(dep_env.ml.analyzed_at, direct_env.ml.analyzed_at);
     }
 
-    /// A dependency's own budget is per report, so a report far larger than the
-    /// limit still contributes exactly the limit — rather than whatever was left
-    /// after the parent's members had taken theirs.
+    /// Selection itself is exhaustive and order-independent. This pure test does
+    /// not need a model bundle and guards every caller of `embedded_entries`.
     #[test]
-    fn embedded_budget_is_per_report() {
-        let members: Vec<serde_json::Value> = (0..EMBEDDED_FILE_LIMIT * 3)
+    fn embedded_selection_has_no_count_limit() {
+        let count = FORMER_EMBEDDED_FILE_LIMIT * 3;
+        let members: Vec<serde_json::Value> = (0..count)
             .map(|i| serde_json::json!({"id": i + 1, "path": format!("m{i}.js"), "sha": "m".repeat(64), "type": "javascript", "size": 1, "depth": 1}))
             .collect();
         let report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
@@ -5528,16 +5583,15 @@ mod dependency_grading_tests {
                 .collect::<Vec<_>>(),
         }))
         .unwrap();
-        let entries: Vec<&cleave::types::CompactFile> = report
-            .files
-            .iter()
-            .filter(|f| f.depth > 0)
-            .take(EMBEDDED_FILE_LIMIT)
-            .collect();
+        let entries: Vec<&cleave::types::CompactFile> = embedded_entries(&report).collect();
         assert_eq!(
             entries.len(),
-            EMBEDDED_FILE_LIMIT,
-            "a dependency grades its own members up to its own limit",
+            count,
+            "every embedded node must be selected regardless of its position",
+        );
+        assert_eq!(
+            usize::try_from(entries.last().expect("tail member").id).unwrap(),
+            count
         );
     }
 }
@@ -6337,7 +6391,6 @@ pub(crate) fn process_report(
         model,
         shap,
         cancellation,
-        Some(EMBEDDED_FILE_LIMIT),
         &tiny_opts_for(config),
         config.interpret(),
         path,
