@@ -16,12 +16,6 @@ import subprocess
 from pathlib import Path
 
 
-def load_profile(path: Path) -> dict:
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8") as profile:
-        return json.load(profile)
-
-
 def thread_chains(thread: dict) -> list[list[str]]:
     strings = thread["stringArray"]
     funcs = thread["funcTable"]
@@ -58,7 +52,7 @@ def resolve(binary: Path, addresses: set[str]) -> dict[str, str]:
         raise RuntimeError(
             f"addr2line returned {len(lines)} lines for {len(ordered)} addresses"
         )
-    return dict(zip(ordered, lines, strict=True))
+    return dict(zip(ordered, lines))
 
 
 def main() -> None:
@@ -70,7 +64,9 @@ def main() -> None:
     parser.add_argument("--top", type=int, default=40)
     args = parser.parse_args()
 
-    profile = load_profile(args.profile)
+    opener = gzip.open if args.profile.suffix == ".gz" else open
+    with opener(args.profile, "rt", encoding="utf-8") as profile_file:
+        profile = json.load(profile_file)
     chains: list[list[str]] = []
     thread_counts = collections.Counter()
     for thread in profile["threads"]:

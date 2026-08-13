@@ -267,7 +267,12 @@ pub fn thread_wait_summary() -> std::collections::BTreeMap<String, usize> {
 }
 
 /// Map an empty / running wait channel to a stable `(running)` key.
-#[allow(dead_code)] // unused on platforms without a per-thread wait channel (macOS)
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "solaris"
+))]
 fn normalize_channel(chan: &str) -> String {
     if chan.is_empty() || chan == "0" || chan == "-" {
         "(running)".to_string()

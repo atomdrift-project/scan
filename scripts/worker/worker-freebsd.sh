@@ -35,6 +35,7 @@ die() { echo "error: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=scripts/worker/lib/freebsd-rcd.sh
 . "$SCRIPT_DIR/lib/freebsd-rcd.sh"
 
 TMP_RCD=""
@@ -73,6 +74,8 @@ fi
 # --- Build (as the invoking user) ------------------------------------------
 # Raise the data-segment limit to its hard cap; FreeBSD's default datasize
 # limit can starve a release build of rustc.
+# FreeBSD /bin/sh exposes the data-segment hard limit through ulimit -Hd.
+# shellcheck disable=SC3045
 ulimit -d "$(ulimit -Hd)" 2>/dev/null || true
 
 log "Building"

@@ -87,6 +87,9 @@ ready_ns=$(date +%s%N)
 
 export responses url
 batch_started_ns=$(date +%s%N)
+# The single-quoted program is intentionally evaluated by each child sh, where
+# $1, $responses, and $url are available.
+# shellcheck disable=SC2016
 find "$dataset" -type f -print0 |
     sort -z |
     xargs -0 -r -P "$workers" -n 1 sh -c '

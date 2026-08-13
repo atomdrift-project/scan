@@ -110,6 +110,10 @@ fn analysis_error_response(error: &anyhow::Error) -> (StatusCode, Response) {
     (status, response)
 }
 
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({"error": message.into()}))).into_response()
+}
+
 fn classify_analysis_error(message: &str) -> (StatusCode, String) {
     let normalized = message.to_ascii_lowercase();
 
@@ -399,6 +403,7 @@ async fn do_model_reload(
                 ctx,
                 interpret: state.interpret.clone(),
                 fetch: state.fetch,
+                zip_passwords: state.zip_passwords.clone(),
             }));
             if let Ok(mut init_error) = state.init_error.write() {
                 *init_error = None;
@@ -443,11 +448,7 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
     // Prevent concurrent reloads — each load allocates significant memory.
     let Ok(_guard) = state.reload_lock.try_lock() else {
         tracing::warn!("reload rejected: already in progress");
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Reload already in progress"})),
-        )
-            .into_response();
+        return error_response(StatusCode::CONFLICT, "Reload already in progress");
     };
 
     match do_model_reload(&state).await {
@@ -461,7 +462,7 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
             }
             Json(body).into_response()
         }
-        Err((status, msg)) => (status, Json(serde_json::json!({ "error": msg }))).into_response(),
+        Err((status, msg)) => error_response(status, msg),
     }
 }
 
@@ -474,11 +475,7 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
     tracing::info!("POST /_/update");
     let Ok(_guard) = state.reload_lock.try_lock() else {
         tracing::warn!("update rejected: reload already in progress");
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Reload already in progress"})),
-        )
-            .into_response();
+        return error_response(StatusCode::CONFLICT, "Reload already in progress");
     };
 
     // Run the two repo pulls on a blocking thread; they're synchronous git
@@ -580,11 +577,10 @@ pub(super) async fn analyze(
         && let Some(message) = init_error.as_ref()
     {
         tracing::error!("analyze rejected: startup failed  id={request_id} error={message}");
-        return (
+        return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Server failed to initialize"})),
-        )
-            .into_response();
+            "Server failed to initialize",
+        );
     }
 
     if let Some(response) = check_memory_pressure(&state).await {
@@ -596,19 +592,11 @@ pub(super) async fn analyze(
         Ok(Some(f)) => f,
         Ok(None) => {
             tracing::warn!("bad request: no file field  id={request_id}");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "No file field in request"})),
-            )
-                .into_response();
+            return error_response(StatusCode::BAD_REQUEST, "No file field in request");
         }
         Err(e) => {
             tracing::warn!("failed to parse multipart: {e}  id={request_id}");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid multipart data"})),
-            )
-                .into_response();
+            return error_response(StatusCode::BAD_REQUEST, "Invalid multipart data");
         }
     };
 
@@ -653,19 +641,11 @@ pub(super) async fn analyze(
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
                 tracing::warn!("failed to create temp dir: {e}  id={request_id}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Internal error"})),
-                )
-                    .into_response();
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
             }
             Err(e) => {
                 tracing::warn!("temp dir task join error (panic?): {e}  id={request_id}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Internal error"})),
-                )
-                    .into_response();
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
             }
         };
 
@@ -675,11 +655,7 @@ pub(super) async fn analyze(
         Ok(file) => file,
         Err(e) => {
             tracing::warn!("failed to reopen temp file for writing: {e}  id={request_id}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response();
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
     };
     let mut tokio_file = tokio::fs::File::from_std(writer);
@@ -694,59 +670,44 @@ pub(super) async fn analyze(
                     tracing::warn!(
                         "upload exceeded size limit: {file_size} > {max_upload}  id={request_id}"
                     );
-                    return (
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        Json(serde_json::json!({"error": "File too large"})),
-                    )
-                        .into_response();
+                    return error_response(StatusCode::PAYLOAD_TOO_LARGE, "File too large");
                 }
                 if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut tokio_file, &chunk).await {
                     tracing::warn!("failed to write chunk: {e}  id={request_id}");
-                    return (
+                    return error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "Failed to save file data"})),
-                    )
-                        .into_response();
+                        "Failed to save file data",
+                    );
                 }
             }
             Ok(Some(_)) => continue,
             Ok(None) => break,
             Err(e) => {
                 tracing::warn!("error reading multipart chunk: {e}  id={request_id}");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "Error reading upload data"})),
-                )
-                    .into_response();
+                return error_response(StatusCode::BAD_REQUEST, "Error reading upload data");
             }
         }
     }
 
     if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut tokio_file).await {
         tracing::warn!("failed to flush temp file: {e}  id={request_id}");
-        return (
+        return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Failed to save file data"})),
-        )
-            .into_response();
+            "Failed to save file data",
+        );
     }
     if let Err(e) = tokio_file.sync_all().await {
         tracing::warn!("failed to sync temp file: {e}  id={request_id}");
-        return (
+        return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Failed to save file data"})),
-        )
-            .into_response();
+            "Failed to save file data",
+        );
     }
     drop(tokio_file);
 
     if file_size == 0 {
         tracing::warn!("bad request: empty file  id={request_id}");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Empty file"})),
-        )
-            .into_response();
+        return error_response(StatusCode::BAD_REQUEST, "Empty file");
     }
 
     tracing::info!(
@@ -763,20 +724,12 @@ pub(super) async fn analyze(
             Some(r) => Arc::clone(r),
             None => {
                 tracing::debug!("analyze rejected: resources not yet loaded  id={request_id}");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({"error": "Server starting up"})),
-                )
-                    .into_response();
+                return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server starting up");
             }
         },
         Err(e) => {
             tracing::error!("read lock poisoned: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response();
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
     };
 
@@ -791,13 +744,10 @@ pub(super) async fn analyze(
             max,
             "rejecting: at capacity"
         );
-        return (
+        return error_response(
             StatusCode::TOO_MANY_REQUESTS,
-            Json(
-                serde_json::json!({"error": format!("At capacity ({max}/{max} active analyses)")}),
-            ),
-        )
-            .into_response();
+            format!("At capacity ({max}/{max} active analyses)"),
+        );
     };
 
     let slow_rule_ms = state.slow_rule_ms;
@@ -908,11 +858,7 @@ pub(super) async fn analyze(
         }
         AnalysisOutcome::JoinError(e) => {
             tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response()
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
         }
         AnalysisOutcome::Timeout(secs) => {
             tracing::warn!(
@@ -957,13 +903,14 @@ pub(crate) fn classify_file(
     }
     let sample_extraction =
         extract_dir.map(|d| cleave::SampleExtractionConfig::new(d.to_path_buf()));
-    let opts = cleave::AnalysisOptions {
+    let mut opts = cleave::AnalysisOptions {
         slow_rule_ms,
         sample_extraction,
         cancellation: cancellation.cloned(),
         phase: phase.cloned(),
         ..Default::default()
     };
+    crate::engine::add_zip_passwords(&mut opts, resources.zip_passwords.as_slice());
     let report =
         cleave::analyze_file(path, &opts).with_context(|| format!("cleave analysis of {label}"))?;
     finish_classify(
@@ -998,12 +945,13 @@ pub(crate) fn classify_bytes(
     if let Some(p) = phase {
         p.set("cleave:init");
     }
-    let opts = cleave::AnalysisOptions {
+    let mut opts = cleave::AnalysisOptions {
         slow_rule_ms,
         cancellation: cancellation.cloned(),
         phase: phase.cloned(),
         ..Default::default()
     };
+    crate::engine::add_zip_passwords(&mut opts, resources.zip_passwords.as_slice());
     let report = cleave::analyze_bytes_shared(data, label, &opts)
         .with_context(|| format!("cleave analysis of {label}"))?;
     finish_classify(
@@ -1054,6 +1002,7 @@ fn finish_classify(
         // operator enabled it. `label` is a best-effort path for that hunt.
         std::path::Path::new(label),
         resources.fetch,
+        resources.zip_passwords.as_slice(),
         // Server output is the JSON envelope: no renders, no fetch log, no
         // manifest listing. Dependency results are captured only for callers
         // that renew results on hopper (worker, `serve --hopper`).
@@ -1143,30 +1092,18 @@ pub(super) async fn analyze_path(
     // Resolve symlinks and canonicalize BEFORE the allowed-dirs check to
     // prevent symlink-based path traversal (e.g., /allowed/link → /etc/shadow).
     let Ok(path) = raw_path.canonicalize() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "File not found"})),
-        )
-            .into_response();
+        return error_response(StatusCode::NOT_FOUND, "File not found");
     };
 
     // Validate the canonical (symlink-resolved) path is under an allowed directory.
     if state.allowed_dirs.is_empty() || !state.allowed_dirs.iter().any(|dir| path.starts_with(dir))
     {
         tracing::warn!(id = request_id, path = %req.path, canonical = %path.display(), "analyze-path rejected: not under allowed dirs");
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "Path not under allowed directories"})),
-        )
-            .into_response();
+        return error_response(StatusCode::FORBIDDEN, "Path not under allowed directories");
     }
 
     if !path.is_file() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "File not found"})),
-        )
-            .into_response();
+        return error_response(StatusCode::NOT_FOUND, "File not found");
     }
 
     // Check memory pressure.
@@ -1177,20 +1114,12 @@ pub(super) async fn analyze_path(
     // Ensure resources are loaded.
     let resources = {
         let Ok(guard) = state.resources.read() else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response();
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         };
         match guard.as_ref() {
             Some(r) => Arc::clone(r),
             None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({"error": "Server starting up"})),
-                )
-                    .into_response();
+                return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server starting up");
             }
         }
     };
@@ -1219,13 +1148,10 @@ pub(super) async fn analyze_path(
             max,
             "rejecting: at capacity"
         );
-        return (
+        return error_response(
             StatusCode::TOO_MANY_REQUESTS,
-            Json(
-                serde_json::json!({"error": format!("At capacity ({max}/{max} active analyses)")}),
-            ),
-        )
-            .into_response();
+            format!("At capacity ({max}/{max} active analyses)"),
+        );
     };
 
     let slow_rule_ms = state.slow_rule_ms;
@@ -1370,11 +1296,7 @@ pub(super) async fn analyze_path(
         }
         AnalysisOutcome::JoinError(e) => {
             tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Internal error"})),
-            )
-                .into_response()
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
         }
         AnalysisOutcome::Timeout(secs) => {
             tracing::warn!(
@@ -1466,13 +1388,10 @@ async fn check_memory_pressure(state: &AppState) -> Option<Response> {
         overloaded_secs,
         "server overloaded: high memory usage (even after cache clear)"
     );
-    Some(
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Server overloaded (memory)"})),
-        )
-            .into_response(),
-    )
+    Some(error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Server overloaded (memory)",
+    ))
 }
 
 /// GET /_/memory — memory diagnostics for all major structures.

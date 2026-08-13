@@ -8,6 +8,8 @@
 #     The entry is copied into the run jail, which has no resolver of its own.
 
 set -ex
+# FreeBSD /bin/sh supports pipefail; this deploy script only runs on FreeBSD.
+# shellcheck disable=SC3040
 set -o pipefail
 
 BUILD="${1:-build}"
@@ -23,14 +25,14 @@ log() {
 }
 
 install_missing_build_packages() {
-    missing=""
+    set --
     for pkg in rust git pkgconf mold gmake; do
         if ! doas bastille cmd "$BUILD" pkg info -e "$pkg" >/dev/null 2>&1; then
-            missing="$missing $pkg"
+            set -- "$@" "$pkg"
         fi
     done
-    if [ -n "$missing" ]; then
-        doas bastille pkg "$BUILD" install -y $missing
+    if [ "$#" -gt 0 ]; then
+        doas bastille pkg "$BUILD" install -y "$@"
     fi
 }
 

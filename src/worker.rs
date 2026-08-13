@@ -7,6 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
@@ -544,7 +545,7 @@ pub struct WorkerConfig {
     /// Worker name (defaults to hostname).
     pub name: String,
     /// Maximum concurrent analyses.
-    pub workers: usize,
+    pub workers: NonZeroUsize,
     /// Seconds to sleep when no work is available.
     pub poll_secs: u64,
     /// Maximum RSS in GB before pausing (0 = unlimited).
@@ -579,63 +580,60 @@ pub struct WorkerConfig {
     /// re-analyze the references it discovers. Reattached to each reloaded
     /// `ModelResources` so renewals preserve it.
     pub fetch: crate::fetch::FetchPolicy,
+    /// Additional passwords to try for encrypted archives.
+    pub zip_passwords: crate::ArchivePasswords,
 }
 
-fn load_model_resources(
-    model_dir: &Path,
-    thresholds: Option<Thresholds>,
-    level: Option<u16>,
-    interpret: Option<crate::interpret::InterpretConfig>,
-    fetch: crate::fetch::FetchPolicy,
-) -> Result<Arc<ModelResources>> {
-    let model = Model::load(model_dir, thresholds, level).context("loading model")?;
-    let shap = ShapImportance::load(model_dir).ok();
-    let ctx = ExtractContext::new(model.spec());
-    Ok(Arc::new(ModelResources {
-        model,
-        shap,
-        ctx,
-        interpret,
-        // Per-job scanning honors the worker's fetch policy (`SCAN_FETCH`). The
-        // fixed validate corpus never fetches — it runs through
-        // `crate::validate::run`, which builds its own offline resources.
-        fetch,
-    }))
-}
-
-fn validate_and_load_resources(
-    model_dir: &Path,
+/// Settings that must survive every model load and periodic renewal unchanged.
+#[derive(Debug)]
+struct ResourceConfig {
+    model_dir: PathBuf,
     thresholds: Option<Thresholds>,
     slow_rule_ms: u64,
     level: Option<u16>,
     interpret: Option<crate::interpret::InterpretConfig>,
     fetch: crate::fetch::FetchPolicy,
-) -> Result<Arc<ModelResources>> {
+    zip_passwords: crate::ArchivePasswords,
+}
+
+fn load_model_resources(config: &ResourceConfig) -> Result<Arc<ModelResources>> {
+    let model =
+        Model::load(&config.model_dir, config.thresholds, config.level).context("loading model")?;
+    let shap = ShapImportance::load(&config.model_dir).ok();
+    let ctx = ExtractContext::new(model.spec());
+    Ok(Arc::new(ModelResources {
+        model,
+        shap,
+        ctx,
+        interpret: config.interpret.clone(),
+        // Per-job scanning honors the worker's fetch policy (`SCAN_FETCH`). The
+        // fixed validate corpus never fetches — it runs through
+        // `crate::validate::run`, which builds its own offline resources.
+        fetch: config.fetch,
+        zip_passwords: config.zip_passwords.clone(),
+    }))
+}
+
+fn validate_and_load_resources(config: &ResourceConfig) -> Result<Arc<ModelResources>> {
     let validate_config = crate::ScanConfig::new(
-        model_dir,
+        &config.model_dir,
         crate::OutputFormat::Terminal,
-        thresholds,
+        config.thresholds,
         crate::DisplayFilter::alerts_only(),
-        slow_rule_ms,
+        config.slow_rule_ms,
         false,
     )?
-    .with_level(level);
+    .with_level(config.level)
+    .with_zip_passwords(config.zip_passwords.clone());
     crate::validate::run(&validate_config, false)?;
-    load_model_resources(model_dir, thresholds, level, interpret, fetch)
+    load_model_resources(config)
 }
 
 /// Pull upstream rules and, **only if something actually changed**, re-validate
 /// and reload the model bundle. Returns `Ok(None)` when both repos are already
 /// up to date — a silent no-op so the periodic renewal doesn't flood the log
 /// with a full validation pass every interval.
-fn renew_resources_once(
-    model_dir: &Path,
-    thresholds: Option<Thresholds>,
-    slow_rule_ms: u64,
-    level: Option<u16>,
-    interpret: Option<crate::interpret::InterpretConfig>,
-    fetch: crate::fetch::FetchPolicy,
-) -> Result<Option<Arc<ModelResources>>> {
+fn renew_resources_once(config: &ResourceConfig) -> Result<Option<Arc<ModelResources>>> {
     // model_update validates the freshly extracted bundle (Model::load) before
     // swapping it in, so a broken bundle never lands on disk — there's no
     // last-known-good state to roll back to. A combined-validation failure below
@@ -668,8 +666,7 @@ fn renew_resources_once(
         "rules changed; revalidating bundle"
     );
 
-    let resources =
-        validate_and_load_resources(model_dir, thresholds, slow_rule_ms, level, interpret, fetch)?;
+    let resources = validate_and_load_resources(config)?;
 
     let (traits, composites) = cleave::reload_capability_mapper()
         .map_err(|error| anyhow::anyhow!("reload cleave capability mapper: {error}"))?;
@@ -678,26 +675,9 @@ fn renew_resources_once(
     Ok(Some(resources))
 }
 
-fn current_resources(handle: &ResourceHandle) -> Result<Arc<ModelResources>> {
-    let guard = handle
-        .read()
-        .map_err(|error| anyhow::anyhow!("worker resources lock poisoned: {error}"))?;
-    Ok(Arc::clone(&guard))
-}
-
-// Mirrors the resource-loading parameter set (model location, thresholds,
-// level, interpret, fetch) plus the renewal handle/shutdown; threading them
-// individually keeps the call chain explicit rather than introducing a struct
-// used in exactly one place.
-#[allow(clippy::too_many_arguments)]
 fn spawn_resource_renewal_task(
     handle: ResourceHandle,
-    model_dir: PathBuf,
-    thresholds: Option<Thresholds>,
-    slow_rule_ms: u64,
-    level: Option<u16>,
-    interpret: Option<crate::interpret::InterpretConfig>,
-    fetch: crate::fetch::FetchPolicy,
+    config: Arc<ResourceConfig>,
     shutdown: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
@@ -711,19 +691,8 @@ fn spawn_resource_renewal_task(
                 interval_secs = RESOURCE_RENEWAL_INTERVAL.as_secs(),
                 "worker resource renewal check starting",
             );
-            let model_dir = model_dir.clone();
-            let interpret = interpret.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                renew_resources_once(
-                    &model_dir,
-                    thresholds,
-                    slow_rule_ms,
-                    level,
-                    interpret,
-                    fetch,
-                )
-            })
-            .await;
+            let config = Arc::clone(&config);
+            let result = tokio::task::spawn_blocking(move || renew_resources_once(&config)).await;
 
             let new_resources = match result {
                 Ok(Ok(Some(resources))) => resources,
@@ -829,15 +798,13 @@ async fn next_smallest_staged(
         .filter(|(_, (_, staged_at))| now.duration_since(*staged_at) >= max_wait)
         .min_by_key(|(_, (_, staged_at))| *staged_at)
         .map(|(i, _)| i);
-    #[allow(clippy::expect_used)]
-    let idx = aged.unwrap_or_else(|| {
+    let idx = aged.or_else(|| {
         reorder
             .iter()
             .enumerate()
             .min_by_key(|(_, (pj, _))| pj.job.size_bytes.max(0))
             .map(|(i, _)| i)
-            .expect("reorder window is non-empty")
-    });
+    })?;
     Some(reorder.swap_remove(idx).0)
 }
 
@@ -1037,7 +1004,7 @@ fn free_disk_bytes(_path: &Path) -> Option<u64> {
 }
 
 /// Why a prefetch did not produce bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PrefetchError {
     /// Download attempted and failed — `run_job` may retry via direct download.
     Transient(String),
@@ -1239,10 +1206,6 @@ struct WorkerMetrics {
     errors: Mutex<ErrorWindow>,
 }
 
-// Each method holds one of the metrics mutexes only for a trivial,
-// panic-free critical section; a poisoned lock means a prior holder panicked,
-// which is already unrecoverable, so propagating via expect is correct.
-#[allow(clippy::expect_used)]
 impl WorkerMetrics {
     fn new() -> Self {
         Self {
@@ -1264,7 +1227,7 @@ impl WorkerMetrics {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.enqueued
             .lock()
-            .expect("metrics mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(id, Instant::now());
         id
     }
@@ -1273,20 +1236,23 @@ impl WorkerMetrics {
     fn complete(&self, id: u64) {
         self.enqueued
             .lock()
-            .expect("metrics mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
-        *self.last_completion.lock().expect("metrics mutex poisoned") = Some(Instant::now());
+        *self
+            .last_completion
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
         let minute = self.minute();
         self.throughput
             .lock()
-            .expect("metrics mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .record(minute);
     }
 
     fn record_error(&self, msg: &str) {
         self.errors
             .lock()
-            .expect("metrics mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .record(msg, Instant::now());
     }
 
@@ -1294,22 +1260,22 @@ impl WorkerMetrics {
         let oldest_age = self
             .enqueued
             .lock()
-            .expect("metrics mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .values()
             .min()
             .map(Instant::elapsed);
         let last_completion_age = self
             .last_completion
             .lock()
-            .expect("metrics mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .map(|t| t.elapsed());
         let files_per_sec = self
             .throughput
             .lock()
-            .expect("metrics mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .per_sec(self.minute());
         let (errors_recent, last_error) = {
-            let mut errors = self.errors.lock().expect("metrics mutex poisoned");
+            let mut errors = self.errors.lock().unwrap_or_else(PoisonError::into_inner);
             errors.prune(Instant::now());
             let last = errors.last.as_ref().map(|(t, m)| (t.elapsed(), m.clone()));
             (errors.times.len(), last)
@@ -1330,7 +1296,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // Arc<str> so every per-job dispatch clones an atomic refcount rather than
     // reallocating the worker name for each `tokio::spawn`.
     let name: Arc<str> = Arc::from(config.name.as_str());
-    let slots = config.workers;
+    let slots = config.workers.get();
     // 120 s per request is long enough for cold cleave scans yet short enough
     // that a wedged hopper can't pin the worker indefinitely — without a
     // timeout the default is "no timeout", which defeats graceful shutdown.
@@ -1396,22 +1362,20 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // pool. See cleave::shared_resources::yara_engine for the contract.
     cleave::prefetch_shared_resources(true);
 
-    let resources = load_model_resources(
-        &config.model_dir,
-        config.thresholds,
-        config.level,
-        config.interpret.clone(),
-        config.fetch,
-    )?;
+    let resource_config = Arc::new(ResourceConfig {
+        model_dir: config.model_dir.clone(),
+        thresholds: config.thresholds,
+        slow_rule_ms: config.slow_rule_ms,
+        level: config.level,
+        interpret: config.interpret.clone(),
+        fetch: config.fetch,
+        zip_passwords: config.zip_passwords.clone(),
+    });
+    let resources = load_model_resources(&resource_config)?;
     let resources: ResourceHandle = Arc::new(RwLock::new(resources));
     spawn_resource_renewal_task(
         Arc::clone(&resources),
-        config.model_dir.clone(),
-        config.thresholds,
-        config.slow_rule_ms,
-        config.level,
-        config.interpret.clone(),
-        config.fetch,
+        resource_config,
         Arc::clone(&shutdown),
     );
 
@@ -1901,8 +1865,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         // Claim a worker slot, then take the next staged sample: work begins as
         // soon as both a free slot and a ready sample exist. An empty channel
         // means the prefetcher has exited (shutdown) — drain and stop.
-        let permit = semaphore
-            .clone()
+        let permit = Arc::clone(&semaphore)
             .acquire_owned()
             .await
             .context("semaphore closed")?;
@@ -1928,9 +1891,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         outstanding.fetch_sub(1, Ordering::Release);
 
         let client = client.clone();
-        let resources = match current_resources(&resources) {
-            Ok(resources) => resources,
+        let resources = match resources.read() {
+            Ok(resources) => Arc::clone(&resources),
             Err(error) => {
+                let error = anyhow::anyhow!("worker resources lock poisoned: {error}");
                 // Lock poisoned (a worker thread panicked). Report the job as
                 // failed so hopper reassigns it instead of waiting out the
                 // lease, then carry on.

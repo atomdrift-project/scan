@@ -257,13 +257,13 @@ impl Filter {
         if buf.get(0..4) != Some(&MAGIC) {
             return Err(LoadError::BadMagic);
         }
-        let version = rd_u16(buf, 4);
+        let version = u16::from_le_bytes([buf[4], buf[5]]);
         if version != FORMAT_VERSION {
             return Err(LoadError::UnsupportedVersion(version));
         }
         let kind = Kind::from_u8(buf[6]).ok_or(LoadError::Corrupt("kind"))?;
         let tier = Tier::from_u8(buf[7]).ok_or(LoadError::Corrupt("tier"))?;
-        let k = rd_u32(buf, 8);
+        let k = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let m_bits = rd_u64(buf, 12);
         let n = rd_u64(buf, 20);
         let seed = rd_u64(buf, 28);
@@ -409,16 +409,6 @@ const fn lane(d: &[u8; 32], i: usize) -> u64 {
         d[s + 6],
         d[s + 7],
     ])
-}
-
-fn rd_u16(b: &[u8], at: usize) -> u16 {
-    b.get(at..at + 2)
-        .map_or(0, |s| u16::from_le_bytes([s[0], s[1]]))
-}
-
-fn rd_u32(b: &[u8], at: usize) -> u32 {
-    b.get(at..at + 4)
-        .map_or(0, |s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 fn rd_u64(b: &[u8], at: usize) -> u64 {

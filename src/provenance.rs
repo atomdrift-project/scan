@@ -697,6 +697,7 @@ mod tests {
         assert_eq!(provenance.document().as_ptr(), ptr);
         let cloned = provenance.clone();
         assert_eq!(cloned.document().as_ptr(), ptr);
+        assert_eq!(provenance.document().as_ptr(), cloned.document().as_ptr());
     }
 
     #[test]

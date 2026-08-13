@@ -155,6 +155,8 @@ if ! command -v cargo >/dev/null 2>&1; then
     log "Installing Rust toolchain"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
         || die "rustup install failed"
+    # rustup creates this file at a runtime-dependent home path.
+    # shellcheck disable=SC1091
     . "$HOME/.cargo/env"
 fi
 

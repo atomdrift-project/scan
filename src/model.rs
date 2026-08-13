@@ -257,17 +257,6 @@ fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
     }
 }
 
-/// Look up the HOSTILE threshold at a specific level in a `severity_levels[]`
-/// table. Returns `None` when the level isn't present or its hostile metric
-/// has no threshold. Used as the building block for both the per-level
-/// hostile lookup and the suspicious-ceiling lookup.
-#[allow(clippy::cast_possible_truncation)]
-fn hostile_threshold_at_level(levels: &[SeverityLevel], level: u16) -> Option<f32> {
-    let entry = levels.iter().find(|entry| entry.level == level)?;
-    let hostile = entry.hostile?.threshold?;
-    Some(hostile as f32)
-}
-
 /// Largest level value present in a `severity_levels[]` table, or `None` when
 /// the table is empty. Used to clamp the suspicious lookup so we never
 /// ask for a level the bundle doesn't have.
@@ -297,7 +286,11 @@ fn thresholds_from_severity_levels(levels: &[SeverityLevel], level: u16) -> Opti
             // Already at the top of the grid; no looser row to pull from.
             hostile
         } else {
-            hostile_threshold_at_level(levels, suspicious_level).unwrap_or(hostile)
+            levels
+                .iter()
+                .find(|entry| entry.level == suspicious_level)
+                .and_then(|entry| entry.hostile?.threshold)
+                .map_or(hostile, |threshold| threshold as f32)
         }
     };
     // Suspicious cutoff sits ABOVE hostile only if the suspicious row's hostile is
@@ -668,7 +661,7 @@ pub enum ThresholdValidationError {
         /// Invalid threshold value.
         value: f32,
     },
-    /// The suspicious threshold was not strictly lower than the hostile threshold.
+    /// The suspicious threshold was greater than the hostile threshold.
     Misordered {
         /// Suspicious threshold value.
         suspicious: f32,
@@ -1042,8 +1035,9 @@ impl FastTreeBackend {
             anyhow::bail!("TreeEnsembleClassifier leaf class id exceeds class count");
         }
 
-        let mut base_values =
-            optional_attr_floats(node, "base_values").unwrap_or_else(|| vec![0.0; n_classes]);
+        let mut base_values = optional_onnx_attr(node, "base_values")
+            .map(|attr| attr.floats.clone())
+            .unwrap_or_else(|| vec![0.0; n_classes]);
         if base_values.is_empty() {
             base_values.resize(n_classes, 0.0);
         }
@@ -1215,10 +1209,6 @@ fn attr_floats_exact(
     Ok(values)
 }
 
-fn optional_attr_floats(node: &tract_onnx::pb::NodeProto, name: &str) -> Option<Vec<f32>> {
-    optional_onnx_attr(node, name).map(|attr| attr.floats.clone())
-}
-
 fn attr_strings_exact(
     node: &tract_onnx::pb::NodeProto,
     name: &str,
@@ -1377,44 +1367,39 @@ impl InnerModel {
 /// mismatches are rejected at load time.
 #[derive(Debug)]
 struct Backend {
-    /// At least one model; up to K for multi-seed bundles. K=1 is the default
-    /// and is byte-equivalent to the pre-multi-seed predict path.
-    models: Vec<InnerModel>,
+    first: InnerModel,
+    rest: Vec<InnerModel>,
 }
 
 impl Backend {
     fn num_features(&self) -> usize {
-        // Constructor enforces uniform num_features; pick member 0.
-        self.models[0].num_features()
+        self.first.num_features()
     }
 
     fn predict(&self, features: &[f32]) -> Result<f32> {
         // Average member predictions in f64 to keep the rounding noise-floor
         // below f32 precision even for K up to a few dozen seeds. The K=1
         // path is mathematically identical to a direct `models[0].predict`.
-        let sum = self
-            .models
-            .par_iter()
+        let sum = rayon::iter::once(&self.first)
+            .chain(self.rest.par_iter())
             .map(|m| m.predict(features).map(f64::from))
             .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))?;
-        // Safety: `models` is non-empty by construction. The narrowing cast
-        // is intentional — every member emits f32 probabilities and our caller
-        // surface is f32, so the f64 accumulator only exists to keep summation
-        // numerically stable across K members.
+        // Every member emits f32 probabilities; f64 only keeps ensemble
+        // summation stable before returning to the public f32 surface.
         #[allow(clippy::cast_possible_truncation)]
-        let avg = (sum / self.models.len() as f64) as f32;
+        let avg = (sum / self.n_members() as f64) as f32;
         Ok(avg)
     }
 
     fn kind(&self) -> &'static str {
-        self.models[0].kind()
+        self.first.kind()
     }
 
     /// Number of trained members (1 = legacy single-model bundle, ≥2 =
     /// multi-seed). Exposed mainly so the load-time `tracing::info!` line
     /// can advertise it.
     fn n_members(&self) -> usize {
-        self.models.len()
+        1 + self.rest.len()
     }
 }
 
@@ -2289,34 +2274,30 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
     // its wait semaphore — the intermittent multi-minute hang seen on `pkg`/`url`
     // scans. A bundle is at most a few small ONNX seeds, so serial loading costs
     // nothing measurable and removes the re-entrancy entirely.
-    let loaded: Vec<Result<(PathBuf, InnerModel)>> = model_paths
-        .into_iter()
-        .map(|path| load_inner_model(&path).map(|inner| (path, inner)))
-        .collect();
-
-    let mut models = Vec::with_capacity(loaded.len());
-    let mut first_n_features: Option<usize> = None;
-    for loaded_model in loaded {
-        let (path, inner) = loaded_model?;
+    let mut paths = model_paths.into_iter();
+    let Some(first_path) = paths.next() else {
+        anyhow::bail!("model bundle contains no loadable model")
+    };
+    let first = load_inner_model(&first_path)?;
+    let n_features = first.num_features();
+    let mut rest = Vec::with_capacity(paths.len());
+    for path in paths {
+        let inner = load_inner_model(&path)?;
         // Refuse to mix feature counts — averaging across heterogeneous
         // feature spaces would silently produce nonsense scores.
         let n = inner.num_features();
-        if let Some(prev) = first_n_features {
-            if prev != n {
-                anyhow::bail!(
-                    "model bundle has mismatched feature counts in {}: member {} expects {n} \
-                     features but earlier members expected {prev}",
-                    bundle_dir.display(),
-                    path.display(),
-                );
-            }
-        } else {
-            first_n_features = Some(n);
+        if n_features != n {
+            anyhow::bail!(
+                "model bundle has mismatched feature counts in {}: member {} expects {n} \
+                 features but earlier members expected {n_features}",
+                bundle_dir.display(),
+                path.display(),
+            );
         }
-        models.push(inner);
+        rest.push(inner);
     }
 
-    Ok(Backend { models })
+    Ok(Backend { first, rest })
 }
 
 /// Pick up every `seed_*.onnx` under a `models/` directory. Native
@@ -2562,7 +2543,7 @@ fn load_specialists(
                 continue;
             }
         };
-        out.insert_lazy(
+        out.lazy.insert(
             name.clone(),
             LazyRoute::new(path, name, category, route_t, calibrator),
         );
@@ -2728,10 +2709,6 @@ struct RouteStore {
 }
 
 impl RouteStore {
-    fn insert_lazy(&mut self, name: String, route: LazyRoute) {
-        self.lazy.insert(name, route);
-    }
-
     fn insert_skipped(&mut self, name: String) {
         self.skipped.insert(name);
     }

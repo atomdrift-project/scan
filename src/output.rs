@@ -254,15 +254,6 @@ fn indicator_colors(
     }
 }
 
-/// Two-block litmus confidence indicator.
-///
-/// The colors shift across the band itself, so threshold-adjacent results
-/// stay visually distinct from high-confidence results in the same class.
-fn confidence_blocks(probability: f32, classification: &Classification, threshold: f32) -> String {
-    let (left, right, _) = indicator_colors(probability, classification, threshold);
-    format!("{}{}", fg(left, BLOCK), fg(right, BLOCK))
-}
-
 /// Rescale raw model probability for display.
 ///
 /// `threshold` is the deciding cutoff (the value `raw` was compared against).
@@ -530,7 +521,11 @@ pub fn print_ps_result(
         eprint!("\r\x1b[2K");
     }
     let p = palette();
-    let blocks = confidence_blocks(result.probability, &result.classification, result.threshold);
+    // Shift both blocks across the verdict band so threshold-adjacent results
+    // remain distinct from high-confidence results in the same class.
+    let (left, right, _) =
+        indicator_colors(result.probability, &result.classification, result.threshold);
+    let blocks = format!("{}{}", fg(left, BLOCK), fg(right, BLOCK));
     let pct = colored_conf_or_pct(
         result.probability,
         &result.classification,

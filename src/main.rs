@@ -87,7 +87,7 @@ use clap::{Parser, Subcommand};
 use scan::OutputFormat;
 use scan::engine::DisplayFilter;
 use std::net::SocketAddr;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -449,7 +449,8 @@ impl Cli {
             api_key,
             min_prob: self.llm_min_prob,
             timeout: std::time::Duration::from_secs(self.llm_timeout),
-            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
+                .unwrap_or(NonZeroUsize::MIN),
         })
     }
 }
@@ -601,7 +602,7 @@ enum Commands {
         /// Maximum concurrent analyses (defaults to the physical
         /// performance-core count, min 2)
         #[arg(long)]
-        workers: Option<usize>,
+        workers: Option<NonZeroUsize>,
 
         /// Comma-separated CIDR networks (in addition to loopback) allowed to
         /// reach the server. /analyze-path is always restricted to loopback
@@ -653,7 +654,7 @@ enum Commands {
 
         /// Number of concurrent analysis slots
         #[arg(short = 'j', long)]
-        workers: Option<usize>,
+        workers: Option<NonZeroUsize>,
 
         /// Poll interval in seconds when no work is available
         #[arg(long, default_value = "2")]
@@ -1184,6 +1185,23 @@ fn main() -> Result<()> {
         all || cli.show.iter().any(|s| matches!(s, Show::Sus)),
         all || cli.show.iter().any(|s| matches!(s, Show::Benign)),
     );
+    let new_scan_config = |hopper| -> Result<scan::ScanConfig> {
+        let model_dir = resolve_model_dir()?;
+        let envelope_level = resolve_envelope_level(&model_dir);
+        Ok(scan::ScanConfig::new(
+            model_dir,
+            cli.format,
+            threshold_overrides(),
+            filter,
+            DEFAULT_SLOW_RULE_MS,
+            cli.extra,
+        )?
+        .with_level(envelope_level)
+        .with_interpret(interpret_cfg.clone())
+        .with_fetch(fetch_policy)
+        .with_zip_passwords(cli.zip_passwords.clone())
+        .with_hopper(hopper))
+    };
 
     match command {
         Commands::Path {
@@ -1191,22 +1209,7 @@ fn main() -> Result<()> {
             hopper,
             registry_map,
         } => {
-            let model_dir = resolve_model_dir()?;
-            let envelope_level = resolve_envelope_level(&model_dir);
-            let thresholds = threshold_overrides();
-            let mut config = scan::ScanConfig::new(
-                model_dir,
-                cli.format,
-                thresholds,
-                filter,
-                DEFAULT_SLOW_RULE_MS,
-                cli.extra,
-            )?
-            .with_level(envelope_level)
-            .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy)
-            .with_zip_passwords(cli.zip_passwords.clone())
-            .with_hopper(hopper);
+            let mut config = new_scan_config(hopper)?;
             // Per-file SHA-256 known-good/known-bad short-circuit (explicit file
             // args only; directories are walked by cleave). Slow mode / workers skip it.
             if effective_mode != scan::Mode::Slow {
@@ -1231,39 +1234,11 @@ fn main() -> Result<()> {
             exit_for_summary(&run_scan_paths(&paths, &config, registry_map.as_ref())?);
         }
         Commands::Sys => {
-            let model_dir = resolve_model_dir()?;
-            let envelope_level = resolve_envelope_level(&model_dir);
-            let thresholds = threshold_overrides();
-            let config = scan::ScanConfig::new(
-                model_dir,
-                cli.format,
-                thresholds,
-                filter,
-                DEFAULT_SLOW_RULE_MS,
-                cli.extra,
-            )?
-            .with_level(envelope_level)
-            .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy)
-            .with_zip_passwords(cli.zip_passwords.clone());
+            let config = new_scan_config(None)?;
             exit_for_summary(&scan::sys::run(&config)?);
         }
         Commands::Ps => {
-            let model_dir = resolve_model_dir()?;
-            let envelope_level = resolve_envelope_level(&model_dir);
-            let thresholds = threshold_overrides();
-            let mut config = scan::ScanConfig::new(
-                model_dir,
-                cli.format,
-                thresholds,
-                filter,
-                DEFAULT_SLOW_RULE_MS,
-                cli.extra,
-            )?
-            .with_level(envelope_level)
-            .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy)
-            .with_zip_passwords(cli.zip_passwords.clone());
+            let mut config = new_scan_config(None)?;
             // Per-binary known-good/known-bad short-circuit (by executable sha256).
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
@@ -1271,41 +1246,11 @@ fn main() -> Result<()> {
             exit_for_summary(&scan::ps::run(&config)?);
         }
         Commands::Url { url, hopper } => {
-            let model_dir = resolve_model_dir()?;
-            let envelope_level = resolve_envelope_level(&model_dir);
-            let thresholds = threshold_overrides();
-            let config = scan::ScanConfig::new(
-                model_dir,
-                cli.format,
-                thresholds,
-                filter,
-                DEFAULT_SLOW_RULE_MS,
-                cli.extra,
-            )?
-            .with_level(envelope_level)
-            .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy)
-            .with_zip_passwords(cli.zip_passwords.clone())
-            .with_hopper(hopper);
+            let config = new_scan_config(hopper)?;
             exit_for_summary(&scan::pkg::run_url(&url, &config)?);
         }
         Commands::Purl { purl, hopper } => {
-            let model_dir = resolve_model_dir()?;
-            let envelope_level = resolve_envelope_level(&model_dir);
-            let thresholds = threshold_overrides();
-            let mut config = scan::ScanConfig::new(
-                model_dir,
-                cli.format,
-                thresholds,
-                filter,
-                DEFAULT_SLOW_RULE_MS,
-                cli.extra,
-            )?
-            .with_level(envelope_level)
-            .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy)
-            .with_zip_passwords(cli.zip_passwords.clone())
-            .with_hopper(hopper);
+            let mut config = new_scan_config(hopper)?;
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
             }
@@ -1337,7 +1282,7 @@ fn main() -> Result<()> {
                     p.canonicalize().unwrap_or(p)
                 })
                 .collect();
-            let workers = workers.unwrap_or_else(default_workers);
+            let workers = workers.unwrap_or_else(default_workers).get();
             let allow_cidrs = match allow_cidr {
                 Some(s) => scan::server::parse_cidr_list(&s)
                     .map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?,
@@ -1363,6 +1308,7 @@ fn main() -> Result<()> {
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy)
+            .with_zip_passwords(cli.zip_passwords.clone())
             .with_hopper(hopper.clone())
             .with_analysis_timeout(analysis_timeout);
             if let Some(url) = hopper.as_deref() {
@@ -1425,7 +1371,8 @@ fn main() -> Result<()> {
                 DEFAULT_SLOW_RULE_MS,
                 cli.extra,
             )?
-            .with_level(envelope_level);
+            .with_level(envelope_level)
+            .with_zip_passwords(cli.zip_passwords.clone());
             scan::validate::run(&config, skip_traits)?;
         }
         Commands::Worker {
@@ -1464,10 +1411,10 @@ fn main() -> Result<()> {
             let raw_max_rss_gb = max_rss_gb;
             let max_rss_gb = resolve_worker_max_rss_gb(raw_max_rss_gb);
             log_worker_startup_diagnostics(&WorkerStartupDiagnostics {
-                argv: std::env::args().collect(),
+                argv: redact_zip_passwords(std::env::args()),
                 hopper_url: &url,
                 name: &name,
-                workers,
+                workers: workers.get(),
                 poll_secs,
                 raw_max_rss_gb,
                 resolved_max_rss_gb: max_rss_gb,
@@ -1515,7 +1462,8 @@ fn main() -> Result<()> {
                     DEFAULT_SLOW_RULE_MS,
                     cli.extra,
                 )?
-                .with_level(envelope_level);
+                .with_level(envelope_level)
+                .with_zip_passwords(cli.zip_passwords.clone());
                 if let Err(e) = scan::validate::run(&validate_config, false) {
                     eprintln!("Worker startup validation failed: {e:#}");
                     process::exit(1);
@@ -1542,6 +1490,7 @@ fn main() -> Result<()> {
                 exit_if_empty,
                 interpret: interpret_cfg.clone(),
                 fetch: worker_fetch_policy,
+                zip_passwords: cli.zip_passwords.clone().into(),
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1711,9 +1660,9 @@ fn git_head(dir: &Path) -> Option<(String, i64)> {
 /// this is the performance-core count via `hw.perflevel0.physicalcpu`).
 /// Platforms where `sysmem` has no physical-core signal fall back to half
 /// the logical CPUs — identical to the physical count on 2-way SMT.
-fn default_workers() -> usize {
+fn default_workers() -> NonZeroUsize {
     if let Some(cores) = cleave::memory_tracker::physical_cpu_count() {
-        return std::cmp::max(2, cores);
+        return NonZeroUsize::new(std::cmp::max(2, cores)).unwrap_or(NonZeroUsize::MIN);
     }
     let cores = cleave::memory_tracker::cpu_count().unwrap_or_else(|| {
         tracing::warn!(
@@ -1722,7 +1671,7 @@ fn default_workers() -> usize {
         );
         4
     });
-    std::cmp::max(2, cores / 2)
+    NonZeroUsize::new(std::cmp::max(2, cores / 2)).unwrap_or(NonZeroUsize::MIN)
 }
 
 struct WorkerStartupDiagnostics<'a> {
@@ -1737,6 +1686,24 @@ struct WorkerStartupDiagnostics<'a> {
     max_jobs: Option<u64>,
     traits_dir: Option<&'a Path>,
     nice: i32,
+}
+
+fn redact_zip_passwords(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut args = args.into_iter();
+    let mut redacted = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == "--zip-password" {
+            redacted.push(arg);
+            if args.next().is_some() {
+                redacted.push("<redacted>".to_string());
+            }
+        } else if arg.starts_with("--zip-password=") {
+            redacted.push("--zip-password=<redacted>".to_string());
+        } else {
+            redacted.push(arg);
+        }
+    }
+    redacted
 }
 
 fn log_worker_startup_diagnostics(d: &WorkerStartupDiagnostics<'_>) {
@@ -1954,21 +1921,12 @@ impl MaxRssPolicy {
     }
 }
 
-/// Auto-resolve the worker RSS ceiling: 85% of cleave's shared memory detector,
-/// which is cgroup-aware on Linux and falls back to 16 GiB only when no memory
-/// signal is available. The fraction scales with the host, so it makes sense
-/// from a 16 GB Mac mini up to a 1 TB workstation; slot count scales with cores
-/// in parallel (`default_workers`), so the larger ceiling on a big host is what
-/// actually lets those extra slots run concurrently.
-fn auto_worker_max_rss_gb() -> u64 {
-    let total_bytes = worker_memory_basis().bytes;
-    std::cmp::max(1, (total_bytes * 85 / 100) / GIB)
-}
-
 fn resolve_worker_max_rss_gb(raw_max_rss_gb: i64) -> u64 {
     match MaxRssPolicy::from_cli(raw_max_rss_gb) {
         MaxRssPolicy::Disabled => 0,
-        MaxRssPolicy::Auto => auto_worker_max_rss_gb(),
+        // 85% of the cgroup-aware memory basis, with a one-GiB floor. Slot
+        // count scales with cores, so larger hosts need a proportionate ceiling.
+        MaxRssPolicy::Auto => std::cmp::max(1, (worker_memory_basis().bytes * 85 / 100) / GIB),
         MaxRssPolicy::Explicit(gb) => gb.get(),
     }
 }
@@ -2034,8 +1992,8 @@ fn run_scan_paths(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        Cli, Commands, GIB, MaxRssPolicy, default_cli_fetch_policy, resolve_process_max_rss_bytes,
-        resolve_worker_max_rss_gb,
+        Cli, Commands, GIB, MaxRssPolicy, default_cli_fetch_policy, redact_zip_passwords,
+        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
@@ -2317,6 +2275,62 @@ mod tests {
     fn gzip_long_aliases_are_not_accepted() {
         assert!(Cli::try_parse_from(["scan", "--fast", "/tmp/a"]).is_err());
         assert!(Cli::try_parse_from(["scan", "--best", "/tmp/a"]).is_err());
+    }
+
+    #[test]
+    fn worker_diagnostics_redact_archive_passwords() {
+        let args = [
+            "atomscan",
+            "worker",
+            "--zip-password",
+            "secret one",
+            "--zip-password=secret-two",
+            "--verbose",
+        ]
+        .map(str::to_string);
+
+        assert_eq!(
+            redact_zip_passwords(args),
+            [
+                "atomscan",
+                "worker",
+                "--zip-password",
+                "<redacted>",
+                "--zip-password=<redacted>",
+                "--verbose",
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_password_flag_is_repeatable_and_global() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "atomscan",
+            "path",
+            "/tmp/a",
+            "--zip-password",
+            "one",
+            "--zip-password=two",
+        ])?;
+
+        assert_eq!(cli.zip_passwords, ["one", "two"]);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrency_flags_reject_zero() {
+        assert!(Cli::try_parse_from(["atomscan", "serve", "--workers", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "atomscan",
+                "worker",
+                "--url",
+                "http://hopper",
+                "--workers",
+                "0",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

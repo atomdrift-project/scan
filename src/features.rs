@@ -1995,10 +1995,6 @@ impl ParsedReport {
 }
 
 impl FileSummary {
-    // Wired into `classify_report` by N2 step 4, which is what actually
-    // removes the JSON DOM; until then this is exercised only by
-    // `reader_equivalence_tests`.
-    #[allow(dead_code)]
     /// Build a summary from the **typed** compact report instead of a
     /// `serde_json::Value` tree — the read that lets `classify_report` skip
     /// materializing a multi-GB DOM (MEMORY_EXPERIMENTS.md, N2).
@@ -2127,7 +2123,6 @@ impl FileSummary {
 }
 
 /// Serialize a typed facts list into the JSON shape the symbol features read.
-#[allow(dead_code)] // see FileSummary::from_compact
 fn to_value_vec<T: serde::Serialize>(items: &[T]) -> Vec<serde_json::Value> {
     items
         .iter()

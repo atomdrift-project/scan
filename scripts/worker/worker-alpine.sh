@@ -17,9 +17,6 @@ URL="$1"
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
-worker_args="worker --url $URL --interpret"
-[ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
-
 BINARY=atomscan
 BIN_DIR="$HOME/bin"
 LOG="$HOME/.local/share/atomdrift/scan/scan-worker.log"
@@ -27,18 +24,21 @@ LOG="$HOME/.local/share/atomdrift/scan/scan-worker.log"
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=scripts/worker/lib/cron.sh
+. "$SCRIPT_DIR/lib/cron.sh"
+
 log "Enabling testing repository"
 grep -q 'edge/testing' /etc/apk/repositories 2>/dev/null || \
     echo 'https://dl-cdn.alpinelinux.org/alpine/edge/testing' | doas tee -a /etc/apk/repositories
 
 log "Installing dependencies"
-pkgs_needed=""
+set --
 for pkg in rustup git 7zip upx rizin innoextract gcc g++ musl-dev; do
-    apk info -e "$pkg" >/dev/null 2>&1 || pkgs_needed="$pkgs_needed $pkg"
+    apk info -e "$pkg" >/dev/null 2>&1 || set -- "$@" "$pkg"
 done
-if [ -n "$pkgs_needed" ]; then
-    # shellcheck disable=SC2086
-    doas apk add --no-cache $pkgs_needed
+if [ "$#" -gt 0 ]; then
+    doas apk add --no-cache "$@"
 else
     log "All packages already installed"
 fi
@@ -48,6 +48,8 @@ if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
     /usr/bin/rustup-init -y --no-modify-path || die "rustup-init failed"
 fi
 "$HOME/.cargo/bin/rustup" update stable || die "rustup update failed"
+# rustup creates this file at a runtime-dependent home path.
+# shellcheck disable=SC1091
 . "$HOME/.cargo/env"
 
 log "Building"
@@ -63,14 +65,29 @@ if ! cmp -s "target/release/$BINARY" "$BIN_DIR/$BINARY" 2>/dev/null; then
 fi
 
 log "Installing cron entry"
-cron_cmd="* * * * * pgrep -af 'atomscan worker' >/dev/null 2>&1 || SCAN_LLM=$LLM nohup $BIN_DIR/$BINARY $worker_args < /dev/null >> $LOG 2>&1 &"
+cron_url=$(scan_shell_quote "$URL") || die "URL cannot contain a newline"
+cron_llm=$(scan_shell_quote "$LLM") || die "LLM URL cannot contain a newline"
+cron_binary=$(scan_shell_quote "$BIN_DIR/$BINARY") || die "binary path cannot contain a newline"
+cron_log=$(scan_shell_quote "$LOG") || die "log path cannot contain a newline"
+cron_args="worker --url $cron_url --interpret"
+if [ -n "$WORKERS" ]; then
+    cron_workers=$(scan_shell_quote "$WORKERS") || die "worker count cannot contain a newline"
+    cron_args="$cron_args --workers $cron_workers"
+fi
+cron_cmd="* * * * * pgrep -af 'atomscan worker' >/dev/null 2>&1 || SCAN_LLM=$cron_llm nohup $cron_binary $cron_args < /dev/null >> $cron_log 2>&1 &"
 (crontab -l 2>/dev/null | grep -v "atomscan worker" || true; echo "$cron_cmd") | crontab -
 
 if [ "$restart_needed" -eq 1 ]; then
     log "Restarting atomscan worker"
     pkill -f "atomscan worker" 2>/dev/null || true
     sleep 1
-    SCAN_LLM="$LLM" nohup "$BIN_DIR/$BINARY" $worker_args < /dev/null >> "$LOG" 2>&1 &
+    if [ -n "$WORKERS" ]; then
+        SCAN_LLM="$LLM" nohup "$BIN_DIR/$BINARY" worker --url "$URL" --interpret \
+            --workers "$WORKERS" < /dev/null >> "$LOG" 2>&1 &
+    else
+        SCAN_LLM="$LLM" nohup "$BIN_DIR/$BINARY" worker --url "$URL" --interpret \
+            < /dev/null >> "$LOG" 2>&1 &
+    fi
 else
     log "Binary unchanged, skipping restart"
 fi

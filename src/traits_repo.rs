@@ -6,7 +6,7 @@
 //! update-rules` does. No git.
 
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Make cleave use an already-installed traits directory instead of attempting
 /// to fetch during resource initialization.
@@ -23,30 +23,19 @@ pub fn prepare_runtime_env() {
     {
         return;
     }
-    if let Some(path) = existing_traits_dir() {
+    let default = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("cleave")
+        .join("traits");
+    if let Some(path) = [PathBuf::from("traits"), default].into_iter().find(|path| {
+        path.is_dir()
+            && (path.join("objectives").is_dir()
+                || path.join("micro-behaviors").is_dir()
+                || path.join("metadata").is_dir())
+    }) {
         tracing::debug!(path = %path.display(), "using existing cleave traits directory");
         cleave::traits_repo::set_override_dir(Some(path));
     }
-}
-
-fn existing_traits_dir() -> Option<PathBuf> {
-    [PathBuf::from("traits"), default_traits_dir()]
-        .into_iter()
-        .find(|path| looks_like_traits_dir(path))
-}
-
-fn default_traits_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("cleave")
-        .join("traits")
-}
-
-fn looks_like_traits_dir(path: &Path) -> bool {
-    path.is_dir()
-        && (path.join("objectives").is_dir()
-            || path.join("micro-behaviors").is_dir()
-            || path.join("metadata").is_dir())
 }
 
 /// Install or refresh cleave traits from the R2 bundle, the same path
