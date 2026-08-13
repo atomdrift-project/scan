@@ -693,6 +693,7 @@ pub(crate) fn orchestrate(
     policy: FetchPolicy,
     progress: bool,
     capture_deps: bool,
+    zip_passwords: &[String],
 ) -> (
     Vec<FetchRecord>,
     Vec<FetchedDependency>,
@@ -710,10 +711,11 @@ pub(crate) fn orchestrate(
     // re-disassembled; and memoize the whole analysis by content sha, so a warm
     // re-run reuses it rather than repeating a minutes-long pass.
     cleave::set_compact_member_retention(true); // compact projection only
-    let opts = AnalysisOptions {
+    let mut opts = AnalysisOptions {
         skip_predicate: dep_skip_predicate(),
         ..AnalysisOptions::default()
     };
+    crate::engine::add_zip_passwords(&mut opts, zip_passwords);
     // Opened lazily on the first payload actually analyzed. Opening it derives
     // the ruleset-version namespace, which calls `cleave::version_info` — and that
     // spins up the YARA engine just to count rules. A scan that fetches nothing

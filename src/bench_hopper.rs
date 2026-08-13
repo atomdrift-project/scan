@@ -921,7 +921,7 @@ mod tests {
         );
 
         // Same seed → same permutation; different seed → (here) a different one.
-        let (mut s1, mut s2, mut s3) = (base.clone(), base.clone(), base.clone());
+        let (mut s1, mut s2, mut s3) = (base.clone(), base.clone(), base);
         order_jobs(&mut s1, Order::Shuffle(1));
         order_jobs(&mut s2, Order::Shuffle(1));
         order_jobs(&mut s3, Order::Shuffle(2));

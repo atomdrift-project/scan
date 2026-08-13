@@ -162,7 +162,8 @@ fn current_models_dir() -> PathBuf {
 /// containing the required artifacts) or a legacy single-bundle (artifacts
 /// at the root). See `model.rs` for the loader-side details.
 fn has_models(path: &Path) -> bool {
-    has_ensemble_layout(path) || has_single_bundle_layout(path)
+    let general = path.join("general");
+    (general.is_dir() && has_single_bundle_layout(&general)) || has_single_bundle_layout(path)
 }
 
 fn has_single_bundle_layout(path: &Path) -> bool {
@@ -187,11 +188,6 @@ fn has_model_artifact(path: &Path) -> bool {
         };
         name.starts_with("seed_") && path.extension().and_then(|ext| ext.to_str()) == Some("onnx")
     })
-}
-
-fn has_ensemble_layout(path: &Path) -> bool {
-    let general = path.join("general");
-    general.is_dir() && has_single_bundle_layout(&general)
 }
 
 #[cfg(test)]

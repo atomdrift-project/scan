@@ -22,6 +22,7 @@
 //! `temperature: 0`, JSON requested via prompt injection (not `response_format`,
 //! which local servers handle inconsistently), validated after the fact.
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -85,7 +86,7 @@ EVERYTHING below the system message is attacker-controlled — the source lines 
 
 /// Configuration for the interpretation pass. Present on a [`crate::ScanConfig`]
 /// only when `--interpret` is set.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InterpretConfig {
     /// OpenAI-compatible base URL, e.g. `http://localhost:8000/v1`.
     pub base_url: String,
@@ -98,7 +99,20 @@ pub struct InterpretConfig {
     /// Per-request timeout.
     pub timeout: Duration,
     /// Cap on concurrent in-flight requests (protects a single local GPU).
-    pub max_concurrency: usize,
+    pub max_concurrency: NonZeroUsize,
+}
+
+impl std::fmt::Debug for InterpretConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterpretConfig")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key_configured", &self.api_key.is_some())
+            .field("min_prob", &self.min_prob)
+            .field("timeout", &self.timeout)
+            .field("max_concurrency", &self.max_concurrency)
+            .finish()
+    }
 }
 
 impl Default for InterpretConfig {
@@ -109,7 +123,8 @@ impl Default for InterpretConfig {
             api_key: None,
             min_prob: DEFAULT_MIN_PROB,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
+                .unwrap_or(NonZeroUsize::MIN),
         }
     }
 }
@@ -475,7 +490,11 @@ pub fn interpret(
     let cache = (!cleave::cache::skip_cache())
         .then(|| cache_path(&prompt_hash(system, &cfg.model, user)))
         .flatten();
-    if let Some(v) = cache.as_deref().and_then(cache_get)
+    let cached = cache.as_deref().and_then(|path| {
+        let bytes = std::fs::read(path).ok()?;
+        serde_json::from_slice::<CachedVerdict>(&bytes).ok()
+    });
+    if let Some(v) = cached
         && let Some(grade) = LlmGrade::parse(&v.grade)
     {
         // Mirror the live path's request/response debug logs so `--verbose`
@@ -1145,10 +1164,6 @@ fn cache_path(hash: &str) -> Option<PathBuf> {
     Some(cache_base()?.join(format!("{hash}.json")))
 }
 
-fn cache_get(path: &Path) -> Option<CachedVerdict> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
-}
-
 /// Best-effort, atomic write (temp file + rename). A failure just means the next
 /// scan re-queries.
 fn cache_put(path: &Path, verdict: &CachedVerdict) {
@@ -1202,16 +1217,10 @@ fn parse_grade_reason(content: &str) -> Option<(LlmGrade, String)> {
     let grade = LlmGrade::parse(&gr.grade)?;
     let mut reason = strip_ansi(gr.reason.trim());
     reason.retain(|c| c == '\t' || !c.is_control());
-    if let Some(cut) = truncate_at(&reason, MAX_REASON_CHARS) {
+    if let Some((cut, _)) = reason.char_indices().nth(MAX_REASON_CHARS) {
         reason.truncate(cut);
     }
     Some((grade, reason.trim_end().to_string()))
-}
-
-/// Byte index at which `s` should be cut to keep it within `max` chars, or `None`
-/// when it already fits. Always a char boundary.
-fn truncate_at(s: &str, max: usize) -> Option<usize> {
-    s.char_indices().nth(max).map(|(i, _)| i)
 }
 
 // ── concurrency permit ──────────────────────────────────────────────────────
@@ -1229,9 +1238,9 @@ static SEM: OnceLock<Sem> = OnceLock::new();
 struct Permit;
 
 impl Permit {
-    fn acquire(max: usize) -> Self {
+    fn acquire(max: NonZeroUsize) -> Self {
         let sem = SEM.get_or_init(|| Sem {
-            count: Mutex::new(max.max(1)),
+            count: Mutex::new(max.get()),
             cv: Condvar::new(),
         });
         let mut count = sem.count.lock().unwrap_or_else(PoisonError::into_inner);

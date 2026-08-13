@@ -59,10 +59,6 @@ const ARCHIVE_ESTIMATE_MULTIPLIER: u64 = 64;
 /// even if no release wakes us).
 const REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
-fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok()?.parse().ok()
-}
-
 /// Live memory usage in bytes toward the ceiling, or `None` when no source is
 /// readable. Prefers the system-wide figure (`total − MemAvailable`) where the
 /// platform exposes live availability (Linux), so the gate respects pressure
@@ -174,7 +170,9 @@ impl MemoryAdmission {
     /// auto = 85% of RAM); `0` disables proactive throttling so an operator who
     /// opts out, or an unsupported platform, degrades to slot-limited dispatch.
     pub fn new(ceiling_bytes: u64) -> Arc<Self> {
-        let fixed_est_bytes = env_u64("SCAN_PER_SLOT_ESTIMATE_MB")
+        let fixed_est_bytes = std::env::var("SCAN_PER_SLOT_ESTIMATE_MB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
             .and_then(|mb| mb.checked_mul(1024 * 1024))
             .filter(|b| *b > 0);
 
@@ -228,10 +226,9 @@ impl MemoryAdmission {
     /// heartbeat so hopper can renew these claims' leases: a multi-hour scan
     /// must not have its claim expire and be re-issued to another worker.
     pub fn in_flight_shas(&self) -> Vec<Arc<str>> {
-        #[allow(clippy::expect_used)]
         self.inflight
             .lock()
-            .expect("admission registry mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|j| Arc::clone(&j.sha256))
             .collect()
@@ -247,7 +244,9 @@ impl MemoryAdmission {
     ) -> AdmissionGuard {
         let started = Instant::now();
         let mut paused = false;
-        let est = self.estimate_bytes(&path, &file_type, on_disk_bytes);
+        let est = self
+            .fixed_est_bytes
+            .unwrap_or_else(|| dynamic_estimate_bytes(&path, &file_type, on_disk_bytes));
 
         loop {
             if self.try_reserve(est) {
@@ -278,15 +277,6 @@ impl MemoryAdmission {
                 () = tokio::time::sleep(REPOLL_INTERVAL) => {}
             }
         }
-    }
-
-    /// Estimate a job's peak footprint for predictive admission. Operators can
-    /// force the historical flat estimate with `SCAN_PER_SLOT_ESTIMATE_MB`.
-    fn estimate_bytes(&self, path: &str, file_type: &str, on_disk_bytes: i64) -> u64 {
-        if let Some(est) = self.fixed_est_bytes {
-            return est;
-        }
-        dynamic_estimate_bytes(path, file_type, on_disk_bytes)
     }
 
     /// Reserve one job if memory allows. Gated on committed reservations and on
@@ -341,10 +331,9 @@ impl MemoryAdmission {
         est_bytes: u64,
     ) -> AdmissionGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        #[allow(clippy::expect_used)]
         self.inflight
             .lock()
-            .expect("admission registry mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(Inflight {
                 id,
                 sha256,
@@ -363,10 +352,9 @@ impl MemoryAdmission {
 
     fn release(&self, id: u64, est: u64) {
         self.reserved.fetch_sub(est, Ordering::AcqRel);
-        #[allow(clippy::expect_used)]
         self.inflight
             .lock()
-            .expect("admission registry mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|j| j.id != id);
         self.released.notify_waiters();
     }
@@ -375,12 +363,11 @@ impl MemoryAdmission {
     /// reserved vs ceiling vs live usage, then one line per in-flight analysis
     /// (oldest first).
     pub fn log_inflight(&self, reason: &str) {
-        #[allow(clippy::expect_used)]
         let mut jobs: Vec<_> = {
             let guard = self
                 .inflight
                 .lock()
-                .expect("admission registry mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard
                 .iter()
                 .map(|j| {

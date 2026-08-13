@@ -64,6 +64,8 @@ pub struct ServerConfig {
     /// parent and members — is renewed on hopper's `/api/result`. `None` disables
     /// upload, leaving the server a pure analyze service.
     hopper: Option<String>,
+    /// Additional passwords to try for encrypted archives.
+    zip_passwords: crate::ArchivePasswords,
 }
 
 /// Default per-request analysis timeout: 20 minutes. Covers cold cleave scans
@@ -147,6 +149,7 @@ impl ServerConfig {
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
+            zip_passwords: crate::ArchivePasswords::default(),
         })
     }
 
@@ -155,6 +158,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_hopper(mut self, hopper: Option<String>) -> Self {
         self.hopper = hopper.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Add passwords to try when cleave encounters encrypted archives.
+    #[must_use]
+    pub fn with_zip_passwords(mut self, passwords: impl Into<crate::ArchivePasswords>) -> Self {
+        self.zip_passwords = passwords.into();
         self
     }
 
@@ -381,6 +391,25 @@ mod config_tests {
         .with_level(Some(5));
         assert_eq!(config.level(), Some(5));
     }
+
+    #[test]
+    fn server_config_keeps_archive_passwords() {
+        let config = ServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], 8081)),
+            100 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+            "/tmp/models",
+            None,
+            4_000,
+            vec![],
+            None,
+            2,
+            vec![],
+        )
+        .expect("valid config")
+        .with_zip_passwords(vec!["private".to_string()]);
+        assert_eq!(config.zip_passwords.as_slice(), ["private"]);
+    }
 }
 
 #[derive(Debug)]
@@ -444,6 +473,8 @@ pub(crate) struct ModelResources {
     pub(crate) interpret: Option<crate::interpret::InterpretConfig>,
     /// External-reference fetch policy; default (empty) disables fetching.
     pub(crate) fetch: crate::fetch::FetchPolicy,
+    /// Additional passwords to try for encrypted archives.
+    pub(crate) zip_passwords: crate::ArchivePasswords,
 }
 
 #[derive(Debug)]
@@ -463,6 +494,8 @@ struct AppState {
     interpret: Option<crate::interpret::InterpretConfig>,
     /// External-reference fetch policy; shared into every [`ModelResources`].
     fetch: crate::fetch::FetchPolicy,
+    /// Additional passwords to try for encrypted archives.
+    zip_passwords: crate::ArchivePasswords,
     /// Process uptime anchor — captured when build_app runs, very close to
     /// process start. /_/health reports `now - started_at` as uptime_secs.
     started_at: Instant,
@@ -533,6 +566,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         allow_cidrs: config.allow_cidrs().to_vec(),
         interpret: config.interpret().cloned(),
         fetch: config.fetch(),
+        zip_passwords: config.zip_passwords.clone(),
         started_at: Instant::now(),
         ready: AtomicBool::new(false),
         init_error: RwLock::new(None),
@@ -643,6 +677,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                                 ctx,
                                 interpret: bg.interpret.clone(),
                                 fetch: bg.fetch,
+                                zip_passwords: bg.zip_passwords.clone(),
                             }));
                             if let Ok(mut init_error) = bg.init_error.write() {
                                 *init_error = None;

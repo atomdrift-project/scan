@@ -90,12 +90,6 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read the notice cache, returning `None` on any error (treated as "no cache").
-fn read_cache() -> Option<Cache> {
-    let text = std::fs::read_to_string(cache_path()?).ok()?;
-    toml::from_str(&text).ok()
-}
-
 /// Persist the notice cache (best-effort; failures are non-fatal).
 fn write_cache(cache: &Cache) {
     let Some(path) = cache_path() else { return };
@@ -132,7 +126,10 @@ pub fn maybe_notify(disabled_by_flag: bool) {
         return;
     }
     let installed = env!("CARGO_PKG_VERSION");
-    let cached = read_cache();
+    // Any read or parse error is equivalent to a missing cache.
+    let cached = cache_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<Cache>(&text).ok());
 
     // A fresh stamp (a recent success *or* a recent failed attempt) is used
     // without any network access.

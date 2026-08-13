@@ -68,6 +68,44 @@ pub use engine::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
 pub use model::Classification;
 pub use model::Thresholds;
 
+/// Archive passwords kept unique and redacted from debug output.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ArchivePasswords(std::sync::Arc<[String]>);
+
+impl ArchivePasswords {
+    /// Borrow the passwords in command-line order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl From<Vec<String>> for ArchivePasswords {
+    fn from(passwords: Vec<String>) -> Self {
+        let mut unique = Vec::with_capacity(passwords.len());
+        for password in passwords {
+            if !unique.contains(&password) {
+                unique.push(password);
+            }
+        }
+        Self(unique.into())
+    }
+}
+
+impl AsRef<[String]> for ArchivePasswords {
+    fn as_ref(&self) -> &[String] {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for ArchivePasswords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchivePasswords")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
 /// Convert a [`std::time::Duration`] to milliseconds as `u64`, saturating at [`u64::MAX`].
 ///
 /// Avoids the `u128 as u64` truncating cast that `as_millis()` requires.
@@ -104,7 +142,7 @@ pub(crate) fn system_load_avg() -> Option<f64> {
 }
 
 /// Output format for scan results.
-#[derive(Debug, Clone, Copy, Default, PartialEq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
     /// Human-readable terminal output.
     #[default]
@@ -139,4 +177,24 @@ pub enum Mode {
     /// No bloom lookups — every artifact is fully scanned. Always used by
     /// long-lived workers, where each job must be analyzed on its own merits.
     Slow,
+}
+
+#[cfg(test)]
+mod archive_password_tests {
+    use super::ArchivePasswords;
+
+    #[test]
+    fn passwords_are_unique_and_debug_is_redacted() {
+        let passwords = ArchivePasswords::from(vec![
+            "secret".to_string(),
+            "second".to_string(),
+            "secret".to_string(),
+        ]);
+
+        assert_eq!(passwords.as_slice(), ["secret", "second"]);
+        let debug = format!("{passwords:?}");
+        assert!(debug.contains("count: 2"));
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("second"));
+    }
 }

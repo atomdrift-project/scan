@@ -199,11 +199,12 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         ctrlc_flag.store(true, Ordering::Relaxed);
     });
     cleave::set_compact_member_retention(true); // compact projection only
-    let cleave_opts = cleave::AnalysisOptions {
+    let mut cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
         ..Default::default()
     };
+    crate::engine::add_zip_passwords(&mut cleave_opts, config.zip_passwords());
     let stdout = Mutex::new(std::io::stdout());
 
     let progress = if is_terminal && total > 1 {
@@ -406,6 +407,7 @@ fn build_result(
         config.interpret(),
         display_path,
         config.fetch_policy(),
+        config.zip_passwords(),
         crate::engine::OutputNeeds {
             // Matching scan's `--format interpret`: the live LLM query's user
             // message, byte-for-byte, without the system prompt.

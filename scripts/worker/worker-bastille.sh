@@ -3,6 +3,8 @@
 # Usage: ./worker-bastille.sh [build-jail] [run-jail] <hopper-url>
 
 set -ex
+# FreeBSD /bin/sh supports pipefail; this deploy script only runs on FreeBSD.
+# shellcheck disable=SC3040
 set -o pipefail
 
 BUILD="${1:-build}"
@@ -20,18 +22,19 @@ log() { echo "==> $*"; }
 
 # Shared rc.d service definition (also used by the native worker-freebsd.sh).
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=scripts/worker/lib/freebsd-rcd.sh
 . "$SCRIPT_DIR/lib/freebsd-rcd.sh"
 worker_args=$(scan_worker_args "$URL" "$WORKERS")
 
 install_missing_build_packages() {
-    missing=""
+    set --
     for pkg in rust git pkgconf mold gmake; do
         if ! doas bastille cmd "$BUILD" pkg info -e "$pkg" >/dev/null 2>&1; then
-            missing="$missing $pkg"
+            set -- "$@" "$pkg"
         fi
     done
-    if [ -n "$missing" ]; then
-        doas bastille pkg "$BUILD" install -y $missing
+    if [ "$#" -gt 0 ]; then
+        doas bastille pkg "$BUILD" install -y "$@"
     fi
 }
 

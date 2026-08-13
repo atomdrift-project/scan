@@ -91,17 +91,18 @@ pub struct ScanConfig {
     interpret: Option<crate::interpret::InterpretConfig>,
     fetch: crate::fetch::FetchPolicy,
     hopper: Option<String>,
-    zip_passwords: Vec<String>,
+    zip_passwords: crate::ArchivePasswords,
     mode: crate::Mode,
     bloom: Option<Arc<Lookup>>,
 }
 
-fn add_configured_zip_passwords(
-    options: &mut cleave::AnalysisOptions,
-    config: &ScanConfig,
-) {
-    for password in &config.zip_passwords {
-        if !options.zip_passwords.iter().any(|existing| existing == password) {
+pub(crate) fn add_zip_passwords(options: &mut cleave::AnalysisOptions, passwords: &[String]) {
+    for password in passwords {
+        if !options
+            .zip_passwords
+            .iter()
+            .any(|existing| existing == password)
+        {
             options.zip_passwords.push(password.clone());
         }
     }
@@ -155,7 +156,7 @@ impl ScanConfig {
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
-            zip_passwords: Vec::new(),
+            zip_passwords: crate::ArchivePasswords::default(),
             // Bloom short-circuiting is opt-in via `with_bloom`; an unconfigured
             // config runs a full scan (slow mode), so server/fs paths are unaffected.
             mode: crate::Mode::Slow,
@@ -176,9 +177,15 @@ impl ScanConfig {
     /// Add passwords to try when cleave encounters encrypted archives.
     /// Cleave's built-in common sample passwords remain enabled.
     #[must_use]
-    pub fn with_zip_passwords(mut self, passwords: Vec<String>) -> Self {
-        self.zip_passwords = passwords;
+    pub fn with_zip_passwords(mut self, passwords: impl Into<crate::ArchivePasswords>) -> Self {
+        self.zip_passwords = passwords.into();
         self
+    }
+
+    /// Additional archive passwords supplied by the caller.
+    #[must_use]
+    pub(crate) fn zip_passwords(&self) -> &[String] {
+        self.zip_passwords.as_slice()
     }
 
     /// Hopper base URL to renew results on, or `None` when uploading is disabled.
@@ -502,6 +509,34 @@ mod config_tests {
         .expect("valid config")
         .with_level(Some(7));
         assert_eq!(config.level(), Some(7));
+    }
+
+    #[test]
+    fn archive_passwords_extend_defaults_without_duplicates() {
+        let mut options = cleave::AnalysisOptions::default();
+        let default_password = options.zip_passwords[0].clone();
+
+        add_zip_passwords(
+            &mut options,
+            &[default_password.clone(), "private".into(), "private".into()],
+        );
+
+        assert_eq!(
+            options
+                .zip_passwords
+                .iter()
+                .filter(|password| *password == &default_password)
+                .count(),
+            1
+        );
+        assert_eq!(
+            options
+                .zip_passwords
+                .iter()
+                .filter(|password| password.as_str() == "private")
+                .count(),
+            1
+        );
     }
 }
 
@@ -1876,7 +1911,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
         skip_predicate: bloom_skip_predicate(config),
         ..Default::default()
     };
-    add_configured_zip_passwords(&mut cleave_opts, config);
+    add_zip_passwords(&mut cleave_opts, config.zip_passwords());
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
     let scan_start = Instant::now();
 
@@ -1996,7 +2031,7 @@ pub fn run_bytes(
         skip_predicate: bloom_skip_predicate(config),
         ..Default::default()
     };
-    add_configured_zip_passwords(&mut cleave_opts, config);
+    add_zip_passwords(&mut cleave_opts, config.zip_passwords());
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
     let scan_start = Instant::now();
     let tally = Tally::default();
@@ -2320,11 +2355,12 @@ pub(crate) fn upload_scan_result(
     dependency_results: Vec<DepResult>,
     envelope: ScanResultEnvelope,
 ) {
+    static COLLECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let artifacts = collect_upload_artifacts(
         file_path,
         &sha256,
         size_bytes,
-        upload_collector(),
+        COLLECTOR.get_or_init(|| format!("scan+{}", crate::upload::default_worker_name())),
         root_provenance,
         root_fetch,
     );
@@ -2551,14 +2587,6 @@ pub(crate) fn dep_envelope(
         llm: None,
         raw,
     })
-}
-
-/// The `fetch.collector` identity stamped on every sidecar this process uploads,
-/// computed once. Mirrors hopper's collector convention (`forager+<id>`,
-/// `prism`) so a sample's origin is legible.
-fn upload_collector() -> &'static str {
-    static COLLECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    COLLECTOR.get_or_init(|| format!("scan+{}", crate::upload::default_worker_name()))
 }
 
 /// The scanned file itself, offered to hopper so a `--upload` run can store a
@@ -2900,7 +2928,7 @@ pub fn run_paths(
         skip_predicate: bloom_skip_predicate(config),
         ..Default::default()
     };
-    add_configured_zip_passwords(&mut cleave_opts, config);
+    add_zip_passwords(&mut cleave_opts, config.zip_passwords());
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
     let scan_start = Instant::now();
 
@@ -3467,6 +3495,7 @@ pub(crate) fn classify_report(
     interpret: Option<&crate::interpret::InterpretConfig>,
     root_path: &Path,
     fetch: crate::fetch::FetchPolicy,
+    zip_passwords: &[String],
     needs: OutputNeeds,
     // The root artifact's own registry metadata, for the one-shot `pkg:`/`url`
     // path. `None` for ordinary scans. Grafted as a child `registry` node (so it
@@ -3549,6 +3578,7 @@ pub(crate) fn classify_report(
         fetch,
         fetch_progress,
         need_dep_results,
+        zip_passwords,
     );
     let fetch_ms = crate::duration_ms(fetch_start.elapsed());
     if let Some(p) = phase {
@@ -3980,7 +4010,7 @@ pub(crate) fn classify_report(
         // `--format interpret`: byte-for-byte the user message the live
         // `--interpret` query sends (built above) — the sanitized render,
         // annotations included — just without the system prompt.
-        llm_ctx.clone().unwrap_or_default()
+        llm_ctx.unwrap_or_default()
     } else if tiny_opts.header == cleave::output::HeaderStyle::Rich {
         let registry_ids: std::collections::HashSet<u32> =
             dependency_registries.iter().map(|r| r.file_id).collect();
@@ -4686,7 +4716,9 @@ fn render_registry_provenance(
 ) -> serde_json::Value {
     let registry = &provenance.record;
     let mut out = serde_json::Map::new();
-    out.insert("record".to_string(), sparse_registry_record(registry));
+    let mut record = serde_json::to_value(registry).unwrap_or(serde_json::Value::Null);
+    remove_empty_json(&mut record);
+    out.insert("record".to_string(), record);
     if let Some(raw) = provenance.raw() {
         out.insert(
             "raw".to_string(),
@@ -4694,12 +4726,6 @@ fn render_registry_provenance(
         );
     }
     serde_json::Value::Object(out)
-}
-
-fn sparse_registry_record(registry: &fletch::Registry) -> serde_json::Value {
-    let mut value = serde_json::to_value(registry).unwrap_or(serde_json::Value::Null);
-    remove_empty_json(&mut value);
-    value
 }
 
 fn remove_empty_json(value: &mut serde_json::Value) {
@@ -5544,7 +5570,7 @@ mod dependency_grading_tests {
             version: "model-9".to_string(),
             analyzed_at: "2026-06-28T00:00:00Z".to_string(),
             cleave: Some(serde_json::from_str(&raw).expect("report parses")),
-            embedded_files: dep.members.clone(),
+            embedded_files: dep.members,
             ..crate::engine::envelope_tests::base_result()
         };
         let direct_env = direct.to_envelope();
@@ -5607,8 +5633,25 @@ mod dependency_grading_tests {
                 .collect::<Vec<_>>(),
         }))
         .unwrap();
+<<<<<<< HEAD
         let entries: Vec<&cleave::types::CompactFile> = embedded_entries(&report).collect();
+||||||| parent of 2232ebc (code cleanup)
+        let entries: Vec<&cleave::types::CompactFile> = report
+            .files
+            .iter()
+            .filter(|f| f.depth > 0)
+            .take(EMBEDDED_FILE_LIMIT)
+            .collect();
+=======
+        let entries = report
+            .files
+            .iter()
+            .filter(|f| f.depth > 0)
+            .take(EMBEDDED_FILE_LIMIT)
+            .count();
+>>>>>>> 2232ebc (code cleanup)
         assert_eq!(
+<<<<<<< HEAD
             entries.len(),
             count,
             "every embedded node must be selected regardless of its position",
@@ -5616,6 +5659,14 @@ mod dependency_grading_tests {
         assert_eq!(
             usize::try_from(entries.last().expect("tail member").id).unwrap(),
             count
+||||||| parent of 2232ebc (code cleanup)
+            entries.len(),
+            EMBEDDED_FILE_LIMIT,
+            "a dependency grades its own members up to its own limit",
+=======
+            entries, EMBEDDED_FILE_LIMIT,
+            "a dependency grades its own members up to its own limit",
+>>>>>>> 2232ebc (code cleanup)
         );
     }
 }
@@ -6419,6 +6470,7 @@ pub(crate) fn process_report(
         config.interpret(),
         path,
         config.fetch_policy(),
+        config.zip_passwords(),
         OutputNeeds {
             llm_view: matches!(config.format(), OutputFormat::Interpret),
             // The live fetch log renders only on the interactive terminal path;
@@ -6549,7 +6601,7 @@ pub fn scan_bytes(
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
     };
-    add_configured_zip_passwords(&mut cleave_opts, config);
+    add_zip_passwords(&mut cleave_opts, config.zip_passwords());
     let report = cleave::analyze_bytes_owned(data, filename, &cleave_opts)
         .with_context(|| format!("cleave analysis of {filename}"))?;
     process_report(
@@ -6594,7 +6646,7 @@ pub fn scan_file(
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
     };
-    add_configured_zip_passwords(&mut cleave_opts, config);
+    add_zip_passwords(&mut cleave_opts, config.zip_passwords());
     let report = cleave::analyze_file(read_path, &cleave_opts)
         .with_context(|| format!("cleave analysis of {filename}"))?;
     process_report(

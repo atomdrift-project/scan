@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Json, Response};
 use super::AppState;
 
 /// A single CIDR network parsed from `--allow-cidr`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
     network: IpAddr,
     prefix_len: u8,

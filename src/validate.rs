@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::engine::{self, ClassifiedReport, EmbeddedFile, ScanConfig};
+use crate::engine::{self, ClassifiedReport, ScanConfig};
 use crate::features::ExtractContext;
 use crate::model::{Classification, Model, Thresholds};
 
@@ -77,13 +77,14 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     // the whole cleave fixture tree.
     cleave::cache::set_skip_cache_override(Some(false));
     cleave::set_compact_member_retention(true); // compact projection only
-    let options = cleave::AnalysisOptions {
+    let mut options = cleave::AnalysisOptions {
         disable_yara: true,
         disable_radare2: true,
         disable_upx: true,
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
     };
+    crate::engine::add_zip_passwords(&mut options, config.zip_passwords());
     let mapper = Arc::new(cleave::CapabilityMapper::try_new_with_load_options(
         cleave::CapabilityMapper::DEFAULT_MIN_HOSTILE_PRECISION,
         cleave::CapabilityMapper::DEFAULT_MIN_SUSPICIOUS_PRECISION,
@@ -117,6 +118,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         None, // validation corpus never calls the LLM
                         &path,
                         crate::fetch::FetchPolicy::default(),
+                        config.zip_passwords(),
                         // Validation consumes ML verdicts only — no renders,
                         // no manifest listing, no dependency uploads.
                         engine::OutputNeeds::default(),
@@ -293,7 +295,9 @@ fn evaluate(
                 thresholds.suspicious,
                 thresholds.hostile,
             );
-            print_top_findings(&result.top_findings, "  ");
+            for finding in &result.top_findings {
+                eprintln!("  l{} {}  {}", finding.crit, finding.id, finding.desc);
+            }
         }
         for embedded in result.embedded_files.values() {
             if embedded.classification != Classification::Benign {
@@ -311,7 +315,9 @@ fn evaluate(
                     thresholds.suspicious,
                     thresholds.hostile,
                 );
-                print_embedded_findings(embedded, "  ");
+                for finding in &embedded.top_findings {
+                    eprintln!("  l{} {}  {}", finding.crit, finding.id, finding.desc);
+                }
             }
         }
 
@@ -364,18 +370,6 @@ fn format_level(level: Option<i32>) -> String {
         Some(-1) => "clean".to_string(),
         Some(n) => format!("L{n}"),
         None => "manual".to_string(),
-    }
-}
-
-fn print_top_findings(findings: &[engine::TopFinding], indent: &str) {
-    for finding in findings {
-        eprintln!("{indent}l{} {}  {}", finding.crit, finding.id, finding.desc);
-    }
-}
-
-fn print_embedded_findings(file: &EmbeddedFile, indent: &str) {
-    for finding in &file.top_findings {
-        eprintln!("{indent}l{} {}  {}", finding.crit, finding.id, finding.desc);
     }
 }
 
