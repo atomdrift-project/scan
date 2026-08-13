@@ -1103,6 +1103,12 @@ jobs:
     timeout-minutes: 150
     permissions:
       contents: read
+    # Like freebsd/cross: an exotic target that fails to build must not block the
+    # release. Only `native` (macOS + Linux, arm64/x86-64) is release-blocking;
+    # everything else ships when it can and is reported missing by publish's
+    # inventory otherwise. Keeps a Windows-ARM64 link regression from stranding
+    # the whole release, as it did for v2.6.0.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
