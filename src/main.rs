@@ -229,6 +229,11 @@ struct Cli {
     #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
     llm_timeout: u64,
 
+    /// Additional passwords to try for encrypted ZIP/7z archives. Repeat the
+    /// option to provide more than one; cleave's common defaults remain active.
+    #[arg(long = "zip-password", value_name = "PASSWORD", global = true)]
+    zip_passwords: Vec<String>,
+
     /// [EXPERIMENTAL] Fetch the external references discovered in analyzed
     /// files, re-analyze each payload, and fold it into the verdict. A
     /// comma-separated selection of what to fetch, by how strongly the reference
@@ -1200,6 +1205,7 @@ fn main() -> Result<()> {
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy)
+            .with_zip_passwords(cli.zip_passwords.clone())
             .with_hopper(hopper);
             // Per-file SHA-256 known-good/known-bad short-circuit (explicit file
             // args only; directories are walked by cleave). Slow mode / workers skip it.
@@ -1238,7 +1244,8 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy);
+            .with_fetch(fetch_policy)
+            .with_zip_passwords(cli.zip_passwords.clone());
             exit_for_summary(&scan::sys::run(&config)?);
         }
         Commands::Ps => {
@@ -1255,7 +1262,8 @@ fn main() -> Result<()> {
             )?
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy);
+            .with_fetch(fetch_policy)
+            .with_zip_passwords(cli.zip_passwords.clone());
             // Per-binary known-good/known-bad short-circuit (by executable sha256).
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
@@ -1277,6 +1285,7 @@ fn main() -> Result<()> {
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy)
+            .with_zip_passwords(cli.zip_passwords.clone())
             .with_hopper(hopper);
             exit_for_summary(&scan::pkg::run_url(&url, &config)?);
         }
@@ -1295,6 +1304,7 @@ fn main() -> Result<()> {
             .with_level(envelope_level)
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy)
+            .with_zip_passwords(cli.zip_passwords.clone())
             .with_hopper(hopper);
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());

@@ -91,8 +91,20 @@ pub struct ScanConfig {
     interpret: Option<crate::interpret::InterpretConfig>,
     fetch: crate::fetch::FetchPolicy,
     hopper: Option<String>,
+    zip_passwords: Vec<String>,
     mode: crate::Mode,
     bloom: Option<Arc<Lookup>>,
+}
+
+fn add_configured_zip_passwords(
+    options: &mut cleave::AnalysisOptions,
+    config: &ScanConfig,
+) {
+    for password in &config.zip_passwords {
+        if !options.zip_passwords.iter().any(|existing| existing == password) {
+            options.zip_passwords.push(password.clone());
+        }
+    }
 }
 
 impl ScanConfig {
@@ -143,6 +155,7 @@ impl ScanConfig {
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
+            zip_passwords: Vec::new(),
             // Bloom short-circuiting is opt-in via `with_bloom`; an unconfigured
             // config runs a full scan (slow mode), so server/fs paths are unaffected.
             mode: crate::Mode::Slow,
@@ -157,6 +170,14 @@ impl ScanConfig {
     #[must_use]
     pub fn with_hopper(mut self, url: Option<String>) -> Self {
         self.hopper = url;
+        self
+    }
+
+    /// Add passwords to try when cleave encounters encrypted archives.
+    /// Cleave's built-in common sample passwords remain enabled.
+    #[must_use]
+    pub fn with_zip_passwords(mut self, passwords: Vec<String>) -> Self {
+        self.zip_passwords = passwords;
         self
     }
 
@@ -1849,12 +1870,13 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     // scan consumes only the compact projection of member nodes; let cleave
     // drop fold-time fields that exist solely for the full v3 schema.
     cleave::set_compact_member_retention(true);
-    let cleave_opts = cleave::AnalysisOptions {
+    let mut cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
         skip_predicate: bloom_skip_predicate(config),
         ..Default::default()
     };
+    add_configured_zip_passwords(&mut cleave_opts, config);
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
     let scan_start = Instant::now();
 
@@ -1969,11 +1991,12 @@ pub fn run_bytes(
     // when the package locator was not in the filter. `record_file_result` emits
     // the verdict from the minimal report cleave returns on a skip.
     cleave::set_compact_member_retention(true); // compact projection only
-    let cleave_opts = cleave::AnalysisOptions {
+    let mut cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         skip_predicate: bloom_skip_predicate(config),
         ..Default::default()
     };
+    add_configured_zip_passwords(&mut cleave_opts, config);
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
     let scan_start = Instant::now();
     let tally = Tally::default();
@@ -2871,12 +2894,13 @@ pub fn run_paths(
     });
 
     cleave::set_compact_member_retention(true); // compact projection only
-    let cleave_opts = cleave::AnalysisOptions {
+    let mut cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
         skip_predicate: bloom_skip_predicate(config),
         ..Default::default()
     };
+    add_configured_zip_passwords(&mut cleave_opts, config);
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
     let scan_start = Instant::now();
 
@@ -6521,10 +6545,11 @@ pub fn scan_bytes(
     prefetch_cleave_resources();
 
     cleave::set_compact_member_retention(true); // compact projection only
-    let cleave_opts = cleave::AnalysisOptions {
+    let mut cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
     };
+    add_configured_zip_passwords(&mut cleave_opts, config);
     let report = cleave::analyze_bytes_owned(data, filename, &cleave_opts)
         .with_context(|| format!("cleave analysis of {filename}"))?;
     process_report(
@@ -6565,10 +6590,11 @@ pub fn scan_file(
     prefetch_cleave_resources();
 
     cleave::set_compact_member_retention(true); // compact projection only
-    let cleave_opts = cleave::AnalysisOptions {
+    let mut cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
     };
+    add_configured_zip_passwords(&mut cleave_opts, config);
     let report = cleave::analyze_file(read_path, &cleave_opts)
         .with_context(|| format!("cleave analysis of {filename}"))?;
     process_report(
