@@ -449,7 +449,18 @@ pub fn interpret(
     // disagreement is exactly where a second opinion pays off, and it is how an
     // ML-blind packed binary (prob ≈ 0 yet flagged by cleave) still reaches the
     // LLM. Truly-clean files (no elevated finding, low ML prob) still skip.
-    if ml_prob < cfg.min_prob && !has_elevated_finding(context) {
+    //
+    // The verdict class is a third admission on its own: a container whose
+    // hostile call came from a member elevation carries the member's class but
+    // its own raw probability, which can sit far below the floor (windows-
+    // bindgen: class hostile at level 0, prob 9e-6, and — post trait-repair —
+    // no elevated finding left in the render). Gating that out publishes a
+    // hostile verdict with no interpretation and no error trace; anything the
+    // scan itself calls non-benign must reach the LLM.
+    if ml_prob < cfg.min_prob
+        && !has_elevated_finding(context)
+        && matches!(ml_class, Classification::Benign)
+    {
         return None;
     }
     // Everything that bounds how far the LLM's opinion may move the verdict,
