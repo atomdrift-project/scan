@@ -509,6 +509,107 @@ pub(crate) fn terminal_artifact_line(
     }
 }
 
+/// A dim subtitle sitting under an archive banner: ` 8 hostile · 1 suspicious
+/// inside` — the tally of independently-scanned packages the archive carried,
+/// so the headline verdict is grounded in a count before the per-package cards
+/// spell each one out. Empty when nothing notable was found inside.
+pub(crate) fn terminal_inside_summary(hostile: usize, suspicious: usize, clean: usize) -> String {
+    let mut parts = Vec::new();
+    if hostile > 0 {
+        parts.push((format!("{hostile} hostile"), Classification::Hostile));
+    }
+    if suspicious > 0 {
+        parts.push((format!("{suspicious} suspicious"), Classification::Suspicious));
+    }
+    if clean > 0 {
+        parts.push((format!("{clean} clean"), Classification::Benign));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
+        let p = palette();
+        let body = parts
+            .iter()
+            .map(|(text, class)| fg(class_color(class), text))
+            .collect::<Vec<_>>()
+            .join(&format!(" {} ", fg(p.very_dim, "\u{00b7}")));
+        format!(" {body} {}", fg(p.dim, "inside"))
+    } else {
+        let body = parts
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" \u{00b7} ");
+        format!(" {body} inside")
+    }
+}
+
+/// Frame one independently-scanned package nested inside an archive as a
+/// bordered card: a verdict stamp + name header opening a left rule that runs
+/// down the package's own findings, so a grab-bag archive reads as a stack of
+/// distinct verdicts rather than one flat member list. `why` is an optional
+/// one-line summary shown dim beneath the header; `body` is cleave's rendered
+/// context for the package's files. Plain (piped) mode drops the border and
+/// indents two spaces, keeping every line grep-able.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn terminal_card(
+    classification: &Classification,
+    probability: f32,
+    threshold: f32,
+    level: Option<i32>,
+    name: &str,
+    file_type: &str,
+    size: u64,
+    why: Option<&str>,
+    body: &str,
+) -> String {
+    let (stamp, _) = terminal_badge(classification, probability, threshold, level);
+    let mut meta = file_type.to_uppercase();
+    let size = human_size(size);
+    if !size.is_empty() {
+        meta.push_str(&format!(" \u{00b7} {size}"));
+    }
+    let mut out = String::new();
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
+        let p = palette();
+        let accent = class_color(classification);
+        let bar = fg(accent, "\u{2502}"); // │
+        out.push_str(&format!(
+            "{} {stamp} {} {}\n",
+            fg(accent, "\u{256d}\u{2500}"), // ╭─
+            fg_bold(p.path_name, name),
+            fg(p.dim, &format!("\u{00b7} {meta}")),
+        ));
+        if let Some(why) = why.filter(|w| !w.is_empty()) {
+            out.push_str(&format!("{bar} {}\n", fg(p.reason, why)));
+        }
+        for line in body.lines() {
+            if line.is_empty() {
+                out.push_str(&bar);
+                out.push('\n');
+            } else {
+                out.push_str(&format!("{bar} {line}\n"));
+            }
+        }
+        out.push_str(&fg(accent, "\u{2570}\u{2500}")); // ╰─
+        out.push('\n');
+    } else {
+        out.push_str(&format!("{stamp} {name} \u{00b7} {meta}\n"));
+        if let Some(why) = why.filter(|w| !w.is_empty()) {
+            out.push_str(&format!("  {why}\n"));
+        }
+        for line in body.lines() {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
+    }
+    out
+}
+
 /// Print a process scan result with PID annotations.
 pub fn print_ps_result(
     result: &ScanResult,

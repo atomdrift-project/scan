@@ -102,6 +102,23 @@ struct State {
     drawn: usize,
     cols: usize,
     rows: usize,
+    /// Distinct manifest basenames the announced references were declared in
+    /// (`package.json`, `requirements.txt`, …), so the header can name what the
+    /// dependencies are being read from. A set: one manifest kind shows by name,
+    /// several collapse to a count.
+    sources: std::collections::BTreeSet<String>,
+}
+
+impl State {
+    /// The header's `from …` clause: the single manifest kind by name, or a
+    /// count when references span several. Empty when no source was noted.
+    fn source_label(&self) -> String {
+        match self.sources.len() {
+            0 => String::new(),
+            1 => self.sources.iter().next().cloned().unwrap_or_default(),
+            n => format!("{n} manifests"),
+        }
+    }
 }
 
 impl State {
@@ -156,6 +173,7 @@ impl DepTree {
                 drawn: 0,
                 cols,
                 rows,
+                sources: std::collections::BTreeSet::new(),
             }),
             tick: AtomicU32::new(0),
             stopped: AtomicBool::new(false),
@@ -177,6 +195,16 @@ impl DepTree {
                 }
             });
         Some(DepTree { inner })
+    }
+
+    /// Note the manifest a batch of references was declared in, so the header
+    /// can name it. Empty paths (a synthetic or unknown source) are ignored.
+    pub(crate) fn note_source(&self, manifest: &str) {
+        if manifest.is_empty() {
+            return;
+        }
+        let mut state = self.lock();
+        state.sources.insert(manifest.to_string());
     }
 
     /// Register a dependency as pending, keyed by its locator. A key already
@@ -343,7 +371,14 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
     let namew = widest.clamp(8, name_cap);
 
     let mut lines = Vec::with_capacity(cap);
-    lines.push(header(done, total, active, finished, state.cols));
+    lines.push(header(
+        done,
+        total,
+        active,
+        finished,
+        &state.source_label(),
+        state.cols,
+    ));
     let body = cap - 1;
 
     if total <= body {
@@ -394,13 +429,25 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
 
 /// The region's header: an arrow (or a check, once finished), the running
 /// `done/total` count, and how many references are in flight right now.
-fn header(done: usize, total: usize, active: usize, finished: bool, cols: usize) -> String {
+fn header(
+    done: usize,
+    total: usize,
+    active: usize,
+    finished: bool,
+    source: &str,
+    cols: usize,
+) -> String {
     let (glyph, r, g, b) = if finished {
         ('\u{2713}', 80, 200, 80)
     } else {
         ('\u{2b07}', 100, 180, 255)
     };
-    let mut text = format!("dependencies  {done}/{total}");
+    let from = if source.is_empty() {
+        String::new()
+    } else {
+        format!(" from {source}")
+    };
+    let mut text = format!("dependencies{from}  {done}/{total}");
     if active > 0 {
         text.push_str(&format!("  \u{b7}  {active} in flight"));
     }
@@ -507,7 +554,7 @@ fn clip(line: &str, visible: usize, cols: usize) -> String {
 }
 
 /// Drop ANSI SGR escapes from a line, leaving its visible text.
-fn strip_ansi(line: &str) -> String {
+pub(crate) fn strip_ansi(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
@@ -544,6 +591,7 @@ mod tests {
             drawn: 0,
             cols: 100,
             rows,
+            sources: std::collections::BTreeSet::new(),
         }
     }
 
@@ -582,6 +630,29 @@ mod tests {
         // header + 3 entries, no footer.
         assert_eq!(lines.len(), 4);
         assert!(strip_ansi(&lines[0]).contains("1/3"));
+    }
+
+    #[test]
+    fn header_names_a_single_source_manifest() {
+        let mut s = state(vec![done("a"), pending("b")], 40);
+        s.sources.insert("package.json".to_string());
+        assert!(strip_ansi(&compose(&s, 0, false)[0]).contains("dependencies from package.json"));
+    }
+
+    #[test]
+    fn header_counts_several_source_manifests() {
+        let mut s = state(vec![done("a"), pending("b")], 40);
+        s.sources.insert("package.json".to_string());
+        s.sources.insert("requirements.txt".to_string());
+        assert!(strip_ansi(&compose(&s, 0, false)[0]).contains("from 2 manifests"));
+    }
+
+    #[test]
+    fn header_without_a_source_stays_bare() {
+        let s = state(vec![done("a"), pending("b")], 40);
+        let head = strip_ansi(&compose(&s, 0, false)[0]);
+        assert!(head.contains("dependencies  "));
+        assert!(!head.contains("from"));
     }
 
     #[test]

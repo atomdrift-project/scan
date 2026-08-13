@@ -794,6 +794,15 @@ pub(crate) fn orchestrate(
     // across hops: once a release is scanned, an older sibling discovered in a
     // later hop never resurrects the package.
     let mut newest_seen: HashMap<String, String> = HashMap::new();
+    // source content-sha → the manifest basename it is, so the live tree's header
+    // can name where the declared dependencies came from (`from package.json`).
+    // Built once from the report's own files; a source discovered only inside a
+    // fetched payload (a deeper hop) simply isn't found and stays unnamed.
+    let source_manifests: HashMap<String, String> = report
+        .files
+        .iter()
+        .map(|f| (f.sha256.clone(), manifest_basename(&f.path)))
+        .collect();
     for _hop in 0..policy.depth {
         if worklist.is_empty() {
             break;
@@ -954,7 +963,10 @@ pub(crate) fn orchestrate(
                 // deliberately never announced — for a large npm graph they are the
                 // overwhelming majority and only a registry-metadata lookup runs on
                 // them, so listing them would bury the handful of live scans.
-                reporter.announce(&selected);
+                reporter.announce(
+                    &selected,
+                    source_manifests.get(&source_sha).map_or("", String::as_str),
+                );
                 if selected.is_empty() {
                     // Nothing to fetch; the group still merges its registry
                     // records below.
@@ -1316,9 +1328,13 @@ impl Reporter {
     }
 
     /// Reveal a hop's references as pending (tree only) so the whole known set is
-    /// visible before any network work begins.
-    fn announce(&self, refs: &[Reference]) {
+    /// visible before any network work begins. `source` is the manifest they were
+    /// declared in (basename), noted so the header can name it.
+    fn announce(&self, refs: &[Reference], source: &str) {
         if let Self::Tree(tree) = self {
+            if !refs.is_empty() {
+                tree.note_source(source);
+            }
             for r in refs {
                 tree.add(&locator_key(r), &dep_display_name(r));
             }
@@ -1416,6 +1432,14 @@ fn fetch_header(header: &AtomicBool) {
 /// (scope preserved, e.g. `@biomejs/cli-darwin-arm64 2.5.0`), or the URL with
 /// its scheme trimmed. This is what the tree shows in place of the full registry
 /// URL the streamed log prints.
+/// The manifest basename of a source file path for the tree header: the last
+/// path segment, after both the archive delimiter (`!!`) and directory
+/// separators. `demo.zip!!app!!package/package.json` → `package.json`.
+fn manifest_basename(path: &str) -> String {
+    let after_archive = path.rsplit_once("!!").map_or(path, |(_, r)| r);
+    after_archive.rsplit('/').next().unwrap_or(after_archive).to_string()
+}
+
 fn dep_display_name(r: &Reference) -> String {
     match &r.locator {
         RefLocator::Purl(p) => purl_display(p),
@@ -2989,6 +3013,20 @@ fn payload_name(rec: &FetchRecord) -> String {
 mod tests {
     use super::*;
     use fletch::RefKind;
+
+    #[test]
+    fn manifest_basename_strips_archive_and_dirs() {
+        assert_eq!(manifest_basename("package.json"), "package.json");
+        assert_eq!(
+            manifest_basename("demo.zip!!app!!package/package.json"),
+            "package.json"
+        );
+        assert_eq!(
+            manifest_basename("demo.zip!!requirements.txt"),
+            "requirements.txt"
+        );
+        assert_eq!(manifest_basename("a/b/c/go.mod"), "go.mod");
+    }
 
     #[test]
     fn dep_pulled_covers_removed_yank_and_hold() {
