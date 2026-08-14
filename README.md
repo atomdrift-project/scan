@@ -74,7 +74,9 @@ Exit codes make CI integration trivial:
 - `0`: all samples are benign
 - `1`: hostile sample detected
 - `2`: suspicious sample detected
-- `3` or more: analysis error
+- `3`: analysis error
+- `4`: the rule set was incomplete — the scan ran with fewer rules than the
+  trait set defines, so anything short of hostile proves nothing. Re-run it.
 
 ## How it works
 

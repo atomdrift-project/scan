@@ -61,10 +61,24 @@ atomscan ./package/ || echo "flagged — block this upload"
 | `1`  | At least one **hostile** file.                    |
 | `2`  | At least one **suspicious** file, none hostile.   |
 | `3`  | An error occurred, nothing hostile or suspicious. |
+| `4`  | The rule set was incomplete — see below.          |
 
 The most severe verdict wins: one hostile file in a tree returns `1` no
 matter what else is in it. A typical policy blocks on `1`, sends `2` to a
 human, and pages on `3`.
+
+`4` means the YARA engine ran degraded: rule sources failed to compile, or
+scanning was disabled mid-run after an engine panic. The scan finished, but
+with fewer rules than the trait set defines, so a clean or merely suspicious
+result proves nothing — the detection that would have fired may simply not
+have been loaded. It outranks `2` and `3` for that reason, and `1` outranks
+it in turn: a hostile verdict still stands, because missing rules can only
+cost you detections, never invent one.
+
+Treat `4` as "run it again", not as a verdict. Gate on it the way you gate on
+a failed build rather than a flagged artifact, and do not let it fall into a
+`>= 2` bucket that a policy reads as "suspicious, needs a human" — nobody can
+review a scan that did not fully happen.
 
 ## Set the false-positive level
 
