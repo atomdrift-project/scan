@@ -1959,9 +1959,26 @@ fn log_max_rss_resolution(role: &'static str, policy: MaxRssPolicy, resolved_byt
 }
 
 /// Exit with the appropriate code based on scan summary counters.
+///
+/// A degraded YARA engine (panic breaker tripped, or rule sources that failed
+/// to compile at runtime) outranks everything: the verdicts above were made
+/// with fewer rules than the trait set defines, so the run must not look like
+/// a clean scan.
 fn exit_for_summary(summary: &scan::ScanSummary) {
+    let degradation = cleave::yara_engine::yara_degradation();
+    if let Some(msg) = &degradation {
+        eprintln!("\n❌ YARA engine degraded during this run: {msg}");
+        eprintln!(
+            "   Verdicts above were produced WITHOUT the full rule set; treat them as incomplete."
+        );
+    }
+    // A hostile verdict stands even degraded (rules only add detections), but a
+    // run that would otherwise look clean or merely suspicious must fail loudly.
     if summary.hostile > 0 {
         process::exit(1);
+    }
+    if degradation.is_some() {
+        process::exit(4);
     }
     if summary.suspicious > 0 {
         process::exit(2);
