@@ -546,25 +546,27 @@ pub(crate) fn terminal_inside_summary(hostile: usize, suspicious: usize, clean: 
 }
 
 /// Frame one independently-scanned package nested inside an archive as a
-/// bordered card: a verdict stamp + name header opening a left rule that runs
-/// down the package's own findings, so a grab-bag archive reads as a stack of
-/// distinct verdicts rather than one flat member list. `why` is an optional
-/// one-line summary shown dim beneath the header; `body` is cleave's rendered
-/// context for the package's files. Plain (piped) mode drops the border and
-/// indents two spaces, keeping every line grep-able.
-#[allow(clippy::too_many_arguments)]
+/// bordered card: a verdict word + name header opening a left rule that runs
+/// down the package's own findings (`body`, cleave's rendered context), so a
+/// grab-bag archive reads as a stack of distinct verdicts rather than one flat
+/// member list. Plain (piped) mode drops the border and indents two spaces,
+/// keeping every line grep-able.
 pub(crate) fn terminal_card(
     classification: &Classification,
-    probability: f32,
-    threshold: f32,
-    level: Option<i32>,
     name: &str,
     file_type: &str,
     size: u64,
-    why: Option<&str>,
     body: &str,
 ) -> String {
-    let (stamp, _) = terminal_badge(classification, probability, threshold, level);
+    // A card leads with the class *word*, not a percentage: every package in a
+    // hostile archive shares the same confidence band, so eight identical `92%`
+    // stamps read as a stuck gauge. The one calibrated number lives on the
+    // archive banner; the cards rank by severity (worst first) and by class.
+    let word = match classification {
+        Classification::Hostile => "HOSTILE",
+        Classification::Suspicious => "SUSPECT",
+        Classification::Benign => "BENIGN",
+    };
     let mut meta = file_type.to_uppercase();
     let size = human_size(size);
     if !size.is_empty() {
@@ -574,16 +576,15 @@ pub(crate) fn terminal_card(
     if colored::control::SHOULD_COLORIZE.should_colorize() {
         let p = palette();
         let accent = class_color(classification);
+        let Rgb(r, g, b) = accent;
         let bar = fg(accent, "\u{2502}"); // │
+        let stamp = format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {word} \x1b[0m");
         out.push_str(&format!(
             "{} {stamp} {} {}\n",
             fg(accent, "\u{256d}\u{2500}"), // ╭─
             fg_bold(p.path_name, name),
             fg(p.dim, &format!("\u{00b7} {meta}")),
         ));
-        if let Some(why) = why.filter(|w| !w.is_empty()) {
-            out.push_str(&format!("{bar} {}\n", fg(p.reason, why)));
-        }
         for line in body.lines() {
             if line.is_empty() {
                 out.push_str(&bar);
@@ -595,10 +596,7 @@ pub(crate) fn terminal_card(
         out.push_str(&fg(accent, "\u{2570}\u{2500}")); // ╰─
         out.push('\n');
     } else {
-        out.push_str(&format!("{stamp} {name} \u{00b7} {meta}\n"));
-        if let Some(why) = why.filter(|w| !w.is_empty()) {
-            out.push_str(&format!("  {why}\n"));
-        }
+        out.push_str(&format!("{word} {name} \u{00b7} {meta}\n"));
         for line in body.lines() {
             if line.is_empty() {
                 out.push('\n');

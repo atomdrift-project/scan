@@ -1607,6 +1607,107 @@ impl Inner {
     }
 }
 
+/// A single-artifact scan has no file-count denominator to fill a progress bar,
+/// but the analysis of one archive can still take many seconds (extraction,
+/// disassembly, per-member scoring) with nothing on screen. This is a minimal
+/// animated spinner for that gap — `⠙ scanning demo.zip · 12s` redrawn in place
+/// on stderr — so the scan visibly *works* rather than appearing to hang. It is
+/// deliberately not a [`Progress`] bar and never registers in `ACTIVE_BAR`, so
+/// the live dependency tree still takes over stderr during the fetch phase.
+pub(crate) struct Spinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    /// Start spinning next to `label`, or `None` when stderr isn't a terminal
+    /// (piped/redirected output draws nothing, matching the progress bar).
+    pub(crate) fn start(label: String) -> Option<Self> {
+        use std::io::IsTerminal as _;
+        if !std::io::stderr().is_terminal() {
+            return None;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let start = Instant::now();
+        let handle = std::thread::Builder::new()
+            .name("scan-spinner".into())
+            .spawn(move || {
+                let mut tick = 0usize;
+                // The distinct archive members seen entering analysis. cleave
+                // fans members across the rayon pool and names each on a
+                // per-thread breadcrumb; sampling those each tick lets us show a
+                // live count and the member currently in hand — real progress
+                // through a deeply nested archive, where one file expands to
+                // thousands of members with nothing else to count. It undercounts
+                // members that begin and finish between two samples, so the count
+                // is prefixed `~`.
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut current = String::new();
+                while !flag.load(Ordering::Relaxed) {
+                    let frame = SPINNER[tick % SPINNER.len()];
+                    let secs = start.elapsed().as_secs();
+                    // One sample of the per-thread breadcrumbs: grow the distinct
+                    // member set (the live count) and show the oldest in-flight
+                    // member (most likely the slow one holding up the scan).
+                    let members = cleave::breadcrumb::snapshot();
+                    for crumb in &members {
+                        if crumb.analyzer == "member" {
+                            seen.insert(crumb.target.clone());
+                        }
+                    }
+                    if let Some(oldest) = members.iter().find(|c| c.analyzer == "member") {
+                        current = oldest.target.clone();
+                    }
+                    let detail = if seen.is_empty() {
+                        String::new()
+                    } else {
+                        let member = spinner_tail(&current, 48);
+                        format!(
+                            "  \x1b[38;2;120;120;120m~{} members\x1b[0m  \x1b[38;2;80;80;80m{member}\x1b[0m",
+                            seen.len()
+                        )
+                    };
+                    eprint!(
+                        "\r\x1b[2K \x1b[38;2;100;180;255m{frame}\x1b[0m  \x1b[38;2;160;160;160mscanning {label}\x1b[0m{detail}  \x1b[38;2;80;80;80m{secs}s\x1b[0m"
+                    );
+                    let _ = std::io::stderr().flush();
+                    tick += 1;
+                    std::thread::sleep(PROGRESS_TICK);
+                }
+            })
+            .ok()?;
+        Some(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+/// Keep the last `width` characters of a member path — its filename and nearest
+/// directories, the telling part — eliding the head with a leading `…`. A short
+/// path is returned unchanged.
+fn spinner_tail(path: &str, width: usize) -> String {
+    let count = path.chars().count();
+    if count <= width {
+        return path.to_string();
+    }
+    let tail: String = path.chars().skip(count - width + 1).collect();
+    format!("\u{2026}{tail}")
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        // Erase the spinner line so the next output starts clean.
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    }
+}
+
 /// Progress bar handle held by the scan loop. Dropping it (or calling `finish`
 /// / `quiesce`) stops the background heartbeat thread.
 pub(crate) struct Progress {
@@ -1919,8 +2020,19 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     if path.is_file() {
         let tally = Tally::default();
         let stdout = Mutex::new(std::io::stdout());
+        // One artifact has no file-count bar, but its static analysis
+        // (extraction, disassembly) is the silent long pole — spin a marker so
+        // the scan visibly works. Dropped before `record_file_result` so its
+        // fetch tree and the final render own the terminal cleanly.
+        let spinner = is_terminal.then(|| {
+            let label = path
+                .file_name()
+                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            Spinner::start(label)
+        });
         let cleave_result = cleave::analyze_file(path, &cleave_opts)
             .with_context(|| format!("cleave analysis of {}", path.display()));
+        drop(spinner);
         record_file_result(
             path,
             cleave_result,
@@ -2989,20 +3101,38 @@ pub fn run_paths(
             );
         };
 
-        if !files.is_empty() {
-            cleave::scan_files(&files, &cleave_opts, |event| {
-                if let cleave::ScanEvent::File { path, result } = event {
-                    record(&path, *result);
-                }
-            })?;
-        }
+        // A single artifact has no file-count bar (total == 1), so its static
+        // analysis — extraction, disassembly, per-member scoring — would run with
+        // nothing on screen for however many seconds it takes. Analyze it
+        // directly with a spinner instead of through the streaming API, dropping
+        // the spinner before `record` so its fetch tree and final render own the
+        // terminal cleanly.
+        if is_terminal && files.len() == 1 && dir_files.is_empty() {
+            let path = &files[0];
+            let label = path
+                .file_name()
+                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let spinner = Spinner::start(label);
+            let result = cleave::analyze_file(path, &cleave_opts)
+                .with_context(|| format!("cleave analysis of {}", path.display()));
+            drop(spinner);
+            record(path, result);
+        } else {
+            if !files.is_empty() {
+                cleave::scan_files(&files, &cleave_opts, |event| {
+                    if let cleave::ScanEvent::File { path, result } = event {
+                        record(&path, *result);
+                    }
+                })?;
+            }
 
-        if !dir_files.is_empty() {
-            cleave::scan_paths(dir_files, &cleave_opts, |event| {
-                if let cleave::ScanEvent::File { path, result } = event {
-                    record(&path, *result);
-                }
-            })?;
+            if !dir_files.is_empty() {
+                cleave::scan_paths(dir_files, &cleave_opts, |event| {
+                    if let cleave::ScanEvent::File { path, result } = event {
+                        record(&path, *result);
+                    }
+                })?;
+            }
         }
     }
 
@@ -3212,7 +3342,6 @@ pub(crate) fn format_llm_line(llm: &crate::interpret::Interpretation, color: boo
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn render_terminal_context(
     report: &cleave::AnalysisReport,
     tiny_opts: &cleave::output::TinyOpts,
@@ -3334,9 +3463,9 @@ fn top_package_id(file: &cleave::FileAnalysis, roots: &[(u32, &str)]) -> Option<
     roots
         .iter()
         .filter(|(_, root)| {
-            file.path.len() > root.len()
-                && file.path.starts_with(root)
-                && file.path[root.len()..].starts_with(ARCHIVE_DELIMITER)
+            file.path
+                .strip_prefix(*root)
+                .is_some_and(|rest| rest.starts_with(ARCHIVE_DELIMITER))
         })
         .max_by_key(|(_, root)| root.len())
         .map(|(id, _)| *id)
@@ -3527,18 +3656,70 @@ fn render_archive_cards(
         let ptype = file.map(|f| f.file_type.as_str()).unwrap_or_default();
         let psize = file.map_or(0, |f| f.size);
         let member_ids: std::collections::HashSet<u32> = pkg.members.iter().copied().collect();
-        let why = package_headline(&member_ids, report);
+
+        // Curate the members shown: a card is a triage summary, not a dump. Keep
+        // the highest-scoring files (score already weights by criticality) plus
+        // the package container and any member a composite trail points at (so
+        // `↳` legs still resolve), and collapse the quiet remainder to a count —
+        // one busy package (a wheel of dozens of modules) must not dominate.
+        const CARD_FILES: usize = 6;
+        let group: Vec<&cleave::FileAnalysis> = report
+            .files
+            .iter()
+            .filter(|f| member_ids.contains(&f.id))
+            .collect();
+        let trail_refs: std::collections::HashSet<u32> = group
+            .iter()
+            .flat_map(|f| f.composite_sources.values().flatten())
+            .map(|s| s.file)
+            .collect();
+        let mut ranked: Vec<&cleave::FileAnalysis> = group
+            .iter()
+            .copied()
+            .filter(|f| !f.findings.is_empty())
+            .collect();
+        ranked.sort_by_key(|f| std::cmp::Reverse(f.score));
+        let mut keep: std::collections::HashSet<u32> =
+            ranked.iter().take(CARD_FILES).map(|f| f.id).collect();
+        keep.insert(pkg.id);
+        keep.extend(&trail_refs);
+        let hidden = ranked.iter().filter(|f| !keep.contains(&f.id)).count();
 
         let mut view = report.clone();
-        view.files.retain(|f| member_ids.contains(&f.id));
-        let body = cleave::output::format_context_badged(
+        view.files.retain(|f| keep.contains(&f.id));
+        for f in &mut view.files {
+            f.path = collapse_decoded_dup(&f.path);
+        }
+        let mut body = cleave::output::format_context_badged(
             &view,
             tiny_opts,
             cleave::output::HeaderBadge::default(),
         );
-        // Two cleanups so the card doesn't repeat what its header already says:
+        // Note the members we didn't spell out, so the card is honest about being
+        // a summary rather than silently dropping files. Exactly one blank line
+        // sets it off — trim any trailing blanks cleave left first so the spacing
+        // is uniform across cards.
+        if hidden > 0 {
+            while body.ends_with('\n') {
+                body.pop();
+            }
+            let plural = if hidden == 1 { "file" } else { "files" };
+            let count = thousands(hidden);
+            if color {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut body,
+                    format_args!("\n\n \x1b[38;2;110;110;110m+{count} quieter {plural}\x1b[0m"),
+                );
+            } else {
+                body.push_str(&format!("\n\n +{count} quieter {plural}"));
+            }
+        }
+        // Three cleanups so the card shows *context*, not bookkeeping:
         //  - drop the package's own `📄 <name>` member line (the card header names
         //    it; its findings still render beneath),
+        //  - drop composite `↳ file, file, …` trails — a card names the package
+        //    once, and the contributing members render their own code context
+        //    below (they are force-kept in the view), so the file list is noise,
         //  - strip the package path prefix from member lines, so a card headed
         //    `vexium-kit-10.0.2.tgz` shows `package/index.js`, not the full path.
         let self_header = format!("{name} \u{00b7}");
@@ -3546,7 +3727,10 @@ fn render_archive_cards(
             .lines()
             .filter(|line| {
                 let visible = crate::deptree::strip_ansi(line);
-                !(visible.trim_start().starts_with('\u{1f4c4}') && visible.contains(&self_header))
+                let trimmed = visible.trim_start();
+                let self_ref = trimmed.starts_with('\u{1f4c4}') && visible.contains(&self_header);
+                let trail = trimmed.starts_with('\u{21b3}');
+                !self_ref && !trail
             })
             .map(|line| {
                 if name.is_empty() {
@@ -3557,17 +3741,10 @@ fn render_archive_cards(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        crate::output::terminal_card(
-            &pkg.decision.class,
-            pkg.decision.probability,
-            pkg.decision.threshold,
-            pkg.decision.level,
-            &name,
-            ptype,
-            psize,
-            why.as_deref(),
-            body.trim_end_matches('\n'),
-        )
+        // No separate summary line: the card leads with cleave's top finding,
+        // which already states the package's worst behavior — a `why` here only
+        // duplicated or contradicted it.
+        crate::output::terminal_card(&pkg.decision.class, &name, ptype, psize, body.trim_end_matches('\n'))
     };
 
     // The archive's own card leads when it earned one — its own hostility is the
@@ -3613,13 +3790,9 @@ fn render_archive_cards(
             out.push('\n');
             out.push_str(&crate::output::terminal_card(
                 &decision.class,
-                decision.probability,
-                decision.threshold,
-                decision.level,
                 label,
                 file_type,
                 size,
-                None,
                 body.trim_end_matches('\n'),
             ));
         }
@@ -3650,29 +3823,50 @@ fn render_archive_cards(
     Some(out)
 }
 
+/// Group a count into thousands with commas (`4467` → `4,467`), so a large
+/// "quieter files" tail reads as a number rather than a raw digit run.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Collapse cleave's decoded-region path duplication for display. A region
+/// decoded out of a member (a unicode-escape/base64 blob) is pathed as
+/// `…!!MEMBER!!MEMBER##encoding@off` — the member repeats around the archive
+/// delimiter — which renders as an alarming doubled path. When the segment
+/// before `##` is immediately preceded by an identical `!!MEMBER`, drop the
+/// duplicate so it reads as `MEMBER##encoding@off`. A no-op for any other path.
+fn collapse_decoded_dup(path: &str) -> String {
+    let Some(enc) = path.rfind("##") else {
+        return path.to_string();
+    };
+    let (head, tail) = path.split_at(enc);
+    // The last archive segment before the encoding marker, and everything before
+    // it. If that preceding text ends with an identical `!!<segment>`, the member
+    // is doubled — keep one copy.
+    let Some((rest, seg)) = head.rsplit_once("!!") else {
+        return path.to_string();
+    };
+    if !seg.is_empty() && rest.strip_suffix(seg).is_some_and(|before| before.ends_with("!!")) {
+        return format!("{rest}{tail}");
+    }
+    path.to_string()
+}
+
 /// The path of a package relative to the root archive: everything after the
 /// first archive delimiter, deeper nesting shown as `/`. `demo.zip!!a.tgz` →
 /// `a.tgz`; a bare root path is returned as-is.
 fn package_display_path(path: &str) -> String {
     path.split_once("!!")
         .map_or_else(|| path.to_string(), |(_, m)| m.replace("!!", "/"))
-}
-
-/// A one-line headline for a package card: the description of its
-/// highest-criticality finding with human-readable text. `None` when no member
-/// carries a described finding (the card's own findings then speak for it).
-fn package_headline(
-    member_ids: &std::collections::HashSet<u32>,
-    report: &cleave::AnalysisReport,
-) -> Option<String> {
-    report
-        .files
-        .iter()
-        .filter(|f| member_ids.contains(&f.id))
-        .flat_map(|f| &f.findings)
-        .filter(|f| !f.desc.is_empty())
-        .max_by_key(|f| f.crit)
-        .map(|f| f.desc.to_string())
 }
 
 /// Wall-clock of each post-analysis phase inside `classify_report`, in
@@ -5427,9 +5621,13 @@ fn render_terminal_fetch_context(
         out.push_str(&cleave::output::format_context(&view, opts));
     }
 
+    // Only footnote the omitted artifacts when something *was* shown — then the
+    // count is useful context ("and N quieter ones"). With nothing hostile to
+    // show, this line would be the entire fetch section: pure noise at the
+    // decision point, so it's dropped and the section stays silent.
     let omitted = candidate_count.saturating_sub(shown_count);
-    if omitted > 0 {
-        let _ = writeln!(out, "\n  {omitted} unremarkable fetched artifacts omitted");
+    if omitted > 0 && shown_count > 0 {
+        let _ = writeln!(out, "\n  {omitted} quieter fetched artifacts omitted");
     }
     (!out.is_empty()).then_some(out)
 }
@@ -5702,6 +5900,37 @@ mod dep_subject_risk_tests {
     fn ungraded_and_unremarkable_ranks_last() {
         assert!(dep_subject_risk(Some(decision(-1, 0.01)), false) > dep_subject_risk(None, false));
         assert!(dep_subject_risk(None, true) > dep_subject_risk(None, false));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod card_render_tests {
+    use super::*;
+
+    #[test]
+    fn collapse_decoded_dup_drops_the_repeated_member() {
+        // A decoded region: the member repeats around the archive delimiter.
+        assert_eq!(
+            collapse_decoded_dup("root!!pkg.tar!!a/b/server.js!!a/b/server.js##unicode-escape@224"),
+            "root!!pkg.tar!!a/b/server.js##unicode-escape@224"
+        );
+        // No `##` marker, or no doubling: returned unchanged.
+        assert_eq!(collapse_decoded_dup("root!!pkg!!a/b.js"), "root!!pkg!!a/b.js");
+        assert_eq!(
+            collapse_decoded_dup("root!!pkg!!a/b.js##base64@0"),
+            "root!!pkg!!a/b.js##base64@0"
+        );
+    }
+
+    #[test]
+    fn spinner_tail_keeps_the_filename_end() {
+        assert_eq!(spinner_tail("short.py", 48), "short.py");
+        let long = "animica/stratum_pool/_data/aicf_rag/chunks/deeply/nested/file.json";
+        let tail = spinner_tail(long, 20);
+        assert!(tail.starts_with('\u{2026}'));
+        assert!(tail.ends_with("file.json"));
+        assert_eq!(tail.chars().count(), 20);
     }
 }
 
