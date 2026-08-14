@@ -1,0 +1,226 @@
+name: Publish release assets
+description: >-
+  Add the artifacts built so far to the release: name them by version, attest
+  and sign them, and upload only what is not already there.
+
+  Called once per wave. The first wave publishes a real release as soon as the
+  platforms people actually download are ready; the second adds the emulated
+  and VM-built ones, which have taken up to 75 minutes on their own, and
+  rewrites SHA256SUMS to cover them. Both waves run this one definition,
+  because two copies of the only code path holding `contents: write` is how
+  they drift apart.
+
+  Re-running is safe by construction: the second wave takes exactly the same
+  "upload the assets that are missing" path a recovery dispatch does, and
+  SHA256SUMS is always rederived from GitHub's server-side digests, so it
+  describes the release's real contents rather than whatever this run rebuilt.
+
+inputs:
+  version:
+    description: Release version, without the leading `v`.
+    required: true
+  tag:
+    description: Release tag.
+    required: true
+  publish:
+    description: '`true` to create or populate the release; anything else is a dry run.'
+    required: true
+  expected:
+    description: >-
+      Space-separated targets this wave expects. A missing one is a warning, not
+      a failure — a broken exotic platform must not strand the release.
+    required: true
+  requested-target:
+    description: Single target for a recovery dispatch, or empty.
+    default: ""
+  artifact-name:
+    description: Name for the dry-run artifact bundle.
+    default: release-dry-run
+
+runs:
+  using: composite
+  steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: atomscan-*
+          merge-multiple: true
+          path: dist
+
+      # `freebsd` and `cross` are continue-on-error, so a run goes green while
+      # quietly shipping fewer platforms than it should. Deliberately a warning
+      # rather than a failure — a broken experimental target shouldn't block the
+      # ones that built — but the gap gets named instead of being invisible.
+      - name: Inventory targets
+        env:
+          # Keep in sync with build.yml's matrices. Windows x86-64 became a
+          # required release target after its native build and smoke tests first
+          # passed in run 30966163861. Windows ARM64 is native-built and smoked on
+          # GitHub's Windows 11 ARM runner. Solaris is release-bound now that
+          # its native build can complete the fat-LTO link with ZFS-backed swap.
+          EXPECTED: ${{ inputs.expected }}
+          REQUESTED_TARGET: ${{ inputs.requested-target }}
+        shell: bash
+        run: |
+          set -eu
+          missing=""
+          for t in $EXPECTED; do
+            if [ -n "$REQUESTED_TARGET" ] && [ "$t" != "$REQUESTED_TARGET" ]; then
+              continue
+            fi
+            if [ -f "dist/atomscan-$t.tar.gz" ]; then
+              echo "  ok      $t"
+            else
+              echo "  MISSING $t"
+              missing="$missing $t"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::release is missing targets:$missing"
+            echo "Missing targets:$missing" >> "$GITHUB_STEP_SUMMARY"
+            # A broad release may publish the platforms that succeeded, but a
+            # targeted retry has one job: produce the requested artifact. Fail
+            # here with that useful diagnosis instead of falling through to an
+            # opaque `cd dist` error when download-artifact found nothing.
+            if [ -n "$REQUESTED_TARGET" ]; then
+              exit 1
+            fi
+          fi
+
+      # Artifacts are named by target; releases are named by version + target.
+      - name: Assemble
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -eu
+          cd dist
+          for f in atomscan-*.tar.gz; do
+            target="${f#atomscan-}"
+            target="${target%.tar.gz}"
+            mv "$f" "atomscan-$VERSION-$target.tar.gz"
+          done
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # Signed, verifiable statement that these exact bytes came out of this
+      # workflow at this commit. Consumers check it with:
+      #   gh attestation verify atomscan-<version>-<target>.tar.gz \
+      #     --repo atomdrift-project/scan
+      # A recovery dispatch runs the repaired workflow from main while checking
+      # out the requested tag. In that case github.sha identifies the workflow
+      # commit, not the tagged source, so emitting the automatic attestation
+      # would be misleading. Tag-push releases retain provenance attestation.
+      - name: Attest provenance
+        if: ${{ inputs.publish == 'true' && startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*.tar.gz
+
+      # GitHub artifact attestations above are already Sigstore-backed, but
+      # consumers need `gh` to retrieve them. A standard bundle beside the
+      # release makes the same trust model usable with standalone `cosign`.
+      - name: Install Cosign
+        if: ${{ inputs.publish == 'true' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # `gh` ships on the runner, so publishing needs no third-party action in
+      # the one job that holds `contents: write`. Add `--draft` if you'd rather
+      # review before it goes live.
+      - name: Publish release
+        if: ${{ inputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -eu
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists; uploading only missing assets"
+            existing_assets="$(
+              gh release view "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json assets \
+                --jq '.assets[].name'
+            )"
+            missing_assets=()
+            for asset in dist/*.tar.gz; do
+              name="${asset##*/}"
+              if printf '%s\n' "$existing_assets" | grep -Fqx -- "$name"; then
+                echo "  exists  $name"
+              else
+                echo "  upload  $name"
+                missing_assets+=("$asset")
+              fi
+            done
+            if [ "${#missing_assets[@]}" -gt 0 ]; then
+              gh release upload "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                "${missing_assets[@]}"
+            else
+              echo "all release assets already exist"
+            fi
+
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Atomdrift Scan $VERSION" \
+              --generate-notes \
+              --verify-tag \
+              dist/*.tar.gz
+          fi
+
+          # SHA256SUMS describes the release's actual immutable archives, not
+          # merely the files rebuilt by a recovery run. Derive it from GitHub's
+          # server-side digests after every missing archive has been uploaded.
+          digest_attempt=1
+          while :; do
+            gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[] | select(.name | startswith("atomscan-")) | select(.name | endswith(".tar.gz")) | select(.digest != null and .digest != "") | "\(.digest | sub("^sha256:"; ""))  \(.name)"' \
+              | LC_ALL=C sort > dist/SHA256SUMS
+            archive_count="$(gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '[.assets[] | select(.name | startswith("atomscan-")) | select(.name | endswith(".tar.gz"))] | length')"
+            digest_count="$(awk 'END { print NR + 0 }' dist/SHA256SUMS)"
+            if [ "$archive_count" -gt 0 ] && [ "$digest_count" -eq "$archive_count" ]; then
+              break
+            fi
+            if [ "$digest_attempt" -ge 6 ]; then
+              echo "::error::GitHub did not report SHA-256 digests for every release archive ($digest_count/$archive_count)"
+              exit 1
+            fi
+            echo "waiting for GitHub release digests ($digest_count/$archive_count)"
+            sleep 5
+            digest_attempt=$((digest_attempt + 1))
+          done
+          cat dist/SHA256SUMS
+
+          # Keyless GitHub OIDC identity. The bundle carries the signature,
+          # short-lived certificate, and transparency-log inclusion proof.
+          cosign sign-blob --yes \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            dist/SHA256SUMS
+          cosign verify-blob dist/SHA256SUMS \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+          gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sigstore.json
+
+      # Everything above ran except the two steps that leave a trace. Keep the
+      # assembled set downloadable so a dry run is inspectable, not just green.
+      - name: Upload dry-run artifacts
+        if: ${{ inputs.publish != 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7

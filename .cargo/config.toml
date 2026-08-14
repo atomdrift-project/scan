@@ -13,3 +13,24 @@
 # affected. Remove if cross-rs's illumos image ever grows a default C++ link.
 [target.x86_64-unknown-illumos]
 rustflags = ["-C", "link-arg=-lstdc++"]
+
+# 32-bit ARM needs libgcc for intrinsics musl does not carry.
+#
+# jemalloc's C sources call `__ffsdi2` (64-bit find-first-set) and
+# `__sync_val_compare_and_swap_1` (byte-width atomic compare-and-swap). On
+# ARMv6/v7 both are compiler-runtime intrinsics that live in libgcc: musl does
+# not provide them, and rustc's compiler_builtins covers only the first. rustc
+# links with `-nodefaultlibs`, so nothing pulls libgcc in and the link ends in
+# undefined references out of libjemalloc.
+#
+# `link-arg` appends to the end of the link line, which is where a static
+# archive has to sit for ld to resolve symbols referenced by the objects before
+# it. These two targets have never produced a release binary on any tag — they
+# fail as continue-on-error and are reported only by publish's inventory
+# warning. If libgcc does not resolve them, the fallback is excluding jemalloc
+# on 32-bit ARM in Cargo.toml and accepting musl's allocator there.
+[target.arm-unknown-linux-musleabihf]
+rustflags = ["-C", "link-arg=-lgcc"]
+
+[target.armv7-unknown-linux-musleabihf]
+rustflags = ["-C", "link-arg=-lgcc"]
