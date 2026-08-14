@@ -117,6 +117,8 @@ For additional interpretation, users can provide access to an LLM via the `--llm
 
 By default, atomscan sends the interpreted evidence (not the original file) to `http://localhost:8000/v1` - to be used with a local service like Ollama or vLLM; but it can also be setup to use a remote service like Claude, ChatGPT, or DeepSeek.
 
+No model is hardcoded: unless you pass `--llm-model`, atomscan asks the endpoint which models it serves and uses the largest one it lists. We recommend serving `Qwen/Qwen3.8-27B`.
+
 ```bash
 atomscan --llm ./project
 atomscan --llm http://model-host:8000/v1 --llm-model my-model ./project
