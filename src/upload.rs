@@ -40,9 +40,19 @@ const UPLOAD_QUEUE_DEPTH: usize = 16;
 /// bounds it near 10 MB). See the clear in the uploader loop.
 const SEEN_SHAS_MAX: usize = 100_000;
 
-/// Attempts per result before giving up. Short, unlike the worker's 20-minute
-/// budget: a renew is idempotent and the operator can simply re-run.
-const MAX_ATTEMPTS: u32 = 3;
+/// Per-attempt request timeouts, escalating. hopper's slow spells are usually
+/// brief, so early attempts fail fast and get another try rather than pinning
+/// the uploader for the full 120s ceiling each time; the final attempt keeps
+/// the old ceiling so a genuinely slow-but-alive hopper still lands the write.
+/// One entry per attempt — its length is the retry budget. Short, unlike the
+/// worker's 20-minute budget: a renew is idempotent and the operator can
+/// simply re-run.
+const ATTEMPT_TIMEOUTS: [Duration; 4] = [
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+];
 
 /// Request timeout per POST. Matches the worker so a wedged hopper can't pin an
 /// uploader thread indefinitely.
@@ -635,14 +645,19 @@ fn post_upload(
     provenance: &[u8],
     build_form: impl Fn() -> Option<reqwest::blocking::multipart::Form>,
 ) -> bool {
-    for attempt in 0..MAX_ATTEMPTS {
+    for (attempt, timeout) in ATTEMPT_TIMEOUTS.into_iter().enumerate() {
         if attempt > 0 {
             std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
         }
         let Some(form) = build_form() else {
             return false; // part build failed — unrecoverable
         };
-        match client.post(upload_url).multipart(form).send() {
+        match client
+            .post(upload_url)
+            .timeout(timeout)
+            .multipart(form)
+            .send()
+        {
             Ok(resp) if resp.status().is_success() => return true,
             Ok(resp) => {
                 let status = resp.status();
@@ -668,7 +683,7 @@ fn post_upload(
             }
         }
     }
-    tracing::warn!(sha256 = %sha256, kind, attempts = MAX_ATTEMPTS, "upload: giving up after retries");
+    tracing::warn!(sha256 = %sha256, kind, attempts = ATTEMPT_TIMEOUTS.len(), "upload: giving up after retries");
     false
 }
 
@@ -743,13 +758,14 @@ fn post_one(
         return;
     };
 
-    for attempt in 0..MAX_ATTEMPTS {
+    for (attempt, timeout) in ATTEMPT_TIMEOUTS.into_iter().enumerate() {
         if attempt > 0 {
-            // 1s, 2s — brief, since a renew is idempotent and re-runnable.
+            // 1s, 2s, 4s — brief, since a renew is idempotent and re-runnable.
             std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
         }
         let mut request = client
             .post(result_url)
+            .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.clone());
         if let Some(enc) = encoding {
@@ -777,7 +793,7 @@ fn post_one(
             }
         }
     }
-    tracing::warn!(sha256 = %sha256, attempts = MAX_ATTEMPTS, "upload: giving up after retries");
+    tracing::warn!(sha256 = %sha256, attempts = ATTEMPT_TIMEOUTS.len(), "upload: giving up after retries");
 }
 
 #[cfg(test)]
