@@ -23,6 +23,14 @@ on:
           complete matrix. Matrix-backed targets run their whole matrix group.
         type: string
         default: ""
+      wave:
+        description: >-
+          Which half of the release matrix to run. `fast` is the native, Windows
+          and cross-compiled targets — everything that finishes in roughly half
+          an hour. `slow` is the emulated and VM-built platforms, which have
+          taken up to 75 minutes. Empty runs both, which is what CI does.
+        type: string
+        default: ""
       profile:
         description: >-
           Cargo profile: `release` (thin LTO, everyday CI) or `release-lto`
@@ -80,7 +88,7 @@ env:
 jobs:
   native:
     name: ${{ matrix.target }}
-    if: ${{ inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin ', format(' {0} ', inputs.target)) }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin ', format(' {0} ', inputs.target))) }}
     runs-on: ${{ matrix.os }}
     # A publishing release may spend up to four hours waiting for Apple's
     # asynchronous notary service after the build. Keep the ordinary CI/dry-run
@@ -466,7 +474,7 @@ jobs:
   # for why it is not part of the always-on matrix.
   freebsd:
     name: x86_64-unknown-freebsd
-    if: ${{ inputs.target == '' || inputs.target == 'x86_64-unknown-freebsd' }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-unknown-freebsd') }}
     # Host image is only the VM host here — the compile happens inside the
     # guest against FreeBSD's libc — so the glibc-floor reasoning that pins
     # `native` to 22.04 does not apply. Newer host, newer KVM stack.
@@ -559,7 +567,7 @@ jobs:
   # The job stays as a cheap dispatch-only canary for when that changes.
   freebsd-arm64:
     name: aarch64-unknown-freebsd
-    if: ${{ inputs.target == 'aarch64-unknown-freebsd' }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == 'aarch64-unknown-freebsd') }}
     runs-on: ubuntu-24.04
     # Hosted-runner jobs are killed at 360 minutes regardless of this value;
     # 350 leaves room for packaging and upload after a slow build.
@@ -626,7 +634,7 @@ jobs:
   # nothing here; the unit tests below are what would surface it.
   openbsd:
     name: x86_64-unknown-openbsd
-    if: ${{ inputs.target == '' || inputs.target == 'x86_64-unknown-openbsd' }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-unknown-openbsd') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -700,7 +708,7 @@ jobs:
   # and pkgsrc rust is the same deal as FreeBSD ports rust.
   netbsd:
     name: x86_64-unknown-netbsd
-    if: ${{ inputs.target == '' || inputs.target == 'x86_64-unknown-netbsd' }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-unknown-netbsd') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -751,7 +759,7 @@ jobs:
   # up, without spending runner time or producing a known-missing release asset.
   dragonfly:
     name: x86_64-unknown-dragonfly
-    if: ${{ inputs.target == 'x86_64-unknown-dragonfly' }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == 'x86_64-unknown-dragonfly') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -807,7 +815,7 @@ jobs:
   # make them immediately eligible for release publication.
   haiku:
     name: x86_64-unknown-haiku
-    if: ${{ inputs.target == 'x86_64-unknown-haiku' }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == 'x86_64-unknown-haiku') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -859,7 +867,7 @@ jobs:
 
   hurd:
     name: x86_64-unknown-hurd-gnu
-    if: ${{ inputs.target == 'x86_64-unknown-hurd-gnu' }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == 'x86_64-unknown-hurd-gnu') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -924,7 +932,7 @@ jobs:
   # Same research shape the OmniOS job used to resolve its package names.
   solaris:
     name: x86_64-pc-solaris
-    if: ${{ inputs.target == '' || inputs.target == 'x86_64-pc-solaris' }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-pc-solaris') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -1003,7 +1011,7 @@ jobs:
   # pattern release.yml downloads.
   omnios:
     name: x86_64-unknown-illumos (omnios)
-    if: ${{ inputs.target == '' || inputs.target == 'omnios-native' }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'omnios-native') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -1098,7 +1106,7 @@ jobs:
   # without relying on a cross-link that cannot execute its result.
   windows:
     name: ${{ matrix.target }}
-    if: ${{ inputs.target == '' || contains(' x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target)) }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target))) }}
     runs-on: ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'windows-11-arm' || 'windows-2025' }}
     timeout-minutes: 150
     permissions:
@@ -1109,10 +1117,16 @@ jobs:
     # inventory otherwise. Keeps a Windows-ARM64 link regression from stranding
     # the whole release, as it did for v2.6.0.
     continue-on-error: true
+    # Windows ARM64 is off by default: it has failed to build every release
+    # since v2.6.0 while burning a 150-minute slot on a scarce runner, and no
+    # consumer has asked for the binary. The target is still wired up — the
+    # `if` above, the runs-on ternary, and release.yml's allowlist all still
+    # accept it — so `-f target=aarch64-pc-windows-msvc` rebuilds it on demand
+    # once the link regression is fixed. Re-add it to the matrix below then.
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJSON(inputs.target != '' && format('["{0}"]', inputs.target) || '["x86_64-pc-windows-msvc","aarch64-pc-windows-msvc"]') }}
+        target: ${{ fromJSON(inputs.target != '' && format('["{0}"]', inputs.target) || '["x86_64-pc-windows-msvc"]') }}
     defaults:
       run:
         shell: bash
@@ -1192,7 +1206,7 @@ jobs:
   # where cmake already exists.
   cross:
     name: ${{ matrix.target }}
-    if: ${{ inputs.target == '' || contains(' x86_64-unknown-linux-musl aarch64-unknown-linux-musl arm-unknown-linux-musleabihf armv7-unknown-linux-musleabihf loongarch64-unknown-linux-musl x86_64-unknown-illumos s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu powerpc64le-unknown-linux-gnu ', format(' {0} ', inputs.target)) }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-musl aarch64-unknown-linux-musl arm-unknown-linux-musleabihf armv7-unknown-linux-musleabihf loongarch64-unknown-linux-musl x86_64-unknown-illumos s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu powerpc64le-unknown-linux-gnu ', format(' {0} ', inputs.target))) }}
     # Container builds, so the host's glibc never reaches the artifact — same
     # reasoning as the freebsd job, and unlike `native`.
     runs-on: ubuntu-24.04
