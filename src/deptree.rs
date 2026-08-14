@@ -66,6 +66,10 @@ struct Entry {
     name: String,
     status: Status,
     seq: u64,
+    /// The manifest this dependency was declared in, shown dim at the end of the
+    /// row so a reader can trace each dependency back to its source file. Empty
+    /// for a reference discovered imperatively (no declaring manifest).
+    source: String,
 }
 
 /// A dependency's rendered status. `Active` holds the transient label shown next
@@ -102,23 +106,6 @@ struct State {
     drawn: usize,
     cols: usize,
     rows: usize,
-    /// Distinct manifest basenames the announced references were declared in
-    /// (`package.json`, `requirements.txt`, …), so the header can name what the
-    /// dependencies are being read from. A set: one manifest kind shows by name,
-    /// several collapse to a count.
-    sources: std::collections::BTreeSet<String>,
-}
-
-impl State {
-    /// The header's `from …` clause: the single manifest kind by name, or a
-    /// count when references span several. Empty when no source was noted.
-    fn source_label(&self) -> String {
-        match self.sources.len() {
-            0 => String::new(),
-            1 => self.sources.iter().next().cloned().unwrap_or_default(),
-            n => format!("{n} manifests"),
-        }
-    }
 }
 
 impl State {
@@ -173,7 +160,6 @@ impl DepTree {
                 drawn: 0,
                 cols,
                 rows,
-                sources: std::collections::BTreeSet::new(),
             }),
             tick: AtomicU32::new(0),
             stopped: AtomicBool::new(false),
@@ -197,19 +183,10 @@ impl DepTree {
         Some(DepTree { inner })
     }
 
-    /// Note the manifest a batch of references was declared in, so the header
-    /// can name it. Empty paths (a synthetic or unknown source) are ignored.
-    pub(crate) fn note_source(&self, manifest: &str) {
-        if manifest.is_empty() {
-            return;
-        }
-        let mut state = self.lock();
-        state.sources.insert(manifest.to_string());
-    }
-
-    /// Register a dependency as pending, keyed by its locator. A key already
-    /// present is ignored, so re-announcing a hop's references is idempotent.
-    pub(crate) fn add(&self, key: &str, name: &str) {
+    /// Register a dependency as pending, keyed by its locator, noting the
+    /// manifest `source` it was declared in. A key already present is ignored, so
+    /// re-announcing a hop's references is idempotent.
+    pub(crate) fn add(&self, key: &str, name: &str, source: &str) {
         let mut state = self.lock();
         if state.index.contains_key(key) {
             return;
@@ -220,6 +197,7 @@ impl DepTree {
             name: name.to_string(),
             status: Status::Pending,
             seq,
+            source: source.to_string(),
         });
         state.index.insert(key.to_string(), idx);
         drop_render(&self.inner, state);
@@ -371,14 +349,7 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
     let namew = widest.clamp(8, name_cap);
 
     let mut lines = Vec::with_capacity(cap);
-    lines.push(header(
-        done,
-        total,
-        active,
-        finished,
-        &state.source_label(),
-        state.cols,
-    ));
+    lines.push(header(done, total, active, finished, state.cols));
     let body = cap - 1;
 
     if total <= body {
@@ -429,25 +400,13 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
 
 /// The region's header: an arrow (or a check, once finished), the running
 /// `done/total` count, and how many references are in flight right now.
-fn header(
-    done: usize,
-    total: usize,
-    active: usize,
-    finished: bool,
-    source: &str,
-    cols: usize,
-) -> String {
+fn header(done: usize, total: usize, active: usize, finished: bool, cols: usize) -> String {
     let (glyph, r, g, b) = if finished {
         ('\u{2713}', 80, 200, 80)
     } else {
         ('\u{2b07}', 100, 180, 255)
     };
-    let from = if source.is_empty() {
-        String::new()
-    } else {
-        format!(" from {source}")
-    };
-    let mut text = format!("dependencies{from}  {done}/{total}");
+    let mut text = format!("dependencies  {done}/{total}");
     if active > 0 {
         text.push_str(&format!("  \u{b7}  {active} in flight"));
     }
@@ -489,11 +448,33 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
     } else {
         format!("  \x1b[38;2;130;130;130m{detail}\x1b[0m")
     };
-    // Visible width for clipping: 4 indent + glyph + space + padded name + 2 +
-    // detail. The name is already truncated to `namew`.
-    let visible = 4 + 1 + 1 + namew.max(name.chars().count()) + 2 + detail.chars().count();
+    // Trailing dim source: `from <manifest>`, so a reader can trace each
+    // dependency back to the file that declared it. Sized to the columns left
+    // after the name and result, and middle-elided only when it won't fit — a
+    // long package-relative path keeps its telling head and its filename tail
+    // (`github.com-…/package-lock.json`) rather than being chopped to a stub.
+    const SOURCE_MIN: usize = 20;
+    let namecol = namew.max(name.chars().count());
+    let used = 4 + 1 + 1 + namecol + 2 + detail.chars().count();
+    let avail = cols.saturating_sub(used + 2 + 5); // 2 gap + "from "
+    let source = if entry.source.is_empty() || avail < SOURCE_MIN {
+        String::new()
+    } else {
+        elide_middle(&entry.source, avail)
+    };
+    let source_col = if source.is_empty() {
+        String::new()
+    } else {
+        format!("  \x1b[38;2;90;90;90mfrom {source}\x1b[0m")
+    };
+    let source_vis = if source.is_empty() {
+        0
+    } else {
+        2 + 5 + source.chars().count()
+    };
+    let visible = used + source_vis;
     clip(
-        &format!("    \x1b[38;2;{r};{g};{b}m{glyph}\x1b[0m {name:<namew$}{detail_col}"),
+        &format!("    \x1b[38;2;{r};{g};{b}m{glyph}\x1b[0m {name:<namew$}{detail_col}{source_col}"),
         visible,
         cols,
     )
@@ -591,7 +572,6 @@ mod tests {
             drawn: 0,
             cols: 100,
             rows,
-            sources: std::collections::BTreeSet::new(),
         }
     }
 
@@ -600,6 +580,7 @@ mod tests {
             name: name.to_string(),
             status,
             seq,
+            source: String::new(),
         }
     }
 
@@ -633,26 +614,13 @@ mod tests {
     }
 
     #[test]
-    fn header_names_a_single_source_manifest() {
-        let mut s = state(vec![done("a"), pending("b")], 40);
-        s.sources.insert("package.json".to_string());
-        assert!(strip_ansi(&compose(&s, 0, false)[0]).contains("dependencies from package.json"));
-    }
-
-    #[test]
-    fn header_counts_several_source_manifests() {
-        let mut s = state(vec![done("a"), pending("b")], 40);
-        s.sources.insert("package.json".to_string());
-        s.sources.insert("requirements.txt".to_string());
-        assert!(strip_ansi(&compose(&s, 0, false)[0]).contains("from 2 manifests"));
-    }
-
-    #[test]
-    fn header_without_a_source_stays_bare() {
-        let s = state(vec![done("a"), pending("b")], 40);
-        let head = strip_ansi(&compose(&s, 0, false)[0]);
-        assert!(head.contains("dependencies  "));
-        assert!(!head.contains("from"));
+    fn row_shows_the_source_manifest() {
+        let mut e = pending("react-dropzone");
+        e.source = "vexium-1.0.tgz/package/package.json".to_string();
+        let s = state(vec![e], 40);
+        let body = strip_ansi(&compose(&s, 0, false).join("\n"));
+        assert!(body.contains("react-dropzone"));
+        assert!(body.contains("package.json"), "source manifest not shown");
     }
 
     #[test]

@@ -794,14 +794,22 @@ pub(crate) fn orchestrate(
     // across hops: once a release is scanned, an older sibling discovered in a
     // later hop never resurrects the package.
     let mut newest_seen: HashMap<String, String> = HashMap::new();
-    // source content-sha → the manifest basename it is, so the live tree's header
-    // can name where the declared dependencies came from (`from package.json`).
-    // Built once from the report's own files; a source discovered only inside a
-    // fetched payload (a deeper hop) simply isn't found and stays unnamed.
+    // Coordinates (`pkg:eco/name`) for which a version-pinned reference exists
+    // anywhere in the tree. A manifest range (`"puppeteer": "^10.4.0"`) reaches
+    // us version-stripped as a bare `pkg:npm/puppeteer` and would resolve to
+    // `dist-tags/latest` — a version the project never installs. When the
+    // co-located lockfile also pins the coordinate (`pkg:npm/puppeteer@10.4.2`),
+    // that pin is ground truth and must win, so the bare sibling is dropped
+    // below. Monotone across hops, mirroring `newest_seen`.
+    let mut pinned_coords: HashSet<String> = HashSet::new();
+    // source content-sha → the declaring manifest's path (relative to the root
+    // artifact), so each dependency row can name the file it came from. Built
+    // once from the report's own files; a source discovered only inside a fetched
+    // payload (a deeper hop) simply isn't found and stays unnamed.
     let source_manifests: HashMap<String, String> = report
         .files
         .iter()
-        .map(|f| (f.sha256.clone(), manifest_basename(&f.path)))
+        .map(|f| (f.sha256.clone(), manifest_relpath(&f.path)))
         .collect();
     for _hop in 0..policy.depth {
         if worklist.is_empty() {
@@ -819,6 +827,8 @@ pub(crate) fn orchestrate(
                 let Some((key, version)) = versioned_purl(&locator) else {
                     continue;
                 };
+                // This coordinate is pinned somewhere; its bare sibling loses.
+                pinned_coords.insert(key.to_string());
                 match newest_seen.get(key) {
                     Some(best)
                         if lenient_version_cmp(version, best) != std::cmp::Ordering::Greater => {}
@@ -946,6 +956,20 @@ pub(crate) fn orchestrate(
                             );
                         }
                         newest
+                    })
+                    // A lockfile pin supersedes the manifest's versionless
+                    // sibling: drop a bare `pkg:eco/name` when the same
+                    // coordinate is pinned elsewhere in the tree, so the exact
+                    // installed version is scanned instead of `dist-tags/latest`.
+                    .filter(|r| {
+                        if superseded_by_pin(r, &pinned_coords) {
+                            tracing::debug!(
+                                package = %locator_key(r),
+                                "versionless dependency superseded by a lockfile-pinned sibling; skipped"
+                            );
+                            return false;
+                        }
+                        true
                     })
                     .filter(|r| seen.insert(locator_key(r)))
                     .collect();
@@ -1329,14 +1353,12 @@ impl Reporter {
 
     /// Reveal a hop's references as pending (tree only) so the whole known set is
     /// visible before any network work begins. `source` is the manifest they were
-    /// declared in (basename), noted so the header can name it.
+    /// declared in (package-relative path), shown per row so each dependency can
+    /// be traced back to its declaring file.
     fn announce(&self, refs: &[Reference], source: &str) {
         if let Self::Tree(tree) = self {
-            if !refs.is_empty() {
-                tree.note_source(source);
-            }
             for r in refs {
-                tree.add(&locator_key(r), &dep_display_name(r));
+                tree.add(&locator_key(r), &dep_display_name(r), source);
             }
         }
     }
@@ -1397,7 +1419,7 @@ impl Reporter {
                 report_skip(r, reg, now, reason);
             }),
             Self::Tree(tree) => {
-                tree.add(&locator_key(r), &dep_display_name(r));
+                tree.add(&locator_key(r), &dep_display_name(r), "");
                 tree.set(&locator_key(r), skip_state(reg, now, reason));
             }
         }
@@ -1432,12 +1454,25 @@ fn fetch_header(header: &AtomicBool) {
 /// (scope preserved, e.g. `@biomejs/cli-darwin-arm64 2.5.0`), or the URL with
 /// its scheme trimmed. This is what the tree shows in place of the full registry
 /// URL the streamed log prints.
-/// The manifest basename of a source file path for the tree header: the last
-/// path segment, after both the archive delimiter (`!!`) and directory
-/// separators. `demo.zip!!app!!package/package.json` → `package.json`.
-fn manifest_basename(path: &str) -> String {
-    let after_archive = path.rsplit_once("!!").map_or(path, |(_, r)| r);
-    after_archive.rsplit('/').next().unwrap_or(after_archive).to_string()
+/// The source manifest's path as the dep tree shows it, led by the scanned
+/// artifact so a nested manifest reads plainly as a file *inside* it:
+/// `demo.zip!!vexium-1.0.tgz!!package/package.json` →
+/// `demo.zip/vexium-1.0.tgz/package/package.json`. The root is reduced to its
+/// basename (`/tmp/demo.zip` → `demo.zip`) and deeper archive boundaries become
+/// `/`. A bare path with no archive nesting (a plain manifest scanned directly)
+/// shows just its basename.
+fn manifest_relpath(path: &str) -> String {
+    match path.split_once("!!") {
+        Some((root, rest)) => {
+            let root_base = root.rsplit(['/', '\\']).next().unwrap_or(root);
+            format!("{root_base}/{}", rest.replace("!!", "/"))
+        }
+        None => path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(path)
+            .to_string(),
+    }
 }
 
 fn dep_display_name(r: &Reference) -> String {
@@ -2039,6 +2074,21 @@ fn versioned_purl(locator: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((key, version))
+}
+
+/// True when `r` is a bare (versionless) PURL whose coordinate is pinned by a
+/// version-carrying sibling elsewhere in the tree (`pinned` holds those
+/// coordinates). A manifest range reaches us version-stripped — `pkg:npm/foo` —
+/// and would resolve to `dist-tags/latest`; when a lockfile pins the same
+/// coordinate (`pkg:npm/foo@1.2.3`), that pin is ground truth and the bare
+/// sibling is redundant, so it is dropped. A versionless PURL's whole string is
+/// its coordinate, so an exact set membership is the supersede; a git/tag pin
+/// (`pkg:npm/foo@dev`) keeps its `@ref`, is not versionless, and never matches.
+fn superseded_by_pin(r: &Reference, pinned: &HashSet<String>) -> bool {
+    let RefLocator::Purl(p) = &r.locator else {
+        return false;
+    };
+    versioned_purl(p).is_none() && pinned.contains(p.as_str())
 }
 
 /// Lenient, numeric-aware version ordering: the string splits into components
@@ -3015,17 +3065,18 @@ mod tests {
     use fletch::RefKind;
 
     #[test]
-    fn manifest_basename_strips_archive_and_dirs() {
-        assert_eq!(manifest_basename("package.json"), "package.json");
+    fn manifest_relpath_leads_with_the_scanned_artifact() {
+        // A plain manifest scanned directly shows just its basename.
+        assert_eq!(manifest_relpath("/home/u/package.json"), "package.json");
+        // A nested manifest reads as a file inside the scanned archive.
         assert_eq!(
-            manifest_basename("demo.zip!!app!!package/package.json"),
-            "package.json"
+            manifest_relpath("/tmp/demo.zip!!vexium-1.0.tgz!!package/package.json"),
+            "demo.zip/vexium-1.0.tgz/package/package.json"
         );
         assert_eq!(
-            manifest_basename("demo.zip!!requirements.txt"),
-            "requirements.txt"
+            manifest_relpath("demo.zip!!requirements.txt"),
+            "demo.zip/requirements.txt"
         );
-        assert_eq!(manifest_basename("a/b/c/go.mod"), "go.mod");
     }
 
     #[test]
@@ -3678,6 +3729,32 @@ mod tests {
         assert_eq!(versioned_purl("pkg:npm/@scope/name"), None);
         assert_eq!(versioned_purl("pkg:cargo/serde"), None);
         assert_eq!(versioned_purl("pkg:generic/x@deadbeef"), None);
+    }
+
+    #[test]
+    fn versionless_dep_superseded_only_when_coordinate_is_pinned() {
+        // The lockfile pin for `puppeteer` is present in the tree.
+        let pinned: HashSet<String> = ["pkg:npm/puppeteer".to_string()].into_iter().collect();
+
+        // The manifest's version-stripped `pkg:npm/puppeteer` loses to the pin.
+        assert!(superseded_by_pin(&purl_ref("pkg:npm/puppeteer"), &pinned));
+        // The pin itself is kept — it is versioned, not a bare coordinate.
+        assert!(!superseded_by_pin(&purl_ref("pkg:npm/puppeteer@10.4.2"), &pinned));
+        // A different, unpinned coordinate keeps its versionless fallback.
+        assert!(!superseded_by_pin(&purl_ref("pkg:npm/left-pad"), &pinned));
+        // A git/tag ref is not versionless and never equals a bare coordinate.
+        assert!(!superseded_by_pin(&purl_ref("pkg:npm/puppeteer@dev"), &pinned));
+        // Non-PURL locators are out of scope.
+        assert!(!superseded_by_pin(&url_ref("https://example.test/x.tgz"), &pinned));
+
+        // Scoped npm names: the bare scoped coordinate loses to its scoped pin.
+        let scoped: HashSet<String> =
+            ["pkg:npm/@puppeteer/browsers".to_string()].into_iter().collect();
+        assert!(superseded_by_pin(&purl_ref("pkg:npm/@puppeteer/browsers"), &scoped));
+        assert!(!superseded_by_pin(
+            &purl_ref("pkg:npm/@puppeteer/browsers@3.2.0"),
+            &scoped
+        ));
     }
 
     #[test]
