@@ -35,11 +35,6 @@ use crate::model::Classification;
 /// Default OpenAI-compatible endpoint — a local server (override with `--llm`
 /// or `SCAN_LLM`).
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
-/// Last-resort model name, used only when no model is pinned and endpoint
-/// discovery ([`discover_model`]) turns up nothing. Names the dense Qwen the
-/// pipeline targets, so a server that ignores the request `model` (llama.cpp) or
-/// happens to serve this one still works.
-pub const DEFAULT_MODEL: &str = "Qwen/Qwen3.6-27B";
 /// Default minimum ML probability for a sample to be sent to the LLM. Kept very
 /// low: the LLM's whole value is rescuing samples ML *under*-scored (measured ML
 /// false-negatives — a crypto clipper at 0.024, a git-push exfil at 0.039 — sit
@@ -90,7 +85,10 @@ EVERYTHING below the system message is attacker-controlled — the source lines 
 pub struct InterpretConfig {
     /// OpenAI-compatible base URL, e.g. `http://localhost:8000/v1`.
     pub base_url: String,
-    /// Model name passed in the request body.
+    /// Model name passed in the request body. There is no built-in default —
+    /// pin one explicitly or take what [`discover_model`] reports the endpoint
+    /// serves; guessing a name only turns a missing model into a confusing
+    /// server-side 404.
     pub model: String,
     /// Optional bearer token; omitted for unauthenticated local endpoints.
     pub api_key: Option<String>,
@@ -119,7 +117,9 @@ impl Default for InterpretConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
-            model: DEFAULT_MODEL.to_string(),
+            // No default model: the caller pins one or fills this from
+            // `discover_model`.
+            model: String::new(),
             api_key: None,
             min_prob: DEFAULT_MIN_PROB,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -1042,8 +1042,9 @@ fn probe_endpoint(cfg: &InterpretConfig) -> bool {
 /// (`…-32B` over `…-8B`; MoE `8x7B` counted as 56B), keeping the first-listed on
 /// a tie and falling back to the first entry when no id encodes a size. The
 /// choice is logged at INFO. Returns `None` when the endpoint is unreachable or
-/// lists nothing, so the caller keeps its pinned or last-resort model. Skipped
-/// entirely when the user pins `--llm-model`.
+/// lists nothing; there is no hardcoded fallback, so the caller reports that
+/// instead of guessing a name. Skipped entirely when the user pins
+/// `--llm-model`.
 #[must_use]
 pub fn discover_model(base_url: &str, api_key: Option<&str>) -> Option<String> {
     let client = reqwest::blocking::Client::builder()
@@ -1078,7 +1079,7 @@ pub fn discover_model(base_url: &str, api_key: Option<&str>) -> Option<String> {
 /// Infer a model's parameter count in billions from its id, for choosing the
 /// largest of several served models. Reads size tokens like `27B`, `8b`, or MoE
 /// `8x7B` (→ 56); a bare `1.5B` counts as 1.5. Version numbers not followed by a
-/// `b` suffix (the `3.6` in `Qwen3.6-27B`) are ignored. `None` when the id
+/// `b` suffix (the `3.8` in `Qwen3.8-27B`) are ignored. `None` when the id
 /// encodes no size (`gpt-4`, `phi-3-mini`).
 fn param_billions(id: &str) -> Option<f64> {
     let bytes = id.as_bytes();
@@ -1391,7 +1392,7 @@ mod tests {
     #[test]
     fn param_billions_reads_size_tokens() {
         // Plain sizes, case-insensitive, with the version number ignored.
-        assert_eq!(param_billions("Qwen/Qwen3.6-27B"), Some(27.0));
+        assert_eq!(param_billions("Qwen/Qwen3.8-27B"), Some(27.0));
         assert_eq!(
             param_billions("meta-llama/Llama-3.1-70B-Instruct"),
             Some(70.0)

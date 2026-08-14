@@ -125,13 +125,20 @@ within a major version.
 
 `--interpret` sends non-trivial samples to a **local** LLM and blends its
 read into the verdict (kept in the `llm` JSON section). It talks to an
-OpenAI-compatible endpoint at `http://localhost:8000/v1` by default — vLLM
-with a Qwen3-class model works well, and ~9B is enough. Nothing leaves your
-network.
+OpenAI-compatible endpoint at `http://localhost:8000/v1` by default. Nothing
+leaves your network.
 
 ```bash
 atomscan --interpret ./pkg/
 ```
+
+No model name is baked in. Unless you pin one with `--llm-model`, atomscan
+asks the endpoint what it serves (`GET /v1/models`) and takes the largest
+model listed — so whatever you started the server with is what gets used. If
+the endpoint lists nothing, the scan stops with an error rather than guessing.
+
+We recommend `Qwen/Qwen3.8-27B` under vLLM; a Qwen3-class model works well
+generally, and ~9B is enough if that is what fits.
 
 Point it elsewhere with `--llm`, `--llm-model`, `--llm-key`. Control which
 samples qualify with `--interpret-min-prob` (default `0.01`).
