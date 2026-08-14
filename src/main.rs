@@ -206,8 +206,9 @@ struct Cli {
     )]
     llm: Option<String>,
 
-    /// LLM model name, e.g. Qwen/Qwen3.6-27B. Defaults to the largest model the
-    /// endpoint serves (env: SCAN_LLM_MODEL)
+    /// LLM model name, e.g. Qwen/Qwen3.8-27B. Defaults to the largest model the
+    /// endpoint itself reports serving; nothing is hardcoded (env:
+    /// SCAN_LLM_MODEL)
     #[arg(long, global = true, value_name = "NAME")]
     llm_model: Option<String>,
 
@@ -417,8 +418,8 @@ impl Cli {
     /// Build the LLM interpretation config from `--llm` (or the legacy
     /// `--interpret`) and the `--llm-*` flags, falling back to env vars. `None`
     /// when interpretation is not requested.
-    fn interpret_config(&self) -> Option<scan::interpret::InterpretConfig> {
-        use scan::interpret::{DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY, DEFAULT_MODEL};
+    fn interpret_config(&self) -> Result<Option<scan::interpret::InterpretConfig>> {
+        use scan::interpret::{DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY};
         let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
             flag.clone()
                 .or_else(|| std::env::var(key).ok())
@@ -428,7 +429,7 @@ impl Cli {
         // or the legacy `--interpret` flag turns the pass on.
         let target = from_env(&self.llm, "SCAN_LLM");
         if target.is_none() && !self.interpret {
-            return None;
+            return Ok(None);
         }
         // Resolve the target to a base URL: `local` (also the bare-flag default)
         // maps to the local endpoint; anything else is an OpenAI-compatible base
@@ -438,12 +439,20 @@ impl Cli {
             Some(url) => url.to_string(),
         };
         let api_key = from_env(&self.llm_key, "SCAN_LLM_KEY");
-        // A pinned model wins; otherwise discover the endpoint's largest served
-        // model; otherwise fall back to the last-resort default.
+        // A pinned model wins; otherwise take what the endpoint says it serves.
+        // Nothing is hardcoded: if the endpoint lists no model there is nothing
+        // sensible to send, and a guessed name would surface as an opaque
+        // server-side error mid-scan instead of here.
         let model = from_env(&self.llm_model, "SCAN_LLM_MODEL")
             .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()))
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-        Some(scan::interpret::InterpretConfig {
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no LLM model available: {base_url}/models listed none (or was \
+                     unreachable). Start the endpoint, or name a model with \
+                     --llm-model (env: SCAN_LLM_MODEL)"
+                )
+            })?;
+        Ok(Some(scan::interpret::InterpretConfig {
             base_url,
             model,
             api_key,
@@ -451,7 +460,7 @@ impl Cli {
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
                 .unwrap_or(NonZeroUsize::MIN),
-        })
+        }))
     }
 }
 
@@ -847,12 +856,10 @@ fn main() -> Result<()> {
         libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
     }
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let selected_severity_level = cli.level;
     let threshold_suspicious = cli.threshold_suspicious;
     let threshold_hostile = cli.threshold_hostile;
-    // Resolve before `cli.command` is moved out below; only one arm uses it.
-    let interpret_cfg = cli.interpret_config();
     // The kind selection comes from `--fetch`; the hop count from `--fetch-depth`,
     // the dependency age ceiling from `--fetch-max-age`, and the per-file ceilings
     // from `--fetch-max-file-*` (each its own flag/env). When `--fetch`/`SCAN_FETCH`
@@ -887,17 +894,10 @@ fn main() -> Result<()> {
         cli.fetch.unwrap_or_else(default_cli_fetch_policy),
         WORKER_MAX_DEP_AGE_DAYS,
     );
-    if let Some(cfg) = &interpret_cfg {
-        tracing::info!(
-            endpoint = %cfg.base_url,
-            model = %cfg.model,
-            min_prob = format!("{:.4}", cfg.min_prob),
-            "LLM interpretation enabled",
-        );
-    }
 
     // Default to a file scan when bare paths are given without a subcommand.
-    let command = match cli.command {
+    // Taken, not moved, so `cli` stays whole for `interpret_config` below.
+    let command = match cli.command.take() {
         Some(cmd) => cmd,
         None => {
             if !cli.paths.is_empty() {
@@ -952,6 +952,19 @@ fn main() -> Result<()> {
         fmt.init();
     } else {
         fmt.without_time().init();
+    }
+
+    // Resolved after logging is up: with no hardcoded default, the model comes
+    // from the endpoint's own listing, so which one was picked has to be
+    // visible rather than swallowed by an uninitialized subscriber.
+    let interpret_cfg = cli.interpret_config()?;
+    if let Some(cfg) = &interpret_cfg {
+        tracing::info!(
+            endpoint = %cfg.base_url,
+            model = %cfg.model,
+            min_prob = format!("{:.4}", cfg.min_prob),
+            "LLM interpretation enabled",
+        );
     }
 
     // Stabilize cleave trait discovery before any cleave shared resources are
