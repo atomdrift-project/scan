@@ -49,7 +49,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.7.0"
+version = "2.7.1"
 default-run = "atomscan"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable. Drives the
