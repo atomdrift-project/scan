@@ -48,16 +48,16 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // Tune rizin for live-process scanning. Unlike a filesystem scan (where we
     // want every architecture and tolerate minutes of deep analysis), `ps` is
     // interactive and dominated by a few giant signed apps (Electron/Bun
-    // binaries can be 100–215 MB). Three caps keep it responsive without
+    // binaries can be 100–215 MB). Two shape/size caps keep it responsive without
     // changing verdicts materially:
     //   - native-arch-only: a universal binary's non-host slice never runs here,
     //     so don't pay full `aaa` on it (roughly halves fat-binary cost).
-    //   - 60s timeout: a process binary needing more rizin than that is
-    //     pathological; goblin's typed views still classify it.
     //   - 100 MB size gate: skip rizin on the giants entirely — disassembling a
     //     signed 200 MB app is never worth blocking the scan on.
+    // The process timeout is configured once by the CLI (ten minutes by
+    // default, overridable with `--rizin-timeout-secs`) so the operator's
+    // explicit deadline applies consistently to every scan mode.
     filefacts::rizin::set_native_arch_only(true);
-    filefacts::rizin::set_timeout_secs(60);
     filefacts::rizin::set_max_bytes(100 * 1024 * 1024);
 
     let scan_start = Instant::now();

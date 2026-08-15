@@ -255,10 +255,8 @@ pub struct FetchPolicy {
     /// the host — the `@scope/pkg-<os>-<arch>` native-binary packages (biome,
     /// esbuild, swc, rollup, sharp…) that ship one prebuilt per platform. On a
     /// darwin-arm64 host only the darwin-arm64 variant is pulled; the linux and
-    /// windows ones never run here, so scanning all of them multiplies the
-    /// expensive binary analysis with no added coverage for this host. `false`
-    /// pulls every platform (`--fetch-all-platforms`) — needed to audit the
-    /// binaries that will run on *other* hosts (a CI image, a shipped release).
+    /// windows siblings cannot run locally. `false` audits every platform,
+    /// which service/corpus roles enable because they scan on behalf of others.
     /// Applies to fetched dependencies only; a directly-scanned artifact is
     /// always analyzed.
     pub host_platform_only: bool,
@@ -1467,11 +1465,7 @@ fn manifest_relpath(path: &str) -> String {
             let root_base = root.rsplit(['/', '\\']).next().unwrap_or(root);
             format!("{root_base}/{}", rest.replace("!!", "/"))
         }
-        None => path
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(path)
-            .to_string(),
+        None => path.rsplit(['/', '\\']).next().unwrap_or(path).to_string(),
     }
 }
 
@@ -3739,18 +3733,31 @@ mod tests {
         // The manifest's version-stripped `pkg:npm/puppeteer` loses to the pin.
         assert!(superseded_by_pin(&purl_ref("pkg:npm/puppeteer"), &pinned));
         // The pin itself is kept — it is versioned, not a bare coordinate.
-        assert!(!superseded_by_pin(&purl_ref("pkg:npm/puppeteer@10.4.2"), &pinned));
+        assert!(!superseded_by_pin(
+            &purl_ref("pkg:npm/puppeteer@10.4.2"),
+            &pinned
+        ));
         // A different, unpinned coordinate keeps its versionless fallback.
         assert!(!superseded_by_pin(&purl_ref("pkg:npm/left-pad"), &pinned));
         // A git/tag ref is not versionless and never equals a bare coordinate.
-        assert!(!superseded_by_pin(&purl_ref("pkg:npm/puppeteer@dev"), &pinned));
+        assert!(!superseded_by_pin(
+            &purl_ref("pkg:npm/puppeteer@dev"),
+            &pinned
+        ));
         // Non-PURL locators are out of scope.
-        assert!(!superseded_by_pin(&url_ref("https://example.test/x.tgz"), &pinned));
+        assert!(!superseded_by_pin(
+            &url_ref("https://example.test/x.tgz"),
+            &pinned
+        ));
 
         // Scoped npm names: the bare scoped coordinate loses to its scoped pin.
-        let scoped: HashSet<String> =
-            ["pkg:npm/@puppeteer/browsers".to_string()].into_iter().collect();
-        assert!(superseded_by_pin(&purl_ref("pkg:npm/@puppeteer/browsers"), &scoped));
+        let scoped: HashSet<String> = ["pkg:npm/@puppeteer/browsers".to_string()]
+            .into_iter()
+            .collect();
+        assert!(superseded_by_pin(
+            &purl_ref("pkg:npm/@puppeteer/browsers"),
+            &scoped
+        ));
         assert!(!superseded_by_pin(
             &purl_ref("pkg:npm/@puppeteer/browsers@3.2.0"),
             &scoped
