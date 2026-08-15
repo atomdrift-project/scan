@@ -2025,9 +2025,10 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
         // the scan visibly works. Dropped before `record_file_result` so its
         // fetch tree and the final render own the terminal cleanly.
         let spinner = is_terminal.then(|| {
-            let label = path
-                .file_name()
-                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let label = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
             Spinner::start(label)
         });
         let cleave_result = cleave::analyze_file(path, &cleave_opts)
@@ -3109,9 +3110,10 @@ pub fn run_paths(
         // terminal cleanly.
         if is_terminal && files.len() == 1 && dir_files.is_empty() {
             let path = &files[0];
-            let label = path
-                .file_name()
-                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let label = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
             let spinner = Spinner::start(label);
             let result = cleave::analyze_file(path, &cleave_opts)
                 .with_context(|| format!("cleave analysis of {}", path.display()));
@@ -3529,8 +3531,18 @@ fn render_archive_cards(
         .filter_map(|(pkg, members)| {
             let decision = members
                 .iter()
-                .filter_map(|id| member_evals.get(&u64::from(*id)).map(EmbeddedFile::decision))
-                .reduce(|best, d| if decision_outranks(&d, &best) { d } else { best })?;
+                .filter_map(|id| {
+                    member_evals
+                        .get(&u64::from(*id))
+                        .map(EmbeddedFile::decision)
+                })
+                .reduce(|best, d| {
+                    if decision_outranks(&d, &best) {
+                        d
+                    } else {
+                        best
+                    }
+                })?;
             Some(Package {
                 id: pkg,
                 decision,
@@ -3744,7 +3756,13 @@ fn render_archive_cards(
         // No separate summary line: the card leads with cleave's top finding,
         // which already states the package's worst behavior — a `why` here only
         // duplicated or contradicted it.
-        crate::output::terminal_card(&pkg.decision.class, &name, ptype, psize, body.trim_end_matches('\n'))
+        crate::output::terminal_card(
+            &pkg.decision.class,
+            &name,
+            ptype,
+            psize,
+            body.trim_end_matches('\n'),
+        )
     };
 
     // The archive's own card leads when it earned one — its own hostility is the
@@ -3766,7 +3784,8 @@ fn render_archive_cards(
             .map(|s| s.file)
             .collect();
         let mut view = report.clone();
-        view.files.retain(|f| f.id == rid || referenced.contains(&f.id));
+        view.files
+            .retain(|f| f.id == rid || referenced.contains(&f.id));
         if let Some(v) = view.files.iter_mut().find(|f| f.id == rid) {
             v.findings.retain(|f| own.contains(f.id.as_str()));
         }
@@ -3855,7 +3874,11 @@ fn collapse_decoded_dup(path: &str) -> String {
     let Some((rest, seg)) = head.rsplit_once("!!") else {
         return path.to_string();
     };
-    if !seg.is_empty() && rest.strip_suffix(seg).is_some_and(|before| before.ends_with("!!")) {
+    if !seg.is_empty()
+        && rest
+            .strip_suffix(seg)
+            .is_some_and(|before| before.ends_with("!!"))
+    {
         return format!("{rest}{tail}");
     }
     path.to_string()
@@ -5916,7 +5939,10 @@ mod card_render_tests {
             "root!!pkg.tar!!a/b/server.js##unicode-escape@224"
         );
         // No `##` marker, or no doubling: returned unchanged.
-        assert_eq!(collapse_decoded_dup("root!!pkg!!a/b.js"), "root!!pkg!!a/b.js");
+        assert_eq!(
+            collapse_decoded_dup("root!!pkg!!a/b.js"),
+            "root!!pkg!!a/b.js"
+        );
         assert_eq!(
             collapse_decoded_dup("root!!pkg!!a/b.js##base64@0"),
             "root!!pkg!!a/b.js##base64@0"

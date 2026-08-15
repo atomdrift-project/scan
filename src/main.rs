@@ -93,6 +93,7 @@ use std::process;
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
+const DEFAULT_RIZIN_TIMEOUT_SECS: u64 = 10 * 60;
 
 /// Classification values accepted by `--show`.
 #[derive(Clone, clap::ValueEnum)]
@@ -164,6 +165,20 @@ struct Cli {
     /// always slow.
     #[arg(long, global = true, default_value = "balanced")]
     mode: scan::Mode,
+
+    /// Hard wall-clock limit for each Rizin subprocess, in seconds. On expiry
+    /// Atomscan kills and reaps Rizin before releasing the analysis worker; on
+    /// Unix it also kills the complete process group. Also settable via
+    /// `SCAN_RIZIN_TIMEOUT_SECS`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECS",
+        env = "SCAN_RIZIN_TIMEOUT_SECS",
+        default_value_t = DEFAULT_RIZIN_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    rizin_timeout_secs: u64,
 
     /// Override suspicious threshold (0.0-1.0); omit to use model's recommendation
     #[arg(long)]
@@ -298,15 +313,29 @@ struct Cli {
     fetch_max_age: Option<u32>,
 
     /// [EXPERIMENTAL] Fetch and scan native-binary dependencies for every
-    /// platform, not just the host's. By default an `<os>-<arch>` package
-    /// (biome, esbuild, swc, rollup, sharp…) is pulled only for the host
-    /// platform — the linux/windows variants never run here, so scanning them
-    /// multiplies the expensive binary analysis with no added coverage for this
-    /// host. Pass this to audit the binaries that ship for *other* platforms (a
-    /// CI image, a published release). Also settable via
+    /// platform, not just the host's. This is automatic in `serve` and
+    /// `worker`, which scan on behalf of other machines; interactive scans
+    /// stay host-only for latency unless this flag is passed. Also settable via
     /// `SCAN_FETCH_ALL_PLATFORMS`.
-    #[arg(long, global = true, env = "SCAN_FETCH_ALL_PLATFORMS")]
+    #[arg(
+        long,
+        global = true,
+        env = "SCAN_FETCH_ALL_PLATFORMS",
+        conflicts_with = "fetch_host_platform_only"
+    )]
     fetch_all_platforms: bool,
+
+    /// [EXPERIMENTAL] Fetch only native-binary dependencies matching this
+    /// host's OS and architecture. This is the interactive default and an
+    /// explicit completeness opt-out for `serve` / `worker`. Also settable
+    /// via `SCAN_FETCH_HOST_PLATFORM_ONLY`.
+    #[arg(
+        long,
+        global = true,
+        env = "SCAN_FETCH_HOST_PLATFORM_ONLY",
+        conflicts_with = "fetch_all_platforms"
+    )]
+    fetch_host_platform_only: bool,
 
     /// [EXPERIMENTAL] How long to trust cached *mutable* registry metadata before
     /// revalidating. Accepts a unit suffix (`90s`, `30m`, `4h`, `2d`) — a bare
@@ -478,6 +507,17 @@ fn default_cli_fetch_policy() -> scan::fetch::FetchPolicy {
         deps: true,
         ..scan::fetch::FetchPolicy::default()
     }
+}
+
+fn cli_host_platform_only(cli: &Cli, scans_for_other_hosts: bool) -> bool {
+    cli.fetch_host_platform_only || (!cli.fetch_all_platforms && !scans_for_other_hosts)
+}
+
+fn command_scans_for_other_hosts(command: Option<&Commands>) -> bool {
+    matches!(
+        command,
+        Some(Commands::Serve { .. } | Commands::Worker { .. })
+    )
 }
 
 #[derive(Debug, Subcommand)]
@@ -857,6 +897,10 @@ fn main() -> Result<()> {
     }
 
     let mut cli = Cli::parse();
+    // Install the process-wide Rizin budget before any analysis or Rayon worker
+    // can start. Filefacts owns the subprocess lifecycle; Atomscan only selects
+    // the deadline through this single global configuration point.
+    filefacts::rizin::set_timeout_secs(cli.rizin_timeout_secs);
     let selected_severity_level = cli.level;
     let threshold_suspicious = cli.threshold_suspicious;
     let threshold_hostile = cli.threshold_hostile;
@@ -865,13 +909,15 @@ fn main() -> Result<()> {
     // from `--fetch-max-file-*` (each its own flag/env). When `--fetch`/`SCAN_FETCH`
     // is unset, the binary defaults to `all` in every mode. An explicit selection
     // is honored verbatim in both; the knobs always apply.
-    let with_knobs = |mut policy: scan::fetch::FetchPolicy, default_max_age: u32| {
+    let with_knobs = |mut policy: scan::fetch::FetchPolicy,
+                      default_max_age: u32,
+                      scans_for_other_hosts: bool| {
         policy.depth = cli.fetch_depth;
         policy.max_dep_age_days = cli.fetch_max_age.unwrap_or(default_max_age);
         policy.max_file_fetches = cli.fetch_max_file_fetches;
         policy.max_url_fetches = cli.fetch_max_urls;
         policy.max_file_bytes = cli.fetch_max_file_size;
-        policy.host_platform_only = !cli.fetch_all_platforms;
+        policy.host_platform_only = cli_host_platform_only(&cli, scans_for_other_hosts);
         policy
     };
     // The per-fetch size ceiling is enforced in the HTTP layer, so it's a
@@ -881,9 +927,11 @@ fn main() -> Result<()> {
     // Registry-metadata staleness bound: a process-global for the same reason,
     // consulted by every registry lookup. `None` keeps the tiered defaults.
     scan::fetch::set_registry_ttl(cli.registry_ttl);
+    let scans_for_other_hosts = command_scans_for_other_hosts(cli.command.as_ref());
     let fetch_policy = with_knobs(
         cli.fetch.unwrap_or_else(default_cli_fetch_policy),
         scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
+        scans_for_other_hosts,
     );
     // A worker exists to populate the shared corpus, not to answer one question
     // quickly: every resolvable dependency it pulls becomes a hopper sample with a
@@ -893,6 +941,7 @@ fn main() -> Result<()> {
     let worker_fetch_policy = with_knobs(
         cli.fetch.unwrap_or_else(default_cli_fetch_policy),
         WORKER_MAX_DEP_AGE_DAYS,
+        true,
     );
 
     // Default to a file scan when bare paths are given without a subcommand.
@@ -2022,8 +2071,8 @@ fn run_scan_paths(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        Cli, Commands, GIB, MaxRssPolicy, default_cli_fetch_policy, redact_zip_passwords,
-        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
+        Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy, default_cli_fetch_policy,
+        redact_zip_passwords, resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
@@ -2061,6 +2110,59 @@ mod tests {
         assert_eq!(policy.max_file_fetches, 100);
         assert_eq!(policy.max_url_fetches, scan::fetch::DEFAULT_MAX_URL_FETCHES);
         assert_eq!(policy.max_url_fetches, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn rizin_timeout_defaults_to_ten_minutes_and_is_overridable() -> Result<()> {
+        let default =
+            Cli::try_parse_from(["scan", "/tmp/a"]).context("default timeout should parse")?;
+        assert_eq!(default.rizin_timeout_secs, DEFAULT_RIZIN_TIMEOUT_SECS);
+
+        let overridden = Cli::try_parse_from(["scan", "--rizin-timeout-secs", "42", "/tmp/a"])
+            .context("timeout override should parse")?;
+        assert_eq!(overridden.rizin_timeout_secs, 42);
+        assert!(
+            Cli::try_parse_from(["scan", "--rizin-timeout-secs", "0", "/tmp/a"]).is_err(),
+            "zero would disable the hard deadline and must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_platform_scope_follows_scanner_role() -> Result<()> {
+        let default = Cli::try_parse_from(["scan", "/tmp/a"]).context("default should parse")?;
+        assert!(
+            super::cli_host_platform_only(
+                &default,
+                super::command_scans_for_other_hosts(default.command.as_ref())
+            ),
+            "interactive scans optimize for the current host"
+        );
+        assert!(
+            scan::fetch::FetchPolicy::default().host_platform_only,
+            "library and CLI defaults must agree"
+        );
+        let compatible = Cli::try_parse_from(["scan", "--fetch-all-platforms", "/tmp/a"])
+            .context("all-platforms opt-in should parse")?;
+        assert!(!super::cli_host_platform_only(&compatible, false));
+
+        let host_only = Cli::try_parse_from(["scan", "--fetch-host-platform-only", "/tmp/a"])
+            .context("host-only opt-out should parse")?;
+        assert!(super::cli_host_platform_only(&host_only, true));
+
+        for daemon in [
+            Cli::try_parse_from(["scan", "serve"]).context("serve should parse")?,
+            Cli::try_parse_from(["scan", "worker", "--url", "http://hopper.test"])
+                .context("worker should parse")?,
+        ] {
+            let role = super::command_scans_for_other_hosts(daemon.command.as_ref());
+            assert!(role);
+            assert!(
+                !super::cli_host_platform_only(&daemon, role),
+                "serve/worker scan on behalf of other hosts"
+            );
+        }
         Ok(())
     }
 

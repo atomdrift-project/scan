@@ -519,7 +519,10 @@ pub(crate) fn terminal_inside_summary(hostile: usize, suspicious: usize, clean: 
         parts.push((format!("{hostile} hostile"), Classification::Hostile));
     }
     if suspicious > 0 {
-        parts.push((format!("{suspicious} suspicious"), Classification::Suspicious));
+        parts.push((
+            format!("{suspicious} suspicious"),
+            Classification::Suspicious,
+        ));
     }
     if clean > 0 {
         parts.push((format!("{clean} clean"), Classification::Benign));
