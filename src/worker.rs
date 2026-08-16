@@ -2905,6 +2905,7 @@ async fn download_bytes(
         .bytes()
         .await
         .map_err(|e| format!("download body failed: path={path} sha256={sha256} url={url}: {e}"))?;
+    verify_download_sha256(&bytes, sha256, path, &url, route)?;
     tracing::info!(
         sha256 = %sha256,
         file = %path,
@@ -2943,6 +2944,7 @@ async fn download_to_spool(
     );
 
     let mut written: u64 = 0;
+    let mut hasher = Sha256::new();
     while let Some(chunk) = resp
         .chunk()
         .await
@@ -2957,10 +2959,12 @@ async fn download_to_spool(
         file.write_all(&chunk)
             .await
             .map_err(|e| format!("spool write failed: sha256={sha256}: {e}"))?;
+        hasher.update(&chunk);
     }
     file.flush()
         .await
         .map_err(|e| format!("spool flush failed: sha256={sha256}: {e}"))?;
+    verify_download_digest(hasher.finalize().into(), sha256, path, &url, route)?;
     tracing::info!(
         sha256 = %sha256,
         file = %path,
@@ -2969,6 +2973,55 @@ async fn download_to_spool(
         "download spooled to disk via {route}",
     );
     Ok(temp.into_temp_path())
+}
+
+fn verify_download_sha256(
+    bytes: &[u8],
+    expected_hex: &str,
+    path: &str,
+    url: &str,
+    route: &str,
+) -> Result<(), String> {
+    verify_download_digest(Sha256::digest(bytes).into(), expected_hex, path, url, route)
+}
+
+fn verify_download_digest(
+    actual: [u8; 32],
+    expected_hex: &str,
+    path: &str,
+    url: &str,
+    route: &str,
+) -> Result<(), String> {
+    let Some(expected) = sha256_from_hex(expected_hex) else {
+        return Err(format!(
+            "download has invalid expected sha256: path={path} sha256={expected_hex} url={url}"
+        ));
+    };
+    if actual == expected {
+        return Ok(());
+    }
+    let actual_hex = digest_hex(&actual);
+    tracing::error!(
+        expected_sha256 = %expected_hex,
+        actual_sha256 = %actual_hex,
+        file = %path,
+        url = %url,
+        route,
+        "downloaded bytes failed sha256 verification"
+    );
+    Err(format!(
+        "download sha256 mismatch: path={path} expected={expected_hex} actual={actual_hex} url={url}"
+    ))
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 /// Open a download stream for a sample, trying the cheap path-based endpoint
@@ -3692,7 +3745,11 @@ mod tests {
 
         // A 4-byte memory threshold forces the spool route.
         let spool = test_spool(4);
-        let job = claim_job("f00d", "samples/big.bin", PAYLOAD.len() as i64);
+        let job = claim_job(
+            &sha256_hex(PAYLOAD),
+            "samples/big.bin",
+            PAYLOAD.len() as i64,
+        );
         let pj = prefetch_one(
             reqwest::Client::new(),
             Arc::from(format!("http://127.0.0.1:{port}").as_str()),
@@ -3716,6 +3773,55 @@ mod tests {
         drop(payload);
         assert!(!spool_path.exists());
         assert_eq!(spool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn download_bytes_rejects_sha256_mismatch() {
+        const PAYLOAD: &[u8] = b"wrong bytes";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_target(&mut stream).await;
+            respond(&mut stream, "200 OK", PAYLOAD).await;
+        });
+        let expected = sha256_hex(b"expected bytes");
+        let err = download_bytes(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &expected,
+            "incoming/sample.bin",
+        )
+        .await
+        .expect_err("mismatched bytes must fail");
+        assert!(err.contains("sha256 mismatch"), "{err}");
+        assert!(err.contains(&sha256_hex(PAYLOAD)), "{err}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_to_spool_rejects_sha256_mismatch() {
+        const PAYLOAD: &[u8] = b"wrong spooled bytes";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_target(&mut stream).await;
+            respond(&mut stream, "200 OK", PAYLOAD).await;
+        });
+        let expected = sha256_hex(b"expected spooled bytes");
+        let err = download_to_spool(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &test_spool(0),
+            &expected,
+            "incoming/sample.bin",
+        )
+        .await
+        .expect_err("mismatched spooled bytes must fail");
+        assert!(err.contains("sha256 mismatch"), "{err}");
+        assert!(err.contains(&sha256_hex(PAYLOAD)), "{err}");
+        server.await.unwrap();
     }
 
     #[test]
@@ -3767,7 +3873,7 @@ mod tests {
                                 .map(|_| {
                                     let id = next_id.fetch_add(1, Ordering::Relaxed);
                                     serde_json::json!({
-                                        "sha256": format!("{id:064x}"),
+                                        "sha256": sha256_hex(PAYLOAD),
                                         "path": format!("samples/s{id}.bin"),
                                         "size_bytes": PAYLOAD.len(),
                                         "file_type": "data",
