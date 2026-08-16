@@ -78,6 +78,22 @@ const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// `/api/next` — still reports liveness, RSS, load, and queue depth on time.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Number of top-level cleave analyses allowed to build nested Rayon work at
+/// once. A worker slot is still useful for prefetching and result delivery, but
+/// cleave archives, fetch composites, and resource loading all recursively use
+/// the one process-global Rayon pool. Letting every slot enter that tree at
+/// once can compound stack usage and abort the process with a stack overflow
+/// before the RSS gate has a chance to reclaim anything.
+const DEFAULT_CLEAVE_CONCURRENCY: usize = 1;
+
+fn cleave_concurrency(slots: usize) -> usize {
+    std::env::var("SCAN_CLEAVE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .map_or(DEFAULT_CLEAVE_CONCURRENCY, |value| value.min(slots.max(1)))
+}
+
 type ResourceHandle = Arc<RwLock<Arc<ModelResources>>>;
 
 #[derive(Debug)]
@@ -1304,6 +1320,13 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         .timeout(Duration::from_secs(120))
         .build()?;
     let semaphore = Arc::new(Semaphore::new(slots));
+    // Keep the outer worker slots independent from cleave's nested Rayon
+    // concurrency. The former controls queue throughput; this gate prevents
+    // several archive/fetch analysis trees from entering the shared nested-work
+    // path simultaneously. Override for controlled benchmarking or
+    // after a cleave release provides a stronger internal bound.
+    let cleave_slots = cleave_concurrency(slots);
+    let cleave_gate = Arc::new(Semaphore::new(cleave_slots));
     // Slot count bounds concurrency but not memory: a slot analysing a huge
     // archive holds it (plus expanded members) resident while a slot analysing a
     // 4 KB script holds nothing. This gate pauses admission on live memory
@@ -1324,6 +1347,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let global_rayon_threads = rayon::current_num_threads();
     tracing::info!(
         slots,
+        cleave_slots,
         rayon_threads = global_rayon_threads,
         "worker concurrency: up to {slots} analyses share one shared \
          {global_rayon_threads}-thread rayon pool (no per-slot pools)",
@@ -1351,6 +1375,14 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         pid = std::process::id(),
         "worker starting; send `kill -USR1 <pid>` for an all-thread backtrace",
     );
+    if cleave_slots < slots {
+        tracing::warn!(
+            slots,
+            cleave_slots,
+            "cleave entry gate is limiting nested analysis concurrency; set \
+             SCAN_CLEAVE_CONCURRENCY to raise it after validating stack/RSS safety",
+        );
+    }
 
     // Start background rayon pool health monitoring.
     cleave::start_rayon_diagnostics();
@@ -1543,9 +1575,20 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 .and_then(|s| s.parse::<u64>().ok())
                 .map_or(60, |s| s.max(1)),
         );
+        // Optional short-cadence snapshots of cleave's per-Rayon-thread
+        // breadcrumbs. This is deliberately separate from wedge detection:
+        // stack overflow aborts synchronously and may happen before any wedge
+        // threshold is reached. A recent snapshot is therefore the useful
+        // evidence when the process dies without a warning.
+        let breadcrumb_interval = std::env::var("SCAN_BREADCRUMB_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .map(Duration::from_secs);
         tokio::spawn(async move {
             tracing::debug!(
                 heartbeat_secs = heartbeat.as_secs(),
+                breadcrumb_secs = breadcrumb_interval.map(|d| d.as_secs()),
                 "worker summary ticker armed"
             );
             // Per-slot census state, carried across ticks.
@@ -1575,9 +1618,13 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             // is longer, so a stuck slot self-documents promptly rather than
             // waiting for the next (possibly minute-long) summary.
             let wedge_check = heartbeat.min(Duration::from_secs(30));
+            let tick_interval =
+                breadcrumb_interval.map_or(wedge_check, |interval| wedge_check.min(interval));
             let mut last_summary = Instant::now();
+            #[cfg(feature = "cleave-breadcrumbs")]
+            let mut last_breadcrumb = Instant::now();
             while !shutdown.load(Ordering::Relaxed) {
-                interruptible_sleep(wedge_check, &shutdown).await;
+                interruptible_sleep(tick_interval, &shutdown).await;
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
@@ -1613,6 +1660,27 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         .filter(|e| !wedge_latched.contains(&e.analysis_id))
                         .collect();
                     let summary_due = now.duration_since(last_summary) >= heartbeat;
+                    #[cfg(feature = "cleave-breadcrumbs")]
+                    let breadcrumb_due = breadcrumb_interval
+                        .is_some_and(|interval| now.duration_since(last_breadcrumb) >= interval);
+
+                    #[cfg(feature = "cleave-breadcrumbs")]
+                    if breadcrumb_due {
+                        for crumb in cleave::breadcrumb::snapshot()
+                            .into_iter()
+                            .take(CENSUS_MAX_LINES)
+                        {
+                            tracing::info!(
+                                rayon_index = ?crumb.rayon_index,
+                                thread_id = crumb.thread_id,
+                                analyzer = crumb.analyzer,
+                                target = %crumb.target,
+                                age_ms = crate::duration_ms(crumb.age),
+                                "RAYON breadcrumb snapshot",
+                            );
+                        }
+                        last_breadcrumb = now;
+                    }
 
                     // Resolve wait-channels once per tick, only when something will
                     // print them (a wedge fired, or the summary census is due).
@@ -1928,6 +1996,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let completed = Arc::clone(&completed);
         let metrics = Arc::clone(&metrics);
         let spool = Arc::clone(&spool);
+        let cleave_gate = Arc::clone(&cleave_gate);
 
         tokio::spawn(async move {
             let result = run_job(
@@ -1937,6 +2006,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 data_root.as_deref(),
                 &pj.job,
                 &resources,
+                &cleave_gate,
                 slow_rule_ms,
                 &spool,
                 pj.data,
@@ -2314,6 +2384,7 @@ async fn run_job(
     data_root: Option<&Path>,
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
+    cleave_gate: &Arc<Semaphore>,
     slow_rule_ms: u64,
     spool: &Arc<SpoolState>,
     prefetched: std::result::Result<PrefetchData, PrefetchError>,
@@ -2466,6 +2537,7 @@ async fn run_job(
     // Uses a tokio task instead of an OS thread to avoid one thread-per-job overhead.
     // The returned JoinHandle is aborted via RAII guard below so the watcher cannot
     // outlive this function even if the outer task is cancelled.
+    let sha_short_for_watcher = Arc::clone(&sha_short);
     let watcher_handle = tokio::task::spawn(async move {
         let mut last_phase = String::new();
         let mut phase_start = Instant::now();
@@ -2484,7 +2556,7 @@ async fn run_job(
                 if elapsed.as_secs() >= 180 && !very_slow_logged {
                     tracing::warn!(
                         analysis_id,
-                        sha256 = %sha_short,
+                        sha256 = %sha_short_for_watcher,
                         file = %label2,
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                         elapsed_ms = crate::duration_ms(elapsed),
@@ -2496,7 +2568,7 @@ async fn run_job(
                 } else if elapsed.as_secs() >= 60 && !slow_logged {
                     tracing::info!(
                         analysis_id,
-                        sha256 = %sha_short,
+                        sha256 = %sha_short_for_watcher,
                         file = %label2,
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                         elapsed_ms = crate::duration_ms(elapsed),
@@ -2510,7 +2582,7 @@ async fn run_job(
                 if !last_phase.is_empty() {
                     tracing::debug!(
                         analysis_id,
-                        sha256 = %sha_short,
+                        sha256 = %sha_short_for_watcher,
                         file = %label2,
                         phase = %last_phase,
                         elapsed_ms = crate::duration_ms(phase_start.elapsed()),
@@ -2523,7 +2595,7 @@ async fn run_job(
                 very_slow_logged = false;
                 tracing::debug!(
                     analysis_id,
-                    sha256 = %sha_short,
+                    sha256 = %sha_short_for_watcher,
                     file = %label2,
                     phase = %last_phase,
                     "phase started",
@@ -2536,7 +2608,7 @@ async fn run_job(
                 if elapsed.as_secs() >= 180 && !very_slow_logged {
                     tracing::warn!(
                         analysis_id,
-                        sha256 = %sha_short,
+                        sha256 = %sha_short_for_watcher,
                         file = %label2,
                         phase = %last_phase,
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
@@ -2548,7 +2620,7 @@ async fn run_job(
                 } else if elapsed.as_secs() >= 60 && !slow_logged {
                     tracing::info!(
                         analysis_id,
-                        sha256 = %sha_short,
+                        sha256 = %sha_short_for_watcher,
                         file = %label2,
                         phase = %last_phase,
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
@@ -2574,6 +2646,28 @@ async fn run_job(
         }
     }
     let _watcher_guard = WatcherGuard(Some(watcher_handle));
+
+    // Acquire this asynchronously so a waiting job does not consume a Tokio
+    // blocking thread. The permit is moved into the closure and held across
+    // the complete classify/fetch/graft operation, including all nested Rayon
+    // work spawned by cleave.
+    phase.set("scan:cleave_gate");
+    let gate_wait_start = Instant::now();
+    let cleave_permit = cleave_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| format!("cleave analysis gate closed: {e}"))?;
+    let gate_wait = gate_wait_start.elapsed();
+    if gate_wait >= Duration::from_secs(1) {
+        tracing::info!(
+            analysis_id,
+            sha256 = %sha_short,
+            file = %label,
+            wait_ms = crate::duration_ms(gate_wait),
+            "analysis admitted to cleave after waiting for nested-work gate",
+        );
+    }
 
     tracing::debug!(
         analysis_id,
@@ -2616,6 +2710,7 @@ async fn run_job(
         // set we want. See `crate::crash_dump`.
         let _inflight =
             crate::crash_dump::register(analysis_id, thread_id, &sha_short2, &label_for_blocking);
+        let _cleave_permit = cleave_permit;
         // Spooled payloads take the same file-path route as local files, so a
         // multi-GiB sample is memory-mapped rather than held in RAM. The
         // spooled payload is moved into this closure and dropped when it
