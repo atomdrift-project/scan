@@ -645,6 +645,30 @@ fn post_upload(
     provenance: &[u8],
     build_form: impl Fn() -> Option<reqwest::blocking::multipart::Form>,
 ) -> bool {
+    let token = std::env::var("HOPPER_UPLOAD_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    post_upload_with_token(
+        client,
+        upload_url,
+        sha256,
+        kind,
+        provenance,
+        token.as_deref(),
+        build_form,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_upload_with_token(
+    client: &reqwest::blocking::Client,
+    upload_url: &str,
+    sha256: &str,
+    kind: &str,
+    provenance: &[u8],
+    token: Option<&str>,
+    build_form: impl Fn() -> Option<reqwest::blocking::multipart::Form>,
+) -> bool {
     for (attempt, timeout) in ATTEMPT_TIMEOUTS.into_iter().enumerate() {
         if attempt > 0 {
             std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
@@ -652,12 +676,11 @@ fn post_upload(
         let Some(form) = build_form() else {
             return false; // part build failed — unrecoverable
         };
-        match client
-            .post(upload_url)
-            .timeout(timeout)
-            .multipart(form)
-            .send()
-        {
+        let mut request = client.post(upload_url).timeout(timeout).multipart(form);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        match request.send() {
             Ok(resp) if resp.status().is_success() => return true,
             Ok(resp) => {
                 let status = resp.status();
@@ -800,6 +823,8 @@ fn post_one(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     /// The wire body round-trips through zstd back to the exact JSON serde
     /// produced: this is the same shape hopper's `/api/result` decodes, so an fs
@@ -834,6 +859,52 @@ mod tests {
         assert!(name.len() <= MAX_WORKER_NAME_LEN);
         // Mirrors hopper's `validWorkerName`: printable ASCII, no spaces.
         assert!(name.chars().all(|c| c.is_ascii_graphic()));
+    }
+
+    #[test]
+    fn upload_sends_configured_bearer_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept upload");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).expect("read upload");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write response");
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        let url = format!("http://{addr}/api/upload");
+        let ok = post_upload_with_token(
+            &reqwest::blocking::Client::new(),
+            &url,
+            &"a".repeat(64),
+            "test",
+            b"{}",
+            Some("test-secret"),
+            || Some(reqwest::blocking::multipart::Form::new().text("sha256", "a".repeat(64))),
+        );
+        assert!(ok);
+        let request = server.join().expect("server thread");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-secret\r\n"),
+            "request headers: {request}"
+        );
     }
 
     /// A dependency's upload artifact loads its bytes lazily from the fetch cache

@@ -16,7 +16,9 @@
 # service management.
 #
 # Environment overrides:
+#   DATA_DIR            local sample root (--data-dir)           (default: unset)
 #   WORKERS             concurrency (--workers)                  (default: worker auto)
+#   MAX_RSS_GB          pause threshold (--max-rss-gb)            (default: 0 = auto)
 #   LLM                 OpenAI-compatible LLM endpoint (SCAN_LLM) (default: http://10.9.8.149:8000/v1)
 
 set -eu
@@ -24,7 +26,9 @@ set -eu
 URL="${1:-}"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
+DATA_DIR="${DATA_DIR:-}"
 WORKERS="${WORKERS:-}"
+MAX_RSS_GB="${MAX_RSS_GB:-0}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 
 BINARY=atomscan
@@ -116,7 +120,7 @@ $SUDO su -l scan -c "${BIN_PATH} update-rules" || die "update-rules failed"
 
 # --- rc.d service -----------------------------------------------------------
 
-worker_args=$(scan_worker_args "$URL" "$WORKERS")
+worker_args=$(scan_worker_args "$URL" "$WORKERS" "$DATA_DIR" "$MAX_RSS_GB")
 
 TMP_RCD=$(mktemp -t scan-worker.rcd.XXXXXX)
 scan_rcd_script "${BIN_PATH}" "$worker_args" "$LLM" >"$TMP_RCD"

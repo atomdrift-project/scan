@@ -15,12 +15,16 @@
 # worker count. The interpret gate (min ML probability) is left at the binary's
 # default. The endpoint itself is supplied via the SCAN_LLM environment variable
 # in scan_rcd_script, not here.
-# Usage: scan_worker_args <url> [workers]
+# Usage: scan_worker_args <url> [workers] [data_dir] [max_rss_gb]
 scan_worker_args() {
 	_lwa_url="$1"
 	_lwa_workers="$2"
+	_lwa_data_dir="${3:-}"
+	_lwa_max_rss_gb="${4:-}"
 	_lwa_args="worker --url $_lwa_url --interpret"
 	[ -n "$_lwa_workers" ] && _lwa_args="$_lwa_args --workers $_lwa_workers"
+	[ -n "$_lwa_data_dir" ] && _lwa_args="$_lwa_args --data-dir $_lwa_data_dir"
+	[ -n "$_lwa_max_rss_gb" ] && _lwa_args="$_lwa_args --max-rss-gb $_lwa_max_rss_gb"
 	printf '%s' "$_lwa_args"
 }
 
@@ -69,6 +73,7 @@ load_rc_config \$name
 
 : \${scan_worker_enable:="NO"}
 : \${scan_worker_logfile:="/var/log/scan-worker.log"}
+: \${scan_worker_env_file:="/usr/local/etc/hopper/env"}
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
 : \${scan_worker_llm:="$_lrs_llm"}
 # Seconds a graceful stop waits for the worker to drain in-flight analyses
@@ -80,6 +85,16 @@ load_rc_config \$name
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
+start_precmd="scan_worker_precmd"
+scan_worker_precmd()
+{
+	# The native Hopper deploy provisions this root-owned file. Jailed or
+	# standalone workers may omit it when they never mirror dependencies.
+	if [ -r "\${scan_worker_env_file}" ]; then
+		. "\${scan_worker_env_file}"
+		export HOPPER_UPLOAD_TOKEN
+	fi
+}
 # MALLOC_CONF tunes FreeBSD's jemalloc to return freed memory to the OS
 # promptly instead of holding dirty pages for 10s (the default). Critical
 # under bursty analysis workloads where RSS would otherwise drift upward.
