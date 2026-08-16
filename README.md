@@ -46,7 +46,17 @@ make install
 
 If deeper binary analysis is required, you should also install
 [7-Zip](https://7-zip.org/), [rizin](https://rizin.re/), [upx](https://upx.github.io/), and [innoextract](https://github.com/dscharrer/innoextract).
-Install upstream 7-Zip (`brew install sevenzip`, `apt install 7zip`) rather than `p7zip` — its `7z` cannot read APFS, so `.dmg` contents go unscanned.
+
+On Windows, using winget:
+
+```powershell
+winget install --exact --id 7zip.7zip
+winget install --exact --id Rizin.Rizin
+winget install --exact --id UPX.UPX
+winget install --exact --id dscharrer.innoextract
+```
+
+On Unix-like systems, install upstream 7-Zip (`brew install sevenzip`, `apt install 7zip`) rather than `p7zip` — its `7z` cannot read APFS, so `.dmg` contents go unscanned.
 
 ## Usage
 
