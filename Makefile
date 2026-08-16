@@ -4,6 +4,10 @@ SHELL := /bin/sh
 # (avast ships its own /usr/bin/scan), so we no longer install one. The product
 # name stays "Atomdrift Scan"; only the invocation is `atomscan`.
 BINARY = atomscan
+# Cargo package name, which is not always the binary name (scan's package is
+# `atomdrift-scan` but ships `atomscan`). Read from Cargo.toml so `cut-release`
+# passes the right `-p` without a second place to keep in sync.
+PACKAGE := $(shell awk -F'"' '/^name = /{print $$2; exit}' Cargo.toml)
 OUT_DIR = out
 BUILD ?= build
 SERVER_RUN ?= scan
@@ -39,7 +43,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish
+.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -633,6 +637,43 @@ install-precommit:
 	cp scripts/pre-commit "$$(git rev-parse --git-dir)/hooks/pre-commit"
 	chmod +x "$$(git rev-parse --git-dir)/hooks/pre-commit"
 	@echo "✓ Pre-commit hook installed."
+
+# Cut a release: set the version everywhere it is recorded, prove the result
+# builds the way CI will, and commit + tag it as one unit.
+#
+#     make cut-release VERSION=1.2.3
+#
+# The version lives in three places that must agree — Cargo.toml, Cargo.lock,
+# and the tag — and release.yml rejects the build when any pair disagrees.
+# Doing it by hand cost four failed release runs in one day: a tag ahead of
+# Cargo.toml, then Cargo.toml ahead of Cargo.lock, each discovered ~40 minutes
+# into a matrix that `cargo check --locked` disproves in seconds.
+#
+# Pushing stays manual on purpose. That is the step that spends an hour of CI
+# and publishes artifacts people download, so it gets a human; everything this
+# target does is local and revertible with `git reset --hard HEAD~1` plus
+# `git tag -d`.
+cut-release: ## Bump version + lockfile, verify, commit and tag (VERSION=x.y.z)
+	@test -n "$(VERSION)" || { echo "usage: make cut-release VERSION=x.y.z" >&2; exit 1; }
+	@printf '%s\n' "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$$' \
+		|| { echo "VERSION must look like 1.2.3 (got '$(VERSION)')" >&2; exit 1; }
+	@test -z "$$(git status --porcelain)" \
+		|| { echo "working tree is dirty — the tag must capture exactly what was tested:" >&2; \
+		     git status --short >&2; exit 1; }
+	@if git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null; then \
+		echo "tag v$(VERSION) already exists" >&2; exit 1; fi
+	@# Rewrite only the first `version =`, which is the one in [package].
+	@awk -v v="$(VERSION)" 'BEGIN{d=0} /^version = "/ && !d {print "version = \"" v "\""; d=1; next} {print}' \
+		Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
+	$(CARGO) update -p $(PACKAGE) --offline
+	@# The exact gate release.yml applies, minus the hour of linking.
+	$(CARGO) check --locked --all-targets
+	git add Cargo.toml Cargo.lock
+	git commit -m "v$(VERSION)"
+	git tag -a "v$(VERSION)" -m "$(BINARY) $(VERSION)"
+	@echo
+	@echo "tagged v$(VERSION). to release:"
+	@echo "    git push origin $$(git rev-parse --abbrev-ref HEAD) && git push origin v$(VERSION)"
 
 clean:
 	$(CARGO) clean
