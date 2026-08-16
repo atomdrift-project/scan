@@ -42,9 +42,9 @@ if [ "${1:-}" = "_run" ]; then
 	exec "${SHELL:-sh}"
 fi
 
-URL="${1:-${URL:-http://10.9.8.5:8081/}}"
+URL="${1:-${URL:-http://10.9.8.10:8081/}}"
 WORKER_NODES="${WORKER_NODES:-10.9.8.2 10.9.8.8 10.9.8.9 10.9.8.149 10.9.8.13}"
-HOPPER_NODE="${HOPPER_NODE:-10.9.8.5}"
+HOPPER_NODE="${HOPPER_NODE:-10.9.8.10}"
 STAGGER="${STAGGER:-5}"
 SESSION="${SESSION:-scan-deploy}"
 

@@ -26,6 +26,7 @@ SCAN_THREADS ?=
 MAX_JOBS ?= 25
 WORKERS  ?=
 MAX_RSS_GB ?=
+URL ?= http://10.9.8.10:8081/
 # LLM second-opinion pass for `make worker` (matches the deploy scripts'
 # defaults). LLM is exported as SCAN_LLM; INTERPRET_MIN_PROB gates which samples
 # are sent. The benchmark/profile targets deliberately omit interpret so LLM
