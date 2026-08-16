@@ -177,6 +177,11 @@ tikv-jemalloc-sys = "0.7"
 tree-sitter = "0.27"
 
 [features]
+# Keep the per-member Rayon breadcrumbs compiled into release workers. They are
+# dormant unless a wedge is detected, but make the next archive failure
+# actionable by naming the exact member running on each Rayon thread.
+default = ["cleave-breadcrumbs"]
+
 # Enables jemalloc heap profiling. Build with:
 #   cargo build --profile profiling --features jemalloc-prof --bin atomscan
 # Run with (note the `_RJEM_` prefix — tikv-jemalloc renames MALLOC_CONF):
@@ -304,5 +309,4 @@ tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev
 
 [patch."https://github.com/tstromberg/dmgwiz.git"]
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
-
 
