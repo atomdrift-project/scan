@@ -109,13 +109,24 @@ pub(crate) fn os_thread_id() -> u64 {
         // SAFETY: `_lwp_self` takes no arguments and cannot fail.
         unsafe { _lwp_self() as u64 }
     }
+    #[cfg(windows)]
+    {
+        // Matches Task Manager / Process Explorer / WinDbg thread ids. Declared
+        // directly so we don't grow a windows-sys dep for one call.
+        unsafe extern "system" {
+            fn GetCurrentThreadId() -> u32;
+        }
+        // SAFETY: `GetCurrentThreadId` takes no arguments and cannot fail.
+        u64::from(unsafe { GetCurrentThreadId() })
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
         target_os = "freebsd",
         target_os = "openbsd",
         target_os = "illumos",
-        target_os = "solaris"
+        target_os = "solaris",
+        windows
     )))]
     {
         0
