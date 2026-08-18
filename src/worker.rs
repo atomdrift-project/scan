@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
@@ -78,20 +78,29 @@ const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// `/api/next` — still reports liveness, RSS, load, and queue depth on time.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Number of top-level cleave analyses allowed to build nested Rayon work at
-/// once. A worker slot is still useful for prefetching and result delivery, but
-/// cleave archives, fetch composites, and resource loading all recursively use
-/// the one process-global Rayon pool. Letting every slot enter that tree at
-/// once can compound stack usage and abort the process with a stack overflow
-/// before the RSS gate has a chance to reclaim anything.
-const DEFAULT_CLEAVE_CONCURRENCY: usize = 1;
-
+/// How many top-level analyses may enter nested Rayon work at once.
+///
+/// Worker slots still bound claim/prefetch/post; this tighter gate bounds how
+/// many deep cleave/fetch trees share the one process-global Rayon pool.
+/// Independent trees compound stack frames via work-stealing (256 MiB stacks +
+/// `stacker` absorb a handful, not dozens). Serializing to 1 made a single
+/// `fetch+graft` whale freeze every other slot — so the default scales with
+/// the pool (⅛, at least 1) and never exceeds `slots`. Override with
+/// `SCAN_CLEAVE_CONCURRENCY`.
 fn cleave_concurrency(slots: usize) -> usize {
-    std::env::var("SCAN_CLEAVE_CONCURRENCY")
+    let override_value = std::env::var("SCAN_CLEAVE_CONCURRENCY")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    cleave_concurrency_from(slots, rayon::current_num_threads(), override_value)
+}
+
+/// Pure gate sizing — `pool` is the Rayon thread count, `override_value` is
+/// `SCAN_CLEAVE_CONCURRENCY` when set.
+fn cleave_concurrency_from(slots: usize, pool: usize, override_value: Option<usize>) -> usize {
+    let slots = slots.max(1);
+    override_value
         .filter(|&value| value > 0)
-        .map_or(DEFAULT_CLEAVE_CONCURRENCY, |value| value.min(slots.max(1)))
+        .map_or_else(|| (pool.max(1) / 8).clamp(1, slots), |value| value.min(slots))
 }
 
 type ResourceHandle = Arc<RwLock<Arc<ModelResources>>>;
@@ -1321,10 +1330,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         .build()?;
     let semaphore = Arc::new(Semaphore::new(slots));
     // Keep the outer worker slots independent from cleave's nested Rayon
-    // concurrency. The former controls queue throughput; this gate prevents
-    // several archive/fetch analysis trees from entering the shared nested-work
-    // path simultaneously. Override for controlled benchmarking or
-    // after a cleave release provides a stronger internal bound.
+    // concurrency. The former controls claim/prefetch/post throughput; this
+    // gate caps how many deep analysis trees share the pool. Acquired in the
+    // dispatch loop before spawn so waiters do not pin prefetch + watchers.
     let cleave_slots = cleave_concurrency(slots);
     let cleave_gate = Arc::new(Semaphore::new(cleave_slots));
     // Slot count bounds concurrency but not memory: a slot analysing a huge
@@ -1379,8 +1387,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         tracing::warn!(
             slots,
             cleave_slots,
-            "cleave entry gate is limiting nested analysis concurrency; set \
-             SCAN_CLEAVE_CONCURRENCY to raise it after validating stack/RSS safety",
+            "cleave entry gate limits nested Rayon trees to {cleave_slots} \
+             (pool/8); set SCAN_CLEAVE_CONCURRENCY to override",
         );
     }
 
@@ -1989,6 +1997,25 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             )
             .await;
 
+        // Admit to nested Rayon work here — before spawn — so a full gate does
+        // not pile up slot-many `run_job` tasks (each holding prefetch bytes and
+        // a phase watcher) behind one whale. Prefetch stays in the bounded
+        // channel; only `cleave_slots` analyses run at a time.
+        let gate_wait_start = Instant::now();
+        let cleave_permit = Arc::clone(&cleave_gate)
+            .acquire_owned()
+            .await
+            .context("cleave analysis gate closed")?;
+        let gate_wait = gate_wait_start.elapsed();
+        if gate_wait >= Duration::from_secs(1) {
+            tracing::info!(
+                sha256 = %pj.job.sha256.get(..12).unwrap_or(&pj.job.sha256),
+                file = %pj.job.path,
+                wait_ms = crate::duration_ms(gate_wait),
+                "analysis admitted to cleave after waiting for nested-work gate",
+            );
+        }
+
         let url = Arc::clone(&base_url);
         let name = Arc::clone(&name);
         let local_index = Arc::clone(&local_index);
@@ -1996,7 +2023,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let completed = Arc::clone(&completed);
         let metrics = Arc::clone(&metrics);
         let spool = Arc::clone(&spool);
-        let cleave_gate = Arc::clone(&cleave_gate);
 
         tokio::spawn(async move {
             let result = run_job(
@@ -2006,7 +2032,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 data_root.as_deref(),
                 &pj.job,
                 &resources,
-                &cleave_gate,
+                cleave_permit,
                 slow_rule_ms,
                 &spool,
                 pj.data,
@@ -2384,7 +2410,10 @@ async fn run_job(
     data_root: Option<&Path>,
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
-    cleave_gate: &Arc<Semaphore>,
+    // Held for the whole classify/fetch/graft so nested Rayon trees stay
+    // within `cleave_slots`. Acquired by the dispatcher before spawn; moved
+    // into the blocking closure so an async cancel cannot release it early.
+    cleave_permit: OwnedSemaphorePermit,
     slow_rule_ms: u64,
     spool: &Arc<SpoolState>,
     prefetched: std::result::Result<PrefetchData, PrefetchError>,
@@ -2647,28 +2676,6 @@ async fn run_job(
     }
     let _watcher_guard = WatcherGuard(Some(watcher_handle));
 
-    // Acquire this asynchronously so a waiting job does not consume a Tokio
-    // blocking thread. The permit is moved into the closure and held across
-    // the complete classify/fetch/graft operation, including all nested Rayon
-    // work spawned by cleave.
-    phase.set("scan:cleave_gate");
-    let gate_wait_start = Instant::now();
-    let cleave_permit = cleave_gate
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|e| format!("cleave analysis gate closed: {e}"))?;
-    let gate_wait = gate_wait_start.elapsed();
-    if gate_wait >= Duration::from_secs(1) {
-        tracing::info!(
-            analysis_id,
-            sha256 = %sha_short,
-            file = %label,
-            wait_ms = crate::duration_ms(gate_wait),
-            "analysis admitted to cleave after waiting for nested-work gate",
-        );
-    }
-
     tracing::debug!(
         analysis_id,
         sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
@@ -2710,6 +2717,9 @@ async fn run_job(
         // set we want. See `crate::crash_dump`.
         let _inflight =
             crate::crash_dump::register(analysis_id, thread_id, &sha_short2, &label_for_blocking);
+        // Keep the nested-work permit on this blocking thread for the whole
+        // classify/fetch/graft. Dropping it from the async frame on cancel
+        // would admit another tree while this one still owns Rayon workers.
         let _cleave_permit = cleave_permit;
         // Spooled payloads take the same file-path route as local files, so a
         // multi-GiB sample is memory-mapped rather than held in RAM. The
@@ -4230,5 +4240,37 @@ mod tests {
             snap.last_error.as_ref().map(|(_, msg)| msg.as_str()),
             Some("boom")
         );
+    }
+
+    #[test]
+    fn cleave_concurrency_scales_with_pool_and_respects_slot_cap() {
+        assert_eq!(cleave_concurrency_from(16, 32, None), 4);
+        assert_eq!(cleave_concurrency_from(16, 8, None), 1);
+        assert_eq!(cleave_concurrency_from(2, 64, None), 2);
+        assert_eq!(cleave_concurrency_from(0, 32, None), 1);
+    }
+
+    #[test]
+    fn cleave_concurrency_override_caps_at_slots() {
+        assert_eq!(cleave_concurrency_from(4, 32, Some(64)), 4);
+        assert_eq!(cleave_concurrency_from(16, 32, Some(2)), 2);
+        // Zero / bogus overrides fall back to the pool formula.
+        assert_eq!(cleave_concurrency_from(16, 32, Some(0)), 4);
+    }
+
+    #[test]
+    fn os_thread_id_is_nonzero_on_supported_hosts() {
+        let tid = crate::thread_dump::os_thread_id();
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+            windows
+        ))]
+        assert_ne!(tid, 0, "os_thread_id must resolve on this host");
+        let _ = tid;
     }
 }

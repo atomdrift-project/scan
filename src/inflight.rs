@@ -33,6 +33,7 @@ pub struct Entry {
     pub file_type: Arc<str>,
     /// OS thread id of the blocking worker thread this analysis runs on; `0`
     /// until it lands on one (it is registered before `spawn_blocking` starts).
+    /// On Windows this is `GetCurrentThreadId`; on Unix it matches `/proc`/ps.
     pub thread_id: AtomicU64,
     /// When the analysis started, for total-elapsed reporting.
     pub started: Instant,
@@ -312,7 +313,52 @@ pub fn process_cpu_secs() -> f64 {
         let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0;
         secs(usage.ru_utime) + secs(usage.ru_stime)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // FILETIME is 100 ns intervals; sum user + kernel like getrusage.
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        impl FileTime {
+            fn as_secs_f64(self) -> f64 {
+                let ticks = (u64::from(self.high) << 32) | u64::from(self.low);
+                ticks as f64 / 10_000_000.0
+            }
+        }
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn GetProcessTimes(
+                process: *mut core::ffi::c_void,
+                creation: *mut FileTime,
+                exit: *mut FileTime,
+                kernel: *mut FileTime,
+                user: *mut FileTime,
+            ) -> i32;
+        }
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        // SAFETY: all four out-pointers are valid locals; handle is the process
+        // pseudo-handle (-1) which GetProcessTimes accepts.
+        let ok = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if ok == 0 {
+            return 0.0;
+        }
+        user.as_secs_f64() + kernel.as_secs_f64()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         0.0
     }
