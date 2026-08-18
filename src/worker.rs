@@ -1,8 +1,16 @@
 //! Pull-based worker that polls a hopper instance for analysis jobs.
 //!
-//! Each worker maintains N concurrent analysis slots via a tokio semaphore.
-//! When a slot is free, it claims work from hopper's `/api/next` endpoint,
-//! analyzes the file, and posts the result back to `/api/result`.
+//! Shape (deliberately boring):
+//!
+//! ```text
+//!   prefetcher ──► job channel ──► N worker tasks (N = --workers)
+//! ```
+//!
+//! Each worker loops: take job → admit memory → cleave-gate → analyze → post.
+//! There is no central dispatcher and no analysis-slot semaphore — the N tasks
+//! *are* the concurrency limit. A permit is never held across a wait that does
+//! not need it: cleave covers only the blocking classify; hopper I/O runs after
+//! admit/cleave are dropped so a wedged hopper cannot freeze analysis.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -16,7 +24,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
+use tokio::task::JoinSet;
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
@@ -80,13 +89,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How many top-level analyses may enter nested Rayon work at once.
 ///
-/// Worker slots still bound claim/prefetch/post; this tighter gate bounds how
-/// many deep cleave/fetch trees share the one process-global Rayon pool.
-/// Independent trees compound stack frames via work-stealing (256 MiB stacks +
-/// `stacker` absorb a handful, not dozens). Serializing to 1 made a single
-/// `fetch+graft` whale freeze every other slot — so the default scales with
+/// The N worker tasks bound how many jobs are in flight; this tighter gate
+/// bounds how many deep cleave/fetch trees share the one process-global Rayon
+/// pool. Independent trees compound stack frames via work-stealing (256 MiB
+/// stacks + `stacker` absorb a handful, not dozens). The default scales with
 /// the pool (⅛, at least 1) and never exceeds `slots`. Override with
 /// `SCAN_CLEAVE_CONCURRENCY`.
+///
+/// Each worker waits on this gate *after* taking a job and *only* around the
+/// blocking classify — never on a shared dispatch loop.
 fn cleave_concurrency(slots: usize) -> usize {
     let override_value = std::env::var("SCAN_CLEAVE_CONCURRENCY")
         .ok()
@@ -751,12 +762,12 @@ fn spawn_resource_renewal_task(
 }
 
 // Phase 2 (WORKER_POOL_PLAN.md): litmus no longer manages rayon. There is no
-// per-slot pool grid — analyses run on the one process-global rayon pool that
-// main installs (sized to the host's cores, 256 MB stacks). The tokio semaphore
-// alone bounds concurrency; cleave's `par_iter` fan-out work-steals across the
-// shared pool, so a single large archive can use the whole machine while total
-// rayon threads stay capped at the pool size (not `slots × per-slot-threads`),
-// which in turn caps cleave's per-thread YARA scanners.
+// per-slot pool grid — N pull-style worker tasks share the one process-global
+// rayon pool that main installs (sized to the host's cores, 256 MB stacks).
+// Cleave's `par_iter` fan-out work-steals across that pool, so a single large
+// archive can use the whole machine while total rayon threads stay capped at
+// the pool size (not `slots × per-slot-threads`), which in turn caps cleave's
+// per-thread YARA scanners.
 
 /// How long a staged job may be passed over by smaller arrivals before SJF
 /// dispatches it anyway. Bounds a big job's staging delay under a continuous
@@ -781,32 +792,68 @@ fn sjf_max_staged_wait() -> Duration {
         .map_or(SJF_MAX_STAGED_WAIT, Duration::from_secs)
 }
 
-/// Size-aware dispatch (default): take the smallest staged job, not the oldest.
+/// Shared job intake for the N worker tasks.
 ///
-/// Sweeps everything currently in the prefetch channel into `reorder` (the
-/// dispatch loop holds jobs the prefetcher has already claimed and downloaded),
-/// then picks the smallest by hopper-reported size — unless something has waited
-/// past [`SJF_MAX_STAGED_WAIT`], in which case the oldest such job goes first.
-/// Blocks only when the window is empty. Returns `None` once the channel is
-/// closed *and* the window is drained, matching `recv()`'s termination contract.
+/// Tokio's `mpsc::Receiver` is single-consumer, so workers serialize briefly on
+/// this mutex to pull the next SJF/FIFO job. The lock is held across an empty
+/// `recv().await` — that is fine: with no work, every worker is idle anyway.
+/// As soon as a job is taken the lock drops and analysis runs concurrently.
 ///
-/// Pairs with hopper's size-interleaved Tier 1 handout: hopper guarantees every
-/// claim batch carries a size mix, this picker guarantees the small ones go
-/// first. Measured on the realworld dataset: median small-sample flow 15.3 →
-/// 6.4 minutes at neutral wall. The known trade-off is at the tail — deferring
-/// archives clusters them wherever small jobs thin out, which raised drain-mode
-/// small p95 and peak RSS (the memory-admission gate is the backstop there).
-/// `SCAN_SJF=0` restores FIFO dispatch.
+/// SJF policy matches the historical dispatcher: sweep the prefetch channel
+/// into a reorder window, prefer the smallest sample, age out long-waiters
+/// after [`SJF_MAX_STAGED_WAIT`]. `SCAN_SJF=0` restores FIFO.
+struct JobSource {
+    state: AsyncMutex<JobSourceState>,
+}
+
+struct JobSourceState {
+    rx: mpsc::UnboundedReceiver<PrefetchedJob>,
+    reorder: Vec<(PrefetchedJob, Instant)>,
+    sjf: bool,
+}
+
+impl JobSource {
+    fn new(rx: mpsc::UnboundedReceiver<PrefetchedJob>, sjf: bool) -> Self {
+        Self {
+            state: AsyncMutex::new(JobSourceState {
+                rx,
+                reorder: Vec::new(),
+                sjf,
+            }),
+        }
+    }
+
+    async fn recv(&self) -> Option<PrefetchedJob> {
+        let mut state = self.state.lock().await;
+        if !state.sjf {
+            return state.rx.recv().await;
+        }
+        // SJF via `&mut state` field access (not two simultaneous &mut borrows
+        // of sibling fields into an async fn — that fails to compile).
+        while let Ok(pj) = state.rx.try_recv() {
+            state.reorder.push((pj, Instant::now()));
+        }
+        if state.reorder.is_empty() {
+            let first = state.rx.recv().await?;
+            state.reorder.push((first, Instant::now()));
+            while let Ok(pj) = state.rx.try_recv() {
+                state.reorder.push((pj, Instant::now()));
+            }
+        }
+        pick_sjf_from_reorder(&mut state.reorder)
+    }
+}
+
+/// Test-facing SJF picker over a bare channel + reorder window. Production
+/// intake goes through [`JobSource::recv`], which inlines the same policy.
+#[cfg(test)]
 async fn next_smallest_staged(
     rx: &mut mpsc::UnboundedReceiver<PrefetchedJob>,
     reorder: &mut Vec<(PrefetchedJob, Instant)>,
 ) -> Option<PrefetchedJob> {
-    // Sweep all ready jobs into the window without blocking.
     while let Ok(pj) = rx.try_recv() {
         reorder.push((pj, Instant::now()));
     }
-    // Empty window: block for the next arrival like FIFO would, then sweep
-    // again so a burst that landed together is reordered together.
     if reorder.is_empty() {
         let first = rx.recv().await?;
         reorder.push((first, Instant::now()));
@@ -814,7 +861,10 @@ async fn next_smallest_staged(
             reorder.push((pj, Instant::now()));
         }
     }
+    pick_sjf_from_reorder(reorder)
+}
 
+fn pick_sjf_from_reorder(reorder: &mut Vec<(PrefetchedJob, Instant)>) -> Option<PrefetchedJob> {
     let now = Instant::now();
     let max_wait = sjf_max_staged_wait();
     let aged = reorder
@@ -1328,11 +1378,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
-    let semaphore = Arc::new(Semaphore::new(slots));
-    // Keep the outer worker slots independent from cleave's nested Rayon
-    // concurrency. The former controls claim/prefetch/post throughput; this
-    // gate caps how many deep analysis trees share the pool. Acquired in the
-    // dispatch loop before spawn so waiters do not pin prefetch + watchers.
+    // Nested-Rayon cap only. Worker-task count (`slots`) is the analysis
+    // concurrency limit — no separate analysis-slot semaphore.
     let cleave_slots = cleave_concurrency(slots);
     let cleave_gate = Arc::new(Semaphore::new(cleave_slots));
     // Slot count bounds concurrency but not memory: a slot analysing a huge
@@ -1347,18 +1394,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(Arc::clone(&shutdown));
 
-    // Phase 2 thread model: `slots` (the tokio semaphore) bounds how many
-    // analyses run concurrently; the one process-global rayon pool provides the
-    // parallelism. Total rayon threads = the pool size, independent of slots —
-    // no per-slot grid, no `slots × threads_per_slot` multiplication. This is
-    // the headline number that caps cleave's per-thread YARA scanners.
+    // Phase 2 thread model: `slots` long-lived worker tasks pull jobs; the one
+    // process-global rayon pool provides member-level parallelism. Total rayon
+    // threads = the pool size, independent of slots — no per-slot grid. This
+    // is the headline number that caps cleave's per-thread YARA scanners.
     let global_rayon_threads = rayon::current_num_threads();
     tracing::info!(
         slots,
         cleave_slots,
         rayon_threads = global_rayon_threads,
-        "worker concurrency: up to {slots} analyses share one shared \
-         {global_rayon_threads}-thread rayon pool (no per-slot pools)",
+        "worker concurrency: {slots} pull-style workers share one \
+         {global_rayon_threads}-thread rayon pool (cleave gate={cleave_slots})",
     );
     // Each in-flight analysis parks a coordinator on the pool and fans member
     // work into it; slots far beyond the pool size just queue analyses against
@@ -1483,14 +1529,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let advertised_max_bytes: usize = usize::try_from(MAX_JOB_BYTES).unwrap_or(usize::MAX);
 
     // Background prefetch keeps `1.1 × slots` samples staged at all times so a
-    // free worker slot never waits on a download. The prefetcher polls and
-    // downloads on its own task, pushing each sample into `rx` the instant its
-    // download finishes; this loop only pulls ready samples and dispatches
-    // them. `outstanding` (staged + in-flight) bounds the depth; `queued_bytes`
-    // bounds staged payload memory against `max_buffer_bytes`.
-    let (tx, mut rx) = mpsc::unbounded_channel::<PrefetchedJob>();
+    // free worker never waits on a download. The prefetcher polls and downloads
+    // on its own task, pushing each sample into the job channel the instant its
+    // download finishes; the N workers pull ready samples. `outstanding`
+    // (staged + in-flight) bounds the depth; `queued_bytes` bounds staged
+    // payload memory against `max_buffer_bytes`.
+    let (tx, rx) = mpsc::unbounded_channel::<PrefetchedJob>();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let outstanding = Arc::new(AtomicUsize::new(0));
+    // Workers currently inside admit/analyze (not posting). Heartbeat/summary
+    // use this instead of a slot semaphore.
+    let analyzing = Arc::new(AtomicUsize::new(0));
     // Size-aware dispatch (default on): the smallest staged job dispatches
     // first instead of FIFO, so tiny samples stop queueing behind multi-minute
     // archives — on the realworld benchmark with hopper's size-interleaved
@@ -1502,6 +1551,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // `SCAN_SJF=0` restores FIFO dispatch; `SCAN_PREFETCH_DEPTH` overrides
     // the slots multiplier in either mode.
     let sjf = std::env::var("SCAN_SJF").ok().is_none_or(|v| v != "0");
+    let jobs = Arc::new(JobSource::new(rx, sjf));
     let depth_factor = std::env::var("SCAN_PREFETCH_DEPTH")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -1567,10 +1617,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         ),
     );
 
-    // The dispatch loop parks in `await`s, so emit the periodic summary from a
-    // dedicated ticker reading the shared counters.
+    // Workers park in `await`s, so emit the periodic summary from a dedicated
+    // ticker reading the shared counters.
     {
-        let semaphore = Arc::clone(&semaphore);
+        let analyzing = Arc::clone(&analyzing);
         let completed = Arc::clone(&completed);
         let outstanding = Arc::clone(&outstanding);
         let queued_bytes = Arc::clone(&queued_bytes);
@@ -1781,12 +1831,13 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
                     let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
                     let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
-                    let available_slots = semaphore.available_permits();
+                    let active_slots = analyzing.load(Ordering::Relaxed);
+                    let available_slots = slots.saturating_sub(active_slots);
                     tracing::info!(
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                         queued_prefetch_jobs = outstanding.load(Ordering::Relaxed),
                         prefetch_buffer_mb = queued_bytes.load(Ordering::Relaxed) / (1024 * 1024),
-                        active_slots = slots.saturating_sub(available_slots),
+                        active_slots,
                         available_slots,
                         cpu_cores_busy = format!("{cpu_cores_busy:.1}"),
                         load1 = system_load_avg().map(|load| format!("{load:.1}")),
@@ -1880,7 +1931,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let encoded_name = heartbeat_name;
         let available_tools = heartbeat_tools;
         let outstanding = Arc::clone(&outstanding);
-        let semaphore = Arc::clone(&semaphore);
+        let analyzing = Arc::clone(&analyzing);
         let metrics = Arc::clone(&metrics);
         let shutdown = Arc::clone(&shutdown);
         let admission = Arc::clone(&admission);
@@ -1892,9 +1943,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
+                let active = analyzing.load(Ordering::Relaxed);
                 let report = HeartbeatReport {
                     slots,
-                    active: slots.saturating_sub(semaphore.available_permits()),
+                    active,
                     queue: outstanding.load(Ordering::Acquire),
                     mem_reserved_mb: admission.reserved_bytes() / MIB,
                     mem_ceiling_mb: admission.ceiling_bytes() / MIB,
@@ -1921,173 +1973,155 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         });
     }
 
-    // SJF reorder window: jobs pulled off the channel but not yet dispatched,
-    // each with its staging time for the anti-starvation age check.
-    let mut reorder: Vec<(PrefetchedJob, Instant)> = Vec::new();
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            tracing::info!("shutdown signalled, draining in-flight work");
-            break;
-        }
-
-        if let Some(max) = max_jobs
-            && completed.load(Ordering::Acquire) >= max
-        {
-            tracing::info!(max_jobs = max, "job limit reached, draining in-flight work");
-            shutdown.store(true, Ordering::Relaxed);
-            break;
-        }
-
-        // Claim a worker slot, then take the next staged sample: work begins as
-        // soon as both a free slot and a ready sample exist. An empty channel
-        // means the prefetcher has exited (shutdown) — drain and stop.
-        let permit = Arc::clone(&semaphore)
-            .acquire_owned()
-            .await
-            .context("semaphore closed")?;
-        let next = if sjf {
-            next_smallest_staged(&mut rx, &mut reorder).await
-        } else {
-            rx.recv().await
-        };
-        let Some(pj) = next else {
-            drop(permit);
-            // A closed channel means the prefetcher already exited
-            // (`--exit-if-empty` drained the queue); break and drain in-flight
-            // work WITHOUT raising the process-wide shutdown flag. Storing it
-            // here killed the summary ticker and heartbeat check-in the moment
-            // the last job was *dispatched* — analyses then ran to completion
-            // (45+ minutes on whale batches) with zero telemetry. Those tasks
-            // end with `run()` returning; nothing else consumes the flag once
-            // the prefetcher is gone.
-            break;
-        };
-        let staged_bytes = pj.data.as_ref().map_or(0, PrefetchData::staged_mem_bytes);
-        queued_bytes.fetch_sub(staged_bytes, Ordering::Release);
-        outstanding.fetch_sub(1, Ordering::Release);
-
+    // N long-lived workers pull from the shared job source. No central
+    // dispatcher, no analysis-slot semaphore — these tasks *are* the slots.
+    let mut workers: JoinSet<()> = JoinSet::new();
+    for worker_id in 0..slots {
         let client = client.clone();
-        let resources = match resources.read() {
-            Ok(resources) => Arc::clone(&resources),
-            Err(error) => {
-                let error = anyhow::anyhow!("worker resources lock poisoned: {error}");
-                // Lock poisoned (a worker thread panicked). Report the job as
-                // failed so hopper reassigns it instead of waiting out the
-                // lease, then carry on.
-                tracing::error!(error = %error, "cannot snapshot worker resources; failing job");
-                drop(permit);
-                let failure = format!("worker resource snapshot failed: {error}");
-                metrics.record_error(&failure);
-                post_result(&client, &base_url, &name, &pj.job.sha256, Err(failure)).await;
-                metrics.complete(pj.queue_id);
-                completed.fetch_add(1, Ordering::Release);
-                continue;
-            }
-        };
-        // Reserve this job's estimated memory footprint before it starts
-        // expanding the archive. Blocks while the in-flight budget is full, so a
-        // burst of large archives serialises rather than co-residing and
-        // exhausting RAM. Held only for the duration of the analysis.
-        let admission_guard = admission
-            .admit(
-                Arc::from(pj.job.sha256.as_str()),
-                Arc::from(pj.job.path.as_str()),
-                Arc::from(pj.job.file_type.as_str()),
-                pj.job.size_bytes,
-            )
-            .await;
-
-        // Admit to nested Rayon work here — before spawn — so a full gate does
-        // not pile up slot-many `run_job` tasks (each holding prefetch bytes and
-        // a phase watcher) behind one whale. Prefetch stays in the bounded
-        // channel; only `cleave_slots` analyses run at a time.
-        let gate_wait_start = Instant::now();
-        let cleave_permit = Arc::clone(&cleave_gate)
-            .acquire_owned()
-            .await
-            .context("cleave analysis gate closed")?;
-        let gate_wait = gate_wait_start.elapsed();
-        if gate_wait >= Duration::from_secs(1) {
-            tracing::info!(
-                sha256 = %pj.job.sha256.get(..12).unwrap_or(&pj.job.sha256),
-                file = %pj.job.path,
-                wait_ms = crate::duration_ms(gate_wait),
-                "analysis admitted to cleave after waiting for nested-work gate",
-            );
-        }
-
-        let url = Arc::clone(&base_url);
+        let base_url = Arc::clone(&base_url);
         let name = Arc::clone(&name);
         let local_index = Arc::clone(&local_index);
         let data_root = data_root.clone();
+        let resources = Arc::clone(&resources);
+        let jobs = Arc::clone(&jobs);
+        let queued_bytes = Arc::clone(&queued_bytes);
+        let outstanding = Arc::clone(&outstanding);
+        let analyzing = Arc::clone(&analyzing);
         let completed = Arc::clone(&completed);
         let metrics = Arc::clone(&metrics);
         let spool = Arc::clone(&spool);
+        let admission = Arc::clone(&admission);
+        let cleave_gate = Arc::clone(&cleave_gate);
+        let shutdown = Arc::clone(&shutdown);
+        workers.spawn(async move {
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(max) = max_jobs
+                    && completed.load(Ordering::Acquire) >= max
+                {
+                    shutdown.store(true, Ordering::Relaxed);
+                    break;
+                }
 
-        tokio::spawn(async move {
-            let result = run_job(
-                &client,
-                &url,
-                local_index.get(),
-                data_root.as_deref(),
-                &pj.job,
-                &resources,
-                cleave_permit,
-                slow_rule_ms,
-                &spool,
-                pj.data,
-            )
-            .await;
-            // The archive and its expanded members are freed when `run_job`
-            // returns; release the memory reservation now so the budget reopens
-            // before the result round-trip to hopper, not after.
-            drop(admission_guard);
-            if let Err(ref e) = result {
-                tracing::warn!(
-                    sha256 = %pj.job.sha256,
-                    file = %pj.job.path,
-                    file_type = %pj.job.file_type,
-                    size = pj.job.size_bytes,
-                    error = %e,
-                    "analysis failed",
-                );
-                metrics.record_error(&e.to_string());
+                let Some(pj) = jobs.recv().await else {
+                    // Prefetcher exited (channel closed). Do not raise shutdown:
+                    // sibling workers and the summary ticker keep running until
+                    // every in-flight analyze+post finishes.
+                    break;
+                };
+                let staged_bytes = pj.data.as_ref().map_or(0, PrefetchData::staged_mem_bytes);
+                queued_bytes.fetch_sub(staged_bytes, Ordering::Release);
+                outstanding.fetch_sub(1, Ordering::Release);
+
+                let snapshot: std::result::Result<Arc<ModelResources>, String> =
+                    match resources.read() {
+                        Ok(guard) => Ok(Arc::clone(&*guard)),
+                        Err(error) => {
+                            let error =
+                                anyhow::anyhow!("worker resources lock poisoned: {error}");
+                            tracing::error!(
+                                worker_id,
+                                error = %error,
+                                "cannot snapshot worker resources; failing job"
+                            );
+                            Err(format!("worker resource snapshot failed: {error}"))
+                        }
+                    };
+                let snapshot = match snapshot {
+                    Ok(snapshot) => snapshot,
+                    Err(failure) => {
+                        metrics.record_error(&failure);
+                        post_result(
+                            &client,
+                            &base_url,
+                            &name,
+                            &pj.job.sha256,
+                            Err(failure),
+                        )
+                        .await;
+                        metrics.complete(pj.queue_id);
+                        completed.fetch_add(1, Ordering::Release);
+                        continue;
+                    }
+                };
+
+                analyzing.fetch_add(1, Ordering::Release);
+                // RAII-ish: always clear the analyzing count if we bail early.
+                struct AnalyzingGuard(Arc<AtomicUsize>);
+                impl Drop for AnalyzingGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Release);
+                    }
+                }
+                let _analyzing_guard = AnalyzingGuard(Arc::clone(&analyzing));
+
+                let admission_guard = admission
+                    .admit(
+                        Arc::from(pj.job.sha256.as_str()),
+                        Arc::from(pj.job.path.as_str()),
+                        Arc::from(pj.job.file_type.as_str()),
+                        pj.job.size_bytes,
+                    )
+                    .await;
+
+                let result = run_job(
+                    &client,
+                    &base_url,
+                    local_index.get(),
+                    data_root.as_deref(),
+                    &pj.job,
+                    &snapshot,
+                    Arc::clone(&cleave_gate),
+                    slow_rule_ms,
+                    &spool,
+                    pj.data,
+                )
+                .await;
+                drop(admission_guard);
+                drop(_analyzing_guard);
+
+                if let Err(ref e) = result {
+                    tracing::warn!(
+                        worker_id,
+                        sha256 = %pj.job.sha256,
+                        file = %pj.job.path,
+                        file_type = %pj.job.file_type,
+                        size = pj.job.size_bytes,
+                        error = %e,
+                        "analysis failed",
+                    );
+                    metrics.record_error(&e.to_string());
+                }
+                // Hopper I/O (including dep mirroring) runs with this worker
+                // busy on post only — siblings keep analyzing.
+                post_result(&client, &base_url, &name, &pj.job.sha256, result).await;
+                metrics.complete(pj.queue_id);
+                let n = completed.fetch_add(1, Ordering::Release) + 1;
+                if n.is_multiple_of(100) {
+                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
+                }
             }
-            post_result(&client, &url, &name, &pj.job.sha256, result).await;
-            metrics.complete(pj.queue_id);
-            let n = completed.fetch_add(1, Ordering::Release) + 1;
-            if n.is_multiple_of(100) {
-                tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
-            }
-            drop(permit);
         });
     }
 
-    // Drain any in-flight work before exiting. Each analysis releases its slot
-    // permit only after posting its result, so acquiring every permit means all
-    // results have reached hopper.
-    //
-    // On a graceful (SIGTERM) shutdown the wait is capped so a stuck cleave
-    // unpack can't block shutdown indefinitely — hopper re-leases anything left
-    // running. But `--exit-if-empty` is batch mode: the operator asked to
-    // process a finite dataset to completion, so we wait unbounded — a 60 s cap
-    // would silently drop the result of any analysis slower than the drain
-    // window (e.g. a large archive), which on a finite run is a lost finding,
-    // not a re-lease.
-    let slot_count = u32::try_from(slots).unwrap_or(u32::MAX);
-    let drain = semaphore.acquire_many(slot_count);
+    // Wait for every worker to finish its current analyze+post. On SIGTERM the
+    // wait is capped so a stuck cleave or wedged hopper cannot block shutdown —
+    // hopper re-leases anything left running. `--exit-if-empty` waits unbounded.
     if exit_if_empty {
-        let _ = drain.await;
+        while workers.join_next().await.is_some() {}
         tracing::info!("all in-flight jobs finished (batch drain), exiting");
     } else {
+        let drain = async { while workers.join_next().await.is_some() {} };
         match tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_SECS), drain).await {
-            Ok(_) => tracing::info!("all in-flight jobs finished, exiting"),
+            Ok(()) => tracing::info!("all in-flight jobs finished, exiting"),
             Err(_) => {
-                let still_running = slots.saturating_sub(semaphore.available_permits());
+                let still_running = workers.len();
                 tracing::warn!(
                     still_running,
                     drain_secs = SHUTDOWN_DRAIN_SECS,
-                    "drain timeout reached, exiting with in-flight analyses still running",
+                    "drain timeout reached, exiting with in-flight workers still running",
                 );
             }
         }
@@ -2402,6 +2436,9 @@ async fn fetch_payload(
 /// download from hopper. The index is an optional accelerator — it finds
 /// samples whose recorded path has drifted — so its absence costs recall on
 /// moved files, never the ability to read a sample that is where it should be.
+///
+/// The cleave gate is acquired only for the blocking analyze — after async
+/// download/provenance — so hopper I/O cannot pin nested-Rayon capacity.
 #[allow(clippy::too_many_arguments)]
 async fn run_job(
     client: &reqwest::Client,
@@ -2410,10 +2447,7 @@ async fn run_job(
     data_root: Option<&Path>,
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
-    // Held for the whole classify/fetch/graft so nested Rayon trees stay
-    // within `cleave_slots`. Acquired by the dispatcher before spawn; moved
-    // into the blocking closure so an async cancel cannot release it early.
-    cleave_permit: OwnedSemaphorePermit,
+    cleave_gate: Arc<Semaphore>,
     slow_rule_ms: u64,
     spool: &Arc<SpoolState>,
     prefetched: std::result::Result<PrefetchData, PrefetchError>,
@@ -2684,6 +2718,25 @@ async fn run_job(
         size = input_size,
         "analysis starting",
     );
+
+    // Nested-Rayon capacity is needed only for the blocking classify. Acquiring
+    // earlier (or on the dispatch loop) pinned the gate across hopper downloads
+    // and froze every other slot behind one whale's preamble.
+    let gate_wait_start = Instant::now();
+    let cleave_permit = Arc::clone(&cleave_gate)
+        .acquire_owned()
+        .await
+        .map_err(|_closed| "cleave analysis gate closed".to_string())?;
+    let gate_wait = gate_wait_start.elapsed();
+    if gate_wait >= Duration::from_secs(1) {
+        tracing::info!(
+            sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
+            file = %job.path,
+            wait_ms = crate::duration_ms(gate_wait),
+            "analysis admitted to cleave after waiting for nested-work gate",
+        );
+    }
+
     let handle = tokio::task::spawn_blocking(move || {
         // Runs on a tokio blocking thread; cleave's `par_iter` fan-out work-steals
         // across the shared global rayon pool. Lifecycle logs report `thread_id` —
@@ -4272,5 +4325,222 @@ mod tests {
         ))]
         assert_ne!(tid, 0, "os_thread_id must resolve on this host");
         let _ = tid;
+    }
+
+    /// Reliability harness: mirrors the production worker loop's permit
+    /// lifetimes without cleave/models/hopper. Each fake worker:
+    ///   take job → analyzing++ → [optional cleave] → analyze → analyzing-- → post
+    /// Regression targets are the Aug-18 hangs: a wedged post or a held cleave
+    /// gate must not freeze sibling workers.
+    async fn run_fake_workers<F, P>(
+        jobs: Arc<JobSource>,
+        n: usize,
+        cleave: Arc<Semaphore>,
+        analyzing: Arc<AtomicUsize>,
+        completed: Arc<AtomicUsize>,
+        analyze: F,
+        post: P,
+    ) where
+        F: Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        P: Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let analyze = Arc::new(analyze);
+        let post = Arc::new(post);
+        let mut set = JoinSet::new();
+        for _ in 0..n {
+            let jobs = Arc::clone(&jobs);
+            let cleave = Arc::clone(&cleave);
+            let analyzing = Arc::clone(&analyzing);
+            let completed = Arc::clone(&completed);
+            let analyze = Arc::clone(&analyze);
+            let post = Arc::clone(&post);
+            set.spawn(async move {
+                while let Some(pj) = jobs.recv().await {
+                    let sha = pj.job.sha256.clone();
+                    analyzing.fetch_add(1, Ordering::Release);
+                    struct Guard(Arc<AtomicUsize>);
+                    impl Drop for Guard {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::Release);
+                        }
+                    }
+                    let _guard = Guard(Arc::clone(&analyzing));
+                    let permit = cleave.acquire().await.expect("cleave open");
+                    analyze(sha.clone()).await;
+                    drop(permit);
+                    drop(_guard);
+                    post(sha).await;
+                    completed.fetch_add(1, Ordering::Release);
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn job_source_serves_all_staged_jobs_to_concurrent_waiters() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for sha in ["a", "b", "c", "d"] {
+            tx.send(staged_pj(sha, 10)).unwrap();
+        }
+        drop(tx);
+        let jobs = Arc::new(JobSource::new(rx, false));
+        let got = Arc::new(AtomicUsize::new(0));
+        let mut set = JoinSet::new();
+        for _ in 0..4 {
+            let jobs = Arc::clone(&jobs);
+            let got = Arc::clone(&got);
+            set.spawn(async move {
+                while jobs.recv().await.is_some() {
+                    got.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = set.join_next() => {
+                    if set.is_empty() { break; }
+                }
+                _ = &mut deadline => panic!("JobSource did not drain under concurrent waiters"),
+            }
+        }
+        assert_eq!(got.load(Ordering::Relaxed), 4);
+    }
+
+    /// Aug-17 regression: waiting on the cleave gate lived on the dispatch loop,
+    /// so one held permit froze job intake. Siblings must still take jobs.
+    #[tokio::test]
+    async fn cleave_hold_does_not_block_sibling_job_intake() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(staged_pj("whale", 100)).unwrap();
+        tx.send(staged_pj("sibling", 10)).unwrap();
+        drop(tx);
+
+        let jobs = Arc::new(JobSource::new(rx, false));
+        let cleave = Arc::new(Semaphore::new(1));
+        let analyzing = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let whale_holds = Arc::new(tokio::sync::Notify::new());
+        let release_whale = Arc::new(tokio::sync::Notify::new());
+
+        let whale_holds2 = Arc::clone(&whale_holds);
+        let release_whale2 = Arc::clone(&release_whale);
+        let analyze = move |sha: String| {
+            let whale_holds = Arc::clone(&whale_holds2);
+            let release_whale = Arc::clone(&release_whale2);
+            Box::pin(async move {
+                if sha == "whale" {
+                    whale_holds.notify_one();
+                    release_whale.notified().await;
+                }
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        };
+        let post = |_sha: String| {
+            Box::pin(async {}) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        };
+
+        let workers = tokio::spawn(run_fake_workers(
+            Arc::clone(&jobs),
+            2,
+            Arc::clone(&cleave),
+            Arc::clone(&analyzing),
+            Arc::clone(&completed),
+            analyze,
+            post,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), whale_holds.notified())
+            .await
+            .expect("whale never entered analyze");
+        // Harness bumps `analyzing` before cleave.acquire. While the whale holds
+        // the only permit, the sibling must already be in that section (count
+        // ≥ 2) — proving intake is not serialized on the gate.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while analyzing.load(Ordering::Acquire) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok(),
+            "sibling failed to take a job while cleave was held (dispatch-loop regression)",
+        );
+
+        release_whale.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), workers)
+            .await
+            .expect("workers hung")
+            .expect("workers panicked");
+        assert_eq!(completed.load(Ordering::Relaxed), 2);
+    }
+
+    /// Aug-18 regression: post_result (dep sync / hopper timeouts) held the
+    /// analysis slot, so a wedged hopper froze the worker. Post must run after
+    /// analyzing drops so siblings keep moving.
+    #[tokio::test]
+    async fn post_hang_does_not_freeze_sibling_workers() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(staged_pj("hang-post", 100)).unwrap();
+        tx.send(staged_pj("ok", 10)).unwrap();
+        drop(tx);
+
+        let jobs = Arc::new(JobSource::new(rx, false));
+        let cleave = Arc::new(Semaphore::new(2));
+        let analyzing = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let ok_done = Arc::new(tokio::sync::Notify::new());
+        let hang_entered_post = Arc::new(tokio::sync::Notify::new());
+
+        let analyze = |_sha: String| {
+            Box::pin(async {}) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        };
+        let ok_done2 = Arc::clone(&ok_done);
+        let hang_entered_post2 = Arc::clone(&hang_entered_post);
+        let post = move |sha: String| {
+            let ok_done = Arc::clone(&ok_done2);
+            let hang_entered_post = Arc::clone(&hang_entered_post2);
+            Box::pin(async move {
+                if sha == "hang-post" {
+                    hang_entered_post.notify_one();
+                    std::future::pending::<()>().await;
+                } else {
+                    ok_done.notify_one();
+                }
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        };
+
+        let _workers = tokio::spawn(run_fake_workers(
+            jobs,
+            2,
+            cleave,
+            Arc::clone(&analyzing),
+            Arc::clone(&completed),
+            analyze,
+            post,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), hang_entered_post.notified())
+            .await
+            .expect("hanging post never started");
+        // While one worker is wedged in post, analyzing must be 0 for that
+        // worker — and the sibling must still complete.
+        tokio::time::timeout(Duration::from_secs(2), ok_done.notified())
+            .await
+            .expect("sibling stuck behind wedged post (slot-held-across-post regression)");
+        assert_eq!(
+            completed.load(Ordering::Relaxed),
+            1,
+            "only the non-hanging job should have completed"
+        );
+        // Hanging worker is in post, not analyze.
+        assert_eq!(analyzing.load(Ordering::Acquire), 0);
     }
 }
