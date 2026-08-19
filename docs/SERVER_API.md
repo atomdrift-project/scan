@@ -37,6 +37,23 @@ The listener binds before the model is loaded. While loading, every
 route returns 503 with `{"error":"server starting"}`. Poll `/_/health`
 until the status flips to `ok`.
 
+### Deploy
+
+`make deploy` (alias of `make deploy-server`) installs a long-lived
+`atomscan serve`:
+
+- **FreeBSD.** Bastille build jail + run jail, rc.d service
+  (`scripts/server/rollout-bastille.sh`).
+- **Linux (systemd).** Native host install, unit `scan.service`
+  (`scripts/server/server-linux.sh`). Same shape as
+  `make deploy-worker` on Linux: unprivileged `scan` user, `MemoryMax=`,
+  traits under `/var/lib/atomdrift/scan`.
+
+Linux overrides (passed through the environment): `BIND=` (default
+`0.0.0.0:49999`, matching the FreeBSD jail), `ALLOW_CIDR=` (default
+`10.0.0.0/8`; set empty to omit), `LLM=`, `WORKERS=`, `MEMORY_MAX=`.
+`make uninstall-server` tears the unit down.
+
 ## Endpoints
 
 ### `POST /analyze`

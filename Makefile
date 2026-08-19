@@ -167,11 +167,19 @@ deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes rollout-basti
 
 deploy: deploy-server
 
+# Long-lived `atomscan serve`. FreeBSD: Bastille build+run jails. Linux: native
+# systemd unit (`scan.service`). Override BIND=, ALLOW_CIDR=, LLM=, MEMORY_MAX=
+# (see scripts/server/server-linux.sh).
 deploy-server:
 	git pull
 	@case "$$(uname -s)" in \
 		FreeBSD) ./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)" ;; \
-		*) echo "error: server deployments are bastille-only; run from a FreeBSD host"; exit 1 ;; \
+		Linux)   if command -v systemctl >/dev/null 2>&1; then \
+		           ./scripts/server/server-linux.sh; \
+		         else \
+		           echo "error: unsupported Linux (systemd required for server deploy)"; exit 1; \
+		         fi ;; \
+		*) echo "error: no deploy-server target for $$(uname -s) (FreeBSD/bastille or Linux/systemd)"; exit 1 ;; \
 	esac
 
 deploy-worker: kill-scan
@@ -210,7 +218,12 @@ deploy-jail-worker:
 uninstall-server:
 	@case "$$(uname -s)" in \
 		FreeBSD) ./scripts/server/uninstall-bastille.sh "$(SERVER_RUN)" ;; \
-		*) echo "error: server deployments are bastille-only; run from a FreeBSD host"; exit 1 ;; \
+		Linux)   if command -v systemctl >/dev/null 2>&1; then \
+		           ./scripts/server/uninstall-linux.sh; \
+		         else \
+		           echo "error: unsupported Linux (systemd required)"; exit 1; \
+		         fi ;; \
+		*) echo "error: no uninstall-server target for $$(uname -s)"; exit 1 ;; \
 	esac
 
 # Hard-stop the running worker without uninstalling it: stops the systemd unit
