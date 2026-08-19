@@ -65,6 +65,35 @@ returns 403.
 
 Same response envelope as `/analyze`.
 
+### `POST /analyze-purl`
+
+JSON body: `{"purl": "pkg:npm/left-pad@1.3.0"}`. The `pkg:` scheme is
+optional (`npm/left-pad@1.3.0` is accepted). Scan resolves the package,
+looks up registry provenance itself, and returns the same envelope as
+`/analyze`. Takes an analyze slot. 400 if the argument is not a PURL.
+
+    curl -s -H 'content-type: application/json' \
+      -d '{"purl":"pkg:npm/left-pad@1.3.0"}' \
+      http://127.0.0.1:49999/analyze-purl | jq .ml
+
+Beamline backends should start the server with `--fetch --interpret
+--analysis-timeout 1800` so dependency follow and LLM interpretation
+match a live `atomscan purl` run.
+
+### `GET /_/bloom`
+
+Known-good / known-bad membership. Does **not** take an analyze slot
+and answers while models are still loading. Provide exactly one key:
+
+    GET /_/bloom?sha256=<64hex>
+    GET /_/bloom?purl=<url-encoded>
+
+    { "decision": "skip" | "known-bad" | "conflicted" | "unknown" }
+
+`skip` is known-good and not revoked by the bad filter. Missing filters
+fail closed (`unknown`). `Cache-Control: public, max-age=3600`. 400 if
+both keys, neither key, or a malformed sha256.
+
 ### `GET /_/health`
 
 Liveness and load. 200 when ready, 503 while loading or failed.
@@ -121,7 +150,7 @@ switch counts; FreeBSD: rayon thread count; other platforms: error).
 | 503  | Starting, failed, overloaded, or at capacity.                           |
 | 504  | Analysis exceeded the per-request watchdog.                             |
 
-`/analyze` and `/analyze-path` also set `X-Total-Ms` on the response.
+`/analyze`, `/analyze-purl`, and `/analyze-path` also set `X-Total-Ms` on the response.
 
 Errors share a single shape:
 

@@ -54,6 +54,19 @@ pub enum Decision {
     Unknown,
 }
 
+impl Decision {
+    /// Wire form for `GET /_/bloom`: lowercase, hyphenated.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::KnownBad => "known-bad",
+            Self::Conflicted => "conflicted",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// The loaded filters for every (kind, tier), queried per scan.
 ///
 /// Cheap to hold; load once at startup like the model. An absent slot is

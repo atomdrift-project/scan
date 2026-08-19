@@ -1,6 +1,6 @@
 //! HTTP request handlers for the litmus API server.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use std::sync::Arc;
@@ -323,6 +323,62 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
         "traits_commit": cleave::traits_repo::version(),
     }))
     .into_response()
+}
+
+/// Query string for `GET /_/bloom`. Exactly one of `sha256` or `purl`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(super) struct BloomQuery {
+    sha256: Option<String>,
+    purl: Option<String>,
+}
+
+/// GET /_/bloom — known-good / known-bad membership.
+///
+/// Does not take an analyze slot and does not wait for the ONNX model: the
+/// filters are files, loaded at process start. A missing filter set fails
+/// closed (`unknown`). Beamline caches this aggressively; the known-bad
+/// channel is the revocation path, so the response is only briefly cacheable.
+pub(super) async fn bloom(Query(q): Query<BloomQuery>) -> Response {
+    match bloom_decide(
+        crate::bloom_repo::global().as_deref(),
+        q.sha256.as_deref(),
+        q.purl.as_deref(),
+    ) {
+        Ok(decision) => {
+            let mut resp = Json(serde_json::json!({ "decision": decision.as_str() })).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("public, max-age=3600"),
+            );
+            resp
+        }
+        Err((status, msg)) => error_response(status, msg),
+    }
+}
+
+/// Membership decision for one key. `lookup` `None` is fail-closed unknown.
+fn bloom_decide(
+    lookup: Option<&crate::bloom_repo::Lookup>,
+    sha256: Option<&str>,
+    purl: Option<&str>,
+) -> Result<crate::bloom_repo::Decision, (StatusCode, &'static str)> {
+    let sha = sha256.map(str::trim).filter(|s| !s.is_empty());
+    let purl = purl.map(str::trim).filter(|s| !s.is_empty());
+    match (sha, purl) {
+        (Some(_), Some(_)) | (None, None) => {
+            Err((StatusCode::BAD_REQUEST, "provide exactly one of sha256 or purl"))
+        }
+        (Some(sha), None) => {
+            let digest = crate::bloom::parse_sha256_hex(sha)
+                .ok_or((StatusCode::BAD_REQUEST, "invalid sha256"))?;
+            Ok(lookup.map_or(crate::bloom_repo::Decision::Unknown, |lk| {
+                lk.decide_sha256(&digest)
+            }))
+        }
+        (None, Some(purl)) => Ok(lookup.map_or(crate::bloom_repo::Decision::Unknown, |lk| {
+            lk.decide_purl(purl)
+        })),
+    }
 }
 
 /// Outcome of [`do_model_reload`] — caller maps this to an HTTP response.
@@ -878,6 +934,240 @@ pub(super) async fn analyze(
                 .into_response()
         }
     }
+}
+
+/// POST /analyze-purl — fetch a package by PURL and analyze it.
+///
+/// Scan looks up registry provenance itself (age, custody, downloads) and
+/// grafts it into the report, the same path as `atomscan purl`. Beamline
+/// calls this when a PURL is not in hopper; it is a full analysis and takes
+/// a slot. Dependency fetch and LLM interpretation follow the process-wide
+/// `--fetch` / `--interpret` flags.
+#[derive(serde::Deserialize)]
+pub(super) struct AnalyzePurlRequest {
+    purl: String,
+}
+
+pub(super) async fn analyze_purl(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AnalyzePurlRequest>,
+) -> Response {
+    let request_id = state.next_request_id();
+    let request_start = Instant::now();
+
+    let purl = match normalize_pkg_purl(&req.purl) {
+        Ok(p) => p,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+    };
+
+    if let Ok(init_error) = state.init_error.read()
+        && let Some(message) = init_error.as_ref()
+    {
+        tracing::error!("analyze-purl rejected: startup failed  id={request_id} error={message}");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server failed to initialize",
+        );
+    }
+
+    if let Some(response) = check_memory_pressure(&state).await {
+        return response;
+    }
+
+    let resources = match state.resources.read() {
+        Ok(lock) => match lock.as_ref() {
+            Some(r) => Arc::clone(r),
+            None => {
+                return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server starting up");
+            }
+        },
+        Err(e) => {
+            tracing::error!("read lock poisoned: {e}");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
+        let max = state.max_concurrent_tasks;
+        tracing::warn!(id = request_id, purl = %purl, max, "rejecting: at capacity");
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("At capacity ({max}/{max} active analyses)"),
+        );
+    };
+
+    tracing::info!(id = request_id, purl = %purl, "--> POST /analyze-purl");
+
+    let slow_rule_ms = state.slow_rule_ms;
+    let should_clear_caches = request_id.is_multiple_of(100);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    state.in_flight.insert(
+        request_id,
+        super::InFlightRequest {
+            name: purl.clone(),
+            size_bytes: 0,
+            started_at: Instant::now(),
+            cancellation: Arc::clone(&cancellation),
+            phase: cleave::PhaseTracker::with_label(format!("req#{request_id} {purl}")),
+            thread_id: AtomicU64::new(0),
+        },
+    );
+    let guard = super::RequestGuard::new(
+        request_id,
+        Arc::clone(&state),
+        Arc::clone(&cancellation),
+        permit,
+    );
+
+    let cancel_flag = Arc::clone(&cancellation);
+    let phase_state = Arc::clone(&state);
+    let phase_tracker = phase_state
+        .in_flight
+        .get(&request_id)
+        .map(|r| r.phase.clone());
+    let deps_for_upload = state.uploader.is_some();
+    let handle = tokio::task::spawn_blocking(move || {
+        if let Some(req) = phase_state.in_flight.get(&request_id) {
+            req.thread_id.store(current_thread_id(), Ordering::Relaxed);
+        }
+        let result = classify_purl(
+            &purl,
+            &resources,
+            slow_rule_ms,
+            Some(&cancel_flag),
+            phase_tracker.as_ref(),
+            deps_for_upload,
+        );
+        if should_clear_caches {
+            cleave::clear_all_thread_caches();
+        }
+        result
+    });
+
+    let result = await_with_timeout(
+        handle,
+        state.analysis_timeout_secs,
+        &cancellation,
+        &state.stuck_orphans,
+    )
+    .await;
+    drop(guard);
+
+    let elapsed_ms = crate::duration_ms(request_start.elapsed());
+    match result {
+        AnalysisOutcome::Ok(Ok(scan_result)) => {
+            let scan_result = *scan_result;
+            tracing::info!(
+                id = request_id,
+                elapsed_ms,
+                sha256 = %scan_result.sha256,
+                classification = %scan_result.classification,
+                "<-- 200 OK",
+            );
+            let mut resp = Json(scan_result.into_envelope()).into_response();
+            resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
+            resp
+        }
+        AnalysisOutcome::Ok(Err(e)) => {
+            let (status, response) = analysis_error_response(&e);
+            tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analyze-purl failed");
+            response
+        }
+        AnalysisOutcome::JoinError(e) => {
+            tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+        AnalysisOutcome::Timeout(secs) => {
+            tracing::warn!(id = request_id, elapsed_ms, timeout_secs = secs, "<-- 504 analysis timeout");
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "analysis timeout",
+                    "timeout_secs": secs,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Canonical `pkg:…` form, or a 400 message. Same prefixing rule as `atomscan purl`.
+fn normalize_pkg_purl(raw: &str) -> Result<String, &'static str> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("missing purl");
+    }
+    let prefixed = if raw.starts_with("pkg:") {
+        raw.to_string()
+    } else {
+        format!("pkg:{raw}")
+    };
+    fletch::purl::normalize(&prefixed).ok_or("not a package URL")
+}
+
+/// Fetch the PURL's artifact (and its registry record) then classify. Scan
+/// looks up provenance itself — beamline does not supply it.
+fn classify_purl(
+    purl: &str,
+    resources: &super::ModelResources,
+    slow_rule_ms: u64,
+    cancellation: Option<&Arc<AtomicBool>>,
+    phase: Option<&cleave::PhaseTracker>,
+    deps_for_upload: bool,
+) -> anyhow::Result<crate::engine::ScanResult> {
+    use fletch::RefLocator;
+
+    let locator = RefLocator::Purl(purl.to_string());
+    let (registry, registry_sources) = crate::fetch::registry_with_sources(&locator);
+    let registry_provenance = registry.clone().map(|record| {
+        crate::provenance::RegistryProvenance::from_record_sources(record, &registry_sources)
+    });
+
+    if let Some(reg) = &registry
+        && reg.version_removed == Some(true)
+        && let Some((name, bytes)) = crate::fetch::registry_document(reg)
+    {
+        return classify_bytes(
+            bytes::Bytes::from(bytes),
+            &name,
+            resources,
+            slow_rule_ms,
+            cancellation,
+            phase,
+            registry_provenance.as_ref(),
+            deps_for_upload,
+        );
+    }
+
+    let (bytes, name, _rec) = match crate::fetch::fetch_one(locator, false) {
+        Ok(t) => t,
+        Err(e) => match registry.as_ref().and_then(crate::fetch::registry_document) {
+            Some((name, bytes)) => {
+                return classify_bytes(
+                    bytes::Bytes::from(bytes),
+                    &name,
+                    resources,
+                    slow_rule_ms,
+                    cancellation,
+                    phase,
+                    registry_provenance.as_ref(),
+                    deps_for_upload,
+                );
+            }
+            None => return Err(e),
+        },
+    };
+
+    classify_bytes(
+        bytes::Bytes::from(bytes),
+        &name,
+        resources,
+        slow_rule_ms,
+        cancellation,
+        phase,
+        registry_provenance.as_ref(),
+        deps_for_upload,
+    )
 }
 
 /// Run the full cleave + litmus pipeline on `path`, returning a `ScanResult`.
@@ -1678,5 +1968,125 @@ mod tests {
         let req: super::AnalyzePathRequest = serde_json::from_str(body).expect("parses");
         let raw = req.registry.expect("registry present");
         assert!(crate::provenance::registry_provenance(raw.get().as_bytes()).is_none());
+    }
+
+    #[test]
+    fn bloom_decide_requires_exactly_one_key() {
+        use crate::bloom_repo::Lookup;
+        let lk = Lookup::default();
+        assert!(super::bloom_decide(Some(&lk), None, None).is_err());
+        assert!(super::bloom_decide(Some(&lk), Some("aa"), Some("pkg:npm/x@1")).is_err());
+        assert!(super::bloom_decide(Some(&lk), Some("not-a-sha"), None).is_err());
+    }
+
+    #[test]
+    fn bloom_decide_unknown_without_filters() {
+        let sha = "a".repeat(64);
+        let d = super::bloom_decide(None, Some(&sha), None).expect("valid sha");
+        assert_eq!(d.as_str(), "unknown");
+        let d = super::bloom_decide(None, None, Some("pkg:npm/left-pad@1.3.0")).expect("valid purl");
+        assert_eq!(d.as_str(), "unknown");
+    }
+
+    #[test]
+    fn bloom_decide_skip_and_known_bad_from_fixture() {
+        use crate::bloom::{Record, generate};
+        use crate::bloom_repo::{Decision, Lookup};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut good_sha = [0u8; 32];
+        good_sha[0] = 1;
+        let mut bad_sha = [0u8; 32];
+        bad_sha[0] = 2;
+        for f in generate(
+            vec![
+                Record {
+                    purl: Some("pkg:npm/good@1".into()),
+                    sha256: Some(good_sha),
+                },
+                Record {
+                    purl: Some("pkg:npm/evil@1".into()),
+                    sha256: Some(bad_sha),
+                },
+            ],
+            vec![Record {
+                purl: Some("pkg:npm/evil@1".into()),
+                sha256: Some(bad_sha),
+            }],
+            1e-9,
+        ) {
+            let path = tmp.path().join(format!("{}.adbl", f.artifact_stem()));
+            std::fs::write(path, f.to_bytes()).expect("write filter");
+        }
+        let lk = Lookup::load_from(tmp.path());
+        assert_eq!(
+            super::bloom_decide(Some(&lk), None, Some("pkg:npm/good@1")).unwrap(),
+            Decision::Skip
+        );
+        assert_eq!(
+            super::bloom_decide(Some(&lk), None, Some("pkg:npm/evil@1")).unwrap(),
+            Decision::KnownBad
+        );
+        let good_hex: String = good_sha.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            super::bloom_decide(Some(&lk), Some(&good_hex), None).unwrap(),
+            Decision::Skip
+        );
+        let unseen = "ab".repeat(32);
+        assert_eq!(
+            super::bloom_decide(Some(&lk), Some(&unseen), None).unwrap(),
+            Decision::Unknown
+        );
+    }
+
+    #[test]
+    fn normalize_pkg_purl_accepts_bare_and_full() {
+        assert_eq!(
+            super::normalize_pkg_purl("pkg:npm/left-pad@1.3.0").unwrap(),
+            "pkg:npm/left-pad@1.3.0"
+        );
+        assert_eq!(
+            super::normalize_pkg_purl("npm/left-pad@1.3.0").unwrap(),
+            "pkg:npm/left-pad@1.3.0"
+        );
+        assert!(super::normalize_pkg_purl("").is_err());
+        assert!(super::normalize_pkg_purl("not a purl").is_err());
+    }
+
+    #[tokio::test]
+    async fn bloom_http_400_and_unknown_without_taking_a_slot() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = Router::new().route("/_/bloom", get(super::bloom));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_/bloom")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let app = Router::new().route("/_/bloom", get(super::bloom));
+        let sha = "a".repeat(64);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/_/bloom?sha256={sha}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["decision"], "unknown");
     }
 }
