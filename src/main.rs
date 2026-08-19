@@ -1421,6 +1421,10 @@ fn main() -> Result<()> {
             if let Some(url) = hopper.as_deref() {
                 eprintln!("Renewing results on hopper at {url}");
             }
+            // Serve never bloom-skips an /analyze job (Mode::Slow), but the
+            // membership endpoint and the --fetch dependency gate read the
+            // process-wide handle. Missing files fail closed (no skip).
+            scan::bloom_repo::set_global(std::sync::Arc::new(scan::bloom_repo::Lookup::load()));
             eprintln!("Starting Atomdrift Scan server on http://{bind} ...");
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

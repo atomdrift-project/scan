@@ -5,9 +5,12 @@
 //! classification, SHAP explanations, and the full cleave report.
 //!
 //! Routes:
-//!   GET  /health   — liveness check
-//!   POST /analyze  — upload a file, receive full classification JSON
-//!   POST /reload   — hot-reload model from disk
+//!   GET  /_/health      — liveness check
+//!   GET  /_/bloom       — known-good / known-bad membership (no analyze slot)
+//!   POST /analyze       — upload a file, receive full classification JSON
+//!   POST /analyze-purl  — fetch a PURL (registry provenance included) and analyze
+//!   POST /analyze-path  — analyze a local path (loopback)
+//!   POST /_/reload      — hot-reload model from disk
 //!
 //! [`ServerConfig`] keeps the public server surface intentionally small:
 //! validated thresholds are supplied up front, and callers use accessors
@@ -781,6 +784,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     // the body limit so rejected peers don't get to upload bytes.
     let app = Router::new()
         .route("/_/health", get(handlers::health))
+        .route("/_/bloom", get(handlers::bloom))
         .route("/_/info", get(handlers::info))
         .route("/_/reload", post(handlers::reload))
         .route("/_/update", post(handlers::update))
@@ -788,6 +792,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         .route("/_/requests", get(handlers::requests))
         .route("/_/threads", get(handlers::threads))
         .route("/analyze", post(handlers::analyze))
+        .route("/analyze-purl", post(handlers::analyze_purl))
         .route("/analyze-path", post(handlers::analyze_path))
         .layer(DefaultBodyLimit::max(config.max_body_size()))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), acl::acl))
