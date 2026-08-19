@@ -82,6 +82,42 @@ mod jemalloc {
     }
 }
 
+/// Windows counterpart of [`jemalloc`]: CRT heap was 12% exclusive on the
+/// two-Go WPR profile, and 16 rayon workers convoy on the process heap.
+/// Route tree-sitter's C allocator through the same arena so parse trees
+/// are not a second heap.
+#[cfg(all(windows, not(feature = "crt-heap")))]
+mod mimalloc_alloc {
+    #[global_allocator]
+    static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+    /// # Safety
+    ///
+    /// Same contract as [`super::jemalloc::route_tree_sitter_through_jemalloc`]:
+    /// call once, first thing in `main`, before any tree-sitter API.
+    unsafe extern "C" fn calloc_compat(count: usize, size: usize) -> *mut std::ffi::c_void {
+        let Some(bytes) = count.checked_mul(size) else {
+            return std::ptr::null_mut();
+        };
+        let ptr = unsafe { libmimalloc_sys::mi_malloc(bytes) };
+        if !ptr.is_null() && bytes > 0 {
+            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes) };
+        }
+        ptr
+    }
+
+    pub(super) unsafe fn route_tree_sitter_through_mimalloc() {
+        unsafe {
+            tree_sitter::set_allocator(Some(tree_sitter::Allocator {
+                malloc: libmimalloc_sys::mi_malloc,
+                calloc: calloc_compat,
+                realloc: libmimalloc_sys::mi_realloc,
+                free: libmimalloc_sys::mi_free,
+            }));
+        }
+    }
+}
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use scan::OutputFormat;
@@ -880,6 +916,11 @@ fn main() -> Result<()> {
     unsafe {
         jemalloc::route_tree_sitter_through_jemalloc()
     };
+    #[cfg(all(windows, not(feature = "crt-heap")))]
+    // SAFETY: first statements of `main` — no tree-sitter API has run.
+    unsafe {
+        mimalloc_alloc::route_tree_sitter_through_mimalloc()
+    };
     propagate_no_analysis_cache();
     // Block SIGUSR1 process-wide before spawning any threads so they all inherit
     // the blocked mask; the dedicated sigusr1 thread below consumes it via sigwait.
@@ -1038,7 +1079,11 @@ fn main() -> Result<()> {
     warn_on_broken_freebsd_malloc_conf();
 
     const RAYON_FALLBACK_THREADS: usize = 4;
-    let detected_cores = cleave::memory_tracker::cpu_count();
+    // Physical cores, matching cleave's own pool. Logical SMT siblings
+    // (32 on this 16-core host) oversubscribe archive-member analysis:
+    // S2 dropped 56.6 s → 51.8 s at 16 threads.
+    let detected_cores = cleave::memory_tracker::physical_cpu_count()
+        .or_else(cleave::memory_tracker::cpu_count);
     let rayon_threads = std::env::var("CLEAVE_RAYON_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())

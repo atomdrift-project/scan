@@ -68,7 +68,7 @@ repository = "https://github.com/atomdrift-project/scan"
 # Path dep while the gauntlet startup-cost work is local; flip back to the git
 # dep once cleave's changes are pushed. (Direct path dep, not [patch] — cargo
 # silently ignores prerelease path patches.)
-cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
+cleave = {  git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 # Path dep while fletch::purl::{normalize,identity} is unpushed — scan's bloom
@@ -156,6 +156,15 @@ backtrace = "0.3"
 # allocator) and tikv-jemalloc-sys bundles a pre-illumos config.sub that fails
 # to recognize the host triple.
 #
+# Windows: CRT heap showed 12% exclusive plus lock convoy under 16-way
+# archive-member analysis (S2pair WPR). mimalloc is the Windows counterpart
+# of the jemalloc routing below. Keep in lockstep with `mod mimalloc_alloc`
+# in src/main.rs.
+[target.'cfg(windows)'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+libmimalloc-sys = "0.1"
+tree-sitter = "0.27"
+
 # Keep this list in lockstep with the three cfg blocks in src/main.rs: the
 # `#[global_allocator]` static, `mod jemalloc_conf`, and the startup call to
 # `route_tree_sitter_through_jemalloc` in `main`.
@@ -195,6 +204,9 @@ jemalloc-prof = ["tikv-jemallocator/profiling"]
 # default so the released-cleave build is unaffected. Enable with a matching
 # cleave via `[patch]` or a version bump.
 cleave-breadcrumbs = []
+
+# Isolate: Windows CRT heap instead of mimalloc (detection A/B).
+crt-heap = []
 
 # Thin LTO + cu=16 keeps most of fat LTO's runtime gain at roughly a
 # third of the link time — the right default for everyday `cargo build
