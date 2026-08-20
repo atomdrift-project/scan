@@ -1,6 +1,6 @@
 //! Bounded LRU of bloom membership decisions.
 //!
-//! Used only by `GET /_/bloom` ([`super::Lookup::memo_sha256`] /
+//! Used only by the lookup routes ([`super::Lookup::memo_sha256`] /
 //! [`super::Lookup::memo_purl`]). Scan-time probes go straight to the filters
 //! so a unique-file crawl cannot evict the lookup working set.
 //!

@@ -37,10 +37,15 @@ fn budgets() -> Vec<Budget> {
     let mut out = vec![stng::stng_budget()];
 
     // scan's own caches: the analysis snapshot store
-    // (`analysis/<version>/<sha>.zst`, depth 2) and the LLM verdict cache
-    // (`interpret/<hash>.json`, depth 1), sharing one ceiling.
+    // (`analysis/<version>/<sha>.zst`, depth 2), the lookup verdict index
+    // (`lookup/<version>/<sha>.json` and its `<key>.purl` aliases, also depth
+    // 2) and the LLM verdict cache (`interpret/<hash>.json`, depth 1), sharing
+    // one ceiling.
     let mut scan_roots = Vec::new();
     if let Some(path) = crate::analysis_cache::cache_base() {
+        scan_roots.push(Root { path, depth: 2 });
+    }
+    if let Some(path) = crate::lookup::index_base() {
         scan_roots.push(Root { path, depth: 2 });
     }
     if let Some(path) = crate::interpret::cache_base() {

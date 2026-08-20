@@ -170,20 +170,63 @@ Beamline backends should start the server with `--fetch --interpret
 --analysis-timeout 1800` so dependency follow and LLM interpretation
 match a live `atomscan purl` run.
 
-### `GET /_/bloom`
+### `GET /sha256/{sha256}`, `GET /purl`
 
-Known-good / known-bad membership. Does **not** take an analyze slot
-and answers while models are still loading. Provide exactly one key:
+What scan already knows about an artifact or a package. Reads stored
+verdicts and the bloom filters; **never analyzes**. Takes no analyze
+slot and answers while the model is still loading, so a restarting
+server keeps serving lookups.
 
-    GET /_/bloom?sha256=<64hex>
-    GET /_/bloom?purl=<url-encoded>
+    GET /sha256/<64hex>
+    GET /purl?purl=<url-encoded>
 
-    { "decision": "skip" | "known-bad" | "conflicted" | "unknown" }
+The PURL travels as a query parameter, not a path segment: its own
+grammar carries `/`, `?` and `#`, so `pkg:npm/x@1?arch=x64` in a path
+would have everything from the `?` parsed as the URL's query and a
+`#subpath` dropped by the client — silently keying on a different
+package. Qualifiers are part of the identity the filters key on.
 
-`skip` is known-good and not revoked by the bad filter. Missing filters
-fail closed (`unknown`). The server memos the last 4096 SHA-256 and 4096
-PURL decisions in process (mutex + LRU). `Cache-Control: public,
-max-age=3600`. 400 if both keys, neither key, or a malformed sha256.
+A stored verdict is a 200:
+
+    {
+      "sha": "2cf24dba…",
+      "purl": "pkg:npm/left-pad@1.3.0",
+      "lvl": -1,
+      "eng": "2.8.0-beta.1",
+      "why": "Postinstall launches a reverse shell.",
+      "hits": [ { "id": "objectives/…", "crit": 5, "file": "lib/install.js",
+                  "pkg": "pkg:npm/evil@1.0.0", "desc": "…" } ],
+      "bloom": "unknown"
+    }
+
+`lvl` is the tightest false-positive budget per 100M benigns at which the
+artifact grades hostile; `-1` never fires. Gate on it. `hits` carries at
+most three findings of criticality 3 or worse, and `why` the
+interpreter's sentence when `--interpret` ran. Empty fields are omitted.
+
+Holding nothing is a 404 — with the filter's opinion still attached, so
+one round trip answers both questions:
+
+    { "error": "unknown sample", "bloom": "skip" }
+
+`bloom` is `skip` (known-good, not revoked), `known-bad`, `conflicted`
+(in both sets), or `unknown`. It rides on the 200 as well. A filter hit
+is not an analysis: it says a published set vouches for this key, not
+what the artifact is, so the two never collapse into one field. Missing
+filters fail closed (`unknown`).
+
+Verdicts are stored per ruleset (scan release, traits commit, model
+bundle), so a rules or model update reads as a miss rather than serving
+a verdict the current detector would no longer give. `SCAN_ANALYSIS_CACHE=0`
+disables the store, which degrades every lookup to `unknown sample`.
+
+Headers: `X-SHA256`, `X-Scan-Source: index`, and `Cache-Control` —
+`max-age=86400` on a verdict (immutable for the ruleset that produced
+it), `no-store` on a miss (it becomes a hit the moment anything analyzes
+the artifact). The scope is `private` when a token is configured.
+
+400 for a malformed digest, a missing `purl`, or a string that is not a
+PURL.
 
 ### `GET /_/health`
 

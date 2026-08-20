@@ -53,6 +53,27 @@ log() {
     echo "==> $*"
 }
 
+# Printed at every exit path so a deploy always ends with the two lookups
+# people actually reach for. Commands are host-side: the jail has no route of
+# its own here, and the token file is only readable by root/scan inside it.
+usage_hints() {
+    # The whole command runs inside the jail: the host has no route to the
+    # jail's loopback, and the token file is only readable in there.
+    _j="doas bastille cmd $RUN sh -c"
+    _h="-H \"Authorization: Bearer \$(cat /home/scan/.tok/scan)\""
+    _u="http://127.0.0.1:49999"
+    log "Health:  $_j 'curl -sS $_u/_/health'"
+    log "SHA256:  $_j 'curl -sS $_h $_u/sha256/<64-hex-digest>'"
+    log "PURL:    $_j 'curl -sS $_h \"$_u/purl?purl=pkg%3Anpm%2Fleft-pad%401.3.0\"'"
+    log "         A stored verdict is a 200 {sha,lvl,eng,why,hits,bloom};"
+    log "         nothing stored is a 404 {error:unknown sample,bloom:…}, where"
+    log "         bloom is skip|known-bad|conflicted|unknown from the published"
+    log "         filters. Lookups never analyze — send bytes or a PURL."
+    log "Analyze: $_j 'curl -sS $_h -H \"Content-Type: application/json\""
+    log "               -d \"{\\\"purl\\\":\\\"pkg:npm/left-pad@1.3.0\\\"}\" $_u/analyze-purl'"
+    log "         $_j 'curl -sS $_h -F file=@sample.bin $_u/analyze'"
+}
+
 install_missing_build_packages() {
     set --
     for pkg in rust git pkgconf mold gmake; do
@@ -255,6 +276,7 @@ set -x
 if [ "$want_tunnel" -eq 0 ]; then
     log "Skipping Cloudflare Tunnel (CLOUDFLARED=$CLOUDFLARED)"
     log "Deployment complete"
+    usage_hints
     exit 0
 fi
 
@@ -394,6 +416,7 @@ elif [ "$tunnel_changed" -eq 1 ]; then
 else
     log "$TUNNEL_SERVICE already running and unchanged"
     log "Deployment complete"
+    usage_hints
     exit 0
 fi
 
@@ -416,3 +439,4 @@ fi
 log "Cloudflare Tunnel connected (origin: http://127.0.0.1:49999)"
 
 log "Deployment complete"
+usage_hints

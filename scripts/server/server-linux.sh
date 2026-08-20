@@ -513,12 +513,26 @@ else
     log "Skipping Cloudflare Tunnel (CLOUDFLARED=${CLOUDFLARED})"
 fi
 
-log "Deployment complete"
-log "Health: curl -sS http://127.0.0.1:${BIND##*:}/_/health"
+BASE="http://127.0.0.1:${BIND##*:}"
+# Every route except /_/health wants the bearer token, so fold it into the
+# examples rather than printing a header the reader has to paste in by hand.
 if [ -n "${TOKEN_SRC}" ]; then
-    log "API:    curl -sS -H \"Authorization: Bearer \$(cat ${TOKEN_SRC})\" \\"
-    log "             -F file=@sample.bin http://127.0.0.1:${BIND##*:}/analyze"
+    auth="-H \"Authorization: Bearer \$(cat ${TOKEN_SRC})\""
+else
+    auth=""
 fi
+
+log "Deployment complete"
+log "Health:  curl -sS ${BASE}/_/health"
+log "SHA256:  curl -sS ${auth} ${BASE}/sha256/<64-hex-digest>"
+log "PURL:    curl -sS ${auth} '${BASE}/purl?purl=pkg%3Anpm%2Fleft-pad%401.3.0'"
+log "         A stored verdict is a 200 {sha,lvl,eng,why,hits,bloom}; nothing"
+log "         stored is a 404 {\"error\":\"unknown sample\",\"bloom\":…}, where"
+log "         bloom is skip|known-bad|conflicted|unknown from the published"
+log "         filters. Lookups never analyze — send bytes or a PURL for that."
+log "Analyze: curl -sS ${auth} -H 'Content-Type: application/json' \\"
+log "              -d '{\"purl\":\"pkg:npm/left-pad@1.3.0\"}' ${BASE}/analyze-purl"
+log "         curl -sS ${auth} -F file=@sample.bin ${BASE}/analyze"
 if [ "$want_tunnel" -eq 1 ]; then
     log "Tunnel: systemctl status scan-tunnel"
 fi

@@ -6,7 +6,8 @@
 //!
 //! Routes:
 //!   GET  /_/health      — liveness check
-//!   GET  /_/bloom       — known-good / known-bad membership (no analyze slot)
+//!   GET  /sha256/{sha}  — stored verdict for an artifact (no analyze slot)
+//!   GET  /purl?purl=…   — stored verdict for a package (no analyze slot)
 //!   POST /analyze       — upload a file, receive full classification JSON
 //!   POST /analyze-purl  — fetch a PURL (registry provenance included) and analyze
 //!   POST /analyze-path  — analyze a local path (loopback)
@@ -825,13 +826,14 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     // the body limit so rejected peers don't get to upload bytes.
     let app = Router::new()
         .route("/_/health", get(handlers::health))
-        .route("/_/bloom", get(handlers::bloom))
         .route("/_/info", get(handlers::info))
         .route("/_/reload", post(handlers::reload))
         .route("/_/update", post(handlers::update))
         .route("/_/memory", get(handlers::memory_stats))
         .route("/_/requests", get(handlers::requests))
         .route("/_/threads", get(handlers::threads))
+        .route("/sha256/{sha256}", get(handlers::lookup_sha))
+        .route("/purl", get(handlers::lookup_purl))
         .route("/analyze", post(handlers::analyze))
         .route("/analyze-purl", post(handlers::analyze_purl))
         .route("/analyze-path", post(handlers::analyze_path))

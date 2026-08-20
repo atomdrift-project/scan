@@ -134,7 +134,7 @@ impl AnalysisCache {
 /// bundle gave it. That is how the 2026-08-04 route-policy defect (benign
 /// OpenDocument files graded hostile at every deploy level) would have
 /// outlived the corrected bundle that fixed it.
-fn ruleset_version() -> String {
+pub(crate) fn ruleset_version() -> String {
     let vi = cleave::version_info();
     let commit = cleave::rule_update::installed(&cleave::traits_repo::install_target())
         .map_or_else(
@@ -181,7 +181,7 @@ fn model_version() -> String {
 /// superseded directories were never reclaimed — unbounded disk growth across
 /// upgrades on long-lived hosts. Best-effort and silent, like the cache itself:
 /// a failed removal just retries on some future open.
-fn prune_stale_versions(base: &std::path::Path, current: &str) {
+pub(crate) fn prune_stale_versions(base: &std::path::Path, current: &str) {
     let Ok(entries) = std::fs::read_dir(base) else {
         return;
     };
