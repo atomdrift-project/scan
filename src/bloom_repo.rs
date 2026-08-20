@@ -17,11 +17,15 @@
 //! fast revocation channel; without it a stale bless cannot be vetoed, so the
 //! skip is withheld (fail closed). See [`Decision`].
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::bloom::{Filter, Kind, Tier};
+
+mod decision_cache;
+use decision_cache::DecisionCache;
 
 /// Process-wide handle to the loaded filters, published by the scan config so
 /// decoupled subsystems (the dependency-fetch reporter) can consult the same
@@ -71,12 +75,41 @@ impl Decision {
 ///
 /// Cheap to hold; load once at startup like the model. An absent slot is
 /// `None` and contributes no fast path.
-#[derive(Debug, Default)]
+///
+/// [`Self::memo_sha256`] / [`Self::memo_purl`] keep a 4096-entry LRU of recent
+/// `/_/bloom` decisions. Scan-time [`Self::decide_sha256`] / [`Self::decide_purl`]
+/// bypass the memo so a unique-file crawl cannot evict the lookup working set.
 pub struct Lookup {
     purl_good: Option<Filter>,
     purl_bad: Option<Filter>,
     sha256_good: Option<Filter>,
     sha256_bad: Option<Filter>,
+    sha256_memo: DecisionCache<[u8; 32]>,
+    purl_memo: DecisionCache<String>,
+}
+
+impl Default for Lookup {
+    fn default() -> Self {
+        Self {
+            purl_good: None,
+            purl_bad: None,
+            sha256_good: None,
+            sha256_bad: None,
+            sha256_memo: DecisionCache::new(decision_cache::CAP),
+            purl_memo: DecisionCache::new(decision_cache::CAP),
+        }
+    }
+}
+
+impl fmt::Debug for Lookup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Lookup")
+            .field("purl_good", &self.purl_good)
+            .field("purl_bad", &self.purl_bad)
+            .field("sha256_good", &self.sha256_good)
+            .field("sha256_bad", &self.sha256_bad)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Lookup {
@@ -95,6 +128,7 @@ impl Lookup {
             purl_bad: load_one(dir, Kind::Purl, Tier::Bad),
             sha256_good: load_one(dir, Kind::Sha256, Tier::Good),
             sha256_bad: load_one(dir, Kind::Sha256, Tier::Bad),
+            ..Self::default()
         };
         tracing::debug!(
             dir = %dir.display(),
@@ -170,6 +204,22 @@ impl Lookup {
                 .as_ref()
                 .is_some_and(|f| f.contains_digest(digest)),
         )
+    }
+
+    /// SHA-256 membership for `GET /_/bloom`: 4096-entry LRU.
+    #[must_use]
+    pub fn memo_sha256(&self, digest: &[u8; 32]) -> Decision {
+        self.sha256_memo
+            .get_or_insert(digest, || self.decide_sha256(digest))
+    }
+
+    /// PURL membership for `GET /_/bloom`: 4096-entry LRU.
+    /// Keyed on the request string so a hit skips `identity()` as well as the
+    /// filter probe.
+    #[must_use]
+    pub fn memo_purl(&self, purl: &str) -> Decision {
+        self.purl_memo
+            .get_or_insert(purl, || self.decide_purl(purl))
     }
 }
 
@@ -374,6 +424,15 @@ mod tests {
         // Never seen → scan normally.
         assert_eq!(lk.decide_purl("pkg:npm/unheard-of@9"), Decision::Unknown);
         assert_eq!(lk.decide_sha256(&sha(3)), Decision::Unknown);
+
+        // The /_/bloom memo must agree with the uncached probe, including on
+        // a second call (the LRU hit path).
+        assert_eq!(lk.memo_purl("pkg:npm/good@1"), Decision::Skip);
+        assert_eq!(lk.memo_purl("pkg:npm/good@1"), Decision::Skip);
+        assert_eq!(lk.memo_sha256(&good_sha), Decision::Skip);
+        assert_eq!(lk.memo_sha256(&good_sha), Decision::Skip);
+        assert_eq!(lk.memo_purl("pkg:npm/evil@1"), Decision::KnownBad);
+        assert_eq!(lk.memo_sha256(&bad_sha), Decision::KnownBad);
     }
 
     #[test]

@@ -297,6 +297,7 @@ dependencies = [
  "hostname",
  "libc",
  "libmimalloc-sys",
+ "lru",
  "mimalloc",
  "proclist",
  "rayon",

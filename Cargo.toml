@@ -118,6 +118,9 @@ tower = { version = "0.5", features = ["limit"] }
 colored = "3.1"
 tempfile = "3"
 dashmap = "6"
+# Bounded LRU for the GET /_/bloom decision memos. Already in the lock graph
+# (via other crates); this only promotes it so we can name the type.
+lru = "0.18"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking", "multipart"], default-features = false }
 # Same `Bytes` type reqwest yields, threaded into cleave's zero-copy
 # `analyze_bytes_shared` so a downloaded sample is analyzed without a Vec copy.
