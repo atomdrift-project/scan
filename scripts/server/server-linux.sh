@@ -312,7 +312,10 @@ fi
 
 # %S is a systemd specifier that expands to /var/lib at unit-load time, so
 # --traits-dir resolves to /var/lib/atomdrift/scan/traits inside the namespace.
-# -u refreshes models/traits at start (non-fatal), matching the FreeBSD rc.d
+# The server refreshes models and traits at startup, installing into that
+# directory — which is how it comes to exist on a first deploy, since
+# StateDirectory= only creates /var/lib/atomdrift itself. -u forces the refresh
+# even when the local copy looks current, matching the FreeBSD rc.d
 # `atomscan -u serve ...` invocation.
 exec_args="-u serve --bind ${BIND} --traits-dir %S/atomdrift/scan/traits --max-rss-gb ${MAX_RSS_GB}"
 exec_args="${exec_args} --interpret"

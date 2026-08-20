@@ -932,6 +932,39 @@ fn propagate_no_analysis_cache() {
     }
 }
 
+/// Refresh models and traits before a long-lived daemon starts serving.
+///
+/// `force` is `-u/--update`: re-fetch even when the local copy looks current.
+///
+/// Both daemons re-read rules only at startup, so this is what a restart is
+/// for. Failures are warnings, never fatal: a disconnected host must still come
+/// up on whatever is already on disk. It runs *after* `--traits-dir` has been
+/// applied, so a pinned traits directory is the one that gets installed into —
+/// which is also how that directory comes to exist on a fresh deploy.
+fn refresh_rules_at_startup(force: bool, no_update: bool) {
+    if no_update {
+        tracing::warn!("--no-update: skipping startup model/traits refresh");
+        return;
+    }
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let dir = scan::models_repo::install_target();
+            if let Err(e) = scan::model_update::update(&dir, force, false) {
+                tracing::warn!(dir = %dir.display(), error = %e, "model update failed");
+            }
+        });
+        s.spawn(|| {
+            if let Err(e) = scan::traits_repo::update(force, false) {
+                tracing::warn!(
+                    dir = %cleave::traits_repo::install_target().display(),
+                    error = format!("{e:#}"),
+                    "traits update failed",
+                );
+            }
+        });
+    });
+}
+
 fn main() -> Result<()> {
     #[cfg(all(
         unix,
@@ -1412,6 +1445,12 @@ fn main() -> Result<()> {
             if let Some(p) = traits_dir.as_ref() {
                 cleave::traits_repo::set_override_dir(Some(p.into()));
             }
+            // Same contract as the worker: refresh on restart. This is also the
+            // step that populates a `--traits-dir` pointing at an empty state
+            // directory on a fresh deploy — without it the server starts, reports
+            // healthy, and fails every analysis on a traits path that never
+            // got created.
+            refresh_rules_at_startup(cli.update, cli.no_update);
             let dirs: Vec<std::path::PathBuf> = allowed_dirs
                 .unwrap_or_default()
                 .split(',')
@@ -1591,23 +1630,7 @@ fn main() -> Result<()> {
             // disconnected environment must still start with whatever is on disk.
             // `--no-update` skips the refresh; `--no-validate` skips the strict
             // pre-flight (benchmark / local-dev against on-disk rules as-is).
-            if no_update {
-                tracing::warn!("--no-update: skipping startup model/traits refresh");
-            } else {
-                std::thread::scope(|s| {
-                    s.spawn(|| {
-                        let dir = scan::models_repo::install_target();
-                        if let Err(e) = scan::model_update::update(&dir, false, false) {
-                            eprintln!("Warning: model update failed: {e}");
-                        }
-                    });
-                    s.spawn(|| {
-                        if let Err(e) = scan::traits_repo::update(false, false) {
-                            eprintln!("Warning: traits update failed: {e}");
-                        }
-                    });
-                });
-            }
+            refresh_rules_at_startup(cli.update, no_update);
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
