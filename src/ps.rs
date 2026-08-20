@@ -437,6 +437,7 @@ fn build_result(
         probability: cr.probability,
         threshold: cr.threshold,
         level: cr.level,
+        analysis_cached: cr.analysis_cached,
         version: crate::engine::model_version_string(model.info()),
         analyzed_at: crate::engine::now_rfc3339(),
         cleave,

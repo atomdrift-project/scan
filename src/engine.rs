@@ -795,6 +795,7 @@ mod envelope_tests {
     pub(super) fn base_result() -> ScanResult {
         ScanResult {
             v: "7",
+            analysis_cached: false,
             classification: Classification::Benign,
             probability: 0.10,
             threshold: 0.65,
@@ -1217,6 +1218,11 @@ pub struct ScanResult {
     /// Serialized as the response `llm` section; `None` when interpretation was
     /// disabled or gated out.
     pub interpretation: Option<crate::interpret::Interpretation>,
+    /// Whether cleave replayed this analysis from its on-disk cache instead of
+    /// running the pipeline. Not serialized — it describes how this run reached
+    /// the verdict, not the verdict — but it is what tells an operator whether a
+    /// fast response was cached work or a fast file.
+    pub analysis_cached: bool,
     /// Fetched dependencies to mirror into hopper as their own samples. Empty
     /// unless the scan fetched dependencies; consumed by the upload paths and
     /// never serialized into this result's own envelope.
@@ -3933,6 +3939,9 @@ pub(crate) struct ClassifiedReport {
     pub(crate) rendered_context: String,
     /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
     pub(crate) interpretation: Option<crate::interpret::Interpretation>,
+    /// Whether cleave replayed this analysis from its on-disk cache rather than
+    /// running the pipeline. See [`ScanResult::analysis_cached`].
+    pub(crate) analysis_cached: bool,
 }
 
 /// crit-4 fraction gate for the trait floor's suspicious arm. A sparse, severe
@@ -4116,6 +4125,10 @@ pub(crate) fn classify_report(
     // misattributed to featurization during triage.
     phase: Option<&cleave::PhaseTracker>,
 ) -> Result<ClassifiedReport> {
+    // Read before the pipeline consumes `report`: whether cleave produced this
+    // analysis or replayed it from its cache is the difference between a
+    // request that did the work and one that did not.
+    let analysis_cached = report.cache_hit;
     let OutputNeeds {
         llm_view,
         fetch_progress,
@@ -4560,8 +4573,9 @@ pub(crate) fn classify_report(
                 grade = grade.as_str(),
                 outcome = %interp.outcome,
                 conf = format!("{:.4}", interp.blended),
+                cached = interp.cached,
                 interpretation = %interp.interpretation,
-                "fetched LLM interpretation",
+                "LLM interpretation",
             );
         }
         Some(interp)
@@ -4693,6 +4707,7 @@ pub(crate) fn classify_report(
         probability: final_decision.probability,
         threshold: final_decision.threshold,
         level: final_decision.level,
+        analysis_cached,
         finding_counts,
         formula,
         reasons,
@@ -7160,6 +7175,7 @@ pub(crate) fn process_report(
         embedded_files: cr.embedded_files,
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
+        analysis_cached: cr.analysis_cached,
         dependency_results: cr.dependency_results,
         bloom_mark,
     })

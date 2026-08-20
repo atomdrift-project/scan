@@ -68,7 +68,7 @@ repository = "https://github.com/atomdrift-project/scan"
 # Path dep while the gauntlet startup-cost work is local; flip back to the git
 # dep once cleave's changes are pushed. (Direct path dep, not [patch] — cargo
 # silently ignores prerelease path patches.)
-cleave = {  git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
+cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 # Path dep while fletch::purl::{normalize,identity} is unpushed — scan's bloom
