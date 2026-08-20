@@ -1,9 +1,8 @@
 # Atomdrift Scan Server API
 
 `atomscan serve` is an HTTP daemon that takes a file and returns a
-classification. It binds to loopback. It has no authentication. Treat
-it as a local service and put a reverse proxy in front of it if
-anything else needs to reach it.
+classification. It binds to loopback. Pass `--token-file` to require a
+bearer token on every route but `/_/health`; `make deploy` always does.
 
 For the pull-based worker, see [WORKERS.md](WORKERS.md).
 For the response schema, see [JSON.md](JSON.md).
@@ -23,6 +22,7 @@ The defaults are deliberate. Override them only when you have a reason.
 | `--allowed-dirs` | none               | Comma-separated roots permitted by `/analyze-path`.        |
 | `--extract-dir`  | none               | Where cleave unpacks archive members.                      |
 | `--allow-cidr`   | none               | Extra CIDR networks allowed beyond loopback.               |
+| `--token-file`   | none               | File holding the required bearer token. See below.         |
 | `--traits-dir`   | none               | Writable cleave traits directory (sets env on launch).     |
 
 Environment variables read at startup:
@@ -37,6 +37,42 @@ The listener binds before the model is loaded. While loading, every
 route returns 503 with `{"error":"server starting"}`. Poll `/_/health`
 until the status flips to `ok`.
 
+## Authentication
+
+`--token-file PATH` reads a token from the first non-empty line of `PATH`
+(minimum 16 bytes) and requires it on every route except `/_/health`:
+
+    curl -H "Authorization: Bearer $(cat ~/.tok/scan)" ...
+
+The examples further down abbreviate that as
+`AUTH="Authorization: Bearer $(cat ~/.tok/scan)"`.
+
+The scheme is case-insensitive; the token is compared byte-exactly. A
+missing or invalid token gets `401` with `WWW-Authenticate: Bearer` and an
+identical body either way, so the endpoint is not an oracle for guesses.
+
+Four properties are deliberate:
+
+- **Loopback is not exempt.** A Cloudflare tunnel runs `cloudflared` on the
+  host and dials the service over loopback, so every remote request arrives
+  with a loopback peer address. Exempting loopback would exempt the internet.
+  For the same reason `--allow-cidr` cannot filter tunnelled traffic, and
+  `/analyze-path`'s loopback-only restriction stops meaning "local" — leave
+  `--allowed-dirs` empty on a tunnelled host, which makes that route reject
+  everything.
+- **The token is a file, never an argument or an environment variable.**
+  `argv` is world-readable through `ps`, and systemd unit files are
+  world-readable in `/etc/systemd/system`. Only the SHA-256 digest is kept in
+  memory, so the token cannot surface in a log line or a core file.
+- **Missing means fatal.** If `--token-file` is set and the file is missing,
+  empty, or unreadable, the server refuses to start. It never falls back to
+  serving unauthenticated.
+- **Rotation needs a restart.** The token is read once at startup;
+  `/_/reload` does not re-read it.
+
+`/_/health` stays open so tunnel and load-balancer probes work without a
+credential — but a valid token there upgrades the response, see below.
+
 ### Deploy
 
 `make deploy` (alias of `make deploy-server`) installs a long-lived
@@ -49,11 +85,24 @@ until the status flips to `ok`.
   `make deploy-worker` on Linux: unprivileged `scan` user, `MemoryMax=`,
   traits under `/var/lib/atomdrift/scan`.
 
+Both paths install an API token. It is read from `~/.tok/scan` on the
+deploying host — generated there on first deploy if absent — and copied into
+the service account's own `~/.tok/scan`, which the unit passes as
+`--token-file`. Rotate by editing `~/.tok/scan` and redeploying. Hand clients
+`$(cat ~/.tok/scan)`.
+
 Linux overrides (passed through the environment): `BIND=` (default
-`0.0.0.0:49999`, matching the FreeBSD jail), `ALLOW_CIDR=` (default
-`10.0.0.0/8`; set empty to omit), `LLM=` / `LLM_URL=` (`local`, `openrouter`,
-or a base URL), `LLM_MODEL=` (required for OpenRouter), `WORKERS=`,
-`MEMORY_MAX=`. `make uninstall-server` tears the unit down.
+`127.0.0.1:49999`, on the assumption that a Cloudflare tunnel or another local
+proxy provides the ingress; set `0.0.0.0:49999` to listen on every interface),
+`TOKEN_SRC=` (default `~/.tok/scan`; set empty to deploy without
+authentication), `ALLOW_CIDR=` (default `10.0.0.0/8`; set empty to omit),
+`LLM=` / `LLM_URL=` (`local`, `openrouter`, or a base URL), `LLM_MODEL=`
+(required for OpenRouter), `WORKERS=`, `MEMORY_MAX=`. `make uninstall-server`
+tears the unit down.
+
+The FreeBSD jail keeps `--bind 0.0.0.0:49999` with `--allow-cidr 10.0.0.0/8`,
+since it is reached over the network rather than through a tunnel, and always
+requires a token.
 
 ## Endpoints
 
@@ -63,7 +112,7 @@ Multipart upload. One part named `file`. The filename is sanitised
 (`[A-Za-z0-9_.-]`, `..` collapsed, truncated to 63 bytes) and copied to
 a private temp directory so cleave sees a plausible extension.
 
-    curl -s -F file=@/bin/ls http://127.0.0.1:49999/analyze | jq .ml
+    curl -s -H "$AUTH" -F file=@/bin/ls http://127.0.0.1:49999/analyze | jq .ml
 
 Returns 200 with the [response envelope](JSON.md). 413 if the
 body exceeds `--max-size-mb`, 415 for unsupported types, 422 for
@@ -72,12 +121,13 @@ saturated, 504 if analysis exceeds the watchdog deadline.
 
 ### `POST /analyze-path`
 
-JSON body: `{"path": "/absolute/path"}`. Loopback only, always. The
-path is canonicalised before it is compared against `--allowed-dirs`,
-so symlinks cannot escape. Without `--allowed-dirs`, every request
-returns 403.
+JSON body: `{"path": "/absolute/path"}`. Loopback only, always — but see the
+tunnel caveat under [Authentication](#authentication): behind a tunnel,
+"loopback" includes every remote caller. The path is canonicalised before it
+is compared against `--allowed-dirs`, so symlinks cannot escape. Without
+`--allowed-dirs`, every request returns 403.
 
-    curl -s -H 'content-type: application/json' \
+    curl -s -H "$AUTH" -H 'content-type: application/json' \
       -d '{"path":"/usr/bin/ls"}' \
       http://127.0.0.1:49999/analyze-path | jq .ml
 
@@ -90,7 +140,7 @@ optional (`npm/left-pad@1.3.0` is accepted). Scan resolves the package,
 looks up registry provenance itself, and returns the same envelope as
 `/analyze`. Takes an analyze slot. 400 if the argument is not a PURL.
 
-    curl -s -H 'content-type: application/json' \
+    curl -s -H "$AUTH" -H 'content-type: application/json' \
       -d '{"purl":"pkg:npm/left-pad@1.3.0"}' \
       http://127.0.0.1:49999/analyze-purl | jq .ml
 
@@ -115,23 +165,34 @@ max-age=3600`. 400 if both keys, neither key, or a malformed sha256.
 
 ### `GET /_/health`
 
-Liveness and load. 200 when ready, 503 while loading or failed.
+Liveness and load. 200 when ready, 503 while loading or failed. The only
+route that does not require a bearer token.
 
     {
       "status": "ok",
       "rss_mb": 312,
       "max_rss_mb": 16384,
       "active_tasks": 1,
-      "stuck_orphans": 0,
-      "long_running_tasks": [],
       "max_concurrent_tasks": 4,
       "load": 0.25,
       "load_avg": 0.42,
-      "uptime_secs": 91,
-      "rayon_threads": 8
+      "uptime_secs": 91
     }
 
 `status` is one of `ok`, `starting`, `failed`, `degraded`, `saturated`.
+
+Because the route is public, that body carries no operational detail. A
+request that *does* present a valid token — or any request to a server with
+no `--token-file`, which behaves exactly as it did before tokens existed —
+additionally gets:
+
+    "stuck_orphans": 0,
+    "long_running_tasks": [ ... ],
+    "oldest_task": { "name": "...", "elapsed_secs": 310 },
+    "rayon_threads": 8
+
+`long_running_tasks` and `oldest_task` name the samples currently being
+analysed, which is why they are not public.
 
 ### `GET /_/info`
 
@@ -164,7 +225,7 @@ switch counts; FreeBSD: rayon thread count; other platforms: error).
 | 403  | `/analyze-path` outside `--allowed-dirs`, or non-loopback peer.         |
 | 413  | Body exceeds `--max-size-mb`.                                           |
 | 415  | Unsupported file, archive, or compression format.                       |
-| 422  | Truncated, encrypted-without-password, depth or count limit exceeded.   |
+| 422  | Corrupt, truncated, encrypted-without-password, depth or count limit.   |
 | 500  | Internal error.                                                         |
 | 503  | Starting, failed, overloaded, or at capacity.                           |
 | 504  | Analysis exceeded the per-request watchdog.                             |
@@ -174,6 +235,43 @@ switch counts; FreeBSD: rayon thread count; other platforms: error).
 Errors share a single shape:
 
     { "error": "string", "detail": "optional chain" }
+
+## Logging
+
+The server writes to stderr (journald under systemd). Every request produces
+exactly one access line when its response is ready:
+
+    INFO scan::server::access: POST /analyze-purl id=9 status=200 dur_ms=10351
+      peer=127.0.0.1 fwd=203.0.113.9 auth="token" req_bytes=33 trace="bl-9f2c"
+      ua="beamline/0.3"
+
+| Field       | Meaning                                                                |
+| ----------- | ---------------------------------------------------------------------- |
+| `id`        | Server-assigned request id; every other line about this request repeats it. |
+| `status`    | HTTP status returned.                                                  |
+| `dur_ms`    | Wall time from arrival to response.                                    |
+| `peer`      | Socket peer address. Behind a tunnel this is always loopback.          |
+| `fwd`       | Client address a proxy reported (`CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`). Advisory: logged, never used for access control. |
+| `auth`      | `token`, `open` (no `--token-file`), `anon` (unauthenticated `/_/health`), or a rejection reason: `bad-token`, `peer-denied`, `loopback-only`, `no-peer-info`. |
+| `req_bytes` | Request `Content-Length`, when the client sent one.                    |
+| `trace`     | The caller's `X-Request-Id`, for correlating with the calling service. |
+| `ua`        | `User-Agent`, control-stripped and truncated to 120 characters.        |
+
+Levels: 5xx logs at WARN, a missing peer address at ERROR, a successful
+`/_/health` probe at DEBUG (so liveness checks do not fill the log), and
+everything else at INFO. Rejected requests are logged only here — the ACL does
+not log a second line of its own.
+
+Analyses add `--> POST …` when they start and `<-- 200 OK` / `<-- analysis
+failed` when they finish, both carrying the same `id`. A failure line carries
+the whole error chain, which is the same text the response body returns as
+`detail`:
+
+    WARN scan::server::handlers: <-- analysis failed id=5 status=422
+      error=cleave analysis of bad.tgz: Failed to read tar entry: corrupt deflate stream
+
+`RUST_LOG` overrides the defaults (`scan=info,cleave=warn` in server mode) —
+`RUST_LOG=scan=debug` turns on health-probe lines and per-request diagnostics.
 
 ## Thresholds
 
@@ -272,10 +370,11 @@ The server is built for trusted networks. The defaults reflect that.
 
 ## Example session
 
-    $ atomscan serve --bind 127.0.0.1:49999 --workers 4
+    $ atomscan serve --bind 127.0.0.1:49999 --workers 4 --token-file ~/.tok/scan
+    $ AUTH="Authorization: Bearer $(cat ~/.tok/scan)"
     $ curl -s http://127.0.0.1:49999/_/health | jq -r .status
     ok
-    $ curl -s -F file=@/bin/ls http://127.0.0.1:49999/analyze \
+    $ curl -s -H "$AUTH" -F file=@/bin/ls http://127.0.0.1:49999/analyze \
         | jq '.ml | {lvl, prob, version}'
     {
       "lvl": -1,

@@ -32,6 +32,20 @@ use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
 use crate::server::{ModelResources, classify_bytes, classify_file};
 use crate::system_load_avg;
+use crate::upload::hopper_token;
+
+/// Attach the hopper bearer token to a request, if there is one.
+///
+/// Every call to hopper goes through this: hopper requires the token on all of
+/// `/api/*` and `/data/`, and does not exempt loopback — a locally supervised
+/// worker on the hopper host authenticates like any remote one. See
+/// [`crate::upload::hopper_token`] for where the token comes from.
+fn authed(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match hopper_token() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
 
 #[derive(Debug, Clone)]
 struct IndexedLocalFile {
@@ -109,9 +123,10 @@ fn cleave_concurrency(slots: usize) -> usize {
 /// `SCAN_CLEAVE_CONCURRENCY` when set.
 fn cleave_concurrency_from(slots: usize, pool: usize, override_value: Option<usize>) -> usize {
     let slots = slots.max(1);
-    override_value
-        .filter(|&value| value > 0)
-        .map_or_else(|| (pool.max(1) / 8).clamp(1, slots), |value| value.min(slots))
+    override_value.filter(|&value| value > 0).map_or_else(
+        || (pool.max(1) / 8).clamp(1, slots),
+        |value| value.min(slots),
+    )
 }
 
 type ResourceHandle = Arc<RwLock<Arc<ModelResources>>>;
@@ -1962,7 +1977,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     metrics: metrics.snapshot(),
                 };
                 let url = heartbeat_url(&base_url, &encoded_name, &available_tools, &report);
-                match client.get(&url).send().await {
+                match authed(client.get(&url)).send().await {
                     Ok(resp) if resp.status().is_success() => {}
                     Ok(resp) => {
                         tracing::debug!(status = %resp.status(), "heartbeat: non-success response");
@@ -2019,8 +2034,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     match resources.read() {
                         Ok(guard) => Ok(Arc::clone(&*guard)),
                         Err(error) => {
-                            let error =
-                                anyhow::anyhow!("worker resources lock poisoned: {error}");
+                            let error = anyhow::anyhow!("worker resources lock poisoned: {error}");
                             tracing::error!(
                                 worker_id,
                                 error = %error,
@@ -2033,14 +2047,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     Ok(snapshot) => snapshot,
                     Err(failure) => {
                         metrics.record_error(&failure);
-                        post_result(
-                            &client,
-                            &base_url,
-                            &name,
-                            &pj.job.sha256,
-                            Err(failure),
-                        )
-                        .await;
+                        post_result(&client, &base_url, &name, &pj.job.sha256, Err(failure)).await;
                         metrics.complete(pj.queue_id);
                         completed.fetch_add(1, Ordering::Release);
                         continue;
@@ -2307,7 +2314,7 @@ impl Prefetcher {
 
 /// Poll hopper's `/api/next` once. `Ok(None)` means no work is available now.
 async fn claim_jobs(client: &reqwest::Client, poll_url: &str) -> Result<Option<Vec<ClaimJob>>> {
-    let resp = client.get(poll_url).send().await.map_err(|e| {
+    let resp = authed(client.get(poll_url)).send().await.map_err(|e| {
         let error_text = e.to_string();
         let is_connect = e.is_connect();
         anyhow::Error::new(e).context(poll_request_context(poll_url, &error_text, is_connect))
@@ -2932,8 +2939,7 @@ async fn post_result(
         }
         tracing::debug!(sha256 = %sha256, attempt, "posting result to server");
         let post_start = Instant::now();
-        let mut request = client
-            .post(&url)
+        let mut request = authed(client.post(&url))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.clone());
         if let Some(enc) = encoding {
@@ -3213,10 +3219,10 @@ async fn download_response(
         url_encode_into(segment, &mut data_url);
     }
     tracing::debug!(sha256 = %sha256, url = %data_url, "downloading via /data/");
-    let resp =
-        client.get(&data_url).send().await.map_err(|e| {
-            format!("download failed: path={path} sha256={sha256} url={data_url}: {e}")
-        })?;
+    let resp = authed(client.get(&data_url))
+        .send()
+        .await
+        .map_err(|e| format!("download failed: path={path} sha256={sha256} url={data_url}: {e}"))?;
 
     if resp.status().is_success() {
         return Ok((resp, "/data/"));
@@ -3233,7 +3239,7 @@ async fn download_response(
     // data root (e.g. different symlink resolution or data root migration).
     let api_url = format!("{base_url}/api/file/{sha256}");
     tracing::debug!(sha256 = %sha256, url = %api_url, "downloading via /api/file/ (fallback)");
-    let resp = client.get(&api_url).send().await.map_err(|e| {
+    let resp = authed(client.get(&api_url)).send().await.map_err(|e| {
         format!("download fallback failed: path={path} sha256={sha256} url={api_url}: {e}")
     })?;
 
@@ -3263,7 +3269,7 @@ async fn download_provenance(
     sha256: &str,
 ) -> Option<crate::provenance::RegistryProvenance> {
     let url = format!("{base_url}/api/provenance/{sha256}");
-    let resp = match client.get(&url).send().await {
+    let resp = match authed(client.get(&url)).send().await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::debug!(sha256 = %sha256, error = %e, "provenance fetch failed");

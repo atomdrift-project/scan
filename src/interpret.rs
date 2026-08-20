@@ -136,13 +136,22 @@ pub fn is_openrouter_endpoint(base_url: &str) -> bool {
         || t.contains("openrouter.ai")
 }
 
-/// `$HOME/.tok/openrouter` — first non-empty trimmed line is the key.
+/// `$HOME/.tok/<name>` — the convention for operator-supplied secrets across
+/// the toolchain: `openrouter` for the LLM key, `hopper` for the hopper API
+/// token, `scan` for this server's own. The first non-empty trimmed line of
+/// the file is the secret; see [`read_token_file`].
 #[must_use]
-pub fn openrouter_token_path() -> Option<PathBuf> {
+pub fn tok_path(name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(dirs::home_dir)?;
-    Some(home.join(".tok").join("openrouter"))
+    Some(home.join(".tok").join(name))
+}
+
+/// `$HOME/.tok/openrouter` — first non-empty trimmed line is the key.
+#[must_use]
+pub fn openrouter_token_path() -> Option<PathBuf> {
+    tok_path("openrouter")
 }
 
 /// Bearer token from [`openrouter_token_path`], if the file is present.

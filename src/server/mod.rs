@@ -16,10 +16,12 @@
 //! validated thresholds are supplied up front, and callers use accessors
 //! rather than mutating fields after construction.
 
+mod access;
 mod acl;
+mod flight;
 mod handlers;
 
-pub use acl::{Cidr, parse_cidr_list};
+pub use acl::{Cidr, TokenDigest, parse_cidr_list};
 pub(crate) use handlers::classify_bytes;
 pub(crate) use handlers::classify_file;
 
@@ -55,6 +57,9 @@ pub struct ServerConfig {
     extract_dir: Option<PathBuf>,
     workers: usize,
     allow_cidrs: Vec<Cidr>,
+    /// Bearer token required on every route except `/_/health`; `None`
+    /// disables authentication. Only the digest is kept — see [`TokenDigest`].
+    auth_digest: Option<TokenDigest>,
     level: Option<u16>,
     /// Per-request analysis timeout in seconds. 0 disables.
     analysis_timeout_secs: u64,
@@ -147,6 +152,7 @@ impl ServerConfig {
             extract_dir,
             workers,
             allow_cidrs,
+            auth_digest: None,
             level: None,
             analysis_timeout_secs: DEFAULT_ANALYSIS_TIMEOUT_SECS,
             interpret: None,
@@ -293,6 +299,25 @@ impl ServerConfig {
     #[must_use]
     pub fn allow_cidrs(&self) -> &[Cidr] {
         &self.allow_cidrs
+    }
+
+    /// Require `Authorization: Bearer <token>` on every route except
+    /// `/_/health` (`--token-file`). `None` leaves the API unauthenticated.
+    ///
+    /// Loopback peers are **not** exempt: behind a Cloudflare tunnel,
+    /// `cloudflared` connects over loopback, so every remote request arrives
+    /// with a loopback peer address.
+    #[must_use]
+    pub const fn with_auth_token(mut self, digest: Option<TokenDigest>) -> Self {
+        self.auth_digest = digest;
+        self
+    }
+
+    /// Digest of the required bearer token, or `None` when the API is
+    /// unauthenticated.
+    #[must_use]
+    pub const fn auth_digest(&self) -> Option<TokenDigest> {
+        self.auth_digest
     }
 }
 
@@ -492,6 +517,9 @@ struct AppState {
     allowed_dirs: Vec<PathBuf>,
     extract_dir: Option<PathBuf>,
     allow_cidrs: Vec<Cidr>,
+    /// Digest of the bearer token required by the ACL middleware; `None`
+    /// disables authentication.
+    auth_digest: Option<TokenDigest>,
     /// LLM interpretation config (`--interpret`); shared into every
     /// [`ModelResources`] so handlers can run the pass.
     interpret: Option<crate::interpret::InterpretConfig>,
@@ -523,6 +551,9 @@ struct AppState {
     reload_lock: tokio::sync::Mutex<()>,
     overloaded_since: std::sync::Mutex<Option<Instant>>,
     in_flight: dashmap::DashMap<u64, InFlightRequest>,
+    /// Analyses in progress, so concurrent requests for the same artifact
+    /// share one run instead of each taking a slot. See [`flight`].
+    flights: Arc<flight::Flights>,
     /// Background hopper uploader (`--hopper`); `None` disables result renewal.
     /// Shared across handlers; each analyzed result is queued to its own thread,
     /// so uploads never block the analyze response.
@@ -567,6 +598,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         allowed_dirs: config.allowed_dirs().to_vec(),
         extract_dir: config.extract_dir().map(PathBuf::from),
         allow_cidrs: config.allow_cidrs().to_vec(),
+        auth_digest: config.auth_digest(),
         interpret: config.interpret().cloned(),
         fetch: config.fetch(),
         zip_passwords: config.zip_passwords.clone(),
@@ -581,6 +613,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         analysis_timeout_secs: config.analysis_timeout_secs(),
         reload_lock: tokio::sync::Mutex::new(()),
         overloaded_since: std::sync::Mutex::new(None),
+        flights: Arc::new(flight::Flights::default()),
         in_flight: dashmap::DashMap::new(),
         // Start the background uploader once when --hopper is set, so every
         // analyzed result (parent and members) is renewed on hopper without
@@ -643,7 +676,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                         tracing::warn!(
                             queue_ms,
                             work_ms = t.elapsed().as_millis(),
-                            "SHAP data unavailable (explanations disabled): {e}"
+                            "SHAP data unavailable (explanations disabled): {e:#}"
                         );
                         None
                     }
@@ -698,7 +731,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     }
                 }
                 (Ok(Err(e)), _, _) => {
-                    record_init_failure(&bg, &format!("failed to load model: {e}"))
+                    record_init_failure(&bg, &format!("failed to load model: {e:#}"))
                 }
                 (Err(e), _, _) => {
                     record_init_failure(&bg, &format!("model load task panicked: {e}"))
@@ -796,6 +829,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         .route("/analyze-path", post(handlers::analyze_path))
         .layer(DefaultBodyLimit::max(config.max_body_size()))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), acl::acl))
+        // Outermost: every request gets an id and an access-log line, including
+        // the ones the ACL rejects.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            access::access_log,
+        ))
         .with_state(state);
 
     Ok(app)
@@ -851,12 +890,42 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         config.bind(),
         config.max_body_size() / 1024 / 1024,
     );
+    // The startup line is the record of what this process actually is: an
+    // operator reading the log after a restart should not have to reconstruct
+    // the running configuration from the unit file.
     tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
         bind = %config.bind(),
         max_body_mb = config.max_body_size() / 1024 / 1024,
+        analysis_timeout_secs = config.analysis_timeout_secs(),
         allow_cidrs = config.allow_cidrs().len(),
+        allowed_dirs = config.allowed_dirs().len(),
+        authenticated = config.auth_digest().is_some(),
         "listening (resources loading in background)",
     );
+
+    // An unauthenticated API is open to anyone who can reach the socket. Warn
+    // unconditionally — a loopback bind is not evidence of safety, because a
+    // Cloudflare tunnel terminates on loopback and puts the whole internet on
+    // the other side of it.
+    if config.auth_digest().is_none() {
+        tracing::warn!(
+            "no --token-file: the API is unauthenticated; any peer that reaches the socket can submit work",
+        );
+    }
+
+    // /analyze-path reads any file under --allowed-dirs and is restricted to
+    // loopback peers — but a tunnel makes every peer a loopback peer, so that
+    // restriction stops protecting it. Leave --allowed-dirs empty unless the
+    // host is genuinely local-only; with no allowed directory the route
+    // rejects every request.
+    if !config.allowed_dirs().is_empty() {
+        tracing::warn!(
+            allowed_dirs = config.allowed_dirs().len(),
+            "--allowed-dirs is set: /analyze-path can read those directories for any peer reaching loopback, including through a tunnel",
+        );
+    }
 
     // Operator footgun: setting --allow-cidr while bound to loopback means
     // the CIDR list can never match (no remote peers can connect). Warn so

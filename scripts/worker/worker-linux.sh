@@ -20,6 +20,8 @@
 #                                                                 `openrouter` → https://openrouter.ai/api/v1)
 #   LLM_MODEL      pinned model (SCAN_LLM_MODEL); required for OpenRouter
 #   SCAN_LLM_KEY   OpenRouter key if ~/.tok/openrouter is absent
+#   HOPPER_TOKEN_FILE  hopper API token to install for the service user
+#                                                                (default: ~/.tok/hopper)
 
 set -eu
 
@@ -194,8 +196,30 @@ fi
 # systemd re-asserts ownership/mode on each start via StateDirectory=.
 $SUDO install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}"
 
-# OpenRouter: the unit runs as `scan` with ProtectHome=true and HOME under
-# StateDirectory, so copy the operator key into the service home.
+# The unit runs as `scan` with ProtectHome=true and HOME under StateDirectory,
+# so operator secrets are copied into the service account's own ~/.tok.
+$SUDO install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}/.tok"
+
+# --- Hopper API token --------------------------------------------------------
+#
+# Hopper requires `Authorization: Bearer <token>` on every API route, so a
+# worker without this file cannot claim work. Copied from the deploying user's
+# ~/.tok/hopper, the same file hopper's own deploy installs; the worker reads it
+# at $HOME/.tok/hopper. Never an argument or an Environment= line: argv is
+# world-readable through ps(1), and unit files are world-readable in
+# /etc/systemd/system.
+hopper_token_src="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
+hopper_token_dst="${STATE_HOME}/.tok/hopper"
+if [ -s "$hopper_token_src" ]; then
+    $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+        "$hopper_token_src" "$hopper_token_dst"
+    log "Installed hopper API token at ${hopper_token_dst}"
+elif ! $SUDO test -s "$hopper_token_dst"; then
+    # Not fatal: a hopper deployed without --token-file needs no client token.
+    log "WARNING: no hopper API token at ${hopper_token_src}; this worker cannot claim work from an authenticated hopper"
+fi
+
+# OpenRouter: copy the operator key into the service home as well.
 openrouter_target() {
     case "$LLM" in
         openrouter|https://openrouter.ai/*|http://openrouter.ai/*) return 0 ;;
@@ -204,7 +228,6 @@ openrouter_target() {
 }
 if openrouter_target; then
     [ -n "$LLM_MODEL" ] || die "OpenRouter deploy requires LLM_MODEL= (e.g. qwen/qwen3.8-27b)"
-    $SUDO install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}/.tok"
     dst="${STATE_HOME}/.tok/openrouter"
     src="${HOME}/.tok/openrouter"
     if [ -n "${SCAN_LLM_KEY:-}" ]; then
