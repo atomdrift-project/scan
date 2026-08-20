@@ -23,7 +23,11 @@
 #   HOPPER      hopper base URL (--hopper / SCAN_HOPPER)         (default: unset)
 #   MAX_RSS_GB  pause threshold (--max-rss-gb)                   (default: -1 = off; systemd MemoryMax handles OOM)
 #   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, 80%, infinity)     (default: 80%)
-#   LLM         OpenAI-compatible LLM endpoint (SCAN_LLM)        (default: http://10.9.8.149:8000/v1)
+#   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target (SCAN_LLM)
+#                                                                (default: http://10.9.8.149:8000/v1;
+#                                                                 `openrouter` → https://openrouter.ai/api/v1)
+#   LLM_MODEL      pinned model (SCAN_LLM_MODEL); required for OpenRouter
+#   SCAN_LLM_KEY   OpenRouter key if ~/.tok/openrouter is absent
 
 set -eu
 
@@ -43,7 +47,12 @@ ALLOWED_DIRS="${ALLOWED_DIRS:-}"
 HOPPER="${HOPPER:-}"
 MAX_RSS_GB="${MAX_RSS_GB:--1}"
 MEMORY_MAX="${MEMORY_MAX:-80%}"
+# LLM_URL is an alias for LLM (SCAN_LLM): `local`, `openrouter`, or a base URL.
+if [ -z "${LLM:-}" ] && [ -n "${LLM_URL:-}" ]; then
+    LLM=$LLM_URL
+fi
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
+LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-}}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
@@ -196,6 +205,32 @@ fi
 # systemd re-asserts ownership/mode on each start via StateDirectory=.
 $SUDO install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}"
 
+# OpenRouter: the unit runs as `scan` with ProtectHome=true and HOME under
+# StateDirectory, so copy the operator key into the service home.
+openrouter_target() {
+    case "$LLM" in
+        openrouter|https://openrouter.ai/*|http://openrouter.ai/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+if openrouter_target; then
+    [ -n "$LLM_MODEL" ] || die "OpenRouter deploy requires LLM_MODEL= (e.g. qwen/qwen3.8-27b)"
+    $SUDO install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}/.tok"
+    dst="${STATE_HOME}/.tok/openrouter"
+    src="${HOME}/.tok/openrouter"
+    if [ -n "${SCAN_LLM_KEY:-}" ]; then
+        tmp=$(mktemp)
+        printf '%s\n' "$SCAN_LLM_KEY" > "$tmp"
+        $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$tmp" "$dst"
+        rm -f "$tmp"
+    elif [ -s "$src" ]; then
+        $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$src" "$dst"
+    else
+        die "OpenRouter deploy needs a key in $src (or SCAN_LLM_KEY)"
+    fi
+    log "Installed OpenRouter token at ${dst}"
+fi
+
 # --- Binary -----------------------------------------------------------------
 
 binary_changed=0
@@ -233,6 +268,10 @@ fi
 # --- Unit -------------------------------------------------------------------
 
 TMP_UNIT=$(mktemp -t scan.service.XXXXXX)
+LLM_MODEL_LINE=""
+if [ -n "$LLM_MODEL" ]; then
+    LLM_MODEL_LINE="Environment=SCAN_LLM_MODEL=${LLM_MODEL}"
+fi
 
 cat >"$TMP_UNIT" <<EOF
 [Unit]
@@ -261,7 +300,9 @@ TimeoutStopSec=30s
 
 Environment=HOME=%S/atomdrift/scan
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
+# Named target `openrouter` is resolved by the binary.
 Environment=SCAN_LLM=${LLM}
+${LLM_MODEL_LINE}
 
 # Resource caps. Under systemd we disable the server's in-process RSS
 # throttling (--max-rss-gb=-1) and let MemoryMax do the enforcement: a

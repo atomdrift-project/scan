@@ -246,8 +246,10 @@ struct Cli {
     /// [optional] Enable additional LLM interpretation of analyzed samples: a
     /// second opinion blended with the ML verdict (stored in the `llm` JSON
     /// section and shown inline). Given with no value, uses a local model (an
-    /// OpenAI-compatible endpoint at http://localhost:8000/v1). TARGET may also
-    /// be an explicit OpenAI-compatible base URL. (env: SCAN_LLM)
+    /// OpenAI-compatible endpoint at http://localhost:8000/v1). TARGET may be
+    /// `local`, `openrouter` (https://openrouter.ai/api/v1; key from `--llm-key`,
+    /// `SCAN_LLM_KEY`, or `~/.tok/openrouter`; `--llm-model` is required), or an
+    /// explicit OpenAI-compatible base URL. (env: SCAN_LLM)
     #[arg(
         long,
         global = true,
@@ -484,7 +486,10 @@ impl Cli {
     /// `--interpret`) and the `--llm-*` flags, falling back to env vars. `None`
     /// when interpretation is not requested.
     fn interpret_config(&self) -> Result<Option<scan::interpret::InterpretConfig>> {
-        use scan::interpret::{DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY};
+        use scan::interpret::{
+            DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY, is_openrouter_endpoint, llm_base_url,
+            openrouter_key_from_home,
+        };
         let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
             flag.clone()
                 .or_else(|| std::env::var(key).ok())
@@ -497,26 +502,46 @@ impl Cli {
             return Ok(None);
         }
         // Resolve the target to a base URL: `local` (also the bare-flag default)
-        // maps to the local endpoint; anything else is an OpenAI-compatible base
-        // URL. Future named providers (e.g. gemini) slot in here.
+        // maps to the local endpoint; `openrouter` is the public API; anything
+        // else is an OpenAI-compatible base URL.
         let base_url = match target.as_deref() {
             None | Some("local") => DEFAULT_BASE_URL.to_string(),
-            Some(url) => url.to_string(),
+            Some(name) => llm_base_url(name),
         };
-        let api_key = from_env(&self.llm_key, "SCAN_LLM_KEY");
+        let mut api_key = from_env(&self.llm_key, "SCAN_LLM_KEY");
+        if api_key.is_none() && is_openrouter_endpoint(&base_url) {
+            api_key = openrouter_key_from_home();
+        }
+        let openrouter = is_openrouter_endpoint(&base_url);
+        if openrouter && api_key.is_none() {
+            anyhow::bail!(
+                "OpenRouter requires a key: --llm-key, SCAN_LLM_KEY, or ~/.tok/openrouter"
+            );
+        }
         // A pinned model wins; otherwise take what the endpoint says it serves.
-        // Nothing is hardcoded: if the endpoint lists no model there is nothing
-        // sensible to send, and a guessed name would surface as an opaque
-        // server-side error mid-scan instead of here.
-        let model = from_env(&self.llm_model, "SCAN_LLM_MODEL")
-            .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()))
-            .ok_or_else(|| {
+        // OpenRouter's catalog is large and billed — never auto-pick. Nothing
+        // else is hardcoded: if a local endpoint lists no model there is
+        // nothing sensible to send, and a guessed name would surface as an
+        // opaque server-side error mid-scan instead of here.
+        let model = from_env(&self.llm_model, "SCAN_LLM_MODEL");
+        let model = if openrouter {
+            model.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no LLM model available: {base_url}/models listed none (or was \
-                     unreachable). Start the endpoint, or name a model with \
-                     --llm-model (env: SCAN_LLM_MODEL)"
+                    "OpenRouter requires --llm-model (env: SCAN_LLM_MODEL); \
+                     the catalog is not auto-selected"
                 )
-            })?;
+            })?
+        } else {
+            model
+                .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no LLM model available: {base_url}/models listed none (or was \
+                         unreachable). Start the endpoint, or name a model with \
+                         --llm-model (env: SCAN_LLM_MODEL)"
+                    )
+                })?
+        };
         Ok(Some(scan::interpret::InterpretConfig {
             base_url,
             model,
@@ -2520,5 +2545,147 @@ mod tests {
         assert!(
             Cli::try_parse_from(["scan", "-9", "--threshold-hostile", "0.90", "/tmp/a"]).is_err()
         );
+    }
+
+    fn with_isolated_llm_env<T>(home: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = [
+            ("HOME", std::env::var_os("HOME")),
+            ("SCAN_LLM", std::env::var_os("SCAN_LLM")),
+            ("SCAN_LLM_MODEL", std::env::var_os("SCAN_LLM_MODEL")),
+            ("SCAN_LLM_KEY", std::env::var_os("SCAN_LLM_KEY")),
+        ];
+        unsafe {
+            std::env::remove_var("SCAN_LLM");
+            std::env::remove_var("SCAN_LLM_MODEL");
+            std::env::remove_var("SCAN_LLM_KEY");
+            if let Some(h) = home {
+                std::env::set_var("HOME", h);
+            }
+        }
+        let out = f();
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn openrouter_alias_requires_model_and_key() -> Result<()> {
+        let empty_home = tempfile::tempdir()?;
+        with_isolated_llm_env(Some(empty_home.path()), || {
+            let missing_key = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "openrouter",
+                "--llm-model",
+                "qwen/qwen3.8-27b",
+                "/tmp/a",
+            ])?;
+            let err = missing_key
+                .interpret_config()
+                .expect_err("openrouter without a key must fail");
+            assert!(
+                err.to_string().contains("~/.tok/openrouter"),
+                "unexpected error: {err}"
+            );
+
+            let missing_model = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "openrouter",
+                "--llm-key",
+                "sk-test",
+                "/tmp/a",
+            ])?;
+            let err = missing_model
+                .interpret_config()
+                .expect_err("openrouter without a model must fail");
+            assert!(
+                err.to_string().contains("--llm-model"),
+                "unexpected error: {err}"
+            );
+
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "openrouter",
+                "--llm-model",
+                "qwen/qwen3.8-27b",
+                "--llm-key",
+                "sk-test",
+                "/tmp/a",
+            ])?;
+            let cfg = cli
+                .interpret_config()?
+                .context("openrouter with model+key should enable interpret")?;
+            assert_eq!(cfg.base_url, scan::interpret::OPENROUTER_BASE_URL);
+            assert_eq!(cfg.model, "qwen/qwen3.8-27b");
+            assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn llm_flags_are_global_on_serve_and_worker() -> Result<()> {
+        with_isolated_llm_env(None, || {
+            let serve = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "openrouter",
+                "--llm-model",
+                "qwen/qwen3.8-27b",
+                "--llm-key",
+                "sk-test",
+                "serve",
+            ])?;
+            assert_eq!(serve.llm.as_deref(), Some("openrouter"));
+            let cfg = serve.interpret_config()?.context("serve inherits --llm")?;
+            assert_eq!(cfg.base_url, scan::interpret::OPENROUTER_BASE_URL);
+
+            let worker = Cli::try_parse_from([
+                "atomscan",
+                "worker",
+                "--url",
+                "http://hopper.test",
+                "--llm",
+                "openrouter",
+                "--llm-model",
+                "qwen/qwen3.8-27b",
+                "--llm-key",
+                "sk-test",
+            ])?;
+            assert_eq!(worker.llm.as_deref(), Some("openrouter"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn openrouter_key_falls_back_to_tok_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tok = dir.path().join(".tok");
+        std::fs::create_dir(&tok)?;
+        std::fs::write(tok.join("openrouter"), "sk-from-file\n")?;
+        with_isolated_llm_env(Some(dir.path()), || {
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "openrouter",
+                "--llm-model",
+                "qwen/qwen3.8-27b",
+                "/tmp/a",
+            ])?;
+            let cfg = cli
+                .interpret_config()?
+                .context("tok file should supply key")?;
+            assert_eq!(cfg.api_key.as_deref(), Some("sk-from-file"));
+            Ok(())
+        })
     }
 }

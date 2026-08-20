@@ -32,10 +32,12 @@ WORKERS  ?=
 MAX_RSS_GB ?=
 URL ?= http://10.9.8.10:8081/
 # LLM second-opinion pass for `make worker` (matches the deploy scripts'
-# defaults). LLM is exported as SCAN_LLM; INTERPRET_MIN_PROB gates which samples
-# are sent. The benchmark/profile targets deliberately omit interpret so LLM
+# defaults). LLM / LLM_URL is exported as SCAN_LLM (`local`, `openrouter`, or a
+# base URL). LLM_MODEL is SCAN_LLM_MODEL (required for OpenRouter). The
+# benchmark/profile targets deliberately omit interpret so LLM
 # round-trips don't distort wall/RSS measurements.
 LLM ?= http://10.9.8.149:8000/v1
+LLM_MODEL ?=
 INTERPRET_MIN_PROB ?= 0.15
 
 # Scrub GNU make's jobserver from cargo's environment. Without this, build
@@ -168,8 +170,8 @@ deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes rollout-basti
 deploy: deploy-server
 
 # Long-lived `atomscan serve`. FreeBSD: Bastille build+run jails. Linux: native
-# systemd unit (`scan.service`). Override BIND=, ALLOW_CIDR=, LLM=, MEMORY_MAX=
-# (see scripts/server/server-linux.sh).
+# systemd unit (`scan.service`). Override BIND=, ALLOW_CIDR=, LLM= / LLM_URL=,
+# LLM_MODEL=, MEMORY_MAX= (see scripts/server/server-linux.sh).
 deploy-server:
 	git pull
 	@case "$$(uname -s)" in \
@@ -303,8 +305,8 @@ benchmark-worker: release
 # Run a worker in the foreground for interactive use. The worker self-nices
 # to 10 by default; pass NICE=0 to disable.
 worker: kill-scan release
-	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>] [LLM=<endpoint>]"; exit 1; }
-	SCAN_LLM="$(LLM)" ./out/$(BINARY) worker --url "$(URL)" \
+	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>] [LLM=<endpoint>] [LLM_MODEL=<name>]"; exit 1; }
+	SCAN_LLM="$(LLM)" SCAN_LLM_MODEL="$(LLM_MODEL)" ./out/$(BINARY) worker --url "$(URL)" \
 		--interpret --interpret-min-prob $(INTERPRET_MIN_PROB) \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		$(if $(NICE),--nice $(NICE),)
