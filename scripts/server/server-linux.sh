@@ -524,8 +524,8 @@ fi
 
 log "Deployment complete"
 log "Health:  curl -sS ${BASE}/_/health"
-log "SHA256:  curl -sS ${auth} ${BASE}/sha256/<64-hex-digest>"
-log "PURL:    curl -sS ${auth} '${BASE}/purl?purl=pkg%3Anpm%2Fleft-pad%401.3.0'"
+log "SHA256:  curl -sS ${auth} '${BASE}/lookup?sha256=<64-hex-digest>'"
+log "PURL:    curl -sS ${auth} '${BASE}/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0'"
 log "         A stored verdict is a 200 {sha,lvl,eng,why,hits,bloom}; nothing"
 log "         stored is a 404 {\"error\":\"unknown sample\",\"bloom\":…}, where"
 log "         bloom is skip|known-bad|conflicted|unknown from the published"
