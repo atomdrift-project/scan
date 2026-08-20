@@ -101,6 +101,17 @@ elif command -v sudo >/dev/null 2>&1; then SUDO=sudo
 else die "need doas or sudo"
 fi
 
+# systemd's StateDirectory= setup rejects a directory that is reached through
+# a symlink (for example /var/lib/atomdrift -> /data/atomdrift). Resolve the
+# deployment path as root, since the target may not be traversable by the
+# invoking user, and use the physical path in the unit below. On hosts without
+# the relocation this remains /var/lib/atomdrift/scan.
+RESOLVED_STATE_HOME=$($SUDO readlink -f -- "${STATE_HOME}") \
+    || die "cannot resolve state directory ${STATE_HOME}"
+[ -n "${RESOLVED_STATE_HOME}" ] || die "resolved state directory is empty"
+STATE_HOME=${RESOLVED_STATE_HOME}
+log "Using state directory: ${STATE_HOME}"
+
 # --- Packages ---------------------------------------------------------------
 #
 # Detect the host package manager, then install two groups:
@@ -229,12 +240,14 @@ if ! getent passwd "${SERVICE_USER}" >/dev/null; then
                  --comment "Atomdrift Scan server" "${SERVICE_USER}"
 fi
 
-# Pre-create state dir so an early failure doesn't leave us without one;
-# systemd re-asserts ownership/mode on each start via StateDirectory=.
+# Pre-create state dir so an early failure doesn't leave us without one. The
+# unit uses the canonical path with ReadWritePaths= below; this also avoids
+# systemd's StateDirectory= symlink handling, which fails before ExecStart.
 $SUDO install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}"
 
-# The unit runs as `scan` with ProtectHome=true and HOME under StateDirectory,
-# so operator secrets are copied into the service account's own ~/.tok.
+# The unit runs as `scan` with ProtectHome=true and HOME under the canonical
+# state directory, so operator secrets are copied into the service account's
+# own ~/.tok.
 $SUDO install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}/.tok"
 
 # --- API token --------------------------------------------------------------
@@ -310,14 +323,10 @@ fi
 
 # --- Compose ExecStart ------------------------------------------------------
 
-# %S is a systemd specifier that expands to /var/lib at unit-load time, so
-# --traits-dir resolves to /var/lib/atomdrift/scan/traits inside the namespace.
-# The server refreshes models and traits at startup, installing into that
-# directory — which is how it comes to exist on a first deploy, since
-# StateDirectory= only creates /var/lib/atomdrift itself. -u forces the refresh
-# even when the local copy looks current, matching the FreeBSD rc.d
-# `atomscan -u serve ...` invocation.
-exec_args="-u serve --bind ${BIND} --traits-dir %S/atomdrift/scan/traits --max-rss-gb ${MAX_RSS_GB}"
+# The server refreshes models and traits at startup, installing into the
+# already-created physical state directory. -u forces the refresh even when
+# the local copy looks current, matching the FreeBSD rc.d invocation.
+exec_args="-u serve --bind ${BIND} --traits-dir ${STATE_HOME}/traits --max-rss-gb ${MAX_RSS_GB}"
 exec_args="${exec_args} --interpret"
 if [ -n "${ALLOW_CIDR}" ]; then
     exec_args="${exec_args} --allow-cidr ${ALLOW_CIDR}"
@@ -334,7 +343,7 @@ fi
 # Pass the path, never the token. atomscan refuses to start if the file is
 # missing or empty, so a lost token fails loudly instead of opening the API.
 if [ -n "${TOKEN_SRC}" ]; then
-    exec_args="${exec_args} --token-file %S/atomdrift/scan/.tok/scan"
+    exec_args="${exec_args} --token-file ${STATE_HOME}/.tok/scan"
 fi
 
 # --- Unit -------------------------------------------------------------------
@@ -357,20 +366,19 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 
-# One writable namespace under /var/lib for all atomdrift tools: the server's
-# HOME is %S/atomdrift/scan, and cleave (and any future tool) caches alongside
-# it under %S/atomdrift/<tool>. Declaring the parent keeps the unit stable as
-# tools are added.
-StateDirectory=atomdrift
-StateDirectoryMode=0750
+# The state directory is canonicalized during deployment. StateDirectory=
+# cannot be used here because systemd rejects symlinked paths while preparing
+# the service; ReadWritePaths= grants the same writable exception to
+# ProtectSystem=strict without requiring /var/lib to be the backing mount.
+ReadWritePaths=${STATE_HOME}
 
-WorkingDirectory=%S/atomdrift/scan
+WorkingDirectory=${STATE_HOME}
 ExecStart=${BIN_PATH} ${exec_args}
 Restart=always
 RestartSec=10s
 TimeoutStopSec=30s
 
-Environment=HOME=%S/atomdrift/scan
+Environment=HOME=${STATE_HOME}
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
 # Named target `openrouter` is resolved by the binary.
 Environment=SCAN_LLM=${LLM}

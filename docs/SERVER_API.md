@@ -103,7 +103,9 @@ credential — but a valid token there upgrades the response, see below.
 - **Linux (systemd).** Native host install, unit `scan.service`
   (`scripts/server/server-linux.sh`). Same shape as
   `make deploy-worker` on Linux: unprivileged `scan` user, `MemoryMax=`,
-  traits under `/var/lib/atomdrift/scan`.
+  traits under the deployed state directory (by default
+  `/var/lib/atomdrift/scan`; the systemd installer resolves symlinked mounts
+  such as `/var/lib/atomdrift` → `/data/atomdrift`).
 
 Both paths install an API token. It is read from `~/.tok/scan` on the
 deploying host — generated there on first deploy if absent — and copied into
