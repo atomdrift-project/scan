@@ -1091,13 +1091,16 @@ fn main() -> Result<()> {
     // RUST_LOG (when set) wins over the mode-derived defaults, so profiling
     // runs can surface targeted modules (e.g. `cleave::mem_profile=info`)
     // without paying for full `--verbose` debug output.
+    // `atomscan` is this binary's own target: startup diagnostics logged from
+    // main.rs (rule refresh, authentication, LLM configuration) are not in the
+    // `scan` library and were being filtered out of the daemons' logs.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if cli.verbose {
-            tracing_subscriber::EnvFilter::new("scan=debug,cleave=debug")
+            tracing_subscriber::EnvFilter::new("atomscan=debug,scan=debug,cleave=debug")
         } else if is_serve {
-            tracing_subscriber::EnvFilter::new("scan=info,cleave=warn")
+            tracing_subscriber::EnvFilter::new("atomscan=info,scan=info,cleave=warn")
         } else {
-            tracing_subscriber::EnvFilter::new("scan=warn,cleave=error")
+            tracing_subscriber::EnvFilter::new("atomscan=warn,scan=warn,cleave=error")
         }
     });
     let fmt = tracing_subscriber::fmt()
@@ -1478,10 +1481,16 @@ fn main() -> Result<()> {
                             path.display()
                         )
                     })?;
-                    Some(
-                        scan::server::TokenDigest::new(&token)
-                            .map_err(|e| anyhow::anyhow!("--token-file {}: {e}", path.display()))?,
-                    )
+                    let digest = scan::server::TokenDigest::new(&token)
+                        .map_err(|e| anyhow::anyhow!("--token-file {}: {e}", path.display()))?;
+                    // Name the file the running process actually read: after a
+                    // rotation the token in a file and the token in memory can
+                    // differ, and the 401 that follows is otherwise unreadable.
+                    tracing::info!(
+                        token_file = %path.display(),
+                        "bearer authentication enabled (token is read once, at startup)",
+                    );
+                    Some(digest)
                 }
                 None => None,
             };

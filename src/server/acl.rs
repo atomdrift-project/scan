@@ -42,7 +42,7 @@ use axum::response::{IntoResponse, Json, Response};
 use sha2::{Digest, Sha256};
 
 use super::AppState;
-use super::access::Auth;
+use super::access::{Auth, Fingerprint};
 
 /// A single CIDR network parsed from `--allow-cidr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +125,21 @@ fn normalize(ip: IpAddr) -> IpAddr {
 /// characters.
 const MIN_TOKEN_LEN: usize = 16;
 
+/// Whether `byte` may appear in a bearer credential.
+///
+/// This is RFC 6750 §2.1 `token68` — the grammar an `Authorization: Bearer`
+/// value is actually allowed to carry (`=` is padding, so it is accepted only
+/// at the end). It is not a policy choice about what makes a good secret: a
+/// token outside this set cannot be *sent*, so a server configured with one
+/// would reject every request forever. Validating it at startup turns that
+/// into a boot failure naming the character, instead of a mystery 401.
+///
+/// Every generator in the deploy scripts produces hex, which is well inside
+/// this set; base64 and URL-safe-base64 tokens fit too.
+fn is_token68_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
 /// SHA-256 of the bearer token the server requires.
 ///
 /// The plaintext token is hashed at construction and never stored, so it
@@ -137,13 +152,38 @@ pub struct TokenDigest([u8; 32]);
 impl TokenDigest {
     /// Hash a token read from `--token-file`.
     ///
+    /// The token has already had surrounding whitespace stripped by
+    /// [`crate::interpret::read_token_file`], which takes the first non-empty
+    /// line and trims it — a trailing newline in the file is not part of the
+    /// secret.
+    ///
     /// # Errors
-    /// Returns an error if the token is shorter than [`MIN_TOKEN_LEN`] bytes.
+    /// Returns an error if the token is shorter than [`MIN_TOKEN_LEN`] bytes,
+    /// or if it contains a character that cannot be sent in an `Authorization`
+    /// header (see [`is_token68_byte`]).
     pub fn new(token: &str) -> Result<Self, String> {
         let len = token.len();
         if len < MIN_TOKEN_LEN {
             return Err(format!(
                 "token is {len} bytes; at least {MIN_TOKEN_LEN} required"
+            ));
+        }
+        // Trailing `=` is base64 padding, valid only at the end of a token68.
+        let body = token.trim_end_matches('=');
+        if body.is_empty() {
+            return Err("token is entirely base64 padding".to_string());
+        }
+        if let Some((index, byte)) = body
+            .bytes()
+            .enumerate()
+            .find(|&(_, byte)| !is_token68_byte(byte))
+        {
+            // Naming the offending character is what makes this actionable,
+            // and it is by definition not part of a usable token.
+            let shown = char::from(byte).escape_debug();
+            return Err(format!(
+                "token contains '{shown}' at position {index}: not sendable in an \
+                 Authorization header (allowed: A-Z a-z 0-9 - . _ ~ + / and trailing =)"
             ));
         }
         Ok(Self(Sha256::digest(token.as_bytes()).into()))
@@ -170,21 +210,52 @@ impl fmt::Debug for TokenDigest {
     }
 }
 
+/// What the request offered in its `Authorization` header.
+///
+/// The three cases are kept apart because they fail for different reasons and
+/// an operator reading a 401 needs to know which: nothing was sent, something
+/// was sent that is not a bearer credential, or a bearer credential was sent
+/// and did not match.
+#[derive(Debug, PartialEq, Eq)]
+enum Presented<'a> {
+    /// No `Authorization` header.
+    None,
+    /// An `Authorization` header that is not a usable bearer credential.
+    Malformed,
+    /// A bearer credential, verbatim.
+    Bearer(&'a [u8]),
+}
+
 /// The credential from an `Authorization: Bearer <token>` header.
 ///
 /// The scheme is matched case-insensitively (RFC 9110 §11.1); the credential
 /// itself is returned verbatim and compared byte-exactly. Exactly one space
 /// may separate the two, as the grammar requires.
-fn bearer_credential(headers: &HeaderMap) -> Option<&[u8]> {
+fn bearer_credential(headers: &HeaderMap) -> Presented<'_> {
     const SCHEME: &[u8] = b"Bearer";
 
-    let value = headers.get(header::AUTHORIZATION)?.as_bytes();
-    let (scheme, rest) = value.split_at_checked(SCHEME.len())?;
-    if !scheme.eq_ignore_ascii_case(SCHEME) {
-        return None;
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return Presented::None;
+    };
+    let value = value.as_bytes();
+    let credential = value
+        .split_at_checked(SCHEME.len())
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(SCHEME))
+        .and_then(|(_, rest)| rest.strip_prefix(b" "))
+        .filter(|credential| !credential.is_empty());
+    match credential {
+        Some(credential) => Presented::Bearer(credential),
+        None => Presented::Malformed,
     }
-    let credential = rest.strip_prefix(b" ")?;
-    (!credential.is_empty()).then_some(credential)
+}
+
+/// A rejected credential's [`Fingerprint`]: the first four bytes of its
+/// SHA-256. See [`Fingerprint`] for why a 401 logs one.
+fn fingerprint(credential: &[u8]) -> Fingerprint {
+    let digest: [u8; 32] = Sha256::digest(credential).into();
+    let mut fp = [0u8; 4];
+    fp.copy_from_slice(&digest[..4]);
+    Fingerprint(fp)
 }
 
 /// Marker attached to requests allowed to see privileged diagnostic detail:
@@ -278,11 +349,23 @@ pub(super) async fn acl(
     // Gate 2: bearer token. Loopback is not exempt — see the module docs.
     let auth = match state.auth_digest {
         None => Auth::Open,
-        Some(digest) if bearer_credential(req.headers()).is_some_and(|c| digest.matches(c)) => {
-            Auth::Token
-        }
-        Some(_) if auth_exempt => Auth::Anonymous,
-        Some(_) => return tag(unauthorized(), Auth::BadToken),
+        Some(digest) => match bearer_credential(req.headers()) {
+            Presented::Bearer(credential) if digest.matches(credential) => Auth::Token,
+            _ if auth_exempt => Auth::Anonymous,
+            // The response is identical in all three cases — only the log
+            // distinguishes them, so the endpoint stays useless as an oracle.
+            Presented::None => return tag(unauthorized(), Auth::NoCredential),
+            Presented::Malformed => return tag(unauthorized(), Auth::MalformedCredential),
+            Presented::Bearer(credential) => {
+                return tag(
+                    unauthorized(),
+                    Auth::BadToken {
+                        len: credential.len(),
+                        fp: fingerprint(credential),
+                    },
+                );
+            }
+        },
     };
     if auth != Auth::Anonymous {
         req.extensions_mut().insert(Trusted);
@@ -393,6 +476,40 @@ mod tests {
         assert!(TokenDigest::new(&"a".repeat(MIN_TOKEN_LEN)).is_ok());
     }
 
+    /// The length floor and the charset gate are both startup checks: a token
+    /// that cannot be sent in a header would otherwise reject every request
+    /// for the life of the process.
+    #[test]
+    fn token_digest_rejects_unusable_tokens() {
+        assert!(TokenDigest::new("x-isotope-scan").is_err(), "14 bytes");
+        assert!(
+            TokenDigest::new("has a space in it and is long enough").is_err(),
+            "space",
+        );
+        assert!(
+            TokenDigest::new("Bearer 0123456789abcdef").is_err(),
+            "scheme pasted into the file",
+        );
+        assert!(TokenDigest::new("\"0123456789abcdef\"").is_err(), "quoted");
+        assert!(TokenDigest::new("0123456789abcdéf0").is_err(), "non-ascii");
+    }
+
+    /// Every shape a generator realistically produces has to pass: hex from
+    /// the deploy scripts, base64 with padding, and URL-safe base64.
+    #[test]
+    fn token_digest_accepts_generated_tokens() {
+        assert!(TokenDigest::new(TOKEN).is_ok(), "64 hex");
+        assert!(
+            TokenDigest::new("dG9rZW4tdmFsdWUtaGVyZQ==").is_ok(),
+            "base64"
+        );
+        assert!(
+            TokenDigest::new("dG9rZW4td-mFsdWUtaG_yZQ").is_ok(),
+            "url-safe base64",
+        );
+        assert!(TokenDigest::new("0123456789abcdef").is_ok(), "at the floor");
+    }
+
     /// The token must not be recoverable from a log line or a crash dump.
     #[test]
     fn token_digest_debug_redacts() {
@@ -405,32 +522,53 @@ mod tests {
     fn parses_bearer_credential() {
         assert_eq!(
             bearer_credential(&auth_header("Bearer abc123")),
-            Some(&b"abc123"[..])
+            Presented::Bearer(b"abc123")
         );
         // RFC 9110 §11.1: the scheme is case-insensitive.
         assert_eq!(
             bearer_credential(&auth_header("bEaReR abc123")),
-            Some(&b"abc123"[..])
+            Presented::Bearer(b"abc123")
         );
     }
 
+    /// An absent header and an unusable one are different failures, and the
+    /// access log reports them differently.
     #[test]
     fn rejects_malformed_authorization() {
-        assert!(bearer_credential(&HeaderMap::new()).is_none(), "absent");
-        assert!(bearer_credential(&auth_header("Bearer")).is_none(), "bare");
-        assert!(
-            bearer_credential(&auth_header("Bearer ")).is_none(),
-            "empty"
-        );
-        assert!(bearer_credential(&auth_header("Basic abc123")).is_none());
-        assert!(bearer_credential(&auth_header("Bearerabc123")).is_none());
-        assert!(bearer_credential(&auth_header("abc123")).is_none());
+        assert_eq!(bearer_credential(&HeaderMap::new()), Presented::None);
+        for header in [
+            "Bearer",
+            "Bearer ",
+            "Basic abc123",
+            "Bearerabc123",
+            "abc123",
+        ] {
+            assert_eq!(
+                bearer_credential(&auth_header(header)),
+                Presented::Malformed,
+                "{header:?}"
+            );
+        }
         // A second space belongs to the credential, not the separator, and so
         // will not match any token the deploy scripts generate.
         assert_eq!(
             bearer_credential(&auth_header("Bearer  abc123")),
-            Some(&b" abc123"[..])
+            Presented::Bearer(b" abc123")
         );
+    }
+
+    /// The logged fingerprint is the first four bytes of the credential's
+    /// SHA-256 — the same prefix `shasum -a 256` prints, so an operator can
+    /// compare a 401 against the token file they hold.
+    #[test]
+    fn fingerprint_is_the_sha256_prefix() {
+        let rendered = fingerprint(b"x-isotope-scan").to_string();
+        let expected: String = format!("{:x}", Sha256::digest(b"x-isotope-scan"))
+            .chars()
+            .take(8)
+            .collect();
+        assert_eq!(rendered, expected);
+        assert_eq!(rendered.len(), 8);
     }
 
     #[test]

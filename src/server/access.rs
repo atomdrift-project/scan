@@ -9,7 +9,7 @@
 //! rather than a warning there and a mystery here.
 //!
 //! Fields, in order: `id`, `status`, `dur_ms`, `peer`, `fwd`, `auth`,
-//! `req_bytes`, `trace`, `ua`. Everything that reaches the line
+//! `req_bytes`, `cred_len`, `cred_fp`, `trace`, `ua`. Everything that reaches the line
 //! is either generated here or parsed/bounded before it is printed, so a
 //! hostile header cannot shape the log.
 //!
@@ -17,6 +17,7 @@
 //! extension, so the access line and every analysis line about the same request
 //! share one identifier.
 
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -59,8 +60,15 @@ pub(super) enum Auth {
     PeerDenied,
     /// Refused: a non-loopback peer asked for a loopback-only route.
     LoopbackOnly,
-    /// Refused: missing or invalid bearer token on a protected route.
-    BadToken,
+    /// Refused: no `Authorization` header at all.
+    NoCredential,
+    /// Refused: an `Authorization` header that is not a usable `Bearer`
+    /// credential — wrong scheme, missing separator, or empty.
+    MalformedCredential,
+    /// Refused: a well-formed bearer credential that is not this server's
+    /// token. Carries the credential's length and [`Fingerprint`], which is
+    /// what distinguishes a stale token from a truncated or mangled one.
+    BadToken { len: usize, fp: Fingerprint },
 }
 
 impl Auth {
@@ -72,8 +80,41 @@ impl Auth {
             Self::NoPeerInfo => "no-peer-info",
             Self::PeerDenied => "peer-denied",
             Self::LoopbackOnly => "loopback-only",
-            Self::BadToken => "bad-token",
+            Self::NoCredential => "no-credential",
+            Self::MalformedCredential => "malformed-credential",
+            Self::BadToken { .. } => "bad-token",
         }
+    }
+
+    /// Whether this outcome refused the request. Denials are the security
+    /// record, so they are logged a level above ordinary traffic.
+    fn denied(self) -> bool {
+        !matches!(self, Self::Token | Self::Open | Self::Anonymous)
+    }
+}
+
+/// The first four bytes of a credential's SHA-256, hex-encoded on demand.
+///
+/// A rejected token cannot be logged — but "which token was it" is the only
+/// question a 401 raises, and without an answer the operator is left guessing
+/// between a stale credential, a truncated one, and a client pointed at the
+/// wrong server. The fingerprint answers it without recording a secret: 32
+/// bits of a preimage-resistant digest identify a token to an operator who
+/// already holds it, and are useless to anyone who does not. Compare against
+/// whichever token file is believed current:
+///
+/// ```sh
+/// printf %s "$(cat ~/.tok/scan)" | shasum -a 256 | cut -c1-8
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Fingerprint(pub(super) [u8; 4]);
+
+impl fmt::Display for Fingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -161,12 +202,20 @@ pub(super) async fn access_log(
     // error because it means the ConnectInfo wiring is broken, not the client.
     let level = if auth == Some(Auth::NoPeerInfo) {
         tracing::Level::ERROR
-    } else if status.is_server_error() {
+    } else if status.is_server_error() || auth.is_some_and(Auth::denied) {
         tracing::Level::WARN
     } else if path == super::acl::HEALTH_ROUTE {
         tracing::Level::DEBUG
     } else {
         tracing::Level::INFO
+    };
+
+    // Only a rejected credential has these, and only then are they worth a
+    // reader's attention: they are what turns "401" into "the client is holding
+    // a different token than the one this process loaded".
+    let (cred_len, cred_fp) = match auth {
+        Some(Auth::BadToken { len, fp }) => (Some(len), Some(fp.to_string())),
+        _ => (None, None),
     };
 
     // `tracing` fixes a level per call site, so the branches are spelled out.
@@ -183,6 +232,8 @@ pub(super) async fn access_log(
                 fwd = fwd.map(tracing::field::display),
                 auth = auth.map(Auth::as_str),
                 req_bytes,
+                cred_len,
+                cred_fp = cred_fp.as_deref(),
                 trace = trace.as_deref(),
                 ua = ua.as_deref(),
                 "{method} {path}",
