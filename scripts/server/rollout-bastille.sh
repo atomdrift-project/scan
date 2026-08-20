@@ -185,7 +185,30 @@ load_rc_config $name
 : ${scan_logfile:="/var/log/scan.log"}
 
 pidfile="/var/run/${name}.pid"
-command="/usr/sbin/daemon"
+# Scheduling priority: the server is the reason this jail exists, so it wins
+# every CPU contest on the host. -20 is the strongest nice(1) level; rc runs as
+# root, so it is allowed, and daemon(8)/atomscan and every analysis child
+# (rizin, cleave) inherit it across the setuid to scan. Realtime (rtprio) is
+# deliberately not used: a CPU-bound analysis at realtime priority can starve
+# sshd and lock the box out. Override with scan_nice= in rc.conf.
+: ${scan_nice:="-20"}
+
+# nice(1) execs daemon(8), so procname must be set explicitly or rc.subr would
+# look for /usr/bin/nice when matching the pidfile for status/stop.
+command="/usr/bin/nice"
+procname="/usr/sbin/daemon"
+
+# OOM priority. FreeBSD has no oom_score_adj; protect(1) sets P_PROTECTED,
+# which exempts the process from the swap-exhaustion killer. The flag is
+# inherited across fork and survives daemon(8)'s setuid to scan. Protection is
+# all-or-nothing, so this puts the server *above* an unprotected sshd rather
+# than just below it; protect the host's sshd too if you want that ordering:
+#   doas protect -p "$(pgrep -o sshd)"
+: ${scan_protect:="YES"}
+_protect=""
+case "$scan_protect" in
+[Yy][Ee][Ss] | [Tt][Rr][Uu][Ee] | 1) _protect="/usr/bin/protect" ;;
+esac
 # --interpret adds a local-LLM second opinion, blended with the ML verdict and
 # kept in the envelope's `llm` section. --llm points at the vLLM endpoint on the
 # "interpret" host; the model defaults to atomscan's DEFAULT_MODEL, which is what
@@ -193,7 +216,7 @@ command="/usr/sbin/daemon"
 # --token-file requires `Authorization: Bearer <token>` on every route except
 # /_/health, including from loopback. atomscan refuses to start if the file is
 # missing or empty, so a lost token fails loudly instead of opening the API.
-command_args="-c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --token-file /home/scan/.tok/scan --interpret --llm http://interpret:8000/v1"
+command_args="-n ${scan_nice} ${_protect} /usr/sbin/daemon -c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --token-file /home/scan/.tok/scan --interpret --llm http://interpret:8000/v1"
 
 run_rc_command "$1"
 EOF

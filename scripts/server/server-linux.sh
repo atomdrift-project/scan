@@ -73,6 +73,12 @@ ALLOWED_DIRS="${ALLOWED_DIRS:-}"
 HOPPER="${HOPPER:-}"
 MAX_RSS_GB="${MAX_RSS_GB:--1}"
 MEMORY_MAX="${MEMORY_MAX:-80%}"
+# Memory the kernel will not reclaim from the server under host-wide pressure.
+# Best-effort (MemoryLow, not MemoryMin) so it cannot deadlock the host.
+MEMORY_LOW="${MEMORY_LOW:-50%}"
+# Scheduling priority. The server is the reason these boxes exist, so it wins
+# every CPU and disk contest against anything else on the host.
+NICE="${NICE:--20}"
 # LLM_URL is an alias for LLM (SCAN_LLM): `local`, `openrouter`, or a base URL.
 if [ -z "${LLM:-}" ] && [ -n "${LLM_URL:-}" ]; then
     LLM=$LLM_URL
@@ -390,7 +396,32 @@ ${LLM_MODEL_LINE}
 # of looping on 503-from-RSS. Override MAX_RSS_GB at install time to
 # re-enable in-process throttling.
 MemoryMax=${MEMORY_MAX}
+MemoryLow=${MEMORY_LOW}
 TasksMax=4096
+
+# OOM priority. Under host-wide memory pressure the kernel picks its victim by
+# oom_score_adj; -900 puts the server behind almost everything else but still
+# ahead of sshd, whose listener sets itself to -1000. -1000 is deliberately not
+# used here: it would make the process ineligible for the OOM killer entirely,
+# so hitting MemoryMax= above would wedge the cgroup instead of restarting it.
+# systemd-oomd is told to look elsewhere first for the same reason.
+OOMScoreAdjust=-900
+ManagedOOMPreference=avoid
+
+# Scheduling priority. Nice= is applied by systemd before it drops to
+# ${SERVICE_USER}, so no CAP_SYS_NICE is needed in the (empty) bounding set,
+# and analysis children (rizin, cleave) inherit it. CPUWeight/IOWeight are the
+# cgroup-v2 shares: 10000 is the maximum, ~100x the default 100, so under
+# contention the server gets essentially all of the CPU and disk bandwidth.
+# Realtime scheduling (SCHED_FIFO/RR) is deliberately not used: a CPU-bound
+# analysis at realtime priority can starve sshd and lock the box out.
+Nice=${NICE}
+CPUWeight=10000
+StartupCPUWeight=10000
+IOWeight=10000
+StartupIOWeight=10000
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
 # A killed analysis subprocess (rizin OOM, etc.) must not bring the server down.
 OOMPolicy=continue
 
