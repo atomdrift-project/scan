@@ -47,8 +47,9 @@ the path, rather than reporting healthy and failing every analysis.
 
 ## Authentication
 
-`--token-file PATH` reads a token from the first non-empty line of `PATH`
-(minimum 16 bytes) and requires it on every route except `/_/health`:
+`--token-file PATH` reads a token from the first non-empty line of `PATH`,
+stripped of surrounding whitespace — a trailing newline is not part of the
+secret — and requires it on every route except `/_/health`:
 
     curl -H "Authorization: Bearer $(cat ~/.tok/scan)" ...
 
@@ -58,6 +59,14 @@ The examples further down abbreviate that as
 The scheme is case-insensitive; the token is compared byte-exactly. A
 missing or invalid token gets `401` with `WWW-Authenticate: Bearer` and an
 identical body either way, so the endpoint is not an oracle for guesses.
+
+The token itself must be at least 16 bytes and drawn from the character set a
+bearer credential is allowed to carry (RFC 6750 `token68`: `A-Z a-z 0-9 - . _
+~ + /`, plus trailing `=` padding). Hex, base64, and URL-safe base64 all pass.
+This is a sanity check, not a strength policy: a token containing anything
+else — a space, a quote, a stray `Bearer ` prefix pasted into the file — cannot
+be sent in a header at all, so the server refuses to start and names the
+offending character rather than 401ing every request for the rest of its life.
 
 Four properties are deliberate:
 
@@ -76,7 +85,10 @@ Four properties are deliberate:
   empty, or unreadable, the server refuses to start. It never falls back to
   serving unauthenticated.
 - **Rotation needs a restart.** The token is read once at startup;
-  `/_/reload` does not re-read it.
+  `/_/reload` does not re-read it. A rotated-but-not-restarted server is the
+  usual cause of a 401 against a token file that looks correct — the access
+  log's `cred_fp` field distinguishes that from a wrong token, see
+  [Logging](#logging).
 
 `/_/health` stays open so tunnel and load-balancer probes work without a
 credential — but a valid token there upgrades the response, see below.
@@ -260,13 +272,26 @@ exactly one access line when its response is ready:
 | `dur_ms`    | Wall time from arrival to response.                                    |
 | `peer`      | Socket peer address. Behind a tunnel this is always loopback.          |
 | `fwd`       | Client address a proxy reported (`CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`). Advisory: logged, never used for access control. |
-| `auth`      | `token`, `open` (no `--token-file`), `anon` (unauthenticated `/_/health`), or a rejection reason: `bad-token`, `peer-denied`, `loopback-only`, `no-peer-info`. |
+| `auth`      | `token`, `open` (no `--token-file`), `anon` (unauthenticated `/_/health`), or a rejection reason: `no-credential`, `malformed-credential`, `bad-token`, `peer-denied`, `loopback-only`, `no-peer-info`. |
 | `req_bytes` | Request `Content-Length`, when the client sent one.                    |
+| `cred_len`  | Length of the rejected bearer credential (`bad-token` only).           |
+| `cred_fp`   | First four bytes of its SHA-256, hex (`bad-token` only). See below.    |
 | `trace`     | The caller's `X-Request-Id`, for correlating with the calling service. |
 | `ua`        | `User-Agent`, control-stripped and truncated to 120 characters.        |
 
-Levels: 5xx logs at WARN, a missing peer address at ERROR, a successful
-`/_/health` probe at DEBUG (so liveness checks do not fill the log), and
+A 401 never says which token was presented — but `cred_fp` identifies it to
+anyone already holding the token, without recording a secret. Compare it with
+whichever token file you believe is current:
+
+    printf %s "$(cat ~/.tok/scan)" | shasum -a 256 | cut -c1-8
+
+A match means the client is using the right token and the *server* is not —
+the token is read once at startup, so a rotation without a restart looks
+exactly like this. A mismatch means the client is holding a different token.
+The startup log names the file the running process actually read.
+
+Levels: 5xx logs at WARN, every access-control rejection at WARN, a missing
+peer address at ERROR, a successful `/_/health` probe at DEBUG (so liveness checks do not fill the log), and
 everything else at INFO. Rejected requests are logged only here — the ACL does
 not log a second line of its own.
 
