@@ -1,14 +1,31 @@
 //! HTTP request handlers for the litmus API server.
 
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::Builder as TempBuilder;
 
 use super::AppState;
+use super::access::RequestId;
+use super::acl::Trusted;
+use super::flight::{Flight, FlightKey, Outcome};
+
+/// Assemble a JSON object body from static keys.
+///
+/// Used by [`health`], which builds one body from a fixed public set and then
+/// adds privileged keys for trusted requests.
+fn object(
+    pairs: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
+) -> serde_json::Map<String, serde_json::Value> {
+    pairs
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
+}
 
 /// Outcome of awaiting a `tokio::spawn_blocking` analysis task with a bound.
 ///
@@ -95,29 +112,145 @@ fn current_thread_id() -> u64 {
 /// Classify an analysis error into its HTTP status and JSON body. Returns the
 /// status alongside the response so callers can log it without reclassifying.
 fn analysis_error_response(error: &anyhow::Error) -> (StatusCode, Response) {
-    let (status, message) = classify_analysis_error(error.root_cause().to_string().as_str());
-    let detail = format!("{error:#}");
+    let (status, body) = analysis_error_body(error);
+    (status, (status, Json(body)).into_response())
+}
 
-    let response = (
-        status,
-        Json(if detail == message {
-            serde_json::json!({ "error": message })
-        } else {
-            serde_json::json!({ "error": message, "detail": detail })
-        }),
-    )
-        .into_response();
-    (status, response)
+/// An anyhow error flattened to its whole `context: cause: root cause` chain.
+///
+/// `Display` on an `anyhow::Error` prints only the outermost context, so a log
+/// line reads "cleave analysis of left-pad-1.3.0.tgz" and never says *why* it
+/// failed. The alternate form carries every link, which is what makes a failed
+/// request diagnosable from the server log alone.
+fn error_chain(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+/// The status and JSON body an analysis failure becomes.
+///
+/// Split out from [`analysis_error_response`] because a shared analysis has to
+/// *store* its failure — `anyhow::Error` is not `Clone`, so the leader renders
+/// it once and every follower replays the result.
+fn analysis_error_body(error: &anyhow::Error) -> (StatusCode, serde_json::Value) {
+    let message = error.root_cause().to_string();
+    let detail = error_chain(error);
+    // Classify over the whole chain, not just the root cause: "unsupported file
+    // type" is often a middle link wrapped around an io error, and classifying
+    // on the root alone reports those as 500.
+    let status = classify_analysis_error(&detail);
+    let body = if detail == message {
+        serde_json::json!({ "error": message })
+    } else {
+        serde_json::json!({ "error": message, "detail": detail })
+    };
+    (status, body)
+}
+
+/// Take the resources snapshot and the analysis slot a flight leader needs, or
+/// the outcome to publish instead of running.
+///
+/// Followers claim neither: riding the leader's run rather than taking a slot
+/// of their own is the whole point of sharing it.
+fn claim_slot(
+    state: &Arc<AppState>,
+    request_id: u64,
+    key: &FlightKey,
+) -> Result<
+    (
+        Arc<super::ModelResources>,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+    Outcome,
+> {
+    let resources = match state.resources.read() {
+        Ok(lock) => match lock.as_ref() {
+            Some(r) => Arc::clone(r),
+            None => {
+                tracing::debug!(id = request_id, "rejected: resources not yet loaded");
+                return Err(Outcome::rendered(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Server starting up",
+                ));
+            }
+        },
+        Err(e) => {
+            tracing::error!("read lock poisoned: {e}");
+            return Err(Outcome::rendered(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            ));
+        }
+    };
+    let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
+        let max = state.max_concurrent_tasks;
+        tracing::warn!(id = request_id, key = %key, max, "rejecting: at capacity");
+        return Err(Outcome::rendered(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("At capacity ({max}/{max} active analyses)"),
+        ));
+    };
+    Ok((resources, permit))
+}
+
+/// Fold an awaited analysis into the outcome every attached request shares.
+fn flight_outcome(
+    result: AnalysisOutcome,
+    request_id: u64,
+    elapsed_ms: u64,
+    key: &FlightKey,
+) -> Outcome {
+    match result {
+        AnalysisOutcome::Ok(Ok(scan_result)) => {
+            tracing::info!(
+                id = request_id,
+                key = %key,
+                elapsed_ms,
+                classification = %scan_result.classification,
+                probability = scan_result.probability,
+                "<-- 200 OK",
+            );
+            Outcome::Report(scan_result)
+        }
+        AnalysisOutcome::Ok(Err(e)) => {
+            let (status, body) = analysis_error_body(&e);
+            tracing::warn!(id = request_id, key = %key, elapsed_ms, status = status.as_u16(), error = %error_chain(&e), "<-- analysis failed");
+            Outcome::Rendered { status, body }
+        }
+        AnalysisOutcome::JoinError(e) => {
+            tracing::warn!(id = request_id, key = %key, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
+            Outcome::rendered(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+        AnalysisOutcome::Timeout(secs) => {
+            tracing::warn!(id = request_id, key = %key, elapsed_ms, timeout_secs = secs, "<-- 504 analysis timeout");
+            Outcome::Rendered {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                body: serde_json::json!({ "error": "analysis timeout", "timeout_secs": secs }),
+            }
+        }
+    }
+}
+
+/// Render the shared outcome as this request's response. `elapsed_ms` is the
+/// caller's own wall time, so a follower reports how long *it* waited.
+fn flight_response(outcome: &Outcome, elapsed_ms: u64) -> Response {
+    match outcome {
+        Outcome::Report(result) => {
+            let mut resp = Json(result.envelope_ref()).into_response();
+            resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
+            resp
+        }
+        Outcome::Rendered { status, body } => (*status, Json(body)).into_response(),
+    }
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({"error": message.into()}))).into_response()
 }
 
-fn classify_analysis_error(message: &str) -> (StatusCode, String) {
+fn classify_analysis_error(message: &str) -> StatusCode {
     let normalized = message.to_ascii_lowercase();
 
-    let status = if normalized.contains("unsupported file type")
+    if normalized.contains("unsupported file type")
         || normalized.contains("unsupported archive type")
         || normalized.contains("unsupported compression")
     {
@@ -126,6 +259,8 @@ fn classify_analysis_error(message: &str) -> (StatusCode, String) {
         || normalized.contains("invalid ")
         || normalized.contains("not a valid ")
         || normalized.contains("truncated")
+        || normalized.contains("corrupt")
+        || normalized.contains("unexpected end of")
         || normalized.contains("too small")
         || normalized.contains("out of bounds")
         || normalized.contains("empty package.json")
@@ -138,9 +273,7 @@ fn classify_analysis_error(message: &str) -> (StatusCode, String) {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
-    };
-
-    (status, message.to_string())
+    }
 }
 use crate::engine::ScanResult;
 use crate::explain::ShapImportance;
@@ -155,7 +288,17 @@ use crate::system_load_avg;
 ///
 /// Every response carries `uptime_secs` (seconds since the server started)
 /// so clients can detect restarts without polling a separate endpoint.
-pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
+pub(super) async fn health(
+    State(state): State<Arc<AppState>>,
+    trusted: Option<Extension<Trusted>>,
+) -> Response {
+    // `/_/health` is the one route reachable without a bearer token, so that
+    // tunnel and load-balancer probes work without holding a credential. The
+    // liveness signal — status, memory, saturation — is public; the diagnostic
+    // detail below it names the samples currently being analysed, so it is
+    // added only for a request that authenticated (or when the server has no
+    // token configured at all, which leaves the body as it always was).
+    let trusted = trusted.is_some();
     let uptime_secs = state.started_at.elapsed().as_secs();
     let load_avg = system_load_avg();
 
@@ -199,46 +342,49 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
 
     if overloaded {
         tracing::warn!("GET /_/health -> 503 (degraded, rss={rss_mb:?}MB)");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "status": "degraded",
-                "reason": "memory_pressure",
-                "rss_mb": rss_mb,
-                "max_rss_mb": max_rss_mb,
-                "active_tasks": active_tasks,
-                "load_avg": load_avg,
-                "uptime_secs": uptime_secs,
-                "rayon_threads": rayon::current_num_threads(),
-            })),
-        )
-            .into_response();
+        let mut body = object([
+            ("status", "degraded".into()),
+            ("reason", "memory_pressure".into()),
+            ("rss_mb", rss_mb.into()),
+            ("max_rss_mb", max_rss_mb.into()),
+            ("active_tasks", active_tasks.into()),
+            ("load_avg", load_avg.into()),
+            ("uptime_secs", uptime_secs.into()),
+        ]);
+        if trusted {
+            body.insert("rayon_threads".into(), rayon::current_num_threads().into());
+        }
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
     let max_tasks = state.max_concurrent_tasks;
     let stuck_orphans = state
         .stuck_orphans
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    // Tasks running longer than 120s — visible in /_/requests with full phase detail.
+    // Tasks running longer than 120s — visible in /_/requests with full phase
+    // detail. The count is always computed (it is cheap: `in_flight` holds at
+    // most one entry per analysis slot, and the count feeds the log line), but
+    // each entry names the sample being analysed, so the detail is built only
+    // when it will actually be served.
     let now = Instant::now();
-    let long_running: Vec<serde_json::Value> = state
-        .in_flight
-        .iter()
-        .filter_map(|e| {
-            let elapsed_secs = now.duration_since(e.started_at).as_secs();
-            if elapsed_secs >= 120 {
-                Some(serde_json::json!({
-                    "request_id": e.key(),
-                    "name": e.name,
-                    "elapsed_secs": elapsed_secs,
-                    "phase": e.phase.get(),
-                    "thread_id": e.thread_id.load(std::sync::atomic::Ordering::Relaxed),
-                }))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut long_running_count = 0usize;
+    let mut long_running: Vec<serde_json::Value> = Vec::new();
+    for entry in &state.in_flight {
+        let elapsed_secs = now.duration_since(entry.started_at).as_secs();
+        if elapsed_secs < 120 {
+            continue;
+        }
+        long_running_count += 1;
+        if trusted {
+            long_running.push(serde_json::json!({
+                "request_id": entry.key(),
+                "name": entry.name,
+                "elapsed_secs": elapsed_secs,
+                "phase": entry.phase.get(),
+                "thread_id": entry.thread_id.load(std::sync::atomic::Ordering::Relaxed),
+            }));
+        }
+    }
 
     let load = if max_tasks > 0 {
         active_tasks as f64 / max_tasks as f64
@@ -250,53 +396,57 @@ pub(super) async fn health(State(state): State<Arc<AppState>>) -> Response {
     // slots busy" from real failures (memory pressure, stuck workers). The
     // /analyze endpoint still rejects with 503 when active >= max, so clients
     // back off correctly without /_/health pretending the server is unhealthy.
-    if active_tasks >= max_tasks {
-        let oldest = state
-            .in_flight
-            .iter()
-            .min_by_key(|e| e.started_at)
-            .map(|e| (e.name.clone(), e.started_at.elapsed().as_secs()));
+    let saturated = active_tasks >= max_tasks;
+    let oldest = saturated
+        .then(|| {
+            state
+                .in_flight
+                .iter()
+                .min_by_key(|e| e.started_at)
+                .map(|e| (e.name.clone(), e.started_at.elapsed().as_secs()))
+        })
+        .flatten();
+
+    if saturated {
         tracing::debug!(
             active_tasks,
             stuck_orphans,
-            long_running = long_running.len(),
+            long_running = long_running_count,
             max_concurrent_tasks = max_tasks,
             oldest_task = ?oldest,
             "GET /_/health -> 200 (saturated)"
         );
-        return Json(serde_json::json!({
-            "status": "saturated",
-            "reason": "thread_pool_saturated",
-            "rss_mb": rss_mb,
-            "active_tasks": active_tasks,
-            "stuck_orphans": stuck_orphans,
-            "long_running_tasks": long_running,
-            "max_concurrent_tasks": max_tasks,
-            "oldest_task": oldest.map(|(name, secs)| serde_json::json!({"name": name, "elapsed_secs": secs})),
-            "load": load,
-            "load_avg": load_avg,
-            "uptime_secs": uptime_secs,
-            "rayon_threads": rayon::current_num_threads(),
-        }))
-            .into_response();
+    } else {
+        tracing::debug!(
+            "GET /_/health -> 200 (rss={rss_mb:?}MB, active={active_tasks}, long_running={long_running_count}, stuck_orphans={stuck_orphans}, load={load:.2})"
+        );
     }
-    tracing::debug!(
-        "GET /_/health -> 200 (rss={rss_mb:?}MB, active={active_tasks}, long_running={}, stuck_orphans={stuck_orphans}, load={load:.2})",
-        long_running.len()
-    );
-    Json(serde_json::json!({
-        "status": "ok",
-        "rss_mb": rss_mb,
-        "active_tasks": active_tasks,
-        "stuck_orphans": stuck_orphans,
-        "long_running_tasks": long_running,
-        "max_concurrent_tasks": max_tasks,
-        "load": load,
-        "load_avg": load_avg,
-        "uptime_secs": uptime_secs,
-        "rayon_threads": rayon::current_num_threads(),
-    }))
-    .into_response()
+
+    let mut body = object([
+        ("status", if saturated { "saturated" } else { "ok" }.into()),
+        ("rss_mb", rss_mb.into()),
+        ("max_rss_mb", max_rss_mb.into()),
+        ("active_tasks", active_tasks.into()),
+        ("max_concurrent_tasks", max_tasks.into()),
+        ("load", load.into()),
+        ("load_avg", load_avg.into()),
+        ("uptime_secs", uptime_secs.into()),
+    ]);
+    if saturated {
+        body.insert("reason".into(), "thread_pool_saturated".into());
+    }
+    if trusted {
+        body.insert("stuck_orphans".into(), stuck_orphans.into());
+        body.insert("long_running_tasks".into(), long_running.into());
+        body.insert("rayon_threads".into(), rayon::current_num_threads().into());
+        if let Some((name, elapsed_secs)) = oldest {
+            body.insert(
+                "oldest_task".into(),
+                serde_json::json!({ "name": name, "elapsed_secs": elapsed_secs }),
+            );
+        }
+    }
+    Json(body).into_response()
 }
 
 /// GET /_/info — static server capacity and version info.
@@ -410,7 +560,7 @@ async fn do_model_reload(
             // Reload cleave traits first so the new model runs against fresh rules.
             let traits_reload_error = match cleave::reload_capability_mapper() {
                 Err(e) => {
-                    tracing::warn!("cleave trait reload failed (previous traits retained): {e}");
+                    tracing::warn!("cleave trait reload failed (previous traits retained): {e:#}");
                     Some(e)
                 }
                 Ok(_) => {
@@ -434,7 +584,7 @@ async fn do_model_reload(
         Ok(Ok(Ok(t))) => t,
         Ok(Ok(Err(e))) => {
             // Log internally but do not expose filesystem paths or model internals to callers.
-            tracing::warn!("reload failed (previous model retained) in {elapsed_ms}ms: {e}");
+            tracing::warn!("reload failed (previous model retained) in {elapsed_ms}ms: {e:#}");
             return Err((StatusCode::UNPROCESSABLE_ENTITY, "Failed to load model"));
         }
         Ok(Err(e)) => {
@@ -554,14 +704,14 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
             let models_err = match crate::model_update::update(&dir, false, false) {
                 Ok(()) => None,
                 Err(e) => {
-                    tracing::warn!("models update failed: {e}");
+                    tracing::warn!("models update failed: {e:#}");
                     Some(e.to_string())
                 }
             };
             let traits_err = match crate::traits_repo::update(false, false) {
                 Ok(_) => None,
                 Err(e) => {
-                    tracing::warn!("traits update failed: {e}");
+                    tracing::warn!("traits update failed: {e:#}");
                     Some(e.to_string())
                 }
             };
@@ -623,12 +773,48 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// The name an upload is staged and reported under.
+///
+/// Every character outside `[A-Za-z0-9_.-]` becomes `_`, `..` collapses to
+/// `__`, and the result keeps its last 63 bytes so the extension survives —
+/// cleave detects file type from it, and the name is also the `path` label in
+/// the report and in every log line about this request.
+///
+/// The filter is deliberately ASCII-only rather than Unicode-aware. Two
+/// reasons, both of them the client's choice to make otherwise: a
+/// `char::is_alphanumeric` filter keeps multi-byte characters, and the
+/// right-truncation below would then slice mid-character and panic the
+/// request; and a name that reaches logs and a filesystem path should not
+/// carry homoglyphs, combining marks, or bidi-shaped text.
+fn sanitize_upload_filename(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .replace("..", "__");
+    // Every retained character is one ASCII byte, so this index is always a
+    // character boundary.
+    #[allow(clippy::string_slice)]
+    if sanitized.len() > 63 {
+        sanitized[sanitized.len() - 63..].to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// POST /analyze — accept multipart file upload, classify, return full JSON result.
 pub(super) async fn analyze(
     State(state): State<Arc<AppState>>,
+    request_id: Extension<RequestId>,
     mut multipart: axum::extract::Multipart,
 ) -> Response {
-    let request_id = state.next_request_id();
+    let request_id = request_id.0.get();
     let request_start = Instant::now();
 
     tracing::info!(id = request_id, "--> POST /analyze");
@@ -636,7 +822,7 @@ pub(super) async fn analyze(
     if let Ok(init_error) = state.init_error.read()
         && let Some(message) = init_error.as_ref()
     {
-        tracing::error!("analyze rejected: startup failed  id={request_id} error={message}");
+        tracing::error!(id = request_id, error = %message, "rejected: startup failed");
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Server failed to initialize",
@@ -651,43 +837,22 @@ pub(super) async fn analyze(
     let mut field = match multipart.next_field().await {
         Ok(Some(f)) => f,
         Ok(None) => {
-            tracing::warn!("bad request: no file field  id={request_id}");
+            tracing::warn!(id = request_id, "bad request: no file field");
             return error_response(StatusCode::BAD_REQUEST, "No file field in request");
         }
         Err(e) => {
-            tracing::warn!("failed to parse multipart: {e}  id={request_id}");
+            tracing::warn!(id = request_id, error = %e, "bad request: unparseable multipart body");
             return error_response(StatusCode::BAD_REQUEST, "Invalid multipart data");
         }
     };
 
-    // Sanitize the uploaded filename: replace any character outside [A-Za-z0-9_.-] with _,
-    // collapse .. to prevent path traversal, and right-truncate to 63 characters so that
-    // the extension is preserved. Used as both the `path` label and the temp file suffix
-    // so that cleave can detect the file type from the extension.
-    // Right-truncation below preserves the tail (and thus the extension). All
-    // remaining chars are ASCII (filter above) so byte indexing is safe.
-    #[allow(clippy::string_slice)]
-    let filename: String = {
-        let raw = field
-            .file_name()
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("upload-{request_id}"));
-        let sanitized: String = raw
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>()
-            .replace("..", "__");
-        if sanitized.len() > 63 {
-            sanitized[sanitized.len() - 63..].to_string()
-        } else {
-            sanitized
-        }
+    // The staged name, used as the temp file's name (so cleave detects the
+    // file type from its extension), as the `path` label in the report, and in
+    // every log line about this request.
+    let filename = match field.file_name() {
+        Some(name) => sanitize_upload_filename(name),
+        // Already within the sanitizer's alphabet.
+        None => format!("upload-{request_id}"),
     };
 
     // Create a temp directory containing a file with the original filename so that
@@ -700,11 +865,11 @@ pub(super) async fn analyze(
         {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
-                tracing::warn!("failed to create temp dir: {e}  id={request_id}");
+                tracing::warn!(id = request_id, error = %e, "failed to create temp dir");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
             }
             Err(e) => {
-                tracing::warn!("temp dir task join error (panic?): {e}  id={request_id}");
+                tracing::warn!(id = request_id, error = %e, "temp dir task join error (panic?)");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
             }
         };
@@ -714,7 +879,7 @@ pub(super) async fn analyze(
     let writer = match std::fs::File::create(&path) {
         Ok(file) => file,
         Err(e) => {
-            tracing::warn!("failed to reopen temp file for writing: {e}  id={request_id}");
+            tracing::warn!(id = request_id, path = %path.display(), error = %e, "failed to open temp file for writing");
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
     };
@@ -722,18 +887,25 @@ pub(super) async fn analyze(
 
     let max_upload = state.max_upload_bytes;
     let mut file_size = 0usize;
+    // Hashed as it streams — every byte is already in hand, and the digest is
+    // what lets a second request for these bytes join the first one's analysis.
+    let mut digest = Sha256::new();
     loop {
         match field.chunk().await {
             Ok(Some(chunk)) if !chunk.is_empty() => {
                 file_size += chunk.len();
                 if file_size > max_upload {
                     tracing::warn!(
-                        "upload exceeded size limit: {file_size} > {max_upload}  id={request_id}"
+                        id = request_id,
+                        file_size,
+                        max_upload,
+                        "upload exceeded size limit",
                     );
                     return error_response(StatusCode::PAYLOAD_TOO_LARGE, "File too large");
                 }
+                digest.update(&chunk);
                 if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut tokio_file, &chunk).await {
-                    tracing::warn!("failed to write chunk: {e}  id={request_id}");
+                    tracing::warn!(id = request_id, error = %e, "failed to write upload chunk");
                     return error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Failed to save file data",
@@ -743,21 +915,21 @@ pub(super) async fn analyze(
             Ok(Some(_)) => continue,
             Ok(None) => break,
             Err(e) => {
-                tracing::warn!("error reading multipart chunk: {e}  id={request_id}");
+                tracing::warn!(id = request_id, error = %e, "failed to read multipart chunk");
                 return error_response(StatusCode::BAD_REQUEST, "Error reading upload data");
             }
         }
     }
 
     if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut tokio_file).await {
-        tracing::warn!("failed to flush temp file: {e}  id={request_id}");
+        tracing::warn!(id = request_id, error = %e, "failed to flush temp file");
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to save file data",
         );
     }
     if let Err(e) = tokio_file.sync_all().await {
-        tracing::warn!("failed to sync temp file: {e}  id={request_id}");
+        tracing::warn!(id = request_id, error = %e, "failed to sync temp file");
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to save file data",
@@ -766,55 +938,98 @@ pub(super) async fn analyze(
     drop(tokio_file);
 
     if file_size == 0 {
-        tracing::warn!("bad request: empty file  id={request_id}");
+        tracing::warn!(id = request_id, "bad request: empty file");
         return error_response(StatusCode::BAD_REQUEST, "Empty file");
     }
 
-    tracing::info!(
-        id = request_id,
-        filename = %filename,
-        size_bytes = file_size,
-        upload_ms = crate::duration_ms(request_start.elapsed()),
-        "received file, starting analysis",
-    );
+    let sha = format!("{:x}", digest.finalize());
 
-    // Snapshot the current model resources (Arc clone, no lock held during analysis).
-    let resources = match state.resources.read() {
-        Ok(lock) => match lock.as_ref() {
-            Some(r) => Arc::clone(r),
-            None => {
-                tracing::debug!("analyze rejected: resources not yet loaded  id={request_id}");
-                return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server starting up");
-            }
-        },
-        Err(e) => {
-            tracing::error!("read lock poisoned: {e}");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
-        }
-    };
-
-    // Claim a slot. OwnedSemaphorePermit is RAII: the slot is released when the
-    // permit is dropped, even on panic or runtime shutdown — no manual fetch_sub needed.
-    let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
-        let max = state.max_concurrent_tasks;
-        tracing::warn!(
+    // Share the run with anyone already analyzing these exact bytes.
+    let attachment = state.flights.join(FlightKey::Sha {
+        sha: sha.clone(),
+        name: filename.clone(),
+    });
+    if attachment.leads() {
+        tracing::info!(
             id = request_id,
             filename = %filename,
             size_bytes = file_size,
-            max,
-            "rejecting: at capacity"
+            sha256 = %sha,
+            upload_ms = crate::duration_ms(request_start.elapsed()),
+            "received file, starting analysis",
         );
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("At capacity ({max}/{max} active analyses)"),
+        let publisher = state.flights.publisher(attachment.flight());
+        match claim_slot(&state, request_id, attachment.flight().key()) {
+            Err(outcome) => publisher.publish(outcome),
+            Ok((resources, permit)) => {
+                let flight = Arc::clone(attachment.flight());
+                let state = Arc::clone(&state);
+                let upload = Upload {
+                    dir: temp_dir,
+                    path,
+                    filename,
+                    size_bytes: file_size,
+                };
+                // Detached, so the analysis outlives whichever request started
+                // it: this client hanging up must not abandon the followers.
+                tokio::spawn(async move {
+                    publisher.publish(
+                        run_file_analysis(state, request_id, upload, &flight, resources, permit)
+                            .await,
+                    );
+                });
+            }
+        }
+    } else {
+        tracing::info!(
+            id = request_id,
+            filename = %filename,
+            size_bytes = file_size,
+            sha256 = %sha,
+            "received file, joined an analysis already in flight",
         );
-    };
+        // These bytes are already being analyzed; ours are surplus.
+        drop(temp_dir);
+    }
 
+    let outcome = attachment.flight().wait().await;
+    flight_response(&outcome, crate::duration_ms(request_start.elapsed()))
+}
+
+/// Bytes a request uploaded, staged on disk and waiting to be analyzed.
+#[derive(Debug)]
+struct Upload {
+    /// Owns the directory holding [`Self::path`]; deleting it deletes the file.
+    dir: tempfile::TempDir,
+    /// The staged file, named so cleave can detect its type from the extension.
+    path: std::path::PathBuf,
+    /// Sanitized upload filename, used as the display path.
+    filename: String,
+    size_bytes: usize,
+}
+
+/// Run one uploaded-file analysis on behalf of every request attached to
+/// `flight`. Takes the staged upload and deletes it on the way out.
+async fn run_file_analysis(
+    state: Arc<AppState>,
+    request_id: u64,
+    upload: Upload,
+    flight: &Arc<Flight>,
+    resources: Arc<super::ModelResources>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Outcome {
+    let Upload {
+        dir: temp_dir,
+        path,
+        filename,
+        size_bytes: file_size,
+    } = upload;
+    let started = Instant::now();
     let slow_rule_ms = state.slow_rule_ms;
-
-    let filename_for_closure = filename.clone();
     let should_clear_caches = request_id.is_multiple_of(100);
-    let cancellation = Arc::new(AtomicBool::new(false));
+    // The flight owns cancellation now: it is raised when the last attached
+    // request goes away, not when any one of them does.
+    let cancellation = flight.cancellation();
     state.in_flight.insert(
         request_id,
         super::InFlightRequest {
@@ -826,10 +1041,6 @@ pub(super) async fn analyze(
             thread_id: AtomicU64::new(0),
         },
     );
-
-    // RAII guard: if the client disconnects and axum drops this future, the guard's
-    // Drop impl signals cancellation to the blocking thread and removes the in-flight
-    // entry, so no slot or dashmap entry leaks.
     let guard = super::RequestGuard::new(
         request_id,
         Arc::clone(&state),
@@ -837,9 +1048,7 @@ pub(super) async fn analyze(
         permit,
     );
 
-    // Save the temp dir path so we can clean it up after the blocking task finishes.
     let temp_dir_path = temp_dir.path().to_path_buf();
-
     let cancel_flag = Arc::clone(&cancellation);
     let phase_state = Arc::clone(&state);
     let phase_tracker = phase_state
@@ -847,13 +1056,13 @@ pub(super) async fn analyze(
         .get(&request_id)
         .map(|r| r.phase.clone());
     let handle = tokio::task::spawn_blocking(move || {
-        // Record the OS thread servicing this request.
+        // Record the OS thread servicing this analysis.
         if let Some(req) = phase_state.in_flight.get(&request_id) {
             req.thread_id.store(current_thread_id(), Ordering::Relaxed);
         }
         let result = classify_file(
             &path,
-            &filename_for_closure,
+            &filename,
             &resources,
             slow_rule_ms,
             None,
@@ -871,11 +1080,9 @@ pub(super) async fn analyze(
         result
     });
 
-    // Await to completion, bounded by the configured per-request timeout. If
-    // the client disconnects, axum drops this future and guard.drop() fires,
-    // signalling cancellation and releasing the slot. On timeout we signal
-    // cancellation and return 504 — the blocking thread continues until
-    // cleave notices the flag, but the slot is freed and `stuck_orphans` is
+    // Bounded by the configured per-request timeout. On timeout we signal
+    // cancellation and report 504 — the blocking thread continues until cleave
+    // notices the flag, but the slot is freed and `stuck_orphans` is
     // incremented so an operator can see zombie work.
     let result = await_with_timeout(
         handle,
@@ -884,60 +1091,19 @@ pub(super) async fn analyze(
         &state.stuck_orphans,
     )
     .await;
-
-    // Normal completion: drop the guard explicitly so its log context is clear.
     drop(guard);
 
-    // Clean up temp directory (handles the case where drop(temp_dir) above didn't run).
+    // Handles the case where drop(temp_dir) above didn't run.
     if let Err(e) = tokio::fs::remove_dir_all(&temp_dir_path).await {
         tracing::debug!(request_id, error = %e, "temp dir cleanup (may already be gone)");
     }
 
-    let elapsed_ms = crate::duration_ms(request_start.elapsed());
-
-    match result {
-        AnalysisOutcome::Ok(Ok(scan_result)) => {
-            let scan_result = *scan_result;
-            tracing::info!(
-                id = request_id,
-                filename = %filename,
-                size_bytes = file_size,
-                elapsed_ms,
-                classification = %scan_result.classification,
-                probability = scan_result.probability,
-                "<-- 200 OK",
-            );
-            let mut resp = Json(scan_result.into_envelope()).into_response();
-            resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
-            resp
-        }
-        AnalysisOutcome::Ok(Err(e)) => {
-            let (status, response) = analysis_error_response(&e);
-            tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analysis failed");
-            response
-        }
-        AnalysisOutcome::JoinError(e) => {
-            tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
-        }
-        AnalysisOutcome::Timeout(secs) => {
-            tracing::warn!(
-                id = request_id,
-                filename = %filename,
-                elapsed_ms,
-                timeout_secs = secs,
-                "<-- 504 analysis timeout",
-            );
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": "analysis timeout",
-                    "timeout_secs": secs,
-                })),
-            )
-                .into_response()
-        }
-    }
+    flight_outcome(
+        result,
+        request_id,
+        crate::duration_ms(started.elapsed()),
+        flight.key(),
+    )
 }
 
 /// POST /analyze-purl — fetch a package by PURL and analyze it.
@@ -954,9 +1120,10 @@ pub(super) struct AnalyzePurlRequest {
 
 pub(super) async fn analyze_purl(
     State(state): State<Arc<AppState>>,
+    request_id: Extension<RequestId>,
     Json(req): Json<AnalyzePurlRequest>,
 ) -> Response {
-    let request_id = state.next_request_id();
+    let request_id = request_id.0.get();
     let request_start = Instant::now();
 
     let purl = match normalize_pkg_purl(&req.purl) {
@@ -967,7 +1134,7 @@ pub(super) async fn analyze_purl(
     if let Ok(init_error) = state.init_error.read()
         && let Some(message) = init_error.as_ref()
     {
-        tracing::error!("analyze-purl rejected: startup failed  id={request_id} error={message}");
+        tracing::error!(id = request_id, error = %message, "rejected: startup failed");
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Server failed to initialize",
@@ -978,37 +1145,57 @@ pub(super) async fn analyze_purl(
         return response;
     }
 
-    let resources = match state.resources.read() {
-        Ok(lock) => match lock.as_ref() {
-            Some(r) => Arc::clone(r),
-            None => {
-                return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server starting up");
+    // Share the run with anyone already analyzing this PURL.
+    let attachment = state.flights.join(FlightKey::Purl(purl.clone()));
+    if attachment.leads() {
+        tracing::info!(id = request_id, purl = %purl, "--> POST /analyze-purl");
+        let publisher = state.flights.publisher(attachment.flight());
+        match claim_slot(&state, request_id, attachment.flight().key()) {
+            Err(outcome) => publisher.publish(outcome),
+            Ok((resources, permit)) => {
+                let flight = Arc::clone(attachment.flight());
+                let state = Arc::clone(&state);
+                // Detached, so the analysis outlives whichever request started
+                // it: this client hanging up must not abandon the followers.
+                tokio::spawn(async move {
+                    publisher.publish(
+                        run_purl_analysis(state, request_id, &purl, &flight, resources, permit)
+                            .await,
+                    );
+                });
             }
-        },
-        Err(e) => {
-            tracing::error!("read lock poisoned: {e}");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
-    };
-
-    let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
-        let max = state.max_concurrent_tasks;
-        tracing::warn!(id = request_id, purl = %purl, max, "rejecting: at capacity");
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("At capacity ({max}/{max} active analyses)"),
+    } else {
+        tracing::info!(
+            id = request_id,
+            purl = %purl,
+            "--> POST /analyze-purl (joined an analysis already in flight)",
         );
-    };
+    }
 
-    tracing::info!(id = request_id, purl = %purl, "--> POST /analyze-purl");
+    let outcome = attachment.flight().wait().await;
+    flight_response(&outcome, crate::duration_ms(request_start.elapsed()))
+}
 
+/// Run one PURL analysis on behalf of every request attached to `flight`.
+async fn run_purl_analysis(
+    state: Arc<AppState>,
+    request_id: u64,
+    purl: &str,
+    flight: &Arc<Flight>,
+    resources: Arc<super::ModelResources>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Outcome {
+    let started = Instant::now();
     let slow_rule_ms = state.slow_rule_ms;
     let should_clear_caches = request_id.is_multiple_of(100);
-    let cancellation = Arc::new(AtomicBool::new(false));
+    // The flight owns cancellation now: it is raised when the last attached
+    // request goes away, not when any one of them does.
+    let cancellation = flight.cancellation();
     state.in_flight.insert(
         request_id,
         super::InFlightRequest {
-            name: purl.clone(),
+            name: purl.to_owned(),
             size_bytes: 0,
             started_at: Instant::now(),
             cancellation: Arc::clone(&cancellation),
@@ -1030,12 +1217,13 @@ pub(super) async fn analyze_purl(
         .get(&request_id)
         .map(|r| r.phase.clone());
     let deps_for_upload = state.uploader.is_some();
+    let owned_purl = purl.to_owned();
     let handle = tokio::task::spawn_blocking(move || {
         if let Some(req) = phase_state.in_flight.get(&request_id) {
             req.thread_id.store(current_thread_id(), Ordering::Relaxed);
         }
         let result = classify_purl(
-            &purl,
+            &owned_purl,
             &resources,
             slow_rule_ms,
             Some(&cancel_flag),
@@ -1057,47 +1245,12 @@ pub(super) async fn analyze_purl(
     .await;
     drop(guard);
 
-    let elapsed_ms = crate::duration_ms(request_start.elapsed());
-    match result {
-        AnalysisOutcome::Ok(Ok(scan_result)) => {
-            let scan_result = *scan_result;
-            tracing::info!(
-                id = request_id,
-                elapsed_ms,
-                sha256 = %scan_result.sha256,
-                classification = %scan_result.classification,
-                "<-- 200 OK",
-            );
-            let mut resp = Json(scan_result.into_envelope()).into_response();
-            resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
-            resp
-        }
-        AnalysisOutcome::Ok(Err(e)) => {
-            let (status, response) = analysis_error_response(&e);
-            tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analyze-purl failed");
-            response
-        }
-        AnalysisOutcome::JoinError(e) => {
-            tracing::warn!(id = request_id, elapsed_ms, error = %e, "<-- 500 task join error (panic?)");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
-        }
-        AnalysisOutcome::Timeout(secs) => {
-            tracing::warn!(
-                id = request_id,
-                elapsed_ms,
-                timeout_secs = secs,
-                "<-- 504 analysis timeout"
-            );
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": "analysis timeout",
-                    "timeout_secs": secs,
-                })),
-            )
-                .into_response()
-        }
-    }
+    flight_outcome(
+        result,
+        request_id,
+        crate::duration_ms(started.elapsed()),
+        flight.key(),
+    )
 }
 
 /// Canonical `pkg:…` form, or a 400 message. Same prefixing rule as `atomscan purl`.
@@ -1381,9 +1534,10 @@ pub(super) struct AnalyzePathRequest {
 /// `/analyze`.
 pub(super) async fn analyze_path(
     State(state): State<Arc<AppState>>,
+    request_id: Extension<RequestId>,
     Json(req): Json<AnalyzePathRequest>,
 ) -> Response {
-    let request_id = state.next_request_id();
+    let request_id = request_id.0.get();
     let request_start = Instant::now();
 
     let raw_path = std::path::PathBuf::from(&req.path);
@@ -1590,7 +1744,7 @@ pub(super) async fn analyze_path(
         }
         AnalysisOutcome::Ok(Err(e)) => {
             let (status, response) = analysis_error_response(&e);
-            tracing::warn!(id = request_id, elapsed_ms, status = status.as_u16(), error = %e, "analysis failed");
+            tracing::warn!(id = request_id, path = %req.path, elapsed_ms, status = status.as_u16(), error = %error_chain(&e), "<-- analysis failed");
             response
         }
         AnalysisOutcome::JoinError(e) => {
@@ -1754,8 +1908,13 @@ pub(super) async fn requests(State(state): State<Arc<AppState>>) -> Json<serde_j
 
     entries.sort_by(|a, b| b["elapsed_ms"].as_u64().cmp(&a["elapsed_ms"].as_u64()));
 
+    // `analyses` counts distinct runs and `attached` counts the requests riding
+    // them; the gap is duplicate work single-flight is absorbing.
+    let census = state.flights.census();
     Json(serde_json::json!({
         "count": entries.len(),
+        "analyses": census.analyses,
+        "attached": census.attached,
         "requests": entries,
     }))
 }
@@ -1921,28 +2080,102 @@ fn read_thread_info_freebsd() -> serde_json::Value {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::classify_analysis_error;
+    use super::{Outcome, classify_analysis_error, flight_response};
     use axum::http::StatusCode;
+
+    /// A follower renders the leader's failure verbatim: same status, same body,
+    /// no second analysis and no second error.
+    #[tokio::test]
+    async fn a_replayed_failure_keeps_its_status_and_body() {
+        let outcome = Outcome::Rendered {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            body: serde_json::json!({ "error": "Unsupported file type", "detail": "nope" }),
+        };
+        let response = flight_response(&outcome, 42);
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("parse body");
+        assert_eq!(parsed["error"], "Unsupported file type");
+        assert_eq!(parsed["detail"], "nope");
+    }
+
+    /// A hostile upload filename must not be able to panic the request. A
+    /// Unicode-aware filter kept multi-byte characters, and the tail
+    /// truncation then sliced one in half.
+    #[test]
+    fn sanitize_upload_filename_survives_multibyte_names() {
+        let raw = "\u{3041}".repeat(80) + ".zip";
+        let name = super::sanitize_upload_filename(&raw);
+        assert_eq!(name.len(), 63);
+        assert!(name.is_ascii(), "{name}");
+        assert!(name.ends_with(".zip"), "the extension must survive: {name}");
+    }
+
+    #[test]
+    fn sanitize_upload_filename_defuses_paths_and_control_characters() {
+        assert_eq!(
+            super::sanitize_upload_filename("../../etc/shadow"),
+            "______etc_shadow"
+        );
+        assert_eq!(
+            super::sanitize_upload_filename("a\nb\r\u{202e}gpj.exe"),
+            "a_b__gpj.exe"
+        );
+        // A name already inside the alphabet is left exactly as it is.
+        assert_eq!(
+            super::sanitize_upload_filename("left-pad-1.3.0.tgz"),
+            "left-pad-1.3.0.tgz"
+        );
+    }
 
     #[test]
     fn classify_unsupported_file_type_as_415() {
-        let (status, message) = classify_analysis_error("Unsupported file type: Unknown");
-        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        assert_eq!(message, "Unsupported file type: Unknown");
+        assert_eq!(
+            classify_analysis_error("Unsupported file type: Unknown"),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
     }
 
     #[test]
     fn classify_invalid_archive_as_422() {
-        let (status, message) =
-            classify_analysis_error("Archive is encrypted but no passwords configured");
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(message, "Archive is encrypted but no passwords configured");
+        assert_eq!(
+            classify_analysis_error("Archive is encrypted but no passwords configured"),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 
     #[test]
     fn classify_unexpected_failure_as_500() {
-        let (status, _) = classify_analysis_error("model evaluation failed");
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            classify_analysis_error("model evaluation failed"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// A malformed upload is the caller's problem, not a server fault: cleave
+    /// reports it from deep in the archive reader, so it arrives as a 422 only
+    /// because the whole chain is classified.
+    #[test]
+    fn classify_corrupt_archive_as_422() {
+        assert_eq!(
+            classify_analysis_error(
+                "cleave analysis of bad.tgz: Failed to read tar entry: corrupt deflate stream"
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// The wrapping context is part of what gets classified: a "truncated"
+    /// cause buried under `cleave analysis of x.tgz` is still a 422, not a 500.
+    #[test]
+    fn classify_reads_the_whole_error_chain() {
+        assert_eq!(
+            classify_analysis_error("cleave analysis of x.tgz: truncated gzip stream"),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 
     /// A request without `registry` still parses — the field is optional, so

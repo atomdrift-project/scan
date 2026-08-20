@@ -1,4 +1,5 @@
 //! Integration tests for the /analyze endpoint.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -165,5 +166,103 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     if let Some(l) = l {
         assert!(l == -1 || (0..=100).contains(&l), "unexpected l value: {l}");
     } // null is also valid (manual thresholds on a hostile verdict)
+    Ok(())
+}
+
+/// Concurrent identical uploads share one analysis.
+///
+/// The coordination itself is unit-tested in `server::flight`; what this covers
+/// is the part those tests cannot reach — that a follower, which never ran an
+/// analysis of its own, renders the leader's real report correctly and gets
+/// byte-for-byte the same answer.
+#[tokio::test]
+async fn concurrent_identical_uploads_share_one_analysis() -> Result<()> {
+    init_tracing();
+    if std::env::var_os("SCAN_MODELS_DIR").is_none() {
+        eprintln!("skipping: SCAN_MODELS_DIR is not set");
+        return Ok(());
+    }
+
+    let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/encrypted.zip");
+    assert!(testdata.exists(), "testdata/encrypted.zip not found");
+    let file_bytes = std::fs::read(&testdata).context("failed to read test archive")?;
+
+    let config = ServerConfig::new(
+        SocketAddr::from(([127, 0, 0, 1], 8081)),
+        100 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        model_dir()?,
+        None,
+        4000,
+        vec![],
+        None,
+        // One slot: without sharing, the duplicates would 429 instead of
+        // riding along with the analysis already running.
+        1,
+        vec![],
+    )?;
+    let app = build_app(&config).await.context("failed to build app")?;
+
+    let max_health_polls: u32 = if cfg!(debug_assertions) { 1800 } else { 600 };
+    let mut ready = false;
+    for _ in 0..max_health_polls {
+        let resp = app
+            .clone()
+            .oneshot(loopback(
+                Request::builder()
+                    .uri("/_/health")
+                    .body(Body::empty())
+                    .context("failed to build health request")?,
+            ))
+            .await
+            .context("health request failed")?;
+        if resp.status() == StatusCode::OK {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "server did not become ready");
+
+    let mut requests = Vec::new();
+    for _ in 0..4 {
+        let (content_type, body) = multipart_body(&file_bytes, "encrypted.zip");
+        let app = app.clone();
+        requests.push(tokio::spawn(async move {
+            let response = app
+                .oneshot(loopback(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/analyze")
+                        .header("content-type", content_type)
+                        .body(Body::from(body))
+                        .expect("build analyze request"),
+                ))
+                .await
+                .expect("analyze request failed");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+                .await
+                .expect("read response body");
+            (status, bytes)
+        }));
+    }
+
+    let mut answers = Vec::new();
+    for request in requests {
+        answers.push(request.await.context("joining request task")?);
+    }
+
+    let (first_status, first_body) = &answers[0];
+    assert_eq!(
+        *first_status,
+        StatusCode::OK,
+        "expected 200 but got {first_status}: {}",
+        String::from_utf8_lossy(first_body),
+    );
+    for (status, body) in &answers[1..] {
+        assert_eq!(status, first_status, "every sharer gets the same status");
+        assert_eq!(body, first_body, "every sharer gets the same report");
+    }
     Ok(())
 }

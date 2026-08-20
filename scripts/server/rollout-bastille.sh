@@ -6,6 +6,14 @@
 #   - "interpret" must have an entry in /etc/hosts on this host, pointing at the
 #     OpenAI-compatible LLM endpoint (vLLM) that --interpret sends samples to.
 #     The entry is copied into the run jail, which has no resolver of its own.
+#
+# Cloudflare Tunnel (optional):
+#   CLOUDFLARED   "auto" installs and supervises a connector in the run jail
+#                 only when CF_TUNNEL_TOKEN is passed or a token from an
+#                 earlier deploy is already in the jail. 1 requires it, 0 skips
+#                 it even with a token present.                 (default: auto)
+#   CF_TUNNEL_TOKEN  tunnel token; needed once, then stored in the jail at
+#                    /usr/local/etc/atomdrift/cloudflared-token
 
 set -ex
 # FreeBSD /bin/sh supports pipefail; this deploy script only runs on FreeBSD.
@@ -14,6 +22,27 @@ set -o pipefail
 
 BUILD="${1:-build}"
 RUN="${2:-scan}"
+CLOUDFLARED="${CLOUDFLARED:-auto}"
+
+# The tunnel token must never reach the `set -x` trace, argv, or the jail's
+# rc.conf. Capture it here, unset it, and move it into the jail through the
+# filesystem — the same discipline the API token below uses.
+set +x
+TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
+unset CF_TUNNEL_TOKEN
+set -x
+
+TUNNEL_SERVICE=scan_tunnel
+TUNNEL_TOKEN_JAIL_PATH=/usr/local/etc/atomdrift/cloudflared-token
+TUNNEL_USER=cloudflared
+TUNNEL_HOME=/var/db/cloudflared
+TUNNEL_LOG=/var/log/${TUNNEL_SERVICE}.log
+
+TUNNEL_TMP=""
+cleanup() {
+    [ -z "$TUNNEL_TMP" ] || rm -f "$TUNNEL_TMP"
+}
+trap cleanup EXIT HUP INT TERM
 
 die() {
     echo "error: $*" >&2
@@ -106,6 +135,36 @@ else
     fi
 fi
 
+# --- API token --------------------------------------------------------------
+#
+# The API requires `Authorization: Bearer <token>` on every route except
+# /_/health. The token lives in a file: never an argument (argv is visible in
+# ps(1)) and never an environment variable. It reaches the jail through the
+# filesystem rather than as a command argument, so the `set -x` trace above
+# cannot echo it — and it is never held in a shell variable, for the same
+# reason. Generated on this host on first deploy; rotate by editing
+# $TOKEN_SRC and redeploying.
+TOKEN_SRC="${TOKEN_SRC:-${HOME}/.tok/scan}"
+TOKEN_DST="$BASTILLE_DIR/$RUN/root/home/scan/.tok/scan"
+
+log "Installing API token"
+if [ ! -s "$TOKEN_SRC" ] && ! doas test -s "$TOKEN_DST"; then
+    (umask 077; mkdir -p "$(dirname "$TOKEN_SRC")")
+    (umask 077; { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; echo; } > "$TOKEN_SRC")
+    [ -s "$TOKEN_SRC" ] || die "failed to generate a token at $TOKEN_SRC"
+    log "Generated an API token at $TOKEN_SRC"
+    log "  clients: curl -H \"Authorization: Bearer \$(cat $TOKEN_SRC)\" ..."
+fi
+doas bastille cmd "$RUN" install -d -m 0700 -o scan -g scan /home/scan/.tok
+# No source token means a redeploy of a host that already has one: keep it,
+# rather than silently dropping authentication.
+if [ -s "$TOKEN_SRC" ]; then
+    doas install -m 0600 "$TOKEN_SRC" "$TOKEN_DST"
+    doas bastille cmd "$RUN" chown scan:scan /home/scan/.tok/scan
+    doas bastille cmd "$RUN" chmod 0600 /home/scan/.tok/scan
+fi
+doas test -s "$TOKEN_DST" || die "no API token at $TOKEN_DST"
+
 log "Creating rc.d service"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
 doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/scan >/dev/null <<'EOF'
@@ -131,7 +190,10 @@ command="/usr/sbin/daemon"
 # kept in the envelope's `llm` section. --llm points at the vLLM endpoint on the
 # "interpret" host; the model defaults to atomscan's DEFAULT_MODEL, which is what
 # that endpoint serves.
-command_args="-c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --interpret --llm http://interpret:8000/v1"
+# --token-file requires `Authorization: Bearer <token>` on every route except
+# /_/health, including from loopback. atomscan refuses to start if the file is
+# missing or empty, so a lost token fails loudly instead of opening the API.
+command_args="-c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --token-file /home/scan/.tok/scan --interpret --llm http://interpret:8000/v1"
 
 run_rc_command "$1"
 EOF
@@ -143,5 +205,191 @@ doas bastille sysrc "$RUN" scan_enable=YES
 doas bastille service "$RUN" scan stop 2>/dev/null || true
 doas bastille cmd "$RUN" pkill -9 -F /var/run/scan.pid 2>/dev/null || true
 doas bastille service "$RUN" scan start
+
+# --- Cloudflare Tunnel (optional) -------------------------------------------
+#
+# The tunnel and its ingress rules are configured in the Cloudflare dashboard;
+# this only installs the connector and points it at the token issued there.
+# Ingress should target http://127.0.0.1:49999 inside this jail.
+#
+# Deployed after scan is serving: a connector that advertises an origin which
+# is not yet up hands Cloudflare a 502 window on every deploy.
+BASTILLE_TOKEN_DST="$BASTILLE_DIR/$RUN/root${TUNNEL_TOKEN_JAIL_PATH}"
+
+set +x
+want_tunnel=0
+case "$CLOUDFLARED" in
+    0|no|NO) ;;
+    auto)
+        if [ -n "$TUNNEL_TOKEN" ] || doas test -s "$BASTILLE_TOKEN_DST"; then
+            want_tunnel=1
+        fi
+        ;;
+    *) want_tunnel=1 ;;
+esac
+set -x
+
+if [ "$want_tunnel" -eq 0 ]; then
+    log "Skipping Cloudflare Tunnel (CLOUDFLARED=$CLOUDFLARED)"
+    log "Deployment complete"
+    exit 0
+fi
+
+set +x
+if [ -z "$TUNNEL_TOKEN" ] && ! doas test -s "$BASTILLE_TOKEN_DST"; then
+    set -x
+    die "no Cloudflare Tunnel token; rerun with CF_TUNNEL_TOKEN set"
+fi
+case "$TUNNEL_TOKEN" in
+    *[[:cntrl:]]*)
+        set -x
+        die "CF_TUNNEL_TOKEN must not contain control characters"
+        ;;
+esac
+set -x
+
+if ! doas bastille cmd "$RUN" pkg info -e cloudflared >/dev/null 2>&1; then
+    log "Installing cloudflared in run jail"
+    doas bastille pkg "$RUN" install -y cloudflared
+fi
+
+# --token-file landed in 2025.4.0. Older connectors only accept --token, which
+# would put the secret in the process arguments.
+TUNNEL_VERSION=$(doas bastille cmd "$RUN" /usr/local/bin/cloudflared --version \
+    | awk '$1 == "cloudflared" && $2 == "version" {print $3; exit}')
+TUNNEL_YEAR=${TUNNEL_VERSION%%.*}
+TUNNEL_REST=${TUNNEL_VERSION#*.}
+TUNNEL_MONTH=${TUNNEL_REST%%.*}
+case "$TUNNEL_YEAR:$TUNNEL_MONTH" in
+    *[!0-9:]*|:*|*:) die "could not parse cloudflared version: $TUNNEL_VERSION" ;;
+esac
+if [ "$TUNNEL_YEAR" -lt 2025 ] \
+    || { [ "$TUNNEL_YEAR" -eq 2025 ] && [ "$TUNNEL_MONTH" -lt 4 ]; }; then
+    die "cloudflared 2025.4.0 or newer is required for --token-file support (have $TUNNEL_VERSION)"
+fi
+
+log "Ensuring cloudflared service user exists in run jail"
+doas bastille cmd "$RUN" id -u "$TUNNEL_USER" >/dev/null 2>&1 || \
+    doas bastille cmd "$RUN" pw useradd "$TUNNEL_USER" -d "$TUNNEL_HOME" \
+        -s /usr/sbin/nologin -c "Cloudflare Tunnel"
+doas bastille cmd "$RUN" install -d -m 0700 -o "$TUNNEL_USER" -g "$TUNNEL_USER" "$TUNNEL_HOME"
+doas bastille cmd "$RUN" install -d -m 0755 -o root -g wheel \
+    "$(dirname "$TUNNEL_TOKEN_JAIL_PATH")"
+
+# Restart only on a real change: a connector that is already serving is the one
+# thing here that does not have to blink.
+tunnel_changed=0
+
+log "Installing Cloudflare Tunnel token"
+set +x
+if [ -n "$TUNNEL_TOKEN" ]; then
+    TUNNEL_TMP=$(mktemp -t scan.cftoken.XXXXXX)
+    chmod 0600 "$TUNNEL_TMP"
+    printf '%s\n' "$TUNNEL_TOKEN" >"$TUNNEL_TMP"
+    TUNNEL_TOKEN=""
+    if doas cmp -s "$TUNNEL_TMP" "$BASTILLE_TOKEN_DST" 2>/dev/null; then
+        set -x
+        log "Cloudflare Tunnel token unchanged"
+    else
+        doas install -m 0600 "$TUNNEL_TMP" "$BASTILLE_TOKEN_DST"
+        set -x
+        log "Cloudflare Tunnel token updated"
+        tunnel_changed=1
+    fi
+    rm -f "$TUNNEL_TMP"
+    TUNNEL_TMP=""
+else
+    set -x
+    log "Keeping the existing Cloudflare Tunnel token"
+fi
+# root:cloudflared 0640 — writable only by root, readable by the connector
+# after daemon(8) drops privileges, opaque to everyone else in the jail.
+doas bastille cmd "$RUN" chown "root:$TUNNEL_USER" "$TUNNEL_TOKEN_JAIL_PATH"
+doas bastille cmd "$RUN" chmod 0640 "$TUNNEL_TOKEN_JAIL_PATH"
+
+# Deliberately not named "cloudflared": net/cloudflared ships its own
+# rc.d/cloudflared, which runs the connector as root off a config file and is
+# rewritten by every pkg upgrade. This is a separate service so neither one
+# silently overwrites the other.
+log "Staging rc.d/$TUNNEL_SERVICE"
+doas bastille cmd "$RUN" tee "/usr/local/etc/rc.d/$TUNNEL_SERVICE.new" >/dev/null <<EOF
+#!/bin/sh
+
+# PROVIDE: $TUNNEL_SERVICE
+# REQUIRE: LOGIN DAEMON NETWORKING scan
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="$TUNNEL_SERVICE"
+rcvar="${TUNNEL_SERVICE}_enable"
+
+load_rc_config \$name
+
+: \${${TUNNEL_SERVICE}_enable:="NO"}
+: \${${TUNNEL_SERVICE}_user:="$TUNNEL_USER"}
+: \${${TUNNEL_SERVICE}_token_file:="$TUNNEL_TOKEN_JAIL_PATH"}
+: \${${TUNNEL_SERVICE}_logfile:="$TUNNEL_LOG"}
+
+pidfile="/var/run/\${name}.pid"
+command="/usr/sbin/daemon"
+# The token is read from a file rather than passed as an argument so it never
+# appears in ps(1) output.
+command_args="-c -f -r -R 5 -P \${pidfile} -o \${${TUNNEL_SERVICE}_logfile} -u \${${TUNNEL_SERVICE}_user} /usr/bin/env HOME=$TUNNEL_HOME /usr/local/bin/cloudflared tunnel --no-autoupdate run --token-file \${${TUNNEL_SERVICE}_token_file}"
+
+run_rc_command "\$1"
+EOF
+
+if doas bastille cmd "$RUN" cmp -s "/usr/local/etc/rc.d/$TUNNEL_SERVICE.new" \
+    "/usr/local/etc/rc.d/$TUNNEL_SERVICE" 2>/dev/null; then
+    log "rc.d/$TUNNEL_SERVICE unchanged"
+    doas bastille cmd "$RUN" rm -f "/usr/local/etc/rc.d/$TUNNEL_SERVICE.new"
+else
+    log "rc.d/$TUNNEL_SERVICE changed"
+    doas bastille cmd "$RUN" mv -f "/usr/local/etc/rc.d/$TUNNEL_SERVICE.new" \
+        "/usr/local/etc/rc.d/$TUNNEL_SERVICE"
+    doas bastille cmd "$RUN" chmod 755 "/usr/local/etc/rc.d/$TUNNEL_SERVICE"
+    tunnel_changed=1
+fi
+doas bastille sysrc "$RUN" "${TUNNEL_SERVICE}_enable=YES"
+# The port's own connector would otherwise come up alongside ours at boot, as
+# root, against a config file nothing here maintains.
+doas bastille sysrc "$RUN" cloudflared_enable=NO
+
+doas bastille cmd "$RUN" sh -c "[ -e '$TUNNEL_LOG' ] || install -m 0640 -o $TUNNEL_USER -g wheel /dev/null '$TUNNEL_LOG'"
+
+# daemon(8) appends to the log, so a "Registered" line from an earlier deploy
+# is still sitting in it. Remember where this run starts and read only past it.
+TUNNEL_LOG_OFFSET=$(doas bastille cmd "$RUN" stat -f %z "$TUNNEL_LOG" 2>/dev/null || echo 0)
+
+if ! doas bastille service "$RUN" "$TUNNEL_SERVICE" status >/dev/null 2>&1; then
+    log "Starting $TUNNEL_SERVICE"
+    doas bastille service "$RUN" "$TUNNEL_SERVICE" start
+elif [ "$tunnel_changed" -eq 1 ]; then
+    log "Restarting $TUNNEL_SERVICE"
+    doas bastille service "$RUN" "$TUNNEL_SERVICE" restart
+else
+    log "$TUNNEL_SERVICE already running and unchanged"
+    log "Deployment complete"
+    exit 0
+fi
+
+# A connector that cannot reach Cloudflare retries forever in the background,
+# so a silent start says nothing about whether the tunnel is actually serving.
+log "Waiting for the tunnel to register a connection"
+tunnel_registered=0
+for _ in $(jot 30 1); do
+    if doas bastille cmd "$RUN" tail -c "+$((TUNNEL_LOG_OFFSET + 1))" "$TUNNEL_LOG" 2>/dev/null \
+        | grep -q "Registered tunnel connection"; then
+        tunnel_registered=1
+        break
+    fi
+    sleep 1
+done
+if [ "$tunnel_registered" -ne 1 ]; then
+    doas bastille cmd "$RUN" tail -n 50 "$TUNNEL_LOG" >&2 || true
+    die "cloudflared did not register a tunnel connection within 30 seconds"
+fi
+log "Cloudflare Tunnel connected (origin: http://127.0.0.1:49999)"
 
 log "Deployment complete"

@@ -721,6 +721,14 @@ enum Commands {
         #[arg(long)]
         allow_cidr: Option<String>,
 
+        /// Require `Authorization: Bearer <token>` on every route except
+        /// /_/health, reading the token from the first non-empty line of
+        /// PATH. Loopback is not exempt: behind a Cloudflare tunnel every
+        /// request arrives from loopback. A missing, empty, or unreadable
+        /// file is a startup error — never a silent drop to unauthenticated.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+
         /// Path to a writable cleave traits directory (overrides CLEAVE_TRAITS_DIR).
         /// Use when running as a restricted user whose $HOME is not writable
         /// (e.g. macOS system accounts where $HOME=/var/empty). Traits are
@@ -731,7 +739,7 @@ enum Commands {
         /// Renew every analyzed result (parent and members) on a hopper instance
         /// by POSTing to <URL>/api/result as analyses complete — the warm-server
         /// equivalent of `scan path --hopper`. Upload failures are logged, never
-        /// fatal. Reads $HOPPER_UPLOAD_TOKEN for authentication.
+        /// fatal. Authenticates with ~/.tok/hopper (or $HOPPER_TOKEN).
         /// Also settable via the `SCAN_HOPPER` env var.
         #[arg(
             long,
@@ -1107,8 +1115,8 @@ fn main() -> Result<()> {
     // Physical cores, matching cleave's own pool. Logical SMT siblings
     // (32 on this 16-core host) oversubscribe archive-member analysis:
     // S2 dropped 56.6 s → 51.8 s at 16 threads.
-    let detected_cores = cleave::memory_tracker::physical_cpu_count()
-        .or_else(cleave::memory_tracker::cpu_count);
+    let detected_cores =
+        cleave::memory_tracker::physical_cpu_count().or_else(cleave::memory_tracker::cpu_count);
     let rayon_threads = std::env::var("CLEAVE_RAYON_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1396,6 +1404,7 @@ fn main() -> Result<()> {
             extract_dir,
             workers,
             allow_cidr,
+            token_file,
             traits_dir,
             hopper,
             analysis_timeout,
@@ -1420,6 +1429,23 @@ fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?,
                 None => Vec::new(),
             };
+            // Fail closed: an operator who asked for authentication must never
+            // get an open server because the token file went missing.
+            let auth_digest = match token_file {
+                Some(ref path) => {
+                    let token = scan::interpret::read_token_file(path).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--token-file {}: missing, empty, or unreadable",
+                            path.display()
+                        )
+                    })?;
+                    Some(
+                        scan::server::TokenDigest::new(&token)
+                            .map_err(|e| anyhow::anyhow!("--token-file {}: {e}", path.display()))?,
+                    )
+                }
+                None => None,
+            };
             let max_rss_bytes = resolve_process_max_rss_bytes(max_rss_gb);
             log_max_rss_resolution("server", MaxRssPolicy::from_cli(max_rss_gb), max_rss_bytes);
             let model_dir = resolve_model_dir()?;
@@ -1438,6 +1464,7 @@ fn main() -> Result<()> {
                 allow_cidrs,
             )?
             .with_level(envelope_level)
+            .with_auth_token(auth_digest)
             .with_interpret(interpret_cfg.clone())
             .with_fetch(fetch_policy)
             .with_zip_passwords(cli.zip_passwords.clone())
@@ -2549,7 +2576,9 @@ mod tests {
 
     fn with_isolated_llm_env<T>(home: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = [
             ("HOME", std::env::var_os("HOME")),
             ("SCAN_LLM", std::env::var_os("SCAN_LLM")),

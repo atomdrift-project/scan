@@ -14,12 +14,51 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::engine::ScanResultEnvelope;
+
+/// Bearer token for hopper's API, or `None` when hopper is unauthenticated.
+///
+/// `$HOPPER_TOKEN` wins, for callers that inject the token some other way;
+/// otherwise it comes from `~/.tok/hopper`, the same convention as
+/// `~/.tok/openrouter` and `~/.tok/scan`. A locally supervised worker inherits
+/// the service account's `HOME`, so it finds the file with no plumbing.
+///
+/// Resolved once per process: hopper reads its own copy once at startup too,
+/// so rotation is a restart on both ends.
+#[must_use]
+pub fn hopper_token() -> Option<&'static str> {
+    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            let env = std::env::var("HOPPER_TOKEN").ok();
+            let path = crate::interpret::tok_path("hopper");
+            resolve_hopper_token(env.as_deref(), path.as_deref())
+        })
+        .as_deref()
+}
+
+/// The precedence behind [`hopper_token`], split out so it is testable without
+/// touching process-wide environment or the `OnceLock`.
+fn resolve_hopper_token(env: Option<&str>, path: Option<&std::path::Path>) -> Option<String> {
+    if let Some(value) = env.map(str::trim).filter(|value| !value.is_empty()) {
+        return Some(value.to_string());
+    }
+    crate::interpret::read_token_file(path?)
+}
+
+/// Attach the hopper bearer token to a blocking request, if there is one.
+fn authed(request: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+    match hopper_token() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
 
 /// Hopper bounds the decompressed result body at 512 MiB (`maxResultBodyBytes`
 /// in hopper's api.go); a larger document is truncated mid-stream and rejected
@@ -597,8 +636,7 @@ fn post_known(
         #[serde(default)]
         known: Vec<String>,
     }
-    let resp = client
-        .post(known_url)
+    let resp = authed(client.post(known_url))
         .json(&KnownRequest { sha256: shas })
         .send();
     match resp {
@@ -645,16 +683,13 @@ fn post_upload(
     provenance: &[u8],
     build_form: impl Fn() -> Option<reqwest::blocking::multipart::Form>,
 ) -> bool {
-    let token = std::env::var("HOPPER_UPLOAD_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
     post_upload_with_token(
         client,
         upload_url,
         sha256,
         kind,
         provenance,
-        token.as_deref(),
+        hopper_token(),
         build_form,
     )
 }
@@ -786,8 +821,7 @@ fn post_one(
             // 1s, 2s, 4s — brief, since a renew is idempotent and re-runnable.
             std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
         }
-        let mut request = client
-            .post(result_url)
+        let mut request = authed(client.post(result_url))
             .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.clone());
@@ -825,6 +859,39 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    /// `$HOPPER_TOKEN` wins, for callers that inject the token some other
+    /// way; otherwise it comes from `~/.tok/hopper`. A blank env value is not
+    /// a credential and must fall through to the file rather than suppress
+    /// it.
+    #[test]
+    fn hopper_token_precedence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("hopper");
+        std::fs::write(&file, "from-file\n").expect("write token");
+
+        assert_eq!(
+            resolve_hopper_token(Some("from-env"), Some(&file)).as_deref(),
+            Some("from-env"),
+        );
+        assert_eq!(
+            resolve_hopper_token(Some("  "), Some(&file)).as_deref(),
+            Some("from-file"),
+        );
+        assert_eq!(
+            resolve_hopper_token(None, Some(&file)).as_deref(),
+            Some("from-file"),
+        );
+        assert_eq!(
+            resolve_hopper_token(Some(" padded "), None).as_deref(),
+            Some("padded"),
+        );
+        assert_eq!(resolve_hopper_token(None, None), None);
+        assert_eq!(
+            resolve_hopper_token(None, Some(&dir.path().join("absent"))),
+            None,
+        );
+    }
 
     /// The wire body round-trips through zstd back to the exact JSON serde
     /// produced: this is the same shape hopper's `/api/result` decodes, so an fs

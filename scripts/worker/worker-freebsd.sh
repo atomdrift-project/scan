@@ -98,6 +98,24 @@ if ! id -u scan >/dev/null 2>&1; then
 	$SUDO pw useradd scan -m -s /bin/sh -c "Atomdrift Scan Worker"
 fi
 
+# --- Hopper API token --------------------------------------------------------
+#
+# Hopper requires `Authorization: Bearer <token>` on every API route, so a
+# worker without this file cannot claim work. Copied from the deploying user's
+# ~/.tok/hopper — the same file hopper's own deploy installs — into the service
+# account's home, where the worker reads it. Never an argument or an
+# environment variable: argv is visible in ps(1).
+HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
+HOPPER_TOKEN_DST="/home/scan/.tok/hopper"
+if [ -s "$HOPPER_TOKEN_SRC" ]; then
+	$SUDO install -d -m 0700 -o scan -g scan /home/scan/.tok
+	$SUDO install -m 0600 -o scan -g scan "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
+	log "Installed hopper API token at $HOPPER_TOKEN_DST"
+elif ! $SUDO test -s "$HOPPER_TOKEN_DST"; then
+	# Not fatal: a hopper deployed without --token-file needs no client token.
+	log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; this worker cannot claim work from an authenticated hopper"
+fi
+
 # --- Binary -----------------------------------------------------------------
 
 binary_changed=0

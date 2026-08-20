@@ -1,25 +1,48 @@
-//! Per-route IP ACL for the litmus HTTP API.
+//! Per-request access control for the litmus HTTP API: a peer-IP ACL, and
+//! bearer-token authentication when `--token-file` is set.
 //!
-//! Loopback connections are allowed unconditionally. The `/analyze-path`
-//! endpoint can read any file under `--allowed-dirs` and is therefore
-//! restricted to loopback at the transport layer regardless of `--allow-cidr`
-//! — exposing it to the network would let any allowed peer turn the server
-//! into a remote file-read primitive. All other routes accept loopback OR
-//! any peer matching one of the configured `--allow-cidr` networks.
+//! Two gates run in order on every request:
+//!
+//! 1. **Peer IP.** Loopback connections pass. Every other peer must match one
+//!    of the configured `--allow-cidr` networks, and may never reach a
+//!    [`LOOPBACK_ONLY_ROUTES`] entry.
+//! 2. **Bearer token.** When a token is configured, every route except
+//!    [`HEALTH_ROUTE`] requires `Authorization: Bearer <token>`. Loopback is
+//!    deliberately *not* exempt: the server is meant to sit behind a
+//!    Cloudflare tunnel, where `cloudflared` runs on the host and dials the
+//!    service over loopback, so every remote request arrives with a loopback
+//!    peer address. Exempting loopback would exempt the entire internet.
+//!
+//! That same property makes [`LOOPBACK_ONLY_ROUTES`] defence in depth rather
+//! than a guarantee: behind a tunnel, "loopback" means "local *or* tunnelled".
+//! `/analyze-path` stays on that list, but the real protection is an empty
+//! `--allowed-dirs`, which makes it reject every request.
+//!
+//! Requests clearing both gates carry a [`Trusted`] marker, which handlers use
+//! to decide whether a response may include privileged diagnostic detail.
+//!
+//! Every response — pass or reject — is tagged with the [`Auth`] decision that
+//! produced it, which [`access_log`](super::access::access_log) turns into the
+//! `auth=` field of that request's one access line. This module therefore logs
+//! nothing itself: a rejection is a normal, expected outcome, and it belongs in
+//! the traffic record rather than in a warning of its own.
 //!
 //! CIDR matching is hand-rolled (no extra crate dependency) and supports
 //! both IPv4 and IPv6.
 
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
+use sha2::{Digest, Sha256};
 
 use super::AppState;
+use super::access::Auth;
 
 /// A single CIDR network parsed from `--allow-cidr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +120,80 @@ fn normalize(ip: IpAddr) -> IpAddr {
     ip
 }
 
+/// Shortest token accepted from `--token-file`. A short secret in front of a
+/// public tunnel is brute-forceable; the deploy scripts generate 64 hex
+/// characters.
+const MIN_TOKEN_LEN: usize = 16;
+
+/// SHA-256 of the bearer token the server requires.
+///
+/// The plaintext token is hashed at construction and never stored, so it
+/// cannot surface in a log line, a `Debug` dump, or a core file. `Debug`
+/// redacts the digest as well: it is preimage-resistant, but there is no
+/// reason to print it either.
+#[derive(Clone, Copy)]
+pub struct TokenDigest([u8; 32]);
+
+impl TokenDigest {
+    /// Hash a token read from `--token-file`.
+    ///
+    /// # Errors
+    /// Returns an error if the token is shorter than [`MIN_TOKEN_LEN`] bytes.
+    pub fn new(token: &str) -> Result<Self, String> {
+        let len = token.len();
+        if len < MIN_TOKEN_LEN {
+            return Err(format!(
+                "token is {len} bytes; at least {MIN_TOKEN_LEN} required"
+            ));
+        }
+        Ok(Self(Sha256::digest(token.as_bytes()).into()))
+    }
+
+    /// Whether `presented` is the token this digest was built from.
+    ///
+    /// Both sides are hashed and the digests compared without an early exit,
+    /// so neither the expected token's length nor a shared prefix is
+    /// observable in the response time.
+    fn matches(&self, presented: &[u8]) -> bool {
+        let presented: [u8; 32] = Sha256::digest(presented).into();
+        let mut diff = 0u8;
+        for (expected, actual) in self.0.iter().zip(presented.iter()) {
+            diff |= expected ^ actual;
+        }
+        diff == 0
+    }
+}
+
+impl fmt::Debug for TokenDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TokenDigest(<redacted>)")
+    }
+}
+
+/// The credential from an `Authorization: Bearer <token>` header.
+///
+/// The scheme is matched case-insensitively (RFC 9110 §11.1); the credential
+/// itself is returned verbatim and compared byte-exactly. Exactly one space
+/// may separate the two, as the grammar requires.
+fn bearer_credential(headers: &HeaderMap) -> Option<&[u8]> {
+    const SCHEME: &[u8] = b"Bearer";
+
+    let value = headers.get(header::AUTHORIZATION)?.as_bytes();
+    let (scheme, rest) = value.split_at_checked(SCHEME.len())?;
+    if !scheme.eq_ignore_ascii_case(SCHEME) {
+        return None;
+    }
+    let credential = rest.strip_prefix(b" ")?;
+    (!credential.is_empty()).then_some(credential)
+}
+
+/// Marker attached to requests allowed to see privileged diagnostic detail:
+/// in-flight sample names, thread counts, orphan counts. Present when the
+/// request carried a valid bearer token — or when authentication is disabled,
+/// which leaves those responses exactly as they were before tokens existed.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Trusted;
+
 /// Routes that may only be reached from loopback regardless of
 /// `--allow-cidr`. `/analyze-path` accepts a server-side path and is gated
 /// against `--allowed-dirs`, but exposing it to the network would still hand
@@ -104,23 +201,53 @@ fn normalize(ip: IpAddr) -> IpAddr {
 /// it loopback-only.
 const LOOPBACK_ONLY_ROUTES: &[&str] = &["/analyze-path"];
 
-fn forbidden(message: &str) -> Response {
+/// The one route reachable without a bearer token, so that load balancers,
+/// tunnel health checks, and monitoring can probe liveness without holding a
+/// credential. A valid token still upgrades the response to the full
+/// diagnostic body; see [`Trusted`].
+pub(super) const HEALTH_ROUTE: &str = "/_/health";
+
+fn forbidden(message: &str, auth: Auth) -> Response {
+    tag(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+        auth,
+    )
+}
+
+/// Record the access decision on the response for the access log to report.
+fn tag(mut response: Response, auth: Auth) -> Response {
+    response.extensions_mut().insert(auth);
+    response
+}
+
+/// 401 for a missing *or* invalid token. The two are deliberately
+/// indistinguishable, so the endpoint cannot be used as an oracle for whether
+/// a guessed token exists.
+fn unauthorized() -> Response {
     (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "error": message })),
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(serde_json::json!({ "error": "missing or invalid bearer token" })),
     )
         .into_response()
 }
 
-/// Per-request peer-IP ACL middleware. Installed via
-/// [`axum::middleware::from_fn_with_state`] in [`super::build_app`].
+/// Per-request access-control middleware: peer-IP ACL, then bearer token.
+/// Installed via [`axum::middleware::from_fn_with_state`] in
+/// [`super::build_app`], outside the body limit, so a rejected request never
+/// gets to upload bytes.
 pub(super) async fn acl(
     State(state): State<Arc<AppState>>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
     let loopback_only = LOOPBACK_ONLY_ROUTES.contains(&path);
+    let auth_exempt = path == HEALTH_ROUTE;
 
     let peer = req
         .extensions()
@@ -131,25 +258,37 @@ pub(super) async fn acl(
     // `run`. Tests inject it manually. If it's missing here in production
     // that's a wiring bug — fail closed rather than allow.
     let Some(ip) = peer else {
-        tracing::error!(path, "ACL: peer ConnectInfo missing — refusing");
-        return forbidden("peer address unavailable");
+        return forbidden("peer address unavailable", Auth::NoPeerInfo);
     };
 
-    if ip.is_loopback() {
-        return next.run(req).await;
+    // Gate 1: peer IP. Loopback passes; anything else needs an --allow-cidr
+    // match and can never reach a loopback-only route.
+    if !ip.is_loopback() {
+        if loopback_only {
+            return forbidden(
+                "this route requires a loopback connection",
+                Auth::LoopbackOnly,
+            );
+        }
+        if !state.allow_cidrs.iter().any(|c| c.contains(ip)) {
+            return forbidden("peer address not in any allow-cidr", Auth::PeerDenied);
+        }
     }
 
-    if loopback_only {
-        tracing::warn!(%ip, path, "ACL: rejected non-loopback access to loopback-only route");
-        return forbidden("this route requires a loopback connection");
+    // Gate 2: bearer token. Loopback is not exempt — see the module docs.
+    let auth = match state.auth_digest {
+        None => Auth::Open,
+        Some(digest) if bearer_credential(req.headers()).is_some_and(|c| digest.matches(c)) => {
+            Auth::Token
+        }
+        Some(_) if auth_exempt => Auth::Anonymous,
+        Some(_) => return tag(unauthorized(), Auth::BadToken),
+    };
+    if auth != Auth::Anonymous {
+        req.extensions_mut().insert(Trusted);
     }
 
-    if state.allow_cidrs.iter().any(|c| c.contains(ip)) {
-        return next.run(req).await;
-    }
-
-    tracing::warn!(%ip, path, "ACL: rejected unauthorized peer");
-    forbidden("peer address not in any allow-cidr")
+    tag(next.run(req).await, auth)
 }
 
 #[cfg(test)]
@@ -227,6 +366,71 @@ mod tests {
     #[test]
     fn list_propagates_error() {
         assert!(parse_cidr_list("10.0.0.0/8,bogus").is_err());
+    }
+
+    fn auth_header(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, value.parse().unwrap());
+        headers
+    }
+
+    const TOKEN: &str = "0123456789abcdef0123";
+
+    #[test]
+    fn token_digest_matches_only_the_exact_token() {
+        let digest = TokenDigest::new(TOKEN).unwrap();
+        assert!(digest.matches(TOKEN.as_bytes()));
+        assert!(!digest.matches(b"0123456789abcdef012"), "prefix");
+        assert!(!digest.matches(b"0123456789abcdef01234"), "extension");
+        assert!(!digest.matches(b"0123456789ABCDEF0123"), "case differs");
+        assert!(!digest.matches(b""));
+    }
+
+    #[test]
+    fn token_digest_rejects_short_tokens() {
+        assert!(TokenDigest::new("").is_err());
+        assert!(TokenDigest::new(&"a".repeat(MIN_TOKEN_LEN - 1)).is_err());
+        assert!(TokenDigest::new(&"a".repeat(MIN_TOKEN_LEN)).is_ok());
+    }
+
+    /// The token must not be recoverable from a log line or a crash dump.
+    #[test]
+    fn token_digest_debug_redacts() {
+        let rendered = format!("{:?}", TokenDigest::new(TOKEN).unwrap());
+        assert_eq!(rendered, "TokenDigest(<redacted>)");
+        assert!(!rendered.contains(TOKEN));
+    }
+
+    #[test]
+    fn parses_bearer_credential() {
+        assert_eq!(
+            bearer_credential(&auth_header("Bearer abc123")),
+            Some(&b"abc123"[..])
+        );
+        // RFC 9110 §11.1: the scheme is case-insensitive.
+        assert_eq!(
+            bearer_credential(&auth_header("bEaReR abc123")),
+            Some(&b"abc123"[..])
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_authorization() {
+        assert!(bearer_credential(&HeaderMap::new()).is_none(), "absent");
+        assert!(bearer_credential(&auth_header("Bearer")).is_none(), "bare");
+        assert!(
+            bearer_credential(&auth_header("Bearer ")).is_none(),
+            "empty"
+        );
+        assert!(bearer_credential(&auth_header("Basic abc123")).is_none());
+        assert!(bearer_credential(&auth_header("Bearerabc123")).is_none());
+        assert!(bearer_credential(&auth_header("abc123")).is_none());
+        // A second space belongs to the credential, not the separator, and so
+        // will not match any token the deploy scripts generate.
+        assert_eq!(
+            bearer_credential(&auth_header("Bearer  abc123")),
+            Some(&b" abc123"[..])
+        );
     }
 
     #[test]

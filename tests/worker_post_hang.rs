@@ -249,9 +249,21 @@ async fn sibling_jobs_complete_while_one_result_post_hangs() {
     let models_dir = PathBuf::from(models_dir);
 
     let data = tempfile::tempdir().expect("temp data dir");
-    let hang = write_sample(data.path(), "samples/hang.txt", b"wedge-me-on-result-post\n");
-    let ok1 = write_sample(data.path(), "samples/ok1.txt", b"sibling-one-should-finish\n");
-    let ok2 = write_sample(data.path(), "samples/ok2.txt", b"sibling-two-should-finish\n");
+    let hang = write_sample(
+        data.path(),
+        "samples/hang.txt",
+        b"wedge-me-on-result-post\n",
+    );
+    let ok1 = write_sample(
+        data.path(),
+        "samples/ok1.txt",
+        b"sibling-one-should-finish\n",
+    );
+    let ok2 = write_sample(
+        data.path(),
+        "samples/ok2.txt",
+        b"sibling-two-should-finish\n",
+    );
     let hang_sha = hang.sha256.clone();
     let expect_posted: HashSet<String> = [ok1.sha256.clone(), ok2.sha256.clone()].into();
     let all_samples = vec![hang.clone(), ok1.clone(), ok2.clone()];

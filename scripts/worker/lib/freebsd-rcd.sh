@@ -92,7 +92,7 @@ scan_worker_precmd()
 	# standalone workers may omit it when they never mirror dependencies.
 	if [ -r "\${scan_worker_env_file}" ]; then
 		. "\${scan_worker_env_file}"
-		export HOPPER_UPLOAD_TOKEN
+		export HOPPER_TOKEN
 	fi
 }
 # MALLOC_CONF tunes FreeBSD's jemalloc to return freed memory to the OS

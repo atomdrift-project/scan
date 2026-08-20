@@ -14,8 +14,19 @@
 #
 # Usage: ./server-linux.sh
 #
+# The API requires a bearer token. The token is read from ~/.tok/scan on this
+# host — generated on first deploy if absent — and installed into the service
+# account's own ~/.tok/scan, which the unit reads at startup. It never passes
+# through the command line, the environment, or the unit file. Clients send it
+# as `Authorization: Bearer <token>`; only /_/health is exempt. Rotate by
+# editing ~/.tok/scan and redeploying.
+#
 # Environment overrides:
-#   BIND        listen address (--bind)                          (default: 0.0.0.0:49999)
+#   TOKEN_SRC   token file to install (empty disables authentication)
+#                                                                (default: ~/.tok/scan)
+#   BIND        listen address (--bind)                          (default: 127.0.0.1:49999,
+#                                                                 i.e. reachable only through
+#                                                                 a local tunnel or proxy)
 #   ALLOW_CIDR  extra CIDR allow-list (--allow-cidr); empty skips the flag
 #                                                                (default: 10.0.0.0/8)
 #   WORKERS     concurrency (--workers)                          (default: server auto)
@@ -28,6 +39,14 @@
 #                                                                 `openrouter` → https://openrouter.ai/api/v1)
 #   LLM_MODEL      pinned model (SCAN_LLM_MODEL); required for OpenRouter
 #   SCAN_LLM_KEY   OpenRouter key if ~/.tok/openrouter is absent
+#   CLOUDFLARED    Cloudflare Tunnel: "auto" installs and supervises cloudflared
+#                  only when CF_TUNNEL_TOKEN is passed or a token from an
+#                  earlier deploy is on disk, so a host reached over the LAN
+#                  needs no extra flags. 1 requires it, 0 skips it even with a
+#                  token present.                                (default: auto)
+#   CF_TUNNEL_TOKEN       tunnel token; needed once, then stored
+#   CF_TUNNEL_TOKEN_FILE  where it is stored
+#                                          (default: /etc/atomdrift/scan/cloudflared-token)
 
 set -eu
 
@@ -38,10 +57,17 @@ BIN_PATH=/usr/local/bin/${BINARY}
 STATE_HOME=/var/lib/atomdrift/scan
 UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
-# `BIND:-` / `MEMORY_MAX:-` treat empty as unset. `ALLOW_CIDR-` (no colon) keeps
-# an explicit empty so operators can disable the CIDR flag with ALLOW_CIDR=.
-BIND="${BIND:-0.0.0.0:49999}"
+# `BIND:-` / `MEMORY_MAX:-` treat empty as unset. `ALLOW_CIDR-` / `TOKEN_SRC-`
+# (no colon) keep an explicit empty, so operators can disable the CIDR flag with
+# ALLOW_CIDR= and — deliberately, on a host they trust — authentication with
+# TOKEN_SRC=.
+#
+# BIND defaults to loopback: the intended exposure is a Cloudflare tunnel (or
+# another local proxy) terminating on this host. Set BIND=0.0.0.0:49999 to
+# listen on every interface, and pair it with ALLOW_CIDR.
+BIND="${BIND:-127.0.0.1:49999}"
 ALLOW_CIDR="${ALLOW_CIDR-10.0.0.0/8}"
+TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/scan}"
 WORKERS="${WORKERS:-}"
 ALLOWED_DIRS="${ALLOWED_DIRS:-}"
 HOPPER="${HOPPER:-}"
@@ -53,6 +79,8 @@ if [ -z "${LLM:-}" ] && [ -n "${LLM_URL:-}" ]; then
 fi
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-}}"
+CLOUDFLARED="${CLOUDFLARED:-auto}"
+CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE:-/etc/atomdrift/scan/cloudflared-token}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
@@ -205,8 +233,45 @@ fi
 # systemd re-asserts ownership/mode on each start via StateDirectory=.
 $SUDO install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}"
 
-# OpenRouter: the unit runs as `scan` with ProtectHome=true and HOME under
-# StateDirectory, so copy the operator key into the service home.
+# The unit runs as `scan` with ProtectHome=true and HOME under StateDirectory,
+# so operator secrets are copied into the service account's own ~/.tok.
+$SUDO install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}/.tok"
+
+# --- API token --------------------------------------------------------------
+#
+# Installed as a file, never as an argument or an Environment= line: argv is
+# world-readable through ps(1), and unit files are world-readable in
+# /etc/systemd/system. Redeploying with no source token keeps the installed
+# one, so a redeploy can never silently drop authentication.
+#
+# The token is never held in a shell variable — only paths are — so it cannot
+# leak through a trace or an error message.
+TOKEN_DST="${STATE_HOME}/.tok/scan"
+token_changed=0
+if [ -n "${TOKEN_SRC}" ]; then
+    if [ ! -s "${TOKEN_SRC}" ] && ! $SUDO test -s "${TOKEN_DST}"; then
+        (umask 077; mkdir -p "$(dirname "${TOKEN_SRC}")")
+        (umask 077; { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; echo; } \
+            > "${TOKEN_SRC}")
+        [ -s "${TOKEN_SRC}" ] || die "failed to generate a token at ${TOKEN_SRC}"
+        log "Generated an API token at ${TOKEN_SRC}"
+        log "  clients: curl -H \"Authorization: Bearer \$(cat ${TOKEN_SRC})\" ..."
+    fi
+    if [ -s "${TOKEN_SRC}" ]; then
+        # cmp compares paths, not contents on the command line. A changed token
+        # must force a restart below: the server reads it once, at startup, so
+        # installing a rotated token without one leaves the old token live.
+        $SUDO cmp -s "${TOKEN_SRC}" "${TOKEN_DST}" 2>/dev/null || token_changed=1
+        $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+            "${TOKEN_SRC}" "${TOKEN_DST}"
+    fi
+    $SUDO test -s "${TOKEN_DST}" || die "no API token at ${TOKEN_DST}"
+    [ "$token_changed" -eq 1 ] && log "API token installed at ${TOKEN_DST}"
+else
+    log "TOKEN_SRC is empty — deploying an UNAUTHENTICATED server"
+fi
+
+# OpenRouter: copy the operator key into the service home as well.
 openrouter_target() {
     case "$LLM" in
         openrouter|https://openrouter.ai/*|http://openrouter.ai/*) return 0 ;;
@@ -215,7 +280,6 @@ openrouter_target() {
 }
 if openrouter_target; then
     [ -n "$LLM_MODEL" ] || die "OpenRouter deploy requires LLM_MODEL= (e.g. qwen/qwen3.8-27b)"
-    $SUDO install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME}/.tok"
     dst="${STATE_HOME}/.tok/openrouter"
     src="${HOME}/.tok/openrouter"
     if [ -n "${SCAN_LLM_KEY:-}" ]; then
@@ -263,6 +327,11 @@ if [ -n "${ALLOWED_DIRS}" ]; then
 fi
 if [ -n "${HOPPER}" ]; then
     exec_args="${exec_args} --hopper ${HOPPER}"
+fi
+# Pass the path, never the token. atomscan refuses to start if the file is
+# missing or empty, so a lost token fails loudly instead of opening the API.
+if [ -n "${TOKEN_SRC}" ]; then
+    exec_args="${exec_args} --token-file %S/atomdrift/scan/.tok/scan"
 fi
 
 # --- Unit -------------------------------------------------------------------
@@ -378,5 +447,36 @@ else
 fi
 
 $SUDO systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+
+# --- Cloudflare Tunnel (optional) -------------------------------------------
+#
+# Started only after the server is up: a connector that advertises an origin
+# which is not yet serving hands Cloudflare a 502 window on every deploy.
+case "$CLOUDFLARED" in
+    0|no|NO) want_tunnel=0 ;;
+    auto)
+        want_tunnel=0
+        if [ -n "${CF_TUNNEL_TOKEN:-}" ] || $SUDO test -s "${CF_TUNNEL_TOKEN_FILE}"; then
+            want_tunnel=1
+        fi
+        ;;
+    *) want_tunnel=1 ;;
+esac
+
+if [ "$want_tunnel" -eq 1 ]; then
+    log "Deploying Cloudflare Tunnel"
+    CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE}" \
+        ./scripts/server/cloudflared-linux.sh "http://127.0.0.1:${BIND##*:}"
+else
+    log "Skipping Cloudflare Tunnel (CLOUDFLARED=${CLOUDFLARED})"
+fi
+
 log "Deployment complete"
 log "Health: curl -sS http://127.0.0.1:${BIND##*:}/_/health"
+if [ -n "${TOKEN_SRC}" ]; then
+    log "API:    curl -sS -H \"Authorization: Bearer \$(cat ${TOKEN_SRC})\" \\"
+    log "             -F file=@sample.bin http://127.0.0.1:${BIND##*:}/analyze"
+fi
+if [ "$want_tunnel" -eq 1 ]; then
+    log "Tunnel: systemctl status scan-tunnel"
+fi

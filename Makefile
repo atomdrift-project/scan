@@ -169,9 +169,17 @@ deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes rollout-basti
 
 deploy: deploy-server
 
+# Cloudflare Tunnel for the server. "auto" installs and supervises a connector
+# only when CF_TUNNEL_TOKEN is passed or a token from an earlier deploy is on
+# disk, so a server reached over the LAN needs no extra flags; 0 skips it, 1
+# requires it. CF_TUNNEL_TOKEN is read from the environment, never from here,
+# so the token stays out of the repository and out of ps(1) on the deploy host.
+CLOUDFLARED ?= auto
+
 # Long-lived `atomscan serve`. FreeBSD: Bastille build+run jails. Linux: native
 # systemd unit (`scan.service`). Override BIND=, ALLOW_CIDR=, LLM= / LLM_URL=,
-# LLM_MODEL=, MEMORY_MAX= (see scripts/server/server-linux.sh).
+# LLM_MODEL=, MEMORY_MAX=, CLOUDFLARED= (see scripts/server/server-linux.sh).
+deploy-server: export CLOUDFLARED := $(CLOUDFLARED)
 deploy-server:
 	git pull
 	@case "$$(uname -s)" in \

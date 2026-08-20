@@ -1,0 +1,459 @@
+//! Single-flight de-duplication of concurrent identical analyses.
+//!
+//! Two clients asking about the same artifact should cost one analysis, not
+//! two. Beamline already collapses duplicate lookups, but only within one
+//! Worker isolate: it runs many, and a client that retries after a `202`
+//! usually lands on a different one, so the same sha can arrive here several
+//! times while the first analysis is still running. Each duplicate would take a
+//! slot of its own and push the server toward `429 At capacity` for work it is
+//! already doing.
+//!
+//! The first request for a key *leads*: it runs the analysis in a detached task
+//! and publishes the outcome. Later requests *follow* — they take no slot and
+//! wait for that same outcome. Because the analysis outlives any one request,
+//! the leader hanging up no longer abandons the followers. Cancellation is
+//! driven by the attachment count instead, so work stops only once nobody is
+//! left to receive it.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use axum::http::StatusCode;
+use tokio::sync::watch;
+
+use crate::engine::ScanResult;
+
+/// What makes two requests the same piece of work.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum FlightKey {
+    /// Lowercase hex SHA-256 of the uploaded bytes, plus the sanitized upload
+    /// filename — `POST /analyze`.
+    ///
+    /// The name is part of the identity, not decoration: cleave detects file
+    /// type from the extension, so the same bytes staged as `readme.txt` and
+    /// as `package.json` are two different analyses with two different
+    /// verdicts. Keying on the digest alone would let whichever request
+    /// happened to lead decide the answer everyone else receives — a way to
+    /// pick another client's verdict by racing it with a benign-looking name
+    /// — and would hand followers the leader's filename in the report's
+    /// `path`.
+    Sha { sha: String, name: String },
+    /// Package URL — `POST /analyze-purl`.
+    Purl(String),
+}
+
+impl fmt::Display for FlightKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sha { sha, name } => write!(f, "sha:{sha} name:{name}"),
+            Self::Purl(purl) => write!(f, "purl:{purl}"),
+        }
+    }
+}
+
+/// The finished analysis, shared by every request attached to a flight.
+#[derive(Debug)]
+pub(super) enum Outcome {
+    /// A completed report. Each waiter serializes it through
+    /// [`ScanResult::envelope_ref`], which borrows the cleave report rather
+    /// than cloning it — the report can be hundreds of kilobytes.
+    Report(Box<ScanResult>),
+    /// Anything that ends in an error response. `anyhow::Error` is not `Clone`,
+    /// so a failure, a timeout, or a panic is rendered to its status and body
+    /// once by the leader and replayed to every follower.
+    Rendered {
+        /// Status the waiters should return.
+        status: StatusCode,
+        /// JSON body the waiters should return.
+        body: serde_json::Value,
+    },
+}
+
+impl Outcome {
+    /// An error response that every waiter replays.
+    pub(super) fn rendered(status: StatusCode, message: impl Into<String>) -> Self {
+        Self::Rendered {
+            status,
+            body: serde_json::json!({ "error": message.into() }),
+        }
+    }
+
+    /// The outcome published when a leader's task dies without producing one.
+    /// Without it every follower would wait out its own client timeout.
+    fn abandoned() -> Self {
+        Self::Rendered {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: serde_json::json!({ "error": "analysis did not complete" }),
+        }
+    }
+}
+
+/// One analysis that concurrent identical requests share.
+#[derive(Debug)]
+pub(super) struct Flight {
+    key: FlightKey,
+    /// Raised when the last attachment goes away; cleave polls it and stops.
+    cancellation: Arc<AtomicBool>,
+    /// Holds `None` until the analysis finishes.
+    outcome: watch::Sender<Option<Arc<Outcome>>>,
+}
+
+impl Flight {
+    fn new(key: FlightKey) -> Self {
+        let (outcome, _) = watch::channel(None);
+        Self {
+            key,
+            cancellation: Arc::new(AtomicBool::new(false)),
+            outcome,
+        }
+    }
+
+    /// The key this analysis is shared under.
+    pub(super) const fn key(&self) -> &FlightKey {
+        &self.key
+    }
+
+    /// Cancellation flag for the analysis, polled by cleave at its checkpoints.
+    pub(super) fn cancellation(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancellation)
+    }
+
+    /// Wait for the analysis to finish.
+    pub(super) async fn wait(&self) -> Arc<Outcome> {
+        let mut rx = self.outcome.subscribe();
+        loop {
+            let settled = rx.borrow_and_update().clone();
+            if let Some(outcome) = settled {
+                return outcome;
+            }
+            if rx.changed().await.is_err() {
+                // The sender lives in this `Flight`, which the caller holds
+                // through its attachment, so this is unreachable in practice.
+                return Arc::new(Outcome::abandoned());
+            }
+        }
+    }
+}
+
+/// Registry of analyses currently in progress.
+#[derive(Debug, Default)]
+pub(super) struct Flights {
+    /// Attachment counts live inside the map so that joining and leaving are
+    /// atomic with respect to each other: a flight cannot gain a follower
+    /// between its count reaching zero and its removal.
+    live: Mutex<HashMap<FlightKey, Live>>,
+}
+
+#[derive(Debug)]
+struct Live {
+    flight: Arc<Flight>,
+    attached: usize,
+}
+
+/// A poisoned lock here means a panic happened while the map was borrowed. The
+/// map is only ever inserted into and removed from under this lock, so there is
+/// no half-updated invariant to recover from and the data stays usable.
+fn lock(live: &Mutex<HashMap<FlightKey, Live>>) -> MutexGuard<'_, HashMap<FlightKey, Live>> {
+    live.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Flights {
+    /// Attach to the analysis for `key`, starting one if it is not already
+    /// running. The returned [`Attachment`] detaches on drop.
+    pub(super) fn join(self: &Arc<Self>, key: FlightKey) -> Attachment {
+        let mut live = lock(&self.live);
+        let (flight, leader) = match live.get_mut(&key) {
+            Some(entry) => {
+                entry.attached += 1;
+                (Arc::clone(&entry.flight), false)
+            }
+            None => {
+                let flight = Arc::new(Flight::new(key.clone()));
+                live.insert(
+                    key,
+                    Live {
+                        flight: Arc::clone(&flight),
+                        attached: 1,
+                    },
+                );
+                (flight, true)
+            }
+        };
+        drop(live);
+        Attachment {
+            flights: Arc::clone(self),
+            flight,
+            leader,
+        }
+    }
+
+    /// Hand the leader the sole right to publish this flight's outcome.
+    pub(super) fn publisher(self: &Arc<Self>, flight: &Arc<Flight>) -> Publisher {
+        Publisher {
+            flights: Arc::clone(self),
+            flight: Arc::clone(flight),
+            published: false,
+        }
+    }
+
+    /// Snapshot how much work de-duplication is saving right now.
+    pub(super) fn census(&self) -> Census {
+        let live = lock(&self.live);
+        let census = Census {
+            analyses: live.len(),
+            attached: live.values().map(|entry| entry.attached).sum(),
+        };
+        drop(live);
+        census
+    }
+
+    /// Retire `flight` and wake everyone waiting on it.
+    fn finish(&self, flight: &Arc<Flight>, outcome: Outcome) {
+        let mut live = lock(&self.live);
+        // Only retire our own flight: if it was already retired, a later
+        // request may have started a fresh one under the same key.
+        if live
+            .get(flight.key())
+            .is_some_and(|entry| Arc::ptr_eq(&entry.flight, flight))
+        {
+            live.remove(flight.key());
+        }
+        drop(live);
+        // `send_replace` stores the value even with no receivers attached yet,
+        // so a follower that subscribes a moment later still sees it.
+        let _ = flight.outcome.send_replace(Some(Arc::new(outcome)));
+    }
+}
+
+/// How many analyses are running and how many requests are riding them. The
+/// gap between the two is work that is not being repeated.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Census {
+    /// Distinct analyses in progress.
+    pub(super) analyses: usize,
+    /// Requests attached to them — at least one apiece.
+    pub(super) attached: usize,
+}
+
+/// One request's claim on a flight. Dropping it detaches; when the last
+/// attachment goes, the analysis is cancelled, because nobody is left to
+/// receive it.
+#[derive(Debug)]
+pub(super) struct Attachment {
+    flights: Arc<Flights>,
+    flight: Arc<Flight>,
+    leader: bool,
+}
+
+impl Attachment {
+    /// True for the one request that must run the analysis.
+    pub(super) const fn leads(&self) -> bool {
+        self.leader
+    }
+
+    /// The shared analysis this request is attached to.
+    pub(super) const fn flight(&self) -> &Arc<Flight> {
+        &self.flight
+    }
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        let mut live = lock(&self.flights.live);
+        let key = self.flight.key();
+        let emptied = match live.get_mut(key) {
+            // A later request may have started a fresh flight under this key
+            // after ours retired; its count is none of our business.
+            Some(entry) if Arc::ptr_eq(&entry.flight, &self.flight) => {
+                entry.attached -= 1;
+                entry.attached == 0
+            }
+            _ => return,
+        };
+        if emptied {
+            live.remove(key);
+        }
+        drop(live);
+        if emptied {
+            self.flight.cancellation.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// The leader's sole right to publish a flight's outcome.
+///
+/// If it is dropped without publishing — the analysis task panicked, or the
+/// runtime shut down under it — an internal-error outcome goes out instead, so
+/// followers get an answer rather than waiting out their own timeouts.
+#[derive(Debug)]
+pub(super) struct Publisher {
+    flights: Arc<Flights>,
+    flight: Arc<Flight>,
+    published: bool,
+}
+
+impl Publisher {
+    /// Publish the analysis outcome to every attached request.
+    pub(super) fn publish(mut self, outcome: Outcome) {
+        self.flights.finish(&self.flight, outcome);
+        self.published = true;
+    }
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        if !self.published {
+            self.flights.finish(&self.flight, Outcome::abandoned());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> FlightKey {
+        FlightKey::Sha {
+            sha: "a".repeat(64),
+            name: "sample.zip".into(),
+        }
+    }
+
+    fn rendered(status: StatusCode) -> Outcome {
+        Outcome::Rendered {
+            status,
+            body: serde_json::json!({ "error": "x" }),
+        }
+    }
+
+    fn status_of(outcome: &Outcome) -> Option<StatusCode> {
+        match outcome {
+            Outcome::Rendered { status, .. } => Some(*status),
+            Outcome::Report(_) => None,
+        }
+    }
+
+    #[test]
+    fn first_request_leads_and_the_rest_follow() {
+        let flights = Arc::new(Flights::default());
+        let leader = flights.join(key());
+        let follower = flights.join(key());
+        assert!(leader.leads());
+        assert!(!follower.leads());
+        assert!(Arc::ptr_eq(leader.flight(), follower.flight()));
+        assert_eq!(flights.census().analyses, 1);
+    }
+
+    /// The same bytes under a different name are a different analysis: cleave
+    /// types the file by its extension, so sharing across names would answer
+    /// one request with another request's verdict.
+    #[test]
+    fn the_same_bytes_under_another_name_do_not_share() {
+        let flights = Arc::new(Flights::default());
+        let zip = flights.join(key());
+        let txt = flights.join(FlightKey::Sha {
+            sha: "a".repeat(64),
+            name: "sample.txt".into(),
+        });
+        assert!(zip.leads());
+        assert!(txt.leads(), "a new name must run its own analysis");
+        assert_eq!(flights.census().analyses, 2);
+    }
+
+    #[test]
+    fn a_different_key_is_a_different_flight() {
+        let flights = Arc::new(Flights::default());
+        let a = flights.join(key());
+        let b = flights.join(FlightKey::Purl("pkg:npm/left-pad@1.3.0".into()));
+        assert!(a.leads());
+        assert!(b.leads());
+        assert_eq!(flights.census().analyses, 2);
+    }
+
+    #[test]
+    fn the_last_request_to_leave_cancels_the_analysis() {
+        let flights = Arc::new(Flights::default());
+        let leader = flights.join(key());
+        let follower = flights.join(key());
+        let flight = Arc::clone(leader.flight());
+        let cancellation = flight.cancellation();
+
+        // The leader hanging up must not stop work the follower still wants.
+        drop(leader);
+        assert!(!cancellation.load(Ordering::Acquire));
+        assert_eq!(flights.census().analyses, 1);
+
+        drop(follower);
+        assert!(cancellation.load(Ordering::Acquire));
+        assert_eq!(flights.census().analyses, 0);
+    }
+
+    #[test]
+    fn a_retired_flight_is_not_rejoined() {
+        let flights = Arc::new(Flights::default());
+        let first = flights.join(key());
+        flights
+            .publisher(first.flight())
+            .publish(rendered(StatusCode::OK));
+        assert_eq!(flights.census().analyses, 0);
+
+        // The next request starts fresh rather than attaching to a finished run.
+        let second = flights.join(key());
+        assert!(second.leads());
+        assert!(!Arc::ptr_eq(first.flight(), second.flight()));
+
+        // Dropping the retired attachment must not disturb the new flight.
+        drop(first);
+        assert_eq!(flights.census().analyses, 1);
+        assert!(!second.flight().cancellation().load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn followers_receive_the_leader_s_outcome() {
+        let flights = Arc::new(Flights::default());
+        let leader = flights.join(key());
+        let follower = flights.join(key());
+
+        flights
+            .publisher(leader.flight())
+            .publish(rendered(StatusCode::UNSUPPORTED_MEDIA_TYPE));
+
+        for attachment in [&leader, &follower] {
+            let outcome = attachment.flight().wait().await;
+            assert_eq!(
+                status_of(&outcome),
+                Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_leader_that_dies_still_answers_its_followers() {
+        let flights = Arc::new(Flights::default());
+        let leader = flights.join(key());
+        let follower = flights.join(key());
+
+        // Task died before publishing: the guard speaks for it.
+        drop(flights.publisher(leader.flight()));
+
+        let outcome = follower.flight().wait().await;
+        assert_eq!(status_of(&outcome), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[tokio::test]
+    async fn a_follower_that_subscribes_late_still_sees_the_outcome() {
+        let flights = Arc::new(Flights::default());
+        let leader = flights.join(key());
+        let follower = flights.join(key());
+
+        flights
+            .publisher(leader.flight())
+            .publish(rendered(StatusCode::OK));
+
+        // Nobody was awaiting `wait()` when the outcome landed.
+        let outcome = follower.flight().wait().await;
+        assert_eq!(status_of(&outcome), Some(StatusCode::OK));
+    }
+}
