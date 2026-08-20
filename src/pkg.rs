@@ -48,6 +48,22 @@ pub fn run_pkg(purl: &str, config: &ScanConfig) -> Result<ScanSummary> {
 
 fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
     let progress = matches!(config.format(), OutputFormat::Terminal);
+    // A raw URL usually still names a package: a registry tarball URL maps back
+    // onto its coordinate. Recover it so `scan url
+    // https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz` gets the same
+    // registry record, provenance, and package-scope composites as the
+    // equivalent `scan purl` — it is the same artifact either way, and which
+    // spelling the operator reached for should not change what we know about
+    // it, or what hopper stores it as.
+    let derived_purl = match &locator {
+        RefLocator::Url(url) => fletch::purl::url_to_purl(url).map(RefLocator::Purl),
+        _ => None,
+    };
+    // Used for the registry lookup only. Everything downstream — the fetch, the
+    // bloom gate, the unpublished-version shortcut — stays keyed on what was
+    // actually asked for: a URL must still be fetched from that URL, even when
+    // the package it belongs to has since been pulled from the registry.
+    let registry_locator = derived_purl.as_ref().unwrap_or(&locator);
     // For a known package system, look up the registry's account of the package
     // (age, author, popularity, deprecation) and print the one-line summary. The
     // record itself is grafted into the artifact's report below as a `registry`
@@ -55,7 +71,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
     // any other file — rather than scanned as a disconnected side report, so a
     // `scope: package` composite can correlate the registry's account with the
     // artifact's own behavior.
-    let (registry, registry_sources) = crate::fetch::registry_with_sources(&locator);
+    let (registry, registry_sources) = crate::fetch::registry_with_sources(registry_locator);
     let registry_provenance = registry.clone().map(|record| {
         crate::provenance::RegistryProvenance::from_record_sources(record, &registry_sources)
     });
@@ -66,6 +82,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
         // was, skip the doomed tarball fetch entirely and scan the registry
         // record directly. No extra lookup, no wasted 404 round-trip.
         if reg.version_removed == Some(true)
+            && matches!(locator, RefLocator::Purl(_))
             && let Some((name, bytes)) = crate::fetch::registry_document(reg)
         {
             if progress {

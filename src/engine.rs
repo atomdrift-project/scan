@@ -689,6 +689,105 @@ mod envelope_tests {
         ));
     }
 
+    /// A fetched package carries its locator to the uploader; a fetched URL and
+    /// a local path carry none, because neither names a package. The verdict's
+    /// identity and the sidecar's package slot read the same rule.
+    #[test]
+    fn fetched_purl_is_only_a_package_locator() {
+        // Built from JSON rather than a struct literal: FetchRecord has a
+        // dozen fields this rule does not read, and listing them here would
+        // make the test break on every unrelated field added to it.
+        let record = |locator: &str| {
+            serde_json::from_value::<fletch::fetch::FetchRecord>(serde_json::json!({
+                "locator": locator,
+                "fetched_at": 0,
+                "cached": false,
+                "outcome": "ok",
+            }))
+            .expect("FetchRecord from locator alone")
+        };
+        assert_eq!(
+            fetched_purl(Some(&record("pkg:npm/left-pad@1.3.0"))),
+            Some("pkg:npm/left-pad@1.3.0"),
+        );
+        assert_eq!(
+            fetched_purl(Some(&record("https://example.com/a.tgz"))),
+            None
+        );
+        assert_eq!(fetched_purl(None), None);
+
+        // The logged identity recovers a package from a registry URL too, so a
+        // `scan url` of a tarball reports what a reader recognises. An
+        // arbitrary URL still identifies nothing.
+        assert_eq!(
+            artifact_purl(Some(&record(
+                "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+            ))),
+            Some("pkg:npm/left-pad@1.3.0".to_string()),
+        );
+        assert_eq!(
+            artifact_purl(Some(&record("pkg:npm/left-pad@1.3.0"))),
+            Some("pkg:npm/left-pad@1.3.0".to_string()),
+        );
+        assert_eq!(
+            artifact_purl(Some(&record("https://example.com/a.tgz"))),
+            None
+        );
+        assert_eq!(artifact_purl(None), None);
+    }
+
+    /// The sidecar hopper stores binds the package a URL-fetched artifact
+    /// belongs to, so `scan url <registry tarball>` and the equivalent `scan
+    /// purl` deposit the same identity rather than one bound row and one
+    /// anonymous one.
+    #[test]
+    fn collect_upload_artifacts_binds_a_recovered_package() {
+        let fetch = |locator: &str, url: &str| {
+            serde_json::from_value::<fletch::fetch::FetchRecord>(serde_json::json!({
+                "locator": locator,
+                "resolved_url": url,
+                "fetched_at": 0,
+                "cached": false,
+                "outcome": "ok",
+            }))
+            .expect("FetchRecord")
+        };
+        let package_of = |rec: &fletch::fetch::FetchRecord| {
+            let arts = collect_upload_artifacts(
+                Path::new("ignored"),
+                &"a".repeat(64),
+                10,
+                "t",
+                None,
+                Some(rec),
+            );
+            let sidecar: serde_json::Value =
+                serde_json::from_slice(&arts[0].sidecar).expect("sidecar json");
+            sidecar["package"].clone()
+        };
+
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        assert_eq!(
+            package_of(&fetch(url, url))["purl"],
+            serde_json::json!("pkg:npm/left-pad@1.3.0"),
+            "a registry URL is stored under the package it names",
+        );
+        assert_eq!(
+            package_of(&fetch("pkg:npm/left-pad@1.3.0", url))["purl"],
+            serde_json::json!("pkg:npm/left-pad@1.3.0"),
+            "and matches what the PURL spelling stores",
+        );
+        // A URL that names no package must not acquire an invented identity.
+        assert!(
+            package_of(&fetch(
+                "https://example.com/a.tgz",
+                "https://example.com/a.tgz"
+            ))
+            .is_null(),
+            "no package slot without a package",
+        );
+    }
+
     #[test]
     fn collect_upload_artifacts_offers_root_only() {
         // Fetched dependencies are mirrored separately (bytes + provenance + their
@@ -2494,7 +2593,10 @@ pub(crate) fn upload_scan_result(
             envelope.ml.analyzed_at.clone(),
         );
     }
-    uploader.submit(sha256, envelope);
+    // `scan purl` names a package outright and a registry URL still identifies
+    // one; a local path or an arbitrary URL identifies nothing, and the
+    // uploader names those by digest alone.
+    uploader.submit(sha256, artifact_purl(root_fetch), envelope);
 }
 
 /// Feature-extract and model-score a report's embedded files — the archive
@@ -2712,6 +2814,37 @@ pub(crate) fn dep_envelope(
 /// locally-analyzed file hopper has never seen. Just the one artifact — fetched
 /// dependencies are mirrored separately (bytes, provenance, *and* verdict) by
 /// [`crate::upload::Uploader::submit_dependencies`], so they never ride here.
+/// The package locator an artifact was fetched as, when it was fetched by one.
+///
+/// A fetch record's locator is either a PURL or a plain URL, and only the
+/// former is a package identity. Shared by the sidecar's package slot — which
+/// hopper projects into its queryable `purl_base` column — and by the verdict
+/// handed to the uploader, so the bytes and the verdict can never disagree
+/// about what this artifact is.
+fn fetched_purl(root_fetch: Option<&fletch::fetch::FetchRecord>) -> Option<&str> {
+    root_fetch
+        .map(|rec| rec.locator.as_str())
+        .filter(|locator| locator.starts_with("pkg:"))
+}
+
+/// The package an artifact *is*, as far as anything here can tell.
+///
+/// Broader than [`fetched_purl`], which asks only whether the *request* named a
+/// package. This also recovers the coordinate from a registry URL, because
+/// `scan url https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz` is a
+/// request about a package whether or not it was spelled as one — and hopper
+/// should store it under that package either way, or the same artifact lands
+/// twice depending on which spelling the operator reached for.
+///
+/// Feeds both the sidecar's package slot — which hopper projects into its
+/// queryable `purl_base` column — and the identity the uploader logs.
+fn artifact_purl(root_fetch: Option<&fletch::fetch::FetchRecord>) -> Option<String> {
+    if let Some(purl) = fetched_purl(root_fetch) {
+        return Some(purl.to_string());
+    }
+    fletch::purl::url_to_purl(&root_fetch?.locator)
+}
+
 fn collect_upload_artifacts(
     file_path: &Path,
     sha256: &str,
@@ -2729,21 +2862,17 @@ fn collect_upload_artifacts(
     // sidecar's fetch slot, and — when the locator is a PURL — the package slot
     // hopper projects into its queryable purl_base column. A local `scan path`
     // root reads from disk and claims none of the rest.
-    let (root_name, bytes, url, purl) = match root_fetch {
+    let purl = artifact_purl(root_fetch).unwrap_or_default();
+    let purl = purl.as_str();
+    let (root_name, bytes, url) = match root_fetch {
         Some(rec) => {
             let url = rec.final_url.as_deref().unwrap_or(&rec.resolved_url);
-            let purl = if rec.locator.starts_with("pkg:") {
-                rec.locator.as_str()
-            } else {
-                ""
-            };
             (
                 artifact_filename(url, &rec.locator),
                 ArtifactBytes::Cached {
                     locator: rec.locator.clone(),
                 },
                 url,
-                purl,
             )
         }
         None => (
@@ -2753,7 +2882,6 @@ fn collect_upload_artifacts(
                 .unwrap_or("file")
                 .to_string(),
             ArtifactBytes::File(file_path.to_path_buf()),
-            "",
             "",
         ),
     };

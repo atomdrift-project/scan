@@ -283,6 +283,11 @@ enum Job {
     /// queued job to its size.
     Result {
         sha256: String,
+        /// The package this artifact was analyzed as, when it was requested by
+        /// one. Carried purely so the upload's log lines name the package the
+        /// operator asked about rather than a digest they would have to
+        /// resolve back to it by hand.
+        purl: Option<String>,
         envelope: Box<ScanResultEnvelope>,
     },
     /// Ensure hopper has these artifacts' bytes+provenance, uploading only the
@@ -344,8 +349,19 @@ impl Uploader {
                         seen.clear();
                     }
                     match job {
-                        Job::Result { sha256, envelope } => {
-                            post_one(&client, &result_url, &worker, &sha256, *envelope);
+                        Job::Result {
+                            sha256,
+                            purl,
+                            envelope,
+                        } => {
+                            post_one(
+                                &client,
+                                &result_url,
+                                &worker,
+                                &sha256,
+                                purl.as_deref(),
+                                *envelope,
+                            );
                         }
                         Job::Artifacts(artifacts) => {
                             reconcile_artifacts(
@@ -398,10 +414,11 @@ impl Uploader {
 
     /// Queue a result for upload. Blocks briefly when the upload queue is full
     /// (backpressure); a closed channel drops the result silently.
-    pub fn submit(&self, sha256: String, envelope: ScanResultEnvelope) {
+    pub fn submit(&self, sha256: String, purl: Option<String>, envelope: ScanResultEnvelope) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Job::Result {
                 sha256,
+                purl,
                 envelope: Box::new(envelope),
             });
         }
@@ -619,7 +636,13 @@ fn sync_dependencies(
             );
             continue;
         };
-        post_one(client, result_url, worker, &dep.sha256, envelope);
+        // A dependency's locator is a PURL or a URL; only the former belongs
+        // under a `purl` field, so a URL-sourced dependency logs by digest.
+        let purl = dep
+            .locator
+            .strip_prefix("pkg:")
+            .map(|_| dep.locator.as_str());
+        post_one(client, result_url, worker, &dep.sha256, purl, envelope);
     }
 }
 
@@ -853,6 +876,7 @@ fn post_one(
     result_url: &str,
     worker: &str,
     sha256: &str,
+    purl: Option<&str>,
     envelope: ScanResultEnvelope,
 ) {
     let payload = ResultPayload {
@@ -882,7 +906,12 @@ fn post_one(
         }
         match request.send() {
             Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(sha256 = %sha256, "upload: result renewed on hopper");
+                tracing::info!(
+                    sha256 = %sha256,
+                    purl,
+                    attempt,
+                    "upload: result renewed on hopper",
+                );
                 return;
             }
             Ok(resp) => {
@@ -892,17 +921,22 @@ fn post_one(
                     && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
                     let body = resp.text().unwrap_or_default();
-                    tracing::warn!(sha256 = %sha256, %status, body = %body, "upload: rejected by hopper; not retrying");
+                    tracing::warn!(sha256 = %sha256, purl, %status, body = %body, "upload: rejected by hopper; not retrying");
                     return;
                 }
-                tracing::warn!(sha256 = %sha256, %status, attempt, "upload: non-success response");
+                tracing::warn!(sha256 = %sha256, purl, %status, attempt, "upload: non-success response");
             }
             Err(e) => {
-                tracing::warn!(sha256 = %sha256, error = %error_chain(&e), attempt, "upload: send failed");
+                tracing::warn!(sha256 = %sha256, purl, error = %error_chain(&e), attempt, "upload: send failed");
             }
         }
     }
-    tracing::warn!(sha256 = %sha256, attempts = ATTEMPT_TIMEOUTS.len(), "upload: giving up after retries");
+    tracing::warn!(
+        sha256 = %sha256,
+        purl,
+        attempts = ATTEMPT_TIMEOUTS.len(),
+        "upload: hopper unreachable, giving up after retries",
+    );
 }
 
 #[cfg(test)]

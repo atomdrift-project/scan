@@ -617,13 +617,23 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         in_flight: dashmap::DashMap::new(),
         // Start the background uploader once when --hopper is set, so every
         // analyzed result (parent and members) is renewed on hopper without
-        // blocking the analyze response.
-        uploader: config.hopper().map(|url| {
-            Arc::new(crate::upload::Uploader::new(
+        // blocking the analyze response. Said once here rather than on every
+        // analysis: a server nobody configured a hopper for still answers, but
+        // every verdict it computes dies with the process, and that is worth
+        // one line at startup instead of silence.
+        uploader: match config.hopper() {
+            Some(url) => Some(Arc::new(crate::upload::Uploader::new(
                 url,
                 crate::upload::default_worker_name(),
-            ))
-        }),
+            ))),
+            None => {
+                tracing::warn!(
+                    "no --hopper configured: analyzed results are kept in this \
+                     process's verdict index only and are never uploaded",
+                );
+                None
+            }
+        },
     });
 
     // Background task: load model + SHAP + YARA concurrently, then mark ready.
