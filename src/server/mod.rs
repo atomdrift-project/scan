@@ -683,10 +683,16 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                 }
             });
             let yara_spawned_at = Instant::now();
-            let yara_task = tokio::task::spawn_blocking(move || {
+            let yara_task = tokio::task::spawn_blocking(move || -> Result<(), String> {
                 let queue_ms = yara_spawned_at.elapsed().as_millis();
                 let t = Instant::now();
                 tracing::info!(queue_ms, "YARA warmup started");
+                // The traits tree is the rule set every analysis runs against.
+                // Resolve it before reporting ready: a server that answers
+                // `/_/health` with "ok" while failing every analysis on a
+                // missing traits directory is worse than one that never starts.
+                let traits = cleave::traits_repo::try_resolve()?;
+                tracing::info!(dir = %traits.display(), "cleave traits resolved");
                 let opts = cleave::AnalysisOptions {
                     slow_rule_ms,
                     ..Default::default()
@@ -697,10 +703,11 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     work_ms = t.elapsed().as_millis(),
                     "YARA warmup complete",
                 );
+                Ok(())
             });
 
             match tokio::join!(model_task, shap_task, yara_task) {
-                (Ok(Ok((model, ctx))), Ok(shap), Ok(())) => {
+                (Ok(Ok((model, ctx))), Ok(shap), Ok(Ok(()))) => {
                     let spec_version = model.spec().version();
                     let features = model.spec().total_features();
                     let shap_loaded = shap.is_some();
@@ -739,6 +746,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                 (_, Err(e), _) => {
                     record_init_failure(&bg, &format!("shap load task panicked: {e}"))
                 }
+                (_, _, Ok(Err(e))) => record_init_failure(&bg, &format!("traits unavailable: {e}")),
                 (_, _, Err(e)) => {
                     record_init_failure(&bg, &format!("yara warmup task panicked: {e}"))
                 }

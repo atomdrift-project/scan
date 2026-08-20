@@ -37,6 +37,14 @@ The listener binds before the model is loaded. While loading, every
 route returns 503 with `{"error":"server starting"}`. Poll `/_/health`
 until the status flips to `ok`.
 
+Models and traits are refreshed once at startup — that is what a restart is
+for, and with `--traits-dir` it is also what installs traits into a directory
+that does not exist yet. `-u` forces the refresh even when the local copy looks
+current; `--no-update` (before the subcommand) skips it. If traits still cannot
+be resolved afterwards the server never reports ready: `/_/health` returns 503
+with `{"status":"failed","reason":"initialization_failed"}` and the log names
+the path, rather than reporting healthy and failing every analysis.
+
 ## Authentication
 
 `--token-file PATH` reads a token from the first non-empty line of `PATH`

@@ -33,6 +33,21 @@ result carries.
 The same environment variables apply as for the server:
 `CLEAVE_TRAITS_DIR`, `CLEAVE_RAYON_THREADS`, `SCAN_MODELS_REPO`.
 
+### Authenticating to hopper
+
+Hopper requires `Authorization: Bearer <token>` on every API route, so a
+worker needs the token before it can claim work. It is read from
+`~/.tok/hopper` in the worker's own home — `$HOPPER_TOKEN` overrides — and
+attached to every call: `/api/next`, `/api/heartbeat`, `/api/result`,
+`/api/upload`, `/api/known`, `/api/file`, `/api/provenance`, and `/data/`.
+
+Loopback is not exempt on hopper's side, so a worker supervised on the hopper
+host authenticates exactly like a remote one. The Linux and FreeBSD worker
+installers copy the deploying user's `~/.tok/hopper` into the service account's
+home; on other platforms, place it there yourself (mode 0600, owned by the
+service user). Rotation is an edit plus a worker restart — the token is read
+once per process.
+
 ## Job lifecycle
 
 1. **Claim.** The worker calls hopper to claim a job. The job carries
@@ -96,6 +111,6 @@ The worker is a client of hopper. It does not listen on any port.
   hash does not match the job claim.
 - **No code execution.** Same static-analysis-only guarantees as the
   server. See [SERVER_API.md#security](SERVER_API.md#security).
-- **Worker identity.** `--name` is purely identifying; hopper trusts
-  any worker that can reach it. Lock down hopper's network, not the
-  worker.
+- **Worker identity.** `--name` is purely identifying. The bearer token
+  is what hopper authenticates; it is shared by the whole fleet and
+  says "a worker", not "which worker".
