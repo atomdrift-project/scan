@@ -7,6 +7,10 @@
 # worker node, over SSH:
 #     cd scan && git pull && make stop-worker && make deploy-worker URL=<url>
 #
+# Each worker node installs the hopper API token from its own
+# ~/.tok/hopper (that account's, on that host) — nothing is shipped between
+# hosts here, so provision that file on each node before the first roll.
+#
 # Nodes are processed strictly sequentially (never in parallel) because each
 # SSH login needs a YubiKey touch — overlapping logins would race the token.
 # An interactive TTY is allocated (ssh -t) so the touch/PIN prompt reaches you.

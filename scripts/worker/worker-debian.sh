@@ -4,6 +4,12 @@
 #
 # build-host / run-host are SSH targets (e.g. "user@host" or an ssh_config alias).
 # The same host may be passed for both. Remote user must have passwordless doas or sudo.
+#
+# Environment overrides:
+#   WORKERS            concurrency (--workers)                   (default: worker auto)
+#   LLM                OpenAI-compatible LLM endpoint (SCAN_LLM)
+#   HOPPER_TOKEN_FILE  hopper API token to install on the run host
+#                                                                (default: ~/.tok/hopper)
 
 set -ex
 
@@ -18,6 +24,10 @@ WORKERS="${WORKERS:-}"
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
 worker_args="worker --url $URL --interpret"
 [ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
+# The service account's home on the run host. The unit runs with
+# ProtectHome=true, so operator secrets live here rather than under /home, and
+# the worker reads ~/.tok/hopper out of it.
+STATE_HOME=/var/lib/atomdrift/scan
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -60,7 +70,26 @@ bssh "$BSUDO cat /home/scan/scan/out/atomscan.tgz" \
     | rssh "$RSUDO tee /tmp/atomscan.tgz >/dev/null"
 
 log "Ensuring run user exists on $RUN"
-rssh "id -u scan >/dev/null 2>&1 || $RSUDO useradd -r -s /usr/sbin/nologin -d /nonexistent -c 'Atomdrift Scan Worker' scan"
+rssh "id -u scan >/dev/null 2>&1 || $RSUDO useradd -r -s /usr/sbin/nologin -d $STATE_HOME -M -c 'Atomdrift Scan Worker' scan"
+rssh "$RSUDO install -d -m 0750 -o scan -g scan $STATE_HOME && \
+      $RSUDO install -d -m 0700 -o scan -g scan $STATE_HOME/.tok"
+
+# --- Hopper API token --------------------------------------------------------
+#
+# Hopper requires `Authorization: Bearer <token>` on every API route, so a
+# worker without this file cannot claim work. Streamed from the deploying
+# host's ~/.tok/hopper into the run host's service account home over the SSH
+# channel — on stdin, never on argv or in a unit file, both of which are
+# world-readable on the run host.
+HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
+if [ -s "$HOPPER_TOKEN_SRC" ]; then
+    rssh "$RSUDO sh -c 'umask 077; cat > $STATE_HOME/.tok/hopper && \
+          chown scan:scan $STATE_HOME/.tok/hopper'" < "$HOPPER_TOKEN_SRC"
+    log "Installed hopper API token at $RUN:$STATE_HOME/.tok/hopper"
+elif ! rssh "$RSUDO test -s $STATE_HOME/.tok/hopper"; then
+    # Not fatal: a hopper deployed without --token-file needs no client token.
+    log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; this worker cannot claim work from an authenticated hopper"
+fi
 
 log "Installing runtime dependencies on $RUN"
 rssh "$RSUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
@@ -90,11 +119,15 @@ StandardError=append:/var/log/scan-worker.log
 
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
 Environment=SCAN_LLM=$LLM
+# ProtectHome=true hides the account's real home, and the token is a file, not
+# an Environment= value — unit files are world-readable in /etc/systemd/system.
+Environment=HOME=$STATE_HOME
 
 # Hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ReadWritePaths=$STATE_HOME
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

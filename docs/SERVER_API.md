@@ -24,6 +24,7 @@ The defaults are deliberate. Override them only when you have a reason.
 | `--allow-cidr`   | none               | Extra CIDR networks allowed beyond loopback.               |
 | `--token-file`   | none               | File holding the required bearer token. See below.         |
 | `--traits-dir`   | none               | Writable cleave traits directory (sets env on launch).     |
+| `--hopper`       | none               | Hopper base URL. Every analyzed result is renewed on its `/api/result`. Needs a hopper token; see below. |
 
 Environment variables read at startup:
 
@@ -110,8 +111,17 @@ credential — but a valid token there upgrades the response, see below.
 Both paths install an API token. It is read from `~/.tok/scan` on the
 deploying host — generated there on first deploy if absent — and copied into
 the service account's own `~/.tok/scan`, which the unit passes as
-`--token-file`. Rotate by editing `~/.tok/scan` and redeploying. Hand clients
+`--token-file`. Rotate by editing `~/.tok/scan` and redeploying — a changed
+token restarts the service, since it is read only at startup. Hand clients
 `$(cat ~/.tok/scan)`.
+
+`--hopper` needs a second, unrelated token: `~/.tok/scan` authenticates
+clients *to this server*, `~/.tok/hopper` authenticates *this server to
+hopper*. When `HOPPER=` is set, `make deploy` copies the deploying user's
+`~/.tok/hopper` into the service account's own `~/.tok/hopper`
+(`HOPPER_TOKEN_FILE=` overrides the source). Without it, hopper rejects every
+result renewal with 401 — it requires a bearer token on every route and does
+not exempt loopback. See [WORKERS.md](WORKERS.md#authenticating-to-hopper).
 
 Linux overrides (passed through the environment): `BIND=` (default
 `127.0.0.1:49999`, on the assumption that a Cloudflare tunnel or another local
@@ -119,7 +129,8 @@ proxy provides the ingress; set `0.0.0.0:49999` to listen on every interface),
 `TOKEN_SRC=` (default `~/.tok/scan`; set empty to deploy without
 authentication), `ALLOW_CIDR=` (default `10.0.0.0/8`; set empty to omit),
 `LLM=` / `LLM_URL=` (`local`, `openrouter`, or a base URL), `LLM_MODEL=`
-(required for OpenRouter), `WORKERS=`, `MEMORY_MAX=`. `make uninstall-server`
+(required for OpenRouter), `WORKERS=`, `MEMORY_MAX=`, `HOPPER=` with
+`HOPPER_TOKEN_FILE=`. `make uninstall-server`
 tears the unit down.
 
 The FreeBSD jail keeps `--bind 0.0.0.0:49999` with `--allow-cidr 10.0.0.0/8`,

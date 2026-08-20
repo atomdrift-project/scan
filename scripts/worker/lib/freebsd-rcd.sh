@@ -73,9 +73,13 @@ load_rc_config \$name
 
 : \${scan_worker_enable:="NO"}
 : \${scan_worker_logfile:="/var/log/scan-worker.log"}
-: \${scan_worker_env_file:="/usr/local/etc/hopper/env"}
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
 : \${scan_worker_llm:="$_lrs_llm"}
+# The hopper API token is NOT read here. It is a file in the service account's
+# home (~/.tok/hopper), installed by worker-freebsd.sh / worker-bastille.sh.
+# This service used to source /usr/local/etc/hopper/env for the retired
+# HOPPER_UPLOAD_TOKEN; that path is gone, so there is exactly one place the
+# token lives and rc.conf never holds a secret.
 # Seconds a graceful stop waits for the worker to drain in-flight analyses
 # before the whole daemon(8) tree is SIGKILLed. Bounds how long a redeploy or
 # reboot blocks; hopper re-leases anything that does not finish. Sized a few
@@ -85,16 +89,6 @@ load_rc_config \$name
 
 pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
-start_precmd="scan_worker_precmd"
-scan_worker_precmd()
-{
-	# The native Hopper deploy provisions this root-owned file. Jailed or
-	# standalone workers may omit it when they never mirror dependencies.
-	if [ -r "\${scan_worker_env_file}" ]; then
-		. "\${scan_worker_env_file}"
-		export HOPPER_TOKEN
-	fi
-}
 # MALLOC_CONF tunes FreeBSD's jemalloc to return freed memory to the OS
 # promptly instead of holding dirty pages for 10s (the default). Critical
 # under bursty analysis workloads where RSS would otherwise drift upward.

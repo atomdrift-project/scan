@@ -6,7 +6,8 @@
 # dnf/yum (Fedora, RHEL, Rocky, Alma, CentOS), zypper (openSUSE, SLE),
 # pacman (Arch, CachyOS, EndeavourOS, Manjaro, ...) or xbps (Void).
 # Re-runnable: idempotent. The unit is daemon-reloaded and the service is
-# restarted only when the binary or unit file actually changed on disk.
+# restarted only when the binary, unit file, or hopper token actually changed
+# on disk.
 #
 # Usage: ./worker-linux.sh <url>
 #
@@ -221,9 +222,14 @@ $SUDO install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_HOME
 # at $HOME/.tok/hopper. Never an argument or an Environment= line: argv is
 # world-readable through ps(1), and unit files are world-readable in
 # /etc/systemd/system.
+#
+# A rotated token must force a restart below: the worker reads it once, at
+# startup, so installing a new one without a restart leaves the old one live.
 hopper_token_src="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
 hopper_token_dst="${STATE_HOME}/.tok/hopper"
+token_changed=0
 if [ -s "$hopper_token_src" ]; then
+    $SUDO cmp -s "$hopper_token_src" "$hopper_token_dst" 2>/dev/null || token_changed=1
     $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
         "$hopper_token_src" "$hopper_token_dst"
     log "Installed hopper API token at ${hopper_token_dst}"
@@ -388,7 +394,7 @@ fi
 # enable --now is idempotent and starts the service on first deploy.
 $SUDO systemctl enable --now "${SERVICE_NAME}.service" >/dev/null
 
-if [ "$binary_changed" -eq 1 ] || [ "$unit_changed" -eq 1 ]; then
+if [ "$binary_changed" -eq 1 ] || [ "$unit_changed" -eq 1 ] || [ "$token_changed" -eq 1 ]; then
     log "Restarting ${SERVICE_NAME}"
     if ! $SUDO systemctl restart "${SERVICE_NAME}.service"; then
         $SUDO systemctl --no-pager --full status "${SERVICE_NAME}.service" || true

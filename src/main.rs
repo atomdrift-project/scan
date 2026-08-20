@@ -596,6 +596,8 @@ enum Commands {
         /// never-before-seen sample lands as its own row instead of being
         /// dropped as an unknown-SHA no-op. Upload failures are logged, never
         /// fatal. Also settable via the `SCAN_HOPPER` env var.
+        /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
+        /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
@@ -634,6 +636,8 @@ enum Commands {
         /// fetched URL is exactly the never-before-seen case, so this is the
         /// flag that gets a freshly-discovered sample into the corpus.
         /// Also settable via the `SCAN_HOPPER` env var.
+        /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
+        /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
@@ -657,6 +661,8 @@ enum Commands {
         /// sidecar's `registry` node, so the uploaded sample carries the same
         /// provenance a forager-collected one would.
         /// Also settable via the `SCAN_HOPPER` env var.
+        /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
+        /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
@@ -739,8 +745,9 @@ enum Commands {
         /// Renew every analyzed result (parent and members) on a hopper instance
         /// by POSTing to <URL>/api/result as analyses complete — the warm-server
         /// equivalent of `scan path --hopper`. Upload failures are logged, never
-        /// fatal. Authenticates with ~/.tok/hopper (or $HOPPER_TOKEN).
-        /// Also settable via the `SCAN_HOPPER` env var.
+        /// fatal. Also settable via the `SCAN_HOPPER` env var.
+        /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
+        /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
@@ -762,7 +769,9 @@ enum Commands {
 
     /// Run as a pull-based worker, polling a hopper instance for analysis jobs
     Worker {
-        /// Hopper API base URL (e.g. http://hopper-host:8081)
+        /// Hopper API base URL (e.g. http://hopper-host:8081). Every call
+        /// authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
+        /// `$HOPPER_TOKEN`); without it hopper rejects the poll with 401.
         #[arg(long)]
         url: String,
 
