@@ -411,7 +411,7 @@ TimeoutStopSec=30s
 
 Environment=HOME=${STATE_HOME}
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
-# Named target `openrouter` is resolved by the binary.
+# Named target 'openrouter' is resolved by the binary.
 Environment=SCAN_LLM=${LLM}
 ${LLM_MODEL_LINE}
 
