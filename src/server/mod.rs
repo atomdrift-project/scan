@@ -6,8 +6,7 @@
 //!
 //! Routes:
 //!   GET  /_/health      — liveness check
-//!   GET  /sha256/{sha}  — stored verdict for an artifact (no analyze slot)
-//!   GET  /purl?purl=…   — stored verdict for a package (no analyze slot)
+//!   GET  /lookup        — stored verdict by ?sha256= or ?purl= (no slot)
 //!   POST /analyze       — upload a file, receive full classification JSON
 //!   POST /analyze-purl  — fetch a PURL (registry provenance included) and analyze
 //!   POST /analyze-path  — analyze a local path (loopback)
@@ -832,8 +831,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         .route("/_/memory", get(handlers::memory_stats))
         .route("/_/requests", get(handlers::requests))
         .route("/_/threads", get(handlers::threads))
-        .route("/sha256/{sha256}", get(handlers::lookup_sha))
-        .route("/purl", get(handlers::lookup_purl))
+        .route("/lookup", get(handlers::lookup))
         .route("/analyze", post(handlers::analyze))
         .route("/analyze-purl", post(handlers::analyze_purl))
         .route("/analyze-path", post(handlers::analyze_path))

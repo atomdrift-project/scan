@@ -1,4 +1,4 @@
-//! Integration tests for the lookup routes (`GET /sha256/{sha}`, `GET /purl`).
+//! Integration tests for `GET /lookup?sha256=… | ?purl=…`.
 //!
 //! Every test here runs against an empty model directory, so the server never
 //! becomes ready — which is the point. A lookup reads stored knowledge and the
@@ -61,7 +61,7 @@ async fn get(uri: &str) -> Result<(StatusCode, serde_json::Value, Option<String>
 #[tokio::test]
 async fn unknown_sha_is_a_404_carrying_the_bloom_decision() -> Result<()> {
     let sha = "a".repeat(64);
-    let (status, body, cache) = get(&format!("/sha256/{sha}")).await?;
+    let (status, body, cache) = get(&format!("/lookup?sha256={sha}")).await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"], "unknown sample");
     assert_eq!(body["bloom"], "unknown", "no filters installed fails closed");
@@ -75,7 +75,7 @@ async fn unknown_sha_is_a_404_carrying_the_bloom_decision() -> Result<()> {
 
 #[tokio::test]
 async fn unknown_purl_is_a_404_carrying_the_bloom_decision() -> Result<()> {
-    let (status, body, _) = get("/purl?purl=pkg%3Anpm%2Fleft-pad%401.3.0").await?;
+    let (status, body, _) = get("/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0").await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"], "unknown sample");
     assert_eq!(body["bloom"], "unknown");
@@ -88,7 +88,7 @@ async fn unknown_purl_is_a_404_carrying_the_bloom_decision() -> Result<()> {
 #[tokio::test]
 async fn purl_qualifiers_survive_the_query_encoding() -> Result<()> {
     let (status, body, _) =
-        get("/purl?purl=pkg%3Ageneric%2Fx%401.0%3Fdownload_url%3Dhttps%3A%2F%2Fe.test%2Fx.tgz")
+        get("/lookup?purl=pkg%3Ageneric%2Fx%401.0%3Fdownload_url%3Dhttps%3A%2F%2Fe.test%2Fx.tgz")
             .await?;
     assert_eq!(
         status,
@@ -101,28 +101,46 @@ async fn purl_qualifiers_survive_the_query_encoding() -> Result<()> {
 
 #[tokio::test]
 async fn malformed_keys_are_rejected() -> Result<()> {
-    let (status, body, _) = get("/sha256/not-a-sha").await?;
+    let (status, body, _) = get("/lookup?sha256=not-a-sha").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid sha256");
 
-    let (status, body, _) = get(&format!("/sha256/{}", "g".repeat(64))).await?;
+    let (status, body, _) = get(&format!("/lookup?sha256={}", "g".repeat(64))).await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "64 chars but not hex");
     assert_eq!(body["error"], "invalid sha256");
 
-    let (status, body, _) = get("/purl").await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "missing purl");
+    let (status, body, _) = get("/lookup").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "neither key");
+    assert_eq!(body["error"], "provide exactly one of sha256 or purl");
 
-    let (status, body, _) = get("/purl?purl=left-pad").await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "no PURL scheme or type");
-    assert_eq!(body["error"], "invalid purl");
+    let sha = "a".repeat(64);
+    let (status, _, _) = get(&format!("/lookup?sha256={sha}&purl=pkg:npm/x@1")).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "both keys");
+
+    let (status, body, _) = get("/lookup?purl=%20").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an empty purl is no key");
+    assert_eq!(body["error"], "provide exactly one of sha256 or purl");
+
+    let (status, body, _) = get("/lookup?purl=not%20a%20purl").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "not a package URL");
+    Ok(())
+}
+
+/// `pkg:` is optional on the way in: a bare `npm/left-pad@1.3.0` is the same
+/// question as the canonical form, not a malformed one.
+#[tokio::test]
+async fn bare_purls_are_normalized_rather_than_rejected() -> Result<()> {
+    let (status, body, _) = get("/lookup?purl=npm%2Fleft-pad%401.3.0").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "understood, just not stored");
+    assert_eq!(body["error"], "unknown sample");
     Ok(())
 }
 
 /// Case and surrounding whitespace name the same artifact.
 #[tokio::test]
 async fn digests_are_matched_case_insensitively() -> Result<()> {
-    let (status, _, _) = get(&format!("/sha256/{}", "A".repeat(64))).await?;
+    let (status, _, _) = get(&format!("/lookup?sha256={}", "A".repeat(64))).await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "uppercase hex is still hex");
     Ok(())
 }

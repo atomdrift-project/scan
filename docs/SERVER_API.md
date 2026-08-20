@@ -170,18 +170,22 @@ Beamline backends should start the server with `--fetch --interpret
 --analysis-timeout 1800` so dependency follow and LLM interpretation
 match a live `atomscan purl` run.
 
-### `GET /sha256/{sha256}`, `GET /purl`
+### `GET /lookup`
 
 What scan already knows about an artifact or a package. Reads stored
 verdicts and the bloom filters; **never analyzes**. Takes no analyze
 slot and answers while the model is still loading, so a restarting
 server keeps serving lookups.
 
-    GET /sha256/<64hex>
-    GET /purl?purl=<url-encoded>
+    GET /lookup?sha256=<64hex>
+    GET /lookup?purl=<url-encoded>
 
-The PURL travels as a query parameter, not a path segment: its own
-grammar carries `/`, `?` and `#`, so `pkg:npm/x@1?arch=x64` in a path
+Exactly one key; both or neither is a 400. On `purl`, the `pkg:` prefix
+is optional (`npm/left-pad@1.3.0` works), and the value is canonicalized
+the way `/analyze-purl` and `atomscan purl` canonicalize it.
+
+Both identifiers travel as query parameters. A PURL's own grammar
+carries `/`, `?` and `#`, so `pkg:npm/x@1?arch=x64` in a path segment
 would have everything from the `?` parsed as the URL's query and a
 `#subpath` dropped by the client — silently keying on a different
 package. Qualifiers are part of the identity the filters key on.
@@ -190,19 +194,31 @@ A stored verdict is a 200:
 
     {
       "sha": "2cf24dba…",
-      "purl": "pkg:npm/left-pad@1.3.0",
-      "lvl": -1,
+      "purl": "pkg:npm/evil@1.0.0",
+      "lvl": 3,
       "eng": "2.8.0-beta.1",
       "why": "Postinstall launches a reverse shell.",
       "hits": [ { "id": "objectives/…", "crit": 5, "file": "lib/install.js",
-                  "pkg": "pkg:npm/evil@1.0.0", "desc": "…" } ],
+                  "pkg": "pkg:npm/evil@1.0.0", "desc": "…",
+                  "off": 109, "line": 12 } ],
       "bloom": "unknown"
     }
 
 `lvl` is the tightest false-positive budget per 100M benigns at which the
-artifact grades hostile; `-1` never fires. Gate on it. `hits` carries at
-most three findings of criticality 3 or worse, and `why` the
+artifact grades hostile; `-1` never fires. Gate on it. `why` is the
 interpreter's sentence when `--interpret` ran. Empty fields are omitted.
+
+`hits` carries at most three findings of criticality 3 or worse, worst
+first. `off` is the byte offset of the match within `file` and `line` its
+1-based source line, read from the context window that recorded the
+match; either may be absent, since a binary has no line structure and a
+report whose context was trimmed keeps only a coarse evidence span.
+
+Only findings *native* to the file they are reported on become hits. An
+archive repeats its members' findings on itself, carrying no path or
+offset of its own; those copies are dropped in favour of the member's,
+and a cross-file composite — which has no single place to point at — is
+dropped with them.
 
 Holding nothing is a 404 — with the filter's opinion still attached, so
 one round trip answers both questions:
@@ -225,8 +241,8 @@ Headers: `X-SHA256`, `X-Scan-Source: index`, and `Cache-Control` —
 it), `no-store` on a miss (it becomes a hit the moment anything analyzes
 the artifact). The scope is `private` when a token is configured.
 
-400 for a malformed digest, a missing `purl`, or a string that is not a
-PURL.
+400 for a malformed digest, for a string that is not a PURL, or for
+anything other than exactly one key.
 
 ### `GET /_/health`
 

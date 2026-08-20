@@ -492,60 +492,68 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
-/// Query string for `GET /purl`.
+/// Query string for `GET /lookup`. Exactly one of `sha256` or `purl`.
 ///
-/// The PURL travels as a query parameter rather than a path segment because its
-/// own grammar carries `/`, `?` and `#`: `pkg:npm/@scope/name@1.0.0?arch=x64`
-/// in a path would have everything from the `?` parsed as the *URL's* query and
-/// a `#subpath` dropped by the client, silently keying on a different package.
-/// Qualifiers are load-bearing here — `fletch::purl::identity` keeps them.
+/// Both identifiers travel as query parameters. A PURL's own grammar carries
+/// `/`, `?` and `#` — `pkg:npm/@scope/name@1.0.0?arch=x64` in a path segment
+/// would have everything from the `?` parsed as the *URL's* query and a
+/// `#subpath` dropped by the client, silently keying on a different package —
+/// and a digest gains nothing from a prettier URL that the other key cannot
+/// have too.
 #[derive(Debug, Default, serde::Deserialize)]
-pub(super) struct PurlQuery {
+pub(super) struct LookupQuery {
+    sha256: Option<String>,
     purl: Option<String>,
 }
 
-/// GET /sha256/{sha256} — what we already know about an artifact.
+/// GET /lookup?sha256=… | ?purl=… — what we already know about an artifact.
 ///
 /// Never analyzes: no slot, no fetch, and it answers while the model is still
 /// loading. A caller that gets `404 unknown sample` asks for a real analysis
 /// with `/analyze` or `/analyze-purl`.
-pub(super) async fn lookup_sha(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(sha256): axum::extract::Path<String>,
-) -> Response {
-    let Some(digest) = crate::bloom::parse_sha256_hex(sha256.trim()) else {
+pub(super) async fn lookup(State(state): State<Arc<AppState>>, Query(q): Query<LookupQuery>) -> Response {
+    let sha = q.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let purl = q.purl.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match (sha, purl) {
+        (Some(_), Some(_)) | (None, None) => error_response(
+            StatusCode::BAD_REQUEST,
+            "provide exactly one of sha256 or purl",
+        ),
+        (Some(sha), None) => lookup_by_sha(&state, sha),
+        (None, Some(purl)) => lookup_by_purl(&state, purl),
+    }
+}
+
+fn lookup_by_sha(state: &AppState, sha256: &str) -> Response {
+    let Some(digest) = crate::bloom::parse_sha256_hex(sha256) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid sha256");
     };
-    let sha = sha256.trim().to_ascii_lowercase();
+    let sha = sha256.to_ascii_lowercase();
     let decision = crate::bloom_repo::global()
         .as_deref()
         .map_or(crate::bloom_repo::Decision::Unknown, |lk| {
             lk.memo_sha256(&digest)
         });
     let verdict = crate::lookup::global().and_then(|index| index.get_sha(&sha));
-    lookup_response(&state, verdict.as_ref(), decision, &sha, None)
+    lookup_response(state, verdict.as_ref(), decision, &sha, None)
 }
 
-/// GET /purl?purl=… — what we already know about a package.
-///
-/// Same contract as [`lookup_sha`]: local knowledge only, never an analysis.
-pub(super) async fn lookup_purl(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<PurlQuery>,
-) -> Response {
-    let purl = q.purl.as_deref().map(str::trim).unwrap_or_default();
-    if purl.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "missing purl");
-    }
-    if fletch::purl::identity(purl).is_none() {
-        return error_response(StatusCode::BAD_REQUEST, "invalid purl");
-    }
+fn lookup_by_purl(state: &AppState, raw: &str) -> Response {
+    // `pkg:` is optional, as it is on /analyze-purl and `atomscan purl`, and
+    // the canonical form is what the filters and the index are keyed by — so
+    // `npm/left-pad@1.3.0` and `pkg:npm/left-pad@1.3.0` are one question.
+    let purl = match normalize_pkg_purl(raw) {
+        Ok(purl) => purl,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
     let decision = crate::bloom_repo::global()
         .as_deref()
-        .map_or(crate::bloom_repo::Decision::Unknown, |lk| lk.memo_purl(purl));
-    let verdict = crate::lookup::global().and_then(|index| index.get_purl(purl));
+        .map_or(crate::bloom_repo::Decision::Unknown, |lk| {
+            lk.memo_purl(&purl)
+        });
+    let verdict = crate::lookup::global().and_then(|index| index.get_purl(&purl));
     let sha = verdict.as_ref().map_or("", |v| v.sha256.as_str()).to_owned();
-    lookup_response(&state, verdict.as_ref(), decision, &sha, Some(purl))
+    lookup_response(state, verdict.as_ref(), decision, &sha, Some(&purl))
 }
 
 /// Render a lookup answer.
