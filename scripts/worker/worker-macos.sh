@@ -3,6 +3,12 @@
 # Usage: ./worker-macos.sh <server-url>
 # Runs entirely on the local machine. Re-run to update.
 # Must be invoked from the repository root.
+#
+# Environment overrides:
+#   WORKERS            concurrency (--workers)                   (default: worker auto)
+#   LLM                OpenAI-compatible LLM endpoint (SCAN_LLM)
+#   HOPPER_TOKEN_FILE  hopper API token to install for the service user
+#                                                                (default: ~/.tok/hopper)
 
 set -ex
 
@@ -18,6 +24,10 @@ BINARY=atomscan
 INSTALL_DIR=/usr/local/share/atomdrift/scan
 MODELS_DIR=/usr/local/share/atomdrift/scan/models
 TRAITS_DIR=/usr/local/share/atomdrift/scan/traits
+# The service account's home. Its directory record points at /var/empty, which
+# is not writable and not a place to keep a secret, so the plist below sets
+# HOME to this instead and the worker reads ~/.tok/hopper out of it.
+STATE_HOME=/usr/local/share/atomdrift/scan/state
 BIN_PATH=/usr/local/bin/atomscan
 PLIST=/Library/LaunchDaemons/com.atomdrift.scan-worker.plist
 LABEL=com.atomdrift.scan-worker
@@ -75,8 +85,33 @@ if [ ! -d "$TRAITS_DIR" ]; then
     $SUDO chown "$SERVICE_USER" "$TRAITS_DIR"
 fi
 
-log "Installing binary"
+log "Preparing service home at $STATE_HOME"
+$SUDO install -d -m 0750 -o "$SERVICE_USER" "$STATE_HOME"
+$SUDO install -d -m 0700 -o "$SERVICE_USER" "$STATE_HOME/.tok"
+
+# --- Hopper API token --------------------------------------------------------
+#
+# Hopper requires `Authorization: Bearer <token>` on every API route, so a
+# worker without this file cannot claim work. Copied from the deploying user's
+# ~/.tok/hopper into the service account's own home, where the worker reads it.
+# Never an argument or a plist EnvironmentVariables entry: argv is visible in
+# ps(1) and the plist is world-readable.
+#
+# A rotated token must force a restart below: the worker reads it once, at
+# startup, so installing a new one without a restart leaves the old one live.
 restart_needed=0
+HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
+HOPPER_TOKEN_DST="$STATE_HOME/.tok/hopper"
+if [ -s "$HOPPER_TOKEN_SRC" ]; then
+    $SUDO cmp -s "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST" 2>/dev/null || restart_needed=1
+    $SUDO install -m 0600 -o "$SERVICE_USER" "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
+    log "Installed hopper API token at $HOPPER_TOKEN_DST"
+elif ! $SUDO test -s "$HOPPER_TOKEN_DST"; then
+    # Not fatal: a hopper deployed without --token-file needs no client token.
+    log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; this worker cannot claim work from an authenticated hopper"
+fi
+
+log "Installing binary"
 if ! cmp -s "out/$BINARY" "$BIN_PATH" 2>/dev/null; then
     $SUDO install -m 755 "out/$BINARY" "$BIN_PATH"
     $SUDO codesign --force --sign - "$BIN_PATH"
@@ -116,6 +151,8 @@ ${workers_args}    </array>
     <dict>
         <key>PATH</key>
         <string>$BREW_PREFIX/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>$STATE_HOME</string>
         <key>SCAN_MODELS_DIR</key>
         <string>$MODELS_DIR</string>
         <key>SCAN_LLM</key>

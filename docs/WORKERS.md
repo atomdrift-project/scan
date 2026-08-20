@@ -36,17 +36,46 @@ The same environment variables apply as for the server:
 ### Authenticating to hopper
 
 Hopper requires `Authorization: Bearer <token>` on every API route, so a
-worker needs the token before it can claim work. It is read from
-`~/.tok/hopper` in the worker's own home — `$HOPPER_TOKEN` overrides — and
-attached to every call: `/api/next`, `/api/heartbeat`, `/api/result`,
-`/api/upload`, `/api/known`, `/api/file`, `/api/provenance`, and `/data/`.
+worker needs the token before it can claim work. The same token authenticates
+`scan <path> --hopper` / `--upload` and `serve --hopper`, which renew results
+over the same API. It is attached to every call: `/api/next`,
+`/api/heartbeat`, `/api/result`, `/api/upload`, `/api/known`, `/api/file`,
+`/api/provenance`, and `/data/`.
+
+It is resolved once per process, in this order:
+
+1. `$HOPPER_TOKEN` — the token itself, for callers that inject it some other way.
+2. `$HOPPER_TOKEN_FILE` — a path to the token file.
+3. `~/.tok/hopper` in the process's own home — the default, and what the
+   deploy scripts install.
 
 Loopback is not exempt on hopper's side, so a worker supervised on the hopper
-host authenticates exactly like a remote one. The Linux and FreeBSD worker
-installers copy the deploying user's `~/.tok/hopper` into the service account's
-home; on other platforms, place it there yourself (mode 0600, owned by the
-service user). Rotation is an edit plus a worker restart — the token is read
-once per process.
+host authenticates exactly like a remote one. The startup log names the source
+it resolved (never the secret); with no token it warns that every request will
+be rejected with 401.
+
+Every worker installer copies the deploying user's `~/.tok/hopper` into the
+account the service runs as, mode 0600 — `make deploy-worker` on macOS,
+Linux (systemd), FreeBSD (host and Bastille jail), Debian-over-SSH, OmniOS,
+Alpine, and OpenBSD. Point them at a different source with
+`make deploy-worker URL=... HOPPER_TOKEN_FILE=/path/to/token`. Where the
+service account has no usable home of its own — macOS `_scan`, whose directory
+record is `/var/empty`, and the systemd units, which run with
+`ProtectHome=true` — the installer sets `HOME` to the service state directory
+and puts the token in its `.tok`. Alpine and OpenBSD run the worker as the
+deploying user under cron, which already has the right `HOME`.
+
+`deploy-workers.sh` and `update-nodes.sh` run `make deploy-worker` over SSH on
+each node, so each node needs the token in the deploying account's
+`~/.tok/hopper` there. Nothing ships it between hosts for you.
+
+Rotation is an edit plus a worker restart — the token is read once per
+process. Re-running the installer with a changed token restarts the service on
+its own.
+
+A worker on the hopper host used to pick the token up from
+`/usr/local/etc/hopper/env` (as `HOPPER_UPLOAD_TOKEN`, later `HOPPER_TOKEN`).
+That path is gone: `~/.tok/hopper` is the only file the worker reads.
 
 ## Job lifecycle
 

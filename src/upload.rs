@@ -22,34 +22,85 @@ use serde::Serialize;
 
 use crate::engine::ScanResultEnvelope;
 
-/// Bearer token for hopper's API, or `None` when hopper is unauthenticated.
+/// A hopper bearer token and where it was found. The origin is a path or an
+/// environment variable name — never the secret — so it is safe to log.
+#[derive(Debug)]
+struct Credential {
+    token: String,
+    origin: String,
+}
+
+/// The hopper credential for this process, or `None` when none is configured.
 ///
 /// `$HOPPER_TOKEN` wins, for callers that inject the token some other way;
-/// otherwise it comes from `~/.tok/hopper`, the same convention as
+/// otherwise it is the first non-empty line of [`token_path`] — `~/.tok/hopper`
+/// unless `$HOPPER_TOKEN_FILE` names another file — the same convention as
 /// `~/.tok/openrouter` and `~/.tok/scan`. A locally supervised worker inherits
 /// the service account's `HOME`, so it finds the file with no plumbing.
 ///
 /// Resolved once per process: hopper reads its own copy once at startup too,
 /// so rotation is a restart on both ends.
-#[must_use]
-pub fn hopper_token() -> Option<&'static str> {
-    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
-    TOKEN
+fn credential() -> Option<&'static Credential> {
+    static CREDENTIAL: OnceLock<Option<Credential>> = OnceLock::new();
+    CREDENTIAL
         .get_or_init(|| {
             let env = std::env::var("HOPPER_TOKEN").ok();
-            let path = crate::interpret::tok_path("hopper");
-            resolve_hopper_token(env.as_deref(), path.as_deref())
+            resolve_credential(env.as_deref(), token_path().as_deref())
         })
-        .as_deref()
+        .as_ref()
 }
 
-/// The precedence behind [`hopper_token`], split out so it is testable without
+/// The file [`credential`] reads the token from: `$HOPPER_TOKEN_FILE` when set,
+/// otherwise `~/.tok/hopper`. The variable names the file rather than the
+/// secret, so the token stays off argv and out of the environment; the deploy
+/// scripts use the same name for the file they install.
+fn token_path() -> Option<PathBuf> {
+    std::env::var_os("HOPPER_TOKEN_FILE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| crate::interpret::tok_path("hopper"))
+}
+
+/// Bearer token for hopper's API, or `None` when hopper is unauthenticated.
+#[must_use]
+pub fn hopper_token() -> Option<&'static str> {
+    credential().map(|credential| credential.token.as_str())
+}
+
+/// The precedence behind [`credential`], split out so it is testable without
 /// touching process-wide environment or the `OnceLock`.
-fn resolve_hopper_token(env: Option<&str>, path: Option<&std::path::Path>) -> Option<String> {
+fn resolve_credential(env: Option<&str>, path: Option<&std::path::Path>) -> Option<Credential> {
     if let Some(value) = env.map(str::trim).filter(|value| !value.is_empty()) {
-        return Some(value.to_string());
+        return Some(Credential {
+            token: value.to_string(),
+            origin: "$HOPPER_TOKEN".to_string(),
+        });
     }
-    crate::interpret::read_token_file(path?)
+    let path = path?;
+    Some(Credential {
+        token: crate::interpret::read_token_file(path)?,
+        origin: path.display().to_string(),
+    })
+}
+
+/// Log where the hopper credential came from, or warn that there is none.
+///
+/// Hopper requires `Authorization: Bearer <token>` on every route and does not
+/// exempt loopback, so an unauthenticated worker or `--hopper` upload is
+/// rejected with 401 on every request. Say so once at startup rather than
+/// leaving an operator to infer it from a retry loop.
+pub fn log_hopper_credential() {
+    match credential() {
+        Some(credential) => {
+            tracing::info!(source = %credential.origin, "hopper API token loaded");
+        }
+        None => tracing::warn!(
+            expected = %token_path().unwrap_or_default().display(),
+            "no hopper API token found; unless hopper runs unauthenticated every \
+             request will be rejected with 401 — install the token at \
+             ~/.tok/hopper (mode 0600) or set $HOPPER_TOKEN",
+        ),
+    }
 }
 
 /// Attach the hopper bearer token to a blocking request, if there is one.
@@ -265,6 +316,7 @@ impl Uploader {
     /// drops submissions so the scan still completes.
     #[must_use]
     pub fn new(hopper_url: &str, worker: String) -> Self {
+        log_hopper_credential();
         let base = hopper_url.trim_end_matches('/');
         let result_url = format!("{base}/api/result");
         let known_url = format!("{base}/api/known");
@@ -869,28 +921,32 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("hopper");
         std::fs::write(&file, "from-file\n").expect("write token");
+        let token = |env, path| resolve_credential(env, path).map(|c| c.token);
 
         assert_eq!(
-            resolve_hopper_token(Some("from-env"), Some(&file)).as_deref(),
-            Some("from-env"),
+            token(Some("from-env"), Some(&file)).as_deref(),
+            Some("from-env")
         );
-        assert_eq!(
-            resolve_hopper_token(Some("  "), Some(&file)).as_deref(),
-            Some("from-file"),
-        );
-        assert_eq!(
-            resolve_hopper_token(None, Some(&file)).as_deref(),
-            Some("from-file"),
-        );
-        assert_eq!(
-            resolve_hopper_token(Some(" padded "), None).as_deref(),
-            Some("padded"),
-        );
-        assert_eq!(resolve_hopper_token(None, None), None);
-        assert_eq!(
-            resolve_hopper_token(None, Some(&dir.path().join("absent"))),
-            None,
-        );
+        assert_eq!(token(Some("  "), Some(&file)).as_deref(), Some("from-file"));
+        assert_eq!(token(None, Some(&file)).as_deref(), Some("from-file"));
+        assert_eq!(token(Some(" padded "), None).as_deref(), Some("padded"));
+        assert_eq!(token(None, None), None);
+        assert_eq!(token(None, Some(&dir.path().join("absent"))), None);
+    }
+
+    /// The logged origin names the source, never the secret.
+    #[test]
+    fn hopper_token_origin_names_its_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("hopper");
+        std::fs::write(&file, "from-file\n").expect("write token");
+
+        let from_env = resolve_credential(Some("from-env"), Some(&file)).expect("credential");
+        assert_eq!(from_env.origin, "$HOPPER_TOKEN");
+
+        let from_file = resolve_credential(None, Some(&file)).expect("credential");
+        assert_eq!(from_file.origin, file.display().to_string());
+        assert!(!from_file.origin.contains("from-file"));
     }
 
     /// The wire body round-trips through zstd back to the exact JSON serde

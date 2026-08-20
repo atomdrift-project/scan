@@ -4,6 +4,12 @@
 # Must be invoked from the scan repository root inside the zone.
 # Idempotent: re-run to update.
 #
+# Environment overrides:
+#   WORKERS            concurrency (--workers)                   (default: worker auto)
+#   LLM                OpenAI-compatible LLM endpoint (SCAN_LLM)
+#   HOPPER_TOKEN_FILE  hopper API token to install for the service user
+#                                                                (default: ~/.tok/hopper)
+#
 # rust + 7zip come from pkgsrc; innoextract, upx, and rizin (HEAD) are
 # built from upstream source only when they are not already available. The
 # worker runs as the unprivileged `scan` user under SMF, with
@@ -294,6 +300,33 @@ id "$SCAN_USER" >/dev/null 2>&1 || \
 mkdir -p "$SCAN_HOME" "$SCAN_LOG_DIR" "$SCAN_TMP_DIR"
 chown "$SCAN_USER:$SCAN_GROUP" "$SCAN_HOME" "$SCAN_LOG_DIR" "$SCAN_TMP_DIR"
 chmod 700 "$SCAN_TMP_DIR"
+
+# --- Hopper API token --------------------------------------------------------
+#
+# Hopper requires `Authorization: Bearer <token>` on every API route, so a
+# worker without this file cannot claim work. Copied into the service account's
+# home, which the SMF manifest below sets as HOME. Never an argument or an
+# envvar in the manifest: argv shows in ps(1) and the manifest is world-readable.
+#
+# A rotated token must force a restart below: the worker reads it once, at
+# startup, so installing a new one without a restart leaves the old one live.
+HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-${HOME:-/root}/.tok/hopper}"
+HOPPER_TOKEN_DST="$SCAN_HOME/.tok/hopper"
+token_changed=0
+if [ -s "$HOPPER_TOKEN_SRC" ]; then
+    mkdir -p "$SCAN_HOME/.tok"
+    chown "$SCAN_USER:$SCAN_GROUP" "$SCAN_HOME/.tok"
+    chmod 700 "$SCAN_HOME/.tok"
+    cmp -s "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST" 2>/dev/null || token_changed=1
+    cp -f "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
+    chown "$SCAN_USER:$SCAN_GROUP" "$HOPPER_TOKEN_DST"
+    chmod 600 "$HOPPER_TOKEN_DST"
+    log "Installed hopper API token at $HOPPER_TOKEN_DST"
+elif [ ! -s "$HOPPER_TOKEN_DST" ]; then
+    # Not fatal: a hopper deployed without --token-file needs no client token.
+    log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; this worker cannot claim work from an authenticated hopper"
+fi
+
 # Sweep leftovers from any prior wedged run so the dir doesn't grow unbounded
 # across restarts. Safe: only the worker writes here.
 find "$SCAN_TMP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
@@ -423,7 +456,8 @@ if [ "$manifest_changed" -eq 1 ] || [ "$service_was_configured" -eq 0 ]; then
 fi
 
 if [ "$scan_changed" -eq 1 ] || [ "$rules_changed" -eq 1 ] \
-        || [ "$manifest_changed" -eq 1 ] || [ "$service_was_configured" -eq 0 ]; then
+        || [ "$manifest_changed" -eq 1 ] || [ "$token_changed" -eq 1 ] \
+        || [ "$service_was_configured" -eq 0 ]; then
     log "Clearing maintenance state and restarting $SMF_FMRI"
     svcadm clear "$SMF_FMRI" 2>/dev/null || true
     svcadm restart "$SMF_FMRI"

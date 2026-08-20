@@ -1,6 +1,10 @@
 #!/bin/sh
 # update-nodes.sh - Deploy Atomdrift Scan worker to remote nodes via SSH in parallel
 # Usage: ./update-nodes.sh <url> <node> [node ...]
+#
+# Each node runs its own `make deploy-worker`, which installs the hopper API
+# token from the *remote* account's ~/.tok/hopper. Nothing is shipped between
+# hosts here; provision that file on each node before the first roll.
 
 if [ $# -lt 2 ]; then
     echo "usage: $0 <url> <node> [node ...]" >&2

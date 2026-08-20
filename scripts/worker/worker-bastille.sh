@@ -1,6 +1,12 @@
 #!/bin/sh
 # worker-bastille.sh - Deploy Atomdrift Scan worker using separate build and run jails
 # Usage: ./worker-bastille.sh [build-jail] [run-jail] <hopper-url>
+#
+# Environment overrides:
+#   WORKERS            concurrency (--workers)                   (default: worker auto)
+#   LLM                OpenAI-compatible LLM endpoint (SCAN_LLM)
+#   HOPPER_TOKEN_FILE  hopper API token to install in the run jail
+#                                                                (default: ~/.tok/hopper)
 
 set -ex
 # FreeBSD /bin/sh supports pipefail; this deploy script only runs on FreeBSD.
@@ -75,6 +81,25 @@ doas bastille cmd "$RUN" id -u scan >/dev/null 2>&1 || \
 
 log "Installing runtime dependencies"
 doas bastille pkg "$RUN" install -y git 7-zip upx rizin innoextract
+
+# --- Hopper API token --------------------------------------------------------
+#
+# Hopper requires `Authorization: Bearer <token>` on every API route, so a
+# worker without this file cannot claim work. Copied from the deploying host's
+# ~/.tok/hopper into the run jail's service account home, where the worker
+# reads it — daemon(8) -u sets HOME from the passwd entry. Never an argument or
+# an rc.conf value: argv is visible in ps(1) and rc.conf is world-readable.
+HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
+HOPPER_TOKEN_DST="$BASTILLE_DIR/$RUN/root/home/scan/.tok/hopper"
+if [ -s "$HOPPER_TOKEN_SRC" ]; then
+    doas bastille cmd "$RUN" install -d -m 0700 -o scan -g scan /home/scan/.tok
+    doas install -m 0600 "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
+    doas bastille cmd "$RUN" chown scan:scan /home/scan/.tok/hopper
+    log "Installed hopper API token at $RUN:/home/scan/.tok/hopper"
+elif ! doas test -s "$HOPPER_TOKEN_DST"; then
+    # Not fatal: a hopper deployed without --token-file needs no client token.
+    log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; this worker cannot claim work from an authenticated hopper"
+fi
 
 log "Installing binary"
 doas bastille cmd "$RUN" tar -xzf /tmp/atomscan.tgz -C /usr/local/bin

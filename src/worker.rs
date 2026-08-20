@@ -32,7 +32,7 @@ use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
 use crate::server::{ModelResources, classify_bytes, classify_file};
 use crate::system_load_avg;
-use crate::upload::hopper_token;
+use crate::upload::{hopper_token, log_hopper_credential};
 
 /// Attach the hopper bearer token to a request, if there is one.
 ///
@@ -1444,6 +1444,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         pid = std::process::id(),
         "worker starting; send `kill -USR1 <pid>` for an all-thread backtrace",
     );
+    // Every hopper call carries this token, so a worker without one claims
+    // nothing. Report the source (or its absence) before the first poll.
+    log_hopper_credential();
     if cleave_slots < slots {
         tracing::warn!(
             slots,

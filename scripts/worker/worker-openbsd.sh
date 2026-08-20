@@ -13,6 +13,7 @@ URL="$1"
 [ -n "$URL" ] || { echo "error: URL required" >&2; exit 1; }
 
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
+# HOPPER_TOKEN_FILE names the hopper API token to install (default: ~/.tok/hopper).
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
 LLM="${LLM:-http://10.9.8.149:8000/v1}"
@@ -44,8 +45,28 @@ cargo build --release || die "build failed"
 
 mkdir -p "$BIN_DIR" "$(dirname "$LOG")"
 
-log "Installing binary"
+# --- Hopper API token --------------------------------------------------------
+#
+# Hopper requires `Authorization: Bearer <token>` on every API route, so a
+# worker without this file cannot claim work. The cron job below runs as this
+# same user, so the worker reads ~/.tok/hopper directly; a HOPPER_TOKEN_FILE
+# pointing elsewhere is copied there, because cron does not carry the deploy
+# environment. A rotated token forces the restart below: the worker reads it
+# once, at startup.
 restart_needed=0
+HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-$HOME/.tok/hopper}"
+HOPPER_TOKEN_DST="$HOME/.tok/hopper"
+if [ ! -s "$HOPPER_TOKEN_SRC" ]; then
+    # Not fatal: a hopper deployed without --token-file needs no client token.
+    log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; this worker cannot claim work from an authenticated hopper"
+elif [ "$HOPPER_TOKEN_SRC" != "$HOPPER_TOKEN_DST" ]; then
+    mkdir -p "$HOME/.tok" && chmod 700 "$HOME/.tok"
+    cmp -s "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST" 2>/dev/null || restart_needed=1
+    install -m 0600 "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
+    log "Installed hopper API token at $HOPPER_TOKEN_DST"
+fi
+
+log "Installing binary"
 if ! cmp -s "target/release/$BINARY" "$BIN_DIR/$BINARY" 2>/dev/null; then
     install -m 755 "target/release/$BINARY" "$BIN_DIR/$BINARY"
     restart_needed=1

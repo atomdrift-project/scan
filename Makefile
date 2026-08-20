@@ -31,6 +31,14 @@ MAX_JOBS ?= 25
 WORKERS  ?=
 MAX_RSS_GB ?=
 URL ?= http://10.9.8.10:8081/
+# Hopper's API token. Hopper requires `Authorization: Bearer <token>` on every
+# route and does not exempt loopback, so the pull worker and every
+# `--hopper`/`--upload` run need it. `atomscan` reads it from `~/.tok/hopper`
+# in its own home (`$HOPPER_TOKEN` overrides); the deploy scripts copy this
+# file into the service account's home, since a supervised service does not
+# share the operator's. Exported so a command-line override reaches them.
+HOPPER_TOKEN_FILE ?= $(HOME)/.tok/hopper
+export HOPPER_TOKEN_FILE
 # LLM second-opinion pass for `make worker` (matches the deploy scripts'
 # defaults). LLM / LLM_URL is exported as SCAN_LLM (`local`, `openrouter`, or a
 # base URL). LLM_MODEL is SCAN_LLM_MODEL (required for OpenRouter). The
@@ -314,6 +322,9 @@ benchmark-worker: release
 # to 10 by default; pass NICE=0 to disable.
 worker: kill-scan release
 	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>] [LLM=<endpoint>] [LLM_MODEL=<name>]"; exit 1; }
+	@# Runs as the invoking user, so atomscan finds $(HOPPER_TOKEN_FILE) on its
+	@# own. Say something here anyway: without it every poll returns 401.
+	@[ -s "$(HOPPER_TOKEN_FILE)" ] || echo "warning: no hopper API token at $(HOPPER_TOKEN_FILE); this worker cannot claim work from an authenticated hopper"
 	SCAN_LLM="$(LLM)" SCAN_LLM_MODEL="$(LLM_MODEL)" ./out/$(BINARY) worker --url "$(URL)" \
 		--interpret --interpret-min-prob $(INTERPRET_MIN_PROB) \
 		$(if $(WORKERS),--workers $(WORKERS),) \

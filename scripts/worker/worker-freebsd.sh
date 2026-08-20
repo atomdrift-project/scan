@@ -105,10 +105,15 @@ fi
 # ~/.tok/hopper — the same file hopper's own deploy installs — into the service
 # account's home, where the worker reads it. Never an argument or an
 # environment variable: argv is visible in ps(1).
+#
+# A rotated token must force a restart below: the worker reads it once, at
+# startup, so installing a new one without a restart leaves the old one live.
 HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
 HOPPER_TOKEN_DST="/home/scan/.tok/hopper"
+token_changed=0
 if [ -s "$HOPPER_TOKEN_SRC" ]; then
 	$SUDO install -d -m 0700 -o scan -g scan /home/scan/.tok
+	$SUDO cmp -s "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST" 2>/dev/null || token_changed=1
 	$SUDO install -m 0600 -o scan -g scan "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
 	log "Installed hopper API token at $HOPPER_TOKEN_DST"
 elif ! $SUDO test -s "$HOPPER_TOKEN_DST"; then
@@ -157,7 +162,7 @@ fi
 # sysrc is idempotent; enable so the service also comes back across reboots.
 $SUDO sysrc scan_worker_enable=YES >/dev/null
 
-if [ "$binary_changed" -eq 1 ] || [ "$rcd_changed" -eq 1 ]; then
+if [ "$binary_changed" -eq 1 ] || [ "$rcd_changed" -eq 1 ] || [ "$token_changed" -eq 1 ]; then
 	log "Restarting scan-worker"
 	# The rc.d stop is now bounded: it SIGTERMs the worker, waits out a short
 	# drain, then SIGKILLs the whole daemon(8) tree — so a busy or wedged worker
