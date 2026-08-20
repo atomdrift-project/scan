@@ -49,7 +49,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.8.0-beta.0"
+version = "2.8.0-beta.1"
 default-run = "atomscan"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable. Drives the
@@ -235,6 +235,16 @@ debug = 2
 
 [profile.dev]
 debug = "line-tables-only"
+
+# Dependencies at opt-level 1 in dev builds. Two reasons, one of them a hard
+# limit: an unoptimized debug binary emits so much DWARF unwind data that
+# `__eh_frame` crosses ld64's 16 MiB compact-unwind ceiling and every link
+# warns; and `target/debug/atomscan` is what `make lint` and the pre-commit
+# hook run fixtures through, so unoptimized dependency code makes those
+# measurably slower. The explicit per-package entries below still win over
+# this glob.
+[profile.dev.package."*"]
+opt-level = 1
 
 # Match cleave's dev-profile tuning for the heavy analysis stack. `scan`
 # frequently gets profiled and validated from `target/debug`; without these
