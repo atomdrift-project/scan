@@ -39,6 +39,30 @@ URL ?= http://10.9.8.10:8081/
 # share the operator's. Exported so a command-line override reaches them.
 HOPPER_TOKEN_FILE ?= $(HOME)/.tok/hopper
 export HOPPER_TOKEN_FILE
+
+# --- `make deploy` / `make deploy-server` knobs ------------------------------
+# Read by scripts/server/server-linux.sh (Linux) and
+# scripts/server/rollout-bastille.sh (FreeBSD); see docs/SERVER_API.md.
+#
+#   make deploy HOPPER=http://hopper-host:8081
+#
+# HOPPER is the hopper the server renews results on (`serve --hopper`). Setting
+# it is also what makes the deploy install HOPPER_TOKEN_FILE for the service
+# account — hopper rejects an unauthenticated renewal with 401.
+HOPPER ?=
+BIND ?=
+ALLOWED_DIRS ?=
+MEMORY_MAX ?=
+export HOPPER BIND ALLOWED_DIRS MEMORY_MAX
+# ALLOW_CIDR and TOKEN_SRC are deliberately NOT declared here. They default
+# with `${VAR-default}` (unset) rather than `${VAR:-default}` (unset or empty),
+# because empty is a meaningful value: no CIDR allow-list, and no
+# authentication at all. Declaring them would export an empty value on every
+# deploy and silently strip both. Pass them on the command line instead — make
+# exports command-line variables, so they still reach the script:
+#   make deploy ALLOW_CIDR=192.168.0.0/16
+#   make deploy TOKEN_SRC=            # deliberately unauthenticated
+
 # LLM second-opinion pass for `make worker` (matches the deploy scripts'
 # defaults). LLM / LLM_URL is exported as SCAN_LLM (`local`, `openrouter`, or a
 # base URL). LLM_MODEL is SCAN_LLM_MODEL (required for OpenRouter). The

@@ -7,6 +7,13 @@
 #     OpenAI-compatible LLM endpoint (vLLM) that --interpret sends samples to.
 #     The entry is copied into the run jail, which has no resolver of its own.
 #
+# Hopper (optional):
+#   HOPPER        hopper base URL. When set, the server renews every analyzed
+#                 result on <HOPPER>/api/result (`serve --hopper`), and the
+#                 hopper API token is installed into the jail.  (default: unset)
+#   HOPPER_TOKEN_FILE  hopper API token to install when HOPPER is set
+#                                                          (default: ~/.tok/hopper)
+#
 # Cloudflare Tunnel (optional):
 #   CLOUDFLARED   "auto" installs and supervises a connector in the run jail
 #                 only when CF_TUNNEL_TOKEN is passed or a token from an
@@ -23,6 +30,9 @@ set -o pipefail
 BUILD="${1:-build}"
 RUN="${2:-scan}"
 CLOUDFLARED="${CLOUDFLARED:-auto}"
+# Not a secret, so unlike the tokens it may live in the jail's rc.conf; the
+# rc.d below reads it as $scan_hopper.
+HOPPER="${HOPPER:-}"
 
 # The tunnel token must never reach the `set -x` trace, argv, or the jail's
 # rc.conf. Capture it here, unset it, and move it into the jail through the
@@ -186,6 +196,28 @@ if [ -s "$TOKEN_SRC" ]; then
 fi
 doas test -s "$TOKEN_DST" || die "no API token at $TOKEN_DST"
 
+# --- Hopper API token --------------------------------------------------------
+#
+# Distinct from the API token above: that one authenticates *clients of this
+# server*, this one authenticates *this server to hopper*. Only needed when
+# HOPPER is set. Hopper requires `Authorization: Bearer <token>` on every API
+# route and does not exempt loopback, so without it every result renewal is
+# rejected with 401. Moved through the filesystem, never as an argument, so the
+# `set -x` trace above cannot echo it.
+if [ -n "$HOPPER" ]; then
+    HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
+    HOPPER_TOKEN_DST="$BASTILLE_DIR/$RUN/root/home/scan/.tok/hopper"
+    log "Installing hopper API token"
+    if [ -s "$HOPPER_TOKEN_SRC" ]; then
+        doas install -m 0600 "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
+        doas bastille cmd "$RUN" chown scan:scan /home/scan/.tok/hopper
+        doas bastille cmd "$RUN" chmod 0600 /home/scan/.tok/hopper
+    elif ! doas test -s "$HOPPER_TOKEN_DST"; then
+        # Not fatal: a hopper deployed without --token-file needs no client token.
+        log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; result renewal on $HOPPER will be rejected"
+    fi
+fi
+
 log "Creating rc.d service"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
 doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/scan >/dev/null <<'EOF'
@@ -237,7 +269,15 @@ esac
 # --token-file requires `Authorization: Bearer <token>` on every route except
 # /_/health, including from loopback. atomscan refuses to start if the file is
 # missing or empty, so a lost token fails loudly instead of opening the API.
-command_args="-n ${scan_nice} ${_protect} /usr/sbin/daemon -c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --token-file /home/scan/.tok/scan --interpret --llm http://interpret:8000/v1"
+#
+# --hopper renews every analyzed result on a hopper instance. The URL is not a
+# secret, so it comes from rc.conf (the deploy sets it with sysrc from HOPPER=);
+# empty omits the flag. Its bearer token is a file, /home/scan/.tok/hopper,
+# which atomscan finds through the scan user's HOME.
+: ${scan_hopper:=""}
+_hopper=""
+[ -n "$scan_hopper" ] && _hopper="--hopper ${scan_hopper}"
+command_args="-n ${scan_nice} ${_protect} /usr/sbin/daemon -c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --token-file /home/scan/.tok/scan --interpret --llm http://interpret:8000/v1 ${_hopper}"
 
 run_rc_command "$1"
 EOF
@@ -246,6 +286,12 @@ doas bastille cmd "$RUN" chmod 755 /usr/local/etc/rc.d/scan
 
 log "Enabling and restarting scan service"
 doas bastille sysrc "$RUN" scan_enable=YES
+# Written unconditionally, empty when HOPPER is not set, so dropping the
+# variable actually turns renewal off instead of silently keeping the previous
+# target — and rc.conf shows that it is off on purpose. Empty rather than
+# `sysrc -x`: the rc.d treats both the same, and this needs no flag forwarded
+# through `bastille sysrc`.
+doas bastille sysrc "$RUN" scan_hopper="$HOPPER"
 doas bastille service "$RUN" scan stop 2>/dev/null || true
 doas bastille cmd "$RUN" pkill -9 -F /var/run/scan.pid 2>/dev/null || true
 doas bastille service "$RUN" scan start

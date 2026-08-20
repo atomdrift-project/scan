@@ -115,13 +115,25 @@ the service account's own `~/.tok/scan`, which the unit passes as
 token restarts the service, since it is read only at startup. Hand clients
 `$(cat ~/.tok/scan)`.
 
-`--hopper` needs a second, unrelated token: `~/.tok/scan` authenticates
-clients *to this server*, `~/.tok/hopper` authenticates *this server to
-hopper*. When `HOPPER=` is set, `make deploy` copies the deploying user's
-`~/.tok/hopper` into the service account's own `~/.tok/hopper`
-(`HOPPER_TOKEN_FILE=` overrides the source). Without it, hopper rejects every
-result renewal with 401 — it requires a bearer token on every route and does
-not exempt loopback. See [WORKERS.md](WORKERS.md#authenticating-to-hopper).
+#### Uploading to hopper
+
+Set the hopper to renew results on with `HOPPER=`, on either platform:
+
+    make deploy HOPPER=http://hopper-host:8081
+
+That adds `--hopper <url>` to the service and installs the credential it needs.
+It is a second, unrelated token: `~/.tok/scan` authenticates clients *to this
+server*, `~/.tok/hopper` authenticates *this server to hopper*. `make deploy`
+copies the deploying user's `~/.tok/hopper` into the service account's own
+`~/.tok/hopper` (`HOPPER_TOKEN_FILE=` overrides the source). Without it, hopper
+rejects every result renewal with 401 — it requires a bearer token on every
+route and does not exempt loopback. See
+[WORKERS.md](WORKERS.md#authenticating-to-hopper).
+
+On FreeBSD the URL lands in the jail's `rc.conf` as `scan_hopper`, so it can
+also be changed in place — `bastille sysrc <jail> scan_hopper=<url>` plus a
+service restart — without a redeploy. Dropping `HOPPER=` from a later deploy
+clears it, so renewal stops rather than silently continuing to the old target.
 
 Linux overrides (passed through the environment): `BIND=` (default
 `127.0.0.1:49999`, on the assumption that a Cloudflare tunnel or another local
@@ -129,13 +141,18 @@ proxy provides the ingress; set `0.0.0.0:49999` to listen on every interface),
 `TOKEN_SRC=` (default `~/.tok/scan`; set empty to deploy without
 authentication), `ALLOW_CIDR=` (default `10.0.0.0/8`; set empty to omit),
 `LLM=` / `LLM_URL=` (`local`, `openrouter`, or a base URL), `LLM_MODEL=`
-(required for OpenRouter), `WORKERS=`, `MEMORY_MAX=`, `HOPPER=` with
-`HOPPER_TOKEN_FILE=`. `make uninstall-server`
+(required for OpenRouter), `WORKERS=`, `MEMORY_MAX=`. `make uninstall-server`
 tears the unit down.
+
+`ALLOW_CIDR=` and `TOKEN_SRC=` treat *empty* as a deliberate choice — no CIDR
+allow-list, no authentication — so unlike the others they are not declared in
+the Makefile, where they would be exported empty on every deploy. Pass them on
+the command line when you mean them.
 
 The FreeBSD jail keeps `--bind 0.0.0.0:49999` with `--allow-cidr 10.0.0.0/8`,
 since it is reached over the network rather than through a tunnel, and always
-requires a token.
+requires a token. `HOPPER=` / `HOPPER_TOKEN_FILE=` apply there too; the other
+overrides above are Linux-only.
 
 ## Endpoints
 
