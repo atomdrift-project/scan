@@ -59,7 +59,8 @@ pub enum Decision {
 }
 
 impl Decision {
-    /// Wire form for `GET /_/bloom`: lowercase, hyphenated.
+    /// Wire form for the `bloom` field of a lookup answer: lowercase,
+    /// hyphenated.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -77,7 +78,7 @@ impl Decision {
 /// `None` and contributes no fast path.
 ///
 /// [`Self::memo_sha256`] / [`Self::memo_purl`] keep a 4096-entry LRU of recent
-/// `/_/bloom` decisions. Scan-time [`Self::decide_sha256`] / [`Self::decide_purl`]
+/// lookup decisions. Scan-time [`Self::decide_sha256`] / [`Self::decide_purl`]
 /// bypass the memo so a unique-file crawl cannot evict the lookup working set.
 pub struct Lookup {
     purl_good: Option<Filter>,
@@ -206,14 +207,14 @@ impl Lookup {
         )
     }
 
-    /// SHA-256 membership for `GET /_/bloom`: 4096-entry LRU.
+    /// SHA-256 membership for `GET /sha256/{sha}`: 4096-entry LRU.
     #[must_use]
     pub fn memo_sha256(&self, digest: &[u8; 32]) -> Decision {
         self.sha256_memo
             .get_or_insert(digest, || self.decide_sha256(digest))
     }
 
-    /// PURL membership for `GET /_/bloom`: 4096-entry LRU.
+    /// PURL membership for `GET /purl`: 4096-entry LRU.
     /// Keyed on the request string so a hit skips `identity()` as well as the
     /// filter probe.
     #[must_use]
@@ -425,7 +426,7 @@ mod tests {
         assert_eq!(lk.decide_purl("pkg:npm/unheard-of@9"), Decision::Unknown);
         assert_eq!(lk.decide_sha256(&sha(3)), Decision::Unknown);
 
-        // The /_/bloom memo must agree with the uncached probe, including on
+        // The lookup memo must agree with the uncached probe, including on
         // a second call (the LRU hit path).
         assert_eq!(lk.memo_purl("pkg:npm/good@1"), Decision::Skip);
         assert_eq!(lk.memo_purl("pkg:npm/good@1"), Decision::Skip);

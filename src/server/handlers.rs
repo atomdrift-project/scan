@@ -209,6 +209,7 @@ fn flight_outcome(
                 probability = scan_result.probability,
                 "<-- 200 OK",
             );
+            index_verdict(&scan_result, key.purl());
             Outcome::Report(scan_result)
         }
         AnalysisOutcome::Ok(Err(e)) => {
@@ -241,6 +242,22 @@ fn flight_response(outcome: &Outcome, elapsed_ms: u64) -> Response {
         }
         Outcome::Rendered { status, body } => (*status, Json(body)).into_response(),
     }
+}
+
+/// Record what this analysis found, so a later lookup of the same artifact is
+/// answerable without re-running it.
+///
+/// Off the response path: the write is small, but it opens the index on first
+/// use (a `create_dir_all` plus a prune of stale ruleset namespaces), which has
+/// no business happening on the reactor. Best-effort — a lookup that misses is
+/// a normal answer, so nothing here is worth failing a request over.
+fn index_verdict(result: &crate::engine::ScanResult, purl: Option<&str>) {
+    let verdict = crate::lookup::Verdict::from_scan(result, purl);
+    tokio::task::spawn_blocking(move || {
+        if let Some(index) = crate::lookup::global() {
+            index.put(&verdict);
+        }
+    });
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
@@ -475,64 +492,113 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
-/// Query string for `GET /_/bloom`. Exactly one of `sha256` or `purl`.
+/// Query string for `GET /purl`.
+///
+/// The PURL travels as a query parameter rather than a path segment because its
+/// own grammar carries `/`, `?` and `#`: `pkg:npm/@scope/name@1.0.0?arch=x64`
+/// in a path would have everything from the `?` parsed as the *URL's* query and
+/// a `#subpath` dropped by the client, silently keying on a different package.
+/// Qualifiers are load-bearing here — `fletch::purl::identity` keeps them.
 #[derive(Debug, Default, serde::Deserialize)]
-pub(super) struct BloomQuery {
-    sha256: Option<String>,
+pub(super) struct PurlQuery {
     purl: Option<String>,
 }
 
-/// GET /_/bloom — known-good / known-bad membership.
+/// GET /sha256/{sha256} — what we already know about an artifact.
 ///
-/// Does not take an analyze slot and does not wait for the ONNX model: the
-/// filters are files, loaded at process start. A missing filter set fails
-/// closed (`unknown`). The last 4096 SHA-256 and 4096 PURL decisions are
-/// memoized in-process (mutex + LRU) so repeated Beamline lookups skip the
-/// probe. The HTTP `Cache-Control` is a separate, coarser cache; known-bad
-/// is the revocation path, so that header stays briefly cacheable.
-pub(super) async fn bloom(Query(q): Query<BloomQuery>) -> Response {
-    match bloom_decide(
-        crate::bloom_repo::global().as_deref(),
-        q.sha256.as_deref(),
-        q.purl.as_deref(),
-    ) {
-        Ok(decision) => {
-            let mut resp =
-                Json(serde_json::json!({ "decision": decision.as_str() })).into_response();
-            resp.headers_mut().insert(
-                axum::http::header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static("public, max-age=3600"),
-            );
-            resp
-        }
-        Err((status, msg)) => error_response(status, msg),
-    }
+/// Never analyzes: no slot, no fetch, and it answers while the model is still
+/// loading. A caller that gets `404 unknown sample` asks for a real analysis
+/// with `/analyze` or `/analyze-purl`.
+pub(super) async fn lookup_sha(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(sha256): axum::extract::Path<String>,
+) -> Response {
+    let Some(digest) = crate::bloom::parse_sha256_hex(sha256.trim()) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid sha256");
+    };
+    let sha = sha256.trim().to_ascii_lowercase();
+    let decision = crate::bloom_repo::global()
+        .as_deref()
+        .map_or(crate::bloom_repo::Decision::Unknown, |lk| {
+            lk.memo_sha256(&digest)
+        });
+    let verdict = crate::lookup::global().and_then(|index| index.get_sha(&sha));
+    lookup_response(&state, verdict.as_ref(), decision, &sha, None)
 }
 
-/// Membership decision for one key. `lookup` `None` is fail-closed unknown.
-fn bloom_decide(
-    lookup: Option<&crate::bloom_repo::Lookup>,
-    sha256: Option<&str>,
-    purl: Option<&str>,
-) -> Result<crate::bloom_repo::Decision, (StatusCode, &'static str)> {
-    let sha = sha256.map(str::trim).filter(|s| !s.is_empty());
-    let purl = purl.map(str::trim).filter(|s| !s.is_empty());
-    match (sha, purl) {
-        (Some(_), Some(_)) | (None, None) => Err((
-            StatusCode::BAD_REQUEST,
-            "provide exactly one of sha256 or purl",
-        )),
-        (Some(sha), None) => {
-            let digest = crate::bloom::parse_sha256_hex(sha)
-                .ok_or((StatusCode::BAD_REQUEST, "invalid sha256"))?;
-            Ok(lookup.map_or(crate::bloom_repo::Decision::Unknown, |lk| {
-                lk.memo_sha256(&digest)
-            }))
-        }
-        (None, Some(purl)) => Ok(lookup.map_or(crate::bloom_repo::Decision::Unknown, |lk| {
-            lk.memo_purl(purl)
-        })),
+/// GET /purl?purl=… — what we already know about a package.
+///
+/// Same contract as [`lookup_sha`]: local knowledge only, never an analysis.
+pub(super) async fn lookup_purl(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<PurlQuery>,
+) -> Response {
+    let purl = q.purl.as_deref().map(str::trim).unwrap_or_default();
+    if purl.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "missing purl");
     }
+    if fletch::purl::identity(purl).is_none() {
+        return error_response(StatusCode::BAD_REQUEST, "invalid purl");
+    }
+    let decision = crate::bloom_repo::global()
+        .as_deref()
+        .map_or(crate::bloom_repo::Decision::Unknown, |lk| lk.memo_purl(purl));
+    let verdict = crate::lookup::global().and_then(|index| index.get_purl(purl));
+    let sha = verdict.as_ref().map_or("", |v| v.sha256.as_str()).to_owned();
+    lookup_response(&state, verdict.as_ref(), decision, &sha, Some(purl))
+}
+
+/// Render a lookup answer.
+///
+/// A stored verdict is a 200; holding nothing is a 404, and the bloom decision
+/// rides on both. That keeps the two kinds of knowledge distinguishable — a
+/// filter says "probably not worth scanning", an analysis says what the thing
+/// *is* — while still answering both questions in one round trip.
+fn lookup_response(
+    state: &AppState,
+    verdict: Option<&crate::lookup::Verdict>,
+    decision: crate::bloom_repo::Decision,
+    sha256: &str,
+    purl: Option<&str>,
+) -> Response {
+    // A token-protected answer must not be stored by a shared cache: it is
+    // knowledge about a specific customer's artifact, not public data.
+    let scope = if state.auth_digest.is_some() {
+        "private"
+    } else {
+        "public"
+    };
+    let Some(verdict) = verdict else {
+        // A miss is not cacheable for any length of time: it becomes a hit the
+        // moment anything analyzes this artifact.
+        let mut resp = (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "unknown sample",
+                "bloom": decision.as_str(),
+            })),
+        )
+            .into_response();
+        resp.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        return resp;
+    };
+    let mut resp = Json(verdict.view(decision.as_str(), purl)).into_response();
+    let headers = resp.headers_mut();
+    // A verdict is immutable for the ruleset that produced it, and the ruleset
+    // is part of the namespace it was read from — a rules or model update
+    // lands in a fresh namespace, which reads as a miss rather than as this
+    // answer going stale.
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!("{scope}, max-age=86400")) {
+        headers.insert(axum::http::header::CACHE_CONTROL, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(sha256.trim()) {
+        headers.insert("X-SHA256", value);
+    }
+    headers.insert("X-Scan-Source", axum::http::HeaderValue::from_static("index"));
+    resp
 }
 
 /// Outcome of [`do_model_reload`] — caller maps this to an HTTP response.
@@ -945,10 +1011,7 @@ pub(super) async fn analyze(
     let sha = format!("{:x}", digest.finalize());
 
     // Share the run with anyone already analyzing these exact bytes.
-    let attachment = state.flights.join(FlightKey::Sha {
-        sha: sha.clone(),
-        name: filename.clone(),
-    });
+    let attachment = state.flights.join(FlightKey::Sha(sha.clone()));
     if attachment.leads() {
         tracing::info!(
             id = request_id,
@@ -1721,6 +1784,7 @@ pub(super) async fn analyze_path(
             // response body first so the (possibly large) envelope moves to the
             // uploader without a clone; the renewal runs off the executor since
             // collect_upload_artifacts reads sidecars from disk.
+            index_verdict(&scan_result, None);
             let sha256 = scan_result.sha256.clone();
             let size = scan_result.size_bytes;
             let deps = std::mem::take(&mut scan_result.dependency_results);
@@ -2212,27 +2276,10 @@ mod tests {
         assert!(crate::provenance::registry_provenance(raw.get().as_bytes()).is_none());
     }
 
+    /// The lookup routes read their decision straight off the filters, so the
+    /// fixture coverage lives with the filters rather than with a handler.
     #[test]
-    fn bloom_decide_requires_exactly_one_key() {
-        use crate::bloom_repo::Lookup;
-        let lk = Lookup::default();
-        assert!(super::bloom_decide(Some(&lk), None, None).is_err());
-        assert!(super::bloom_decide(Some(&lk), Some("aa"), Some("pkg:npm/x@1")).is_err());
-        assert!(super::bloom_decide(Some(&lk), Some("not-a-sha"), None).is_err());
-    }
-
-    #[test]
-    fn bloom_decide_unknown_without_filters() {
-        let sha = "a".repeat(64);
-        let d = super::bloom_decide(None, Some(&sha), None).expect("valid sha");
-        assert_eq!(d.as_str(), "unknown");
-        let d =
-            super::bloom_decide(None, None, Some("pkg:npm/left-pad@1.3.0")).expect("valid purl");
-        assert_eq!(d.as_str(), "unknown");
-    }
-
-    #[test]
-    fn bloom_decide_skip_and_known_bad_from_fixture() {
+    fn filters_answer_skip_known_bad_and_unknown() {
         use crate::bloom::{Record, generate};
         use crate::bloom_repo::{Decision, Lookup};
 
@@ -2262,24 +2309,22 @@ mod tests {
             std::fs::write(path, f.to_bytes()).expect("write filter");
         }
         let lk = Lookup::load_from(tmp.path());
-        assert_eq!(
-            super::bloom_decide(Some(&lk), None, Some("pkg:npm/good@1")).unwrap(),
-            Decision::Skip
-        );
-        assert_eq!(
-            super::bloom_decide(Some(&lk), None, Some("pkg:npm/evil@1")).unwrap(),
-            Decision::KnownBad
-        );
-        let good_hex: String = good_sha.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            super::bloom_decide(Some(&lk), Some(&good_hex), None).unwrap(),
-            Decision::Skip
-        );
-        let unseen = "ab".repeat(32);
-        assert_eq!(
-            super::bloom_decide(Some(&lk), Some(&unseen), None).unwrap(),
-            Decision::Unknown
-        );
+        assert_eq!(lk.memo_purl("pkg:npm/good@1"), Decision::Skip);
+        assert_eq!(lk.memo_purl("pkg:npm/evil@1"), Decision::KnownBad);
+        assert_eq!(lk.memo_sha256(&good_sha), Decision::Skip);
+        let mut unseen = [0u8; 32];
+        unseen[0] = 0xab;
+        assert_eq!(lk.memo_sha256(&unseen), Decision::Unknown);
+    }
+
+    /// Without filters installed every key is `unknown` — fail closed, never
+    /// an error, so a lookup still answers.
+    #[test]
+    fn filters_absent_reads_unknown() {
+        use crate::bloom_repo::{Decision, Lookup};
+        let lk = Lookup::default();
+        assert_eq!(lk.memo_purl("pkg:npm/left-pad@1.3.0"), Decision::Unknown);
+        assert_eq!(lk.memo_sha256(&[7u8; 32]), Decision::Unknown);
     }
 
     #[test]
@@ -2296,40 +2341,4 @@ mod tests {
         assert!(super::normalize_pkg_purl("not a purl").is_err());
     }
 
-    #[tokio::test]
-    async fn bloom_http_400_and_unknown_without_taking_a_slot() {
-        use axum::Router;
-        use axum::body::Body;
-        use axum::http::Request;
-        use axum::routing::get;
-        use tower::ServiceExt;
-
-        let app = Router::new().route("/_/bloom", get(super::bloom));
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .uri("/_/bloom")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-
-        let app = Router::new().route("/_/bloom", get(super::bloom));
-        let sha = "a".repeat(64);
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/_/bloom?sha256={sha}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["decision"], "unknown");
-    }
 }

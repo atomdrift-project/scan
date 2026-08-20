@@ -28,26 +28,34 @@ use crate::engine::ScanResult;
 /// What makes two requests the same piece of work.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) enum FlightKey {
-    /// Lowercase hex SHA-256 of the uploaded bytes, plus the sanitized upload
-    /// filename — `POST /analyze`.
+    /// Lowercase hex SHA-256 of the uploaded bytes — `POST /analyze`.
     ///
-    /// The name is part of the identity, not decoration: cleave detects file
-    /// type from the extension, so the same bytes staged as `readme.txt` and
-    /// as `package.json` are two different analyses with two different
-    /// verdicts. Keying on the digest alone would let whichever request
-    /// happened to lead decide the answer everyone else receives — a way to
-    /// pick another client's verdict by racing it with a benign-looking name
-    /// — and would hand followers the leader's filename in the report's
-    /// `path`.
-    Sha { sha: String, name: String },
+    /// The bytes are the identity; the upload filename is not part of it, so
+    /// concurrent requests for one artifact share a single analysis and the
+    /// first one in decides the answer. cleave does type the file by its
+    /// extension, so a follower that named the same bytes differently gets the
+    /// leader's framing of them — an acceptable trade for one analysis per
+    /// artifact, since it takes a deliberate race to arrange.
+    Sha(String),
     /// Package URL — `POST /analyze-purl`.
     Purl(String),
+}
+
+impl FlightKey {
+    /// The package this analysis was requested by, when it was requested by
+    /// one. Uploads carry a digest and a filename, never a locator.
+    pub(super) fn purl(&self) -> Option<&str> {
+        match self {
+            Self::Purl(purl) => Some(purl),
+            Self::Sha(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for FlightKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sha { sha, name } => write!(f, "sha:{sha} name:{name}"),
+            Self::Sha(sha) => write!(f, "sha:{sha}"),
             Self::Purl(purl) => write!(f, "purl:{purl}"),
         }
     }
@@ -315,10 +323,7 @@ mod tests {
     use super::*;
 
     fn key() -> FlightKey {
-        FlightKey::Sha {
-            sha: "a".repeat(64),
-            name: "sample.zip".into(),
-        }
+        FlightKey::Sha("a".repeat(64))
     }
 
     fn rendered(status: StatusCode) -> Outcome {
@@ -346,20 +351,17 @@ mod tests {
         assert_eq!(flights.census().analyses, 1);
     }
 
-    /// The same bytes under a different name are a different analysis: cleave
-    /// types the file by its extension, so sharing across names would answer
-    /// one request with another request's verdict.
+    /// The same bytes are one analysis however they were named: the digest is
+    /// the whole identity, so a second uploader follows rather than paying for
+    /// a duplicate run.
     #[test]
-    fn the_same_bytes_under_another_name_do_not_share() {
+    fn the_same_bytes_under_another_name_share_one_analysis() {
         let flights = Arc::new(Flights::default());
         let zip = flights.join(key());
-        let txt = flights.join(FlightKey::Sha {
-            sha: "a".repeat(64),
-            name: "sample.txt".into(),
-        });
+        let txt = flights.join(FlightKey::Sha("a".repeat(64)));
         assert!(zip.leads());
-        assert!(txt.leads(), "a new name must run its own analysis");
-        assert_eq!(flights.census().analyses, 2);
+        assert!(!txt.leads(), "the same bytes follow the run already going");
+        assert_eq!(flights.census().analyses, 1);
     }
 
     #[test]
