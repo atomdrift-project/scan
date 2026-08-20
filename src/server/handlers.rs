@@ -336,8 +336,10 @@ pub(super) struct BloomQuery {
 ///
 /// Does not take an analyze slot and does not wait for the ONNX model: the
 /// filters are files, loaded at process start. A missing filter set fails
-/// closed (`unknown`). Beamline caches this aggressively; the known-bad
-/// channel is the revocation path, so the response is only briefly cacheable.
+/// closed (`unknown`). The last 4096 SHA-256 and 4096 PURL decisions are
+/// memoized in-process (mutex + LRU) so repeated Beamline lookups skip the
+/// probe. The HTTP `Cache-Control` is a separate, coarser cache; known-bad
+/// is the revocation path, so that header stays briefly cacheable.
 pub(super) async fn bloom(Query(q): Query<BloomQuery>) -> Response {
     match bloom_decide(
         crate::bloom_repo::global().as_deref(),
@@ -345,7 +347,8 @@ pub(super) async fn bloom(Query(q): Query<BloomQuery>) -> Response {
         q.purl.as_deref(),
     ) {
         Ok(decision) => {
-            let mut resp = Json(serde_json::json!({ "decision": decision.as_str() })).into_response();
+            let mut resp =
+                Json(serde_json::json!({ "decision": decision.as_str() })).into_response();
             resp.headers_mut().insert(
                 axum::http::header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("public, max-age=3600"),
@@ -365,18 +368,19 @@ fn bloom_decide(
     let sha = sha256.map(str::trim).filter(|s| !s.is_empty());
     let purl = purl.map(str::trim).filter(|s| !s.is_empty());
     match (sha, purl) {
-        (Some(_), Some(_)) | (None, None) => {
-            Err((StatusCode::BAD_REQUEST, "provide exactly one of sha256 or purl"))
-        }
+        (Some(_), Some(_)) | (None, None) => Err((
+            StatusCode::BAD_REQUEST,
+            "provide exactly one of sha256 or purl",
+        )),
         (Some(sha), None) => {
             let digest = crate::bloom::parse_sha256_hex(sha)
                 .ok_or((StatusCode::BAD_REQUEST, "invalid sha256"))?;
             Ok(lookup.map_or(crate::bloom_repo::Decision::Unknown, |lk| {
-                lk.decide_sha256(&digest)
+                lk.memo_sha256(&digest)
             }))
         }
         (None, Some(purl)) => Ok(lookup.map_or(crate::bloom_repo::Decision::Unknown, |lk| {
-            lk.decide_purl(purl)
+            lk.memo_purl(purl)
         })),
     }
 }
@@ -1078,7 +1082,12 @@ pub(super) async fn analyze_purl(
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
         }
         AnalysisOutcome::Timeout(secs) => {
-            tracing::warn!(id = request_id, elapsed_ms, timeout_secs = secs, "<-- 504 analysis timeout");
+            tracing::warn!(
+                id = request_id,
+                elapsed_ms,
+                timeout_secs = secs,
+                "<-- 504 analysis timeout"
+            );
             (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(serde_json::json!({
@@ -1984,7 +1993,8 @@ mod tests {
         let sha = "a".repeat(64);
         let d = super::bloom_decide(None, Some(&sha), None).expect("valid sha");
         assert_eq!(d.as_str(), "unknown");
-        let d = super::bloom_decide(None, None, Some("pkg:npm/left-pad@1.3.0")).expect("valid purl");
+        let d =
+            super::bloom_decide(None, None, Some("pkg:npm/left-pad@1.3.0")).expect("valid purl");
         assert_eq!(d.as_str(), "unknown");
     }
 

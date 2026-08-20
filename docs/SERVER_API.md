@@ -108,8 +108,9 @@ and answers while models are still loading. Provide exactly one key:
     { "decision": "skip" | "known-bad" | "conflicted" | "unknown" }
 
 `skip` is known-good and not revoked by the bad filter. Missing filters
-fail closed (`unknown`). `Cache-Control: public, max-age=3600`. 400 if
-both keys, neither key, or a malformed sha256.
+fail closed (`unknown`). The server memos the last 4096 SHA-256 and 4096
+PURL decisions in process (mutex + LRU). `Cache-Control: public,
+max-age=3600`. 400 if both keys, neither key, or a malformed sha256.
 
 ### `GET /_/health`
 

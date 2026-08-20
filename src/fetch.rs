@@ -3288,7 +3288,7 @@ mod tests {
             "metadata/registry::registry-security-hold-record"
         );
         assert!(
-            by_declared_locator.get(&fetched.locator).is_none(),
+            !by_declared_locator.contains_key(&fetched.locator),
             "control: joining on the resolved fetch locator would drop the sidecar"
         );
     }
