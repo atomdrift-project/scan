@@ -35,6 +35,8 @@ use crate::model::Classification;
 /// Default OpenAI-compatible endpoint — a local server (override with `--llm`
 /// or `SCAN_LLM`).
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
+/// Named `--llm openrouter` / `SCAN_LLM=openrouter` target.
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// Default minimum ML probability for a sample to be sent to the LLM. Kept very
 /// low: the LLM's whole value is rescuing samples ML *under*-scored (measured ML
 /// false-negatives — a crypto clipper at 0.024, a git-push exfil at 0.039 — sit
@@ -111,6 +113,52 @@ impl std::fmt::Debug for InterpretConfig {
             .field("max_concurrency", &self.max_concurrency)
             .finish()
     }
+}
+
+/// Map `--llm` / `SCAN_LLM` to an OpenAI-compatible base URL. `local` is the
+/// loopback vLLM/Ollama default; `openrouter` is the public OpenRouter API;
+/// anything else is used as a base URL verbatim.
+#[must_use]
+pub fn llm_base_url(target: &str) -> String {
+    match target {
+        "local" => DEFAULT_BASE_URL.to_string(),
+        "openrouter" => OPENROUTER_BASE_URL.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether this base URL (or the unresolved `openrouter` alias) is OpenRouter.
+#[must_use]
+pub fn is_openrouter_endpoint(base_url: &str) -> bool {
+    let t = base_url.trim_end_matches('/');
+    t == "openrouter"
+        || t.eq_ignore_ascii_case(OPENROUTER_BASE_URL.trim_end_matches('/'))
+        || t.contains("openrouter.ai")
+}
+
+/// `$HOME/.tok/openrouter` — first non-empty trimmed line is the key.
+#[must_use]
+pub fn openrouter_token_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(home.join(".tok").join("openrouter"))
+}
+
+/// Bearer token from [`openrouter_token_path`], if the file is present.
+#[must_use]
+pub fn openrouter_key_from_home() -> Option<String> {
+    read_token_file(&openrouter_token_path()?)
+}
+
+/// First non-empty trimmed line of a token file.
+#[must_use]
+pub fn read_token_file(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 impl Default for InterpretConfig {
@@ -800,12 +848,24 @@ struct ChatRequest<'a> {
     stream: bool,
     /// vLLM extension to disable Qwen-style chain-of-thought: without it the
     /// model spends the token budget "thinking" and returns a null `content`.
-    chat_template_kwargs: ChatTemplateKwargs,
+    /// Omitted for OpenRouter, which rejects or ignores unknown vLLM fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// OpenRouter reasoning toggle. vLLM does not take this field; OpenRouter
+    /// thinking models otherwise burn [`MAX_TOKENS`] on chain-of-thought and
+    /// return empty `content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningParam>,
 }
 
 #[derive(Serialize)]
 struct ChatTemplateKwargs {
     enable_thinking: bool,
+}
+
+#[derive(Serialize)]
+struct ReasoningParam {
+    enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -924,6 +984,7 @@ fn chat_raw(
         .context("building LLM HTTP client")
         .map_err(CallError::Transport)?;
 
+    let openrouter = is_openrouter_endpoint(&cfg.base_url);
     let body = ChatRequest {
         model: &cfg.model,
         messages: [
@@ -939,9 +1000,10 @@ fn chat_raw(
         temperature: 0.0,
         max_tokens,
         stream: false,
-        chat_template_kwargs: ChatTemplateKwargs {
+        chat_template_kwargs: (!openrouter).then_some(ChatTemplateKwargs {
             enable_thinking: false,
-        },
+        }),
+        reasoning: openrouter.then_some(ReasoningParam { enabled: false }),
     };
 
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
@@ -1410,6 +1472,45 @@ mod tests {
         // No size token → None (falls back to listing order).
         assert_eq!(param_billions("gpt-4"), None);
         assert_eq!(param_billions("microsoft/phi-3-mini-4k-instruct"), None);
+    }
+
+    #[test]
+    fn llm_base_url_maps_named_targets() {
+        assert_eq!(llm_base_url("local"), DEFAULT_BASE_URL);
+        assert_eq!(llm_base_url("openrouter"), OPENROUTER_BASE_URL);
+        assert_eq!(
+            llm_base_url("https://example.test/v1"),
+            "https://example.test/v1"
+        );
+        assert!(is_openrouter_endpoint("openrouter"));
+        assert!(is_openrouter_endpoint(OPENROUTER_BASE_URL));
+        assert!(is_openrouter_endpoint("https://openrouter.ai/api/v1/"));
+        assert!(!is_openrouter_endpoint(DEFAULT_BASE_URL));
+        assert!(!is_openrouter_endpoint("http://10.9.8.149:8000/v1"));
+    }
+
+    #[test]
+    fn read_token_file_takes_first_nonempty_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openrouter");
+        std::fs::write(&path, "\n  sk-test  \n# ignore\n").unwrap();
+        assert_eq!(read_token_file(&path).as_deref(), Some("sk-test"));
+        assert!(read_token_file(&dir.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn openrouter_token_path_is_under_dot_tok() {
+        let path = openrouter_token_path().expect("home");
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("openrouter")
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some(".tok")
+        );
     }
 
     /// A deploy level of `-l 25` over a full grid, so the two band boundaries sit

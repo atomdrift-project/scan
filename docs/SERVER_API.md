@@ -51,8 +51,9 @@ until the status flips to `ok`.
 
 Linux overrides (passed through the environment): `BIND=` (default
 `0.0.0.0:49999`, matching the FreeBSD jail), `ALLOW_CIDR=` (default
-`10.0.0.0/8`; set empty to omit), `LLM=`, `WORKERS=`, `MEMORY_MAX=`.
-`make uninstall-server` tears the unit down.
+`10.0.0.0/8`; set empty to omit), `LLM=` / `LLM_URL=` (`local`, `openrouter`,
+or a base URL), `LLM_MODEL=` (required for OpenRouter), `WORKERS=`,
+`MEMORY_MAX=`. `make uninstall-server` tears the unit down.
 
 ## Endpoints
 

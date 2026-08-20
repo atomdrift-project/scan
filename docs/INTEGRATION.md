@@ -140,8 +140,10 @@ the endpoint lists nothing, the scan stops with an error rather than guessing.
 We recommend `Qwen/Qwen3.8-27B` under vLLM; a Qwen3-class model works well
 generally, and ~9B is enough if that is what fits.
 
-Point it elsewhere with `--llm`, `--llm-model`, `--llm-key`. Control which
-samples qualify with `--interpret-min-prob` (default `0.01`).
+Point it elsewhere with `--llm`, `--llm-model`, `--llm-key`. `--llm openrouter`
+uses `https://openrouter.ai/api/v1`; the key is `--llm-key`, `SCAN_LLM_KEY`, or
+`~/.tok/openrouter`, and `--llm-model` is required. Control which samples
+qualify with `--interpret-min-prob` (default `0.01`).
 
 ## Following references: `--fetch` (experimental)
 
