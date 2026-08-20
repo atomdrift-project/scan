@@ -146,6 +146,40 @@ fn analysis_error_body(error: &anyhow::Error) -> (StatusCode, serde_json::Value)
     (status, body)
 }
 
+/// Where this result's analysis came from, for the completion log line.
+///
+/// `cached` means cleave replayed the whole report from its on-disk cache
+/// (SQLite, keyed by content digest, options, and traits revision) rather than
+/// running the pipeline. It survives restarts, so a fast response is not
+/// evidence of a warm process. A request that instead rode *another request's*
+/// in-flight run reports `shared=true` on its access line — that path never
+/// reaches here, because only the leader logs the completion.
+fn analysis_source(result: &ScanResult) -> &'static str {
+    if result.analysis_cached {
+        "cached"
+    } else {
+        "fresh"
+    }
+}
+
+/// Where this result's LLM verdict came from, for the completion log line.
+///
+/// `--interpret` dominates a request's wall time when it actually queries the
+/// endpoint and costs nothing when the verdict is replayed from the prompt
+/// cache — a minute versus a tenth of a second on the same sample. Naming the
+/// source turns that difference from a timing anomaly into a fact on the line.
+/// `None` when no pass ran, which omits the field.
+fn llm_source(interpretation: Option<&crate::interpret::Interpretation>) -> Option<&'static str> {
+    let interpretation = interpretation?;
+    Some(if interpretation.error.is_some() {
+        "failed"
+    } else if interpretation.cached {
+        "cached"
+    } else {
+        "queried"
+    })
+}
+
 /// Take the resources snapshot and the analysis slot a flight leader needs, or
 /// the outcome to publish instead of running.
 ///
@@ -207,6 +241,8 @@ fn flight_outcome(
                 elapsed_ms,
                 classification = %scan_result.classification,
                 probability = scan_result.probability,
+                analysis = analysis_source(&scan_result),
+                llm = llm_source(scan_result.interpretation.as_ref()),
                 "<-- 200 OK",
             );
             index_verdict(&scan_result, key.purl());
@@ -232,16 +268,21 @@ fn flight_outcome(
 }
 
 /// Render the shared outcome as this request's response. `elapsed_ms` is the
-/// caller's own wall time, so a follower reports how long *it* waited.
-fn flight_response(outcome: &Outcome, elapsed_ms: u64) -> Response {
-    match outcome {
+/// caller's own wall time, so a follower reports how long *it* waited, and
+/// `shared` marks the response as one that rode another request's analysis.
+fn flight_response(outcome: &Outcome, elapsed_ms: u64, shared: bool) -> Response {
+    let mut resp = match outcome {
         Outcome::Report(result) => {
             let mut resp = Json(result.envelope_ref()).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
         Outcome::Rendered { status, body } => (*status, Json(body)).into_response(),
+    };
+    if shared {
+        resp.extensions_mut().insert(super::access::Shared);
     }
+    resp
 }
 
 /// Record what this analysis found, so a later lookup of the same artifact is
@@ -1020,7 +1061,8 @@ pub(super) async fn analyze(
 
     // Share the run with anyone already analyzing these exact bytes.
     let attachment = state.flights.join(FlightKey::Sha(sha.clone()));
-    if attachment.leads() {
+    let leads = attachment.leads();
+    if leads {
         tracing::info!(
             id = request_id,
             filename = %filename,
@@ -1064,7 +1106,11 @@ pub(super) async fn analyze(
     }
 
     let outcome = attachment.flight().wait().await;
-    flight_response(&outcome, crate::duration_ms(request_start.elapsed()))
+    flight_response(
+        &outcome,
+        crate::duration_ms(request_start.elapsed()),
+        !leads,
+    )
 }
 
 /// Bytes a request uploaded, staged on disk and waiting to be analyzed.
@@ -1218,7 +1264,8 @@ pub(super) async fn analyze_purl(
 
     // Share the run with anyone already analyzing this PURL.
     let attachment = state.flights.join(FlightKey::Purl(purl.clone()));
-    if attachment.leads() {
+    let leads = attachment.leads();
+    if leads {
         tracing::info!(id = request_id, purl = %purl, "--> POST /analyze-purl");
         let publisher = state.flights.publisher(attachment.flight());
         match claim_slot(&state, request_id, attachment.flight().key()) {
@@ -1245,7 +1292,11 @@ pub(super) async fn analyze_purl(
     }
 
     let outcome = attachment.flight().wait().await;
-    flight_response(&outcome, crate::duration_ms(request_start.elapsed()))
+    flight_response(
+        &outcome,
+        crate::duration_ms(request_start.elapsed()),
+        !leads,
+    )
 }
 
 /// Run one PURL analysis on behalf of every request attached to `flight`.
@@ -1424,6 +1475,14 @@ pub(crate) fn classify_file(
     if let Some(p) = phase {
         p.set("cleave:init");
     }
+    // Every scan entry point declares this before its first analysis (see
+    // `engine::classify_*`); the daemons reach cleave through here, so this is
+    // theirs. It is not just a memory setting: it is part of cleave's analysis
+    // cache key, so a daemon that left it at the default analyzed its first
+    // sample under one key and every later one under another — orphaning that
+    // first entry, and making the first response's member shape differ from the
+    // rest.
+    cleave::set_compact_member_retention(true); // compact projection only
     let sample_extraction =
         extract_dir.map(|d| cleave::SampleExtractionConfig::new(d.to_path_buf()));
     let mut opts = cleave::AnalysisOptions {
@@ -1468,6 +1527,9 @@ pub(crate) fn classify_bytes(
     if let Some(p) = phase {
         p.set("cleave:init");
     }
+    // See `classify_file`: this is part of cleave's cache key, not only a
+    // retention setting.
+    cleave::set_compact_member_retention(true); // compact projection only
     let mut opts = cleave::AnalysisOptions {
         slow_rule_ms,
         cancellation: cancellation.cloned(),
@@ -1557,6 +1619,7 @@ fn scan_result_from(
         probability: cr.probability,
         threshold: cr.threshold,
         level: cr.level,
+        analysis_cached: cr.analysis_cached,
         version: crate::engine::model_version_string(resources.model.info()),
         analyzed_at: crate::engine::now_rfc3339(),
         cleave: Some(cr.report),
@@ -1768,6 +1831,8 @@ pub(super) async fn analyze_path(
     match result {
         AnalysisOutcome::Ok(Ok(scan_result)) => {
             let mut scan_result = *scan_result;
+            let llm = llm_source(scan_result.interpretation.as_ref());
+            let analysis = analysis_source(&scan_result);
             // Record where archive members were extracted on disk, so cyclotron
             // can open them.
             if let (Some(extract_dir), Some(raw)) = (&state.extract_dir, &mut scan_result.cleave)
@@ -1786,6 +1851,8 @@ pub(super) async fn analyze_path(
                 elapsed_ms,
                 classification = %scan_result.classification,
                 probability = scan_result.probability,
+                analysis,
+                llm,
                 "<-- 200 OK",
             );
             // Renew the result on hopper when --hopper is set. Serialize the
@@ -2155,6 +2222,32 @@ mod tests {
     use super::{Outcome, classify_analysis_error, flight_response};
     use axum::http::StatusCode;
 
+    /// The `llm=` field separates a minute-long endpoint query from a replay of
+    /// the prompt cache, which are otherwise distinguishable only by timing.
+    #[test]
+    fn llm_source_names_where_the_verdict_came_from() {
+        use crate::interpret::Interpretation;
+
+        let pass = |cached, error: Option<&str>| Interpretation {
+            grade: None,
+            outcome: crate::Classification::Benign,
+            blended: 0.1,
+            interpretation: String::new(),
+            model: "m".to_string(),
+            error: error.map(str::to_string),
+            analyzer_directed: false,
+            cached,
+        };
+        assert_eq!(super::llm_source(None), None, "no pass ran");
+        assert_eq!(super::llm_source(Some(&pass(false, None))), Some("queried"));
+        assert_eq!(super::llm_source(Some(&pass(true, None))), Some("cached"));
+        assert_eq!(
+            super::llm_source(Some(&pass(true, Some("timeout")))),
+            Some("failed"),
+            "a failed pass is not a cache hit even if a stale entry existed",
+        );
+    }
+
     /// A follower renders the leader's failure verbatim: same status, same body,
     /// no second analysis and no second error.
     #[tokio::test]
@@ -2163,7 +2256,7 @@ mod tests {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             body: serde_json::json!({ "error": "Unsupported file type", "detail": "nope" }),
         };
-        let response = flight_response(&outcome, 42);
+        let response = flight_response(&outcome, 42, false);
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)

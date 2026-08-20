@@ -252,6 +252,13 @@ pub struct Interpretation {
     /// `inject: true` so an operator can see that a clearing verdict was
     /// distrusted — and that the sample tried.
     pub analyzer_directed: bool,
+    /// Whether the grade was replayed from the verdict cache instead of queried.
+    ///
+    /// A cached pass is the difference between a request that took a minute and
+    /// one that took a tenth of a second, so it is logged rather than left to be
+    /// inferred from the timing. Not serialized: it describes how this run got
+    /// its answer, not the answer.
+    pub cached: bool,
 }
 
 impl Serialize for Interpretation {
@@ -578,7 +585,7 @@ pub fn interpret(
             v.grade,
             v.reason,
         );
-        return Some(blended(cfg, ml_class, ml_prob, grade, v.reason, ev));
+        return Some(blended(cfg, ml_class, ml_prob, grade, v.reason, ev, true));
     }
 
     // Health gate: only send work to a healthy endpoint. If it's currently down,
@@ -607,7 +614,7 @@ pub fn interpret(
                     },
                 );
             }
-            Some(blended(cfg, ml_class, ml_prob, grade, reason, ev))
+            Some(blended(cfg, ml_class, ml_prob, grade, reason, ev, false))
         }
         Err(e) => {
             // A transport failure marks the endpoint unhealthy so the next file
@@ -638,6 +645,7 @@ fn failure(
         blended: ml_prob,
         interpretation: String::new(),
         model: cfg.model.clone(),
+        cached: false,
         error: Some(error),
         analyzer_directed,
     }
@@ -835,6 +843,7 @@ fn blended(
     grade: LlmGrade,
     reason: String,
     ev: Evidence,
+    cached: bool,
 ) -> Interpretation {
     let (outcome, conf) = blend(ml_class, ml_prob, grade, ev);
     Interpretation {
@@ -845,6 +854,7 @@ fn blended(
         model: cfg.model.clone(),
         error: None,
         analyzer_directed: ev.analyzer_directed,
+        cached,
     }
 }
 
@@ -2148,6 +2158,7 @@ mod tests {
             model: "m".to_string(),
             error: None,
             analyzer_directed: false,
+            cached: false,
         };
         // Absent when clean, so the flag's presence is itself the signal.
         let clean = serde_json::to_value(&base).expect("serialize");

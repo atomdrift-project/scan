@@ -9,7 +9,8 @@
 //! rather than a warning there and a mystery here.
 //!
 //! Fields, in order: `id`, `status`, `dur_ms`, `peer`, `fwd`, `auth`,
-//! `req_bytes`, `cred_len`, `cred_fp`, `trace`, `ua`. Everything that reaches the line
+//! `req_bytes`, `shared`, `cred_len`, `cred_fp`, `trace`, `ua`. Everything that
+//! reaches the line
 //! is either generated here or parsed/bounded before it is printed, so a
 //! hostile header cannot shape the log.
 //!
@@ -41,6 +42,15 @@ impl RequestId {
         self.0
     }
 }
+
+/// Marks a response that did not perform its own analysis: it attached to a
+/// run already in flight for the same bytes (or the same PURL) and replayed
+/// that result.
+///
+/// Without it a follower's access line is indistinguishable from a leader's,
+/// which makes a burst of duplicate submissions look like a burst of work.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Shared;
 
 /// How a request fared at the access-control edge.
 ///
@@ -213,6 +223,7 @@ pub(super) async fn access_log(
     // Only a rejected credential has these, and only then are they worth a
     // reader's attention: they are what turns "401" into "the client is holding
     // a different token than the one this process loaded".
+    let shared = response.extensions().get::<Shared>().map(|_| true);
     let (cred_len, cred_fp) = match auth {
         Some(Auth::BadToken { len, fp }) => (Some(len), Some(fp.to_string())),
         _ => (None, None),
@@ -232,6 +243,7 @@ pub(super) async fn access_log(
                 fwd = fwd.map(tracing::field::display),
                 auth = auth.map(Auth::as_str),
                 req_bytes,
+                shared,
                 cred_len,
                 cred_fp = cred_fp.as_deref(),
                 trace = trace.as_deref(),

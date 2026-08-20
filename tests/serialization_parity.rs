@@ -123,7 +123,9 @@ fn full_result_serializes_identically() {
             model: "claude-test".to_string(),
             error: None,
             analyzer_directed: true,
+            cached: false,
         }),
+        analysis_cached: false,
         dependency_results: vec![],
         bloom_mark: None,
     };
@@ -160,6 +162,7 @@ fn minimal_result_serializes_identically() {
         skipped_models: vec![],
         rendered_context: String::new(),
         interpretation: None,
+        analysis_cached: false,
         dependency_results: vec![],
         bloom_mark: None,
     };

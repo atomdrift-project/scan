@@ -335,6 +335,7 @@ exactly one access line when its response is ready:
 | `fwd`       | Client address a proxy reported (`CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`). Advisory: logged, never used for access control. |
 | `auth`      | `token`, `open` (no `--token-file`), `anon` (unauthenticated `/_/health`), or a rejection reason: `no-credential`, `malformed-credential`, `bad-token`, `peer-denied`, `loopback-only`, `no-peer-info`. |
 | `req_bytes` | Request `Content-Length`, when the client sent one.                    |
+| `shared`    | `true` when this request attached to an analysis already in flight for the same bytes or PURL and replayed its result instead of doing the work. Absent otherwise. |
 | `cred_len`  | Length of the rejected bearer credential (`bad-token` only).           |
 | `cred_fp`   | First four bytes of its SHA-256, hex (`bad-token` only). See below.    |
 | `trace`     | The caller's `X-Request-Id`, for correlating with the calling service. |
@@ -357,7 +358,18 @@ everything else at INFO. Rejected requests are logged only here — the ACL does
 not log a second line of its own.
 
 Analyses add `--> POST …` when they start and `<-- 200 OK` / `<-- analysis
-failed` when they finish, both carrying the same `id`. A failure line carries
+failed` when they finish, both carrying the same `id`. A successful analysis
+carries two fields naming where its answer came from, so a fast response is
+never a mystery:
+
+| Field      | Values                          | Meaning                          |
+| ---------- | ------------------------------- | -------------------------------- |
+| `analysis` | `fresh` / `cached`              | Whether cleave ran the pipeline or replayed the whole report from its on-disk cache (SQLite, keyed by content digest, options, and traits revision). Survives restarts. |
+| `llm`      | `queried` / `cached` / `failed` | Where the `--interpret` verdict came from. Absent when no pass ran. |
+
+Together with `shared=true` on the access line, those cover every way a request
+avoids work: riding another request's in-flight run (`shared`), replaying a
+stored report (`analysis=cached`), and skipping the LLM call (`llm=cached`). A failure line carries
 the whole error chain, which is the same text the response body returns as
 `detail`:
 
