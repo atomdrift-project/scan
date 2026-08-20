@@ -121,14 +121,17 @@ Set the hopper to renew results on with `HOPPER=`, on either platform:
 
     make deploy HOPPER=http://hopper-host:8081
 
-That adds `--hopper <url>` to the service and installs the credential it needs.
-It is a second, unrelated token: `~/.tok/scan` authenticates clients *to this
-server*, `~/.tok/hopper` authenticates *this server to hopper*. `make deploy`
-copies the deploying user's `~/.tok/hopper` into the service account's own
-`~/.tok/hopper` (`HOPPER_TOKEN_FILE=` overrides the source). Without it, hopper
+That adds `--hopper <url>` to the service. The credential it needs is a second,
+unrelated token: `~/.tok/scan` authenticates clients *to this server*,
+`~/.tok/hopper` authenticates *this server to hopper*. Without it, hopper
 rejects every result renewal with 401 — it requires a bearer token on every
 route and does not exempt loopback. See
 [WORKERS.md](WORKERS.md#authenticating-to-hopper).
+
+Every `make deploy` copies the deploying user's `~/.tok/hopper` into the
+service account's own `~/.tok/hopper` (`HOPPER_TOKEN_FILE=` overrides the
+source), whether or not `HOPPER=` is set — so turning renewal on later needs
+nothing else in place. The file is inert while `--hopper` is off.
 
 On FreeBSD the URL lands in the jail's `rc.conf` as `scan_hopper`, so it can
 also be changed in place — `bastille sysrc <jail> scan_hopper=<url>` plus a
@@ -351,8 +354,10 @@ The server writes to stderr (journald under systemd). Every request produces
 exactly one access line when its response is ready:
 
     INFO scan::server::access: POST /analyze-purl id=9 status=200 dur_ms=10351
-      peer=127.0.0.1 fwd=203.0.113.9 auth="token" req_bytes=33 trace="bl-9f2c"
-      ua="beamline/0.3"
+      peer=127.0.0.1 fwd=203.0.113.9 auth="token" req_bytes=33
+      purl="pkg:npm/left-pad@1.3.0" trace="bl-9f2c" ua="beamline/0.3"
+
+A field with nothing to say is left off the line rather than printed empty.
 
 | Field       | Meaning                                                                |
 | ----------- | ---------------------------------------------------------------------- |
@@ -364,10 +369,49 @@ exactly one access line when its response is ready:
 | `auth`      | `token`, `open` (no `--token-file`), `anon` (unauthenticated `/_/health`), or a rejection reason: `no-credential`, `malformed-credential`, `bad-token`, `peer-denied`, `loopback-only`, `no-peer-info`. |
 | `req_bytes` | Request `Content-Length`, when the client sent one.                    |
 | `shared`    | `true` when this request attached to an analysis already in flight for the same bytes or PURL and replayed its result instead of doing the work. Absent otherwise. |
+| `sha256`    | The artifact the request was about, by digest: the `/lookup?sha256=` key, or the digest of the bytes uploaded to `/analyze`. On a `/lookup?purl=` that hit, the digest that PURL resolved to. |
+| `purl`      | The artifact the request was about, by package locator, in canonical form — `/lookup?purl=` or `/analyze-purl`. A locator that failed to parse is echoed as sent, so a 400 names the typo. |
+| `path`      | The file `/analyze-path` was asked for, as the caller wrote it. Where the canonicalized form differs, a rejection line carries both. |
 | `cred_len`  | Length of the rejected bearer credential (`bad-token` only).           |
 | `cred_fp`   | First four bytes of its SHA-256, hex (`bad-token` only). See below.    |
 | `trace`     | The caller's `X-Request-Id`, for correlating with the calling service. |
 | `ua`        | `User-Agent`, control-stripped and truncated to 120 characters.        |
+
+### Following a result to hopper
+
+An analysis that succeeds writes a completion line before its access line, and
+that line ends with where the verdict goes next:
+
+    INFO scan::server::handlers: <-- 200 OK id=45 key=purl:pkg:npm/left-pad@1.3.0
+      elapsed_ms=11563 classification=benign analysis="fresh" hopper="queued"
+
+`hopper="queued"` means the verdict was handed to the background uploader;
+`hopper="disabled"` means the server was started without `--hopper`, so the
+answer lives only in this process's verdict index. A server with no `--hopper`
+also says so once, at startup.
+
+The uploader reports the outcome on its own thread, after the response has
+already gone back to the caller, naming the artifact by digest and — when the
+request named one — by PURL:
+
+    INFO scan::upload: upload: result renewed on hopper
+      sha256=870c0fe… purl="pkg:npm/left-pad@1.3.0" attempt=0
+
+    WARN scan::upload: upload: hopper unreachable, giving up after retries
+      sha256=870c0fe… purl="pkg:npm/left-pad@1.3.0" attempts=4
+
+A rejected upload logs `upload: rejected by hopper; not retrying` with the
+status and body — a 401 there means this server's `~/.tok/hopper` is not the
+token hopper loaded. See
+[WORKERS.md](WORKERS.md#authenticating-to-hopper).
+
+An upload failure never fails the request: the caller already has its answer,
+and hopper renewal is best-effort by design.
+
+The identifier is never taken from the raw query string or request body: each
+handler attaches the key it actually parsed and validated, control-stripped and
+bounded to 200 characters. A newline in a caller-supplied locator therefore
+cannot fabricate a second log line.
 
 A 401 never says which token was presented — but `cred_fp` identifies it to
 anyone already holding the token, without recording a secret. Compare it with

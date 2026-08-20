@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tempfile::Builder as TempBuilder;
 
 use super::AppState;
-use super::access::RequestId;
+use super::access::{RequestId, Subject, with_subject};
 use super::acl::Trusted;
 use super::flight::{Flight, FlightKey, Outcome};
 
@@ -232,6 +232,7 @@ fn flight_outcome(
     request_id: u64,
     elapsed_ms: u64,
     key: &FlightKey,
+    uploader: Option<&Arc<crate::upload::Uploader>>,
 ) -> Outcome {
     match result {
         AnalysisOutcome::Ok(Ok(scan_result)) => {
@@ -243,9 +244,31 @@ fn flight_outcome(
                 probability = scan_result.probability,
                 analysis = analysis_source(&scan_result),
                 llm = llm_source(scan_result.interpretation.as_ref()),
+                // Where this verdict goes next. `queued` hands it to the
+                // uploader thread, whose own line reports whether it landed;
+                // `disabled` means the server was started without --hopper and
+                // the answer lives only in this process's index.
+                hopper = if uploader.is_some() {
+                    "queued"
+                } else {
+                    "disabled"
+                },
                 "<-- 200 OK",
             );
             index_verdict(&scan_result, key.purl());
+            // Renew the verdict on hopper too, so it outlives this process and
+            // this request. A caller that hangs up — or a proxy that gives up
+            // at its own read timeout on a long run — still finds the answer
+            // waiting on its next lookup, because the analysis was never the
+            // connection's to lose. One clone per analysis, against a run
+            // measured in seconds.
+            if let Some(uploader) = uploader {
+                uploader.submit(
+                    scan_result.sha256.clone(),
+                    key.purl().map(str::to_owned),
+                    (*scan_result).clone().into_envelope(),
+                );
+            }
             Outcome::Report(scan_result)
         }
         AnalysisOutcome::Ok(Err(e)) => {
@@ -268,9 +291,10 @@ fn flight_outcome(
 }
 
 /// Render the shared outcome as this request's response. `elapsed_ms` is the
-/// caller's own wall time, so a follower reports how long *it* waited, and
-/// `shared` marks the response as one that rode another request's analysis.
-fn flight_response(outcome: &Outcome, elapsed_ms: u64, shared: bool) -> Response {
+/// caller's own wall time, so a follower reports how long *it* waited, `shared`
+/// marks the response as one that rode another request's analysis, and `key`
+/// names the artifact on the access line.
+fn flight_response(outcome: &Outcome, elapsed_ms: u64, shared: bool, key: &FlightKey) -> Response {
     let mut resp = match outcome {
         Outcome::Report(result) => {
             let mut resp = Json(result.envelope_ref()).into_response();
@@ -282,6 +306,7 @@ fn flight_response(outcome: &Outcome, elapsed_ms: u64, shared: bool) -> Response
     if shared {
         resp.extensions_mut().insert(super::access::Shared);
     }
+    resp.extensions_mut().insert(Subject::from(key));
     resp
 }
 
@@ -552,15 +577,21 @@ pub(super) struct LookupQuery {
 /// Never analyzes: no slot, no fetch, and it answers while the model is still
 /// loading. A caller that gets `404 unknown sample` asks for a real analysis
 /// with `/analyze` or `/analyze-purl`.
-pub(super) async fn lookup(State(state): State<Arc<AppState>>, Query(q): Query<LookupQuery>) -> Response {
+pub(super) async fn lookup(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<LookupQuery>,
+) -> Response {
     let sha = q.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let purl = q.purl.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    // Every arm names its subject, so the request's access line says which
+    // artifact was asked about — including the arms that reject, where the key
+    // is the only way to tell a caller's bug from a caller's typo.
     match (sha, purl) {
         (Some(_), Some(_)) | (None, None) => error_response(
             StatusCode::BAD_REQUEST,
             "provide exactly one of sha256 or purl",
         ),
-        (Some(sha), None) => lookup_by_sha(&state, sha),
+        (Some(sha), None) => with_subject(lookup_by_sha(&state, sha), Subject::sha256(sha)),
         (None, Some(purl)) => lookup_by_purl(&state, purl),
     }
 }
@@ -585,7 +616,14 @@ fn lookup_by_purl(state: &AppState, raw: &str) -> Response {
     // `npm/left-pad@1.3.0` and `pkg:npm/left-pad@1.3.0` are one question.
     let purl = match normalize_pkg_purl(raw) {
         Ok(purl) => purl,
-        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+        // Unparseable: name what the caller actually sent, not the canonical
+        // form there isn't one of.
+        Err(message) => {
+            return with_subject(
+                error_response(StatusCode::BAD_REQUEST, message),
+                Subject::purl(raw, None),
+            );
+        }
     };
     let decision = crate::bloom_repo::global()
         .as_deref()
@@ -593,8 +631,14 @@ fn lookup_by_purl(state: &AppState, raw: &str) -> Response {
             lk.memo_purl(&purl)
         });
     let verdict = crate::lookup::global().and_then(|index| index.get_purl(&purl));
-    let sha = verdict.as_ref().map_or("", |v| v.sha256.as_str()).to_owned();
-    lookup_response(state, verdict.as_ref(), decision, &sha, Some(&purl))
+    let sha = verdict
+        .as_ref()
+        .map_or("", |v| v.sha256.as_str())
+        .to_owned();
+    let response = lookup_response(state, verdict.as_ref(), decision, &sha, Some(&purl));
+    // The canonical PURL, plus the digest it resolved to when it hit — that
+    // mapping is knowledge only this handler has.
+    with_subject(response, Subject::purl(&purl, Some(&sha)))
 }
 
 /// Render a lookup answer.
@@ -646,7 +690,10 @@ fn lookup_response(
     if let Ok(value) = axum::http::HeaderValue::from_str(sha256.trim()) {
         headers.insert("X-SHA256", value);
     }
-    headers.insert("X-Scan-Source", axum::http::HeaderValue::from_static("index"));
+    headers.insert(
+        "X-Scan-Source",
+        axum::http::HeaderValue::from_static("index"),
+    );
     resp
 }
 
@@ -1110,6 +1157,7 @@ pub(super) async fn analyze(
         &outcome,
         crate::duration_ms(request_start.elapsed()),
         !leads,
+        attachment.flight().key(),
     )
 }
 
@@ -1220,6 +1268,7 @@ async fn run_file_analysis(
         request_id,
         crate::duration_ms(started.elapsed()),
         flight.key(),
+        state.uploader.as_ref(),
     )
 }
 
@@ -1245,7 +1294,14 @@ pub(super) async fn analyze_purl(
 
     let purl = match normalize_pkg_purl(&req.purl) {
         Ok(p) => p,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+        // No flight, so no key to take the subject from: name what the caller
+        // sent, bounded, as the lookup route does.
+        Err(msg) => {
+            return with_subject(
+                error_response(StatusCode::BAD_REQUEST, msg),
+                Subject::purl(&req.purl, None),
+            );
+        }
     };
 
     if let Ok(init_error) = state.init_error.read()
@@ -1296,6 +1352,7 @@ pub(super) async fn analyze_purl(
         &outcome,
         crate::duration_ms(request_start.elapsed()),
         !leads,
+        attachment.flight().key(),
     )
 }
 
@@ -1372,6 +1429,7 @@ async fn run_purl_analysis(
         request_id,
         crate::duration_ms(started.elapsed()),
         flight.key(),
+        state.uploader.as_ref(),
     )
 }
 
@@ -1668,10 +1726,26 @@ pub(super) struct AnalyzePathRequest {
 /// `/analyze`.
 pub(super) async fn analyze_path(
     State(state): State<Arc<AppState>>,
-    request_id: Extension<RequestId>,
+    Extension(request_id): Extension<RequestId>,
     Json(req): Json<AnalyzePathRequest>,
 ) -> Response {
-    let request_id = request_id.0.get();
+    // Attached around the whole handler rather than at each return: this route
+    // rejects from several places — not found, not under an allowed dir, under
+    // memory pressure — and a rejected path is the one an operator most needs
+    // named. The path is as the caller wrote it; where the canonical form
+    // differs, the rejection line below carries both.
+    let subject = Subject::path(&req.path);
+    with_subject(
+        analyze_path_inner(state, request_id.get(), req).await,
+        subject,
+    )
+}
+
+async fn analyze_path_inner(
+    state: Arc<AppState>,
+    request_id: u64,
+    req: AnalyzePathRequest,
+) -> Response {
     let request_start = Instant::now();
 
     let raw_path = std::path::PathBuf::from(&req.path);
@@ -1848,11 +1922,20 @@ pub(super) async fn analyze_path(
 
             tracing::info!(
                 id = request_id,
+                path = %req.path,
                 elapsed_ms,
                 classification = %scan_result.classification,
                 probability = scan_result.probability,
                 analysis,
                 llm,
+                // Where this verdict goes next; see the same field on the
+                // flight path. A local file has no locator, so the uploader's
+                // own line names it by digest alone.
+                hopper = if state.uploader.is_some() {
+                    "queued"
+                } else {
+                    "disabled"
+                },
                 "<-- 200 OK",
             );
             // Renew the result on hopper when --hopper is set. Serialize the
@@ -2256,8 +2339,17 @@ mod tests {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             body: serde_json::json!({ "error": "Unsupported file type", "detail": "nope" }),
         };
-        let response = flight_response(&outcome, 42, false);
+        let key = super::FlightKey::Sha("f".repeat(64));
+        let response = flight_response(&outcome, 42, false, &key);
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        // Even a replayed failure names its artifact on the access line.
+        assert!(
+            response
+                .extensions()
+                .get::<super::super::access::Subject>()
+                .is_some(),
+            "flight responses carry their subject",
+        );
 
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
@@ -2441,5 +2533,4 @@ mod tests {
         assert!(super::normalize_pkg_purl("").is_err());
         assert!(super::normalize_pkg_purl("not a purl").is_err());
     }
-
 }

@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use axum::http::StatusCode;
@@ -48,6 +48,18 @@ impl FlightKey {
         match self {
             Self::Purl(purl) => Some(purl),
             Self::Sha(_) => None,
+        }
+    }
+}
+
+impl From<&FlightKey> for super::access::Subject {
+    /// The key a flight was created under is exactly the artifact its requests
+    /// were about, so the access line takes it verbatim: uploads are named by
+    /// the digest of their bytes, PURL analyses by the canonical locator.
+    fn from(key: &FlightKey) -> Self {
+        match key {
+            FlightKey::Sha(sha) => Self::sha256(sha),
+            FlightKey::Purl(purl) => Self::purl(purl, None),
         }
     }
 }
@@ -284,9 +296,12 @@ impl Drop for Attachment {
             live.remove(key);
         }
         drop(live);
-        if emptied {
-            self.flight.cancellation.store(true, Ordering::Release);
-        }
+        // Deliberately *not* cancelled when the last request leaves. An
+        // analysis is worth finishing with nobody waiting: its verdict is
+        // indexed locally and renewed on hopper, so a caller that hung up — or
+        // a proxy that timed out at two minutes on a twenty-minute run — finds
+        // the answer waiting rather than starting again from nothing. The
+        // watchdog's `--analysis-timeout` is what bounds a runaway.
     }
 }
 
@@ -321,6 +336,7 @@ impl Drop for Publisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn key() -> FlightKey {
         FlightKey::Sha("a".repeat(64))
@@ -375,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_request_to_leave_cancels_the_analysis() {
+    fn an_analysis_outlives_every_request_that_was_waiting_on_it() {
         let flights = Arc::new(Flights::default());
         let leader = flights.join(key());
         let follower = flights.join(key());
@@ -387,9 +403,19 @@ mod tests {
         assert!(!cancellation.load(Ordering::Acquire));
         assert_eq!(flights.census().analyses, 1);
 
+        // Nor does the last one leaving: the verdict is indexed locally and
+        // renewed on hopper, so the work is not the connection's to lose. Only
+        // the watchdog's --analysis-timeout stops a runaway.
         drop(follower);
-        assert!(cancellation.load(Ordering::Acquire));
-        assert_eq!(flights.census().analyses, 0);
+        assert!(
+            !cancellation.load(Ordering::Acquire),
+            "a departed caller must not cancel work that still has somewhere to go",
+        );
+        assert_eq!(
+            flights.census().analyses,
+            0,
+            "but the flight is retired, so the next request starts fresh",
+        );
     }
 
     #[test]
