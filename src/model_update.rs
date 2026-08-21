@@ -355,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // std::os::unix symlink; Windows symlink creation also needs privileges
     fn same_dir_resolves_symlinks() {
         // The deploy dir is a symlink to a checkout; a pin naming either spelling
         // must resolve to the same bundle.
