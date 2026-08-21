@@ -77,7 +77,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -224,7 +224,30 @@ deploy-server:
 		*) echo "error: no deploy-server target for $$(uname -s) (FreeBSD/bastille or Linux/systemd)"; exit 1 ;; \
 	esac
 
-deploy-worker: kill-scan
+# Refuse to start a worker without a hopper credential. Hopper requires
+# `Authorization: Bearer <token>` on every route and does not exempt loopback,
+# so a worker without one 401s on every poll and retries forever behind a
+# heartbeat that still looks healthy — a silent no-op that used to cost a whole
+# run. Mirrors `resolve_credential` in src/upload.rs: `$HOPPER_TOKEN` wins,
+# otherwise the file must hold a non-blank line. Deliberately not wired into
+# `deploy-worker-nodes` / `deploy-workers`, which use each remote account's own
+# token and never ship one from here.
+check-hopper-token:
+	@if [ -n "$${HOPPER_TOKEN:-}" ] && printf '%s' "$${HOPPER_TOKEN}" | grep -q '[^[:space:]]'; then exit 0; fi; \
+	if [ ! -f "$(HOPPER_TOKEN_FILE)" ]; then \
+		echo "error: no hopper API token at $(HOPPER_TOKEN_FILE)"; \
+		echo "       an authenticated hopper rejects every poll from this worker with 401."; \
+		echo "       install the token there, or pass HOPPER_TOKEN_FILE=<path> / HOPPER_TOKEN=<token>."; \
+		exit 1; \
+	fi; \
+	if ! grep -q '[^[:space:]]' "$(HOPPER_TOKEN_FILE)" 2>/dev/null; then \
+		echo "error: hopper API token at $(HOPPER_TOKEN_FILE) is empty"; \
+		echo "       an authenticated hopper rejects every poll from this worker with 401."; \
+		echo "       write the token to that file, or pass HOPPER_TOKEN_FILE=<path> / HOPPER_TOKEN=<token>."; \
+		exit 1; \
+	fi
+
+deploy-worker: check-hopper-token kill-scan
 	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker URL=<url> [BUILD=<host>] [WORKER_RUN=<host>]"; exit 1; }
 	git stash
 	git pull
@@ -344,11 +367,10 @@ benchmark-worker: release
 
 # Run a worker in the foreground for interactive use. The worker self-nices
 # to 10 by default; pass NICE=0 to disable.
-worker: kill-scan release
+worker: check-hopper-token kill-scan release
 	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>] [LLM=<endpoint>] [LLM_MODEL=<name>]"; exit 1; }
 	@# Runs as the invoking user, so atomscan finds $(HOPPER_TOKEN_FILE) on its
-	@# own. Say something here anyway: without it every poll returns 401.
-	@[ -s "$(HOPPER_TOKEN_FILE)" ] || echo "warning: no hopper API token at $(HOPPER_TOKEN_FILE); this worker cannot claim work from an authenticated hopper"
+	@# own; `check-hopper-token` has already established that it is there.
 	SCAN_LLM="$(LLM)" SCAN_LLM_MODEL="$(LLM_MODEL)" ./out/$(BINARY) worker --url "$(URL)" \
 		--interpret --interpret-min-prob $(INTERPRET_MIN_PROB) \
 		$(if $(WORKERS),--workers $(WORKERS),) \
