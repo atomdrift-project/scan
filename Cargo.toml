@@ -71,9 +71,10 @@ repository = "https://github.com/atomdrift-project/scan"
 cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
-# Path dep while fletch::purl::{normalize,identity} is unpushed — scan's bloom
-# keys and CLI normalize through it. Flip back to the git dep once fletch is
-# pushed and `cargo update -p fletch` picks up the new API.
+# Path dep while the scoped-npm fix in fletch::purl::normalize is unpushed —
+# scan's bloom keys and CLI normalize through it, so `pkg:npm/@scope/name` is
+# refused as "not a package URL" against the pushed revision. Flip back to the
+# git dep once fletch is pushed and `cargo update -p fletch` picks it up.
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
 proclist = { git = "https://github.com/atomdrift-project/proclist.git" }
 # Direct handle on filefacts (already in the graph via cleave/fletch) so the

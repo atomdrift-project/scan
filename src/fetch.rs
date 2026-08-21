@@ -2990,7 +2990,10 @@ fn apply_package_composites(
         opts,
     ) {
         Ok(0) => {}
-        Ok(n) => tracing::info!(
+        // Per-package and routine on any registry-metadata scan: one line per
+        // artifact drowns a worker's log. The grafted composites themselves
+        // show up in the report, which is where they matter.
+        Ok(n) => tracing::debug!(
             grafted = n,
             "package-scoped composites fired across artifact and registry metadata"
         ),

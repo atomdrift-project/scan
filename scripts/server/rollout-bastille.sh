@@ -9,10 +9,11 @@
 #
 # Hopper (optional):
 #   HOPPER        hopper base URL. When set, the server renews every analyzed
-#                 result on <HOPPER>/api/result (`serve --hopper`), and the
-#                 hopper API token is installed into the jail.  (default: unset)
-#   HOPPER_TOKEN_FILE  hopper API token to install when HOPPER is set
-#                                                          (default: ~/.tok/hopper)
+#                 result on <HOPPER>/api/result (`serve --hopper`); stored in
+#                 the jail's rc.conf as scan_hopper.        (default: unset)
+#   HOPPER_TOKEN_FILE  hopper API token, installed into the jail whenever the
+#                 file exists — HOPPER need not be set, so turning renewal on
+#                 later needs nothing else.                 (default: ~/.tok/hopper)
 #
 # Cloudflare Tunnel (optional):
 #   CLOUDFLARED   "auto" installs and supervises a connector in the run jail
@@ -199,23 +200,26 @@ doas test -s "$TOKEN_DST" || die "no API token at $TOKEN_DST"
 # --- Hopper API token --------------------------------------------------------
 #
 # Distinct from the API token above: that one authenticates *clients of this
-# server*, this one authenticates *this server to hopper*. Only needed when
-# HOPPER is set. Hopper requires `Authorization: Bearer <token>` on every API
-# route and does not exempt loopback, so without it every result renewal is
-# rejected with 401. Moved through the filesystem, never as an argument, so the
-# `set -x` trace above cannot echo it.
-if [ -n "$HOPPER" ]; then
-    HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
-    HOPPER_TOKEN_DST="$BASTILLE_DIR/$RUN/root/home/scan/.tok/hopper"
+# server*, this one authenticates *this server to hopper*. Hopper requires
+# `Authorization: Bearer <token>` on every API route and does not exempt
+# loopback, so without it every result renewal is rejected with 401. Moved
+# through the filesystem, never as an argument, so the `set -x` trace above
+# cannot echo it.
+#
+# Installed whenever the operator has one, NOT only when HOPPER is set: the URL
+# lives in the jail's rc.conf and can be switched on later with `sysrc
+# scan_hopper=`, and a server that gains --hopper without the token 401s on
+# every renewal. The file is inert while --hopper is off.
+HOPPER_TOKEN_SRC="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
+HOPPER_TOKEN_DST="$BASTILLE_DIR/$RUN/root/home/scan/.tok/hopper"
+if [ -s "$HOPPER_TOKEN_SRC" ]; then
     log "Installing hopper API token"
-    if [ -s "$HOPPER_TOKEN_SRC" ]; then
-        doas install -m 0600 "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
-        doas bastille cmd "$RUN" chown scan:scan /home/scan/.tok/hopper
-        doas bastille cmd "$RUN" chmod 0600 /home/scan/.tok/hopper
-    elif ! doas test -s "$HOPPER_TOKEN_DST"; then
-        # Not fatal: a hopper deployed without --token-file needs no client token.
-        log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; result renewal on $HOPPER will be rejected"
-    fi
+    doas install -m 0600 "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
+    doas bastille cmd "$RUN" chown scan:scan /home/scan/.tok/hopper
+    doas bastille cmd "$RUN" chmod 0600 /home/scan/.tok/hopper
+elif [ -n "$HOPPER" ] && ! doas test -s "$HOPPER_TOKEN_DST"; then
+    # Only worth a warning when there is a hopper to talk to.
+    log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; result renewal on $HOPPER will be rejected"
 fi
 
 log "Creating rc.d service"

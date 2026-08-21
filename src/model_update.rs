@@ -87,8 +87,42 @@ fn is_git_managed(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+/// Same directory, comparing symlink-resolved paths when both exist.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// True when `dir` is the bundle a `SCAN_MODELS_DIR` override points at.
+///
+/// An explicit override means "load exactly this bundle" — a deploy validating
+/// a candidate, a test pinning a fixture, a developer on a working tree — so
+/// the updater treats it as read-only. [`is_git_managed`] cannot stand in for
+/// this: collimator's deploy stages its candidate into a `mktemp -d`, which has
+/// no `.git`, and a swap there silently replaces the candidate with the
+/// currently published bundle. Every gate downstream then validates the *old*
+/// models and the deploy mirrors them straight back (2026-08-21: a whole
+/// nightly retrain shipped nothing but this module's sidecar).
+fn is_pinned_override(dir: &Path) -> bool {
+    std::env::var_os("SCAN_MODELS_DIR").is_some_and(|pinned| same_dir(Path::new(&pinned), dir))
+}
+
 /// Install or refresh the model bundle compatible with this litmus release.
 pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<()> {
+    if is_pinned_override(dir) {
+        if !quiet {
+            eprintln!(
+                "Models at {} come from SCAN_MODELS_DIR; leaving them untouched.\nUnset SCAN_MODELS_DIR to update the installed bundle.",
+                dir.display()
+            );
+        }
+        return Ok(());
+    }
     if is_git_managed(dir) {
         if !quiet {
             eprintln!(
@@ -138,6 +172,13 @@ pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<()> {
 
 /// Report what would be installed without changing anything.
 pub fn check(dir: &Path) -> Result<()> {
+    if is_pinned_override(dir) {
+        eprintln!(
+            "Models at {} come from SCAN_MODELS_DIR; unset it to check the installed bundle.",
+            dir.display()
+        );
+        return Ok(());
+    }
     if is_git_managed(dir) {
         eprintln!(
             "Models at {} are git-managed; use 'git pull' there to update.",
@@ -295,4 +336,42 @@ fn http_get(url: &str, connect: Option<Duration>) -> Result<Vec<u8>> {
         .bytes()
         .with_context(|| format!("reading {url}"))?
         .to_vec())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::same_dir;
+    use std::path::Path;
+
+    #[test]
+    fn same_dir_matches_identical_paths() {
+        assert!(same_dir(Path::new("/tmp/bundle"), Path::new("/tmp/bundle")));
+    }
+
+    #[test]
+    fn same_dir_rejects_unrelated_paths() {
+        assert!(!same_dir(Path::new("/tmp/bundle"), Path::new("/tmp/other")));
+    }
+
+    #[test]
+    fn same_dir_resolves_symlinks() {
+        // The deploy dir is a symlink to a checkout; a pin naming either spelling
+        // must resolve to the same bundle.
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(same_dir(&link, &real));
+    }
+
+    #[test]
+    fn same_dir_is_lexical_when_paths_do_not_exist() {
+        // Nonexistent paths can't be canonicalized; equal spellings still match,
+        // unequal ones stay distinct rather than erroring.
+        let a = Path::new("/nonexistent/a");
+        assert!(same_dir(a, Path::new("/nonexistent/a")));
+        assert!(!same_dir(a, Path::new("/nonexistent/b")));
+    }
 }
