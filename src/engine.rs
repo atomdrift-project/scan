@@ -4244,20 +4244,27 @@ pub(crate) fn classify_report(
             Some(((edge.source_sha256.as_str(), off), len))
         })
         .collect();
-    let mut compact = cleave::types::compact::compact_from_files(&report.files);
     // Text/LLM renderers consume the typed report. Plain JSON does not: compact
     // conversion has already retained precisely the traits, metrics, symbols,
     // references, and context it emits. Release the much wider cleave graph
     // before featurizing thousands of compact member nodes.
     //
-    // Released *here*, before the `Value` below, and not after it: `compact` is
-    // fully owned (`CompactReport` borrows nothing), so from this point the
-    // cleave graph is dead weight — and on a member-heavy sample it is the
-    // single largest live allocation in the process. Freeing it after the
-    // `to_value` instead made the report, the compact copy, and the JSON DOM
-    // all peak together (MiniMax: a ~3 GB step at the very end of an already
-    // 12.8 GB run, for a report whose serialized form is 490 MB).
+    // Released *during conversion* when nothing later renders the typed
+    // report: the consuming variant drops each `FileAnalysis` as its compact
+    // projection is built, so the full typed graph and the full compact copy
+    // never co-reside (the borrowing version held both until the whole
+    // conversion finished — on a member-heavy sample the typed graph is the
+    // single largest live allocation in the process). The rest of the typed
+    // report is reset right after for the same reason. Freeing all of it
+    // after the `to_value` instead made the report, the compact copy, and the
+    // JSON DOM all peak together (MiniMax: a ~3 GB step at the very end of an
+    // already 12.8 GB run, for a report whose serialized form is 490 MB).
     let keep_typed_report = render_context || interpret.is_some() || llm_view || dump_dir.is_some();
+    let mut compact = if keep_typed_report {
+        cleave::types::compact::compact_from_files(&report.files)
+    } else {
+        cleave::types::compact::compact_from_files_consuming(std::mem::take(&mut report.files))
+    };
     if !keep_typed_report {
         let target = report.target.clone();
         report = cleave::AnalysisReport::new(target);
