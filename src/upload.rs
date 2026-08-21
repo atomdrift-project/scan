@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -134,15 +134,44 @@ const SEEN_SHAS_MAX: usize = 100_000;
 /// brief, so early attempts fail fast and get another try rather than pinning
 /// the uploader for the full 120s ceiling each time; the final attempt keeps
 /// the old ceiling so a genuinely slow-but-alive hopper still lands the write.
-/// One entry per attempt — its length is the retry budget. Short, unlike the
-/// worker's 20-minute budget: a renew is idempotent and the operator can
-/// simply re-run.
+/// Indexed by attempt and clamped to the last entry, so a long retry budget
+/// keeps the 120s ceiling rather than running out of table.
 const ATTEMPT_TIMEOUTS: [Duration; 4] = [
     Duration::from_secs(15),
     Duration::from_secs(30),
     Duration::from_secs(60),
     Duration::from_secs(120),
 ];
+
+/// Hopper's ingestion lane header. A result renewed by `serve --hopper` is
+/// one-shot: the caller that asked for the scan is already holding the verdict
+/// in its own cache, so it will never ask again, and a renewal that does not
+/// land means the artifact never enters the corpus at all. A worker result is
+/// retryable for free — the job returns to the queue and is dispatched again.
+///
+/// Hopper reserves ingestion slots for this lane so the retryable firehose
+/// cannot starve the irreversible trickle. Declaring it is what claims the
+/// reservation; a client that omits the header takes the worker lane.
+const HOPPER_LANE_HEADER: &str = "X-Hopper-Lane";
+const HOPPER_LANE_RENEW: &str = "renew";
+
+/// Total wall-clock budget for renewing one result on hopper.
+///
+/// Hopper sheds result submissions with 503 + Retry-After when its ingestion
+/// slots are saturated, and that saturation is driven by the worker fleet's
+/// backlog — it can persist for many minutes. The old budget was four attempts
+/// over ~16s, which is not a retry so much as a coin flip: measured against a
+/// saturated hopper it lost every renewal it was given.
+const RENEW_BUDGET: Duration = Duration::from_secs(15 * 60);
+
+/// Ceiling on one backoff sleep, so a long budget still probes often enough to
+/// catch a short window of free capacity rather than sleeping through it.
+const RENEW_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Floor on one backoff sleep. Full jitter can draw near zero, and a renewal
+/// that retries instantly just spends a slot-acquire on a pool it was told is
+/// full.
+const RENEW_MIN_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Request timeout per POST. Matches the worker so a wedged hopper can't pin an
 /// uploader thread indefinitely.
@@ -892,24 +921,36 @@ fn post_one(
         return;
     };
 
-    for (attempt, timeout) in ATTEMPT_TIMEOUTS.into_iter().enumerate() {
+    let started = Instant::now();
+    let mut retry_after: Option<Duration> = None;
+    for attempt in 0.. {
         if attempt > 0 {
-            // 1s, 2s, 4s — brief, since a renew is idempotent and re-runnable.
-            std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+            match renew_delay(attempt, retry_after, started.elapsed(), fuzz()) {
+                Some(delay) => std::thread::sleep(delay),
+                None => break,
+            }
         }
+        // The table is indexed by attempt and clamped, so a long budget keeps
+        // retrying at the 120s ceiling instead of running off the end.
+        let timeout = ATTEMPT_TIMEOUTS[attempt.min(ATTEMPT_TIMEOUTS.len() - 1)];
         let mut request = authed(client.post(result_url))
             .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            // Claim hopper's reserved lane: this renewal is one-shot, and the
+            // caller is already holding the verdict in its cache.
+            .header(HOPPER_LANE_HEADER, HOPPER_LANE_RENEW)
             .body(body.clone());
         if let Some(enc) = encoding {
             request = request.header(reqwest::header::CONTENT_ENCODING, enc);
         }
+        retry_after = None;
         match request.send() {
             Ok(resp) if resp.status().is_success() => {
                 tracing::info!(
                     sha256 = %sha256,
                     purl,
                     attempt,
+                    waited_ms = started.elapsed().as_millis(),
                     "upload: result renewed on hopper",
                 );
                 return;
@@ -924,6 +965,9 @@ fn post_one(
                     tracing::warn!(sha256 = %sha256, purl, %status, body = %body, "upload: rejected by hopper; not retrying");
                     return;
                 }
+                // Hopper sends Retry-After when it sheds; it knows when its
+                // slots free, so honour it rather than guessing shorter.
+                retry_after = parse_retry_after(resp.headers());
                 tracing::warn!(sha256 = %sha256, purl, %status, attempt, "upload: non-success response");
             }
             Err(e) => {
@@ -934,15 +978,175 @@ fn post_one(
     tracing::warn!(
         sha256 = %sha256,
         purl,
-        attempts = ATTEMPT_TIMEOUTS.len(),
-        "upload: hopper unreachable, giving up after retries",
+        budget_s = RENEW_BUDGET.as_secs(),
+        "upload: hopper unreachable, giving up after the renewal budget",
     );
+}
+
+/// Delay before retry `attempt`, or `None` once the budget is spent.
+///
+/// Exponential with full jitter: the sleep is drawn from `[0, ceiling)` where
+/// the ceiling doubles per attempt up to [`RENEW_MAX_BACKOFF`]. The jitter
+/// matters more than the growth here — every scan server renewing against the
+/// same saturated hopper would otherwise retry in lockstep and re-saturate it
+/// the instant a slot frees.
+///
+/// `retry_after` is hopper's own hint and acts as a floor: returning before it
+/// only spends a slot-acquire on a pool that just said it was full.
+///
+/// Pure, with the random draw passed in, so the policy is testable without
+/// sleeping or seeding.
+fn renew_delay(
+    attempt: usize,
+    retry_after: Option<Duration>,
+    elapsed: Duration,
+    fuzz: f64,
+) -> Option<Duration> {
+    let remaining = RENEW_BUDGET.checked_sub(elapsed)?;
+    if remaining.is_zero() {
+        return None;
+    }
+    let ceiling = RENEW_MAX_BACKOFF.min(
+        RENEW_MIN_BACKOFF
+            .saturating_mul(1u32 << attempt.min(16))
+            .max(RENEW_MIN_BACKOFF),
+    );
+    let jittered = ceiling.mul_f64(fuzz.clamp(0.0, 1.0));
+    let delay = jittered
+        .max(retry_after.unwrap_or(RENEW_MIN_BACKOFF))
+        .max(RENEW_MIN_BACKOFF);
+    // Never sleep past the budget: a sleep that outlives it would turn the
+    // ceiling into a lie and delay the give-up log.
+    Some(delay.min(remaining))
+}
+
+/// A uniform-ish draw in `[0, 1)` for backoff jitter.
+///
+/// Deliberately not a `rand` dependency: spreading retries needs decorrelation,
+/// not statistical quality. Mixes the clock through splitmix64 so two uploader
+/// threads starting in the same millisecond still diverge.
+fn fuzz() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Seconds and sub-second nanos combined without going through u128, so
+    // there is no truncating cast to explain away.
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        d.as_secs()
+            .wrapping_shl(20)
+            .wrapping_add(u64::from(d.subsec_nanos()))
+    });
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // 53 bits is the mantissa width, so this maps onto [0, 1) without bias.
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Parse `Retry-After` in its delta-seconds form. The HTTP-date form and any
+/// unparseable value yield `None`, leaving the caller on its own backoff.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (secs > 0).then(|| Duration::from_secs(secs).min(RENEW_MAX_BACKOFF))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The budget is the whole point: a renewal is one-shot, so it must outlive
+    /// a saturated hopper rather than the ~16s the old four-attempt loop gave
+    /// it.
+    #[test]
+    fn renew_delay_respects_the_budget() {
+        assert!(renew_delay(1, None, Duration::ZERO, 0.5).is_some());
+        assert!(renew_delay(9, None, RENEW_BUDGET - Duration::from_secs(1), 0.5).is_some());
+        assert!(renew_delay(9, None, RENEW_BUDGET, 0.5).is_none());
+        assert!(renew_delay(9, None, RENEW_BUDGET + Duration::from_secs(1), 0.5).is_none());
+    }
+
+    /// A sleep must never outlive the budget, or the give-up log arrives late
+    /// and the ceiling stops meaning anything.
+    #[test]
+    fn renew_delay_never_sleeps_past_the_budget() {
+        let elapsed = RENEW_BUDGET - Duration::from_millis(400);
+        let d = renew_delay(12, Some(Duration::from_secs(60)), elapsed, 1.0).unwrap();
+        assert!(d <= Duration::from_millis(400), "slept past the budget: {d:?}");
+    }
+
+    /// Full jitter: the draw scales the ceiling, so a fleet retrying against one
+    /// saturated hopper spreads out instead of re-saturating it in lockstep.
+    #[test]
+    fn renew_delay_applies_full_jitter() {
+        let low = renew_delay(10, None, Duration::ZERO, 0.0).unwrap();
+        let high = renew_delay(10, None, Duration::ZERO, 1.0).unwrap();
+        assert!(high > low, "jitter had no effect: {low:?} vs {high:?}");
+        assert!(low >= RENEW_MIN_BACKOFF, "a near-zero draw must still back off: {low:?}");
+        assert!(high <= RENEW_MAX_BACKOFF, "exceeded the ceiling: {high:?}");
+    }
+
+    /// The ceiling grows with the attempt and then stops.
+    #[test]
+    fn renew_delay_backs_off_exponentially_then_caps() {
+        let at = |n| renew_delay(n, None, Duration::ZERO, 1.0).unwrap();
+        assert!(at(1) < at(3), "not growing: {:?} then {:?}", at(1), at(3));
+        assert!(at(3) < at(6), "not growing: {:?} then {:?}", at(3), at(6));
+        assert_eq!(at(20), RENEW_MAX_BACKOFF, "ceiling not enforced");
+    }
+
+    /// Hopper knows when its slots free; a shorter sleep just burns a
+    /// slot-acquire on a pool that has already said it is full.
+    #[test]
+    fn renew_delay_honours_retry_after_as_a_floor() {
+        let hint = Duration::from_secs(30);
+        let d = renew_delay(1, Some(hint), Duration::ZERO, 0.0).unwrap();
+        assert!(d >= hint, "ignored Retry-After: {d:?}");
+    }
+
+    #[test]
+    fn parse_retry_after_forms() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(RETRY_AFTER, HeaderValue::from_str(v).unwrap());
+            parse_retry_after(&h)
+        };
+        assert_eq!(with("2"), Some(Duration::from_secs(2)));
+        assert_eq!(with(" 5 "), Some(Duration::from_secs(5)));
+        assert_eq!(with("0"), None);
+        assert_eq!(with("-1"), None);
+        // The HTTP-date form is legal but unparsed here; fall back to our own.
+        assert_eq!(with("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        // A hostile value must not park an uploader thread for hours.
+        assert_eq!(with("86400"), Some(RENEW_MAX_BACKOFF));
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
+
+    /// Decorrelation is the property that matters, not distribution quality.
+    #[test]
+    fn fuzz_is_in_range_and_varies() {
+        let draws: Vec<f64> = (0..64).map(|_| fuzz()).collect();
+        assert!(draws.iter().all(|d| (0.0..1.0).contains(d)), "out of range");
+        let distinct = draws
+            .iter()
+            .map(|d| (d * 1e9) as u64)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(distinct.len() > 1, "fuzz returned a constant");
+    }
+
+    /// Claiming hopper's reserved lane is what keeps a one-shot renewal from
+    /// competing with the retryable worker firehose.
+    #[test]
+    fn lane_header_matches_hoppers_contract() {
+        assert_eq!(HOPPER_LANE_HEADER, "X-Hopper-Lane");
+        assert_eq!(HOPPER_LANE_RENEW, "renew");
+    }
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
