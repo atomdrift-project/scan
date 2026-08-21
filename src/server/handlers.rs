@@ -1396,6 +1396,7 @@ async fn run_purl_analysis(
         .get(&request_id)
         .map(|r| r.phase.clone());
     let deps_for_upload = state.uploader.is_some();
+    let uploader_for_artifacts = state.uploader.clone();
     let owned_purl = purl.to_owned();
     let handle = tokio::task::spawn_blocking(move || {
         if let Some(req) = phase_state.in_flight.get(&request_id) {
@@ -1408,6 +1409,7 @@ async fn run_purl_analysis(
             Some(&cancel_flag),
             phase_tracker.as_ref(),
             deps_for_upload,
+            uploader_for_artifacts.as_ref(),
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -1456,6 +1458,7 @@ fn classify_purl(
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
     deps_for_upload: bool,
+    uploader: Option<&Arc<crate::upload::Uploader>>,
 ) -> anyhow::Result<crate::engine::ScanResult> {
     use fletch::RefLocator;
 
@@ -1481,7 +1484,7 @@ fn classify_purl(
         );
     }
 
-    let (bytes, name, _rec) = match crate::fetch::fetch_one(locator, false) {
+    let (bytes, name, rec) = match crate::fetch::fetch_one(locator, false) {
         Ok(t) => t,
         Err(e) => match registry.as_ref().and_then(crate::fetch::registry_document) {
             Some((name, bytes)) => {
@@ -1500,7 +1503,7 @@ fn classify_purl(
         },
     };
 
-    classify_bytes(
+    let result = classify_bytes(
         bytes::Bytes::from(bytes),
         &name,
         resources,
@@ -1509,7 +1512,36 @@ fn classify_purl(
         phase,
         registry_provenance.as_ref(),
         deps_for_upload,
-    )
+    )?;
+
+    // Offer the artifact — bytes, registry record, and fetch provenance —
+    // before its verdict, exactly as the CLI (`scan purl --hopper`) and the
+    // pull worker do. Hopper drops a result for a SHA it never ingested, so a
+    // renewal on its own lands nowhere: the POST is accepted and the sample
+    // stays unknown, which is invisible until something asks hopper for it.
+    //
+    // Queued, not sent: the uploader is one background thread reading a FIFO,
+    // so the artifact is already ahead of the verdict the caller submits when
+    // this returns.
+    if let Some(uploader) = uploader {
+        uploader.submit_artifacts(crate::engine::collect_upload_artifacts(
+            std::path::Path::new(&name),
+            &result.sha256,
+            result.size_bytes,
+            upload_collector(),
+            registry_provenance.as_ref(),
+            Some(&rec),
+        ));
+    }
+    Ok(result)
+}
+
+/// The collector name recorded on every artifact this server files, matching
+/// the CLI's `scan+<worker>` form so hopper's provenance reads the same
+/// whichever path ingested the sample.
+fn upload_collector() -> &'static str {
+    static COLLECTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    COLLECTOR.get_or_init(|| format!("scan+{}", crate::upload::default_worker_name()))
 }
 
 /// Run the full cleave + litmus pipeline on `path`, returning a `ScanResult`.
@@ -2532,5 +2564,72 @@ mod tests {
         );
         assert!(super::normalize_pkg_purl("").is_err());
         assert!(super::normalize_pkg_purl("not a purl").is_err());
+    }
+}
+
+#[cfg(test)]
+mod artifact_upload_tests {
+    use super::*;
+
+    /// The collector must read the same whichever path ingested the sample, so
+    /// hopper's provenance does not fork by ingest route.
+    #[test]
+    fn collector_matches_the_cli_form() {
+        let got = upload_collector();
+        assert!(got.starts_with("scan+"), "collector = {got}");
+        assert_eq!(got, upload_collector(), "collector is not stable");
+    }
+
+    /// A fetched root's bytes live in fletch's blob cache, keyed by locator —
+    /// not on disk. Building the artifact from the fetch record is what makes
+    /// the upload possible at all.
+    ///
+    /// It also pins a dependency on the caller: the PURL slot hopper projects
+    /// into its queryable `purl_base` column is filled only when the locator
+    /// carries the `pkg:` prefix. Beamline forwards the canonical form, so this
+    /// holds today; if that ever changes, the artifact still uploads but
+    /// `/api/sample?purl=` stops finding it, which is exactly the silent gap
+    /// this whole path exists to close.
+    #[test]
+    fn fetched_root_offers_cached_bytes_and_its_purl() {
+        let record = |locator: &str| {
+            serde_json::from_value::<fletch::fetch::FetchRecord>(serde_json::json!({
+                "locator": locator,
+                "resolved_url": "https://crates.io/api/v1/crates/libc/0.2.101/download",
+                "fetched_at": 0,
+                "cached": false,
+                "outcome": "ok",
+            }))
+            .expect("FetchRecord")
+        };
+        let build = |rec: &fletch::fetch::FetchRecord| {
+            crate::engine::collect_upload_artifacts(
+                std::path::Path::new("libc-0.2.101.crate"),
+                &"a".repeat(64),
+                1234,
+                "scan+test",
+                None,
+                Some(rec),
+            )
+        };
+
+        let arts = build(&record("pkg:cargo/libc@0.2.101"));
+        assert_eq!(arts.len(), 1);
+        let art = &arts[0];
+        assert_eq!(art.size, 1234);
+        assert!(
+            matches!(art.bytes, crate::upload::ArtifactBytes::Cached { .. }),
+            "a fetched root must take its bytes from the blob cache, not a path",
+        );
+        assert!(
+            art.backfill,
+            "a PURL-identified artifact is worth backfilling onto an existing sample",
+        );
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&art.sidecar).expect("sidecar json");
+        assert_eq!(
+            sidecar["package"]["purl"], "pkg:cargo/libc@0.2.101",
+            "the PURL must reach the sidecar slot hopper reads into purl_base",
+        );
     }
 }
