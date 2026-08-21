@@ -1136,6 +1136,15 @@ async fn interruptible_sleep(duration: Duration, shutdown: &AtomicBool) {
     }
 }
 
+/// Park until `shutdown` is raised, polling at the same 500 ms granularity as
+/// [`interruptible_sleep`]. A worker parks here for its whole life, which is
+/// past what `interruptible_sleep`'s deadline arithmetic can express.
+async fn wait_for_shutdown(shutdown: &AtomicBool) {
+    while !shutdown.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Spawn a task that flips `shutdown` when SIGINT, SIGTERM (unix), or Ctrl-C
 /// (other platforms) arrive. Registration failures are logged, not fatal —
 /// better to run without graceful shutdown than to refuse to start.
@@ -1610,7 +1619,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         "large payloads spool to disk (SCAN_SPOOL_DIR / SCAN_SPOOL_BUDGET_GB)",
     );
 
-    tokio::spawn(
+    let prefetch_task = tokio::spawn(
         Prefetcher {
             client: client.clone(),
             base_url: Arc::clone(&base_url),
@@ -2114,6 +2123,34 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 }
             }
         });
+    }
+
+    // A worker has no reason to stop on its own: it polls, analyses, posts, and
+    // repeats. Park here until something actually asks it to stop, so the drain
+    // below measures a shutdown deadline and not uptime — without this the cap
+    // fires 15 s after startup and abandons eight healthy in-flight analyses.
+    tokio::select! {
+        // SIGTERM/SIGINT, or `--max-jobs` satisfied by the workers themselves.
+        () = wait_for_shutdown(&shutdown) => {}
+        // The prefetcher is the only source of work. It returns on shutdown and,
+        // in `--exit-if-empty` mode, when the hopper runs dry; any other return
+        // is a panic, which starves every slot forever. Say so and exit rather
+        // than idle behind a heartbeat that still looks healthy — dropping `tx`
+        // closes the dispatch channel, so the workers finish what is staged and
+        // then stop on their own.
+        res = prefetch_task => {
+            if !exit_if_empty && !shutdown.load(Ordering::Relaxed) {
+                match res {
+                    Ok(()) => tracing::error!(
+                        "prefetcher exited unexpectedly; no further jobs will be claimed"
+                    ),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "prefetcher task died; no further jobs will be claimed"
+                    ),
+                }
+            }
+        }
     }
 
     // Wait for every worker to finish its current analyze+post. On SIGTERM the
