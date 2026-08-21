@@ -66,16 +66,14 @@ elif command -v sudo >/dev/null 2>&1; then SUDO=sudo
 else die "need doas or sudo"
 fi
 
-# systemd's StateDirectory= setup rejects a directory that is reached through
-# a symlink (for example /var/lib/atomdrift -> /data/atomdrift). Resolve the
-# deployment path as root, since the target may not be traversable by the
-# invoking user, and use the physical path in the unit below. On hosts without
-# the relocation this remains /var/lib/atomdrift/scan.
-RESOLVED_STATE_HOME=$($SUDO readlink -f -- "${STATE_HOME}") \
+# Keep the logical path as the service's canonical path. Resolve a separate
+# physical path for systemd's filesystem exception when /var/lib/atomdrift is
+# relocated through a symlink (for example to /data/atomdrift). Do this as root
+# because the target may not be traversable by the invoking user.
+PHYSICAL_STATE_HOME=$($SUDO readlink -f -- "${STATE_HOME}") \
     || die "cannot resolve state directory ${STATE_HOME}"
-[ -n "${RESOLVED_STATE_HOME}" ] || die "resolved state directory is empty"
-STATE_HOME=${RESOLVED_STATE_HOME}
-log "Using state directory: ${STATE_HOME}"
+[ -n "${PHYSICAL_STATE_HOME}" ] || die "resolved state directory is empty"
+log "Using state directory: ${STATE_HOME} (backing path: ${PHYSICAL_STATE_HOME})"
 
 # --- Packages ---------------------------------------------------------------
 #
@@ -304,11 +302,10 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 
-# The state directory is canonicalized during deployment. StateDirectory=
-# cannot be used here because systemd rejects symlinked paths while preparing
-# the service; ReadWritePaths= grants the same writable exception to
+# Keep the logical state path in the service configuration. ReadWritePaths=
+# uses the physical backing path because it grants the writable exception to
 # ProtectSystem=strict without requiring /var/lib to be the backing mount.
-ReadWritePaths=${STATE_HOME}
+ReadWritePaths=${PHYSICAL_STATE_HOME}
 
 WorkingDirectory=${STATE_HOME}
 ExecStart=${BIN_PATH} ${exec_args}

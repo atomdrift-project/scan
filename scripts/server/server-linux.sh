@@ -32,8 +32,8 @@
 #   WORKERS     concurrency (--workers)                          (default: server auto)
 #   ALLOWED_DIRS  comma-separated /analyze-path roots            (default: unset)
 #   HOPPER      hopper base URL (--hopper / SCAN_HOPPER)         (default: unset)
-#   HOPPER_TOKEN_FILE  hopper API token to install when HOPPER is set
-#                                                                (default: ~/.tok/hopper)
+#   HOPPER_TOKEN_FILE  hopper API token, installed whenever the file exists
+#                      (HOPPER need not be set)               (default: ~/.tok/hopper)
 #   MAX_RSS_GB  pause threshold (--max-rss-gb)                   (default: -1 = off; systemd MemoryMax handles OOM)
 #   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, 80%, infinity)     (default: 80%)
 #   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target (SCAN_LLM)
@@ -295,24 +295,25 @@ fi
 # --- Hopper API token --------------------------------------------------------
 #
 # Distinct from TOKEN_SRC above: that one authenticates *clients of this
-# server*, this one authenticates *this server to hopper*. Only needed when
-# --hopper is set, so a plain server pays nothing. Hopper requires
+# server*, this one authenticates *this server to hopper*. Hopper requires
 # `Authorization: Bearer <token>` on every API route and does not exempt
 # loopback, so without it every result renewal is rejected with 401. Installed
 # as a file for the same reason as the others: argv is world-readable through
 # ps(1), and unit files are world-readable in /etc/systemd/system.
-if [ -n "${HOPPER}" ]; then
-    hopper_token_src="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
-    hopper_token_dst="${STATE_HOME}/.tok/hopper"
-    if [ -s "$hopper_token_src" ]; then
-        $SUDO cmp -s "$hopper_token_src" "$hopper_token_dst" 2>/dev/null || token_changed=1
-        $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
-            "$hopper_token_src" "$hopper_token_dst"
-        log "Installed hopper API token at ${hopper_token_dst}"
-    elif ! $SUDO test -s "$hopper_token_dst"; then
-        # Not fatal: a hopper deployed without --token-file needs no client token.
-        log "WARNING: no hopper API token at ${hopper_token_src}; result renewal on ${HOPPER} will be rejected"
-    fi
+#
+# Installed whenever the operator has one, NOT only when HOPPER is set, so
+# adding HOPPER= to a later deploy needs nothing else in place. The file is
+# inert while --hopper is off. Matches rollout-bastille.sh.
+hopper_token_src="${HOPPER_TOKEN_FILE:-${HOME}/.tok/hopper}"
+hopper_token_dst="${STATE_HOME}/.tok/hopper"
+if [ -s "$hopper_token_src" ]; then
+    $SUDO cmp -s "$hopper_token_src" "$hopper_token_dst" 2>/dev/null || token_changed=1
+    $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+        "$hopper_token_src" "$hopper_token_dst"
+    log "Installed hopper API token at ${hopper_token_dst}"
+elif [ -n "${HOPPER}" ] && ! $SUDO test -s "$hopper_token_dst"; then
+    # Only worth a warning when there is a hopper to talk to.
+    log "WARNING: no hopper API token at ${hopper_token_src}; result renewal on ${HOPPER} will be rejected"
 fi
 
 # OpenRouter: copy the operator key into the service home as well.

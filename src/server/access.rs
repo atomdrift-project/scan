@@ -9,10 +9,11 @@
 //! rather than a warning there and a mystery here.
 //!
 //! Fields, in order: `id`, `status`, `dur_ms`, `peer`, `fwd`, `auth`,
-//! `req_bytes`, `shared`, `cred_len`, `cred_fp`, `trace`, `ua`. Everything that
-//! reaches the line
+//! `req_bytes`, `shared`, `sha256`, `purl`, `path`, `cred_len`, `cred_fp`,
+//! `trace`, `ua`. Everything that reaches the line
 //! is either generated here or parsed/bounded before it is printed, so a
-//! hostile header cannot shape the log.
+//! hostile header cannot shape the log. A field with nothing to say is left
+//! off the line entirely rather than printed empty.
 //!
 //! The `id` is allocated here and handed down to the handlers as a request
 //! extension, so the access line and every analysis line about the same request
@@ -51,6 +52,78 @@ impl RequestId {
 /// which makes a burst of duplicate submissions look like a burst of work.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Shared;
+
+/// Longest identifier echoed onto the access line. A PURL carrying a scope, a
+/// version and qualifiers fits well inside this; past it the excerpt is still
+/// enough to recognise what a caller sent.
+const MAX_SUBJECT_LEN: usize = 200;
+
+/// Which artifact a request was about.
+///
+/// The line carries the method and route, but a route is not an artifact:
+/// `GET /lookup` and `POST /analyze` are the whole path for every caller, and
+/// the identifier travels in a query string or a body that is deliberately
+/// never logged raw. Each handler attaches the key it actually parsed, so one
+/// line says both what was asked and what it was asked about — and a request
+/// can be found by the artifact it concerned without joining `id` across two
+/// lines.
+///
+/// Exactly one field is the caller's question; any others are what it
+/// resolved to.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Subject {
+    sha256: Option<String>,
+    purl: Option<String>,
+    path: Option<String>,
+}
+
+impl Subject {
+    /// A request about an artifact named by content digest — a `/lookup` by
+    /// sha, or the digest of the bytes uploaded to `/analyze`.
+    pub(super) fn sha256(value: &str) -> Self {
+        Self {
+            sha256: subject_field(value),
+            ..Self::default()
+        }
+    }
+
+    /// A request about an artifact named by package locator. `sha256` is the
+    /// digest that locator resolved to, when it resolved to one — for a lookup
+    /// that missed, or a locator that would not parse, there is no digest and
+    /// the field is simply absent.
+    pub(super) fn purl(value: &str, sha256: Option<&str>) -> Self {
+        Self {
+            sha256: sha256.and_then(subject_field),
+            purl: subject_field(value),
+            ..Self::default()
+        }
+    }
+
+    /// A request about a file already on this host — `/analyze-path`. The path
+    /// as the caller wrote it, which is what they will search the log for; the
+    /// canonicalized form is on the handler's own line when they differ.
+    pub(super) fn path(value: &str) -> Self {
+        Self {
+            path: subject_field(value),
+            ..Self::default()
+        }
+    }
+}
+
+/// Bound and strip caller-supplied text so it cannot forge or flood a log
+/// line: no control characters (a newline would fabricate a second line) and
+/// no unbounded length. Empty in, nothing out.
+fn subject_field(value: &str) -> Option<String> {
+    let clean = sanitize(value, MAX_SUBJECT_LEN);
+    (!clean.is_empty()).then_some(clean)
+}
+
+/// Attach a [`Subject`] to a response, so the access line for this request
+/// names what it was about.
+pub(super) fn with_subject(mut response: Response, subject: Subject) -> Response {
+    response.extensions_mut().insert(subject);
+    response
+}
 
 /// How a request fared at the access-control edge.
 ///
@@ -136,12 +209,17 @@ impl fmt::Display for Fingerprint {
 /// reaches the record.
 fn loggable(headers: &HeaderMap, name: header::HeaderName, max_len: usize) -> Option<String> {
     let raw = headers.get(name)?.to_str().ok()?;
-    let clean: String = raw
-        .chars()
+    let clean = sanitize(raw, max_len);
+    (!clean.is_empty()).then_some(clean)
+}
+
+/// Drop control characters and bound the length. The one gate every piece of
+/// caller-supplied text passes through before it reaches a log line.
+fn sanitize(raw: &str, max_len: usize) -> String {
+    raw.chars()
         .filter(|c| !c.is_ascii_control())
         .take(max_len)
-        .collect();
-    (!clean.is_empty()).then_some(clean)
+        .collect()
 }
 
 /// The originating client address a fronting proxy reported, if any.
@@ -224,6 +302,11 @@ pub(super) async fn access_log(
     // reader's attention: they are what turns "401" into "the client is holding
     // a different token than the one this process loaded".
     let shared = response.extensions().get::<Shared>().map(|_| true);
+    let subject = response
+        .extensions()
+        .get::<Subject>()
+        .cloned()
+        .unwrap_or_default();
     let (cred_len, cred_fp) = match auth {
         Some(Auth::BadToken { len, fp }) => (Some(len), Some(fp.to_string())),
         _ => (None, None),
@@ -244,6 +327,9 @@ pub(super) async fn access_log(
                 auth = auth.map(Auth::as_str),
                 req_bytes,
                 shared,
+                sha256 = subject.sha256.as_deref(),
+                purl = subject.purl.as_deref(),
+                path = subject.path.as_deref(),
                 cred_len,
                 cred_fp = cred_fp.as_deref(),
                 trace = trace.as_deref(),
@@ -266,6 +352,55 @@ pub(super) async fn access_log(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    /// A lookup key reaches the line as the handler parsed it.
+    #[test]
+    fn subject_carries_both_keys() {
+        let by_sha = Subject::sha256("ab".repeat(32).as_str());
+        assert_eq!(by_sha.sha256.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(by_sha.purl, None);
+
+        let by_purl = Subject::purl("pkg:npm/left-pad@1.3.0", Some("beef"));
+        assert_eq!(by_purl.purl.as_deref(), Some("pkg:npm/left-pad@1.3.0"));
+        assert_eq!(by_purl.sha256.as_deref(), Some("beef"));
+    }
+
+    /// A local-file request is named by the path the caller asked for.
+    #[test]
+    fn subject_carries_a_path() {
+        let subject = Subject::path("/srv/samples/a.bin");
+        assert_eq!(subject.path.as_deref(), Some("/srv/samples/a.bin"));
+        assert_eq!(subject.sha256, None);
+        assert_eq!(subject.purl, None);
+    }
+
+    /// A PURL lookup that missed resolves to no digest, and an absent field is
+    /// left off the line rather than printed empty.
+    #[test]
+    fn subject_omits_unresolved_digest() {
+        assert_eq!(
+            Subject::purl("pkg:npm/left-pad@1.3.0", Some("")).sha256,
+            None
+        );
+        assert_eq!(Subject::purl("pkg:npm/left-pad@1.3.0", None).sha256, None);
+    }
+
+    /// The query string is caller-controlled: a newline in it must not be able
+    /// to fabricate a second log line, and length must not be able to flood
+    /// one. This is why the raw query is never logged directly.
+    #[test]
+    fn subject_cannot_forge_or_flood_a_log_line() {
+        let forged = Subject::purl("pkg:npm/a\n2026-01-01 INFO forged line", None);
+        // The newline is gone, so what would have been a second line is now
+        // just text inside the first one's `purl` field.
+        assert_eq!(
+            forged.purl.as_deref(),
+            Some("pkg:npm/a2026-01-01 INFO forged line"),
+        );
+
+        let flood = Subject::sha256(&"a".repeat(MAX_SUBJECT_LEN * 4));
+        assert_eq!(flood.sha256.map(|s| s.len()), Some(MAX_SUBJECT_LEN));
+    }
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

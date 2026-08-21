@@ -55,6 +55,22 @@ async fn get(uri: &str) -> Result<(StatusCode, serde_json::Value, Option<String>
     Ok((status, body, cache_control))
 }
 
+/// A package nothing will ever have analyzed. The verdict index is a real
+/// directory under the user's cache, shared by every scan on this machine, so a
+/// test that wants "not stored" has to pick a key that cannot be stored — using
+/// a real package name makes the result depend on what else has run here.
+const UNKNOWN: &str = "pkg:npm/scan-lookup-fixture-never-analyzed@0.0.0";
+
+/// Percent-encode a PURL for the query string.
+fn encoded_purl(purl: &str) -> String {
+    purl.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '.' | '_' | '~' => c.to_string(),
+            other => format!("%{:02X}", other as u32),
+        })
+        .collect()
+}
+
 /// Nothing stored is `404 unknown sample` — not an empty 200, and not a 500.
 /// The bloom decision rides along, so one round trip answers both "do we have
 /// an analysis" and "does a filter already vouch for this".
@@ -75,7 +91,7 @@ async fn unknown_sha_is_a_404_carrying_the_bloom_decision() -> Result<()> {
 
 #[tokio::test]
 async fn unknown_purl_is_a_404_carrying_the_bloom_decision() -> Result<()> {
-    let (status, body, _) = get("/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0").await?;
+    let (status, body, _) = get(&format!("/lookup?purl={}", encoded_purl(UNKNOWN))).await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"], "unknown sample");
     assert_eq!(body["bloom"], "unknown");
@@ -127,11 +143,12 @@ async fn malformed_keys_are_rejected() -> Result<()> {
     Ok(())
 }
 
-/// `pkg:` is optional on the way in: a bare `npm/left-pad@1.3.0` is the same
-/// question as the canonical form, not a malformed one.
+/// `pkg:` is optional on the way in: a bare `npm/…` is the same question as
+/// the canonical form, not a malformed one.
 #[tokio::test]
 async fn bare_purls_are_normalized_rather_than_rejected() -> Result<()> {
-    let (status, body, _) = get("/lookup?purl=npm%2Fleft-pad%401.3.0").await?;
+    let bare = UNKNOWN.strip_prefix("pkg:").expect("UNKNOWN is canonical");
+    let (status, body, _) = get(&format!("/lookup?purl={}", encoded_purl(bare))).await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "understood, just not stored");
     assert_eq!(body["error"], "unknown sample");
     Ok(())
