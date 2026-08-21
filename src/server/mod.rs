@@ -74,6 +74,17 @@ pub struct ServerConfig {
     hopper: Option<String>,
     /// Additional passwords to try for encrypted archives.
     zip_passwords: crate::ArchivePasswords,
+    /// Analysis slots the idle worker may use. `0` disables it.
+    ///
+    /// Idle capacity is otherwise wasted: a scan server spends most of its life
+    /// waiting for the next request while hopper holds a queue of work. The
+    /// worker fills that gap and pauses the moment a request arrives.
+    ///
+    /// Deliberately fewer than `max_concurrent_tasks`: the difference is the
+    /// interactive reserve. Pausing stops new claims but does not abandon a job
+    /// already running, so without slots held back a request could still queue
+    /// behind background work — the reserve is what keeps the answer prompt.
+    idle_worker_slots: usize,
 }
 
 /// Default per-request analysis timeout: 20 minutes. Covers cold cleave scans
@@ -159,6 +170,7 @@ impl ServerConfig {
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
             zip_passwords: crate::ArchivePasswords::default(),
+            idle_worker_slots: 0,
         })
     }
 
@@ -175,6 +187,19 @@ impl ServerConfig {
     pub fn with_zip_passwords(mut self, passwords: impl Into<crate::ArchivePasswords>) -> Self {
         self.zip_passwords = passwords.into();
         self
+    }
+
+    /// Set how many analysis slots the idle worker may use; `0` disables it.
+    #[must_use]
+    pub fn with_idle_worker_slots(mut self, slots: usize) -> Self {
+        self.idle_worker_slots = slots;
+        self
+    }
+
+    /// Analysis slots available to the idle worker.
+    #[must_use]
+    pub fn idle_worker_slots(&self) -> usize {
+        self.idle_worker_slots
     }
 
     /// The configured hopper upload root, or `None` when `--hopper` was not set.
@@ -474,6 +499,9 @@ impl RequestGuard {
         cancellation: Arc<AtomicBool>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
+        if let Some(pause) = &state.idle_pause {
+            pause.store(true, Ordering::Release);
+        }
         Self {
             request_id,
             state,
@@ -489,11 +517,25 @@ impl Drop for RequestGuard {
         // in-flight entry. The permit is released automatically via _permit.
         self.cancellation.store(true, Ordering::Release);
         self.state.in_flight.remove(&self.request_id);
+        // Resume the idle worker once the last interactive request is done.
+        // Checked after the removal so a concurrent arrival cannot be missed:
+        // that request raised the flag before its guard existed.
+        if let Some(pause) = &self.state.idle_pause
+            && self.state.in_flight.is_empty()
+        {
+            pause.store(false, Ordering::Release);
+        }
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct ModelResources {
+/// The loaded model bundle an analysis runs against: thresholds, the ML
+/// ensemble, and the optional LLM and fetch policies attached to it.
+///
+/// Public because [`crate::worker::Embedded`] carries one — an idle worker
+/// running inside a serve process shares the server's already-loaded models
+/// rather than loading a second copy of the largest thing in the process.
+pub struct ModelResources {
     pub(crate) model: Model,
     pub(crate) shap: Option<ShapImportance>,
     pub(crate) ctx: ExtractContext,
@@ -551,6 +593,22 @@ struct AppState {
     reload_lock: tokio::sync::Mutex<()>,
     overloaded_since: std::sync::Mutex<Option<Instant>>,
     in_flight: dashmap::DashMap<u64, InFlightRequest>,
+    /// Hopper root, kept so the idle worker can claim from the same instance
+    /// the uploader renews to.
+    hopper: Option<String>,
+    /// Analysis slots the idle worker may use; the rest are the interactive
+    /// reserve. Zero disables it.
+    idle_worker_slots: usize,
+    /// Raised once the HTTP server stops, so the idle worker winds down with it
+    /// rather than outliving the thing it exists to fill the gaps of.
+    shutdown: Arc<AtomicBool>,
+    /// Raised while any interactive request is in flight, so an embedded idle
+    /// worker stops claiming queue work. `None` when no idle worker is running.
+    ///
+    /// Driven from [`RequestGuard`] rather than polled: the guard already
+    /// brackets exactly the window that matters, and a poller would either lag
+    /// a request's arrival or spin.
+    idle_pause: Option<Arc<AtomicBool>>,
     /// Analyses in progress, so concurrent requests for the same artifact
     /// share one run instead of each taking a slot. See [`flight`].
     flights: Arc<flight::Flights>,
@@ -615,6 +673,13 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         overloaded_since: std::sync::Mutex::new(None),
         flights: Arc::new(flight::Flights::default()),
         in_flight: dashmap::DashMap::new(),
+        hopper: config.hopper().map(str::to_owned),
+        idle_worker_slots: config.idle_worker_slots(),
+        shutdown: Arc::new(AtomicBool::new(false)),
+        // Decided here because AppState lives behind an Arc and cannot be
+        // amended later. The worker itself starts once the models are loaded.
+        idle_pause: (config.idle_worker_slots() > 0 && config.hopper().is_some())
+            .then(|| Arc::new(AtomicBool::new(false))),
         // Start the background uploader once when --hopper is set, so every
         // analyzed result (parent and members) is renewed on hopper without
         // blocking the analyze response. Said once here rather than on every
@@ -638,6 +703,17 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
 
     // Background task: load model + SHAP + YARA concurrently, then mark ready.
     {
+        // The idle worker fills the gaps around this server, so it winds down
+        // with it. Awaiting the signal alongside axum's own graceful shutdown
+        // is safe — signal streams deliver to every listener.
+        {
+            let stopping = Arc::clone(&state);
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                stopping.shutdown.store(true, Ordering::Release);
+            });
+        }
+
         let bg = Arc::clone(&state);
         let model_dir = config.model_dir().to_path_buf();
         let model_dir_shap = config.model_dir().to_path_buf();
@@ -743,6 +819,10 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                                 shap_loaded,
                                 "server ready",
                             );
+                            // Idle capacity is otherwise wasted. Started here
+                            // rather than at bind time because it needs the
+                            // loaded models — the same ones, not a second copy.
+                            spawn_idle_worker(&bg);
                         }
                         Err(e) => tracing::error!("resources lock poisoned during init: {e}"),
                     }
@@ -964,8 +1044,82 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
+
     tracing::info!("server shut down");
     Ok(())
+}
+
+/// Start the embedded idle worker: fill unused analysis capacity with queue
+/// work from hopper, and stand aside the moment a request arrives.
+///
+/// A scan server spends most of its life waiting. Meanwhile hopper holds a
+/// backlog and the fleet's dedicated workers grind through it, so the idle
+/// capacity here is pure waste — and, usefully, running the same queue work on
+/// every server produces a continuous like-for-like measurement of how fast
+/// each one actually is.
+///
+/// Interactive work always wins: [`RequestGuard`] raises the pause flag before
+/// a request starts and lowers it when the last one finishes, and the worker's
+/// prefetcher stops claiming while it is raised. Jobs already running are not
+/// abandoned — that work is real, and a claim that dies is redispatched by
+/// hopper anyway — so promptness comes from the slots held back for requests,
+/// not from killing work mid-flight.
+fn spawn_idle_worker(state: &Arc<AppState>) {
+    let (Some(pause), Some(hopper)) = (state.idle_pause.clone(), state.hopper.clone()) else {
+        return;
+    };
+    let slots = state.idle_worker_slots;
+    let Some(slots) = std::num::NonZeroUsize::new(slots) else {
+        return;
+    };
+    let Some(resources) = state
+        .resources
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(Arc::clone))
+    else {
+        tracing::warn!("idle worker not started: models are not loaded");
+        return;
+    };
+
+    tracing::info!(
+        slots = slots.get(),
+        reserved_for_requests = state.max_concurrent_tasks.saturating_sub(slots.get()),
+        hopper = %hopper,
+        "idle worker: filling spare capacity with hopper queue work",
+    );
+
+    let config = crate::worker::WorkerConfig {
+        hopper_url: hopper,
+        name: format!("{}-idle", crate::upload::default_worker_name()),
+        workers: slots,
+        poll_secs: 30,
+        // Memory is the host's to manage: the server already bounds its own
+        // concurrency, and a second RSS ceiling here would pause the worker on
+        // the server's own footprint.
+        max_rss_gb: 0,
+        model_dir: state.model_dir.clone(),
+        thresholds: None,
+        data_dir: None,
+        slow_rule_ms: state.slow_rule_ms,
+        max_jobs: None,
+        exit_if_empty: false,
+        level: None,
+        nice: 0,
+        interpret: state.interpret.clone(),
+        fetch: state.fetch,
+        zip_passwords: state.zip_passwords.clone(),
+        embedded: Some(crate::worker::Embedded {
+            pause,
+            shutdown: Arc::clone(&state.shutdown),
+            resources,
+        }),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = crate::worker::run(config).await {
+            tracing::warn!(error = %e, "idle worker stopped");
+        }
+    });
 }
 
 async fn shutdown_signal() {

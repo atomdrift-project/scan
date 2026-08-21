@@ -70,7 +70,10 @@ fi
 # physical path for systemd's filesystem exception when /var/lib/atomdrift is
 # relocated through a symlink (for example to /data/atomdrift). Do this as root
 # because the target may not be traversable by the invoking user.
-PHYSICAL_STATE_HOME=$($SUDO readlink -f -- "${STATE_HOME}") \
+# -m, not -f: the directory is created further down, so on a first deploy the
+# path does not exist yet and -f would fail on the missing parent. -m still
+# resolves symlinks in the components that do exist.
+PHYSICAL_STATE_HOME=$($SUDO readlink -m -- "${STATE_HOME}") \
     || die "cannot resolve state directory ${STATE_HOME}"
 [ -n "${PHYSICAL_STATE_HOME}" ] || die "resolved state directory is empty"
 log "Using state directory: ${STATE_HOME} (backing path: ${PHYSICAL_STATE_HOME})"

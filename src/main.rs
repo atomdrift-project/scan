@@ -756,6 +756,21 @@ enum Commands {
         )]
         hopper: Option<String>,
 
+        /// Fill idle capacity with queue work from `--hopper`, pausing the
+        /// moment a request arrives.
+        ///
+        /// A serve process spends most of its life waiting while hopper holds a
+        /// backlog, so the spare capacity is otherwise wasted. Requests always
+        /// win: the worker stops claiming while any is in flight, and the slots
+        /// it is *not* given are the interactive reserve, so an arriving
+        /// request never queues behind background work.
+        ///
+        /// Defaults to 1, leaving every other slot reserved for requests, and
+        /// the worker holds exactly one claim at a time. 0 disables it.
+        /// Requires `--hopper`.
+        #[arg(long, value_name = "N", env = "SCAN_IDLE_WORKER_SLOTS")]
+        idle_worker_slots: Option<usize>,
+
         /// Per-request analysis timeout in seconds; 0 disables. Raise when
         /// `--fetch` is on and dependency analysis can exceed the default.
         #[arg(
@@ -1452,6 +1467,7 @@ fn main() -> Result<()> {
             token_file,
             traits_dir,
             hopper,
+            idle_worker_slots,
             analysis_timeout,
         } => {
             if let Some(p) = traits_dir.as_ref() {
@@ -1508,6 +1524,20 @@ fn main() -> Result<()> {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
+            // One slot by default: every other slot stays reserved for
+            // requests. Pausing stops new claims but does not abandon a running
+            // job, so the reserve — not the pause — is what keeps an arriving
+            // request from waiting. One slot also bounds the worst case to a
+            // single background analysis in flight, which is the whole point of
+            // filling *idle* capacity rather than competing for it.
+            //
+            // Disabled without --hopper: there would be nothing to claim from.
+            let idle_slots = match (hopper.as_deref(), idle_worker_slots) {
+                (None, _) => 0,
+                (Some(_), Some(n)) => n,
+                (Some(_), None) => 1,
+            };
+
             let config = scan::server::ServerConfig::new(
                 bind,
                 max_size_mb.saturating_mul(1024 * 1024),
@@ -1526,6 +1556,7 @@ fn main() -> Result<()> {
             .with_fetch(fetch_policy)
             .with_zip_passwords(cli.zip_passwords.clone())
             .with_hopper(hopper.clone())
+            .with_idle_worker_slots(idle_slots)
             .with_analysis_timeout(analysis_timeout);
             if let Some(url) = hopper.as_deref() {
                 eprintln!("Renewing results on hopper at {url}");
@@ -1679,6 +1710,8 @@ fn main() -> Result<()> {
                 max_rss_gb.saturating_mul(GIB),
             );
             let config = scan::worker::WorkerConfig {
+                // Standalone: owns its signals, its nice value, and its models.
+                embedded: None,
                 hopper_url: url,
                 name,
                 workers,
