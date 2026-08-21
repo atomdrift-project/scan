@@ -2845,7 +2845,7 @@ fn artifact_purl(root_fetch: Option<&fletch::fetch::FetchRecord>) -> Option<Stri
     fletch::purl::url_to_purl(&root_fetch?.locator)
 }
 
-fn collect_upload_artifacts(
+pub(crate) fn collect_upload_artifacts(
     file_path: &Path,
     sha256: &str,
     size_bytes: u64,
