@@ -499,6 +499,7 @@ impl RequestGuard {
         cancellation: Arc<AtomicBool>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
+        state.jobs_started.fetch_add(1, Ordering::Relaxed);
         if let Some(pause) = &state.idle_pause {
             pause.store(true, Ordering::Release);
         }
@@ -526,6 +527,32 @@ impl Drop for RequestGuard {
             pause.store(false, Ordering::Release);
         }
     }
+}
+
+/// Upper bounds, in bytes, of each size bucket; the last is open-ended.
+/// Chosen around where behaviour actually changes: a source tarball, a typical
+/// package, a large archive, and the multi-hundred-megabyte inputs whose member
+/// expansion dominates everything else.
+pub(crate) const SIZE_BUCKETS: [u64; 4] = [1 << 20, 16 << 20, 128 << 20, u64::MAX];
+
+/// Human labels for [`SIZE_BUCKETS`], used as JSON keys on `/_/stats`.
+pub(crate) const SIZE_BUCKET_NAMES: [&str; 4] = ["le_1mb", "le_16mb", "le_128mb", "gt_128mb"];
+
+/// Completion totals for one size bucket. Totals rather than a rolling window:
+/// they cost two atomics, survive an idle period without decaying to nothing,
+/// and divide at read time.
+#[derive(Debug, Default)]
+pub(crate) struct JobBucket {
+    pub(crate) count: AtomicU64,
+    pub(crate) micros: AtomicU64,
+}
+
+/// The bucket index for an artifact of `size` bytes.
+pub(crate) fn size_bucket(size: u64) -> usize {
+    SIZE_BUCKETS
+        .iter()
+        .position(|&bound| size <= bound)
+        .unwrap_or(SIZE_BUCKETS.len() - 1)
 }
 
 #[derive(Debug)]
@@ -602,6 +629,30 @@ struct AppState {
     /// Raised once the HTTP server stops, so the idle worker winds down with it
     /// rather than outliving the thing it exists to fill the gaps of.
     shutdown: Arc<AtomicBool>,
+    /// Per-size-bucket completion totals, for the size-aware half of routing.
+    ///
+    /// One scalar average is not enough to choose a server. The 12.5s-vs-90s
+    /// spread measured across two scanners on the same artifact was a large
+    /// archive's member analysis, not a constant handicap — a single number
+    /// would brand a box "slow" when it is only slow at big inputs, and send
+    /// every small package somewhere worse. A caller usually knows the size
+    /// before it dispatches, so the useful answer is per bucket.
+    job_buckets: [JobBucket; SIZE_BUCKETS.len()],
+    /// Analyses this server has begun, completed, and the totals behind their
+    /// averages.
+    ///
+    /// Counted rather than sampled: a router wants "how big and how slow are
+    /// this server's jobs, typically", and totals divided at read time answer
+    /// that without keeping a window. `started` minus `completed` is also the
+    /// honest count of work that went in and never came out.
+    jobs_started: AtomicU64,
+    jobs_completed: AtomicU64,
+    job_bytes_total: AtomicU64,
+    job_micros_total: AtomicU64,
+    /// Set once the idle worker has actually been spawned. Published on
+    /// `/_/info`: "configured" and "running" are different states, and the gap
+    /// between them is exactly where a silent early return hides.
+    idle_worker_started: AtomicBool,
     /// Raised while any interactive request is in flight, so an embedded idle
     /// worker stops claiming queue work. `None` when no idle worker is running.
     ///
@@ -676,6 +727,12 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         hopper: config.hopper().map(str::to_owned),
         idle_worker_slots: config.idle_worker_slots(),
         shutdown: Arc::new(AtomicBool::new(false)),
+        idle_worker_started: AtomicBool::new(false),
+        job_buckets: Default::default(),
+        jobs_started: AtomicU64::new(0),
+        jobs_completed: AtomicU64::new(0),
+        job_bytes_total: AtomicU64::new(0),
+        job_micros_total: AtomicU64::new(0),
         // Decided here because AppState lives behind an Arc and cannot be
         // amended later. The worker itself starts once the models are loaded.
         idle_pause: (config.idle_worker_slots() > 0 && config.hopper().is_some())
@@ -800,14 +857,15 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                     tracing::info!("all resources ready, installing into AppState");
                     match bg.resources.write() {
                         Ok(mut lock) => {
-                            *lock = Some(Arc::new(ModelResources {
+                            let loaded = Arc::new(ModelResources {
                                 model,
                                 shap,
                                 ctx,
                                 interpret: bg.interpret.clone(),
                                 fetch: bg.fetch,
                                 zip_passwords: bg.zip_passwords.clone(),
-                            }));
+                            });
+                            *lock = Some(Arc::clone(&loaded));
                             if let Ok(mut init_error) = bg.init_error.write() {
                                 *init_error = None;
                             }
@@ -822,7 +880,14 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                             // Idle capacity is otherwise wasted. Started here
                             // rather than at bind time because it needs the
                             // loaded models — the same ones, not a second copy.
-                            spawn_idle_worker(&bg);
+                            //
+                            // The Arc is handed over rather than read back out
+                            // of `bg.resources`: this scope still holds the
+                            // write guard, and taking a read lock under it is a
+                            // self-deadlock that would wedge the server the
+                            // moment an idle worker was actually configured.
+                            drop(lock);
+                            spawn_idle_worker(&bg, &loaded);
                         }
                         Err(e) => tracing::error!("resources lock poisoned during init: {e}"),
                     }
@@ -916,6 +981,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     let app = Router::new()
         .route("/_/health", get(handlers::health))
         .route("/_/info", get(handlers::info))
+        .route("/_/stats", get(handlers::stats))
         .route("/_/reload", post(handlers::reload))
         .route("/_/update", post(handlers::update))
         .route("/_/memory", get(handlers::memory_stats))
@@ -1064,23 +1130,28 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 /// abandoned — that work is real, and a claim that dies is redispatched by
 /// hopper anyway — so promptness comes from the slots held back for requests,
 /// not from killing work mid-flight.
-fn spawn_idle_worker(state: &Arc<AppState>) {
-    let (Some(pause), Some(hopper)) = (state.idle_pause.clone(), state.hopper.clone()) else {
+fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
+    // Every exit says why. The first cut returned silently on three separate
+    // paths, so a worker that never started was indistinguishable from one that
+    // started and found nothing to do — and the only way to tell them apart was
+    // to read the source.
+    let Some(hopper) = state.hopper.clone() else {
+        tracing::info!("idle worker disabled: no --hopper to claim work from");
         return;
     };
-    let slots = state.idle_worker_slots;
-    let Some(slots) = std::num::NonZeroUsize::new(slots) else {
+    let Some(slots) = std::num::NonZeroUsize::new(state.idle_worker_slots) else {
+        tracing::info!("idle worker disabled: --idle-worker-slots is 0");
         return;
     };
-    let Some(resources) = state
-        .resources
-        .read()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(Arc::clone))
-    else {
-        tracing::warn!("idle worker not started: models are not loaded");
+    let Some(pause) = state.idle_pause.clone() else {
+        tracing::warn!(
+            slots = slots.get(),
+            "idle worker not started: no pause flag, so it could not yield to \
+             requests — refusing rather than competing with them",
+        );
         return;
     };
+    let resources = Arc::clone(resources);
 
     tracing::info!(
         slots = slots.get(),
@@ -1088,6 +1159,7 @@ fn spawn_idle_worker(state: &Arc<AppState>) {
         hopper = %hopper,
         "idle worker: filling spare capacity with hopper queue work",
     );
+    state.idle_worker_started.store(true, Ordering::Release);
 
     let config = crate::worker::WorkerConfig {
         hopper_url: hopper,
@@ -1149,5 +1221,48 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("received SIGINT"),
         _ = terminate => tracing::info!("received SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod size_bucket_tests {
+    use super::{SIZE_BUCKETS, SIZE_BUCKET_NAMES, size_bucket};
+
+    /// Every bucket has a label, or `/_/stats` would silently drop one.
+    #[test]
+    fn every_bucket_is_named() {
+        assert_eq!(SIZE_BUCKETS.len(), SIZE_BUCKET_NAMES.len());
+    }
+
+    /// The boundaries are inclusive upper bounds and the last is open-ended, so
+    /// no size — including zero and u64::MAX — can fall outside.
+    #[test]
+    fn every_size_lands_in_a_bucket() {
+        for size in [0, 1, 1 << 20, (1 << 20) + 1, 16 << 20, 128 << 20, u64::MAX] {
+            let i = size_bucket(size);
+            assert!(i < SIZE_BUCKETS.len(), "size {size} fell outside the buckets");
+        }
+    }
+
+    /// Boundaries are inclusive: an artifact of exactly 1 MiB is a small one,
+    /// not the first of the next class up.
+    #[test]
+    fn boundaries_are_inclusive_and_ordered() {
+        assert_eq!(size_bucket(0), 0);
+        assert_eq!(size_bucket(1 << 20), 0);
+        assert_eq!(size_bucket((1 << 20) + 1), 1);
+        assert_eq!(size_bucket(16 << 20), 1);
+        assert_eq!(size_bucket((16 << 20) + 1), 2);
+        assert_eq!(size_bucket(128 << 20), 2);
+        assert_eq!(size_bucket((128 << 20) + 1), 3);
+        assert_eq!(size_bucket(u64::MAX), 3);
+        // Monotonic: a bigger artifact never lands in an earlier bucket.
+        let mut last = 0;
+        for size in [0_u64, 1 << 10, 1 << 20, 1 << 24, 1 << 27, 1 << 30, u64::MAX] {
+            let i = size_bucket(size);
+            assert!(i >= last, "bucket went backwards at {size}");
+            last = i;
+        }
     }
 }

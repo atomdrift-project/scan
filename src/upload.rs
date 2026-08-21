@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::thread::JoinHandle;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -342,6 +344,39 @@ pub struct Uploader {
     /// then degrade to silent no-ops rather than failing the scan).
     tx: Option<std::sync::mpsc::SyncSender<Job>>,
     worker: Option<JoinHandle<()>>,
+    /// Jobs accepted but not yet handled. A `SyncSender` cannot be asked its
+    /// depth, and this is the difference between "quiet because nothing needs
+    /// filing" and "quiet because the filing is stuck".
+    pending: Arc<AtomicUsize>,
+    /// Renewals that exhausted their retry budget. Every one is a verdict that
+    /// will never reach hopper, and until this counter existed the only trace
+    /// was a warning in a log nobody was reading.
+    failed: Arc<AtomicUsize>,
+    /// Renewals hopper accepted. The pair with `failed` is what turns "results
+    /// are being filed" from an assumption into a number.
+    uploaded: Arc<AtomicUsize>,
+}
+
+/// The two ends a renewal can reach, counted together because they are only
+/// meaningful together: `uploaded` alone says nothing without `failed` beside
+/// it, and a router reading one without the other would mistake a server that
+/// files nothing for one with nothing to file.
+struct RenewTally<'a> {
+    uploaded: &'a AtomicUsize,
+    failed: &'a AtomicUsize,
+}
+
+/// A point-in-time view of the uploader, for `/_/stats`.
+#[derive(Debug, Clone, Copy)]
+pub struct UploadStats {
+    /// Jobs accepted but not yet handled.
+    pub pending: usize,
+    /// Queue capacity; at this depth `submit` blocks the analysis thread.
+    pub capacity: usize,
+    /// Renewals that gave up after exhausting their retries.
+    pub failed: usize,
+    /// Renewals hopper accepted.
+    pub uploaded: usize,
 }
 
 impl Uploader {
@@ -360,6 +395,12 @@ impl Uploader {
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
         let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(UPLOAD_QUEUE_DEPTH);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicUsize::new(0));
+        let uploaded = Arc::new(AtomicUsize::new(0));
+        let pending_rx = Arc::clone(&pending);
+        let failed_rx = Arc::clone(&failed);
+        let uploaded_rx = Arc::clone(&uploaded);
         let handle = std::thread::Builder::new()
             .name("scan-upload".into())
             .spawn(move || {
@@ -370,6 +411,9 @@ impl Uploader {
                 // files is negotiated and uploaded at most once.
                 let mut seen: HashSet<String> = HashSet::new();
                 for job in rx {
+                    // Handled below whatever the outcome; the depth is about
+                    // the queue, not about success.
+                    pending_rx.fetch_sub(1, Ordering::Relaxed);
                     // Bound the dedup set: a long-lived `serve --hopper` process
                     // reconciles an unbounded stream of unique shas, and this set
                     // otherwise grows forever. Clearing past the cap only costs a
@@ -390,6 +434,10 @@ impl Uploader {
                                 &sha256,
                                 purl.as_deref(),
                                 *envelope,
+                                &RenewTally {
+                                    uploaded: &uploaded_rx,
+                                    failed: &failed_rx,
+                                },
                             );
                         }
                         Job::Artifacts(artifacts) => {
@@ -418,6 +466,10 @@ impl Uploader {
                                 cache.as_ref(),
                                 &mut seen,
                                 deps,
+                                &RenewTally {
+                                    uploaded: &uploaded_rx,
+                                    failed: &failed_rx,
+                                },
                             );
                         }
                     }
@@ -429,6 +481,9 @@ impl Uploader {
                 Self {
                     tx: Some(tx),
                     worker: Some(worker),
+                    pending,
+                    failed,
+                    uploaded,
                 }
             }
             Err(e) => {
@@ -436,8 +491,26 @@ impl Uploader {
                 Self {
                     tx: None,
                     worker: None,
+                    pending,
+                    failed,
+                    uploaded,
                 }
             }
+        }
+    }
+
+    /// A point-in-time view of the upload queue.
+    ///
+    /// `pending` at capacity means analyses are blocking on `submit`; `failed`
+    /// climbing means verdicts are being computed and then lost, which no other
+    /// signal reports.
+    #[must_use]
+    pub fn stats(&self) -> UploadStats {
+        UploadStats {
+            pending: self.pending.load(Ordering::Relaxed),
+            capacity: UPLOAD_QUEUE_DEPTH,
+            failed: self.failed.load(Ordering::Relaxed),
+            uploaded: self.uploaded.load(Ordering::Relaxed),
         }
     }
 
@@ -445,6 +518,7 @@ impl Uploader {
     /// (backpressure); a closed channel drops the result silently.
     pub fn submit(&self, sha256: String, purl: Option<String>, envelope: ScanResultEnvelope) {
         if let Some(tx) = &self.tx {
+            self.pending.fetch_add(1, Ordering::Relaxed);
             let _ = tx.send(Job::Result {
                 sha256,
                 purl,
@@ -462,6 +536,7 @@ impl Uploader {
             return;
         }
         if let Some(tx) = &self.tx {
+            self.pending.fetch_add(1, Ordering::Relaxed);
             let _ = tx.send(Job::Artifacts(artifacts));
         }
     }
@@ -481,6 +556,7 @@ impl Uploader {
             return;
         }
         if let Some(tx) = &self.tx {
+            self.pending.fetch_add(1, Ordering::Relaxed);
             let _ = tx.send(Job::Dependencies {
                 deps,
                 version,
@@ -603,6 +679,11 @@ pub fn sync_result_dependencies(
         cache,
         &mut seen,
         deps,
+        // Standalone reconciliation: nothing is watching these counters here.
+        &RenewTally {
+            uploaded: &AtomicUsize::new(0),
+            failed: &AtomicUsize::new(0),
+        },
     );
 }
 
@@ -623,6 +704,7 @@ fn sync_dependencies(
     cache: Option<&fletch::fetch::BlobCache>,
     seen: &mut HashSet<String>,
     deps: Vec<crate::engine::DepResult>,
+    tally: &RenewTally<'_>,
 ) {
     // Each dependency is reconciled and verdict-posted once per run; a dependency
     // shared by many scanned files is handled the first time it is seen.
@@ -671,7 +753,7 @@ fn sync_dependencies(
             .locator
             .strip_prefix("pkg:")
             .map(|_| dep.locator.as_str());
-        post_one(client, result_url, worker, &dep.sha256, purl, envelope);
+        post_one(client, result_url, worker, &dep.sha256, purl, envelope, tally);
     }
 }
 
@@ -907,6 +989,7 @@ fn post_one(
     sha256: &str,
     purl: Option<&str>,
     envelope: ScanResultEnvelope,
+    tally: &RenewTally<'_>,
 ) {
     let payload = ResultPayload {
         sha256: sha256.to_string(),
@@ -953,6 +1036,7 @@ fn post_one(
                     waited_ms = started.elapsed().as_millis(),
                     "upload: result renewed on hopper",
                 );
+                tally.uploaded.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             Ok(resp) => {
@@ -981,6 +1065,7 @@ fn post_one(
         budget_s = RENEW_BUDGET.as_secs(),
         "upload: hopper unreachable, giving up after the renewal budget",
     );
+    tally.failed.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Delay before retry `attempt`, or `None` once the budget is spent.
