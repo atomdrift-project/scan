@@ -52,6 +52,8 @@ async fn idle_worker_outlives_the_shutdown_drain_window() {
     });
 
     let config = WorkerConfig {
+        // Standalone worker under test; no host server to defer to.
+        embedded: None,
         hopper_url: format!("http://{addr}"),
         name: "idle-lifetime-regression".into(),
         workers: NonZeroUsize::new(2).expect("2 workers"),

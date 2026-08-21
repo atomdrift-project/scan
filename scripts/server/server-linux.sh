@@ -114,7 +114,11 @@ fi
 # deployment path as root, since the target may not be traversable by the
 # invoking user, and use the physical path in the unit below. On hosts without
 # the relocation this remains /var/lib/atomdrift/scan.
-RESOLVED_STATE_HOME=$($SUDO readlink -f -- "${STATE_HOME}") \
+#
+# -m, not -f: the directory is created further down, so on a first deploy the
+# path does not exist yet and -f would fail on the missing parent. -m still
+# resolves symlinks in the components that do exist.
+RESOLVED_STATE_HOME=$($SUDO readlink -m -- "${STATE_HOME}") \
     || die "cannot resolve state directory ${STATE_HOME}"
 [ -n "${RESOLVED_STATE_HOME}" ] || die "resolved state directory is empty"
 STATE_HOME=${RESOLVED_STATE_HOME}

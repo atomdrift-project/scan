@@ -633,6 +633,47 @@ pub struct WorkerConfig {
     pub fetch: crate::fetch::FetchPolicy,
     /// Additional passwords to try for encrypted archives.
     pub zip_passwords: crate::ArchivePasswords,
+    /// Set when this worker runs inside `atomscan serve` rather than as its own
+    /// process. See [`Embedded`].
+    pub embedded: Option<Embedded>,
+}
+
+/// Wiring for a worker running inside a serve process, filling idle capacity
+/// with queue work.
+///
+/// Three things change when embedded, and each is a correctness issue rather
+/// than a preference:
+///
+///   - **Signals and nice belong to the host.** Installing a second SIGTERM
+///     handler, or renicing the process, would reach the server's own request
+///     handling.
+///   - **The models are already loaded.** Loading a second copy would double
+///     the resident set of the largest thing in the process, on hosts we size
+///     deliberately.
+///   - **Interactive work comes first.** `pause` is raised while a user request
+///     is in flight; the prefetcher stops claiming and the queue drains. It
+///     does not abandon a job already running — that work is real and a claim
+///     that dies is redispatched by hopper anyway — so responsiveness comes
+///     from leaving slots free, not from killing work mid-flight.
+#[derive(Clone)]
+pub struct Embedded {
+    /// Raised by the server while interactive requests are in flight.
+    pub pause: Arc<AtomicBool>,
+    /// The host's shutdown flag, so one signal stops both.
+    pub shutdown: Arc<AtomicBool>,
+    /// The server's already-loaded models.
+    pub resources: Arc<ModelResources>,
+}
+
+// ModelResources carries no Debug, and dumping a model bundle into a log line
+// would help nobody; report the state an operator can act on.
+impl std::fmt::Debug for Embedded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Embedded")
+            .field("paused", &self.pause.load(Ordering::Relaxed))
+            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 /// Settings that must survive every model load and periodic renewal unchanged.
@@ -1391,7 +1432,11 @@ impl WorkerMetrics {
 
 /// Run the worker loop. Blocks until cancelled.
 pub async fn run(config: WorkerConfig) -> Result<()> {
-    apply_nice(config.nice);
+    // nice(2) is process-wide: renicing here would slow the server's own
+    // request handling, not just this worker.
+    if config.embedded.is_none() {
+        apply_nice(config.nice);
+    }
     // Arc<str> so every per-job dispatch clones an atomic refcount rather than
     // reallocating the worker name for each `tokio::spawn`.
     let name: Arc<str> = Arc::from(config.name.as_str());
@@ -1415,8 +1460,16 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let admission = crate::admission::MemoryAdmission::new(
         config.max_rss_gb.saturating_mul(1024 * 1024 * 1024),
     );
-    let shutdown = Arc::new(AtomicBool::new(false));
-    install_shutdown_handler(Arc::clone(&shutdown));
+    // Embedded: share the host's shutdown flag and leave its signal handler
+    // alone. A second handler on the same signals would race the first.
+    let shutdown = match &config.embedded {
+        Some(embedded) => Arc::clone(&embedded.shutdown),
+        None => {
+            let flag = Arc::new(AtomicBool::new(false));
+            install_shutdown_handler(Arc::clone(&flag));
+            flag
+        }
+    };
 
     // Phase 2 thread model: `slots` long-lived worker tasks pull jobs; the one
     // process-global rayon pool provides member-level parallelism. Total rayon
@@ -1484,13 +1537,22 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         fetch: config.fetch,
         zip_passwords: config.zip_passwords.clone(),
     });
-    let resources = load_model_resources(&resource_config)?;
-    let resources: ResourceHandle = Arc::new(RwLock::new(resources));
-    spawn_resource_renewal_task(
-        Arc::clone(&resources),
-        resource_config,
-        Arc::clone(&shutdown),
-    );
+    let resources: ResourceHandle = match &config.embedded {
+        // Share the server's models rather than loading a second copy, and
+        // leave renewal to the host: its /_/reload owns the handle, and two
+        // renewal tasks would reload the same directory on different clocks.
+        Some(embedded) => Arc::new(RwLock::new(Arc::clone(&embedded.resources))),
+        None => {
+            let handle: ResourceHandle =
+                Arc::new(RwLock::new(load_model_resources(&resource_config)?));
+            spawn_resource_renewal_task(
+                Arc::clone(&handle),
+                resource_config,
+                Arc::clone(&shutdown),
+            );
+            handle
+        }
+    };
 
     // Arc<str> for the hopper URL — cloned per prefetched job and per dispatched
     // analysis; an atomic bump is far cheaper than a String reallocation.
@@ -1589,7 +1651,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
-    let target_depth = ((slots as f64 * depth_factor).ceil() as usize).max(1);
+    // Embedded: hold exactly one claim, never stage ahead. A prefetched job is
+    // a claim hopper believes is being worked on, and an idle worker that keeps
+    // yielding to requests could sit on a staged job for a long time — hopper
+    // would wait out the lease before redispatching it to a worker that could
+    // have started immediately. Claiming only what it is about to analyze keeps
+    // the queue honest.
+    let target_depth = if config.embedded.is_some() {
+        1
+    } else {
+        ((slots as f64 * depth_factor).ceil() as usize).max(1)
+    };
     if sjf {
         tracing::info!(
             target_depth,
@@ -1621,6 +1693,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
     let prefetch_task = tokio::spawn(
         Prefetcher {
+            pause: config.embedded.as_ref().map(|e| Arc::clone(&e.pause)),
             client: client.clone(),
             base_url: Arc::clone(&base_url),
             data_dir: data_dir.clone(),
@@ -2205,6 +2278,11 @@ struct Prefetcher {
     /// Stop (closing the dispatch channel) when the hopper reports no work and
     /// the queue has drained — drives clean batch/benchmark termination.
     exit_if_empty: bool,
+    /// Raised while the host server has interactive work in flight. The
+    /// prefetcher is the single place work enters this worker, so gating here
+    /// stops the whole pipeline at one point: staged jobs finish, slots drain,
+    /// and nothing new is claimed until the flag clears.
+    pause: Option<Arc<AtomicBool>>,
 }
 
 impl Prefetcher {
@@ -2251,9 +2329,32 @@ impl Prefetcher {
         shutdown: Arc<AtomicBool>,
     ) {
         let mut consecutive_errors: u32 = 0;
+        let mut paused_logged = false;
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 return;
+            }
+
+            // Interactive work has priority. Stop claiming — but do not abandon
+            // what is already staged or running: that work is real, and hopper
+            // redispatches a claim that dies anyway. Responsiveness comes from
+            // the slots the server keeps for itself, not from killing jobs.
+            if self
+                .pause
+                .as_ref()
+                .is_some_and(|p| p.load(Ordering::Relaxed))
+            {
+                if !paused_logged {
+                    tracing::debug!("idle worker paused: interactive work in flight");
+                    paused_logged = true;
+                }
+                self.poll_state.buffer_room.store(0, Ordering::Release);
+                interruptible_sleep(Duration::from_millis(200), &shutdown).await;
+                continue;
+            }
+            if paused_logged {
+                tracing::debug!("idle worker resumed");
+                paused_logged = false;
             }
 
             // Hold at the target depth and don't stage more bytes than the
@@ -4105,6 +4206,8 @@ mod tests {
 
         let handle = tokio::spawn(
             Prefetcher {
+                // Standalone worker: nothing to defer to.
+                pause: None,
                 client: reqwest::Client::new(),
                 base_url: Arc::from(format!("http://127.0.0.1:{port}").as_str()),
                 data_dir: None,
