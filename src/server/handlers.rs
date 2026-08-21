@@ -232,8 +232,9 @@ fn flight_outcome(
     request_id: u64,
     elapsed_ms: u64,
     key: &FlightKey,
-    uploader: Option<&Arc<crate::upload::Uploader>>,
+    state: &Arc<AppState>,
 ) -> Outcome {
+    let uploader = state.uploader.as_ref();
     match result {
         AnalysisOutcome::Ok(Ok(scan_result)) => {
             tracing::info!(
@@ -255,6 +256,18 @@ fn flight_outcome(
                 },
                 "<-- 200 OK",
             );
+            // Record the completion first: size and duration are what a
+            // router averages to decide whether this server is a good choice
+            // for the next artifact of a given size.
+            state.jobs_completed.fetch_add(1, Ordering::Relaxed);
+            state
+                .job_bytes_total
+                .fetch_add(scan_result.size_bytes, Ordering::Relaxed);
+            let micros = elapsed_ms.saturating_mul(1_000);
+            state.job_micros_total.fetch_add(micros, Ordering::Relaxed);
+            let bucket = &state.job_buckets[super::size_bucket(scan_result.size_bytes)];
+            bucket.count.fetch_add(1, Ordering::Relaxed);
+            bucket.micros.fetch_add(micros, Ordering::Relaxed);
             index_verdict(&scan_result, key.purl());
             // Renew the verdict on hopper too, so it outlives this process and
             // this request. A caller that hangs up — or a proxy that gives up
@@ -554,6 +567,120 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
         "total_mem_mb": total_mem_mb,
         "model_commit": crate::models_repo::version(),
         "traits_commit": cleave::traits_repo::version(),
+        // Idle worker: whether it is configured, whether it is running, and
+        // whether it is currently standing aside for a request. Published
+        // because its absence is otherwise invisible — it either starts or it
+        // does not, and until this existed the only evidence was a log line
+        // that never appeared.
+        "idle_worker": {
+            "slots": state.idle_worker_slots,
+            "hopper": state.hopper.is_some(),
+            "started": state.idle_worker_started.load(Ordering::Relaxed),
+            "paused": state
+                .idle_pause
+                .as_ref()
+                .is_some_and(|p| p.load(Ordering::Relaxed)),
+            "interactive_in_flight": state.in_flight.len(),
+        },
+    }))
+    .into_response()
+}
+
+/// `GET /_/stats` — the live signals a router needs to choose this server.
+///
+/// Separate from `/_/info` because the two have different lifetimes: `/_/info`
+/// reports what this build *is* and barely changes, while everything here moves
+/// every second and must not be cached.
+///
+/// The vocabulary deliberately matches what the pull worker already advertises
+/// to hopper on `/api/next` — slots, rss, load, max_bytes, traits, tools — so a
+/// caller reasoning about which scanner to use is reading the same facts hopper
+/// uses to ration work, rather than a second dialect of the same idea.
+pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
+    let in_flight = state.in_flight.len();
+    let free = state.slots.available_permits();
+    let uploads = state.uploader.as_ref().map(|u| u.stats());
+    let started = state.jobs_started.load(Ordering::Relaxed);
+    let completed = state.jobs_completed.load(Ordering::Relaxed);
+    let bytes = state.job_bytes_total.load(Ordering::Relaxed);
+    let micros = state.job_micros_total.load(Ordering::Relaxed);
+    // Averages over completed jobs only: a job still running has contributed no
+    // duration, and dividing by `started` would report every busy server as
+    // faster than it is.
+    let avg = |total: u64| (completed > 0).then(|| total / completed);
+    Json(serde_json::json!({
+        // Saturation. The best routing signal available, because it is current
+        // rather than lagging: a latency average still reports health for the
+        // minute after a server takes on four large archives.
+        "slots": state.max_concurrent_tasks,
+        "slots_free": free,
+        "in_flight": in_flight,
+        "overloaded": state.overloaded_since.lock().is_ok_and(|g| g.is_some()),
+        "stuck_orphans": state.stuck_orphans.load(Ordering::Relaxed),
+
+        // What this server has actually done. More useful for routing than a
+        // load average, which is a whole-host number that folds in every other
+        // tenant on the box — real on a shared host, but not a statement about
+        // this scanner. These are.
+        "uptime_secs": state.started_at.elapsed().as_secs(),
+        "jobs_started": started,
+        "jobs_completed": completed,
+        // Begun and never finished: timeouts, panics, and clients that hung up
+        // mid-analysis. Non-zero and climbing is the shape of a sick server.
+        "jobs_unfinished": started.saturating_sub(completed).saturating_sub(in_flight as u64),
+        "avg_job_bytes": avg(bytes),
+        "avg_job_ms": avg(micros).map(|us| us / 1_000),
+        // The same average, split by input size. A caller that knows how big
+        // the artifact is should compare servers at that size, not overall.
+        "avg_job_ms_by_size": super::SIZE_BUCKET_NAMES
+            .iter()
+            .zip(state.job_buckets.iter())
+            .map(|(name, b)| {
+                let n = b.count.load(Ordering::Relaxed);
+                let ms = (n > 0).then(|| b.micros.load(Ordering::Relaxed) / n / 1_000);
+                ((*name).to_string(), serde_json::json!({ "jobs": n, "avg_ms": ms }))
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+
+        // Memory headroom. A server near its ceiling is about to pause
+        // admission; a router should move away before that, not discover it by
+        // timing out.
+        "rss_mb": cleave::memory_tracker::current_rss().map(|b| b / 1024 / 1024),
+        "max_rss_mb": state.max_rss_bytes.map(|n| n.get() / 1024 / 1024),
+        "load1": crate::system_load_avg(),
+
+        // Capability, not speed. A server without 7z cannot read a DMG, so it
+        // returns a *weaker verdict* rather than a slower one — routing on
+        // latency alone would quietly pick it. Likewise an artifact past
+        // max_upload_mb is refused, so sending it wastes a whole round trip.
+        "tools": crate::tools::available_names(),
+        "max_upload_mb": state.max_upload_bytes / 1024 / 1024,
+
+        // Verdict comparability. A scanner on stale traits produces an answer
+        // that should not be cached as authoritative alongside a current one.
+        "traits_commit": cleave::traits_repo::version(),
+        "model_commit": crate::models_repo::version(),
+        "ready": state.ready.load(Ordering::Relaxed),
+
+        // Whether the verdicts it computes are actually reaching hopper.
+        // `failed` climbing means work is being done and then lost — the exact
+        // failure that went unnoticed for weeks.
+        "uploads": uploads.map(|u| serde_json::json!({
+            "pending": u.pending,
+            "capacity": u.capacity,
+            "failed": u.failed,
+            "uploaded": u.uploaded,
+        })),
+
+        // Whether spare capacity is genuinely spare.
+        "idle_worker": {
+            "slots": state.idle_worker_slots,
+            "started": state.idle_worker_started.load(Ordering::Relaxed),
+            "paused": state
+                .idle_pause
+                .as_ref()
+                .is_some_and(|p| p.load(Ordering::Relaxed)),
+        },
     }))
     .into_response()
 }
@@ -1268,7 +1395,7 @@ async fn run_file_analysis(
         request_id,
         crate::duration_ms(started.elapsed()),
         flight.key(),
-        state.uploader.as_ref(),
+        &state,
     )
 }
 
@@ -1431,7 +1558,7 @@ async fn run_purl_analysis(
         request_id,
         crate::duration_ms(started.elapsed()),
         flight.key(),
-        state.uploader.as_ref(),
+        &state,
     )
 }
 
