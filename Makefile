@@ -44,15 +44,27 @@ export HOPPER_TOKEN_FILE
 # Read by scripts/server/server-linux.sh (Linux) and
 # scripts/server/rollout-bastille.sh (FreeBSD); see docs/SERVER_API.md.
 #
-#   make deploy HOPPER=http://hopper-host:8081
+#   make deploy HOPPER=https://hops.isotope13.ai
 #
 # HOPPER is the hopper the server renews results on (`serve --hopper`). Setting
 # it is also what makes the deploy install HOPPER_TOKEN_FILE for the service
 # account — hopper rejects an unauthenticated renewal with 401.
+#
+# It is REQUIRED: `deploy-server` refuses to install a server that files
+# nothing. Pass HOPPER=none to opt out deliberately.
 HOPPER ?=
 BIND ?=
 ALLOWED_DIRS ?=
 MEMORY_MAX ?=
+
+# HOPPER=none is the deliberate opt-out. It collapses to an empty HOPPER here,
+# before the export, so the deploy scripts see "unset" and emit no --hopper —
+# they must never receive the literal string as a URL.
+ifeq ($(strip $(HOPPER)),none)
+override HOPPER :=
+HOPPER_OPTOUT := 1
+endif
+
 export HOPPER BIND ALLOWED_DIRS MEMORY_MAX
 # ALLOW_CIDR and TOKEN_SRC are deliberately NOT declared here. They default
 # with `${VAR-default}` (unset) rather than `${VAR:-default}` (unset or empty),
@@ -77,7 +89,7 @@ INTERPRET_MIN_PROB ?= 0.15
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -212,7 +224,7 @@ CLOUDFLARED ?= auto
 # systemd unit (`scan.service`). Override BIND=, ALLOW_CIDR=, LLM= / LLM_URL=,
 # LLM_MODEL=, MEMORY_MAX=, CLOUDFLARED= (see scripts/server/server-linux.sh).
 deploy-server: export CLOUDFLARED := $(CLOUDFLARED)
-deploy-server:
+deploy-server: check-hopper-url
 	git pull
 	@case "$$(uname -s)" in \
 		FreeBSD) ./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)" ;; \
@@ -246,6 +258,31 @@ check-hopper-token:
 		echo "       write the token to that file, or pass HOPPER_TOKEN_FILE=<path> / HOPPER_TOKEN=<token>."; \
 		exit 1; \
 	fi
+
+# Refuse to install a server that files nothing. Without `serve --hopper` the
+# server answers every analysis and stores none of them: the caller caches the
+# verdict, so the same PURL is never asked again, and hopper never receives the
+# artifact. Nothing fails at deploy time and nothing fails at request time —
+# the gap only surfaces much later, as a sample hopper should have had and
+# does not. That is the failure this check exists to prevent; a scan server
+# with no hopper to feed is not a configuration anyone wants by accident.
+#
+# Mirrors check-hopper-token: HOPPER=none is the explicit escape hatch, the
+# same shape as `TOKEN_SRC=` for a deliberately unauthenticated server.
+check-hopper-url:
+	@if [ -n "$(HOPPER_OPTOUT)" ]; then \
+		echo "warning: HOPPER=none — this server will analyze and file nothing on hopper"; \
+		exit 0; \
+	fi; \
+	if [ -n "$(strip $(HOPPER))" ]; then exit 0; fi; \
+	echo "error: HOPPER is unset, so the server would run without --hopper."; \
+	echo "       It would answer every analysis and file none of them: the caller"; \
+	echo "       caches the verdict and hopper never sees the artifact, so the loss"; \
+	echo "       is silent until something asks hopper for a sample it should hold."; \
+	echo; \
+	echo "       make deploy HOPPER=https://hops.isotope13.ai"; \
+	echo "       make deploy HOPPER=none    # deliberately file nothing"; \
+	exit 1
 
 deploy-worker: check-hopper-token kill-scan
 	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker URL=<url> [BUILD=<host>] [WORKER_RUN=<host>]"; exit 1; }
@@ -349,7 +386,7 @@ uninstall-worker-nodes:
 	@[ -n "$(NODES)" ] || { echo "Usage: make uninstall-worker-nodes NODES=\"node1 node2\""; exit 1; }
 	./scripts/worker/uninstall-nodes.sh $(NODES)
 
-rollout-bastille:
+rollout-bastille: check-hopper-url
 	./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)"
 
 benchmark: release

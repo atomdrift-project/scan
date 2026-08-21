@@ -117,9 +117,16 @@ token restarts the service, since it is read only at startup. Hand clients
 
 #### Uploading to hopper
 
-Set the hopper to renew results on with `HOPPER=`, on either platform:
+`HOPPER=` is **required**. The deploy refuses to install a server without it:
 
-    make deploy HOPPER=http://hopper-host:8081
+    make deploy HOPPER=https://hopper-host
+
+A server with no `--hopper` answers every analysis and files none of them. The
+caller caches the verdict, so the same artifact is never asked for again, and
+hopper never receives it. Nothing fails at deploy time and nothing fails at
+request time — the loss only surfaces later, as a sample hopper should hold and
+does not. Pass `HOPPER=none` to opt out deliberately (a laptop, a CI box); it
+is the same shape as `TOKEN_SRC=` for a deliberately unauthenticated server.
 
 That adds `--hopper <url>` to the service. The credential it needs is a second,
 unrelated token: `~/.tok/scan` authenticates clients *to this server*,
@@ -135,8 +142,9 @@ nothing else in place. The file is inert while `--hopper` is off.
 
 On FreeBSD the URL lands in the jail's `rc.conf` as `scan_hopper`, so it can
 also be changed in place — `bastille sysrc <jail> scan_hopper=<url>` plus a
-service restart — without a redeploy. Dropping `HOPPER=` from a later deploy
-clears it, so renewal stops rather than silently continuing to the old target.
+service restart — without a redeploy. Dropping `HOPPER=` from a later deploy is
+now refused rather than silently clearing it; `HOPPER=none` clears it
+explicitly, so renewal stops on purpose rather than by omission.
 
 Linux overrides (passed through the environment): `BIND=` (default
 `127.0.0.1:49999`, on the assumption that a Cloudflare tunnel or another local
