@@ -538,13 +538,41 @@ pub(crate) const SIZE_BUCKETS: [u64; 4] = [1 << 20, 16 << 20, 128 << 20, u64::MA
 /// Human labels for [`SIZE_BUCKETS`], used as JSON keys on `/_/stats`.
 pub(crate) const SIZE_BUCKET_NAMES: [&str; 4] = ["le_1mb", "le_16mb", "le_128mb", "gt_128mb"];
 
-/// Completion totals for one size bucket. Totals rather than a rolling window:
-/// they cost two atomics, survive an idle period without decaying to nothing,
-/// and divide at read time.
+/// How many completions a bucket remembers before it starts forgetting.
+///
+/// Halving both totals at this point preserves the mean exactly while letting
+/// newer samples dominate — an aging average with the cost of the plain one.
+const JOB_BUCKET_MEMORY: u64 = 256;
+
+/// Completion totals for one bucket, aged so they describe the recent past.
+///
+/// Two atomics and a division at read time, as before — but bounded. Pure
+/// running totals looked cheaper and were badly wrong across an incident: a
+/// hopper outage produced analyses of 8 to 55 minutes, and because nothing ever
+/// decayed, the resulting averages (7 to 9 *minutes*, against a normal 4-5
+/// seconds) went on steering beamline's routing long after the outage was over,
+/// pinning every hedge to its ceiling. A statistic used for live decisions has
+/// to be able to forget.
 #[derive(Debug, Default)]
 pub(crate) struct JobBucket {
     pub(crate) count: AtomicU64,
     pub(crate) micros: AtomicU64,
+}
+
+impl JobBucket {
+    /// Record one completion, aging the totals when they get long in the tooth.
+    pub(crate) fn record(&self, micros: u64) {
+        let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.micros.fetch_add(micros, Ordering::Relaxed);
+        if n >= JOB_BUCKET_MEMORY {
+            // Racy by construction: two threads crossing the line together may
+            // both halve. That costs a little extra forgetting and nothing else,
+            // which is a better trade here than a lock on the hot path.
+            self.count.fetch_sub(n / 2, Ordering::Relaxed);
+            let m = self.micros.load(Ordering::Relaxed);
+            self.micros.fetch_sub(m / 2, Ordering::Relaxed);
+        }
+    }
 }
 
 /// PURL types tracked separately on `/_/stats`, plus a catch-all.
@@ -662,6 +690,10 @@ struct AppState {
     /// before it dispatches, so the useful answer is per bucket.
     job_buckets: [JobBucket; SIZE_BUCKETS.len()],
     job_types: [JobBucket; PURL_TYPE_NAMES.len()],
+    /// The blended average, aged like the others. Separate from
+    /// `jobs_completed`, which stays a true lifetime count for reporting: one
+    /// answers "how fast is this server now", the other "how much has it done".
+    job_overall: JobBucket,
     /// Analyses this server has begun, completed, and the totals behind their
     /// averages.
     ///
@@ -754,6 +786,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         idle_worker_started: AtomicBool::new(false),
         job_buckets: Default::default(),
         job_types: Default::default(),
+        job_overall: Default::default(),
         jobs_started: AtomicU64::new(0),
         jobs_completed: AtomicU64::new(0),
         job_bytes_total: AtomicU64::new(0),
@@ -1322,5 +1355,50 @@ mod purl_type_tests {
     #[test]
     fn a_golang_module_path_keeps_its_slashes_out_of_the_type() {
         assert_eq!(purl_type_bucket("pkg:golang/github.com/spf13/cobra@v1.10.2"), 1);
+    }
+}
+
+#[cfg(test)]
+mod job_bucket_tests {
+    use super::{JobBucket, JOB_BUCKET_MEMORY};
+
+    fn mean(b: &JobBucket) -> u64 {
+        let n = b.count.load(std::sync::atomic::Ordering::Relaxed);
+        b.micros.load(std::sync::atomic::Ordering::Relaxed) / n.max(1)
+    }
+
+    #[test]
+    fn aging_preserves_the_mean_of_a_steady_stream() {
+        let b = JobBucket::default();
+        for _ in 0..JOB_BUCKET_MEMORY * 4 {
+            b.record(1_000);
+        }
+        assert_eq!(mean(&b), 1_000, "halving must not shift a constant mean");
+        assert!(
+            b.count.load(std::sync::atomic::Ordering::Relaxed) <= JOB_BUCKET_MEMORY,
+            "memory is unbounded",
+        );
+    }
+
+    #[test]
+    fn an_incident_is_forgotten_once_normal_work_resumes() {
+        let b = JobBucket::default();
+        // Normal, then an outage's worth of multi-minute jobs, then normal again.
+        for _ in 0..200 {
+            b.record(5_000_000); // 5s
+        }
+        for _ in 0..30 {
+            b.record(3_300_000_000); // 55 min, the real figure from the outage
+        }
+        let poisoned = mean(&b);
+        assert!(poisoned > 100_000_000, "test setup failed to poison the mean");
+        for _ in 0..JOB_BUCKET_MEMORY * 6 {
+            b.record(5_000_000);
+        }
+        let recovered = mean(&b);
+        assert!(
+            recovered < 6_000_000,
+            "still poisoned after recovery: {recovered}us (was {poisoned}us)",
+        );
     }
 }

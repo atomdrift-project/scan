@@ -265,16 +265,13 @@ fn flight_outcome(
                 .fetch_add(scan_result.size_bytes, Ordering::Relaxed);
             let micros = elapsed_ms.saturating_mul(1_000);
             state.job_micros_total.fetch_add(micros, Ordering::Relaxed);
-            let bucket = &state.job_buckets[super::size_bucket(scan_result.size_bytes)];
-            bucket.count.fetch_add(1, Ordering::Relaxed);
-            bucket.micros.fetch_add(micros, Ordering::Relaxed);
+            state.job_overall.record(micros);
+            state.job_buckets[super::size_bucket(scan_result.size_bytes)].record(micros);
             // Also by PURL type, when this job was named by one. That is the
             // only cost signal a router has before dispatch for `?purl=` work,
             // which is most of the traffic this fleet serves.
             if let Some(purl) = key.purl() {
-                let by_type = &state.job_types[super::purl_type_bucket(purl)];
-                by_type.count.fetch_add(1, Ordering::Relaxed);
-                by_type.micros.fetch_add(micros, Ordering::Relaxed);
+                state.job_types[super::purl_type_bucket(purl)].record(micros);
             }
             index_verdict(&scan_result, key.purl());
             // Renew the verdict on hopper too, so it outlives this process and
@@ -612,6 +609,9 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
     let completed = state.jobs_completed.load(Ordering::Relaxed);
     let bytes = state.job_bytes_total.load(Ordering::Relaxed);
     let micros = state.job_micros_total.load(Ordering::Relaxed);
+    // Aged, so a past incident stops steering present routing.
+    let recent_n = state.job_overall.count.load(Ordering::Relaxed);
+    let recent_micros = state.job_overall.micros.load(Ordering::Relaxed);
     // Averages over completed jobs only: a job still running has contributed no
     // duration, and dividing by `started` would report every busy server as
     // faster than it is.
@@ -637,7 +637,10 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         // mid-analysis. Non-zero and climbing is the shape of a sick server.
         "jobs_unfinished": started.saturating_sub(completed).saturating_sub(in_flight as u64),
         "avg_job_bytes": avg(bytes),
-        "avg_job_ms": avg(micros).map(|us| us / 1_000),
+        "avg_job_ms": (recent_n > 0).then(|| recent_micros / recent_n / 1_000),
+        // Lifetime, for the operator rather than the router.
+        "avg_job_ms_lifetime": avg(micros).map(|us| us / 1_000),
+        "avg_job_samples": recent_n,
         // The same average, split by PURL type. A `?purl=` request has no size
         // until the artifact is fetched, so this is what a router can compare
         // on when the choice still matters. Types differ by more than an order
