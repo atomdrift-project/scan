@@ -693,7 +693,22 @@ struct AppState {
     /// The blended average, aged like the others. Separate from
     /// `jobs_completed`, which stays a true lifetime count for reporting: one
     /// answers "how fast is this server now", the other "how much has it done".
+    ///
+    /// Fresh analyses only — see [`AppState::job_cached`]. So are
+    /// `job_buckets` and `job_types`.
     job_overall: JobBucket,
+    /// Analyses answered from this server's own verdict index.
+    ///
+    /// Kept apart from the fresh numbers because mixing them makes every
+    /// average bimodal and therefore useless for prediction: the same artifact
+    /// is milliseconds on a hit and minutes on a miss. A router choosing a
+    /// worker for work it has not done wants the fresh figure; blending in
+    /// cache hits only tells it how lucky this server has been.
+    job_cached: JobBucket,
+    /// `/lookup` service time. Near-constant — an index probe, not an analysis
+    /// — and so the honest input for ordering the cheap-source race, where the
+    /// analysis averages would be wrong by three orders of magnitude.
+    lookups: JobBucket,
     /// Analyses this server has begun, completed, and the totals behind their
     /// averages.
     ///
@@ -787,6 +802,8 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         job_buckets: Default::default(),
         job_types: Default::default(),
         job_overall: Default::default(),
+        job_cached: Default::default(),
+        lookups: Default::default(),
         jobs_started: AtomicU64::new(0),
         jobs_completed: AtomicU64::new(0),
         job_bytes_total: AtomicU64::new(0),
