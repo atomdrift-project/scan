@@ -19,6 +19,7 @@
 mod access;
 mod acl;
 mod flight;
+mod latency;
 mod handlers;
 
 pub use acl::{Cidr, TokenDigest, parse_cidr_list};
@@ -538,30 +539,28 @@ pub(crate) const SIZE_BUCKETS: [u64; 4] = [1 << 20, 16 << 20, 128 << 20, u64::MA
 /// Human labels for [`SIZE_BUCKETS`], used as JSON keys on `/_/stats`.
 pub(crate) const SIZE_BUCKET_NAMES: [&str; 4] = ["le_1mb", "le_16mb", "le_128mb", "gt_128mb"];
 
-/// How many completions a bucket remembers before it starts forgetting.
+/// Completion totals for one class of work.
 ///
-/// Halving both totals at this point preserves the mean exactly while letting
-/// newer samples dominate — an aging average with the cost of the plain one.
-const JOB_BUCKET_MEMORY: u64 = 256;
-
-/// Completion totals for one bucket, aged so they describe the recent past.
-///
-/// Two atomics and a division at read time, as before — but bounded. Pure
-/// running totals looked cheaper and were badly wrong across an incident: a
-/// hopper outage produced analyses of 8 to 55 minutes, and because nothing ever
-/// decayed, the resulting averages (7 to 9 *minutes*, against a normal 4-5
-/// seconds) went on steering beamline's routing long after the outage was over,
-/// pinning every hedge to its ceiling. A statistic used for live decisions has
-/// to be able to forget.
+/// Keeps two views because they answer different questions. The running totals
+/// are cumulative-with-aging and say what this server has done; the windowed
+/// [`latency::Latency`] says what it is doing *now*, and is what a router
+/// reads. See that module for why a percentile over a time window beats a mean
+/// over a sample count.
 #[derive(Debug, Default)]
 pub(crate) struct JobBucket {
     pub(crate) count: AtomicU64,
     pub(crate) micros: AtomicU64,
+    pub(crate) recent: latency::Latency,
 }
 
+/// How many completions the cumulative totals remember before they start
+/// forgetting. The windowed view has its own, time-based expiry.
+const JOB_BUCKET_MEMORY: u64 = 256;
+
 impl JobBucket {
-    /// Record one completion, aging the totals when they get long in the tooth.
+    /// Record one completion in both views.
     pub(crate) fn record(&self, micros: u64) {
+        self.recent.record(micros);
         let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         self.micros.fetch_add(micros, Ordering::Relaxed);
         if n >= JOB_BUCKET_MEMORY {
@@ -573,6 +572,22 @@ impl JobBucket {
             self.micros.fetch_sub(m / 2, Ordering::Relaxed);
         }
     }
+
+    /// The windowed view, in milliseconds, for `/_/stats`.
+    pub(crate) fn recent_json(&self) -> serde_json::Value {
+        let s = self.recent.summary();
+        serde_json::json!({
+            "samples": s.samples,
+            "p80_ms": s.p80_micros.map(|us| us / 1_000),
+            "mean_ms": s.mean_micros.map(|us| us / 1_000),
+        })
+    }
+}
+
+/// How much recent history the windowed estimates cover, for `/_/stats`. A
+/// consumer that knows the window can tell "quiet worker" from "stale reading".
+pub(crate) fn latency_window_secs() -> u64 {
+    latency::WINDOW.as_secs()
 }
 
 /// PURL types tracked separately on `/_/stats`, plus a catch-all.
@@ -1417,5 +1432,43 @@ mod job_bucket_tests {
             recovered < 6_000_000,
             "still poisoned after recovery: {recovered}us (was {poisoned}us)",
         );
+    }
+}
+
+#[cfg(test)]
+mod job_bucket_recent_tests {
+    use super::JobBucket;
+
+    // `recent_json` is what ships on /_/stats, and beamline indexes it by these
+    // exact names. Asserting the shape here is what stops a rename from
+    // silently demoting the router back to lifetime means — a failure that
+    // looks like nothing at all from the outside.
+    #[test]
+    fn recent_json_publishes_the_keys_beamline_reads() {
+        let b = JobBucket::default();
+        b.record(9_000_000); // 9s
+        let v = b.recent_json();
+        assert_eq!(v["samples"], 1);
+        assert!(v["p80_ms"].is_number(), "p80_ms missing or not a number: {v}");
+        assert!(v["mean_ms"].is_number(), "mean_ms missing or not a number: {v}");
+    }
+
+    #[test]
+    fn recent_json_reports_an_untouched_bucket_as_empty_not_zero() {
+        let v = JobBucket::default().recent_json();
+        assert_eq!(v["samples"], 0);
+        assert!(v["p80_ms"].is_null(), "an unsampled class must not claim 0ms");
+    }
+
+    // The cumulative and windowed views answer different questions and must
+    // both advance: routing reads one, operators read the other.
+    #[test]
+    fn record_feeds_both_the_lifetime_and_the_windowed_view() {
+        let b = JobBucket::default();
+        for _ in 0..5 {
+            b.record(2_000_000);
+        }
+        assert_eq!(b.count.load(std::sync::atomic::Ordering::Relaxed), 5);
+        assert_eq!(b.recent_json()["samples"], 5);
     }
 }
