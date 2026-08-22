@@ -660,6 +660,10 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "cached_samples": cached_n,
         // `/lookup` service time — an index probe, near-constant in the size of
         // the artifact, and three orders of magnitude below an analysis.
+        // Windowed p80 for the fleet-wide view, beside the lifetime means.
+        "recent": state.job_overall.recent_json(),
+        "recent_lookup": state.lookups.recent_json(),
+        "latency_window_secs": super::latency_window_secs(),
         "avg_lookup_ms": (lookup_n > 0).then(|| lookup_micros / lookup_n / 1_000),
         // Microseconds too: a healthy index probe rounds to 0ms, and a routing
         // signal that is always zero is no signal at all.
@@ -678,7 +682,11 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
             .map(|(name, b)| {
                 let n = b.count.load(Ordering::Relaxed);
                 let ms = (n > 0).then(|| b.micros.load(Ordering::Relaxed) / n / 1_000);
-                ((*name).to_string(), serde_json::json!({ "jobs": n, "avg_ms": ms }))
+                // `recent` is the one a router should read: a p80 over the last
+                // hour rather than a mean over the last few hundred jobs.
+                ((*name).to_string(), serde_json::json!({
+                    "jobs": n, "avg_ms": ms, "recent": b.recent_json(),
+                }))
             })
             .collect::<serde_json::Map<String, serde_json::Value>>(),
 
@@ -690,7 +698,9 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
             .map(|(name, b)| {
                 let n = b.count.load(Ordering::Relaxed);
                 let ms = (n > 0).then(|| b.micros.load(Ordering::Relaxed) / n / 1_000);
-                ((*name).to_string(), serde_json::json!({ "jobs": n, "avg_ms": ms }))
+                ((*name).to_string(), serde_json::json!({
+                    "jobs": n, "avg_ms": ms, "recent": b.recent_json(),
+                }))
             })
             .collect::<serde_json::Map<String, serde_json::Value>>(),
 
