@@ -269,15 +269,18 @@ struct Cli {
     #[arg(long, global = true, value_name = "KEY")]
     llm_key: Option<String>,
 
-    /// Minimum ML probability for a sample to be sent to the LLM
+    /// Loosest FP level (0-25000, per 100M benigns) at which ML alone sends a
+    /// sample to the LLM; higher = more samples. Defaults to the model's grid
+    /// ceiling — anything ML flagged at any level. Files cleave flagged
+    /// suspicious/hostile are sent regardless of this cutoff.
     #[arg(
         long,
         global = true,
-        alias = "interpret-min-prob",
-        default_value_t = scan::interpret::DEFAULT_MIN_PROB,
-        value_name = "P",
+        alias = "interpret-min-level",
+        value_parser = clap::value_parser!(u16).range(0..=25000),
+        value_name = "N",
     )]
-    llm_min_prob: f32,
+    llm_min_level: Option<u16>,
 
     /// Per-request LLM timeout, in seconds
     #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
@@ -546,7 +549,7 @@ impl Cli {
             base_url,
             model,
             api_key,
-            min_prob: self.llm_min_prob,
+            min_level: self.llm_min_level,
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
                 .unwrap_or(NonZeroUsize::MIN),
@@ -1145,7 +1148,12 @@ fn main() -> Result<()> {
         tracing::info!(
             endpoint = %cfg.base_url,
             model = %cfg.model,
-            min_prob = format!("{:.4}", cfg.min_prob),
+            min_level = cfg
+                .min_level
+                .map_or_else(
+                    || scan::interpret::DEFAULT_MIN_LEVEL_LABEL.to_string(),
+                    |n| n.to_string()
+                ),
             "LLM interpretation enabled",
         );
     }
