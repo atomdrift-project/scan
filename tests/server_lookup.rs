@@ -127,15 +127,26 @@ async fn malformed_keys_are_rejected() -> Result<()> {
 
     let (status, body, _) = get("/lookup").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "neither key");
-    assert_eq!(body["error"], "provide exactly one of sha256 or purl");
+    assert_eq!(body["error"], "provide sha256, purl, or both");
 
+    // Both together is the fast path for a caller who already knows the pair,
+    // not an error: each filter is evidence about the same artifact.
     let sha = "a".repeat(64);
     let (status, _, _) = get(&format!("/lookup?sha256={sha}&purl=pkg:npm/x@1")).await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "both keys");
+    assert_eq!(status, StatusCode::NOT_FOUND, "both keys, neither known");
+
+    // A malformed member of the pair is still malformed.
+    let (status, body, _) = get("/lookup?sha256=nope&purl=pkg:npm/x@1").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "bad digest alongside a good purl");
+    assert_eq!(body["error"], "invalid sha256");
+
+    let (status, body, _) = get(&format!("/lookup?sha256={sha}&purl=not%20a%20purl")).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "bad purl alongside a good digest");
+    assert_eq!(body["error"], "not a package URL");
 
     let (status, body, _) = get("/lookup?purl=%20").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty purl is no key");
-    assert_eq!(body["error"], "provide exactly one of sha256 or purl");
+    assert_eq!(body["error"], "provide sha256, purl, or both");
 
     let (status, body, _) = get("/lookup?purl=not%20a%20purl").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);

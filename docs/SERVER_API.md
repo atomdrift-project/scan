@@ -218,10 +218,30 @@ server keeps serving lookups.
 
     GET /lookup?sha256=<64hex>
     GET /lookup?purl=<url-encoded>
+    GET /lookup?purl=<url-encoded>&sha256=<64hex>
 
-Exactly one key; both or neither is a 400. On `purl`, the `pkg:` prefix
+Name at least one key; neither is a 400. On `purl`, the `pkg:` prefix
 is optional (`npm/left-pad@1.3.0` works), and the value is canonicalized
 the way `/analyze-purl` and `atomscan purl` canonicalize it.
+
+Sending both is the cheapest way to ask, and is what a caller holding an
+artifact it can also name should do. The filters are separate — a digest
+and a locator are keyed independently — so each is evidence about the
+same artifact, and asking with both costs four in-memory probes instead
+of two rather than a second request.
+
+The two answers are merged the way a single key's good and bad channels
+already are: bad from either key wins, good from either key wins, and
+holding both at once is the `conflicted` decision that already exists for
+a key in both sets. So a digest in the good set whose release is in the
+bad set does not come back `skip` because the digest was asked first — it
+comes back `conflicted`, and the caller scans.
+
+A stored verdict is looked up by digest first, since a digest names exact
+bytes. The PURL's verdict is a second chance when the digest is unknown,
+and is returned only if it resolved to the same digest: a release whose
+artifact has changed is answering about something other than what was
+asked about.
 
 Both identifiers travel as query parameters. A PURL's own grammar
 carries `/`, `?` and `#`, so `pkg:npm/x@1?arch=x64` in a path segment

@@ -70,6 +70,40 @@ impl Decision {
             Self::Unknown => "unknown",
         }
     }
+
+    /// What two keys naming one artifact say together.
+    ///
+    /// A caller who knows both the digest and the PURL is asserting they are
+    /// the same artifact, so both filters are evidence about it. The rule is
+    /// the one [`resolve`] already applies within a single key, widened across
+    /// the pair: badness and goodness are taken from either, and holding both
+    /// at once is the contradiction [`Decision::Conflicted`] exists to name.
+    ///
+    /// That makes disagreement between the keys — a digest in the good set
+    /// whose release is in the bad set, or the reverse — land on `Conflicted`
+    /// rather than on whichever key happened to be asked first. Trusting
+    /// neither, and scanning, is the right answer to a contradiction.
+    #[must_use]
+    pub const fn merge(self, other: Self) -> Self {
+        let bad = self.implies_bad() || other.implies_bad();
+        let good = self.implies_good() || other.implies_good();
+        match (bad, good) {
+            (true, true) => Self::Conflicted,
+            (true, false) => Self::KnownBad,
+            // A `Skip` from either key already cleared the bad-channel veto
+            // when it was resolved, so it does not need re-checking here.
+            (false, true) => Self::Skip,
+            (false, false) => Self::Unknown,
+        }
+    }
+
+    const fn implies_bad(self) -> bool {
+        matches!(self, Self::KnownBad | Self::Conflicted)
+    }
+
+    const fn implies_good(self) -> bool {
+        matches!(self, Self::Skip | Self::Conflicted)
+    }
 }
 
 /// The loaded filters for every (kind, tier), queried per scan.
@@ -513,5 +547,56 @@ mod tests {
         let lk = Lookup::load_from(tmp.path());
         // In both sets → conflicted (not Skip, not KnownBad) → caller scans it.
         assert_eq!(lk.decide_sha256(&k), Decision::Conflicted);
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::Decision::{Conflicted, KnownBad, Skip, Unknown};
+
+    #[test]
+    fn a_lone_key_decides_on_its_own() {
+        for d in [Skip, KnownBad, Conflicted, Unknown] {
+            assert_eq!(d.merge(Unknown), d, "{d:?} with nothing known should stand");
+            assert_eq!(Unknown.merge(d), d, "order must not matter");
+        }
+    }
+
+    #[test]
+    fn bad_from_either_key_wins_over_silence() {
+        assert_eq!(KnownBad.merge(Unknown), KnownBad);
+        assert_eq!(Unknown.merge(KnownBad), KnownBad);
+    }
+
+    // The case the pair exists to catch: the digest and the release disagree.
+    #[test]
+    fn disagreement_between_the_keys_is_a_conflict() {
+        assert_eq!(Skip.merge(KnownBad), Conflicted);
+        assert_eq!(KnownBad.merge(Skip), Conflicted);
+    }
+
+    #[test]
+    fn agreement_keeps_the_shared_answer() {
+        assert_eq!(Skip.merge(Skip), Skip);
+        assert_eq!(KnownBad.merge(KnownBad), KnownBad);
+        assert_eq!(Unknown.merge(Unknown), Unknown);
+    }
+
+    // Conflicted is already "both sets"; nothing can make it cleaner.
+    #[test]
+    fn a_conflict_is_absorbing() {
+        for d in [Skip, KnownBad, Conflicted, Unknown] {
+            assert_eq!(Conflicted.merge(d), Conflicted, "{d:?} should not clear a conflict");
+            assert_eq!(d.merge(Conflicted), Conflicted);
+        }
+    }
+
+    #[test]
+    fn merge_is_commutative() {
+        for a in [Skip, KnownBad, Conflicted, Unknown] {
+            for b in [Skip, KnownBad, Conflicted, Unknown] {
+                assert_eq!(a.merge(b), b.merge(a), "{a:?} vs {b:?}");
+            }
+        }
     }
 }

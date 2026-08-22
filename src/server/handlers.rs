@@ -787,10 +787,11 @@ fn lookup_inner(state: &Arc<AppState>, q: &LookupQuery) -> Response {
     // artifact was asked about — including the arms that reject, where the key
     // is the only way to tell a caller's bug from a caller's typo.
     match (sha, purl) {
-        (Some(_), Some(_)) | (None, None) => error_response(
+        (None, None) => error_response(
             StatusCode::BAD_REQUEST,
-            "provide exactly one of sha256 or purl",
+            "provide sha256, purl, or both",
         ),
+        (Some(sha), Some(purl)) => lookup_by_both(state, sha, purl),
         (Some(sha), None) => with_subject(lookup_by_sha(state, sha), Subject::sha256(sha)),
         (None, Some(purl)) => lookup_by_purl(state, purl),
     }
@@ -808,6 +809,52 @@ fn lookup_by_sha(state: &AppState, sha256: &str) -> Response {
         });
     let verdict = crate::lookup::global().and_then(|index| index.get_sha(&sha));
     lookup_response(state, verdict.as_ref(), decision, &sha, None)
+}
+
+/// Answer for an artifact the caller can name both ways.
+///
+/// Both filters are consulted, because they are cheap — four in-memory probes,
+/// already memoized — and because a caller who names both is asserting they are
+/// one artifact, which makes each filter evidence about it. A key the other
+/// missed is a hit neither would have produced alone, and a disagreement
+/// between them lands on `Conflicted` instead of on whichever was asked first.
+///
+/// The digest stays the identity. Its stored verdict wins outright; the PURL's
+/// is accepted only when it describes the same bytes, because a release whose
+/// digest has moved is answering about a different artifact than the one asked
+/// about. That check costs nothing here — the index already returns the digest
+/// it resolved to.
+fn lookup_by_both(state: &AppState, sha256: &str, raw: &str) -> Response {
+    let Some(digest) = crate::bloom::parse_sha256_hex(sha256) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid sha256");
+    };
+    let purl = match normalize_pkg_purl(raw) {
+        Ok(purl) => purl,
+        Err(message) => {
+            return with_subject(
+                error_response(StatusCode::BAD_REQUEST, message),
+                Subject::purl(raw, None),
+            );
+        }
+    };
+    let sha = sha256.to_ascii_lowercase();
+
+    let decision = crate::bloom_repo::global().as_deref().map_or(
+        crate::bloom_repo::Decision::Unknown,
+        |lk| lk.memo_sha256(&digest).merge(lk.memo_purl(&purl)),
+    );
+
+    let index = crate::lookup::global();
+    let verdict = index.and_then(|i| i.get_sha(&sha)).or_else(|| {
+        // Second chance: the index can know the release without having seen
+        // these bytes. Only accepted when the digests agree.
+        index
+            .and_then(|i| i.get_purl(&purl))
+            .filter(|v| v.sha256.eq_ignore_ascii_case(&sha))
+    });
+
+    let response = lookup_response(state, verdict.as_ref(), decision, &sha, Some(&purl));
+    with_subject(response, Subject::purl(&purl, Some(&sha)))
 }
 
 fn lookup_by_purl(state: &AppState, raw: &str) -> Response {
