@@ -143,7 +143,11 @@ generally, and ~9B is enough if that is what fits.
 Point it elsewhere with `--llm`, `--llm-model`, `--llm-key`. `--llm openrouter`
 uses `https://openrouter.ai/api/v1`; the key is `--llm-key`, `SCAN_LLM_KEY`, or
 `~/.tok/openrouter`, and `--llm-model` is required. Control which samples
-qualify with `--interpret-min-prob` (default `0.01`).
+qualify with `--llm-min-level`: a sample is sent when ML fires at or below that
+FP level — the model's own per-route cutoff — or when cleave surfaced a
+suspicious/hostile finding, whichever comes first. It defaults to the model's
+grid ceiling, so ML admits anything it flagged at any level; pass a lower `N` to
+tighten.
 
 ## Following references: `--fetch` (experimental)
 

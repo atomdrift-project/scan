@@ -4684,8 +4684,8 @@ pub(crate) fn classify_report(
     }
     let interpret_start = Instant::now();
     let interpretation = interpret.and_then(|cfg| {
-        // The gate lives in `interpret::interpret`: it runs when ML clears the
-        // probability floor OR cleave surfaced a suspicious/hostile finding ML
+        // The gate lives in `interpret::interpret`: it runs when ML fired at or
+        // below the cutoff level OR cleave surfaced a suspicious/hostile finding ML
         // under-weighted (so an ML-blind packed binary still gets a second
         // opinion); it returns `None` when gated out or on any failure.
         let interp = crate::interpret::interpret(

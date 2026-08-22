@@ -37,14 +37,12 @@ use crate::model::Classification;
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
 /// Named `--llm openrouter` / `SCAN_LLM=openrouter` target.
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-/// Default minimum ML probability for a sample to be sent to the LLM. Kept very
-/// low: the LLM's whole value is rescuing samples ML *under*-scored (measured ML
-/// false-negatives — a crypto clipper at 0.024, a git-push exfil at 0.039 — sit
-/// well below a 0.10 floor), so a low floor is what makes `--interpret` effective;
-/// only genuinely-clean files (prob below this) skip the call. Files ML scored low
-/// but cleave flagged suspicious/hostile are interpreted regardless (see the
-/// elevated-finding bypass in [`interpret`]).
-pub const DEFAULT_MIN_PROB: f32 = 0.01;
+/// Documented `--llm-min-level` default: the model's own grid ceiling, so the
+/// literal here is only what the `--help` text prints. The gate resolves the
+/// real value from [`LevelContext::grid_max`] at call time — see
+/// [`LevelContext::ml_admits`] — which is why this is a doc constant and not a
+/// fallback.
+pub const DEFAULT_MIN_LEVEL_LABEL: &str = "the model's grid ceiling";
 /// Default per-request timeout, in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Default cap on concurrent in-flight LLM requests.
@@ -94,8 +92,11 @@ pub struct InterpretConfig {
     pub model: String,
     /// Optional bearer token; omitted for unauthenticated local endpoints.
     pub api_key: Option<String>,
-    /// Minimum ML probability for a sample to be sent to the LLM.
-    pub min_prob: f32,
+    /// Loosest FP level at which ML alone admits a sample to the LLM. `None` —
+    /// the default — means the model's own grid ceiling, i.e. any file ML placed
+    /// anywhere on the calibrated grid. Files that fire only above the cutoff (or
+    /// never) reach the LLM solely through the bypasses in [`interpret`].
+    pub min_level: Option<u16>,
     /// Per-request timeout.
     pub timeout: Duration,
     /// Cap on concurrent in-flight requests (protects a single local GPU).
@@ -108,7 +109,7 @@ impl std::fmt::Debug for InterpretConfig {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("api_key_configured", &self.api_key.is_some())
-            .field("min_prob", &self.min_prob)
+            .field("min_level", &self.min_level)
             .field("timeout", &self.timeout)
             .field("max_concurrency", &self.max_concurrency)
             .finish()
@@ -178,7 +179,7 @@ impl Default for InterpretConfig {
             // `discover_model`.
             model: String::new(),
             api_key: None,
-            min_prob: DEFAULT_MIN_PROB,
+            min_level: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
                 .unwrap_or(NonZeroUsize::MIN),
@@ -333,6 +334,33 @@ pub struct LevelContext {
 }
 
 impl LevelContext {
+    /// Whether ML's own position admits this file to the LLM: it fires somewhere
+    /// on the grid, no looser than the cutoff. `-1` (never fires) is ML seeing
+    /// nothing and is not an admission.
+    ///
+    /// `None` resolves to [`Self::grid_max`], which makes the default admission
+    /// "ML fired at all" — the most inclusive line that still means something,
+    /// and the one that cannot drift: a literal ceiling stops meaning *the whole
+    /// grid* the moment the calibrated grid is re-cut (`level_confidence` already
+    /// reserves rungs for an L50000 grid). It also costs almost nothing over a
+    /// tighter literal, because the benign quantile runs out of tail resolution
+    /// long before the ceiling — on the 2026-08-21 bundle, 58 of 104 routes have
+    /// the same threshold at L10000 and L25000, and most of the rest differ by
+    /// 0.037.
+    ///
+    /// Off-grid trait-floor markers (`grid_max + 1/2`) fall outside and are not an
+    /// ML admission; they are floored *because* a trait fired, so the class and
+    /// elevated-finding bypasses already carry them.
+    ///
+    /// Manual-threshold mode (`fired == None`) has no calibrated axis to read, so
+    /// ML abstains and the caller's remaining admissions — an elevated cleave
+    /// finding, a non-benign class — carry the decision. Nothing is lost: with
+    /// operator-set thresholds, a score above them already lands as non-benign.
+    fn ml_admits(self, min_level: Option<u16>) -> bool {
+        let cutoff = i32::from(min_level.unwrap_or(self.grid_max));
+        matches!(self.fired, Some(fired) if (0..=cutoff).contains(&fired))
+    }
+
     /// Whether ML placed this file within a single [`MAX_STEER`] of the hostile
     /// boundary — the active deploy level — measured in confidence space
     /// (`level_confidence` is the calibrated, monotone projection of the level
@@ -508,20 +536,20 @@ pub fn interpret(
     if context.trim().is_empty() {
         return None;
     }
-    // Gate: interpret when ML is above the floor, OR when cleave surfaced an
-    // elevated (suspicious/hostile) finding that ML scored below it — that
-    // disagreement is exactly where a second opinion pays off, and it is how an
-    // ML-blind packed binary (prob ≈ 0 yet flagged by cleave) still reaches the
-    // LLM. Truly-clean files (no elevated finding, low ML prob) still skip.
+    // Gate: interpret when ML fired at or below the cutoff level, OR when cleave
+    // surfaced an elevated (suspicious/hostile) finding that ML scored below it —
+    // that disagreement is exactly where a second opinion pays off, and it is how
+    // an ML-blind packed binary (prob ≈ 0 yet flagged by cleave) still reaches the
+    // LLM. Truly-clean files (no elevated finding, no calibrated ML signal) skip.
     //
     // The verdict class is a third admission on its own: a container whose
     // hostile call came from a member elevation carries the member's class but
-    // its own raw probability, which can sit far below the floor (windows-
-    // bindgen: class hostile at level 0, prob 9e-6, and — post trait-repair —
-    // no elevated finding left in the render). Gating that out publishes a
-    // hostile verdict with no interpretation and no error trace; anything the
-    // scan itself calls non-benign must reach the LLM.
-    if ml_prob < cfg.min_prob
+    // its own raw score, which can sit far below the cutoff (windows-bindgen:
+    // class hostile at level 0, prob 9e-6, and — post trait-repair — no elevated
+    // finding left in the render). Gating that out publishes a hostile verdict
+    // with no interpretation and no error trace; anything the scan itself calls
+    // non-benign must reach the LLM.
+    if !levels.ml_admits(cfg.min_level)
         && !has_elevated_finding(context)
         && matches!(ml_class, Classification::Benign)
     {
@@ -1614,6 +1642,35 @@ mod tests {
                     .flat_map(move |p| evidence.clone().into_iter().map(move |ev| (ml, g, ev, p)))
             })
         })
+    }
+
+    #[test]
+    fn ml_admits_defaults_to_the_whole_grid() {
+        // `levels()` carries grid_max 25000, so `None` means "fired at all".
+        for fired in [0, 3000, 10_000, 25_000] {
+            assert!(levels(fired).ml_admits(None), "L{fired} fires on the grid");
+        }
+        // Never fires: ML saw nothing, which is not an admission.
+        assert!(!levels(-1).ml_admits(None));
+        // Off-grid trait-floor markers sit past the ceiling; the class and
+        // elevated-finding bypasses carry those, not ML.
+        assert!(!levels(25_001).ml_admits(None));
+        // Manual-threshold mode: no calibrated axis, so ML abstains.
+        assert!(!LevelContext {
+            fired: None,
+            active: None,
+            grid_max: 0,
+        }
+        .ml_admits(None));
+    }
+
+    #[test]
+    fn an_explicit_cutoff_tightens_the_admission() {
+        assert!(levels(10_000).ml_admits(Some(10_000)));
+        assert!(!levels(10_001).ml_admits(Some(10_000)));
+        assert!(!levels(25_000).ml_admits(Some(10_000)));
+        // Still no admission for a file that never fired.
+        assert!(!levels(-1).ml_admits(Some(25_000)));
     }
 
     #[test]

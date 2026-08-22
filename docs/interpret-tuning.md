@@ -76,15 +76,47 @@ prompt and motivated it:
 Beyond the prompt, these tuning points govern whether `--interpret` delivers the
 right verdict:
 
-1. **The gate — floor lowered to 0.01.** `--interpret` runs when ML
-   `prob ≥ --interpret-min-prob` OR cleave surfaced a suspicious/hostile finding
-   (the *elevated-finding bypass*). The LLM's whole value is rescuing samples ML
-   *under*-scored — measured false-negatives sit far below the old 0.10 floor (a
-   crypto clipper at 0.024, a git-push exfil at 0.039, an unverified download-exec
-   at 0.012) — so the default floor is **0.01** (`DEFAULT_MIN_PROB`). Note ML
-   probabilities on real malware bunch near 0 *and* near 1 with little in between,
-   so a low floor mostly adds LLM calls on genuinely-clean files (which the LLM
-   correctly clears), not accuracy risk.
+1. **The gate — the calibrated level axis, not a probability.** `--interpret` runs
+   when ML fires at or below `--llm-min-level` OR cleave surfaced a
+   suspicious/hostile finding (the *elevated-finding bypass*) OR the scan's own
+   class is non-benign. The cutoff defaults to the model's **grid ceiling**
+   (`LevelContext::ml_admits` resolves `None` to `grid_max`), so ML admits any file
+   it placed anywhere on the calibrated grid; only `ml.lvl = -1` — ML saw nothing —
+   is an ML non-admission.
+
+   It replaced a flat `prob ≥ 0.01` floor, which could not express "ML saw
+   something": the score that means *something* is per-route. On the 2026-08-21
+   azoth bundle, L10000 lands at 0.036 for `clojure`, 0.99 for `python`, 0.9996
+   for `pe` — so one scalar is simultaneously far too loose for one file type and
+   far too tight for another, and 0.01 sat below all of them. ML probabilities on
+   real malware bunch near 0 *and* near 1 with little in between, so the old floor
+   mostly bought LLM calls on genuinely-clean files.
+
+   **Why the ceiling and not a literal rung.** L10000 and L25000 are nearly the
+   same cutoff in practice — on that bundle 58 of 104 comparable routes carry an
+   *identical* threshold at both, and most of the rest differ by 0.037 (the shared
+   `general` row); only `scala` (0.946 → 0.393) and `markdown` (0.920 → 0.820)
+   move meaningfully. The benign quantile runs out of tail resolution well before
+   the ceiling — what azoth's own search notes as levels "clustering at the 1-FP
+   ceiling below resolution". So a literal buys nothing over the ceiling but can
+   drift: `level_confidence` already reserves rungs for an L50000 grid, and a
+   hardcoded `25000` stops meaning *the whole grid* the day the grid is re-cut.
+
+   Note the admission sits far past the suspicious ceiling (L3000, see
+   `SUSPICIOUS_LEVEL_CEILING`): a file admitted by ML alone out here is *not*
+   suspicious under the deployed policy, just the weak tail. Measured ML
+   false-negatives (a crypto clipper at 0.024, a git-push exfil at 0.039, an
+   unverified download-exec at 0.012) sit under *every* calibrated cutoff — they
+   are carried by the elevated-finding bypass, not by the ML admission, so the
+   level knob cannot chase them; lowering it only buys clean-file calls.
+
+   Off-grid trait-floor markers (`grid_max + 1/2`) fall outside the ceiling and are
+   not an ML admission — they are floored *because* a trait fired, so the class
+   and finding bypasses already carry them.
+
+   In manual-threshold mode there is no level axis; ML abstains from the gate and
+   the bypasses carry it (a score over an operator-set threshold is already
+   non-benign).
 2. **The steering rule — one step, one third.** `interpret::blend` enforces a
    single symmetric bound in both directions:
 
