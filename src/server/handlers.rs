@@ -265,12 +265,22 @@ fn flight_outcome(
                 .fetch_add(scan_result.size_bytes, Ordering::Relaxed);
             let micros = elapsed_ms.saturating_mul(1_000);
             state.job_micros_total.fetch_add(micros, Ordering::Relaxed);
-            state.job_overall.record(micros);
-            state.job_buckets[super::size_bucket(scan_result.size_bytes)].record(micros);
+            // Routing predicts the cost of work this server has *not* done, so
+            // only fresh analyses feed the figures a router reads. A cache hit
+            // is real and worth reporting, but it predicts nothing about the
+            // next unseen artifact.
+            if scan_result.analysis_cached {
+                state.job_cached.record(micros);
+            } else {
+                state.job_overall.record(micros);
+                state.job_buckets[super::size_bucket(scan_result.size_bytes)].record(micros);
+            }
             // Also by PURL type, when this job was named by one. That is the
             // only cost signal a router has before dispatch for `?purl=` work,
             // which is most of the traffic this fleet serves.
-            if let Some(purl) = key.purl() {
+            if let Some(purl) = key.purl()
+                && !scan_result.analysis_cached
+            {
                 state.job_types[super::purl_type_bucket(purl)].record(micros);
             }
             index_verdict(&scan_result, key.purl());
@@ -612,6 +622,10 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
     // Aged, so a past incident stops steering present routing.
     let recent_n = state.job_overall.count.load(Ordering::Relaxed);
     let recent_micros = state.job_overall.micros.load(Ordering::Relaxed);
+    let cached_n = state.job_cached.count.load(Ordering::Relaxed);
+    let cached_micros = state.job_cached.micros.load(Ordering::Relaxed);
+    let lookup_n = state.lookups.count.load(Ordering::Relaxed);
+    let lookup_micros = state.lookups.micros.load(Ordering::Relaxed);
     // Averages over completed jobs only: a job still running has contributed no
     // duration, and dividing by `started` would report every busy server as
     // faster than it is.
@@ -637,7 +651,20 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         // mid-analysis. Non-zero and climbing is the shape of a sick server.
         "jobs_unfinished": started.saturating_sub(completed).saturating_sub(in_flight as u64),
         "avg_job_bytes": avg(bytes),
+        // Fresh analyses only: what this server costs on work it has not seen.
         "avg_job_ms": (recent_n > 0).then(|| recent_micros / recent_n / 1_000),
+        // Answered from this server's own index. Reported so an operator can
+        // see the hit rate, and kept out of the figures above so it cannot
+        // flatter a server into looking fast at work it never did.
+        "avg_job_ms_cached": (cached_n > 0).then(|| cached_micros / cached_n / 1_000),
+        "cached_samples": cached_n,
+        // `/lookup` service time — an index probe, near-constant in the size of
+        // the artifact, and three orders of magnitude below an analysis.
+        "avg_lookup_ms": (lookup_n > 0).then(|| lookup_micros / lookup_n / 1_000),
+        // Microseconds too: a healthy index probe rounds to 0ms, and a routing
+        // signal that is always zero is no signal at all.
+        "avg_lookup_us": (lookup_n > 0).then(|| lookup_micros / lookup_n),
+        "lookup_samples": lookup_n,
         // Lifetime, for the operator rather than the router.
         "avg_job_ms_lifetime": avg(micros).map(|us| us / 1_000),
         "avg_job_samples": recent_n,
@@ -733,6 +760,17 @@ pub(super) async fn lookup(
     State(state): State<Arc<AppState>>,
     Query(q): Query<LookupQuery>,
 ) -> Response {
+    let started = Instant::now();
+    let response = lookup_inner(&state, &q);
+    // Timed here rather than inside each arm so every answer counts — a
+    // rejection is as much a measure of this endpoint's speed as a hit.
+    state
+        .lookups
+        .record(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    response
+}
+
+fn lookup_inner(state: &Arc<AppState>, q: &LookupQuery) -> Response {
     let sha = q.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let purl = q.purl.as_deref().map(str::trim).filter(|s| !s.is_empty());
     // Every arm names its subject, so the request's access line says which
@@ -743,8 +781,8 @@ pub(super) async fn lookup(
             StatusCode::BAD_REQUEST,
             "provide exactly one of sha256 or purl",
         ),
-        (Some(sha), None) => with_subject(lookup_by_sha(&state, sha), Subject::sha256(sha)),
-        (None, Some(purl)) => lookup_by_purl(&state, purl),
+        (Some(sha), None) => with_subject(lookup_by_sha(state, sha), Subject::sha256(sha)),
+        (None, Some(purl)) => lookup_by_purl(state, purl),
     }
 }
 
