@@ -845,16 +845,36 @@ fn lookup_by_both(state: &AppState, sha256: &str, raw: &str) -> Response {
     );
 
     let index = crate::lookup::global();
-    let verdict = index.and_then(|i| i.get_sha(&sha)).or_else(|| {
-        // Second chance: the index can know the release without having seen
-        // these bytes. Only accepted when the digests agree.
-        index
-            .and_then(|i| i.get_purl(&purl))
-            .filter(|v| v.sha256.eq_ignore_ascii_case(&sha))
-    });
+    let verdict = pick_verdict(
+        index.and_then(|i| i.get_sha(&sha)),
+        || index.and_then(|i| i.get_purl(&purl)),
+        &sha,
+    );
 
     let response = lookup_response(state, verdict.as_ref(), decision, &sha, Some(&purl));
     with_subject(response, Subject::purl(&purl, Some(&sha)))
+}
+
+/// Which stored verdict answers for a caller who named both keys.
+///
+/// Digest first, because a digest names exact bytes and a verdict filed under
+/// it is about those bytes and nothing else. The PURL is consulted only when
+/// the digest is unknown — lazily, so an exact hit costs no index lookup at all
+/// — and its verdict is accepted only if it resolved to the same digest.
+///
+/// That last condition is the whole point of holding both keys. A release whose
+/// artifact has changed under it still has a perfectly good verdict; it is just
+/// a verdict about a different artifact than the caller asked about, and
+/// serving it would answer a question nobody posed.
+fn pick_verdict(
+    by_sha: Option<crate::lookup::Verdict>,
+    by_purl: impl FnOnce() -> Option<crate::lookup::Verdict>,
+    sha: &str,
+) -> Option<crate::lookup::Verdict> {
+    if by_sha.is_some() {
+        return by_sha;
+    }
+    by_purl().filter(|v| v.sha256.eq_ignore_ascii_case(sha))
 }
 
 fn lookup_by_purl(state: &AppState, raw: &str) -> Response {
@@ -2879,5 +2899,67 @@ mod artifact_upload_tests {
             sidecar["package"]["purl"], "pkg:cargo/libc@0.2.101",
             "the PURL must reach the sidecar slot hopper reads into purl_base",
         );
+    }
+}
+
+#[cfg(test)]
+mod pick_verdict_tests {
+    use super::pick_verdict;
+    use crate::lookup::Verdict;
+
+    fn verdict(sha: &str, eng: &str) -> Verdict {
+        Verdict {
+            sha256: sha.to_owned(),
+            lvl: Some(-1),
+            eng: eng.to_owned(),
+            at: "2026-01-01T00:00:00Z".to_owned(),
+            purl: None,
+            why: None,
+            hits: Vec::new(),
+        }
+    }
+
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn a_digest_hit_wins_and_costs_no_purl_lookup() {
+        let mut asked = false;
+        let got = pick_verdict(
+            Some(verdict(SHA, "by-sha")),
+            || {
+                asked = true;
+                Some(verdict(SHA, "by-purl"))
+            },
+            SHA,
+        );
+        assert_eq!(got.expect("verdict").eng, "by-sha");
+        assert!(!asked, "an exact hit must not cost a second index lookup");
+    }
+
+    // The second chance: the index knows the release even though these exact
+    // bytes are new to it, and the digests agree.
+    #[test]
+    fn the_purl_answers_when_the_digest_is_unknown() {
+        let got = pick_verdict(None, || Some(verdict(SHA, "by-purl")), SHA);
+        assert_eq!(got.expect("verdict").eng, "by-purl");
+    }
+
+    // The guard the pair exists for: the release resolved to other bytes.
+    #[test]
+    fn a_purl_verdict_for_other_bytes_is_refused() {
+        let got = pick_verdict(None, || Some(verdict(OTHER, "different-artifact")), SHA);
+        assert!(got.is_none(), "served a verdict about bytes nobody asked about");
+    }
+
+    #[test]
+    fn digest_comparison_is_case_insensitive() {
+        let got = pick_verdict(None, || Some(verdict(&SHA.to_uppercase(), "by-purl")), SHA);
+        assert!(got.is_some(), "hex case must not decide identity");
+    }
+
+    #[test]
+    fn neither_key_known_is_no_verdict() {
+        assert!(pick_verdict(None, || None, SHA).is_none());
     }
 }
