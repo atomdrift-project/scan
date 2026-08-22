@@ -268,6 +268,14 @@ fn flight_outcome(
             let bucket = &state.job_buckets[super::size_bucket(scan_result.size_bytes)];
             bucket.count.fetch_add(1, Ordering::Relaxed);
             bucket.micros.fetch_add(micros, Ordering::Relaxed);
+            // Also by PURL type, when this job was named by one. That is the
+            // only cost signal a router has before dispatch for `?purl=` work,
+            // which is most of the traffic this fleet serves.
+            if let Some(purl) = key.purl() {
+                let by_type = &state.job_types[super::purl_type_bucket(purl)];
+                by_type.count.fetch_add(1, Ordering::Relaxed);
+                by_type.micros.fetch_add(micros, Ordering::Relaxed);
+            }
             index_verdict(&scan_result, key.purl());
             // Renew the verdict on hopper too, so it outlives this process and
             // this request. A caller that hangs up — or a proxy that gives up
@@ -630,6 +638,20 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "jobs_unfinished": started.saturating_sub(completed).saturating_sub(in_flight as u64),
         "avg_job_bytes": avg(bytes),
         "avg_job_ms": avg(micros).map(|us| us / 1_000),
+        // The same average, split by PURL type. A `?purl=` request has no size
+        // until the artifact is fetched, so this is what a router can compare
+        // on when the choice still matters. Types differ by more than an order
+        // of magnitude: a golang pseudo-version is a repository clone.
+        "avg_job_ms_by_type": super::PURL_TYPE_NAMES
+            .iter()
+            .zip(state.job_types.iter())
+            .map(|(name, b)| {
+                let n = b.count.load(Ordering::Relaxed);
+                let ms = (n > 0).then(|| b.micros.load(Ordering::Relaxed) / n / 1_000);
+                ((*name).to_string(), serde_json::json!({ "jobs": n, "avg_ms": ms }))
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+
         // The same average, split by input size. A caller that knows how big
         // the artifact is should compare servers at that size, not overall.
         "avg_job_ms_by_size": super::SIZE_BUCKET_NAMES

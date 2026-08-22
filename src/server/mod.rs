@@ -547,6 +547,29 @@ pub(crate) struct JobBucket {
     pub(crate) micros: AtomicU64,
 }
 
+/// PURL types tracked separately on `/_/stats`, plus a catch-all.
+///
+/// A PURL carries no size, so a router choosing a worker for one has nothing to
+/// look up in [`SIZE_BUCKET_NAMES`] until the artifact has already been fetched
+/// — by which point the choice is made. The type is the next best predictor and
+/// is known up front: a golang pseudo-version resolves to a repository clone, an
+/// npm package to a small tarball, and the two are not comparable work.
+pub(crate) const PURL_TYPE_NAMES: [&str; 5] = ["cargo", "golang", "npm", "pypi", "other"];
+
+/// The bucket index for `purl`, matching on the type between `pkg:` and `/`.
+pub(crate) fn purl_type_bucket(purl: &str) -> usize {
+    let rest = purl.strip_prefix("pkg:").unwrap_or(purl);
+    let ty = rest.split('/').next().unwrap_or("");
+    // Only the type is case-insensitive per the PURL spec; the rest is not
+    // touched here because nothing downstream of this counter reads it.
+    PURL_TYPE_NAMES
+        .iter()
+        .position(|n| ty.eq_ignore_ascii_case(n))
+        // `other` is the last name and is never matched by a real type.
+        .filter(|i| *i + 1 < PURL_TYPE_NAMES.len())
+        .unwrap_or(PURL_TYPE_NAMES.len() - 1)
+}
+
 /// The bucket index for an artifact of `size` bytes.
 pub(crate) fn size_bucket(size: u64) -> usize {
     SIZE_BUCKETS
@@ -638,6 +661,7 @@ struct AppState {
     /// every small package somewhere worse. A caller usually knows the size
     /// before it dispatches, so the useful answer is per bucket.
     job_buckets: [JobBucket; SIZE_BUCKETS.len()],
+    job_types: [JobBucket; PURL_TYPE_NAMES.len()],
     /// Analyses this server has begun, completed, and the totals behind their
     /// averages.
     ///
@@ -729,6 +753,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         shutdown: Arc::new(AtomicBool::new(false)),
         idle_worker_started: AtomicBool::new(false),
         job_buckets: Default::default(),
+        job_types: Default::default(),
         jobs_started: AtomicU64::new(0),
         jobs_completed: AtomicU64::new(0),
         job_bytes_total: AtomicU64::new(0),
@@ -1264,5 +1289,38 @@ mod size_bucket_tests {
             assert!(i >= last, "bucket went backwards at {size}");
             last = i;
         }
+    }
+}
+
+#[cfg(test)]
+mod purl_type_tests {
+    use super::{purl_type_bucket, PURL_TYPE_NAMES};
+
+    #[test]
+    fn known_types_get_their_own_bucket() {
+        for (i, name) in PURL_TYPE_NAMES.iter().enumerate().take(4) {
+            assert_eq!(purl_type_bucket(&format!("pkg:{name}/thing@1.0")), i);
+        }
+    }
+
+    #[test]
+    fn the_type_is_case_insensitive_and_pkg_is_optional() {
+        assert_eq!(purl_type_bucket("pkg:PyPI/requests@2.0"), 3);
+        assert_eq!(purl_type_bucket("npm/left-pad@1.0"), 2);
+    }
+
+    #[test]
+    fn unknown_and_malformed_fall_into_other() {
+        let other = PURL_TYPE_NAMES.len() - 1;
+        assert_eq!(purl_type_bucket("pkg:maven/g/a@1"), other);
+        assert_eq!(purl_type_bucket(""), other);
+        // "other" is a bucket name, not a type: a PURL literally spelled that
+        // way must not be mistaken for a real match on it.
+        assert_eq!(purl_type_bucket("pkg:other/x@1"), other);
+    }
+
+    #[test]
+    fn a_golang_module_path_keeps_its_slashes_out_of_the_type() {
+        assert_eq!(purl_type_bucket("pkg:golang/github.com/spf13/cobra@v1.10.2"), 1);
     }
 }
