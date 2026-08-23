@@ -118,9 +118,10 @@ impl Route {
         self.0.get(attempt.min(last)).map_or("", String::as_str)
     }
 
-    /// The preferred address, for a log line that names where work is going.
-    fn primary(&self) -> &str {
-        self.at(0)
+    /// Every address, for a caller that tries each exactly once rather than
+    /// retrying on a schedule.
+    fn each(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
     }
 }
 
@@ -996,32 +997,41 @@ fn post_known(
         #[serde(default)]
         current: Vec<String>,
     }
-    let resp = authed(client.post(known_url.primary()))
-        .json(&KnownRequest {
-            sha256: shas,
-            traits_version,
-        })
-        .send();
-    match resp {
-        Ok(resp) if resp.status().is_success() => match resp.json::<KnownResponse>() {
-            Ok(kr) => KnownSets {
-                known: kr.known.into_iter().collect(),
-                current: kr.current.into_iter().collect(),
-            },
-            Err(e) => {
-                tracing::warn!(error = %error_chain(&e), "upload: known response decode failed");
-                KnownSets::default()
+    // Each address in turn. Failing this probe is safe but not free: the
+    // caller then treats every artifact as missing and pushes bytes hopper
+    // already holds, so stopping at an unreachable replica would spend an
+    // outage re-uploading the corpus to a primary that is up and one line down
+    // the list. A decode failure is not retried elsewhere — the next address
+    // runs the same build and would answer the same way.
+    for url in known_url.each() {
+        let resp = authed(client.post(url))
+            .json(&KnownRequest {
+                sha256: shas,
+                traits_version,
+            })
+            .send();
+        match resp {
+            Ok(resp) if resp.status().is_success() => {
+                return match resp.json::<KnownResponse>() {
+                    Ok(kr) => KnownSets {
+                        known: kr.known.into_iter().collect(),
+                        current: kr.current.into_iter().collect(),
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %error_chain(&e), "upload: known response decode failed");
+                        KnownSets::default()
+                    }
+                };
             }
-        },
-        Ok(resp) => {
-            tracing::warn!(status = %resp.status(), "upload: known probe non-success");
-            KnownSets::default()
-        }
-        Err(e) => {
-            tracing::warn!(error = %error_chain(&e), "upload: known probe failed");
-            KnownSets::default()
+            Ok(resp) => {
+                tracing::warn!(endpoint = %url, status = %resp.status(), "upload: known probe non-success");
+            }
+            Err(e) => {
+                tracing::warn!(endpoint = %url, error = %error_chain(&e), "upload: known probe failed");
+            }
         }
     }
+    KnownSets::default()
 }
 
 /// Build the multipart provenance part from an artifact's sidecar.
@@ -1380,7 +1390,6 @@ mod tests {
         assert_eq!(route.at(0), "https://ro/api/result");
         assert_eq!(route.at(1), "http://rw/api/result");
         assert_eq!(route.at(9), "http://rw/api/result");
-        assert_eq!(route.primary(), "https://ro/api/result");
     }
 
     /// One address is the ordinary case, and every attempt uses it.
@@ -1599,6 +1608,45 @@ mod tests {
         assert!(name.len() <= MAX_WORKER_NAME_LEN);
         // Mirrors hopper's `validWorkerName`: printable ASCII, no spaces.
         assert!(name.chars().all(|c| c.is_ascii_graphic()));
+    }
+
+    /// The `/api/known` probe walks the list like every other call.
+    ///
+    /// Its failure is safe — an unanswered probe makes the uploader treat
+    /// every artifact as missing, and hopper's upsert is idempotent — but it
+    /// is not free: that is the probe whose whole job is keeping bytes hopper
+    /// already holds off the wire. Stopping at a dead replica would spend the
+    /// outage re-uploading the corpus to a primary that was up the whole time.
+    #[test]
+    fn a_dead_replica_does_not_stop_the_known_probe() {
+        // Port 1 refuses immediately, so this measures the decision rather
+        // than a timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept known");
+            let _ = stream.read(&mut [0u8; 4096]);
+            let body = br#"{"known":["aa"],"current":["bb"]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            stream.write_all(head.as_bytes()).expect("write head");
+            stream.write_all(body).expect("write body");
+        });
+
+        let bases = endpoints(&format!("http://127.0.0.1:1,http://{addr}"));
+        let known_url = Route::new(&bases, "/api/known");
+        let sets = post_known(
+            &reqwest::blocking::Client::new(),
+            &known_url,
+            &["aa", "bb"],
+            None,
+        );
+        server.join().expect("server thread");
+        assert!(sets.known.contains("aa"), "the primary's answer was discarded");
+        assert!(sets.current.contains("bb"));
     }
 
     #[test]
