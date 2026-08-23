@@ -82,7 +82,6 @@ export HOPPER BIND ALLOWED_DIRS MEMORY_MAX
 # round-trips don't distort wall/RSS measurements.
 LLM ?= http://10.9.8.149:8000/v1
 LLM_MODEL ?=
-INTERPRET_MIN_PROB ?= 0.15
 
 # Scrub GNU make's jobserver from cargo's environment. Without this, build
 # scripts that spawn their own `make` (e.g. tikv-jemalloc-sys) inherit a
@@ -409,7 +408,7 @@ worker: check-hopper-token kill-scan release
 	@# Runs as the invoking user, so atomscan finds $(HOPPER_TOKEN_FILE) on its
 	@# own; `check-hopper-token` has already established that it is there.
 	SCAN_LLM="$(LLM)" SCAN_LLM_MODEL="$(LLM_MODEL)" ./out/$(BINARY) worker --url "$(URL)" \
-		--interpret --interpret-min-prob $(INTERPRET_MIN_PROB) \
+		--interpret \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		$(if $(NICE),--nice $(NICE),)
 
