@@ -745,12 +745,28 @@ enum Commands {
         #[arg(long)]
         traits_dir: Option<PathBuf>,
 
-        /// Renew every analyzed result (parent and members) on a hopper instance
-        /// by POSTing to <URL>/api/result as analyses complete — the warm-server
-        /// equivalent of `scan path --hopper`. Upload failures are logged, never
-        /// fatal. Also settable via the `SCAN_HOPPER` env var.
-        /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
-        /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
+        /// The hopper this server reads from and files to.
+        ///
+        /// Every analyzed result (parent and members) is renewed by POSTing to
+        /// <URL>/api/result as analyses complete — the warm-server equivalent of
+        /// `scan path --hopper` — and a lookup this server's own index cannot
+        /// answer is deferred to the same place.
+        ///
+        /// Several addresses may be given, comma-separated, in preference
+        /// order: put the replica first and the primary behind it. Reads try
+        /// them in that order, and a retry on a write walks down the list, so a
+        /// replica that stops answering costs one attempt rather than a lost
+        /// verdict. Reads and writes deliberately take the same list — routing
+        /// them apart is a topology this server would have to know, and
+        /// hopper's write relay exists so that it does not: a replica answers
+        /// lookups locally and forwards the renewals.
+        ///
+        ///   --hopper https://hops-ro.example,http://hopper.internal:8081
+        ///
+        /// Upload failures are logged, never fatal. Also settable via the
+        /// `SCAN_HOPPER` env var. Authenticates with `~/.tok/hopper` (or
+        /// `$HOPPER_TOKEN_FILE` / `$HOPPER_TOKEN`); hopper rejects an
+        /// unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",

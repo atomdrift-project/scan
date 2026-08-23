@@ -31,9 +31,10 @@
 #                                                                (default: 10.0.0.0/8)
 #   WORKERS     concurrency (--workers)                          (default: server auto)
 #   ALLOWED_DIRS  comma-separated /analyze-path roots            (default: unset)
-#   HOPPER      hopper base URL (--hopper / SCAN_HOPPER)         (default: unset)
-#   HOPPER_READ hopper replica for lookups (--hopper-read); reads prefer it and
-#               fall back to HOPPER, writes always go to HOPPER  (default: unset)
+#   HOPPER      hopper base URL, or several comma-separated in preference
+#               order: put the replica first and the primary behind it, and a
+#               replica outage costs a retry rather than a lost verdict.
+#               (--hopper / SCAN_HOPPER)                          (default: unset)
 #   HOPPER_TOKEN_FILE  hopper API token, installed whenever the file exists
 #                      (HOPPER need not be set)               (default: ~/.tok/hopper)
 #   MAX_RSS_GB  pause threshold (--max-rss-gb)                   (default: -1 = off; systemd MemoryMax handles OOM)
@@ -75,7 +76,6 @@ TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/scan}"
 WORKERS="${WORKERS:-}"
 ALLOWED_DIRS="${ALLOWED_DIRS:-}"
 HOPPER="${HOPPER:-}"
-HOPPER_READ="${HOPPER_READ:-}"
 MAX_RSS_GB="${MAX_RSS_GB:--1}"
 MEMORY_MAX="${MEMORY_MAX:-80%}"
 # Memory the kernel will not reclaim from the server under host-wide pressure.
@@ -378,15 +378,6 @@ if [ -n "${ALLOWED_DIRS}" ]; then
 fi
 if [ -n "${HOPPER}" ]; then
     exec_args="${exec_args} --hopper ${HOPPER}"
-fi
-# A lookup this worker's index cannot answer is deferred to the corpus, which
-# is a read and belongs on a replica rather than on the machine taking every
-# write. Set both to get failover: reads prefer HOPPER_READ and fall back to
-# HOPPER when it cannot be reached. Set HOPPER alone and reads go wherever
-# writes do, which a replica running the write relay handles fine — it just
-# has nowhere to fall back to.
-if [ -n "${HOPPER_READ}" ]; then
-    exec_args="${exec_args} --hopper-read ${HOPPER_READ}"
 fi
 # Pass the path, never the token. atomscan refuses to start if the file is
 # missing or empty, so a lost token fails loudly instead of opening the API.
