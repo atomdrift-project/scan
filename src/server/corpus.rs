@@ -16,6 +16,7 @@
 //! cost of an unreachable address is a timeout, and paying that in front of
 //! every lookup would be worse than the outage it is reacting to.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -83,9 +84,29 @@ pub(crate) struct CorpusFinding {
 pub(crate) struct Corpus {
     /// Every address the corpus can be reached at, in preference order.
     bases: Vec<String>,
+    /// Per-address traffic, parallel to `bases`.
+    ///
+    /// Failover is otherwise invisible: a fleet quietly reading from the
+    /// primary because the replica stopped answering looks exactly like one
+    /// reading from the replica, and the first sign is the primary's load. This
+    /// is what turns that into a number an operator can see before it becomes a
+    /// page.
+    traffic: Vec<Address>,
     client: reqwest::Client,
     /// When the preferred address may lead again, or `None` while it leads.
     rested: Mutex<Option<Instant>>,
+    /// What the corpus said, across every address.
+    found: AtomicU64,
+    nothing: AtomicU64,
+    unreachable: AtomicU64,
+}
+
+/// One address's share of the traffic.
+#[derive(Debug, Default)]
+struct Address {
+    asked: AtomicU64,
+    answered: AtomicU64,
+    failed: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -104,10 +125,15 @@ impl Corpus {
             .timeout(READ_TIMEOUT)
             .build()
             .unwrap_or_default();
+        let traffic = bases.iter().map(|_| Address::default()).collect();
         Some(Arc::new(Self {
             bases,
+            traffic,
             client,
             rested: Mutex::new(None),
+            found: AtomicU64::new(0),
+            nothing: AtomicU64::new(0),
+            unreachable: AtomicU64::new(0),
         }))
     }
 
@@ -155,6 +181,7 @@ impl Corpus {
         let path = format!("/v1/lookup?{}", query.join("&"));
 
         for base in self.order_at(Instant::now()) {
+            self.count(base, |a| &a.asked);
             match self.ask(base, &path).await {
                 // An answer, whichever kind. A 404 from the replica is taken as
                 // the answer rather than re-asked at the primary: "we hold
@@ -165,15 +192,59 @@ impl Corpus {
                 // where replication lag reads as absence.
                 Some(reached) => {
                     self.note_at(base, true, Instant::now());
+                    self.count(base, |a| &a.answered);
+                    match &reached {
+                        Reached::Record(_) => &self.found,
+                        _ => &self.nothing,
+                    }
+                    .fetch_add(1, Ordering::Relaxed);
                     return reached;
                 }
                 None => {
                     self.note_at(base, false, Instant::now());
+                    self.count(base, |a| &a.failed);
                     tracing::warn!(endpoint = %base, "corpus unreachable");
                 }
             }
         }
+        self.unreachable.fetch_add(1, Ordering::Relaxed);
         Reached::Unreachable
+    }
+
+    /// Bump one of an address's counters.
+    fn count(&self, base: &str, pick: impl Fn(&Address) -> &AtomicU64) {
+        if let Some(i) = self.bases.iter().position(|b| b == base) {
+            pick(&self.traffic[i]).fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A snapshot for `/_/stats`.
+    pub(crate) fn stats(&self) -> serde_json::Value {
+        let by_address: Vec<_> = self
+            .bases
+            .iter()
+            .zip(&self.traffic)
+            .map(|(base, a)| {
+                serde_json::json!({
+                    "address": base,
+                    "asked": a.asked.load(Ordering::Relaxed),
+                    "answered": a.answered.load(Ordering::Relaxed),
+                    "failed": a.failed.load(Ordering::Relaxed),
+                })
+            })
+            .collect();
+        let resting = lock(&self.rested).is_some_and(|until| Instant::now() < until);
+        serde_json::json!({
+            // Every deferral, and what came back. `unreachable` is the one that
+            // reaches a caller as a decision about us rather than the artifact.
+            "found": self.found.load(Ordering::Relaxed),
+            "nothing": self.nothing.load(Ordering::Relaxed),
+            "unreachable": self.unreachable.load(Ordering::Relaxed),
+            // Non-zero `failed` on the first address with traffic on a later one
+            // is a failover in progress, whether or not anyone has noticed.
+            "preferred_resting": resting,
+            "by_address": by_address,
+        })
     }
 
     /// One endpoint's answer, or `None` when it could not give one.
