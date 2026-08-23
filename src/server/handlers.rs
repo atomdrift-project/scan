@@ -2612,7 +2612,11 @@ async fn v1_analyze_bytes(
     // artifact already being analyzed costs no disk at all.
     let sha = format!("{:x}", Sha256::digest(&bytes));
 
-    let purl = match q.purl.first().map(String::as_str).map(normalize_pkg_purl) {
+    // Kept apart on purpose: `purl` is the key everything downstream is stored
+    // and looked up by, `asked` is what the caller typed and what the answer is
+    // spelled with. See `V1Decision::asked_about`.
+    let asked = q.purl.first().map(String::as_str);
+    let purl = match asked.map(normalize_pkg_purl) {
         Some(Ok(purl)) => Some(purl),
         Some(Err(message)) => {
             return v1_error(StatusCode::BAD_REQUEST, "invalid_purl", message);
@@ -2649,11 +2653,15 @@ async fn v1_analyze_bytes(
 
     let flight = Arc::clone(attachment.flight());
     // The digest labels the request in logs; it is never the locator.
-    let subject = purl.clone().unwrap_or_else(|| sha.clone());
+    let named = Named {
+        subject: purl.clone().unwrap_or_else(|| sha.clone()),
+        key: purl,
+        asked: asked.map(str::to_owned),
+    };
     match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
         Ok(outcome) => {
             let elapsed = crate::duration_ms(request_start.elapsed());
-            v1_outcome_response(&outcome, purl.as_deref(), &subject, budget, elapsed, !leads)
+            v1_outcome_response(&outcome, &named, budget, elapsed, !leads)
         }
         Err(_) => {
             tracing::info!(id = request_id, sha256 = %sha, "answering as a stream");
@@ -2661,8 +2669,7 @@ async fn v1_analyze_bytes(
                 Arc::clone(state),
                 attachment,
                 flight,
-                purl,
-                subject,
+                named,
                 budget,
                 request_start,
             )
@@ -2829,6 +2836,13 @@ pub(super) async fn v1_analyze(
     }
 
     let flight = Arc::clone(attachment.flight());
+    // Named, not analyzed from bytes, so there is always a coordinate: the
+    // normalized one keys everything, and `req.purl` is what the caller typed.
+    let about = Named {
+        key: Some(purl.clone()),
+        asked: Some(req.purl.clone()),
+        subject: purl.clone(),
+    };
     // Inside the grace window the ordinary response still applies, which is what
     // keeps `429 At capacity` a real 429 the router can act on rather than a
     // decision buried in a 200 body. Capacity is refused the moment a slot is
@@ -2836,7 +2850,7 @@ pub(super) async fn v1_analyze(
     match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
         Ok(outcome) => {
             let elapsed = crate::duration_ms(request_start.elapsed());
-            v1_outcome_response(&outcome, Some(&purl), &purl, budget, elapsed, !leads)
+            v1_outcome_response(&outcome, &about, budget, elapsed, !leads)
         }
         Err(_) => {
             tracing::info!(id = request_id, purl = %purl, "answering as a stream");
@@ -2844,8 +2858,7 @@ pub(super) async fn v1_analyze(
                 Arc::clone(&state),
                 attachment,
                 flight,
-                Some(purl.clone()),
-                purl,
+                about,
                 budget,
                 request_start,
             )
@@ -2853,23 +2866,41 @@ pub(super) async fn v1_analyze(
     }
 }
 
+/// The package a request is about, in the three spellings that are not
+/// interchangeable.
+///
+/// Collapsing them into one string is what produced the bug this exists to
+/// prevent: `key` is what the index and the corpus are keyed by, `asked` is
+/// what the caller typed and what the answer is spelled with, and `subject`
+/// labels logs and progress — the digest, when an upload named no coordinate
+/// at all.
+struct Named {
+    key: Option<String>,
+    asked: Option<String>,
+    subject: String,
+}
+
 /// A finished analysis, as a decision.
 fn v1_outcome_response(
     outcome: &Outcome,
-    purl: Option<&str>,
-    subject: &str,
+    named: &Named,
     budget: u16,
     elapsed_ms: u64,
     shared: bool,
 ) -> Response {
+    let (purl, asked) = (named.key.as_deref(), named.asked.as_deref());
+    let subject = named.subject.as_str();
     let mut resp = match outcome {
         Outcome::Report(result) => {
             // An upload has no locator, and the digest is not one: passing it
             // here would put a sha256 in the `purl` field, where /v1/lookup
             // reports null for the same artifact. The two routes answer with
             // one shape or neither is trustworthy.
+            // The verdict is stored under the normalized key; only the answer
+            // going back out is spelled the caller's way.
             let verdict = crate::lookup::Verdict::from_scan(result, purl);
-            let mut resp = Json(V1Decision::stored(&verdict, purl, budget)).into_response();
+            let decided = V1Decision::stored(&verdict, purl, budget).asked_about(asked);
+            let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
@@ -2908,12 +2939,20 @@ fn v1_streamed(
     state: Arc<AppState>,
     attachment: super::flight::Attachment,
     flight: Arc<Flight>,
-    purl: Option<String>,
-    subject: String,
+    named: Named,
     budget: u16,
     request_start: Instant,
 ) -> Response {
+    let Named {
+        key: purl,
+        asked,
+        subject,
+    } = named;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+    // Progress frames name the package too, and a caller reading the stream
+    // correlates on the same field the decision carries. An upload has no
+    // coordinate at all, so there the digest-derived subject stands.
+    let labelled_purl = asked.clone().unwrap_or_else(|| subject.clone());
     let labelled = subject.clone();
     tokio::spawn(async move {
         // Held for the life of the stream: an attachment dropped early would
@@ -2928,7 +2967,7 @@ fn v1_streamed(
                     next = V1_PROGRESS_EVERY;
                     let frame = serde_json::json!({
                         "state": "analyzing",
-                        "purl": subject,
+                        "purl": labelled_purl,
                         "elapsed_ms": crate::duration_ms(request_start.elapsed()),
                         "phase": v1_phase_of(&state, &subject),
                     });
@@ -2947,11 +2986,11 @@ fn v1_streamed(
                 // As on the unstreamed path: an upload has no locator, and the
                 // digest is not one.
                 let verdict = crate::lookup::Verdict::from_scan(result, purl.as_deref());
-                V1Decision::stored(&verdict, purl.as_deref(), budget)
+                V1Decision::stored(&verdict, purl.as_deref(), budget).asked_about(asked.as_deref())
             }
             Outcome::Rendered { status, .. } => {
                 tracing::warn!(subject = %subject, status = status.as_u16(), elapsed_ms = elapsed, "streamed analysis failed");
-                V1Decision::unavailable(None, purl.as_deref())
+                V1Decision::unavailable(None, purl.as_deref()).asked_about(asked.as_deref())
             }
         };
         v1_send(&tx, &decided).await;
@@ -3097,10 +3136,24 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Response {
     Json(out).into_response()
 }
 
-/// One package, resolved and decided. `Err` is a request-level rejection: a key
-/// we cannot parse is the caller's mistake and stops the whole call, because
-/// answering the rest would hide it.
+/// One package, resolved and decided, answered about the coordinate the caller
+/// named. `Err` is a request-level rejection: a key we cannot parse is the
+/// caller's mistake and stops the whole call, because answering the rest would
+/// hide it.
 async fn v1_resolve(
+    state: &Arc<AppState>,
+    sha: Option<&str>,
+    raw_purl: Option<&str>,
+    budget: u16,
+) -> Result<V1Decision, Box<Response>> {
+    Ok(v1_decide(state, sha, raw_purl, budget)
+        .await?
+        .asked_about(raw_purl))
+}
+
+/// The decision itself, in this worker's own vocabulary: every key here is the
+/// normalized one, because that is what the index and the corpus are keyed by.
+async fn v1_decide(
     state: &Arc<AppState>,
     sha: Option<&str>,
     raw_purl: Option<&str>,
@@ -3277,6 +3330,31 @@ impl V1Decision {
             engine_version: r.engine_version.clone(),
             analyzed_at: r.analyzed_at.clone(),
         }
+    }
+
+    /// Answer about the coordinate the caller named, in the spelling they
+    /// named it.
+    ///
+    /// Every key is normalized before it is looked up — PyPI folds `.` and `_`
+    /// to `-` per PEP 503, npm scopes are unwrapped, a bare `npm/left-pad` gets
+    /// its `pkg:` — and echoing the normalized form back is how
+    /// `pkg:pypi/info.gianlucacosta.eos.core@2.0.2` came home answered about
+    /// `pkg:pypi/info-gianlucacosta-eos-core@2.0.2`. The same package, and a
+    /// caller has no way to know that without implementing PEP 503 themselves.
+    ///
+    /// That matters most where it is least visible: a lookup may name fifty
+    /// packages and the reply is a list, so `purl` is what a caller matches
+    /// response to request by. Rewriting the spelling breaks that silently, and
+    /// only for the names that happen to contain a `.` or a `_`.
+    ///
+    /// So the field answers "the package you asked about" and the caller's
+    /// bytes are returned unaltered. `sha256` remains the identity, and it is
+    /// the field to compare when two spellings must be proven to be one thing.
+    fn asked_about(mut self, asked: Option<&str>) -> Self {
+        if let Some(asked) = asked {
+            self.purl = Some(asked.to_owned());
+        }
+        self
     }
 }
 
@@ -3630,7 +3708,11 @@ mod tests {
         let expected = keys(&shapes[0]);
         assert_eq!(expected.len(), 9, "the shape changed: {expected:?}");
         for shape in &shapes[1..] {
-            assert_eq!(keys(shape), expected, "a decision answered with different keys");
+            assert_eq!(
+                keys(shape),
+                expected,
+                "a decision answered with different keys"
+            );
         }
 
         // And a finding keeps its shape across the two sources, which know
@@ -3654,6 +3736,85 @@ mod tests {
         );
     }
 
+    /// A caller gets an answer about the package they named, spelled the way
+    /// they named it.
+    ///
+    /// Found in production: `pkg:pypi/info.gianlucacosta.eos.core@2.0.2` came
+    /// back answered about `pkg:pypi/info-gianlucacosta-eos-core@2.0.2`. Both
+    /// name the same project — PEP 503 folds `.` and `_` to `-` — but a caller
+    /// cannot know that without implementing PEP 503, and a lookup that names
+    /// fifty packages is matched to its request by this field. Rewriting it
+    /// breaks that correlation silently, and only for names with a `.` or `_`
+    /// in them.
+    #[test]
+    fn a_decision_is_spelled_the_way_the_caller_asked() {
+        use super::V1Decision;
+        use crate::lookup::Verdict;
+
+        let asked = "pkg:pypi/info.gianlucacosta.eos.core@2.0.2";
+        let normalized = "pkg:pypi/info-gianlucacosta-eos-core@2.0.2";
+        assert_eq!(
+            super::normalize_pkg_purl(asked).as_deref(),
+            Ok(normalized),
+            "the premise: these two spellings are one package",
+        );
+
+        // PEP 503 lowercases as well as folding separators, and that half was
+        // sighted separately in production: `pkg:pypi/ImportanceScore@1.2` came
+        // back answered about `pkg:pypi/importancescore@1.2`. Same cause, and a
+        // caller whose package name has no `.` or `_` in it at all.
+        let mixed = "pkg:pypi/ImportanceScore@1.2";
+        assert_eq!(
+            super::normalize_pkg_purl(mixed).as_deref(),
+            Ok("pkg:pypi/importancescore@1.2"),
+            "the premise: case folds too",
+        );
+        let cased = V1Decision::unknown(None, Some("pkg:pypi/importancescore@1.2"))
+            .asked_about(Some(mixed));
+        assert_eq!(
+            serde_json::to_value(&cased).expect("serializes")["purl"],
+            mixed,
+            "the caller's capitalization was rewritten",
+        );
+
+        let stored = Verdict {
+            sha256: "a".repeat(64),
+            lvl: Some(-1),
+            eng: "2.8.0".into(),
+            at: "2026-08-01T00:00:00Z".into(),
+            // What the index holds, which is always the normalized key.
+            purl: Some(normalized.to_string()),
+            why: None,
+            hits: Vec::new(),
+        };
+
+        // Every kind of decision, since a caller correlating a list of fifty
+        // gets whichever kind we happen to have.
+        let decisions = [
+            V1Decision::stored(&stored, Some(normalized), 25).asked_about(Some(asked)),
+            V1Decision::unknown(None, Some(normalized)).asked_about(Some(asked)),
+            V1Decision::unavailable(None, Some(normalized)).asked_about(Some(asked)),
+        ];
+        for d in &decisions {
+            let v = serde_json::to_value(d).expect("serializes");
+            assert_eq!(
+                v["purl"], asked,
+                "answered about a different spelling than was asked about",
+            );
+        }
+
+        // The digest still names the artifact, and is what proves two
+        // spellings are one thing.
+        let v = serde_json::to_value(&decisions[0]).expect("serializes");
+        assert_eq!(v["sha256"], "a".repeat(64));
+
+        // A lookup by digest alone has no spelling to echo, so the stored one
+        // stands rather than becoming null.
+        let by_sha = V1Decision::stored(&stored, None, 25).asked_about(None);
+        let v = serde_json::to_value(&by_sha).expect("serializes");
+        assert_eq!(v["purl"], normalized);
+    }
+
     /// Findings are evidence for the decision, not a dump of everything the
     /// scanner noticed. A benign crate matched ten "Rust test marker" traits at
     /// `crit: 3`; answering an `allow` with all ten invites a caller to read
@@ -3674,9 +3835,8 @@ mod tests {
             off: None,
             line: None,
         };
-        let ids = |d: &V1Decision| -> Vec<String> {
-            d.findings.iter().map(|f| f.id.clone()).collect()
-        };
+        let ids =
+            |d: &V1Decision| -> Vec<String> { d.findings.iter().map(|f| f.id.clone()).collect() };
 
         let benign = Verdict {
             sha256: "a".repeat(64),
@@ -3685,7 +3845,9 @@ mod tests {
             at: "2026-08-01T00:00:00Z".into(),
             purl: Some("pkg:cargo/tokio@1.40.0".into()),
             why: None,
-            hits: (0..10).map(|i| hit(&format!("testing/harness::{i}"), 3)).collect(),
+            hits: (0..10)
+                .map(|i| hit(&format!("testing/harness::{i}"), 3))
+                .collect(),
         };
         let d = V1Decision::stored(&benign, None, 25);
         assert_eq!(d.decision, super::decision::Decision::Allow);

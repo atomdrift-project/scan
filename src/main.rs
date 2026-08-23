@@ -573,6 +573,24 @@ fn default_cli_fetch_policy() -> scan::fetch::FetchPolicy {
     }
 }
 
+/// Publish the known-good/known-bad filters process-wide, so
+/// [`scan::fetch::age_gate`] can skip a dependency whose coordinate is already
+/// vouched. This is deliberately separate from `ScanConfig::with_bloom`, which
+/// additionally lets the bloom short-circuit the *scan target* itself: every
+/// mode wants the dependency skip, but only a bulk walk wants its own input
+/// answered from a bless.
+///
+/// `--mode slow` means "consult no filters", so it publishes nothing. Note this
+/// reads the operator's `cli.mode` rather than the effective mode: `serve` and
+/// `worker` force themselves slow so a submitted job is always analyzed on its
+/// own merits, and that internal choice must not also switch off their
+/// dependency skip — only an explicit `--mode slow` does.
+fn publish_bloom_filters(mode: scan::Mode) {
+    if mode != scan::Mode::Slow {
+        scan::bloom_repo::set_global(std::sync::Arc::new(scan::bloom_repo::Lookup::load()));
+    }
+}
+
 fn cli_host_platform_only(cli: &Cli, scans_for_other_hosts: bool) -> bool {
     cli.fetch_host_platform_only || (!cli.fetch_all_platforms && !scans_for_other_hosts)
 }
@@ -1444,8 +1462,10 @@ fn main() -> Result<()> {
             registry_map,
         } => {
             let mut config = new_scan_config(hopper)?;
-            // Per-file SHA-256 known-good/known-bad short-circuit (explicit file
-            // args only; directories are walked by cleave). Slow mode / workers skip it.
+            // Per-file SHA-256 known-good/known-bad short-circuit, for the files
+            // found by walking a directory the operator named. A path named
+            // directly on the command line is always analyzed — see
+            // `engine::named_target_opts`. Slow mode / workers skip it entirely.
             if effective_mode != scan::Mode::Slow {
                 config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
             }
@@ -1479,15 +1499,20 @@ fn main() -> Result<()> {
             }
             exit_for_summary(&scan::ps::run(&config)?);
         }
+        // `url` and `purl` name one artifact, so neither gets `with_bloom`: the
+        // thing the operator asked about is always fetched and scanned, never
+        // answered from a bless. The filters are still published process-wide,
+        // which is what `fetch::age_gate` reads to skip the *dependencies* the
+        // scan discovers — the bulk case a bloom is actually for. `--mode slow`
+        // opts out of consulting them at all.
         Commands::Url { url, hopper } => {
             let config = new_scan_config(hopper)?;
+            publish_bloom_filters(cli.mode);
             exit_for_summary(&scan::pkg::run_url(&url, &config)?);
         }
         Commands::Purl { purl, hopper } => {
-            let mut config = new_scan_config(hopper)?;
-            if effective_mode != scan::Mode::Slow {
-                config = config.with_bloom(effective_mode, scan::bloom_repo::Lookup::load());
-            }
+            let config = new_scan_config(hopper)?;
+            publish_bloom_filters(cli.mode);
             exit_for_summary(&scan::pkg::run_pkg(&purl, &config)?);
         }
         Commands::Serve {
@@ -1601,7 +1626,7 @@ fn main() -> Result<()> {
             // Serve never bloom-skips an /analyze job (Mode::Slow), but the
             // membership endpoint and the --fetch dependency gate read the
             // process-wide handle. Missing files fail closed (no skip).
-            scan::bloom_repo::set_global(std::sync::Arc::new(scan::bloom_repo::Lookup::load()));
+            publish_bloom_filters(cli.mode);
             eprintln!("Starting Atomdrift Scan server on http://{bind} ...");
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1688,7 +1713,7 @@ fn main() -> Result<()> {
             // artifact fetch+scan, keeping only the registry-metadata node.
             // Publishing the filters here enables that skip without touching
             // the job-level always-scan guarantee.
-            scan::bloom_repo::set_global(std::sync::Arc::new(scan::bloom_repo::Lookup::load()));
+            publish_bloom_filters(cli.mode);
             // Accept the comma list `serve --hopper` takes, so one deploy
             // variable can feed both, but keep only the primary: a replica
             // refuses worker routes with a 403 whether or not its relay is on,

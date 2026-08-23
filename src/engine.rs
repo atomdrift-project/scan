@@ -689,6 +689,33 @@ mod envelope_tests {
         ));
     }
 
+    /// A target the operator named is never handed to cleave with a skip
+    /// predicate: the bless is a bulk shortcut for directory walks and fetched
+    /// dependencies, and answering "scan this file" from one returns a lookup
+    /// where an analysis was asked for. The directory-walk options keep theirs.
+    #[test]
+    fn named_target_opts_drop_the_skip_predicate_and_keep_everything_else() {
+        let walk = cleave::AnalysisOptions {
+            slow_rule_ms: 1234,
+            skip_predicate: Some(cleave::SkipPredicate(Arc::new(|_, _| true))),
+            ..Default::default()
+        };
+        assert!(
+            walk.skip_predicate.is_some(),
+            "a directory walk keeps the known-good shortcut"
+        );
+
+        let named = named_target_opts(&walk);
+        assert!(
+            named.skip_predicate.is_none(),
+            "a named target must be analyzed on its own merits"
+        );
+        // Only the predicate moves; everything else the caller configured has to
+        // survive, or a named file would be analyzed under different settings
+        // than the same file found by walking its parent directory.
+        assert_eq!(named.slow_rule_ms, walk.slow_rule_ms);
+    }
+
     /// A fetched package carries its locator to the uploader; a fetched URL and
     /// a local path carry none, because neither names a package. The verdict's
     /// identity and the sidecar's package slot read the same rule.
@@ -1994,6 +2021,21 @@ pub(crate) fn bloom_gate_fresh(
     bloom_gate(config, &path.display().to_string(), decision)
 }
 
+/// The analysis options for a target the operator named by path, which is the
+/// shared options with the bloom skip predicate removed.
+///
+/// A named target is always analyzed on its own merits, so cleave must not
+/// short-circuit it into a minimal report. The gate in [`record_file_result`]
+/// makes the same call for the same reason; both are needed, because they act at
+/// different points — the predicate decides whether analysis runs at all, the
+/// gate decides whether the result is counted without an ML pass.
+fn named_target_opts(opts: &cleave::AnalysisOptions) -> cleave::AnalysisOptions {
+    cleave::AnalysisOptions {
+        skip_predicate: None,
+        ..opts.clone()
+    }
+}
+
 /// Build the cleave skip predicate from the active bloom filters: a file whose
 /// sha256 is known-good (or, in fast mode, simply unknown) is skipped before
 /// analysis. Known-bad and conflicted return `false` so they are still analyzed;
@@ -2136,7 +2178,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             );
             Spinner::start(label)
         });
-        let cleave_result = cleave::analyze_file(path, &cleave_opts)
+        let cleave_result = cleave::analyze_file(path, &named_target_opts(&cleave_opts))
             .with_context(|| format!("cleave analysis of {}", path.display()));
         drop(spinner);
         record_file_result(
@@ -2153,6 +2195,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             None,
             None,
             None,
+            true,
         );
         let summary = tally.summary(scan_start);
         if is_terminal {
@@ -2199,6 +2242,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                 None,
                 None,
                 None,
+                false,
             );
         }
     })?;
@@ -2280,6 +2324,9 @@ pub fn run_bytes(
         uploader.as_ref(),
         root_registry,
         root_fetch,
+        // The url/purl the operator named — the fetched artifact itself, not a
+        // dependency of it.
+        true,
     );
     drop(uploader);
 
@@ -2333,8 +2380,16 @@ impl Tally {
 
 /// Freshness window for the local known-good re-scan: a known-good file created,
 /// changed, or modified this recently is scanned on its own merits rather than
-/// skipped. Mirrors the dependency freshness window in [`crate::fetch`].
-const KNOWN_GOOD_RESCAN_SECS: u64 = crate::fetch::FRESH_WINDOW_SECS;
+/// skipped.
+///
+/// Deliberately its own value rather than the dependency window in
+/// [`crate::fetch`]. The two answer different questions: that one asks how long
+/// a *registry release* stays too new to trust a vouch for, and is sized in
+/// hours because a published version is immutable; this one asks how recently a
+/// *local file* was written, and is the guard against a bloom false-positive
+/// shielding something a live intrusion just planted. Shrinking it to match the
+/// dependency window would narrow that guard for no reason connected to it.
+const KNOWN_GOOD_RESCAN_SECS: u64 = 48 * 3_600;
 
 /// Whether the file at `path` was created (btime), status-changed (ctime), or
 /// modified (mtime) within the last `window` seconds. A known-good file this
@@ -2387,12 +2442,16 @@ fn record_file_result(
     uploader: Option<&crate::upload::Uploader>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     root_fetch: Option<&fletch::fetch::FetchRecord>,
+    named: bool,
 ) {
     // Bloom verdict, re-derived from the root sha cleave computed. A file cleave
     // skipped at our request (a stale known-good, or fast-mode unknown) arrives as
     // a minimal report and is short-circuited here; a known-bad/conflicted file —
     // or a fresh known-good scanned on its own merits — was analyzed and carries a
     // provenance marker on its SHA-256 line, derived from the same decision.
+    //
+    // `named` marks a target the operator asked for by path, which is never
+    // answered from a bless — see the `scan_anyway` comment below.
     let mut bloom_mark = None;
     // Resolve the bloom decision from the sha cleave computed.
     let decision = if let Some(lookup) = config.bloom()
@@ -2404,14 +2463,22 @@ fn record_file_result(
         None
     };
     if let Some(decision) = decision {
-        // A known-good file created/changed/modified within the last 48h is scanned
-        // on its own merits: the skip predicate declined to skip it, so cleave has
-        // already produced a full report — fall through to the normal scan and mark
-        // it ✓ known-good. A stale known-good (and, in fast mode, an unknown)
+        // Two known-good files are still scanned on their own merits, and in both
+        // cases the skip predicate already declined to skip, so cleave has
+        // produced a full report — fall through to the normal scan and mark it
+        // ✓ known-good. A stale known-good (and, in fast mode, an unknown)
         // arrived as a minimal report and is counted here without an ML pass.
-        let fresh_known_good = decision == BloomDecision::Skip
-            && file_touched_within(file_path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now());
-        if !fresh_known_good
+        //
+        //   - a file created/changed/modified within KNOWN_GOOD_RESCAN_SECS, and
+        //   - a file the operator named on the command line.
+        //
+        // The second is a policy, not an optimization: a bless is a bulk
+        // shortcut for dependencies and directory walks, and returning one where
+        // a scan was asked for answers a different question than the one put to
+        // us. The mark is still emitted, so a named known-bad still says so.
+        let scan_anyway = decision == BloomDecision::Skip
+            && (named || file_touched_within(file_path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now()));
+        if !scan_anyway
             && let Some(summary) = bloom_gate(config, &file_path.display().to_string(), decision)
         {
             if summary.benign > 0 {
@@ -3214,7 +3281,7 @@ pub fn run_paths(
         .map(|url| crate::upload::Uploader::new(url, crate::upload::default_worker_name()));
 
     {
-        let record = |file_path: &Path, result: Result<cleave::AnalysisReport>| {
+        let record = |file_path: &Path, result: Result<cleave::AnalysisReport>, named: bool| {
             // Per-file provenance: match this artifact's content sha to its registry
             // record in the map. A file with no entry simply scans without it.
             let root_registry =
@@ -3233,6 +3300,7 @@ pub fn run_paths(
                 uploader.as_ref(),
                 root_registry,
                 None,
+                named,
             );
         };
 
@@ -3249,15 +3317,20 @@ pub fn run_paths(
                 |n| n.to_string_lossy().into_owned(),
             );
             let spinner = Spinner::start(label);
-            let result = cleave::analyze_file(path, &cleave_opts)
+            let result = cleave::analyze_file(path, &named_target_opts(&cleave_opts))
                 .with_context(|| format!("cleave analysis of {}", path.display()));
             drop(spinner);
-            record(path, result);
+            record(path, result, true);
         } else {
+            // The two batches differ in exactly one way: a file the operator
+            // named is analyzed unconditionally, while a file found by walking a
+            // directory they named is eligible for the known-good shortcut. That
+            // is the whole point of the partition above — the bloom is a bulk
+            // optimization, and a named path is not bulk.
             if !files.is_empty() {
-                cleave::scan_files(&files, &cleave_opts, |event| {
+                cleave::scan_files(&files, &named_target_opts(&cleave_opts), |event| {
                     if let cleave::ScanEvent::File { path, result } = event {
-                        record(&path, *result);
+                        record(&path, *result, true);
                     }
                 })?;
             }
@@ -3265,7 +3338,7 @@ pub fn run_paths(
             if !dir_files.is_empty() {
                 cleave::scan_paths(dir_files, &cleave_opts, |event| {
                     if let cleave::ScanEvent::File { path, result } = event {
-                        record(&path, *result);
+                        record(&path, *result, false);
                     }
                 })?;
             }

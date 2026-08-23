@@ -734,7 +734,17 @@ fn reconcile_artifacts(
         }
         let bytes = match &art.bytes {
             ArtifactBytes::File(path) => std::fs::read(path).ok(),
-            ArtifactBytes::Cached { locator } => cache.and_then(|c| c.load(locator)),
+            // The blob cache is size-capped and swept on a timer, so a
+            // dependency's bytes can be evicted between the fetch that cached
+            // them and this upload — a window that is a whole archive analysis
+            // wide. Losing that race is how a dependency lands in hopper as a
+            // row with a verdict and no bytes: analyzed, uncontained, and
+            // therefore claimable, but with nothing any worker can be served.
+            // Re-fetch rather than give up; the artifact is content-addressed,
+            // so recovering it is always possible while the registry serves it.
+            ArtifactBytes::Cached { locator } => cache
+                .and_then(|c| c.load(locator))
+                .or_else(|| refetch_artifact(locator, &art.sha256)),
         };
         let Some(bytes) = bytes else {
             tracing::warn!(sha256 = %art.sha256, file = %art.filename, "upload: artifact bytes unavailable; skipping");
@@ -957,6 +967,60 @@ fn dep_artifact(dep: &crate::engine::DepResult, collector: &str, now: &str) -> U
         },
         backfill: true,
     }
+}
+
+/// Re-fetch a dependency's bytes after the blob cache lost them, returning them
+/// only if they still hash to the digest the verdict was computed over.
+///
+/// The digest check is not a formality. A locator is not always a pin: a
+/// versionless PURL re-resolves to whatever the registry's `latest` is *now*,
+/// and a tag can be moved. Uploading whatever comes back under the recorded
+/// sha256 would file one artifact's bytes under another's identity — worse than
+/// the missing bytes this is recovering from — so a mismatch is dropped loudly
+/// and the artifact stays absent.
+fn refetch_artifact(locator: &str, sha256: &str) -> Option<Vec<u8>> {
+    let target = if locator.starts_with("pkg:") {
+        fletch::RefLocator::Purl(locator.to_string())
+    } else {
+        fletch::RefLocator::Url(locator.to_string())
+    };
+    let (bytes, _, _) = match crate::fetch::fetch_one(target, false) {
+        Ok(fetched) => fetched,
+        Err(e) => {
+            tracing::warn!(
+                %locator, %sha256, error = %error_chain(&*e),
+                "upload: dependency bytes gone from the cache and could not be re-fetched"
+            );
+            return None;
+        }
+    };
+    if !bytes_match_digest(&bytes, sha256, locator) {
+        return None;
+    }
+    tracing::info!(
+        %locator, %sha256, bytes = bytes.len(),
+        "upload: dependency bytes evicted from the cache; re-fetched for upload"
+    );
+    Some(bytes)
+}
+
+/// Whether `bytes` are the ones `sha256` names — the guard that keeps a
+/// re-fetch from filing one artifact's content under another's identity.
+///
+/// Split out from [`refetch_artifact`] so the rule can be tested without a
+/// network: it is the one step there that must never be relaxed, and a caller
+/// that ever treats a mismatch as acceptable would corrupt the corpus silently.
+fn bytes_match_digest(bytes: &[u8], sha256: &str, locator: &str) -> bool {
+    use sha2::{Digest as _, Sha256};
+    let got = format!("{:x}", Sha256::digest(bytes));
+    if got != sha256 {
+        tracing::warn!(
+            %locator, expected = %sha256, got = %got,
+            "upload: re-fetched dependency does not match the analyzed bytes; not uploading"
+        );
+        return false;
+    }
+    true
 }
 
 /// What `/api/known` reported for one probe batch.
@@ -1368,14 +1432,20 @@ mod tests {
             Some("https://rw"),
         );
         // The ordinary single-address case is unchanged.
-        assert_eq!(worker_endpoint("https://rw/").as_deref(), Some("https://rw"));
+        assert_eq!(
+            worker_endpoint("https://rw/").as_deref(),
+            Some("https://rw")
+        );
         // Nowhere to file results is a valid deploy, not an address.
         assert_eq!(worker_endpoint(""), None);
         assert_eq!(worker_endpoint(" , , "), None);
         // Whatever a worker polls, it is one address — never a list.
         for raw in ["https://ro,https://rw", "https://rw", " a , b , c "] {
             let picked = worker_endpoint(raw).expect("an address");
-            assert!(!picked.contains(','), "a worker was handed a list: {picked}");
+            assert!(
+                !picked.contains(','),
+                "a worker was handed a list: {picked}"
+            );
         }
     }
 
@@ -1645,7 +1715,10 @@ mod tests {
             None,
         );
         server.join().expect("server thread");
-        assert!(sets.known.contains("aa"), "the primary's answer was discarded");
+        assert!(
+            sets.known.contains("aa"),
+            "the primary's answer was discarded"
+        );
         assert!(sets.current.contains("bb"));
     }
 
@@ -1701,6 +1774,36 @@ mod tests {
     /// hopper already holds the bytes. The test uses an unsupported PURL to prove
     /// artifact construction does not perform a registry lookup.
     ///
+    /// A re-fetch recovers bytes the blob cache evicted, but a locator is not
+    /// always a pin — a versionless PURL re-resolves to today's `latest`, and a
+    /// tag can move. Only bytes that still hash to the analyzed digest may be
+    /// uploaded under it; anything else would file one artifact's content under
+    /// another's identity, which is worse than the absence being repaired.
+    #[test]
+    fn only_bytes_matching_the_analyzed_digest_are_uploaded() {
+        let bytes = b"the exact bytes the verdict was computed over";
+        let sha = {
+            use sha2::{Digest as _, Sha256};
+            format!("{:x}", Sha256::digest(bytes))
+        };
+        assert!(
+            bytes_match_digest(bytes, &sha, "pkg:npm/x@1"),
+            "the analyzed bytes must be accepted"
+        );
+        assert!(
+            !bytes_match_digest(b"different bytes at the same locator", &sha, "pkg:npm/x@1"),
+            "a moved tag or re-resolved range must not be filed under the old digest"
+        );
+        assert!(
+            !bytes_match_digest(bytes, &"0".repeat(64), "pkg:npm/x@1"),
+            "an unrelated digest must not accept these bytes"
+        );
+        // Empty content hashes to a real, well-known digest rather than to
+        // nothing, so a truncated or zero-length re-fetch is a mismatch and not
+        // an accidental pass.
+        assert!(!bytes_match_digest(b"", &sha, "pkg:npm/x@1"));
+    }
+
     /// Built here from an *unevaluated* dependency: the artifact is independent
     /// of the verdict, so bytes and provenance reach hopper even when scan has
     /// no verdict to post for them.

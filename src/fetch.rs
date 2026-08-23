@@ -1886,10 +1886,22 @@ enum SkipReason {
 }
 
 /// Whether a dependency version has been withdrawn from its registry — an npm
-/// unpublish/yank (`version_removed`), a pypi/crates yank (recorded as a
+/// unpublish (`version_removed`), a pypi/crates yank (recorded as a
 /// `deprecated` reason, which never sets `version_removed`), or an npm security
 /// takedown (`security_hold`). A withdrawn version's known-good vouch is suspect
 /// — it is often *removed because* it was found malicious — so it is re-scanned.
+///
+/// Withdrawn is not the same as unfetchable, which is what makes re-scanning
+/// worth doing. Only an npm unpublish actually removes the bytes; a yank on
+/// crates.io or PyPI leaves the artifact downloadable forever (it only stops
+/// *new* resolution, so pinned builds keep working), and npm's security hold
+/// replaces the release with a placeholder that is served like any other. Those
+/// are the cases worth a second look, and their bytes are still there to look at.
+///
+/// The `version_removed` arm is consequently unreachable from [`age_gate`],
+/// which tests it first and settles those as [`SkipReason::Removed`] before
+/// consulting [`must_rescan`] at all. It is kept because this predicate is about
+/// withdrawal, not about that one caller's ordering.
 fn dep_pulled(reg: &Registry) -> bool {
     reg.version_removed == Some(true)
         || reg.security_hold == Some(true)
@@ -1900,22 +1912,27 @@ fn dep_pulled(reg: &Registry) -> bool {
 }
 
 /// Number of seconds in the freshness window: a version published this recently
-/// is re-scanned rather than trusted on a known-good vouch. Mirrors the local
-/// file recency window in [`crate::engine`].
-pub(crate) const FRESH_WINDOW_SECS: u64 = 48 * 3_600;
+/// is re-scanned rather than trusted on a known-good vouch.
+///
+/// A published registry version is immutable — npm, crates.io and PyPI all
+/// refuse to re-publish `name@version` with different bytes — so a vouch for a
+/// pinned coordinate cannot go stale the way a mutable one can, and age is
+/// otherwise no reason to distrust it. What this window buys is narrower: cover
+/// for the hours right after a release, where a compromise is freshest and
+/// least-vetted, and insurance against the bloom itself being wrong about a
+/// brand-new package. Hours, not days, is the right size for that.
+pub(crate) const FRESH_WINDOW_SECS: u64 = 4 * 3_600;
 
-/// Whether this version was published within the last 48h. A known-good bloom
-/// vouch is built ahead of time; for a freshly minted release the vouch may
-/// predate the bytes now being served, so re-scan rather than trust it.
-fn fresh_48h(reg: &Registry, now: u64) -> bool {
+/// Whether this version was published inside [`FRESH_WINDOW_SECS`].
+fn freshly_published(reg: &Registry, now: u64) -> bool {
     reg.age_secs(now)
         .is_some_and(|age| age <= FRESH_WINDOW_SECS)
 }
 
 /// A known-good dependency is normally skipped; re-scan it anyway when its trust
-/// may be stale — the version was pulled/yanked, or published in the last 48h.
+/// may be stale — the version was pulled/yanked, or published very recently.
 pub(crate) fn must_rescan(reg: &Registry, now: u64) -> bool {
-    dep_pulled(reg) || fresh_48h(reg, now)
+    dep_pulled(reg) || freshly_published(reg, now)
 }
 
 /// The publish timestamp a Go pseudo-version carries in its own version string,
@@ -3493,13 +3510,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_48h_and_must_rescan_track_publish_age() {
+    fn freshly_published_and_must_rescan_track_publish_age() {
         let now = 1_000_000_u64;
         let fresh = Registry {
             published_at: Some(now - 3_600), // 1h ago
             ..Registry::default()
         };
-        // 30h ago: inside the 48h window, but would be outside a 24h one.
+        // 30h ago: outside the 4h window, and the case that separates it from
+        // the local-file window in `engine`, which is still measured in days.
         let day_and_a_half = Registry {
             published_at: Some(now - 30 * 3_600),
             ..Registry::default()
@@ -3508,13 +3526,32 @@ mod tests {
             published_at: Some(now - 300_000), // ~3.5d ago
             ..Registry::default()
         };
-        assert!(fresh_48h(&fresh, now));
-        assert!(fresh_48h(&day_and_a_half, now));
-        assert!(!fresh_48h(&stale, now));
-        // A stale, unwithdrawn version needs no re-scan; a fresh one does, and a
-        // withdrawn one always does regardless of age.
+        assert!(freshly_published(&fresh, now));
+        assert!(!freshly_published(&day_and_a_half, now));
+        assert!(!freshly_published(&stale, now));
+        // A settled, unwithdrawn version needs no re-scan; a just-published one
+        // does, and a withdrawn one always does regardless of age.
         assert!(!must_rescan(&stale, now));
+        assert!(!must_rescan(&day_and_a_half, now));
         assert!(must_rescan(&fresh, now));
+        // A yank leaves the artifact downloadable, so re-scanning it is not a
+        // doomed fetch — this is the arm that earns `dep_pulled` its keep.
+        assert!(must_rescan(
+            &Registry {
+                published_at: Some(now - 300_000),
+                deprecated: Some("yanked".to_string()),
+                ..Registry::default()
+            },
+            now
+        ));
+        assert!(must_rescan(
+            &Registry {
+                published_at: Some(now - 300_000),
+                security_hold: Some(true),
+                ..Registry::default()
+            },
+            now
+        ));
         assert!(must_rescan(
             &Registry {
                 published_at: Some(now - 300_000),
