@@ -275,7 +275,10 @@ mod tests {
         let l = Latency::default();
         let s = l.summary();
         assert_eq!(s.samples, 0);
-        assert_eq!(s.mean_micros, None, "no data must be distinguishable from 0ms");
+        assert_eq!(
+            s.mean_micros, None,
+            "no data must be distinguishable from 0ms"
+        );
         assert_eq!(s.p80_micros, None);
     }
 
@@ -315,7 +318,10 @@ mod tests {
         let p80 = s.p80_micros.expect("p80");
         // The mean sits at ~2 minutes: slower than every small job and faster
         // than every large one, describing neither.
-        assert!(mean > 100_000 * MS, "mean {mean} should be dragged up by the tail");
+        assert!(
+            mean > 100_000 * MS,
+            "mean {mean} should be dragged up by the tail"
+        );
         assert!(
             p80 < mean,
             "p80 {p80} must sit below a tail-dragged mean {mean}",
@@ -351,7 +357,10 @@ mod tests {
             l.record_at(3_300_000 * MS, base); // 55 min, the real outage figure
         }
         let during = l.summary_at(base).p80_micros.expect("p80");
-        assert!(during > 1_000_000 * MS, "test setup failed to poison the window");
+        assert!(
+            during > 1_000_000 * MS,
+            "test setup failed to poison the window"
+        );
 
         // An hour later, with no traffic at all, it must report nothing rather
         // than the incident.
@@ -396,7 +405,10 @@ mod tests {
         // Now past the point where only the burst remains.
         let late = at(base, WINDOW.as_secs() + SLOT.as_secs());
         let s = l.summary_at(late);
-        assert_eq!(s.samples, 99, "the old sample should have retired, the burst should not");
+        assert_eq!(
+            s.samples, 99,
+            "the old sample should have retired, the burst should not"
+        );
     }
 
     #[test]
@@ -412,7 +424,11 @@ mod tests {
         // And the window must still be usable afterwards.
         let now = at(base, 60 * 60 * 24 * 3);
         l.record_at(7_000 * MS, now);
-        assert_eq!(l.summary_at(now).samples, 1, "window unusable after a long idle");
+        assert_eq!(
+            l.summary_at(now).samples,
+            1,
+            "window unusable after a long idle"
+        );
     }
 
     #[test]
@@ -479,7 +495,10 @@ mod tests {
         l.record_at(u64::MAX / 2, base);
         let s = l.summary_at(base);
         assert_eq!(s.samples, 1);
-        assert!(s.p80_micros.is_some(), "an absurd duration must still summarise");
+        assert!(
+            s.p80_micros.is_some(),
+            "an absurd duration must still summarise"
+        );
     }
     // The central claim, and the one every other test here assumes rather than
     // checks: that p80 is actually the 80th percentile. Straddling the boundary
@@ -497,7 +516,10 @@ mod tests {
             below.record_at(if i < 79 { fast } else { slow }, base);
         }
         let p = below.summary_at(base).p80_micros.expect("p80");
-        assert!(p > 100_000 * MS, "p80 {p} should have crossed into the slow group");
+        assert!(
+            p > 100_000 * MS,
+            "p80 {p} should have crossed into the slow group"
+        );
 
         // 81 fast, 19 slow: rank 80 is still a fast sample.
         let above = Latency::default();
@@ -505,7 +527,10 @@ mod tests {
             above.record_at(if i < 81 { fast } else { slow }, base);
         }
         let p = above.summary_at(base).p80_micros.expect("p80");
-        assert!(p < 8_000 * MS, "p80 {p} should have stayed in the fast group");
+        assert!(
+            p < 8_000 * MS,
+            "p80 {p} should have stayed in the fast group"
+        );
     }
 
     // Concurrent writers are the reason this holds a lock at all.
@@ -595,12 +620,19 @@ mod tests {
         for key in ["samples", "p80_ms", "mean_ms"] {
             assert!(json.get(key).is_some(), "published shape lost `{key}`");
         }
-        assert!(!json["p80_ms"].is_null(), "p80_ms must carry a number when sampled");
+        assert!(
+            !json["p80_ms"].is_null(),
+            "p80_ms must carry a number when sampled"
+        );
     }
 
     #[test]
     fn absurd_and_degenerate_durations_convert_safely() {
-        assert_eq!(micros_from_ms(f64::NAN), u64::MAX, "NaN must not read as instant");
+        assert_eq!(
+            micros_from_ms(f64::NAN),
+            u64::MAX,
+            "NaN must not read as instant"
+        );
         assert_eq!(micros_from_ms(f64::INFINITY), u64::MAX);
         assert_eq!(micros_from_ms(-5.0), 0);
         assert_eq!(micros_from_ms(0.0), 0);

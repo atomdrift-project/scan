@@ -80,7 +80,10 @@ async fn unknown_sha_is_a_404_carrying_the_bloom_decision() -> Result<()> {
     let (status, body, cache) = get(&format!("/lookup?sha256={sha}")).await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"], "unknown sample");
-    assert_eq!(body["bloom"], "unknown", "no filters installed fails closed");
+    assert_eq!(
+        body["bloom"], "unknown",
+        "no filters installed fails closed"
+    );
     assert_eq!(
         cache.as_deref(),
         Some("no-store"),
@@ -137,11 +140,19 @@ async fn malformed_keys_are_rejected() -> Result<()> {
 
     // A malformed member of the pair is still malformed.
     let (status, body, _) = get("/lookup?sha256=nope&purl=pkg:npm/x@1").await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "bad digest alongside a good purl");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "bad digest alongside a good purl"
+    );
     assert_eq!(body["error"], "invalid sha256");
 
     let (status, body, _) = get(&format!("/lookup?sha256={sha}&purl=not%20a%20purl")).await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "bad purl alongside a good digest");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "bad purl alongside a good digest"
+    );
     assert_eq!(body["error"], "not a package URL");
 
     let (status, body, _) = get("/lookup?purl=%20").await?;

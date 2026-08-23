@@ -21,8 +21,8 @@ mod acl;
 mod corpus;
 mod decision;
 mod flight;
-mod latency;
 mod handlers;
+mod latency;
 
 pub use acl::{Cidr, TokenDigest, parse_cidr_list};
 pub(crate) use handlers::classify_bytes;
@@ -75,10 +75,6 @@ pub struct ServerConfig {
     /// parent and members — is renewed on hopper's `/api/result`. `None` disables
     /// upload, leaving the server a pure analyze service.
     hopper: Option<String>,
-    /// hopper read replica (`--hopper-read`); lookups that miss this worker's
-    /// index defer here first and fall back to `hopper`. `None` reads from the
-    /// primary alone. Writes are unaffected: they always go to the primary.
-    hopper_read: Option<String>,
     /// Additional passwords to try for encrypted archives.
     zip_passwords: crate::ArchivePasswords,
     /// Analysis slots the idle worker may use. `0` disables it.
@@ -176,7 +172,6 @@ impl ServerConfig {
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
-            hopper_read: None,
             zip_passwords: crate::ArchivePasswords::default(),
             idle_worker_slots: 0,
         })
@@ -188,21 +183,6 @@ impl ServerConfig {
     pub fn with_hopper(mut self, hopper: Option<String>) -> Self {
         self.hopper = hopper.filter(|s| !s.trim().is_empty());
         self
-    }
-
-    /// Attach a hopper read replica (`--hopper-read`). Lookups that miss this
-    /// worker's index prefer it and fall back to `--hopper`; writes are
-    /// unaffected and always go to the primary.
-    #[must_use]
-    pub fn with_hopper_read(mut self, hopper_read: Option<String>) -> Self {
-        self.hopper_read = hopper_read.filter(|s| !s.trim().is_empty());
-        self
-    }
-
-    /// The configured read replica, or `None` when reads use the primary.
-    #[must_use]
-    pub fn hopper_read(&self) -> Option<&str> {
-        self.hopper_read.as_deref()
     }
 
     /// Add passwords to try when cleave encounters encrypted archives.
@@ -872,21 +852,17 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
             }
         },
         corpus: {
-            let corpus = corpus::Corpus::new(
-                config.hopper_read().map(str::to_string),
-                config.hopper().map(str::to_string),
-            );
-            match (&corpus, config.hopper_read()) {
-                (Some(_), Some(replica)) => {
-                    tracing::info!(replica, "lookups defer to the corpus, replica first");
-                }
-                (Some(_), None) => {
-                    tracing::info!("lookups defer to the corpus on the primary");
+            let corpus = corpus::Corpus::new(config.hopper());
+            match &corpus {
+                Some(c) => {
+                    tracing::info!(addresses = %c.addresses(), "lookups defer to the corpus")
                 }
                 // Not a warning: a worker with no corpus behind it answers from
                 // its own index, which is a whole deployment rather than a
                 // broken one.
-                (None, _) => tracing::info!("no hopper configured: lookups answer from the local index alone"),
+                None => tracing::info!(
+                    "no hopper configured: lookups answer from the local index alone"
+                ),
             }
             corpus
         },
@@ -1247,7 +1223,6 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
-
     tracing::info!("server shut down");
     Ok(())
 }
@@ -1364,7 +1339,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod size_bucket_tests {
-    use super::{SIZE_BUCKETS, SIZE_BUCKET_NAMES, size_bucket};
+    use super::{SIZE_BUCKET_NAMES, SIZE_BUCKETS, size_bucket};
 
     /// Every bucket has a label, or `/_/stats` would silently drop one.
     #[test]
@@ -1378,7 +1353,10 @@ mod size_bucket_tests {
     fn every_size_lands_in_a_bucket() {
         for size in [0, 1, 1 << 20, (1 << 20) + 1, 16 << 20, 128 << 20, u64::MAX] {
             let i = size_bucket(size);
-            assert!(i < SIZE_BUCKETS.len(), "size {size} fell outside the buckets");
+            assert!(
+                i < SIZE_BUCKETS.len(),
+                "size {size} fell outside the buckets"
+            );
         }
     }
 
@@ -1406,7 +1384,7 @@ mod size_bucket_tests {
 
 #[cfg(test)]
 mod purl_type_tests {
-    use super::{purl_type_bucket, PURL_TYPE_NAMES};
+    use super::{PURL_TYPE_NAMES, purl_type_bucket};
 
     #[test]
     fn known_types_get_their_own_bucket() {
@@ -1433,13 +1411,16 @@ mod purl_type_tests {
 
     #[test]
     fn a_golang_module_path_keeps_its_slashes_out_of_the_type() {
-        assert_eq!(purl_type_bucket("pkg:golang/github.com/spf13/cobra@v1.10.2"), 1);
+        assert_eq!(
+            purl_type_bucket("pkg:golang/github.com/spf13/cobra@v1.10.2"),
+            1
+        );
     }
 }
 
 #[cfg(test)]
 mod job_bucket_tests {
-    use super::{JobBucket, JOB_BUCKET_MEMORY};
+    use super::{JOB_BUCKET_MEMORY, JobBucket};
 
     fn mean(b: &JobBucket) -> u64 {
         let n = b.count.load(std::sync::atomic::Ordering::Relaxed);
@@ -1470,7 +1451,10 @@ mod job_bucket_tests {
             b.record(3_300_000_000); // 55 min, the real figure from the outage
         }
         let poisoned = mean(&b);
-        assert!(poisoned > 100_000_000, "test setup failed to poison the mean");
+        assert!(
+            poisoned > 100_000_000,
+            "test setup failed to poison the mean"
+        );
         for _ in 0..JOB_BUCKET_MEMORY * 6 {
             b.record(5_000_000);
         }
@@ -1496,15 +1480,24 @@ mod job_bucket_recent_tests {
         b.record(9_000_000); // 9s
         let v = b.recent_json();
         assert_eq!(v["samples"], 1);
-        assert!(v["p80_ms"].is_number(), "p80_ms missing or not a number: {v}");
-        assert!(v["mean_ms"].is_number(), "mean_ms missing or not a number: {v}");
+        assert!(
+            v["p80_ms"].is_number(),
+            "p80_ms missing or not a number: {v}"
+        );
+        assert!(
+            v["mean_ms"].is_number(),
+            "mean_ms missing or not a number: {v}"
+        );
     }
 
     #[test]
     fn recent_json_reports_an_untouched_bucket_as_empty_not_zero() {
         let v = JobBucket::default().recent_json();
         assert_eq!(v["samples"], 0);
-        assert!(v["p80_ms"].is_null(), "an unsampled class must not claim 0ms");
+        assert!(
+            v["p80_ms"].is_null(),
+            "an unsampled class must not claim 0ms"
+        );
     }
 
     // The cumulative and windowed views answer different questions and must

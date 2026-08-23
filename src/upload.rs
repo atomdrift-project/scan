@@ -14,10 +14,10 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::thread::JoinHandle;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -61,6 +61,50 @@ fn token_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| crate::interpret::tok_path("hopper"))
+}
+
+/// Split `--hopper` into the endpoints to try, in preference order.
+///
+/// One address is the ordinary case. Several — comma-separated, as `SCAN_URL`
+/// and `--allowed-dirs` already are — name the same hopper reached two ways:
+/// put the replica first and the primary behind it, and a replica outage costs
+/// a retry rather than a lost verdict. Reads and writes take the same list on
+/// purpose. Routing them separately is a topology this worker would have to
+/// know, and hopper's write relay exists precisely so it does not: a replica
+/// answers lookups locally and forwards the renewals.
+#[must_use]
+pub fn endpoints(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|url| url.trim().trim_end_matches('/').trim().to_string())
+        .filter(|url| !url.is_empty())
+        .collect()
+}
+
+/// One hopper route, at every address it can be reached.
+///
+/// Ordered as `--hopper` named them. A retry walks down the list rather than
+/// hammering one address, so the second attempt after a replica stops answering
+/// lands on the primary instead of on the same silence.
+#[derive(Debug, Clone)]
+pub(crate) struct Route(Vec<String>);
+
+impl Route {
+    fn new(bases: &[String], suffix: &str) -> Self {
+        Self(bases.iter().map(|base| format!("{base}{suffix}")).collect())
+    }
+
+    /// The address to use on this attempt, clamped to the last: a budget longer
+    /// than the list keeps retrying the final address rather than wrapping back
+    /// to one already known to be failing.
+    fn at(&self, attempt: usize) -> &str {
+        let last = self.0.len().saturating_sub(1);
+        self.0.get(attempt.min(last)).map_or("", String::as_str)
+    }
+
+    /// The preferred address, for a log line that names where work is going.
+    fn primary(&self) -> &str {
+        self.at(0)
+    }
 }
 
 /// Bearer token for hopper's API, or `None` when hopper is unauthenticated.
@@ -386,10 +430,14 @@ impl Uploader {
     #[must_use]
     pub fn new(hopper_url: &str, worker: String) -> Self {
         log_hopper_credential();
-        let base = hopper_url.trim_end_matches('/');
-        let result_url = format!("{base}/api/result");
-        let known_url = format!("{base}/api/known");
-        let upload_url = format!("{base}/api/upload");
+        // One entry per address `--hopper` named, in preference order. A retry
+        // walks down the list, so a replica that stops answering costs the
+        // first attempt and the primary takes the rest — the verdict lands
+        // either way, which is the whole point of retrying at all.
+        let bases = endpoints(hopper_url);
+        let result_url = Route::new(&bases, "/api/result");
+        let known_url = Route::new(&bases, "/api/known");
+        let upload_url = Route::new(&bases, "/api/upload");
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -629,8 +677,8 @@ pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
 /// license to skip posting those verdicts. `None` returns an empty set.
 fn reconcile_artifacts(
     client: &reqwest::blocking::Client,
-    known_url: &str,
-    upload_url: &str,
+    known_url: &Route,
+    upload_url: &Route,
     cache: Option<&fletch::fetch::BlobCache>,
     seen: &mut HashSet<String>,
     artifacts: Vec<UploadArtifact>,
@@ -696,10 +744,10 @@ pub fn sync_result_dependencies(
     if deps.is_empty() {
         return;
     }
-    let base = base_url.trim_end_matches('/');
-    let result_url = format!("{base}/api/result");
-    let known_url = format!("{base}/api/known");
-    let upload_url = format!("{base}/api/upload");
+    let bases = endpoints(base_url);
+    let result_url = Route::new(&bases, "/api/result");
+    let known_url = Route::new(&bases, "/api/known");
+    let upload_url = Route::new(&bases, "/api/upload");
     let mut seen = HashSet::new();
     sync_dependencies(
         client,
@@ -728,9 +776,9 @@ pub fn sync_result_dependencies(
 #[allow(clippy::too_many_arguments)]
 fn sync_dependencies(
     client: &reqwest::blocking::Client,
-    known_url: &str,
-    upload_url: &str,
-    result_url: &str,
+    known_url: &Route,
+    upload_url: &Route,
+    result_url: &Route,
     worker: &str,
     version: &str,
     analyzed_at: &str,
@@ -805,7 +853,15 @@ fn sync_dependencies(
             .locator
             .strip_prefix("pkg:")
             .map(|_| dep.locator.as_str());
-        post_one(client, result_url, worker, &dep.sha256, purl, envelope, tally);
+        post_one(
+            client,
+            result_url,
+            worker,
+            &dep.sha256,
+            purl,
+            envelope,
+            tally,
+        );
     }
     if skipped_current > 0 {
         tracing::info!(
@@ -830,7 +886,11 @@ fn dep_traits_version(deps: &[crate::engine::DepResult]) -> Option<String> {
     }
     deps.iter().find_map(|d| {
         let parsed: RevOnly = serde_json::from_str(&d.raw).ok()?;
-        let v = if !parsed.rev.is_empty() { parsed.rev } else { parsed.tv };
+        let v = if !parsed.rev.is_empty() {
+            parsed.rev
+        } else {
+            parsed.tv
+        };
         (!v.is_empty()).then_some(v)
     })
 }
@@ -902,7 +962,7 @@ struct KnownSets {
 /// `current`, restoring today's post-everything behavior.
 fn post_known(
     client: &reqwest::blocking::Client,
-    known_url: &str,
+    known_url: &Route,
     shas: &[&str],
     traits_version: Option<&str>,
 ) -> KnownSets {
@@ -919,7 +979,7 @@ fn post_known(
         #[serde(default)]
         current: Vec<String>,
     }
-    let resp = authed(client.post(known_url))
+    let resp = authed(client.post(known_url.primary()))
         .json(&KnownRequest {
             sha256: shas,
             traits_version,
@@ -966,7 +1026,7 @@ fn provenance_part(art: &UploadArtifact) -> Option<reqwest::blocking::multipart:
 /// permanent and stops immediately; the caller logs its own success detail.
 fn post_upload(
     client: &reqwest::blocking::Client,
-    upload_url: &str,
+    upload_url: &Route,
     sha256: &str,
     kind: &str,
     provenance: &[u8],
@@ -986,7 +1046,7 @@ fn post_upload(
 #[allow(clippy::too_many_arguments)]
 fn post_upload_with_token(
     client: &reqwest::blocking::Client,
-    upload_url: &str,
+    upload_url: &Route,
     sha256: &str,
     kind: &str,
     provenance: &[u8],
@@ -1000,7 +1060,10 @@ fn post_upload_with_token(
         let Some(form) = build_form() else {
             return false; // part build failed — unrecoverable
         };
-        let mut request = client.post(upload_url).timeout(timeout).multipart(form);
+        let mut request = client
+            .post(upload_url.at(attempt))
+            .timeout(timeout)
+            .multipart(form);
         if let Some(token) = token {
             request = request.bearer_auth(token);
         }
@@ -1038,7 +1101,7 @@ fn post_upload_with_token(
 /// provenance part precedes the file part, as hopper's handler requires.
 fn upload_one(
     client: &reqwest::blocking::Client,
-    upload_url: &str,
+    upload_url: &Route,
     art: &UploadArtifact,
     bytes: &[u8],
 ) {
@@ -1066,7 +1129,7 @@ fn upload_one(
 /// part (no file). hopper attaches it without moving any bytes.
 fn upload_provenance_only(
     client: &reqwest::blocking::Client,
-    upload_url: &str,
+    upload_url: &Route,
     art: &UploadArtifact,
 ) {
     use reqwest::blocking::multipart::Form;
@@ -1087,7 +1150,7 @@ fn upload_provenance_only(
 /// (other than 408/429) can never succeed on resend, so it stops immediately.
 fn post_one(
     client: &reqwest::blocking::Client,
-    result_url: &str,
+    result_url: &Route,
     worker: &str,
     sha256: &str,
     purl: Option<&str>,
@@ -1119,7 +1182,7 @@ fn post_one(
         // The table is indexed by attempt and clamped, so a long budget keeps
         // retrying at the 120s ceiling instead of running off the end.
         let timeout = ATTEMPT_TIMEOUTS[attempt.min(ATTEMPT_TIMEOUTS.len() - 1)];
-        let mut request = authed(client.post(result_url))
+        let mut request = authed(client.post(result_url.at(attempt)))
             .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             // Claim hopper's reserved lane: this renewal is one-shot, and the
@@ -1246,6 +1309,44 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    /// `--hopper` may name the same corpus twice: the replica first, the
+    /// primary behind it. Reads and writes take the same list, because routing
+    /// them apart is a topology this worker would have to know and hopper's
+    /// write relay exists so that it does not.
+    #[test]
+    fn hopper_endpoints_are_a_preference_order() {
+        assert_eq!(endpoints("https://ro/"), vec!["https://ro"]);
+        assert_eq!(
+            endpoints(" https://ro/ , http://rw:8081/ "),
+            vec!["https://ro", "http://rw:8081"],
+        );
+        assert!(endpoints("").is_empty());
+        assert!(endpoints(" , , ").is_empty());
+    }
+
+    /// A retry walks down the list rather than hammering one address, so the
+    /// attempt after a replica stops answering lands on the primary instead of
+    /// on the same silence. Past the end it holds on the last: a budget longer
+    /// than the list must not wrap back to an address already known to fail.
+    #[test]
+    fn a_retry_moves_to_the_next_address() {
+        let bases = endpoints("https://ro,http://rw");
+        let route = Route::new(&bases, "/api/result");
+        assert_eq!(route.at(0), "https://ro/api/result");
+        assert_eq!(route.at(1), "http://rw/api/result");
+        assert_eq!(route.at(9), "http://rw/api/result");
+        assert_eq!(route.primary(), "https://ro/api/result");
+    }
+
+    /// One address is the ordinary case, and every attempt uses it.
+    #[test]
+    fn a_single_address_is_used_for_every_attempt() {
+        let route = Route::new(&endpoints("https://only"), "/api/known");
+        assert_eq!(route.at(0), "https://only/api/known");
+        assert_eq!(route.at(5), "https://only/api/known");
+    }
+
     use super::*;
 
     /// The budget is the whole point: a renewal is one-shot, so it must outlive
@@ -1265,7 +1366,10 @@ mod tests {
     fn renew_delay_never_sleeps_past_the_budget() {
         let elapsed = RENEW_BUDGET - Duration::from_millis(400);
         let d = renew_delay(12, Some(Duration::from_secs(60)), elapsed, 1.0).unwrap();
-        assert!(d <= Duration::from_millis(400), "slept past the budget: {d:?}");
+        assert!(
+            d <= Duration::from_millis(400),
+            "slept past the budget: {d:?}"
+        );
     }
 
     /// Full jitter: the draw scales the ceiling, so a fleet retrying against one
@@ -1275,7 +1379,10 @@ mod tests {
         let low = renew_delay(10, None, Duration::ZERO, 0.0).unwrap();
         let high = renew_delay(10, None, Duration::ZERO, 1.0).unwrap();
         assert!(high > low, "jitter had no effect: {low:?} vs {high:?}");
-        assert!(low >= RENEW_MIN_BACKOFF, "a near-zero draw must still back off: {low:?}");
+        assert!(
+            low >= RENEW_MIN_BACKOFF,
+            "a near-zero draw must still back off: {low:?}"
+        );
         assert!(high <= RENEW_MAX_BACKOFF, "exceeded the ceiling: {high:?}");
     }
 
@@ -1349,7 +1456,11 @@ mod tests {
             Some("def34"),
             "an unparseable report is skipped, not fatal"
         );
-        assert_eq!(dep_traits_version(&[dep(r#"{}"#)]), None, "no version fields -> no probe");
+        assert_eq!(
+            dep_traits_version(&[dep(r#"{}"#)]),
+            None,
+            "no version fields -> no probe"
+        );
         assert_eq!(dep_traits_version(&[]), None, "empty batch -> no probe");
     }
 
@@ -1472,7 +1583,7 @@ mod tests {
             String::from_utf8_lossy(&request).into_owned()
         });
 
-        let url = format!("http://{addr}/api/upload");
+        let url = Route::new(&[format!("http://{addr}")], "/api/upload");
         let ok = post_upload_with_token(
             &reqwest::blocking::Client::new(),
             &url,

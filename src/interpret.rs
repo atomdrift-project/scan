@@ -1656,12 +1656,14 @@ mod tests {
         // elevated-finding bypasses carry those, not ML.
         assert!(!levels(25_001).ml_admits(None));
         // Manual-threshold mode: no calibrated axis, so ML abstains.
-        assert!(!LevelContext {
-            fired: None,
-            active: None,
-            grid_max: 0,
-        }
-        .ml_admits(None));
+        assert!(
+            !LevelContext {
+                fired: None,
+                active: None,
+                grid_max: 0,
+            }
+            .ml_admits(None)
+        );
     }
 
     #[test]

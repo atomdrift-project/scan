@@ -586,7 +586,11 @@ mod merge_tests {
     #[test]
     fn a_conflict_is_absorbing() {
         for d in [Skip, KnownBad, Conflicted, Unknown] {
-            assert_eq!(Conflicted.merge(d), Conflicted, "{d:?} should not clear a conflict");
+            assert_eq!(
+                Conflicted.merge(d),
+                Conflicted,
+                "{d:?} should not clear a conflict"
+            );
             assert_eq!(d.merge(Conflicted), Conflicted);
         }
     }

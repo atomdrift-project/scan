@@ -797,10 +797,7 @@ fn lookup_inner(state: &Arc<AppState>, q: &LookupQuery) -> Response {
     // artifact was asked about — including the arms that reject, where the key
     // is the only way to tell a caller's bug from a caller's typo.
     match (sha, purl) {
-        (None, None) => error_response(
-            StatusCode::BAD_REQUEST,
-            "provide sha256, purl, or both",
-        ),
+        (None, None) => error_response(StatusCode::BAD_REQUEST, "provide sha256, purl, or both"),
         (Some(sha), Some(purl)) => lookup_by_both(state, sha, purl),
         (Some(sha), None) => with_subject(lookup_by_sha(state, sha), Subject::sha256(sha)),
         (None, Some(purl)) => lookup_by_purl(state, purl),
@@ -849,10 +846,11 @@ fn lookup_by_both(state: &AppState, sha256: &str, raw: &str) -> Response {
     };
     let sha = sha256.to_ascii_lowercase();
 
-    let decision = crate::bloom_repo::global().as_deref().map_or(
-        crate::bloom_repo::Decision::Unknown,
-        |lk| lk.memo_sha256(&digest).merge(lk.memo_purl(&purl)),
-    );
+    let decision = crate::bloom_repo::global()
+        .as_deref()
+        .map_or(crate::bloom_repo::Decision::Unknown, |lk| {
+            lk.memo_sha256(&digest).merge(lk.memo_purl(&purl))
+        });
 
     let index = crate::lookup::global();
     let verdict = pick_verdict(
@@ -2566,6 +2564,142 @@ const V1_PROGRESS_FIRST: Duration = Duration::from_secs(1);
 /// How often progress is reported after that.
 const V1_PROGRESS_EVERY: Duration = Duration::from_secs(5);
 
+/// Analyze the bytes a caller sent, rather than a package they named.
+///
+/// The digest is the identity, so two callers uploading the same artifact share
+/// one analysis exactly as two callers naming one PURL do. `?purl=` may still
+/// accompany the bytes: scan grafts the registry provenance onto the report,
+/// and it is echoed in each finding's `pkg`.
+async fn v1_analyze_bytes(
+    state: &Arc<AppState>,
+    request_id: u64,
+    q: &V1LookupQuery,
+    headers: axum::http::HeaderMap,
+    bytes: bytes::Bytes,
+    request_start: Instant,
+) -> Response {
+    if let Ok(init_error) = state.init_error.read()
+        && let Some(message) = init_error.as_ref()
+    {
+        tracing::error!(id = request_id, error = %message, "rejected: startup failed");
+        return v1_error(StatusCode::SERVICE_UNAVAILABLE, "starting", message);
+    }
+    if let Some(response) = check_memory_pressure(state).await {
+        return response;
+    }
+
+    let budget = q
+        .false_positive_budget
+        .unwrap_or_else(|| decision::default_budget(state.level));
+    // The name only decides how cleave types the bytes, so a caller that sends
+    // none still gets an analysis — of an artifact typed by content rather than
+    // by extension.
+    let filename = headers
+        .get("x-filename")
+        .and_then(|v| v.to_str().ok())
+        .map(sanitize_upload_filename)
+        .unwrap_or_else(|| format!("upload-{request_id}"));
+
+    // Read whole rather than streamed to disk, and bounded by the same limit
+    // the multipart path enforces: this is the small-artifact route — a caller
+    // with gigabytes has a registry to publish to — and having every byte in
+    // hand is what lets the digest be known before a temp file exists, so an
+    // artifact already being analyzed costs no disk at all.
+    let sha = format!("{:x}", Sha256::digest(&bytes));
+
+    let purl = match q.purl.first().map(String::as_str).map(normalize_pkg_purl) {
+        Some(Ok(purl)) => Some(purl),
+        Some(Err(message)) => {
+            return v1_error(StatusCode::BAD_REQUEST, "invalid_purl", message);
+        }
+        None => None,
+    };
+
+    let attachment = state.flights.join(FlightKey::Sha(sha.clone()));
+    let leads = attachment.leads();
+    if leads {
+        tracing::info!(id = request_id, sha256 = %sha, size_bytes = bytes.len(), filename = %filename, "--> POST /v1/analyze (bytes)");
+        let publisher = state.flights.publisher(attachment.flight());
+        match claim_slot(state, request_id, attachment.flight().key()) {
+            Err(outcome) => publisher.publish(outcome),
+            Ok((resources, permit)) => match stage_upload(request_id, &filename, &bytes).await {
+                Err(outcome) => publisher.publish(outcome),
+                Ok(upload) => {
+                    let flight = Arc::clone(attachment.flight());
+                    let state = Arc::clone(state);
+                    tokio::spawn(async move {
+                        publisher.publish(
+                            run_file_analysis(
+                                state, request_id, upload, &flight, resources, permit,
+                            )
+                            .await,
+                        );
+                    });
+                }
+            },
+        }
+    } else {
+        tracing::info!(id = request_id, sha256 = %sha, "--> POST /v1/analyze (bytes; joined a run already in flight)");
+    }
+
+    let flight = Arc::clone(attachment.flight());
+    let subject = purl.clone().unwrap_or_else(|| sha.clone());
+    match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
+        Ok(outcome) => {
+            let elapsed = crate::duration_ms(request_start.elapsed());
+            v1_outcome_response(&outcome, &subject, budget, elapsed, !leads)
+        }
+        Err(_) => {
+            tracing::info!(id = request_id, sha256 = %sha, "answering as a stream");
+            v1_streamed(
+                Arc::clone(state),
+                attachment,
+                flight,
+                subject,
+                budget,
+                request_start,
+            )
+        }
+    }
+}
+
+/// Write the uploaded bytes into a temp directory, named so cleave detects the
+/// artifact's type from its extension.
+async fn stage_upload(request_id: u64, filename: &str, bytes: &[u8]) -> Result<Upload, Outcome> {
+    let dir =
+        match tokio::task::spawn_blocking(|| TempBuilder::new().prefix("scan-").tempdir()).await {
+            Ok(Ok(dir)) => dir,
+            Ok(Err(e)) => {
+                tracing::warn!(id = request_id, error = %e, "failed to create temp dir");
+                return Err(Outcome::rendered(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error",
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(id = request_id, error = %e, "temp dir task join error (panic?)");
+                return Err(Outcome::rendered(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error",
+                ));
+            }
+        };
+    let path = dir.path().join(filename);
+    if let Err(e) = tokio::fs::write(&path, bytes).await {
+        tracing::warn!(id = request_id, path = %path.display(), error = %e, "failed to write upload");
+        return Err(Outcome::rendered(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save file data",
+        ));
+    }
+    Ok(Upload {
+        dir,
+        path,
+        filename: filename.to_string(),
+        size_bytes: bytes.len(),
+    })
+}
+
 /// POST /v1/analyze — analyze an artifact and answer with a decision.
 ///
 /// The whole point of this route over `/analyze-purl` is that it survives being
@@ -2585,11 +2719,26 @@ pub(super) async fn v1_analyze(
     State(state): State<Arc<AppState>>,
     request_id: Extension<RequestId>,
     raw: axum::extract::RawQuery,
-    Json(req): Json<AnalyzePurlRequest>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
 ) -> Response {
     let request_id = request_id.0.get();
     let request_start = Instant::now();
     let q = V1LookupQuery::parse(raw.0.as_deref());
+
+    // Two ways to name an artifact, and the artifact itself is one of them: a
+    // caller holding bytes nobody has published — a build output, something
+    // pulled from a mirror, a file off disk — has nothing to locate them by.
+    //
+    // Which one is meant is decided by what arrived, not by a header the caller
+    // has to remember: bytes are an artifact, and no bytes means the package
+    // named in the query. `Content-Type` says nothing here that the presence of
+    // a body does not, and requiring it only turns a correct request into a
+    // 415 for a reason the caller cannot see.
+    // Checked before anything is read: a budget that is not a number is the
+    // caller's mistake whichever way they named the artifact, and answering it
+    // only after the body has been read would make the same request a 400 or a
+    // 503 depending on whether the model happened to be loaded.
     if let Some(bad) = q.bad_budget.as_deref() {
         return v1_error(
             StatusCode::BAD_REQUEST,
@@ -2597,6 +2746,34 @@ pub(super) async fn v1_analyze(
             &format!("false_positive_budget must be a whole number from 0 to 65535, not {bad:?}."),
         );
     }
+    let Ok(bytes) = axum::body::to_bytes(body, state.max_upload_bytes).await else {
+        tracing::warn!(
+            id = request_id,
+            max = state.max_upload_bytes,
+            "upload exceeded size limit"
+        );
+        return v1_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "artifact_too_large",
+            &format!(
+                "The artifact exceeds the {} byte limit.",
+                state.max_upload_bytes
+            ),
+        );
+    };
+    if !bytes.is_empty() {
+        return v1_analyze_bytes(&state, request_id, &q, headers, bytes, request_start).await;
+    }
+    let Some(named) = q.purl.first() else {
+        return v1_error(
+            StatusCode::BAD_REQUEST,
+            "missing_package",
+            "Name a package with ?purl=, or send the artifact as the body.",
+        );
+    };
+    let req = AnalyzePurlRequest {
+        purl: named.clone(),
+    };
     let budget = q
         .false_positive_budget
         .unwrap_or_else(|| decision::default_budget(state.level));
@@ -2656,7 +2833,14 @@ pub(super) async fn v1_analyze(
         }
         Err(_) => {
             tracing::info!(id = request_id, purl = %purl, "answering as a stream");
-            v1_streamed(Arc::clone(&state), attachment, flight, purl, budget, request_start)
+            v1_streamed(
+                Arc::clone(&state),
+                attachment,
+                flight,
+                purl,
+                budget,
+                request_start,
+            )
         }
     }
 }
@@ -2771,7 +2955,10 @@ fn v1_streamed(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
     );
-    headers.insert("X-Accel-Buffering", axum::http::HeaderValue::from_static("no"));
+    headers.insert(
+        "X-Accel-Buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
     resp.extensions_mut().insert(Subject::purl(&subject, None));
     resp
 }
@@ -2906,7 +3093,11 @@ async fn v1_resolve(
     let purl = match raw_purl.map(normalize_pkg_purl) {
         Some(Ok(purl)) => Some(purl),
         Some(Err(message)) => {
-            return Err(Box::new(v1_error(StatusCode::BAD_REQUEST, "invalid_purl", message)));
+            return Err(Box::new(v1_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_purl",
+                message,
+            )));
         }
         None => None,
     };
@@ -3338,8 +3529,17 @@ mod tests {
         let v = serde_json::to_value(&d).expect("serializes");
         assert_eq!(v["decision"], "unavailable");
         assert_eq!(v["purl"], "pkg:npm/x@1.0.0");
-        for empty in ["severity", "fires_at", "reason", "engine_version", "analyzed_at"] {
-            assert!(v[empty].is_null(), "{empty} leaked into an unavailable decision");
+        for empty in [
+            "severity",
+            "fires_at",
+            "reason",
+            "engine_version",
+            "analyzed_at",
+        ] {
+            assert!(
+                v[empty].is_null(),
+                "{empty} leaked into an unavailable decision"
+            );
         }
         assert_eq!(v["findings"].as_array().map(Vec::len), Some(0));
     }
@@ -3689,7 +3889,10 @@ mod pick_verdict_tests {
     #[test]
     fn a_purl_verdict_for_other_bytes_is_refused() {
         let got = pick_verdict(None, || Some(verdict(OTHER, "different-artifact")), SHA);
-        assert!(got.is_none(), "served a verdict about bytes nobody asked about");
+        assert!(
+            got.is_none(),
+            "served a verdict about bytes nobody asked about"
+        );
     }
 
     #[test]
