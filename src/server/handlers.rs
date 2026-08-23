@@ -644,6 +644,11 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         // Saturation. The best routing signal available, because it is current
         // rather than lagging: a latency average still reports health for the
         // minute after a server takes on four large archives.
+        // Where lookups this index could not answer actually went. A fleet
+        // quietly reading from the primary because the replica stopped
+        // answering is otherwise indistinguishable from one reading the
+        // replica, until the primary's load says so.
+        "corpus": state.corpus.as_ref().map(|c| c.stats()),
         "slots": state.max_concurrent_tasks,
         "slots_free": free,
         "in_flight": in_flight,
@@ -2643,11 +2648,12 @@ async fn v1_analyze_bytes(
     }
 
     let flight = Arc::clone(attachment.flight());
+    // The digest labels the request in logs; it is never the locator.
     let subject = purl.clone().unwrap_or_else(|| sha.clone());
     match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
         Ok(outcome) => {
             let elapsed = crate::duration_ms(request_start.elapsed());
-            v1_outcome_response(&outcome, &subject, budget, elapsed, !leads)
+            v1_outcome_response(&outcome, purl.as_deref(), &subject, budget, elapsed, !leads)
         }
         Err(_) => {
             tracing::info!(id = request_id, sha256 = %sha, "answering as a stream");
@@ -2655,6 +2661,7 @@ async fn v1_analyze_bytes(
                 Arc::clone(state),
                 attachment,
                 flight,
+                purl,
                 subject,
                 budget,
                 request_start,
@@ -2829,7 +2836,7 @@ pub(super) async fn v1_analyze(
     match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
         Ok(outcome) => {
             let elapsed = crate::duration_ms(request_start.elapsed());
-            v1_outcome_response(&outcome, &purl, budget, elapsed, !leads)
+            v1_outcome_response(&outcome, Some(&purl), &purl, budget, elapsed, !leads)
         }
         Err(_) => {
             tracing::info!(id = request_id, purl = %purl, "answering as a stream");
@@ -2837,6 +2844,7 @@ pub(super) async fn v1_analyze(
                 Arc::clone(&state),
                 attachment,
                 flight,
+                Some(purl.clone()),
                 purl,
                 budget,
                 request_start,
@@ -2848,15 +2856,20 @@ pub(super) async fn v1_analyze(
 /// A finished analysis, as a decision.
 fn v1_outcome_response(
     outcome: &Outcome,
-    purl: &str,
+    purl: Option<&str>,
+    subject: &str,
     budget: u16,
     elapsed_ms: u64,
     shared: bool,
 ) -> Response {
     let mut resp = match outcome {
         Outcome::Report(result) => {
-            let verdict = crate::lookup::Verdict::from_scan(result, Some(purl));
-            let mut resp = Json(V1Decision::stored(&verdict, Some(purl), budget)).into_response();
+            // An upload has no locator, and the digest is not one: passing it
+            // here would put a sha256 in the `purl` field, where /v1/lookup
+            // reports null for the same artifact. The two routes answer with
+            // one shape or neither is trustworthy.
+            let verdict = crate::lookup::Verdict::from_scan(result, purl);
+            let mut resp = Json(V1Decision::stored(&verdict, purl, budget)).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
@@ -2868,7 +2881,7 @@ fn v1_outcome_response(
     if shared {
         resp.extensions_mut().insert(super::access::Shared);
     }
-    resp.extensions_mut().insert(Subject::purl(purl, None));
+    resp.extensions_mut().insert(Subject::purl(subject, None));
     resp
 }
 
@@ -2895,12 +2908,13 @@ fn v1_streamed(
     state: Arc<AppState>,
     attachment: super::flight::Attachment,
     flight: Arc<Flight>,
-    purl: String,
+    purl: Option<String>,
+    subject: String,
     budget: u16,
     request_start: Instant,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
-    let subject = purl.clone();
+    let labelled = subject.clone();
     tokio::spawn(async move {
         // Held for the life of the stream: an attachment dropped early would
         // tell the flight nobody is waiting on this analysis while somebody is.
@@ -2914,9 +2928,9 @@ fn v1_streamed(
                     next = V1_PROGRESS_EVERY;
                     let frame = serde_json::json!({
                         "state": "analyzing",
-                        "purl": purl,
+                        "purl": subject,
                         "elapsed_ms": crate::duration_ms(request_start.elapsed()),
-                        "phase": v1_phase_of(&state, &purl),
+                        "phase": v1_phase_of(&state, &subject),
                     });
                     // A caller that has gone away shows up here as a closed
                     // channel, which ends the stream. The analysis keeps going:
@@ -2930,12 +2944,14 @@ fn v1_streamed(
         let elapsed = crate::duration_ms(request_start.elapsed());
         let decided = match outcome.as_ref() {
             Outcome::Report(result) => {
-                let verdict = crate::lookup::Verdict::from_scan(result, Some(&purl));
-                V1Decision::stored(&verdict, Some(&purl), budget)
+                // As on the unstreamed path: an upload has no locator, and the
+                // digest is not one.
+                let verdict = crate::lookup::Verdict::from_scan(result, purl.as_deref());
+                V1Decision::stored(&verdict, purl.as_deref(), budget)
             }
             Outcome::Rendered { status, .. } => {
-                tracing::warn!(purl = %purl, status = status.as_u16(), elapsed_ms = elapsed, "streamed analysis failed");
-                V1Decision::unavailable(None, Some(&purl))
+                tracing::warn!(subject = %subject, status = status.as_u16(), elapsed_ms = elapsed, "streamed analysis failed");
+                V1Decision::unavailable(None, purl.as_deref())
             }
         };
         v1_send(&tx, &decided).await;
@@ -2959,7 +2975,7 @@ fn v1_streamed(
         "X-Accel-Buffering",
         axum::http::HeaderValue::from_static("no"),
     );
-    resp.extensions_mut().insert(Subject::purl(&subject, None));
+    resp.extensions_mut().insert(Subject::purl(&labelled, None));
     resp
 }
 
@@ -3518,6 +3534,96 @@ fn read_thread_info_freebsd() -> serde_json::Value {
 mod tests {
     use super::{Outcome, classify_analysis_error, flight_response};
     use axum::http::StatusCode;
+
+    /// One shape, whichever route answered and whatever it found.
+    ///
+    /// A caller writes one parser against nine keys and reads `decision` to
+    /// know what happened. That only holds if every way of producing a decision
+    /// produces the same keys — a field present on a lookup and absent on an
+    /// analysis is a field nobody can rely on, and the difference would show up
+    /// as an intermittent null rather than as an error.
+    #[test]
+    fn every_decision_has_the_same_shape() {
+        use super::super::corpus::{CorpusFinding, CorpusRecord};
+        use super::V1Decision;
+        use crate::lookup::{Hit, Verdict};
+
+        let stored = Verdict {
+            sha256: "a".repeat(64),
+            lvl: Some(3),
+            eng: "2.8.0".into(),
+            at: "2026-08-01T00:00:00Z".into(),
+            purl: Some("pkg:npm/evil@1.0.0".into()),
+            why: Some("Reverse shell in postinstall.".into()),
+            hits: vec![Hit {
+                id: "objectives/c2/backdoor".into(),
+                crit: 5,
+                file: "lib/install.js".into(),
+                pkg: String::new(),
+                desc: "Spawns bash".into(),
+                off: Some(109),
+                line: Some(12),
+            }],
+        };
+        let from_corpus = CorpusRecord {
+            sha256: Some("a".repeat(64)),
+            purl: Some("pkg:npm/evil@1.0.0".into()),
+            fires_at: Some(3),
+            engine_version: Some("2.8.0".into()),
+            analyzed_at: Some("2026-08-01T00:00:00Z".into()),
+            reason: Some("Reverse shell in postinstall.".into()),
+            findings: vec![CorpusFinding {
+                id: "objectives/c2/backdoor".into(),
+                crit: 5,
+            }],
+        };
+
+        let shapes = [
+            // What /v1/lookup and /v1/analyze both answer with on a hit.
+            V1Decision::stored(&stored, Some("pkg:npm/evil@1.0.0"), 25),
+            // What a lookup answers with when the corpus knew instead.
+            V1Decision::corpus(&from_corpus, None, Some("pkg:npm/evil@1.0.0"), 25),
+            V1Decision::unknown(None, Some("pkg:npm/evil@1.0.0")),
+            V1Decision::unavailable(None, Some("pkg:npm/evil@1.0.0")),
+        ];
+
+        let keys = |d: &V1Decision| -> Vec<String> {
+            let v = serde_json::to_value(d).expect("serializes");
+            let mut k: Vec<String> = v
+                .as_object()
+                .expect("an object")
+                .keys()
+                .map(String::clone)
+                .collect();
+            k.sort();
+            k
+        };
+        let expected = keys(&shapes[0]);
+        assert_eq!(expected.len(), 9, "the shape changed: {expected:?}");
+        for shape in &shapes[1..] {
+            assert_eq!(keys(shape), expected, "a decision answered with different keys");
+        }
+
+        // And a finding keeps its shape across the two sources, which know
+        // different amounts about the same thing: the corpus holds no file or
+        // offset, so those are null rather than absent.
+        let finding_keys = |d: &V1Decision| -> Vec<String> {
+            let v = serde_json::to_value(d).expect("serializes");
+            let mut k: Vec<String> = v["findings"][0]
+                .as_object()
+                .expect("a finding")
+                .keys()
+                .map(String::clone)
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            finding_keys(&shapes[0]),
+            finding_keys(&shapes[1]),
+            "a finding from the corpus is shaped differently from a stored one",
+        );
+    }
 
     /// `unavailable` is a statement about us, not about the artifact, so nothing
     /// about the artifact may ride along on one. A caller that could read a
