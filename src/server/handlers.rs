@@ -12,6 +12,8 @@ use tempfile::Builder as TempBuilder;
 use super::AppState;
 use super::access::{RequestId, Subject, with_subject};
 use super::acl::Trusted;
+use super::corpus::{self, Reached};
+use super::decision;
 use super::flight::{Flight, FlightKey, Outcome};
 
 /// Assemble a JSON object body from static keys.
@@ -215,6 +217,14 @@ fn claim_slot(
             ));
         }
     };
+    // Refusing past full, rather than queueing. A queue here would hide the one
+    // fact the router most needs: a rejection is information, delivered in
+    // milliseconds, and beamline answers it by promoting the next arm onto a
+    // worker that has room. A queued request looks identical to a slow one from
+    // outside, so the router keeps choosing a saturated worker while a idle one
+    // waits — and the queued analysis still runs after somebody else has
+    // already answered, which is the duplicate work single-flight exists to
+    // prevent.
     let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
         let max = state.max_concurrent_tasks;
         tracing::warn!(id = request_id, key = %key, max, "rejecting: at capacity");
@@ -929,16 +939,33 @@ fn lookup_response(
         "public"
     };
     let Some(verdict) = verdict else {
+        // Nothing stored does not mean nothing happening: an analysis of this
+        // very artifact may be minutes in. Saying so costs nothing — the caller
+        // is already asking about this key, and the registry is a map lookup —
+        // and it is what lets a caller who reconnects be routed back to the
+        // worker already running their analysis instead of starting a second
+        // one beside it. `/status` answers the same question on its own, for a
+        // caller who has nothing else to ask.
+        let running = purl
+            .and_then(|p| state.flights.running(&FlightKey::Purl(p.to_string())))
+            .or_else(|| {
+                state
+                    .flights
+                    .running(&FlightKey::Sha(sha256.trim().to_ascii_lowercase()))
+            });
+        let mut body = serde_json::json!({
+            "error": "unknown sample",
+            "bloom": decision.as_str(),
+        });
+        if let Some(run) = running {
+            body["analyzing"] = serde_json::json!({
+                "elapsed_ms": crate::duration_ms(run.elapsed),
+                "attached": run.attached,
+            });
+        }
         // A miss is not cacheable for any length of time: it becomes a hit the
         // moment anything analyzes this artifact.
-        let mut resp = (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "unknown sample",
-                "bloom": decision.as_str(),
-            })),
-        )
-            .into_response();
+        let mut resp = (StatusCode::NOT_FOUND, Json(body)).into_response();
         resp.headers_mut().insert(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
@@ -2406,6 +2433,703 @@ pub(super) async fn memory_stats(State(state): State<Arc<AppState>>) -> Json<ser
 }
 
 /// GET /_/requests — all analyses currently in flight, sorted by elapsed time descending.
+/// GET /status?sha256=… | ?purl=… — where an analysis of this artifact stands.
+///
+/// Exists for the caller whose connection did not survive the analysis. The run
+/// keeps going here when a proxy gives up at its own ceiling, but from outside
+/// a run in progress and a run that never started are both `404 unknown sample`
+/// on /lookup. That ambiguity is the whole problem: it is the difference
+/// between waiting a little longer and paying for a twenty-minute analysis
+/// twice.
+///
+/// Running is reported before complete, so a caller is never told to go away
+/// while a run it could ride is still live. The reverse order has a window —
+/// between a flight publishing and its verdict reaching the index — where a
+/// live run reads as `unknown`.
+///
+/// `lost` is deliberately not a state. It is the caller's own inference: they
+/// dispatched, their connection died, and this answers `unknown`. Reporting it
+/// here would mean keeping a graveyard of every run that ever ended, to tell a
+/// caller something they already know.
+pub(super) async fn status(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<LookupQuery>,
+) -> Response {
+    let sha = q.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let raw = q.purl.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if sha.is_none() && raw.is_none() {
+        return error_response(StatusCode::BAD_REQUEST, "provide sha256, purl, or both");
+    }
+    // The canonical form is what a flight is keyed by, so an uncanonical spelling
+    // must not read as a different artifact — the same rule /lookup follows.
+    let purl = match raw.map(normalize_pkg_purl) {
+        Some(Ok(purl)) => Some(purl),
+        Some(Err(message)) => return error_response(StatusCode::BAD_REQUEST, message),
+        None => None,
+    };
+    let sha = sha.map(str::to_ascii_lowercase);
+
+    let running = purl
+        .as_deref()
+        .and_then(|p| state.flights.running(&FlightKey::Purl(p.to_string())))
+        .or_else(|| {
+            sha.as_deref()
+                .and_then(|s| state.flights.running(&FlightKey::Sha(s.to_string())))
+        });
+    if let Some(run) = running {
+        return Json(serde_json::json!({
+            "state": "running",
+            "purl": purl,
+            "sha256": sha,
+            "elapsed_ms": crate::duration_ms(run.elapsed),
+            "attached": run.attached,
+        }))
+        .into_response();
+    }
+
+    let index = crate::lookup::global();
+    let complete = index.is_some_and(|index| {
+        purl.as_deref().is_some_and(|p| index.get_purl(p).is_some())
+            || sha.as_deref().is_some_and(|s| index.get_sha(s).is_some())
+    });
+    Json(serde_json::json!({
+        "state": if complete { "complete" } else { "unknown" },
+        "purl": purl,
+        "sha256": sha,
+    }))
+    .into_response()
+}
+
+/// Query for `GET /v1/lookup`. `purl` repeats; `sha256` names one artifact.
+///
+/// Parsed from the raw query rather than through `Query<T>`: a repeated key is
+/// a sequence, and `serde_urlencoded` — what axum's `Query` is built on —
+/// cannot deserialize one. It silently rejects the whole request instead, which
+/// would make `?purl=a&purl=b` a 400 with no explanation.
+pub(super) struct V1LookupQuery {
+    purl: Vec<String>,
+    sha256: Option<String>,
+    /// How many false positives per 100 million benign files the caller will
+    /// tolerate. Chosen by them, unlike `fires_at`, which is measured.
+    false_positive_budget: Option<u16>,
+    /// A budget that was sent but is not a number. Held rather than silently
+    /// defaulted: a caller who meant to loosen their budget and got the strict
+    /// default back would see verdicts they never asked for and never learn why.
+    bad_budget: Option<String>,
+}
+
+impl V1LookupQuery {
+    fn parse(raw: Option<&str>) -> Self {
+        let mut q = Self {
+            purl: Vec::new(),
+            sha256: None,
+            false_positive_budget: None,
+            bad_budget: None,
+        };
+        for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
+            match key.as_ref() {
+                "purl" => q.purl.push(value.into_owned()),
+                "sha256" => q.sha256 = Some(value.into_owned()),
+                "false_positive_budget" => match value.parse::<u16>() {
+                    Ok(n) => q.false_positive_budget = Some(n),
+                    Err(_) => q.bad_budget = Some(value.into_owned()),
+                },
+                // Unknown parameters are ignored, so a caller can carry their
+                // own tracing keys through without us rejecting the request.
+                _ => {}
+            }
+        }
+        q
+    }
+}
+
+/// How many packages one URL may name.
+///
+/// A PURL runs about fifty characters encoded, so fifty of them sits well
+/// inside every intermediary's URL limit with room to spare. Past this the
+/// answer is POST, and the error says so rather than leaving it to be
+/// discovered by a truncated query string.
+const V1_MAX_KEYS: usize = 50;
+
+/// How long the ordinary response still applies.
+///
+/// Only long enough to catch an outcome that needed no work to reach — a
+/// refusal, or a run that was already finished when this request joined it.
+/// Capacity is refused the instant a slot is asked for, which is what keeps
+/// `429 At capacity` a real 429 the router can act on rather than a decision
+/// buried in a 200 body.
+const V1_ANALYZE_GRACE: Duration = Duration::from_millis(250);
+
+/// When the first progress frame goes out, for an analysis still running.
+const V1_PROGRESS_FIRST: Duration = Duration::from_secs(1);
+
+/// How often progress is reported after that.
+const V1_PROGRESS_EVERY: Duration = Duration::from_secs(5);
+
+/// POST /v1/analyze — analyze an artifact and answer with a decision.
+///
+/// The whole point of this route over `/analyze-purl` is that it survives being
+/// slow. A proxy between us and the caller gives up on a silent connection —
+/// measured at 125 seconds in front of this fleet — and tears it down, which
+/// costs the caller an analysis that in fact completed: the worker finishes,
+/// files its verdict, and answers the next asker in milliseconds, but the reply
+/// to *this* request had nowhere to go.
+///
+/// So the answer starts before it is known. Nothing is sent for the first
+/// [`V1_ANALYZE_GRACE`], because most analyses finish inside it and deserve an
+/// ordinary response with an ordinary status code. Past that the response
+/// begins — headers, then a space every [`V1_HEARTBEAT`] — and the connection
+/// stops being idle, so nothing between here and the caller has cause to cut
+/// it. The decision follows whenever the analysis lands.
+pub(super) async fn v1_analyze(
+    State(state): State<Arc<AppState>>,
+    request_id: Extension<RequestId>,
+    raw: axum::extract::RawQuery,
+    Json(req): Json<AnalyzePurlRequest>,
+) -> Response {
+    let request_id = request_id.0.get();
+    let request_start = Instant::now();
+    let q = V1LookupQuery::parse(raw.0.as_deref());
+    if let Some(bad) = q.bad_budget.as_deref() {
+        return v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_false_positive_budget",
+            &format!("false_positive_budget must be a whole number from 0 to 65535, not {bad:?}."),
+        );
+    }
+    let budget = q
+        .false_positive_budget
+        .unwrap_or_else(|| decision::default_budget(state.level));
+
+    let purl = match normalize_pkg_purl(&req.purl) {
+        Ok(purl) => purl,
+        Err(message) => {
+            return with_subject(
+                v1_error(StatusCode::BAD_REQUEST, "invalid_purl", message),
+                Subject::purl(&req.purl, None),
+            );
+        }
+    };
+
+    if let Ok(init_error) = state.init_error.read()
+        && let Some(message) = init_error.as_ref()
+    {
+        tracing::error!(id = request_id, error = %message, "rejected: startup failed");
+        return v1_error(StatusCode::SERVICE_UNAVAILABLE, "starting", message);
+    }
+    if let Some(response) = check_memory_pressure(&state).await {
+        return response;
+    }
+
+    let attachment = state.flights.join(FlightKey::Purl(purl.clone()));
+    let leads = attachment.leads();
+    if leads {
+        tracing::info!(id = request_id, purl = %purl, "--> POST /v1/analyze");
+        let publisher = state.flights.publisher(attachment.flight());
+        match claim_slot(&state, request_id, attachment.flight().key()) {
+            Err(outcome) => publisher.publish(outcome),
+            Ok((resources, permit)) => {
+                let flight = Arc::clone(attachment.flight());
+                let state = Arc::clone(&state);
+                let purl = purl.clone();
+                tokio::spawn(async move {
+                    publisher.publish(
+                        run_purl_analysis(state, request_id, &purl, &flight, resources, permit)
+                            .await,
+                    );
+                });
+            }
+        }
+    } else {
+        tracing::info!(id = request_id, purl = %purl, "--> POST /v1/analyze (joined a run already in flight)");
+    }
+
+    let flight = Arc::clone(attachment.flight());
+    // Inside the grace window the ordinary response still applies, which is what
+    // keeps `429 At capacity` a real 429 the router can act on rather than a
+    // decision buried in a 200 body. Capacity is refused the moment a slot is
+    // asked for, so it never reaches the streaming path.
+    match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
+        Ok(outcome) => {
+            let elapsed = crate::duration_ms(request_start.elapsed());
+            v1_outcome_response(&outcome, &purl, budget, elapsed, !leads)
+        }
+        Err(_) => {
+            tracing::info!(id = request_id, purl = %purl, "answering as a stream");
+            v1_streamed(Arc::clone(&state), attachment, flight, purl, budget, request_start)
+        }
+    }
+}
+
+/// A finished analysis, as a decision.
+fn v1_outcome_response(
+    outcome: &Outcome,
+    purl: &str,
+    budget: u16,
+    elapsed_ms: u64,
+    shared: bool,
+) -> Response {
+    let mut resp = match outcome {
+        Outcome::Report(result) => {
+            let verdict = crate::lookup::Verdict::from_scan(result, Some(purl));
+            let mut resp = Json(V1Decision::stored(&verdict, Some(purl), budget)).into_response();
+            resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
+            resp
+        }
+        // A refusal keeps its status: the caller's router uses it to send the
+        // work somewhere that can take it, which a decision in a 200 body
+        // cannot be made to do.
+        Outcome::Rendered { status, body } => (*status, Json(body)).into_response(),
+    };
+    if shared {
+        resp.extensions_mut().insert(super::access::Shared);
+    }
+    resp.extensions_mut().insert(Subject::purl(purl, None));
+    resp
+}
+
+/// The same answer, delivered as a stream that reports progress until the
+/// analysis lands.
+///
+/// Newline-delimited JSON: zero or more progress frames, then the decision.
+/// A caller reads lines until one carries `decision`, and that is the answer;
+/// an analysis that finishes before the first frame is due emits nothing but
+/// the decision, so a fast call still looks like a single JSON object and still
+/// parses as one.
+///
+/// Progress is real rather than a keepalive. The phase a run is in is already
+/// tracked for the watchdog, so saying it costs nothing and turns a silent
+/// connection into one a caller can watch — which is also what stops anything
+/// between here and them from concluding the connection is idle and cutting it.
+///
+/// Committing to `200` here is the trade: the status goes out before the
+/// outcome is known, so a failure past the grace window arrives as a decision
+/// of `unavailable` rather than a 5xx. That is the v1 contract either way — a
+/// caller reads `decision`, not the status line — and the alternative on this
+/// path is not a truthful 504 but a severed connection and no answer at all.
+fn v1_streamed(
+    state: Arc<AppState>,
+    attachment: super::flight::Attachment,
+    flight: Arc<Flight>,
+    purl: String,
+    budget: u16,
+    request_start: Instant,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+    let subject = purl.clone();
+    tokio::spawn(async move {
+        // Held for the life of the stream: an attachment dropped early would
+        // tell the flight nobody is waiting on this analysis while somebody is.
+        let _attachment = attachment;
+        let mut waiting = std::pin::pin!(flight.wait());
+        let mut next = V1_PROGRESS_FIRST;
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut waiting => break outcome,
+                () = tokio::time::sleep(next) => {
+                    next = V1_PROGRESS_EVERY;
+                    let frame = serde_json::json!({
+                        "state": "analyzing",
+                        "purl": purl,
+                        "elapsed_ms": crate::duration_ms(request_start.elapsed()),
+                        "phase": v1_phase_of(&state, &purl),
+                    });
+                    // A caller that has gone away shows up here as a closed
+                    // channel, which ends the stream. The analysis keeps going:
+                    // it is not this connection's to lose.
+                    if !v1_send(&tx, &frame).await {
+                        return;
+                    }
+                }
+            }
+        };
+        let elapsed = crate::duration_ms(request_start.elapsed());
+        let decided = match outcome.as_ref() {
+            Outcome::Report(result) => {
+                let verdict = crate::lookup::Verdict::from_scan(result, Some(&purl));
+                V1Decision::stored(&verdict, Some(&purl), budget)
+            }
+            Outcome::Rendered { status, .. } => {
+                tracing::warn!(purl = %purl, status = status.as_u16(), elapsed_ms = elapsed, "streamed analysis failed");
+                V1Decision::unavailable(None, Some(&purl))
+            }
+        };
+        v1_send(&tx, &decided).await;
+    });
+
+    let mut resp = Response::new(axum::body::Body::from_stream(ChannelStream(rx)));
+    let headers = resp.headers_mut();
+    // NDJSON, because the body is a sequence rather than one document. A caller
+    // that only wants the answer reads the last line.
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/x-ndjson"),
+    );
+    // Nothing may buffer this: a proxy that holds the bytes back to measure the
+    // body defeats the only thing progress frames are for.
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert("X-Accel-Buffering", axum::http::HeaderValue::from_static("no"));
+    resp.extensions_mut().insert(Subject::purl(&subject, None));
+    resp
+}
+
+/// Write one NDJSON line. Reports whether the caller is still there.
+async fn v1_send<T: serde::Serialize>(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    frame: &T,
+) -> bool {
+    let Ok(mut line) = serde_json::to_vec(frame) else {
+        return true;
+    };
+    line.push(b'\n');
+    tx.send(Ok(bytes::Bytes::from(line))).await.is_ok()
+}
+
+/// Which phase this artifact's run is in, if it is one of ours.
+///
+/// Read from the same registry the watchdog reports from. A follower riding
+/// somebody else's run does not know their request id, so the lookup is by the
+/// artifact rather than the request — there is at most one run per key, which
+/// is what single-flight guarantees.
+fn v1_phase_of(state: &Arc<AppState>, purl: &str) -> Option<String> {
+    state
+        .in_flight
+        .iter()
+        .find(|entry| entry.name == purl)
+        .map(|entry| entry.phase.get())
+}
+
+/// An mpsc receiver as a body stream. Hand-written so the crate takes the
+/// `Stream` trait alone rather than all of futures-util for one adapter.
+struct ChannelStream(tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>);
+
+impl futures_core::Stream for ChannelStream {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+/// GET /v1/lookup — what we know, at the caller's threshold. Never analyzes.
+///
+/// Answers a single object when one package is named and an array when `purl`
+/// repeats, so the shape follows the shape of the question rather than the data:
+/// a caller that always asks about one always gets one, and a caller that always
+/// asks about many always gets many. Neither ever has to branch on what came
+/// back.
+pub(super) async fn v1_lookup(
+    State(state): State<Arc<AppState>>,
+    raw: axum::extract::RawQuery,
+) -> Response {
+    let started = Instant::now();
+    let q = V1LookupQuery::parse(raw.0.as_deref());
+    let response = v1_lookup_inner(&state, &q).await;
+    state
+        .lookups
+        .record(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    response
+}
+
+async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Response {
+    if let Some(bad) = q.bad_budget.as_deref() {
+        return v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_false_positive_budget",
+            &format!("false_positive_budget must be a whole number from 0 to 65535, not {bad:?}."),
+        );
+    }
+    let budget = q
+        .false_positive_budget
+        .unwrap_or_else(|| decision::default_budget(state.level));
+    let sha = q.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let purls: Vec<&str> = q
+        .purl
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if sha.is_none() && purls.is_empty() {
+        return v1_error(
+            StatusCode::BAD_REQUEST,
+            "missing_package",
+            "Name a package with ?purl= or ?sha256=.",
+        );
+    }
+    if purls.len() > V1_MAX_KEYS {
+        return v1_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_many_packages",
+            &format!(
+                "{} packages exceeds the limit of {V1_MAX_KEYS} for a URL. Use POST /v1/lookup.",
+                purls.len()
+            ),
+        );
+    }
+
+    // One package named two ways is one question, so a lone sha256 and a lone
+    // purl resolve together rather than as two entries.
+    if purls.len() <= 1 {
+        let purl = purls.first().copied();
+        return match v1_resolve(state, sha, purl, budget).await {
+            Ok(decided) => Json(decided).into_response(),
+            Err(response) => *response,
+        };
+    }
+
+    let mut out = Vec::with_capacity(purls.len());
+    for purl in purls {
+        match v1_resolve(state, None, Some(purl), budget).await {
+            Ok(decided) => out.push(decided),
+            Err(response) => return *response,
+        }
+    }
+    Json(out).into_response()
+}
+
+/// One package, resolved and decided. `Err` is a request-level rejection: a key
+/// we cannot parse is the caller's mistake and stops the whole call, because
+/// answering the rest would hide it.
+async fn v1_resolve(
+    state: &Arc<AppState>,
+    sha: Option<&str>,
+    raw_purl: Option<&str>,
+    budget: u16,
+) -> Result<V1Decision, Box<Response>> {
+    let purl = match raw_purl.map(normalize_pkg_purl) {
+        Some(Ok(purl)) => Some(purl),
+        Some(Err(message)) => {
+            return Err(Box::new(v1_error(StatusCode::BAD_REQUEST, "invalid_purl", message)));
+        }
+        None => None,
+    };
+    let sha = match sha {
+        Some(sha) if crate::bloom::parse_sha256_hex(sha).is_none() => {
+            return Err(Box::new(v1_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_sha256",
+                "sha256 must be 64 hexadecimal characters.",
+            )));
+        }
+        Some(sha) => Some(sha.to_ascii_lowercase()),
+        None => None,
+    };
+
+    // A missing index is not an empty one. Reporting `unknown` here would tell
+    // the caller nobody has analyzed this package, when what is true is that we
+    // cannot say — and those two carry different policies at the other end.
+    // This is the whole reason `unavailable` is a separate value.
+    let Some(index) = crate::lookup::global() else {
+        return Ok(V1Decision::unavailable(sha.as_deref(), purl.as_deref()));
+    };
+    let index = Some(index);
+    let by_sha = sha
+        .as_deref()
+        .and_then(|s| index.as_ref().and_then(|i| i.get_sha(s)));
+    // The digest is the identity: a PURL's verdict is accepted only when it
+    // describes the same bytes, because a release whose digest has moved is an
+    // answer about a different artifact than the one asked about.
+    let verdict = match (&by_sha, &sha) {
+        (Some(_), _) => by_sha,
+        (None, Some(sha)) => pick_verdict(
+            None,
+            || {
+                purl.as_deref()
+                    .and_then(|p| index.as_ref().and_then(|i| i.get_purl(p)))
+            },
+            sha,
+        ),
+        (None, None) => purl
+            .as_deref()
+            .and_then(|p| index.as_ref().and_then(|i| i.get_purl(p))),
+    };
+
+    if let Some(verdict) = verdict.as_ref() {
+        return Ok(V1Decision::stored(verdict, purl.as_deref(), budget));
+    }
+
+    // Not in this worker's index. The corpus behind it may still know, and a
+    // caller should not have to learn that two services exist in order to get
+    // one answer — so ask, rather than reporting an absence that is only ours.
+    let Some(corpus) = state.corpus.as_ref() else {
+        return Ok(V1Decision::unknown(sha.as_deref(), purl.as_deref()));
+    };
+    Ok(match corpus.known(sha.as_deref(), purl.as_deref()).await {
+        Reached::Record(record) => {
+            V1Decision::corpus(&record, sha.as_deref(), purl.as_deref(), budget)
+        }
+        Reached::Nothing => V1Decision::unknown(sha.as_deref(), purl.as_deref()),
+        // The corpus could not answer, so neither can we. Emphatically not
+        // `unknown`: that would tell the caller nobody has analyzed this
+        // package, which is a claim about the package rather than about us, and
+        // the one that lets a gate fail open during an outage.
+        Reached::Unreachable => V1Decision::unavailable(sha.as_deref(), purl.as_deref()),
+    })
+}
+
+/// One decision, as it goes on the wire.
+///
+/// Every field is always present. A key that is unknown is `null` and a list
+/// that is empty is `[]`, never absent — a caller writes one code path against
+/// a shape that does not move, and a generated type has no optionals to unwrap
+/// that are really just "we had nothing to say".
+#[derive(serde::Serialize)]
+pub(super) struct V1Decision {
+    decision: decision::Decision,
+    purl: Option<String>,
+    sha256: Option<String>,
+    severity: Option<decision::Severity>,
+    /// The tightest false-positive budget per 100 million benign files at which
+    /// this artifact grades hostile — lower being worse, and `-1` meaning it
+    /// fires at none. A property of the file and the model: measured, never
+    /// chosen, which is what separates it from the caller's own
+    /// `false_positive_budget` that it is compared against. Present so a caller
+    /// can tune that budget against real numbers.
+    fires_at: Option<i32>,
+    reason: Option<String>,
+    findings: Vec<V1Finding>,
+    engine_version: Option<String>,
+    analyzed_at: Option<String>,
+}
+
+impl V1Decision {
+    /// Nobody has analyzed this artifact. Nothing is wrong; there is simply no
+    /// answer, and what a caller does about that is their policy to set.
+    fn unknown(sha: Option<&str>, purl: Option<&str>) -> Self {
+        Self::empty(decision::Decision::Unknown, sha, purl)
+    }
+
+    /// We could not answer. Deliberately carries no severity, no level and no
+    /// findings: this decision is about us, not about the artifact, and a
+    /// caller must not be able to read anything into it.
+    fn unavailable(sha: Option<&str>, purl: Option<&str>) -> Self {
+        Self::empty(decision::Decision::Unavailable, sha, purl)
+    }
+
+    fn empty(decided: decision::Decision, sha: Option<&str>, purl: Option<&str>) -> Self {
+        Self {
+            decision: decided,
+            purl: purl.map(str::to_owned),
+            sha256: sha.map(str::to_owned),
+            severity: None,
+            fires_at: None,
+            reason: None,
+            findings: Vec::new(),
+            engine_version: None,
+            analyzed_at: None,
+        }
+    }
+
+    /// A verdict this worker holds in its own index.
+    ///
+    /// Takes no digest: a stored verdict always carries its own, and it is the
+    /// artifact's identity rather than whatever the caller happened to type.
+    fn stored(v: &crate::lookup::Verdict, purl: Option<&str>, budget: u16) -> Self {
+        let (decided, severity) = decision::decide(v.lvl, budget);
+        Self {
+            decision: decided,
+            // The verdict names the artifact it is about; the caller's spelling
+            // only fills in what it could not.
+            purl: v.purl.clone().or_else(|| purl.map(str::to_owned)),
+            sha256: Some(v.sha256.clone()),
+            severity: Some(severity),
+            fires_at: v.lvl,
+            reason: v.why.clone(),
+            findings: v.hits.iter().map(V1Finding::from_hit).collect(),
+            engine_version: Some(v.eng.clone()),
+            analyzed_at: Some(v.at.clone()),
+        }
+    }
+
+    /// A record the corpus holds. Decided here rather than there: hopper stores
+    /// what an artifact is, and turning that into allow or block is policy this
+    /// worker owns, so the same budget produces the same answer whichever side
+    /// of the index the record came from.
+    fn corpus(
+        r: &corpus::CorpusRecord,
+        sha: Option<&str>,
+        purl: Option<&str>,
+        budget: u16,
+    ) -> Self {
+        let (decided, severity) = decision::decide(r.fires_at, budget);
+        Self {
+            decision: decided,
+            purl: r.purl.clone().or_else(|| purl.map(str::to_owned)),
+            sha256: r.sha256.clone().or_else(|| sha.map(str::to_owned)),
+            severity: Some(severity),
+            fires_at: r.fires_at,
+            reason: r.reason.clone(),
+            findings: r.findings.iter().map(V1Finding::from_corpus).collect(),
+            engine_version: r.engine_version.clone(),
+            analyzed_at: r.analyzed_at.clone(),
+        }
+    }
+}
+
+/// One finding on the wire.
+///
+/// Fed from this worker's index or from the corpus, which know different
+/// amounts about the same thing: a stored hit carries the file and offset it
+/// fired on, while the corpus keeps only the trait and its criticality — those
+/// details live in the one column a lookup must not read. The extras are
+/// therefore optional rather than absent, so both sources produce one shape.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(super) struct V1Finding {
+    id: String,
+    crit: u8,
+    file: Option<String>,
+    pkg: Option<String>,
+    desc: Option<String>,
+    off: Option<u64>,
+    line: Option<u64>,
+}
+
+impl V1Finding {
+    fn from_hit(h: &crate::lookup::Hit) -> Self {
+        let some = |s: &String| (!s.is_empty()).then(|| s.clone());
+        Self {
+            id: h.id.clone(),
+            crit: h.crit,
+            file: some(&h.file),
+            pkg: some(&h.pkg),
+            desc: some(&h.desc),
+            off: h.off,
+            line: h.line,
+        }
+    }
+
+    fn from_corpus(f: &corpus::CorpusFinding) -> Self {
+        Self {
+            id: f.id.clone(),
+            crit: f.crit,
+            file: None,
+            pkg: None,
+            desc: None,
+            off: None,
+            line: None,
+        }
+    }
+}
+
+/// A v1 error. `code` is stable and machine-readable; `message` is for humans
+/// and may be reworded freely.
+fn v1_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "code": code, "message": message }
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn requests(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let now = Instant::now();
     let mut entries: Vec<serde_json::Value> = state
@@ -2603,6 +3327,22 @@ fn read_thread_info_freebsd() -> serde_json::Value {
 mod tests {
     use super::{Outcome, classify_analysis_error, flight_response};
     use axum::http::StatusCode;
+
+    /// `unavailable` is a statement about us, not about the artifact, so nothing
+    /// about the artifact may ride along on one. A caller that could read a
+    /// severity or a budget out of a failed lookup would eventually branch on
+    /// it, and would then be treating our outage as evidence.
+    #[test]
+    fn an_unavailable_decision_carries_nothing_about_the_package() {
+        let d = super::V1Decision::unavailable(Some("a"), Some("pkg:npm/x@1.0.0"));
+        let v = serde_json::to_value(&d).expect("serializes");
+        assert_eq!(v["decision"], "unavailable");
+        assert_eq!(v["purl"], "pkg:npm/x@1.0.0");
+        for empty in ["severity", "fires_at", "reason", "engine_version", "analyzed_at"] {
+            assert!(v[empty].is_null(), "{empty} leaked into an unavailable decision");
+        }
+        assert_eq!(v["findings"].as_array().map(Vec::len), Some(0));
+    }
 
     /// The `llm=` field separates a minute-long endpoint query from a replay of
     /// the prompt cache, which are otherwise distinguishable only by timing.

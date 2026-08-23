@@ -18,6 +18,8 @@
 
 mod access;
 mod acl;
+mod corpus;
+mod decision;
 mod flight;
 mod latency;
 mod handlers;
@@ -73,6 +75,10 @@ pub struct ServerConfig {
     /// parent and members — is renewed on hopper's `/api/result`. `None` disables
     /// upload, leaving the server a pure analyze service.
     hopper: Option<String>,
+    /// hopper read replica (`--hopper-read`); lookups that miss this worker's
+    /// index defer here first and fall back to `hopper`. `None` reads from the
+    /// primary alone. Writes are unaffected: they always go to the primary.
+    hopper_read: Option<String>,
     /// Additional passwords to try for encrypted archives.
     zip_passwords: crate::ArchivePasswords,
     /// Analysis slots the idle worker may use. `0` disables it.
@@ -170,6 +176,7 @@ impl ServerConfig {
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
+            hopper_read: None,
             zip_passwords: crate::ArchivePasswords::default(),
             idle_worker_slots: 0,
         })
@@ -181,6 +188,21 @@ impl ServerConfig {
     pub fn with_hopper(mut self, hopper: Option<String>) -> Self {
         self.hopper = hopper.filter(|s| !s.trim().is_empty());
         self
+    }
+
+    /// Attach a hopper read replica (`--hopper-read`). Lookups that miss this
+    /// worker's index prefer it and fall back to `--hopper`; writes are
+    /// unaffected and always go to the primary.
+    #[must_use]
+    pub fn with_hopper_read(mut self, hopper_read: Option<String>) -> Self {
+        self.hopper_read = hopper_read.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// The configured read replica, or `None` when reads use the primary.
+    #[must_use]
+    pub fn hopper_read(&self) -> Option<&str> {
+        self.hopper_read.as_deref()
     }
 
     /// Add passwords to try when cleave encounters encrypted archives.
@@ -753,6 +775,9 @@ struct AppState {
     /// Shared across handlers; each analyzed result is queued to its own thread,
     /// so uploads never block the analyze response.
     uploader: Option<Arc<crate::upload::Uploader>>,
+    /// The corpus behind this worker's index. `None` when no hopper is
+    /// configured, which leaves a lookup answering from local knowledge alone.
+    corpus: Option<Arc<corpus::Corpus>>,
 }
 
 impl AppState {
@@ -845,6 +870,25 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                 );
                 None
             }
+        },
+        corpus: {
+            let corpus = corpus::Corpus::new(
+                config.hopper_read().map(str::to_string),
+                config.hopper().map(str::to_string),
+            );
+            match (&corpus, config.hopper_read()) {
+                (Some(_), Some(replica)) => {
+                    tracing::info!(replica, "lookups defer to the corpus, replica first");
+                }
+                (Some(_), None) => {
+                    tracing::info!("lookups defer to the corpus on the primary");
+                }
+                // Not a warning: a worker with no corpus behind it answers from
+                // its own index, which is a whole deployment rather than a
+                // broken one.
+                (None, _) => tracing::info!("no hopper configured: lookups answer from the local index alone"),
+            }
+            corpus
         },
     });
 
@@ -1078,6 +1122,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         .route("/_/requests", get(handlers::requests))
         .route("/_/threads", get(handlers::threads))
         .route("/lookup", get(handlers::lookup))
+        .route("/status", get(handlers::status))
+        .route("/v1/lookup", get(handlers::v1_lookup))
+        .route("/v1/analyze", post(handlers::v1_analyze))
         .route("/analyze", post(handlers::analyze))
         .route("/analyze-purl", post(handlers::analyze_purl))
         .route("/analyze-path", post(handlers::analyze_path))

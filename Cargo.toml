@@ -112,6 +112,10 @@ sha2 = "0.10"
 base64 = "0.22"
 terminal-colorsaurus = "0.4"
 axum = { version = "0.8", features = ["multipart"] }
+# Repeated query keys (?purl=a&purl=b) are a sequence, which serde_urlencoded
+# cannot deserialize. Already in the tree via url; taken directly rather than
+# hand-rolling percent-decoding for what is a security key.
+form_urlencoded = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
 tower = { version = "0.5", features = ["limit"] }
 # Same terminal-color crate cleave uses, so scan's verdict line and cleave's
@@ -126,6 +130,10 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking", "mul
 # Same `Bytes` type reqwest yields, threaded into cleave's zero-copy
 # `analyze_bytes_shared` so a downloaded sample is analyzed without a Vec copy.
 bytes = "1"
+# The Stream trait alone, for the heartbeat body on /v1/analyze. Already in the
+# tree via axum; taken directly rather than pulling in all of futures-util for
+# one trait we implement ourselves.
+futures-core = "0.3"
 hostname = "0.4"
 rayon = "1"
 ctrlc = "3"

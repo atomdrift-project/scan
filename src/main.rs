@@ -759,6 +759,18 @@ enum Commands {
         )]
         hopper: Option<String>,
 
+        /// Read the corpus from a hopper replica, falling back to `--hopper`.
+        ///
+        /// A lookup this worker's own index cannot answer is deferred to the
+        /// corpus, which is a read and belongs on a replica rather than on the
+        /// machine taking every write. Reads prefer this and fall back to
+        /// `--hopper` when it cannot be reached; writes are unaffected and
+        /// always go to `--hopper`. With neither set, a lookup answers from the
+        /// local index alone.
+        /// Also settable via the `SCAN_HOPPER_READ` env var.
+        #[arg(long, value_name = "URL", env = "SCAN_HOPPER_READ")]
+        hopper_read: Option<String>,
+
         /// Fill idle capacity with queue work from `--hopper`, pausing the
         /// moment a request arrives.
         ///
@@ -1475,6 +1487,7 @@ fn main() -> Result<()> {
             token_file,
             traits_dir,
             hopper,
+            hopper_read,
             idle_worker_slots,
             analysis_timeout,
         } => {
@@ -1564,10 +1577,16 @@ fn main() -> Result<()> {
             .with_fetch(fetch_policy)
             .with_zip_passwords(cli.zip_passwords.clone())
             .with_hopper(hopper.clone())
+            .with_hopper_read(hopper_read.clone())
             .with_idle_worker_slots(idle_slots)
             .with_analysis_timeout(analysis_timeout);
             if let Some(url) = hopper.as_deref() {
                 eprintln!("Renewing results on hopper at {url}");
+            }
+            // Reads prefer the replica and fall back to the primary, so name
+            // whichever one a lookup will reach first.
+            if let Some(url) = hopper_read.as_deref().or(hopper.as_deref()) {
+                eprintln!("Deferring unknown lookups to the corpus at {url}");
             }
             // Serve never bloom-skips an /analyze job (Mode::Slow), but the
             // membership endpoint and the --fetch dependency gate read the
