@@ -191,14 +191,27 @@ async fn a_bad_digest_is_rejected() -> Result<()> {
 }
 
 /// The canonical form is what the index and the filters are keyed by, so an
-/// uncanonical spelling must name the same artifact rather than a different one.
+/// uncanonical spelling must reach the same decision. The response keeps the
+/// caller's spelling, though: that is how a batched caller correlates replies
+/// without reproducing every ecosystem's normalization rules.
 #[tokio::test]
 async fn the_pkg_prefix_stays_optional() -> Result<()> {
     let bare = "npm/scan-v1-fixture-never-analyzed@0.0.0";
-    let (status, body) = get(&format!("/v1/lookup?purl={}", encoded_purl(bare))).await?;
-    assert_eq!(status, StatusCode::OK);
+    let (bare_status, bare_body) = get(&format!("/v1/lookup?purl={}", encoded_purl(bare))).await?;
+    let (canonical_status, mut canonical_body) =
+        get(&format!("/v1/lookup?purl={}", encoded_purl(UNKNOWN))).await?;
+    assert_eq!(bare_status, StatusCode::OK);
+    assert_eq!(bare_status, canonical_status);
     assert_eq!(
-        body["purl"], UNKNOWN,
+        bare_body["purl"], bare,
+        "the caller's spelling was rewritten"
+    );
+
+    // The spelling is presentation; all other fields prove both forms were
+    // resolved through the same canonical key.
+    canonical_body["purl"] = bare.into();
+    assert_eq!(
+        bare_body, canonical_body,
         "an uncanonical spelling named a different package"
     );
     Ok(())

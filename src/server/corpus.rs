@@ -207,6 +207,14 @@ impl Corpus {
                 }
             }
         }
+        // Every address failed, which the per-address warnings above say one at
+        // a time and nobody reads that way. Say it once, plainly: this is the
+        // case where a caller gating installs gets `unavailable` and has to
+        // decide what to do without us.
+        tracing::error!(
+            endpoints = %self.addresses(),
+            "corpus unreachable at every address; answering unavailable",
+        );
         self.unreachable.fetch_add(1, Ordering::Relaxed);
         Reached::Unreachable
     }

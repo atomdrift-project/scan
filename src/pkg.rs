@@ -100,24 +100,15 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
             );
         }
     }
-    // Known-good/known-bad by package coordinate, consulted *after* the registry
-    // lookup so a known-good vouch can be overridden when the version was pulled
-    // or freshly published (its trust may predate the current bytes). A known-bad
-    // coordinate returns `None` here and falls through to a full fetch+scan — the
-    // content-digest gate in `run_bytes` flags it inline. Removed versions are
-    // already handled above (metadata-only scan).
-    if let RefLocator::Purl(purl) = &locator
-        && let Some(lookup) = config.bloom()
-    {
-        let rescan = registry
-            .as_ref()
-            .is_some_and(|reg| crate::fetch::must_rescan(reg, crate::fetch::unix_now()));
-        if !rescan
-            && let Some(summary) = crate::engine::bloom_gate(config, purl, lookup.decide_purl(purl))
-        {
-            return Ok(summary);
-        }
-    }
+    // No known-good short-circuit here, by design. This function only ever runs
+    // for a location the operator named on the command line (`scan url` / `scan
+    // purl`), and a coordinate-keyed bless is a bulk optimization for
+    // dependencies and directory walks — not an answer to "scan this". Skipping
+    // the named artifact would return a lookup where a scan was asked for. The
+    // bloom still gates the *dependencies* this scan discovers, via
+    // `fetch::age_gate`, which reads the process-wide handle. Removed versions
+    // are still handled above (metadata-only scan), since there are no bytes to
+    // fetch at all.
     match crate::fetch::fetch_one(locator, progress) {
         Ok((bytes, name, rec)) => {
             // Display under the resolved URL when there is one (a PURL resolves to
