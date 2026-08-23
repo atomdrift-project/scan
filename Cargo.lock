@@ -294,6 +294,8 @@ dependencies = [
  "dirs",
  "filefacts",
  "fletch",
+ "form_urlencoded",
+ "futures-core",
  "hostname",
  "libc",
  "libmimalloc-sys",

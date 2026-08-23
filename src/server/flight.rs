@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use axum::http::StatusCode;
 use tokio::sync::watch;
@@ -114,8 +115,13 @@ impl Outcome {
 #[derive(Debug)]
 pub(super) struct Flight {
     key: FlightKey,
-    /// Raised when the last attachment goes away; cleave polls it and stops.
+    /// Raised when the analysis outruns `--analysis-timeout`; cleave polls it
+    /// at its checkpoints and stops. Callers leaving does *not* raise it — see
+    /// [`Attachment::drop`] for why the work outlives them.
     cancellation: Arc<AtomicBool>,
+    /// When the analysis began, so `/status` can say how far along a run is
+    /// and a caller can tell a long analysis from a stuck one.
+    started_at: Instant,
     /// Holds `None` until the analysis finishes.
     outcome: watch::Sender<Option<Arc<Outcome>>>,
 }
@@ -126,6 +132,7 @@ impl Flight {
         Self {
             key,
             cancellation: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
             outcome,
         }
     }
@@ -133,6 +140,11 @@ impl Flight {
     /// The key this analysis is shared under.
     pub(super) const fn key(&self) -> &FlightKey {
         &self.key
+    }
+
+    /// How long this analysis has been running.
+    pub(super) fn elapsed(&self) -> std::time::Duration {
+        self.started_at.elapsed()
     }
 
     /// Cancellation flag for the analysis, polled by cleave at its checkpoints.
@@ -218,6 +230,20 @@ impl Flights {
         }
     }
 
+    /// What is running under `key` right now, if anything. `/status` answers
+    /// from this: a caller whose connection was cut needs to tell an analysis
+    /// still in progress from one that never started, and the two are
+    /// indistinguishable from the outside.
+    pub(super) fn running(&self, key: &FlightKey) -> Option<Running> {
+        let live = lock(&self.live);
+        let found = live.get(key).map(|entry| Running {
+            elapsed: entry.flight.elapsed(),
+            attached: entry.attached,
+        });
+        drop(live);
+        found
+    }
+
     /// Snapshot how much work de-duplication is saving right now.
     pub(super) fn census(&self) -> Census {
         let live = lock(&self.live);
@@ -245,6 +271,16 @@ impl Flights {
         // so a follower that subscribes a moment later still sees it.
         let _ = flight.outcome.send_replace(Some(Arc::new(outcome)));
     }
+}
+
+/// One analysis in progress, as `/status` reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Running {
+    /// How long the analysis has been going.
+    pub(super) elapsed: std::time::Duration,
+    /// How many requests are waiting on it. Zero is normal and is the case
+    /// this exists for: the proxy gave up, the analysis did not.
+    pub(super) attached: usize,
 }
 
 /// How many analyses are running and how many requests are riding them. The
@@ -283,17 +319,13 @@ impl Drop for Attachment {
     fn drop(&mut self) {
         let mut live = lock(&self.flights.live);
         let key = self.flight.key();
-        let emptied = match live.get_mut(key) {
+        match live.get_mut(key) {
             // A later request may have started a fresh flight under this key
             // after ours retired; its count is none of our business.
             Some(entry) if Arc::ptr_eq(&entry.flight, &self.flight) => {
                 entry.attached -= 1;
-                entry.attached == 0
             }
             _ => return,
-        };
-        if emptied {
-            live.remove(key);
         }
         drop(live);
         // Deliberately *not* cancelled when the last request leaves. An
@@ -302,6 +334,14 @@ impl Drop for Attachment {
         // a proxy that timed out at two minutes on a twenty-minute run — finds
         // the answer waiting rather than starting again from nothing. The
         // watchdog's `--analysis-timeout` is what bounds a runaway.
+        //
+        // The flight is left registered for the same reason. Retiring it here
+        // would leave the analysis running but unreachable, so the caller who
+        // reconnected — the one this is all for — would key a second flight and
+        // pay for a run already minutes in. Only [`Flights::finish`] retires a
+        // flight, and every flight reaches it: the leader publishes, and a
+        // leader that dies without publishing has its outcome published by the
+        // [`Publisher`] it dropped.
     }
 }
 
@@ -413,9 +453,82 @@ mod tests {
         );
         assert_eq!(
             flights.census().analyses,
-            0,
-            "but the flight is retired, so the next request starts fresh",
+            1,
+            "the flight stays reachable, so a caller who comes back rejoins it",
         );
+    }
+
+    /// The reconnect guarantee. A proxy that gives up at its own ceiling takes
+    /// every attachment down with it, but the analysis is still running — so
+    /// the caller coming back must ride that run rather than key a second one
+    /// for work already minutes old. Retiring the flight when the count hit
+    /// zero left the analysis running but unreachable, which is the worst of
+    /// both: still burning a slot, and paid for twice.
+    #[test]
+    fn a_caller_who_reconnects_rejoins_the_running_analysis() {
+        let flights = Arc::new(Flights::default());
+        let cut = flights.join(key());
+        let flight = Arc::clone(cut.flight());
+        drop(cut);
+
+        let back = flights.join(key());
+        assert!(!back.leads(), "the reconnect started a second analysis");
+        assert!(Arc::ptr_eq(&flight, back.flight()));
+        assert_eq!(flights.census().attached, 1);
+
+        // And it still ends: publishing retires the flight exactly as before,
+        // so a flight nobody rejoins cannot linger past its own outcome.
+        flights.publisher(&flight).publish(rendered(StatusCode::OK));
+        assert_eq!(flights.census().analyses, 0);
+        assert!(flights.join(key()).leads(), "a finished flight was rejoined");
+    }
+
+    /// `/status` has to tell a run in progress from one that never started,
+    /// and the interesting case is the one with nobody attached: that is
+    /// exactly the state a cut connection leaves behind, and the state where
+    /// answering "unknown" would send the caller off to pay for it again.
+    #[test]
+    fn a_running_analysis_is_visible_with_nobody_attached() {
+        let flights = Arc::new(Flights::default());
+        assert_eq!(flights.running(&key()), None, "nothing has started");
+
+        let cut = flights.join(key());
+        assert_eq!(flights.running(&key()).map(|r| r.attached), Some(1));
+
+        drop(cut);
+        let run = flights.running(&key()).expect("the run vanished with its caller");
+        assert_eq!(run.attached, 0, "nobody is waiting, but it is still running");
+
+        let other = FlightKey::Purl("pkg:npm/left-pad@1.3.0".into());
+        assert_eq!(flights.running(&other), None, "a different key is a different run");
+    }
+
+    /// The other half: once a run is over it must stop advertising itself, or a
+    /// caller waits on an analysis that will never publish again.
+    #[test]
+    fn a_finished_analysis_stops_reporting_as_running() {
+        let flights = Arc::new(Flights::default());
+        let leader = flights.join(key());
+        flights
+            .publisher(leader.flight())
+            .publish(rendered(StatusCode::OK));
+        assert_eq!(flights.running(&key()), None);
+    }
+
+    /// Reattaching is only worth anything if the verdict actually arrives, so
+    /// the caller who reconnects is served by the run they rejoined.
+    #[tokio::test]
+    async fn a_reconnecting_caller_is_served_by_the_run_it_rejoined() {
+        let flights = Arc::new(Flights::default());
+        let cut = flights.join(key());
+        let flight = Arc::clone(cut.flight());
+        let publisher = flights.publisher(&flight);
+        drop(cut);
+
+        let back = flights.join(key());
+        publisher.publish(rendered(StatusCode::OK));
+        let outcome = back.flight().wait().await;
+        assert_eq!(status_of(&outcome), Some(StatusCode::OK));
     }
 
     #[test]

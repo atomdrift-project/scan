@@ -209,6 +209,110 @@ Beamline backends should start the server with `--fetch --interpret
 --analysis-timeout 1800` so dependency follow and LLM interpretation
 match a live `atomscan purl` run.
 
+### `GET /v1/lookup`
+
+What is known about an artifact, as a decision. Never analyzes.
+
+    GET /v1/lookup?purl=<url-encoded>
+    GET /v1/lookup?sha256=<64hex>
+    GET /v1/lookup?purl=a&purl=b          up to 50 per URL
+    GET /v1/lookup?purl=<p>&false_positive_budget=25
+
+Answers from this worker's own index first. On a miss it defers to the
+corpus — hopper's `/v1/lookup`, read from `--hopper-read` and falling
+back to `--hopper` — so one question gets one answer and a caller need
+not know two services exist. With neither configured it answers from
+the local index alone.
+
+    {
+      "decision": "block",
+      "purl": "pkg:npm/evil@1.0.0",
+      "sha256": "2cf24dba…",
+      "severity": "hostile",
+      "fires_at": 3,
+      "reason": "Postinstall launches a reverse shell.",
+      "findings": [{"id": "objectives/execution/shell/bash", "crit": 5}],
+      "engine_version": "2.8.0",
+      "analyzed_at": "2026-08-01T00:00:00Z"
+    }
+
+One package answers with one object; a repeated `purl` answers with a
+list, in the order asked. Every field is always present — `null` when
+unknown, `[]` when empty.
+
+`decision` is one of:
+
+| | |
+| --- | --- |
+| `allow` | Analyzed. Not hostile at the caller's budget. |
+| `block` | Analyzed. Hostile at the caller's budget. |
+| `unknown` | Nobody has analyzed it, and nothing is wrong. |
+| `unavailable` | We could not answer. Nothing about the artifact. |
+
+`unknown` and `unavailable` are kept distinct on purpose: one is a
+claim about the package, the other about us, and a caller's policy is
+entitled to treat them differently. A verdict index that has not
+loaded, or a corpus that cannot be reached, is `unavailable` — never
+`unknown`, which would report our own outage as a clean bill of health.
+
+`fires_at` is the stored `lvl`: the tightest false-positive budget per
+100 million benign files at which the artifact grades hostile, `-1` for
+one that fires at no level, `null` for a record predating levels or
+written under manual `--threshold-*`. It is measured.
+
+`false_positive_budget` is chosen: what the caller will tolerate.
+Default is this server's own `--level`, resolved as usual (flag, then
+the bundle's `default_severity_level`, then the shipped constant), so a
+retuned deploy moves with it. `decision` is `block` when `fires_at` is
+at or below it. A budget that is not a whole number from 0 to 65535 is
+a 400 rather than a silent fall back.
+
+`severity` is `benign`, `suspicious` or `hostile` — the same grades
+`Classification` uses, and independent of the caller's budget.
+
+Errors carry a stable code: `missing_package`, `invalid_purl`,
+`invalid_sha256`, `invalid_false_positive_budget`, `too_many_packages`.
+
+### `POST /v1/analyze`
+
+Analyze a package and answer with a decision.
+
+    POST /v1/analyze
+    POST /v1/analyze?false_positive_budget=25
+    {"purl": "pkg:npm/evil@1.0.0"}
+
+The reply is newline-delimited JSON: progress while the run is going,
+then the decision. Read lines until one carries `decision`.
+
+    {"state":"analyzing","elapsed_ms":1002,"phase":"fetch","purl":"…"}
+    {"state":"analyzing","elapsed_ms":6004,"phase":"unpack","purl":"…"}
+    {"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0",…}
+
+This exists because a proxy gives up on a silent connection — measured
+at 125 seconds in front of this fleet — and tears it down, costing the
+caller an analysis that in fact completed: the worker finishes, files
+its verdict, and answers the next asker in milliseconds, but the reply
+to that request had nowhere to go. Progress frames keep the connection
+from being idle, and say what a long run is doing.
+
+Nothing is sent for the first 250ms, so an outcome that needed no work
+still gets an ordinary status code. That is what keeps `429 At
+capacity` a real 429 a router can act on rather than a decision buried
+in a 200 body — capacity is refused the instant a slot is asked for, so
+it never reaches the streaming path.
+
+Once streaming starts the status is committed, so an analysis that
+fails past that point arrives as `decision: unavailable` rather than a
+5xx. A caller reads `decision`, not the status line.
+
+An analysis that finishes before the first frame is due emits only the
+decision, so a fast call is a single JSON object.
+
+A stream that ends without a decision was cut short, not answered. The
+analysis continues regardless — it is not that connection's to lose —
+and a caller that reconnects joins the run already in progress rather
+than starting a second one.
+
 ### `GET /lookup`
 
 What scan already knows about an artifact or a package. Reads stored
@@ -302,6 +406,39 @@ the artifact). The scope is `private` when a token is configured.
 
 400 for a malformed digest, for a string that is not a PURL, or for
 anything other than exactly one key.
+
+### `GET /status`
+
+`?sha256=…`, `?purl=…`, or both. Where an analysis of this artifact
+stands, without starting one:
+
+| state | meaning |
+| --- | --- |
+| `running` | an analysis is in progress here, with `elapsed_ms` and `attached` |
+| `complete` | a verdict is stored; fetch it from `/lookup` |
+| `unknown` | nothing running here and nothing stored |
+
+For the caller whose connection did not survive the analysis. A proxy
+that gives up at its own ceiling leaves the run going here, but from
+outside a run in progress and a run that never started are both
+`404 unknown sample` on `/lookup` — and confusing them means paying for
+a twenty-minute analysis twice. A caller that reconnects asks here
+first and sends the retry to whichever worker answers `running`, which
+attaches it to the run already going rather than starting another.
+
+`attached: 0` is the normal case, not an error: it says the proxy gave
+up but the analysis did not.
+
+There is no `lost`. That is the caller's own inference — they
+dispatched, their connection died, and this says `unknown` — and
+reporting it would mean keeping a record of every run that ever ended
+in order to tell a caller something they already know.
+
+`/lookup` carries the same signal on a miss: an `analyzing` object
+appears beside `bloom` when a run for that key is live, so a caller
+already making that request needs no second one.
+
+400 for a malformed digest, an unparseable PURL, or no key at all.
 
 ### `GET /_/health`
 
