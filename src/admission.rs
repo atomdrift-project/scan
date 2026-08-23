@@ -24,10 +24,11 @@
 //! progress even on a host too small to fit a single slot's estimate.
 //!
 //! When the gate closes it logs the per-slot breakdown and clears caches once,
-//! then re-polls until memory frees. Admission is acquired from the single
-//! dispatch loop, so the check-then-reserve sequence races nothing; releases
-//! happen on the per-job tokio tasks and only ever *decrease* the reservation,
-//! so they cannot cause over-commit.
+//! then re-polls until memory frees. Admission is acquired concurrently from
+//! every worker task (and every paused waiter retries on the repoll tick), so
+//! the check-then-reserve sequence runs as a CAS loop on `reserved`; releases
+//! happen on the per-job tokio tasks and saturate at zero, so no interleaving
+//! can wrap the reservation below zero and wedge the gate shut.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -284,7 +285,10 @@ impl MemoryAdmission {
     /// in flight) guarantees forward progress on a host too small for one job or
     /// whose allocator has retained RSS after earlier jobs.
     ///
-    /// Single caller per loop iteration; releases only decrease `reserved`.
+    /// Called concurrently from every worker task, and races per-job releases,
+    /// so the check-then-reserve must be a CAS: a plain load+store here loses
+    /// concurrent updates, and one lost add is enough to later wrap `reserved`
+    /// below zero — which reads as ~2^64 and closes the gate permanently.
     fn try_reserve(&self, est: u64) -> bool {
         // Disabled: dispatch is bounded by slot count alone.
         if self.ceiling_bytes == 0 {
@@ -292,33 +296,39 @@ impl MemoryAdmission {
             return true;
         }
 
-        let reserved = self.reserved.load(Ordering::Acquire);
         let used = (self.used_fn)();
+        let mut reserved = self.reserved.load(Ordering::Acquire);
+        loop {
+            // Forward-progress hatch: with nothing of ours in flight, admit one
+            // job even when the job estimate exceeds the ceiling, or when RSS
+            // stayed high because the allocator retained freed arenas. The CAS
+            // below admits exactly one job through the hatch even when several
+            // waiters observe zero at once.
+            if reserved != 0 {
+                // Predictive: committed reservations must leave room for this job.
+                if reserved.saturating_add(est) > self.ceiling_bytes {
+                    return false;
+                }
 
-        // Forward-progress hatch: with nothing of ours in flight, admit one job
-        // even when the job estimate exceeds the ceiling, or when RSS stayed high
-        // because the allocator retained freed arenas.
-        if reserved == 0 {
-            self.reserved.store(est, Ordering::Release);
-            return true;
+                // Reactive: live usage must leave room for this job, catching
+                // estimates that ran low and pressure from other processes.
+                if let Some(used) = used
+                    && used.saturating_add(est) > self.ceiling_bytes
+                {
+                    return false;
+                }
+            }
+
+            match self.reserved.compare_exchange_weak(
+                reserved,
+                reserved.saturating_add(est),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => reserved = actual,
+            }
         }
-
-        // Predictive: committed reservations must leave room for this job.
-        if reserved.saturating_add(est) > self.ceiling_bytes {
-            return false;
-        }
-
-        // Reactive: live usage must leave room for this job, catching
-        // estimates that ran low and pressure from other processes.
-        if let Some(used) = used
-            && used.saturating_add(est) > self.ceiling_bytes
-        {
-            return false;
-        }
-
-        self.reserved
-            .store(reserved.saturating_add(est), Ordering::Release);
-        true
     }
 
     /// Record an admitted job (its `est` is already reserved) and return its guard.
@@ -351,7 +361,14 @@ impl MemoryAdmission {
     }
 
     fn release(&self, id: u64, est: u64) {
-        self.reserved.fetch_sub(est, Ordering::AcqRel);
+        // Saturating: an accounting bug must degrade to a reservation leaked
+        // toward zero, never a wrap below zero — a wrapped counter reads as
+        // ~2^64 and pauses admission forever (seen live on smaug 2026-08-22).
+        let _ = self
+            .reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |r| {
+                Some(r.saturating_sub(est))
+            });
         self.inflight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -534,6 +551,30 @@ mod tests {
             dynamic_estimate_bytes("plain.js", "javascript", 10 * 1024 * 1024),
             DEFAULT_FLAT_ESTIMATE_BYTES,
         );
+    }
+
+    #[test]
+    fn concurrent_reserve_release_never_wraps_reserved() {
+        // Regression: try_reserve used a load+store, so a release landing
+        // between them was overwritten; the corresponding guards still
+        // subtracted their full estimate and `reserved` wrapped below zero,
+        // closing the gate permanently. With the CAS every add is recorded,
+        // so after all guards release the counter must be exactly zero.
+        let est = GB;
+        let g = gate(4 * GB, est, no_used);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..1000 {
+                        if g.try_reserve(est) {
+                            g.release(u64::MAX, est);
+                        }
+                    }
+                });
+            }
+        });
+        let reserved = g.reserved.load(Ordering::Acquire);
+        assert_eq!(reserved, 0, "reserved leaked or wrapped: {reserved:#x}");
     }
 
     #[test]
