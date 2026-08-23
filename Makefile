@@ -50,6 +50,14 @@ export HOPPER_TOKEN_FILE
 # it is also what makes the deploy install HOPPER_TOKEN_FILE for the service
 # account — hopper rejects an unauthenticated renewal with 401.
 #
+# It may name the same corpus twice, replica first and primary behind it, so a
+# replica outage costs a retry rather than a lost verdict:
+#
+#   make deploy HOPPER=https://hops-ro.isotope13.ai,https://hops.isotope13.ai
+#
+# Lookups and renewals walk that list. The idle worker does not: it claims from
+# the primary alone, because a replica refuses worker routes with a 403.
+#
 # It is REQUIRED: `deploy-server` refuses to install a server that files
 # nothing. Pass HOPPER=none to opt out deliberately.
 HOPPER ?=

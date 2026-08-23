@@ -787,6 +787,11 @@ enum Commands {
         /// Defaults to 1, leaving every other slot reserved for requests, and
         /// the worker holds exactly one claim at a time. 0 disables it.
         /// Requires `--hopper`.
+        ///
+        /// When `--hopper` names several addresses this claims from the
+        /// primary — the last of them — and only from it. A replica refuses
+        /// worker routes with a 403 even with its relay enabled, so unlike
+        /// lookups and renewals there is no second address to fall back to.
         #[arg(long, value_name = "N", env = "SCAN_IDLE_WORKER_SLOTS")]
         idle_worker_slots: Option<usize>,
 
@@ -806,6 +811,11 @@ enum Commands {
         /// Hopper API base URL (e.g. http://hopper-host:8081). Every call
         /// authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
         /// `$HOPPER_TOKEN`); without it hopper rejects the poll with 401.
+        ///
+        /// Accepts the comma list `serve --hopper` takes, so one deploy
+        /// variable can feed both, but a worker uses only the primary — the
+        /// last address. A replica refuses worker routes outright, so the
+        /// earlier ones are not a fallback here.
         #[arg(long)]
         url: String,
 
@@ -1679,6 +1689,15 @@ fn main() -> Result<()> {
             // Publishing the filters here enables that skip without touching
             // the job-level always-scan guarantee.
             scan::bloom_repo::set_global(std::sync::Arc::new(scan::bloom_repo::Lookup::load()));
+            // Accept the comma list `serve --hopper` takes, so one deploy
+            // variable can feed both, but keep only the primary: a replica
+            // refuses worker routes with a 403 whether or not its relay is on,
+            // so the later addresses are not a fallback for this loop. Passing
+            // the whole string through reaches a URL parser, which reads the
+            // commas as part of one very strange hostname.
+            let Some(url) = scan::upload::worker_endpoint(&url) else {
+                anyhow::bail!("--url names no hopper address");
+            };
             let workers = workers.unwrap_or_else(default_workers);
             let name = name.unwrap_or_else(|| {
                 hostname::get()

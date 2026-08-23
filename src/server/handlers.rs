@@ -3249,7 +3249,7 @@ impl V1Decision {
             severity: Some(severity),
             fires_at: v.lvl,
             reason: v.why.clone(),
-            findings: v.hits.iter().map(V1Finding::from_hit).collect(),
+            findings: V1Finding::worth_reporting(v.hits.iter().map(V1Finding::from_hit)),
             engine_version: Some(v.eng.clone()),
             analyzed_at: Some(v.at.clone()),
         }
@@ -3273,7 +3273,7 @@ impl V1Decision {
             severity: Some(severity),
             fires_at: r.fires_at,
             reason: r.reason.clone(),
-            findings: r.findings.iter().map(V1Finding::from_corpus).collect(),
+            findings: V1Finding::worth_reporting(r.findings.iter().map(V1Finding::from_corpus)),
             engine_version: r.engine_version.clone(),
             analyzed_at: r.analyzed_at.clone(),
         }
@@ -3323,7 +3323,36 @@ impl V1Finding {
             line: None,
         }
     }
+
+    /// The findings worth putting on the wire: the strongest few, worst first.
+    ///
+    /// The corpus already decides this in a trigger — `crit >= 4`, ordered by
+    /// criticality, at most three — and a decision answered from this worker's
+    /// own index has to land on the same set, or one artifact reads differently
+    /// depending on which side of the index happened to answer. Applying it
+    /// here rather than trusting each source keeps the two in step by
+    /// construction; on corpus records it is a no-op.
+    ///
+    /// A benign artifact clears the bar with nothing, and that is the intended
+    /// answer rather than a gap to fill: ten "Rust test marker" hits explain
+    /// nothing about an allow, and listing them invites a caller to read
+    /// significance into noise.
+    fn worth_reporting(all: impl Iterator<Item = Self>) -> Vec<Self> {
+        let mut kept: Vec<Self> = all.filter(|f| f.crit >= REPORT_MIN_CRIT).collect();
+        // Stable, so equal criticalities keep the order their source listed
+        // them in — the same tiebreak as the trigger's `ORDER BY crit DESC,
+        // ord`.
+        kept.sort_by_key(|f| std::cmp::Reverse(f.crit));
+        kept.truncate(REPORT_LIMIT);
+        kept
+    }
 }
+
+/// Suspicious and above. Below this a trait is an observation, not a reason.
+const REPORT_MIN_CRIT: u8 = 4;
+
+/// Enough to show why, few enough to read. Matches the corpus's `LIMIT 3`.
+const REPORT_LIMIT: usize = 3;
 
 /// A v1 error. `code` is stable and machine-readable; `message` is for humans
 /// and may be reworded freely.
@@ -3622,6 +3651,88 @@ mod tests {
             finding_keys(&shapes[0]),
             finding_keys(&shapes[1]),
             "a finding from the corpus is shaped differently from a stored one",
+        );
+    }
+
+    /// Findings are evidence for the decision, not a dump of everything the
+    /// scanner noticed. A benign crate matched ten "Rust test marker" traits at
+    /// `crit: 3`; answering an `allow` with all ten invites a caller to read
+    /// significance into noise, and it disagreed with the same artifact looked
+    /// up from the corpus, where the trigger had already cut them.
+    #[test]
+    fn only_the_strongest_few_findings_reach_the_wire() {
+        use super::super::corpus::{CorpusFinding, CorpusRecord};
+        use super::V1Decision;
+        use crate::lookup::{Hit, Verdict};
+
+        let hit = |id: &str, crit: u8| Hit {
+            id: id.into(),
+            crit,
+            file: "lib/install.js".into(),
+            pkg: String::new(),
+            desc: String::new(),
+            off: None,
+            line: None,
+        };
+        let ids = |d: &V1Decision| -> Vec<String> {
+            d.findings.iter().map(|f| f.id.clone()).collect()
+        };
+
+        let benign = Verdict {
+            sha256: "a".repeat(64),
+            lvl: Some(-1),
+            eng: "2.8.0".into(),
+            at: "2026-08-01T00:00:00Z".into(),
+            purl: Some("pkg:cargo/tokio@1.40.0".into()),
+            why: None,
+            hits: (0..10).map(|i| hit(&format!("testing/harness::{i}"), 3)).collect(),
+        };
+        let d = V1Decision::stored(&benign, None, 25);
+        assert_eq!(d.decision, super::decision::Decision::Allow);
+        assert!(
+            ids(&d).is_empty(),
+            "sub-threshold traits were reported as evidence: {:?}",
+            ids(&d),
+        );
+
+        // Worst first, capped at three, and equal criticalities keep the order
+        // their source listed them in.
+        let noisy = Verdict {
+            hits: vec![
+                hit("weak", 4),
+                hit("worst", 6),
+                hit("dropped", 3),
+                hit("strong-a", 5),
+                hit("strong-b", 5),
+                hit("cut", 4),
+            ],
+            ..benign
+        };
+        assert_eq!(
+            ids(&V1Decision::stored(&noisy, None, 25)),
+            ["worst", "strong-a", "strong-b"],
+        );
+
+        // The corpus applies the same rule in a trigger, so passing it through
+        // here changes nothing — which is the point: one artifact reads the
+        // same whichever side of the index answered.
+        let record = CorpusRecord {
+            sha256: Some("a".repeat(64)),
+            purl: Some("pkg:cargo/tokio@1.40.0".into()),
+            fires_at: Some(-1),
+            engine_version: Some("2.8.0".into()),
+            analyzed_at: Some("2026-08-01T00:00:00Z".into()),
+            reason: None,
+            findings: (0..10)
+                .map(|i| CorpusFinding {
+                    id: format!("testing/harness::{i}"),
+                    crit: 3,
+                })
+                .collect(),
+        };
+        assert!(
+            ids(&V1Decision::corpus(&record, None, None, 25)).is_empty(),
+            "a corpus record reported findings a stored verdict would have cut",
         );
     }
 
