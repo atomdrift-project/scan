@@ -267,8 +267,19 @@ impl Corpus {
             // 404 is "nothing stored"; 202 is "held, nobody has looked at it".
             // Neither is a verdict, and neither is a failure.
             404 | 202 => Some(Reached::Nothing),
-            // 4xx is this request being wrong, which the next endpoint would
-            // also say. 5xx is the endpoint being unwell, which it might not.
+            // Being turned away is about this endpoint, not about the query:
+            // a credential can be wrong for one address and right for the
+            // next, and 403 is exactly how a replica declines a route it will
+            // not serve. Answering "nothing known" here would be a claim about
+            // the artifact made on the strength of never having asked, and it
+            // would strand every lookup on a replica whose token went stale.
+            401 | 403 => {
+                tracing::warn!(endpoint = %base, status = response.status().as_u16(), "corpus turned us away");
+                None
+            }
+            // Any other 4xx is this request being wrong, which the next
+            // endpoint would also say. 5xx is the endpoint being unwell, which
+            // it might not.
             status if (400..500).contains(&status) => {
                 tracing::warn!(endpoint = %base, status, "corpus refused the query");
                 Some(Reached::Nothing)
@@ -415,6 +426,75 @@ mod tests {
             c.order_at(Instant::now()).first(),
             Some(&"http://127.0.0.1:2"),
             "the address that just failed is still being tried first",
+        );
+    }
+
+    /// An endpoint that answers every request with `status`, for the failover
+    /// tests. Stays up for the life of the test: a corpus may ask it twice.
+    fn endpoint(status: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.read(&mut [0u8; 2048]);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A stale token on the replica must not read as an empty corpus.
+    ///
+    /// 401 and 403 are the endpoint declining us, not the corpus reporting on
+    /// the artifact — and a credential can be wrong for one address and right
+    /// for the next. Taking either as "nothing known" would answer `unknown`
+    /// for every package in the corpus, indefinitely, without ever asking the
+    /// primary sitting one line down the list.
+    #[tokio::test]
+    async fn a_refused_credential_falls_through_to_the_primary() {
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            let replica = endpoint(status, r#"{"error":"nope"}"#);
+            let primary = endpoint("200 OK", r#"{"sha256":"abc","fires_at":-1}"#);
+            let c = corpus(&format!("{replica},{primary}"));
+            let reached = c.known(None, Some("pkg:npm/left-pad@1.3.0")).await;
+            let Reached::Record(record) = reached else {
+                panic!("{status} at the replica became {reached:?}");
+            };
+            assert_eq!(record.sha256.as_deref(), Some("abc"));
+        }
+    }
+
+    /// And when every address turns us away there is no answer to give. Saying
+    /// `Nothing` there would be a statement about the artifact resting on
+    /// nothing but our own inability to ask.
+    #[tokio::test]
+    async fn a_corpus_that_refuses_everywhere_is_unreachable() {
+        let a = endpoint("401 Unauthorized", r#"{"error":"nope"}"#);
+        let b = endpoint("403 Forbidden", r#"{"error":"nope"}"#);
+        let c = corpus(&format!("{a},{b}"));
+        assert_eq!(
+            c.known(None, Some("pkg:npm/left-pad@1.3.0")).await,
+            Reached::Unreachable,
+        );
+    }
+
+    /// A malformed query, though, really is wrong everywhere: the next address
+    /// is running the same build and would say the same thing. Failing over on
+    /// it would double every bad request against the primary.
+    #[tokio::test]
+    async fn a_bad_request_is_not_retried_elsewhere() {
+        let replica = endpoint("400 Bad Request", r#"{"error":"nope"}"#);
+        let primary = endpoint("200 OK", r#"{"sha256":"abc","fires_at":-1}"#);
+        let c = corpus(&format!("{replica},{primary}"));
+        assert_eq!(
+            c.known(None, Some("pkg:npm/left-pad@1.3.0")).await,
+            Reached::Nothing,
         );
     }
 
