@@ -80,6 +80,23 @@ pub fn endpoints(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// The one address a worker may poll: the primary, which [`endpoints`] puts
+/// last.
+///
+/// Worker routes are the exception to the rule above. A replica answers
+/// lookups and relays renewals, but it refuses `/api/next` and the plain
+/// `/api/result` with a 403 even when its relay is enabled — the fleet's queue
+/// is the primary's to hand out, and passing the worker firehose through a
+/// replica helps no one. So there is nothing to fail over to here: the second
+/// address is not another way to reach the same answer, it is the only one.
+///
+/// Returns `None` for an empty or blank `--hopper`, which is how the deploy
+/// says "do not file results anywhere".
+#[must_use]
+pub fn worker_endpoint(raw: &str) -> Option<String> {
+    endpoints(raw).pop()
+}
+
 /// One hopper route, at every address it can be reached.
 ///
 /// Ordered as `--hopper` named them. A retry walks down the list rather than
@@ -1323,6 +1340,33 @@ mod tests {
         );
         assert!(endpoints("").is_empty());
         assert!(endpoints(" , , ").is_empty());
+    }
+
+    /// The worker loop is the exception: hopper refuses `/api/next` on a
+    /// replica with a 403 whether or not its relay is on, so a worker takes the
+    /// primary — the last address — and nothing else. Handing it the raw string
+    /// instead put the commas inside a hostname, and every poll for the life of
+    /// the process failed with `invalid dns name`.
+    #[test]
+    fn a_worker_polls_the_primary_only() {
+        assert_eq!(
+            worker_endpoint("https://ro,https://rw").as_deref(),
+            Some("https://rw"),
+        );
+        assert_eq!(
+            worker_endpoint(" https://ro/ , https://rw/ ").as_deref(),
+            Some("https://rw"),
+        );
+        // The ordinary single-address case is unchanged.
+        assert_eq!(worker_endpoint("https://rw/").as_deref(), Some("https://rw"));
+        // Nowhere to file results is a valid deploy, not an address.
+        assert_eq!(worker_endpoint(""), None);
+        assert_eq!(worker_endpoint(" , , "), None);
+        // Whatever a worker polls, it is one address — never a list.
+        for raw in ["https://ro,https://rw", "https://rw", " a , b , c "] {
+            let picked = worker_endpoint(raw).expect("an address");
+            assert!(!picked.contains(','), "a worker was handed a list: {picked}");
+        }
     }
 
     /// A retry walks down the list rather than hammering one address, so the

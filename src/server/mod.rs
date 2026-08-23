@@ -1251,6 +1251,14 @@ fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
         tracing::info!("idle worker disabled: no --hopper to claim work from");
         return;
     };
+    // `--hopper` may name several addresses, replica first. Reads and renewals
+    // take that whole list; a worker may not. Claiming work is the primary's
+    // route alone, so this takes the one address rather than the string — which
+    // a URL parser reads as a single very strange hostname.
+    let Some(hopper) = crate::upload::worker_endpoint(&hopper) else {
+        tracing::info!("idle worker disabled: --hopper names no address");
+        return;
+    };
     let Some(slots) = std::num::NonZeroUsize::new(state.idle_worker_slots) else {
         tracing::info!("idle worker disabled: --idle-worker-slots is 0");
         return;
