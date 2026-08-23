@@ -427,27 +427,53 @@ impl Uploader {
                             purl,
                             envelope,
                         } => {
-                            post_one(
-                                &client,
-                                &result_url,
-                                &worker,
-                                &sha256,
-                                purl.as_deref(),
-                                *envelope,
-                                &RenewTally {
-                                    uploaded: &uploaded_rx,
-                                    failed: &failed_rx,
-                                },
-                            );
+                            // Same currency rule as the dependency sync below:
+                            // this renewal is a push hopper never asked for, so
+                            // when hopper already holds a verdict at this exact
+                            // traits version, skip the envelope POST entirely.
+                            // The probe is one tiny request against a renew
+                            // lane of three slots; a cache-replayed popular
+                            // artifact — the common case — costs the probe
+                            // instead of the envelope. Probe failure or an
+                            // older hopper returns nothing "current", and the
+                            // renewal proceeds exactly as before.
+                            let already_current = envelope
+                                .raw
+                                .traits_version
+                                .as_deref()
+                                .is_some_and(|tv| {
+                                    post_known(&client, &known_url, &[sha256.as_str()], Some(tv))
+                                        .current
+                                        .contains(&sha256)
+                                });
+                            if already_current {
+                                tracing::debug!(sha256 = %sha256, "upload: verdict already current on hopper; renewal skipped");
+                            } else {
+                                post_one(
+                                    &client,
+                                    &result_url,
+                                    &worker,
+                                    &sha256,
+                                    purl.as_deref(),
+                                    *envelope,
+                                    &RenewTally {
+                                        uploaded: &uploaded_rx,
+                                        failed: &failed_rx,
+                                    },
+                                );
+                            }
                         }
                         Job::Artifacts(artifacts) => {
-                            reconcile_artifacts(
+                            // Bytes-only reconciliation: no verdicts follow
+                            // this job, so there is no currency to probe.
+                            let _ = reconcile_artifacts(
                                 &client,
                                 &known_url,
                                 &upload_url,
                                 cache.as_ref(),
                                 &mut seen,
                                 artifacts,
+                                None,
                             );
                         }
                         Job::Dependencies {
@@ -597,6 +623,10 @@ pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
 /// (one `/api/known` round-trip), then upload only those — bytes plus provenance.
 /// The `seen` set dedups across batches so a dependency shared by many files is
 /// handled once. Best-effort throughout: a failure logs and the scan continues.
+///
+/// `traits_version`, when given, rides the same probe and the return value is
+/// the digests hopper already holds a same-version verdict for — the caller's
+/// license to skip posting those verdicts. `None` returns an empty set.
 fn reconcile_artifacts(
     client: &reqwest::blocking::Client,
     known_url: &str,
@@ -604,7 +634,8 @@ fn reconcile_artifacts(
     cache: Option<&fletch::fetch::BlobCache>,
     seen: &mut HashSet<String>,
     artifacts: Vec<UploadArtifact>,
-) {
+    traits_version: Option<&str>,
+) -> HashSet<String> {
     // Drop anything reconciled earlier this run; mark the rest seen now so a
     // later batch never re-negotiates them.
     let fresh: Vec<UploadArtifact> = artifacts
@@ -612,13 +643,14 @@ fn reconcile_artifacts(
         .filter(|a| seen.insert(a.sha256.clone()))
         .collect();
     if fresh.is_empty() {
-        return;
+        return HashSet::new();
     }
 
     // The only question that gates the expensive byte transfer: which of these
-    // does hopper already have? Everything it has, we never send.
+    // does hopper already have? Everything it has, we never send. The same
+    // round-trip also learns which verdicts are already current.
     let shas: Vec<&str> = fresh.iter().map(|a| a.sha256.as_str()).collect();
-    let known = post_known(client, known_url, &shas);
+    let KnownSets { known, current } = post_known(client, known_url, &shas, traits_version);
 
     for art in fresh {
         if known.contains(&art.sha256) {
@@ -644,6 +676,7 @@ fn reconcile_artifacts(
         };
         upload_one(client, upload_url, &art, &bytes);
     }
+    current
 }
 
 /// Mirror a result's fetched dependencies into a hopper instance from a caller
@@ -716,6 +749,11 @@ fn sync_dependencies(
         return;
     }
     let collector = format!("scan+{worker}");
+    // The traits version these verdicts were computed at, read from the deps'
+    // own reports — the exact value hopper stores from these envelopes, so the
+    // currency comparison is self-consistent by construction (never a build
+    // string that merely correlates with it).
+    let traits_version = dep_traits_version(&fresh);
     // Bytes + provenance first, so each dependency's row exists before its verdict
     // UPDATE (hopper's `/api/result` no-ops on a missing row). The local seen set
     // starts empty — the run-level dedup above already removed repeats.
@@ -724,13 +762,14 @@ fn sync_dependencies(
         .map(|d| dep_artifact(d, &collector, analyzed_at))
         .collect();
     let mut local_seen = HashSet::new();
-    reconcile_artifacts(
+    let current = reconcile_artifacts(
         client,
         known_url,
         upload_url,
         cache,
         &mut local_seen,
         artifacts,
+        traits_version.as_deref(),
     );
     // Then the verdict for each dependency that has one, keyed by its content
     // sha. A dependency the embedded pass never reached carries none: its bytes
@@ -738,7 +777,20 @@ fn sync_dependencies(
     // it, but scan posts no verdict it did not compute. Logged rather than
     // dropped silently — an unevaluated dependency is a coverage gap worth
     // seeing, not a routine skip.
+    //
+    // A dependency whose stored verdict is already at this traits version is
+    // skipped entirely: re-posting it would be a redundant `samples` UPDATE on
+    // hopper (measured 2026-08-23: the same wildly popular deps — inherits,
+    // x/tools, setup-go — were re-renewed by every worker run, dominating the
+    // reserved renew lane). A popular dep now costs one renewal per analyzer
+    // release instead of one per run.
+    let mut skipped_current = 0usize;
     for dep in fresh {
+        if current.contains(&dep.sha256) {
+            skipped_current += 1;
+            tracing::debug!(sha256 = %dep.sha256, locator = %dep.locator, "upload: dependency verdict already current on hopper; skipping");
+            continue;
+        }
         let Some(envelope) = crate::engine::dep_envelope(&dep, version, analyzed_at) else {
             tracing::info!(
                 sha256 = %dep.sha256,
@@ -755,6 +807,32 @@ fn sync_dependencies(
             .map(|_| dep.locator.as_str());
         post_one(client, result_url, worker, &dep.sha256, purl, envelope, tally);
     }
+    if skipped_current > 0 {
+        tracing::info!(
+            skipped = skipped_current,
+            "upload: dependency verdicts already current on hopper; not re-posted"
+        );
+    }
+}
+
+/// The traits version the batch's verdicts were computed at: the `rev` (v8) or
+/// `tv` (v7) field of the first dependency report that carries one. All deps
+/// in a run share one build, so the first answer speaks for the batch. `None`
+/// (no reports, or none parseable) disables the currency probe — the safe
+/// direction, posting everything as before.
+fn dep_traits_version(deps: &[crate::engine::DepResult]) -> Option<String> {
+    #[derive(serde::Deserialize, Default)]
+    struct RevOnly {
+        #[serde(default)]
+        rev: String,
+        #[serde(default)]
+        tv: String,
+    }
+    deps.iter().find_map(|d| {
+        let parsed: RevOnly = serde_json::from_str(&d.raw).ok()?;
+        let v = if !parsed.rev.is_empty() { parsed.rev } else { parsed.tv };
+        (!v.is_empty()).then_some(v)
+    })
 }
 
 /// Build the upload artifact for a fetched dependency. Its bytes load from the
@@ -803,43 +881,68 @@ fn dep_artifact(dep: &crate::engine::DepResult, collector: &str, now: &str) -> U
     }
 }
 
-/// POST the batch existence probe (`/api/known`) and return the subset hopper
-/// already holds. On any failure returns an empty set — the caller then treats
-/// every artifact as missing and tries to upload (hopper's upsert is idempotent),
-/// which is the safe direction: we never skip a needed upload because the probe
-/// failed.
+/// What `/api/known` reported for one probe batch.
+#[derive(Default)]
+struct KnownSets {
+    /// Digests whose bytes hopper already holds — never re-upload these.
+    known: HashSet<String>,
+    /// Digests whose stored verdict already matches the traits version we
+    /// declared — re-posting those verdicts would be a redundant UPDATE.
+    /// Empty when no version was declared or hopper predates the field.
+    current: HashSet<String>,
+}
+
+/// POST the batch existence probe (`/api/known`) and return what hopper
+/// already holds. When `traits_version` is declared, hopper additionally
+/// reports which of the known digests hold a verdict at that same version.
+/// On any failure returns empty sets — the caller then treats every artifact
+/// as missing and every verdict as stale (hopper's upsert is idempotent),
+/// which is the safe direction: we never skip a needed upload because the
+/// probe failed, and a hopper too old to know `traits_version` simply omits
+/// `current`, restoring today's post-everything behavior.
 fn post_known(
     client: &reqwest::blocking::Client,
     known_url: &str,
     shas: &[&str],
-) -> HashSet<String> {
+    traits_version: Option<&str>,
+) -> KnownSets {
     #[derive(Serialize)]
     struct KnownRequest<'a> {
         sha256: &'a [&'a str],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        traits_version: Option<&'a str>,
     }
     #[derive(serde::Deserialize)]
     struct KnownResponse {
         #[serde(default)]
         known: Vec<String>,
+        #[serde(default)]
+        current: Vec<String>,
     }
     let resp = authed(client.post(known_url))
-        .json(&KnownRequest { sha256: shas })
+        .json(&KnownRequest {
+            sha256: shas,
+            traits_version,
+        })
         .send();
     match resp {
         Ok(resp) if resp.status().is_success() => match resp.json::<KnownResponse>() {
-            Ok(kr) => kr.known.into_iter().collect(),
+            Ok(kr) => KnownSets {
+                known: kr.known.into_iter().collect(),
+                current: kr.current.into_iter().collect(),
+            },
             Err(e) => {
                 tracing::warn!(error = %error_chain(&e), "upload: known response decode failed");
-                HashSet::new()
+                KnownSets::default()
             }
         },
         Ok(resp) => {
             tracing::warn!(status = %resp.status(), "upload: known probe non-success");
-            HashSet::new()
+            KnownSets::default()
         }
         Err(e) => {
             tracing::warn!(error = %error_chain(&e), "upload: known probe failed");
-            HashSet::new()
+            KnownSets::default()
         }
     }
 }
@@ -1214,6 +1317,42 @@ mod tests {
     }
 
     /// Decorrelation is the property that matters, not distribution quality.
+    /// The currency probe's version must be the value hopper stores from these
+    /// very reports: rev (v8) first, tv (v7) fallback, and no answer at all —
+    /// never a guess — when the batch carries neither. A wrong-but-nonempty
+    /// version would silently disable every skip; a fabricated one could skip
+    /// verdicts hopper actually needs.
+    #[test]
+    fn dep_traits_version_reads_rev_then_tv_then_gives_up() {
+        let dep = |raw: &str| crate::engine::DepResult {
+            sha256: "s".into(),
+            locator: "pkg:npm/x@1".into(),
+            url: String::new(),
+            size: 0,
+            provenance: None,
+            verdict: None,
+            members: crate::engine::MemberEvals::new(),
+            raw: raw.into(),
+        };
+        assert_eq!(
+            dep_traits_version(&[dep(r#"{"rev":"abc12","tv":"old"}"#)]).as_deref(),
+            Some("abc12"),
+            "rev (v8) must win over tv"
+        );
+        assert_eq!(
+            dep_traits_version(&[dep(r#"{"tv":"old55"}"#)]).as_deref(),
+            Some("old55"),
+            "tv (v7) is the fallback"
+        );
+        assert_eq!(
+            dep_traits_version(&[dep("not json"), dep(r#"{"rev":"def34"}"#)]).as_deref(),
+            Some("def34"),
+            "an unparseable report is skipped, not fatal"
+        );
+        assert_eq!(dep_traits_version(&[dep(r#"{}"#)]), None, "no version fields -> no probe");
+        assert_eq!(dep_traits_version(&[]), None, "empty batch -> no probe");
+    }
+
     #[test]
     fn fuzz_is_in_range_and_varies() {
         let draws: Vec<f64> = (0..64).map(|_| fuzz()).collect();
