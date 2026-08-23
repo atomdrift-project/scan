@@ -6,9 +6,14 @@
 //! to reconcile against the other, so a worker that does not know finds out
 //! rather than reporting absence.
 //!
-//! Reads go to the replica first and fall back to the primary. The replica is
-//! rested after a failure rather than retried on the next request, because the
-//! cost of an unreachable endpoint is a timeout, and paying that in front of
+//! `--hopper` may name several addresses for the same corpus, in preference
+//! order: put the replica first and the primary behind it. Reads and writes
+//! take the same list, because routing them separately is a topology this
+//! worker would have to know and hopper's write relay exists so that it does
+//! not — a replica answers lookups locally and forwards the renewals.
+//!
+//! A head that fails is rested rather than retried on the next request: the
+//! cost of an unreachable address is a timeout, and paying that in front of
 //! every lookup would be worse than the outage it is reacting to.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -22,12 +27,12 @@ use std::time::{Duration, Instant};
 /// far end of two hops.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long the replica stops leading after a failure.
+/// How long the preferred address stops leading after a failure.
 ///
 /// Long enough that a restart or a failover is not fronted by a timeout on
-/// every lookup, short enough that a recovered replica takes the load back
+/// every lookup, short enough that a recovered address takes the load back
 /// without an operator doing anything.
-const REPLICA_REST: Duration = Duration::from_secs(10);
+const REST: Duration = Duration::from_secs(10);
 
 /// What hopper said about an artifact.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,10 +81,10 @@ pub(crate) struct CorpusFinding {
 /// The corpus behind this worker's index.
 #[derive(Debug)]
 pub(crate) struct Corpus {
-    replica: Option<String>,
-    primary: Option<String>,
+    /// Every address the corpus can be reached at, in preference order.
+    bases: Vec<String>,
     client: reqwest::Client,
-    /// When the replica may lead again, or `None` while it is leading.
+    /// When the preferred address may lead again, or `None` while it leads.
     rested: Mutex<Option<Instant>>,
 }
 
@@ -88,22 +93,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Corpus {
-    /// A corpus reader, or `None` when neither endpoint is configured and there
-    /// is nothing behind this worker to defer to.
-    ///
-    /// `replica` is `--hopper-read`, `primary` is `--hopper`. Either alone is a
-    /// valid deployment: a worker with only the primary reads from what it
-    /// writes to, and one with only a replica reads and never writes.
-    pub(crate) fn new(replica: Option<String>, primary: Option<String>) -> Option<Arc<Self>> {
-        // Whitespace first, then trailing slashes: a config set to blank is
-        // not an endpoint, and treating it as one would put a doomed request in
-        // front of every lookup.
-        let trim = |s: Option<String>| {
-            s.map(|s| s.trim().trim_end_matches('/').trim().to_string())
-                .filter(|s| !s.is_empty())
-        };
-        let (replica, primary) = (trim(replica), trim(primary));
-        if replica.is_none() && primary.is_none() {
+    /// A corpus reader, or `None` when `--hopper` named nothing and there is
+    /// nothing behind this worker to defer to.
+    pub(crate) fn new(hopper: Option<&str>) -> Option<Arc<Self>> {
+        let bases = crate::upload::endpoints(hopper.unwrap_or(""));
+        if bases.is_empty() {
             return None;
         }
         let client = reqwest::Client::builder()
@@ -111,41 +105,39 @@ impl Corpus {
             .build()
             .unwrap_or_default();
         Some(Arc::new(Self {
-            replica,
-            primary,
+            bases,
             client,
             rested: Mutex::new(None),
         }))
     }
 
-    /// The endpoints to try, in order.
-    ///
-    /// A rested replica is tried last rather than not at all: if the primary is
-    /// also down, an endpoint we believe to be failing is still a better answer
-    /// than none, and trying it costs nothing when the primary succeeds first.
-    fn order_at(&self, now: Instant) -> Vec<&str> {
-        let resting = lock(&self.rested).is_some_and(|until| now < until);
-        match (self.replica.as_deref(), self.primary.as_deref()) {
-            (Some(replica), Some(primary)) if resting => vec![primary, replica],
-            (Some(replica), Some(primary)) => vec![replica, primary],
-            (Some(only), None) | (None, Some(only)) => vec![only],
-            (None, None) => Vec::new(),
-        }
+    /// The addresses this corpus can be reached at, for a startup log line.
+    pub(crate) fn addresses(&self) -> String {
+        self.bases.join(", ")
     }
 
-    /// Record how an endpoint behaved. Only the replica's standing changes:
-    /// the primary is where everything falls back to, so demoting it would
-    /// leave nowhere to fall.
+    /// The addresses to try, in order.
+    ///
+    /// A rested head goes last rather than being dropped: if everything behind
+    /// it is also down, an address we believe to be failing still beats no
+    /// address, and trying it costs nothing when something earlier answers.
+    fn order_at(&self, now: Instant) -> Vec<&str> {
+        let mut order: Vec<&str> = self.bases.iter().map(String::as_str).collect();
+        if order.len() > 1 && lock(&self.rested).is_some_and(|until| now < until) {
+            order.rotate_left(1);
+        }
+        order
+    }
+
+    /// Record how an address behaved. Only the preferred one's standing
+    /// changes: everything else is where it falls back to, and demoting those
+    /// would leave nowhere to fall.
     fn note_at(&self, base: &str, reachable: bool, now: Instant) {
-        if self.replica.as_deref() != Some(base) {
+        if self.bases.first().map(String::as_str) != Some(base) {
             return;
         }
         let mut rested = lock(&self.rested);
-        *rested = if reachable {
-            None
-        } else {
-            Some(now + REPLICA_REST)
-        };
+        *rested = if reachable { None } else { Some(now + REST) };
     }
 
     /// Ask the corpus about an artifact, trying each endpoint in turn.
@@ -239,20 +231,23 @@ fn percent_encode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    fn corpus(replica: Option<&str>, primary: Option<&str>) -> Arc<Corpus> {
-        Corpus::new(replica.map(str::to_string), primary.map(str::to_string)).expect("configured")
+    fn corpus(addresses: &str) -> Arc<Corpus> {
+        Corpus::new(Some(addresses)).expect("configured")
     }
 
     #[test]
     fn nothing_configured_is_no_corpus() {
-        assert!(Corpus::new(None, None).is_none());
-        assert!(Corpus::new(Some("  ".into()), None).is_none());
+        assert!(Corpus::new(None).is_none());
+        // A blank setting is not an address, and treating it as one would put a
+        // doomed request in front of every lookup.
+        assert!(Corpus::new(Some("  ")).is_none());
+        assert!(Corpus::new(Some(" , , ")).is_none());
     }
 
     /// Reads belong on the replica; the primary is where they fall back to.
     #[test]
     fn the_replica_leads() {
-        let c = corpus(Some("http://ro"), Some("http://rw"));
+        let c = corpus("http://ro, http://rw/");
         assert_eq!(c.order_at(Instant::now()), vec!["http://ro", "http://rw"]);
     }
 
@@ -261,7 +256,7 @@ mod tests {
     /// every answer is worse than the outage it reacts to.
     #[test]
     fn a_failed_replica_stops_leading_then_takes_it_back() {
-        let c = corpus(Some("http://ro"), Some("http://rw"));
+        let c = corpus("http://ro, http://rw/");
         let t0 = Instant::now();
 
         c.note_at("http://ro", false, t0);
@@ -274,12 +269,11 @@ mod tests {
         // Tried last rather than not at all: if the primary is down too, an
         // endpoint we doubt beats no endpoint.
         assert_eq!(
-            c.order_at(t0 + REPLICA_REST - Duration::from_millis(1))
-                .first(),
+            c.order_at(t0 + REST - Duration::from_millis(1)).first(),
             Some(&"http://rw")
         );
         assert_eq!(
-            c.order_at(t0 + REPLICA_REST).first(),
+            c.order_at(t0 + REST).first(),
             Some(&"http://ro"),
             "a rested replica never took the load back",
         );
@@ -289,7 +283,7 @@ mod tests {
     /// reaction to failure, not a penalty to serve out.
     #[test]
     fn a_recovered_replica_leads_again_at_once() {
-        let c = corpus(Some("http://ro"), Some("http://rw"));
+        let c = corpus("http://ro, http://rw/");
         let t0 = Instant::now();
         c.note_at("http://ro", false, t0);
         c.note_at("http://ro", true, t0);
@@ -300,21 +294,56 @@ mod tests {
     /// fallback order pointing at nothing.
     #[test]
     fn the_primary_is_never_demoted() {
-        let c = corpus(Some("http://ro"), Some("http://rw"));
+        let c = corpus("http://ro, http://rw/");
         let t0 = Instant::now();
         c.note_at("http://rw", false, t0);
         assert_eq!(c.order_at(t0), vec!["http://ro", "http://rw"]);
     }
 
+    /// One address is the ordinary deployment, and it must not be demoted into
+    /// nothing: with nowhere to fall back to, resting the only address we have
+    /// would answer `unavailable` for the whole cooldown.
     #[test]
-    fn one_endpoint_is_a_valid_deployment() {
+    fn one_address_is_a_valid_deployment() {
+        let c = corpus("http://only");
+        let t0 = Instant::now();
+        assert_eq!(c.order_at(t0), vec!["http://only"]);
+        c.note_at("http://only", false, t0);
         assert_eq!(
-            corpus(Some("http://ro"), None).order_at(Instant::now()),
-            vec!["http://ro"]
+            c.order_at(t0),
+            vec!["http://only"],
+            "the only address stopped being tried",
         );
+    }
+
+    /// The distinction the whole reliability contract rests on, at the layer
+    /// that decides it. A corpus that cannot be reached must report exactly
+    /// that: `Nothing` would become `unknown` one layer up and tell a caller
+    /// nobody has analyzed the package — a claim about the package rather than
+    /// about us, and the one that lets a gate fail open during an outage.
+    #[tokio::test]
+    async fn an_unreachable_corpus_reports_itself() {
+        // Port 1 refuses immediately, so this measures the decision rather than
+        // a timeout.
+        let c = corpus("http://127.0.0.1:1");
         assert_eq!(
-            corpus(None, Some("http://rw")).order_at(Instant::now()),
-            vec!["http://rw"]
+            c.known(None, Some("pkg:npm/left-pad@1.3.0")).await,
+            Reached::Unreachable,
+        );
+    }
+
+    /// And a failed read rests the address, so the next lookup does not pay the
+    /// same timeout again before falling back.
+    #[tokio::test]
+    async fn a_failed_read_rests_the_address() {
+        let c = corpus("http://127.0.0.1:1, http://127.0.0.1:2");
+        let before = c.order_at(Instant::now());
+        assert_eq!(before.first(), Some(&"http://127.0.0.1:1"));
+        let _ = c.known(None, Some("pkg:npm/left-pad@1.3.0")).await;
+        assert_eq!(
+            c.order_at(Instant::now()).first(),
+            Some(&"http://127.0.0.1:2"),
+            "the address that just failed is still being tried first",
         );
     }
 

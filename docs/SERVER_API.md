@@ -277,9 +277,17 @@ Errors carry a stable code: `missing_package`, `invalid_purl`,
 
 Analyze a package and answer with a decision.
 
-    POST /v1/analyze
+    POST /v1/analyze                  {"purl": "pkg:npm/evil@1.0.0"}
     POST /v1/analyze?false_positive_budget=25
-    {"purl": "pkg:npm/evil@1.0.0"}
+    POST /v1/analyze                  <the artifact, any other content type>
+
+An `application/json` body names a package; anything else is the artifact
+itself, staged and analyzed under the digest of its bytes. The digest is the
+identity, so two callers uploading one artifact share a single analysis exactly
+as two naming one PURL do — and `?purl=` may still accompany the bytes, which
+grafts the registry provenance onto the report. `X-Filename` names the upload so
+cleave can type it by extension; without one it is typed by content. The upload
+is bounded by `--max-size-mb`, and an empty body is a 400.
 
 The reply is newline-delimited JSON: progress while the run is going,
 then the decision. Read lines until one carries `decision`.

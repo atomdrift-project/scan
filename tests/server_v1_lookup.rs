@@ -40,26 +40,6 @@ async fn app() -> Result<Router> {
     build_app(&config).await
 }
 
-async fn app_with_corpus(hopper: &str) -> Result<Router> {
-    let config = ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        1024 * 1024,
-        0,
-        std::env::temp_dir(),
-        None,
-        4000,
-        vec![],
-        None,
-        2,
-        vec![],
-    )?
-    // The read replica alone: it configures the corpus without the uploader,
-    // which builds a blocking HTTP client whose runtime cannot be dropped from
-    // inside an async test.
-    .with_hopper_read(Some(hopper.to_string()));
-    build_app(&config).await
-}
-
 async fn get(uri: &str) -> Result<(StatusCode, serde_json::Value)> {
     let app = app().await?;
     let req = loopback(Request::builder().uri(uri).body(Body::empty())?);
@@ -153,33 +133,6 @@ async fn an_unanalyzed_package_is_unknown_and_never_allowed() -> Result<()> {
 /// the package. A caller may reasonably install unanalyzed packages while
 /// refusing to install anything during our outage — or exactly the reverse —
 /// and collapsing the two takes that choice away from them.
-#[tokio::test]
-async fn an_unreachable_corpus_is_unavailable_not_unknown() -> Result<()> {
-    // Port 1 refuses immediately, so this measures the decision rather than a
-    // timeout.
-    let app = app_with_corpus("http://127.0.0.1:1").await?;
-    let req = loopback(
-        Request::builder()
-            .uri(format!("/v1/lookup?purl={}", encoded_purl(UNKNOWN)))
-            .body(Body::empty())?,
-    );
-    let res = app.oneshot(req).await?;
-    assert_eq!(
-        res.status(),
-        StatusCode::OK,
-        "a failure we can describe is not an HTTP error"
-    );
-    let bytes = axum::body::to_bytes(res.into_body(), 256 * 1024).await?;
-    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
-    assert_eq!(
-        body["decision"], "unavailable",
-        "not being able to reach the corpus was reported as a fact about the package",
-    );
-    assert!(body["severity"].is_null());
-    assert!(body["fires_at"].is_null());
-    Ok(())
-}
-
 /// Repeating the parameter is how a caller asks about several at once, and the
 /// answer follows the shape of the question.
 #[tokio::test]

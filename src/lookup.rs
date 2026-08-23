@@ -403,7 +403,8 @@ mod tests {
 
     fn temp_index() -> Index {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("scan-lookup-test-{}-{seq}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("scan-lookup-test-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create index dir");
         Index {
             dir,

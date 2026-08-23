@@ -480,7 +480,10 @@ mod tests {
         // so a flight nobody rejoins cannot linger past its own outcome.
         flights.publisher(&flight).publish(rendered(StatusCode::OK));
         assert_eq!(flights.census().analyses, 0);
-        assert!(flights.join(key()).leads(), "a finished flight was rejoined");
+        assert!(
+            flights.join(key()).leads(),
+            "a finished flight was rejoined"
+        );
     }
 
     /// `/status` has to tell a run in progress from one that never started,
@@ -496,11 +499,20 @@ mod tests {
         assert_eq!(flights.running(&key()).map(|r| r.attached), Some(1));
 
         drop(cut);
-        let run = flights.running(&key()).expect("the run vanished with its caller");
-        assert_eq!(run.attached, 0, "nobody is waiting, but it is still running");
+        let run = flights
+            .running(&key())
+            .expect("the run vanished with its caller");
+        assert_eq!(
+            run.attached, 0,
+            "nobody is waiting, but it is still running"
+        );
 
         let other = FlightKey::Purl("pkg:npm/left-pad@1.3.0".into());
-        assert_eq!(flights.running(&other), None, "a different key is a different run");
+        assert_eq!(
+            flights.running(&other),
+            None,
+            "a different key is a different run"
+        );
     }
 
     /// The other half: once a run is over it must stop advertising itself, or a

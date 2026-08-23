@@ -57,9 +57,11 @@ async fn post(uri: &str, body: &str) -> Result<(StatusCode, serde_json::Value)> 
     Ok((status, parsed))
 }
 
+/// The package is named in the query, as it is on /v1/lookup. The body is the
+/// artifact, so it cannot also be where the locator goes.
 #[tokio::test]
 async fn an_unparseable_purl_is_refused_by_name() -> Result<()> {
-    let (status, body) = post("/v1/analyze", r#"{"purl":"not a purl"}"#).await?;
+    let (status, body) = post("/v1/analyze?purl=not%20a%20purl", "").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "invalid_purl");
     Ok(())
@@ -70,8 +72,8 @@ async fn an_unparseable_purl_is_refused_by_name() -> Result<()> {
 #[tokio::test]
 async fn a_malformed_budget_is_refused() -> Result<()> {
     let (status, body) = post(
-        "/v1/analyze?false_positive_budget=loose",
-        r#"{"purl":"pkg:npm/left-pad@1.3.0"}"#,
+        "/v1/analyze?purl=npm%2Fleft-pad%401.3.0&false_positive_budget=loose",
+        "",
     )
     .await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -89,7 +91,7 @@ async fn a_malformed_budget_is_refused() -> Result<()> {
 /// streaming everything.
 #[tokio::test]
 async fn a_refusal_keeps_a_status_a_router_can_act_on() -> Result<()> {
-    let (status, _) = post("/v1/analyze", r#"{"purl":"pkg:npm/left-pad@1.3.0"}"#).await?;
+    let (status, _) = post("/v1/analyze?purl=npm%2Fleft-pad%401.3.0", "").await?;
     assert!(
         status.is_client_error() || status.is_server_error(),
         "a refusal arrived as {status}, which a router cannot route around",
@@ -99,6 +101,48 @@ async fn a_refusal_keeps_a_status_a_router_can_act_on() -> Result<()> {
         StatusCode::OK,
         "a worker that cannot analyze answered as though it had",
     );
+    Ok(())
+}
+
+/// Which of the two things a caller means is decided by what arrived, not by a
+/// header they have to remember. `Content-Type` says nothing here that the
+/// presence of a body does not, and requiring it turned a correct `curl -T`
+/// into a 415 for a reason the caller could not see.
+#[tokio::test]
+async fn bytes_need_no_content_type() -> Result<()> {
+    for content_type in [None, Some("application/octet-stream"), Some("text/plain")] {
+        let app = app().await?;
+        let mut builder = Request::builder().method("POST").uri("/v1/analyze");
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        let req = loopback(builder.body(Body::from("some artifact bytes"))?);
+        let res = app.oneshot(req).await?;
+        assert_ne!(
+            res.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content-type {content_type:?} was refused",
+        );
+        assert_ne!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "content-type {content_type:?} was read as naming no package",
+        );
+    }
+    Ok(())
+}
+
+/// Sending neither is the only way to name nothing, and the message has to
+/// offer both ways in — a caller holding bytes told only about `?purl=` has
+/// been sent to look for a package they do not have.
+#[tokio::test]
+async fn naming_nothing_offers_both_ways_in() -> Result<()> {
+    let (status, body) = post("/v1/analyze", "").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "missing_package");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("purl"), "{message}");
+    assert!(message.contains("body"), "{message}");
     Ok(())
 }
 
@@ -121,9 +165,8 @@ async fn something_is_said_almost_immediately() -> Result<()> {
     let req = loopback(
         Request::builder()
             .method("POST")
-            .uri("/v1/analyze")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"purl":"pkg:npm/left-pad@1.3.0"}"#))?,
+            .uri("/v1/analyze?purl=npm%2Fleft-pad%401.3.0")
+            .body(Body::empty())?,
     );
     // 125s is what was measured in front of this fleet; the first byte must
     // arrive with room to spare for a slower hop elsewhere.
