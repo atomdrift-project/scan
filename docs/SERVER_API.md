@@ -279,10 +279,20 @@ Analyze a package and answer with a decision.
 
     POST /v1/analyze                  {"purl": "pkg:npm/evil@1.0.0"}
     POST /v1/analyze?false_positive_budget=25
+    POST /v1/analyze?purl=pkg:npm/evil@1.0.0&force=1
     POST /v1/analyze                  <the artifact, any other content type>
 
+A named package is looked up before anything is analyzed, exactly the way
+`GET /v1/lookup` resolves it — same normalization, same index-then-corpus order,
+same budget. A verdict already held is returned immediately and costs no
+analysis slot; `unknown` and `unavailable` are not verdicts, so both fall
+through and run. Pass `force=1` to analyze regardless of what is already known,
+which is what to use after an engine upgrade.
+
 An `application/json` body names a package; anything else is the artifact
-itself, staged and analyzed under the digest of its bytes. The digest is the
+itself, staged and analyzed under the digest of its bytes. An upload is always
+analyzed: it is a request about *those bytes*, and a `?purl=` sent with it names
+provenance rather than the artifact in hand. The digest is the
 identity, so two callers uploading one artifact share a single analysis exactly
 as two naming one PURL do — and `?purl=` may still accompany the bytes, which
 grafts the registry provenance onto the report. `X-Filename` names the upload so
