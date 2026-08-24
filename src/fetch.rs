@@ -2850,6 +2850,27 @@ fn analyze_payload(
         });
     }
 
+    // Fleet-shared skip: the corpus already holds a benign verdict for these
+    // exact bytes, analyzed within the freshness window. The local cache above
+    // is better when it hits (it returns the full sub-report to graft); this
+    // covers the fleet-wide case it cannot — another worker analyzed the same
+    // dependency, or a release just invalidated every local cache at once. A
+    // skipped payload merges like a benign analysis that found nothing: no
+    // sub-report to graft, no next-hop references, and — because it never
+    // enters the envelope — no member fan-out or renewal on hopper's side.
+    if !content_sha.is_empty() && crate::corpus_precheck::skip_reanalysis(&content_sha) {
+        tracing::debug!(
+            locator = %rec.locator,
+            content_sha = %content_sha,
+            "corpus precheck: verdict stands in hopper; skipping re-analysis"
+        );
+        return Some(Analyzed {
+            sub: None,
+            content_sha,
+            next_from_bytes: Vec::new(),
+        });
+    }
+
     let bytes = cache.load(&rec.locator)?;
     let name = payload_name(rec);
 
