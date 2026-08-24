@@ -52,6 +52,12 @@ fn credential() -> Option<&'static Credential> {
         .as_ref()
 }
 
+/// The process's hopper bearer token, for other modules that call hopper-family
+/// APIs (the corpus precheck's replica lookups). Never the origin, never logged.
+pub(crate) fn bearer_token() -> Option<&'static str> {
+    credential().map(|c| c.token.as_str())
+}
+
 /// The file [`credential`] reads the token from: `$HOPPER_TOKEN_FILE` when set,
 /// otherwise `~/.tok/hopper`. The variable names the file rather than the
 /// secret, so the token stays off argv and out of the environment; the deploy
@@ -448,6 +454,9 @@ impl Uploader {
     #[must_use]
     pub fn new(hopper_url: &str, worker: String) -> Self {
         log_hopper_credential();
+        // Submitting results here implies the corpus is authoritative for this
+        // process; arm the dependency precheck against the same hopper.
+        crate::corpus_precheck::configure(hopper_url);
         // One entry per address `--hopper` named, in preference order. A retry
         // walks down the list, so a replica that stops answering costs the
         // first attempt and the primary takes the rest — the verdict lands

@@ -1946,6 +1946,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         blocking_finished_total = finished,
                         inflight_blocking = started.saturating_sub(finished),
                         completed = completed.load(Ordering::Acquire),
+                        corpus_checks = crate::corpus_precheck::counters().0,
+                        corpus_skips = crate::corpus_precheck::counters().1,
                         "worker summary",
                     );
 

@@ -28,6 +28,7 @@
 
 pub mod admission;
 pub mod analysis_cache;
+pub mod corpus_precheck;
 pub mod analyzer;
 pub mod auto_update;
 pub mod bench_hopper;
