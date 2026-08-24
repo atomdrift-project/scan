@@ -652,6 +652,18 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "slots": state.max_concurrent_tasks,
         "slots_free": free,
         "in_flight": in_flight,
+        // The basis `slots` was sized on, so a caller can read `load1` against
+        // the right denominator. `/_/info` reports logical CPUs; slots are
+        // sized on physical, and halving the denominator would halve the
+        // apparent pressure.
+        //
+        // Worth reporting because `in_flight` is this process's own count and
+        // nothing else's. A scan host commonly runs the pull worker beside this
+        // server, and may run an ad-hoc analysis too: measured on a 64-core
+        // node, `slots_free=64 in_flight=0` alongside `load1=50`. Every word of
+        // that is true and the impression is wrong, and only `load1` against a
+        // real core count corrects it.
+        "physical_cpus": cleave::memory_tracker::physical_cpu_count(),
         "overloaded": state.overloaded_since.lock().is_ok_and(|g| g.is_some()),
         "stuck_orphans": state.stuck_orphans.load(Ordering::Relaxed),
 
