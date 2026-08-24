@@ -2531,6 +2531,14 @@ pub(super) struct V1LookupQuery {
     /// defaulted: a caller who meant to loosen their budget and got the strict
     /// default back would see verdicts they never asked for and never learn why.
     bad_budget: Option<String>,
+    /// Whether the caller insists on a fresh run.
+    ///
+    /// `/v1/analyze` answers from a verdict it already holds, which is what
+    /// makes asking twice cheap. Somebody re-checking an artifact under a new
+    /// engine needs a way to say so, and without one the only way to force a
+    /// re-analysis would be to have no verdict — which is not a state a caller
+    /// can arrange. Meaningless to `/v1/lookup`, which never analyzes.
+    force: bool,
 }
 
 impl V1LookupQuery {
@@ -2540,6 +2548,7 @@ impl V1LookupQuery {
             sha256: None,
             false_positive_budget: None,
             bad_budget: None,
+            force: false,
         };
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             match key.as_ref() {
@@ -2549,6 +2558,11 @@ impl V1LookupQuery {
                     Ok(n) => q.false_positive_budget = Some(n),
                     Err(_) => q.bad_budget = Some(value.into_owned()),
                 },
+                // Only an affirmative spelling forces a run. Anything else —
+                // including `force=0` and a bare `force=` — leaves the cheap
+                // path in place, because the expensive reading of an ambiguous
+                // value is the one that burns an analysis slot.
+                "force" => q.force = matches!(value.as_ref(), "1" | "true" | "yes"),
                 // Unknown parameters are ignored, so a caller can carry their
                 // own tracing keys through without us rejecting the request.
                 _ => {}
@@ -2635,6 +2649,52 @@ async fn v1_analyze_bytes(
         }
         None => None,
     };
+
+    // Already answered?
+    //
+    // The digest is in hand before any temp file exists — which is the reason
+    // the bytes are read whole rather than streamed — so this costs one index
+    // probe against the very artifact the caller sent. Without it, re-uploading
+    // something this worker has already analyzed pays for the whole analysis
+    // again, which is the same omission the named path above carried until the
+    // day this did.
+    //
+    // Resolved by digest, because the digest is the identity. The PURL is
+    // passed only so the answer is spelled the caller's way: it rides along
+    // with an upload as registry provenance and is not what is being asked
+    // about, and `v1_decide` prefers the sha-keyed verdict for exactly that
+    // reason.
+    //
+    // Only a real verdict short-circuits. `unknown` means nobody has analyzed
+    // these bytes, which is why the caller sent them, and `unavailable` means
+    // we could not find out — turning either into an answer would report on
+    // work never done.
+    if !q.force {
+        if let Ok(decided) = v1_resolve(state, Some(&sha), asked, budget).await
+            && decided.is_verdict()
+        {
+            let elapsed = crate::duration_ms(request_start.elapsed());
+            tracing::info!(
+                id = request_id,
+                sha256 = %sha,
+                size_bytes = bytes.len(),
+                ms = elapsed,
+                "--> POST /v1/analyze (bytes; answered from a verdict already held; no slot spent)"
+            );
+            let mut resp = Json(decided).into_response();
+            resp.headers_mut().insert("X-Total-Ms", elapsed.into());
+            resp.extensions_mut().insert(match purl.as_deref() {
+                Some(named) => Subject::purl(named, Some(&sha)),
+                None => Subject::sha256(&sha),
+            });
+            return resp;
+        }
+        tracing::info!(
+            id = request_id,
+            sha256 = %sha,
+            "no verdict held for these bytes; analyzing"
+        );
+    }
 
     let attachment = state.flights.join(FlightKey::Sha(sha.clone()));
     let leads = attachment.leads();
@@ -2822,6 +2882,47 @@ pub(super) async fn v1_analyze(
     }
     if let Some(response) = check_memory_pressure(&state).await {
         return response;
+    }
+
+    // Already answered?
+    //
+    // This is the expensive door into the question `/v1/lookup` answers
+    // cheaply, and until now it never asked: every caller paid a full
+    // download-and-classify for an artifact this worker already held a verdict
+    // for. Measured against production, three consecutive analyses of
+    // pkg:cargo/tokio@1.40.0 ran 291s, 161s and 116s while `/v1/lookup`
+    // answered the same question from the index in a single hop.
+    //
+    // Resolved exactly the way the lookup resolves it — same normalization,
+    // same index-then-corpus order, same budget — because two routes answering
+    // one question differently is worse than either answer alone. The index is
+    // consulted first and costs nothing; only a miss reaches the corpus.
+    //
+    // Only a real verdict short-circuits. `unknown` means nobody has analyzed
+    // this, which is the whole reason the caller is here, and `unavailable`
+    // means we could not find out — turning that into a refusal to work would
+    // make a corpus outage look like an answer. Both fall through and run.
+    if !q.force {
+        if let Ok(decided) = v1_resolve(&state, None, Some(&req.purl), budget).await
+            && decided.is_verdict()
+        {
+            let elapsed = crate::duration_ms(request_start.elapsed());
+            tracing::info!(
+                id = request_id,
+                purl = %purl,
+                ms = elapsed,
+                "--> POST /v1/analyze (answered from a verdict already held; no slot spent)"
+            );
+            let mut resp = Json(decided).into_response();
+            resp.headers_mut().insert("X-Total-Ms", elapsed.into());
+            resp.extensions_mut().insert(Subject::purl(&purl, None));
+            return resp;
+        }
+        tracing::info!(
+            id = request_id,
+            purl = %purl,
+            "no verdict held; analyzing"
+        );
     }
 
     let attachment = state.flights.join(FlightKey::Purl(purl.clone()));
@@ -3299,6 +3400,18 @@ impl V1Decision {
         }
     }
 
+    /// Whether this says something about the artifact rather than about us.
+    ///
+    /// `unknown` reports that nobody has analyzed it, which is precisely what
+    /// `/v1/analyze` exists to fix, and `unavailable` reports that we could not
+    /// find out. Neither may stand in for a run.
+    fn is_verdict(&self) -> bool {
+        !matches!(
+            self.decision,
+            decision::Decision::Unknown | decision::Decision::Unavailable
+        )
+    }
+
     /// A verdict this worker holds in its own index.
     ///
     /// Takes no digest: a stored verdict always carries its own, and it is the
@@ -3653,6 +3766,42 @@ fn read_thread_info_freebsd() -> serde_json::Value {
 mod tests {
     use super::{Outcome, classify_analysis_error, flight_response};
     use axum::http::StatusCode;
+
+    /// A decision that is about us rather than about the artifact must never
+    /// stand in for a run.
+    ///
+    /// `/v1/analyze` short-circuits on this predicate, so an `unavailable`
+    /// slipping through would turn a corpus outage into a silent refusal to
+    /// analyze anything — the caller would be told we could not find out, about
+    /// work we never attempted. `unknown` is the same mistake in the other
+    /// direction: it reports that nobody has analyzed the artifact, which is
+    /// precisely the state the caller asked us to change.
+    #[test]
+    fn only_a_real_verdict_may_replace_an_analysis() {
+        use super::V1Decision;
+        use super::decision::Decision;
+        let purl = Some("pkg:npm/left-pad@1.3.0");
+        assert!(!V1Decision::unknown(None, purl).is_verdict());
+        assert!(!V1Decision::unavailable(None, purl).is_verdict());
+        assert!(V1Decision::empty(Decision::Allow, None, purl).is_verdict());
+        assert!(V1Decision::empty(Decision::Block, None, purl).is_verdict());
+    }
+
+    /// Forcing a fresh run is opt-in, and only an affirmative spelling opts in.
+    /// The expensive reading of an ambiguous value is the one that burns an
+    /// analysis slot, so anything else leaves the cheap path in place.
+    #[test]
+    fn only_an_affirmative_force_spends_a_slot() {
+        use super::V1LookupQuery;
+        let q = |raw| V1LookupQuery::parse(Some(raw)).force;
+        assert!(q("purl=pkg:npm/left-pad@1.3.0&force=1"));
+        assert!(q("purl=pkg:npm/left-pad@1.3.0&force=true"));
+        assert!(q("purl=pkg:npm/left-pad@1.3.0&force=yes"));
+        assert!(!q("purl=pkg:npm/left-pad@1.3.0&force=0"));
+        assert!(!q("purl=pkg:npm/left-pad@1.3.0&force=false"));
+        assert!(!q("purl=pkg:npm/left-pad@1.3.0&force="));
+        assert!(!q("purl=pkg:npm/left-pad@1.3.0"));
+    }
 
     /// One shape, whichever route answered and whatever it found.
     ///
