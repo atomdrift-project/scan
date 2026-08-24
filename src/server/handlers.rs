@@ -2659,18 +2659,33 @@ async fn v1_analyze_bytes(
     // again, which is the same omission the named path above carried until the
     // day this did.
     //
-    // Resolved by digest, because the digest is the identity. The PURL is
-    // passed only so the answer is spelled the caller's way: it rides along
-    // with an upload as registry provenance and is not what is being asked
-    // about, and `v1_decide` prefers the sha-keyed verdict for exactly that
-    // reason.
+    // Resolved by digest and by digest ALONE. The PURL must not reach the
+    // resolver here, and this is not a style preference — passing it was a
+    // false negative with a CVE's shape.
+    //
+    // `v1_decide` hands both keys to the corpus, and hopper answers a
+    // `?sha256=…&purl=…` query on either. So an upload of arbitrary bytes
+    // carrying `?purl=` of a package the corpus knows came back with *that
+    // package's* verdict: measured against production, 25 bytes of text sent as
+    // `?purl=pkg:npm/chalk@5.3.0` were answered `allow` under chalk's digest,
+    // and the bytes were never looked at. Anything can be laundered through a
+    // reputable coordinate that way, which is precisely the attack this route
+    // exists to catch.
+    //
+    // The index path was already safe — `pick_verdict` accepts a PURL's verdict
+    // only when it describes the same bytes — and the corpus path had no such
+    // guard. Now neither needs one: what is asked about is the digest, which is
+    // the only thing an upload actually names. The caller's PURL is grafted
+    // back on afterwards as provenance, which is all it ever was.
     //
     // Only a real verdict short-circuits. `unknown` means nobody has analyzed
     // these bytes, which is why the caller sent them, and `unavailable` means
     // we could not find out — turning either into an answer would report on
     // work never done.
     if !q.force {
-        if let Ok(decided) = v1_resolve(state, Some(&sha), asked, budget).await
+        if let Ok(decided) = v1_decide(state, Some(&sha), None, budget)
+            .await
+            .map(|d| d.asked_about(asked))
             && decided.is_verdict()
         {
             let elapsed = crate::duration_ms(request_start.elapsed());
