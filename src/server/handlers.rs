@@ -3522,16 +3522,30 @@ impl V1Decision {
 /// Fed from this worker's index or from the corpus, which know different
 /// amounts about the same thing: a stored hit carries the file and offset it
 /// fired on, while the corpus keeps only the trait and its criticality — those
-/// details live in the one column a lookup must not read. The extras are
-/// therefore optional rather than absent, so both sources produce one shape.
+/// details live in the one column a lookup must not read.
+///
+/// `id` and `crit` are therefore the only fields always present, and the rest
+/// are omitted when there is nothing to say rather than sent as null. That is
+/// the opposite of the rule the enclosing decision object follows, and the two
+/// differ because the questions do. A decision has a FIXED set of things it
+/// answers, so a caller writes one code path against nine keys that never move
+/// and `"engine_version": null` is itself the answer to "which engine". A
+/// finding has no such set: how much is known about one varies by where it came
+/// from, four nulls per corpus finding is most of the object, and a reader
+/// checking `desc` has to handle absence anyway.
 #[derive(Clone, Debug, serde::Serialize)]
 pub(super) struct V1Finding {
     id: String,
     crit: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pkg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     desc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     off: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     line: Option<u64>,
 }
 
@@ -3810,6 +3824,39 @@ mod tests {
     /// work we never attempted. `unknown` is the same mistake in the other
     /// direction: it reports that nobody has analyzed the artifact, which is
     /// precisely the state the caller asked us to change.
+    /// A finding says only what is known about it.
+    ///
+    /// The decision object around it keeps every key at all times; a finding
+    /// does not, because how much is known about one varies by where it came
+    /// from. A corpus finding knows the trait and its criticality and nothing
+    /// else — sending four nulls to say so is most of the object.
+    #[test]
+    fn a_finding_omits_what_it_does_not_know() {
+        use super::super::corpus::CorpusFinding;
+        use super::V1Finding;
+        let corpus = V1Finding::from_corpus(&CorpusFinding {
+            id: "intel/feed/malicious".into(),
+            crit: 5,
+            desc: Some("Cited as malicious by 3 independent sources.".into()),
+        });
+        let json = serde_json::to_value(&corpus).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert!(obj.contains_key("id"), "id is the finding's identity");
+        assert!(obj.contains_key("crit"), "crit is always known");
+        assert!(obj.contains_key("desc"), "a desc that exists must be sent");
+        for absent in ["file", "pkg", "off", "line"] {
+            assert!(
+                !obj.contains_key(absent),
+                "{absent} is unknown here and must be omitted, not null"
+            );
+        }
+        // Never null: absent is how "nothing to say" is spelled in a finding.
+        assert!(
+            obj.values().all(|v| !v.is_null()),
+            "a null survived into a finding: {json}"
+        );
+    }
+
     #[test]
     fn only_a_real_verdict_may_replace_an_analysis() {
         use super::V1Decision;
@@ -3928,9 +3975,12 @@ mod tests {
             );
         }
 
-        // And a finding keeps its shape across the two sources, which know
-        // different amounts about the same thing: the corpus holds no file or
-        // offset, so those are null rather than absent.
+        // A finding, by contrast, does NOT keep one shape across the two
+        // sources, and that is deliberate. The decision object answers a fixed
+        // set of questions, so its keys never move; a finding's content depends
+        // on where it came from, and the corpus holds no file or offset at all.
+        // Sending four nulls to say so is most of the object, so absence is how
+        // "nothing to say" is spelled here.
         let finding_keys = |d: &V1Decision| -> Vec<String> {
             let v = serde_json::to_value(d).expect("serializes");
             let mut k: Vec<String> = v["findings"][0]
@@ -3942,11 +3992,35 @@ mod tests {
             k.sort();
             k
         };
+        let stored_finding = finding_keys(&shapes[0]);
+        let corpus_finding = finding_keys(&shapes[1]);
         assert_eq!(
-            finding_keys(&shapes[0]),
-            finding_keys(&shapes[1]),
-            "a finding from the corpus is shaped differently from a stored one",
+            corpus_finding,
+            ["crit", "id"],
+            "a corpus finding must carry only what it knows",
         );
+        // Whatever a finding does carry, it is never a null.
+        for shape in &shapes[..2] {
+            let v = serde_json::to_value(shape).expect("serializes");
+            assert!(
+                v["findings"][0]
+                    .as_object()
+                    .expect("a finding")
+                    .values()
+                    .all(|x| !x.is_null()),
+                "a null survived into a finding: {}",
+                v["findings"][0]
+            );
+        }
+        // The identity and severity are the two a caller may always rely on,
+        // whichever side of the index answered.
+        for id_or_crit in ["id", "crit"] {
+            assert!(
+                stored_finding.iter().any(|k| k == id_or_crit)
+                    && corpus_finding.iter().any(|k| k == id_or_crit),
+                "{id_or_crit} must be present on every finding",
+            );
+        }
     }
 
     /// A caller gets an answer about the package they named, spelled the way
