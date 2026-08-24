@@ -3415,16 +3415,25 @@ impl V1Decision {
         }
     }
 
-    /// Whether this says something about the artifact rather than about us.
+    /// Whether this says something about the artifact rather than about us,
+    /// and says it because an engine of ours measured it.
     ///
     /// `unknown` reports that nobody has analyzed it, which is precisely what
     /// `/v1/analyze` exists to fix, and `unavailable` reports that we could not
     /// find out. Neither may stand in for a run.
+    ///
+    /// Nor may a level derived from threat-feed citations, and that one is the
+    /// easy miss: it carries a real `decision`, so it reads as a verdict at
+    /// every glance. Standing in for the run would mean an artifact nobody has
+    /// analyzed never gets analyzed — the caller is told `block`, the corpus
+    /// learns nothing, and the gap the derived level papers over stays open for
+    /// good. An engine is exactly what separates a measurement from a citation,
+    /// so an engine is what is asked for.
     fn is_verdict(&self) -> bool {
         !matches!(
             self.decision,
             decision::Decision::Unknown | decision::Decision::Unavailable
-        )
+        ) && self.engine_version.is_some()
     }
 
     /// A verdict this worker holds in its own index.
@@ -3462,7 +3471,17 @@ impl V1Decision {
         Self {
             decision: decided,
             purl: r.purl.clone().or_else(|| purl.map(str::to_owned)),
-            sha256: r.sha256.clone().or_else(|| sha.map(str::to_owned)),
+            // Empty is absent. A record standing on threat-feed citations for a
+            // package nobody has analyzed names no bytes, and the corpus sends
+            // the field as "" rather than omitting it — which would put an
+            // empty string where the wire contract says string|null, and where
+            // a caller comparing digests to prove two spellings are one thing
+            // would find them equal.
+            sha256: r
+                .sha256
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| sha.map(str::to_owned)),
             severity: Some(severity),
             fires_at: r.fires_at,
             reason: r.reason.clone(),
@@ -3536,7 +3555,7 @@ impl V1Finding {
             crit: f.crit,
             file: None,
             pkg: None,
-            desc: None,
+            desc: f.desc.clone(),
             off: None,
             line: None,
         }
@@ -3798,8 +3817,25 @@ mod tests {
         let purl = Some("pkg:npm/left-pad@1.3.0");
         assert!(!V1Decision::unknown(None, purl).is_verdict());
         assert!(!V1Decision::unavailable(None, purl).is_verdict());
-        assert!(V1Decision::empty(Decision::Allow, None, purl).is_verdict());
-        assert!(V1Decision::empty(Decision::Block, None, purl).is_verdict());
+
+        // An engine is what makes a decision a verdict, so the fixtures below
+        // name one. `empty` leaves it unset because its other callers are the
+        // answers no engine produced.
+        let measured = |d| {
+            let mut v = V1Decision::empty(d, None, purl);
+            v.engine_version = Some("2.8.0".into());
+            v
+        };
+        assert!(measured(Decision::Allow).is_verdict());
+        assert!(measured(Decision::Block).is_verdict());
+
+        // A level derived from threat-feed citations carries a real decision
+        // and no engine. It must not stand in for a run: the artifact it
+        // describes is precisely the one nobody has analyzed, and answering
+        // from it would mean nobody ever does.
+        let cited = V1Decision::empty(Decision::Block, None, purl);
+        assert!(cited.engine_version.is_none());
+        assert!(!cited.is_verdict());
     }
 
     /// Forcing a fresh run is opt-in, and only an affirmative spelling opts in.
@@ -3858,6 +3894,7 @@ mod tests {
             findings: vec![CorpusFinding {
                 id: "objectives/c2/backdoor".into(),
                 crit: 5,
+                desc: None,
             }],
         };
 
@@ -4065,6 +4102,7 @@ mod tests {
                 .map(|i| CorpusFinding {
                     id: format!("testing/harness::{i}"),
                     crit: 3,
+                    desc: None,
                 })
                 .collect(),
         };

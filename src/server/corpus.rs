@@ -97,6 +97,11 @@ pub(crate) struct CorpusFinding {
     pub id: String,
     #[serde(default)]
     pub crit: u8,
+    /// A sentence for a person, present only on findings the analyzer did not
+    /// produce. A trait id describes itself; a citation does not, and the
+    /// record's `reason` is already taken when the verdict was also measured.
+    #[serde(default)]
+    pub desc: Option<String>,
 }
 
 /// The corpus behind this worker's index.
