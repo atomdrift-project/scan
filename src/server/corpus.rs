@@ -28,6 +28,26 @@ use std::time::{Duration, Instant};
 /// far end of two hops.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How stale the preferred address may be before its silence stops counting as
+/// an answer.
+///
+/// A replica 404 is taken as "nothing known" so that the miss load — which for
+/// a caller gating installs is most of the load — stays off the primary. That
+/// bargain assumes the replica is current. When it is not, a verdict the
+/// primary already holds reads as absence: analyze a package, get `block`, look
+/// it up a minute later and be told nobody has ever seen it.
+///
+/// Measured at 27 minutes in production, so the assumption needs enforcing
+/// rather than asserting. 60s is far above healthy replication, which runs
+/// sub-second, and far below any lag that could hide a verdict a caller just
+/// asked us to produce.
+const MAX_REPLICA_LAG: Duration = Duration::from_secs(60);
+
+/// How long a lag reading is trusted before asking again. Short enough to catch
+/// a replica falling behind, long enough that it costs one request a minute
+/// rather than one per lookup.
+const LAG_TTL: Duration = Duration::from_secs(30);
+
 /// How long the preferred address stops leading after a failure.
 ///
 /// Long enough that a restart or a failover is not fronted by a timeout on
@@ -95,6 +115,9 @@ pub(crate) struct Corpus {
     client: reqwest::Client,
     /// When the preferred address may lead again, or `None` while it leads.
     rested: Mutex<Option<Instant>>,
+    /// The preferred address's data lag when last asked, and when we asked.
+    /// `None` inside means it could not tell us.
+    lag: Mutex<Option<(Instant, Option<Duration>)>>,
     /// What the corpus said, across every address.
     found: AtomicU64,
     nothing: AtomicU64,
@@ -131,6 +154,7 @@ impl Corpus {
             traffic,
             client,
             rested: Mutex::new(None),
+            lag: Mutex::new(None),
             found: AtomicU64::new(0),
             nothing: AtomicU64::new(0),
             unreachable: AtomicU64::new(0),
@@ -178,7 +202,15 @@ impl Corpus {
         if query.is_empty() {
             return Reached::Nothing;
         }
-        let path = format!("/v1/lookup?{}", query.join("&"));
+        let mut path = format!("/v1/lookup?{}", query.join("&"));
+        // A replica too far behind cannot be believed about an absence, so its
+        // reads are relayed to the primary until it catches up. `fresh=1` is
+        // hopper's own read-after-write hatch and a no-op on the primary, which
+        // has no relay to forward to — so this is safe to send to whichever
+        // address answers.
+        if self.preferred_is_stale().await {
+            path.push_str("&fresh=1");
+        }
 
         for base in self.order_at(Instant::now()) {
             self.count(base, |a| &a.asked);
@@ -217,6 +249,72 @@ impl Corpus {
         );
         self.unreachable.fetch_add(1, Ordering::Relaxed);
         Reached::Unreachable
+    }
+
+    /// Whether the preferred address is too far behind to be trusted about an
+    /// absence.
+    ///
+    /// Only the preferred address is asked: it is the one whose 404 we would
+    /// otherwise believe, and the addresses behind it are where a stale reading
+    /// sends the traffic. A reading is cached for [`LAG_TTL`] so this costs a
+    /// request a minute rather than one per lookup.
+    ///
+    /// An address that cannot tell us its lag is trusted as before. The other
+    /// choice — treat silence as staleness — relays every read to the primary
+    /// the moment this endpoint has a bad day, which is the load the replica
+    /// exists to prevent. A single address is never stale by this measure:
+    /// there is nowhere to send the traffic instead.
+    async fn preferred_is_stale(&self) -> bool {
+        if self.bases.len() < 2 {
+            return false;
+        }
+        let Some(base) = self.bases.first() else {
+            return false;
+        };
+        let now = Instant::now();
+        let cached = lock(&self.lag)
+            .filter(|(at, _)| now.duration_since(*at) < LAG_TTL)
+            .map(|(_, lag)| lag);
+        let lag = match cached {
+            Some(lag) => lag,
+            None => {
+                let fresh = self.ask_lag(base).await;
+                *lock(&self.lag) = Some((now, fresh));
+                if let Some(lag) = fresh.filter(|lag| *lag >= MAX_REPLICA_LAG) {
+                    tracing::warn!(
+                        endpoint = %base,
+                        lag_secs = lag.as_secs(),
+                        max_secs = MAX_REPLICA_LAG.as_secs(),
+                        "corpus replica is behind; relaying reads to the primary",
+                    );
+                }
+                fresh
+            }
+        };
+        lag.is_some_and(|lag| lag >= MAX_REPLICA_LAG)
+    }
+
+    /// One address's reported data lag, or `None` when it did not say.
+    async fn ask_lag(&self, base: &str) -> Option<Duration> {
+        #[derive(serde::Deserialize)]
+        struct Status {
+            #[serde(default)]
+            lag_seconds: Option<i64>,
+        }
+        let mut request = self.client.get(format!("{base}/_/replica"));
+        if let Some(token) = crate::upload::hopper_token() {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let status = response.json::<Status>().await.ok()?;
+        status
+            .lag_seconds
+            .filter(|secs| *secs >= 0)
+            .and_then(|secs| u64::try_from(secs).ok())
+            .map(Duration::from_secs)
     }
 
     /// Bump one of an address's counters.
@@ -455,6 +553,55 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// A replica too far behind cannot be believed about an absence.
+    ///
+    /// The bargain is that a replica's 404 is taken as the answer so the miss
+    /// load stays off the primary. It holds only while the replica is current.
+    /// Measured at 27 minutes behind in production, during which a verdict the
+    /// primary already held read as `unknown` — analyze a package, get a
+    /// decision, look it up a minute later and be told nobody has seen it.
+    #[tokio::test]
+    async fn a_replica_that_is_behind_has_its_reads_relayed() {
+        let behind = endpoint("200 OK", r#"{"replica":true,"lag_seconds":1620}"#);
+        let c = corpus(&format!("{behind},http://127.0.0.1:1"));
+        assert!(c.preferred_is_stale().await, "27 minutes behind was believed");
+
+        // Cached, so this costs a request a minute and not one per lookup.
+        assert!(c.preferred_is_stale().await);
+    }
+
+    /// A replica that is keeping up is believed, which is the whole point of
+    /// having one.
+    #[tokio::test]
+    async fn a_current_replica_is_still_trusted() {
+        let current = endpoint("200 OK", r#"{"replica":true,"lag_seconds":2}"#);
+        let c = corpus(&format!("{current},http://127.0.0.1:1"));
+        assert!(!c.preferred_is_stale().await);
+    }
+
+    /// And one that cannot say is trusted as before. Treating silence as
+    /// staleness would relay every read to the primary the moment this endpoint
+    /// had a bad day — the exact load the replica exists to prevent.
+    #[tokio::test]
+    async fn an_address_that_cannot_report_its_lag_is_trusted() {
+        let quiet = endpoint("404 Not Found", r#"{}"#);
+        let c = corpus(&format!("{quiet},http://127.0.0.1:1"));
+        assert!(!c.preferred_is_stale().await);
+
+        // Unreachable is the same answer, not a worse one.
+        let c = corpus("http://127.0.0.1:1,http://127.0.0.1:2");
+        assert!(!c.preferred_is_stale().await);
+    }
+
+    /// A single address is never stale by this measure: `fresh=1` would ask the
+    /// same machine the same question, and there is nowhere else to send it.
+    #[tokio::test]
+    async fn one_address_is_never_relayed_past_itself() {
+        let behind = endpoint("200 OK", r#"{"replica":true,"lag_seconds":9999}"#);
+        let c = corpus(&behind);
+        assert!(!c.preferred_is_stale().await);
     }
 
     /// A stale token on the replica must not read as an empty corpus.
