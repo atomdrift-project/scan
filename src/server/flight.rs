@@ -40,15 +40,50 @@ pub(super) enum FlightKey {
     Sha(String),
     /// Package URL — `POST /analyze-purl`.
     Purl(String),
+    /// Uploaded bytes analyzed with a request-specific follow selection.
+    ShaFollow(String, u8),
+    /// PURL analyzed with a request-specific follow selection.
+    PurlFollow(String, u8),
 }
 
 impl FlightKey {
+    /// Scope a v1 upload by follow policy only when it differs from the
+    /// deployment default. The ordinary key remains compatible with legacy
+    /// routes and reconnect status checks.
+    pub(super) fn sha_follow(sha: String, requested: u8, configured: u8) -> Self {
+        if requested == configured {
+            Self::Sha(sha)
+        } else {
+            Self::ShaFollow(sha, requested)
+        }
+    }
+
+    /// PURL equivalent of [`Self::sha_follow`].
+    pub(super) fn purl_follow(purl: String, requested: u8, configured: u8) -> Self {
+        if requested == configured {
+            Self::Purl(purl)
+        } else {
+            Self::PurlFollow(purl, requested)
+        }
+    }
+
     /// The package this analysis was requested by, when it was requested by
     /// one. Uploads carry a digest and a filename, never a locator.
     pub(super) fn purl(&self) -> Option<&str> {
         match self {
-            Self::Purl(purl) => Some(purl),
-            Self::Sha(_) => None,
+            Self::Purl(purl) | Self::PurlFollow(purl, _) => Some(purl),
+            Self::Sha(_) | Self::ShaFollow(_, _) => None,
+        }
+    }
+
+    /// Whether two keys identify the same root artifact, ignoring policy.
+    fn same_artifact(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Sha(a) | Self::ShaFollow(a, _), Self::Sha(b) | Self::ShaFollow(b, _)) => a == b,
+            (Self::Purl(a) | Self::PurlFollow(a, _), Self::Purl(b) | Self::PurlFollow(b, _)) => {
+                a == b
+            }
+            _ => false,
         }
     }
 }
@@ -59,8 +94,8 @@ impl From<&FlightKey> for super::access::Subject {
     /// the digest of their bytes, PURL analyses by the canonical locator.
     fn from(key: &FlightKey) -> Self {
         match key {
-            FlightKey::Sha(sha) => Self::sha256(sha),
-            FlightKey::Purl(purl) => Self::purl(purl, None),
+            FlightKey::Sha(sha) | FlightKey::ShaFollow(sha, _) => Self::sha256(sha),
+            FlightKey::Purl(purl) | FlightKey::PurlFollow(purl, _) => Self::purl(purl, None),
         }
     }
 }
@@ -70,6 +105,8 @@ impl fmt::Display for FlightKey {
         match self {
             Self::Sha(sha) => write!(f, "sha:{sha}"),
             Self::Purl(purl) => write!(f, "purl:{purl}"),
+            Self::ShaFollow(sha, follow) => write!(f, "sha:{sha} follow:{follow:04b}"),
+            Self::PurlFollow(purl, follow) => write!(f, "purl:{purl} follow:{follow:04b}"),
         }
     }
 }
@@ -236,10 +273,18 @@ impl Flights {
     /// indistinguishable from the outside.
     pub(super) fn running(&self, key: &FlightKey) -> Option<Running> {
         let live = lock(&self.live);
-        let found = live.get(key).map(|entry| Running {
-            elapsed: entry.flight.elapsed(),
-            attached: entry.attached,
-        });
+        let found = live
+            .get(key)
+            .or_else(|| {
+                live.iter()
+                    .filter(|(candidate, _)| candidate.same_artifact(key))
+                    .max_by_key(|(_, entry)| entry.flight.elapsed())
+                    .map(|(_, entry)| entry)
+            })
+            .map(|entry| Running {
+                elapsed: entry.flight.elapsed(),
+                attached: entry.attached,
+            });
         drop(live);
         found
     }
@@ -428,6 +473,26 @@ mod tests {
         assert!(a.leads());
         assert!(b.leads());
         assert_eq!(flights.census().analyses, 2);
+    }
+
+    #[test]
+    fn different_follow_policies_do_not_share_an_analysis() {
+        let flights = Arc::new(Flights::default());
+        let sha = "a".repeat(64);
+        let dependencies = flights.join(FlightKey::ShaFollow(sha.clone(), 0b0100));
+        let none = flights.join(FlightKey::ShaFollow(sha, 0));
+        assert!(dependencies.leads());
+        assert!(none.leads());
+        assert_eq!(flights.census().analyses, 2);
+    }
+
+    #[test]
+    fn status_finds_a_policy_scoped_analysis() {
+        let flights = Arc::new(Flights::default());
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let run = flights.join(FlightKey::PurlFollow(purl.clone(), 0));
+        assert!(run.leads());
+        assert!(flights.running(&FlightKey::Purl(purl)).is_some());
     }
 
     #[test]

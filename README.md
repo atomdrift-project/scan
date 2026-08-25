@@ -102,7 +102,7 @@ Exit codes make CI integration trivial:
 atomscan will never send telemetry data. It will however reach out to the Internet for 2 reasons:
 
 - **rule updates**: every 24h, can be disabled using `--no-update` or `SCAN_NO_UPDATE_CHECK=1`
-- **dependency fetching**: to detect if a benign package depends on downloading a compromised package or  payload. Set `--fetch=none` to prevent this.
+- **following discovered references**: to detect if a benign package depends on or downloads a compromised payload. Set `--follow=none` to analyze only the requested artifact.
 
 ## Tune the false-positive level
 

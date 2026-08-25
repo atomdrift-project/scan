@@ -291,49 +291,45 @@ struct Cli {
     #[arg(long = "zip-password", value_name = "PASSWORD", global = true)]
     zip_passwords: Vec<String>,
 
-    /// [EXPERIMENTAL] Fetch the external references discovered in analyzed
-    /// files, re-analyze each payload, and fold it into the verdict. A
-    /// comma-separated selection of what to fetch, by how strongly the reference
-    /// is bound to the artifact:
-    ///   `deps`     — strict dependencies declared in a manifest/lockfile
-    ///                (package.json, Cargo.lock, .SRCINFO depends);
-    ///   `packages` — packages merely mentioned by an install command
-    ///                (`npm install foo`, `pip install bar`), typically injected
-    ///                by a build/lifecycle script rather than pinned;
-    ///   `urls`     — raw URLs with no package identity (curl/wget targets,
-    ///                staged downloads), the largest exposure.
-    /// `all` (or a bare `--fetch`) selects every kind; `none` disables fetching
-    /// entirely (a fully offline scan). When omitted, all three kinds are
-    /// fetched by default. Also settable per deployment via the `SCAN_FETCH`
-    /// env var (e.g. `SCAN_FETCH=urls,packages` or `SCAN_FETCH=none`), which
-    /// overrides the default. An online step performed after the offline
-    /// analysis.
+    /// [EXPERIMENTAL] Follow references discovered inside the requested
+    /// artifact, analyze their payloads, and fold them into the verdict:
+    ///   `dependencies` — manifest and lockfile dependencies;
+    ///   `references`   — packages and URLs named by install/download commands;
+    ///   `ci-actions`   — third-party actions referenced by CI configuration.
+    /// `all` selects every category; `none` analyzes only the requested artifact.
+    /// A bare `--follow` and the default follow dependencies and references but
+    /// not CI actions. The old `--fetch` flag and `deps`, `packages`, `urls`, and
+    /// `ci` values remain accepted as aliases. Also settable via `SCAN_FOLLOW`;
+    /// `SCAN_FETCH` remains a compatibility alias.
     #[arg(
-        long,
+        long = "follow",
+        visible_alias = "fetch",
         global = true,
-        value_name = "KINDS",
+        value_name = "TARGETS",
         num_args = 0..=1,
         require_equals = true,
-        // A bare `--fetch` selects the artifact's own reachable code, not CI:
-        // `--fetch=all` (or `--fetch=ci`) is the explicit opt-in for GitHub
+        // A bare `--follow` selects the artifact's own reachable code, not CI:
+        // `--follow=all` (or `--follow=ci-actions`) is the explicit opt-in for GitHub
         // Actions, which run only in CI and never reach an installed artifact.
-        // Keep in lockstep with `default_cli_fetch_policy`, which resolves an
-        // absent `--fetch` to the same kinds.
-        default_missing_value = "urls,packages,deps",
-        env = "SCAN_FETCH"
+        // Keep in lockstep with `default_cli_follow_policy`, which resolves an
+        // absent `--follow` to the same targets.
+        default_missing_value = "references,dependencies",
+        env = "SCAN_FOLLOW"
     )]
-    fetch: Option<scan::fetch::FetchPolicy>,
+    follow: Option<scan::fetch::FetchPolicy>,
 
-    /// [EXPERIMENTAL] How many hops of references to follow when `--fetch` is on:
+    /// [EXPERIMENTAL] How many hops of references to follow when `--follow` is on:
     /// `1` fetches only what the scanned files reference, `2` also follows
     /// references found inside those payloads (reaching a stage-3 `curl | bash`
-    /// dropper), and so on. Also settable via `SCAN_FETCH_DEPTH`.
+    /// dropper), and so on. Also settable via `SCAN_FOLLOW_DEPTH`; the old
+    /// `--fetch-depth` and `SCAN_FETCH_DEPTH` names remain aliases.
     #[arg(
-        long,
+        long = "follow-depth",
+        visible_alias = "fetch-depth",
         global = true,
         value_name = "N",
         default_value_t = scan::fetch::DEFAULT_FETCH_DEPTH,
-        env = "SCAN_FETCH_DEPTH"
+        env = "SCAN_FOLLOW_DEPTH"
     )]
     fetch_depth: u8,
 
@@ -586,12 +582,13 @@ impl Cli {
 
 /// The binary's online default: everything the artifact itself reaches, but not
 /// CI — GitHub Actions run only on a runner and never land in an installed
-/// artifact, so auditing them is an explicit `--fetch=ci`/`--fetch=all` opt-in.
+/// artifact, so auditing them is an explicit
+/// `--follow=ci-actions`/`--follow=all` opt-in.
 /// Keep [`FetchPolicy::default`] offline for the library API.
 ///
-/// Must agree with the `default_missing_value` on `Cli::fetch`, so a bare
-/// `--fetch` and an absent one select the same kinds.
-fn default_cli_fetch_policy() -> scan::fetch::FetchPolicy {
+/// Must agree with the `default_missing_value` on `Cli::follow`, so a bare
+/// `--follow` and an absent one select the same targets.
+fn default_cli_follow_policy() -> scan::fetch::FetchPolicy {
     scan::fetch::FetchPolicy {
         urls: true,
         packages: true,
@@ -1123,6 +1120,21 @@ fn main() -> Result<()> {
         libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
     }
 
+    // Preserve the old deployment variable while teaching new configurations
+    // the same vocabulary as the HTTP API. The canonical variable wins when
+    // both are present. This runs before clap or any worker thread starts.
+    if std::env::var_os("SCAN_FOLLOW").is_none()
+        && let Some(value) = std::env::var_os("SCAN_FETCH")
+    {
+        // SAFETY: argument parsing happens before this process starts threads.
+        unsafe { std::env::set_var("SCAN_FOLLOW", value) };
+    }
+    if std::env::var_os("SCAN_FOLLOW_DEPTH").is_none()
+        && let Some(value) = std::env::var_os("SCAN_FETCH_DEPTH")
+    {
+        // SAFETY: argument parsing happens before this process starts threads.
+        unsafe { std::env::set_var("SCAN_FOLLOW_DEPTH", value) };
+    }
     let mut cli = Cli::parse();
     // Install the process-wide Rizin budget before any analysis or Rayon worker
     // can start. Filefacts owns the subprocess lifecycle; Atomscan only selects
@@ -1131,11 +1143,12 @@ fn main() -> Result<()> {
     let selected_severity_level = cli.level;
     let threshold_suspicious = cli.threshold_suspicious;
     let threshold_hostile = cli.threshold_hostile;
-    // The kind selection comes from `--fetch`; the hop count from `--fetch-depth`,
+    // The selection comes from `--follow`; the hop count from `--follow-depth`,
     // the dependency age ceiling from `--fetch-max-age`, and the per-file ceilings
-    // from `--fetch-max-file-*` (each its own flag/env). When `--fetch`/`SCAN_FETCH`
-    // is unset, the binary defaults to `all` in every mode. An explicit selection
-    // is honored verbatim in both; the knobs always apply.
+    // from `--fetch-max-file-*` (each its own flag/env). When `--follow`/`SCAN_FOLLOW`
+    // is unset, the binary defaults to dependencies and executable references
+    // in every mode (CI actions remain opt-in). An explicit selection is honored
+    // verbatim in both; the knobs always apply.
     let with_knobs = |mut policy: scan::fetch::FetchPolicy,
                       default_max_age: u32,
                       scans_for_other_hosts: bool| {
@@ -1157,7 +1170,7 @@ fn main() -> Result<()> {
     scan::fetch::set_registry_ttl(cli.registry_ttl);
     let scans_for_other_hosts = command_scans_for_other_hosts(cli.command.as_ref());
     let fetch_policy = with_knobs(
-        cli.fetch.unwrap_or_else(default_cli_fetch_policy),
+        cli.follow.unwrap_or_else(default_cli_follow_policy),
         scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
         scans_for_other_hosts,
     );
@@ -1167,7 +1180,7 @@ fn main() -> Result<()> {
     // fresh-risk window that keeps an interactive scan fast is exactly the wrong
     // default there — it discards the long tail the cache most wants.
     let worker_fetch_policy = with_knobs(
-        cli.fetch.unwrap_or_else(default_cli_fetch_policy),
+        cli.follow.unwrap_or_else(default_cli_follow_policy),
         WORKER_MAX_DEP_AGE_DAYS,
         true,
     );
@@ -2368,7 +2381,7 @@ fn run_scan_paths(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy, default_cli_fetch_policy,
+        Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy, default_cli_follow_policy,
         redact_zip_passwords, resolve_hopper_value, resolve_process_max_rss_bytes,
         resolve_worker_max_rss_gb,
     };
@@ -2379,24 +2392,24 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn fetch_defaults_to_all_with_separate_url_and_dependency_caps() -> Result<()> {
+    fn follow_defaults_to_references_and_dependencies() -> Result<()> {
         let cli = Cli::try_parse_from(["scan", "/tmp/a"]).context("parse should work")?;
         assert!(
-            cli.fetch.is_none(),
-            "absence of --fetch is resolved at startup"
+            cli.follow.is_none(),
+            "absence of --follow is resolved at startup"
         );
 
-        let policy = default_cli_fetch_policy();
+        let policy = default_cli_follow_policy();
         assert!(policy.urls && policy.packages && policy.deps);
         assert!(
             !policy.ci,
             "CI actions never reach an installed artifact; auditing them is opt-in"
         );
-        // A bare `--fetch` must select exactly what an absent one resolves to.
-        let bare = Cli::try_parse_from(["scan", "--fetch", "/tmp/a"])
-            .context("bare --fetch should parse")?
-            .fetch
-            .context("bare --fetch has a default_missing_value")?;
+        // A bare `--follow` must select exactly what an absent one resolves to.
+        let bare = Cli::try_parse_from(["scan", "--follow", "/tmp/a"])
+            .context("bare --follow should parse")?
+            .follow
+            .context("bare --follow has a default_missing_value")?;
         assert_eq!(
             (bare.urls, bare.packages, bare.deps, bare.ci),
             (policy.urls, policy.packages, policy.deps, policy.ci),
@@ -2408,6 +2421,24 @@ mod tests {
         assert_eq!(policy.max_file_fetches, 100);
         assert_eq!(policy.max_url_fetches, scan::fetch::DEFAULT_MAX_URL_FETCHES);
         assert_eq!(policy.max_url_fetches, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn old_fetch_flag_and_target_names_remain_aliases() -> Result<()> {
+        let old = Cli::try_parse_from(["scan", "--fetch=deps,packages,urls,ci", "/tmp/a"])
+            .context("legacy --fetch vocabulary should parse")?
+            .follow
+            .context("legacy --fetch should select a policy")?;
+        let new = Cli::try_parse_from([
+            "scan",
+            "--follow=dependencies,references,ci-actions",
+            "/tmp/a",
+        ])
+        .context("canonical --follow vocabulary should parse")?
+        .follow
+        .context("canonical --follow should select a policy")?;
+        assert_eq!(old, new);
         Ok(())
     }
 

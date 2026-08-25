@@ -198,9 +198,13 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("duration {s:?} is too large"))
 }
 
-/// What to fetch — a selection of reference *kinds*, parsed from the
-/// comma-separated `--fetch=KINDS` flag (`urls`, `packages`, `deps`) — plus how
-/// many hops to follow. An empty kind selection (the default) disables fetching.
+/// Which discovered references to follow, plus how many hops to traverse.
+///
+/// The public vocabulary groups implementation-level reference kinds by what a
+/// caller means: `dependencies` are manifest/lockfile declarations,
+/// `references` are packages or URLs named by executable commands, and
+/// `ci-actions` are third-party CI actions. The older `deps`, `packages`,
+/// `urls`, and `ci` spellings remain CLI aliases.
 ///
 /// The three kinds map onto [`fletch`]'s [`RefKind`] taxonomy, so the selection
 /// distinguishes how strongly a reference is bound to the artifact:
@@ -303,6 +307,99 @@ impl FetchPolicy {
         self.urls || self.packages || self.deps || self.ci
     }
 
+    /// Parse the customer-facing `follow` vocabulary. Unlike [`FromStr`], this
+    /// deliberately rejects the old CLI aliases so the HTTP contract has one
+    /// clear spelling for each concept.
+    pub(crate) fn parse_follow(value: &str) -> Result<Self, String> {
+        Self::parse_selection(value, false)
+    }
+
+    /// Copy only the selected reference kinds onto an operator-configured
+    /// policy, preserving depth, age, byte, platform, and fan-out ceilings.
+    #[must_use]
+    pub(crate) const fn with_selection(mut self, selected: Self) -> Self {
+        self.urls = selected.urls;
+        self.packages = selected.packages;
+        self.deps = selected.deps;
+        self.ci = selected.ci;
+        self
+    }
+
+    /// True when `requested` does not enable anything the operator disabled.
+    #[must_use]
+    pub(crate) const fn allows(&self, requested: Self) -> bool {
+        (!requested.urls || self.urls)
+            && (!requested.packages || self.packages)
+            && (!requested.deps || self.deps)
+            && (!requested.ci || self.ci)
+    }
+
+    /// Compact identity for single-flight keys and structured logs.
+    #[must_use]
+    pub(crate) const fn selection_bits(&self) -> u8 {
+        (self.urls as u8)
+            | ((self.packages as u8) << 1)
+            | ((self.deps as u8) << 2)
+            | ((self.ci as u8) << 3)
+    }
+
+    fn parse_selection(value: &str, legacy_aliases: bool) -> Result<Self, String> {
+        const VALID: &str = "valid: all, dependencies, references, ci-actions, none";
+        let mut policy = Self::default();
+        let mut saw_kind = false;
+        let mut saw_none = false;
+
+        for raw in value.split(',') {
+            let kind = raw.trim();
+            if kind.is_empty() {
+                continue;
+            }
+            saw_kind = true;
+            match kind {
+                "none" => saw_none = true,
+                "all" => {
+                    policy.urls = true;
+                    policy.packages = true;
+                    policy.deps = true;
+                    policy.ci = true;
+                }
+                "dependencies" => policy.deps = true,
+                "references" => {
+                    policy.urls = true;
+                    policy.packages = true;
+                }
+                // A CI action is represented as a dependency with CI context,
+                // so selecting actions necessarily enables dependency traversal.
+                "ci-actions" => {
+                    policy.deps = true;
+                    policy.ci = true;
+                }
+                "deps" if legacy_aliases => policy.deps = true,
+                "packages" if legacy_aliases => policy.packages = true,
+                "urls" if legacy_aliases => policy.urls = true,
+                "ci" if legacy_aliases => {
+                    policy.deps = true;
+                    policy.ci = true;
+                }
+                other => return Err(format!("unknown follow target {other:?} ({VALID})")),
+            }
+        }
+
+        if !saw_kind {
+            return Err(format!("empty follow selection ({VALID})"));
+        }
+        if saw_none && policy.enabled() {
+            return Err("none cannot be combined with another follow target".to_string());
+        }
+        if saw_none {
+            return Ok(Self::default());
+        }
+        if !policy.enabled() {
+            return Err(format!("empty follow selection ({VALID})"));
+        }
+        Ok(policy)
+    }
+
     /// Whether `kind` is selected by this policy. References whose kind is
     /// neither a URL, a command-mentioned package, nor a declared dependency
     /// (e.g. [`RefKind::Repository`] identity) are never fetched.
@@ -328,47 +425,9 @@ impl FetchPolicy {
 impl std::str::FromStr for FetchPolicy {
     type Err = String;
 
-    /// Parse a comma-separated kind list (`urls`, `packages`, `deps`, or `all`).
-    /// `all` selects every kind. Empty entries are ignored; an unknown kind or an
-    /// empty selection is an error so a typo is never silently a no-op.
+    /// Parse the canonical `follow` vocabulary and the legacy CLI aliases.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        const VALID: &str = "valid: all, urls, packages, deps, ci, none";
-        // `none` disables fetching outright — the only fully-offline switch,
-        // since an absent --fetch resolves to all-on at startup. Benchmarks
-        // need it (network wait and run-to-run fetch drift poison both wall
-        // clock and output comparison), and so does any air-gapped scan.
-        if s.trim() == "none" {
-            return Ok(Self::default());
-        }
-        let mut policy = Self::default();
-        for kind in s.split(',') {
-            match kind.trim() {
-                "" => {}
-                "all" => {
-                    policy.urls = true;
-                    policy.packages = true;
-                    policy.deps = true;
-                    policy.ci = true;
-                }
-                "urls" => policy.urls = true,
-                "packages" => policy.packages = true,
-                "deps" => policy.deps = true,
-                // A CI action is a declared dependency, so fetching it needs
-                // dependency fetching on; `ci` adds the CI *context* on top of
-                // `deps` rather than being a separate kind.
-                "ci" => {
-                    policy.deps = true;
-                    policy.ci = true;
-                }
-                other => {
-                    return Err(format!("unknown fetch kind {other:?} ({VALID})"));
-                }
-            }
-        }
-        if !policy.enabled() {
-            return Err(format!("empty fetch selection ({VALID})"));
-        }
-        Ok(policy)
+        Self::parse_selection(s, true)
     }
 }
 
@@ -3888,6 +3947,25 @@ mod tests {
     #[test]
     fn fetch_policy_parses_kinds_and_rejects_garbage() {
         assert_eq!(
+            FetchPolicy::parse_follow("dependencies,references"),
+            Ok(FetchPolicy {
+                urls: true,
+                packages: true,
+                deps: true,
+                ..FetchPolicy::default()
+            })
+        );
+        let actions = FetchPolicy::parse_follow("ci-actions").unwrap();
+        assert!(actions.ci && actions.deps);
+        assert_eq!(
+            FetchPolicy::parse_follow("none"),
+            Ok(FetchPolicy::default())
+        );
+        assert!(FetchPolicy::parse_follow("deps").is_err());
+        assert!(FetchPolicy::parse_follow("none,references").is_err());
+
+        // Legacy CLI values remain aliases for existing scripts.
+        assert_eq!(
             "deps".parse(),
             Ok(FetchPolicy {
                 deps: true,
@@ -3948,7 +4026,7 @@ mod tests {
         );
         assert!("".parse::<FetchPolicy>().is_err());
         assert!("sigs".parse::<FetchPolicy>().is_err());
-        // The retired vocabulary is now a hard error, not a silent no-op.
+        // A truly retired vocabulary is a hard error, not a silent no-op.
         assert!("refs".parse::<FetchPolicy>().is_err());
         assert!("deps,bogus".parse::<FetchPolicy>().is_err());
         assert!(!FetchPolicy::default().enabled());
