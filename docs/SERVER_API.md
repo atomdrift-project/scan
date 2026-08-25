@@ -205,7 +205,7 @@ looks up registry provenance itself, and returns the same envelope as
       -d '{"purl":"pkg:npm/left-pad@1.3.0"}' \
       http://127.0.0.1:49999/analyze-purl | jq .ml
 
-Beamline backends should start the server with `--fetch --interpret
+Beamline backends should start the server with `--follow --interpret
 --analysis-timeout 1800` so dependency follow and LLM interpretation
 match a live `atomscan purl` run.
 
@@ -280,6 +280,8 @@ Analyze a package and answer with a decision.
     POST /v1/analyze                  {"purl": "pkg:npm/evil@1.0.0"}
     POST /v1/analyze?false_positive_budget=25
     POST /v1/analyze?purl=pkg:npm/evil@1.0.0&force=1
+    POST /v1/analyze?purl=pkg:npm/evil@1.0.0&follow=none
+    POST /v1/analyze?purl=pkg:npm/evil@1.0.0&follow=dependencies,references
     POST /v1/analyze                  <the artifact, any other content type>
 
 A named package is looked up before anything is analyzed, exactly the way
@@ -288,6 +290,20 @@ same budget. A verdict already held is returned immediately and costs no
 analysis slot; `unknown` and `unavailable` are not verdicts, so both fall
 through and run. Pass `force=1` to analyze regardless of what is already known,
 which is what to use after an engine upgrade.
+
+The requested artifact is always retrieved. `follow` controls which references
+discovered inside it are also retrieved and analyzed: `dependencies` follows
+manifest and lockfile declarations, `references` follows packages and URLs
+named by install/download commands, `ci-actions` follows third-party CI actions
+and implies dependencies, `all` selects every category, and `none` follows
+nothing. Values may be comma-separated or repeated. Omitting `follow` uses the
+server's configured policy. A request may narrow that policy but cannot enable
+a category disabled by the operator.
+
+An explicit policy that differs from the server default bypasses the local
+index and Hopper, gets its own single-flight key, and is not indexed or uploaded
+afterward. Policy changes can change the verdict, so such a result cannot safely
+replace the deployment's canonical answer.
 
 An `application/json` body names a package; anything else is the artifact
 itself, staged and analyzed under the digest of its bytes. An upload is always

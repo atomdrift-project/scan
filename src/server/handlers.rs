@@ -243,6 +243,7 @@ fn flight_outcome(
     elapsed_ms: u64,
     key: &FlightKey,
     state: &Arc<AppState>,
+    persist: bool,
 ) -> Outcome {
     let uploader = state.uploader.as_ref();
     match result {
@@ -259,7 +260,9 @@ fn flight_outcome(
                 // uploader thread, whose own line reports whether it landed;
                 // `disabled` means the server was started without --hopper and
                 // the answer lives only in this process's index.
-                hopper = if uploader.is_some() {
+                hopper = if !persist {
+                    "policy-specific"
+                } else if uploader.is_some() {
                     "queued"
                 } else {
                     "disabled"
@@ -293,14 +296,16 @@ fn flight_outcome(
             {
                 state.job_types[super::purl_type_bucket(purl)].record(micros);
             }
-            index_verdict(&scan_result, key.purl());
+            if persist {
+                index_verdict(&scan_result, key.purl());
+            }
             // Renew the verdict on hopper too, so it outlives this process and
             // this request. A caller that hangs up — or a proxy that gives up
             // at its own read timeout on a long run — still finds the answer
             // waiting on its next lookup, because the analysis was never the
             // connection's to lose. One clone per analysis, against a run
             // measured in seconds.
-            if let Some(uploader) = uploader {
+            if persist && let Some(uploader) = uploader {
                 uploader.submit(
                     scan_result.sha256.clone(),
                     key.purl().map(str::to_owned),
@@ -1451,6 +1456,7 @@ pub(super) async fn analyze(
         match claim_slot(&state, request_id, attachment.flight().key()) {
             Err(outcome) => publisher.publish(outcome),
             Ok((resources, permit)) => {
+                let follow = resources.fetch;
                 let flight = Arc::clone(attachment.flight());
                 let state = Arc::clone(&state);
                 let upload = Upload {
@@ -1463,8 +1469,19 @@ pub(super) async fn analyze(
                 // it: this client hanging up must not abandon the followers.
                 tokio::spawn(async move {
                     publisher.publish(
-                        run_file_analysis(state, request_id, upload, &flight, resources, permit)
-                            .await,
+                        run_file_analysis(
+                            state,
+                            request_id,
+                            upload,
+                            &flight,
+                            resources,
+                            permit,
+                            RequestFollow {
+                                policy: follow,
+                                persist: true,
+                            },
+                        )
+                        .await,
                     );
                 });
             }
@@ -1502,6 +1519,15 @@ struct Upload {
     size_bytes: usize,
 }
 
+/// Request-scoped traversal and storage behavior. Keeping these together makes
+/// it difficult to thread a custom follow policy into classification while
+/// accidentally retaining the canonical cache-write behavior.
+#[derive(Clone, Copy)]
+struct RequestFollow {
+    policy: crate::fetch::FetchPolicy,
+    persist: bool,
+}
+
 /// Run one uploaded-file analysis on behalf of every request attached to
 /// `flight`. Takes the staged upload and deletes it on the way out.
 async fn run_file_analysis(
@@ -1511,6 +1537,7 @@ async fn run_file_analysis(
     flight: &Arc<Flight>,
     resources: Arc<super::ModelResources>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    request_follow: RequestFollow,
 ) -> Outcome {
     let Upload {
         dir: temp_dir,
@@ -1554,7 +1581,7 @@ async fn run_file_analysis(
         if let Some(req) = phase_state.in_flight.get(&request_id) {
             req.thread_id.store(current_thread_id(), Ordering::Relaxed);
         }
-        let result = classify_file(
+        let result = classify_file_with_follow(
             &path,
             &filename,
             &resources,
@@ -1563,6 +1590,7 @@ async fn run_file_analysis(
             Some(&cancel_flag),
             phase_tracker.as_ref(),
             None, // interactive upload carries no fetch-time registry provenance
+            request_follow.policy,
             // /analyze returns the envelope and discards the result — only
             // /analyze-path renews results (and their dependencies) on hopper.
             false,
@@ -1598,6 +1626,7 @@ async fn run_file_analysis(
         crate::duration_ms(started.elapsed()),
         flight.key(),
         &state,
+        request_follow.persist,
     )
 }
 
@@ -1607,7 +1636,7 @@ async fn run_file_analysis(
 /// grafts it into the report, the same path as `atomscan purl`. Beamline
 /// calls this when a PURL is not in hopper; it is a full analysis and takes
 /// a slot. Dependency fetch and LLM interpretation follow the process-wide
-/// `--fetch` / `--interpret` flags.
+/// `--follow` / `--interpret` flags.
 #[derive(serde::Deserialize)]
 pub(super) struct AnalyzePurlRequest {
     purl: String,
@@ -1656,14 +1685,26 @@ pub(super) async fn analyze_purl(
         match claim_slot(&state, request_id, attachment.flight().key()) {
             Err(outcome) => publisher.publish(outcome),
             Ok((resources, permit)) => {
+                let follow = resources.fetch;
                 let flight = Arc::clone(attachment.flight());
                 let state = Arc::clone(&state);
                 // Detached, so the analysis outlives whichever request started
                 // it: this client hanging up must not abandon the followers.
                 tokio::spawn(async move {
                     publisher.publish(
-                        run_purl_analysis(state, request_id, &purl, &flight, resources, permit)
-                            .await,
+                        run_purl_analysis(
+                            state,
+                            request_id,
+                            &purl,
+                            &flight,
+                            resources,
+                            permit,
+                            RequestFollow {
+                                policy: follow,
+                                persist: true,
+                            },
+                        )
+                        .await,
                     );
                 });
             }
@@ -1693,6 +1734,7 @@ async fn run_purl_analysis(
     flight: &Arc<Flight>,
     resources: Arc<super::ModelResources>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    request_follow: RequestFollow,
 ) -> Outcome {
     let started = Instant::now();
     let slow_rule_ms = state.slow_rule_ms;
@@ -1724,8 +1766,12 @@ async fn run_purl_analysis(
         .in_flight
         .get(&request_id)
         .map(|r| r.phase.clone());
-    let deps_for_upload = state.uploader.is_some();
-    let uploader_for_artifacts = state.uploader.clone();
+    let deps_for_upload = request_follow.persist && state.uploader.is_some();
+    let uploader_for_artifacts = if request_follow.persist {
+        state.uploader.clone()
+    } else {
+        None
+    };
     let owned_purl = purl.to_owned();
     let handle = tokio::task::spawn_blocking(move || {
         if let Some(req) = phase_state.in_flight.get(&request_id) {
@@ -1739,6 +1785,7 @@ async fn run_purl_analysis(
             phase_tracker.as_ref(),
             deps_for_upload,
             uploader_for_artifacts.as_ref(),
+            request_follow.policy,
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -1761,6 +1808,7 @@ async fn run_purl_analysis(
         crate::duration_ms(started.elapsed()),
         flight.key(),
         &state,
+        request_follow.persist,
     )
 }
 
@@ -1780,6 +1828,7 @@ fn normalize_pkg_purl(raw: &str) -> Result<String, &'static str> {
 
 /// Fetch the PURL's artifact (and its registry record) then classify. Scan
 /// looks up provenance itself — beamline does not supply it.
+#[allow(clippy::too_many_arguments)] // one linear package analysis path
 fn classify_purl(
     purl: &str,
     resources: &super::ModelResources,
@@ -1788,6 +1837,7 @@ fn classify_purl(
     phase: Option<&cleave::PhaseTracker>,
     deps_for_upload: bool,
     uploader: Option<&Arc<crate::upload::Uploader>>,
+    follow: crate::fetch::FetchPolicy,
 ) -> anyhow::Result<crate::engine::ScanResult> {
     use fletch::RefLocator;
 
@@ -1810,7 +1860,7 @@ fn classify_purl(
         if let Some(p) = phase {
             p.set("purl:registry-document");
         }
-        return classify_bytes(
+        return classify_bytes_with_follow(
             bytes::Bytes::from(bytes),
             &name,
             resources,
@@ -1818,6 +1868,7 @@ fn classify_purl(
             cancellation,
             phase,
             registry_provenance.as_ref(),
+            follow,
             deps_for_upload,
         );
     }
@@ -1832,7 +1883,7 @@ fn classify_purl(
                 if let Some(p) = phase {
                     p.set("purl:registry-document");
                 }
-                return classify_bytes(
+                return classify_bytes_with_follow(
                     bytes::Bytes::from(bytes),
                     &name,
                     resources,
@@ -1840,6 +1891,7 @@ fn classify_purl(
                     cancellation,
                     phase,
                     registry_provenance.as_ref(),
+                    follow,
                     deps_for_upload,
                 );
             }
@@ -1847,7 +1899,7 @@ fn classify_purl(
         },
     };
 
-    let result = classify_bytes(
+    let result = classify_bytes_with_follow(
         bytes::Bytes::from(bytes),
         &name,
         resources,
@@ -1855,6 +1907,7 @@ fn classify_purl(
         cancellation,
         phase,
         registry_provenance.as_ref(),
+        follow,
         deps_for_upload,
     )?;
 
@@ -1904,6 +1957,33 @@ pub(crate) fn classify_file(
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     deps_for_upload: bool,
 ) -> anyhow::Result<ScanResult> {
+    classify_file_with_follow(
+        path,
+        label,
+        resources,
+        slow_rule_ms,
+        extract_dir,
+        cancellation,
+        phase,
+        root_registry,
+        resources.fetch,
+        deps_for_upload,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_file_with_follow(
+    path: &std::path::Path,
+    label: &str,
+    resources: &super::ModelResources,
+    slow_rule_ms: u64,
+    extract_dir: Option<&std::path::Path>,
+    cancellation: Option<&Arc<AtomicBool>>,
+    phase: Option<&cleave::PhaseTracker>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
+    follow: crate::fetch::FetchPolicy,
+    deps_for_upload: bool,
+) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
     if let Some(p) = phase {
@@ -1936,6 +2016,7 @@ pub(crate) fn classify_file(
         cancellation,
         phase,
         root_registry,
+        follow,
         deps_for_upload,
     )
 }
@@ -1954,6 +2035,31 @@ pub(crate) fn classify_bytes(
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
+    deps_for_upload: bool,
+) -> anyhow::Result<ScanResult> {
+    classify_bytes_with_follow(
+        data,
+        label,
+        resources,
+        slow_rule_ms,
+        cancellation,
+        phase,
+        root_registry,
+        resources.fetch,
+        deps_for_upload,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_bytes_with_follow(
+    data: bytes::Bytes,
+    label: &str,
+    resources: &super::ModelResources,
+    slow_rule_ms: u64,
+    cancellation: Option<&Arc<AtomicBool>>,
+    phase: Option<&cleave::PhaseTracker>,
+    root_registry: Option<&crate::provenance::RegistryProvenance>,
+    follow: crate::fetch::FetchPolicy,
     deps_for_upload: bool,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
@@ -1980,6 +2086,7 @@ pub(crate) fn classify_bytes(
         cancellation,
         phase,
         root_registry,
+        follow,
         deps_for_upload,
     )
 }
@@ -1988,6 +2095,7 @@ pub(crate) fn classify_bytes(
 /// run feature extraction + model inference, and assemble the [`ScanResult`].
 /// `deps_for_upload` marks callers that renew results on hopper and therefore
 /// need per-dependency standalone reports captured (worker, `--hopper` server).
+#[allow(clippy::too_many_arguments)] // shared linear tail for file and byte analyses
 fn finish_classify(
     label: &str,
     report: cleave::AnalysisReport,
@@ -1995,6 +2103,7 @@ fn finish_classify(
     cancellation: Option<&Arc<AtomicBool>>,
     phase: Option<&cleave::PhaseTracker>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
+    follow: crate::fetch::FetchPolicy,
     deps_for_upload: bool,
 ) -> anyhow::Result<ScanResult> {
     // If the timeout fired while cleave was running, bail now rather than
@@ -2020,7 +2129,7 @@ fn finish_classify(
         // declared references from the report are still fetched when the
         // operator enabled it. `label` is a best-effort path for that hunt.
         std::path::Path::new(label),
-        resources.fetch,
+        follow,
         resources.zip_passwords.as_slice(),
         // Server output is the JSON envelope: no renders, no fetch log, no
         // manifest listing. Dependency results are captured only for callers
@@ -2574,6 +2683,10 @@ pub(super) struct V1LookupQuery {
     /// re-analysis would be to have no verdict — which is not a state a caller
     /// can arrange. Meaningless to `/v1/lookup`, which never analyzes.
     force: bool,
+    /// Which references discovered inside the root artifact the caller wants
+    /// followed. Repeated keys and comma-separated values are both accepted.
+    /// Empty means use the deployment policy.
+    follow: Vec<String>,
 }
 
 impl V1LookupQuery {
@@ -2584,6 +2697,7 @@ impl V1LookupQuery {
             false_positive_budget: None,
             bad_budget: None,
             force: false,
+            follow: Vec::new(),
         };
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             match key.as_ref() {
@@ -2598,6 +2712,7 @@ impl V1LookupQuery {
                 // path in place, because the expensive reading of an ambiguous
                 // value is the one that burns an analysis slot.
                 "force" => q.force = matches!(value.as_ref(), "1" | "true" | "yes"),
+                "follow" => q.follow.push(value.into_owned()),
                 // Unknown parameters are ignored, so a caller can carry their
                 // own tracing keys through without us rejecting the request.
                 _ => {}
@@ -2605,6 +2720,28 @@ impl V1LookupQuery {
         }
         q
     }
+}
+
+/// Resolve a request's follow selection under the operator's configured
+/// ceiling. Request policy may restrict a deployment but never enable network
+/// traversal the operator disabled.
+fn v1_follow_policy(
+    q: &V1LookupQuery,
+    configured: crate::fetch::FetchPolicy,
+) -> Result<crate::fetch::FetchPolicy, (&'static str, String)> {
+    if q.follow.is_empty() {
+        return Ok(configured);
+    }
+    let selected = crate::fetch::FetchPolicy::parse_follow(&q.follow.join(","))
+        .map_err(|message| ("invalid_follow_policy", message))?;
+    if !configured.allows(selected) {
+        return Err((
+            "follow_policy_not_allowed",
+            "The requested follow policy enables a category disabled by this deployment."
+                .to_string(),
+        ));
+    }
+    Ok(configured.with_selection(selected))
 }
 
 /// How many packages one URL may name.
@@ -2643,6 +2780,7 @@ async fn v1_analyze_bytes(
     headers: axum::http::HeaderMap,
     bytes: bytes::Bytes,
     request_start: Instant,
+    request_follow: RequestFollow,
 ) -> Response {
     if let Ok(init_error) = state.init_error.read()
         && let Some(message) = init_error.as_ref()
@@ -2717,7 +2855,7 @@ async fn v1_analyze_bytes(
     // these bytes, which is why the caller sent them, and `unavailable` means
     // we could not find out — turning either into an answer would report on
     // work never done.
-    if !q.force {
+    if !q.force && request_follow.persist {
         if let Ok((decided, source)) = v1_decide(state, Some(&sha), None, budget)
             .await
             .map(|(d, source)| (d.asked_about(asked), source))
@@ -2750,7 +2888,11 @@ async fn v1_analyze_bytes(
         );
     }
 
-    let attachment = state.flights.join(FlightKey::Sha(sha.clone()));
+    let attachment = state.flights.join(FlightKey::sha_follow(
+        sha.clone(),
+        request_follow.policy.selection_bits(),
+        state.fetch.selection_bits(),
+    ));
     let leads = attachment.leads();
     if leads {
         tracing::info!(id = request_id, sha256 = %sha, size_bytes = bytes.len(), filename = %filename, "--> POST /v1/analyze (bytes)");
@@ -2765,7 +2907,13 @@ async fn v1_analyze_bytes(
                     tokio::spawn(async move {
                         publisher.publish(
                             run_file_analysis(
-                                state, request_id, upload, &flight, resources, permit,
+                                state,
+                                request_id,
+                                upload,
+                                &flight,
+                                resources,
+                                permit,
+                                request_follow,
                             )
                             .await,
                         );
@@ -2886,6 +3034,16 @@ pub(super) async fn v1_analyze(
             &format!("false_positive_budget must be a whole number from 0 to 65535, not {bad:?}."),
         );
     }
+    let follow = match v1_follow_policy(&q, state.fetch) {
+        Ok(policy) => policy,
+        Err((code, message)) => return v1_error(StatusCode::BAD_REQUEST, code, &message),
+    };
+    // A policy-specific result can differ from the deployment's canonical
+    // verdict, so it must not read or populate the shared index or Hopper.
+    let request_follow = RequestFollow {
+        policy: follow,
+        persist: follow == state.fetch,
+    };
     let Ok(bytes) = axum::body::to_bytes(body, state.max_upload_bytes).await else {
         tracing::warn!(
             id = request_id,
@@ -2902,7 +3060,16 @@ pub(super) async fn v1_analyze(
         );
     };
     if !bytes.is_empty() {
-        return v1_analyze_bytes(&state, request_id, &q, headers, bytes, request_start).await;
+        return v1_analyze_bytes(
+            &state,
+            request_id,
+            &q,
+            headers,
+            bytes,
+            request_start,
+            request_follow,
+        )
+        .await;
     }
     let Some(named) = q.purl.first() else {
         return v1_error(
@@ -2956,7 +3123,7 @@ pub(super) async fn v1_analyze(
     // this, which is the whole reason the caller is here, and `unavailable`
     // means we could not find out — turning that into a refusal to work would
     // make a corpus outage look like an answer. Both fall through and run.
-    if !q.force {
+    if !q.force && request_follow.persist {
         if let Ok((decided, source)) = v1_resolve(&state, None, Some(&req.purl), budget).await
             && decided.is_verdict()
         {
@@ -2983,7 +3150,11 @@ pub(super) async fn v1_analyze(
         );
     }
 
-    let attachment = state.flights.join(FlightKey::Purl(purl.clone()));
+    let attachment = state.flights.join(FlightKey::purl_follow(
+        purl.clone(),
+        request_follow.policy.selection_bits(),
+        state.fetch.selection_bits(),
+    ));
     let leads = attachment.leads();
     if leads {
         tracing::info!(id = request_id, purl = %purl, "--> POST /v1/analyze");
@@ -2996,8 +3167,16 @@ pub(super) async fn v1_analyze(
                 let purl = purl.clone();
                 tokio::spawn(async move {
                     publisher.publish(
-                        run_purl_analysis(state, request_id, &purl, &flight, resources, permit)
-                            .await,
+                        run_purl_analysis(
+                            state,
+                            request_id,
+                            &purl,
+                            &flight,
+                            resources,
+                            permit,
+                            request_follow,
+                        )
+                        .await,
                     );
                 });
             }
@@ -3988,6 +4167,27 @@ mod tests {
         assert!(!q("purl=pkg:npm/left-pad@1.3.0&force=false"));
         assert!(!q("purl=pkg:npm/left-pad@1.3.0&force="));
         assert!(!q("purl=pkg:npm/left-pad@1.3.0"));
+    }
+
+    #[test]
+    fn follow_policy_repeats_union_under_the_server_ceiling() {
+        use super::{V1LookupQuery, v1_follow_policy};
+        use crate::fetch::FetchPolicy;
+
+        let configured: FetchPolicy = "all".parse().unwrap();
+        let query = V1LookupQuery::parse(Some(
+            "purl=pkg:npm/app@1.0.0&follow=references&follow=ci-actions",
+        ));
+        assert_eq!(query.follow, ["references", "ci-actions"]);
+        let effective = v1_follow_policy(&query, configured).expect("allowed restriction");
+        assert!(effective.urls && effective.packages && effective.deps && effective.ci);
+
+        let dependencies_only: FetchPolicy = "dependencies".parse().unwrap();
+        let references = V1LookupQuery::parse(Some("follow=references"));
+        assert!(v1_follow_policy(&references, dependencies_only).is_err());
+
+        let legacy = V1LookupQuery::parse(Some("follow=deps"));
+        assert!(v1_follow_policy(&legacy, configured).is_err());
     }
 
     /// One shape, whichever route answered and whatever it found.
