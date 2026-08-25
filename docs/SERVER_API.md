@@ -297,8 +297,9 @@ manifest and lockfile declarations, `references` follows packages and URLs
 named by install/download commands, `ci-actions` follows third-party CI actions
 and implies dependencies, `all` selects every category, and `none` follows
 nothing. Values may be comma-separated or repeated. Omitting `follow` uses the
-server's configured policy. A request may narrow that policy but cannot enable
-a category disabled by the operator.
+server's configured policy. An explicit `follow` selection replaces the
+configured categories after validation; the server's depth, size, and fan-out
+limits still apply.
 
 An explicit policy that differs from the server default bypasses the local
 index and Hopper, gets its own single-flight key, and is not indexed or uploaded

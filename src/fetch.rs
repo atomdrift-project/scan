@@ -325,15 +325,6 @@ impl FetchPolicy {
         self
     }
 
-    /// True when `requested` does not enable anything the operator disabled.
-    #[must_use]
-    pub(crate) const fn allows(&self, requested: Self) -> bool {
-        (!requested.urls || self.urls)
-            && (!requested.packages || self.packages)
-            && (!requested.deps || self.deps)
-            && (!requested.ci || self.ci)
-    }
-
     /// Compact identity for single-flight keys and structured logs.
     #[must_use]
     pub(crate) const fn selection_bits(&self) -> u8 {
