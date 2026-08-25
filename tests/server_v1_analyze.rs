@@ -67,6 +67,37 @@ async fn an_unparseable_purl_is_refused_by_name() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn an_exact_url_reaches_the_analysis_path() -> Result<()> {
+    let (status, body) = post(
+        "/v1/analyze?url=https%3A%2F%2Fcdn.example.test%2Fapp.tgz",
+        "",
+    )
+    .await?;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a valid URL was rejected: {body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_exact_url_is_validated_and_cannot_mix_with_a_purl() -> Result<()> {
+    let (status, body) = post("/v1/analyze?url=file%3A%2F%2F%2Ftmp%2Fapp.tgz", "").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_url");
+
+    let (status, body) = post(
+        "/v1/analyze?url=https%3A%2F%2Fcdn.example.test%2Fapp.tgz&purl=npm%2Fapp%401.0.0",
+        "",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "multiple_locators");
+    Ok(())
+}
+
 /// A budget that is not a number must be refused rather than quietly replaced
 /// by the default, exactly as on /v1/lookup: one surface, one rule.
 #[tokio::test]

@@ -1,11 +1,16 @@
 //! R2-backed download and install of the known-good / known-bad bloom filters.
 //!
 //! Mirrors [`crate::model_update`]: fetch `bloom.toml`, download each filter at
-//! `<base>/v<FORMAT_VERSION>/<file>`, verify its sha256, validate it loads (the
-//! [`FORMAT_VERSION`] gate fails closed on an unknown layout) and matches its
-//! declared identity, then atomically swap the whole set into place. Validation
-//! happens on the staged copy *before* the swap, so a broken or partial download
-//! never replaces the live filters.
+//! `<base>/bloom/v<N>/<file>`, verify its sha256, validate it loads (the
+//! version gate fails closed on a layout outside
+//! [`crate::bloom::SUPPORTED_VERSIONS`]) and matches its declared identity, then
+//! atomically swap the whole set into place. Validation happens on the staged
+//! copy *before* the swap, so a broken or partial download never replaces the
+//! live filters.
+//!
+//! `<N>` is resolved rather than assumed: the newest published prefix this build
+//! can read wins, so one bucket can serve a bundle per format version and a
+//! client takes the best one it understands. See [`fetch_manifest`].
 //!
 //! No signing: the filters carry only a versioned layout and per-file sha256,
 //! not an authenticity claim — trust is HTTPS to our own bucket. The base URL is
@@ -17,7 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::bloom::{FORMAT_VERSION, Filter};
+use crate::bloom::{Filter, SUPPORTED_VERSIONS};
 use crate::bloom_build::Manifest;
 
 /// Public update bucket base. Bloom artifacts live under a format-versioned
@@ -40,8 +45,8 @@ const SIDECAR: &str = "bloom.toml";
 /// Path prefix for this build's bloom artifacts: namespaced under `bloom/` and
 /// selecting the on-wire format it speaks, e.g. `bloom/v1`. A format bump moves
 /// the whole prefix, so old and new clients never read each other's artifacts.
-fn bloom_prefix() -> String {
-    format!("bloom/v{FORMAT_VERSION}")
+fn bloom_prefix_for(version: u16) -> String {
+    format!("bloom/v{version}")
 }
 
 fn base_url() -> String {
@@ -80,7 +85,7 @@ pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<bool> {
     // explicit, non-quiet update — stays patient so a slow first fetch still
     // completes.
     let connect = (quiet && installed_manifest(dir).is_some()).then_some(CONNECT_TIMEOUT);
-    let manifest = fetch_manifest(connect)?;
+    let (manifest, prefix) = fetch_manifest(connect)?;
     if !force && installed_manifest(dir).is_some_and(|installed| is_current(&installed, &manifest))
     {
         if !quiet {
@@ -88,7 +93,7 @@ pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<bool> {
         }
         return Ok(false);
     }
-    install(dir, &manifest)?;
+    install(dir, &manifest, &prefix)?;
     if !quiet {
         eprintln!(
             "Bloom filters updated to {} at {}",
@@ -104,7 +109,7 @@ pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<bool> {
 /// # Errors
 /// Returns an error if the manifest cannot be fetched or parsed.
 pub fn check(dir: &Path) -> Result<()> {
-    let manifest = fetch_manifest(None)?;
+    let (manifest, _prefix) = fetch_manifest(None)?;
     match installed_manifest(dir) {
         Some(installed) if is_current(&installed, &manifest) => {
             eprintln!("Bloom filters up to date: {}", installed.built);
@@ -120,18 +125,64 @@ pub fn check(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn fetch_manifest(connect: Option<Duration>) -> Result<Manifest> {
-    let url = format!("{}/{}/bloom.toml", base_url(), bloom_prefix());
-    let text = http_get(&url, connect)?;
-    let text = String::from_utf8(text).context("bloom manifest is not valid UTF-8")?;
-    toml::from_str(&text).with_context(|| format!("parsing bloom manifest {url}"))
+/// The newest bundle the bucket actually carries, with the prefix it came from.
+///
+/// Tries each of [`SUPPORTED_VERSIONS`] newest-first, so a build that speaks v2
+/// keeps working against a bucket that has not been dual-published yet, and
+/// against the v1 prefix during a rollback. The prefix travels with the manifest
+/// because the filters must be fetched from the SAME one: deriving it again
+/// later would download v2 files against a v1 manifest the moment the two
+/// disagree.
+///
+/// Only a 404 advances to the next prefix. Every other failure — a timeout, a
+/// 5xx, DNS — is a real failure and is returned as one; treating it as "not
+/// published here" would let one slow request silently downgrade a client to an
+/// older format and leave it there.
+fn fetch_manifest(connect: Option<Duration>) -> Result<(Manifest, String)> {
+    let mut tried: Vec<String> = Vec::new();
+    for version in SUPPORTED_VERSIONS {
+        let prefix = bloom_prefix_for(*version);
+        let url = format!("{}/{prefix}/bloom.toml", base_url());
+        match http_get_optional(&url, connect)? {
+            Some(bytes) => {
+                let text = String::from_utf8(bytes).context("bloom manifest is not valid UTF-8")?;
+                let manifest: Manifest = toml::from_str(&text)
+                    .with_context(|| format!("parsing bloom manifest {url}"))?;
+                if !tried.is_empty() {
+                    tracing::debug!(
+                        "no bloom bundle at {}; using {prefix}",
+                        tried.join(", ")
+                    );
+                }
+                return Ok((manifest, prefix));
+            }
+            None => tried.push(prefix),
+        }
+    }
+    bail!(
+        "no bloom manifest published at any prefix this build understands ({})",
+        tried.join(", ")
+    )
+}
+
+/// `Ok(None)` when the object is absent, `Err` when the fetch itself failed.
+fn http_get_optional(url: &str, connect: Option<Duration>) -> Result<Option<Vec<u8>>> {
+    match http_get(url, connect) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) => {
+            let missing = err
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+                .any(|e| e.status() == Some(reqwest::StatusCode::NOT_FOUND));
+            if missing { Ok(None) } else { Err(err) }
+        }
+    }
 }
 
 /// Download, verify, and validate every filter into a staging dir, then swap it
 /// in atomically (old aside, staging in, drop old; restore on failure).
-fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
+fn install(dir: &Path, manifest: &Manifest, prefix: &str) -> Result<()> {
     let base = base_url();
-    let prefix = bloom_prefix();
     let parent = dir.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
@@ -141,10 +192,14 @@ fn install(dir: &Path, manifest: &Manifest) -> Result<()> {
     std::fs::create_dir_all(&staging).context("creating staging dir")?;
 
     for (stem, entry) in &manifest.filter {
-        if entry.format_version != FORMAT_VERSION {
+        // A version this build cannot read is a real stop, not something to
+        // work around: the layout would have to be guessed at. Fail closed and
+        // keep the installed filters, which are at least a layout we understand.
+        if !SUPPORTED_VERSIONS.contains(&entry.format_version) {
             bail!(
-                "bloom filter {stem} needs format v{}, this build supports v{FORMAT_VERSION}; upgrade scan",
-                entry.format_version
+                "bloom filter {stem} needs format v{}, this build reads {:?}; upgrade scan",
+                entry.format_version,
+                SUPPORTED_VERSIONS
             );
         }
         let url = format!("{base}/{prefix}/{}", entry.file);

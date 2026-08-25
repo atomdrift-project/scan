@@ -779,7 +779,7 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
-/// Query string for `GET /lookup`. Exactly one of `sha256` or `purl`.
+/// Query string for `GET /lookup`. Exactly one of `sha256`, `purl`, or `url`.
 ///
 /// Both identifiers travel as query parameters. A PURL's own grammar carries
 /// `/`, `?` and `#` — `pkg:npm/@scope/name@1.0.0?arch=x64` in a path segment
@@ -791,6 +791,7 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
 pub(super) struct LookupQuery {
     sha256: Option<String>,
     purl: Option<String>,
+    url: Option<String>,
 }
 
 /// GET /lookup?sha256=… | ?purl=… — what we already know about an artifact.
@@ -815,15 +816,42 @@ pub(super) async fn lookup(
 fn lookup_inner(state: &Arc<AppState>, q: &LookupQuery) -> Response {
     let sha = q.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let purl = q.purl.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let url = q.url.as_deref().map(str::trim).filter(|s| !s.is_empty());
     // Every arm names its subject, so the request's access line says which
     // artifact was asked about — including the arms that reject, where the key
     // is the only way to tell a caller's bug from a caller's typo.
-    match (sha, purl) {
-        (None, None) => error_response(StatusCode::BAD_REQUEST, "provide sha256, purl, or both"),
-        (Some(sha), Some(purl)) => lookup_by_both(state, sha, purl),
-        (Some(sha), None) => with_subject(lookup_by_sha(state, sha), Subject::sha256(sha)),
-        (None, Some(purl)) => lookup_by_purl(state, purl),
+    match (sha, purl, url) {
+        (None, None, None) => error_response(
+            StatusCode::BAD_REQUEST,
+            "provide sha256, purl, url, or both",
+        ),
+        (_, Some(_), Some(_)) | (Some(_), None, Some(_)) => error_response(
+            StatusCode::BAD_REQUEST,
+            "provide one locator plus an optional sha256",
+        ),
+        (Some(sha), Some(purl), None) => lookup_by_both(state, sha, purl),
+        (Some(sha), None, None) => with_subject(lookup_by_sha(state, sha), Subject::sha256(sha)),
+        (None, Some(purl), None) => lookup_by_purl(state, purl),
+        (None, None, Some(url)) => lookup_by_url(url),
     }
+}
+
+fn lookup_by_url(raw: &str) -> Response {
+    if !valid_http_url(raw) {
+        return with_subject(
+            error_response(StatusCode::BAD_REQUEST, "invalid url"),
+            Subject::url(raw, None),
+        );
+    }
+    // The legacy lookup route never analyzes or fetches. URL resolution is
+    // provided by `/v1/analyze?url=...`; this route can only answer a URL once
+    // the durable index has a record keyed by its resolved digest.
+    let mut response = error_response(StatusCode::NOT_FOUND, "unknown sample");
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    with_subject(response, Subject::url(raw, None))
 }
 
 fn lookup_by_sha(state: &AppState, sha256: &str) -> Response {
@@ -938,12 +966,33 @@ fn lookup_by_purl(state: &AppState, raw: &str) -> Response {
     with_subject(response, Subject::purl(&purl, Some(&sha)))
 }
 
+/// How long a bloom-derived answer may be cached.
+///
+/// Two hours — deliberately longer than the hourly filter rebuild, so a derived
+/// answer can outlive one cycle. That is the safe direction to be stale in: the
+/// filters only ever ADD claims, so an answer that lags errs toward flagging an
+/// artifact rather than clearing one. The cost is the reverse case — an artifact
+/// analyzed and found clean can keep reading as cited until the entry ages out —
+/// which is bounded, visible in the `bloom` field, and cheaper than paying a
+/// hopper round trip on every repeat ask.
+///
+/// Still far below the 24h a measured verdict earns: that one is immutable for
+/// the ruleset that produced it, and this one is not.
+const BLOOM_DERIVED_MAX_AGE: u32 = 7200;
+
 /// Render a lookup answer.
 ///
-/// A stored verdict is a 200; holding nothing is a 404, and the bloom decision
-/// rides on both. That keeps the two kinds of knowledge distinguishable — a
-/// filter says "probably not worth scanning", an analysis says what the thing
-/// *is* — while still answering both questions in one round trip.
+/// A stored verdict is a 200; an adverse bloom match with nothing stored is a
+/// 200 carrying a *derived* answer (see [`crate::lookup::bloom_derived_view`]);
+/// holding neither is a 404. The bloom decision rides on all three. That keeps
+/// the kinds of knowledge distinguishable — a filter says who has claimed what,
+/// an analysis says what the thing *is* — while still answering in one round
+/// trip.
+///
+/// A derived answer carries no `eng`, which is how a consumer tells it from a
+/// measurement, and how `/v1/analyze` knows it must still run: a citation is
+/// exactly what that route exists to replace with a measurement, so it must
+/// never stand in for one.
 fn lookup_response(
     state: &AppState,
     verdict: Option<&crate::lookup::Verdict>,
@@ -959,6 +1008,40 @@ fn lookup_response(
         "public"
     };
     let Some(verdict) = verdict else {
+        // Nothing measured, but the filters may still have something to say. A
+        // bloom match is answerable on its own — see `bloom_derived_view` — so
+        // rather than answering "unknown" about a digest several operators call
+        // malware, answer with what they say, marked as what it is. Mirrors
+        // hopper's fromLedger, and saves the round trip to it.
+        let mut synth_hits = Vec::new();
+        if let Some(view) = crate::lookup::bloom_derived_view(
+            decision,
+            decision.as_str(),
+            sha256.trim(),
+            purl,
+            &mut synth_hits,
+        ) {
+            let mut resp = Json(view).into_response();
+            let headers = resp.headers_mut();
+            // Emphatically NOT the 24h a measured verdict gets. This answer
+            // stands on a filter that is rebuilt hourly and on a ledger that
+            // moves underneath it, and it must stop being served the moment a
+            // real analysis exists. hopper bounds its own ledger-derived
+            // records the same way and for the same reason.
+            if let Ok(value) =
+                axum::http::HeaderValue::from_str(&format!("{scope}, max-age={BLOOM_DERIVED_MAX_AGE}"))
+            {
+                headers.insert(axum::http::header::CACHE_CONTROL, value);
+            }
+            if let Ok(value) = axum::http::HeaderValue::from_str(sha256.trim()) {
+                headers.insert("X-SHA256", value);
+            }
+            headers.insert(
+                "X-Scan-Source",
+                axum::http::HeaderValue::from_static("scan:bloom"),
+            );
+            return resp;
+        }
         // Nothing stored does not mean nothing happening: an analysis of this
         // very artifact may be minutes in. Saying so costs nothing — the caller
         // is already asking about this key, and the registry is a map lookup —
@@ -1812,6 +1895,88 @@ async fn run_purl_analysis(
     )
 }
 
+/// Run one exact-URL analysis on behalf of every request attached to `flight`.
+/// Unlike a PURL, the URL is fetched verbatim; the resulting ScanResult carries
+/// the SHA-256 that Beamline uses to alias this URL to the canonical artifact.
+async fn run_url_analysis(
+    state: Arc<AppState>,
+    request_id: u64,
+    url: &str,
+    flight: &Arc<Flight>,
+    resources: Arc<super::ModelResources>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    request_follow: RequestFollow,
+) -> Outcome {
+    let started = Instant::now();
+    let cancellation = flight.cancellation();
+    state.in_flight.insert(
+        request_id,
+        super::InFlightRequest {
+            name: url.to_owned(),
+            size_bytes: 0,
+            started_at: Instant::now(),
+            cancellation: Arc::clone(&cancellation),
+            phase: cleave::PhaseTracker::with_label(format!("req#{request_id} {url}")),
+            thread_id: AtomicU64::new(0),
+        },
+    );
+    let guard = super::RequestGuard::new(
+        request_id,
+        Arc::clone(&state),
+        Arc::clone(&cancellation),
+        permit,
+    );
+    let phase_state = Arc::clone(&state);
+    let phase_tracker = phase_state
+        .in_flight
+        .get(&request_id)
+        .map(|r| r.phase.clone());
+    let cancel_flag = Arc::clone(&cancellation);
+    let slow_rule_ms = state.slow_rule_ms;
+    let analysis_timeout_secs = state.analysis_timeout_secs;
+    let stuck_orphans = &state.stuck_orphans;
+    let handle = tokio::task::spawn_blocking({
+        let url = url.to_owned();
+        let uploader = if request_follow.persist {
+            state.uploader.clone()
+        } else {
+            None
+        };
+        let deps_for_upload = request_follow.persist && state.uploader.is_some();
+        let policy = request_follow.policy;
+        move || {
+            if let Some(req) = phase_state.in_flight.get(&request_id) {
+                req.thread_id.store(current_thread_id(), Ordering::Relaxed);
+            }
+            let result = classify_url(
+                &url,
+                &resources,
+                slow_rule_ms,
+                Some(&cancel_flag),
+                phase_tracker.as_ref(),
+                deps_for_upload,
+                uploader.as_ref(),
+                policy,
+            );
+            if request_id.is_multiple_of(100) {
+                cleave::clear_all_thread_caches();
+            }
+            result
+        }
+    });
+    let result =
+        await_with_timeout(handle, analysis_timeout_secs, &cancellation, stuck_orphans).await;
+    drop(guard);
+    flight_outcome(
+        result,
+        request_id,
+        crate::duration_ms(started.elapsed()),
+        flight.key(),
+        &state,
+        request_follow.persist,
+    )
+}
+
 /// Canonical `pkg:…` form, or a 400 message. Same prefixing rule as `atomscan purl`.
 fn normalize_pkg_purl(raw: &str) -> Result<String, &'static str> {
     let raw = raw.trim();
@@ -1824,6 +1989,12 @@ fn normalize_pkg_purl(raw: &str) -> Result<String, &'static str> {
         format!("pkg:{raw}")
     };
     fletch::purl::normalize(&prefixed).ok_or("not a package URL")
+}
+
+fn valid_http_url(raw: &str) -> bool {
+    reqwest::Url::parse(raw)
+        .map(|url| matches!(url.scheme(), "http" | "https"))
+        .unwrap_or(false)
 }
 
 /// Fetch the PURL's artifact (and its registry record) then classify. Scan
@@ -1927,6 +2098,48 @@ fn classify_purl(
             result.size_bytes,
             upload_collector(),
             registry_provenance.as_ref(),
+            Some(&rec),
+        ));
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_url(
+    url: &str,
+    resources: &super::ModelResources,
+    slow_rule_ms: u64,
+    cancellation: Option<&Arc<AtomicBool>>,
+    phase: Option<&cleave::PhaseTracker>,
+    deps_for_upload: bool,
+    uploader: Option<&Arc<crate::upload::Uploader>>,
+    follow: crate::fetch::FetchPolicy,
+) -> anyhow::Result<crate::engine::ScanResult> {
+    use fletch::RefLocator;
+
+    if let Some(p) = phase {
+        p.set("url:payload");
+    }
+    let (bytes, name, rec) = crate::fetch::fetch_one(RefLocator::Url(url.to_owned()), false)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let result = classify_bytes_with_follow(
+        bytes::Bytes::from(bytes),
+        &name,
+        resources,
+        slow_rule_ms,
+        cancellation,
+        phase,
+        None,
+        follow,
+        deps_for_upload,
+    )?;
+    if let Some(uploader) = uploader {
+        uploader.submit_artifacts(crate::engine::collect_upload_artifacts(
+            std::path::Path::new(&name),
+            &result.sha256,
+            result.size_bytes,
+            upload_collector(),
+            None,
             Some(&rec),
         ));
     }
@@ -2616,8 +2829,20 @@ pub(super) async fn status(
 ) -> Response {
     let sha = q.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let raw = q.purl.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    if sha.is_none() && raw.is_none() {
-        return error_response(StatusCode::BAD_REQUEST, "provide sha256, purl, or both");
+    let raw_url = q.url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if raw.is_some() && raw_url.is_some() {
+        return error_response(StatusCode::BAD_REQUEST, "provide purl or url, not both");
+    }
+    if let Some(url) = raw_url
+        && !valid_http_url(url)
+    {
+        return error_response(StatusCode::BAD_REQUEST, "invalid url");
+    }
+    if sha.is_none() && raw.is_none() && raw_url.is_none() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "provide sha256, purl, url, or both",
+        );
     }
     // The canonical form is what a flight is keyed by, so an uncanonical spelling
     // must not read as a different artifact — the same rule /lookup follows.
@@ -2627,10 +2852,15 @@ pub(super) async fn status(
         None => None,
     };
     let sha = sha.map(str::to_ascii_lowercase);
+    let url = raw_url.map(str::to_owned);
 
     let running = purl
         .as_deref()
         .and_then(|p| state.flights.running(&FlightKey::Purl(p.to_string())))
+        .or_else(|| {
+            url.as_deref()
+                .and_then(|u| state.flights.running(&FlightKey::Url(u.to_string())))
+        })
         .or_else(|| {
             sha.as_deref()
                 .and_then(|s| state.flights.running(&FlightKey::Sha(s.to_string())))
@@ -2639,6 +2869,7 @@ pub(super) async fn status(
         return Json(serde_json::json!({
             "state": "running",
             "purl": purl,
+            "url": url,
             "sha256": sha,
             "elapsed_ms": crate::duration_ms(run.elapsed),
             "attached": run.attached,
@@ -2654,12 +2885,13 @@ pub(super) async fn status(
     Json(serde_json::json!({
         "state": if complete { "complete" } else { "unknown" },
         "purl": purl,
+        "url": url,
         "sha256": sha,
     }))
     .into_response()
 }
 
-/// Query for `GET /v1/lookup`. `purl` repeats; `sha256` names one artifact.
+/// Query for `GET /v1/lookup`. `purl` and `url` repeat; `sha256` names one artifact.
 ///
 /// Parsed from the raw query rather than through `Query<T>`: a repeated key is
 /// a sequence, and `serde_urlencoded` — what axum's `Query` is built on —
@@ -2667,6 +2899,7 @@ pub(super) async fn status(
 /// would make `?purl=a&purl=b` a 400 with no explanation.
 pub(super) struct V1LookupQuery {
     purl: Vec<String>,
+    url: Vec<String>,
     sha256: Option<String>,
     /// How many false positives per 100 million benign files the caller will
     /// tolerate. Chosen by them, unlike `fires_at`, which is measured.
@@ -2683,25 +2916,71 @@ pub(super) struct V1LookupQuery {
     /// re-analysis would be to have no verdict — which is not a state a caller
     /// can arrange. Meaningless to `/v1/lookup`, which never analyzes.
     force: bool,
+    /// Whether the caller wants the authoritative answer rather than the cheap
+    /// one.
+    ///
+    /// Distinct from [`Self::force`], which is about spending an analysis slot.
+    /// This is about which layer may answer: the bloom filters are membership
+    /// rebuilt on a schedule, so a caller who needs current truth — reading
+    /// after a write, or checking whether a revocation has landed — must be able
+    /// to say "not from a filter". It bypasses both bloom paths and applies to
+    /// `/v1/lookup` as much as to `/v1/analyze`, because a stale bless is a
+    /// lookup problem too.
+    ///
+    /// Spelled to match hopper's own escape hatch (`?fresh=1`), so one word
+    /// means the same thing at both hops.
+    fresh: bool,
     /// Which references discovered inside the root artifact the caller wants
     /// followed. Repeated keys and comma-separated values are both accepted.
     /// Empty means use the deployment policy.
     follow: Vec<String>,
 }
 
+/// The spellings that opt in to a boolean flag. Anything else — including a
+/// bare `=` — leaves the default in place, because the reading that costs
+/// something must never be reached by an ambiguous value.
+fn affirmative(value: &str) -> bool {
+    matches!(value, "1" | "true" | "yes")
+}
+
+/// `X-Hopper-Fresh`, the header spelling of `?fresh=1`.
+///
+/// Named for hopper's own escape hatch rather than for scan, because it is the
+/// same request travelling: a caller sets it once and every hop that can answer
+/// from something cheaper stands down. Accepts the same spellings the query
+/// parameter does — hopper itself only reads `1`, and accepting a superset here
+/// costs nothing and surprises nobody.
+fn header_wants_fresh(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-hopper-fresh")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(affirmative)
+}
+
 impl V1LookupQuery {
+    /// Fold the header alias into the parsed query. Either spelling opts in;
+    /// neither can opt back out, so a proxy that adds the header cannot be
+    /// defeated by a stale `fresh=0` further down the chain.
+    fn with_fresh_header(mut self, headers: &axum::http::HeaderMap) -> Self {
+        self.fresh = self.fresh || header_wants_fresh(headers);
+        self
+    }
+
     fn parse(raw: Option<&str>) -> Self {
         let mut q = Self {
             purl: Vec::new(),
+            url: Vec::new(),
             sha256: None,
             false_positive_budget: None,
             bad_budget: None,
             force: false,
+            fresh: false,
             follow: Vec::new(),
         };
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             match key.as_ref() {
                 "purl" => q.purl.push(value.into_owned()),
+                "url" => q.url.push(value.into_owned()),
                 "sha256" => q.sha256 = Some(value.into_owned()),
                 "false_positive_budget" => match value.parse::<u16>() {
                     Ok(n) => q.false_positive_budget = Some(n),
@@ -2712,6 +2991,10 @@ impl V1LookupQuery {
                 // path in place, because the expensive reading of an ambiguous
                 // value is the one that burns an analysis slot.
                 "force" => q.force = matches!(value.as_ref(), "1" | "true" | "yes"),
+                // Same affirmative-only rule as `force`, for the same reason:
+                // an ambiguous value must not silently change which layer
+                // answers.
+                "fresh" => q.fresh = affirmative(value.as_ref()),
                 "follow" => q.follow.push(value.into_owned()),
                 // Unknown parameters are ignored, so a caller can carry their
                 // own tracing keys through without us rejecting the request.
@@ -2856,10 +3139,10 @@ async fn v1_analyze_bytes(
     // we could not find out — turning either into an answer would report on
     // work never done.
     if !q.force && request_follow.persist {
-        if let Ok((decided, source)) = v1_decide(state, Some(&sha), None, budget)
+        if let Ok((decided, source)) = v1_decide(state, Some(&sha), None, None, budget, q.fresh)
             .await
             .map(|(d, source)| (d.asked_about(asked), source))
-            && decided.is_verdict()
+            && decided.is_answerable()
         {
             let elapsed = crate::duration_ms(request_start.elapsed());
             tracing::info!(
@@ -2867,7 +3150,8 @@ async fn v1_analyze_bytes(
                 sha256 = %sha,
                 size_bytes = bytes.len(),
                 ms = elapsed,
-                "--> POST /v1/analyze (bytes; answered from a verdict already held; no slot spent)"
+                kind = if decided.is_verdict() { "verdict" } else { "derived" },
+                "--> POST /v1/analyze (bytes; answered from what we already knew; no slot spent)"
             );
             let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed.into());
@@ -2931,6 +3215,7 @@ async fn v1_analyze_bytes(
         subject: purl.clone().unwrap_or_else(|| sha.clone()),
         key: purl,
         asked: asked.map(str::to_owned),
+        is_url: false,
     };
     match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
         Ok(outcome) => {
@@ -3012,7 +3297,15 @@ pub(super) async fn v1_analyze(
 ) -> Response {
     let request_id = request_id.0.get();
     let request_start = Instant::now();
-    let q = V1LookupQuery::parse(raw.0.as_deref());
+    let q = V1LookupQuery::parse(raw.0.as_deref()).with_fresh_header(&headers);
+
+    if !q.purl.is_empty() && !q.url.is_empty() {
+        return v1_error(
+            StatusCode::BAD_REQUEST,
+            "multiple_locators",
+            "Use ?purl= or ?url=, not both.",
+        );
+    }
 
     // Two ways to name an artifact, and the artifact itself is one of them: a
     // caller holding bytes nobody has published — a build output, something
@@ -3044,6 +3337,9 @@ pub(super) async fn v1_analyze(
         policy: follow,
         persist: follow == state.fetch,
     };
+    let budget = q
+        .false_positive_budget
+        .unwrap_or_else(|| decision::default_budget(state.level));
     let Ok(bytes) = axum::body::to_bytes(body, state.max_upload_bytes).await else {
         tracing::warn!(
             id = request_id,
@@ -3060,6 +3356,13 @@ pub(super) async fn v1_analyze(
         );
     };
     if !bytes.is_empty() {
+        if !q.url.is_empty() {
+            return v1_error(
+                StatusCode::BAD_REQUEST,
+                "url_with_body",
+                "Use either an exact url or an uploaded artifact, not both.",
+            );
+        }
         return v1_analyze_bytes(
             &state,
             request_id,
@@ -3071,20 +3374,102 @@ pub(super) async fn v1_analyze(
         )
         .await;
     }
+    if let Some(raw_url) = q.url.first() {
+        if q.url.len() > 1 {
+            return v1_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_many_packages",
+                "Only one exact url may be analyzed per request.",
+            );
+        }
+        let url = raw_url.trim();
+        if !valid_http_url(url) {
+            return v1_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_url",
+                "url must be an absolute http or https URL.",
+            );
+        }
+        let url = url.to_owned();
+        if let Ok(init_error) = state.init_error.read()
+            && let Some(message) = init_error.as_ref()
+        {
+            tracing::error!(id = request_id, error = %message, "rejected: startup failed");
+            return v1_error(StatusCode::SERVICE_UNAVAILABLE, "starting", message);
+        }
+        if let Some(response) = check_memory_pressure(&state).await {
+            return response;
+        }
+        let attachment = state.flights.join(FlightKey::url_follow(
+            url.clone(),
+            request_follow.policy.selection_bits(),
+            state.fetch.selection_bits(),
+        ));
+        let leads = attachment.leads();
+        if leads {
+            tracing::info!(id = request_id, url = %url, "--> POST /v1/analyze");
+            let publisher = state.flights.publisher(attachment.flight());
+            match claim_slot(&state, request_id, attachment.flight().key()) {
+                Err(outcome) => publisher.publish(outcome),
+                Ok((resources, permit)) => {
+                    let flight = Arc::clone(attachment.flight());
+                    let state = Arc::clone(&state);
+                    let url_for_task = url.clone();
+                    tokio::spawn(async move {
+                        publisher.publish(
+                            run_url_analysis(
+                                state,
+                                request_id,
+                                &url_for_task,
+                                &flight,
+                                resources,
+                                permit,
+                                request_follow,
+                            )
+                            .await,
+                        );
+                    });
+                }
+            }
+        } else {
+            tracing::info!(id = request_id, url = %url, "--> POST /v1/analyze (joined a run already in flight)");
+        }
+        let flight = Arc::clone(attachment.flight());
+        let about = Named {
+            key: Some(url.clone()),
+            asked: Some(url.clone()),
+            subject: url,
+            is_url: true,
+        };
+        return match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
+            Ok(outcome) => {
+                let elapsed = crate::duration_ms(request_start.elapsed());
+                v1_outcome_response(&outcome, &about, budget, elapsed, !leads)
+            }
+            Err(_) => {
+                tracing::info!(id = request_id, "answering as a stream");
+                v1_streamed(
+                    Arc::clone(&state),
+                    attachment,
+                    flight,
+                    about,
+                    budget,
+                    request_start,
+                )
+            }
+        };
+    }
+
     let Some(named) = q.purl.first() else {
         return v1_error(
             StatusCode::BAD_REQUEST,
             "missing_package",
-            "Name a package with ?purl=, or send the artifact as the body.",
+            "Name an artifact with ?purl= or ?url=, or send it as the body.",
         );
     };
     let req = AnalyzePurlRequest {
         purl: named.clone(),
     };
-    let budget = q
-        .false_positive_budget
-        .unwrap_or_else(|| decision::default_budget(state.level));
-
     let purl = match normalize_pkg_purl(&req.purl) {
         Ok(purl) => purl,
         Err(message) => {
@@ -3124,15 +3509,16 @@ pub(super) async fn v1_analyze(
     // means we could not find out — turning that into a refusal to work would
     // make a corpus outage look like an answer. Both fall through and run.
     if !q.force && request_follow.persist {
-        if let Ok((decided, source)) = v1_resolve(&state, None, Some(&req.purl), budget).await
-            && decided.is_verdict()
+        if let Ok((decided, source)) = v1_resolve(&state, None, Some(&req.purl), None, budget, q.fresh).await
+            && decided.is_answerable()
         {
             let elapsed = crate::duration_ms(request_start.elapsed());
             tracing::info!(
                 id = request_id,
                 purl = %purl,
                 ms = elapsed,
-                "--> POST /v1/analyze (answered from a verdict already held; no slot spent)"
+                kind = if decided.is_verdict() { "verdict" } else { "derived" },
+                "--> POST /v1/analyze (answered from what we already knew; no slot spent)"
             );
             let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed.into());
@@ -3192,6 +3578,7 @@ pub(super) async fn v1_analyze(
         key: Some(purl.clone()),
         asked: Some(req.purl.clone()),
         subject: purl.clone(),
+        is_url: false,
     };
     // Inside the grace window the ordinary response still applies, which is what
     // keeps `429 At capacity` a real 429 the router can act on rather than a
@@ -3228,6 +3615,7 @@ struct Named {
     key: Option<String>,
     asked: Option<String>,
     subject: String,
+    is_url: bool,
 }
 
 /// A finished analysis, as a decision.
@@ -3248,8 +3636,13 @@ fn v1_outcome_response(
             // one shape or neither is trustworthy.
             // The verdict is stored under the normalized key; only the answer
             // going back out is spelled the caller's way.
-            let verdict = crate::lookup::Verdict::from_scan(result, purl);
-            let decided = V1Decision::stored(&verdict, purl, budget).asked_about(asked);
+            let verdict_key = (!named.is_url).then_some(purl).flatten();
+            let verdict = crate::lookup::Verdict::from_scan(result, verdict_key);
+            let decided = if named.is_url {
+                V1Decision::stored(&verdict, None, budget).asked_about_url(asked)
+            } else {
+                V1Decision::stored(&verdict, purl, budget).asked_about(asked)
+            };
             let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
             resp.headers_mut().insert(
@@ -3266,7 +3659,11 @@ fn v1_outcome_response(
     if shared {
         resp.extensions_mut().insert(super::access::Shared);
     }
-    resp.extensions_mut().insert(Subject::purl(subject, None));
+    resp.extensions_mut().insert(if named.is_url {
+        Subject::url(subject, None)
+    } else {
+        Subject::purl(subject, None)
+    });
     resp
 }
 
@@ -3301,12 +3698,13 @@ fn v1_streamed(
         key: purl,
         asked,
         subject,
+        is_url,
     } = named;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
     // Progress frames name the package too, and a caller reading the stream
     // correlates on the same field the decision carries. An upload has no
     // coordinate at all, so there the digest-derived subject stands.
-    let labelled_purl = asked.clone().unwrap_or_else(|| subject.clone());
+    let labelled_locator = asked.clone().unwrap_or_else(|| subject.clone());
     let labelled = subject.clone();
     tokio::spawn(async move {
         // Held for the life of the stream: an attachment dropped early would
@@ -3319,12 +3717,13 @@ fn v1_streamed(
                 outcome = &mut waiting => break outcome,
                 () = tokio::time::sleep(next) => {
                     next = V1_PROGRESS_EVERY;
-                    let frame = serde_json::json!({
+                    let mut frame = serde_json::json!({
                         "state": "analyzing",
-                        "purl": labelled_purl,
                         "elapsed_ms": crate::duration_ms(request_start.elapsed()),
                         "phase": v1_phase_of(&state, &subject),
                     });
+                    frame[if is_url { "url" } else { "purl" }] =
+                        serde_json::Value::String(labelled_locator.clone());
                     // A caller that has gone away shows up here as a closed
                     // channel, which ends the stream. The analysis keeps going:
                     // it is not this connection's to lose.
@@ -3339,12 +3738,22 @@ fn v1_streamed(
             Outcome::Report(result) => {
                 // As on the unstreamed path: an upload has no locator, and the
                 // digest is not one.
-                let verdict = crate::lookup::Verdict::from_scan(result, purl.as_deref());
-                V1Decision::stored(&verdict, purl.as_deref(), budget).asked_about(asked.as_deref())
+                let verdict_key = (!is_url).then_some(purl.as_deref()).flatten();
+                let verdict = crate::lookup::Verdict::from_scan(result, verdict_key);
+                if is_url {
+                    V1Decision::stored(&verdict, None, budget).asked_about_url(asked.as_deref())
+                } else {
+                    V1Decision::stored(&verdict, purl.as_deref(), budget)
+                        .asked_about(asked.as_deref())
+                }
             }
             Outcome::Rendered { status, .. } => {
                 tracing::warn!(subject = %subject, status = status.as_u16(), elapsed_ms = elapsed, "streamed analysis failed");
-                V1Decision::unavailable(None, purl.as_deref()).asked_about(asked.as_deref())
+                if is_url {
+                    V1Decision::unavailable(None, None).asked_about_url(asked.as_deref())
+                } else {
+                    V1Decision::unavailable(None, purl.as_deref()).asked_about(asked.as_deref())
+                }
             }
         };
         v1_send(&tx, &decided).await;
@@ -3372,7 +3781,11 @@ fn v1_streamed(
         "X-Scan-Source",
         axum::http::HeaderValue::from_static("scan:analysis"),
     );
-    resp.extensions_mut().insert(Subject::purl(&labelled, None));
+    resp.extensions_mut().insert(if is_url {
+        Subject::url(&labelled, None)
+    } else {
+        Subject::purl(&labelled, None)
+    });
     resp
 }
 
@@ -3427,9 +3840,10 @@ impl futures_core::Stream for ChannelStream {
 pub(super) async fn v1_lookup(
     State(state): State<Arc<AppState>>,
     raw: axum::extract::RawQuery,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let started = Instant::now();
-    let q = V1LookupQuery::parse(raw.0.as_deref());
+    let q = V1LookupQuery::parse(raw.0.as_deref()).with_fresh_header(&headers);
     let response = v1_lookup_inner(&state, &q).await;
     state
         .lookups
@@ -3455,30 +3869,71 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Response {
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .collect();
+    let urls: Vec<&str> = q
+        .url
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
 
-    if sha.is_none() && purls.is_empty() {
+    if !purls.is_empty() && !urls.is_empty() {
+        return v1_error(
+            StatusCode::BAD_REQUEST,
+            "multiple_locators",
+            "Use ?purl= or ?url=, not both.",
+        );
+    }
+    if urls.iter().any(|url| !valid_http_url(url)) {
+        return v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_url",
+            "url must be an absolute http or https URL.",
+        );
+    }
+    if sha.is_none() && purls.is_empty() && urls.is_empty() {
         return v1_error(
             StatusCode::BAD_REQUEST,
             "missing_package",
-            "Name a package with ?purl= or ?sha256=.",
+            "Name an artifact with ?purl=, ?url=, or ?sha256=.",
         );
     }
-    if purls.len() > V1_MAX_KEYS {
+    if purls.len().max(urls.len()) > V1_MAX_KEYS {
         return v1_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "too_many_packages",
             &format!(
                 "{} packages exceeds the limit of {V1_MAX_KEYS} for a URL. Use POST /v1/lookup.",
-                purls.len()
+                purls.len().max(urls.len())
             ),
         );
+    }
+
+    if let Some(url) = urls.first() {
+        if urls.len() > 1 {
+            return v1_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_many_packages",
+                "Only one exact url may be analyzed per request.",
+            );
+        }
+        return match v1_resolve(state, sha, None, Some(url), budget, q.fresh).await {
+            Ok((decided, source)) => {
+                let mut resp = Json(decided).into_response();
+                resp.headers_mut().insert(
+                    "X-Scan-Source",
+                    axum::http::HeaderValue::from_static(source),
+                );
+                resp
+            }
+            Err(response) => *response,
+        };
     }
 
     // One package named two ways is one question, so a lone sha256 and a lone
     // purl resolve together rather than as two entries.
     if purls.len() <= 1 {
         let purl = purls.first().copied();
-        return match v1_resolve(state, sha, purl, budget).await {
+        return match v1_resolve(state, sha, purl, None, budget, q.fresh).await {
             Ok((decided, source)) => {
                 let mut resp = Json(decided).into_response();
                 resp.headers_mut().insert(
@@ -3494,7 +3949,7 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Response {
     let mut out = Vec::with_capacity(purls.len());
     let mut source = None;
     for purl in purls {
-        match v1_resolve(state, None, Some(purl), budget).await {
+        match v1_resolve(state, None, Some(purl), None, budget, q.fresh).await {
             Ok((decided, row_source)) => {
                 source = Some(match source {
                     None => row_source,
@@ -3522,19 +3977,45 @@ async fn v1_resolve(
     state: &Arc<AppState>,
     sha: Option<&str>,
     raw_purl: Option<&str>,
+    raw_url: Option<&str>,
     budget: u16,
+    fresh: bool,
 ) -> Result<(V1Decision, &'static str), Box<Response>> {
-    let (decided, source) = v1_decide(state, sha, raw_purl, budget).await?;
-    Ok((decided.asked_about(raw_purl), source))
+    let (decided, source) = v1_decide(state, sha, raw_purl, raw_url, budget, fresh).await?;
+    Ok((
+        decided.asked_about(raw_purl).asked_about_url(raw_url),
+        source,
+    ))
 }
 
 /// The decision itself, in this worker's own vocabulary: every key here is the
 /// normalized one, because that is what the index and the corpus are keyed by.
+/// The filters' opinion of an artifact named by a digest, a PURL, or both.
+///
+/// Both keys are evidence about one artifact, so their answers merge under the
+/// same worst-pool-wins rule a single key follows — see
+/// [`crate::bloom_repo::Decision::merge`]. A caller who names both is asserting
+/// they are the same thing, and a bless on one beside a claim on the other is a
+/// contradiction rather than a coin flip.
+fn bloom_decision(sha: Option<&str>, purl: Option<&str>) -> crate::bloom_repo::Decision {
+    use crate::bloom_repo::Decision;
+    let Some(lk) = crate::bloom_repo::global() else {
+        return Decision::Unknown;
+    };
+    let by_sha = sha
+        .and_then(crate::bloom::parse_sha256_hex)
+        .map_or(Decision::Unknown, |d| lk.memo_sha256(&d));
+    let by_purl = purl.map_or(Decision::Unknown, |p| lk.memo_purl(p));
+    by_sha.merge(by_purl)
+}
+
 async fn v1_decide(
     state: &Arc<AppState>,
     sha: Option<&str>,
     raw_purl: Option<&str>,
+    raw_url: Option<&str>,
     budget: u16,
+    fresh: bool,
 ) -> Result<(V1Decision, &'static str), Box<Response>> {
     let purl = match raw_purl.map(normalize_pkg_purl) {
         Some(Ok(purl)) => Some(purl),
@@ -3545,6 +4026,17 @@ async fn v1_decide(
                 message,
             )));
         }
+        None => None,
+    };
+    let url = match raw_url {
+        Some(url) if !valid_http_url(url) => {
+            return Err(Box::new(v1_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_url",
+                "url must be an absolute http or https URL.",
+            )));
+        }
+        Some(url) => Some(url.trim().to_owned()),
         None => None,
     };
     let sha = match sha {
@@ -3593,17 +4085,50 @@ async fn v1_decide(
 
     if let Some(verdict) = verdict.as_ref() {
         return Ok((
-            V1Decision::stored(verdict, purl.as_deref(), budget),
+            V1Decision::stored(verdict, purl.as_deref(), budget).with_url(url.as_deref()),
             "scan:analysis",
         ));
+    }
+
+    // Nothing measured here. Ask the filters before the network: they are the
+    // cheapest knowledge in the process, and for a blessed artifact they are
+    // the whole answer.
+    //
+    // Unless the caller asked for the authoritative answer. A filter is
+    // membership rebuilt on a schedule, so it is exactly what somebody reading
+    // after a write — or checking whether a revocation has landed — needs
+    // bypassed. Withholding the decision here disables both bloom paths at
+    // once: the fast bless below, and the derived fallback after the corpus.
+    let bloom = if fresh {
+        crate::bloom_repo::Decision::Unknown
+    } else {
+        bloom_decision(sha.as_deref(), purl.as_deref())
+    };
+
+    // A bless answers immediately and does not pay the hopper round trip. The
+    // exposure is a bless that has gone stale — but that is bounded by the
+    // filter rebuild, because `good` is rebuilt as `good − (bad ∪ sighted)` and
+    // the bad channel is the designed revocation path. It is also the bargain
+    // the local scan path already takes: `bloom_skip_predicate` skips the
+    // download outright on a good hit, without asking anyone.
+    if bloom == crate::bloom_repo::Decision::Skip
+        && let Some(d) = V1Decision::bloom(bloom, sha.as_deref(), purl.as_deref(), budget)
+    {
+        return Ok((d.with_url(url.as_deref()), "scan:bloom"));
     }
 
     // Not in this worker's index. The corpus behind it may still know, and a
     // caller should not have to learn that two services exist in order to get
     // one answer — so ask, rather than reporting an absence that is only ours.
+    //
+    // Measured beats derived: a filter claim is a floor, and hopper may hold
+    // the real level, the real findings and the sentence a person reads. Only
+    // when it holds nothing does the filter's own claim stand in.
     let Some(corpus) = state.corpus.as_ref() else {
         return Ok((
-            V1Decision::unknown(sha.as_deref(), purl.as_deref()),
+            V1Decision::bloom(bloom, sha.as_deref(), purl.as_deref(), budget)
+                .unwrap_or_else(|| V1Decision::unknown(sha.as_deref(), purl.as_deref()))
+                .with_url(url.as_deref()),
             "scan:bloom",
         ));
     };
@@ -3618,13 +4143,21 @@ async fn v1_decide(
         match reached {
             Reached::Record(record) => {
                 V1Decision::corpus(&record, sha.as_deref(), purl.as_deref(), budget)
+                    .with_url(url.as_deref())
             }
-            Reached::Nothing => V1Decision::unknown(sha.as_deref(), purl.as_deref()),
+            // The corpus holds nothing either. A filter claim is the last thing
+            // we know, and answering `unknown` about a digest several operators
+            // call malware is a worse answer than saying who says so.
+            Reached::Nothing => V1Decision::bloom(bloom, sha.as_deref(), purl.as_deref(), budget)
+                .unwrap_or_else(|| V1Decision::unknown(sha.as_deref(), purl.as_deref()))
+                .with_url(url.as_deref()),
             // The corpus could not answer, so neither can we. Emphatically not
             // `unknown`: that would tell the caller nobody has analyzed this
             // package, which is a claim about the package rather than about us, and
             // the one that lets a gate fail open during an outage.
-            Reached::Unreachable => V1Decision::unavailable(sha.as_deref(), purl.as_deref()),
+            Reached::Unreachable => {
+                V1Decision::unavailable(sha.as_deref(), purl.as_deref()).with_url(url.as_deref())
+            }
         },
         source,
     ))
@@ -3640,6 +4173,8 @@ async fn v1_decide(
 pub(super) struct V1Decision {
     decision: decision::Decision,
     purl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
     sha256: Option<String>,
     severity: Option<decision::Severity>,
     /// The tightest false-positive budget per 100 million benign files at which
@@ -3669,10 +4204,50 @@ impl V1Decision {
         Self::empty(decision::Decision::Unavailable, sha, purl)
     }
 
+    /// What the filters alone justify, for an artifact no stored verdict and no
+    /// corpus record covers. `None` when the filters had no opinion.
+    ///
+    /// `engine_version` and `analyzed_at` stay `None`, which is the whole
+    /// contract: an engine is what separates a measurement from a citation, so
+    /// a caller (and beamline's cache) can tell this from a scan we ran, and
+    /// `/v1/analyze` is free to replace it with a real one.
+    ///
+    /// Levels come from [`crate::lookup::bloom_claim`] — the loosest each tier
+    /// can justify, since a filter carries membership and not a measurement.
+    fn bloom(
+        d: crate::bloom_repo::Decision,
+        sha: Option<&str>,
+        purl: Option<&str>,
+        budget: u16,
+    ) -> Option<Self> {
+        let claim = crate::lookup::bloom_claim(d)?;
+        let fires_at = claim
+            .as_ref()
+            .map_or(crate::lookup::BENIGN_LEVEL, |c| c.lvl);
+        let (decided, severity) = decision::decide(Some(fires_at), budget);
+        Some(Self {
+            decision: decided,
+            purl: purl.map(str::to_owned),
+            url: None,
+            sha256: sha.map(str::to_owned),
+            severity: Some(severity),
+            fires_at: Some(fires_at),
+            reason: claim.as_ref().map(|c| c.desc.to_owned()),
+            findings: claim
+                .as_ref()
+                .map(|c| V1Finding::from_bloom(c, purl))
+                .into_iter()
+                .collect(),
+            engine_version: None,
+            analyzed_at: None,
+        })
+    }
+
     fn empty(decided: decision::Decision, sha: Option<&str>, purl: Option<&str>) -> Self {
         Self {
             decision: decided,
             purl: purl.map(str::to_owned),
+            url: None,
             sha256: sha.map(str::to_owned),
             severity: None,
             fires_at: None,
@@ -3704,6 +4279,31 @@ impl V1Decision {
         ) && self.engine_version.is_some()
     }
 
+    /// Anything that answers the caller's question, measured or not.
+    ///
+    /// Wider than [`Self::is_verdict`] on purpose, and the difference is a
+    /// policy choice rather than an oversight. `is_verdict` remains the strict
+    /// question — is this a measurement of ours — and downstream still asks it
+    /// by looking for an engine. This one governs whether `/v1/analyze` may
+    /// answer at all, where the operator's judgement is that a fast answer from
+    /// what we already know beats spending a slot to rediscover it.
+    ///
+    /// The cost is real and worth naming: for an artifact nobody has analyzed
+    /// and a feed has cited, this answers from the citation and the analysis
+    /// never happens, so the corpus does not learn. `?fresh=1` is the escape
+    /// hatch for a caller who needs the measurement, and the derived answer
+    /// still carries no `engine_version`, so nothing downstream mistakes it for
+    /// one.
+    ///
+    /// `unknown` and `unavailable` are excluded exactly as before: the first is
+    /// what `/v1/analyze` exists to fix, the second is a statement about us.
+    fn is_answerable(&self) -> bool {
+        !matches!(
+            self.decision,
+            decision::Decision::Unknown | decision::Decision::Unavailable
+        ) && self.fires_at.is_some()
+    }
+
     /// A verdict this worker holds in its own index.
     ///
     /// Takes no digest: a stored verdict always carries its own, and it is the
@@ -3715,6 +4315,7 @@ impl V1Decision {
             // The verdict names the artifact it is about; the caller's spelling
             // only fills in what it could not.
             purl: v.purl.clone().or_else(|| purl.map(str::to_owned)),
+            url: None,
             sha256: Some(v.sha256.clone()),
             severity: Some(severity),
             fires_at: v.lvl,
@@ -3739,6 +4340,7 @@ impl V1Decision {
         Self {
             decision: decided,
             purl: r.purl.clone().or_else(|| purl.map(str::to_owned)),
+            url: None,
             // Empty is absent. A record standing on threat-feed citations for a
             // package nobody has analyzed names no bytes, and the corpus sends
             // the field as "" rather than omitting it — which would put an
@@ -3780,6 +4382,20 @@ impl V1Decision {
     fn asked_about(mut self, asked: Option<&str>) -> Self {
         if let Some(asked) = asked {
             self.purl = Some(asked.to_owned());
+        }
+        self
+    }
+
+    fn asked_about_url(mut self, asked: Option<&str>) -> Self {
+        if let Some(asked) = asked {
+            self.url = Some(asked.to_owned());
+        }
+        self
+    }
+
+    fn with_url(mut self, url: Option<&str>) -> Self {
+        if let Some(url) = url {
+            self.url = Some(url.to_owned());
         }
         self
     }
@@ -3828,6 +4444,21 @@ impl V1Finding {
             desc: some(&h.desc),
             off: h.off,
             line: h.line,
+        }
+    }
+
+    /// A finding synthesized from a filter hit. Carries no `file`, `off` or
+    /// `line` — a filter knows membership and nothing about where anything
+    /// fired — which is the same shape the corpus sends for a citation.
+    fn from_bloom(c: &crate::lookup::BloomClaim, purl: Option<&str>) -> Self {
+        Self {
+            id: c.id.to_owned(),
+            crit: c.crit,
+            file: None,
+            pkg: purl.map(str::to_owned),
+            desc: Some(c.desc.to_owned()),
+            off: None,
+            line: None,
         }
     }
 
@@ -4125,32 +4756,108 @@ mod tests {
         );
     }
 
+    /// What may answer `/v1/analyze` without spending a slot.
+    ///
+    /// The rule is "anything that actually answers the question", which is
+    /// wider than "a measurement of ours" — an operator's call, made because a
+    /// fast answer from what we already know beats rediscovering it. What stays
+    /// excluded is what was always excluded: `unknown`, which is the very thing
+    /// the route exists to fix, and `unavailable`, which is a statement about us
+    /// rather than about the artifact.
     #[test]
-    fn only_a_real_verdict_may_replace_an_analysis() {
+    fn only_a_real_answer_may_replace_an_analysis() {
         use super::V1Decision;
         use super::decision::Decision;
         let purl = Some("pkg:npm/left-pad@1.3.0");
-        assert!(!V1Decision::unknown(None, purl).is_verdict());
-        assert!(!V1Decision::unavailable(None, purl).is_verdict());
+        assert!(!V1Decision::unknown(None, purl).is_answerable());
+        assert!(!V1Decision::unavailable(None, purl).is_answerable());
 
-        // An engine is what makes a decision a verdict, so the fixtures below
-        // name one. `empty` leaves it unset because its other callers are the
-        // answers no engine produced.
+        // A decision with no level answers nothing, whatever it is labelled.
+        assert!(!V1Decision::empty(Decision::Block, None, purl).is_answerable());
+
         let measured = |d| {
             let mut v = V1Decision::empty(d, None, purl);
             v.engine_version = Some("2.8.0".into());
+            v.fires_at = Some(10);
             v
         };
-        assert!(measured(Decision::Allow).is_verdict());
-        assert!(measured(Decision::Block).is_verdict());
+        assert!(measured(Decision::Allow).is_answerable());
+        assert!(measured(Decision::Block).is_answerable());
+    }
 
-        // A level derived from threat-feed citations carries a real decision
-        // and no engine. It must not stand in for a run: the artifact it
-        // describes is precisely the one nobody has analyzed, and answering
-        // from it would mean nobody ever does.
-        let cited = V1Decision::empty(Decision::Block, None, purl);
-        assert!(cited.engine_version.is_none());
-        assert!(!cited.is_verdict());
+    /// A derived answer may answer, but must never claim to be a measurement:
+    /// the absent engine is what stops it being cached as one downstream, and
+    /// what `?fresh=1` exists to get past.
+    #[test]
+    fn a_derived_answer_answers_without_claiming_an_engine() {
+        use super::V1Decision;
+        let purl = Some("pkg:npm/left-pad@1.3.0");
+        for d in [
+            crate::bloom_repo::Decision::Skip,
+            crate::bloom_repo::Decision::SightedHostile,
+            crate::bloom_repo::Decision::SightedSuspicious,
+            crate::bloom_repo::Decision::KnownBad,
+        ] {
+            let derived = V1Decision::bloom(d, None, purl, 25).expect("answerable");
+            assert!(derived.is_answerable(), "{d:?}");
+            assert!(!derived.is_verdict(), "{d:?} is not a measurement");
+            assert!(derived.engine_version.is_none(), "{d:?}");
+            assert!(derived.analyzed_at.is_none(), "{d:?}");
+        }
+        // No filter had an opinion: nothing to answer with.
+        assert!(V1Decision::bloom(crate::bloom_repo::Decision::Unknown, None, purl, 25).is_none());
+    }
+
+    /// `fresh` is opt-in on the same affirmative-only terms as `force`, and is
+    /// a separate question from it: `force` spends a slot, `fresh` chooses
+    /// which layer may answer. A caller can want either without the other.
+    #[test]
+    fn only_an_affirmative_fresh_bypasses_the_filters() {
+        use super::V1LookupQuery;
+        let q = |raw| V1LookupQuery::parse(Some(raw));
+        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=1").fresh);
+        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=true").fresh);
+        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=yes").fresh);
+        assert!(!q("purl=pkg:npm/left-pad@1.3.0&fresh=0").fresh);
+        assert!(!q("purl=pkg:npm/left-pad@1.3.0&fresh=").fresh);
+        assert!(!q("purl=pkg:npm/left-pad@1.3.0").fresh);
+
+        // Independent of `force`, in both directions.
+        let both = q("purl=pkg:npm/left-pad@1.3.0&fresh=1&force=0");
+        assert!(both.fresh && !both.force);
+        let other = q("purl=pkg:npm/left-pad@1.3.0&fresh=0&force=1");
+        assert!(!other.fresh && other.force);
+    }
+
+    /// The header spelling is an alias, not an override: either opts in, and a
+    /// proxy that adds the header cannot be defeated by a stale `fresh=0`
+    /// further down the chain.
+    #[test]
+    fn the_fresh_header_is_an_alias_that_only_opts_in() {
+        use super::V1LookupQuery;
+        let headers = |value: Option<&str>| {
+            let mut h = axum::http::HeaderMap::new();
+            if let Some(v) = value {
+                h.insert(
+                    "x-hopper-fresh",
+                    axum::http::HeaderValue::from_str(v).expect("header value"),
+                );
+            }
+            h
+        };
+        let q = |raw, header| {
+            V1LookupQuery::parse(Some(raw))
+                .with_fresh_header(&headers(header))
+                .fresh
+        };
+        let base = "purl=pkg:npm/left-pad@1.3.0";
+        assert!(q(base, Some("1")), "the header alone opts in");
+        assert!(q(base, Some("true")));
+        assert!(!q(base, Some("0")), "a negative header is not an opt-in");
+        assert!(!q(base, None));
+        // Neither spelling can opt back out of the other.
+        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=1", Some("0")));
+        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=0", Some("1")));
     }
 
     /// Forcing a fresh run is opt-in, and only an affirmative spelling opts in.

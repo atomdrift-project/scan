@@ -40,10 +40,14 @@ pub(super) enum FlightKey {
     Sha(String),
     /// Package URL — `POST /analyze-purl`.
     Purl(String),
+    /// Exact fetch URL — `POST /v1/analyze?url=…`.
+    Url(String),
     /// Uploaded bytes analyzed with a request-specific follow selection.
     ShaFollow(String, u8),
     /// PURL analyzed with a request-specific follow selection.
     PurlFollow(String, u8),
+    /// URL analyzed with a request-specific follow selection.
+    UrlFollow(String, u8),
 }
 
 impl FlightKey {
@@ -67,20 +71,30 @@ impl FlightKey {
         }
     }
 
+    /// URL equivalent of [`Self::purl_follow`].
+    pub(super) fn url_follow(url: String, requested: u8, configured: u8) -> Self {
+        if requested == configured {
+            Self::Url(url)
+        } else {
+            Self::UrlFollow(url, requested)
+        }
+    }
+
     /// The package this analysis was requested by, when it was requested by
     /// one. Uploads carry a digest and a filename, never a locator.
     pub(super) fn purl(&self) -> Option<&str> {
         match self {
             Self::Purl(purl) | Self::PurlFollow(purl, _) => Some(purl),
-            Self::Sha(_) | Self::ShaFollow(_, _) => None,
+            Self::Sha(_) | Self::ShaFollow(_, _) | Self::Url(_) | Self::UrlFollow(_, _) => None,
         }
     }
 
     /// Whether two keys identify the same root artifact, ignoring policy.
     fn same_artifact(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Sha(a) | Self::ShaFollow(a, _), Self::Sha(b) | Self::ShaFollow(b, _)) => a == b,
-            (Self::Purl(a) | Self::PurlFollow(a, _), Self::Purl(b) | Self::PurlFollow(b, _)) => {
+            (Self::Sha(a) | Self::ShaFollow(a, _), Self::Sha(b) | Self::ShaFollow(b, _))
+            | (Self::Purl(a) | Self::PurlFollow(a, _), Self::Purl(b) | Self::PurlFollow(b, _))
+            | (Self::Url(a) | Self::UrlFollow(a, _), Self::Url(b) | Self::UrlFollow(b, _)) => {
                 a == b
             }
             _ => false,
@@ -96,6 +110,7 @@ impl From<&FlightKey> for super::access::Subject {
         match key {
             FlightKey::Sha(sha) | FlightKey::ShaFollow(sha, _) => Self::sha256(sha),
             FlightKey::Purl(purl) | FlightKey::PurlFollow(purl, _) => Self::purl(purl, None),
+            FlightKey::Url(url) | FlightKey::UrlFollow(url, _) => Self::url(url, None),
         }
     }
 }
@@ -107,6 +122,8 @@ impl fmt::Display for FlightKey {
             Self::Purl(purl) => write!(f, "purl:{purl}"),
             Self::ShaFollow(sha, follow) => write!(f, "sha:{sha} follow:{follow:04b}"),
             Self::PurlFollow(purl, follow) => write!(f, "purl:{purl} follow:{follow:04b}"),
+            Self::Url(url) => write!(f, "url:{url}"),
+            Self::UrlFollow(url, follow) => write!(f, "url:{url} follow:{follow:04b}"),
         }
     }
 }

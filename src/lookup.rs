@@ -195,6 +195,145 @@ pub(crate) struct View<'a> {
     pub bloom: &'a str,
 }
 
+/// The finding id on a bloom-derived answer, mirroring hopper's `feedTraitID`.
+///
+/// Namespaced apart from the analyzer's taxonomy (`objectives/…`, `metadata/…`)
+/// for the reason hopper gives: those ids say what an artifact DOES, and this
+/// one says where a claim about it CAME FROM. A consumer resolving trait ids to
+/// documentation would otherwise look this up and find nothing.
+pub(crate) const FEED_TRAIT_ID: &str = "intel/feed/malicious";
+
+/// The finding id when our own catalogue is the source rather than an outside
+/// feed. Same namespace, different claim: the corpus convicted this artifact at
+/// some earlier point, and the filter remembers only that it did.
+pub(crate) const CORPUS_TRAIT_ID: &str = "intel/corpus/known-bad";
+
+/// Synthesize the answer a bloom match justifies on its own, for an artifact no
+/// stored verdict covers.
+///
+/// This is scan's mirror of hopper's `fromLedger`: rather than answering
+/// "unknown" about a digest several operators call malware, answer with what
+/// they say, marked as what it is. It lets the server answer without a round
+/// trip to hopper, and without holding a verdict of its own.
+///
+/// # The levels
+///
+/// A filter is membership, not a measurement — the tier survives, the level does
+/// not. So each tier reports the LOOSEST level its band can justify, because
+/// claiming a tighter one would assert evidence we cannot see:
+///
+/// * `sighted-hostile` covers hopper's `Conclusive`/`Corroborated`/`Strong`
+///   (floors 1/10/25). We cannot tell which, so we report 25 — enough to
+///   convict at the default budget, and no more.
+/// * `sighted-suspicious` covers `Moderate`/`Weak` (floors 50/100), reported as
+///   100. Above the default budget on purpose: a lone unadjudicated citation
+///   allows, and blocks only for a caller who has widened past it.
+/// * `known-bad` is our own prior conviction, reported at the operating level.
+///
+/// Never 0, and never below the default budget, for hopper's reason: a derived
+/// level should be able to convict without outranking measurement.
+///
+/// # The empty engine
+///
+/// `eng` is deliberately empty. Downstream branches on it to tell a measured
+/// verdict from a citation — beamline's `customerView` omits an empty `eng`
+/// entirely, and its cache treats an engine-less body as short-lived and refuses
+/// to let it stand in for an analysis. Stamping a build here would make a filter
+/// hit read as a scan we never ran, which is the one thing this must not do.
+pub(crate) struct BloomClaim {
+    /// The level this claim justifies on its own.
+    pub lvl: i32,
+    /// Criticality of the synthesized finding: 5 hostile, 4 suspicious.
+    pub crit: u8,
+    /// Which taxonomy made the claim.
+    pub id: &'static str,
+    /// One sentence a person reads.
+    pub desc: &'static str,
+}
+
+/// What a bloom decision alone justifies saying, or `None` when it justifies
+/// nothing.
+///
+/// `Skip` maps to a benign claim carrying no finding: the filters say we looked
+/// at this and found nothing, which is an answer even though it names no
+/// evidence. `Unknown` maps to `None` — no filter had an opinion, so there is
+/// nothing to report and the caller's own policy decides.
+///
+/// One definition, read by both the native lookup route and the `/v1` decision,
+/// so the two cannot drift into answering the same filter hit differently.
+pub(crate) fn bloom_claim(decision: crate::bloom_repo::Decision) -> Option<Option<BloomClaim>> {
+    use crate::bloom_repo::Decision;
+    let default_level = i32::from(crate::model::DEFAULT_SEVERITY_LEVEL);
+    Some(Some(match decision {
+        // Nothing was claimed: benign, and no finding to name.
+        Decision::Skip => return Some(None),
+        // Conflicted is a bless standing beside a conviction. Worst wins, so it
+        // answers as the conviction — but says so, because the disagreement is
+        // the operator's problem to see.
+        Decision::KnownBad | Decision::Conflicted => BloomClaim {
+            lvl: default_level,
+            crit: 5,
+            id: CORPUS_TRAIT_ID,
+            desc: "Catalogued as malicious by a previous analysis in our corpus.",
+        },
+        Decision::SightedHostile => BloomClaim {
+            lvl: default_level,
+            crit: 5,
+            id: FEED_TRAIT_ID,
+            desc: "Cited as malicious by corroborated threat intelligence.",
+        },
+        Decision::SightedSuspicious => BloomClaim {
+            lvl: SIGHTED_SUSPICIOUS_LEVEL,
+            crit: 4,
+            id: FEED_TRAIT_ID,
+            desc: "Cited as malicious by one unadjudicated threat intelligence source.",
+        },
+        // No filter had an opinion.
+        Decision::Unknown => return None,
+    }))
+}
+
+/// The native-route projection of [`bloom_claim`]. `hits` is scratch the caller
+/// owns so the view can borrow from it.
+pub(crate) fn bloom_derived_view<'a>(
+    decision: crate::bloom_repo::Decision,
+    bloom: &'a str,
+    sha256: &'a str,
+    purl: Option<&'a str>,
+    hits: &'a mut Vec<Hit>,
+) -> Option<View<'a>> {
+    let claim = bloom_claim(decision)?;
+    let lvl = claim.as_ref().map_or(BENIGN_LEVEL, |c| c.lvl);
+    if let Some(c) = claim {
+        hits.push(Hit {
+            id: c.id.to_owned(),
+            crit: c.crit,
+            desc: c.desc.to_owned(),
+            file: String::new(),
+            pkg: purl.unwrap_or_default().to_owned(),
+            off: None,
+            line: None,
+        });
+    }
+    Some(View {
+        sha: sha256,
+        purl,
+        lvl: Some(lvl),
+        eng: "",
+        why: None,
+        hits: &hits[..],
+        bloom,
+    })
+}
+
+/// The level meaning "fires at no budget at all" — a benign answer.
+pub(crate) const BENIGN_LEVEL: i32 = -1;
+
+/// The level a lone, unadjudicated outside citation justifies — hopper's
+/// `Floor(Weak)`. Above the default budget deliberately, so it does not convict
+/// by itself. Mirrors hopper's corroboration.go; keep the pair in sync.
+const SIGHTED_SUSPICIOUS_LEVEL: i32 = 100;
+
 impl Verdict {
     /// Project the stored verdict onto the wire, worst findings first.
     /// `requested_purl` is what the caller asked by, which names the artifact
@@ -388,6 +527,88 @@ fn purl_key(purl: &str) -> Option<String> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::bloom_repo::Decision;
+
+    /// The invariant everything downstream depends on: a derived answer carries
+    /// no engine. beamline omits an empty `eng` entirely, and branches on its
+    /// absence to keep a citation from standing in for an analysis — so if this
+    /// ever stamps a build, a filter hit starts reading as a scan we never ran
+    /// and `/v1/analyze` stops running.
+    #[test]
+    fn a_derived_view_never_claims_an_engine() {
+        for d in [
+            Decision::KnownBad,
+            Decision::Conflicted,
+            Decision::SightedHostile,
+            Decision::SightedSuspicious,
+        ] {
+            let mut hits = Vec::new();
+            let view = bloom_derived_view(d, d.as_str(), "abc", None, &mut hits)
+                .expect("an adverse decision is answerable");
+            assert_eq!(view.eng, "", "{d:?} must not claim an engine");
+            assert_eq!(view.hits.len(), 1, "{d:?}");
+        }
+    }
+
+    /// No filter had an opinion, so there is nothing to say — this must stay a
+    /// miss rather than becoming a fabricated `allow`.
+    #[test]
+    fn an_unknown_decision_synthesizes_nothing() {
+        let mut hits = Vec::new();
+        assert!(
+            bloom_derived_view(Decision::Unknown, "unknown", "abc", None, &mut hits).is_none()
+        );
+    }
+
+    /// A bless answers benign and names no evidence: the filters say we looked
+    /// and found nothing, which is an answer, but not a finding.
+    #[test]
+    fn a_bless_answers_benign_with_no_findings() {
+        let mut hits = Vec::new();
+        let view = bloom_derived_view(Decision::Skip, "skip", "abc", None, &mut hits)
+            .expect("a bless is answerable");
+        assert_eq!(view.lvl, Some(BENIGN_LEVEL));
+        assert!(view.hits.is_empty(), "a bless names no evidence");
+        assert_eq!(view.eng, "", "still not a measurement of ours");
+    }
+
+    /// Levels follow hopper's floors: the loosest its band can justify, never
+    /// tighter than the evidence a filter can carry.
+    #[test]
+    fn derived_levels_are_the_loosest_of_their_band() {
+        let default_level = i32::from(crate::model::DEFAULT_SEVERITY_LEVEL);
+        let level = |d: Decision| {
+            let mut hits = Vec::new();
+            bloom_derived_view(d, d.as_str(), "abc", None, &mut hits)
+                .and_then(|v| v.lvl)
+                .expect("a level")
+        };
+        assert_eq!(level(Decision::SightedHostile), default_level);
+        assert_eq!(level(Decision::KnownBad), default_level);
+        assert_eq!(
+            level(Decision::SightedSuspicious),
+            SIGHTED_SUSPICIOUS_LEVEL,
+            "a lone unadjudicated citation must not convict at the default budget"
+        );
+        assert!(
+            SIGHTED_SUSPICIOUS_LEVEL > default_level,
+            "suspicious must sit above the default budget, or it blocks by itself"
+        );
+    }
+
+    /// Hostile cites the feed taxonomy, our own catalogue does not — the point
+    /// of the split is that they are different claims.
+    #[test]
+    fn derived_findings_name_their_source() {
+        let id = |d: Decision| {
+            let mut hits = Vec::new();
+            let v = bloom_derived_view(d, d.as_str(), "abc", None, &mut hits).expect("a view");
+            v.hits[0].id.clone()
+        };
+        assert_eq!(id(Decision::SightedHostile), FEED_TRAIT_ID);
+        assert_eq!(id(Decision::SightedSuspicious), FEED_TRAIT_ID);
+        assert_eq!(id(Decision::KnownBad), CORPUS_TRAIT_ID);
+    }
 
     fn verdict(sha: &str) -> Verdict {
         Verdict {
