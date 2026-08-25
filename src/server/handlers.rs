@@ -3005,9 +3005,9 @@ impl V1LookupQuery {
     }
 }
 
-/// Resolve a request's follow selection under the operator's configured
-/// ceiling. Request policy may restrict a deployment but never enable network
-/// traversal the operator disabled.
+/// Resolve a request's follow selection. The configured policy supplies the
+/// default and the operational limits; an explicit request replaces only the
+/// selected reference categories after its syntax has been validated.
 fn v1_follow_policy(
     q: &V1LookupQuery,
     configured: crate::fetch::FetchPolicy,
@@ -3017,13 +3017,6 @@ fn v1_follow_policy(
     }
     let selected = crate::fetch::FetchPolicy::parse_follow(&q.follow.join(","))
         .map_err(|message| ("invalid_follow_policy", message))?;
-    if !configured.allows(selected) {
-        return Err((
-            "follow_policy_not_allowed",
-            "The requested follow policy enables a category disabled by this deployment."
-                .to_string(),
-        ));
-    }
     Ok(configured.with_selection(selected))
 }
 
@@ -4877,7 +4870,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_policy_repeats_union_under_the_server_ceiling() {
+    fn follow_policy_repeats_union_and_overrides_the_server_default() {
         use super::{V1LookupQuery, v1_follow_policy};
         use crate::fetch::FetchPolicy;
 
@@ -4886,12 +4879,15 @@ mod tests {
             "purl=pkg:npm/app@1.0.0&follow=references&follow=ci-actions",
         ));
         assert_eq!(query.follow, ["references", "ci-actions"]);
-        let effective = v1_follow_policy(&query, configured).expect("allowed restriction");
+        let effective = v1_follow_policy(&query, configured).expect("valid selection");
         assert!(effective.urls && effective.packages && effective.deps && effective.ci);
 
         let dependencies_only: FetchPolicy = "dependencies".parse().unwrap();
         let references = V1LookupQuery::parse(Some("follow=references"));
-        assert!(v1_follow_policy(&references, dependencies_only).is_err());
+        let effective = v1_follow_policy(&references, dependencies_only)
+            .expect("a request may override the configured categories");
+        assert!(effective.urls && effective.packages);
+        assert!(!effective.deps && !effective.ci);
 
         let legacy = V1LookupQuery::parse(Some("follow=deps"));
         assert!(v1_follow_policy(&legacy, configured).is_err());
