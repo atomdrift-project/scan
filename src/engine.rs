@@ -554,78 +554,224 @@ mod trait_floor_tests {
         }
     }
 
-    fn finding(crit: u8, conf: f32) -> cleave::types::CompactTrait {
+    /// One finding, in the family `objectives/<area>/<n>` — distinct `area`
+    /// values put findings in distinct families.
+    fn finding(area: &str, crit: u8, conf: f32) -> cleave::types::CompactTrait {
         cleave::types::CompactTrait {
+            id: format!("objectives/{area}/sub/leaf::trait-{crit}-{conf}"),
             criticality: crit,
             confidence: conf,
             ..cleave::types::CompactTrait::default()
         }
     }
 
-    /// `n` findings at crit `crit`/confidence `conf`, padded with `pad`
-    /// baseline (crit-0) findings so the total — and so the crit-4 fraction —
-    /// can be controlled.
-    fn findings(crit: u8, conf: f32, n: usize, pad: usize) -> Vec<cleave::types::CompactTrait> {
-        let mut ts: Vec<cleave::types::CompactTrait> =
-            (0..n).map(|_| finding(crit, conf)).collect();
-        ts.extend((0..pad).map(|_| finding(0, 0.9)));
-        ts
+    /// `n` findings at `crit`/`conf`, each in its own family.
+    fn spread(crit: u8, conf: f32, n: usize) -> Vec<cleave::types::CompactTrait> {
+        (0..n)
+            .map(|i| finding(&format!("area{i}"), crit, conf))
+            .collect()
+    }
+
+    /// `n` findings at `crit`/`conf`, all in one family — the shape a single
+    /// behavior described several ways produces.
+    fn clustered(crit: u8, conf: f32, n: usize) -> Vec<cleave::types::CompactTrait> {
+        (0..n)
+            .map(|i| cleave::types::CompactTrait {
+                id: format!("objectives/evasion/process/hook/inline::variant-{i}"),
+                criticality: crit,
+                confidence: conf,
+                ..cleave::types::CompactTrait::default()
+            })
+            .collect()
     }
 
     #[test]
-    fn one_confident_crit5_escalates_to_hostile_band() {
+    fn family_is_the_first_four_hierarchy_segments() {
+        assert_eq!(
+            trait_family("objectives/evasion/process/hook/inline::rust-inline-hook-hijack"),
+            "objectives/evasion/process/hook"
+        );
+        // One behavior spelled several ways shares a family...
+        assert_eq!(
+            trait_family("objectives/evasion/process/hook/inline::rust-inline-hook-hijack"),
+            trait_family("objectives/evasion/process/hook/inline::rust-hook-byte-copy"),
+        );
+        // ...while genuinely distinct capabilities under one objective do not.
+        // This pair is `darkglitch`, which a shallower family wrongly collapsed.
+        assert_ne!(
+            trait_family("objectives/command-and-control/backdoor/rat/multi::a"),
+            trait_family("objectives/command-and-control/backdoor/tasking/filesystem::b"),
+        );
+        assert_ne!(
+            trait_family("objectives/evasion/process/hook/inline::a"),
+            trait_family("objectives/supply-chain/install-hook/npm::b"),
+        );
+        // A short or path-less id is its own family, never a shared bucket.
+        assert_eq!(trait_family("micro-behaviors/mem::x"), "micro-behaviors/mem");
+        assert_eq!(trait_family("bare-id"), "bare-id");
+        // The leaf trait id is never part of the family, at any path length —
+        // otherwise every trait would be its own family and the diversity test
+        // would pass on any cluster of near-duplicates.
+        for id in [
+            "objectives/evasion/process/hook/inline::rust-inline-hook-hijack",
+            "objectives/a/b::leaf",
+            "micro-behaviors/mem::x",
+            "a::b",
+        ] {
+            assert!(
+                !trait_family(id).contains("::"),
+                "family kept the trait id: {id} -> {}",
+                trait_family(id)
+            );
+        }
+        // Two traits differing only in their leaf are one family.
+        assert_eq!(
+            trait_family("objectives/a/b/c/d::one"),
+            trait_family("objectives/a/b/c/d::two"),
+        );
+    }
+
+    #[test]
+    fn two_crit5_with_a_third_severe_escalates_to_hostile_band() {
         let mut d = benign();
-        apply_trait_floor(&mut d, &findings(5, 0.8, 1, 0), Some(50), 100, "test");
+        let mut ts = spread(5, 0.8, 2);
+        ts.push(finding("supply-chain", 4, 0.9));
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
+        // The probability is the strongest *crit-5*, not the strongest finding.
         assert_eq!(d.probability, 0.8);
         assert_eq!(d.level, Some(50));
+    }
+
+    #[test]
+    fn a_lone_crit5_stays_benign() {
+        let mut d = benign();
+        // One hostile trait cannot carry a verdict, however confident: nothing
+        // corroborates it. This is the shape that graded WannaCry hostile off a
+        // single finding — and static-keys benign code with it.
+        apply_trait_floor(&mut d, &spread(5, 0.98, 1), Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+    }
+
+    #[test]
+    fn a_crit5_with_one_thin_corroborator_stays_benign() {
+        let mut d = benign();
+        // Two findings in two families still falls short of the severe count.
+        // This is the real pair that marked a stock `libwebp.dll` hostile: an
+        // RMM signature plus a generic PE-layout anomaly.
+        let ts = vec![
+            finding("command-and-control", 5, 0.9),
+            finding("binary-anomaly", 4, 0.97),
+        ];
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+    }
+
+    #[test]
+    fn a_crit5_corroborated_across_families_escalates_to_hostile_band() {
+        let mut d = benign();
+        // One anchor plus two independent severe findings — `rex-powershell`.
+        let mut ts = spread(5, 0.98, 1);
+        ts.extend([finding("evasion", 4, 0.8), finding("execution", 4, 0.94)]);
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Hostile);
+        assert_eq!(d.probability, 0.98);
+        assert_eq!(d.level, Some(50));
+    }
+
+    #[test]
+    fn three_crit4_in_two_families_stays_benign() {
+        let mut d = benign();
+        // Count alone would clear the suspicious arm; breadth does not.
+        let ts = vec![
+            finding("evasion", 4, 0.9),
+            finding("evasion", 4, 0.92),
+            finding("execution", 4, 0.88),
+        ];
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+    }
+
+    #[test]
+    fn two_crit5_without_further_corroboration_stays_benign() {
+        let mut d = benign();
+        apply_trait_floor(&mut d, &spread(5, 0.9, 2), Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+    }
+
+    #[test]
+    fn a_single_family_cluster_cannot_corroborate_itself() {
+        let mut d = benign();
+        // Three confident crit-5s, all from `objectives/evasion/process` —
+        // counts clear, diversity does not. This is the static-keys shape.
+        apply_trait_floor(&mut d, &clustered(5, 0.98, 3), Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+        // Same for the suspicious arm.
+        let mut d = benign();
+        apply_trait_floor(&mut d, &clustered(4, 0.93, 4), Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
     }
 
     #[test]
     fn low_confidence_crit5_is_ignored() {
         let mut d = benign();
         // c < 0.76 → not counted, stays benign.
-        apply_trait_floor(&mut d, &findings(5, 0.5, 3, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &spread(5, 0.5, 3), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
     #[test]
-    fn two_confident_crit4_above_fraction_escalates_to_suspicious_band() {
+    fn three_confident_crit4_across_families_escalates_to_suspicious_band() {
         let mut d = benign();
-        // 4 confident crit-4 out of 4 total → fraction 1.0 >= 0.05.
-        apply_trait_floor(&mut d, &findings(4, 0.9, 4, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &spread(4, 0.9, 3), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Suspicious);
         assert_eq!(d.probability, 0.9);
         assert_eq!(d.level, Some(100));
     }
 
     #[test]
-    fn confident_crit4_below_fraction_stays_benign() {
+    fn two_confident_crit4_stays_benign() {
         let mut d = benign();
-        // 2 confident crit-4 diluted by 200 baseline findings → fraction ~0.01.
-        apply_trait_floor(&mut d, &findings(4, 0.9, 2, 200), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &spread(4, 0.9, 2), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
     #[test]
-    fn low_confidence_crit4_does_not_count_toward_pair() {
+    fn a_busy_file_is_not_diluted_out_of_an_escalation() {
+        let mut d = benign();
+        // Three confident crit-4s in distinct families, among 200 baseline
+        // findings. The fraction gate this replaced scored ~0.015 here and
+        // stayed benign; activity elsewhere in the file is not evidence about
+        // these three.
+        let mut ts = spread(4, 0.9, 3);
+        ts.extend((0..200).map(|i| finding(&format!("noise{i}"), 0, 0.9)));
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Suspicious);
+    }
+
+    #[test]
+    fn low_confidence_crit4_does_not_count_toward_the_trio() {
         let mut d = benign();
         // Only one confident crit-4; the other two are below threshold.
-        let ts = vec![finding(4, 0.9), finding(4, 0.5), finding(4, 0.6)];
+        let ts = vec![
+            finding("a", 4, 0.9),
+            finding("b", 4, 0.5),
+            finding("c", 4, 0.6),
+        ];
         apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
     /// cleave now always writes `conf`, but reports from builds that omitted it
     /// still decode — as 0.0, "no confidence recorded", which is below the 0.76
-    /// gate. So an unscored crit-5 in an old report never trips the floor on
-    /// its own.
+    /// gate. So unscored crit-5s in an old report never trip the floor.
     #[test]
     fn confidence_omitted_by_an_older_build_decodes_below_threshold() {
         let mut d = benign();
         let ts: Vec<cleave::types::CompactTrait> = serde_json::from_value(serde_json::json!([
-            {"id": "a", "crit": 5},
-            {"id": "b", "crit": 5},
+            {"id": "objectives/a/b/c::x", "crit": 5},
+            {"id": "objectives/d/e/f::y", "crit": 5},
+            {"id": "objectives/g/h/i::z", "crit": 4},
         ]))
         .unwrap();
         assert_eq!(
@@ -641,7 +787,7 @@ mod trait_floor_tests {
         let mut d = benign();
         d.class = Classification::Hostile;
         d.level = Some(50);
-        apply_trait_floor(&mut d, &findings(5, 0.9, 5, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &spread(4, 0.9, 5), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
         assert_eq!(d.level, Some(50));
     }
@@ -653,7 +799,11 @@ mod trait_floor_tests {
         let mut d = benign();
         let report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
             "files": [{"id": 0, "path": "x", "type": "elf", "sha": "s", "size": 1,
-                       "traits": [{"id": "t", "crit": 5, "conf": 0.98}]}]
+                       "traits": [
+                           {"id": "objectives/command-and-control/backdoor/a::t1", "crit": 5, "conf": 0.98},
+                           {"id": "objectives/persistence/service/b::t2", "crit": 5, "conf": 0.9},
+                           {"id": "objectives/discovery/env-vars/c::t3", "crit": 4, "conf": 0.8}
+                       ]}]
         }))
         .unwrap();
         apply_trait_floor(&mut d, root_findings(&report), Some(50), 100, "test");
@@ -4145,33 +4295,55 @@ pub(crate) struct ClassifiedReport {
     pub(crate) analysis_cached: bool,
 }
 
-/// Confident crit-5 findings the hostile arm needs. One is not enough: a single
-/// mislabeled trait then carries an entire verdict on its own, which is how a
-/// vendored `static-keys` crate — mmap, patch, `mprotect`, `mremap`, all over
-/// its own page — graded hostile at 92%.
-const TRAIT_FLOOR_HOSTILE_CRIT5: u32 = 2;
+/// Confident crit-5 findings the hostile arm needs — the anchor the rest of the
+/// arm corroborates. One suffices *because* it is corroborated: real malware
+/// routinely carries a single hostile trait beside supporting crit-4s
+/// (`rex-powershell`, `openclaude`, and a rhadamanthys coinminer all have
+/// exactly one), and demanding two lost all three while fixing nothing the
+/// clauses below do not already catch.
+const TRAIT_FLOOR_HOSTILE_CRIT5: u32 = 1;
 
 /// Confident severe findings (crit-5 *or* crit-4) the hostile arm needs in
-/// total. One above [`TRAIT_FLOOR_HOSTILE_CRIT5`], so the override always rests
-/// on something beyond the two hostile traits themselves.
+/// total. Rejects the thin pair that family diversity alone admits: a
+/// ScreenConnect RMM signature plus `pe-large-without-material-section` is two
+/// findings in two families, but a generic PE-layout anomaly is not evidence of
+/// malice, and that pair was marking a stock `libwebp.dll` hostile.
 const TRAIT_FLOOR_HOSTILE_SEVERE: u32 = 3;
 
-/// Confident crit-4 findings the suspicious arm needs.
-const TRAIT_FLOOR_SUSPICIOUS_CRIT4: u32 = 3;
+/// Distinct trait families the hostile arm's severe findings must span.
+/// Counting alone treats one behavior described three ways as three independent
+/// witnesses: the static-keys false positive presented as
+/// `rust-inline-hook-hijack`, `rust-hook-byte-copy`, and
+/// `rust-mprotect-hook-patch` — three findings, one directory, overlapping
+/// regexes over the same two tokens. Corroboration has to come from somewhere
+/// else in the tree to be corroboration at all.
+///
+/// Two, not more: every false positive observed is a *single*-family cluster
+/// and is already rejected here, while three would discard `darkglitch`, a
+/// Python RAT whose three hostile traits span only `backdoor/rat` and
+/// `backdoor/tasking`.
+const TRAIT_FLOOR_HOSTILE_FAMILIES: usize = 2;
 
-/// Distinct trait families an arm's findings must span. Counting alone treats
-/// one behavior described three ways as three independent witnesses: the
-/// static-keys false positive presented as `rust-inline-hook-hijack`,
-/// `rust-hook-byte-copy`, and `rust-mprotect-hook-patch` — three findings, one
-/// directory, overlapping regexes over the same two tokens. Corroboration has
-/// to come from somewhere else in the tree to be corroboration at all.
-const TRAIT_FLOOR_MIN_FAMILIES: usize = 2;
+/// Distinct trait families the suspicious arm's crit-4 findings must span.
+/// Subsumes a count — n families need n findings — so this is the arm's only
+/// threshold.
+///
+/// Set above [`TRAIT_FLOOR_HOSTILE_FAMILIES`] deliberately. The hostile arm has
+/// a confident crit-5 anchoring it; this arm has nothing but the breadth of its
+/// own evidence, so it has to be broader to make the same claim.
+const TRAIT_FLOOR_SUSPICIOUS_FAMILIES: usize = 3;
 
-/// Trait-hierarchy depth that defines a family: `objectives/evasion/process`,
-/// not the leaf `objectives/evasion/process/hook/inline`. Deep enough to
-/// separate unrelated behaviors, shallow enough that two spellings of one
-/// behavior land in the same bucket.
-const TRAIT_FLOOR_FAMILY_DEPTH: usize = 3;
+/// Trait-hierarchy depth that defines a family: `objectives/evasion/process/hook`
+/// rather than the whole leaf path or a coarser `objectives/evasion/process`.
+///
+/// Measured against both failure modes. Three deep: the static-keys cluster
+/// collapses to one family (correct — it is one behavior spelled three ways),
+/// but so does `darkglitch`, a Python RAT whose three hostile traits are
+/// genuinely distinct capabilities under `command-and-control/backdoor`
+/// (`rat/multi` and `tasking/filesystem`) — it lost its verdict entirely. Four
+/// deep separates them, and on the bad/fallout corpora depths 4, 5, 6 and
+/// full-path all agree, so this is the shallowest depth that gives up nothing.
+const TRAIT_FLOOR_FAMILY_DEPTH: usize = 4;
 
 /// The family a finding belongs to: the first [`TRAIT_FLOOR_FAMILY_DEPTH`]
 /// segments of its hierarchy path. A trait id is `path::leaf`
@@ -4182,7 +4354,10 @@ fn trait_family(id: &str) -> &str {
     let path = id.split("::").next().unwrap_or(id);
     path.match_indices('/')
         .nth(TRAIT_FLOOR_FAMILY_DEPTH - 1)
-        .map_or(path, |(cut, _)| &path[..cut])
+        // `cut` indexes an ASCII '/', so it is a char boundary by construction;
+        // `get` keeps that fact from resting on a panic.
+        .and_then(|(cut, _)| path.get(..cut))
+        .unwrap_or(path)
 }
 
 /// Minimum cleave confidence (`c`) for a finding to count toward the trait floor.
@@ -4249,14 +4424,20 @@ fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCou
 
 /// Trait floor: override a model-**Benign** verdict when cleave surfaced
 /// high-criticality evidence the model did not act on:
-///   - one or more hostile (crit-5) traits → **Hostile**
-///   - two or more suspicious (crit-4) traits whose fraction clears
-///     `TRAIT_FLOOR_CRIT4_FRACTION` → **Suspicious**
+///   - a hostile (crit-5) trait, corroborated by enough further severe findings
+///     to reach [`TRAIT_FLOOR_HOSTILE_SEVERE`] across
+///     [`TRAIT_FLOOR_HOSTILE_FAMILIES`] trait families → **Hostile**
+///   - suspicious (crit-4) traits spanning
+///     [`TRAIT_FLOOR_SUSPICIOUS_FAMILIES`] families → **Suspicious**
 ///
-/// Only confident findings count (`c >= TRAIT_FLOOR_MIN_CONFIDENCE`); the crit-4
-/// fraction's denominator is the file's *total* finding count, so a sparse, severe
-/// dropper clears it while a busy benign binary with a couple of incidental
-/// crit-4s does not.
+/// Both arms count only confident findings (`c >= TRAIT_FLOOR_MIN_CONFIDENCE`),
+/// and both measure evidence by the families it comes from, so one behavior
+/// spelled several ways cannot corroborate itself.
+///
+/// This is a backstop for model misses, not a second opinion: it fires only on
+/// a model-Benign verdict, and every threshold above is deliberately set where
+/// a lone mislabeled trait — or a cluster of near-duplicate ones — cannot reach
+/// it alone.
 ///
 /// Never lowers a model verdict. Override levels are pinned to the same band
 /// boundaries used by ordinary and interpreted verdicts, so a level-only
@@ -4272,7 +4453,10 @@ fn apply_trait_floor(
         return;
     }
     let counts = trait_floor_counts(findings);
-    if counts.hostile >= 1 {
+    if counts.hostile >= TRAIT_FLOOR_HOSTILE_CRIT5
+        && counts.severe() >= TRAIT_FLOOR_HOSTILE_SEVERE
+        && counts.severe_families.len() >= TRAIT_FLOOR_HOSTILE_FAMILIES
+    {
         decision.class = Classification::Hostile;
         decision.probability = counts.hostile_confidence;
         decision.level = interpreted_level(active_level, grid_max, Classification::Hostile);
@@ -4284,31 +4468,26 @@ fn apply_trait_floor(
             path = %label,
             arm = "crit5",
             confident_hostile = counts.hostile,
+            confident_severe = counts.severe(),
+            families = counts.severe_families.len(),
             trait_confidence = format!("{:.3}", counts.hostile_confidence),
             level = ?decision.level,
-            "TRAIT FLOOR: model said benign but cleave found a confident hostile trait — escalated to hostile",
+            "TRAIT FLOOR: model said benign but cleave found corroborated hostile traits — escalated to hostile",
         );
         return;
     }
-    if counts.suspicious >= 2
-        && counts.total > 0
-        && counts.suspicious as f32 / counts.total as f32 >= TRAIT_FLOOR_CRIT4_FRACTION
-    {
+    if counts.suspicious_families.len() >= TRAIT_FLOOR_SUSPICIOUS_FAMILIES {
         decision.class = Classification::Suspicious;
         decision.probability = counts.suspicious_confidence;
         decision.level = interpreted_level(active_level, grid_max, Classification::Suspicious);
         tracing::info!(
             path = %label,
-            arm = "crit4_fraction",
+            arm = "crit4",
             confident_suspicious = counts.suspicious,
-            total_findings = counts.total,
-            crit4_fraction = format!(
-                "{:.3}",
-                counts.suspicious as f32 / counts.total as f32
-            ),
+            families = counts.suspicious_families.len(),
             trait_confidence = format!("{:.3}", counts.suspicious_confidence),
             level = ?decision.level,
-            "TRAIT FLOOR: model said benign but cleave found a sparse cluster of confident suspicious traits — escalated to suspicious",
+            "TRAIT FLOOR: model said benign but cleave found corroborated suspicious traits — escalated to suspicious",
         );
     }
 }
