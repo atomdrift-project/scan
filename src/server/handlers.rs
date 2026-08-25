@@ -985,6 +985,10 @@ fn lookup_response(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
         );
+        resp.headers_mut().insert(
+            "X-Scan-Source",
+            axum::http::HeaderValue::from_static(lookup_source(None, decision)),
+        );
         return resp;
     };
     let mut resp = Json(verdict.view(decision.as_str(), purl)).into_response();
@@ -1001,9 +1005,25 @@ fn lookup_response(
     }
     headers.insert(
         "X-Scan-Source",
-        axum::http::HeaderValue::from_static("index"),
+        axum::http::HeaderValue::from_static(lookup_source(Some(verdict), decision)),
     );
     resp
+}
+
+/// Explain which local knowledge produced a lookup answer. A stored verdict is
+/// an analysis result; when there is no verdict, a non-unknown Bloom decision
+/// is the only artifact-derived answer left. A lookup miss is therefore still
+/// attributed to the Bloom/lookup layer, even when the Bloom decision is
+/// `unknown`.
+fn lookup_source(
+    verdict: Option<&crate::lookup::Verdict>,
+    _decision: crate::bloom_repo::Decision,
+) -> &'static str {
+    if verdict.is_some() {
+        "scan:analysis"
+    } else {
+        "scan:bloom"
+    }
 }
 
 /// Outcome of [`do_model_reload`] — caller maps this to an HTTP response.
@@ -1772,6 +1792,12 @@ fn classify_purl(
     use fletch::RefLocator;
 
     let locator = RefLocator::Purl(purl.to_string());
+    // This happens before cleave sees the initial bytes. Keep it distinct from
+    // `fetch+graft`, which is the later dependency-fetch phase inside the
+    // report pipeline.
+    if let Some(p) = phase {
+        p.set("purl:registry");
+    }
     let (registry, registry_sources) = crate::fetch::registry_with_sources(&locator);
     let registry_provenance = registry.clone().map(|record| {
         crate::provenance::RegistryProvenance::from_record_sources(record, &registry_sources)
@@ -1781,6 +1807,9 @@ fn classify_purl(
         && reg.version_removed == Some(true)
         && let Some((name, bytes)) = crate::fetch::registry_document(reg)
     {
+        if let Some(p) = phase {
+            p.set("purl:registry-document");
+        }
         return classify_bytes(
             bytes::Bytes::from(bytes),
             &name,
@@ -1793,10 +1822,16 @@ fn classify_purl(
         );
     }
 
+    if let Some(p) = phase {
+        p.set("purl:payload");
+    }
     let (bytes, name, rec) = match crate::fetch::fetch_one(locator, false) {
         Ok(t) => t,
         Err(e) => match registry.as_ref().and_then(crate::fetch::registry_document) {
             Some((name, bytes)) => {
+                if let Some(p) = phase {
+                    p.set("purl:registry-document");
+                }
                 return classify_bytes(
                     bytes::Bytes::from(bytes),
                     &name,
@@ -2683,9 +2718,9 @@ async fn v1_analyze_bytes(
     // we could not find out — turning either into an answer would report on
     // work never done.
     if !q.force {
-        if let Ok(decided) = v1_decide(state, Some(&sha), None, budget)
+        if let Ok((decided, source)) = v1_decide(state, Some(&sha), None, budget)
             .await
-            .map(|d| d.asked_about(asked))
+            .map(|(d, source)| (d.asked_about(asked), source))
             && decided.is_verdict()
         {
             let elapsed = crate::duration_ms(request_start.elapsed());
@@ -2698,6 +2733,10 @@ async fn v1_analyze_bytes(
             );
             let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed.into());
+            resp.headers_mut().insert(
+                "X-Scan-Source",
+                axum::http::HeaderValue::from_static(source),
+            );
             resp.extensions_mut().insert(match purl.as_deref() {
                 Some(named) => Subject::purl(named, Some(&sha)),
                 None => Subject::sha256(&sha),
@@ -2918,7 +2957,7 @@ pub(super) async fn v1_analyze(
     // means we could not find out — turning that into a refusal to work would
     // make a corpus outage look like an answer. Both fall through and run.
     if !q.force {
-        if let Ok(decided) = v1_resolve(&state, None, Some(&req.purl), budget).await
+        if let Ok((decided, source)) = v1_resolve(&state, None, Some(&req.purl), budget).await
             && decided.is_verdict()
         {
             let elapsed = crate::duration_ms(request_start.elapsed());
@@ -2930,6 +2969,10 @@ pub(super) async fn v1_analyze(
             );
             let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed.into());
+            resp.headers_mut().insert(
+                "X-Scan-Source",
+                axum::http::HeaderValue::from_static(source),
+            );
             resp.extensions_mut().insert(Subject::purl(&purl, None));
             return resp;
         }
@@ -3030,6 +3073,10 @@ fn v1_outcome_response(
             let decided = V1Decision::stored(&verdict, purl, budget).asked_about(asked);
             let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
+            resp.headers_mut().insert(
+                "X-Scan-Source",
+                axum::http::HeaderValue::from_static("scan:analysis"),
+            );
             resp
         }
         // A refusal keeps its status: the caller's router uses it to send the
@@ -3142,6 +3189,10 @@ fn v1_streamed(
         "X-Accel-Buffering",
         axum::http::HeaderValue::from_static("no"),
     );
+    headers.insert(
+        "X-Scan-Source",
+        axum::http::HeaderValue::from_static("scan:analysis"),
+    );
     resp.extensions_mut().insert(Subject::purl(&labelled, None));
     resp
 }
@@ -3249,19 +3300,39 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Response {
     if purls.len() <= 1 {
         let purl = purls.first().copied();
         return match v1_resolve(state, sha, purl, budget).await {
-            Ok(decided) => Json(decided).into_response(),
+            Ok((decided, source)) => {
+                let mut resp = Json(decided).into_response();
+                resp.headers_mut().insert(
+                    "X-Scan-Source",
+                    axum::http::HeaderValue::from_static(source),
+                );
+                resp
+            }
             Err(response) => *response,
         };
     }
 
     let mut out = Vec::with_capacity(purls.len());
+    let mut source = None;
     for purl in purls {
         match v1_resolve(state, None, Some(purl), budget).await {
-            Ok(decided) => out.push(decided),
+            Ok((decided, row_source)) => {
+                source = Some(match source {
+                    None => row_source,
+                    Some(previous) if previous == row_source => previous,
+                    Some(_) => "scan:analysis",
+                });
+                out.push(decided);
+            }
             Err(response) => return *response,
         }
     }
-    Json(out).into_response()
+    let mut resp = Json(out).into_response();
+    resp.headers_mut().insert(
+        "X-Scan-Source",
+        axum::http::HeaderValue::from_static(source.unwrap_or("scan:analysis")),
+    );
+    resp
 }
 
 /// One package, resolved and decided, answered about the coordinate the caller
@@ -3273,10 +3344,9 @@ async fn v1_resolve(
     sha: Option<&str>,
     raw_purl: Option<&str>,
     budget: u16,
-) -> Result<V1Decision, Box<Response>> {
-    Ok(v1_decide(state, sha, raw_purl, budget)
-        .await?
-        .asked_about(raw_purl))
+) -> Result<(V1Decision, &'static str), Box<Response>> {
+    let (decided, source) = v1_decide(state, sha, raw_purl, budget).await?;
+    Ok((decided.asked_about(raw_purl), source))
 }
 
 /// The decision itself, in this worker's own vocabulary: every key here is the
@@ -3286,7 +3356,7 @@ async fn v1_decide(
     sha: Option<&str>,
     raw_purl: Option<&str>,
     budget: u16,
-) -> Result<V1Decision, Box<Response>> {
+) -> Result<(V1Decision, &'static str), Box<Response>> {
     let purl = match raw_purl.map(normalize_pkg_purl) {
         Some(Ok(purl)) => Some(purl),
         Some(Err(message)) => {
@@ -3315,7 +3385,10 @@ async fn v1_decide(
     // cannot say — and those two carry different policies at the other end.
     // This is the whole reason `unavailable` is a separate value.
     let Some(index) = crate::lookup::global() else {
-        return Ok(V1Decision::unavailable(sha.as_deref(), purl.as_deref()));
+        return Ok((
+            V1Decision::unavailable(sha.as_deref(), purl.as_deref()),
+            "none",
+        ));
     };
     let index = Some(index);
     let by_sha = sha
@@ -3340,26 +3413,42 @@ async fn v1_decide(
     };
 
     if let Some(verdict) = verdict.as_ref() {
-        return Ok(V1Decision::stored(verdict, purl.as_deref(), budget));
+        return Ok((
+            V1Decision::stored(verdict, purl.as_deref(), budget),
+            "scan:analysis",
+        ));
     }
 
     // Not in this worker's index. The corpus behind it may still know, and a
     // caller should not have to learn that two services exist in order to get
     // one answer — so ask, rather than reporting an absence that is only ours.
     let Some(corpus) = state.corpus.as_ref() else {
-        return Ok(V1Decision::unknown(sha.as_deref(), purl.as_deref()));
+        return Ok((
+            V1Decision::unknown(sha.as_deref(), purl.as_deref()),
+            "scan:bloom",
+        ));
     };
-    Ok(match corpus.known(sha.as_deref(), purl.as_deref()).await {
-        Reached::Record(record) => {
-            V1Decision::corpus(&record, sha.as_deref(), purl.as_deref(), budget)
-        }
-        Reached::Nothing => V1Decision::unknown(sha.as_deref(), purl.as_deref()),
-        // The corpus could not answer, so neither can we. Emphatically not
-        // `unknown`: that would tell the caller nobody has analyzed this
-        // package, which is a claim about the package rather than about us, and
-        // the one that lets a gate fail open during an outage.
-        Reached::Unreachable => V1Decision::unavailable(sha.as_deref(), purl.as_deref()),
-    })
+    let (reached, source) = corpus
+        .known_with_source(sha.as_deref(), purl.as_deref())
+        .await;
+    let source = source.map_or("none", |source| match source {
+        corpus::CorpusSource::Replica => "scan:replica",
+        corpus::CorpusSource::Primary => "scan:primary",
+    });
+    Ok((
+        match reached {
+            Reached::Record(record) => {
+                V1Decision::corpus(&record, sha.as_deref(), purl.as_deref(), budget)
+            }
+            Reached::Nothing => V1Decision::unknown(sha.as_deref(), purl.as_deref()),
+            // The corpus could not answer, so neither can we. Emphatically not
+            // `unknown`: that would tell the caller nobody has analyzed this
+            // package, which is a claim about the package rather than about us, and
+            // the one that lets a gate fail open during an outage.
+            Reached::Unreachable => V1Decision::unavailable(sha.as_deref(), purl.as_deref()),
+        },
+        source,
+    ))
 }
 
 /// One decision, as it goes on the wire.
