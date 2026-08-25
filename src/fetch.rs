@@ -651,6 +651,26 @@ const API_URL_PATH_COMPONENTS: &[&str] = &[
 /// This is deliberately a shape check, not a content or reputation check:
 /// direct scans still fetch exactly what the operator names, and a URL with a
 /// plausible payload basename remains eligible even when its host is unknown.
+/// Whether a path component reads as a version rather than a filename: every
+/// dot-separated segment is digits, with at least one dot and an optional
+/// leading `v` (`0.40.0`, `v2.1`, `10.0.1`). A bare `v1` or a plain number has
+/// no dot and keeps whatever the surrounding rules decide.
+///
+/// Deliberately strict about the tail. Recognizing a pre-release suffix as part
+/// of the version means splitting at `-`, which throws away everything after —
+/// including a real extension. A Go module's
+/// `v0.0.0-20260823143148-1fb3b878e2fb.zip` then reads as version `0.0.0` and
+/// the artifact stops being fetched. Requiring every segment to be numeric can
+/// only ever miss a version, never swallow a file: anything ending in an
+/// alphabetic extension fails the test by construction.
+fn is_version_shaped(component: &str) -> bool {
+    let core = component.strip_prefix(['v', 'V']).unwrap_or(component);
+    core.contains('.')
+        && core
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn looks_like_dropper_download_url(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once("://") else {
         return false;
@@ -669,6 +689,13 @@ fn looks_like_dropper_download_url(url: &str) -> bool {
         return false;
     };
     let path = path_and_suffix.split(['?', '#']).next().unwrap_or_default();
+    // A path ending in `/` names a directory, not a file: whatever a server
+    // returns for it is an index or a landing page, never the download itself.
+    // `https://pypi.org/project/diffusers/0.40.0/` was being fetched as a
+    // payload because the trailing component parsed as a filename.
+    if path.ends_with('/') {
+        return false;
+    }
     let components: Vec<&str> = path
         .split('/')
         .filter(|component| !component.is_empty())
@@ -677,6 +704,13 @@ fn looks_like_dropper_download_url(url: &str) -> bool {
         return false;
     };
     if filename == "." || filename == ".." {
+        return false;
+    }
+    // A version is not a file. `0.40.0`, `v2.1`, `1.2.3-rc1` all end in what
+    // looks like an extension, so the dotted-basename test reads them as
+    // downloads and pulls project pages, release-tag pages, and API version
+    // roots. Nothing named this way is an artifact.
+    if is_version_shaped(filename) {
         return false;
     }
 
@@ -2742,12 +2776,73 @@ fn collect_references(
         let name = root_path
             .file_name()
             .map_or_else(|| root_path.to_string_lossy(), |n| n.to_string_lossy());
-        let hunted = find::references_in_bytes(&bytes, &name);
+        // A provenance document names one artifact and catalogues many. The
+        // string hunt cannot tell those apart, so it is replaced by the subject
+        // this document is *about* — see `provenance_subject`.
+        let hunted = if is_provenance_document(&root.file_type, &name) {
+            provenance_subject(&bytes).into_iter().collect()
+        } else {
+            find::references_in_bytes(&bytes, &name)
+        };
         if !hunted.is_empty() {
             merge_into_root(&mut groups, &root.sha256, hunted);
         }
     }
     groups
+}
+
+/// Whether this root is one of our own provenance records rather than a
+/// collected artifact: hopper's `*.forage.json` collection sidecar, or the
+/// normalized `*.registry.json` a fetch materializes.
+fn is_provenance_document(file_type: &str, name: &str) -> bool {
+    file_type == "registry"
+        || name
+            .rsplit_once(".forage.")
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("json"))
+}
+
+/// The single artifact a provenance document is *about*, as a pinned reference.
+///
+/// These documents embed the provider's verbatim response, and for PyPI that is
+/// the project's whole release catalogue: one 179 KB `diffusers` sidecar carries
+/// 191 `files.pythonhosted.org` URLs covering every version ever published. The
+/// string hunt has no way to tell the subject from the catalogue — it recovered
+/// all 199 URLs and started pulling `diffusers` releases from 0.0.1 upward until
+/// the URL budget stopped it. Mining our own cached metadata for dropper
+/// candidates is the bug; the document already states its subject, so read that
+/// instead of guessing from `strings`.
+///
+/// Parsed here rather than from filefacts' `values` because a large sidecar
+/// exceeds cleave's JSON parse limit (76 KB) while still being small enough to
+/// hunt, so the facts view cannot be relied on for exactly the documents that
+/// carry the biggest catalogues.
+fn provenance_subject(bytes: &[u8]) -> Option<Reference> {
+    let doc: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let url = doc
+        .pointer("/fetch/url")
+        .or_else(|| doc.pointer("/registry/url"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|u| !u.is_empty())?;
+    // The recorded digest pins the fetch: this document exists because those
+    // exact bytes were collected, so a mismatch is a substitution worth failing.
+    let pinned_hash = doc
+        .pointer("/artifact/sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|d| fletch::PinnedHash {
+            algo: fletch::HashAlgo::Sha256,
+            value: d.to_ascii_lowercase(),
+        });
+    let content_sha256 = pinned_hash.as_ref().map(|p| p.value.clone());
+    Some(Reference {
+        locator: RefLocator::Url(url.to_string()),
+        kind: RefKind::UrlFetch,
+        source: "forage.fetch.url".to_string(),
+        evidence: url.to_string(),
+        offset: 0,
+        pinned_hash,
+        content_sha256,
+    })
 }
 
 fn is_vendored_node_module(path: &str) -> bool {
@@ -3742,12 +3837,101 @@ mod tests {
             "https://example.test/download/index.html",
             "https://example.test/file%2Ezip",
             "ftp://example.test/stage-2.sh",
+            // A trailing `/` names a directory; the response is an index or a
+            // landing page. This is the shape that pulled PyPI project pages.
+            "https://pypi.org/project/diffusers/0.40.0/",
+            "https://example.test/releases/v1.2.3/",
+            // A version is not a filename, with or without the trailing slash.
+            "https://pypi.org/project/diffusers/0.40.0",
+            "https://github.com/foo/bar/releases/tag/v1.2.3",
+            "https://api.example.test/v2.1",
+            "https://example.test/lib/1.2.3/",
+            "https://example.test/pkg/2.0.0",
         ] {
             assert!(
                 !looks_like_dropper_download_url(url),
                 "site/API-shaped URL was kept: {url}"
             );
         }
+    }
+
+    #[test]
+    fn version_shape_does_not_swallow_real_filenames() {
+        // Versions — rejected as download targets.
+        for v in ["0.40.0", "v2.1", "V10.0.1", "2.1"] {
+            assert!(is_version_shaped(v), "version not recognized: {v}");
+        }
+        // Not versions: a real artifact whose name merely contains digits and
+        // dots must still be fetchable. A Go module's pseudo-version filename
+        // is the case that matters — mistaking it for a version stops the
+        // module being fetched at all.
+        for v in [
+            "v0.0.0-20260823143148-1fb3b878e2fb.zip",
+            "diffusers-0.0.1.tar.gz",
+            "payload.exe",
+            "stage-2.sh",
+            "v1",
+            "1",
+            "lib.so.6",
+            ".2.3",
+            "1.2.",
+            "",
+        ] {
+            assert!(!is_version_shaped(v), "filename misread as version: {v}");
+        }
+        // The versioned artifacts themselves stay fetchable end to end.
+        for url in [
+            "https://files.pythonhosted.org/packages/a0/05/x/diffusers-0.0.1.tar.gz",
+            "https://example.test/releases/v1.2.3/payload.bin",
+            "https://proxy.golang.org/github.com/o/r/@v/v0.0.0-20260823143148-1fb3b878e2fb.zip",
+        ] {
+            assert!(
+                looks_like_dropper_download_url(url),
+                "versioned artifact was rejected: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_documents_yield_their_subject_not_their_catalogue() {
+        // A forage sidecar: one artifact named by `fetch.url`, wrapped around a
+        // provider response that lists every release of the project.
+        let doc = serde_json::json!({
+            "fetch": {"url": "https://files.example.test/pkg-1.0.tar.gz"},
+            "artifact": {"sha256": "A".repeat(64), "filename": "pkg-1.0.tar.gz"},
+            "registry": {
+                "url": "https://files.example.test/pkg-1.0.tar.gz",
+                "raw": [
+                    {"url": "https://files.example.test/pkg-0.0.1.tar.gz"},
+                    {"url": "https://files.example.test/pkg-0.0.2.tar.gz"}
+                ]
+            }
+        });
+        let bytes = serde_json::to_vec(&doc).expect("serialize");
+        let subject = provenance_subject(&bytes).expect("subject reference");
+        assert_eq!(
+            subject.locator,
+            RefLocator::Url("https://files.example.test/pkg-1.0.tar.gz".into()),
+            "the catalogue must not supply the reference"
+        );
+        // The recorded digest pins the fetch.
+        assert_eq!(
+            subject.content_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(subject.kind, RefKind::UrlFetch);
+
+        // Both provenance shapes are recognized; an ordinary JSON root is not.
+        assert!(is_provenance_document("json", "pkg-1.0.tar.gz.forage.json"));
+        assert!(is_provenance_document("registry", "left-pad@1.3.0.registry.json"));
+        assert!(!is_provenance_document("json", "package.json"));
+        assert!(!is_provenance_document("json", "forage.json.txt"));
+
+        // A document with no subject yields nothing rather than falling back to
+        // the catalogue.
+        let empty = serde_json::to_vec(&serde_json::json!({"registry": {"raw": []}}))
+            .expect("serialize");
+        assert!(provenance_subject(&empty).is_none());
     }
 
     #[test]
