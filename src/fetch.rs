@@ -251,6 +251,22 @@ pub struct FetchPolicy {
     /// Ceiling on total bytes fetched on behalf of a single scanned file
     /// (`--fetch-max-file-size`). The sweep stops once retrieved bytes cross it.
     pub max_file_bytes: u64,
+    /// Follow declared dependencies past the **first** hop — the dependencies
+    /// of a fetched dependency, and so on to `depth`.
+    ///
+    /// Off for an interactive scan. Hop 1 is the artifact's own declared supply
+    /// chain, which is the thing being judged; hop 2+ is a transitive closure
+    /// that multiplies per hop and is dominated by the long tail of ordinary,
+    /// old releases. Each of those costs a registry round trip *before* the age
+    /// gate can rule it out, because the publish date is what the lookup is for:
+    /// one 2.2 KB manifest sidecar pointing at a Go module drew 398 lookups at
+    /// hop 2, of which 398 aged out and none was fetched.
+    ///
+    /// The dropper chain `--fetch-depth 2` exists for runs through URLs and
+    /// install-command packages, and those are followed at every hop regardless.
+    /// `serve`/`worker` set this because they are cache-population roles, where
+    /// the transitive tail is the point rather than an overhead.
+    pub transitive_deps: bool,
     /// Skip fetching a *dependency* whose name pins it to a platform other than
     /// the host — the `@scope/pkg-<os>-<arch>` native-binary packages (biome,
     /// esbuild, swc, rollup, sharp…) that ship one prebuilt per platform. On a
@@ -274,6 +290,7 @@ impl Default for FetchPolicy {
             max_file_fetches: DEFAULT_MAX_FILE_FETCHES,
             max_url_fetches: DEFAULT_MAX_URL_FETCHES,
             max_file_bytes: DEFAULT_MAX_FILE_SIZE,
+            transitive_deps: false,
             host_platform_only: true,
         }
     }
@@ -297,6 +314,14 @@ impl FetchPolicy {
             RefKind::Dependency => self.deps,
             _ => false,
         }
+    }
+
+    /// Whether `kind` is selected on hop `hop` (0-based). Identical to
+    /// [`Self::wants`] except that declared dependencies stop at the first hop
+    /// unless [`Self::transitive_deps`] is set — see that field for why.
+    #[must_use]
+    fn wants_at(&self, kind: RefKind, hop: u8) -> bool {
+        self.wants(kind) && (self.transitive_deps || hop == 0 || kind != RefKind::Dependency)
     }
 }
 
@@ -809,7 +834,7 @@ pub(crate) fn orchestrate(
         .iter()
         .map(|f| (f.sha256.clone(), manifest_relpath(&f.path)))
         .collect();
-    for _hop in 0..policy.depth {
+    for hop in 0..policy.depth {
         if worklist.is_empty() {
             break;
         }
@@ -818,7 +843,7 @@ pub(crate) fn orchestrate(
         // running cross-hop maximum only rises.
         for (_, refs) in &worklist {
             for r in refs {
-                if !policy.wants(r.kind) {
+                if !policy.wants_at(r.kind, hop) {
                     continue;
                 }
                 let locator = locator_key(r);
@@ -882,7 +907,17 @@ pub(crate) fn orchestrate(
                 // been fetched yet this run.
                 let selected: Vec<Reference> = refs
                     .into_iter()
-                    .filter(|r| policy.wants(r.kind))
+                    .filter(|r| {
+                        let wanted = policy.wants_at(r.kind, hop);
+                        if !wanted && policy.wants(r.kind) {
+                            tracing::debug!(
+                                package = %locator_key(r),
+                                hop = hop + 1,
+                                "transitive dependency; registry lookup and fetch both skipped"
+                            );
+                        }
+                        wanted
+                    })
                     // Drop publisher-controlled URLs, obvious site/API
                     // endpoints, and the exact documentation/update URLs
                     // observed in stock /bin binaries. They cost a round trip
@@ -1383,8 +1418,18 @@ impl Reporter {
 
     /// Print the streamed fetch line (stream only); the tree already moved this
     /// row in [`Reporter::landed`].
+    ///
+    /// A plain cache hit says nothing a reader needs: no bytes crossed the
+    /// network and nothing is known about the artifact beyond what the scan
+    /// itself reports. On a warm cache those rows are nearly every row, burying
+    /// the ones that matter (`live`, `known`, `stale`, `fail`), so they are
+    /// dropped here. A bloom verdict relabels the row `known`, and that still
+    /// prints.
     fn report(&self, rec: &FetchRecord) {
         if let Self::Stream { header } = self {
+            if fetch_row(rec).1 == "cache" {
+                return;
+            }
             crate::engine::print_above_bar(|| {
                 fetch_header(header);
                 report_fetch(rec);
@@ -3924,6 +3969,28 @@ mod tests {
                 .unwrap()
                 .wants(RefKind::Repository)
         );
+    }
+
+    #[test]
+    fn declared_deps_stop_at_the_first_hop_unless_transitive() {
+        // Hop 0 is the artifact's own declared supply chain and is always
+        // followed. Past it, declared dependencies are the transitive tail —
+        // a registry lookup each, almost all of it aged out — so an interactive
+        // policy drops them while the dropper kinds keep going.
+        let mut policy: FetchPolicy = "all".parse().unwrap();
+        assert!(!policy.transitive_deps, "interactive default");
+        assert!(policy.wants_at(RefKind::Dependency, 0));
+        assert!(!policy.wants_at(RefKind::Dependency, 1));
+        for hop in 0..3 {
+            assert!(policy.wants_at(RefKind::UrlFetch, hop), "hop {hop}");
+            assert!(policy.wants_at(RefKind::Command, hop), "hop {hop}");
+        }
+        // A corpus-facing role takes the whole closure.
+        policy.transitive_deps = true;
+        assert!(policy.wants_at(RefKind::Dependency, 3));
+        // The hop rule never *adds* a kind the selection left out.
+        let urls: FetchPolicy = "urls".parse().unwrap();
+        assert!(!urls.wants_at(RefKind::Dependency, 0));
     }
 
     #[test]

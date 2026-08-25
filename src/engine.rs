@@ -4145,12 +4145,45 @@ pub(crate) struct ClassifiedReport {
     pub(crate) analysis_cached: bool,
 }
 
-/// crit-4 fraction gate for the trait floor's suspicious arm. A sparse, severe
-/// dropper (an npm install-hook beacon: the embedded package.json is ~0.15, its
-/// .tgz container ~0.08) clears it; a busy benign binary with a couple of
-/// incidental crit-4 findings among hundreds (bash/sh ~0.01) does not. Measured
-/// on a /usr/bin sample — see the trait-floor prevalence check.
-const TRAIT_FLOOR_CRIT4_FRACTION: f32 = 0.05;
+/// Confident crit-5 findings the hostile arm needs. One is not enough: a single
+/// mislabeled trait then carries an entire verdict on its own, which is how a
+/// vendored `static-keys` crate — mmap, patch, `mprotect`, `mremap`, all over
+/// its own page — graded hostile at 92%.
+const TRAIT_FLOOR_HOSTILE_CRIT5: u32 = 2;
+
+/// Confident severe findings (crit-5 *or* crit-4) the hostile arm needs in
+/// total. One above [`TRAIT_FLOOR_HOSTILE_CRIT5`], so the override always rests
+/// on something beyond the two hostile traits themselves.
+const TRAIT_FLOOR_HOSTILE_SEVERE: u32 = 3;
+
+/// Confident crit-4 findings the suspicious arm needs.
+const TRAIT_FLOOR_SUSPICIOUS_CRIT4: u32 = 3;
+
+/// Distinct trait families an arm's findings must span. Counting alone treats
+/// one behavior described three ways as three independent witnesses: the
+/// static-keys false positive presented as `rust-inline-hook-hijack`,
+/// `rust-hook-byte-copy`, and `rust-mprotect-hook-patch` — three findings, one
+/// directory, overlapping regexes over the same two tokens. Corroboration has
+/// to come from somewhere else in the tree to be corroboration at all.
+const TRAIT_FLOOR_MIN_FAMILIES: usize = 2;
+
+/// Trait-hierarchy depth that defines a family: `objectives/evasion/process`,
+/// not the leaf `objectives/evasion/process/hook/inline`. Deep enough to
+/// separate unrelated behaviors, shallow enough that two spellings of one
+/// behavior land in the same bucket.
+const TRAIT_FLOOR_FAMILY_DEPTH: usize = 3;
+
+/// The family a finding belongs to: the first [`TRAIT_FLOOR_FAMILY_DEPTH`]
+/// segments of its hierarchy path. A trait id is `path::leaf`
+/// (`objectives/evasion/process/hook/inline::rust-inline-hook-hijack`); an id
+/// carrying no path, or a shorter one, is its own family rather than joining a
+/// catch-all bucket that would let unrelated traits corroborate each other.
+fn trait_family(id: &str) -> &str {
+    let path = id.split("::").next().unwrap_or(id);
+    path.match_indices('/')
+        .nth(TRAIT_FLOOR_FAMILY_DEPTH - 1)
+        .map_or(path, |(cut, _)| &path[..cut])
+}
 
 /// Minimum cleave confidence (`c`) for a finding to count toward the trait floor.
 /// Low-confidence high-crit findings are exactly the incidental ones that fire on
@@ -4160,16 +4193,25 @@ const TRAIT_FLOOR_CRIT4_FRACTION: f32 = 0.05;
 /// no /usr/bin benign trips the crit-5 arm.
 const TRAIT_FLOOR_MIN_CONFIDENCE: f32 = 0.76;
 
-/// Confidence-filtered crit-5/crit-4 tallies plus the file's total finding count.
-/// The crit tiers count only findings with `c >= TRAIT_FLOOR_MIN_CONFIDENCE`; the
-/// total is every finding (the fraction's denominator is the file's whole activity,
-/// not just its confident severe traits).
+/// Confidence-filtered crit-5/crit-4 tallies, with the trait families each tier
+/// drew from. Only findings scoring `>= TRAIT_FLOOR_MIN_CONFIDENCE` are counted
+/// at all, so an unscored or hedged trait contributes to neither arm.
 struct TraitFloorCounts {
     hostile: u32,
     suspicious: u32,
     hostile_confidence: f32,
     suspicious_confidence: f32,
-    total: u32,
+    /// Families across both severe tiers — the hostile arm's diversity test.
+    severe_families: std::collections::HashSet<String>,
+    /// Families among the crit-4s alone — the suspicious arm's.
+    suspicious_families: std::collections::HashSet<String>,
+}
+
+impl TraitFloorCounts {
+    /// Confident severe findings across both tiers.
+    const fn severe(&self) -> u32 {
+        self.hostile + self.suspicious
+    }
 }
 
 fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCounts {
@@ -4178,22 +4220,26 @@ fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCou
         suspicious: 0,
         hostile_confidence: 0.0,
         suspicious_confidence: 0.0,
-        total: 0,
+        severe_families: std::collections::HashSet::new(),
+        suspicious_families: std::collections::HashSet::new(),
     };
     for f in findings {
-        out.total += 1;
         let conf = f.confidence;
         if conf < TRAIT_FLOOR_MIN_CONFIDENCE {
             continue;
         }
+        let family = trait_family(&f.id);
         match f.criticality {
             5 => {
                 out.hostile += 1;
                 out.hostile_confidence = out.hostile_confidence.max(conf);
+                out.severe_families.insert(family.to_string());
             }
             4 => {
                 out.suspicious += 1;
                 out.suspicious_confidence = out.suspicious_confidence.max(conf);
+                out.severe_families.insert(family.to_string());
+                out.suspicious_families.insert(family.to_string());
             }
             _ => {}
         }
@@ -5759,8 +5805,6 @@ fn render_terminal_fetch_context(
         .collect();
     let mut visited_roots = std::collections::HashSet::new();
     let mut shown_registry_ids = std::collections::HashSet::new();
-    let mut candidate_count = 0_usize;
-    let mut shown_count = 0_usize;
     let mut out = String::new();
 
     for rec in fetch_edges.iter().filter(|r| r.content_sha256.is_some()) {
@@ -5775,7 +5819,6 @@ fn render_terminal_fetch_context(
         if !visited_roots.insert(root.id) {
             continue;
         }
-        candidate_count += 1;
         let graded = deps.iter().find(|d| d.sha256 == content_sha);
         let registry = registries.iter().find(|r| r.locator == rec.locator);
         let member_ids: std::collections::HashSet<u32> = fetched_root_by_file
@@ -5798,7 +5841,6 @@ fn render_terminal_fetch_context(
         if !hostile_finding && !hostile_verdict {
             continue;
         }
-        shown_count += 1;
 
         let subject = if rec.kind == fletch::RefKind::Dependency {
             "dependency"
@@ -5846,7 +5888,6 @@ fn render_terminal_fetch_context(
         {
             continue;
         }
-        candidate_count += 1;
         // A registry-only entry (no bytes fetched, so no verdict) is shown only
         // when the registry itself flags it hostile — a pulled version or a
         // security hold. "Older than fetch age limit" and other benign states are
@@ -5857,7 +5898,6 @@ fn render_terminal_fetch_context(
         if !hostile_signal {
             continue;
         }
-        shown_count += 1;
         let status = registry.artifact_skip.unwrap_or("registry only");
         let _ = writeln!(out, "\n  ↳ {} · {status}", registry.locator);
         let mut signals = Vec::new();
@@ -5867,14 +5907,10 @@ fn render_terminal_fetch_context(
         out.push_str(&cleave::output::format_context(&view, opts));
     }
 
-    // Only footnote the omitted artifacts when something *was* shown — then the
-    // count is useful context ("and N quieter ones"). With nothing hostile to
-    // show, this line would be the entire fetch section: pure noise at the
-    // decision point, so it's dropped and the section stays silent.
-    let omitted = candidate_count.saturating_sub(shown_count);
-    if omitted > 0 && shown_count > 0 {
-        let _ = writeln!(out, "\n  {omitted} quieter fetched artifacts omitted");
-    }
+    // Nothing is footnoted for the artifacts that stayed quiet. Their count
+    // says nothing at the decision point — the streamed fetch summary already
+    // reports how many were retrieved — and a section that ends by naming what
+    // it declined to show reads as withheld evidence rather than a clean pass.
     (!out.is_empty()).then_some(out)
 }
 
