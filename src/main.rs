@@ -595,6 +595,17 @@ fn cli_host_platform_only(cli: &Cli, scans_for_other_hosts: bool) -> bool {
     cli.fetch_host_platform_only || (!cli.fetch_all_platforms && !scans_for_other_hosts)
 }
 
+/// Resolve the hopper destination consistently for every scan mode. Most
+/// subcommands let clap populate their local `hopper` field from the
+/// environment, but bare-path shorthand bypasses subcommand parsing.
+fn resolve_hopper(hopper: Option<String>) -> Option<String> {
+    resolve_hopper_value(hopper, std::env::var("SCAN_HOPPER").ok())
+}
+
+fn resolve_hopper_value(hopper: Option<String>, env: Option<String>) -> Option<String> {
+    hopper.or(env).filter(|url| !url.trim().is_empty())
+}
+
 fn command_scans_for_other_hosts(command: Option<&Commands>) -> bool {
     matches!(
         command,
@@ -615,8 +626,9 @@ enum Commands {
         /// `<URL>/api/result`. A SHA hopper has not ingested is negotiated over
         /// `/api/known` and uploaded bytes-and-provenance first, so a
         /// never-before-seen sample lands as its own row instead of being
-        /// dropped as an unknown-SHA no-op. Upload failures are logged, never
-        /// fatal. Also settable via the `SCAN_HOPPER` env var.
+        /// dropped as an unknown-SHA no-op. Upload failures are reported as
+        /// errors, but never make the scan fatal. Also settable via the
+        /// `SCAN_HOPPER` env var.
         /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
         /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
         #[arg(
@@ -781,8 +793,9 @@ enum Commands {
         ///
         ///   --hopper https://hops-ro.example,http://hopper.internal:8081
         ///
-        /// Upload failures are logged, never fatal. Also settable via the
-        /// `SCAN_HOPPER` env var. Authenticates with `~/.tok/hopper` (or
+        /// Upload failures are reported as errors, but never make the scan
+        /// fatal. Also settable via the `SCAN_HOPPER` env var. Authenticates
+        /// with `~/.tok/hopper` (or
         /// `$HOPPER_TOKEN_FILE` / `$HOPPER_TOKEN`); hopper rejects an
         /// unauthenticated request with 401.
         #[arg(
@@ -834,7 +847,8 @@ enum Commands {
         /// variable can feed both, but a worker uses only the primary — the
         /// last address. A replica refuses worker routes outright, so the
         /// earlier ones are not a fallback here.
-        #[arg(long)]
+        /// Also settable via `SCAN_HOPPER`.
+        #[arg(long, env = "SCAN_HOPPER")]
         url: String,
 
         /// Worker name (defaults to hostname)
@@ -1130,7 +1144,7 @@ fn main() -> Result<()> {
             if !cli.paths.is_empty() {
                 Commands::Path {
                     paths: cli.paths.clone(),
-                    hopper: None,
+                    hopper: resolve_hopper(None),
                     // Bare `scan <path>` bypasses clap's per-subcommand parsing, so
                     // read the registry-map env var here too — this is the form
                     // cyclotron's LLM agents run.
@@ -1452,7 +1466,7 @@ fn main() -> Result<()> {
         .with_interpret(interpret_cfg.clone())
         .with_fetch(fetch_policy)
         .with_zip_passwords(cli.zip_passwords.clone())
-        .with_hopper(hopper))
+        .with_hopper(resolve_hopper(hopper)))
     };
 
     match command {
@@ -1529,6 +1543,7 @@ fn main() -> Result<()> {
             idle_worker_slots,
             analysis_timeout,
         } => {
+            let hopper = resolve_hopper(hopper);
             if let Some(p) = traits_dir.as_ref() {
                 cleave::traits_repo::set_override_dir(Some(p.into()));
             }
@@ -2318,7 +2333,8 @@ fn run_scan_paths(
 mod tests {
     use super::{
         Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy, default_cli_fetch_policy,
-        redact_zip_passwords, resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
+        redact_zip_passwords, resolve_hopper_value, resolve_process_max_rss_bytes,
+        resolve_worker_max_rss_gb,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
@@ -2421,6 +2437,23 @@ mod tests {
         );
         assert!(cli.command.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn hopper_environment_fills_missing_scan_destination() {
+        assert_eq!(
+            resolve_hopper_value(None, Some("http://hopper:8081/".to_string())).as_deref(),
+            Some("http://hopper:8081/")
+        );
+        assert_eq!(
+            resolve_hopper_value(
+                Some("http://flag:8081".to_string()),
+                Some("http://env".to_string())
+            )
+            .as_deref(),
+            Some("http://flag:8081")
+        );
+        assert!(resolve_hopper_value(None, Some("  ".to_string())).is_none());
     }
 
     #[test]
