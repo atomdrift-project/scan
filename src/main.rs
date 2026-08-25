@@ -378,6 +378,33 @@ struct Cli {
     )]
     fetch_host_platform_only: bool,
 
+    /// [EXPERIMENTAL] Follow declared dependencies past the first hop — the
+    /// dependencies of a fetched dependency, out to `--fetch-depth`. This is
+    /// automatic in `serve` and `worker`, which populate the shared corpus;
+    /// an interactive scan stops declared dependencies at the first hop, since
+    /// the transitive tail costs a registry lookup each and is almost entirely
+    /// old releases the age gate then discards. URLs and command-mentioned
+    /// packages — the dropper chain — are followed at every hop either way.
+    /// Also settable via `SCAN_FETCH_TRANSITIVE_DEPS`.
+    #[arg(
+        long,
+        global = true,
+        env = "SCAN_FETCH_TRANSITIVE_DEPS",
+        conflicts_with = "fetch_direct_deps_only"
+    )]
+    fetch_transitive_deps: bool,
+
+    /// [EXPERIMENTAL] Follow declared dependencies for one hop only. This is the
+    /// interactive default and an explicit completeness opt-out for `serve` /
+    /// `worker`. Also settable via `SCAN_FETCH_DIRECT_DEPS_ONLY`.
+    #[arg(
+        long,
+        global = true,
+        env = "SCAN_FETCH_DIRECT_DEPS_ONLY",
+        conflicts_with = "fetch_transitive_deps"
+    )]
+    fetch_direct_deps_only: bool,
+
     /// [EXPERIMENTAL] How long to trust cached *mutable* registry metadata before
     /// revalidating. Accepts a unit suffix (`90s`, `30m`, `4h`, `2d`) — a bare
     /// number is seconds; `never` caches indefinitely (offline/air-gapped). This
@@ -593,6 +620,14 @@ fn publish_bloom_filters(mode: scan::Mode) {
 
 fn cli_host_platform_only(cli: &Cli, scans_for_other_hosts: bool) -> bool {
     cli.fetch_host_platform_only || (!cli.fetch_all_platforms && !scans_for_other_hosts)
+}
+
+/// Whether declared dependencies are followed past the first hop. Corpus-facing
+/// modes take the transitive tail by default; an interactive scan stops at the
+/// artifact's own declared dependencies. Either default is overridable, and the
+/// two flags conflict, so at most one arm can fire.
+fn cli_transitive_deps(cli: &Cli, scans_for_other_hosts: bool) -> bool {
+    cli.fetch_transitive_deps || (!cli.fetch_direct_deps_only && scans_for_other_hosts)
 }
 
 /// Resolve the hopper destination consistently for every scan mode. Most
@@ -1110,6 +1145,7 @@ fn main() -> Result<()> {
         policy.max_url_fetches = cli.fetch_max_urls;
         policy.max_file_bytes = cli.fetch_max_file_size;
         policy.host_platform_only = cli_host_platform_only(&cli, scans_for_other_hosts);
+        policy.transitive_deps = cli_transitive_deps(&cli, scans_for_other_hosts);
         policy
     };
     // The per-fetch size ceiling is enforced in the HTTP layer, so it's a
