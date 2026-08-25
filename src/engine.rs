@@ -166,8 +166,8 @@ impl ScanConfig {
 
     /// Upload (renew) each scan result on the hopper instance at `url` by POSTing
     /// its envelope to `/api/result`. `None` (default) disables uploading. Used by
-    /// `scan path --hopper`; failures degrade to logged warnings and never affect
-    /// the scan's outcome.
+    /// `scan path --hopper`; failures are reported as errors but never affect the
+    /// scan's outcome.
     #[must_use]
     pub fn with_hopper(mut self, url: Option<String>) -> Self {
         self.hopper = url;
