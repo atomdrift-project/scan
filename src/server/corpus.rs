@@ -28,6 +28,12 @@ use std::time::{Duration, Instant};
 /// far end of two hops.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// A transient Hopper failure gets a small, bounded retry before the reader
+/// gives the next address a chance. This catches a restarted backend without
+/// turning a lookup into an unbounded wait.
+const READ_RETRIES: usize = 2;
+const READ_BACKOFF: Duration = Duration::from_millis(100);
+
 /// How stale the preferred address may be before its silence stops counting as
 /// an answer.
 ///
@@ -37,11 +43,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// primary already holds reads as absence: analyze a package, get `block`, look
 /// it up a minute later and be told nobody has ever seen it.
 ///
-/// Measured at 27 minutes in production, so the assumption needs enforcing
-/// rather than asserting. 60s is far above healthy replication, which runs
-/// sub-second, and far below any lag that could hide a verdict a caller just
-/// asked us to produce.
-const MAX_REPLICA_LAG: Duration = Duration::from_secs(60);
+/// The replica remains an acceptable read source while it is within the
+/// four-hour operational freshness window. A miss inside that window can
+/// still be a replication race, but the caller's contract is to fall through
+/// to local analysis when Hopper has no analyzed verdict; a stale replica is
+/// different because its absence cannot be trusted at all.
+const MAX_REPLICA_LAG: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// How long a lag reading is trusted before asking again. Short enough to catch
 /// a replica falling behind, long enough that it costs one request a minute
@@ -66,6 +73,15 @@ pub(crate) enum Reached {
     /// No endpoint could be reached. Says nothing about the artifact, which is
     /// the whole reason it is distinct from [`Self::Nothing`].
     Unreachable,
+}
+
+/// Where a reachable corpus answer was served. Hopper supplies this header so
+/// a replica relay can distinguish its local database from the primary it
+/// contacted for a `fresh=1` read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CorpusSource {
+    Replica,
+    Primary,
 }
 
 /// One artifact as hopper's `/v1/lookup` reports it.
@@ -195,8 +211,12 @@ impl Corpus {
         *rested = if reachable { None } else { Some(now + REST) };
     }
 
-    /// Ask the corpus about an artifact, trying each endpoint in turn.
-    pub(crate) async fn known(&self, sha: Option<&str>, purl: Option<&str>) -> Reached {
+    /// Ask the corpus and retain the serving source for the HTTP response.
+    pub(crate) async fn known_with_source(
+        &self,
+        sha: Option<&str>,
+        purl: Option<&str>,
+    ) -> (Reached, Option<CorpusSource>) {
         let mut query = Vec::with_capacity(2);
         if let Some(sha) = sha {
             query.push(format!("sha256={sha}"));
@@ -205,7 +225,7 @@ impl Corpus {
             query.push(format!("purl={}", percent_encode(purl)));
         }
         if query.is_empty() {
-            return Reached::Nothing;
+            return (Reached::Nothing, None);
         }
         let mut path = format!("/v1/lookup?{}", query.join("&"));
         // A replica too far behind cannot be believed about an absence, so its
@@ -213,12 +233,12 @@ impl Corpus {
         // hopper's own read-after-write hatch and a no-op on the primary, which
         // has no relay to forward to — so this is safe to send to whichever
         // address answers.
-        if self.preferred_is_stale().await {
+        let force_primary = self.preferred_is_stale().await;
+        if force_primary {
             path.push_str("&fresh=1");
         }
 
         for base in self.order_at(Instant::now()) {
-            self.count(base, |a| &a.asked);
             match self.ask(base, &path).await {
                 // An answer, whichever kind. A 404 from the replica is taken as
                 // the answer rather than re-asked at the primary: "we hold
@@ -227,20 +247,41 @@ impl Corpus {
                 // put the whole miss load back on the machine the replica
                 // exists to spare. The cost is a narrow window after a write
                 // where replication lag reads as absence.
-                Some(reached) => {
+                Some((reached, source)) => {
                     self.note_at(base, true, Instant::now());
                     self.count(base, |a| &a.answered);
-                    match &reached {
+                    let outcome = match &reached {
                         Reached::Record(_) => &self.found,
                         _ => &self.nothing,
-                    }
-                    .fetch_add(1, Ordering::Relaxed);
-                    return reached;
+                    };
+                    outcome.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        endpoint = %base,
+                        sha256 = sha.unwrap_or(""),
+                        purl = purl.unwrap_or(""),
+                        force_primary,
+                        outcome = match &reached {
+                            Reached::Record(_) => "record",
+                            Reached::Nothing => "nothing",
+                            Reached::Unreachable => "unreachable",
+                        },
+                        source = source.map_or("unknown", |s| match s {
+                            CorpusSource::Replica => "replica",
+                            CorpusSource::Primary => "primary",
+                        }),
+                        "corpus lookup answered",
+                    );
+                    return (reached, source);
                 }
                 None => {
                     self.note_at(base, false, Instant::now());
                     self.count(base, |a| &a.failed);
-                    tracing::warn!(endpoint = %base, "corpus unreachable");
+                    tracing::warn!(
+                        endpoint = %base,
+                        sha256 = sha.unwrap_or(""),
+                        purl = purl.unwrap_or(""),
+                        "corpus unreachable",
+                    );
                 }
             }
         }
@@ -250,10 +291,12 @@ impl Corpus {
         // decide what to do without us.
         tracing::error!(
             endpoints = %self.addresses(),
+            sha256 = sha.unwrap_or(""),
+            purl = purl.unwrap_or(""),
             "corpus unreachable at every address; answering unavailable",
         );
         self.unreachable.fetch_add(1, Ordering::Relaxed);
-        Reached::Unreachable
+        (Reached::Unreachable, None)
     }
 
     /// Whether the preferred address is too far behind to be trusted about an
@@ -285,7 +328,7 @@ impl Corpus {
             None => {
                 let fresh = self.ask_lag(base).await;
                 *lock(&self.lag) = Some((now, fresh));
-                if let Some(lag) = fresh.filter(|lag| *lag >= MAX_REPLICA_LAG) {
+                if let Some(lag) = fresh.filter(|lag| *lag > MAX_REPLICA_LAG) {
                     tracing::warn!(
                         endpoint = %base,
                         lag_secs = lag.as_secs(),
@@ -296,7 +339,7 @@ impl Corpus {
                 fresh
             }
         };
-        lag.is_some_and(|lag| lag >= MAX_REPLICA_LAG)
+        lag.is_some_and(|lag| lag > MAX_REPLICA_LAG)
     }
 
     /// One address's reported data lag, or `None` when it did not say.
@@ -359,48 +402,100 @@ impl Corpus {
     }
 
     /// One endpoint's answer, or `None` when it could not give one.
-    async fn ask(&self, base: &str, path: &str) -> Option<Reached> {
-        let mut request = self.client.get(format!("{base}{path}"));
-        if let Some(token) = crate::upload::hopper_token() {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await.ok()?;
-        match response.status().as_u16() {
-            200 => match response.json::<CorpusRecord>().await {
-                Ok(record) => Some(Reached::Record(Box::new(record))),
-                // Reachable, but not speaking our protocol. Not a reason to try
-                // the other endpoint, which is running the same build.
-                Err(error) => {
-                    tracing::warn!(endpoint = %base, %error, "corpus record did not parse");
-                    Some(Reached::Nothing)
+    async fn ask(&self, base: &str, path: &str) -> Option<(Reached, Option<CorpusSource>)> {
+        for attempt in 0..=READ_RETRIES {
+            self.count(base, |a| &a.asked);
+            let mut request = self.client.get(format!("{base}{path}"));
+            if let Some(token) = crate::upload::hopper_token() {
+                request = request.bearer_auth(token);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) if attempt < READ_RETRIES => {
+                    tracing::warn!(
+                        endpoint = %base,
+                        path = %path,
+                        attempt = attempt + 1,
+                        max_attempts = READ_RETRIES + 1,
+                        %error,
+                        "retrying transient corpus read",
+                    );
+                    tokio::time::sleep(read_backoff(attempt)).await;
+                    continue;
                 }
-            },
-            // 404 is "nothing stored"; 202 is "held, nobody has looked at it".
-            // Neither is a verdict, and neither is a failure.
-            404 | 202 => Some(Reached::Nothing),
-            // Being turned away is about this endpoint, not about the query:
-            // a credential can be wrong for one address and right for the
-            // next, and 403 is exactly how a replica declines a route it will
-            // not serve. Answering "nothing known" here would be a claim about
-            // the artifact made on the strength of never having asked, and it
-            // would strand every lookup on a replica whose token went stale.
-            401 | 403 => {
-                tracing::warn!(endpoint = %base, status = response.status().as_u16(), "corpus turned us away");
-                None
+                Err(error) => {
+                    tracing::warn!(endpoint = %base, %error, "corpus read failed");
+                    return None;
+                }
+            };
+            let status = response.status().as_u16();
+            let source = hopper_source(&response);
+            if (status == 408 || status == 429 || status >= 500) && attempt < READ_RETRIES {
+                tracing::warn!(
+                    endpoint = %base,
+                    path = %path,
+                    status,
+                    attempt = attempt + 1,
+                    max_attempts = READ_RETRIES + 1,
+                    "retrying transient corpus response",
+                );
+                tokio::time::sleep(read_backoff(attempt)).await;
+                continue;
             }
-            // Any other 4xx is this request being wrong, which the next
-            // endpoint would also say. 5xx is the endpoint being unwell, which
-            // it might not.
-            status if (400..500).contains(&status) => {
-                tracing::warn!(endpoint = %base, status, "corpus refused the query");
-                Some(Reached::Nothing)
-            }
-            status => {
-                tracing::warn!(endpoint = %base, status, "corpus returned an error");
-                None
-            }
+            return match status {
+                200 => match response.json::<CorpusRecord>().await {
+                    Ok(record) => Some((Reached::Record(Box::new(record)), source)),
+                    // Reachable, but not speaking our protocol. Not a reason to try
+                    // the other endpoint, which is running the same build.
+                    Err(error) => {
+                        tracing::warn!(endpoint = %base, %error, "corpus record did not parse");
+                        Some((Reached::Nothing, source))
+                    }
+                },
+                // 404 is "nothing stored"; 202 is "held, nobody has looked at it".
+                // Neither is a verdict, and neither is a failure.
+                404 | 202 => Some((Reached::Nothing, source)),
+                // Being turned away is about this endpoint, not about the query:
+                // a credential can be wrong for one address and right for the
+                // next, and 403 is exactly how a replica declines a route it will
+                // not serve. Answering "nothing known" here would be a claim about
+                // the artifact made on the strength of never having asked, and it
+                // would strand every lookup on a replica whose token went stale.
+                401 | 403 => {
+                    tracing::warn!(endpoint = %base, status = response.status().as_u16(), "corpus turned us away");
+                    None
+                }
+                // Any other 4xx is this request being wrong, which the next
+                // endpoint would also say. 5xx is the endpoint being unwell, which
+                // it might not.
+                status if (400..500).contains(&status) => {
+                    tracing::warn!(endpoint = %base, status, "corpus refused the query");
+                    Some((Reached::Nothing, source))
+                }
+                status => {
+                    tracing::warn!(endpoint = %base, status, "corpus returned an error");
+                    None
+                }
+            };
         }
+        None
     }
+}
+
+fn hopper_source(response: &reqwest::Response) -> Option<CorpusSource> {
+    match response
+        .headers()
+        .get("X-Hopper-Source")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("replica") => Some(CorpusSource::Replica),
+        Some("primary") => Some(CorpusSource::Primary),
+        _ => None,
+    }
+}
+
+fn read_backoff(attempt: usize) -> Duration {
+    READ_BACKOFF.saturating_mul(1u32 << attempt.min(4))
 }
 
 /// Percent-encode a PURL for a query string. A PURL's own grammar carries `?`,
@@ -520,7 +615,9 @@ mod tests {
         // a timeout.
         let c = corpus("http://127.0.0.1:1");
         assert_eq!(
-            c.known(None, Some("pkg:npm/left-pad@1.3.0")).await,
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0,
             Reached::Unreachable,
         );
     }
@@ -532,7 +629,9 @@ mod tests {
         let c = corpus("http://127.0.0.1:1, http://127.0.0.1:2");
         let before = c.order_at(Instant::now());
         assert_eq!(before.first(), Some(&"http://127.0.0.1:1"));
-        let _ = c.known(None, Some("pkg:npm/left-pad@1.3.0")).await;
+        let _ = c
+            .known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+            .await;
         assert_eq!(
             c.order_at(Instant::now()).first(),
             Some(&"http://127.0.0.1:2"),
@@ -560,7 +659,48 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
-    /// A replica too far behind cannot be believed about an absence.
+    /// An endpoint that fails once and then answers, for the retry test.
+    fn flaky_endpoint() -> (String, Arc<AtomicU64>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&attempts);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.read(&mut [0u8; 2048]);
+                let attempt = seen.fetch_add(1, Ordering::Relaxed);
+                let (status, body) = if attempt == 0 {
+                    ("500 Internal Server Error", "{}")
+                } else {
+                    ("200 OK", r#"{"sha256":"recovered"}"#)
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), attempts)
+    }
+
+    /// A transient 5xx is retried with backoff before the lookup is failed over.
+    #[tokio::test]
+    async fn a_transient_read_is_retried_before_failing_over() {
+        let (base, attempts) = flaky_endpoint();
+        let c = corpus(&base);
+        assert!(matches!(
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0,
+            Reached::Record(_)
+        ));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    /// A replica beyond the four-hour window cannot be believed about an absence.
     ///
     /// The bargain is that a replica's 404 is taken as the answer so the miss
     /// load stays off the primary. It holds only while the replica is current.
@@ -569,9 +709,12 @@ mod tests {
     /// decision, look it up a minute later and be told nobody has seen it.
     #[tokio::test]
     async fn a_replica_that_is_behind_has_its_reads_relayed() {
-        let behind = endpoint("200 OK", r#"{"replica":true,"lag_seconds":1620}"#);
+        let behind = endpoint("200 OK", r#"{"replica":true,"lag_seconds":14401}"#);
         let c = corpus(&format!("{behind},http://127.0.0.1:1"));
-        assert!(c.preferred_is_stale().await, "27 minutes behind was believed");
+        assert!(
+            c.preferred_is_stale().await,
+            "four hours plus one second was believed"
+        );
 
         // Cached, so this costs a request a minute and not one per lookup.
         assert!(c.preferred_is_stale().await);
@@ -582,6 +725,15 @@ mod tests {
     #[tokio::test]
     async fn a_current_replica_is_still_trusted() {
         let current = endpoint("200 OK", r#"{"replica":true,"lag_seconds":2}"#);
+        let c = corpus(&format!("{current},http://127.0.0.1:1"));
+        assert!(!c.preferred_is_stale().await);
+    }
+
+    /// The policy boundary is inclusive: exactly four hours remains a valid
+    /// replica source, while the next second forces a primary relay.
+    #[tokio::test]
+    async fn exactly_four_hours_of_replica_lag_is_still_trusted() {
+        let current = endpoint("200 OK", r#"{"replica":true,"lag_seconds":14400}"#);
         let c = corpus(&format!("{current},http://127.0.0.1:1"));
         assert!(!c.preferred_is_stale().await);
     }
@@ -622,7 +774,10 @@ mod tests {
             let replica = endpoint(status, r#"{"error":"nope"}"#);
             let primary = endpoint("200 OK", r#"{"sha256":"abc","fires_at":-1}"#);
             let c = corpus(&format!("{replica},{primary}"));
-            let reached = c.known(None, Some("pkg:npm/left-pad@1.3.0")).await;
+            let reached = c
+                .known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0;
             let Reached::Record(record) = reached else {
                 panic!("{status} at the replica became {reached:?}");
             };
@@ -639,7 +794,9 @@ mod tests {
         let b = endpoint("403 Forbidden", r#"{"error":"nope"}"#);
         let c = corpus(&format!("{a},{b}"));
         assert_eq!(
-            c.known(None, Some("pkg:npm/left-pad@1.3.0")).await,
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0,
             Reached::Unreachable,
         );
     }
@@ -653,7 +810,9 @@ mod tests {
         let primary = endpoint("200 OK", r#"{"sha256":"abc","fires_at":-1}"#);
         let c = corpus(&format!("{replica},{primary}"));
         assert_eq!(
-            c.known(None, Some("pkg:npm/left-pad@1.3.0")).await,
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0,
             Reached::Nothing,
         );
     }
