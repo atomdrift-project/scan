@@ -4120,7 +4120,7 @@ async fn v1_decide(
     let Some(corpus) = state.corpus.as_ref() else {
         return Ok((
             V1Decision::bloom(bloom, sha.as_deref(), purl.as_deref(), budget)
-                .unwrap_or_else(|| V1Decision::unknown(sha.as_deref(), purl.as_deref()))
+                .unwrap_or_else(|| V1Decision::unanalyzed(sha.as_deref(), purl.as_deref()))
                 .with_url(url.as_deref()),
             "scan:bloom",
         ));
@@ -4139,13 +4139,13 @@ async fn v1_decide(
                     .with_url(url.as_deref())
             }
             // The corpus holds nothing either. A filter claim is the last thing
-            // we know, and answering `unknown` about a digest several operators
+            // we know, and answering `unanalyzed` about a digest several operators
             // call malware is a worse answer than saying who says so.
             Reached::Nothing => V1Decision::bloom(bloom, sha.as_deref(), purl.as_deref(), budget)
-                .unwrap_or_else(|| V1Decision::unknown(sha.as_deref(), purl.as_deref()))
+                .unwrap_or_else(|| V1Decision::unanalyzed(sha.as_deref(), purl.as_deref()))
                 .with_url(url.as_deref()),
             // The corpus could not answer, so neither can we. Emphatically not
-            // `unknown`: that would tell the caller nobody has analyzed this
+            // `unanalyzed`: that would tell the caller nobody has analyzed this
             // package, which is a claim about the package rather than about us, and
             // the one that lets a gate fail open during an outage.
             Reached::Unreachable => {
@@ -4186,8 +4186,8 @@ pub(super) struct V1Decision {
 impl V1Decision {
     /// Nobody has analyzed this artifact. Nothing is wrong; there is simply no
     /// answer, and what a caller does about that is their policy to set.
-    fn unknown(sha: Option<&str>, purl: Option<&str>) -> Self {
-        Self::empty(decision::Decision::Unknown, sha, purl)
+    fn unanalyzed(sha: Option<&str>, purl: Option<&str>) -> Self {
+        Self::empty(decision::Decision::Unanalyzed, sha, purl)
     }
 
     /// We could not answer. Deliberately carries no severity, no level and no
@@ -4254,7 +4254,7 @@ impl V1Decision {
     /// Whether this says something about the artifact rather than about us,
     /// and says it because an engine of ours measured it.
     ///
-    /// `unknown` reports that nobody has analyzed it, which is precisely what
+    /// `unanalyzed` reports that nobody has analyzed it, which is precisely what
     /// `/v1/analyze` exists to fix, and `unavailable` reports that we could not
     /// find out. Neither may stand in for a run.
     ///
@@ -4268,7 +4268,7 @@ impl V1Decision {
     fn is_verdict(&self) -> bool {
         !matches!(
             self.decision,
-            decision::Decision::Unknown | decision::Decision::Unavailable
+            decision::Decision::Unanalyzed | decision::Decision::Unavailable
         ) && self.engine_version.is_some()
     }
 
@@ -4288,12 +4288,12 @@ impl V1Decision {
     /// still carries no `engine_version`, so nothing downstream mistakes it for
     /// one.
     ///
-    /// `unknown` and `unavailable` are excluded exactly as before: the first is
+    /// `unanalyzed` and `unavailable` are excluded exactly as before: the first is
     /// what `/v1/analyze` exists to fix, the second is a statement about us.
     fn is_answerable(&self) -> bool {
         !matches!(
             self.decision,
-            decision::Decision::Unknown | decision::Decision::Unavailable
+            decision::Decision::Unanalyzed | decision::Decision::Unavailable
         ) && self.fires_at.is_some()
     }
 
@@ -4754,7 +4754,7 @@ mod tests {
     /// The rule is "anything that actually answers the question", which is
     /// wider than "a measurement of ours" — an operator's call, made because a
     /// fast answer from what we already know beats rediscovering it. What stays
-    /// excluded is what was always excluded: `unknown`, which is the very thing
+    /// excluded is what was always excluded: `unanalyzed`, which is the very thing
     /// the route exists to fix, and `unavailable`, which is a statement about us
     /// rather than about the artifact.
     #[test]
@@ -4762,7 +4762,7 @@ mod tests {
         use super::V1Decision;
         use super::decision::Decision;
         let purl = Some("pkg:npm/left-pad@1.3.0");
-        assert!(!V1Decision::unknown(None, purl).is_answerable());
+        assert!(!V1Decision::unanalyzed(None, purl).is_answerable());
         assert!(!V1Decision::unavailable(None, purl).is_answerable());
 
         // A decision with no level answers nothing, whatever it is labelled.
@@ -4942,7 +4942,7 @@ mod tests {
             V1Decision::stored(&stored, Some("pkg:npm/evil@1.0.0"), 25),
             // What a lookup answers with when the corpus knew instead.
             V1Decision::corpus(&from_corpus, None, Some("pkg:npm/evil@1.0.0"), 25),
-            V1Decision::unknown(None, Some("pkg:npm/evil@1.0.0")),
+            V1Decision::unanalyzed(None, Some("pkg:npm/evil@1.0.0")),
             V1Decision::unavailable(None, Some("pkg:npm/evil@1.0.0")),
         ];
 
@@ -5048,7 +5048,7 @@ mod tests {
             Ok("pkg:pypi/importancescore@1.2"),
             "the premise: case folds too",
         );
-        let cased = V1Decision::unknown(None, Some("pkg:pypi/importancescore@1.2"))
+        let cased = V1Decision::unanalyzed(None, Some("pkg:pypi/importancescore@1.2"))
             .asked_about(Some(mixed));
         assert_eq!(
             serde_json::to_value(&cased).expect("serializes")["purl"],
@@ -5071,7 +5071,7 @@ mod tests {
         // gets whichever kind we happen to have.
         let decisions = [
             V1Decision::stored(&stored, Some(normalized), 25).asked_about(Some(asked)),
-            V1Decision::unknown(None, Some(normalized)).asked_about(Some(asked)),
+            V1Decision::unanalyzed(None, Some(normalized)).asked_about(Some(asked)),
             V1Decision::unavailable(None, Some(normalized)).asked_about(Some(asked)),
         ];
         for d in &decisions {

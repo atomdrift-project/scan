@@ -106,14 +106,14 @@ async fn the_shape_never_moves() -> Result<()> {
 /// With no corpus configured there is nothing behind the index to defer to, so
 /// this is the whole answer rather than the first half of one.
 #[tokio::test]
-async fn an_unanalyzed_package_is_unknown_and_never_allowed() -> Result<()> {
+async fn an_unanalyzed_package_is_named_and_never_allowed() -> Result<()> {
     let (status, body) = get(&format!("/v1/lookup?purl={}", encoded_purl(UNKNOWN))).await?;
     assert_eq!(
         status,
         StatusCode::OK,
         "having no answer is not an HTTP error"
     );
-    assert_eq!(body["decision"], "unknown");
+    assert_eq!(body["decision"], "unanalyzed");
     assert_ne!(
         body["decision"], "allow",
         "an unanalyzed package was cleared"
@@ -128,7 +128,7 @@ async fn an_unanalyzed_package_is_unknown_and_never_allowed() -> Result<()> {
 
 /// The distinction the whole reliability contract rests on, exercised across
 /// the hop this design adds. A corpus that cannot be reached must answer
-/// `unavailable`, never `unknown`: one says nobody has analyzed this package,
+/// `unavailable`, never `unanalyzed`: one says nobody has analyzed this package,
 /// the other says we could not find out, and only the first is a claim about
 /// the package. A caller may reasonably install unanalyzed packages while
 /// refusing to install anything during our outage — or exactly the reverse —

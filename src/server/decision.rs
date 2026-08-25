@@ -25,7 +25,7 @@ use serde::Serialize;
 ///
 /// `None` is manual-threshold mode, where no level table applies at all; the
 /// fallback const stands in so the parameter still has a meaning, though
-/// [`decide`] answers `Unknown` for such verdicts regardless.
+/// [`decide`] answers `Unanalyzed` for such verdicts regardless.
 pub(crate) fn default_budget(server_level: Option<u16>) -> u16 {
     server_level.unwrap_or(crate::model::DEFAULT_SEVERITY_LEVEL)
 }
@@ -47,10 +47,10 @@ pub(crate) enum Decision {
     /// Analyzed, and hostile at the caller's threshold.
     Block,
     /// Nobody has analyzed this. Nothing is wrong; there is simply no answer.
-    Unknown,
+    Unanalyzed,
     /// We failed. This says nothing about the package.
     ///
-    /// Kept rigorously distinct from [`Self::Unknown`]: a caller may reasonably
+    /// Kept rigorously distinct from [`Self::Unanalyzed`]: a caller may reasonably
     /// install unanalyzed packages while refusing to install anything during an
     /// outage, or exactly the reverse, and collapsing the two takes that choice
     /// away from them.
@@ -83,12 +83,12 @@ pub(crate) enum Severity {
 /// million the caller will tolerate. Mirrors `verdict_for_level(fired_level,
 /// level, ..)`, whose two parameters are that same pair.
 ///
-/// `None` is manual-threshold mode and answers [`Decision::Unknown`] rather
+/// `None` is manual-threshold mode and answers [`Decision::Unanalyzed`] rather
 /// than guessing: no level table applies to such a verdict, so no budget can be
 /// evaluated against it, and saying so is honest where allowing it would not.
 pub(crate) fn decide(fires_at: Option<i32>, budget: u16) -> (Decision, Severity) {
     let Some(lvl) = fires_at else {
-        return (Decision::Unknown, Severity::Benign);
+        return (Decision::Unanalyzed, Severity::Benign);
     };
     // The sentinel is not a level: it is the absence of one, and it is negative
     // precisely so it cannot be compared as though it were the tightest budget
@@ -147,12 +147,12 @@ mod tests {
         }
     }
 
-    /// A verdict with no level table cannot be judged against a budget. Unknown
+    /// A verdict with no level table cannot be judged against a budget. Unanalyzed
     /// hands the choice to the caller's policy; allow would make it for them.
     #[test]
-    fn manual_threshold_mode_is_unknown_not_allowed() {
-        assert_eq!(decide(None, 25).0, Decision::Unknown);
-        assert_eq!(decide(None, 25_000).0, Decision::Unknown);
+    fn manual_threshold_mode_is_unanalyzed_not_allowed() {
+        assert_eq!(decide(None, 25).0, Decision::Unanalyzed);
+        assert_eq!(decide(None, 25_000).0, Decision::Unanalyzed);
     }
 
     #[test]
