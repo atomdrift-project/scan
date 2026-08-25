@@ -246,14 +246,14 @@ unknown, `[]` when empty.
 | --- | --- |
 | `allow` | Analyzed. Not hostile at the caller's budget. |
 | `block` | Analyzed. Hostile at the caller's budget. |
-| `unknown` | Nobody has analyzed it, and nothing is wrong. |
+| `unanalyzed` | Nobody has analyzed it, and nothing is wrong. |
 | `unavailable` | We could not answer. Nothing about the artifact. |
 
-`unknown` and `unavailable` are kept distinct on purpose: one is a
+`unanalyzed` and `unavailable` are kept distinct on purpose: one is a
 claim about the package, the other about us, and a caller's policy is
 entitled to treat them differently. A verdict index that has not
 loaded, or a corpus that cannot be reached, is `unavailable` — never
-`unknown`, which would report our own outage as a clean bill of health.
+`unanalyzed`, which would report our own outage as a clean bill of health.
 
 `fires_at` is the stored `lvl`: the tightest false-positive budget per
 100 million benign files at which the artifact grades hostile, `-1` for
@@ -287,7 +287,7 @@ Analyze a package and answer with a decision.
 A named package is looked up before anything is analyzed, exactly the way
 `GET /v1/lookup` resolves it — same normalization, same index-then-corpus order,
 same budget. A verdict already held is returned immediately and costs no
-analysis slot; `unknown` and `unavailable` are not verdicts, so both fall
+analysis slot; `unanalyzed` and `unavailable` are not verdicts, so both fall
 through and run. Pass `force=1` to analyze regardless of what is already known,
 which is what to use after an engine upgrade.
 
