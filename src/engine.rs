@@ -2129,7 +2129,12 @@ pub(crate) fn bloom_gate(
         // analysis in every mode — the scan is the verdict — and the flag rides
         // the normal result inline (see `BloomMark`), so no separate banner is
         // printed here. The caller derives the mark from this same decision.
-        BloomDecision::KnownBad => None,
+        // A sighting is the same shape of answer as known-bad — a flag that
+        // runs the full analysis — but says somebody else reported it rather
+        // than that we measured it. The distinction rides the inline mark.
+        BloomDecision::KnownBad
+        | BloomDecision::SightedHostile
+        | BloomDecision::SightedSuspicious => None,
         BloomDecision::Conflicted => {
             // Build-time subtraction removes bad keys from good, so a conflict can
             // only mean filter version skew or a producer bug — it should never
@@ -2210,7 +2215,13 @@ fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
                     !file_touched_within(path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now())
                 }
                 BloomDecision::Unknown => fast,
-                BloomDecision::KnownBad | BloomDecision::Conflicted => false,
+                // Every adverse tier is analyzed, including the weakest: a
+                // lone outside citation cannot convict, but it is ample reason
+                // to spend the scan rather than trust a bless.
+                BloomDecision::KnownBad
+                | BloomDecision::SightedHostile
+                | BloomDecision::SightedSuspicious
+                | BloomDecision::Conflicted => false,
             }
         },
     )))

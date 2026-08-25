@@ -130,7 +130,7 @@ async fn malformed_keys_are_rejected() -> Result<()> {
 
     let (status, body, _) = get("/lookup").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "neither key");
-    assert_eq!(body["error"], "provide sha256, purl, or both");
+    assert_eq!(body["error"], "provide sha256, purl, url, or both");
 
     // Both together is the fast path for a caller who already knows the pair,
     // not an error: each filter is evidence about the same artifact.
@@ -157,7 +157,7 @@ async fn malformed_keys_are_rejected() -> Result<()> {
 
     let (status, body, _) = get("/lookup?purl=%20").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty purl is no key");
-    assert_eq!(body["error"], "provide sha256, purl, or both");
+    assert_eq!(body["error"], "provide sha256, purl, url, or both");
 
     let (status, body, _) = get("/lookup?purl=not%20a%20purl").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);

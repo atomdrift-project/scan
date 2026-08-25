@@ -45,16 +45,30 @@ pub fn global() -> Option<Arc<Lookup>> {
 }
 
 /// What to do with a key before doing expensive work.
+///
+/// Ordered worst to best. WORST POOL WINS: a key claimed by more than one tier
+/// takes the worst of them, and a bless survives only when nothing else has
+/// anything to say about the key. See [`resolve`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    /// Known-good and not vetoed by the bad channel — skip the full scan.
-    Skip,
-    /// Matched the known-bad set — surface the match and still scan it.
+    /// Matched the known-bad set — an engine of ours measured it hostile.
+    /// Surface the match and still scan it.
     KnownBad,
-    /// In *both* the good and bad sets (e.g. filter version skew) — the verdict
-    /// is contradictory, so trust neither: surface the conflict and scan.
+    /// Matched a corroborated outside claim: two or more independent operators,
+    /// or one whose report a person adjudicated. Nothing of ours measured it.
+    /// Surface and scan.
+    SightedHostile,
+    /// Matched a lone, unadjudicated outside claim — a flag, not a verdict.
+    /// Surface and scan.
+    SightedSuspicious,
+    /// In the good set AND in one of the tiers above (e.g. filter version
+    /// skew) — the verdict is contradictory, so trust neither: surface the
+    /// conflict and scan. Build-time subtraction makes this impossible within
+    /// one consistent bundle, so seeing it means the files on disk disagree.
     Conflicted,
-    /// Not in either set, or skip withheld for safety — scan normally.
+    /// Known-good and claimed by no other tier — skip the full scan.
+    Skip,
+    /// In no set, or skip withheld for safety — scan normally.
     Unknown,
 }
 
@@ -66,8 +80,25 @@ impl Decision {
         match self {
             Self::Skip => "skip",
             Self::KnownBad => "known-bad",
+            Self::SightedHostile => "sighted-hostile",
+            Self::SightedSuspicious => "sighted-suspicious",
             Self::Conflicted => "conflicted",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// How bad this decision is, for "worst pool wins". Higher is worse; `None`
+    /// means the decision makes no adverse claim.
+    ///
+    /// `Conflicted` ranks with `KnownBad`: a bless standing beside a conviction
+    /// is at least as alarming as the conviction alone, and must never resolve
+    /// back to a skip when merged with a second key.
+    const fn adverse_rank(self) -> Option<u8> {
+        match self {
+            Self::KnownBad | Self::Conflicted => Some(3),
+            Self::SightedHostile => Some(2),
+            Self::SightedSuspicious => Some(1),
+            Self::Skip | Self::Unknown => None,
         }
     }
 
@@ -85,20 +116,24 @@ impl Decision {
     /// neither, and scanning, is the right answer to a contradiction.
     #[must_use]
     pub const fn merge(self, other: Self) -> Self {
-        let bad = self.implies_bad() || other.implies_bad();
+        let worst = match (self.adverse_rank(), other.adverse_rank()) {
+            (Some(a), Some(b)) => Some(if a >= b { self } else { other }),
+            (Some(_), None) => Some(self),
+            (None, Some(_)) => Some(other),
+            (None, None) => None,
+        };
         let good = self.implies_good() || other.implies_good();
-        match (bad, good) {
-            (true, true) => Self::Conflicted,
-            (true, false) => Self::KnownBad,
-            // A `Skip` from either key already cleared the bad-channel veto
-            // when it was resolved, so it does not need re-checking here.
-            (false, true) => Self::Skip,
-            (false, false) => Self::Unknown,
+        match (worst, good) {
+            // A bless from one key and a claim against the other: the two
+            // disagree about one artifact, which is the contradiction
+            // `Conflicted` names. Never resolves back to a skip.
+            (Some(_), true) => Self::Conflicted,
+            (Some(w), false) => w,
+            // A `Skip` from either key already cleared the veto when it was
+            // resolved, so it does not need re-checking here.
+            (None, true) => Self::Skip,
+            (None, false) => Self::Unknown,
         }
-    }
-
-    const fn implies_bad(self) -> bool {
-        matches!(self, Self::KnownBad | Self::Conflicted)
     }
 
     const fn implies_good(self) -> bool {
@@ -119,6 +154,10 @@ pub struct Lookup {
     purl_bad: Option<Filter>,
     sha256_good: Option<Filter>,
     sha256_bad: Option<Filter>,
+    purl_sighted_hostile: Option<Filter>,
+    sha256_sighted_hostile: Option<Filter>,
+    purl_sighted_suspicious: Option<Filter>,
+    sha256_sighted_suspicious: Option<Filter>,
     sha256_memo: DecisionCache<[u8; 32]>,
     purl_memo: DecisionCache<String>,
 }
@@ -130,6 +169,10 @@ impl Default for Lookup {
             purl_bad: None,
             sha256_good: None,
             sha256_bad: None,
+            purl_sighted_hostile: None,
+            sha256_sighted_hostile: None,
+            purl_sighted_suspicious: None,
+            sha256_sighted_suspicious: None,
             sha256_memo: DecisionCache::new(decision_cache::CAP),
             purl_memo: DecisionCache::new(decision_cache::CAP),
         }
@@ -158,11 +201,19 @@ impl Lookup {
     /// skipped; the result is always a valid (possibly empty) `Lookup`.
     #[must_use]
     pub fn load_from(dir: &Path) -> Self {
+        // The sighted slots are absent in a v1 bundle. That is a bundle from
+        // before those tiers existed, not a broken one: `resolve` treats a
+        // missing adverse filter as "no claim", so an older bundle behaves
+        // exactly as it did before they were introduced.
         let me = Self {
             purl_good: load_one(dir, Kind::Purl, Tier::Good),
             purl_bad: load_one(dir, Kind::Purl, Tier::Bad),
             sha256_good: load_one(dir, Kind::Sha256, Tier::Good),
             sha256_bad: load_one(dir, Kind::Sha256, Tier::Bad),
+            purl_sighted_hostile: load_one(dir, Kind::Purl, Tier::SightedHostile),
+            sha256_sighted_hostile: load_one(dir, Kind::Sha256, Tier::SightedHostile),
+            purl_sighted_suspicious: load_one(dir, Kind::Purl, Tier::SightedSuspicious),
+            sha256_sighted_suspicious: load_one(dir, Kind::Sha256, Tier::SightedSuspicious),
             ..Self::default()
         };
         tracing::debug!(
@@ -171,6 +222,10 @@ impl Lookup {
             purl_bad = me.purl_bad.is_some(),
             sha256_good = me.sha256_good.is_some(),
             sha256_bad = me.sha256_bad.is_some(),
+            purl_sighted_hostile = me.purl_sighted_hostile.is_some(),
+            sha256_sighted_hostile = me.sha256_sighted_hostile.is_some(),
+            purl_sighted_suspicious = me.purl_sighted_suspicious.is_some(),
+            sha256_sighted_suspicious = me.sha256_sighted_suspicious.is_some(),
             "loaded bloom filters"
         );
         me
@@ -181,26 +236,31 @@ impl Lookup {
     /// into the `ps` banner's rule tally.
     #[must_use]
     pub fn rule_count(&self) -> u64 {
+        self.filters().filter_map(Option::as_ref).map(Filter::len).sum()
+    }
+
+    /// Every filter slot, present or not. One place to enumerate them so a new
+    /// tier cannot be added to the struct and forgotten by the tally or the
+    /// is-anything-loaded check.
+    fn filters(&self) -> impl Iterator<Item = &Option<Filter>> {
         [
             &self.purl_good,
             &self.purl_bad,
             &self.sha256_good,
             &self.sha256_bad,
+            &self.purl_sighted_hostile,
+            &self.sha256_sighted_hostile,
+            &self.purl_sighted_suspicious,
+            &self.sha256_sighted_suspicious,
         ]
         .into_iter()
-        .filter_map(Option::as_ref)
-        .map(Filter::len)
-        .sum()
     }
 
     /// True when at least one filter is loaded — lets a caller skip the lookup
     /// entirely when nothing is synced.
     #[must_use]
-    pub const fn is_active(&self) -> bool {
-        self.purl_good.is_some()
-            || self.purl_bad.is_some()
-            || self.sha256_good.is_some()
-            || self.sha256_bad.is_some()
+    pub fn is_active(&self) -> bool {
+        self.filters().any(Option::is_some)
     }
 
     /// Decide a package by its PURL, before fetching it. Keys use the identity
@@ -215,14 +275,13 @@ impl Lookup {
             return Decision::Unknown;
         };
         let bytes = key.as_bytes();
+        let hit = |f: &Option<Filter>| f.as_ref().is_some_and(|f| f.contains_key(bytes));
         resolve(
-            self.purl_bad
-                .as_ref()
-                .is_some_and(|f| f.contains_key(bytes)),
+            hit(&self.purl_bad),
             self.purl_bad.is_some(),
-            self.purl_good
-                .as_ref()
-                .is_some_and(|f| f.contains_key(bytes)),
+            hit(&self.purl_good),
+            hit(&self.purl_sighted_hostile),
+            hit(&self.purl_sighted_suspicious),
         )
     }
 
@@ -230,14 +289,13 @@ impl Lookup {
     /// expensive analysis.
     #[must_use]
     pub fn decide_sha256(&self, digest: &[u8; 32]) -> Decision {
+        let hit = |f: &Option<Filter>| f.as_ref().is_some_and(|f| f.contains_digest(digest));
         resolve(
-            self.sha256_bad
-                .as_ref()
-                .is_some_and(|f| f.contains_digest(digest)),
+            hit(&self.sha256_bad),
             self.sha256_bad.is_some(),
-            self.sha256_good
-                .as_ref()
-                .is_some_and(|f| f.contains_digest(digest)),
+            hit(&self.sha256_good),
+            hit(&self.sha256_sighted_hostile),
+            hit(&self.sha256_sighted_suspicious),
         )
     }
 
@@ -258,20 +316,44 @@ impl Lookup {
     }
 }
 
-/// The decision rule, shared by both kinds:
-/// - in both sets → [`Decision::Conflicted`] (contradictory; trust neither, scan);
-/// - bad only → [`Decision::KnownBad`] (flag and scan);
-/// - good only, *and* the bad channel is loaded to veto it → [`Decision::Skip`];
+/// The decision rule, shared by both kinds. WORST POOL WINS:
+/// - claimed by any adverse tier AND blessed → [`Decision::Conflicted`]
+///   (contradictory; trust neither, scan);
+/// - claimed by one or more adverse tiers → the worst of them, i.e.
+///   `bad` > `sighted-hostile` > `sighted-suspicious`;
+/// - blessed and claimed by nothing, *and* the bad channel is loaded to veto
+///   it → [`Decision::Skip`];
 /// - otherwise (incl. a good hit with no bad channel) → [`Decision::Unknown`].
-const fn resolve(is_bad: bool, bad_loaded: bool, is_good: bool) -> Decision {
-    if is_bad && is_good {
-        Decision::Conflicted
-    } else if is_bad {
-        Decision::KnownBad
-    } else if is_good && bad_loaded {
-        Decision::Skip
+///
+/// The weakest adverse tier is enough to withhold a skip. A lone predicted
+/// citation cannot convict — that is why it is not `bad` — but a bless means
+/// "do not look at this at all", and one outside voice is ample reason to look.
+///
+/// `bad_loaded` gates the skip and the other tiers deliberately do not: the bad
+/// channel is the revocation path, so a bundle missing it cannot be trusted to
+/// have vetoed anything. A missing `sighted` file is a bundle from before those
+/// tiers existed, which is not the same failure.
+const fn resolve(
+    is_bad: bool,
+    bad_loaded: bool,
+    is_good: bool,
+    is_sighted_hostile: bool,
+    is_sighted_suspicious: bool,
+) -> Decision {
+    let adverse = if is_bad {
+        Some(Decision::KnownBad)
+    } else if is_sighted_hostile {
+        Some(Decision::SightedHostile)
+    } else if is_sighted_suspicious {
+        Some(Decision::SightedSuspicious)
     } else {
-        Decision::Unknown
+        None
+    };
+    match (adverse, is_good) {
+        (Some(_), true) => Decision::Conflicted,
+        (Some(worst), false) => worst,
+        (None, true) if bad_loaded => Decision::Skip,
+        (None, _) => Decision::Unknown,
     }
 }
 
@@ -281,6 +363,7 @@ const fn resolve(is_bad: bool, bad_loaded: bool, is_good: bool) -> Decision {
 struct BloomStats {
     skipped: AtomicU32,
     flagged: AtomicU32,
+    sighted: AtomicU32,
     conflicted: AtomicU32,
     unscanned: AtomicU32,
 }
@@ -288,6 +371,7 @@ struct BloomStats {
 static STATS: BloomStats = BloomStats {
     skipped: AtomicU32::new(0),
     flagged: AtomicU32::new(0),
+    sighted: AtomicU32::new(0),
     conflicted: AtomicU32::new(0),
     unscanned: AtomicU32::new(0),
 };
@@ -299,6 +383,12 @@ pub struct BloomCounts {
     pub skipped: u32,
     /// Known-bad artifacts flagged (and still analyzed).
     pub flagged: u32,
+    /// Artifacts matched only by an outside threat-intelligence claim (and
+    /// still analyzed). Counted apart from [`Self::flagged`] because the two
+    /// answer different questions: how often our own catalogue fired, versus
+    /// how often somebody else's did. Both hostile and suspicious sightings
+    /// land here; the wire `bloom` field carries the finer split.
+    pub sighted: u32,
     /// Artifacts found in both good and bad (should never happen).
     pub conflicted: u32,
     /// Artifacts left unscanned in fast mode (in neither set).
@@ -309,7 +399,7 @@ impl BloomCounts {
     /// True when no bloom decisions were recorded (nothing to report).
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.skipped == 0 && self.flagged == 0 && self.conflicted == 0 && self.unscanned == 0
+        self.skipped == 0 && self.flagged == 0 && self.sighted == 0 && self.conflicted == 0 && self.unscanned == 0
     }
 }
 
@@ -320,6 +410,7 @@ pub(crate) fn record(decision: Decision, unscanned: bool) {
     let counter = match decision {
         Decision::Skip => &STATS.skipped,
         Decision::KnownBad => &STATS.flagged,
+        Decision::SightedHostile | Decision::SightedSuspicious => &STATS.sighted,
         Decision::Conflicted => &STATS.conflicted,
         Decision::Unknown if unscanned => &STATS.unscanned,
         Decision::Unknown => return,
@@ -333,6 +424,7 @@ pub fn counts() -> BloomCounts {
     BloomCounts {
         skipped: STATS.skipped.load(Ordering::Relaxed),
         flagged: STATS.flagged.load(Ordering::Relaxed),
+        sighted: STATS.sighted.load(Ordering::Relaxed),
         conflicted: STATS.conflicted.load(Ordering::Relaxed),
         unscanned: STATS.unscanned.load(Ordering::Relaxed),
     }
@@ -421,6 +513,104 @@ mod tests {
         let mut d = [0u8; 32];
         d[0] = tag;
         d
+    }
+
+    /// Publish an arbitrary tier mix through the real producer path, so the
+    /// on-disk round trip (including `good − everything`) is exercised.
+    fn publish_labelled(dir: &Path, rows: &[(crate::bloom::Label, Record)]) {
+        let mut sets = crate::bloom::KeySets::default();
+        for (label, r) in rows {
+            sets.insert(*label, r.clone());
+        }
+        for f in sets.into_filters(1e-9) {
+            let path = dir.join(format!("{}.adbl", f.artifact_stem()));
+            std::fs::write(path, f.to_bytes()).expect("write filter");
+        }
+    }
+
+    /// Worst pool wins, and the weakest adverse tier is enough to deny a skip.
+    #[test]
+    fn worst_pool_wins_across_tiers() {
+        use crate::bloom::Label;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (bad, hostile, suspicious, blessed) = (sha(1), sha(2), sha(3), sha(4));
+        let rec = |d: [u8; 32]| Record {
+            purl: None,
+            sha256: Some(d),
+        };
+        publish_labelled(
+            tmp.path(),
+            &[
+                // Each of these is ALSO blessed: the good tier must lose every
+                // time, at build time and at query time both.
+                (Label::Good, rec(bad)),
+                (Label::Bad, rec(bad)),
+                (Label::Good, rec(hostile)),
+                (Label::SightedHostile, rec(hostile)),
+                (Label::Good, rec(suspicious)),
+                (Label::SightedSuspicious, rec(suspicious)),
+                (Label::Good, rec(blessed)),
+            ],
+        );
+
+        let lk = Lookup::load_from(tmp.path());
+        assert_eq!(lk.decide_sha256(&bad), Decision::KnownBad);
+        assert_eq!(lk.decide_sha256(&hostile), Decision::SightedHostile);
+        assert_eq!(
+            lk.decide_sha256(&suspicious),
+            Decision::SightedSuspicious,
+            "a lone outside citation must still deny the skip"
+        );
+        assert_eq!(lk.decide_sha256(&blessed), Decision::Skip);
+    }
+
+    /// Ordering when one key is claimed by several tiers at once — which
+    /// build-time subtraction prevents within a bundle, but file skew does not.
+    #[test]
+    fn resolve_takes_the_worst_claim() {
+        // bad outranks both sighted tiers; hostile outranks suspicious.
+        assert_eq!(resolve(true, true, false, true, true), Decision::KnownBad);
+        assert_eq!(
+            resolve(false, true, false, true, true),
+            Decision::SightedHostile
+        );
+        assert_eq!(
+            resolve(false, true, false, false, true),
+            Decision::SightedSuspicious
+        );
+        // A bless beside any claim is the contradiction, never a skip.
+        assert_eq!(resolve(false, true, true, false, true), Decision::Conflicted);
+        assert_eq!(resolve(false, true, true, true, false), Decision::Conflicted);
+        // Blessed and unclaimed, with the revocation channel present.
+        assert_eq!(resolve(false, true, true, false, false), Decision::Skip);
+        // ...and withheld without it.
+        assert_eq!(
+            resolve(false, false, true, false, false),
+            Decision::Unknown,
+            "a bless with no bad channel to veto it is still withheld"
+        );
+    }
+
+    /// Merging two keys keeps the worst, and never resolves back to a skip.
+    #[test]
+    fn merge_keeps_the_worst_of_two_keys() {
+        assert_eq!(
+            Decision::SightedSuspicious.merge(Decision::SightedHostile),
+            Decision::SightedHostile
+        );
+        assert_eq!(
+            Decision::SightedHostile.merge(Decision::KnownBad),
+            Decision::KnownBad
+        );
+        assert_eq!(
+            Decision::Unknown.merge(Decision::SightedSuspicious),
+            Decision::SightedSuspicious
+        );
+        assert_eq!(
+            Decision::Skip.merge(Decision::SightedSuspicious),
+            Decision::Conflicted,
+            "one key blessed and the other cited is a contradiction, not a skip"
+        );
     }
 
     #[test]

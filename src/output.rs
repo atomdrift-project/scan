@@ -435,6 +435,7 @@ pub(crate) fn terminal_hash_line(sha256: &str, bloom: Option<BloomMark>) -> Opti
     let p = palette();
     let (glyph, trailer) = match bloom {
         Some(BloomMark::KnownBad) => ("\u{1f6a9}", String::new()), // 🚩
+        Some(BloomMark::Sighted) => ("\u{1f4e1}", String::new()), // 📡
         Some(BloomMark::Conflicted) => ("\u{1f3f4}", String::new()), // 🏴
         Some(BloomMark::KnownGood) => ("\u{1f9ec}", format!("  {}", fg(p.benign, "\u{2713}"))),
         None => ("\u{1f9ec}", String::new()), // 🧬
@@ -850,6 +851,11 @@ pub enum BloomMark {
     KnownGood,
     /// Matched the known-bad set — 🚩.
     KnownBad,
+    /// Matched an outside threat-intelligence claim rather than a measurement
+    /// of ours — 📡. Marked apart from [`Self::KnownBad`] because the two say
+    /// different things: one is what we found, the other is what somebody else
+    /// reported. Still scanned, exactly as known-bad is.
+    Sighted,
     /// In both the good and bad sets — 🏴; treated as known-bad, still scanned.
     Conflicted,
 }
@@ -864,16 +870,20 @@ impl BloomMark {
         match decision {
             crate::bloom_repo::Decision::Skip => Some(Self::KnownGood),
             crate::bloom_repo::Decision::KnownBad => Some(Self::KnownBad),
+            crate::bloom_repo::Decision::SightedHostile
+            | crate::bloom_repo::Decision::SightedSuspicious => Some(Self::Sighted),
             crate::bloom_repo::Decision::Conflicted => Some(Self::Conflicted),
             crate::bloom_repo::Decision::Unknown => None,
         }
     }
 
-    /// The glyph identifying this status: ✓ known-good, 🚩 known-bad, 🏴 conflicted.
+    /// The glyph identifying this status: ✓ known-good, 🚩 known-bad,
+    /// 📡 sighted by outside intelligence, 🏴 conflicted.
     const fn glyph(self) -> &'static str {
         match self {
             Self::KnownGood => "\u{2713}",   // ✓
             Self::KnownBad => "\u{1f6a9}",   // 🚩
+            Self::Sighted => "\u{1f4e1}",    // 📡
             Self::Conflicted => "\u{1f3f4}", // 🏴
         }
     }
@@ -884,7 +894,9 @@ impl BloomMark {
         match self {
             Self::KnownGood => p.benign,
             Self::KnownBad => p.hostile,
-            Self::Conflicted => p.warning,
+            // Warning, not hostile: an outside citation is somebody's claim,
+            // and this scan has not confirmed it.
+            Self::Sighted | Self::Conflicted => p.warning,
         }
     }
 
@@ -904,6 +916,7 @@ impl BloomMark {
         match self {
             Self::KnownGood => "known-good",
             Self::KnownBad => "known-bad",
+            Self::Sighted => "sighted",
             Self::Conflicted => "conflicted",
         }
     }
