@@ -337,10 +337,9 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 # tops out at 0.26.11 — so this patch is load-bearing for resolution, not only
 # for the fix, and cleave/filefacts carry an identical block for their own
 # standalone builds. Remove all three once a release carries it.
-tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
-tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 
 
 [patch."https://github.com/tstromberg/dmgwiz.git"]
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
-
