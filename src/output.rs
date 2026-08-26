@@ -418,6 +418,128 @@ pub(crate) fn terminal_interpretation(
     })
 }
 
+/// One concise identity claim beneath the artifact name. The ID-card glyph
+/// gives this optional line the same visual gutter as artifact and hash lines.
+pub(crate) fn terminal_identity_line(identity: &str) -> Option<String> {
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return None;
+    }
+    Some(if colored::control::SHOULD_COLORIZE.should_colorize() {
+        format!(" \u{1faaA} {}", fg(palette().header_path, identity)) // 🪪
+    } else {
+        format!("   {identity}")
+    })
+}
+
+/// One finding in the artifact-level terminal summary.
+pub(crate) struct TerminalTrait {
+    pub(crate) criticality: cleave::Criticality,
+    pub(crate) description: String,
+    pub(crate) location: String,
+}
+
+fn truncate_terminal_text(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len <= width {
+        return text.to_string();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    text.chars()
+        .take(width - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+fn truncate_terminal_location(text: &str, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width {
+        return text.to_string();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let head = (width - 1) / 2;
+    let tail = width - 1 - head;
+    chars[..head]
+        .iter()
+        .copied()
+        .chain(std::iter::once('…'))
+        .chain(chars[chars.len() - tail..].iter().copied())
+        .collect()
+}
+
+fn severity_dots(criticality: cleave::Criticality) -> String {
+    let dots = match criticality {
+        cleave::Criticality::Hostile => "●●●",
+        cleave::Criticality::Suspicious => "●● ",
+        cleave::Criticality::Notable => "●  ",
+        _ => "·  ",
+    };
+    if !colored::control::SHOULD_COLORIZE.should_colorize() {
+        return dots.to_string();
+    }
+    match criticality {
+        cleave::Criticality::Hostile => cleave::theme::paint_hostile(dots).to_string(),
+        cleave::Criticality::Suspicious => cleave::theme::paint_suspicious(dots).to_string(),
+        cleave::Criticality::Notable => cleave::theme::paint_notable(dots).to_string(),
+        cleave::Criticality::Baseline => cleave::theme::paint_baseline(dots).to_string(),
+        _ => cleave::theme::paint_component(dots).to_string(),
+    }
+}
+
+/// Render at most three globally-curated traits as a compact aligned grid.
+/// Severity is encoded twice (dot count and color), while the evidence anchor
+/// sits in a quiet right column for fast triage and copy/paste.
+pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usize) -> String {
+    if traits.is_empty() {
+        return String::new();
+    }
+
+    // Keep the reading measure composed on very wide terminals, but respect a
+    // narrow terminal so these rows never become an accidental second line.
+    let width = terminal_width.min(100);
+    let fixed = 6usize; // leading space + 3 dots + 2-space gutter
+    let available = width.saturating_sub(fixed);
+    let max_location = traits
+        .iter()
+        .map(|t| t.location.chars().count())
+        .max()
+        .unwrap_or(0);
+    let location_width = if available >= 28 && max_location > 0 {
+        max_location.min(36).min(available.saturating_sub(20))
+    } else {
+        0
+    };
+    let location_gap = usize::from(location_width > 0) * 2;
+    let description_width = available.saturating_sub(location_width + location_gap);
+    let color = colored::control::SHOULD_COLORIZE.should_colorize();
+    let p = palette();
+
+    traits
+        .iter()
+        .take(3)
+        .map(|t| {
+            let description = truncate_terminal_text(&t.description, description_width);
+            let dots = severity_dots(t.criticality);
+            if location_width == 0 {
+                return format!(" {dots}  {description}");
+            }
+            let location = truncate_terminal_location(&t.location, location_width);
+            let padding = " ".repeat(description_width.saturating_sub(description.chars().count()));
+            let location = if color {
+                fg(p.dim, &location)
+            } else {
+                location
+            };
+            format!(" {dots}  {description}{padding}  {location}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The card's identity line: a glyph, then the full SHA-256 (copy-able for
 /// lookups) in the dimmest ink on screen. The glyph carries the bloom verdict —
 /// 🧬 ordinarily, 🚩 known-bad, 🏴 conflicted — because the SHA-256 is what the
@@ -510,42 +632,77 @@ pub(crate) fn terminal_artifact_line(
     }
 }
 
-/// A dim subtitle sitting under an archive banner: ` 8 hostile · 1 suspicious
-/// inside` — the tally of independently-scanned packages the archive carried,
-/// so the headline verdict is grounded in a count before the per-package cards
-/// spell each one out. Empty when nothing notable was found inside.
-pub(crate) fn terminal_inside_summary(hostile: usize, suspicious: usize, clean: usize) -> String {
-    let mut parts = Vec::new();
-    if hostile > 0 {
-        parts.push((format!("{hostile} hostile"), Classification::Hostile));
-    }
-    if suspicious > 0 {
-        parts.push((
-            format!("{suspicious} suspicious"),
-            Classification::Suspicious,
-        ));
-    }
-    if clean > 0 {
-        parts.push((format!("{clean} clean"), Classification::Benign));
-    }
-    if parts.is_empty() {
-        return String::new();
-    }
+/// Header for one externally fetched artifact nested beneath the file that
+/// referenced it: `↳ HOSTILE 99% · URL`. The locator gets its own aligned line
+/// so a long URL never pushes the relationship or verdict out of view.
+pub(crate) fn terminal_reference_heading(
+    classification: &Classification,
+    probability: f32,
+    subject: &str,
+) -> String {
+    let word = match classification {
+        Classification::Hostile => "HOSTILE",
+        Classification::Suspicious => "SUSPECT",
+        Classification::Benign => "BENIGN",
+    };
+    let pct = format!("{:.0}%", probability * 100.0);
     if colored::control::SHOULD_COLORIZE.should_colorize() {
         let p = palette();
-        let body = parts
-            .iter()
-            .map(|(text, class)| fg(class_color(class), text))
-            .collect::<Vec<_>>()
-            .join(&format!(" {} ", fg(p.very_dim, "\u{00b7}")));
-        format!(" {body} {}", fg(p.dim, "inside"))
+        format!(
+            "  ↳ {} {} {} {}",
+            fg_bold(class_color(classification), word),
+            fg(p.dim, &pct),
+            fg(p.very_dim, "·"),
+            fg(p.dim, subject),
+        )
     } else {
-        let body = parts
-            .iter()
-            .map(|(text, _)| text.as_str())
-            .collect::<Vec<_>>()
-            .join(" \u{00b7} ");
-        format!(" {body} inside")
+        format!("  ↳ {word} {pct} · {subject}")
+    }
+}
+
+/// Non-graded counterpart for a fetched/registry branch.
+pub(crate) fn terminal_reference_status_heading(status: &str, subject: &str) -> String {
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
+        let p = palette();
+        format!(
+            "  ↳ {} {} {}",
+            fg_bold(p.warning, status),
+            fg(p.very_dim, "·"),
+            fg(p.dim, subject),
+        )
+    } else {
+        format!("  ↳ {status} · {subject}")
+    }
+}
+
+/// The fetched locator as a secondary identity line in the nested branch.
+pub(crate) fn terminal_reference_locator(locator: &str) -> String {
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
+        format!("    {}", fg_bold(palette().path_name, locator))
+    } else {
+        format!("    {locator}")
+    }
+}
+
+/// Full hash plus the fetched artifact's type and size, aligned with the nested
+/// locator and provenance lines.
+pub(crate) fn terminal_reference_hash(sha256: &str, file_type: &str, size: u64) -> String {
+    let mut meta = file_type.to_uppercase();
+    let size = human_size(size);
+    if !size.is_empty() {
+        meta.push_str(&format!(" · {size}"));
+    }
+    let hash = terminal_hash_line(sha256, None)
+        .unwrap_or_default()
+        .trim_start()
+        .to_string();
+    if meta.is_empty() {
+        return format!("    {hash}");
+    }
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
+        format!("    {hash}  {}", fg(palette().dim, &format!("· {meta}")))
+    } else {
+        format!("    {hash}  · {meta}")
     }
 }
 
@@ -1372,6 +1529,37 @@ mod tests {
         assert_eq!(human_size(352), "352B");
         assert_eq!(human_size(5 * 1024 + 400), "5.4KB");
         assert_eq!(human_size(44 * 1024 * 1024 / 10 * 10), "44.0MB");
+    }
+
+    #[test]
+    fn terminal_trait_grid_is_three_rows_and_keeps_location_tail() {
+        let traits = [
+            TerminalTrait {
+                criticality: cleave::Criticality::Hostile,
+                description: "Remote terminal agent".to_string(),
+                location: "very-long-hash-named-member-that-needs-truncation.py:114".to_string(),
+            },
+            TerminalTrait {
+                criticality: cleave::Criticality::Suspicious,
+                description: "Hidden execution".to_string(),
+                location: "runner.py:9".to_string(),
+            },
+            TerminalTrait {
+                criticality: cleave::Criticality::Notable,
+                description: "Third trait".to_string(),
+                location: "manifest.json".to_string(),
+            },
+            TerminalTrait {
+                criticality: cleave::Criticality::Notable,
+                description: "Must not render".to_string(),
+                location: "fourth.txt".to_string(),
+            },
+        ];
+        let rendered = terminal_trait_rows(&traits, 72);
+        assert_eq!(rendered.lines().count(), 3);
+        assert!(rendered.lines().next().unwrap().contains("…"));
+        assert!(rendered.lines().next().unwrap().ends_with("py:114"));
+        assert!(!rendered.contains("Must not render"));
     }
 
     #[test]
