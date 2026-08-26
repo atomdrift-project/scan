@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -131,6 +131,23 @@ fn charge_total_budget(fetches: usize, bytes: u64) {
     let _ = TOTAL_FETCH_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_sub(bytes))
     });
+}
+
+/// Describe the count budget that can clip one fetch class. The per-file cap
+/// is normally the limiting value; a smaller process-wide remainder takes
+/// precedence so the notice names the budget that actually stopped the work.
+fn fetch_count_budget_notice(
+    per_file_flag: &str,
+    per_file_limit: usize,
+    total_remaining: usize,
+) -> String {
+    if total_remaining < per_file_limit {
+        format!(
+            "Skipping remaining fetches, hit fetch budget (--fetch-max-total-fetches={total_remaining})"
+        )
+    } else {
+        format!("Skipping remaining fetches, hit fetch budget ({per_file_flag}={per_file_limit})")
+    }
 }
 
 /// Count the live network work represented by a batch. Cache hits and
@@ -662,6 +679,80 @@ fn is_version_shaped(component: &str) -> bool {
             .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Whether a discovered URL has a real network host. URL extraction also sees
+/// relative paths, malformed authority strings, and single-label local names
+/// such as `wpad`; none can identify a public download host. IP literals are
+/// valid, while DNS names must have at least two labels.
+fn valid_discovered_url_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return public_ip(ip);
+    }
+
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.len() <= 253
+        && host.contains('.')
+        && host.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 63
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
+}
+
+/// Whether an IP literal is publicly routable enough to justify a discovered
+/// fetch. This excludes RFC1918/private space and the other special-use ranges
+/// that describe the scanner's host, a lab network, or documentation rather
+/// than an external payload service.
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    if let std::net::IpAddr::V6(ipv6) = ip
+        && let Some(ipv4) = ipv6.to_ipv4()
+    {
+        return public_ip(std::net::IpAddr::V4(ipv4));
+    }
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+                && !ip.is_multicast()
+                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                && !(octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                && !(octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                && !(octets[0] == 198 && (18..=19).contains(&octets[1]))
+                && !(octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                && octets[0] < 224
+        }
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && (segments[0] & 0xfe00) != 0xfc00
+                && (segments[0] & 0xffc0) != 0xfe80
+                && (segments[0] & 0xffc0) != 0xfec0
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
 fn looks_like_dropper_download_url(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once("://") else {
         return false;
@@ -1014,6 +1105,14 @@ pub(crate) fn orchestrate(
                         let RefLocator::Url(url) = &r.locator else {
                             return true;
                         };
+                        if !valid_discovered_url_host(url) {
+                            tracing::debug!(
+                                url = %url,
+                                source = %r.source,
+                                "invalid or local URL host; fetch skipped"
+                            );
+                            return false;
+                        }
                         let boilerplate = hosts::publisher_controlled(url)
                             || hosts::discovery_exception(url);
                         if boilerplate {
@@ -1128,6 +1227,12 @@ pub(crate) fn orchestrate(
                     .cloned()
                     .partition(|r| r.kind == RefKind::UrlFetch);
 
+                let dep_budget_notice = fetch_count_budget_notice(
+                    "--fetch-max-file-fetches",
+                    policy.max_file_fetches,
+                    TOTAL_FETCH_COUNT.load(Ordering::Relaxed),
+                );
+
                 // Mark the to-fetch set in flight, then fetch. The callback fires as
                 // each download lands (from a pool worker, so it's `Sync`), flipping
                 // that row to "analyzing" the moment its bytes arrive rather than when
@@ -1168,6 +1273,11 @@ pub(crate) fn orchestrate(
                         .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
                     max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
                 };
+                let url_budget_notice = fetch_count_budget_notice(
+                    "--fetch-max-urls",
+                    policy.max_url_fetches,
+                    TOTAL_FETCH_COUNT.load(Ordering::Relaxed),
+                );
                 let url_fetched = fetch_references_with(
                     &url_selected,
                     &source_sha,
@@ -1209,7 +1319,12 @@ pub(crate) fn orchestrate(
                 // exactly one record per reference in declaration order.
                 for (r, rec) in selected.iter().zip(&fetched) {
                     reporter.landed(r, rec);
-                    reporter.report(rec);
+                    let budget_notice = if r.kind == RefKind::UrlFetch {
+                        &url_budget_notice
+                    } else {
+                        &dep_budget_notice
+                    };
+                    reporter.report(rec, Some(budget_notice));
                 }
 
                 // Benchmark escape hatch: stop after the network phase, before the
@@ -1437,20 +1552,27 @@ pub(crate) fn orchestrate(
 /// Where the fetch phase's progress is surfaced.
 ///
 /// `Off` — machine output (JSON/tiny/server): nothing is printed; the edges ride
-/// the report. `Stream` — the append-only fetch log, printed above any active
-/// scan progress bar (a multi-file scan, a pipeline); reveals each reference
-/// lazily as it completes. `Tree` — the live, in-place dependency tree that
-/// takes over stderr for an interactive single-artifact scan (see
+/// the report. `Stream` — the fetch work is folded into the active scan bar; only
+/// actionable per-reference outcomes are logged above it. `Tree` — the live,
+/// in-place dependency tree that takes over stderr for an interactive
+/// single-artifact scan (see
 /// [`crate::deptree`]), listing the whole known set up front and animating each
 /// row through its lifecycle.
 ///
-/// The methods take `&self` (the stream's header latch is atomic) so the fetch
-/// completion callback — invoked concurrently from fletch's pool — can share one
-/// reporter with the sequential orchestration.
+/// The methods take `&self` so the fetch completion callback — invoked
+/// concurrently from fletch's pool — can share one reporter with the sequential
+/// orchestration.
 enum Reporter {
     Off,
-    Stream { header: AtomicBool },
-    Tree(DepTree),
+    Stream {
+        external_dependencies: AtomicU32,
+        external_urls: AtomicU32,
+        budget_notice: AtomicBool,
+    },
+    Tree {
+        tree: DepTree,
+        budget_notice: std::sync::Mutex<Option<String>>,
+    },
 }
 
 impl Reporter {
@@ -1462,9 +1584,14 @@ impl Reporter {
         }
         DepTree::activate().map_or_else(
             || Self::Stream {
-                header: AtomicBool::new(false),
+                external_dependencies: AtomicU32::new(0),
+                external_urls: AtomicU32::new(0),
+                budget_notice: AtomicBool::new(false),
             },
-            Self::Tree,
+            |tree| Self::Tree {
+                tree,
+                budget_notice: std::sync::Mutex::new(None),
+            },
         )
     }
 
@@ -1473,19 +1600,36 @@ impl Reporter {
     /// declared in (package-relative path), shown per row so each dependency can
     /// be traced back to its declaring file.
     fn announce(&self, refs: &[Reference], source: &str) {
-        if let Self::Tree(tree) = self {
+        if let Self::Tree { tree, .. } = self {
             for r in refs {
                 tree.add(&locator_key(r), &dep_display_name(r), source);
             }
         }
     }
 
-    /// Mark the to-fetch set in flight (tree only).
+    /// Mark the to-fetch set in flight. The stream folds its counts into the
+    /// active scan bar; the tree animates each row in place.
     fn fetching(&self, refs: &[Reference]) {
-        if let Self::Tree(tree) = self {
-            for r in refs {
-                tree.set(&locator_key(r), DepState::Fetching);
+        match self {
+            Self::Stream {
+                external_dependencies,
+                external_urls,
+                ..
+            } => {
+                let urls = refs.iter().filter(|r| r.kind == RefKind::UrlFetch).count();
+                let dependencies = refs.len().saturating_sub(urls);
+                let dependencies_u32 = u32::try_from(dependencies).unwrap_or(u32::MAX);
+                let urls_u32 = u32::try_from(urls).unwrap_or(u32::MAX);
+                external_dependencies.fetch_add(dependencies_u32, Ordering::Relaxed);
+                external_urls.fetch_add(urls_u32, Ordering::Relaxed);
+                crate::engine::external_fetch_started(dependencies, urls);
             }
+            Self::Tree { tree, .. } => {
+                for r in refs {
+                    tree.set(&locator_key(r), DepState::Fetching);
+                }
+            }
+            Self::Off => {}
         }
     }
 
@@ -1495,36 +1639,63 @@ impl Reporter {
     /// live per completion and again authoritatively after the batch; both are
     /// idempotent.
     fn landed(&self, r: &Reference, rec: &FetchRecord) {
-        if let Self::Tree(tree) = self {
-            tree.set(&locator_key(r), landed_state(rec));
+        if let Self::Tree { tree, .. } = self {
+            if matches!(rec.outcome, Outcome::BudgetExceeded) {
+                tree.set(&locator_key(r), DepState::Hidden);
+            } else {
+                tree.set(&locator_key(r), landed_state(rec));
+            }
         }
     }
 
-    /// Print the streamed fetch line (stream only); the tree already moved this
-    /// row in [`Reporter::landed`].
+    /// Print an actionable streamed fetch line (stream only); successful fetches
+    /// are represented by the aggregate header and final summary. The tree
+    /// already moved this row in [`Reporter::landed`].
     ///
-    /// A plain cache hit says nothing a reader needs: no bytes crossed the
-    /// network and nothing is known about the artifact beyond what the scan
-    /// itself reports. On a warm cache those rows are nearly every row, burying
-    /// the ones that matter (`live`, `known`, `stale`, `fail`), so they are
-    /// dropped here. A bloom verdict relabels the row `known`, and that still
-    /// prints.
-    fn report(&self, rec: &FetchRecord) {
-        if let Self::Stream { header } = self {
-            if fetch_row(rec).1 == "cache" {
+    /// Successful rows are intentionally omitted; failures, skips, and pin
+    /// mismatches remain visible because they need attention.
+    fn report(&self, rec: &FetchRecord, budget_notice: Option<&str>) {
+        if matches!(rec.outcome, Outcome::BudgetExceeded) {
+            match self {
+                Self::Off => {}
+                Self::Stream {
+                    budget_notice: emitted,
+                    ..
+                } => {
+                    if !emitted.swap(true, Ordering::Relaxed) {
+                        tracing::debug!(
+                            message = budget_notice
+                                .unwrap_or("Skipping remaining fetches, hit fetch budget"),
+                            "fetch budget exceeded; remaining references skipped"
+                        );
+                    }
+                }
+                Self::Tree {
+                    budget_notice: stored,
+                    ..
+                } => {
+                    let mut guard = stored
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if guard.is_none() {
+                        *guard = budget_notice.map(str::to_owned);
+                    }
+                }
+            }
+            return;
+        }
+        if let Self::Stream { .. } = self {
+            if matches!(rec.outcome, Outcome::Ok) {
                 return;
             }
-            crate::engine::print_above_bar(|| {
-                fetch_header(header);
-                report_fetch(rec);
-            });
+            crate::engine::print_above_bar(|| report_fetch(rec));
         }
     }
 
     /// A payload finished analysis: settle its row to the final fetch glyph
     /// (tree only).
     fn analyzed(&self, r: &Reference, rec: &FetchRecord) {
-        if let Self::Tree(tree) = self {
+        if let Self::Tree { tree, .. } = self {
             tree.set(&locator_key(r), done_state(rec));
         }
     }
@@ -1541,11 +1712,10 @@ impl Reporter {
         }
         match self {
             Self::Off => {}
-            Self::Stream { header } => crate::engine::print_above_bar(|| {
-                fetch_header(header);
-                report_skip(r, reg, now, reason);
-            }),
-            Self::Tree(tree) => {
+            Self::Stream { .. } => {
+                crate::engine::print_above_bar(|| report_skip(r, reg, now, reason))
+            }
+            Self::Tree { tree, .. } => {
                 tree.add(&locator_key(r), &dep_display_name(r), "");
                 tree.set(&locator_key(r), skip_state(reg, now, reason));
             }
@@ -1558,22 +1728,29 @@ impl Reporter {
     fn finish(&self, records: &[FetchRecord]) {
         match self {
             Self::Off => {}
-            Self::Stream { header } => {
-                if header.load(Ordering::Relaxed) {
-                    report_summary(records);
+            Self::Stream {
+                external_dependencies,
+                external_urls,
+                ..
+            } => {
+                let dependencies = external_dependencies.swap(0, Ordering::Relaxed);
+                let urls = external_urls.swap(0, Ordering::Relaxed);
+                crate::engine::external_fetch_finished(dependencies as usize, urls as usize);
+            }
+            Self::Tree {
+                tree,
+                budget_notice,
+            } => {
+                tree.finish(&summary_line(records));
+                let message = budget_notice
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(message) = message {
+                    eprintln!("    {message}");
                 }
             }
-            Self::Tree(tree) => tree.finish(&summary_line(records)),
         }
-    }
-}
-
-/// Emit the streamed log's lazy header once, before its first row.
-fn fetch_header(header: &AtomicBool) {
-    if !header.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
-        );
     }
 }
 
@@ -2589,15 +2766,10 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Print the run's fetch summary to stderr (the streamed log's closing line).
-fn report_summary(records: &[FetchRecord]) {
-    eprintln!("{}", summary_line(records));
-}
-
 /// Tally the run's fetches into a one-line summary mirroring the progress bar's
 /// completion line: how many came live off the network vs. served from cache,
-/// how many failed, and the total bytes pulled. Shared by the streamed log and
-/// the live tree, which prints it beneath the settled dependency rows.
+/// how many failed, and the total bytes pulled. Used by the live tree, which
+/// prints it beneath the settled dependency rows.
 fn summary_line(records: &[FetchRecord]) -> String {
     let mut live = 0u32;
     let mut cached = 0u32;
@@ -3566,6 +3738,18 @@ mod tests {
     }
 
     #[test]
+    fn budget_notice_names_the_limiting_count_flag() {
+        assert_eq!(
+            fetch_count_budget_notice("--fetch-max-urls", 4, usize::MAX),
+            "Skipping remaining fetches, hit fetch budget (--fetch-max-urls=4)"
+        );
+        assert_eq!(
+            fetch_count_budget_notice("--fetch-max-file-fetches", 100, 7),
+            "Skipping remaining fetches, hit fetch budget (--fetch-max-total-fetches=7)"
+        );
+    }
+
+    #[test]
     fn go_pseudo_versions_date_themselves_without_a_lookup() {
         // Fixed points spanning the civil-days arithmetic: the epoch itself, a
         // century/leap-rule boundary, a leap day, and both year edges. These
@@ -3842,6 +4026,37 @@ mod tests {
             assert!(
                 !looks_like_dropper_download_url(url),
                 "site/API-shaped URL was kept: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovered_urls_need_a_domain_or_ip_host() {
+        for url in ["https://example.com/stage.sh", "http://8.8.8.8/payload.bin"] {
+            assert!(
+                valid_discovered_url_host(url),
+                "valid host was rejected: {url}"
+            );
+        }
+        for url in [
+            "http://wpad/wpad.dat",
+            "http://localhost/payload.bin",
+            "http://%@:%u/rfc2585/%@.crl",
+            "http://10.0.0.1/payload.bin",
+            "http://100.64.0.1/payload.bin",
+            "http://172.16.0.1/payload.bin",
+            "http://192.168.1.1/payload.bin",
+            "http://192.0.2.1/payload.bin",
+            "http://127.0.0.1/payload.bin",
+            "http://[::1]/payload.bin",
+            "http://[fd00::1]/payload.bin",
+            "http://[fe80::1]/payload.bin",
+            "/relative/payload.bin",
+            "relative/payload.bin",
+        ] {
+            assert!(
+                !valid_discovered_url_host(url),
+                "invalid or local host was accepted: {url}"
             );
         }
     }

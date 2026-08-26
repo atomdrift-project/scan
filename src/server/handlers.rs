@@ -3696,7 +3696,8 @@ fn v1_streamed(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
     // Progress frames name the package too, and a caller reading the stream
     // correlates on the same field the decision carries. An upload has no
-    // coordinate at all, so there the digest-derived subject stands.
+    // coordinate at all, so identify it as sha256 rather than putting the
+    // digest in the purl field.
     let labelled_locator = asked.clone().unwrap_or_else(|| subject.clone());
     let labelled = subject.clone();
     tokio::spawn(async move {
@@ -3715,8 +3716,14 @@ fn v1_streamed(
                         "elapsed_ms": crate::duration_ms(request_start.elapsed()),
                         "phase": v1_phase_of(&state, &subject),
                     });
-                    frame[if is_url { "url" } else { "purl" }] =
-                        serde_json::Value::String(labelled_locator.clone());
+                    let field = if is_url {
+                        "url"
+                    } else if asked.is_some() {
+                        "purl"
+                    } else {
+                        "sha256"
+                    };
+                    frame[field] = serde_json::Value::String(labelled_locator.clone());
                     // A caller that has gone away shows up here as a closed
                     // channel, which ends the stream. The analysis keeps going:
                     // it is not this connection's to lose.

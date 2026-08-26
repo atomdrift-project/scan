@@ -1738,6 +1738,8 @@ fn term_cols() -> usize {
 /// a clone independent of the `Progress` handle the scan loop borrows.
 struct Inner {
     analyzed: AtomicU32,
+    external_dependencies: AtomicU32,
+    external_urls: AtomicU32,
     total: u32,
     start: Instant,
     /// Elapsed millis at the most recent `increment`; lets `render` measure how
@@ -1759,18 +1761,17 @@ struct Inner {
 }
 
 /// The active terminal progress bar, published so incidental stderr writers —
-/// chiefly the fetch progress block (`report_fetch`/`report_skip` and their
-/// header) — can print *above* the bar instead of grafting onto or racing its
-/// `\r`-parked line. Only the single-process terminal CLI ever installs a bar;
+/// chiefly actionable fetch failures/skips — can print *above* the bar instead
+/// of grafting onto or racing its `\r`-parked line. Only the single-process
+/// terminal CLI ever installs a bar;
 /// server/JSON modes run none and leave this `None`. A `Weak` so a finished bar
 /// is never kept alive; [`print_above_bar`] upgrades it per call.
 static ACTIVE_BAR: Mutex<Option<Weak<Inner>>> = Mutex::new(None);
 
 /// Whether an interactive scan progress bar currently owns the terminal. The
 /// live dependency tree ([`crate::deptree`]) defers to it: a multi-file scan's
-/// bar keeps the streamed fetch log (which coexists with the bar via
-/// [`print_above_bar`]), so only a single-artifact scan — where no bar is live —
-/// takes over stderr with an in-place tree.
+/// bar owns external-fetch status, so only a single-artifact scan — where no bar
+/// is live — takes over stderr with an in-place tree.
 pub(crate) fn bar_active() -> bool {
     ACTIVE_BAR
         .lock()
@@ -1778,6 +1779,56 @@ pub(crate) fn bar_active() -> bool {
         .as_ref()
         .and_then(Weak::upgrade)
         .is_some()
+}
+
+/// Add one file's active external-reference work to the main scan bar. The
+/// counters are process-wide only while that bar is alive; concurrent files
+/// contribute to the same compact status note.
+pub(crate) fn external_fetch_started(dependencies: usize, urls: usize) {
+    let bar = ACTIVE_BAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(Weak::upgrade);
+    let Some(inner) = bar else { return };
+    let dependencies = u32::try_from(dependencies).unwrap_or(u32::MAX);
+    let urls = u32::try_from(urls).unwrap_or(u32::MAX);
+    inner
+        .external_dependencies
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_add(dependencies))
+        })
+        .ok();
+    inner
+        .external_urls
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_add(urls))
+        })
+        .ok();
+}
+
+/// Remove one file's external-reference work from the main scan bar.
+pub(crate) fn external_fetch_finished(dependencies: usize, urls: usize) {
+    let bar = ACTIVE_BAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(Weak::upgrade);
+    let Some(inner) = bar else { return };
+    let dependencies = u32::try_from(dependencies).unwrap_or(u32::MAX);
+    let urls = u32::try_from(urls).unwrap_or(u32::MAX);
+    inner
+        .external_dependencies
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(dependencies))
+        })
+        .ok();
+    inner
+        .external_urls
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(urls))
+        })
+        .ok();
 }
 
 /// Run `print` (which writes one or more *complete* newline-terminated lines to
@@ -1828,6 +1879,8 @@ impl Inner {
 
     fn render(&self) {
         let done = self.analyzed.load(Ordering::Relaxed);
+        let external_dependencies = self.external_dependencies.load(Ordering::Relaxed);
+        let external_urls = self.external_urls.load(Ordering::Relaxed);
         let elapsed = self.start.elapsed();
         let rate = f64::from(done) / elapsed.as_secs_f64().max(0.001);
         let eta = f64::from(self.total - done) / rate.max(0.001);
@@ -1862,13 +1915,14 @@ impl Inner {
         let stalled_ms = elapsed
             .as_millis()
             .saturating_sub(u128::from(self.last_advance_ms.load(Ordering::Relaxed)));
-        let note = if (1..=TAIL_FILES).contains(&left) && stalled_ms >= TAIL_STALL_MS {
-            // Fixed visible prefix: 1 indent + spinner + space + bar + 2 spaces.
-            let used = 25 + stats.chars().count();
-            fit_notice(TAIL_MESSAGE, self.term_cols.saturating_sub(used + 1))
-        } else {
-            String::new()
-        };
+        let note_text = external_fetch_note(external_dependencies, external_urls).or_else(|| {
+            ((1..=TAIL_FILES).contains(&left) && stalled_ms >= TAIL_STALL_MS)
+                .then(|| TAIL_MESSAGE.to_string())
+        });
+        let used = 25 + stats.chars().count();
+        let note = note_text.map_or_else(String::new, |text| {
+            fit_notice(&text, self.term_cols.saturating_sub(used + 1))
+        });
 
         // `\x1b[K` erases to end of line — robustly clears a wider previous
         // frame (a longer ETA, or the notice once it's gone) without padding.
@@ -1886,6 +1940,28 @@ impl Inner {
             .draw_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+/// Compact status text for external work currently shared by the scan's
+/// concurrent workers. Keep it short enough to coexist with the file counter.
+fn external_fetch_note(dependencies: u32, urls: u32) -> Option<String> {
+    fn noun(count: u32, singular: &str, plural: &str) -> String {
+        format!("{count} {}", if count == 1 { singular } else { plural })
+    }
+
+    match (dependencies, urls) {
+        (0, 0) => None,
+        (0, urls) => Some(format!("fetching {}", noun(urls, "URL", "URLs"))),
+        (dependencies, 0) => Some(format!(
+            "fetching {}",
+            noun(dependencies, "dependency", "dependencies")
+        )),
+        (dependencies, urls) => Some(format!(
+            "fetching {} · {}",
+            noun(dependencies, "dependency", "dependencies"),
+            noun(urls, "URL", "URLs")
+        )),
     }
 }
 
@@ -2000,6 +2076,8 @@ impl Progress {
     pub(crate) fn new(total: u32) -> Self {
         let inner = Arc::new(Inner {
             analyzed: AtomicU32::new(0),
+            external_dependencies: AtomicU32::new(0),
+            external_urls: AtomicU32::new(0),
             total,
             start: Instant::now(),
             last_advance_ms: AtomicU64::new(0),
@@ -2008,8 +2086,9 @@ impl Progress {
             stopped: AtomicBool::new(false),
             draw_lock: Mutex::new(()),
         });
-        // Publish this bar so the fetch progress block can print above it (see
-        // `print_above_bar`). Overwrites any prior registration — the terminal
+        // Publish this bar so fetch status can join it and actionable failures
+        // can print above it (see `print_above_bar`). Overwrites any prior
+        // registration — the terminal
         // CLI runs one bar at a time — and is cleared on drop.
         *ACTIVE_BAR
             .lock()
@@ -2308,7 +2387,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             cleave::kill_all_rizin_groups();
             std::process::exit(130);
         }
-        eprintln!("\nInterrupted — finishing current file…");
+        crate::engine::print_above_bar(|| eprintln!("\nInterrupted — finishing current file…"));
         ctrlc_flag.store(true, Ordering::Relaxed);
     });
     // scan consumes only the compact projection of member nodes; let cleave
@@ -2715,6 +2794,12 @@ fn record_file_result(
             }
         }
         Err(e) => {
+            if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                // Ctrl-C makes in-flight cleave work return cancellation errors
+                // on every worker. Cancellation is expected control flow, not a
+                // failed file; keep it out of both the log and the error tally.
+                return;
+            }
             let msg = crate::tools::enrich_error(&e).unwrap_or_else(|| format!("{e:#}"));
             tracing::error!("error analyzing {}: {}", file_path.display(), msg);
             // A failed file still gets a line on stdout under `--format json`, so a
@@ -3392,7 +3477,7 @@ pub fn run_paths(
             cleave::kill_all_rizin_groups();
             std::process::exit(130);
         }
-        eprintln!("\nInterrupted — finishing current file…");
+        crate::engine::print_above_bar(|| eprintln!("\nInterrupted — finishing current file…"));
         ctrlc_flag.store(true, Ordering::Relaxed);
     });
 
@@ -6406,6 +6491,19 @@ mod card_render_tests {
         assert!(tail.starts_with('\u{2026}'));
         assert!(tail.ends_with("file.json"));
         assert_eq!(tail.chars().count(), 20);
+    }
+
+    #[test]
+    fn external_fetch_note_stays_compact_and_grammatical() {
+        assert_eq!(external_fetch_note(0, 0), None);
+        assert_eq!(
+            external_fetch_note(1, 1).as_deref(),
+            Some("fetching 1 dependency · 1 URL")
+        );
+        assert_eq!(
+            external_fetch_note(0, 2).as_deref(),
+            Some("fetching 2 URLs")
+        );
     }
 }
 
