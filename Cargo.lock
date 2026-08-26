@@ -323,6 +323,7 @@ dependencies = [
  "tract-linalg",
  "tract-onnx",
  "tree-sitter",
+ "unicode-width",
  "walkdir",
  "zstd",
 ]

@@ -2371,25 +2371,32 @@ fn discover_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Total detection rules resident in memory, folding in `bloom_rules` bloom
-/// signatures: YAML traits + composite rules + YARA rules + `bloom_rules`.
-/// `cleave::version_info()` loads (or reuses) the shared resources. Split out so
-/// the auto-update checkmark — which knows its bloom count without a
-/// [`ScanConfig`] — reports the same figure as the banner.
-pub(crate) fn detection_rule_count_from(bloom_rules: u64) -> u64 {
-    let info = cleave::version_info();
-    info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64 + bloom_rules
+/// The two distinct detection inventories shown in the banner. Bloom entries
+/// are SHA-256/PURL signatures; traits, composites, and YARA are actual rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetectionCounts {
+    pub(crate) hashes_and_purls: u64,
+    pub(crate) rules: u64,
 }
 
-/// Total detection rules resident in memory after resource load — YAML traits +
-/// composite rules + YARA rules + bloom signatures — for the scan banner. Reads
-/// already-loaded counts, so it adds no work. Shared by [`run`], [`run_paths`],
-/// and the `ps` subcommand so every banner reports the same figure.
-pub(crate) fn detection_rule_count(config: &ScanConfig) -> u64 {
-    let bloom_rules = config
+/// Detection inventory after resource load. `cleave::version_info()` loads (or
+/// reuses) shared resources; `hashes_and_purls` comes from the already-loaded
+/// Bloom repository.
+pub(crate) fn detection_counts_from(hashes_and_purls: u64) -> DetectionCounts {
+    let info = cleave::version_info();
+    DetectionCounts {
+        hashes_and_purls,
+        rules: info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64,
+    }
+}
+
+/// Detection inventory already resident in memory for the scan banner. Shared
+/// by [`run`], [`run_paths`], and `ps` so every scanner reports the same counts.
+pub(crate) fn detection_counts(config: &ScanConfig) -> DetectionCounts {
+    let hashes_and_purls = config
         .bloom()
         .map_or(0, crate::bloom_repo::Lookup::rule_count);
-    detection_rule_count_from(bloom_rules)
+    detection_counts_from(hashes_and_purls)
 }
 
 /// Run a scan against a file or directory tree.
@@ -2491,7 +2498,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     let tally = Tally::default();
     let stdout = Mutex::new(std::io::stdout());
     let progress = (is_terminal && files.len() > 1).then(|| {
-        crate::output::print_banner(detection_rule_count(config));
+        crate::output::print_banner(detection_counts(config));
         Progress::new(total)
     });
 
@@ -3552,7 +3559,7 @@ pub fn run_paths(
 
     let total = u32::try_from(files.len() + dir_files.len()).unwrap_or(u32::MAX);
     let progress = (is_terminal && total > 1).then(|| {
-        crate::output::print_banner(detection_rule_count(config));
+        crate::output::print_banner(detection_counts(config));
         Progress::new(total)
     });
 
@@ -3911,6 +3918,9 @@ fn terminal_identity_summary(report: &cleave::AnalysisReport, label: &str) -> Op
 }
 
 fn terminal_finding_path(path: &str) -> String {
+    if let Some(decoded) = decoded_region_display_path(path) {
+        return decoded;
+    }
     let path = collapse_decoded_dup(path);
     let leaf = path.rsplit(ARCHIVE_DELIMITER).next().unwrap_or(&path);
     let name = leaf.rsplit('/').next().unwrap_or(leaf);
@@ -3946,6 +3956,7 @@ fn terminal_finding_location(
 ) -> String {
     let by_id: std::collections::HashMap<u32, &cleave::FileAnalysis> =
         report.files.iter().map(|f| (f.id, f)).collect();
+    let primary_id = report.files.first().map(|f| f.id);
     if let Some(source) = file
         .composite_sources
         .get(finding.id.as_str())
@@ -3957,11 +3968,23 @@ fn terminal_finding_location(
         })
         && let Some(source_file) = by_id.get(&source.file)
     {
+        if Some(source_file.id) == primary_id {
+            return source
+                .line
+                .map_or_else(String::new, |line| format!("line {line}"));
+        }
         let mut location = terminal_finding_path(&source_file.path);
         if let Some(line) = source.line {
             location.push_str(&format!(":{line}"));
         }
         return location;
+    }
+
+    if Some(file.id) == primary_id {
+        return terminal_note_anchor(file, finding.id.as_str())
+            .map_or_else(String::new, |anchor| {
+                format!("line {}", anchor.trim_start_matches(':'))
+            });
     }
 
     let mut location = terminal_finding_path(&file.path);
@@ -4075,7 +4098,7 @@ fn render_terminal_context(
     member_evals: &MemberEvals,
 ) -> String {
     // The card frame, top-down: verdict rule → artifact → optional claimed
-    // identity → SHA-256 → optional model reason → one quiet breath → the three
+    // identity → SHA-256 → optional model reason → the three
     // strongest traits across the whole artifact. Plain (piped) output keeps the
     // same information as unframed grep-able lines.
     let root = report.files.first();
@@ -4149,7 +4172,6 @@ fn render_terminal_context(
         head.push('\n');
     } else if let Some(trailer) = crate::output::terminal_trailer(reasons) {
         // Without an LLM, keep the model's compact explanation in the same slot.
-        head.push(' ');
         head.push_str(&trailer);
         head.push('\n');
     }
@@ -4157,7 +4179,6 @@ fn render_terminal_context(
     let traits = terminal_top_traits(report);
     let body = crate::output::terminal_trait_rows(&traits, cleave::output::terminal_width());
     if !body.trim().is_empty() {
-        head.push('\n');
         head.push_str(&body);
     }
     // Flush ending: the next card (or the footer) supplies the separator.
@@ -4375,8 +4396,17 @@ fn render_archive_cards(
         out.push('\n');
     }
 
-    // ── One card per notable package, worst first ──
-    let render_card = |pkg: &Package| -> String {
+    // Decoded regions are children of the named artifact, not sibling packages.
+    // Give them a compact branch tree; real archive members retain the stronger
+    // package cards used for grab-bag archives.
+    let embedded_tree = notable.iter().all(|pkg| {
+        by_id
+            .get(&pkg.id)
+            .is_some_and(|file| decoded_region_display_path(&file.path).is_some())
+    });
+
+    // ── One independently notable child, worst first ──
+    let render_child = |pkg: &Package, last: bool| -> String {
         let file = by_id.get(&pkg.id);
         let name = file.map_or_else(String::new, |f| package_display_path(&f.path));
         let ptype = file.map(|f| f.file_type.as_str()).unwrap_or_default();
@@ -4396,16 +4426,23 @@ fn render_archive_cards(
             &traits,
             cleave::output::terminal_width().saturating_sub(2),
         );
-        let body = if rows.is_empty() {
-            String::new()
+        if embedded_tree {
+            crate::output::terminal_embedded_branch(
+                &pkg.decision.class,
+                &name,
+                ptype,
+                psize,
+                &rows,
+                last,
+            )
         } else {
-            format!("\n{rows}")
-        };
-        crate::output::terminal_card(&pkg.decision.class, &name, ptype, psize, &body)
+            crate::output::terminal_card(&pkg.decision.class, &name, ptype, psize, &rows)
+        }
     };
 
-    // The archive's own card leads when it earned one — its own hostility is the
-    // headline, the packages it carried are the detail.
+    // The root's own conclusion belongs directly beneath the root metadata in a
+    // decoded tree. A second card repeating the root filename would imply a
+    // sibling object where none exists.
     if archive_card && let Some((rid, root)) = root_id.zip(report.files.first()) {
         // The archive's own findings, and the member files their cross-package
         // trails point at — the members must stay in the view so those `↳` legs
@@ -4433,26 +4470,28 @@ fn render_archive_cards(
             &traits,
             cleave::output::terminal_width().saturating_sub(2),
         );
-        let body = if rows.is_empty() {
-            String::new()
-        } else {
-            format!("\n{rows}")
-        };
-        if !body.trim().is_empty() {
-            out.push('\n');
-            out.push_str(&crate::output::terminal_card(
-                &decision.class,
-                label,
-                file_type,
-                size,
-                &body,
-            ));
+        if !rows.trim().is_empty() {
+            if embedded_tree {
+                out.push_str(&rows);
+                out.push('\n');
+            } else {
+                out.push('\n');
+                out.push_str(&crate::output::terminal_card(
+                    &decision.class,
+                    label,
+                    file_type,
+                    size,
+                    &rows,
+                ));
+            }
         }
     }
 
-    for pkg in &notable {
-        out.push('\n');
-        out.push_str(&render_card(pkg));
+    for (index, pkg) in notable.iter().enumerate() {
+        if !embedded_tree {
+            out.push('\n');
+        }
+        out.push_str(&render_child(pkg, index + 1 == notable.len()));
     }
 
     // Note quiet packages omitted from the detailed cards.
@@ -4493,19 +4532,49 @@ fn collapse_decoded_dup(path: &str) -> String {
         return path.to_string();
     };
     if !seg.is_empty()
-        && rest
-            .strip_suffix(seg)
-            .is_some_and(|before| before.ends_with("!!"))
+        && (rest == seg
+            || rest
+                .strip_suffix(seg)
+                .is_some_and(|before| before.ends_with("!!")))
     {
         return format!("{rest}{tail}");
     }
     path.to_string()
 }
 
+/// Turn cleave's decoded-region suffix into a compact relationship label.
+/// The parent artifact already owns its filename in the summary, so a direct
+/// child reads `embedded base64 @ 11096`; a decoded archive member retains only
+/// the useful member leaf: `install.js · embedded unicode escape @ 20`.
+fn decoded_region_display_path(path: &str) -> Option<String> {
+    let path = collapse_decoded_dup(path);
+    let (parent, region) = path.rsplit_once("##")?;
+    let (encoding, offset) = region.rsplit_once('@')?;
+    if encoding.is_empty() || offset.is_empty() {
+        return None;
+    }
+    let encoding = terminal_safe_text(&encoding.replace('-', " "));
+    let offset = terminal_safe_text(offset);
+    if encoding.is_empty() || offset.is_empty() {
+        return None;
+    }
+    let decoded = format!("embedded {encoding} @ {offset}");
+    if parent.contains(ARCHIVE_DELIMITER) {
+        let member = terminal_finding_path(parent);
+        if !member.is_empty() {
+            return Some(format!("{member} \u{00b7} {decoded}"));
+        }
+    }
+    Some(decoded)
+}
+
 /// The path of a package relative to the root archive: everything after the
 /// first archive delimiter, deeper nesting shown as `/`. `demo.zip!!a.tgz` →
 /// `a.tgz`; a bare root path is returned as-is.
 fn package_display_path(path: &str) -> String {
+    if let Some(decoded) = decoded_region_display_path(path) {
+        return decoded;
+    }
     path.split_once("!!")
         .map_or_else(|| path.to_string(), |(_, m)| m.replace("!!", "/"))
 }
@@ -6243,6 +6312,13 @@ fn render_terminal_fetch_context(
     let mut visited_roots = std::collections::HashSet::new();
     let mut shown_registry_ids = std::collections::HashSet::new();
     let mut out = String::new();
+    struct FetchBranch {
+        verdict: Option<(Classification, f32)>,
+        subject: String,
+        source: String,
+        body: String,
+    }
+    let mut branches = Vec::new();
 
     for rec in fetch_edges.iter().filter(|r| r.content_sha256.is_some()) {
         let content_sha = rec.content_sha256.as_deref().unwrap_or_default();
@@ -6280,51 +6356,35 @@ fn render_terminal_fetch_context(
         }
 
         let subject = if rec.kind == fletch::RefKind::Dependency {
-            "DEPENDENCY"
+            "dependency"
         } else {
-            "URL"
+            "external URL"
         };
-        out.push('\n');
-        match graded.and_then(|d| d.verdict) {
-            Some(verdict) => {
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    crate::output::terminal_reference_heading(
-                        &verdict.class,
-                        verdict.probability,
-                        subject,
-                    )
-                );
-            }
-            None => {
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    crate::output::terminal_reference_status_heading("NOT EVALUATED", subject)
-                );
-            }
-        }
+        let verdict = graded
+            .and_then(|d| d.verdict)
+            .map(|verdict| (verdict.class, verdict.probability));
+        let source = terminal_fetch_source(rec, report);
+        let mut body = String::new();
         let _ = writeln!(
-            out,
+            body,
             "{}",
-            crate::output::terminal_reference_locator(&rec.locator)
+            crate::output::terminal_reference_locator_row(&rec.locator)
         );
-        write_terminal_fetch_provenance(&mut out, rec, report);
+        write_terminal_fetch_redirects(&mut body, rec);
         let _ = writeln!(
-            out,
+            body,
             "{}",
-            crate::output::terminal_reference_hash(content_sha, &root.file_type, root.size,)
+            crate::output::terminal_reference_hash_row(content_sha, &root.file_type, root.size,)
         );
         let mut signals = Vec::new();
         if rec.pin_verified == Some(false) {
             signals.push("checksum mismatch");
         }
         if let Some(registry) = registry {
-            write_terminal_registry_provenance(&mut out, registry, &mut signals);
+            write_terminal_registry_provenance(&mut body, registry, &mut signals, true);
             shown_registry_ids.insert(registry.file_id);
         } else if !signals.is_empty() {
-            let _ = writeln!(out, "    signals  {}", signals.join(" · "));
+            let _ = writeln!(body, " \u{00b7}   signals  {}", signals.join(" · "));
         }
 
         let mut view = report.clone();
@@ -6337,11 +6397,32 @@ fn render_terminal_fetch_context(
             cleave::output::terminal_width().saturating_sub(3),
         );
         if !rows.is_empty() {
-            out.push('\n');
             for row in rows.lines() {
-                let _ = writeln!(out, "   {row}");
+                let _ = writeln!(body, "{row}");
             }
         }
+        branches.push(FetchBranch {
+            verdict,
+            subject: subject.to_string(),
+            source,
+            body,
+        });
+    }
+
+    for (index, branch) in branches.iter().enumerate() {
+        if index == 0 {
+            out.push('\n');
+        }
+        out.push_str(&crate::output::terminal_reference_branch(
+            branch
+                .verdict
+                .as_ref()
+                .map(|(classification, probability)| (classification, *probability)),
+            &branch.subject,
+            &branch.source,
+            &branch.body,
+            index + 1 == branches.len(),
+        ));
     }
 
     for registry in registries {
@@ -6377,7 +6458,7 @@ fn render_terminal_fetch_context(
             crate::output::terminal_reference_locator(&registry.locator)
         );
         let mut signals = Vec::new();
-        write_terminal_registry_provenance(&mut out, registry, &mut signals);
+        write_terminal_registry_provenance(&mut out, registry, &mut signals, false);
         let mut view = report.clone();
         view.files.retain(|file| file.id == registry.file_id);
         let traits = terminal_top_traits(&view);
@@ -6386,7 +6467,6 @@ fn render_terminal_fetch_context(
             cleave::output::terminal_width().saturating_sub(3),
         );
         if !rows.is_empty() {
-            out.push('\n');
             for row in rows.lines() {
                 let _ = writeln!(out, "   {row}");
             }
@@ -6400,18 +6480,15 @@ fn render_terminal_fetch_context(
     (!out.is_empty()).then_some(out)
 }
 
-fn write_terminal_fetch_provenance(
-    out: &mut String,
+fn terminal_fetch_source(
     rec: &fletch::fetch::FetchRecord,
     report: &cleave::AnalysisReport,
-) {
-    use std::fmt::Write as _;
-
+) -> String {
     let source_file = report
         .files
         .iter()
         .find(|file| file.sha256 == rec.source_sha256);
-    let source = source_file.map_or_else(
+    source_file.map_or_else(
         || "<unknown>".to_string(),
         |file| {
             if file.depth == 0 {
@@ -6420,21 +6497,21 @@ fn write_terminal_fetch_provenance(
                 terminal_finding_path(&file.path)
             }
         },
-    );
-    let _ = write!(out, "    from  {source}");
-    if let Some(offset) = rec.source_offset {
-        let _ = write!(out, " @ byte {offset}");
-    }
-    out.push('\n');
+    )
+}
+
+fn write_terminal_fetch_redirects(out: &mut String, rec: &fletch::fetch::FetchRecord) {
+    use std::fmt::Write as _;
+
     if !rec.resolved_url.is_empty() && rec.resolved_url != rec.locator {
-        let _ = writeln!(out, "    resolved  {}", rec.resolved_url);
+        let _ = writeln!(out, " \u{00b7}   resolved  {}", rec.resolved_url);
     }
     if let Some(final_url) = rec
         .final_url
         .as_deref()
         .filter(|url| *url != rec.resolved_url && *url != rec.locator)
     {
-        let _ = writeln!(out, "    final  {final_url}");
+        let _ = writeln!(out, " \u{00b7}   final  {final_url}");
     }
 }
 
@@ -6442,10 +6519,12 @@ fn write_terminal_registry_provenance(
     out: &mut String,
     registry: &crate::fetch::DependencyRegistry,
     signals: &mut Vec<&'static str>,
+    marker_rows: bool,
 ) {
     use std::fmt::Write as _;
 
     let record = &registry.provenance.record;
+    let prefix = if marker_rows { " \u{00b7}   " } else { "    " };
     let mut summary = Vec::new();
     if let Some(age) = record.age_days {
         summary.push(format!("{age}d old"));
@@ -6462,7 +6541,7 @@ fn write_terminal_registry_provenance(
         summary.push(format!("{maintainers} {noun}"));
     }
     if !summary.is_empty() {
-        let _ = writeln!(out, "    registry  {}", summary.join(" · "));
+        let _ = writeln!(out, "{prefix}registry  {}", summary.join(" · "));
     }
     if record.version_removed == Some(true) {
         signals.push("version removed");
@@ -6480,16 +6559,16 @@ fn write_terminal_registry_provenance(
         signals.push("install script");
     }
     if let Some(deprecated) = record.deprecated.as_deref() {
-        let _ = writeln!(out, "    deprecated  {deprecated}");
+        let _ = writeln!(out, "{prefix}deprecated  {deprecated}");
     }
     if !signals.is_empty() {
-        let _ = writeln!(out, "    signals  {}", signals.join(" · "));
+        let _ = writeln!(out, "{prefix}signals  {}", signals.join(" · "));
     }
     if let Some(repository) = record.repository.as_deref() {
-        let _ = writeln!(out, "    upstream  {repository}");
+        let _ = writeln!(out, "{prefix}upstream  {repository}");
     }
     for url in registry.provenance.source_urls() {
-        let _ = writeln!(out, "    metadata  {url}");
+        let _ = writeln!(out, "{prefix}metadata  {url}");
     }
 }
 
@@ -6854,6 +6933,28 @@ mod card_render_tests {
         assert_eq!(
             collapse_decoded_dup("root!!pkg!!a/b.js##base64@0"),
             "root!!pkg!!a/b.js##base64@0"
+        );
+        // A decoder may repeat the root itself around the delimiter.
+        assert_eq!(
+            collapse_decoded_dup("root.sh!!root.sh##base64@1"),
+            "root.sh##base64@1"
+        );
+    }
+
+    #[test]
+    fn decoded_regions_use_relationship_labels() {
+        assert_eq!(
+            decoded_region_display_path("/tmp/sample.sh##base64@11096").as_deref(),
+            Some("embedded base64 @ 11096")
+        );
+        assert_eq!(
+            decoded_region_display_path("root.zip!!scripts/install.js##unicode-escape@20")
+                .as_deref(),
+            Some("install.js \u{00b7} embedded unicode escape @ 20")
+        );
+        assert_eq!(
+            package_display_path("/tmp/sample.sh##base64@21"),
+            "embedded base64 @ 21"
         );
     }
 
@@ -7810,15 +7911,16 @@ mod dep_backref_tests {
         let terminal = render_terminal_fetch_context(&edges, &deps, &registries, &report)
             .expect("hostile dependency is shown");
         let terminal = crate::deptree::strip_ansi(&terminal);
-        let provenance = terminal.find("    from  this file").unwrap();
+        let provenance = terminal.find("dependency from this file").unwrap();
         let finding = terminal.find("dependency package finding").unwrap();
         assert!(provenance < finding);
         assert!(
             terminal.contains(
-                "\n  ↳ HOSTILE 97% · DEPENDENCY\n    pkg:test/dep@1\n    from  this file"
+                "\n   └─ dependency from this file · HOSTILE 97%\n      🔗  pkg:test/dep@1"
             )
         );
-        assert!(terminal.contains("\n\n    ●●●  dependency package finding"));
+        assert!(terminal.contains("\n      ●●● dependency package finding"));
+        assert!(!terminal.contains("\n\n    ●●●"));
         assert_eq!(terminal.matches("pkg:test/dep@1").count(), 1);
         assert!(
             terminal.contains(&"d".repeat(64)),
@@ -7957,15 +8059,16 @@ mod dep_backref_tests {
             ..cleave::FileAnalysis::default()
         }];
         let mut out = String::new();
-        write_terminal_fetch_provenance(&mut out, &rec, &report);
-        assert!(out.contains("from  this file @ byte 42"));
+        assert_eq!(terminal_fetch_source(&rec, &report), "this file");
+        write_terminal_fetch_redirects(&mut out, &rec);
+        assert!(!out.contains("byte 42"));
         assert!(!out.contains(&sha));
         assert!(!out.contains("resolved"));
         assert!(!out.contains("final"));
 
         rec.final_url = Some("https://cdn.example.test/stage.sh".to_string());
         out.clear();
-        write_terminal_fetch_provenance(&mut out, &rec, &report);
+        write_terminal_fetch_redirects(&mut out, &rec);
         assert!(out.contains("final  https://cdn.example.test/stage.sh"));
     }
 }

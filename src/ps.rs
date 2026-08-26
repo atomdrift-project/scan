@@ -177,7 +177,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         // Detection rules already resident in memory — no extra loading.
         // `prefetch_shared_resources` above has fully built the YARA engine and
         // capability mapper; the bloom signatures were loaded with the config.
-        output::print_banner(crate::engine::detection_rule_count(config));
+        output::print_banner(crate::engine::detection_counts(config));
     }
 
     // Load model and scan each unique binary.
