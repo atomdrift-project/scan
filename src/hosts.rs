@@ -148,6 +148,7 @@ const DISCOVERY_DOMAINS: &[&str] = &[
     "openzfs.github.io",
     "rust-lang-nursery.github.io",
     "rust-lang.github.io",
+    "schemas.datacontract.org",
     "schemas.openxmlformats.org",
     "smarden.org",
     "sodipodi.sourceforge.net",
@@ -1140,6 +1141,9 @@ mod tests {
         assert!(discovery_exception("https://keys.gnupg.net/"));
         assert!(discovery_exception("https://www.kornshell.com/"));
         assert!(discovery_exception("https://www.spinics.net/lists/foo"));
+        assert!(discovery_exception(
+            "http://schemas.datacontract.org/2004/07/Microsoft.VisualStudio.TestPlatform.Extensions.HtmlLogger.ObjectModel"
+        ));
         assert!(!discovery_exception(
             "https://github.com/clap-rs/clap/issues/999999"
         ));
