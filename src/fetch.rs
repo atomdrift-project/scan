@@ -712,6 +712,30 @@ fn valid_discovered_url_host(url: &str) -> bool {
         })
 }
 
+/// Whether a discovered URL still contains a source-template placeholder.
+/// These commonly appear in documentation or client code as repository and
+/// release examples (`$REPO`, `${this.repositoryId}`, `$VERSION`); fetching
+/// them can only produce an avoidable 4xx response.
+fn has_unexpanded_url_placeholder(url: &str) -> bool {
+    let contains_placeholder = |part: &str| {
+        let bytes = part.as_bytes();
+        bytes.windows(2).any(|window| {
+            window[0] == b'$'
+                && (window[1] == b'{' || window[1].is_ascii_alphabetic() || window[1] == b'_')
+        })
+    };
+    if contains_placeholder(url) {
+        return true;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    [Some(parsed.path()), parsed.query()]
+        .into_iter()
+        .flatten()
+        .any(contains_placeholder)
+}
+
 /// Whether an IP literal is publicly routable enough to justify a discovered
 /// fetch. This excludes RFC1918/private space and the other special-use ranges
 /// that describe the scanner's host, a lab network, or documentation rather
@@ -1110,6 +1134,14 @@ pub(crate) fn orchestrate(
                                 url = %url,
                                 source = %r.source,
                                 "invalid or local URL host; fetch skipped"
+                            );
+                            return false;
+                        }
+                        if has_unexpanded_url_placeholder(url) {
+                            tracing::debug!(
+                                url = %url,
+                                source = %r.source,
+                                "unexpanded URL template; fetch skipped"
                             );
                             return false;
                         }
@@ -4059,6 +4091,26 @@ mod tests {
                 "invalid or local host was accepted: {url}"
             );
         }
+    }
+
+    #[test]
+    fn discovered_urls_with_unexpanded_templates_are_skipped() {
+        for url in [
+            "https://github.com/$REPO/releases/latest",
+            "https://api.github.com/repos/$REPO/releases/latest",
+            "https://github.com/$REPO/releases/download/v$VERSION",
+            "https://github.com/$REPO.git",
+            "https://bitbucket.org/${this.repositoryId}/raw/${r}/${e}",
+            "https://gitlab.com/${this.repositoryId}/raw/${r}/${e}",
+        ] {
+            assert!(
+                has_unexpanded_url_placeholder(url),
+                "unexpanded template was not recognized: {url}"
+            );
+        }
+        assert!(!has_unexpanded_url_placeholder(
+            "https://github.com/atomdrift-project/scan/releases/download/v2.8.0/atomscan"
+        ));
     }
 
     #[test]
