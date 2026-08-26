@@ -839,16 +839,17 @@ enum Commands {
         hopper: Option<String>,
 
         /// Fill idle capacity with queue work from `--hopper`, pausing the
-        /// moment a request arrives.
+        /// moment an analysis request arrives.
         ///
         /// A serve process spends most of its life waiting while hopper holds a
-        /// backlog, so the spare capacity is otherwise wasted. Requests always
-        /// win: the worker stops claiming while any is in flight, and the slots
-        /// it is *not* given are the interactive reserve, so an arriving
-        /// request never queues behind background work.
+        /// backlog, so the spare capacity is otherwise wasted. Analysis
+        /// requests always win: the worker stops claiming while any is in
+        /// flight and remains paused for 7 seconds after the latest analysis
+        /// request, so a new burst does not compete with background work.
         ///
-        /// Defaults to 1, leaving every other slot reserved for requests, and
-        /// the worker holds exactly one claim at a time. 0 disables it.
+        /// Defaults to half of `--workers` (rounded down), leaving the other
+        /// half reserved for requests. The requested value is capped at that
+        /// same half-slot limit. 0 disables it.
         /// Requires `--hopper`.
         ///
         /// When `--hopper` names several addresses this claims from the
@@ -1647,18 +1648,15 @@ fn main() -> Result<()> {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            // One slot by default: every other slot stays reserved for
-            // requests. Pausing stops new claims but does not abandon a running
-            // job, so the reserve — not the pause — is what keeps an arriving
-            // request from waiting. One slot also bounds the worst case to a
-            // single background analysis in flight, which is the whole point of
-            // filling *idle* capacity rather than competing for it.
+            // Use at most half the request capacity for background work. The
+            // idle worker pauses immediately while an analysis is in flight and
+            // for a short quiet period after the latest analysis request.
             //
             // Disabled without --hopper: there would be nothing to claim from.
             let idle_slots = match (hopper.as_deref(), idle_worker_slots) {
                 (None, _) => 0,
-                (Some(_), Some(n)) => n,
-                (Some(_), None) => 1,
+                (Some(_), Some(n)) => n.min(workers / 2),
+                (Some(_), None) => workers / 2,
             };
 
             let config = scan::server::ServerConfig::new(

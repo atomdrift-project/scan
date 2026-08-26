@@ -1613,7 +1613,7 @@ mod tests {
         assert!(draws.iter().all(|d| (0.0..1.0).contains(d)), "out of range");
         let distinct = draws
             .iter()
-            .map(|d| (d * 1e9) as u64)
+            .map(|d| d.to_bits())
             .collect::<std::collections::HashSet<_>>();
         assert!(distinct.len() > 1, "fuzz returned a constant");
     }
