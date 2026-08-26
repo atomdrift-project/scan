@@ -639,51 +639,99 @@ mod tests {
         );
     }
 
-    /// An endpoint that answers every request with `status`, for the failover
-    /// tests. Stays up for the life of the test: a corpus may ask it twice.
-    fn endpoint(status: &'static str, body: &'static str) -> String {
+    /// A scoped endpoint for the failover tests. Joining its server thread on
+    /// drop keeps nextest's leak detector quiet and prevents one test's fixture
+    /// from surviving into another test process.
+    struct TestEndpoint {
+        url: String,
+        stop: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl std::fmt::Display for TestEndpoint {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.url)
+        }
+    }
+
+    impl std::ops::Deref for TestEndpoint {
+        type Target = str;
+
+        fn deref(&self) -> &Self::Target {
+            &self.url
+        }
+    }
+
+    impl Drop for TestEndpoint {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn endpoint_with_response(
+        mut response: impl FnMut(u64) -> (&'static str, &'static str) + Send + 'static,
+    ) -> TestEndpoint {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let _ = stream.read(&mut [0u8; 2048]);
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
+        listener.set_nonblocking(true).expect("nonblocking");
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut request = 0;
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.read(&mut [0u8; 2048]);
+                        let (status, body) = response(request);
+                        request += 1;
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len(),
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
             }
         });
-        format!("http://127.0.0.1:{port}")
+        TestEndpoint {
+            url: format!("http://127.0.0.1:{port}"),
+            stop: Some(stop_tx),
+            thread: Some(thread),
+        }
+    }
+
+    /// An endpoint that answers every request with `status`, for the failover
+    /// tests. Stays up for the life of the fixture: a corpus may ask it twice.
+    fn endpoint(status: &'static str, body: &'static str) -> TestEndpoint {
+        endpoint_with_response(move |_| (status, body))
     }
 
     /// An endpoint that fails once and then answers, for the retry test.
-    fn flaky_endpoint() -> (String, Arc<AtomicU64>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
+    fn flaky_endpoint() -> (TestEndpoint, Arc<AtomicU64>) {
         let attempts = Arc::new(AtomicU64::new(0));
         let seen = Arc::clone(&attempts);
-        std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let _ = stream.read(&mut [0u8; 2048]);
-                let attempt = seen.fetch_add(1, Ordering::Relaxed);
-                let (status, body) = if attempt == 0 {
-                    ("500 Internal Server Error", "{}")
-                } else {
-                    ("200 OK", r#"{"sha256":"recovered"}"#)
-                };
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
+        let endpoint = endpoint_with_response(move |_| {
+            let attempt = seen.fetch_add(1, Ordering::Relaxed);
+            if attempt == 0 {
+                ("500 Internal Server Error", "{}")
+            } else {
+                ("200 OK", r#"{"sha256":"recovered"}"#)
             }
         });
-        (format!("http://127.0.0.1:{port}"), attempts)
+        (endpoint, attempts)
     }
 
     /// A transient 5xx is retried with backoff before the lookup is failed over.
