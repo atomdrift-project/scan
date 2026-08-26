@@ -720,11 +720,14 @@ mod tests {
     }
 
     /// An endpoint that fails once and then answers, for the retry test.
-    fn flaky_endpoint() -> (TestEndpoint, Arc<AtomicU64>) {
-        let attempts = Arc::new(AtomicU64::new(0));
+    fn flaky_endpoint() -> (TestEndpoint, Arc<Mutex<u64>>) {
+        let attempts = Arc::new(Mutex::new(0));
         let seen = Arc::clone(&attempts);
         let endpoint = endpoint_with_response(move |_| {
-            let attempt = seen.fetch_add(1, Ordering::Relaxed);
+            let mut attempts = lock(&seen);
+            let attempt = *attempts;
+            *attempts += 1;
+            drop(attempts);
             if attempt == 0 {
                 ("500 Internal Server Error", "{}")
             } else {
@@ -745,7 +748,7 @@ mod tests {
                 .0,
             Reached::Record(_)
         ));
-        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(*lock(&attempts), 2);
     }
 
     /// A replica beyond the four-hour window cannot be believed about an absence.

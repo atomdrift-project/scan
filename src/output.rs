@@ -3,12 +3,29 @@
 
 use std::io::IsTerminal;
 use std::sync::{LazyLock, RwLock};
+use unicode_width::UnicodeWidthStr;
 
 use crate::OutputFormat;
 use crate::engine::{ScanResult, ScanSummary, level_confidence};
 use crate::model::{Classification, RouteScore};
 
 const BLOCK: &str = "\u{2588}";
+const TERMINAL_MARKER_WIDTH: usize = 3;
+
+/// Prefix a card row with one fixed-width marker rail and one-cell gutter.
+/// Emoji are generally two terminal cells while severity dots are one cell
+/// each; measuring display width keeps their following text on one column.
+fn terminal_marker_prefix(indent: usize, marker: &str) -> String {
+    terminal_marker_prefix_with_width(indent, marker, UnicodeWidthStr::width(marker))
+}
+
+fn terminal_marker_prefix_with_width(indent: usize, marker: &str, marker_width: usize) -> String {
+    format!(
+        "{}{marker}{} ",
+        " ".repeat(indent),
+        " ".repeat(TERMINAL_MARKER_WIDTH.saturating_sub(marker_width)),
+    )
+}
 
 /// RGB color tuple.
 #[derive(Debug, Clone, Copy)]
@@ -363,7 +380,7 @@ pub(crate) fn terminal_badge(
     )
 }
 
-/// The one-line summary that trails the file type on the headline: `· <text>`
+/// One aligned model-summary row: ` ·   <text>`.
 /// built from the SHAP reasons. `None` when there are none. When an LLM
 /// interpretation exists it supersedes this entirely — rendered prominent on
 /// its own line by [`terminal_interpretation`] instead of dim on the headline.
@@ -379,7 +396,11 @@ pub(crate) fn terminal_trailer(reasons: &[crate::explain::Reason]) -> Option<Str
         .join(", ");
     if colored::control::SHOULD_COLORIZE.should_colorize() {
         let p = palette();
-        Some(format!("{} {}", fg(p.dim, "\u{00b7}"), fg(p.reason, &body)))
+        Some(format!(
+            "{}{}",
+            terminal_marker_prefix_with_width(1, &fg(p.dim, "\u{00b7}"), 1),
+            fg(p.reason, &body)
+        ))
     } else {
         Some(format!("\u{00b7} {body}"))
     }
@@ -398,16 +419,20 @@ pub(crate) fn terminal_interpretation(
     let pad = " ".repeat(indent);
     let color = colored::control::SHOULD_COLORIZE.should_colorize();
     if llm.error.is_some() {
-        let text = "\u{2728} interpretation unavailable";
         return Some(if color {
-            format!("{pad}{}", fg(palette().very_dim, text))
+            format!(
+                "{}{}",
+                terminal_marker_prefix(indent, "\u{2728}"),
+                fg(palette().very_dim, "interpretation unavailable")
+            )
         } else {
-            format!("{pad}{text}")
+            format!("{pad}\u{2728} interpretation unavailable")
         });
     }
     Some(if color {
         format!(
-            "{pad}\u{2728} {}",
+            "{}{}",
+            terminal_marker_prefix(indent, "\u{2728}"),
             fg_bold(palette().path_name, &llm.interpretation)
         )
     } else {
@@ -423,7 +448,11 @@ pub(crate) fn terminal_identity_line(identity: &str) -> Option<String> {
         return None;
     }
     Some(if colored::control::SHOULD_COLORIZE.should_colorize() {
-        format!(" \u{1faaA} {}", fg(palette().header_path, identity)) // 🪪
+        format!(
+            "{}{}",
+            terminal_marker_prefix(1, "\u{1faaA}"), // 🪪
+            fg(palette().header_path, identity)
+        )
     } else {
         format!("   {identity}")
     })
@@ -468,23 +497,25 @@ fn truncate_terminal_location(text: &str, width: usize) -> String {
         .collect()
 }
 
-fn severity_dots(criticality: cleave::Criticality) -> String {
+fn severity_dots(criticality: cleave::Criticality) -> (String, usize) {
     let dots = match criticality {
         cleave::Criticality::Hostile => "●●●",
-        cleave::Criticality::Suspicious => "●● ",
-        cleave::Criticality::Notable => "●  ",
-        _ => "·  ",
+        cleave::Criticality::Suspicious => "●●",
+        cleave::Criticality::Notable => "●",
+        _ => "·",
     };
+    let width = UnicodeWidthStr::width(dots);
     if !colored::control::SHOULD_COLORIZE.should_colorize() {
-        return dots.to_string();
+        return (dots.to_string(), width);
     }
-    match criticality {
+    let rendered = match criticality {
         cleave::Criticality::Hostile => cleave::theme::paint_hostile(dots).to_string(),
         cleave::Criticality::Suspicious => cleave::theme::paint_suspicious(dots).to_string(),
         cleave::Criticality::Notable => cleave::theme::paint_notable(dots).to_string(),
         cleave::Criticality::Baseline => cleave::theme::paint_baseline(dots).to_string(),
         _ => cleave::theme::paint_component(dots).to_string(),
-    }
+    };
+    (rendered, width)
 }
 
 /// Render at most three globally-curated traits as a compact aligned grid.
@@ -498,7 +529,7 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
     // Keep the reading measure composed on very wide terminals, but respect a
     // narrow terminal so these rows never become an accidental second line.
     let width = terminal_width.min(100);
-    let fixed = 6usize; // leading space + 3 dots + 2-space gutter
+    let fixed = 5usize; // leading space + 3-cell marker rail + 1-cell gutter
     let available = width.saturating_sub(fixed);
     let max_location = traits
         .iter()
@@ -520,9 +551,10 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
         .take(3)
         .map(|t| {
             let description = truncate_terminal_text(&t.description, description_width);
-            let dots = severity_dots(t.criticality);
+            let (dots, dots_width) = severity_dots(t.criticality);
+            let prefix = terminal_marker_prefix_with_width(1, &dots, dots_width);
             if location_width == 0 {
-                return format!(" {dots}  {description}");
+                return format!("{prefix}{description}");
             }
             let location = truncate_terminal_location(&t.location, location_width);
             let padding = " ".repeat(description_width.saturating_sub(description.chars().count()));
@@ -531,7 +563,7 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
             } else {
                 location
             };
-            format!(" {dots}  {description}{padding}  {location}")
+            format!("{prefix}{description}{padding}  {location}")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -559,7 +591,11 @@ pub(crate) fn terminal_hash_line(sha256: &str, bloom: Option<BloomMark>) -> Opti
         Some(BloomMark::KnownGood) => ("\u{1f9ec}", format!("  {}", fg(p.benign, "\u{2713}"))),
         None => ("\u{1f9ec}", String::new()), // 🧬
     };
-    Some(format!(" {glyph} {}{trailer}", fg(p.very_dim, sha256)))
+    Some(format!(
+        "{}{}{trailer}",
+        terminal_marker_prefix(1, glyph),
+        fg(p.very_dim, sha256)
+    ))
 }
 
 /// Human-compact byte size for headers: `352B`, `5.4KB`, `1.2MB`. Empty for 0
@@ -620,7 +656,8 @@ pub(crate) fn terminal_artifact_line(
     if colored::control::SHOULD_COLORIZE.should_colorize() {
         let p = palette();
         format!(
-            " {glyph} {} {}",
+            "{}{} {}",
+            terminal_marker_prefix(1, glyph),
             fg_bold(p.path_name, label),
             fg(p.dim, &format!("\u{00b7} {meta}")),
         )
@@ -629,32 +666,72 @@ pub(crate) fn terminal_artifact_line(
     }
 }
 
-/// Header for one externally fetched artifact nested beneath the file that
-/// referenced it: `↳ HOSTILE 99% · URL`. The locator gets its own aligned line
-/// so a long URL never pushes the relationship or verdict out of view.
-pub(crate) fn terminal_reference_heading(
-    classification: &Classification,
-    probability: f32,
+/// Render one fetched artifact as a branch beneath the file that referenced it.
+/// Provenance belongs in the relationship (`dependency from package.json`),
+/// while URL, hash, and traits occupy one aligned child column.
+pub(crate) fn terminal_reference_branch(
+    verdict: Option<(&Classification, f32)>,
     subject: &str,
+    source: &str,
+    body: &str,
+    last: bool,
 ) -> String {
-    let word = match classification {
-        Classification::Hostile => "HOSTILE",
-        Classification::Suspicious => "SUSPECT",
-        Classification::Benign => "BENIGN",
+    let status = verdict.map(|(classification, probability)| {
+        let word = match classification {
+            Classification::Hostile => "HOSTILE",
+            Classification::Suspicious => "SUSPECT",
+            Classification::Benign => "BENIGN",
+        };
+        (word, format!("{:.0}%", probability * 100.0))
+    });
+    let relationship = format!("{subject} from {source}");
+    let fork = if last {
+        "\u{2514}\u{2500}"
+    } else {
+        "\u{251c}\u{2500}"
     };
-    let pct = format!("{:.0}%", probability * 100.0);
+    let stem = if last { "  " } else { "\u{2502} " };
+    let indent = "   ";
+    let mut out = String::new();
     if colored::control::SHOULD_COLORIZE.should_colorize() {
         let p = palette();
-        format!(
-            "  ↳ {} {} {} {}",
-            fg_bold(class_color(classification), word),
-            fg(p.dim, &pct),
-            fg(p.very_dim, "·"),
-            fg(p.dim, subject),
-        )
+        out.push_str(indent);
+        out.push_str(&fg(p.very_dim, fork));
+        out.push(' ');
+        out.push_str(&fg_bold(p.path_name, &relationship));
+        out.push(' ');
+        out.push_str(&fg(p.very_dim, "·"));
+        out.push(' ');
+        if let (Some((classification, _)), Some((word, pct))) = (verdict, status.as_ref()) {
+            out.push_str(&fg_bold(class_color(classification), word));
+            out.push(' ');
+            out.push_str(&fg(p.dim, pct));
+        } else {
+            out.push_str(&fg_bold(p.warning, "NOT EVALUATED"));
+        }
+        out.push('\n');
+        for line in body.lines() {
+            out.push_str(indent);
+            out.push_str(&fg(p.very_dim, stem));
+            out.push_str(line);
+            out.push('\n');
+        }
     } else {
-        format!("  ↳ {word} {pct} · {subject}")
+        let status = status.map_or_else(
+            || "NOT EVALUATED".to_string(),
+            |(word, pct)| format!("{word} {pct}"),
+        );
+        out.push_str(&format!(
+            "{indent}{fork} {relationship} \u{00b7} {status}\n"
+        ));
+        for line in body.lines() {
+            out.push_str(indent);
+            out.push_str(stem);
+            out.push_str(line);
+            out.push('\n');
+        }
     }
+    out
 }
 
 /// Non-graded counterpart for a fetched/registry branch.
@@ -681,25 +758,42 @@ pub(crate) fn terminal_reference_locator(locator: &str) -> String {
     }
 }
 
-/// Full hash plus the fetched artifact's type and size, aligned with the nested
-/// locator and provenance lines.
-pub(crate) fn terminal_reference_hash(sha256: &str, file_type: &str, size: u64) -> String {
+/// Locator row used inside a compact fetched-reference branch.
+pub(crate) fn terminal_reference_locator_row(locator: &str) -> String {
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
+        format!(
+            "{}{}",
+            terminal_marker_prefix(1, "\u{1f517}"), // 🔗
+            fg_bold(palette().path_name, locator)
+        )
+    } else {
+        format!(" \u{1f517}  {locator}")
+    }
+}
+
+/// Hash/type/size row used inside a compact fetched-reference branch.
+pub(crate) fn terminal_reference_hash_row(sha256: &str, file_type: &str, size: u64) -> String {
     let mut meta = file_type.to_uppercase();
     let size = human_size(size);
     if !size.is_empty() {
-        meta.push_str(&format!(" · {size}"));
+        meta.push_str(&format!(" \u{00b7} {size}"));
     }
-    let hash = terminal_hash_line(sha256, None)
-        .unwrap_or_default()
-        .trim_start()
-        .to_string();
+    let hash = if colored::control::SHOULD_COLORIZE.should_colorize() {
+        format!(
+            "{}{}",
+            terminal_marker_prefix(1, "\u{1f9ec}"), // 🧬
+            fg(palette().very_dim, sha256)
+        )
+    } else {
+        format!(" \u{1f9ec}  {sha256}")
+    };
     if meta.is_empty() {
-        return format!("    {hash}");
+        return hash;
     }
     if colored::control::SHOULD_COLORIZE.should_colorize() {
-        format!("    {hash}  {}", fg(palette().dim, &format!("· {meta}")))
+        format!("{hash}  {}", fg(palette().dim, &format!("\u{00b7} {meta}")))
     } else {
-        format!("    {hash}  · {meta}")
+        format!("{hash}  \u{00b7} {meta}")
     }
 }
 
@@ -761,6 +855,68 @@ pub(crate) fn terminal_card(
             } else {
                 out.push_str(&format!("  {line}\n"));
             }
+        }
+    }
+    out
+}
+
+/// Render one decoded child as a compact branch beneath its parent artifact.
+/// Unlike a package card, a two-line embedded result does not need a closing
+/// border: the branch itself communicates containment and keeps sibling
+/// payloads visually connected.
+pub(crate) fn terminal_embedded_branch(
+    classification: &Classification,
+    name: &str,
+    file_type: &str,
+    size: u64,
+    body: &str,
+    last: bool,
+) -> String {
+    let word = match classification {
+        Classification::Hostile => "HOSTILE",
+        Classification::Suspicious => "SUSPECT",
+        Classification::Benign => "BENIGN",
+    };
+    let mut meta = file_type.to_uppercase();
+    let size = human_size(size);
+    if !size.is_empty() {
+        meta.push_str(&format!(" \u{00b7} {size}"));
+    }
+
+    let fork = if last {
+        "\u{2514}\u{2500}"
+    } else {
+        "\u{251c}\u{2500}"
+    }; // └─ / ├─
+    let stem = if last { "  " } else { "\u{2502} " }; //    / │
+    let indent = "   ";
+    let mut out = String::new();
+    if colored::control::SHOULD_COLORIZE.should_colorize() {
+        let p = palette();
+        let accent = class_color(classification);
+        out.push_str(indent);
+        out.push_str(&fg(p.very_dim, fork));
+        out.push(' ');
+        out.push_str(&fg_bold(p.path_name, name));
+        out.push(' ');
+        out.push_str(&fg(p.dim, &format!("\u{00b7} {meta} \u{00b7} ")));
+        out.push_str(&fg_bold(accent, word));
+        out.push('\n');
+        for line in body.lines() {
+            out.push_str(indent);
+            out.push_str(&fg(p.very_dim, stem));
+            out.push_str(line);
+            out.push('\n');
+        }
+    } else {
+        out.push_str(&format!(
+            "{indent}{fork} {name} \u{00b7} {meta} \u{00b7} {word}\n"
+        ));
+        for line in body.lines() {
+            out.push_str(indent);
+            out.push_str(stem);
+            out.push_str(line);
+            out.push('\n');
         }
     }
     out
@@ -1273,12 +1429,10 @@ pub fn summary_status_line(summary: &ScanSummary) -> String {
 }
 
 /// Print the scan banner shared by every scanning subcommand (`ps`, directory,
-/// multi-path): the atom mark, version, and the count of detection rules already
-/// resident in memory (YAML traits + composite rules + YARA + bloom signatures).
-/// `rules` is precomputed by the caller from resources the scan has *already*
-/// loaded, so this adds no work. The target being scanned is not named here — the
-/// file count is evident from the progress bar and the closing summary.
-pub fn print_banner(rules: u64) {
+/// multi-path): the atom mark, version, and the two detection inventories already
+/// resident in memory. SHA-256/PURL Bloom entries stay distinct from executable
+/// trait/composite/YARA rules instead of inflating a misleading "rules" total.
+pub(crate) fn print_banner(counts: crate::engine::DetectionCounts) {
     let p = palette();
     eprintln!();
     eprintln!(
@@ -1289,9 +1443,17 @@ pub fn print_banner(rules: u64) {
         ),
         fg(
             p.very_dim,
-            &format!("\u{00b7} {} rules", with_commas(rules))
+            &detection_inventory_text(counts.hashes_and_purls, counts.rules)
         ),
     );
+}
+
+fn detection_inventory_text(hashes_and_purls: u64, rules: u64) -> String {
+    format!(
+        "\u{00b7} {} hashes \u{00b7} {} rules",
+        with_commas(hashes_and_purls),
+        with_commas(rules),
+    )
 }
 
 /// Format an integer with `,` thousands separators (e.g. `1093027` → `1,093,027`).
@@ -1335,9 +1497,9 @@ pub struct SourceRow {
     pub epoch: Option<i64>,
 }
 
-/// Render `scan version`: the scan banner with the grand total of rules, then one
-/// aligned row per detection source with its count, version, and upstream age.
-pub fn print_version(scan_version: &str, total_rules: u64, rows: &[SourceRow]) {
+/// Render `scan version`: the split signature/rule inventory, then one aligned
+/// row per detection source with its count, version, and upstream age.
+pub fn print_version(scan_version: &str, hashes_and_purls: u64, rules: u64, rows: &[SourceRow]) {
     let p = palette();
     let now = now_unix();
 
@@ -1347,7 +1509,7 @@ pub fn print_version(scan_version: &str, total_rules: u64, rows: &[SourceRow]) {
         fg_bold(p.path_name, &format!("Atomdrift Scan v{scan_version}")),
         fg(
             p.very_dim,
-            &format!("\u{2014} {} rules", with_commas(total_rules))
+            &detection_inventory_text(hashes_and_purls, rules)
         ),
     );
     println!();
@@ -1518,6 +1680,30 @@ mod tests {
     }
 
     #[test]
+    fn card_markers_share_one_content_column() {
+        for marker in [
+            "📦",
+            "📄",
+            "🧬",
+            "🚩",
+            "📡",
+            "🏴",
+            "🪪",
+            "✨",
+            "●",
+            "●●",
+            "●●●",
+        ] {
+            let prefix = terminal_marker_prefix(1, marker);
+            assert_eq!(
+                UnicodeWidthStr::width(prefix.as_str()),
+                5,
+                "marker {marker:?} produced prefix {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
     fn terminal_trait_grid_is_three_rows_and_keeps_location_tail() {
         let traits = [
             TerminalTrait {
@@ -1549,6 +1735,23 @@ mod tests {
     }
 
     #[test]
+    fn embedded_branch_uses_two_lines_without_a_closing_rule() {
+        let body = " \u{25cf}\u{25cf}\u{25cf} Payload behavior";
+        let rendered = terminal_embedded_branch(
+            &Classification::Hostile,
+            "embedded base64 @ 11096",
+            "shell",
+            11_766,
+            body,
+            true,
+        );
+        assert_eq!(rendered.lines().count(), 2);
+        assert!(rendered.contains("   \u{2514}\u{2500} embedded base64 @ 11096"));
+        assert!(rendered.contains("      \u{25cf}\u{25cf}\u{25cf} Payload behavior"));
+        assert!(!rendered.contains('\u{2570}'));
+    }
+
+    #[test]
     fn commas_group_by_threes() {
         assert_eq!(with_commas(0), "0");
         assert_eq!(with_commas(42), "42");
@@ -1557,6 +1760,14 @@ mod tests {
         assert_eq!(with_commas(12_345), "12,345");
         assert_eq!(with_commas(123_456), "123,456");
         assert_eq!(with_commas(1_093_027), "1,093,027");
+    }
+
+    #[test]
+    fn detection_inventory_keeps_signatures_separate_from_rules() {
+        assert_eq!(
+            detection_inventory_text(9_099_016, 120_680),
+            "\u{00b7} 9,099,016 hashes \u{00b7} 120,680 rules"
+        );
     }
 
     #[test]

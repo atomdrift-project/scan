@@ -121,6 +121,7 @@ tower = { version = "0.5", features = ["limit"] }
 # Same terminal-color crate cleave uses, so scan's verdict line and cleave's
 # context body gate (tty / NO_COLOR) and color identically.
 colored = "3.1"
+unicode-width = "0.2"
 tempfile = "3"
 dashmap = "6"
 # Bounded LRU for the GET /_/bloom decision memos. Already in the lock graph

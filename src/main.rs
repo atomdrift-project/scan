@@ -126,6 +126,61 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process;
+use tracing_subscriber::prelude::*;
+
+const EXPECTED_YARA_CACHE_MISMATCH: &str =
+    "compiled YARA rules do not match the rule sources on disk; ignoring them and recompiling";
+
+fn is_expected_yara_cache_mismatch(target: &str, message: &str) -> bool {
+    target == "cleave::yara_engine" && message.contains(EXPECTED_YARA_CACHE_MISMATCH)
+}
+
+/// Hide one expected cache invalidation without muting real YARA errors from
+/// the same tracing target. The upstream event remains available whenever the
+/// operator explicitly asks for diagnostic logs.
+#[derive(Debug, Clone, Copy)]
+struct ExpectedYaraCacheFilter {
+    hide: bool,
+}
+
+#[derive(Default)]
+struct EventMessage {
+    text: String,
+}
+
+impl tracing::field::Visit for EventMessage {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.text = format!("{value:?}");
+        }
+    }
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for ExpectedYaraCacheFilter
+where
+    S: tracing::Subscriber,
+{
+    fn enabled(
+        &self,
+        _metadata: &tracing::Metadata<'_>,
+        _context: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        true
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        if !self.hide || event.metadata().target() != "cleave::yara_engine" {
+            return true;
+        }
+        let mut message = EventMessage::default();
+        event.record(&mut message);
+        !is_expected_yara_cache_mismatch(event.metadata().target(), &message.text)
+    }
+}
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -1238,14 +1293,33 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::new("atomscan=warn,scan=warn,cleave=error")
         }
     });
-    let fmt = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_thread_names(true)
-        .with_writer(std::io::stderr);
+    // Cleave rejects a stale precompiled YARA cache safely and recompiles from
+    // source. That expected maintenance path is not an operator-facing error;
+    // filter only its exact event. Explicit diagnostics still show it.
+    let quiet_expected_yara_cache = ExpectedYaraCacheFilter {
+        hide: !cli.verbose && std::env::var_os("RUST_LOG").is_none(),
+    };
     if is_serve {
-        fmt.init();
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_thread_names(true)
+                    .with_writer(std::io::stderr)
+                    .with_filter(quiet_expected_yara_cache),
+            )
+            .init();
     } else {
-        fmt.without_time().init();
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_thread_names(true)
+                    .with_writer(std::io::stderr)
+                    .with_filter(quiet_expected_yara_cache),
+            )
+            .init();
     }
 
     // Resolved after logging is up: with no hardcoded default, the model comes
@@ -1937,10 +2011,8 @@ fn main() -> Result<()> {
                     .as_ref()
                     .and_then(|m| scan::output::parse_ymd(&m.built));
 
-                let total = info.trait_count as u64
-                    + info.composite_count as u64
-                    + info.yara_rules as u64
-                    + bloom_count;
+                let rules =
+                    info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64;
 
                 let mut rows = Vec::new();
                 if bloom.is_some() {
@@ -1995,7 +2067,7 @@ fn main() -> Result<()> {
                     });
                 }
 
-                scan::output::print_version(env!("CARGO_PKG_VERSION"), total, &rows);
+                scan::output::print_version(env!("CARGO_PKG_VERSION"), bloom_count, rules, &rows);
             }
         }
     }
@@ -2380,14 +2452,29 @@ fn run_scan_paths(
 mod tests {
     use super::{
         Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy, default_cli_follow_policy,
-        redact_zip_passwords, resolve_hopper_value, resolve_process_max_rss_bytes,
-        resolve_worker_max_rss_gb,
+        is_expected_yara_cache_mismatch, redact_zip_passwords, resolve_hopper_value,
+        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
     use std::net::SocketAddr;
     use std::num::NonZeroU64;
     use std::path::PathBuf;
+
+    #[test]
+    fn only_expected_yara_cache_mismatch_is_quietable() {
+        let expected = "compiled YARA rules do not match the rule sources on disk; \
+                        ignoring them and recompiling";
+        assert!(is_expected_yara_cache_mismatch(
+            "cleave::yara_engine",
+            expected
+        ));
+        assert!(!is_expected_yara_cache_mismatch(
+            "cleave::yara_engine",
+            "YARA bucket scan failed, skipping bucket"
+        ));
+        assert!(!is_expected_yara_cache_mismatch("scan::engine", expected));
+    }
 
     #[test]
     fn follow_defaults_to_references_and_dependencies() -> Result<()> {
