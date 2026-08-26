@@ -1394,6 +1394,7 @@ pub(super) async fn analyze(
     mut multipart: axum::extract::Multipart,
 ) -> Response {
     let request_id = request_id.0.get();
+    state.note_analyze_request();
     let request_start = Instant::now();
 
     tracing::info!(id = request_id, "--> POST /analyze");
@@ -1731,6 +1732,7 @@ pub(super) async fn analyze_purl(
     Json(req): Json<AnalyzePurlRequest>,
 ) -> Response {
     let request_id = request_id.0.get();
+    state.note_analyze_request();
     let request_start = Instant::now();
 
     let purl = match normalize_pkg_purl(&req.purl) {
@@ -2427,6 +2429,7 @@ pub(super) async fn analyze_path(
     Extension(request_id): Extension<RequestId>,
     Json(req): Json<AnalyzePathRequest>,
 ) -> Response {
+    state.note_analyze_request();
     // Attached around the whole handler rather than at each return: this route
     // rejects from several places — not found, not under an allowed dir, under
     // memory pressure — and a rejected path is the one an operator most needs
@@ -5510,6 +5513,7 @@ mod artifact_upload_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod pick_verdict_tests {
     use super::pick_verdict;
     use crate::lookup::Verdict;

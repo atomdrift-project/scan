@@ -121,15 +121,15 @@ async fn stub_corpus(holds: Holds) -> Result<(String, Arc<Asked>)> {
 /// the server binary reaches the same code from its own startup path.
 fn arm_corpus_precheck(base: &str) {
     let base = base.to_owned();
-    std::thread::spawn(move || {
+    let joined = std::thread::spawn(move || {
         // Constructed and dropped off-runtime, which is the whole point.
         drop(scan::upload::Uploader::new(
             &base,
             "precheck-arming".to_owned(),
         ));
     })
-    .join()
-    .expect("arming thread panicked");
+    .join();
+    assert!(joined.is_ok(), "arming thread panicked");
 }
 
 async fn app_with_corpus(base: Option<&str>) -> Result<Router> {
@@ -207,6 +207,7 @@ async fn a_held_verdict_answers_without_analyzing() -> Result<()> {
         "a named package must be asked about by PURL, got {:?}",
         queries[0],
     );
+    drop(queries);
     Ok(())
 }
 
@@ -237,6 +238,7 @@ async fn an_upload_is_answered_from_a_verdict_held_for_its_digest() -> Result<()
         "an upload must be asked about by its digest, got {:?}",
         queries[0],
     );
+    drop(queries);
     Ok(())
 }
 
@@ -277,6 +279,7 @@ async fn an_uploads_purl_never_reaches_the_resolver() -> Result<()> {
             "answered about a different artifact than the bytes uploaded",
         );
     }
+    drop(queries);
     Ok(())
 }
 

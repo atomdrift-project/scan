@@ -169,7 +169,9 @@ async fn malformed_keys_are_rejected() -> Result<()> {
 /// the canonical form, not a malformed one.
 #[tokio::test]
 async fn bare_purls_are_normalized_rather_than_rejected() -> Result<()> {
-    let bare = UNKNOWN.strip_prefix("pkg:").expect("UNKNOWN is canonical");
+    let bare = UNKNOWN
+        .strip_prefix("pkg:")
+        .context("UNKNOWN is canonical")?;
     let (status, body, _) = get(&format!("/lookup?purl={}", encoded_purl(bare))).await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "understood, just not stored");
     assert_eq!(body["error"], "unknown sample");

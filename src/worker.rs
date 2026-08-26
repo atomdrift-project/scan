@@ -663,6 +663,12 @@ pub struct Embedded {
     pub shutdown: Arc<AtomicBool>,
     /// The server's already-loaded models.
     pub resources: Arc<ModelResources>,
+    /// Elapsed-time marker for the most recent analysis request.
+    pub last_analyze_request_ms: Arc<AtomicU64>,
+    /// Same monotonic clock anchor used to produce the request marker.
+    pub started_at: Instant,
+    /// How long after an analysis request the idle worker must remain quiet.
+    pub quiet_period: Duration,
 }
 
 // ModelResources carries no Debug, and dumping a model bundle into a log line
@@ -672,6 +678,7 @@ impl std::fmt::Debug for Embedded {
         f.debug_struct("Embedded")
             .field("paused", &self.pause.load(Ordering::Relaxed))
             .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .field("quiet_period", &self.quiet_period)
             .finish_non_exhaustive()
     }
 }
@@ -1694,6 +1701,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let prefetch_task = tokio::spawn(
         Prefetcher {
             pause: config.embedded.as_ref().map(|e| Arc::clone(&e.pause)),
+            last_analyze_request_ms: config
+                .embedded
+                .as_ref()
+                .map(|e| Arc::clone(&e.last_analyze_request_ms)),
+            activity_started_at: config.embedded.as_ref().map(|e| e.started_at),
+            quiet_period: config.embedded.as_ref().map(|e| e.quiet_period),
             client: client.clone(),
             base_url: Arc::clone(&base_url),
             data_dir: data_dir.clone(),
@@ -2285,9 +2298,38 @@ struct Prefetcher {
     /// stops the whole pipeline at one point: staged jobs finish, slots drain,
     /// and nothing new is claimed until the flag clears.
     pause: Option<Arc<AtomicBool>>,
+    /// Elapsed-time marker for the most recent host `/analyze` request.
+    last_analyze_request_ms: Option<Arc<AtomicU64>>,
+    /// Host clock anchor for interpreting `last_analyze_request_ms`.
+    activity_started_at: Option<Instant>,
+    /// Quiet period after host analysis traffic.
+    quiet_period: Option<Duration>,
 }
 
 impl Prefetcher {
+    fn recently_saw_analyze_request(&self) -> bool {
+        let (Some(last), Some(started_at), Some(quiet_period)) = (
+            self.last_analyze_request_ms.as_ref(),
+            self.activity_started_at,
+            self.quiet_period,
+        ) else {
+            return false;
+        };
+        let last_ms = last.load(Ordering::Acquire);
+        if last_ms == 0 {
+            return false;
+        }
+        let now_ms = u64::try_from(
+            started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX.saturating_sub(1))),
+        )
+        .unwrap_or(u64::MAX.saturating_sub(1))
+        .saturating_add(1);
+        u128::from(now_ms.saturating_sub(last_ms)) < quiet_period.as_millis()
+    }
+
     /// Build the `/api/next` URL, attaching the live signals hopper uses to
     /// ration work: traits version, current RSS, 1-minute load, and tools.
     fn poll_url(&self, count: usize) -> String {
@@ -2341,13 +2383,18 @@ impl Prefetcher {
             // what is already staged or running: that work is real, and hopper
             // redispatches a claim that dies anyway. Responsiveness comes from
             // the slots the server keeps for itself, not from killing jobs.
-            if self
+            let interactive = self
                 .pause
                 .as_ref()
-                .is_some_and(|p| p.load(Ordering::Relaxed))
-            {
+                .is_some_and(|p| p.load(Ordering::Relaxed));
+            let recently_active = self.recently_saw_analyze_request();
+            if interactive || recently_active {
                 if !paused_logged {
-                    tracing::debug!("idle worker paused: interactive work in flight");
+                    tracing::debug!(
+                        interactive,
+                        recently_active,
+                        "idle worker paused: recent interactive analysis activity"
+                    );
                     paused_logged = true;
                 }
                 self.poll_state.buffer_room.store(0, Ordering::Release);
@@ -4210,6 +4257,9 @@ mod tests {
             Prefetcher {
                 // Standalone worker: nothing to defer to.
                 pause: None,
+                last_analyze_request_ms: None,
+                activity_started_at: None,
+                quiet_period: None,
                 client: reqwest::Client::new(),
                 base_url: Arc::from(format!("http://127.0.0.1:{port}").as_str()),
                 data_dir: None,
