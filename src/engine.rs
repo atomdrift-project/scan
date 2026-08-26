@@ -3931,7 +3931,10 @@ fn terminal_note_anchor(file: &cleave::FileAnalysis, finding_id: &str) -> Option
             let added = u64::try_from(added).unwrap_or(u64::MAX);
             return Some(format!(":{}", base_line.saturating_add(added)));
         }
-        return Some(format!("@0x{:x}", note.off));
+        // Byte offsets are precise but add little triage value in the compact
+        // trait grid. Keep source lines when available; otherwise the filename
+        // is the useful anchor.
+        return None;
     }
     None
 }
@@ -3957,8 +3960,6 @@ fn terminal_finding_location(
         let mut location = terminal_finding_path(&source_file.path);
         if let Some(line) = source.line {
             location.push_str(&format!(":{line}"));
-        } else if let Some(offset) = source.offset {
-            location.push_str(&format!("@0x{offset:x}"));
         }
         return location;
     }
@@ -4050,7 +4051,10 @@ fn terminal_top_traits(report: &cleave::AnalysisReport) -> Vec<crate::output::Te
                     description,
                     location: terminal_finding_location(report, file, finding),
                 });
-                if selected.len() == 3 {
+                // A hostile conclusion is sufficient for triage. Additional
+                // rows at the same or weaker severity only repeat support for
+                // a verdict the first row already makes unambiguously.
+                if criticality == cleave::Criticality::Hostile || selected.len() == 3 {
                     return selected;
                 }
             }
@@ -6683,7 +6687,7 @@ mod card_render_tests {
     }
 
     #[test]
-    fn terminal_traits_are_global_ranked_and_attributed() {
+    fn terminal_hostile_trait_stops_global_selection() {
         let report = terminal_report(serde_json::json!({
             "version": "3",
             "files": [
@@ -6711,13 +6715,61 @@ mod card_render_tests {
         }));
 
         let traits = terminal_top_traits(&report);
-        assert_eq!(traits.len(), 3);
+        assert_eq!(traits.len(), 1);
         assert_eq!(traits[0].description, "Archive dropper");
         assert_eq!(traits[0].location, "agent.py:42");
-        assert_eq!(traits[1].description, "Remote terminal agent");
-        assert_eq!(traits[1].location, "agent.py");
-        assert_eq!(traits[2].description, "Hides execution");
         assert!(traits.iter().all(|t| t.description != "Inherited copy"));
+    }
+
+    #[test]
+    fn terminal_non_hostile_traits_still_fill_three_rows() {
+        let report = terminal_report(serde_json::json!({
+            "version": "3",
+            "files": [{
+                "id": 0, "path": "sample.bin", "depth": 0,
+                "file_type": "binary", "sha256": "root", "size": 10,
+                "findings": [
+                    {"id": "capabilities/network::one", "desc": "Contacts remote host", "conf": 0.99, "crit": "suspicious"},
+                    {"id": "evasion/packing::one", "desc": "Packed executable", "conf": 0.98, "crit": "suspicious"},
+                    {"id": "metadata/identity::one", "desc": "Unsigned identity", "conf": 0.97, "crit": "notable"},
+                    {"id": "metadata/toolchain::one", "desc": "Compiler metadata", "conf": 0.96, "crit": "notable"}
+                ]
+            }]
+        }));
+
+        let traits = terminal_top_traits(&report);
+        assert_eq!(traits.len(), 3);
+        assert_eq!(traits[0].description, "Contacts remote host");
+        assert_eq!(traits[1].description, "Packed executable");
+        assert_eq!(traits[2].description, "Unsigned identity");
+    }
+
+    #[test]
+    fn terminal_trait_location_omits_byte_offset() {
+        let report = terminal_report(serde_json::json!({
+            "version": "3",
+            "files": [
+                {
+                    "id": 0, "path": "sample.zip", "depth": 0,
+                    "file_type": "zip", "sha256": "root", "size": 10,
+                    "findings": [
+                        {"id": "evasion/packing::one", "desc": "Packed executable", "conf": 0.99, "crit": "suspicious"}
+                    ],
+                    "composite_sources": {
+                        "evasion/packing::one": [{"file": 1, "offset": 1114110}]
+                    }
+                },
+                {
+                    "id": 1, "path": "sample.zip!!payload.exe", "depth": 1,
+                    "file_type": "pe", "sha256": "member", "size": 8
+                }
+            ]
+        }));
+
+        let traits = terminal_top_traits(&report);
+        assert_eq!(traits.len(), 1);
+        assert_eq!(traits[0].location, "payload.exe");
+        assert!(!traits[0].location.contains("@0x"));
     }
 
     #[test]
