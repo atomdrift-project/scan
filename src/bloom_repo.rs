@@ -236,7 +236,10 @@ impl Lookup {
     /// into the `ps` banner's rule tally.
     #[must_use]
     pub fn rule_count(&self) -> u64 {
-        self.filters().filter_map(Option::as_ref).map(Filter::len).sum()
+        self.filters()
+            .filter_map(Option::as_ref)
+            .map(Filter::len)
+            .sum()
     }
 
     /// Every filter slot, present or not. One place to enumerate them so a new
@@ -399,7 +402,11 @@ impl BloomCounts {
     /// True when no bloom decisions were recorded (nothing to report).
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.skipped == 0 && self.flagged == 0 && self.sighted == 0 && self.conflicted == 0 && self.unscanned == 0
+        self.skipped == 0
+            && self.flagged == 0
+            && self.sighted == 0
+            && self.conflicted == 0
+            && self.unscanned == 0
     }
 }
 
@@ -579,8 +586,14 @@ mod tests {
             Decision::SightedSuspicious
         );
         // A bless beside any claim is the contradiction, never a skip.
-        assert_eq!(resolve(false, true, true, false, true), Decision::Conflicted);
-        assert_eq!(resolve(false, true, true, true, false), Decision::Conflicted);
+        assert_eq!(
+            resolve(false, true, true, false, true),
+            Decision::Conflicted
+        );
+        assert_eq!(
+            resolve(false, true, true, true, false),
+            Decision::Conflicted
+        );
         // Blessed and unclaimed, with the revocation channel present.
         assert_eq!(resolve(false, true, true, false, false), Decision::Skip);
         // ...and withheld without it.

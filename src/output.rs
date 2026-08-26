@@ -42,7 +42,6 @@ struct Palette {
     dim: Rgb,
     very_dim: Rgb,
     path_name: Rgb,
-    header_icon: Rgb,
     header_path: Rgb,
     summary_line: Rgb,
     warning: Rgb,
@@ -66,7 +65,6 @@ impl Palette {
             dim: Rgb(100, 100, 100),
             very_dim: Rgb(80, 80, 80),
             path_name: Rgb(230, 230, 230),
-            header_icon: Rgb(160, 160, 160),
             header_path: Rgb(180, 180, 180),
             summary_line: Rgb(50, 50, 50),
             warning: Rgb(180, 180, 60),
@@ -90,7 +88,6 @@ impl Palette {
             dim: Rgb(120, 120, 120),
             very_dim: Rgb(150, 150, 150),
             path_name: Rgb(30, 30, 30),
-            header_icon: Rgb(110, 110, 110),
             header_path: Rgb(80, 80, 80),
             summary_line: Rgb(190, 190, 190),
             warning: Rgb(140, 140, 0),
@@ -557,7 +554,7 @@ pub(crate) fn terminal_hash_line(sha256: &str, bloom: Option<BloomMark>) -> Opti
     let p = palette();
     let (glyph, trailer) = match bloom {
         Some(BloomMark::KnownBad) => ("\u{1f6a9}", String::new()), // 🚩
-        Some(BloomMark::Sighted) => ("\u{1f4e1}", String::new()), // 📡
+        Some(BloomMark::Sighted) => ("\u{1f4e1}", String::new()),  // 📡
         Some(BloomMark::Conflicted) => ("\u{1f3f4}", String::new()), // 🏴
         Some(BloomMark::KnownGood) => ("\u{1f9ec}", format!("  {}", fg(p.benign, "\u{2713}"))),
         None => ("\u{1f9ec}", String::new()), // 🧬
@@ -1034,6 +1031,14 @@ impl BloomMark {
         }
     }
 
+    /// Whether this mark must bypass the terminal's ordinary classification
+    /// filter. A known-good file that was rescanned and remained benign is still
+    /// quiet; bad, sighted, and conflicted claims must be surfaced even when the
+    /// model itself rates the bytes benign.
+    pub(crate) const fn forces_terminal_display(self) -> bool {
+        !matches!(self, Self::KnownGood)
+    }
+
     /// The glyph identifying this status: ✓ known-good, 🚩 known-bad,
     /// 📡 sighted by outside intelligence, 🏴 conflicted.
     const fn glyph(self) -> &'static str {
@@ -1201,29 +1206,6 @@ pub fn print_summary(summary: &ScanSummary) {
 
     let line = fg(p.summary_line, &"\u{2500}".repeat(52));
     eprintln!(" {line}");
-
-    // Bloom decision tally (only when filters were consulted this run).
-    if !bloom.is_empty() {
-        let mut parts = Vec::new();
-        if bloom.skipped > 0 {
-            parts.push(fg(p.benign, &format!("{} known-good", bloom.skipped)));
-        }
-        if bloom.flagged > 0 {
-            parts.push(fg(p.hostile, &format!("{} known-bad", bloom.flagged)));
-        }
-        if bloom.conflicted > 0 {
-            parts.push(fg(p.warning, &format!("{} conflicted", bloom.conflicted)));
-        }
-        if bloom.unscanned > 0 {
-            parts.push(fg(p.very_dim, &format!("{} unscanned", bloom.unscanned)));
-        }
-        let sep = format!("  {}  ", fg(p.dot_sep, "\u{00b7}"));
-        eprintln!(
-            " {}  bloom  {}",
-            fg(p.header_icon, "\u{25c6}"),
-            parts.join(&sep)
-        );
-    }
 
     eprintln!(" {}", summary_status_line(summary));
     eprintln!();
@@ -1503,6 +1485,10 @@ mod tests {
         // Each state is visually distinct.
         assert_ne!(BloomMark::KnownGood.glyph(), BloomMark::KnownBad.glyph());
         assert_ne!(BloomMark::KnownBad.glyph(), BloomMark::Conflicted.glyph());
+        assert!(!BloomMark::KnownGood.forces_terminal_display());
+        assert!(BloomMark::KnownBad.forces_terminal_display());
+        assert!(BloomMark::Sighted.forces_terminal_display());
+        assert!(BloomMark::Conflicted.forces_terminal_display());
     }
 
     #[test]

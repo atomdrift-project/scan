@@ -607,7 +607,10 @@ mod trait_floor_tests {
             trait_family("objectives/supply-chain/install-hook/npm::b"),
         );
         // A short or path-less id is its own family, never a shared bucket.
-        assert_eq!(trait_family("micro-behaviors/mem::x"), "micro-behaviors/mem");
+        assert_eq!(
+            trait_family("micro-behaviors/mem::x"),
+            "micro-behaviors/mem"
+        );
         assert_eq!(trait_family("bare-id"), "bare-id");
         // The leaf trait id is never part of the family, at any path length —
         // otherwise every trait would be its own family and the diversity test
@@ -1881,8 +1884,6 @@ impl Inner {
         let external_dependencies = self.external_dependencies.load(Ordering::Relaxed);
         let external_urls = self.external_urls.load(Ordering::Relaxed);
         let elapsed = self.start.elapsed();
-        let rate = f64::from(done) / elapsed.as_secs_f64().max(0.001);
-        let eta = f64::from(self.total - done) / rate.max(0.001);
 
         let frame = SPINNER[self.tick.fetch_add(1, Ordering::Relaxed) as usize % SPINNER.len()];
         let bar_w = 20;
@@ -1902,7 +1903,7 @@ impl Inner {
         let filled_str: String = bar.chars().take(filled + 1).collect();
         let dim_str: String = bar.chars().skip(filled + 1).collect();
 
-        let stats = format!("{done}/{}  {:.0}/s  {}", self.total, rate, format_eta(eta));
+        let stats = progress_stats(done, self.total, elapsed);
 
         // Long-tail reassurance: when only a few files remain and the count has
         // not moved for a while, the scan is almost certainly deep in a slow
@@ -1910,7 +1911,7 @@ impl Inner {
         // separate line) so the bar's own clear erases it — the note shows while
         // the tail is stalled and vanishes the instant a file completes or the
         // scan ends. Capped to the terminal width so it can never wrap.
-        let left = self.total - done;
+        let left = self.total.saturating_sub(done);
         let stalled_ms = elapsed
             .as_millis()
             .saturating_sub(u128::from(self.last_advance_ms.load(Ordering::Relaxed)));
@@ -1940,6 +1941,18 @@ impl Inner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
+}
+
+/// Stable right-hand progress text. There is no rate before the first file
+/// completes, so keep that otherwise-nonsensical initial ETA qualitative.
+fn progress_stats(done: u32, total: u32, elapsed: Duration) -> String {
+    if done == 0 {
+        return format!("{done}/{total}  Estimating\u{2026}");
+    }
+
+    let rate = f64::from(done) / elapsed.as_secs_f64().max(0.001);
+    let eta = f64::from(total.saturating_sub(done)) / rate.max(0.001);
+    format!("{done}/{total}  {rate:.0}/s  {}", format_eta(eta))
 }
 
 /// Compact status text for external work currently shared by the scan's
@@ -2176,6 +2189,27 @@ fn format_eta(secs: f64) -> String {
         format!("~{:.0}s", secs)
     } else {
         format!("~{}m{:.0}s", (secs / 60.0) as u32, secs % 60.0)
+    }
+}
+
+#[cfg(test)]
+mod progress_render_tests {
+    use super::*;
+
+    #[test]
+    fn eta_waits_for_a_real_sample() {
+        assert_eq!(
+            progress_stats(0, 100, Duration::from_secs(30)),
+            "0/100  Estimating…",
+            "elapsed time alone cannot produce a rate"
+        );
+    }
+
+    #[test]
+    fn eta_appears_after_the_first_completed_file() {
+        let stats = progress_stats(1, 100, Duration::from_millis(500));
+        assert!(!stats.contains("Estimating"));
+        assert!(stats.contains("/s"));
     }
 }
 
@@ -2753,15 +2787,19 @@ fn record_file_result(
     match scan_result {
         Ok(mut r) => {
             tally.count(r.classification);
-            // A bloom-flagged (known-bad/conflicted) file is always surfaced — its
-            // flag replaces the old unconditional banner, so the benign filter must
-            // not swallow a known-bad file the model happens to rate benign.
+            // An adversely bloom-marked file is always surfaced — its flag
+            // replaces the old unconditional banner, so the benign filter must
+            // not swallow a known-bad file the model happens to rate benign. A
+            // fresh known-good that was rescanned and remained benign still
+            // obeys the ordinary display filter.
             // JSON, tiny, and interpret are machine/LLM payload formats: they
             // emit every scanned file — `--show` gates only the terminal view.
             if matches!(
                 config.format(),
                 OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
-            ) || r.bloom_mark.is_some()
+            ) || r
+                .bloom_mark
+                .is_some_and(crate::output::BloomMark::forces_terminal_display)
                 || config.filter().shows(&r.classification)
             {
                 if let Some(p) = progress {
@@ -3814,10 +3852,7 @@ fn terminal_identity_tokens(text: &str) -> Vec<String> {
             normalized.push(' ');
         }
     }
-    normalized
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect()
+    normalized.split_whitespace().map(str::to_owned).collect()
 }
 
 fn terminal_label_contains_identity(label: &str, identity: &str) -> bool {
@@ -3988,9 +4023,7 @@ fn terminal_top_traits(report: &cleave::AnalysisReport) -> Vec<crate::output::Te
                     continue;
                 }
                 let full_id = finding.id.as_str();
-                let base_id = full_id
-                    .split_once("::")
-                    .map_or(full_id, |(base, _)| base);
+                let base_id = full_id.split_once("::").map_or(full_id, |(base, _)| base);
                 if seen_ids.contains(base_id) {
                     continue;
                 }
@@ -4364,13 +4397,7 @@ fn render_archive_cards(
         } else {
             format!("\n{rows}")
         };
-        crate::output::terminal_card(
-            &pkg.decision.class,
-            &name,
-            ptype,
-            psize,
-            &body,
-        )
+        crate::output::terminal_card(&pkg.decision.class, &name, ptype, psize, &body)
     };
 
     // The archive's own card leads when it earned one — its own hostility is the
@@ -6283,11 +6310,7 @@ fn render_terminal_fetch_context(
         let _ = writeln!(
             out,
             "{}",
-            crate::output::terminal_reference_hash(
-                content_sha,
-                &root.file_type,
-                root.size,
-            )
+            crate::output::terminal_reference_hash(content_sha, &root.file_type, root.size,)
         );
         let mut signals = Vec::new();
         if rec.pin_verified == Some(false) {
@@ -7732,20 +7755,17 @@ mod dep_backref_tests {
             "sparse records must omit nulls: {ctx}"
         );
 
-        let terminal = render_terminal_fetch_context(
-            &edges,
-            &deps,
-            &registries,
-            &report,
-        )
-        .expect("hostile dependency is shown");
+        let terminal = render_terminal_fetch_context(&edges, &deps, &registries, &report)
+            .expect("hostile dependency is shown");
         let terminal = crate::deptree::strip_ansi(&terminal);
         let provenance = terminal.find("    from  this file").unwrap();
         let finding = terminal.find("dependency package finding").unwrap();
         assert!(provenance < finding);
-        assert!(terminal.contains(
-            "\n  ↳ HOSTILE 97% · DEPENDENCY\n    pkg:test/dep@1\n    from  this file"
-        ));
+        assert!(
+            terminal.contains(
+                "\n  ↳ HOSTILE 97% · DEPENDENCY\n    pkg:test/dep@1\n    from  this file"
+            )
+        );
         assert!(terminal.contains("\n\n    ●●●  dependency package finding"));
         assert_eq!(terminal.matches("pkg:test/dep@1").count(), 1);
         assert!(
