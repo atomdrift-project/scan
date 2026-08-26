@@ -555,9 +555,7 @@ mod tests {
     #[test]
     fn an_unknown_decision_synthesizes_nothing() {
         let mut hits = Vec::new();
-        assert!(
-            bloom_derived_view(Decision::Unknown, "unknown", "abc", None, &mut hits).is_none()
-        );
+        assert!(bloom_derived_view(Decision::Unknown, "unknown", "abc", None, &mut hits).is_none());
     }
 
     /// A bless answers benign and names no evidence: the filters say we looked

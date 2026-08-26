@@ -32,8 +32,9 @@ use crate::engine::{PROGRESS_TICK, SPINNER, bar_active, term_dims};
 pub(crate) enum DepState {
     Fetching,
     Analyzing,
-    /// The fetch was clipped by a budget. Keep the key settled internally but
-    /// omit the row; the fetch reporter emits one aggregate notice instead.
+    /// The fetch has no useful per-reference terminal result (for example, a
+    /// budget-clipped or unresolved locator). Keep the key settled internally
+    /// while omitting its row.
     Hidden,
     Done {
         glyph: char,

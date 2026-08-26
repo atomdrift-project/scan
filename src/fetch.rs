@@ -1672,7 +1672,7 @@ impl Reporter {
     /// idempotent.
     fn landed(&self, r: &Reference, rec: &FetchRecord) {
         if let Self::Tree { tree, .. } = self {
-            if matches!(rec.outcome, Outcome::BudgetExceeded) {
+            if matches!(rec.outcome, Outcome::BudgetExceeded) || !terminal_fetch_row_visible(rec) {
                 tree.set(&locator_key(r), DepState::Hidden);
             } else {
                 tree.set(&locator_key(r), landed_state(rec));
@@ -1714,6 +1714,9 @@ impl Reporter {
                     }
                 }
             }
+            return;
+        }
+        if !terminal_fetch_row_visible(rec) {
             return;
         }
         if let Self::Stream { .. } = self {
@@ -1855,6 +1858,9 @@ fn landed_state(rec: &FetchRecord) -> DepState {
 /// The settled tree state for a fetch: the shared [`fetch_row`] glyph/colour,
 /// with the detail column (a size, or a failure note) as its trailing text.
 fn done_state(rec: &FetchRecord) -> DepState {
+    if !terminal_fetch_row_visible(rec) {
+        return DepState::Hidden;
+    }
     let (glyph, _label, r, g, b, detail) = fetch_row(rec);
     DepState::Done {
         glyph,
@@ -2063,6 +2069,9 @@ pub fn report_registry(reg: &Registry, progress: bool) {
 /// Only the interactive terminal path passes `progress`; JSON/server callers
 /// stay silent. Colors mirror the scan progress bar's truecolor palette.
 fn report_fetch(rec: &FetchRecord) {
+    if !terminal_fetch_row_visible(rec) {
+        return;
+    }
     let (glyph, label, r, g, b, detail) = fetch_row(rec);
 
     // The actual URL fetched; fall back to the bare locator (PURL) when the
@@ -2087,6 +2096,14 @@ fn report_fetch(rec: &FetchRecord) {
     eprintln!(
         "    \x1b[38;2;{r};{g};{b}m{glyph} {label:<6}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {url}{redirect}"
     );
+}
+
+/// Whether one fetch outcome deserves a terminal row. An unresolved locator
+/// produced no bytes and carries no actionable failure detail; retain its
+/// [`FetchRecord`] for machine output and diagnostics, but keep the default
+/// human view quiet.
+fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
+    !matches!(rec.outcome, Outcome::Unresolved)
 }
 
 /// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
@@ -3770,6 +3787,20 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_fetches_stay_out_of_the_terminal_view() {
+        let mut rec = fetched_record();
+        rec.outcome = Outcome::Unresolved;
+
+        assert!(!terminal_fetch_row_visible(&rec));
+        assert!(matches!(landed_state(&rec), DepState::Hidden));
+        assert!(matches!(done_state(&rec), DepState::Hidden));
+
+        rec.outcome = Outcome::Failed("transport".to_string());
+        assert!(terminal_fetch_row_visible(&rec));
+        assert!(matches!(done_state(&rec), DepState::Done { .. }));
+    }
+
+    #[test]
     fn budget_notice_names_the_limiting_count_flag() {
         assert_eq!(
             fetch_count_budget_notice("--fetch-max-urls", 4, usize::MAX),
@@ -4181,14 +4212,17 @@ mod tests {
 
         // Both provenance shapes are recognized; an ordinary JSON root is not.
         assert!(is_provenance_document("json", "pkg-1.0.tar.gz.forage.json"));
-        assert!(is_provenance_document("registry", "left-pad@1.3.0.registry.json"));
+        assert!(is_provenance_document(
+            "registry",
+            "left-pad@1.3.0.registry.json"
+        ));
         assert!(!is_provenance_document("json", "package.json"));
         assert!(!is_provenance_document("json", "forage.json.txt"));
 
         // A document with no subject yields nothing rather than falling back to
         // the catalogue.
-        let empty = serde_json::to_vec(&serde_json::json!({"registry": {"raw": []}}))
-            .expect("serialize");
+        let empty =
+            serde_json::to_vec(&serde_json::json!({"registry": {"raw": []}})).expect("serialize");
         assert!(provenance_subject(&empty).is_none());
     }
 

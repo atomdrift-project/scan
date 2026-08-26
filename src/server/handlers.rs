@@ -1028,9 +1028,9 @@ fn lookup_response(
             // moves underneath it, and it must stop being served the moment a
             // real analysis exists. hopper bounds its own ledger-derived
             // records the same way and for the same reason.
-            if let Ok(value) =
-                axum::http::HeaderValue::from_str(&format!("{scope}, max-age={BLOOM_DERIVED_MAX_AGE}"))
-            {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+                "{scope}, max-age={BLOOM_DERIVED_MAX_AGE}"
+            )) {
                 headers.insert(axum::http::header::CACHE_CONTROL, value);
             }
             if let Ok(value) = axum::http::HeaderValue::from_str(sha256.trim()) {
@@ -3502,7 +3502,8 @@ pub(super) async fn v1_analyze(
     // means we could not find out — turning that into a refusal to work would
     // make a corpus outage look like an answer. Both fall through and run.
     if !q.force && request_follow.persist {
-        if let Ok((decided, source)) = v1_resolve(&state, None, Some(&req.purl), None, budget, q.fresh).await
+        if let Ok((decided, source)) =
+            v1_resolve(&state, None, Some(&req.purl), None, budget, q.fresh).await
             && decided.is_answerable()
         {
             let elapsed = crate::duration_ms(request_start.elapsed());

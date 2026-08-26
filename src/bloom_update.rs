@@ -149,10 +149,7 @@ fn fetch_manifest(connect: Option<Duration>) -> Result<(Manifest, String)> {
                 let manifest: Manifest = toml::from_str(&text)
                     .with_context(|| format!("parsing bloom manifest {url}"))?;
                 if !tried.is_empty() {
-                    tracing::debug!(
-                        "no bloom bundle at {}; using {prefix}",
-                        tried.join(", ")
-                    );
+                    tracing::debug!("no bloom bundle at {}; using {prefix}", tried.join(", "));
                 }
                 return Ok((manifest, prefix));
             }

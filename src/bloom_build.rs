@@ -466,7 +466,9 @@ mod tests {
     fn verify_rejects_eicar_in_good() {
         let eicar = parse_sha256_hex(EICAR).unwrap();
         let filters = filters_from(&[(Label::Good, eicar)]);
-        let err = verify_build(&filters, None, &[], false).unwrap_err().to_string();
+        let err = verify_build(&filters, None, &[], false)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("canary") && err.contains("sha256-good"),
             "{err}"

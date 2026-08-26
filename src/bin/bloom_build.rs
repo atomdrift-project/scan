@@ -60,7 +60,10 @@ struct Args {
     /// collapse-to-zero guard all stay fatal, and every accepted breach is
     /// printed. Prefer setting it for the one cutover run rather than leaving it
     /// on in the timer.
-    #[arg(long = "accept-unusual-growth", env = "SCAN_BLOOM_ACCEPT_UNUSUAL_GROWTH")]
+    #[arg(
+        long = "accept-unusual-growth",
+        env = "SCAN_BLOOM_ACCEPT_UNUSUAL_GROWTH"
+    )]
     accept_unusual_growth: bool,
 }
 

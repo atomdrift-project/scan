@@ -28,7 +28,6 @@
 
 pub mod admission;
 pub mod analysis_cache;
-pub mod corpus_precheck;
 pub mod analyzer;
 pub mod auto_update;
 pub mod bench_hopper;
@@ -37,6 +36,7 @@ pub mod bloom_build;
 pub mod bloom_repo;
 pub mod bloom_update;
 pub mod cache_cleanup;
+pub mod corpus_precheck;
 pub mod crash_dump;
 pub mod deptree;
 pub mod engine;

@@ -129,9 +129,7 @@ struct Record {
 fn local_traits() -> Option<&'static str> {
     static TRAITS: OnceLock<Option<String>> = OnceLock::new();
     TRAITS
-        .get_or_init(|| {
-            cleave::traits_repo::version().map(|v| v.chars().take(5).collect())
-        })
+        .get_or_init(|| cleave::traits_repo::version().map(|v| v.chars().take(5).collect()))
         .as_deref()
 }
 
@@ -146,7 +144,10 @@ pub(crate) fn skip_reanalysis(content_sha: &str) -> bool {
     }
     CHECKS.fetch_add(1, Ordering::Relaxed);
 
-    let mut req = p.client.get(&p.lookup_url).query(&[("sha256", content_sha)]);
+    let mut req = p
+        .client
+        .get(&p.lookup_url)
+        .query(&[("sha256", content_sha)]);
     if let Some(token) = crate::upload::bearer_token() {
         req = req.bearer_auth(token);
     }
@@ -214,7 +215,10 @@ fn verdict_stands(rec: &Record, my_traits: Option<&str>, max_age_s: u64, now: u6
 /// (lookups attempted, analyses skipped) since process start, for the worker
 /// summary line.
 pub(crate) fn counters() -> (u64, u64) {
-    (CHECKS.load(Ordering::Relaxed), SKIPS.load(Ordering::Relaxed))
+    (
+        CHECKS.load(Ordering::Relaxed),
+        SKIPS.load(Ordering::Relaxed),
+    )
 }
 
 /// Parse an RFC 3339 UTC timestamp ("2026-08-23T23:00:44Z", fractional seconds
@@ -225,7 +229,13 @@ pub(crate) fn counters() -> (u64, u64) {
 /// parse here would silently misjudge freshness.
 fn parse_rfc3339_epoch(s: &str) -> Option<u64> {
     let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
     if b[b.len() - 1] != b'Z' {
@@ -314,21 +324,61 @@ mod tests {
         let stale = Some("2026-08-01T00:00:00Z"); // 23 days old
 
         // Rule 1: same analyzer skips any verdict, hostile included, any age.
-        assert!(verdict_stands(&rec(Some(3), Some("b8c1c"), stale), Some("b8c1c"), week, now));
+        assert!(verdict_stands(
+            &rec(Some(3), Some("b8c1c"), stale),
+            Some("b8c1c"),
+            week,
+            now
+        ));
         // ...but never on a record with no verdict at all.
-        assert!(!verdict_stands(&rec(None, Some("b8c1c"), fresh), Some("b8c1c"), week, now));
+        assert!(!verdict_stands(
+            &rec(None, Some("b8c1c"), fresh),
+            Some("b8c1c"),
+            week,
+            now
+        ));
         // ...and never across analyzers for a non-benign verdict.
-        assert!(!verdict_stands(&rec(Some(3), Some("f6eaa"), fresh), Some("b8c1c"), week, now));
+        assert!(!verdict_stands(
+            &rec(Some(3), Some("f6eaa"), fresh),
+            Some("b8c1c"),
+            week,
+            now
+        ));
         // Empty-string traits (the member-row gap) must not match anything.
-        assert!(!verdict_stands(&rec(Some(3), Some(""), fresh), Some(""), week, now));
+        assert!(!verdict_stands(
+            &rec(Some(3), Some(""), fresh),
+            Some(""),
+            week,
+            now
+        ));
 
         // Rule 2: benign and fresh skips across analyzers...
-        assert!(verdict_stands(&rec(Some(-1), Some("f6eaa"), fresh), Some("b8c1c"), week, now));
+        assert!(verdict_stands(
+            &rec(Some(-1), Some("f6eaa"), fresh),
+            Some("b8c1c"),
+            week,
+            now
+        ));
         // ...including when the stored row has no traits at all.
-        assert!(verdict_stands(&rec(Some(-1), None, fresh), Some("b8c1c"), week, now));
+        assert!(verdict_stands(
+            &rec(Some(-1), None, fresh),
+            Some("b8c1c"),
+            week,
+            now
+        ));
         // ...but not stale, and not without a timestamp.
-        assert!(!verdict_stands(&rec(Some(-1), None, stale), Some("b8c1c"), week, now));
-        assert!(!verdict_stands(&rec(Some(-1), None, None), Some("b8c1c"), week, now));
+        assert!(!verdict_stands(
+            &rec(Some(-1), None, stale),
+            Some("b8c1c"),
+            week,
+            now
+        ));
+        assert!(!verdict_stands(
+            &rec(Some(-1), None, None),
+            Some("b8c1c"),
+            week,
+            now
+        ));
     }
 
     #[test]
