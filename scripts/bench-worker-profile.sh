@@ -22,7 +22,9 @@ done
 [ -n "$port" ] || { echo "error: mock hopper did not start" >&2; exit 1; }
 echo "hopper on port $port"
 
-CLEAVE_SKIP_CACHE=1 SCAN_NO_ANALYSIS_CACHE=1 SCAN_FETCH=all SCAN_NO_UPDATE_CHECK=1 \
+# Bypass persisted analysis results while retaining compiled runtime caches, as
+# a long-lived worker does after startup.
+SCAN_NO_ANALYSIS_CACHE=1 SCAN_FETCH=all SCAN_NO_UPDATE_CHECK=1 \
 SCAN_HEARTBEAT_SECS=5 \
 samply record --save-only -o "$out" -- \
     "$binary" worker \

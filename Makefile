@@ -437,6 +437,9 @@ HEARTBEAT_SECS       ?= 5
 ORDER                ?= fifo
 BENCH_SUMMARY        ?= /tmp/litmus-worker-bench-summary.json
 BENCH_BODIES         ?= /tmp/litmus-worker-bodies
+# Disable persisted analysis-result reuse while retaining compiled mapper/YARA
+# caches. Long-lived workers pay compilation once, so forcing those caches cold
+# would measure artificial startup work rather than sustained throughput.
 worker-benchmark: release ## Benchmark the worker model over a local dataset via the bundled mock hopper
 	@[ -e "$(WORKER_BENCH_PATH)" ] || { echo "error: dataset not found: $(WORKER_BENCH_PATH)"; exit 1; }
 	@echo "worker-benchmark: dataset=$(WORKER_BENCH_PATH) workers=$(if $(WORKERS),$(WORKERS),default) order=$(ORDER) max_rss_gb=$(if $(MAX_RSS_GB),$(MAX_RSS_GB),auto)"
@@ -457,7 +460,7 @@ worker-benchmark: release ## Benchmark the worker model over a local dataset via
 	[ -n "$$port" ] || { echo "error: mock hopper did not start"; cat $$out; exit 1; }; \
 	echo "hopper: port=$$port jobs=$$jobs"; \
 	tflag=$$( [ "$$(uname -s)" = "Darwin" ] && echo -l || echo -v ); \
-	CLEAVE_SKIP_CACHE=1 SCAN_HEARTBEAT_SECS=$(HEARTBEAT_SECS) \
+	SCAN_NO_ANALYSIS_CACHE=1 SCAN_HEARTBEAT_SECS=$(HEARTBEAT_SECS) \
 	$(if $(GRID),SCAN_PER_SLOT_POOLS=1,) \
 	/usr/bin/time $$tflag ./out/$(BINARY) worker \
 		--url "http://127.0.0.1:$$port" \

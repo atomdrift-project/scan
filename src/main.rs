@@ -1360,6 +1360,7 @@ fn main() -> Result<()> {
     }
 
     warn_on_broken_freebsd_malloc_conf();
+    scan::heap_profile::warn_if_debug_allocator();
 
     const RAYON_FALLBACK_THREADS: usize = 4;
     // Physical cores, matching cleave's own pool. Logical SMT siblings
