@@ -1390,7 +1390,7 @@ pub(crate) fn orchestrate(
                 }
                 batch_payloads += fetched
                     .iter()
-                    .filter(|r| matches!(r.outcome, Outcome::Ok | Outcome::PinMismatch))
+                    .filter(|r| delivered_bytes(r))
                     .count();
                 batch.push(GroupWork {
                     source_sha,
@@ -1844,11 +1844,23 @@ fn purl_display(purl: &str) -> String {
     }
 }
 
+/// Whether a fetch put bytes in our hands: a clean fetch, bytes whose hash
+/// contradicted the declared pin, or bytes carrying a pin Fletch cannot verify.
+/// All three are worth scanning — the two pin outcomes most of all — while an
+/// unresolved, skipped, budget-capped, or failed fetch has nothing to scan.
+fn delivered_bytes(rec: &FetchRecord) -> bool {
+    matches!(
+        rec.outcome,
+        Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin
+    )
+}
+
 /// The tree state for a fetch the moment it lands: "analyzing" when bytes are in
-/// hand and a scan will follow (an `Ok` or a pin mismatch — the mismatch settles
-/// to its own glyph once analyzed), else the settled fetch glyph.
+/// hand and a scan will follow (an `Ok`, a pin mismatch, or an unverifiable pin —
+/// each pin outcome settles to its own glyph once analyzed), else the settled
+/// fetch glyph.
 fn landed_state(rec: &FetchRecord) -> DepState {
-    if matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
+    if delivered_bytes(rec) {
         DepState::Analyzing
     } else {
         done_state(rec)
@@ -1946,7 +1958,7 @@ pub fn fetch_one(
         );
         report_fetch(&rec);
     }
-    if !matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
+    if !delivered_bytes(&rec) {
         let target = if rec.resolved_url.is_empty() {
             rec.locator.as_str()
         } else {
@@ -2125,6 +2137,14 @@ fn fetch_row(rec: &FetchRecord) -> FetchRow {
             90,
             90,
             Some("hash mismatch".to_string()),
+        ),
+        Outcome::UnverifiablePin => (
+            '\u{25cb}',
+            "pin?",
+            230,
+            180,
+            80,
+            Some("pin unverifiable".to_string()),
         ),
         Outcome::Ok if rec.stale => ('\u{25cf}', "stale", 230, 180, 80, None),
         Outcome::Ok => {
@@ -2827,8 +2847,10 @@ fn summary_line(records: &[FetchRecord]) -> String {
     for rec in records {
         bytes += rec.size.unwrap_or(0);
         match &rec.outcome {
-            Outcome::Ok | Outcome::PinMismatch if rec.cached => cached += 1,
-            Outcome::Ok | Outcome::PinMismatch => live += 1,
+            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin if rec.cached => {
+                cached += 1;
+            }
+            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin => live += 1,
             Outcome::Failed(_) => failed += 1,
             Outcome::BudgetExceeded | Outcome::Unresolved | Outcome::Skipped => {}
         }
@@ -3234,9 +3256,10 @@ fn analyze_payload(
     opts: &AnalysisOptions,
     acache: Option<&AnalysisCache>,
 ) -> Option<Analyzed> {
-    // Scan whatever bytes we hold: a clean fetch or a pin mismatch (a mismatch
-    // is exactly the case worth analyzing). Skipped/unresolved/failed have none.
-    if !matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
+    // Scan whatever bytes we hold: a clean fetch, a pin mismatch, or a pin we
+    // could not verify (the pin outcomes are exactly the cases worth analyzing).
+    // Skipped/unresolved/failed have no bytes.
+    if !delivered_bytes(rec) {
         return None;
     }
     let content_sha = rec.content_sha256.clone().unwrap_or_default();
@@ -3798,6 +3821,30 @@ mod tests {
         rec.outcome = Outcome::Failed("transport".to_string());
         assert!(terminal_fetch_row_visible(&rec));
         assert!(matches!(done_state(&rec), DepState::Done { .. }));
+    }
+
+    /// Regression for the silent-skip bug: `UnverifiablePin` delivers bytes just
+    /// as `Ok` and `PinMismatch` do. The "did we get bytes" gates are `matches!`,
+    /// which the compiler does not check for exhaustiveness, so a new Outcome can
+    /// slip through them and drop a fetched payload out of analysis unnoticed —
+    /// precisely the payload whose pin could not be verified.
+    #[test]
+    fn an_unverifiable_pin_is_analyzed_and_tallied_like_any_delivered_bytes() {
+        let mut rec = fetched_record();
+        rec.outcome = Outcome::UnverifiablePin;
+
+        assert!(delivered_bytes(&rec));
+        assert!(matches!(landed_state(&rec), DepState::Analyzing));
+        assert!(terminal_fetch_row_visible(&rec));
+
+        // It must reach the run summary rather than vanish from the counts.
+        let line = summary_line(std::slice::from_ref(&rec));
+        assert!(line.contains("1 cached"), "{line}");
+
+        // And read as its own row, distinct from a verified fetch and from the
+        // harder `pin!` mismatch.
+        let (_, label, ..) = fetch_row(&rec);
+        assert_eq!(label, "pin?");
     }
 
     #[test]
