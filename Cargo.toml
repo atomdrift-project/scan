@@ -79,7 +79,7 @@ repository = "https://github.com/atomdrift-project/scan"
 # stop doing anything and cleave logs `allocator="system"`. The flag was here
 # until 88baea5 (2026-08-20) dropped it by accident, on a rationale that did not
 # hold; leaving it off is the correct end state, so do not add it back.
-cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
+cleave = { path = "/tmp/claude-1000/-home-t-gauntlet/9862f84c-4090-4266-9193-2bf21cabca43/scratchpad/cleave-head" }  # TEMP
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }

@@ -5826,14 +5826,37 @@ fn render_interpret_context(
     let primary_context =
         cleave::output::format_context(&primary, &cleave::output::TinyOpts::tiny());
     let _ = writeln!(out, "== PRIMARY {label} ==");
-    let primary_provenance =
-        primary_provenance(label, sha256, root_fetch, root_registry, &mut raw_seen);
-    let _ = writeln!(
-        out,
-        "provenance={}",
-        serde_json::to_string(&primary_provenance).unwrap_or_else(|_| "{}".to_string())
+    let now_secs = scan_now_secs();
+    let primary_provenance = slim_provenance_for_interpret(
+        primary_provenance(label, sha256, root_fetch, root_registry, &mut raw_seen),
+        now_secs,
     );
+    let primary_provenance_line =
+        serde_json::to_string(&primary_provenance).unwrap_or_else(|_| "{}".to_string());
+    let _ = writeln!(out, "provenance={primary_provenance_line}");
     out.push_str(&primary_context);
+    // Restated after the findings. One `provenance=` line at the head of a render
+    // that runs to tens of KB is not read: the grader infers identity from
+    // filenames and source instead, and the registry's claim never enters the
+    // judgment at all. The same bytes at the tail are read — measured on a
+    // mislabelled sample, where head-only provenance graded benign ("standard LDAP
+    // gem", describing the code and ignoring the claim) and the tail restatement
+    // caught it ("registry mismatch").
+    // Only the registry record is restated, never the whole block: `raw` is the
+    // bulk of it and repeating that would cost more than the restatement buys.
+    // The claim is what the grader needs a second look at.
+    let identity = primary_provenance
+        .get("registry")
+        .and_then(|registry| registry.get("record"))
+        .filter(|record| record.as_object().is_some_and(|r| !r.is_empty()));
+    if let Some(identity) = identity {
+        let line = serde_json::to_string(&serde_json::json!({"registry": {"record": identity}}))
+            .unwrap_or_else(|_| "{}".to_string());
+        let _ = writeln!(
+            out,
+            "\n== SUBJECT IDENTITY (registry claim for PRIMARY) ==\nprovenance={line}"
+        );
+    }
 
     let mut shown_registry_ids = std::collections::HashSet::new();
     let mut visited_roots = std::collections::HashSet::new();
@@ -5892,7 +5915,10 @@ fn render_interpret_context(
             "FETCH"
         };
         let _ = writeln!(out, "\n== {subject} {} class={class} ==", rec.locator);
-        let provenance = dependency_provenance(rec, registry, report, &mut raw_seen);
+        let provenance = slim_provenance_for_interpret(
+            dependency_provenance(rec, registry, report, &mut raw_seen),
+            now_secs,
+        );
         let _ = writeln!(
             out,
             "provenance={}",
@@ -5966,7 +5992,97 @@ fn render_interpret_context(
     if omitted > 0 {
         let _ = writeln!(out, "\ndeps_omitted={omitted}");
     }
+    recategorize_annotations(&out)
+}
+
+/// Rewrite each finding annotation from a graded conclusion into a categorized
+/// observation, for the LLM view only.
+///
+/// cleave announces a finding as `# SEV LOC desc (trait::id)`. Both the severity
+/// letter and the prose are the analyzer's *answer*, and handing the answer to a
+/// second opinion asked to check it produces agreement, not review: the model
+/// summarizes the highest-severity assertion instead of reading the bytes under
+/// it. Measured on the poppy/gauntlet false positives, a .NET single-file bundle
+/// whose overlay carries the CLR graded hostile under every prompt, provenance
+/// and carve-out we tried, and benign as soon as the annotation stopped asserting
+/// "process-hollowing API chain" outright.
+///
+/// The rewrite keeps the description and drops the grade:
+///
+/// ```text
+/// // H Dynamically resolved process-hollowing API chain (objectives/evasion/process/injection/hollowing::…)
+/// // Possible evasion/process — Dynamically resolved process-hollowing API chain
+/// ```
+///
+/// Dropping the description instead was also measured, and costs recall exactly
+/// where `docs/interpret-tuning.md` predicts: on packed binaries the prose is the
+/// only readable signal, and a real dropper went benign without it. So the prose
+/// stays and only its authority is removed.
+///
+/// The terminal view is untouched — this is the machine/LLM render alone.
+fn recategorize_annotations(rendered: &str) -> String {
+    let mut out = String::with_capacity(rendered.len());
+    for line in rendered.split_inclusive('\n') {
+        match recategorize_annotation(line.trim_end_matches('\n')) {
+            Some(rewritten) => {
+                out.push_str(&rewritten);
+                if line.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            None => out.push_str(line),
+        }
+    }
     out
+}
+
+/// One annotation line, or `None` when the line is not one.
+fn recategorize_annotation(line: &str) -> Option<String> {
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+    let (comment, rest) = rest
+        .strip_prefix("// ")
+        .map(|r| ("//", r))
+        .or_else(|| rest.strip_prefix("# ").map(|r| ("#", r)))?;
+    // `SEV ` — a single grade letter and a space.
+    let (sev, rest) = rest.split_at(rest.char_indices().nth(1)?.0 + 1);
+    if !matches!(sev.trim(), "H" | "S" | "N" | "B") || !sev.ends_with(' ') {
+        return None;
+    }
+    // The trait id is the trailing parenthesized group; without one there is no
+    // category to name and the line is left alone.
+    let open = rest.rfind(" (")?;
+    let inner = rest[open + 2..].strip_suffix(')')?;
+    if inner.contains('(') || inner.contains(')') || !inner.contains("::") {
+        return None;
+    }
+    let body = &rest[..open];
+    // `LOC ` (a `line:col` or `@offset`) stays; it is a pointer, not a verdict.
+    let (loc, desc) = match body.split_once(' ') {
+        Some((head, tail))
+            if head.starts_with('@') || head.split_once(':').is_some_and(|(a, b)| {
+                !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit())
+            }) =>
+        {
+            (format!("{head} "), tail)
+        }
+        _ => (String::new(), body),
+    };
+    let category = trait_category(inner);
+    Some(format!("{indent}{comment} {loc}Possible {category} — {desc}"))
+}
+
+/// The family a trait belongs to: the two path components below its namespace,
+/// e.g. `objectives/evasion/process/injection/hollowing::x` → `evasion/process`.
+/// Broad on purpose — it should place the match, not characterize it.
+fn trait_category(trait_id: &str) -> String {
+    let path = trait_id.split("::").next().unwrap_or(trait_id);
+    let mut parts = path.split('/').filter(|p| !p.is_empty()).skip(1);
+    match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => format!("{a}/{b}"),
+        (Some(a), None) => a.to_string(),
+        _ => "pattern".to_string(),
+    }
 }
 
 fn fetched_root_id<'a>(
@@ -6112,7 +6228,8 @@ fn render_registry_provenance(
 /// and version history the LLM never uses to grade. What it does use is the
 /// package's *claimed identity* (does the observed behavior have a plausible
 /// role in what this package says it is for?) and the handful of signals that
-/// say whether that claim is worth anything.
+/// say whether that claim is worth anything, so the record is projected to those
+/// and nothing else.
 ///
 /// `page` is recomputed from `first_published_at`/`published_at` against scan
 /// time rather than read from the record's own `age_days`. An offline
@@ -6129,7 +6246,11 @@ fn slim_provenance_for_interpret(
     let Some(registry) = provenance.get_mut("registry").and_then(|r| r.as_object_mut()) else {
         return provenance;
     };
-    registry.remove("raw");
+    // `raw` is deliberately kept: two render tests pin that provider-only fields
+    // reach the grader through it ("interpret projection must derive from
+    // preserved raw provenance"), and a sparse `record` can leave it as the only
+    // place a provider's own signal survives. It is also the bulk of the payload
+    // — see the note in `docs/interpret-tuning.md` on trimming it separately.
     if let Some(record) = registry.get("record") {
         let slim = project_registry_record(record, now_secs);
         registry.insert("record".to_string(), slim);
@@ -6185,11 +6306,19 @@ fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_j
     if let Some(url) = get_str("repository").or_else(|| get_str("homepage")) {
         out.insert("u".to_string(), serde_json::json!(url));
     }
-    // Age at scan time, from the earliest publication the record knows about.
-    if let Some(first) = get_i64("first_published_at").or_else(|| get_i64("published_at"))
-        && now_secs > first
-    {
-        out.insert("page".to_string(), serde_json::json!((now_secs - first) / 86_400));
+    // Two distinct ages, both measured at scan time. `page` is how long the
+    // *package* has existed and is the credibility signal; `vage` is how long
+    // this *version* has, which is a freshness signal and nothing more. Folding
+    // them into one key would report a decade-old gem as days old whenever it
+    // had just cut a release — inverting exactly the signal the coherence test
+    // leans on — so `page` is emitted only when the record actually carries a
+    // first-publication date.
+    let days_since = |ts: i64| (now_secs > ts).then(|| (now_secs - ts) / 86_400);
+    if let Some(days) = get_i64("first_published_at").and_then(days_since) {
+        out.insert("page".to_string(), serde_json::json!(days));
+    }
+    if let Some(days) = get_i64("published_at").and_then(days_since) {
+        out.insert("vage".to_string(), serde_json::json!(days));
     }
     if let Some(releases) = get_i64("release_count") {
         out.insert("rel".to_string(), serde_json::json!(releases));
@@ -8005,7 +8134,10 @@ mod dep_backref_tests {
         assert!(primary_trait < dep_header);
         assert!(dep_provenance < dep_trait);
         assert_eq!(ctx.matches("dependency package finding").count(), 1);
-        assert!(ctx.contains(r#""record":{"ecosystem":"test","name":"dep","version":"1"}"#));
+        // The record is projected for the grader: identity as one `n` key plus the
+        // credibility signals, not the full normalized record (see
+        // `project_registry_record`).
+        assert!(ctx.contains(r#""record":{"n":"test/dep@1"}"#), "{ctx}");
         assert!(
             ctx.contains(r#""provider_only":{"kept":true}"#),
             "interpret projection must derive from preserved raw provenance: {ctx}"
