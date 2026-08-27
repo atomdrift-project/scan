@@ -317,6 +317,11 @@ RestartSec=10s
 TimeoutStopSec=30s
 
 Environment=HOME=${STATE_HOME}
+# So a panic inside an analysis task names the frame that raised it. Without
+# it a panic reaches hopper as a bare message — "end byte index 2 is not a
+# char boundary" says a str was sliced mid-character but not by whom. Paid
+# only on a panic, which is already a lost job.
+Environment=RUST_BACKTRACE=1
 # OpenAI-compatible endpoint for the --interpret LLM second-opinion pass.
 # Named target 'openrouter' is resolved by the binary.
 Environment=SCAN_LLM=${LLM}
