@@ -149,25 +149,29 @@ suspicious/hostile finding, whichever comes first. It defaults to the model's
 grid ceiling, so ML admits anything it flagged at any level; pass a lower `N` to
 tighten.
 
-## Following references: `--fetch` (experimental)
+## Following references: `--follow` (experimental)
 
-`--fetch` makes the scan active. It follows the external references a file
-points at — declared dependencies (`deps`), packages named by install
-commands (`packages`), and bare or encoded URLs (`urls`) — fetches each one,
-analyzes it, and folds the result back in. Pass a comma-separated selection
-(`--fetch=deps,packages`) or a bare `--fetch` for `all`; an interactive scan
-defaults to `deps,packages`. With `--fetch-depth` it follows hops: a script
-that pulls a loader that runs a `curl | bash` dropper is caught as one chain.
+`--follow` retrieves references discovered inside the requested artifact,
+analyzes them, and folds their results back into its verdict. Choose declared
+manifest/lockfile dependencies (`dependencies`), packages and URLs named by
+install/download commands (`references`), or third-party CI actions
+(`ci-actions`, which also implies dependencies). A bare `--follow` and the
+default select `dependencies,references`; `all` also includes CI actions. With
+`--follow-depth` it follows hops: a script that pulls a loader that runs a
+`curl | bash` dropper is caught as one chain.
 
 ```bash
-atomscan --fetch=deps ./pkg/             # follow declared dependencies only
-atomscan --fetch --fetch-depth 3 ./pkg/  # follow everything, three hops deep
+atomscan --follow=dependencies ./pkg/             # manifests and lockfiles only
+atomscan --follow --follow-depth 3 ./pkg/          # dependencies and references
+atomscan --follow=all --follow-depth 3 ./pkg/      # include CI actions too
 ```
 
-This is the only mode that touches the network while analyzing. Leave it off
-for air-gapped or untrusted-input gates unless you mean it. Set it per
-deployment with `SCAN_FETCH` and `SCAN_FETCH_DEPTH` instead of flags if that
-suits you better.
+This is the only analysis phase that makes additional network requests. Use
+`--follow=none` for air-gapped or transparent-proxy gates that already know
+which artifacts will be requested. Set the default per
+deployment with `SCAN_FOLLOW` and `SCAN_FOLLOW_DEPTH` instead of flags if that
+suits you better. Existing `--fetch` and `SCAN_FETCH` configurations continue
+to work, as do the old `deps`, `packages`, `urls`, and `ci` value names.
 
 ## Library
 

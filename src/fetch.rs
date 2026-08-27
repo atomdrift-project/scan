@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -133,6 +133,23 @@ fn charge_total_budget(fetches: usize, bytes: u64) {
     });
 }
 
+/// Describe the count budget that can clip one fetch class. The per-file cap
+/// is normally the limiting value; a smaller process-wide remainder takes
+/// precedence so the notice names the budget that actually stopped the work.
+fn fetch_count_budget_notice(
+    per_file_flag: &str,
+    per_file_limit: usize,
+    total_remaining: usize,
+) -> String {
+    if total_remaining < per_file_limit {
+        format!(
+            "Skipping remaining fetches, hit fetch budget (--fetch-max-total-fetches={total_remaining})"
+        )
+    } else {
+        format!("Skipping remaining fetches, hit fetch budget ({per_file_flag}={per_file_limit})")
+    }
+}
+
 /// Count the live network work represented by a batch. Cache hits and
 /// budget-clipped edges are intentionally free of both process-wide budgets.
 fn live_fetch_usage(records: &[FetchRecord]) -> (usize, u64) {
@@ -198,9 +215,13 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("duration {s:?} is too large"))
 }
 
-/// What to fetch — a selection of reference *kinds*, parsed from the
-/// comma-separated `--fetch=KINDS` flag (`urls`, `packages`, `deps`) — plus how
-/// many hops to follow. An empty kind selection (the default) disables fetching.
+/// Which discovered references to follow, plus how many hops to traverse.
+///
+/// The public vocabulary groups implementation-level reference kinds by what a
+/// caller means: `dependencies` are manifest/lockfile declarations,
+/// `references` are packages or URLs named by executable commands, and
+/// `ci-actions` are third-party CI actions. The older `deps`, `packages`,
+/// `urls`, and `ci` spellings remain CLI aliases.
 ///
 /// The three kinds map onto [`fletch`]'s [`RefKind`] taxonomy, so the selection
 /// distinguishes how strongly a reference is bound to the artifact:
@@ -251,6 +272,22 @@ pub struct FetchPolicy {
     /// Ceiling on total bytes fetched on behalf of a single scanned file
     /// (`--fetch-max-file-size`). The sweep stops once retrieved bytes cross it.
     pub max_file_bytes: u64,
+    /// Follow declared dependencies past the **first** hop — the dependencies
+    /// of a fetched dependency, and so on to `depth`.
+    ///
+    /// Off for an interactive scan. Hop 1 is the artifact's own declared supply
+    /// chain, which is the thing being judged; hop 2+ is a transitive closure
+    /// that multiplies per hop and is dominated by the long tail of ordinary,
+    /// old releases. Each of those costs a registry round trip *before* the age
+    /// gate can rule it out, because the publish date is what the lookup is for:
+    /// one 2.2 KB manifest sidecar pointing at a Go module drew 398 lookups at
+    /// hop 2, of which 398 aged out and none was fetched.
+    ///
+    /// The dropper chain `--fetch-depth 2` exists for runs through URLs and
+    /// install-command packages, and those are followed at every hop regardless.
+    /// `serve`/`worker` set this because they are cache-population roles, where
+    /// the transitive tail is the point rather than an overhead.
+    pub transitive_deps: bool,
     /// Skip fetching a *dependency* whose name pins it to a platform other than
     /// the host — the `@scope/pkg-<os>-<arch>` native-binary packages (biome,
     /// esbuild, swc, rollup, sharp…) that ship one prebuilt per platform. On a
@@ -274,6 +311,7 @@ impl Default for FetchPolicy {
             max_file_fetches: DEFAULT_MAX_FILE_FETCHES,
             max_url_fetches: DEFAULT_MAX_URL_FETCHES,
             max_file_bytes: DEFAULT_MAX_FILE_SIZE,
+            transitive_deps: false,
             host_platform_only: true,
         }
     }
@@ -284,6 +322,90 @@ impl FetchPolicy {
     #[must_use]
     pub(crate) const fn enabled(&self) -> bool {
         self.urls || self.packages || self.deps || self.ci
+    }
+
+    /// Parse the customer-facing `follow` vocabulary. Unlike [`FromStr`], this
+    /// deliberately rejects the old CLI aliases so the HTTP contract has one
+    /// clear spelling for each concept.
+    pub(crate) fn parse_follow(value: &str) -> Result<Self, String> {
+        Self::parse_selection(value, false)
+    }
+
+    /// Copy only the selected reference kinds onto an operator-configured
+    /// policy, preserving depth, age, byte, platform, and fan-out ceilings.
+    #[must_use]
+    pub(crate) const fn with_selection(mut self, selected: Self) -> Self {
+        self.urls = selected.urls;
+        self.packages = selected.packages;
+        self.deps = selected.deps;
+        self.ci = selected.ci;
+        self
+    }
+
+    /// Compact identity for single-flight keys and structured logs.
+    #[must_use]
+    pub(crate) const fn selection_bits(&self) -> u8 {
+        (self.urls as u8)
+            | ((self.packages as u8) << 1)
+            | ((self.deps as u8) << 2)
+            | ((self.ci as u8) << 3)
+    }
+
+    fn parse_selection(value: &str, legacy_aliases: bool) -> Result<Self, String> {
+        const VALID: &str = "valid: all, dependencies, references, ci-actions, none";
+        let mut policy = Self::default();
+        let mut saw_kind = false;
+        let mut saw_none = false;
+
+        for raw in value.split(',') {
+            let kind = raw.trim();
+            if kind.is_empty() {
+                continue;
+            }
+            saw_kind = true;
+            match kind {
+                "none" => saw_none = true,
+                "all" => {
+                    policy.urls = true;
+                    policy.packages = true;
+                    policy.deps = true;
+                    policy.ci = true;
+                }
+                "dependencies" => policy.deps = true,
+                "references" => {
+                    policy.urls = true;
+                    policy.packages = true;
+                }
+                // A CI action is represented as a dependency with CI context,
+                // so selecting actions necessarily enables dependency traversal.
+                "ci-actions" => {
+                    policy.deps = true;
+                    policy.ci = true;
+                }
+                "deps" if legacy_aliases => policy.deps = true,
+                "packages" if legacy_aliases => policy.packages = true,
+                "urls" if legacy_aliases => policy.urls = true,
+                "ci" if legacy_aliases => {
+                    policy.deps = true;
+                    policy.ci = true;
+                }
+                other => return Err(format!("unknown follow target {other:?} ({VALID})")),
+            }
+        }
+
+        if !saw_kind {
+            return Err(format!("empty follow selection ({VALID})"));
+        }
+        if saw_none && policy.enabled() {
+            return Err("none cannot be combined with another follow target".to_string());
+        }
+        if saw_none {
+            return Ok(Self::default());
+        }
+        if !policy.enabled() {
+            return Err(format!("empty follow selection ({VALID})"));
+        }
+        Ok(policy)
     }
 
     /// Whether `kind` is selected by this policy. References whose kind is
@@ -298,52 +420,22 @@ impl FetchPolicy {
             _ => false,
         }
     }
+
+    /// Whether `kind` is selected on hop `hop` (0-based). Identical to
+    /// [`Self::wants`] except that declared dependencies stop at the first hop
+    /// unless [`Self::transitive_deps`] is set — see that field for why.
+    #[must_use]
+    fn wants_at(&self, kind: RefKind, hop: u8) -> bool {
+        self.wants(kind) && (self.transitive_deps || hop == 0 || kind != RefKind::Dependency)
+    }
 }
 
 impl std::str::FromStr for FetchPolicy {
     type Err = String;
 
-    /// Parse a comma-separated kind list (`urls`, `packages`, `deps`, or `all`).
-    /// `all` selects every kind. Empty entries are ignored; an unknown kind or an
-    /// empty selection is an error so a typo is never silently a no-op.
+    /// Parse the canonical `follow` vocabulary and the legacy CLI aliases.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        const VALID: &str = "valid: all, urls, packages, deps, ci, none";
-        // `none` disables fetching outright — the only fully-offline switch,
-        // since an absent --fetch resolves to all-on at startup. Benchmarks
-        // need it (network wait and run-to-run fetch drift poison both wall
-        // clock and output comparison), and so does any air-gapped scan.
-        if s.trim() == "none" {
-            return Ok(Self::default());
-        }
-        let mut policy = Self::default();
-        for kind in s.split(',') {
-            match kind.trim() {
-                "" => {}
-                "all" => {
-                    policy.urls = true;
-                    policy.packages = true;
-                    policy.deps = true;
-                    policy.ci = true;
-                }
-                "urls" => policy.urls = true,
-                "packages" => policy.packages = true,
-                "deps" => policy.deps = true,
-                // A CI action is a declared dependency, so fetching it needs
-                // dependency fetching on; `ci` adds the CI *context* on top of
-                // `deps` rather than being a separate kind.
-                "ci" => {
-                    policy.deps = true;
-                    policy.ci = true;
-                }
-                other => {
-                    return Err(format!("unknown fetch kind {other:?} ({VALID})"));
-                }
-            }
-        }
-        if !policy.enabled() {
-            return Err(format!("empty fetch selection ({VALID})"));
-        }
-        Ok(policy)
+        Self::parse_selection(s, true)
     }
 }
 
@@ -567,6 +659,124 @@ const API_URL_PATH_COMPONENTS: &[&str] = &[
 /// This is deliberately a shape check, not a content or reputation check:
 /// direct scans still fetch exactly what the operator names, and a URL with a
 /// plausible payload basename remains eligible even when its host is unknown.
+/// Whether a path component reads as a version rather than a filename: every
+/// dot-separated segment is digits, with at least one dot and an optional
+/// leading `v` (`0.40.0`, `v2.1`, `10.0.1`). A bare `v1` or a plain number has
+/// no dot and keeps whatever the surrounding rules decide.
+///
+/// Deliberately strict about the tail. Recognizing a pre-release suffix as part
+/// of the version means splitting at `-`, which throws away everything after —
+/// including a real extension. A Go module's
+/// `v0.0.0-20260823143148-1fb3b878e2fb.zip` then reads as version `0.0.0` and
+/// the artifact stops being fetched. Requiring every segment to be numeric can
+/// only ever miss a version, never swallow a file: anything ending in an
+/// alphabetic extension fails the test by construction.
+fn is_version_shaped(component: &str) -> bool {
+    let core = component.strip_prefix(['v', 'V']).unwrap_or(component);
+    core.contains('.')
+        && core
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether a discovered URL has a real network host. URL extraction also sees
+/// relative paths, malformed authority strings, and single-label local names
+/// such as `wpad`; none can identify a public download host. IP literals are
+/// valid, while DNS names must have at least two labels.
+fn valid_discovered_url_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return public_ip(ip);
+    }
+
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.len() <= 253
+        && host.contains('.')
+        && host.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 63
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
+}
+
+/// Whether a discovered URL still contains a source-template placeholder.
+/// These commonly appear in documentation or client code as repository and
+/// release examples (`$REPO`, `${this.repositoryId}`, `$VERSION`); fetching
+/// them can only produce an avoidable 4xx response.
+fn has_unexpanded_url_placeholder(url: &str) -> bool {
+    let contains_placeholder = |part: &str| {
+        let bytes = part.as_bytes();
+        bytes.windows(2).any(|window| {
+            window[0] == b'$'
+                && (window[1] == b'{' || window[1].is_ascii_alphabetic() || window[1] == b'_')
+        })
+    };
+    if contains_placeholder(url) {
+        return true;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    [Some(parsed.path()), parsed.query()]
+        .into_iter()
+        .flatten()
+        .any(contains_placeholder)
+}
+
+/// Whether an IP literal is publicly routable enough to justify a discovered
+/// fetch. This excludes RFC1918/private space and the other special-use ranges
+/// that describe the scanner's host, a lab network, or documentation rather
+/// than an external payload service.
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    if let std::net::IpAddr::V6(ipv6) = ip
+        && let Some(ipv4) = ipv6.to_ipv4()
+    {
+        return public_ip(std::net::IpAddr::V4(ipv4));
+    }
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+                && !ip.is_multicast()
+                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                && !(octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                && !(octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                && !(octets[0] == 198 && (18..=19).contains(&octets[1]))
+                && !(octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                && octets[0] < 224
+        }
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && (segments[0] & 0xfe00) != 0xfc00
+                && (segments[0] & 0xffc0) != 0xfe80
+                && (segments[0] & 0xffc0) != 0xfec0
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
 fn looks_like_dropper_download_url(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once("://") else {
         return false;
@@ -585,6 +795,13 @@ fn looks_like_dropper_download_url(url: &str) -> bool {
         return false;
     };
     let path = path_and_suffix.split(['?', '#']).next().unwrap_or_default();
+    // A path ending in `/` names a directory, not a file: whatever a server
+    // returns for it is an index or a landing page, never the download itself.
+    // `https://pypi.org/project/diffusers/0.40.0/` was being fetched as a
+    // payload because the trailing component parsed as a filename.
+    if path.ends_with('/') {
+        return false;
+    }
     let components: Vec<&str> = path
         .split('/')
         .filter(|component| !component.is_empty())
@@ -593,6 +810,13 @@ fn looks_like_dropper_download_url(url: &str) -> bool {
         return false;
     };
     if filename == "." || filename == ".." {
+        return false;
+    }
+    // A version is not a file. `0.40.0`, `v2.1`, `1.2.3-rc1` all end in what
+    // looks like an extension, so the dotted-basename test reads them as
+    // downloads and pulls project pages, release-tag pages, and API version
+    // roots. Nothing named this way is an artifact.
+    if is_version_shaped(filename) {
         return false;
     }
 
@@ -809,7 +1033,7 @@ pub(crate) fn orchestrate(
         .iter()
         .map(|f| (f.sha256.clone(), manifest_relpath(&f.path)))
         .collect();
-    for _hop in 0..policy.depth {
+    for hop in 0..policy.depth {
         if worklist.is_empty() {
             break;
         }
@@ -818,7 +1042,7 @@ pub(crate) fn orchestrate(
         // running cross-hop maximum only rises.
         for (_, refs) in &worklist {
             for r in refs {
-                if !policy.wants(r.kind) {
+                if !policy.wants_at(r.kind, hop) {
                     continue;
                 }
                 let locator = locator_key(r);
@@ -882,7 +1106,17 @@ pub(crate) fn orchestrate(
                 // been fetched yet this run.
                 let selected: Vec<Reference> = refs
                     .into_iter()
-                    .filter(|r| policy.wants(r.kind))
+                    .filter(|r| {
+                        let wanted = policy.wants_at(r.kind, hop);
+                        if !wanted && policy.wants(r.kind) {
+                            tracing::debug!(
+                                package = %locator_key(r),
+                                hop = hop + 1,
+                                "transitive dependency; registry lookup and fetch both skipped"
+                            );
+                        }
+                        wanted
+                    })
                     // Drop publisher-controlled URLs, obvious site/API
                     // endpoints, and the exact documentation/update URLs
                     // observed in stock /bin binaries. They cost a round trip
@@ -895,6 +1129,22 @@ pub(crate) fn orchestrate(
                         let RefLocator::Url(url) = &r.locator else {
                             return true;
                         };
+                        if !valid_discovered_url_host(url) {
+                            tracing::debug!(
+                                url = %url,
+                                source = %r.source,
+                                "invalid or local URL host; fetch skipped"
+                            );
+                            return false;
+                        }
+                        if has_unexpanded_url_placeholder(url) {
+                            tracing::debug!(
+                                url = %url,
+                                source = %r.source,
+                                "unexpanded URL template; fetch skipped"
+                            );
+                            return false;
+                        }
                         let boilerplate = hosts::publisher_controlled(url)
                             || hosts::discovery_exception(url);
                         if boilerplate {
@@ -1009,6 +1259,12 @@ pub(crate) fn orchestrate(
                     .cloned()
                     .partition(|r| r.kind == RefKind::UrlFetch);
 
+                let dep_budget_notice = fetch_count_budget_notice(
+                    "--fetch-max-file-fetches",
+                    policy.max_file_fetches,
+                    TOTAL_FETCH_COUNT.load(Ordering::Relaxed),
+                );
+
                 // Mark the to-fetch set in flight, then fetch. The callback fires as
                 // each download lands (from a pool worker, so it's `Sync`), flipping
                 // that row to "analyzing" the moment its bytes arrive rather than when
@@ -1049,6 +1305,11 @@ pub(crate) fn orchestrate(
                         .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
                     max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
                 };
+                let url_budget_notice = fetch_count_budget_notice(
+                    "--fetch-max-urls",
+                    policy.max_url_fetches,
+                    TOTAL_FETCH_COUNT.load(Ordering::Relaxed),
+                );
                 let url_fetched = fetch_references_with(
                     &url_selected,
                     &source_sha,
@@ -1090,7 +1351,12 @@ pub(crate) fn orchestrate(
                 // exactly one record per reference in declaration order.
                 for (r, rec) in selected.iter().zip(&fetched) {
                     reporter.landed(r, rec);
-                    reporter.report(rec);
+                    let budget_notice = if r.kind == RefKind::UrlFetch {
+                        &url_budget_notice
+                    } else {
+                        &dep_budget_notice
+                    };
+                    reporter.report(rec, Some(budget_notice));
                 }
 
                 // Benchmark escape hatch: stop after the network phase, before the
@@ -1124,7 +1390,7 @@ pub(crate) fn orchestrate(
                 }
                 batch_payloads += fetched
                     .iter()
-                    .filter(|r| matches!(r.outcome, Outcome::Ok | Outcome::PinMismatch))
+                    .filter(|r| delivered_bytes(r))
                     .count();
                 batch.push(GroupWork {
                     source_sha,
@@ -1318,20 +1584,27 @@ pub(crate) fn orchestrate(
 /// Where the fetch phase's progress is surfaced.
 ///
 /// `Off` — machine output (JSON/tiny/server): nothing is printed; the edges ride
-/// the report. `Stream` — the append-only fetch log, printed above any active
-/// scan progress bar (a multi-file scan, a pipeline); reveals each reference
-/// lazily as it completes. `Tree` — the live, in-place dependency tree that
-/// takes over stderr for an interactive single-artifact scan (see
+/// the report. `Stream` — the fetch work is folded into the active scan bar; only
+/// actionable per-reference outcomes are logged above it. `Tree` — the live,
+/// in-place dependency tree that takes over stderr for an interactive
+/// single-artifact scan (see
 /// [`crate::deptree`]), listing the whole known set up front and animating each
 /// row through its lifecycle.
 ///
-/// The methods take `&self` (the stream's header latch is atomic) so the fetch
-/// completion callback — invoked concurrently from fletch's pool — can share one
-/// reporter with the sequential orchestration.
+/// The methods take `&self` so the fetch completion callback — invoked
+/// concurrently from fletch's pool — can share one reporter with the sequential
+/// orchestration.
 enum Reporter {
     Off,
-    Stream { header: AtomicBool },
-    Tree(DepTree),
+    Stream {
+        external_dependencies: AtomicU32,
+        external_urls: AtomicU32,
+        budget_notice: AtomicBool,
+    },
+    Tree {
+        tree: DepTree,
+        budget_notice: std::sync::Mutex<Option<String>>,
+    },
 }
 
 impl Reporter {
@@ -1343,9 +1616,14 @@ impl Reporter {
         }
         DepTree::activate().map_or_else(
             || Self::Stream {
-                header: AtomicBool::new(false),
+                external_dependencies: AtomicU32::new(0),
+                external_urls: AtomicU32::new(0),
+                budget_notice: AtomicBool::new(false),
             },
-            Self::Tree,
+            |tree| Self::Tree {
+                tree,
+                budget_notice: std::sync::Mutex::new(None),
+            },
         )
     }
 
@@ -1354,19 +1632,36 @@ impl Reporter {
     /// declared in (package-relative path), shown per row so each dependency can
     /// be traced back to its declaring file.
     fn announce(&self, refs: &[Reference], source: &str) {
-        if let Self::Tree(tree) = self {
+        if let Self::Tree { tree, .. } = self {
             for r in refs {
                 tree.add(&locator_key(r), &dep_display_name(r), source);
             }
         }
     }
 
-    /// Mark the to-fetch set in flight (tree only).
+    /// Mark the to-fetch set in flight. The stream folds its counts into the
+    /// active scan bar; the tree animates each row in place.
     fn fetching(&self, refs: &[Reference]) {
-        if let Self::Tree(tree) = self {
-            for r in refs {
-                tree.set(&locator_key(r), DepState::Fetching);
+        match self {
+            Self::Stream {
+                external_dependencies,
+                external_urls,
+                ..
+            } => {
+                let urls = refs.iter().filter(|r| r.kind == RefKind::UrlFetch).count();
+                let dependencies = refs.len().saturating_sub(urls);
+                let dependencies_u32 = u32::try_from(dependencies).unwrap_or(u32::MAX);
+                let urls_u32 = u32::try_from(urls).unwrap_or(u32::MAX);
+                external_dependencies.fetch_add(dependencies_u32, Ordering::Relaxed);
+                external_urls.fetch_add(urls_u32, Ordering::Relaxed);
+                crate::engine::external_fetch_started(dependencies, urls);
             }
+            Self::Tree { tree, .. } => {
+                for r in refs {
+                    tree.set(&locator_key(r), DepState::Fetching);
+                }
+            }
+            Self::Off => {}
         }
     }
 
@@ -1376,26 +1671,66 @@ impl Reporter {
     /// live per completion and again authoritatively after the batch; both are
     /// idempotent.
     fn landed(&self, r: &Reference, rec: &FetchRecord) {
-        if let Self::Tree(tree) = self {
-            tree.set(&locator_key(r), landed_state(rec));
+        if let Self::Tree { tree, .. } = self {
+            if matches!(rec.outcome, Outcome::BudgetExceeded) || !terminal_fetch_row_visible(rec) {
+                tree.set(&locator_key(r), DepState::Hidden);
+            } else {
+                tree.set(&locator_key(r), landed_state(rec));
+            }
         }
     }
 
-    /// Print the streamed fetch line (stream only); the tree already moved this
-    /// row in [`Reporter::landed`].
-    fn report(&self, rec: &FetchRecord) {
-        if let Self::Stream { header } = self {
-            crate::engine::print_above_bar(|| {
-                fetch_header(header);
-                report_fetch(rec);
-            });
+    /// Print an actionable streamed fetch line (stream only); successful fetches
+    /// are represented by the aggregate header and final summary. The tree
+    /// already moved this row in [`Reporter::landed`].
+    ///
+    /// Successful rows are intentionally omitted; failures, skips, and pin
+    /// mismatches remain visible because they need attention.
+    fn report(&self, rec: &FetchRecord, budget_notice: Option<&str>) {
+        if matches!(rec.outcome, Outcome::BudgetExceeded) {
+            match self {
+                Self::Off => {}
+                Self::Stream {
+                    budget_notice: emitted,
+                    ..
+                } => {
+                    if !emitted.swap(true, Ordering::Relaxed) {
+                        tracing::debug!(
+                            message = budget_notice
+                                .unwrap_or("Skipping remaining fetches, hit fetch budget"),
+                            "fetch budget exceeded; remaining references skipped"
+                        );
+                    }
+                }
+                Self::Tree {
+                    budget_notice: stored,
+                    ..
+                } => {
+                    let mut guard = stored
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if guard.is_none() {
+                        *guard = budget_notice.map(str::to_owned);
+                    }
+                }
+            }
+            return;
+        }
+        if !terminal_fetch_row_visible(rec) {
+            return;
+        }
+        if let Self::Stream { .. } = self {
+            if matches!(rec.outcome, Outcome::Ok) {
+                return;
+            }
+            crate::engine::print_above_bar(|| report_fetch(rec));
         }
     }
 
     /// A payload finished analysis: settle its row to the final fetch glyph
     /// (tree only).
     fn analyzed(&self, r: &Reference, rec: &FetchRecord) {
-        if let Self::Tree(tree) = self {
+        if let Self::Tree { tree, .. } = self {
             tree.set(&locator_key(r), done_state(rec));
         }
     }
@@ -1412,11 +1747,10 @@ impl Reporter {
         }
         match self {
             Self::Off => {}
-            Self::Stream { header } => crate::engine::print_above_bar(|| {
-                fetch_header(header);
-                report_skip(r, reg, now, reason);
-            }),
-            Self::Tree(tree) => {
+            Self::Stream { .. } => {
+                crate::engine::print_above_bar(|| report_skip(r, reg, now, reason))
+            }
+            Self::Tree { tree, .. } => {
                 tree.add(&locator_key(r), &dep_display_name(r), "");
                 tree.set(&locator_key(r), skip_state(reg, now, reason));
             }
@@ -1429,22 +1763,29 @@ impl Reporter {
     fn finish(&self, records: &[FetchRecord]) {
         match self {
             Self::Off => {}
-            Self::Stream { header } => {
-                if header.load(Ordering::Relaxed) {
-                    report_summary(records);
+            Self::Stream {
+                external_dependencies,
+                external_urls,
+                ..
+            } => {
+                let dependencies = external_dependencies.swap(0, Ordering::Relaxed);
+                let urls = external_urls.swap(0, Ordering::Relaxed);
+                crate::engine::external_fetch_finished(dependencies as usize, urls as usize);
+            }
+            Self::Tree {
+                tree,
+                budget_notice,
+            } => {
+                tree.finish(&summary_line(records));
+                let message = budget_notice
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(message) = message {
+                    eprintln!("    {message}");
                 }
             }
-            Self::Tree(tree) => tree.finish(&summary_line(records)),
         }
-    }
-}
-
-/// Emit the streamed log's lazy header once, before its first row.
-fn fetch_header(header: &AtomicBool) {
-    if !header.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching external references\x1b[0m"
-        );
     }
 }
 
@@ -1503,11 +1844,23 @@ fn purl_display(purl: &str) -> String {
     }
 }
 
+/// Whether a fetch put bytes in our hands: a clean fetch, bytes whose hash
+/// contradicted the declared pin, or bytes carrying a pin Fletch cannot verify.
+/// All three are worth scanning — the two pin outcomes most of all — while an
+/// unresolved, skipped, budget-capped, or failed fetch has nothing to scan.
+fn delivered_bytes(rec: &FetchRecord) -> bool {
+    matches!(
+        rec.outcome,
+        Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin
+    )
+}
+
 /// The tree state for a fetch the moment it lands: "analyzing" when bytes are in
-/// hand and a scan will follow (an `Ok` or a pin mismatch — the mismatch settles
-/// to its own glyph once analyzed), else the settled fetch glyph.
+/// hand and a scan will follow (an `Ok`, a pin mismatch, or an unverifiable pin —
+/// each pin outcome settles to its own glyph once analyzed), else the settled
+/// fetch glyph.
 fn landed_state(rec: &FetchRecord) -> DepState {
-    if matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
+    if delivered_bytes(rec) {
         DepState::Analyzing
     } else {
         done_state(rec)
@@ -1517,6 +1870,9 @@ fn landed_state(rec: &FetchRecord) -> DepState {
 /// The settled tree state for a fetch: the shared [`fetch_row`] glyph/colour,
 /// with the detail column (a size, or a failure note) as its trailing text.
 fn done_state(rec: &FetchRecord) -> DepState {
+    if !terminal_fetch_row_visible(rec) {
+        return DepState::Hidden;
+    }
     let (glyph, _label, r, g, b, detail) = fetch_row(rec);
     DepState::Done {
         glyph,
@@ -1602,7 +1958,7 @@ pub fn fetch_one(
         );
         report_fetch(&rec);
     }
-    if !matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
+    if !delivered_bytes(&rec) {
         let target = if rec.resolved_url.is_empty() {
             rec.locator.as_str()
         } else {
@@ -1725,6 +2081,9 @@ pub fn report_registry(reg: &Registry, progress: bool) {
 /// Only the interactive terminal path passes `progress`; JSON/server callers
 /// stay silent. Colors mirror the scan progress bar's truecolor palette.
 fn report_fetch(rec: &FetchRecord) {
+    if !terminal_fetch_row_visible(rec) {
+        return;
+    }
     let (glyph, label, r, g, b, detail) = fetch_row(rec);
 
     // The actual URL fetched; fall back to the bare locator (PURL) when the
@@ -1751,6 +2110,14 @@ fn report_fetch(rec: &FetchRecord) {
     );
 }
 
+/// Whether one fetch outcome deserves a terminal row. An unresolved locator
+/// produced no bytes and carries no actionable failure detail; retain its
+/// [`FetchRecord`] for machine output and diagnostics, but keep the default
+/// human view quiet.
+fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
+    !matches!(rec.outcome, Outcome::Unresolved)
+}
+
 /// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
 /// `detail` replaces the size column when set.
 type FetchRow = (char, &'static str, u8, u8, u8, Option<String>);
@@ -1770,6 +2137,14 @@ fn fetch_row(rec: &FetchRecord) -> FetchRow {
             90,
             90,
             Some("hash mismatch".to_string()),
+        ),
+        Outcome::UnverifiablePin => (
+            '\u{25cb}',
+            "pin?",
+            230,
+            180,
+            80,
+            Some("pin unverifiable".to_string()),
         ),
         Outcome::Ok if rec.stale => ('\u{25cf}', "stale", 230, 180, 80, None),
         Outcome::Ok => {
@@ -2460,15 +2835,10 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Print the run's fetch summary to stderr (the streamed log's closing line).
-fn report_summary(records: &[FetchRecord]) {
-    eprintln!("{}", summary_line(records));
-}
-
 /// Tally the run's fetches into a one-line summary mirroring the progress bar's
 /// completion line: how many came live off the network vs. served from cache,
-/// how many failed, and the total bytes pulled. Shared by the streamed log and
-/// the live tree, which prints it beneath the settled dependency rows.
+/// how many failed, and the total bytes pulled. Used by the live tree, which
+/// prints it beneath the settled dependency rows.
 fn summary_line(records: &[FetchRecord]) -> String {
     let mut live = 0u32;
     let mut cached = 0u32;
@@ -2477,8 +2847,10 @@ fn summary_line(records: &[FetchRecord]) -> String {
     for rec in records {
         bytes += rec.size.unwrap_or(0);
         match &rec.outcome {
-            Outcome::Ok | Outcome::PinMismatch if rec.cached => cached += 1,
-            Outcome::Ok | Outcome::PinMismatch => live += 1,
+            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin if rec.cached => {
+                cached += 1;
+            }
+            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin => live += 1,
             Outcome::Failed(_) => failed += 1,
             Outcome::BudgetExceeded | Outcome::Unresolved | Outcome::Skipped => {}
         }
@@ -2638,12 +3010,73 @@ fn collect_references(
         let name = root_path
             .file_name()
             .map_or_else(|| root_path.to_string_lossy(), |n| n.to_string_lossy());
-        let hunted = find::references_in_bytes(&bytes, &name);
+        // A provenance document names one artifact and catalogues many. The
+        // string hunt cannot tell those apart, so it is replaced by the subject
+        // this document is *about* — see `provenance_subject`.
+        let hunted = if is_provenance_document(&root.file_type, &name) {
+            provenance_subject(&bytes).into_iter().collect()
+        } else {
+            find::references_in_bytes(&bytes, &name)
+        };
         if !hunted.is_empty() {
             merge_into_root(&mut groups, &root.sha256, hunted);
         }
     }
     groups
+}
+
+/// Whether this root is one of our own provenance records rather than a
+/// collected artifact: hopper's `*.forage.json` collection sidecar, or the
+/// normalized `*.registry.json` a fetch materializes.
+fn is_provenance_document(file_type: &str, name: &str) -> bool {
+    file_type == "registry"
+        || name
+            .rsplit_once(".forage.")
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("json"))
+}
+
+/// The single artifact a provenance document is *about*, as a pinned reference.
+///
+/// These documents embed the provider's verbatim response, and for PyPI that is
+/// the project's whole release catalogue: one 179 KB `diffusers` sidecar carries
+/// 191 `files.pythonhosted.org` URLs covering every version ever published. The
+/// string hunt has no way to tell the subject from the catalogue — it recovered
+/// all 199 URLs and started pulling `diffusers` releases from 0.0.1 upward until
+/// the URL budget stopped it. Mining our own cached metadata for dropper
+/// candidates is the bug; the document already states its subject, so read that
+/// instead of guessing from `strings`.
+///
+/// Parsed here rather than from filefacts' `values` because a large sidecar
+/// exceeds cleave's JSON parse limit (76 KB) while still being small enough to
+/// hunt, so the facts view cannot be relied on for exactly the documents that
+/// carry the biggest catalogues.
+fn provenance_subject(bytes: &[u8]) -> Option<Reference> {
+    let doc: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let url = doc
+        .pointer("/fetch/url")
+        .or_else(|| doc.pointer("/registry/url"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|u| !u.is_empty())?;
+    // The recorded digest pins the fetch: this document exists because those
+    // exact bytes were collected, so a mismatch is a substitution worth failing.
+    let pinned_hash = doc
+        .pointer("/artifact/sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|d| fletch::PinnedHash {
+            algo: fletch::HashAlgo::Sha256,
+            value: d.to_ascii_lowercase(),
+        });
+    let content_sha256 = pinned_hash.as_ref().map(|p| p.value.clone());
+    Some(Reference {
+        locator: RefLocator::Url(url.to_string()),
+        kind: RefKind::UrlFetch,
+        source: "forage.fetch.url".to_string(),
+        evidence: url.to_string(),
+        offset: 0,
+        pinned_hash,
+        content_sha256,
+    })
 }
 
 fn is_vendored_node_module(path: &str) -> bool {
@@ -2823,9 +3256,10 @@ fn analyze_payload(
     opts: &AnalysisOptions,
     acache: Option<&AnalysisCache>,
 ) -> Option<Analyzed> {
-    // Scan whatever bytes we hold: a clean fetch or a pin mismatch (a mismatch
-    // is exactly the case worth analyzing). Skipped/unresolved/failed have none.
-    if !matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch) {
+    // Scan whatever bytes we hold: a clean fetch, a pin mismatch, or a pin we
+    // could not verify (the pin outcomes are exactly the cases worth analyzing).
+    // Skipped/unresolved/failed have no bytes.
+    if !delivered_bytes(rec) {
         return None;
     }
     let content_sha = rec.content_sha256.clone().unwrap_or_default();
@@ -3376,6 +3810,56 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_fetches_stay_out_of_the_terminal_view() {
+        let mut rec = fetched_record();
+        rec.outcome = Outcome::Unresolved;
+
+        assert!(!terminal_fetch_row_visible(&rec));
+        assert!(matches!(landed_state(&rec), DepState::Hidden));
+        assert!(matches!(done_state(&rec), DepState::Hidden));
+
+        rec.outcome = Outcome::Failed("transport".to_string());
+        assert!(terminal_fetch_row_visible(&rec));
+        assert!(matches!(done_state(&rec), DepState::Done { .. }));
+    }
+
+    /// Regression for the silent-skip bug: `UnverifiablePin` delivers bytes just
+    /// as `Ok` and `PinMismatch` do. The "did we get bytes" gates are `matches!`,
+    /// which the compiler does not check for exhaustiveness, so a new Outcome can
+    /// slip through them and drop a fetched payload out of analysis unnoticed —
+    /// precisely the payload whose pin could not be verified.
+    #[test]
+    fn an_unverifiable_pin_is_analyzed_and_tallied_like_any_delivered_bytes() {
+        let mut rec = fetched_record();
+        rec.outcome = Outcome::UnverifiablePin;
+
+        assert!(delivered_bytes(&rec));
+        assert!(matches!(landed_state(&rec), DepState::Analyzing));
+        assert!(terminal_fetch_row_visible(&rec));
+
+        // It must reach the run summary rather than vanish from the counts.
+        let line = summary_line(std::slice::from_ref(&rec));
+        assert!(line.contains("1 cached"), "{line}");
+
+        // And read as its own row, distinct from a verified fetch and from the
+        // harder `pin!` mismatch.
+        let (_, label, ..) = fetch_row(&rec);
+        assert_eq!(label, "pin?");
+    }
+
+    #[test]
+    fn budget_notice_names_the_limiting_count_flag() {
+        assert_eq!(
+            fetch_count_budget_notice("--fetch-max-urls", 4, usize::MAX),
+            "Skipping remaining fetches, hit fetch budget (--fetch-max-urls=4)"
+        );
+        assert_eq!(
+            fetch_count_budget_notice("--fetch-max-file-fetches", 100, 7),
+            "Skipping remaining fetches, hit fetch budget (--fetch-max-total-fetches=7)"
+        );
+    }
+
+    #[test]
     fn go_pseudo_versions_date_themselves_without_a_lookup() {
         // Fixed points spanning the civil-days arithmetic: the epoch itself, a
         // century/leap-rule boundary, a leap day, and both year edges. These
@@ -3638,12 +4122,155 @@ mod tests {
             "https://example.test/download/index.html",
             "https://example.test/file%2Ezip",
             "ftp://example.test/stage-2.sh",
+            // A trailing `/` names a directory; the response is an index or a
+            // landing page. This is the shape that pulled PyPI project pages.
+            "https://pypi.org/project/diffusers/0.40.0/",
+            "https://example.test/releases/v1.2.3/",
+            // A version is not a filename, with or without the trailing slash.
+            "https://pypi.org/project/diffusers/0.40.0",
+            "https://github.com/foo/bar/releases/tag/v1.2.3",
+            "https://api.example.test/v2.1",
+            "https://example.test/lib/1.2.3/",
+            "https://example.test/pkg/2.0.0",
         ] {
             assert!(
                 !looks_like_dropper_download_url(url),
                 "site/API-shaped URL was kept: {url}"
             );
         }
+    }
+
+    #[test]
+    fn discovered_urls_need_a_domain_or_ip_host() {
+        for url in ["https://example.com/stage.sh", "http://8.8.8.8/payload.bin"] {
+            assert!(
+                valid_discovered_url_host(url),
+                "valid host was rejected: {url}"
+            );
+        }
+        for url in [
+            "http://wpad/wpad.dat",
+            "http://localhost/payload.bin",
+            "http://%@:%u/rfc2585/%@.crl",
+            "http://10.0.0.1/payload.bin",
+            "http://100.64.0.1/payload.bin",
+            "http://172.16.0.1/payload.bin",
+            "http://192.168.1.1/payload.bin",
+            "http://192.0.2.1/payload.bin",
+            "http://127.0.0.1/payload.bin",
+            "http://[::1]/payload.bin",
+            "http://[fd00::1]/payload.bin",
+            "http://[fe80::1]/payload.bin",
+            "/relative/payload.bin",
+            "relative/payload.bin",
+        ] {
+            assert!(
+                !valid_discovered_url_host(url),
+                "invalid or local host was accepted: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovered_urls_with_unexpanded_templates_are_skipped() {
+        for url in [
+            "https://github.com/$REPO/releases/latest",
+            "https://api.github.com/repos/$REPO/releases/latest",
+            "https://github.com/$REPO/releases/download/v$VERSION",
+            "https://github.com/$REPO.git",
+            "https://bitbucket.org/${this.repositoryId}/raw/${r}/${e}",
+            "https://gitlab.com/${this.repositoryId}/raw/${r}/${e}",
+        ] {
+            assert!(
+                has_unexpanded_url_placeholder(url),
+                "unexpanded template was not recognized: {url}"
+            );
+        }
+        assert!(!has_unexpanded_url_placeholder(
+            "https://github.com/atomdrift-project/scan/releases/download/v2.8.0/atomscan"
+        ));
+    }
+
+    #[test]
+    fn version_shape_does_not_swallow_real_filenames() {
+        // Versions — rejected as download targets.
+        for v in ["0.40.0", "v2.1", "V10.0.1", "2.1"] {
+            assert!(is_version_shaped(v), "version not recognized: {v}");
+        }
+        // Not versions: a real artifact whose name merely contains digits and
+        // dots must still be fetchable. A Go module's pseudo-version filename
+        // is the case that matters — mistaking it for a version stops the
+        // module being fetched at all.
+        for v in [
+            "v0.0.0-20260823143148-1fb3b878e2fb.zip",
+            "diffusers-0.0.1.tar.gz",
+            "payload.exe",
+            "stage-2.sh",
+            "v1",
+            "1",
+            "lib.so.6",
+            ".2.3",
+            "1.2.",
+            "",
+        ] {
+            assert!(!is_version_shaped(v), "filename misread as version: {v}");
+        }
+        // The versioned artifacts themselves stay fetchable end to end.
+        for url in [
+            "https://files.pythonhosted.org/packages/a0/05/x/diffusers-0.0.1.tar.gz",
+            "https://example.test/releases/v1.2.3/payload.bin",
+            "https://proxy.golang.org/github.com/o/r/@v/v0.0.0-20260823143148-1fb3b878e2fb.zip",
+        ] {
+            assert!(
+                looks_like_dropper_download_url(url),
+                "versioned artifact was rejected: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_documents_yield_their_subject_not_their_catalogue() {
+        // A forage sidecar: one artifact named by `fetch.url`, wrapped around a
+        // provider response that lists every release of the project.
+        let doc = serde_json::json!({
+            "fetch": {"url": "https://files.example.test/pkg-1.0.tar.gz"},
+            "artifact": {"sha256": "A".repeat(64), "filename": "pkg-1.0.tar.gz"},
+            "registry": {
+                "url": "https://files.example.test/pkg-1.0.tar.gz",
+                "raw": [
+                    {"url": "https://files.example.test/pkg-0.0.1.tar.gz"},
+                    {"url": "https://files.example.test/pkg-0.0.2.tar.gz"}
+                ]
+            }
+        });
+        let bytes = serde_json::to_vec(&doc).expect("serialize");
+        let subject = provenance_subject(&bytes).expect("subject reference");
+        assert_eq!(
+            subject.locator,
+            RefLocator::Url("https://files.example.test/pkg-1.0.tar.gz".into()),
+            "the catalogue must not supply the reference"
+        );
+        // The recorded digest pins the fetch.
+        assert_eq!(
+            subject.content_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(subject.kind, RefKind::UrlFetch);
+
+        // Both provenance shapes are recognized; an ordinary JSON root is not.
+        assert!(is_provenance_document("json", "pkg-1.0.tar.gz.forage.json"));
+        assert!(is_provenance_document(
+            "registry",
+            "left-pad@1.3.0.registry.json"
+        ));
+        assert!(!is_provenance_document("json", "package.json"));
+        assert!(!is_provenance_document("json", "forage.json.txt"));
+
+        // A document with no subject yields nothing rather than falling back to
+        // the catalogue.
+        let empty =
+            serde_json::to_vec(&serde_json::json!({"registry": {"raw": []}})).expect("serialize");
+        assert!(provenance_subject(&empty).is_none());
     }
 
     #[test]
@@ -3843,6 +4470,25 @@ mod tests {
     #[test]
     fn fetch_policy_parses_kinds_and_rejects_garbage() {
         assert_eq!(
+            FetchPolicy::parse_follow("dependencies,references"),
+            Ok(FetchPolicy {
+                urls: true,
+                packages: true,
+                deps: true,
+                ..FetchPolicy::default()
+            })
+        );
+        let actions = FetchPolicy::parse_follow("ci-actions").unwrap();
+        assert!(actions.ci && actions.deps);
+        assert_eq!(
+            FetchPolicy::parse_follow("none"),
+            Ok(FetchPolicy::default())
+        );
+        assert!(FetchPolicy::parse_follow("deps").is_err());
+        assert!(FetchPolicy::parse_follow("none,references").is_err());
+
+        // Legacy CLI values remain aliases for existing scripts.
+        assert_eq!(
             "deps".parse(),
             Ok(FetchPolicy {
                 deps: true,
@@ -3903,7 +4549,7 @@ mod tests {
         );
         assert!("".parse::<FetchPolicy>().is_err());
         assert!("sigs".parse::<FetchPolicy>().is_err());
-        // The retired vocabulary is now a hard error, not a silent no-op.
+        // A truly retired vocabulary is a hard error, not a silent no-op.
         assert!("refs".parse::<FetchPolicy>().is_err());
         assert!("deps,bogus".parse::<FetchPolicy>().is_err());
         assert!(!FetchPolicy::default().enabled());
@@ -3924,6 +4570,28 @@ mod tests {
                 .unwrap()
                 .wants(RefKind::Repository)
         );
+    }
+
+    #[test]
+    fn declared_deps_stop_at_the_first_hop_unless_transitive() {
+        // Hop 0 is the artifact's own declared supply chain and is always
+        // followed. Past it, declared dependencies are the transitive tail —
+        // a registry lookup each, almost all of it aged out — so an interactive
+        // policy drops them while the dropper kinds keep going.
+        let mut policy: FetchPolicy = "all".parse().unwrap();
+        assert!(!policy.transitive_deps, "interactive default");
+        assert!(policy.wants_at(RefKind::Dependency, 0));
+        assert!(!policy.wants_at(RefKind::Dependency, 1));
+        for hop in 0..3 {
+            assert!(policy.wants_at(RefKind::UrlFetch, hop), "hop {hop}");
+            assert!(policy.wants_at(RefKind::Command, hop), "hop {hop}");
+        }
+        // A corpus-facing role takes the whole closure.
+        policy.transitive_deps = true;
+        assert!(policy.wants_at(RefKind::Dependency, 3));
+        // The hop rule never *adds* a kind the selection left out.
+        let urls: FetchPolicy = "urls".parse().unwrap();
+        assert!(!urls.wants_at(RefKind::Dependency, 0));
     }
 
     #[test]

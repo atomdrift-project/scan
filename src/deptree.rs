@@ -32,6 +32,10 @@ use crate::engine::{PROGRESS_TICK, SPINNER, bar_active, term_dims};
 pub(crate) enum DepState {
     Fetching,
     Analyzing,
+    /// The fetch has no useful per-reference terminal result (for example, a
+    /// budget-clipped or unresolved locator). Keep the key settled internally
+    /// while omitting its row.
+    Hidden,
     Done {
         glyph: char,
         color: (u8, u8, u8),
@@ -77,6 +81,7 @@ struct Entry {
 enum Status {
     Pending,
     Active(&'static str),
+    Hidden,
     Done {
         glyph: char,
         color: (u8, u8, u8),
@@ -87,7 +92,7 @@ enum Status {
 impl Status {
     /// Whether this status is terminal (contributes to the `done/total` count).
     fn is_done(&self) -> bool {
-        matches!(self, Status::Done { .. })
+        matches!(self, Status::Done { .. } | Status::Hidden)
     }
 }
 
@@ -216,6 +221,7 @@ impl DepTree {
         entry.status = match state {
             DepState::Fetching => Status::Active("fetching"),
             DepState::Analyzing => Status::Active("analyzing"),
+            DepState::Hidden => Status::Hidden,
             DepState::Done {
                 glyph,
                 color,
@@ -320,14 +326,23 @@ fn render_locked(mut state: std::sync::MutexGuard<'_, State>, tick: u32, finishe
 /// point: on a large graph the answer to "what is it doing" is the handful of
 /// in-flight rows, not a scroll of already-settled ones.
 fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
-    let total = state.entries.len();
+    let visible: Vec<usize> = state
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, entry)| (!matches!(entry.status, Status::Hidden)).then_some(i))
+        .collect();
+    let total = visible.len();
     // Nothing announced yet (or a scan that fetches nothing): draw no region, so
     // the header never flashes before the first dependency and a no-fetch scan
     // stays silent.
     if total == 0 {
         return Vec::new();
     }
-    let done = state.entries.iter().filter(|e| e.status.is_done()).count();
+    let done = visible
+        .iter()
+        .filter(|&&i| state.entries[i].status.is_done())
+        .count();
     let active = state
         .entries
         .iter()
@@ -343,6 +358,7 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
     let widest = state
         .entries
         .iter()
+        .filter(|e| !matches!(e.status, Status::Hidden))
         .map(|e| e.name.chars().count())
         .max()
         .unwrap_or(0);
@@ -353,8 +369,8 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
     let body = cap - 1;
 
     if total <= body {
-        for e in &state.entries {
-            lines.push(row(e, tick, namew, state.cols));
+        for &i in &visible {
+            lines.push(row(&state.entries[i], tick, namew, state.cols));
         }
         return lines;
     }
@@ -363,10 +379,14 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
     // flight, then the most recently settled (a sense of motion), then upcoming
     // pending — reserving one line for the footer that counts the remainder.
     let slots = body.saturating_sub(1);
-    let mut chosen: Vec<usize> = (0..total)
+    let mut chosen: Vec<usize> = visible
+        .iter()
+        .copied()
         .filter(|&i| matches!(state.entries[i].status, Status::Active(_)))
         .collect();
-    let mut recent: Vec<usize> = (0..total)
+    let mut recent: Vec<usize> = visible
+        .iter()
+        .copied()
         .filter(|&i| state.entries[i].status.is_done())
         .collect();
     recent.sort_unstable_by_key(|&i| std::cmp::Reverse(state.entries[i].seq));
@@ -377,7 +397,7 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
         chosen.push(i);
     }
     if chosen.len() < slots {
-        for i in 0..total {
+        for &i in &visible {
             if chosen.len() >= slots {
                 break;
             }
@@ -435,6 +455,7 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
     let (glyph, color, detail) = match &entry.status {
         Status::Pending => ('\u{00b7}', (110, 110, 110), "pending".to_string()),
         Status::Active(label) => (spinner(tick), (100, 180, 255), format!("{label}\u{2026}")),
+        Status::Hidden => (' ', (0, 0, 0), String::new()),
         Status::Done {
             glyph,
             color,
@@ -611,6 +632,18 @@ mod tests {
         // header + 3 entries, no footer.
         assert_eq!(lines.len(), 4);
         assert!(strip_ansi(&lines[0]).contains("1/3"));
+    }
+
+    #[test]
+    fn hidden_entries_are_omitted_from_the_tree_count() {
+        let s = state(
+            vec![done("a"), entry("b", Status::Hidden, 1), pending("c")],
+            40,
+        );
+        let body = strip_ansi(&compose(&s, 0, false).join("\n"));
+        assert!(body.contains("1/2"));
+        assert!(!body.contains("b"));
+        assert!(body.contains("a") && body.contains("c"));
     }
 
     #[test]

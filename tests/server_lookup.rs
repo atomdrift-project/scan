@@ -130,7 +130,7 @@ async fn malformed_keys_are_rejected() -> Result<()> {
 
     let (status, body, _) = get("/lookup").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "neither key");
-    assert_eq!(body["error"], "provide sha256, purl, or both");
+    assert_eq!(body["error"], "provide sha256, purl, url, or both");
 
     // Both together is the fast path for a caller who already knows the pair,
     // not an error: each filter is evidence about the same artifact.
@@ -157,7 +157,7 @@ async fn malformed_keys_are_rejected() -> Result<()> {
 
     let (status, body, _) = get("/lookup?purl=%20").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty purl is no key");
-    assert_eq!(body["error"], "provide sha256, purl, or both");
+    assert_eq!(body["error"], "provide sha256, purl, url, or both");
 
     let (status, body, _) = get("/lookup?purl=not%20a%20purl").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -169,7 +169,9 @@ async fn malformed_keys_are_rejected() -> Result<()> {
 /// the canonical form, not a malformed one.
 #[tokio::test]
 async fn bare_purls_are_normalized_rather_than_rejected() -> Result<()> {
-    let bare = UNKNOWN.strip_prefix("pkg:").expect("UNKNOWN is canonical");
+    let bare = UNKNOWN
+        .strip_prefix("pkg:")
+        .context("UNKNOWN is canonical")?;
     let (status, body, _) = get(&format!("/lookup?purl={}", encoded_purl(bare))).await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "understood, just not stored");
     assert_eq!(body["error"], "unknown sample");

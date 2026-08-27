@@ -77,7 +77,9 @@ pub struct ServerConfig {
     hopper: Option<String>,
     /// Additional passwords to try for encrypted archives.
     zip_passwords: crate::ArchivePasswords,
-    /// Analysis slots the idle worker may use. `0` disables it.
+    /// Analysis slots the idle worker may use. `0` disables it. The value is
+    /// capped at half of `workers`, leaving the other half for interactive
+    /// analyses.
     ///
     /// Idle capacity is otherwise wasted: a scan server spends most of its life
     /// waiting for the next request while hopper holds a queue of work. The
@@ -96,6 +98,10 @@ pub struct ServerConfig {
 /// from pinning a slot forever. Override with `--analysis-timeout` /
 /// [`ServerConfig::with_analysis_timeout`].
 pub const DEFAULT_ANALYSIS_TIMEOUT_SECS: u64 = 1200;
+
+/// After the most recent `/analyze` request, keep the embedded hopper worker
+/// paused for this long before it starts claiming queue work again.
+pub const IDLE_WORKER_QUIET_SECS: u64 = 7;
 
 impl ServerConfig {
     /// Create a server configuration.
@@ -193,9 +199,10 @@ impl ServerConfig {
     }
 
     /// Set how many analysis slots the idle worker may use; `0` disables it.
+    /// The value is capped at half of the interactive worker slots.
     #[must_use]
     pub fn with_idle_worker_slots(mut self, slots: usize) -> Self {
-        self.idle_worker_slots = slots;
+        self.idle_worker_slots = slots.min(self.workers / 2);
         self
     }
 
@@ -748,6 +755,10 @@ struct AppState {
     /// brackets exactly the window that matters, and a poller would either lag
     /// a request's arrival or spin.
     idle_pause: Option<Arc<AtomicBool>>,
+    /// Monotonic elapsed-time marker for the most recent analysis request.
+    /// Unlike `idle_pause`, this also covers requests that are rejected before
+    /// they acquire an analysis slot.
+    last_analyze_request_ms: Arc<AtomicU64>,
     /// Analyses in progress, so concurrent requests for the same artifact
     /// share one run instead of each taking a slot. See [`flight`].
     flights: Arc<flight::Flights>,
@@ -763,6 +774,17 @@ struct AppState {
 impl AppState {
     fn next_request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record activity from one of the analysis endpoints. The marker is
+    /// elapsed milliseconds plus one so zero can mean "no request yet".
+    pub(super) fn note_analyze_request(&self) {
+        let elapsed_ms = self.started_at.elapsed().as_millis();
+        let marker = u64::try_from(elapsed_ms)
+            .unwrap_or(u64::MAX.saturating_sub(1))
+            .saturating_add(1);
+        self.last_analyze_request_ms
+            .store(marker, Ordering::Release);
     }
 }
 
@@ -819,6 +841,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         idle_worker_slots: config.idle_worker_slots(),
         shutdown: Arc::new(AtomicBool::new(false)),
         idle_worker_started: AtomicBool::new(false),
+        last_analyze_request_ms: Arc::new(AtomicU64::new(0)),
         job_buckets: Default::default(),
         job_types: Default::default(),
         job_overall: Default::default(),
@@ -1305,6 +1328,9 @@ fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
             pause,
             shutdown: Arc::clone(&state.shutdown),
             resources,
+            last_analyze_request_ms: Arc::clone(&state.last_analyze_request_ms),
+            started_at: state.started_at,
+            quiet_period: Duration::from_secs(IDLE_WORKER_QUIET_SECS),
         }),
     };
     tokio::spawn(async move {

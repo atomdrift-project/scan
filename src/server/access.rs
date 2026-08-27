@@ -9,7 +9,7 @@
 //! rather than a warning there and a mystery here.
 //!
 //! Fields, in order: `id`, `status`, `dur_ms`, `peer`, `fwd`, `auth`,
-//! `req_bytes`, `shared`, `sha256`, `purl`, `path`, `cred_len`, `cred_fp`,
+//! `req_bytes`, `shared`, `sha256`, `purl`, `url`, `path`, `cred_len`, `cred_fp`,
 //! `trace`, `ua`. Everything that reaches the line
 //! is either generated here or parsed/bounded before it is printed, so a
 //! hostile header cannot shape the log. A field with nothing to say is left
@@ -74,6 +74,7 @@ const MAX_SUBJECT_LEN: usize = 200;
 pub(super) struct Subject {
     sha256: Option<String>,
     purl: Option<String>,
+    url: Option<String>,
     path: Option<String>,
 }
 
@@ -95,6 +96,15 @@ impl Subject {
         Self {
             sha256: sha256.and_then(subject_field),
             purl: subject_field(value),
+            ..Self::default()
+        }
+    }
+
+    /// A request about an artifact named by its exact fetch URL.
+    pub(super) fn url(value: &str, sha256: Option<&str>) -> Self {
+        Self {
+            sha256: sha256.and_then(subject_field),
+            url: subject_field(value),
             ..Self::default()
         }
     }
@@ -329,6 +339,7 @@ pub(super) async fn access_log(
                 shared,
                 sha256 = subject.sha256.as_deref(),
                 purl = subject.purl.as_deref(),
+                url = subject.url.as_deref(),
                 path = subject.path.as_deref(),
                 cred_len,
                 cred_fp = cred_fp.as_deref(),

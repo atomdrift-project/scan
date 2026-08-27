@@ -188,17 +188,15 @@ fn refresh() -> Outcome {
     Outcome { changed, failed }
 }
 
-/// Erase the transient line and print the update checkmark: the current rule
-/// count (computed exactly as the banner does) and the newest of the trait and
-/// model bundle dates. `version_info()` here loads the shared resources on the
-/// main thread — the same load the scan needs — so it is reused, not duplicated.
+/// Erase the transient line and print the update checkmark: the current split
+/// signature/rule inventory and newest trait/model bundle date.
 fn print_checkmark(mode: Mode) {
-    let bloom_rules = if mode == Mode::Slow {
+    let hashes_and_purls = if mode == Mode::Slow {
         0
     } else {
         crate::bloom_repo::Lookup::load().rule_count()
     };
-    let count = crate::engine::detection_rule_count_from(bloom_rules);
+    let counts = crate::engine::detection_counts_from(hashes_and_purls);
 
     let traits_dir = cleave::traits_repo::install_target();
     let models_dir = crate::models_repo::install_target();
@@ -210,15 +208,16 @@ fn print_checkmark(mode: Mode) {
     .flatten()
     .max();
 
-    // ` ✓ updated · 3,659,085 rules · newest 2026-06-28` (the date omitted only
-    // if neither bundle reports one, which a successful install should never do).
+    // The date is omitted only if neither bundle reports one, which a successful
+    // install should never do.
     let tail = match &newest {
         Some(date) => format!(" \u{b7} newest {date}"),
         None => String::new(),
     };
     eprint!(
-        "\r\x1b[2K \x1b[38;2;80;220;80m\u{2713}\x1b[0m \x1b[38;2;160;160;160mupdated \u{b7} {} rules{tail}\x1b[0m\n",
-        commas(count),
+        "\r\x1b[2K \x1b[38;2;80;220;80m\u{2713}\x1b[0m \x1b[38;2;160;160;160mupdated \u{b7} {} hashes \u{b7} {} rules{tail}\x1b[0m\n",
+        commas(counts.hashes_and_purls),
+        commas(counts.rules),
     );
     let _ = std::io::stderr().flush();
 }

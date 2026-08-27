@@ -107,7 +107,15 @@ command="/usr/sbin/daemon"
 # Measured on uruk-hai 2026-08-03 (128 cores, --workers 96): with the option,
 # cpu_cores_busy 14-28/128 and the worker wedged with all 96 slots occupied and
 # zero completions for 14h27m; without it, 126/128 and steady completions.
-malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,abort_conf:true"
+#
+# junk:false turns off jemalloc's fill-on-malloc/fill-on-free debugging. FreeBSD
+# builds libc's jemalloc with --enable-fill on -CURRENT (releases disable it),
+# so without this every allocation and free memsets its region and the cost is
+# charged to whatever called malloc, invisible in any profile. Measured on
+# uruk-hai 2026-08-27 (128 cores, --workers 96) over four large nested archives
+# with warm YARA caches: 284.7s stock, 227.7s with junk:false (-20%), identical
+# result hashes. Peak RSS fell 16.0 GiB -> 14.0 GiB over the same pair.
+malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,abort_conf:true,junk:false"
 # -r -R 5 : supervise the worker and restart it forever (5s back-off) after
 #           any exit, so an OOM kill or panic self-heals. -P is the supervisor
 #           pidfile; \`service scan-worker stop\` signals it to tear the

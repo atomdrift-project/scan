@@ -39,6 +39,32 @@ struct Args {
     /// ~1.8M-key corpus each SHA filter lands in the 16 MiB power-of-two bucket.
     #[arg(long, default_value_t = 1e-9, value_name = "P")]
     fp: f64,
+
+    /// On-disk layout version to emit. Defaults to this build's
+    /// [`scan::bloom::FORMAT_VERSION`].
+    ///
+    /// Publishing an older version alongside the current one is how clients that
+    /// predate a tier keep receiving fresh data: the bundle is projected down
+    /// (see `KeySets::into_filters_for`) rather than withheld. Run once per
+    /// version over the same pool file — the pool is on disk anyway, and a
+    /// second read is far cheaper than holding a second copy of the key sets.
+    #[arg(long = "format-version", default_value_t = scan::bloom::FORMAT_VERSION,
+          value_name = "N")]
+    format_version: u16,
+
+    /// Accept a filter whose row count shrank or grew past the safety ratios.
+    ///
+    /// For a deliberate tier-rule change, where the large step IS the change and
+    /// is indistinguishable from the corrupt export the ratios exist to catch.
+    /// Narrow by construction: canaries, caller-vouched digests, and the
+    /// collapse-to-zero guard all stay fatal, and every accepted breach is
+    /// printed. Prefer setting it for the one cutover run rather than leaving it
+    /// on in the timer.
+    #[arg(
+        long = "accept-unusual-growth",
+        env = "SCAN_BLOOM_ACCEPT_UNUSUAL_GROWTH"
+    )]
+    accept_unusual_growth: bool,
 }
 
 /// Ubiquitous system binaries that must never be catalogued bad. Hashed at build
@@ -82,12 +108,25 @@ fn main() -> Result<()> {
         .with_context(|| format!("creating {}", args.out.display()))?;
     // Size the new build against the previous one (read before we overwrite it).
     let prev = read_prev_manifest(&args.out);
-    let filters = sets.into_filters(args.fp);
+    let filters = sets.into_filters_for(args.format_version, args.fp);
+    if filters.is_empty() {
+        anyhow::bail!(
+            "format version {} produced no filters — is it a version this build knows? \
+             (supported: {:?})",
+            args.format_version,
+            scan::bloom::SUPPORTED_VERSIONS,
+        );
+    }
 
     // Fail loud before writing, so a poisoned or hollow build never lands in the
     // output dir (nor reaches `make publish-bloom`).
-    verify_build(&filters, prev.as_ref(), &host_good_digests())
-        .context("bloom safety check failed")?;
+    verify_build(
+        &filters,
+        prev.as_ref(),
+        &host_good_digests(),
+        args.accept_unusual_growth,
+    )
+    .context("bloom safety check failed")?;
 
     let manifest = write_bundle(&args.out, &filters, &args.date)?;
 
@@ -98,8 +137,9 @@ fn main() -> Result<()> {
         );
     }
     eprintln!(
-        "wrote {} filters + bloom.toml to {}",
+        "wrote {} filters + bloom.toml (format v{}) to {}",
         manifest.filter.len(),
+        args.format_version,
         args.out.display()
     );
     Ok(())

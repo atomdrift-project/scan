@@ -126,6 +126,61 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process;
+use tracing_subscriber::prelude::*;
+
+const EXPECTED_YARA_CACHE_MISMATCH: &str =
+    "compiled YARA rules do not match the rule sources on disk; ignoring them and recompiling";
+
+fn is_expected_yara_cache_mismatch(target: &str, message: &str) -> bool {
+    target == "cleave::yara_engine" && message.contains(EXPECTED_YARA_CACHE_MISMATCH)
+}
+
+/// Hide one expected cache invalidation without muting real YARA errors from
+/// the same tracing target. The upstream event remains available whenever the
+/// operator explicitly asks for diagnostic logs.
+#[derive(Debug, Clone, Copy)]
+struct ExpectedYaraCacheFilter {
+    hide: bool,
+}
+
+#[derive(Default)]
+struct EventMessage {
+    text: String,
+}
+
+impl tracing::field::Visit for EventMessage {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.text = format!("{value:?}");
+        }
+    }
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for ExpectedYaraCacheFilter
+where
+    S: tracing::Subscriber,
+{
+    fn enabled(
+        &self,
+        _metadata: &tracing::Metadata<'_>,
+        _context: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        true
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        if !self.hide || event.metadata().target() != "cleave::yara_engine" {
+            return true;
+        }
+        let mut message = EventMessage::default();
+        event.record(&mut message);
+        !is_expected_yara_cache_mismatch(event.metadata().target(), &message.text)
+    }
+}
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -291,49 +346,45 @@ struct Cli {
     #[arg(long = "zip-password", value_name = "PASSWORD", global = true)]
     zip_passwords: Vec<String>,
 
-    /// [EXPERIMENTAL] Fetch the external references discovered in analyzed
-    /// files, re-analyze each payload, and fold it into the verdict. A
-    /// comma-separated selection of what to fetch, by how strongly the reference
-    /// is bound to the artifact:
-    ///   `deps`     — strict dependencies declared in a manifest/lockfile
-    ///                (package.json, Cargo.lock, .SRCINFO depends);
-    ///   `packages` — packages merely mentioned by an install command
-    ///                (`npm install foo`, `pip install bar`), typically injected
-    ///                by a build/lifecycle script rather than pinned;
-    ///   `urls`     — raw URLs with no package identity (curl/wget targets,
-    ///                staged downloads), the largest exposure.
-    /// `all` (or a bare `--fetch`) selects every kind; `none` disables fetching
-    /// entirely (a fully offline scan). When omitted, all three kinds are
-    /// fetched by default. Also settable per deployment via the `SCAN_FETCH`
-    /// env var (e.g. `SCAN_FETCH=urls,packages` or `SCAN_FETCH=none`), which
-    /// overrides the default. An online step performed after the offline
-    /// analysis.
+    /// [EXPERIMENTAL] Follow references discovered inside the requested
+    /// artifact, analyze their payloads, and fold them into the verdict:
+    ///   `dependencies` — manifest and lockfile dependencies;
+    ///   `references`   — packages and URLs named by install/download commands;
+    ///   `ci-actions`   — third-party actions referenced by CI configuration.
+    /// `all` selects every category; `none` analyzes only the requested artifact.
+    /// A bare `--follow` and the default follow dependencies and references but
+    /// not CI actions. The old `--fetch` flag and `deps`, `packages`, `urls`, and
+    /// `ci` values remain accepted as aliases. Also settable via `SCAN_FOLLOW`;
+    /// `SCAN_FETCH` remains a compatibility alias.
     #[arg(
-        long,
+        long = "follow",
+        visible_alias = "fetch",
         global = true,
-        value_name = "KINDS",
+        value_name = "TARGETS",
         num_args = 0..=1,
         require_equals = true,
-        // A bare `--fetch` selects the artifact's own reachable code, not CI:
-        // `--fetch=all` (or `--fetch=ci`) is the explicit opt-in for GitHub
+        // A bare `--follow` selects the artifact's own reachable code, not CI:
+        // `--follow=all` (or `--follow=ci-actions`) is the explicit opt-in for GitHub
         // Actions, which run only in CI and never reach an installed artifact.
-        // Keep in lockstep with `default_cli_fetch_policy`, which resolves an
-        // absent `--fetch` to the same kinds.
-        default_missing_value = "urls,packages,deps",
-        env = "SCAN_FETCH"
+        // Keep in lockstep with `default_cli_follow_policy`, which resolves an
+        // absent `--follow` to the same targets.
+        default_missing_value = "references,dependencies",
+        env = "SCAN_FOLLOW"
     )]
-    fetch: Option<scan::fetch::FetchPolicy>,
+    follow: Option<scan::fetch::FetchPolicy>,
 
-    /// [EXPERIMENTAL] How many hops of references to follow when `--fetch` is on:
+    /// [EXPERIMENTAL] How many hops of references to follow when `--follow` is on:
     /// `1` fetches only what the scanned files reference, `2` also follows
     /// references found inside those payloads (reaching a stage-3 `curl | bash`
-    /// dropper), and so on. Also settable via `SCAN_FETCH_DEPTH`.
+    /// dropper), and so on. Also settable via `SCAN_FOLLOW_DEPTH`; the old
+    /// `--fetch-depth` and `SCAN_FETCH_DEPTH` names remain aliases.
     #[arg(
-        long,
+        long = "follow-depth",
+        visible_alias = "fetch-depth",
         global = true,
         value_name = "N",
         default_value_t = scan::fetch::DEFAULT_FETCH_DEPTH,
-        env = "SCAN_FETCH_DEPTH"
+        env = "SCAN_FOLLOW_DEPTH"
     )]
     fetch_depth: u8,
 
@@ -377,6 +428,33 @@ struct Cli {
         conflicts_with = "fetch_all_platforms"
     )]
     fetch_host_platform_only: bool,
+
+    /// [EXPERIMENTAL] Follow declared dependencies past the first hop — the
+    /// dependencies of a fetched dependency, out to `--fetch-depth`. This is
+    /// automatic in `serve` and `worker`, which populate the shared corpus;
+    /// an interactive scan stops declared dependencies at the first hop, since
+    /// the transitive tail costs a registry lookup each and is almost entirely
+    /// old releases the age gate then discards. URLs and command-mentioned
+    /// packages — the dropper chain — are followed at every hop either way.
+    /// Also settable via `SCAN_FETCH_TRANSITIVE_DEPS`.
+    #[arg(
+        long,
+        global = true,
+        env = "SCAN_FETCH_TRANSITIVE_DEPS",
+        conflicts_with = "fetch_direct_deps_only"
+    )]
+    fetch_transitive_deps: bool,
+
+    /// [EXPERIMENTAL] Follow declared dependencies for one hop only. This is the
+    /// interactive default and an explicit completeness opt-out for `serve` /
+    /// `worker`. Also settable via `SCAN_FETCH_DIRECT_DEPS_ONLY`.
+    #[arg(
+        long,
+        global = true,
+        env = "SCAN_FETCH_DIRECT_DEPS_ONLY",
+        conflicts_with = "fetch_transitive_deps"
+    )]
+    fetch_direct_deps_only: bool,
 
     /// [EXPERIMENTAL] How long to trust cached *mutable* registry metadata before
     /// revalidating. Accepts a unit suffix (`90s`, `30m`, `4h`, `2d`) — a bare
@@ -559,12 +637,13 @@ impl Cli {
 
 /// The binary's online default: everything the artifact itself reaches, but not
 /// CI — GitHub Actions run only on a runner and never land in an installed
-/// artifact, so auditing them is an explicit `--fetch=ci`/`--fetch=all` opt-in.
+/// artifact, so auditing them is an explicit
+/// `--follow=ci-actions`/`--follow=all` opt-in.
 /// Keep [`FetchPolicy::default`] offline for the library API.
 ///
-/// Must agree with the `default_missing_value` on `Cli::fetch`, so a bare
-/// `--fetch` and an absent one select the same kinds.
-fn default_cli_fetch_policy() -> scan::fetch::FetchPolicy {
+/// Must agree with the `default_missing_value` on `Cli::follow`, so a bare
+/// `--follow` and an absent one select the same targets.
+fn default_cli_follow_policy() -> scan::fetch::FetchPolicy {
     scan::fetch::FetchPolicy {
         urls: true,
         packages: true,
@@ -595,6 +674,25 @@ fn cli_host_platform_only(cli: &Cli, scans_for_other_hosts: bool) -> bool {
     cli.fetch_host_platform_only || (!cli.fetch_all_platforms && !scans_for_other_hosts)
 }
 
+/// Whether declared dependencies are followed past the first hop. Corpus-facing
+/// modes take the transitive tail by default; an interactive scan stops at the
+/// artifact's own declared dependencies. Either default is overridable, and the
+/// two flags conflict, so at most one arm can fire.
+fn cli_transitive_deps(cli: &Cli, scans_for_other_hosts: bool) -> bool {
+    cli.fetch_transitive_deps || (!cli.fetch_direct_deps_only && scans_for_other_hosts)
+}
+
+/// Resolve the hopper destination consistently for every scan mode. Most
+/// subcommands let clap populate their local `hopper` field from the
+/// environment, but bare-path shorthand bypasses subcommand parsing.
+fn resolve_hopper(hopper: Option<String>) -> Option<String> {
+    resolve_hopper_value(hopper, std::env::var("SCAN_HOPPER").ok())
+}
+
+fn resolve_hopper_value(hopper: Option<String>, env: Option<String>) -> Option<String> {
+    hopper.or(env).filter(|url| !url.trim().is_empty())
+}
+
 fn command_scans_for_other_hosts(command: Option<&Commands>) -> bool {
     matches!(
         command,
@@ -615,8 +713,9 @@ enum Commands {
         /// `<URL>/api/result`. A SHA hopper has not ingested is negotiated over
         /// `/api/known` and uploaded bytes-and-provenance first, so a
         /// never-before-seen sample lands as its own row instead of being
-        /// dropped as an unknown-SHA no-op. Upload failures are logged, never
-        /// fatal. Also settable via the `SCAN_HOPPER` env var.
+        /// dropped as an unknown-SHA no-op. Upload failures are reported as
+        /// errors, but never make the scan fatal. Also settable via the
+        /// `SCAN_HOPPER` env var.
         /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
         /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
         #[arg(
@@ -781,8 +880,9 @@ enum Commands {
         ///
         ///   --hopper https://hops-ro.example,http://hopper.internal:8081
         ///
-        /// Upload failures are logged, never fatal. Also settable via the
-        /// `SCAN_HOPPER` env var. Authenticates with `~/.tok/hopper` (or
+        /// Upload failures are reported as errors, but never make the scan
+        /// fatal. Also settable via the `SCAN_HOPPER` env var. Authenticates
+        /// with `~/.tok/hopper` (or
         /// `$HOPPER_TOKEN_FILE` / `$HOPPER_TOKEN`); hopper rejects an
         /// unauthenticated request with 401.
         #[arg(
@@ -794,16 +894,17 @@ enum Commands {
         hopper: Option<String>,
 
         /// Fill idle capacity with queue work from `--hopper`, pausing the
-        /// moment a request arrives.
+        /// moment an analysis request arrives.
         ///
         /// A serve process spends most of its life waiting while hopper holds a
-        /// backlog, so the spare capacity is otherwise wasted. Requests always
-        /// win: the worker stops claiming while any is in flight, and the slots
-        /// it is *not* given are the interactive reserve, so an arriving
-        /// request never queues behind background work.
+        /// backlog, so the spare capacity is otherwise wasted. Analysis
+        /// requests always win: the worker stops claiming while any is in
+        /// flight and remains paused for 7 seconds after the latest analysis
+        /// request, so a new burst does not compete with background work.
         ///
-        /// Defaults to 1, leaving every other slot reserved for requests, and
-        /// the worker holds exactly one claim at a time. 0 disables it.
+        /// Defaults to half of `--workers` (rounded down), leaving the other
+        /// half reserved for requests. The requested value is capped at that
+        /// same half-slot limit. 0 disables it.
         /// Requires `--hopper`.
         ///
         /// When `--hopper` names several addresses this claims from the
@@ -834,7 +935,8 @@ enum Commands {
         /// variable can feed both, but a worker uses only the primary — the
         /// last address. A replica refuses worker routes outright, so the
         /// earlier ones are not a fallback here.
-        #[arg(long)]
+        /// Also settable via `SCAN_HOPPER`.
+        #[arg(long, env = "SCAN_HOPPER")]
         url: String,
 
         /// Worker name (defaults to hostname)
@@ -1074,6 +1176,21 @@ fn main() -> Result<()> {
         libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
     }
 
+    // Preserve the old deployment variable while teaching new configurations
+    // the same vocabulary as the HTTP API. The canonical variable wins when
+    // both are present. This runs before clap or any worker thread starts.
+    if std::env::var_os("SCAN_FOLLOW").is_none()
+        && let Some(value) = std::env::var_os("SCAN_FETCH")
+    {
+        // SAFETY: argument parsing happens before this process starts threads.
+        unsafe { std::env::set_var("SCAN_FOLLOW", value) };
+    }
+    if std::env::var_os("SCAN_FOLLOW_DEPTH").is_none()
+        && let Some(value) = std::env::var_os("SCAN_FETCH_DEPTH")
+    {
+        // SAFETY: argument parsing happens before this process starts threads.
+        unsafe { std::env::set_var("SCAN_FOLLOW_DEPTH", value) };
+    }
     let mut cli = Cli::parse();
     // Install the process-wide Rizin budget before any analysis or Rayon worker
     // can start. Filefacts owns the subprocess lifecycle; Atomscan only selects
@@ -1082,11 +1199,12 @@ fn main() -> Result<()> {
     let selected_severity_level = cli.level;
     let threshold_suspicious = cli.threshold_suspicious;
     let threshold_hostile = cli.threshold_hostile;
-    // The kind selection comes from `--fetch`; the hop count from `--fetch-depth`,
+    // The selection comes from `--follow`; the hop count from `--follow-depth`,
     // the dependency age ceiling from `--fetch-max-age`, and the per-file ceilings
-    // from `--fetch-max-file-*` (each its own flag/env). When `--fetch`/`SCAN_FETCH`
-    // is unset, the binary defaults to `all` in every mode. An explicit selection
-    // is honored verbatim in both; the knobs always apply.
+    // from `--fetch-max-file-*` (each its own flag/env). When `--follow`/`SCAN_FOLLOW`
+    // is unset, the binary defaults to dependencies and executable references
+    // in every mode (CI actions remain opt-in). An explicit selection is honored
+    // verbatim in both; the knobs always apply.
     let with_knobs = |mut policy: scan::fetch::FetchPolicy,
                       default_max_age: u32,
                       scans_for_other_hosts: bool| {
@@ -1096,6 +1214,7 @@ fn main() -> Result<()> {
         policy.max_url_fetches = cli.fetch_max_urls;
         policy.max_file_bytes = cli.fetch_max_file_size;
         policy.host_platform_only = cli_host_platform_only(&cli, scans_for_other_hosts);
+        policy.transitive_deps = cli_transitive_deps(&cli, scans_for_other_hosts);
         policy
     };
     // The per-fetch size ceiling is enforced in the HTTP layer, so it's a
@@ -1107,7 +1226,7 @@ fn main() -> Result<()> {
     scan::fetch::set_registry_ttl(cli.registry_ttl);
     let scans_for_other_hosts = command_scans_for_other_hosts(cli.command.as_ref());
     let fetch_policy = with_knobs(
-        cli.fetch.unwrap_or_else(default_cli_fetch_policy),
+        cli.follow.unwrap_or_else(default_cli_follow_policy),
         scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
         scans_for_other_hosts,
     );
@@ -1117,7 +1236,7 @@ fn main() -> Result<()> {
     // fresh-risk window that keeps an interactive scan fast is exactly the wrong
     // default there — it discards the long tail the cache most wants.
     let worker_fetch_policy = with_knobs(
-        cli.fetch.unwrap_or_else(default_cli_fetch_policy),
+        cli.follow.unwrap_or_else(default_cli_follow_policy),
         WORKER_MAX_DEP_AGE_DAYS,
         true,
     );
@@ -1130,7 +1249,7 @@ fn main() -> Result<()> {
             if !cli.paths.is_empty() {
                 Commands::Path {
                     paths: cli.paths.clone(),
-                    hopper: None,
+                    hopper: resolve_hopper(None),
                     // Bare `scan <path>` bypasses clap's per-subcommand parsing, so
                     // read the registry-map env var here too — this is the form
                     // cyclotron's LLM agents run.
@@ -1174,14 +1293,33 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::new("atomscan=warn,scan=warn,cleave=error")
         }
     });
-    let fmt = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_thread_names(true)
-        .with_writer(std::io::stderr);
+    // Cleave rejects a stale precompiled YARA cache safely and recompiles from
+    // source. That expected maintenance path is not an operator-facing error;
+    // filter only its exact event. Explicit diagnostics still show it.
+    let quiet_expected_yara_cache = ExpectedYaraCacheFilter {
+        hide: !cli.verbose && std::env::var_os("RUST_LOG").is_none(),
+    };
     if is_serve {
-        fmt.init();
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_thread_names(true)
+                    .with_writer(std::io::stderr)
+                    .with_filter(quiet_expected_yara_cache),
+            )
+            .init();
     } else {
-        fmt.without_time().init();
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_thread_names(true)
+                    .with_writer(std::io::stderr)
+                    .with_filter(quiet_expected_yara_cache),
+            )
+            .init();
     }
 
     // Resolved after logging is up: with no hardcoded default, the model comes
@@ -1222,6 +1360,7 @@ fn main() -> Result<()> {
     }
 
     warn_on_broken_freebsd_malloc_conf();
+    scan::heap_profile::warn_if_debug_allocator();
 
     const RAYON_FALLBACK_THREADS: usize = 4;
     // Physical cores, matching cleave's own pool. Logical SMT siblings
@@ -1315,6 +1454,7 @@ fn main() -> Result<()> {
     // analysis thread's stack without a debugger (lldb/gdb can't attach in the
     // production jails). Must precede the SIGUSR1 thread below.
     scan::thread_dump::install();
+    scan::heap_profile::install();
 
     // Dump all analysis-thread backtraces on SIGUSR1 (Linux equivalent of BSD
     // SIGINFO / Ctrl-T), captured in-process — works in jails where ptrace is
@@ -1337,6 +1477,7 @@ fn main() -> Result<()> {
                 // In-process capture: no debugger, works in jails. See
                 // `scan::thread_dump`.
                 scan::thread_dump::dump_all_threads();
+                scan::heap_profile::dump_on_signal();
             }
         });
 
@@ -1452,7 +1593,7 @@ fn main() -> Result<()> {
         .with_interpret(interpret_cfg.clone())
         .with_fetch(fetch_policy)
         .with_zip_passwords(cli.zip_passwords.clone())
-        .with_hopper(hopper))
+        .with_hopper(resolve_hopper(hopper)))
     };
 
     match command {
@@ -1529,6 +1670,7 @@ fn main() -> Result<()> {
             idle_worker_slots,
             analysis_timeout,
         } => {
+            let hopper = resolve_hopper(hopper);
             if let Some(p) = traits_dir.as_ref() {
                 cleave::traits_repo::set_override_dir(Some(p.into()));
             }
@@ -1583,18 +1725,15 @@ fn main() -> Result<()> {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            // One slot by default: every other slot stays reserved for
-            // requests. Pausing stops new claims but does not abandon a running
-            // job, so the reserve — not the pause — is what keeps an arriving
-            // request from waiting. One slot also bounds the worst case to a
-            // single background analysis in flight, which is the whole point of
-            // filling *idle* capacity rather than competing for it.
+            // Use at most half the request capacity for background work. The
+            // idle worker pauses immediately while an analysis is in flight and
+            // for a short quiet period after the latest analysis request.
             //
             // Disabled without --hopper: there would be nothing to claim from.
             let idle_slots = match (hopper.as_deref(), idle_worker_slots) {
                 (None, _) => 0,
-                (Some(_), Some(n)) => n,
-                (Some(_), None) => 1,
+                (Some(_), Some(n)) => n.min(workers / 2),
+                (Some(_), None) => workers / 2,
             };
 
             let config = scan::server::ServerConfig::new(
@@ -1875,10 +2014,8 @@ fn main() -> Result<()> {
                     .as_ref()
                     .and_then(|m| scan::output::parse_ymd(&m.built));
 
-                let total = info.trait_count as u64
-                    + info.composite_count as u64
-                    + info.yara_rules as u64
-                    + bloom_count;
+                let rules =
+                    info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64;
 
                 let mut rows = Vec::new();
                 if bloom.is_some() {
@@ -1933,7 +2070,7 @@ fn main() -> Result<()> {
                     });
                 }
 
-                scan::output::print_version(env!("CARGO_PKG_VERSION"), total, &rows);
+                scan::output::print_version(env!("CARGO_PKG_VERSION"), bloom_count, rules, &rows);
             }
         }
     }
@@ -2317,8 +2454,9 @@ fn run_scan_paths(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy, default_cli_fetch_policy,
-        redact_zip_passwords, resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
+        Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy, default_cli_follow_policy,
+        is_expected_yara_cache_mismatch, redact_zip_passwords, resolve_hopper_value,
+        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
@@ -2327,24 +2465,39 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn fetch_defaults_to_all_with_separate_url_and_dependency_caps() -> Result<()> {
+    fn only_expected_yara_cache_mismatch_is_quietable() {
+        let expected = "compiled YARA rules do not match the rule sources on disk; \
+                        ignoring them and recompiling";
+        assert!(is_expected_yara_cache_mismatch(
+            "cleave::yara_engine",
+            expected
+        ));
+        assert!(!is_expected_yara_cache_mismatch(
+            "cleave::yara_engine",
+            "YARA bucket scan failed, skipping bucket"
+        ));
+        assert!(!is_expected_yara_cache_mismatch("scan::engine", expected));
+    }
+
+    #[test]
+    fn follow_defaults_to_references_and_dependencies() -> Result<()> {
         let cli = Cli::try_parse_from(["scan", "/tmp/a"]).context("parse should work")?;
         assert!(
-            cli.fetch.is_none(),
-            "absence of --fetch is resolved at startup"
+            cli.follow.is_none(),
+            "absence of --follow is resolved at startup"
         );
 
-        let policy = default_cli_fetch_policy();
+        let policy = default_cli_follow_policy();
         assert!(policy.urls && policy.packages && policy.deps);
         assert!(
             !policy.ci,
             "CI actions never reach an installed artifact; auditing them is opt-in"
         );
-        // A bare `--fetch` must select exactly what an absent one resolves to.
-        let bare = Cli::try_parse_from(["scan", "--fetch", "/tmp/a"])
-            .context("bare --fetch should parse")?
-            .fetch
-            .context("bare --fetch has a default_missing_value")?;
+        // A bare `--follow` must select exactly what an absent one resolves to.
+        let bare = Cli::try_parse_from(["scan", "--follow", "/tmp/a"])
+            .context("bare --follow should parse")?
+            .follow
+            .context("bare --follow has a default_missing_value")?;
         assert_eq!(
             (bare.urls, bare.packages, bare.deps, bare.ci),
             (policy.urls, policy.packages, policy.deps, policy.ci),
@@ -2356,6 +2509,24 @@ mod tests {
         assert_eq!(policy.max_file_fetches, 100);
         assert_eq!(policy.max_url_fetches, scan::fetch::DEFAULT_MAX_URL_FETCHES);
         assert_eq!(policy.max_url_fetches, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn old_fetch_flag_and_target_names_remain_aliases() -> Result<()> {
+        let old = Cli::try_parse_from(["scan", "--fetch=deps,packages,urls,ci", "/tmp/a"])
+            .context("legacy --fetch vocabulary should parse")?
+            .follow
+            .context("legacy --fetch should select a policy")?;
+        let new = Cli::try_parse_from([
+            "scan",
+            "--follow=dependencies,references,ci-actions",
+            "/tmp/a",
+        ])
+        .context("canonical --follow vocabulary should parse")?
+        .follow
+        .context("canonical --follow should select a policy")?;
+        assert_eq!(old, new);
         Ok(())
     }
 
@@ -2421,6 +2592,23 @@ mod tests {
         );
         assert!(cli.command.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn hopper_environment_fills_missing_scan_destination() {
+        assert_eq!(
+            resolve_hopper_value(None, Some("http://hopper:8081/".to_string())).as_deref(),
+            Some("http://hopper:8081/")
+        );
+        assert_eq!(
+            resolve_hopper_value(
+                Some("http://flag:8081".to_string()),
+                Some("http://env".to_string())
+            )
+            .as_deref(),
+            Some("http://flag:8081")
+        );
+        assert!(resolve_hopper_value(None, Some("  ".to_string())).is_none());
     }
 
     #[test]

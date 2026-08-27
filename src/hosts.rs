@@ -121,6 +121,7 @@ const DISCOVERY_DOMAINS: &[&str] = &[
     "docs.gluster.org",
     "download.salixos.org",
     "drobilla.net",
+    "eel.is",
     "elfutils.org",
     "etherx.jabber.org",
     "fukuchi.org",
@@ -148,6 +149,7 @@ const DISCOVERY_DOMAINS: &[&str] = &[
     "openzfs.github.io",
     "rust-lang-nursery.github.io",
     "rust-lang.github.io",
+    "schemas.datacontract.org",
     "schemas.openxmlformats.org",
     "smarden.org",
     "sodipodi.sourceforge.net",
@@ -183,6 +185,7 @@ const DISCOVERY_DOMAINS: &[&str] = &[
     "www.tested.com",
     "www.tmpgenc.com",
     "www.tomshardware.com",
+    "www.topologi.com",
     "www.vesa.org",
     "www.yubi.co",
     "x265.readthedocs.org",
@@ -1140,6 +1143,15 @@ mod tests {
         assert!(discovery_exception("https://keys.gnupg.net/"));
         assert!(discovery_exception("https://www.kornshell.com/"));
         assert!(discovery_exception("https://www.spinics.net/lists/foo"));
+        assert!(discovery_exception(
+            "http://eel.is/c++draft/container.reqmts"
+        ));
+        assert!(discovery_exception(
+            "http://www.topologi.com/resources/iso-pre-pro.xsl"
+        ));
+        assert!(discovery_exception(
+            "http://schemas.datacontract.org/2004/07/Microsoft.VisualStudio.TestPlatform.Extensions.HtmlLogger.ObjectModel"
+        ));
         assert!(!discovery_exception(
             "https://github.com/clap-rs/clap/issues/999999"
         ));

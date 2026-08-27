@@ -15,10 +15,9 @@
 //!   member reports and parse trees. A burst commits its full reservation the
 //!   instant it is admitted, so the gate closes *before* archives expand, not
 //!   after.
-//! * **Reactive** — live memory usage (`total − MemAvailable` on Linux, this
-//!   process's RSS elsewhere) must leave room for the next reservation. This
-//!   catches estimates that ran low and pressure from other processes on the
-//!   host.
+//! * **Reactive** — this process's live RSS must leave room for the next
+//!   reservation. This catches estimates that ran low without conflating the
+//!   worker's `--max-rss-gb` ceiling with unrelated host-wide memory use.
 //!
 //! One always-admit hatch (when nothing is in flight) guarantees forward
 //! progress even on a host too small to fit a single slot's estimate.
@@ -60,19 +59,14 @@ const ARCHIVE_ESTIMATE_MULTIPLIER: u64 = 64;
 /// even if no release wakes us).
 const REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Live memory usage in bytes toward the ceiling, or `None` when no source is
-/// readable. Prefers the system-wide figure (`total − MemAvailable`) where the
-/// platform exposes live availability (Linux), so the gate respects pressure
-/// from *other* processes too; elsewhere falls back to this process's RSS, which
-/// every supported platform exposes. The default `used_fn`; tests inject a value.
+/// This process's live resident memory in bytes toward the `--max-rss-gb`
+/// ceiling, or `None` when the platform cannot read it. The old implementation
+/// preferred `total - available` whenever both happened to be implemented. On
+/// FreeBSD that measured the whole host (108 GiB in the affected run) while the
+/// worker itself used 1.5 GiB, causing a 64 GiB process ceiling to admit only
+/// one job. The default `used_fn`; tests inject a value.
 fn live_used() -> Option<u64> {
-    match (
-        cleave::memory_tracker::total_memory(),
-        cleave::memory_tracker::available_memory(),
-    ) {
-        (Some(total), Some(avail)) => Some(total.saturating_sub(avail)),
-        _ => cleave::memory_tracker::current_rss(),
-    }
+    cleave::memory_tracker::current_rss()
 }
 
 fn dynamic_estimate_bytes(path: &str, file_type: &str, on_disk_bytes: i64) -> u64 {

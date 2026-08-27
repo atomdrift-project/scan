@@ -16,7 +16,7 @@ The defaults are deliberate. Override them only when you have a reason.
 | Flag             | Default            | Meaning                                                    |
 | ---------------- | ------------------ | ---------------------------------------------------------- |
 | `--bind`         | `127.0.0.1:49999`  | Listen address.                                            |
-| `--workers`      | `max(1, ncpu / 2)` | Hard cap on concurrent analyses. Excess requests get 503.  |
+| `--workers`      | physical performance-core count (min 2) | Hard cap on concurrent analyses. Excess requests get 503. |
 | `--max-size-mb`  | `100`              | Per-request upload limit.                                  |
 | `--max-rss-gb`   | `0` (auto)         | RSS ceiling. `0` reads the cgroup signal. `-1` disables.   |
 | `--allowed-dirs` | none               | Comma-separated roots permitted by `/analyze-path`.        |
@@ -25,6 +25,7 @@ The defaults are deliberate. Override them only when you have a reason.
 | `--token-file`   | none               | File holding the required bearer token. See below.         |
 | `--traits-dir`   | none               | Writable cleave traits directory (sets env on launch).     |
 | `--hopper`       | none               | Hopper base URL. Every analyzed result is renewed on its `/api/result`. Needs a hopper token; see below. |
+| `--idle-worker-slots` | half of `--workers` when `--hopper` is set | Background hopper analyses while no analysis request has arrived for 7 seconds; capped at half of `--workers`, and paused immediately during active analysis requests. `0` disables. |
 
 Environment variables read at startup:
 
@@ -205,7 +206,7 @@ looks up registry provenance itself, and returns the same envelope as
       -d '{"purl":"pkg:npm/left-pad@1.3.0"}' \
       http://127.0.0.1:49999/analyze-purl | jq .ml
 
-Beamline backends should start the server with `--fetch --interpret
+Beamline backends should start the server with `--follow --interpret
 --analysis-timeout 1800` so dependency follow and LLM interpretation
 match a live `atomscan purl` run.
 
@@ -246,14 +247,14 @@ unknown, `[]` when empty.
 | --- | --- |
 | `allow` | Analyzed. Not hostile at the caller's budget. |
 | `block` | Analyzed. Hostile at the caller's budget. |
-| `unknown` | Nobody has analyzed it, and nothing is wrong. |
+| `unanalyzed` | Nobody has analyzed it, and nothing is wrong. |
 | `unavailable` | We could not answer. Nothing about the artifact. |
 
-`unknown` and `unavailable` are kept distinct on purpose: one is a
+`unanalyzed` and `unavailable` are kept distinct on purpose: one is a
 claim about the package, the other about us, and a caller's policy is
 entitled to treat them differently. A verdict index that has not
 loaded, or a corpus that cannot be reached, is `unavailable` — never
-`unknown`, which would report our own outage as a clean bill of health.
+`unanalyzed`, which would report our own outage as a clean bill of health.
 
 `fires_at` is the stored `lvl`: the tightest false-positive budget per
 100 million benign files at which the artifact grades hostile, `-1` for
@@ -280,14 +281,31 @@ Analyze a package and answer with a decision.
     POST /v1/analyze                  {"purl": "pkg:npm/evil@1.0.0"}
     POST /v1/analyze?false_positive_budget=25
     POST /v1/analyze?purl=pkg:npm/evil@1.0.0&force=1
+    POST /v1/analyze?purl=pkg:npm/evil@1.0.0&follow=none
+    POST /v1/analyze?purl=pkg:npm/evil@1.0.0&follow=dependencies,references
     POST /v1/analyze                  <the artifact, any other content type>
 
 A named package is looked up before anything is analyzed, exactly the way
 `GET /v1/lookup` resolves it — same normalization, same index-then-corpus order,
 same budget. A verdict already held is returned immediately and costs no
-analysis slot; `unknown` and `unavailable` are not verdicts, so both fall
+analysis slot; `unanalyzed` and `unavailable` are not verdicts, so both fall
 through and run. Pass `force=1` to analyze regardless of what is already known,
 which is what to use after an engine upgrade.
+
+The requested artifact is always retrieved. `follow` controls which references
+discovered inside it are also retrieved and analyzed: `dependencies` follows
+manifest and lockfile declarations, `references` follows packages and URLs
+named by install/download commands, `ci-actions` follows third-party CI actions
+and implies dependencies, `all` selects every category, and `none` follows
+nothing. Values may be comma-separated or repeated. Omitting `follow` uses the
+server's configured policy. An explicit `follow` selection replaces the
+configured categories after validation; the server's depth, size, and fan-out
+limits still apply.
+
+An explicit policy that differs from the server default bypasses the local
+index and Hopper, gets its own single-flight key, and is not indexed or uploaded
+afterward. Policy changes can change the verdict, so such a result cannot safely
+replace the deployment's canonical answer.
 
 An `application/json` body names a package; anything else is the artifact
 itself, staged and analyzed under the digest of its bytes. An upload is always

@@ -101,14 +101,15 @@ const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// `/api/next` — still reports liveness, RSS, load, and queue depth on time.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
-/// How many top-level analyses may enter nested Rayon work at once.
+/// How many top-level analyses may execute at once.
 ///
-/// The N worker tasks bound how many jobs are in flight; this tighter gate
-/// bounds how many deep cleave/fetch trees share the one process-global Rayon
-/// pool. Independent trees compound stack frames via work-stealing (256 MiB
-/// stacks + `stacker` absorb a handful, not dozens). The default scales with
-/// the pool (⅛, at least 1) and never exceeds `slots`. Override with
-/// `SCAN_CLEAVE_CONCURRENCY`.
+/// The N worker tasks bound jobs that may be claimed/in flight; this tighter
+/// gate bounds memory-bandwidth-heavy cleave executions. Within that gate,
+/// cleave gives only a bounded subset of sibling analyses access to nested
+/// Rayon work while the other admitted analyses make serial progress. The
+/// default scales with the pool (1/16, at least 1: eight analyses on the
+/// 128-thread FreeBSD worker) and never exceeds `slots`;
+/// `SCAN_CLEAVE_CONCURRENCY` remains an explicit production override.
 ///
 /// Each worker waits on this gate *after* taking a job and *only* around the
 /// blocking classify — never on a shared dispatch loop.
@@ -124,7 +125,7 @@ fn cleave_concurrency(slots: usize) -> usize {
 fn cleave_concurrency_from(slots: usize, pool: usize, override_value: Option<usize>) -> usize {
     let slots = slots.max(1);
     override_value.filter(|&value| value > 0).map_or_else(
-        || (pool.max(1) / 8).clamp(1, slots),
+        || (pool.max(1) / 16).clamp(1, slots),
         |value| value.min(slots),
     )
 }
@@ -663,6 +664,12 @@ pub struct Embedded {
     pub shutdown: Arc<AtomicBool>,
     /// The server's already-loaded models.
     pub resources: Arc<ModelResources>,
+    /// Elapsed-time marker for the most recent analysis request.
+    pub last_analyze_request_ms: Arc<AtomicU64>,
+    /// Same monotonic clock anchor used to produce the request marker.
+    pub started_at: Instant,
+    /// How long after an analysis request the idle worker must remain quiet.
+    pub quiet_period: Duration,
 }
 
 // ModelResources carries no Debug, and dumping a model bundle into a log line
@@ -672,6 +679,7 @@ impl std::fmt::Debug for Embedded {
         f.debug_struct("Embedded")
             .field("paused", &self.pause.load(Ordering::Relaxed))
             .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .field("quiet_period", &self.quiet_period)
             .finish_non_exhaustive()
     }
 }
@@ -1505,8 +1513,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
-    // Nested-Rayon cap only. Worker-task count (`slots`) is the analysis
-    // concurrency limit — no separate analysis-slot semaphore.
+    // Worker tasks (`slots`) claim and stage jobs; the cleave gate separately
+    // bounds simultaneous memory-bandwidth-heavy analyses.
     let cleave_slots = cleave_concurrency(slots);
     let cleave_gate = Arc::new(Semaphore::new(cleave_slots));
     // Slot count bounds concurrency but not memory: a slot analysing a huge
@@ -1571,8 +1579,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         tracing::warn!(
             slots,
             cleave_slots,
-            "cleave entry gate limits nested Rayon trees to {cleave_slots} \
-             (pool/8); set SCAN_CLEAVE_CONCURRENCY to override",
+            "cleave entry gate allows {cleave_slots} simultaneous analyses; \
+             other claimed worker slots deliberately wait at this gate. Set \
+             SCAN_CLEAVE_CONCURRENCY to override",
         );
     }
 
@@ -1752,6 +1761,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let prefetch_task = tokio::spawn(
         Prefetcher {
             pause: config.embedded.as_ref().map(|e| Arc::clone(&e.pause)),
+            last_analyze_request_ms: config
+                .embedded
+                .as_ref()
+                .map(|e| Arc::clone(&e.last_analyze_request_ms)),
+            activity_started_at: config.embedded.as_ref().map(|e| e.started_at),
+            quiet_period: config.embedded.as_ref().map(|e| e.quiet_period),
             client: client.clone(),
             base_url: Arc::clone(&base_url),
             data_dir: data_dir.clone(),
@@ -2008,8 +2023,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
                     let active_slots = analyzing.load(Ordering::Relaxed);
                     let available_slots = slots.saturating_sub(active_slots);
+                    let heap = crate::heap_profile::stats();
+                    let (regex_scratch_bytes, regex_scratch_budget_bytes) =
+                        cleave::regex_scratch_usage();
                     tracing::info!(
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                        jemalloc_allocated_mb = heap.map(|stats| stats.allocated / (1024 * 1024)),
+                        jemalloc_active_mb = heap.map(|stats| stats.active / (1024 * 1024)),
+                        jemalloc_resident_mb = heap.map(|stats| stats.resident / (1024 * 1024)),
+                        jemalloc_retained_mb = heap.map(|stats| stats.retained / (1024 * 1024)),
+                        regex_scratch_mb = regex_scratch_bytes / (1024 * 1024),
+                        regex_scratch_budget_mb = regex_scratch_budget_bytes / (1024 * 1024),
                         queued_prefetch_jobs = outstanding.load(Ordering::Relaxed),
                         prefetch_buffer_mb = queued_bytes.load(Ordering::Relaxed) / (1024 * 1024),
                         active_slots,
@@ -2412,9 +2436,38 @@ struct Prefetcher {
     /// stops the whole pipeline at one point: staged jobs finish, slots drain,
     /// and nothing new is claimed until the flag clears.
     pause: Option<Arc<AtomicBool>>,
+    /// Elapsed-time marker for the most recent host `/analyze` request.
+    last_analyze_request_ms: Option<Arc<AtomicU64>>,
+    /// Host clock anchor for interpreting `last_analyze_request_ms`.
+    activity_started_at: Option<Instant>,
+    /// Quiet period after host analysis traffic.
+    quiet_period: Option<Duration>,
 }
 
 impl Prefetcher {
+    fn recently_saw_analyze_request(&self) -> bool {
+        let (Some(last), Some(started_at), Some(quiet_period)) = (
+            self.last_analyze_request_ms.as_ref(),
+            self.activity_started_at,
+            self.quiet_period,
+        ) else {
+            return false;
+        };
+        let last_ms = last.load(Ordering::Acquire);
+        if last_ms == 0 {
+            return false;
+        }
+        let now_ms = u64::try_from(
+            started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX.saturating_sub(1))),
+        )
+        .unwrap_or(u64::MAX.saturating_sub(1))
+        .saturating_add(1);
+        u128::from(now_ms.saturating_sub(last_ms)) < quiet_period.as_millis()
+    }
+
     /// Build the `/api/next` URL, attaching the live signals hopper uses to
     /// ration work: traits version, current RSS, 1-minute load, and tools.
     fn poll_url(&self, count: usize) -> String {
@@ -2475,13 +2528,18 @@ impl Prefetcher {
             // what is already staged or running: that work is real, and hopper
             // redispatches a claim that dies anyway. Responsiveness comes from
             // the slots the server keeps for itself, not from killing jobs.
-            if self
+            let interactive = self
                 .pause
                 .as_ref()
-                .is_some_and(|p| p.load(Ordering::Relaxed))
-            {
+                .is_some_and(|p| p.load(Ordering::Relaxed));
+            let recently_active = self.recently_saw_analyze_request();
+            if interactive || recently_active {
                 if !paused_logged {
-                    tracing::debug!("idle worker paused: interactive work in flight");
+                    tracing::debug!(
+                        interactive,
+                        recently_active,
+                        "idle worker paused: recent interactive analysis activity"
+                    );
                     paused_logged = true;
                 }
                 self.poll_state.buffer_room.store(0, Ordering::Release);
@@ -4441,6 +4499,11 @@ mod tests {
                 metrics: Arc::new(WorkerMetrics::new()),
                 poll_state: Arc::new(PollState::default()),
                 exit_if_empty,
+                // Standalone prefetcher: no embedded server to defer to, so the
+                // quiet-period signals upstream added are all absent.
+                last_analyze_request_ms: None,
+                activity_started_at: None,
+                quiet_period: None,
                 // Far below the 1 s poll cadence, so the second empty poll trips it.
                 idle_warn_after: Duration::from_millis(10),
             }
@@ -4752,6 +4815,9 @@ mod tests {
             Prefetcher {
                 // Standalone worker: nothing to defer to.
                 pause: None,
+                last_analyze_request_ms: None,
+                activity_started_at: None,
+                quiet_period: None,
                 client: reqwest::Client::new(),
                 base_url: Arc::from(format!("http://127.0.0.1:{port}").as_str()),
                 data_dir: None,
@@ -4991,7 +5057,7 @@ mod tests {
 
     #[test]
     fn cleave_concurrency_scales_with_pool_and_respects_slot_cap() {
-        assert_eq!(cleave_concurrency_from(16, 32, None), 4);
+        assert_eq!(cleave_concurrency_from(16, 32, None), 2);
         assert_eq!(cleave_concurrency_from(16, 8, None), 1);
         assert_eq!(cleave_concurrency_from(2, 64, None), 2);
         assert_eq!(cleave_concurrency_from(0, 32, None), 1);
@@ -5002,7 +5068,7 @@ mod tests {
         assert_eq!(cleave_concurrency_from(4, 32, Some(64)), 4);
         assert_eq!(cleave_concurrency_from(16, 32, Some(2)), 2);
         // Zero / bogus overrides fall back to the pool formula.
-        assert_eq!(cleave_concurrency_from(16, 32, Some(0)), 4);
+        assert_eq!(cleave_concurrency_from(16, 32, Some(0)), 2);
     }
 
     #[test]
