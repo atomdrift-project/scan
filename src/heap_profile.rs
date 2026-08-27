@@ -216,3 +216,57 @@ fn dump_freebsd(path: &str) -> Result<(), String> {
         Err(format!("mallctl prof.dump returned errno {status}"))
     }
 }
+
+/// Warn when the host's in-libc jemalloc taxes every allocation.
+///
+/// FreeBSD builds libc's jemalloc with `--enable-debug` and `--enable-fill` on
+/// -CURRENT, so each allocation runs jemalloc's invariant assertions and both
+/// `malloc` and `free` memset the region (`opt.junk`). Neither shows up as
+/// application time: profiles blame whatever called `malloc`, so the tax is
+/// invisible unless something looks for it. Measured on uruk-hai (128-core
+/// arm64, 16.0-CURRENT) over four large nested archives at 96 worker slots with
+/// warm YARA caches: 284.7 s stock against 227.7 s with `junk:false`, at an
+/// identical result hash. For reference, swapping the whole allocator out for
+/// mimalloc scored 231.2 s on the same workload — i.e. `junk:false` alone
+/// recovers what a different allocator would, which is why there is no bundled
+/// allocator on this platform.
+///
+/// `opt.junk` is settable at startup; the assertions are compiled in and can
+/// only be dropped by a `MALLOC_PRODUCTION` world, so the warning names
+/// whichever remedy the host still needs.
+pub fn warn_if_debug_allocator() {
+    #[cfg(target_os = "freebsd")]
+    {
+        let junk = junk_setting().filter(|setting| *setting != "false");
+        let is_debug_build = read_ctl::<bool>(b"config.debug\0") == Some(true);
+        if junk.is_none() && !is_debug_build {
+            return;
+        }
+        // One line, not one per condition: this fires on every start on a
+        // -CURRENT host, and the operator's next move is the same either way.
+        let remedy = if junk.is_some() {
+            "add junk:false to MALLOC_CONF"
+        } else {
+            "build world with MALLOC_PRODUCTION to drop the assertions too"
+        };
+        tracing::warn!(
+            opt_junk = junk.unwrap_or("false"),
+            config_debug = is_debug_build,
+            "the system jemalloc is a debugging build, which taxes every allocation and \
+             free. Measured on a 128-core arm64 -CURRENT host: junk filling alone cost 20% \
+             of wall-clock. To fix: {remedy}.",
+        );
+    }
+}
+
+/// The runtime value of `opt.junk` (`"true"`, `"false"`, `"alloc"`, `"free"`).
+#[cfg(target_os = "freebsd")]
+fn junk_setting() -> Option<&'static str> {
+    let value = read_ctl::<*const std::ffi::c_char>(b"opt.junk\0")?;
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: `opt.junk` yields a pointer to a NUL-terminated string owned by
+    // libc for the life of the process; it is never mutated or freed.
+    unsafe { std::ffi::CStr::from_ptr(value) }.to_str().ok()
+}
