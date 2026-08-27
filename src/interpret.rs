@@ -582,7 +582,11 @@ pub fn interpret(
     // independent and the prompt caches by content), annotations included — the
     // system prompt frames each description as a fallible interpretation, so no
     // wrapper text is added.
-    let user = context;
+    // The model sees categorized observations, not graded conclusions; `context`
+    // itself keeps its `SEV` letters because [`Evidence`] above was computed from
+    // them and the admission gate keys on them too.
+    let user_view = crate::engine::recategorize_annotations(context);
+    let user = user_view.as_str();
     let system = SYSTEM_PROMPT;
     // Honor cleave's `CLEAVE_SKIP_CACHE=1`: when set, bypass the verdict cache
     // (both read and write) so a benchmark or prompt-tuning run always re-queries
