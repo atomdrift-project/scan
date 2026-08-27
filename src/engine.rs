@@ -6105,6 +6105,114 @@ fn render_registry_provenance(
     serde_json::Value::Object(out)
 }
 
+/// Trim a rendered provenance block down to what the grader actually reads.
+///
+/// The full block runs 5–9 KB per subject — on a small package that is ~74% of
+/// the whole render — and almost all of it is `raw`: provider response bodies
+/// and version history the LLM never uses to grade. What it does use is the
+/// package's *claimed identity* (does the observed behavior have a plausible
+/// role in what this package says it is for?) and the handful of signals that
+/// say whether that claim is worth anything.
+///
+/// `page` is recomputed from `first_published_at`/`published_at` against scan
+/// time rather than read from the record's own `age_days`. An offline
+/// `--registry-map` sidecar freezes `age_days` at *collection* time, and a
+/// corpus collected within days of publication carries `0` for everything —
+/// which would tell the grader that every long-established package is brand
+/// new, exactly inverting the signal. `downloads_recent` is likewise dropped
+/// when zero rather than reported as zero, since the sidecar path leaves it
+/// unset rather than measured.
+fn slim_provenance_for_interpret(
+    mut provenance: serde_json::Value,
+    now_secs: i64,
+) -> serde_json::Value {
+    let Some(registry) = provenance.get_mut("registry").and_then(|r| r.as_object_mut()) else {
+        return provenance;
+    };
+    registry.remove("raw");
+    if let Some(record) = registry.get("record") {
+        let slim = project_registry_record(record, now_secs);
+        registry.insert("record".to_string(), slim);
+    }
+    provenance
+}
+
+/// Identity plus the three credibility signals the prompt's coherence test names.
+///
+/// Reads the record through its serialized keys rather than the `fletch::Registry`
+/// struct: these are the wire names every consumer of the envelope already sees,
+/// and ecosystems populate different subsets of them (a gem record carries
+/// downloads but no release count; a pypi record carries both).
+fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_json::Value {
+    let get_str = |key: &str| {
+        record
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let get_i64 = |key: &str| record.get(key).and_then(serde_json::Value::as_i64);
+    let truncate = |s: &str, max: usize| {
+        if s.chars().count() <= max {
+            s.to_string()
+        } else {
+            let head: String = s.chars().take(max).collect();
+            format!("{head}…")
+        }
+    };
+
+    let mut out = serde_json::Map::new();
+    if let Some(name) = get_str("name") {
+        let eco = get_str("ecosystem").unwrap_or("");
+        let version = get_str("version").unwrap_or("");
+        let mut id = String::new();
+        if !eco.is_empty() {
+            id.push_str(eco);
+            id.push('/');
+        }
+        id.push_str(name);
+        if !version.is_empty() {
+            id.push('@');
+            id.push_str(version);
+        }
+        out.insert("n".to_string(), serde_json::json!(id));
+    }
+    if let Some(description) = get_str("description") {
+        out.insert("d".to_string(), serde_json::json!(truncate(description, 200)));
+    }
+    if let Some(author) = get_str("publisher").or_else(|| get_str("author")) {
+        out.insert("a".to_string(), serde_json::json!(truncate(author, 60)));
+    }
+    if let Some(url) = get_str("repository").or_else(|| get_str("homepage")) {
+        out.insert("u".to_string(), serde_json::json!(url));
+    }
+    // Age at scan time, from the earliest publication the record knows about.
+    if let Some(first) = get_i64("first_published_at").or_else(|| get_i64("published_at"))
+        && now_secs > first
+    {
+        out.insert("page".to_string(), serde_json::json!((now_secs - first) / 86_400));
+    }
+    if let Some(releases) = get_i64("release_count") {
+        out.insert("rel".to_string(), serde_json::json!(releases));
+    }
+    if let Some(downloads) = get_i64("downloads_total")
+        .or_else(|| get_i64("downloads_recent"))
+        .filter(|d| *d > 0)
+    {
+        out.insert("dl".to_string(), serde_json::json!(downloads));
+    }
+    if let Some(vulns) = get_i64("vulnerability_count").filter(|v| *v > 0) {
+        out.insert("v".to_string(), serde_json::json!(vulns));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Seconds since the Unix epoch, or `0` when the clock is before it.
+fn scan_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 fn remove_empty_json(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(obj) => {
