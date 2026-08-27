@@ -239,6 +239,11 @@ pub struct Interpretation {
     pub grade: Option<LlmGrade>,
     /// The final outcome — the blended verdict on success, the ML verdict on error.
     pub outcome: Classification,
+    /// Whether cleave independently surfaced a hostile finding on this sample.
+    /// Carried out of the blend because it is what earns a corroborated
+    /// escalation, and what places an interpreted-suspicious verdict nearer the
+    /// hostile boundary than the middle of the band.
+    pub corroborated: bool,
     /// Confidence in `[0, 1]` — blended on success, the raw ML probability on error.
     pub blended: f32,
     /// One-sentence rationale from the model (empty on error).
@@ -430,10 +435,24 @@ impl Evidence {
         if from != Classification::Hostile && to != Classification::Hostile {
             return true;
         }
-        if class_rank(to) > class_rank(from) && self.hostile_finding {
-            return true;
+        if class_rank(to) > class_rank(from) {
+            return self.hostile_finding || self.levels.within_one_steer_of_hostile_boundary();
         }
-        self.levels.within_one_steer_of_hostile_boundary()
+        // Leaving hostile is permitted except from the strictest rung there is.
+        //
+        // It was gated on the same proximity test as an escalation, which made the
+        // LLM's ability to correct a false positive shrink as ML grew more
+        // confidently wrong — backwards for the case `--interpret` exists to
+        // catch. Measured on the poppy corpus: yt-dlp, gallery-dl, androguard,
+        // crawl4ai and pyarmor all sat at L1 with a correct exoneration in the
+        // same record and no way to act on it.
+        //
+        // The step lands on *suspicious*, never benign, so a real threat the LLM
+        // wrongly clears is routed for review rather than released, and how far
+        // into the suspicious band it lands scales with how deep ML fired (see
+        // `crate::engine::softened_level`). `L0` is the exception: nothing one
+        // fallible opinion says moves a file off the tightest budget the grid has.
+        !matches!(self.levels.fired, Some(0))
     }
 }
 
@@ -512,6 +531,23 @@ fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade, ev: Evidence) -> (Clas
         (class, steer(p, toward_severe))
     };
     match class_rank(target).cmp(&class_rank(ml)) {
+        // Corroborated escalation to hostile crosses both rungs. The one-rung cap
+        // exists because "a two-step jump on *one model's word*, over input the
+        // author controls, is not evidence enough to block" — and here it is not
+        // one model's word: cleave independently surfaced a hostile finding and
+        // the LLM independently graded the sample hostile, with ML the lone
+        // outlier. Escalation-only, so a sample still cannot corroborate its own
+        // clearing, and `may_cross` still has to admit the crossing.
+        Ordering::Greater
+            if target == Classification::Hostile && ev.hostile_finding =>
+        {
+            let class = if ev.may_cross(ml, target) {
+                target
+            } else {
+                one_step_toward(ml, target)
+            };
+            (class, steer(p, true))
+        }
         Ordering::Greater => stepped(true),
         // Agreement is corroboration, so it firms up the verdict already held:
         // toward 1.0 for a flagged file…
@@ -673,6 +709,8 @@ fn failure(
 ) -> Interpretation {
     Interpretation {
         grade: None,
+        // An error path carries no cleave reading of its own.
+        corroborated: false,
         outcome: ml_class,
         blended: ml_prob,
         interpretation: String::new(),
@@ -750,17 +788,73 @@ fn has_hostile_finding(rendered: &str) -> bool {
 /// escaped bytes. A render with no context lines counts as readable (there is
 /// nothing opaque to distrust). Gates the blend's content-aware safety valve.
 fn render_mostly_readable(rendered: &str) -> bool {
-    let (mut binary, mut total) = (0usize, 0usize);
+    // Judged per member, not over the whole render.
+    //
+    // Counting lines across the render lets one member outvote every other: a
+    // wheel of readable Python that also ships a DLL renders as thousands of hex
+    // rows beside a few hundred source lines, so the whole archive reads as
+    // opaque and the LLM's clear is discarded — measured on `PyAutoIt`, a
+    // legitimate AutoIt wrapper the model correctly cleared and the blend refused,
+    // and on `gitversion`. A package is opaque when *most of its members* are,
+    // which is the question this gate was always asking.
+    //
+    // Note what it does not claim: that the LLM read the flagged bytes. A clear
+    // can rest on recognizing the package — an AutoIt wrapper shipping AutoIt
+    // DLLs — and that is a judgment about a mostly-readable archive, not about
+    // hex it cannot see. A sample that really is one packed binary still has a
+    // single opaque member and is still refused.
+    let mut readable_members = 0usize;
+    let mut total_members = 0usize;
+    let mut binary = 0usize;
+    let mut lines = 0usize;
+    let close = |binary: usize, lines: usize, readable: &mut usize, total: &mut usize| {
+        if lines == 0 {
+            return;
+        }
+        *total += 1;
+        if binary * 2 < lines {
+            *readable += 1;
+        }
+    };
     for line in rendered.lines() {
+        if is_member_header(line) {
+            close(binary, lines, &mut readable_members, &mut total_members);
+            binary = 0;
+            lines = 0;
+            continue;
+        }
         if line.trim().is_empty() || parse_annotation(line).is_some() {
             continue;
         }
-        total += 1;
+        lines += 1;
         if is_binary_render(line) {
             binary += 1;
         }
     }
-    total == 0 || binary * 2 < total
+    close(binary, lines, &mut readable_members, &mut total_members);
+    total_members == 0 || readable_members * 2 >= total_members
+}
+
+/// A member header line: `path\ttype size count`, the row cleave draws above each
+/// file's context. Matched on the shape of the second field — a bare type word
+/// followed by a size like `19KB` — because a source line may well contain a tab
+/// but will not have that after one.
+fn is_member_header(line: &str) -> bool {
+    let Some((_, rest)) = line.trim_end().split_once('\t') else {
+        return false;
+    };
+    let mut fields = rest.split_whitespace();
+    let Some(kind) = fields.next() else {
+        return false;
+    };
+    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+        return false;
+    }
+    fields.next().is_some_and(|size| {
+        size.starts_with(|c: char| c.is_ascii_digit())
+            && size.ends_with('B')
+            && size.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+    })
 }
 
 /// Text that addresses the grader instead of describing the program. Matched
@@ -880,6 +974,7 @@ fn blended(
     let (outcome, conf) = blend(ml_class, ml_prob, grade, ev);
     Interpretation {
         grade: Some(grade),
+        corroborated: ev.hostile_finding,
         outcome,
         blended: conf,
         interpretation: reason,
@@ -1839,9 +1934,18 @@ mod tests {
                 (0.0..=1.0).contains(&conf),
                 "{ctx}: conf out of range {conf}"
             );
-            // Class moves at most one rung, in either direction.
+            // Class moves at most one rung — except a corroborated escalation to
+            // hostile, which two independent detectors earn (see `blend`).
             let step = i16::from(class_rank(out)) - i16::from(class_rank(ml));
-            assert!(step.abs() <= 1, "{ctx}: moved to {out:?}");
+            let corroborated_escalation = out == Classification::Hostile
+                && g.classification() == Classification::Hostile
+                && ev.hostile_finding;
+            let max_up = if corroborated_escalation { 2 } else { 1 };
+            assert!(step <= max_up, "{ctx}: moved up to {out:?}");
+            // Softening is capped at one rung, always and without exception: the
+            // relaxation above is escalation-only, so nothing a sample carries can
+            // buy it a two-rung clearing.
+            assert!(step >= -1, "{ctx}: moved down to {out:?}");
             // Confidence moves at most MAX_STEER of the distance to the bound it
             // moved toward — the defensibility claim, stated as an assertion.
             let moved = conf - p;
@@ -1907,18 +2011,22 @@ mod tests {
     }
 
     #[test]
-    fn proximity_gate_is_symmetric_across_the_hostile_boundary() {
+    fn the_proximity_gate_is_asymmetric_by_design() {
         use Classification::{Hostile, Suspicious};
-        // The same predicate governs a crossing in either direction — "the gap is
-        // no wider than one steer" does not care which side ML sits on.
-        for fired in [-1, 0, 5, 20, 25, 30, 500, 3000, 25_000] {
-            let ev = ev_at(fired);
-            assert_eq!(
-                ev.may_cross(Suspicious, Hostile),
-                ev.may_cross(Hostile, Suspicious),
-                "direction changed the answer at L{fired}",
+        // Escalating *into* hostile spends the deploy level's FP budget, so it
+        // stays proximity-gated: near the line yes, far from it no.
+        assert!(ev_at(30).may_cross(Suspicious, Hostile));
+        assert!(!ev_at(500).may_cross(Suspicious, Hostile));
+        // Leaving hostile returns budget rather than spending it, and lands on
+        // suspicious, so it is ungated at any depth…
+        for fired in [-1, 1, 5, 20, 25, 30, 500, 3000, 25_000] {
+            assert!(
+                ev_at(fired).may_cross(Hostile, Suspicious),
+                "L{fired} should be free to step down",
             );
         }
+        // …except from the strictest rung there is.
+        assert!(!ev_at(0).may_cross(Hostile, Suspicious));
     }
 
     #[test]
@@ -1949,23 +2057,59 @@ mod tests {
     }
 
     #[test]
-    fn a_deeply_fired_hostile_cannot_be_talked_down() {
-        // Leaving hostile is gated the same way, measured from the inside: a file
-        // firing at L20 sits right at the deploy boundary and may drop…
-        let (out, _) = blend(Classification::Hostile, 0.9, LlmGrade::Benign, ev_at(20));
-        assert_eq!(out, Classification::Suspicious);
-        // …but one firing at L5, and still more one at L0, is deep inside the
-        // hostile band. No bounded steer reaches the boundary, so it stands.
-        for fired in [5, 0] {
-            let (held, conf) = blend(
+    fn readability_is_judged_per_member_not_per_line() {
+        // A wheel of readable source that also ships one binary: the binary's hex
+        // rows outnumber every source line put together, which is exactly how
+        // `PyAutoIt` — a legitimate AutoIt wrapper — read as opaque and had its
+        // clear discarded.
+        let mut render = String::from("pkg.whl\twhl 900KB 3\n");
+        for i in 0..4 {
+            render.push_str(&format!("  pkg.whl/mod{i}.py\tpython 2KB 1\n"));
+            render.push_str("  def handler(request):\n      return process(request)\n");
+        }
+        render.push_str("  pkg.whl/lib/native.dll\tpe 400KB 9\n");
+        for _ in 0..80 {
+            render.push_str(concat!(r"  0000: MZ\x90\x00\x03\x00\x00\x00\x04\x00\xff\xff", "\n"));
+        }
+        assert!(
+            render_mostly_readable(&render),
+            "four readable members beside one binary is a readable archive",
+        );
+
+        // A sample that really is one packed binary still has nothing to read.
+        let mut packed = String::from("dropper.exe\tpe 400KB 9\n");
+        for _ in 0..80 {
+            packed.push_str(concat!(r"  0000: MZ\x90\x00\x03\x00\x00\x00\x04\x00\xff\xff", "\n"));
+        }
+        assert!(!render_mostly_readable(&packed));
+
+        // Header detection: a tab-indented source line is not a member header.
+        assert!(is_member_header("  pkg.whl/lib/native.dll\tpe 400KB 9"));
+        assert!(!is_member_header("\tif x:\treturn 1"));
+        assert!(!is_member_header("no tabs here at all"));
+    }
+
+    #[test]
+    fn only_the_strictest_rung_cannot_be_talked_down() {
+        // A hostile verdict the LLM clears steps to *suspicious* — never benign —
+        // wherever inside the band ML fired, so the sample is routed for review
+        // rather than released. Depth decides where in the suspicious band it
+        // lands (`engine::softened_level`), not whether it may move at all.
+        for fired in [20, 5, 1] {
+            let (out, conf) = blend(
                 Classification::Hostile,
                 0.99,
                 LlmGrade::Benign,
                 ev_at(fired),
             );
-            assert_eq!(held, Classification::Hostile, "L{fired} held");
+            assert_eq!(out, Classification::Suspicious, "L{fired} should step down");
             assert!((conf - steer(0.99, false)).abs() < 1e-6);
         }
+        // L0 is the exception: the tightest budget the grid has does not move on
+        // one fallible opinion, however confident its prose.
+        let (held, conf) = blend(Classification::Hostile, 0.99, LlmGrade::Benign, ev_at(0));
+        assert_eq!(held, Classification::Hostile);
+        assert!((conf - steer(0.99, false)).abs() < 1e-6);
     }
 
     #[test]
@@ -2214,6 +2358,7 @@ mod tests {
     #[test]
     fn interpretation_serializes_inject_flag_only_when_set() {
         let base = Interpretation {
+            corroborated: false,
             grade: Some(LlmGrade::Benign),
             outcome: Classification::Hostile,
             blended: 0.9,

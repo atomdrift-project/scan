@@ -713,6 +713,26 @@ mod trait_floor_tests {
     }
 
     #[test]
+    fn two_families_no_longer_reach_the_hostile_arm() {
+        // Enough anchors and enough severe findings, but drawn from only two
+        // kinds of behavior — the `PyAutoIt` shape, where input synthesis and
+        // window manipulation are the package's whole purpose. Both arms now ask
+        // for three (see [`TRAIT_FLOOR_HOSTILE_FAMILIES`]).
+        let mut d = benign();
+        let mut ts = spread(5, 0.98, 2);
+        ts.extend([finding("area0", 4, 0.94), finding("area1", 4, 0.92)]);
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_ne!(d.class, Classification::Hostile);
+
+        // A third family is what earns it.
+        let mut wider = benign();
+        let mut ts = spread(5, 0.98, 2);
+        ts.extend([finding("execution", 4, 0.94)]);
+        apply_trait_floor(&mut wider, &ts, Some(50), 100, "test");
+        assert_eq!(wider.class, Classification::Hostile);
+    }
+
+    #[test]
     fn a_lone_crit5_beside_crit4s_no_longer_reaches_the_hostile_arm() {
         // The `rex-powershell` shape, and the one `ansible-core` fired on: a
         // single crit-5 anchor with two crit-4s beside it. An accepted
@@ -810,7 +830,11 @@ mod trait_floor_tests {
         apply_trait_floor(&mut d, &spread(4, 0.9, 3), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Suspicious);
         assert_eq!(d.probability, 0.9);
-        assert_eq!(d.level, Some(100));
+        // Placed inside the band (51..=100) rather than pinned to its weakest
+        // rung — see `interpreted_level`. No crit-5 here, so it sits at the
+        // uncorroborated midpoint.
+        let lvl = d.level.expect("a floored verdict carries a level");
+        assert!(lvl > 50 && lvl < 100, "expected inside the band, got {lvl}");
     }
 
     #[test]
@@ -1181,6 +1205,7 @@ mod envelope_tests {
             interpretation: None,
             dependency_results: Vec::new(),
             bloom_mark: None,
+            hopper_route: HopperRoute::Normal,
         }
     }
 
@@ -1207,50 +1232,70 @@ mod envelope_tests {
     }
 
     #[test]
-    fn interpreted_level_pins_to_the_single_band_boundaries() {
+    fn interpreted_level_places_a_verdict_inside_its_band() {
         use crate::model::{capped_suspicious_level, verdict_for_level};
         use Classification::{Benign, Hostile, Suspicious};
 
-        // There is exactly one hostile and one suspicious threshold on the grid,
-        // so an interpreted level is pinned to the loosest rung of the target
-        // band — derived from the model's live thresholds (active level +
-        // suspicious ceiling), never hardcoded, so it tracks the boundary even if
-        // we move the hostile level or the suspicious ceiling.
         let grid_max = 30_000;
+        let ceiling = i32::from(capped_suspicious_level(grid_max));
         for deploy in [4_u16, 5, 25, 50] {
             // Escalation to hostile lands on the active deploy level: the loosest
             // rung still inside the hostile budget.
             assert_eq!(
-                interpreted_level(Some(deploy), grid_max, Hostile),
+                interpreted_level(Some(deploy), grid_max, Hostile, true),
                 Some(i32::from(deploy))
             );
-            // Hold/downgrade to suspicious lands on the suspicious ceiling.
-            assert_eq!(
-                interpreted_level(Some(deploy), grid_max, Suspicious),
-                Some(i32::from(capped_suspicious_level(grid_max)))
+
+            // Suspicious lands *within* the band, not on its weakest rung, so two
+            // interpreted verdicts of differing strength no longer collapse onto
+            // one number.
+            let alone = interpreted_level(Some(deploy), grid_max, Suspicious, false).unwrap();
+            let corroborated =
+                interpreted_level(Some(deploy), grid_max, Suspicious, true).unwrap();
+            assert!(
+                i32::from(deploy) < corroborated && corroborated < alone && alone < ceiling,
+                "deploy {deploy}: expected deploy < {corroborated} < {alone} < {ceiling}",
             );
-            // Each round-trips through the model's own classifier into exactly the
-            // class the LLM lifted it to — the guarantee that keeps a `lvl`-based
-            // consumer (e.g. hopper) from re-reading an escalation as the wrong class.
-            let hostile_lvl =
-                u16::try_from(interpreted_level(Some(deploy), grid_max, Hostile).unwrap()).unwrap();
-            let susp_lvl =
-                u16::try_from(interpreted_level(Some(deploy), grid_max, Suspicious).unwrap())
-                    .unwrap();
-            assert_eq!(verdict_for_level(hostile_lvl, deploy, grid_max), Hostile);
-            assert_eq!(verdict_for_level(susp_lvl, deploy, grid_max), Suspicious);
+
+            // The round trip is the load-bearing part: whatever level we synthesize,
+            // the model's own classifier must read it back as the class we lifted
+            // the sample to, or a `lvl`-only consumer (hopper) sees a different
+            // verdict than we published.
+            for lvl in [
+                interpreted_level(Some(deploy), grid_max, Hostile, true).unwrap(),
+                alone,
+                corroborated,
+            ] {
+                let lvl = u16::try_from(lvl).unwrap();
+                assert_ne!(
+                    verdict_for_level(lvl, deploy, grid_max),
+                    Benign,
+                    "deploy {deploy}: level {lvl} read back as benign",
+                );
+            }
+            assert_eq!(
+                verdict_for_level(u16::try_from(alone).unwrap(), deploy, grid_max),
+                Suspicious
+            );
+            assert_eq!(
+                verdict_for_level(u16::try_from(corroborated).unwrap(), deploy, grid_max),
+                Suspicious
+            );
         }
-        // A grid tighter than the ceiling caps the suspicious rung at grid_max.
+        // A grid tighter than the ceiling keeps the placement inside it.
+        let tight = interpreted_level(Some(25), 2_000, Suspicious, false).unwrap();
+        assert!(tight <= i32::from(capped_suspicious_level(2_000)) && tight > 25);
+        // A deploy level at or above the ceiling leaves no band to place within.
         assert_eq!(
-            interpreted_level(Some(25), 2_000, Suspicious),
-            Some(i32::from(capped_suspicious_level(2_000)))
+            interpreted_level(Some(3_000), grid_max, Suspicious, false),
+            Some(ceiling)
         );
         // Benign is the clean marker regardless of grid (even in manual mode).
-        assert_eq!(interpreted_level(Some(25), grid_max, Benign), Some(-1));
-        assert_eq!(interpreted_level(None, 0, Benign), Some(-1));
+        assert_eq!(interpreted_level(Some(25), grid_max, Benign, false), Some(-1));
+        assert_eq!(interpreted_level(None, 0, Benign, false), Some(-1));
         // Manual-threshold mode (no grid): no synthetic hostile/suspicious level.
-        assert_eq!(interpreted_level(None, 0, Hostile), None);
-        assert_eq!(interpreted_level(None, 0, Suspicious), None);
+        assert_eq!(interpreted_level(None, 0, Hostile, true), None);
+        assert_eq!(interpreted_level(None, 0, Suspicious, false), None);
     }
 
     #[test]
@@ -1501,17 +1546,73 @@ pub const fn level_confidence(level: Option<i32>) -> Option<u8> {
 /// displayed confidence tracks automatically. `active_level` is `None` in
 /// manual-threshold mode (no grid); hostile/suspicious then return `None`,
 /// matching how a genuine ML verdict serializes its level there.
+/// Where a hostile verdict lands when the LLM clears it.
+///
+/// Positioned by how deep ML fired rather than pinned: the level ML reached is
+/// the budget for how far one contrary opinion may move it. A file that fired at
+/// the loosest hostile rung barely survived the boundary, so a clear pushes it
+/// most of the way across the suspicious band; a file that fired near the
+/// strictest rung is moved barely past it.
+///
+/// Geometric, for the same reason as [`interpreted_level`] — the axis is. At the
+/// shipped `-l 25` an ML `L1` lands at `L31`, an `L12` at `L248`.
+///
+/// `L0` never reaches here: [`Evidence::may_cross`] refuses the crossing outright.
+#[allow(clippy::cast_possible_truncation)] // bounded by `ceiling` (<= grid_max)
+fn softened_level(ml_level: Option<i32>, active_level: Option<u16>, grid_max: u16) -> Option<i32> {
+    let active = active_level?;
+    let ceiling = i32::from(crate::model::capped_suspicious_level(grid_max));
+    let floor = i32::from(active).saturating_add(1);
+    if floor >= ceiling {
+        return Some(ceiling);
+    }
+    // No level to scale by (manual-threshold mode) falls back to the midpoint.
+    let fraction = match ml_level {
+        Some(lvl) if lvl > 0 && active > 0 => {
+            (f64::from(lvl) / f64::from(active)).clamp(0.0, 1.0)
+        }
+        _ => 0.5,
+    };
+    let placed = f64::from(floor) * (f64::from(ceiling) / f64::from(floor)).powf(fraction);
+    Some((placed.round() as i32).clamp(floor, ceiling))
+}
+
+#[allow(clippy::cast_possible_truncation)] // bounded by `ceiling` (<= grid_max)
 fn interpreted_level(
     active_level: Option<u16>,
     grid_max: u16,
     outcome: Classification,
+    corroborated: bool,
 ) -> Option<i32> {
     match outcome {
         Classification::Benign => Some(-1),
         Classification::Hostile => active_level.map(i32::from),
-        Classification::Suspicious => {
-            active_level.map(|_| i32::from(crate::model::capped_suspicious_level(grid_max)))
-        }
+        Classification::Suspicious => active_level.map(|active| {
+            let ceiling = i32::from(crate::model::capped_suspicious_level(grid_max));
+            let floor = i32::from(active).saturating_add(1);
+            if floor >= ceiling {
+                return ceiling;
+            }
+            // Placed *within* the band rather than at its weakest rung.
+            //
+            // Pinning every interpreted-suspicious verdict to the ceiling put all
+            // of them on one number, which threw away the ordering the level axis
+            // exists to carry: a sample cleave independently flagged and a sample
+            // resting on the LLM's word alone both read as 3000.
+            //
+            // Geometric, because the axis is: `level_confidence` compresses
+            // 200→82, 1000→75, 2000→66, 5000→54, so a *linear* midpoint of
+            // 26..3000 sits at 1513 and reads as barely-suspicious. The geometric
+            // one lands near 279, which is where the middle of the band actually
+            // is in confidence terms.
+            //
+            // Corroboration moves it a quarter of the way in instead of half —
+            // nearer the hostile boundary, because two detectors agreeing is a
+            // stronger claim than one.
+            let fraction = if corroborated { 0.25 } else { 0.5 };
+            let placed = f64::from(floor) * (f64::from(ceiling) / f64::from(floor)).powf(fraction);
+            (placed.round() as i32).clamp(floor, ceiling)
+        }),
     }
 }
 
@@ -1591,6 +1692,33 @@ pub struct ScanResult {
     /// tiny` line. `None` for unremarkable files; a terminal-UI concern only, so
     /// it is never serialized into the JSON envelope.
     pub bloom_mark: Option<crate::output::BloomMark>,
+    /// Where this result's verdict should land on hopper, when that differs
+    /// from the ordinary "post under `sha256`" rule. Not serialized — like
+    /// [`analysis_cached`](Self::analysis_cached), it describes how this
+    /// result reached hopper, not the verdict itself. `Normal` for every
+    /// ordinary analysis; only `classify_purl`'s registry-metadata fallback
+    /// (real artifact bytes unfetchable) sets the other variants, because
+    /// that fallback's own content — the registry's JSON record, not a real
+    /// artifact — hashes differently on every fetch and would otherwise mint
+    /// hopper a fresh, never-deduplicating row each time it fires.
+    pub hopper_route: HopperRoute,
+}
+
+/// See [`ScanResult::hopper_route`].
+#[derive(Debug, Clone, Default)]
+pub enum HopperRoute {
+    /// Post the verdict under this result's own `sha256`, as always.
+    #[default]
+    Normal,
+    /// Post the verdict under this sha256 instead of the result's own —
+    /// hopper already holds real content for the requested coordinate under
+    /// a different, stable sha256, and the registry-metadata verdict backs
+    /// onto that row rather than minting a new one.
+    Redirect(String),
+    /// Post nothing to hopper for this result. Hopper has never seen real
+    /// content for the requested coordinate, so there is nothing to attach
+    /// a verdict to that would not just be more of the same churn.
+    Suppress,
 }
 
 /// A fetched dependency to mirror into hopper as its own sample: the aggregate
@@ -4742,11 +4870,25 @@ const TRAIT_FLOOR_HOSTILE_SEVERE: u32 = 3;
 /// regexes over the same two tokens. Corroboration has to come from somewhere
 /// else in the tree to be corroboration at all.
 ///
-/// Two, not more: every false positive observed is a *single*-family cluster
-/// and is already rejected here, while three would discard `darkglitch`, a
-/// Python RAT whose three hostile traits span only `backdoor/rat` and
-/// `backdoor/tasking`.
-const TRAIT_FLOOR_HOSTILE_FAMILIES: usize = 2;
+/// Counted over both severe tiers, so crit-5 and crit-4 families together have
+/// to reach it — the same set the arm's `severe()` total draws from.
+///
+/// Was two. The argument for two was that every observed false positive was a
+/// *single*-family cluster, already rejected, while three would have discarded
+/// `darkglitch` — a Python RAT whose hostile traits span only `backdoor/rat` and
+/// `backdoor/tasking`. That argument was made against a four-deep family, and
+/// [`TRAIT_FLOOR_FAMILY_DEPTH`] is now two: `darkglitch`'s pair collapses to one
+/// family at this depth regardless, so three no longer costs what it did.
+///
+/// Raised to three (2026-08-27) because two families is a materially weaker claim
+/// once a family is a *kind* of behavior rather than a technique. `PyAutoIt` — a
+/// legitimate AutoIt wrapper — reached the hostile arm at `confident_hostile=4,
+/// severe=5, families=2`, on the input-synthesis and window-manipulation traits
+/// that are AutoIt's entire purpose. It also makes the two arms consistent: the
+/// suspicious arm has always required three (see
+/// [`TRAIT_FLOOR_SUSPICIOUS_FAMILIES`]), and the hostile arm demanding *less*
+/// diversity than the suspicious one had no principle behind it.
+const TRAIT_FLOOR_HOSTILE_FAMILIES: usize = 3;
 
 /// Distinct trait families the suspicious arm's crit-4 findings must span.
 /// Subsumes a count — n families need n findings — so this is the arm's only
@@ -4935,7 +5077,7 @@ fn apply_trait_floor(
     {
         decision.class = Classification::Hostile;
         decision.probability = counts.hostile_confidence;
-        decision.level = interpreted_level(active_level, grid_max, Classification::Hostile);
+        decision.level = interpreted_level(active_level, grid_max, Classification::Hostile, true);
         // The model graded this benign yet cleave is confident it carries a
         // hostile (crit-5) trait — a model gap worth investigating. INFO keeps
         // it visible in serve/worker mode (scan=info) without spamming default
@@ -4955,7 +5097,10 @@ fn apply_trait_floor(
     if counts.suspicious_families.len() >= TRAIT_FLOOR_SUSPICIOUS_FAMILIES {
         decision.class = Classification::Suspicious;
         decision.probability = counts.suspicious_confidence;
-        decision.level = interpreted_level(active_level, grid_max, Classification::Suspicious);
+        // The crit-4 arm by definition lacked the crit-5 anchor, but a lone
+        // confident hostile trait may still be present and is corroboration.
+        decision.level =
+            interpreted_level(active_level, grid_max, Classification::Suspicious, counts.hostile > 0);
         tracing::info!(
             path = %label,
             arm = "crit4",
@@ -5516,10 +5661,69 @@ pub(crate) fn classify_report(
             reason = %interp.interpretation,
             "LLM interpretation shifted the verdict",
         );
+        let ml_class = final_decision.class;
+        let ml_level = final_decision.level;
         final_decision.class = interp.outcome;
         final_decision.probability = interp.blended;
-        final_decision.level =
-            interpreted_level(model.active_level(), model.grid_max(), interp.outcome);
+        final_decision.level = if ml_class == Classification::Hostile
+            && interp.outcome == Classification::Suspicious
+        {
+            // A cleared hostile is placed by how deep ML fired, not pinned to the
+            // band's edge: the level ML reached is the budget for how far one
+            // contrary opinion may move it.
+            softened_level(ml_level, model.active_level(), model.grid_max())
+        } else {
+            interpreted_level(
+                model.active_level(),
+                model.grid_max(),
+                interp.outcome,
+                interp.corroborated,
+            )
+        };
+    } else if let Some(interp) = &interpretation
+        && interp.grade == Some(crate::interpret::LlmGrade::Benign)
+        && final_decision.class == Classification::Hostile
+        && final_decision.level == Some(0)
+    {
+        // `may_cross` refused to move a verdict off the grid's tightest budget on
+        // one contrary opinion, and that stands — but the disagreement is still
+        // evidence, so the verdict gives up the depth it cannot justify and sits
+        // on the weakest hostile rung instead. Still blocked, still reviewed.
+        let weakened = model.active_level().map(i32::from);
+        tracing::info!(
+            path = %label,
+            from = 0,
+            to = ?weakened,
+            reason = %interp.interpretation,
+            "LLM cleared an L0 hostile — held in band, moved to the weakest rung",
+        );
+        final_decision.level = weakened;
+    } else if let Some(interp) = &interpretation
+        && interp.grade == Some(crate::interpret::LlmGrade::Hostile)
+        && final_decision.class == Classification::Hostile
+        && let Some(level) = final_decision.level
+        && level > 0
+    {
+        // Both detectors independently said hostile, so the class does not move —
+        // but agreement is still evidence, and leaving the verdict on the rung ML
+        // happened to stop at understates it. Halve the level: deeper into the
+        // hostile band, bounded at 0, and never out of it.
+        //
+        // What it refines is usually already an assertion rather than a
+        // measurement: a floor-driven hostile is pinned to the *weakest* hostile
+        // rung by `interpreted_level`, which is why every L25 in the gauntlet
+        // missed pool carries a floor probability (0.98/0.99) rather than a model
+        // one. On a genuinely swept level it does overwrite measured data, and a
+        // stricter deploy than this one will read the halved value as hostile
+        // where the sweep alone would have said suspicious.
+        let strengthened = level / 2;
+        tracing::info!(
+            path = %label,
+            from = level,
+            to = strengthened,
+            "both detectors agree hostile — verdict moved deeper into the band",
+        );
+        final_decision.level = Some(strengthened);
     }
 
     // Render cleave's context view now, while the typed (finalized) report is in
@@ -8589,6 +8793,7 @@ pub(crate) fn process_report(
         analysis_cached: cr.analysis_cached,
         dependency_results: cr.dependency_results,
         bloom_mark,
+        hopper_route: HopperRoute::Normal,
     })
 }
 
