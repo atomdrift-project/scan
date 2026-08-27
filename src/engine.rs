@@ -586,6 +586,24 @@ mod trait_floor_tests {
     }
 
     #[test]
+    fn recategorizing_an_annotation_survives_multibyte_descriptions() {
+        // A description opening with a multi-byte character used to split the
+        // severity off at a computed byte index, landing inside the character.
+        let line = "  // H über-loader resolves imports (objectives/anti-static/obfuscation/string::x)";
+        assert_eq!(
+            recategorize_annotation(line).as_deref(),
+            Some("  // Possible anti-static/obfuscation — über-loader resolves imports"),
+        );
+        // Multi-byte content anywhere else is fine too, and a whole render of it
+        // must not panic.
+        let render = "== PRIMARY x ==\n# S 4:2 naïve café résumé (micro-behaviors/data/encode::y)\n  körper\n";
+        assert!(recategorize_annotations(render).contains("Possible data/encode — naïve café résumé"));
+        // Non-annotation lines pass through untouched.
+        assert_eq!(recategorize_annotation("  let x = 1;"), None);
+        assert_eq!(recategorize_annotation("# H no trait id here"), None);
+    }
+
+    #[test]
     fn family_is_the_first_two_hierarchy_segments() {
         assert_eq!(
             trait_family("objectives/evasion/process/hook/inline::rust-inline-hook-hijack"),
@@ -6179,11 +6197,18 @@ fn recategorize_annotation(line: &str) -> Option<String> {
         .strip_prefix("// ")
         .map(|r| ("//", r))
         .or_else(|| rest.strip_prefix("# ").map(|r| ("#", r)))?;
-    // `SEV ` — a single grade letter and a space.
-    let (sev, rest) = rest.split_at(rest.char_indices().nth(1)?.0 + 1);
-    if !matches!(sev.trim(), "H" | "S" | "N" | "B") || !sev.ends_with(' ') {
+    // `SEV ` — one grade letter then a space. Parsed by chars rather than byte
+    // offsets: an annotation body can open with a multi-byte character, and
+    // splitting at a computed byte index lands inside it and panics (observed on
+    // browser-extension samples whose descriptions begin with 'ü').
+    let mut head = rest.chars();
+    let sev = head.next()?;
+    if !matches!(sev, 'H' | 'S' | 'N' | 'B') || head.next() != Some(' ') {
         return None;
     }
+    // `sev` is ASCII and the char after it is a space, so this index is a
+    // boundary by construction; `get` keeps that from resting on a panic.
+    let rest = rest.get(sev.len_utf8() + 1..)?;
     // The trait id is the trailing parenthesized group; without one there is no
     // category to name and the line is left alone.
     let open = rest.rfind(" (")?;
