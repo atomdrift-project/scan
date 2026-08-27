@@ -1064,6 +1064,12 @@ impl SpoolState {
     /// the memory gate, an idle spool always admits one payload so a tight
     /// budget cannot starve large files forever.
     fn try_reserve(&self, size: u64) -> Result<(), String> {
+        // The spool dir can vanish under a long-lived worker (a Windows %TEMP%
+        // sweep removes it once it is empty), and `free_disk_bytes` returns
+        // `None` for a missing path — silently skipping the disk check. Heal it
+        // here so the check below measures the filesystem we will actually
+        // write to.
+        self.ensure_dir()?;
         let used = self.used.load(Ordering::Acquire);
         if used > 0 && used.saturating_add(size) > self.budget_bytes {
             return Err(format!(
@@ -1087,12 +1093,34 @@ impl SpoolState {
         self.used.fetch_sub(size, Ordering::AcqRel);
     }
 
+    /// Ensure the spool directory exists, creating it if it does not.
+    ///
+    /// Called on every spool admission and every spool write, not just at
+    /// startup: the directory lives under `%TEMP%`/`/tmp`, and an OS temp sweep
+    /// (Windows Storage Sense, `systemd-tmpfiles`) will delete it out from under
+    /// a worker that has been up for days — it looks like an abandoned empty
+    /// directory. Without this, a create-once spool leaves every payload above
+    /// `mem_threshold_bytes` failing with "cannot create spool file" for the
+    /// rest of the process's life, and the direct-download retry path fails the
+    /// same way because it lands in the same missing directory.
+    fn ensure_dir(&self) -> Result<(), String> {
+        if self.dir.is_dir() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| {
+            format!(
+                "cannot create spool dir {}: {e}",
+                self.dir.display()
+            )
+        })
+    }
+
     /// Create the spool directory and clear leftovers from crashed runs.
     /// Best-effort: only files older than a day are removed, so concurrent
     /// worker processes on the same host cannot delete each other's live
     /// spools.
     fn prepare(&self) {
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
+        if let Err(e) = self.ensure_dir() {
             tracing::warn!(dir = %self.dir.display(), error = %e, "cannot create spool dir");
             return;
         }
@@ -1161,6 +1189,36 @@ impl std::fmt::Display for PrefetchError {
 /// costs a re-scan, never a lost result. (Batch `--exit-if-empty` runs drain
 /// unbounded instead — a finite dataset must complete, not re-lease.)
 const SHUTDOWN_DRAIN_SECS: u64 = 15;
+
+/// How long hopper must have nothing for this worker before the dry spell is
+/// reported at WARN. A worker pointed at a healthy hopper should never sit this
+/// long without a claim, so crossing it means something upstream is wrong — an
+/// empty queue, a routing filter no sample matches, or a worker whose advertised
+/// tools/`max_bytes` exclude it from everything queued.
+///
+/// Deliberately well above the 2 s poll cadence: brief gaps between batches are
+/// normal and must not warn. Tunable via `SCAN_IDLE_WARN_SECS` (min 1).
+const DEFAULT_IDLE_WARN_SECS: u64 = 120;
+
+/// Re-warn cadence once a dry spell is already being reported, so a multi-hour
+/// outage stays visible in the log without filling it at the poll rate.
+const IDLE_WARN_REPEAT: Duration = Duration::from_secs(15 * 60);
+
+/// Whether a dry spell of `dry` should be (re-)reported now.
+///
+/// Split out from the poll loop so the escalation policy — warn once on
+/// crossing the threshold, then at [`IDLE_WARN_REPEAT`] — is testable without
+/// driving a real prefetcher against a real hopper.
+fn idle_warn_due(dry: Duration, since_last_warn: Option<Duration>, warn_after: Duration) -> bool {
+    if dry < warn_after {
+        return false;
+    }
+    match since_last_warn {
+        // First crossing of the threshold for this dry spell.
+        None => true,
+        Some(since) => since >= IDLE_WARN_REPEAT,
+    }
+}
 
 /// Poll the shutdown flag at ≤500 ms granularity so a signal interrupts any
 /// sleep the main loop is parked in (no-work backoff, memory-pressure pause,
@@ -1708,6 +1766,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             metrics: Arc::clone(&metrics),
             poll_state: Arc::clone(&poll_state),
             exit_if_empty,
+            idle_warn_after: Duration::from_secs(
+                std::env::var("SCAN_IDLE_WARN_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map_or(DEFAULT_IDLE_WARN_SECS, |s| s.max(1)),
+            ),
         }
         .run(
             tx,
@@ -1725,6 +1789,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let outstanding = Arc::clone(&outstanding);
         let queued_bytes = Arc::clone(&queued_bytes);
         let shutdown = Arc::clone(&shutdown);
+        // Poll telemetry so the summary can say *why* the worker is idle. It
+        // already reaches hopper on the heartbeat; an operator reading worker
+        // logs had no equivalent and could not tell "hopper has no work" from
+        // "the poll loop is wedged" — both look like zero active slots.
+        let poll_state = Arc::clone(&poll_state);
+        let metrics_for_summary = Arc::clone(&metrics);
         // Default 60 s; `SCAN_HEARTBEAT_SECS` lowers it (min 1 s) so a short
         // benchmark run still emits a usable rss / active-slot time series.
         let heartbeat = Duration::from_secs(
@@ -1762,6 +1832,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 std::collections::HashMap::new();
             let mut wedge_latched: std::collections::HashSet<u64> =
                 std::collections::HashSet::new();
+            // `idle_trimmed`: whether the allocator has already been asked to
+            // hand back retained pages during the *current* idle stretch. Latched
+            // so a worker parked on an empty hopper trims once, not once a
+            // minute forever; cleared as soon as a slot picks work back up.
+            let mut idle_trimmed = false;
             // Slots whose analysis has run past this long are flagged as stuck and
             // logged at WARN so a wedge stands out in the stream. Tunable via
             // `SCAN_STUCK_WARN_SECS` (min 1) for noisy shards or test runs.
@@ -1948,8 +2023,50 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         completed = completed.load(Ordering::Acquire),
                         corpus_checks = crate::corpus_precheck::counters().0,
                         corpus_skips = crate::corpus_precheck::counters().1,
+                        // Why this worker is (or is not) claiming. `poll_age_s`
+                        // far above the poll cadence means the loop is wedged;
+                        // `last_claim=0` with a fresh `poll_age_s` and non-zero
+                        // `buffer_room` means hopper simply has no work — an
+                        // idle worker, not a stuck one.
+                        poll_age_s = metrics_for_summary
+                            .start
+                            .elapsed()
+                            .as_secs()
+                            .saturating_sub(poll_state.last_poll_secs.load(Ordering::Acquire)),
+                        last_want = poll_state.last_want.load(Ordering::Acquire),
+                        last_claim = poll_state.last_claim.load(Ordering::Acquire),
+                        buffer_room = poll_state.buffer_room.load(Ordering::Acquire),
                         "worker summary",
                     );
+
+                    // Idle with memory still held: hand the allocator's retained
+                    // pages back to the OS. This matters because the admission
+                    // gate rations intake on *live process memory*, so pages the
+                    // allocator is only holding throttle the next batch as
+                    // effectively as pages in use. No-op on unix, where
+                    // jemalloc's background thread already does it.
+                    if active_slots == 0 {
+                        if !idle_trimmed {
+                            idle_trimmed = true;
+                            tokio::task::spawn_blocking(|| {
+                                let before = cleave::memory_tracker::current_rss();
+                                cleave::clear_all_thread_caches();
+                                crate::allocator::trim();
+                                let after = cleave::memory_tracker::current_rss();
+                                if let (Some(before), Some(after)) = (before, after) {
+                                    tracing::info!(
+                                        rss_before_mb = before / 1024 / 1024,
+                                        rss_after_mb = after / 1024 / 1024,
+                                        reclaimed_mb =
+                                            before.saturating_sub(after) / 1024 / 1024,
+                                        "idle: returned retained allocator pages to the OS",
+                                    );
+                                }
+                            });
+                        }
+                    } else {
+                        idle_trimmed = false;
+                    }
 
                     // Per-slot census: one line per in-flight analysis — file, size,
                     // how long it has been running, the stage it is in (and for how
@@ -2194,7 +2311,13 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 metrics.complete(pj.queue_id);
                 let n = completed.fetch_add(1, Ordering::Release) + 1;
                 if n.is_multiple_of(100) {
-                    tokio::task::spawn_blocking(cleave::clear_all_thread_caches);
+                    // Clearing cleave's caches returns memory to the allocator;
+                    // the trim is what returns it to the OS, which is the half
+                    // the admission gate can actually see.
+                    tokio::task::spawn_blocking(|| {
+                        cleave::clear_all_thread_caches();
+                        crate::allocator::trim();
+                    });
                 }
             }
         });
@@ -2280,6 +2403,10 @@ struct Prefetcher {
     /// Stop (closing the dispatch channel) when the hopper reports no work and
     /// the queue has drained — drives clean batch/benchmark termination.
     exit_if_empty: bool,
+    /// How long hopper must have nothing for this worker before the dry spell is
+    /// reported at WARN. A field rather than an env read inside the poll loop so
+    /// the escalation is exercisable from a test. See [`DEFAULT_IDLE_WARN_SECS`].
+    idle_warn_after: Duration,
     /// Raised while the host server has interactive work in flight. The
     /// prefetcher is the single place work enters this worker, so gating here
     /// stops the whole pipeline at one point: staged jobs finish, slots drain,
@@ -2332,6 +2459,13 @@ impl Prefetcher {
     ) {
         let mut consecutive_errors: u32 = 0;
         let mut paused_logged = false;
+        // Dry-spell tracking. `last_productive` is the last moment this worker
+        // had a reason to believe hopper had work for it — a successful claim,
+        // or a deliberate decision not to ask (paused, or buffer full). Measuring
+        // from there rather than from the last empty poll means a hopper that
+        // trickles one job an hour still reads as starved, which it is.
+        let mut last_productive = Instant::now();
+        let mut dry_warned_at: Option<Instant> = None;
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 return;
@@ -2351,6 +2485,9 @@ impl Prefetcher {
                     paused_logged = true;
                 }
                 self.poll_state.buffer_room.store(0, Ordering::Release);
+                // Yielding to interactive work is not hopper being dry.
+                last_productive = Instant::now();
+                dry_warned_at = None;
                 interruptible_sleep(Duration::from_millis(200), &shutdown).await;
                 continue;
             }
@@ -2370,6 +2507,9 @@ impl Prefetcher {
             self.poll_state.buffer_room.store(room, Ordering::Release);
             let over_budget = queued_bytes.load(Ordering::Acquire) >= self.max_buffer_bytes;
             if room == 0 || over_budget {
+                // Full buffer: this worker is saturated, not starved.
+                last_productive = Instant::now();
+                dry_warned_at = None;
                 interruptible_sleep(Duration::from_millis(100), &shutdown).await;
                 continue;
             }
@@ -2387,6 +2527,32 @@ impl Prefetcher {
                 Ok(None) => {
                     self.poll_state.last_claim.store(0, Ordering::Release);
                     consecutive_errors = 0;
+                    // Hopper answered, and had nothing. Rare on a healthy
+                    // deployment, so say so loudly once the gap stops looking
+                    // like the pause between batches. `--exit-if-empty` runs
+                    // (batch/benchmark) drain to empty on purpose and are exempt.
+                    let dry = last_productive.elapsed();
+                    if !self.exit_if_empty
+                        && idle_warn_due(
+                            dry,
+                            dry_warned_at.map(|at| at.elapsed()),
+                            self.idle_warn_after,
+                        )
+                    {
+                        dry_warned_at = Some(Instant::now());
+                        tracing::warn!(
+                            dry_s = dry.as_secs(),
+                            hopper = %self.base_url,
+                            worker = %self.encoded_name,
+                            slots = self.slots,
+                            wanted = count,
+                            max_bytes = self.advertised_max_bytes,
+                            tools = %self.available_tools,
+                            traits = cleave::traits_repo::version()
+                                .map(|t| t.chars().take(5).collect::<String>()),
+                            "hopper has had no work for this worker — every analysis slot is                              idle. Check hopper's queue depth; if it is non-empty this worker                              is being filtered out of it, so compare the tools, max_bytes and                              traits above against what the queued samples require.",
+                        );
+                    }
                     // Batch/benchmark mode: once the hopper has no work AND the
                     // dispatch channel is drained (every claimed job picked up),
                     // stop. Returning drops `tx`, so the dispatch loop's
@@ -2406,6 +2572,16 @@ impl Prefetcher {
                         .last_claim
                         .store(jobs.len(), Ordering::Release);
                     consecutive_errors = 0;
+                    // Close out a reported dry spell so the log shows the outage
+                    // ending, not just beginning.
+                    if dry_warned_at.take().is_some() {
+                        tracing::info!(
+                            dry_s = last_productive.elapsed().as_secs(),
+                            claimed = jobs.len(),
+                            "hopper has work again; resuming",
+                        );
+                    }
+                    last_productive = Instant::now();
                     outstanding.fetch_add(jobs.len(), Ordering::Release);
                     let mut set = tokio::task::JoinSet::new();
                     for job in jobs {
@@ -2504,6 +2680,28 @@ async fn prefetch_one(
     spool: Arc<SpoolState>,
     job: ClaimJob,
 ) -> PrefetchedJob {
+    // `job.sha256` names the spool file (see `download_to_spool`), and
+    // `tempfile`'s `prefix` is concatenated into the filename verbatim — it does
+    // not reject path separators. A job whose digest is not 64 hex characters is
+    // malformed no matter what, so refuse it here rather than let an arbitrary
+    // string become a path component. Permanent: a bad digest never becomes good.
+    if sha256_from_hex(&job.sha256).is_none() {
+        tracing::warn!(
+            sha256 = %job.sha256,
+            path = %job.path,
+            "refusing job: sha256 is not 64 hex characters",
+        );
+        let err = PrefetchError::Skipped(format!(
+            "malformed sha256: expected 64 hex characters, got {:?}",
+            job.sha256
+        ));
+        return PrefetchedJob {
+            job,
+            data: Err(err),
+            queue_id: 0,
+        };
+    }
+
     // Local files need no download or staging, so no size check applies.
     let local_path = data_dir.as_deref().map(|d| d.join(&job.path));
     if matches!(local_path, Some(ref p) if p.exists()) {
@@ -3236,10 +3434,25 @@ async fn download_to_spool(
 ) -> Result<tempfile::TempPath, String> {
     use tokio::io::AsyncWriteExt as _;
 
+    // The digest becomes part of the spool filename below. `prefetch_one`
+    // already rejects a malformed one, but this is the function that builds the
+    // path, so it does not take that on trust — `tempfile` concatenates `prefix`
+    // into the name verbatim, without rejecting path separators, so an unchecked
+    // string here would be a traversal primitive out of the spool directory.
+    // Checked before any I/O: a malformed job is not worth a request.
+    if sha256_from_hex(sha256).is_none() {
+        return Err(format!(
+            "refusing to spool under a malformed sha256: {sha256:?}"
+        ));
+    }
+
     let start = Instant::now();
     let (mut resp, route) = download_response(client, base_url, sha256, path).await?;
     let url = resp.url().to_string();
 
+    // Re-create the spool dir if an OS temp sweep removed it since startup;
+    // otherwise every large payload fails here for the life of the process.
+    spool.ensure_dir()?;
     let temp = tempfile::Builder::new()
         .prefix(sha256.get(..16).unwrap_or(sha256))
         .tempfile_in(&spool.dir)
@@ -3992,7 +4205,7 @@ mod tests {
     #[tokio::test]
     async fn prefetch_one_rejects_jobs_over_max_job_bytes() {
         // Rejected before any download, so the unreachable base_url is never hit.
-        let job = claim_job("cafe", "samples/huge.bin", (MAX_JOB_BYTES + 1) as i64);
+        let job = claim_job(&sha256_hex(b"huge"), "samples/huge.bin", (MAX_JOB_BYTES + 1) as i64);
         let pj = prefetch_one(
             reqwest::Client::new(),
             Arc::from("http://127.0.0.1:1"),
@@ -4011,13 +4224,82 @@ mod tests {
         }
     }
 
+    /// `job.sha256` becomes the spool filename, and `tempfile` concatenates a
+    /// `prefix` into that name without rejecting path separators — so an
+    /// unvalidated digest is a write-anywhere primitive. Hopper is authenticated,
+    /// but the worker builds the path, so the worker checks it.
+    #[tokio::test]
+    async fn prefetch_one_refuses_a_sha256_that_is_not_hex() {
+        let bad_digests: Vec<String> = vec![
+            "../../../../evil".to_string(),
+            r"..\..\evil".to_string(),
+            "nul".to_string(),
+            String::new(),
+            // Right length, wrong alphabet.
+            "z".repeat(64),
+            // Hex but too short: `sha256.get(..16)` would still have yielded a name.
+            "abc123".to_string(),
+        ];
+        for bad in &bad_digests {
+            let job = claim_job(bad, "samples/x.bin", 16);
+            let pj = prefetch_one(
+                reqwest::Client::new(),
+                // Unreachable: a malformed digest must be refused before any I/O.
+                Arc::from("http://127.0.0.1:1"),
+                None,
+                test_spool(1 << 20),
+                job,
+            )
+            .await;
+            match pj.data {
+                Err(PrefetchError::Skipped(msg)) => {
+                    assert!(msg.contains("malformed sha256"), "message was: {msg}");
+                }
+                _ => panic!("sha256 {bad:?} must be refused before any I/O"),
+            }
+        }
+    }
+
+    /// The same check at the point the path is actually built, so the guard does
+    /// not depend on every caller having validated first.
+    #[tokio::test]
+    async fn download_to_spool_refuses_a_malformed_sha256_before_touching_disk() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("spool");
+        let spool = SpoolState {
+            dir: dir.clone(),
+            budget_bytes: u64::MAX,
+            used: AtomicU64::new(0),
+            mem_threshold_bytes: 0,
+            disk_headroom_bytes: 0,
+        };
+        let err = download_to_spool(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            &spool,
+            "../../escape",
+            "samples/x.bin",
+        )
+        .await
+        .expect_err("a malformed digest must not name a spool file");
+        assert!(err.contains("malformed sha256"), "message was: {err}");
+        // Nothing was created anywhere outside the spool dir.
+        assert!(
+            std::fs::read_dir(parent.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|e| e.path() == dir),
+            "no stray entries beside the spool dir",
+        );
+    }
+
     #[tokio::test]
     async fn prefetch_one_uses_local_file_regardless_of_size() {
         // A local file needs no download or staging, so even a job bigger than
         // MAX_JOB_BYTES analyzes in place instead of being rejected.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("big.bin"), b"data").unwrap();
-        let job = claim_job("beef", "big.bin", (MAX_JOB_BYTES + 1) as i64);
+        let job = claim_job(&sha256_hex(b"data"), "big.bin", (MAX_JOB_BYTES + 1) as i64);
         let pj = prefetch_one(
             reqwest::Client::new(),
             Arc::from("http://127.0.0.1:1"),
@@ -4080,6 +4362,266 @@ mod tests {
         drop(payload);
         assert!(!spool_path.exists());
         assert_eq!(spool.used.load(Ordering::Acquire), 0);
+    }
+
+    /// A writer that collects formatted log output so a test can assert on what
+    /// was actually emitted.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn contains(&self, needle: &str) -> bool {
+            self.0
+                .lock()
+                .map(|buf| String::from_utf8_lossy(&buf).contains(needle))
+                .unwrap_or(false)
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut sink) = self.0.lock() {
+                sink.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Spawn a hopper that always answers `/api/next` with "no work", and run a
+    /// prefetcher against it until `done` says stop. Returns whatever was logged.
+    async fn run_against_empty_hopper(exit_if_empty: bool, done: &str) -> CapturedLog {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if read_target(&mut stream).await.is_some() {
+                        // 204: hopper is up and has nothing for this worker.
+                        respond(&mut stream, "204 No Content", b"").await;
+                    }
+                });
+            }
+        });
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        // Thread-local: this is a current-thread runtime, so every task polls on
+        // this thread and picks up the subscriber.
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, _rx) = mpsc::unbounded_channel::<PrefetchedJob>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(
+            Prefetcher {
+                pause: None,
+                client: reqwest::Client::new(),
+                base_url: Arc::from(format!("http://127.0.0.1:{port}").as_str()),
+                data_dir: None,
+                encoded_name: "test-worker".to_string(),
+                available_tools: "7z".to_string(),
+                slots: 4,
+                spool: test_spool(1 << 20),
+                max_buffer_bytes: 1 << 30,
+                advertised_max_bytes: usize::try_from(MAX_JOB_BYTES).unwrap_or(usize::MAX),
+                poll_secs: 1,
+                target_depth: 8,
+                metrics: Arc::new(WorkerMetrics::new()),
+                poll_state: Arc::new(PollState::default()),
+                exit_if_empty,
+                // Far below the 1 s poll cadence, so the second empty poll trips it.
+                idle_warn_after: Duration::from_millis(10),
+            }
+            .run(
+                tx,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&shutdown),
+            ),
+        );
+
+        let found = wait_until(|| captured.contains(done)).await;
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.await;
+        if !found {
+            // Not an assertion: the exempt case deliberately never logs.
+            tracing::debug!("marker {done} never appeared");
+        }
+        captured
+    }
+
+    /// A worker whose hopper has nothing for it is a real problem — an empty
+    /// queue, or a routing filter that excludes this worker from everything
+    /// queued — and used to be indistinguishable from healthy idling in the log.
+    #[tokio::test]
+    async fn empty_hopper_is_reported_loudly() {
+        let log = run_against_empty_hopper(false, "no work for this worker").await;
+        assert!(
+            log.contains("no work for this worker"),
+            "a dry hopper must be reported",
+        );
+        assert!(log.contains("WARN"), "the dry-spell report must be at WARN");
+        // The report has to carry the routing inputs, or an operator cannot tell
+        // "the queue is empty" from "this worker is filtered out of a full queue".
+        for field in ["dry_s", "hopper", "slots", "max_bytes", "tools"] {
+            assert!(log.contains(field), "the report should carry `{field}`");
+        }
+    }
+
+    /// `--exit-if-empty` (batch and benchmark runs) drains the hopper on purpose
+    /// and then stops. Warning there would fire on every clean run.
+    #[tokio::test]
+    async fn batch_mode_draining_the_hopper_is_not_reported() {
+        let log = run_against_empty_hopper(true, "--exit-if-empty stopping prefetch").await;
+        assert!(
+            !log.contains("no work for this worker"),
+            "draining on purpose must not warn: {}",
+            String::from_utf8_lossy(&log.0.lock().unwrap()),
+        );
+    }
+
+    #[test]
+    fn idle_warn_holds_until_the_threshold_then_repeats_on_a_slow_cadence() {
+        let after = Duration::from_secs(120);
+
+        // A gap shorter than the threshold is the normal pause between batches.
+        assert!(!idle_warn_due(Duration::from_secs(0), None, after));
+        assert!(!idle_warn_due(Duration::from_secs(119), None, after));
+
+        // First crossing warns.
+        assert!(idle_warn_due(Duration::from_secs(120), None, after));
+        assert!(idle_warn_due(Duration::from_secs(9_000), None, after));
+
+        // Already reported: stay quiet until the repeat cadence comes round, so
+        // a long outage does not warn at the 2 s poll rate.
+        assert!(!idle_warn_due(
+            Duration::from_secs(300),
+            Some(Duration::from_secs(0)),
+            after,
+        ));
+        assert!(!idle_warn_due(
+            Duration::from_secs(900),
+            Some(IDLE_WARN_REPEAT - Duration::from_secs(1)),
+            after,
+        ));
+
+        // ...and then re-warns, so an hours-long outage stays visible.
+        assert!(idle_warn_due(
+            Duration::from_secs(3_600),
+            Some(IDLE_WARN_REPEAT),
+            after,
+        ));
+    }
+
+    /// The threshold is operator-tunable, so the policy must honour whatever it
+    /// is handed rather than the default constant.
+    #[test]
+    fn idle_warn_respects_a_custom_threshold() {
+        let after = Duration::from_secs(5);
+        assert!(!idle_warn_due(Duration::from_secs(4), None, after));
+        assert!(idle_warn_due(Duration::from_secs(5), None, after));
+    }
+
+    /// Regression: an OS temp sweep can delete the spool directory out from
+    /// under a long-running worker (observed on Windows, where Storage Sense
+    /// removes the empty directory under `%TEMP%`). The spool used to be created
+    /// once at startup, so from that moment every payload above the memory
+    /// threshold failed with `os error 3` for the rest of the process's life —
+    /// including the "download directly" retry, which lands in the same missing
+    /// directory. The spool must heal itself instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spool_recreates_its_directory_after_an_external_sweep() {
+        const PAYLOAD: &[u8] = b"a payload too big for the ram buffer";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Some(target) = read_target(&mut stream).await else {
+                        return;
+                    };
+                    if target.starts_with("/data/") {
+                        respond(&mut stream, "200 OK", PAYLOAD).await;
+                    } else {
+                        respond(&mut stream, "404 Not Found", b"").await;
+                    }
+                });
+            }
+        });
+
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("scan-spool");
+        let spool = Arc::new(SpoolState {
+            dir: dir.clone(),
+            budget_bytes: u64::MAX,
+            used: AtomicU64::new(0),
+            // A 4-byte memory threshold forces the spool route.
+            mem_threshold_bytes: 4,
+            disk_headroom_bytes: 0,
+        });
+        spool.prepare();
+        assert!(dir.is_dir(), "prepare() should create the spool dir");
+
+        // The sweep.
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
+
+        let job = claim_job(
+            &sha256_hex(PAYLOAD),
+            "samples/big.bin",
+            PAYLOAD.len() as i64,
+        );
+        let pj = prefetch_one(
+            reqwest::Client::new(),
+            Arc::from(format!("http://127.0.0.1:{port}").as_str()),
+            None,
+            Arc::clone(&spool),
+            job,
+        )
+        .await;
+
+        let data = pj
+            .data
+            .unwrap_or_else(|e| panic!("spool must recreate its dir, got: {e}"));
+        let PrefetchData::Spooled(payload) = data else {
+            panic!("payload above the memory threshold must spool to disk");
+        };
+        assert_eq!(std::fs::read(&payload.path).unwrap(), PAYLOAD);
+        assert!(dir.is_dir(), "the spool dir should have been recreated");
+    }
+
+    /// The free-disk gate reads the spool filesystem, and `free_disk_bytes`
+    /// returns `None` for a path that does not exist — so a swept directory used
+    /// to silently skip the check entirely. Reserving must heal the directory
+    /// first, so the check measures the filesystem actually written to.
+    #[test]
+    fn try_reserve_recreates_a_swept_spool_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("scan-spool");
+        let spool = SpoolState {
+            dir: dir.clone(),
+            budget_bytes: u64::MAX,
+            used: AtomicU64::new(0),
+            mem_threshold_bytes: 1 << 20,
+            disk_headroom_bytes: 0,
+        };
+        assert!(!dir.exists());
+        spool.try_reserve(1024).expect("reserve should heal the dir");
+        assert!(dir.is_dir(), "try_reserve should have recreated the dir");
+        assert_eq!(spool.used.load(Ordering::Acquire), 1024);
     }
 
     #[tokio::test]
@@ -4224,6 +4766,7 @@ mod tests {
                 metrics: Arc::new(WorkerMetrics::new()),
                 poll_state: Arc::new(PollState::default()),
                 exit_if_empty: false,
+                idle_warn_after: Duration::from_secs(DEFAULT_IDLE_WARN_SECS),
             }
             .run(
                 tx,

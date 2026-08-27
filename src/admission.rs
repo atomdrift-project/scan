@@ -267,7 +267,15 @@ impl MemoryAdmission {
                 // this cannot thrash.
                 self.log_inflight("admission paused: memory at saturation");
                 paused = true;
-                if let Err(e) = tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await {
+                // Clearing the caches only moves memory back to the allocator.
+                // This gate re-polls *live process memory*, so unless those pages
+                // also go back to the OS the pause sees no improvement and waits
+                // out the full re-poll for nothing.
+                let reclaim = tokio::task::spawn_blocking(|| {
+                    cleave::clear_all_thread_caches();
+                    crate::allocator::trim();
+                });
+                if let Err(e) = reclaim.await {
                     tracing::warn!(error = %e, "cache-clear task failed");
                 }
             }

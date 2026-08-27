@@ -27,6 +27,7 @@
 //! ```
 
 pub mod admission;
+pub mod allocator;
 pub mod analysis_cache;
 pub mod corpus_precheck;
 pub mod analyzer;
