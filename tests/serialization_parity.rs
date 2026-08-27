@@ -128,6 +128,7 @@ fn full_result_serializes_identically() {
         analysis_cached: false,
         dependency_results: vec![],
         bloom_mark: None,
+        hopper_route: scan::engine::HopperRoute::Normal,
     };
     assert_envelopes_identical(result, "full");
 }
@@ -165,6 +166,7 @@ fn minimal_result_serializes_identically() {
         analysis_cached: false,
         dependency_results: vec![],
         bloom_mark: None,
+        hopper_route: scan::engine::HopperRoute::Normal,
     };
     assert_envelopes_identical(result, "minimal");
 }

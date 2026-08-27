@@ -305,9 +305,23 @@ fn flight_outcome(
             // waiting on its next lookup, because the analysis was never the
             // connection's to lose. One clone per analysis, against a run
             // measured in seconds.
-            if persist && let Some(uploader) = uploader {
+            //
+            // Ordinarily that's under this result's own sha256 — but
+            // `classify_purl`'s registry-metadata fallback sets `hopper_route`
+            // to redirect onto a real sha hopper already holds, or to suppress
+            // the post entirely when hopper holds nothing for the coordinate at
+            // all. See [`crate::engine::HopperRoute`].
+            let hopper_sha = match &scan_result.hopper_route {
+                crate::engine::HopperRoute::Suppress => None,
+                crate::engine::HopperRoute::Redirect(sha) => Some(sha.clone()),
+                crate::engine::HopperRoute::Normal => Some(scan_result.sha256.clone()),
+            };
+            if persist
+                && let Some(uploader) = uploader
+                && let Some(hopper_sha) = hopper_sha
+            {
                 uploader.submit(
-                    scan_result.sha256.clone(),
+                    hopper_sha,
                     key.purl().map(str::to_owned),
                     (*scan_result).clone().into_envelope(),
                 );
@@ -1882,6 +1896,7 @@ async fn run_purl_analysis(
     } else {
         None
     };
+    let corpus_for_fallback = state.corpus.clone();
     let owned_purl = purl.to_owned();
     let handle = tokio::task::spawn_blocking(move || {
         if let Some(req) = phase_state.in_flight.get(&request_id) {
@@ -1896,6 +1911,7 @@ async fn run_purl_analysis(
             deps_for_upload,
             uploader_for_artifacts.as_ref(),
             request_follow.policy,
+            corpus_for_fallback.as_deref(),
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -2027,6 +2043,83 @@ fn valid_http_url(raw: &str) -> bool {
 /// Fetch the PURL's artifact (and its registry record) then classify. Scan
 /// looks up provenance itself — beamline does not supply it.
 #[allow(clippy::too_many_arguments)] // one linear package analysis path
+/// Offer a registry-metadata fallback's provenance to hopper without ever
+/// posting the fallback's own content as a new sample: that content is the
+/// registry's JSON record, not a real artifact, and it hashes differently
+/// every time it's built (`with_age()`-derived fields are relative to the
+/// call), so treating it as content-addressed mints hopper a fresh,
+/// never-deduplicating row on every single fetch — confirmed 2026-08-27
+/// against production (`lodash.once@4.1.1` and friends: 8-9 distinct shas for
+/// 8-9 fetches of the identical coordinate, in under two hours).
+///
+/// Looks up whether hopper already holds *real* content for this purl (a
+/// prior successful fetch, by this process or another producer). If so,
+/// backfills this fresh registry metadata onto that existing sha as
+/// provenance-only — no bytes move — and the caller's verdict should redirect
+/// onto it too. If hopper has never seen this coordinate under any sha, there
+/// is nothing to attach to; the caller's verdict is suppressed rather than
+/// minting a placeholder that would just be more of the same churn.
+///
+/// Runs the corpus lookup via `block_on`: this is always called from a
+/// `spawn_blocking` thread (`classify_purl` never runs on the async
+/// executor), so blocking here costs nothing the caller isn't already paying.
+fn offer_registry_fallback(
+    corpus: Option<&corpus::Corpus>,
+    uploader: Option<&Arc<crate::upload::Uploader>>,
+    purl: &str,
+    name: &str,
+    registry_provenance: Option<&crate::provenance::RegistryProvenance>,
+) -> crate::engine::HopperRoute {
+    use crate::engine::HopperRoute;
+    let Some(corpus) = corpus else {
+        return HopperRoute::Suppress;
+    };
+    let (reached, _source) =
+        tokio::runtime::Handle::current().block_on(corpus.known_with_source(None, Some(purl)));
+    let Reached::Record(record) = reached else {
+        return HopperRoute::Suppress;
+    };
+    let Some(real_sha) = record.sha256 else {
+        return HopperRoute::Suppress;
+    };
+    if let Some(uploader) = uploader {
+        let now = crate::engine::now_rfc3339();
+        let sidecar = match registry_provenance {
+            Some(provenance) => crate::provenance::build_sidecar_from_provenance(
+                name,
+                &real_sha,
+                0,
+                upload_collector(),
+                &now,
+                "",
+                purl,
+                provenance,
+            ),
+            None => crate::provenance::build_sidecar(
+                name,
+                &real_sha,
+                0,
+                upload_collector(),
+                &now,
+                "",
+                purl,
+                None,
+                &[],
+            ),
+        };
+        uploader.submit_artifacts(vec![crate::upload::UploadArtifact {
+            sha256: real_sha.clone(),
+            size: 0,
+            filename: name.to_string(),
+            bytes: crate::upload::ArtifactBytes::File(std::path::PathBuf::new()),
+            sidecar,
+            backfill: true,
+        }]);
+    }
+    HopperRoute::Redirect(real_sha)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn classify_purl(
     purl: &str,
     resources: &super::ModelResources,
@@ -2036,6 +2129,7 @@ fn classify_purl(
     deps_for_upload: bool,
     uploader: Option<&Arc<crate::upload::Uploader>>,
     follow: crate::fetch::FetchPolicy,
+    corpus: Option<&corpus::Corpus>,
 ) -> anyhow::Result<crate::engine::ScanResult> {
     use fletch::RefLocator;
 
@@ -2058,7 +2152,9 @@ fn classify_purl(
         if let Some(p) = phase {
             p.set("purl:registry-document");
         }
-        return classify_bytes_with_follow(
+        let hopper_route =
+            offer_registry_fallback(corpus, uploader, purl, &name, registry_provenance.as_ref());
+        let mut result = classify_bytes_with_follow(
             bytes::Bytes::from(bytes),
             &name,
             resources,
@@ -2068,7 +2164,9 @@ fn classify_purl(
             registry_provenance.as_ref(),
             follow,
             deps_for_upload,
-        );
+        )?;
+        result.hopper_route = hopper_route;
+        return Ok(result);
     }
 
     if let Some(p) = phase {
@@ -2081,7 +2179,14 @@ fn classify_purl(
                 if let Some(p) = phase {
                     p.set("purl:registry-document");
                 }
-                return classify_bytes_with_follow(
+                let hopper_route = offer_registry_fallback(
+                    corpus,
+                    uploader,
+                    purl,
+                    &name,
+                    registry_provenance.as_ref(),
+                );
+                let mut result = classify_bytes_with_follow(
                     bytes::Bytes::from(bytes),
                     &name,
                     resources,
@@ -2091,7 +2196,9 @@ fn classify_purl(
                     registry_provenance.as_ref(),
                     follow,
                     deps_for_upload,
-                );
+                )?;
+                result.hopper_route = hopper_route;
+                return Ok(result);
             }
             None => return Err(e),
         },
@@ -2426,6 +2533,7 @@ fn scan_result_from(
         interpretation: cr.interpretation,
         dependency_results: cr.dependency_results,
         bloom_mark: None,
+        hopper_route: crate::engine::HopperRoute::Normal,
     }
 }
 
@@ -4744,6 +4852,93 @@ fn read_thread_info_freebsd() -> serde_json::Value {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{Outcome, classify_analysis_error, flight_response};
+
+    /// A registry-metadata fallback must never mint hopper a placeholder row:
+    /// with nothing known about the purl (a 404 from `/v1/lookup`), the result
+    /// is `Suppress` — nothing gets posted for it. See
+    /// [`super::offer_registry_fallback`]'s doc comment for why (the fallback's
+    /// own content hashes differently on every fetch).
+    #[tokio::test]
+    async fn unknown_purl_suppresses_the_registry_fallback() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock corpus");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept lookup");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write 404");
+        });
+
+        let corpus = super::super::corpus::Corpus::new(Some(&format!("http://{addr}")))
+            .expect("corpus configured");
+        let route = tokio::task::spawn_blocking(move || {
+            super::offer_registry_fallback(
+                Some(&corpus),
+                None,
+                "pkg:npm/never-seen@0.0.0",
+                "never-seen@0.0.0.registry.json",
+                None,
+            )
+        })
+        .await
+        .expect("task");
+        server.join().expect("server thread");
+
+        assert!(
+            matches!(route, crate::engine::HopperRoute::Suppress),
+            "an unknown coordinate must suppress the post, not mint a row: {route:?}"
+        );
+    }
+
+    /// A registry-metadata fallback for a purl hopper already holds real
+    /// content for redirects onto that sha instead of minting a new one.
+    #[tokio::test]
+    async fn known_purl_redirects_the_registry_fallback() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock corpus");
+        let addr = listener.local_addr().expect("addr");
+        let real_sha = "b".repeat(64);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept lookup");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = format!(r#"{{"sha256":"{real_sha}"}}"#);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            stream.write_all(head.as_bytes()).expect("write head");
+            stream.write_all(body.as_bytes()).expect("write body");
+        });
+
+        let corpus = super::super::corpus::Corpus::new(Some(&format!("http://{addr}")))
+            .expect("corpus configured");
+        let route = tokio::task::spawn_blocking(move || {
+            super::offer_registry_fallback(
+                Some(&corpus),
+                None,
+                "pkg:npm/known-package@1.0.0",
+                "known-package@1.0.0.registry.json",
+                None,
+            )
+        })
+        .await
+        .expect("task");
+        server.join().expect("server thread");
+
+        match route {
+            crate::engine::HopperRoute::Redirect(sha) => assert_eq!(sha, "b".repeat(64)),
+            other => panic!("expected a redirect onto the known sha, got {other:?}"),
+        }
+    }
     use axum::http::StatusCode;
 
     /// A decision that is about us rather than about the artifact must never
@@ -5249,6 +5444,7 @@ mod tests {
         use crate::interpret::Interpretation;
 
         let pass = |cached, error: Option<&str>| Interpretation {
+            corroborated: false,
             grade: None,
             outcome: crate::Classification::Benign,
             blended: 0.1,

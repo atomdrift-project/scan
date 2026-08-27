@@ -458,6 +458,7 @@ fn build_result(
         interpretation: cr.interpretation,
         dependency_results: cr.dependency_results,
         bloom_mark,
+        hopper_route: crate::engine::HopperRoute::Normal,
     })
 }
 
