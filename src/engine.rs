@@ -5385,9 +5385,16 @@ pub(crate) fn classify_report(
         String::new()
     } else if llm_view {
         // `--format interpret`: byte-for-byte the user message the live
-        // `--interpret` query sends (built above) — the sanitized render,
-        // annotations included — just without the system prompt.
-        llm_ctx.unwrap_or_default()
+        // `--interpret` query sends — the sanitized render with its annotations
+        // recategorized, just without the system prompt. The recategorization is
+        // applied here and in `interpret::interpret`, never in
+        // `render_interpret_context` itself: scan parses that render back for the
+        // LLM admission gate and for `Evidence` (`has_elevated_finding`,
+        // `has_hostile_finding`, `render_mostly_readable`), all of which key on
+        // the `SEV` letter this transform removes. Stripping it upstream silently
+        // withdrew samples from the gate — measured as seven true positives
+        // dropping from a caught verdict to `lvl = -1`.
+        recategorize_annotations(&llm_ctx.unwrap_or_default())
     } else if tiny_opts.header == cleave::output::HeaderStyle::Rich {
         let registry_ids: std::collections::HashSet<u32> =
             dependency_registries.iter().map(|r| r.file_id).collect();
@@ -5992,7 +5999,7 @@ fn render_interpret_context(
     if omitted > 0 {
         let _ = writeln!(out, "\ndeps_omitted={omitted}");
     }
-    recategorize_annotations(&out)
+    out
 }
 
 /// Rewrite each finding annotation from a graded conclusion into a categorized
@@ -6020,7 +6027,7 @@ fn render_interpret_context(
 /// stays and only its authority is removed.
 ///
 /// The terminal view is untouched — this is the machine/LLM render alone.
-fn recategorize_annotations(rendered: &str) -> String {
+pub(crate) fn recategorize_annotations(rendered: &str) -> String {
     let mut out = String::with_capacity(rendered.len());
     for line in rendered.split_inclusive('\n') {
         match recategorize_annotation(line.trim_end_matches('\n')) {
