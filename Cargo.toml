@@ -61,20 +61,25 @@ license = "Apache-2.0"
 repository = "https://github.com/atomdrift-project/scan"
 
 [dependencies]
-# default-features = false drops cleave's `jemalloc` default (its only default
-# feature), so cleave doesn't pull in tikv-jemalloc-{ctl,sys}. Litmus declares
-# its own #[global_allocator] in main.rs (cfg-gated to skip illumos/Solaris/the
-# BSDs that ship jemalloc natively), so we don't need cleave's copy.
-# Path dep while the gauntlet startup-cost work is local; flip back to the git
-# dep once cleave's changes are pushed. (Direct path dep, not [patch] — cargo
-# silently ignores prerelease path patches.)
+# The atomdrift crates below carry no `rev`/`tag`/`branch`: each tracks its
+# repository's default branch, so `cargo update -p <crate>` re-pins to HEAD on
+# demand. Cargo.lock holds the exact revision in use — read it, not this file,
+# to answer "which commit are we on?". When one of these needs a local, unpushed
+# change, swap in a direct `path` dep temporarily (not `[patch]` — cargo silently
+# ignores prerelease path patches) and say so here.
+# Default features stay ON. Cleave's only default is `jemalloc`, which gates
+# `memory_tracker::{configure_jemalloc_low_memory, jemalloc_stats}` — server mode
+# calls both (src/server/mod.rs, src/server/handlers.rs) to return freed pages to
+# the OS across a long lifetime and to report allocator stats. `default-features
+# = false` does not remove jemalloc: scan declares its own tikv-jemalloc* below
+# and owns the `#[global_allocator]` in main.rs, and cleave's own is in its
+# binary, never linked here. It only blinds cleave to the allocator already
+# linked, and does it silently — the gated functions still compile, they just
+# stop doing anything and cleave logs `allocator="system"`. Dropped by accident
+# in 88baea5 (2026-08-20) on a since-corrected rationale; restored deliberately.
 cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
-# Path dep while the scoped-npm fix in fletch::purl::normalize is unpushed —
-# scan's bloom keys and CLI normalize through it, so `pkg:npm/@scope/name` is
-# refused as "not a package URL" against the pushed revision. Flip back to the
-# git dep once fletch is pushed and `cargo update -p fletch` picks it up.
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
 proclist = { git = "https://github.com/atomdrift-project/proclist.git" }
 # Direct handle on filefacts (already in the graph via cleave/fletch) so the
