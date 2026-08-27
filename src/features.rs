@@ -2717,11 +2717,16 @@ fn write_aggregate_features(
         }
     }
     w.set("agg:attack_technique_count", attack_techniques.len() as f32);
-    #[allow(clippy::string_slice)]
+    // An ATT&CK technique ID is ASCII ("T1059.001"), but `atk` is whatever the
+    // finding carried and nothing validates it, so a multi-byte codepoint can
+    // sit inside the first four bytes. `len() >= 4` counts bytes and says
+    // nothing about where characters begin: "Tü─…" is T(0) ü(1..3) ─(3..6), so
+    // a byte-4 slice lands mid-character and panics, taking the whole analysis
+    // task with it. `get` yields None on a non-boundary index instead.
     let tactic_prefixes: HashSet<&str> = attack_techniques
         .iter()
-        .filter(|t| t.starts_with('T') && t.len() >= 4)
-        .map(|t| &t[..4])
+        .filter_map(|t| t.get(..4))
+        .filter(|prefix| prefix.starts_with('T'))
         .collect();
     w.set("agg:attack_tactic_count", tactic_prefixes.len() as f32);
     w.set("agg:mbc_behavior_count", mbc_behaviors.len() as f32);
@@ -4149,6 +4154,45 @@ mod tests {
 
     fn paths(id: &str) -> Vec<&str> {
         finding_paths(id).collect()
+    }
+
+    /// An ATT&CK ID whose first four bytes straddle a codepoint must not take
+    /// the analysis task down with it. `atk` is copied straight from a finding
+    /// and nothing validates it, so hostile or mojibake input reaches the
+    /// tactic-prefix slice directly; in production this panicked 38 analyses
+    /// with "end byte index 4 is not a char boundary".
+    #[test]
+    fn attack_tactic_prefix_tolerates_non_ascii_technique_id() {
+        let hostile = FileSummary {
+            raw_findings: vec![
+                RawFinding {
+                    // T(0) ü(1..3) ─(3..6) — byte 4 lands inside the box char.
+                    id: "hostile".to_string(),
+                    conf: 1.0,
+                    crit: 1,
+                    atk: Some("T\u{fc}\u{2500}x".to_string()),
+                    mbc: None,
+                },
+                RawFinding {
+                    id: "ordinary".to_string(),
+                    conf: 1.0,
+                    crit: 1,
+                    atk: Some("T1059.001".to_string()),
+                    mbc: None,
+                },
+            ],
+            ..FileSummary::default()
+        };
+        let lookup: HashMap<String, usize> =
+            [("agg:attack_tactic_count".to_string(), 0)].into_iter().collect();
+        let mut vec = vec![0.0f32; 1];
+        write_aggregate_features(
+            &FindingSummary::default(),
+            std::slice::from_ref(&hostile),
+            &mut FeatureWriter { vec: &mut vec, lookup: &lookup },
+        );
+        // The unusable ID is skipped; the well-formed one still counts.
+        assert_eq!(vec[0], 1.0, "expected only the ASCII technique to yield a tactic prefix");
     }
 
     #[test]

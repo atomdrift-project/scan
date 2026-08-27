@@ -116,11 +116,16 @@ command="/usr/sbin/daemon"
 # with warm YARA caches: 284.7s stock, 227.7s with junk:false (-20%), identical
 # result hashes. Peak RSS fell 16.0 GiB -> 14.0 GiB over the same pair.
 malloc_conf="dirty_decay_ms:1000,muzzy_decay_ms:0,abort_conf:true,junk:false"
+# RUST_BACKTRACE=1 so a panic inside an analysis task names the frame that
+# raised it. Without it a panic reaches hopper as a bare message — "end byte
+# index 2 is not a char boundary" says a str was sliced mid-character but not
+# by whom, and the call can be anywhere in the analyzer or its dependencies.
+# The cost is paid only on a panic, which is already a lost job.
 # -r -R 5 : supervise the worker and restart it forever (5s back-off) after
 #           any exit, so an OOM kill or panic self-heals. -P is the supervisor
 #           pidfile; \`service scan-worker stop\` signals it to tear the
 #           whole tree down.
-command_args="-c -f -r -R 5 -P \${pidfile} -o \${scan_worker_logfile} -u scan /usr/bin/env MALLOC_CONF=\${malloc_conf} SCAN_LLM=\${scan_worker_llm} $_lrs_bin $_lrs_worker_args"
+command_args="-c -f -r -R 5 -P \${pidfile} -o \${scan_worker_logfile} -u scan /usr/bin/env MALLOC_CONF=\${malloc_conf} RUST_BACKTRACE=1 SCAN_LLM=\${scan_worker_llm} $_lrs_bin $_lrs_worker_args"
 
 # Bounded, orphan-free stop (see the header comment for why the default won't
 # do). SIGTERM the daemon(8) supervisor — it forwards the signal to the worker,
