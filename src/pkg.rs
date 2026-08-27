@@ -75,6 +75,24 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
     let registry_provenance = registry.clone().map(|record| {
         crate::provenance::RegistryProvenance::from_record_sources(record, &registry_sources)
     });
+    // What both fallback branches below offer hopper's `/v1/lookup` a chance
+    // at, if `--hopper` is set and the real artifact can't be fetched: almost
+    // always a real purl (`registry_locator` resolved through `derived_purl`
+    // or the operator's own `scan purl`), occasionally a bare URL when a
+    // registry still resolved one without a purl mapping — hopper's lookup
+    // just won't match that, and the fallback lands on `run_bytes`'s
+    // never-post-the-substitute-hash default. Passing a locator string here
+    // unconditionally (never `None`) is what keeps that default in force for
+    // every registry-document call below, not only the common purl case.
+    // Owned rather than borrowed: `registry_locator` may alias `locator`
+    // itself (when `derived_purl` is `None`), and `locator` moves into
+    // `fetch_one` below before this is used again in the fetch-failure arm.
+    // `run`/`run_pkg`/`run_url` never build a `Path` locator; folded into this
+    // arm only because `RefLocator` is matched exhaustively.
+    let fallback_locator = match registry_locator {
+        RefLocator::Purl(p) | RefLocator::Path(p) => p.clone(),
+        RefLocator::Url(u) => u.clone(),
+    };
     if let Some(reg) = &registry {
         crate::fetch::report_registry(reg, progress);
         // The registry lookup we just did (the packument we need for the record
@@ -97,6 +115,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                 config,
                 registry_provenance.as_ref(),
                 None,
+                Some(fallback_locator.as_str()),
             );
         }
     }
@@ -125,6 +144,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                 config,
                 registry_provenance.as_ref(),
                 Some(&rec),
+                None,
             )
         }
         // The artifact couldn't be fetched — most often because the version was
@@ -147,6 +167,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                     config,
                     registry_provenance.as_ref(),
                     None,
+                    Some(fallback_locator.as_str()),
                 )
             }
             None => Err(e),
