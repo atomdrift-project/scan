@@ -101,14 +101,15 @@ const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// `/api/next` — still reports liveness, RSS, load, and queue depth on time.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
-/// How many top-level analyses may enter nested Rayon work at once.
+/// How many top-level analyses may execute at once.
 ///
-/// The N worker tasks bound how many jobs are in flight; this tighter gate
-/// bounds how many deep cleave/fetch trees share the one process-global Rayon
-/// pool. Independent trees compound stack frames via work-stealing (256 MiB
-/// stacks + `stacker` absorb a handful, not dozens). The default scales with
-/// the pool (⅛, at least 1) and never exceeds `slots`. Override with
-/// `SCAN_CLEAVE_CONCURRENCY`.
+/// The N worker tasks bound jobs that may be claimed/in flight; this tighter
+/// gate bounds memory-bandwidth-heavy cleave executions. Within that gate,
+/// cleave gives only a bounded subset of sibling analyses access to nested
+/// Rayon work while the other admitted analyses make serial progress. The
+/// default scales with the pool (1/16, at least 1: eight analyses on the
+/// 128-thread FreeBSD worker) and never exceeds `slots`;
+/// `SCAN_CLEAVE_CONCURRENCY` remains an explicit production override.
 ///
 /// Each worker waits on this gate *after* taking a job and *only* around the
 /// blocking classify — never on a shared dispatch loop.
@@ -124,7 +125,7 @@ fn cleave_concurrency(slots: usize) -> usize {
 fn cleave_concurrency_from(slots: usize, pool: usize, override_value: Option<usize>) -> usize {
     let slots = slots.max(1);
     override_value.filter(|&value| value > 0).map_or_else(
-        || (pool.max(1) / 8).clamp(1, slots),
+        || (pool.max(1) / 16).clamp(1, slots),
         |value| value.min(slots),
     )
 }
@@ -1454,8 +1455,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
-    // Nested-Rayon cap only. Worker-task count (`slots`) is the analysis
-    // concurrency limit — no separate analysis-slot semaphore.
+    // Worker tasks (`slots`) claim and stage jobs; the cleave gate separately
+    // bounds simultaneous memory-bandwidth-heavy analyses.
     let cleave_slots = cleave_concurrency(slots);
     let cleave_gate = Arc::new(Semaphore::new(cleave_slots));
     // Slot count bounds concurrency but not memory: a slot analysing a huge
@@ -1520,8 +1521,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         tracing::warn!(
             slots,
             cleave_slots,
-            "cleave entry gate limits nested Rayon trees to {cleave_slots} \
-             (pool/8); set SCAN_CLEAVE_CONCURRENCY to override",
+            "cleave entry gate allows {cleave_slots} simultaneous analyses; \
+             other claimed worker slots deliberately wait at this gate. Set \
+             SCAN_CLEAVE_CONCURRENCY to override",
         );
     }
 
@@ -1946,8 +1948,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
                     let active_slots = analyzing.load(Ordering::Relaxed);
                     let available_slots = slots.saturating_sub(active_slots);
+                    let heap = crate::heap_profile::stats();
+                    let (regex_scratch_bytes, regex_scratch_budget_bytes) =
+                        cleave::regex_scratch_usage();
                     tracing::info!(
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
+                        jemalloc_allocated_mb = heap.map(|stats| stats.allocated / (1024 * 1024)),
+                        jemalloc_active_mb = heap.map(|stats| stats.active / (1024 * 1024)),
+                        jemalloc_resident_mb = heap.map(|stats| stats.resident / (1024 * 1024)),
+                        jemalloc_retained_mb = heap.map(|stats| stats.retained / (1024 * 1024)),
+                        regex_scratch_mb = regex_scratch_bytes / (1024 * 1024),
+                        regex_scratch_budget_mb = regex_scratch_budget_bytes / (1024 * 1024),
                         queued_prefetch_jobs = outstanding.load(Ordering::Relaxed),
                         prefetch_buffer_mb = queued_bytes.load(Ordering::Relaxed) / (1024 * 1024),
                         active_slots,
@@ -1963,7 +1974,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         corpus_skips = crate::corpus_precheck::counters().1,
                         "worker summary",
                     );
-
                     // Per-slot census: one line per in-flight analysis — file, size,
                     // how long it has been running, the stage it is in (and for how
                     // long), the worker thread, and what a blocked thread is waiting
@@ -4498,7 +4508,7 @@ mod tests {
 
     #[test]
     fn cleave_concurrency_scales_with_pool_and_respects_slot_cap() {
-        assert_eq!(cleave_concurrency_from(16, 32, None), 4);
+        assert_eq!(cleave_concurrency_from(16, 32, None), 2);
         assert_eq!(cleave_concurrency_from(16, 8, None), 1);
         assert_eq!(cleave_concurrency_from(2, 64, None), 2);
         assert_eq!(cleave_concurrency_from(0, 32, None), 1);
@@ -4509,7 +4519,7 @@ mod tests {
         assert_eq!(cleave_concurrency_from(4, 32, Some(64)), 4);
         assert_eq!(cleave_concurrency_from(16, 32, Some(2)), 2);
         // Zero / bogus overrides fall back to the pool formula.
-        assert_eq!(cleave_concurrency_from(16, 32, Some(0)), 4);
+        assert_eq!(cleave_concurrency_from(16, 32, Some(0)), 2);
     }
 
     #[test]
