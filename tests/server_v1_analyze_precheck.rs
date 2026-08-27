@@ -121,12 +121,15 @@ async fn stub_corpus(holds: Holds) -> Result<(String, Arc<Asked>)> {
 /// the server binary reaches the same code from its own startup path.
 fn arm_corpus_precheck(base: &str) {
     let base = base.to_owned();
-    std::thread::spawn(move || {
+    let joined = std::thread::spawn(move || {
         // Constructed and dropped off-runtime, which is the whole point.
-        drop(scan::upload::Uploader::new(&base, "precheck-arming".to_owned()));
+        drop(scan::upload::Uploader::new(
+            &base,
+            "precheck-arming".to_owned(),
+        ));
     })
-    .join()
-    .expect("arming thread panicked");
+    .join();
+    assert!(joined.is_ok(), "arming thread panicked");
 }
 
 async fn app_with_corpus(base: Option<&str>) -> Result<Router> {
@@ -158,7 +161,10 @@ async fn app_with_corpus(base: Option<&str>) -> Result<Router> {
 }
 
 async fn analyze(app: Router, uri: &str, body: &str) -> Result<(StatusCode, serde_json::Value)> {
-    let mut req = Request::builder().method("POST").uri(uri).body(Body::from(body.to_owned()))?;
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .body(Body::from(body.to_owned()))?;
     req.extensions_mut()
         .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
     let res = app.oneshot(req).await?;
@@ -180,19 +186,28 @@ async fn a_held_verdict_answers_without_analyzing() -> Result<()> {
     let app = app_with_corpus(Some(&base)).await?;
     let (status, body) = analyze(app, "/v1/analyze?purl=npm%2Fleft-pad%401.3.0", "").await?;
 
-    assert_eq!(status, StatusCode::OK, "a held verdict was not answered with");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a held verdict was not answered with"
+    );
     assert_eq!(
         body["engine_version"], "corpus-probe",
         "the answer did not come from the corpus: {body}",
     );
     assert!(!body["decision"].is_null(), "no decision in {body}");
-    assert_eq!(asked.count.load(Ordering::SeqCst), 1, "the corpus was not asked exactly once");
+    assert_eq!(
+        asked.count.load(Ordering::SeqCst),
+        1,
+        "the corpus was not asked exactly once"
+    );
     let queries = asked.queries.lock().await;
     assert!(
         queries[0].contains("purl="),
         "a named package must be asked about by PURL, got {:?}",
         queries[0],
     );
+    drop(queries);
     Ok(())
 }
 
@@ -208,14 +223,22 @@ async fn an_upload_is_answered_from_a_verdict_held_for_its_digest() -> Result<()
 
     let (status, body) = analyze(app, "/v1/analyze", artifact).await?;
 
-    assert_eq!(status, StatusCode::OK, "a held verdict for these bytes was not answered with");
-    assert_eq!(body["engine_version"], "corpus-probe", "not from the corpus: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a held verdict for these bytes was not answered with"
+    );
+    assert_eq!(
+        body["engine_version"], "corpus-probe",
+        "not from the corpus: {body}"
+    );
     let queries = asked.queries.lock().await;
     assert!(
         queries[0].contains(&format!("sha256={sha}")),
         "an upload must be asked about by its digest, got {:?}",
         queries[0],
     );
+    drop(queries);
     Ok(())
 }
 
@@ -256,6 +279,7 @@ async fn an_uploads_purl_never_reaches_the_resolver() -> Result<()> {
             "answered about a different artifact than the bytes uploaded",
         );
     }
+    drop(queries);
     Ok(())
 }
 
@@ -268,7 +292,11 @@ async fn nothing_held_still_analyzes() -> Result<()> {
     let app = app_with_corpus(Some(&base)).await?;
     let (status, body) = analyze(app, "/v1/analyze?purl=npm%2Fleft-pad%401.3.0", "").await?;
 
-    assert_eq!(asked.count.load(Ordering::SeqCst), 1, "the corpus was not consulted");
+    assert_eq!(
+        asked.count.load(Ordering::SeqCst),
+        1,
+        "the corpus was not consulted"
+    );
     assert_ne!(
         status,
         StatusCode::OK,
@@ -300,7 +328,11 @@ async fn an_unreachable_corpus_still_analyzes() -> Result<()> {
 async fn no_corpus_configured_still_analyzes() -> Result<()> {
     let app = app_with_corpus(None).await?;
     let (status, body) = analyze(app, "/v1/analyze?purl=npm%2Fleft-pad%401.3.0", "").await?;
-    assert_ne!(status, StatusCode::OK, "answered without a corpus or a model: {body}");
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "answered without a corpus or a model: {body}"
+    );
     Ok(())
 }
 
@@ -312,7 +344,8 @@ async fn no_corpus_configured_still_analyzes() -> Result<()> {
 async fn force_analyzes_even_when_a_verdict_is_held() -> Result<()> {
     let (base, asked) = stub_corpus(Holds::Verdict).await?;
     let app = app_with_corpus(Some(&base)).await?;
-    let (status, body) = analyze(app, "/v1/analyze?purl=npm%2Fleft-pad%401.3.0&force=1", "").await?;
+    let (status, body) =
+        analyze(app, "/v1/analyze?purl=npm%2Fleft-pad%401.3.0&force=1", "").await?;
 
     assert_eq!(
         asked.count.load(Ordering::SeqCst),

@@ -166,8 +166,8 @@ impl ScanConfig {
 
     /// Upload (renew) each scan result on the hopper instance at `url` by POSTing
     /// its envelope to `/api/result`. `None` (default) disables uploading. Used by
-    /// `scan path --hopper`; failures degrade to logged warnings and never affect
-    /// the scan's outcome.
+    /// `scan path --hopper`; failures are reported as errors but never affect the
+    /// scan's outcome.
     #[must_use]
     pub fn with_hopper(mut self, url: Option<String>) -> Self {
         self.hopper = url;
@@ -554,78 +554,227 @@ mod trait_floor_tests {
         }
     }
 
-    fn finding(crit: u8, conf: f32) -> cleave::types::CompactTrait {
+    /// One finding, in the family `objectives/<area>/<n>` — distinct `area`
+    /// values put findings in distinct families.
+    fn finding(area: &str, crit: u8, conf: f32) -> cleave::types::CompactTrait {
         cleave::types::CompactTrait {
+            id: format!("objectives/{area}/sub/leaf::trait-{crit}-{conf}"),
             criticality: crit,
             confidence: conf,
             ..cleave::types::CompactTrait::default()
         }
     }
 
-    /// `n` findings at crit `crit`/confidence `conf`, padded with `pad`
-    /// baseline (crit-0) findings so the total — and so the crit-4 fraction —
-    /// can be controlled.
-    fn findings(crit: u8, conf: f32, n: usize, pad: usize) -> Vec<cleave::types::CompactTrait> {
-        let mut ts: Vec<cleave::types::CompactTrait> =
-            (0..n).map(|_| finding(crit, conf)).collect();
-        ts.extend((0..pad).map(|_| finding(0, 0.9)));
-        ts
+    /// `n` findings at `crit`/`conf`, each in its own family.
+    fn spread(crit: u8, conf: f32, n: usize) -> Vec<cleave::types::CompactTrait> {
+        (0..n)
+            .map(|i| finding(&format!("area{i}"), crit, conf))
+            .collect()
+    }
+
+    /// `n` findings at `crit`/`conf`, all in one family — the shape a single
+    /// behavior described several ways produces.
+    fn clustered(crit: u8, conf: f32, n: usize) -> Vec<cleave::types::CompactTrait> {
+        (0..n)
+            .map(|i| cleave::types::CompactTrait {
+                id: format!("objectives/evasion/process/hook/inline::variant-{i}"),
+                criticality: crit,
+                confidence: conf,
+                ..cleave::types::CompactTrait::default()
+            })
+            .collect()
     }
 
     #[test]
-    fn one_confident_crit5_escalates_to_hostile_band() {
+    fn family_is_the_first_four_hierarchy_segments() {
+        assert_eq!(
+            trait_family("objectives/evasion/process/hook/inline::rust-inline-hook-hijack"),
+            "objectives/evasion/process/hook"
+        );
+        // One behavior spelled several ways shares a family...
+        assert_eq!(
+            trait_family("objectives/evasion/process/hook/inline::rust-inline-hook-hijack"),
+            trait_family("objectives/evasion/process/hook/inline::rust-hook-byte-copy"),
+        );
+        // ...while genuinely distinct capabilities under one objective do not.
+        // This pair is `darkglitch`, which a shallower family wrongly collapsed.
+        assert_ne!(
+            trait_family("objectives/command-and-control/backdoor/rat/multi::a"),
+            trait_family("objectives/command-and-control/backdoor/tasking/filesystem::b"),
+        );
+        assert_ne!(
+            trait_family("objectives/evasion/process/hook/inline::a"),
+            trait_family("objectives/supply-chain/install-hook/npm::b"),
+        );
+        // A short or path-less id is its own family, never a shared bucket.
+        assert_eq!(
+            trait_family("micro-behaviors/mem::x"),
+            "micro-behaviors/mem"
+        );
+        assert_eq!(trait_family("bare-id"), "bare-id");
+        // The leaf trait id is never part of the family, at any path length —
+        // otherwise every trait would be its own family and the diversity test
+        // would pass on any cluster of near-duplicates.
+        for id in [
+            "objectives/evasion/process/hook/inline::rust-inline-hook-hijack",
+            "objectives/a/b::leaf",
+            "micro-behaviors/mem::x",
+            "a::b",
+        ] {
+            assert!(
+                !trait_family(id).contains("::"),
+                "family kept the trait id: {id} -> {}",
+                trait_family(id)
+            );
+        }
+        // Two traits differing only in their leaf are one family.
+        assert_eq!(
+            trait_family("objectives/a/b/c/d::one"),
+            trait_family("objectives/a/b/c/d::two"),
+        );
+    }
+
+    #[test]
+    fn two_crit5_with_a_third_severe_escalates_to_hostile_band() {
         let mut d = benign();
-        apply_trait_floor(&mut d, &findings(5, 0.8, 1, 0), Some(50), 100, "test");
+        let mut ts = spread(5, 0.8, 2);
+        ts.push(finding("supply-chain", 4, 0.9));
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
+        // The probability is the strongest *crit-5*, not the strongest finding.
         assert_eq!(d.probability, 0.8);
         assert_eq!(d.level, Some(50));
+    }
+
+    #[test]
+    fn a_lone_crit5_stays_benign() {
+        let mut d = benign();
+        // One hostile trait cannot carry a verdict, however confident: nothing
+        // corroborates it. This is the shape that graded WannaCry hostile off a
+        // single finding — and static-keys benign code with it.
+        apply_trait_floor(&mut d, &spread(5, 0.98, 1), Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+    }
+
+    #[test]
+    fn a_crit5_with_one_thin_corroborator_stays_benign() {
+        let mut d = benign();
+        // Two findings in two families still falls short of the severe count.
+        // This is the real pair that marked a stock `libwebp.dll` hostile: an
+        // RMM signature plus a generic PE-layout anomaly.
+        let ts = vec![
+            finding("command-and-control", 5, 0.9),
+            finding("binary-anomaly", 4, 0.97),
+        ];
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+    }
+
+    #[test]
+    fn a_crit5_corroborated_across_families_escalates_to_hostile_band() {
+        let mut d = benign();
+        // One anchor plus two independent severe findings — `rex-powershell`.
+        let mut ts = spread(5, 0.98, 1);
+        ts.extend([finding("evasion", 4, 0.8), finding("execution", 4, 0.94)]);
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Hostile);
+        assert_eq!(d.probability, 0.98);
+        assert_eq!(d.level, Some(50));
+    }
+
+    #[test]
+    fn three_crit4_in_two_families_stays_benign() {
+        let mut d = benign();
+        // Count alone would clear the suspicious arm; breadth does not.
+        let ts = vec![
+            finding("evasion", 4, 0.9),
+            finding("evasion", 4, 0.92),
+            finding("execution", 4, 0.88),
+        ];
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+    }
+
+    #[test]
+    fn two_crit5_without_further_corroboration_stays_benign() {
+        let mut d = benign();
+        apply_trait_floor(&mut d, &spread(5, 0.9, 2), Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+    }
+
+    #[test]
+    fn a_single_family_cluster_cannot_corroborate_itself() {
+        let mut d = benign();
+        // Three confident crit-5s, all from `objectives/evasion/process` —
+        // counts clear, diversity does not. This is the static-keys shape.
+        apply_trait_floor(&mut d, &clustered(5, 0.98, 3), Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
+        // Same for the suspicious arm.
+        let mut d = benign();
+        apply_trait_floor(&mut d, &clustered(4, 0.93, 4), Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Benign);
     }
 
     #[test]
     fn low_confidence_crit5_is_ignored() {
         let mut d = benign();
         // c < 0.76 → not counted, stays benign.
-        apply_trait_floor(&mut d, &findings(5, 0.5, 3, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &spread(5, 0.5, 3), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
     #[test]
-    fn two_confident_crit4_above_fraction_escalates_to_suspicious_band() {
+    fn three_confident_crit4_across_families_escalates_to_suspicious_band() {
         let mut d = benign();
-        // 4 confident crit-4 out of 4 total → fraction 1.0 >= 0.05.
-        apply_trait_floor(&mut d, &findings(4, 0.9, 4, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &spread(4, 0.9, 3), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Suspicious);
         assert_eq!(d.probability, 0.9);
         assert_eq!(d.level, Some(100));
     }
 
     #[test]
-    fn confident_crit4_below_fraction_stays_benign() {
+    fn two_confident_crit4_stays_benign() {
         let mut d = benign();
-        // 2 confident crit-4 diluted by 200 baseline findings → fraction ~0.01.
-        apply_trait_floor(&mut d, &findings(4, 0.9, 2, 200), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &spread(4, 0.9, 2), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
     #[test]
-    fn low_confidence_crit4_does_not_count_toward_pair() {
+    fn a_busy_file_is_not_diluted_out_of_an_escalation() {
+        let mut d = benign();
+        // Three confident crit-4s in distinct families, among 200 baseline
+        // findings. The fraction gate this replaced scored ~0.015 here and
+        // stayed benign; activity elsewhere in the file is not evidence about
+        // these three.
+        let mut ts = spread(4, 0.9, 3);
+        ts.extend((0..200).map(|i| finding(&format!("noise{i}"), 0, 0.9)));
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_eq!(d.class, Classification::Suspicious);
+    }
+
+    #[test]
+    fn low_confidence_crit4_does_not_count_toward_the_trio() {
         let mut d = benign();
         // Only one confident crit-4; the other two are below threshold.
-        let ts = vec![finding(4, 0.9), finding(4, 0.5), finding(4, 0.6)];
+        let ts = vec![
+            finding("a", 4, 0.9),
+            finding("b", 4, 0.5),
+            finding("c", 4, 0.6),
+        ];
         apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
         assert_eq!(d.class, Classification::Benign);
     }
 
     /// cleave now always writes `conf`, but reports from builds that omitted it
     /// still decode — as 0.0, "no confidence recorded", which is below the 0.76
-    /// gate. So an unscored crit-5 in an old report never trips the floor on
-    /// its own.
+    /// gate. So unscored crit-5s in an old report never trip the floor.
     #[test]
     fn confidence_omitted_by_an_older_build_decodes_below_threshold() {
         let mut d = benign();
         let ts: Vec<cleave::types::CompactTrait> = serde_json::from_value(serde_json::json!([
-            {"id": "a", "crit": 5},
-            {"id": "b", "crit": 5},
+            {"id": "objectives/a/b/c::x", "crit": 5},
+            {"id": "objectives/d/e/f::y", "crit": 5},
+            {"id": "objectives/g/h/i::z", "crit": 4},
         ]))
         .unwrap();
         assert_eq!(
@@ -641,7 +790,7 @@ mod trait_floor_tests {
         let mut d = benign();
         d.class = Classification::Hostile;
         d.level = Some(50);
-        apply_trait_floor(&mut d, &findings(5, 0.9, 5, 0), Some(50), 100, "test");
+        apply_trait_floor(&mut d, &spread(4, 0.9, 5), Some(50), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
         assert_eq!(d.level, Some(50));
     }
@@ -653,7 +802,11 @@ mod trait_floor_tests {
         let mut d = benign();
         let report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
             "files": [{"id": 0, "path": "x", "type": "elf", "sha": "s", "size": 1,
-                       "traits": [{"id": "t", "crit": 5, "conf": 0.98}]}]
+                       "traits": [
+                           {"id": "objectives/command-and-control/backdoor/a::t1", "crit": 5, "conf": 0.98},
+                           {"id": "objectives/persistence/service/b::t2", "crit": 5, "conf": 0.9},
+                           {"id": "objectives/discovery/env-vars/c::t3", "crit": 4, "conf": 0.8}
+                       ]}]
         }))
         .unwrap();
         apply_trait_floor(&mut d, root_findings(&report), Some(50), 100, "test");
@@ -1336,9 +1489,8 @@ pub struct ScanResult {
     pub model_scores: Vec<RouteScore>,
     /// Applicable model routes skipped by the routed ensemble.
     pub skipped_models: Vec<SkippedRoute>,
-    /// cleave's rendered context view (the annotated hex/source block), captured
-    /// while the typed report was in scope. Body-only for the terminal format
-    /// (litmus draws the headline); header-prefixed for `--format tiny`.
+    /// Human result card for terminal output, or cleave's annotated context for
+    /// the tiny/interpret formats. Built while the typed report is still in scope.
     pub rendered_context: String,
     /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
     /// Serialized as the response `llm` section; `None` when interpretation was
@@ -1588,6 +1740,8 @@ fn term_cols() -> usize {
 /// a clone independent of the `Progress` handle the scan loop borrows.
 struct Inner {
     analyzed: AtomicU32,
+    external_dependencies: AtomicU32,
+    external_urls: AtomicU32,
     total: u32,
     start: Instant,
     /// Elapsed millis at the most recent `increment`; lets `render` measure how
@@ -1609,18 +1763,17 @@ struct Inner {
 }
 
 /// The active terminal progress bar, published so incidental stderr writers —
-/// chiefly the fetch progress block (`report_fetch`/`report_skip` and their
-/// header) — can print *above* the bar instead of grafting onto or racing its
-/// `\r`-parked line. Only the single-process terminal CLI ever installs a bar;
+/// chiefly actionable fetch failures/skips — can print *above* the bar instead
+/// of grafting onto or racing its `\r`-parked line. Only the single-process
+/// terminal CLI ever installs a bar;
 /// server/JSON modes run none and leave this `None`. A `Weak` so a finished bar
 /// is never kept alive; [`print_above_bar`] upgrades it per call.
 static ACTIVE_BAR: Mutex<Option<Weak<Inner>>> = Mutex::new(None);
 
 /// Whether an interactive scan progress bar currently owns the terminal. The
 /// live dependency tree ([`crate::deptree`]) defers to it: a multi-file scan's
-/// bar keeps the streamed fetch log (which coexists with the bar via
-/// [`print_above_bar`]), so only a single-artifact scan — where no bar is live —
-/// takes over stderr with an in-place tree.
+/// bar owns external-fetch status, so only a single-artifact scan — where no bar
+/// is live — takes over stderr with an in-place tree.
 pub(crate) fn bar_active() -> bool {
     ACTIVE_BAR
         .lock()
@@ -1628,6 +1781,56 @@ pub(crate) fn bar_active() -> bool {
         .as_ref()
         .and_then(Weak::upgrade)
         .is_some()
+}
+
+/// Add one file's active external-reference work to the main scan bar. The
+/// counters are process-wide only while that bar is alive; concurrent files
+/// contribute to the same compact status note.
+pub(crate) fn external_fetch_started(dependencies: usize, urls: usize) {
+    let bar = ACTIVE_BAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(Weak::upgrade);
+    let Some(inner) = bar else { return };
+    let dependencies = u32::try_from(dependencies).unwrap_or(u32::MAX);
+    let urls = u32::try_from(urls).unwrap_or(u32::MAX);
+    inner
+        .external_dependencies
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_add(dependencies))
+        })
+        .ok();
+    inner
+        .external_urls
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_add(urls))
+        })
+        .ok();
+}
+
+/// Remove one file's external-reference work from the main scan bar.
+pub(crate) fn external_fetch_finished(dependencies: usize, urls: usize) {
+    let bar = ACTIVE_BAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(Weak::upgrade);
+    let Some(inner) = bar else { return };
+    let dependencies = u32::try_from(dependencies).unwrap_or(u32::MAX);
+    let urls = u32::try_from(urls).unwrap_or(u32::MAX);
+    inner
+        .external_dependencies
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(dependencies))
+        })
+        .ok();
+    inner
+        .external_urls
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(urls))
+        })
+        .ok();
 }
 
 /// Run `print` (which writes one or more *complete* newline-terminated lines to
@@ -1678,9 +1881,9 @@ impl Inner {
 
     fn render(&self) {
         let done = self.analyzed.load(Ordering::Relaxed);
+        let external_dependencies = self.external_dependencies.load(Ordering::Relaxed);
+        let external_urls = self.external_urls.load(Ordering::Relaxed);
         let elapsed = self.start.elapsed();
-        let rate = f64::from(done) / elapsed.as_secs_f64().max(0.001);
-        let eta = f64::from(self.total - done) / rate.max(0.001);
 
         let frame = SPINNER[self.tick.fetch_add(1, Ordering::Relaxed) as usize % SPINNER.len()];
         let bar_w = 20;
@@ -1700,7 +1903,7 @@ impl Inner {
         let filled_str: String = bar.chars().take(filled + 1).collect();
         let dim_str: String = bar.chars().skip(filled + 1).collect();
 
-        let stats = format!("{done}/{}  {:.0}/s  {}", self.total, rate, format_eta(eta));
+        let stats = progress_stats(done, self.total, elapsed);
 
         // Long-tail reassurance: when only a few files remain and the count has
         // not moved for a while, the scan is almost certainly deep in a slow
@@ -1708,17 +1911,18 @@ impl Inner {
         // separate line) so the bar's own clear erases it — the note shows while
         // the tail is stalled and vanishes the instant a file completes or the
         // scan ends. Capped to the terminal width so it can never wrap.
-        let left = self.total - done;
+        let left = self.total.saturating_sub(done);
         let stalled_ms = elapsed
             .as_millis()
             .saturating_sub(u128::from(self.last_advance_ms.load(Ordering::Relaxed)));
-        let note = if (1..=TAIL_FILES).contains(&left) && stalled_ms >= TAIL_STALL_MS {
-            // Fixed visible prefix: 1 indent + spinner + space + bar + 2 spaces.
-            let used = 25 + stats.chars().count();
-            fit_notice(TAIL_MESSAGE, self.term_cols.saturating_sub(used + 1))
-        } else {
-            String::new()
-        };
+        let note_text = external_fetch_note(external_dependencies, external_urls).or_else(|| {
+            ((1..=TAIL_FILES).contains(&left) && stalled_ms >= TAIL_STALL_MS)
+                .then(|| TAIL_MESSAGE.to_string())
+        });
+        let used = 25 + stats.chars().count();
+        let note = note_text.map_or_else(String::new, |text| {
+            fit_notice(&text, self.term_cols.saturating_sub(used + 1))
+        });
 
         // `\x1b[K` erases to end of line — robustly clears a wider previous
         // frame (a longer ETA, or the notice once it's gone) without padding.
@@ -1736,6 +1940,40 @@ impl Inner {
             .draw_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+/// Stable right-hand progress text. There is no rate before the first file
+/// completes, so keep that otherwise-nonsensical initial ETA qualitative.
+fn progress_stats(done: u32, total: u32, elapsed: Duration) -> String {
+    if done == 0 {
+        return format!("{done}/{total}  Estimating\u{2026}");
+    }
+
+    let rate = f64::from(done) / elapsed.as_secs_f64().max(0.001);
+    let eta = f64::from(total.saturating_sub(done)) / rate.max(0.001);
+    format!("{done}/{total}  {rate:.0}/s  {}", format_eta(eta))
+}
+
+/// Compact status text for external work currently shared by the scan's
+/// concurrent workers. Keep it short enough to coexist with the file counter.
+fn external_fetch_note(dependencies: u32, urls: u32) -> Option<String> {
+    fn noun(count: u32, singular: &str, plural: &str) -> String {
+        format!("{count} {}", if count == 1 { singular } else { plural })
+    }
+
+    match (dependencies, urls) {
+        (0, 0) => None,
+        (0, urls) => Some(format!("fetching {}", noun(urls, "URL", "URLs"))),
+        (dependencies, 0) => Some(format!(
+            "fetching {}",
+            noun(dependencies, "dependency", "dependencies")
+        )),
+        (dependencies, urls) => Some(format!(
+            "fetching {} · {}",
+            noun(dependencies, "dependency", "dependencies"),
+            noun(urls, "URL", "URLs")
+        )),
     }
 }
 
@@ -1850,6 +2088,8 @@ impl Progress {
     pub(crate) fn new(total: u32) -> Self {
         let inner = Arc::new(Inner {
             analyzed: AtomicU32::new(0),
+            external_dependencies: AtomicU32::new(0),
+            external_urls: AtomicU32::new(0),
             total,
             start: Instant::now(),
             last_advance_ms: AtomicU64::new(0),
@@ -1858,8 +2098,9 @@ impl Progress {
             stopped: AtomicBool::new(false),
             draw_lock: Mutex::new(()),
         });
-        // Publish this bar so the fetch progress block can print above it (see
-        // `print_above_bar`). Overwrites any prior registration — the terminal
+        // Publish this bar so fetch status can join it and actionable failures
+        // can print above it (see `print_above_bar`). Overwrites any prior
+        // registration — the terminal
         // CLI runs one bar at a time — and is cleared on drop.
         *ACTIVE_BAR
             .lock()
@@ -1951,6 +2192,27 @@ fn format_eta(secs: f64) -> String {
     }
 }
 
+#[cfg(test)]
+mod progress_render_tests {
+    use super::*;
+
+    #[test]
+    fn eta_waits_for_a_real_sample() {
+        assert_eq!(
+            progress_stats(0, 100, Duration::from_secs(30)),
+            "0/100  Estimating…",
+            "elapsed time alone cannot produce a rate"
+        );
+    }
+
+    #[test]
+    fn eta_appears_after_the_first_completed_file() {
+        let stats = progress_stats(1, 100, Duration::from_millis(500));
+        assert!(!stats.contains("Estimating"));
+        assert!(stats.contains("/s"));
+    }
+}
+
 /// Apply a bloom-filter decision before any expensive analysis. Emits the
 /// verdict and returns `Some(summary)` when the artifact is short-circuited (a
 /// known-good skip, or — in fast mode — a bloom-only verdict); `None` to proceed.
@@ -1979,7 +2241,12 @@ pub(crate) fn bloom_gate(
         // analysis in every mode — the scan is the verdict — and the flag rides
         // the normal result inline (see `BloomMark`), so no separate banner is
         // printed here. The caller derives the mark from this same decision.
-        BloomDecision::KnownBad => None,
+        // A sighting is the same shape of answer as known-bad — a flag that
+        // runs the full analysis — but says somebody else reported it rather
+        // than that we measured it. The distinction rides the inline mark.
+        BloomDecision::KnownBad
+        | BloomDecision::SightedHostile
+        | BloomDecision::SightedSuspicious => None,
         BloomDecision::Conflicted => {
             // Build-time subtraction removes bad keys from good, so a conflict can
             // only mean filter version skew or a producer bug — it should never
@@ -2060,7 +2327,13 @@ fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
                     !file_touched_within(path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now())
                 }
                 BloomDecision::Unknown => fast,
-                BloomDecision::KnownBad | BloomDecision::Conflicted => false,
+                // Every adverse tier is analyzed, including the weakest: a
+                // lone outside citation cannot convict, but it is ample reason
+                // to spend the scan rather than trust a bless.
+                BloomDecision::KnownBad
+                | BloomDecision::SightedHostile
+                | BloomDecision::SightedSuspicious
+                | BloomDecision::Conflicted => false,
             }
         },
     )))
@@ -2098,25 +2371,32 @@ fn discover_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Total detection rules resident in memory, folding in `bloom_rules` bloom
-/// signatures: YAML traits + composite rules + YARA rules + `bloom_rules`.
-/// `cleave::version_info()` loads (or reuses) the shared resources. Split out so
-/// the auto-update checkmark — which knows its bloom count without a
-/// [`ScanConfig`] — reports the same figure as the banner.
-pub(crate) fn detection_rule_count_from(bloom_rules: u64) -> u64 {
-    let info = cleave::version_info();
-    info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64 + bloom_rules
+/// The two distinct detection inventories shown in the banner. Bloom entries
+/// are SHA-256/PURL signatures; traits, composites, and YARA are actual rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetectionCounts {
+    pub(crate) hashes_and_purls: u64,
+    pub(crate) rules: u64,
 }
 
-/// Total detection rules resident in memory after resource load — YAML traits +
-/// composite rules + YARA rules + bloom signatures — for the scan banner. Reads
-/// already-loaded counts, so it adds no work. Shared by [`run`], [`run_paths`],
-/// and the `ps` subcommand so every banner reports the same figure.
-pub(crate) fn detection_rule_count(config: &ScanConfig) -> u64 {
-    let bloom_rules = config
+/// Detection inventory after resource load. `cleave::version_info()` loads (or
+/// reuses) shared resources; `hashes_and_purls` comes from the already-loaded
+/// Bloom repository.
+pub(crate) fn detection_counts_from(hashes_and_purls: u64) -> DetectionCounts {
+    let info = cleave::version_info();
+    DetectionCounts {
+        hashes_and_purls,
+        rules: info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64,
+    }
+}
+
+/// Detection inventory already resident in memory for the scan banner. Shared
+/// by [`run`], [`run_paths`], and `ps` so every scanner reports the same counts.
+pub(crate) fn detection_counts(config: &ScanConfig) -> DetectionCounts {
+    let hashes_and_purls = config
         .bloom()
         .map_or(0, crate::bloom_repo::Lookup::rule_count);
-    detection_rule_count_from(bloom_rules)
+    detection_counts_from(hashes_and_purls)
 }
 
 /// Run a scan against a file or directory tree.
@@ -2147,7 +2427,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             cleave::kill_all_rizin_groups();
             std::process::exit(130);
         }
-        eprintln!("\nInterrupted — finishing current file…");
+        crate::engine::print_above_bar(|| eprintln!("\nInterrupted — finishing current file…"));
         ctrlc_flag.store(true, Ordering::Relaxed);
     });
     // scan consumes only the compact projection of member nodes; let cleave
@@ -2218,7 +2498,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
     let tally = Tally::default();
     let stdout = Mutex::new(std::io::stdout());
     let progress = (is_terminal && files.len() > 1).then(|| {
-        crate::output::print_banner(detection_rule_count(config));
+        crate::output::print_banner(detection_counts(config));
         Progress::new(total)
     });
 
@@ -2514,15 +2794,19 @@ fn record_file_result(
     match scan_result {
         Ok(mut r) => {
             tally.count(r.classification);
-            // A bloom-flagged (known-bad/conflicted) file is always surfaced — its
-            // flag replaces the old unconditional banner, so the benign filter must
-            // not swallow a known-bad file the model happens to rate benign.
+            // An adversely bloom-marked file is always surfaced — its flag
+            // replaces the old unconditional banner, so the benign filter must
+            // not swallow a known-bad file the model happens to rate benign. A
+            // fresh known-good that was rescanned and remained benign still
+            // obeys the ordinary display filter.
             // JSON, tiny, and interpret are machine/LLM payload formats: they
             // emit every scanned file — `--show` gates only the terminal view.
             if matches!(
                 config.format(),
                 OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
-            ) || r.bloom_mark.is_some()
+            ) || r
+                .bloom_mark
+                .is_some_and(crate::output::BloomMark::forces_terminal_display)
                 || config.filter().shows(&r.classification)
             {
                 if let Some(p) = progress {
@@ -2554,6 +2838,12 @@ fn record_file_result(
             }
         }
         Err(e) => {
+            if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                // Ctrl-C makes in-flight cleave work return cancellation errors
+                // on every worker. Cancellation is expected control flow, not a
+                // failed file; keep it out of both the log and the error tally.
+                return;
+            }
             let msg = crate::tools::enrich_error(&e).unwrap_or_else(|| format!("{e:#}"));
             tracing::error!("error analyzing {}: {}", file_path.display(), msg);
             // A failed file still gets a line on stdout under `--format json`, so a
@@ -3231,7 +3521,7 @@ pub fn run_paths(
             cleave::kill_all_rizin_groups();
             std::process::exit(130);
         }
-        eprintln!("\nInterrupted — finishing current file…");
+        crate::engine::print_above_bar(|| eprintln!("\nInterrupted — finishing current file…"));
         ctrlc_flag.store(true, Ordering::Relaxed);
     });
 
@@ -3269,7 +3559,7 @@ pub fn run_paths(
 
     let total = u32::try_from(files.len() + dir_files.len()).unwrap_or(u32::MAX);
     let progress = (is_terminal && total > 1).then(|| {
-        crate::output::print_banner(detection_rule_count(config));
+        crate::output::print_banner(detection_counts(config));
         Progress::new(total)
     });
 
@@ -3378,21 +3668,28 @@ fn emit_result(
             }
             let _ = out.write_all(b"\n");
         }
-        // The terminal view's full render (litmus badge + cleave header/body)
-        // was built in `classify_report`; write it verbatim.
+        // The terminal result card was built in `classify_report`; write it
+        // verbatim, then flush before the stderr footer.
         OutputFormat::Terminal => {
             let _ = show_progress;
             let Ok(mut out) = stdout.lock() else {
                 return;
             };
             let _ = out.write_all(r.rendered_context.as_bytes());
+            if !r.rendered_context.ends_with('\n') {
+                let _ = out.write_all(b"\n");
+            }
             // `--extra`: append the full ML diagnostics that explain the grade —
             // which route drove it and the top SHAP features behind it. The
-            // terminal view's cleave body only shows static findings; route
-            // scores + reasons are computed but were previously dropped here.
+            // compact trait grid only shows static findings; route scores +
+            // reasons are computed but otherwise omitted here.
             if config.extra() {
                 write_extra_diagnostics(&mut *out, r);
             }
+            // The closing summary is written to stderr. Commit this whole card
+            // first so stdio buffering cannot strand its final trait beneath the
+            // footer (especially visible for a single-file scan).
+            let _ = out.flush();
         }
         // `--format tiny` prefixes the machine verdict line, never colored.
         OutputFormat::Tiny => {
@@ -3411,11 +3708,8 @@ fn emit_result(
     }
 }
 
-/// The cleave context density litmus renders at. `--format tiny` uses cleave's
-/// full tiny (machine/LLM). The terminal view is cut from cleave's own terminal
-/// render — same rich header and body — but focused: at most 5 traits per file,
-/// and once anything suspicious+ fired, only those traits and the component
-/// legs their composites reference. litmus adds a verdict badge + subtitle.
+/// Cleave context density for machine/LLM output. The primary terminal artifact
+/// and its fetched appendix use Scan's own global three-trait cards.
 pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
     if matches!(
         config.format(),
@@ -3424,20 +3718,16 @@ pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
         cleave::output::TinyOpts::tiny()
     } else {
         cleave::output::TinyOpts {
-            // The five most important traits, full stop: `always_crit: None`
-            // means even hostile findings compete for the cap (ranked by
-            // crit × conf), rather than bypassing it.
+            // Keep five findings per file in machine-facing compact output.
             top_n: 5,
             always_crit: None,
             // Focus on suspicious+ (plus their composite legs) whenever any
             // fired; a merged capture window renders only selected rows, and a
             // suspicious+ hit keeps one trailing row/line of context — the
-            // continuation tends to carry the payoff. Unremarkable files fall
-            // back to their notable top-5.
+            // continuation tends to carry the payoff. Unremarkable dependency
+            // files fall back to their notable top-five.
             focus_crit: Some(cleave::Criticality::Suspicious),
-            // Card layout: litmus prints the artifact header (verdict rule,
-            // 📦 name, ✨ interpretation, 🧬 hash); cleave renders only the
-            // headerless body with `📄` member headers and gutterless rows.
+            // Card layout keeps the compact render headerless.
             card: true,
             // Only the hit lines/rows — no surrounding context, no `⋯` gap
             // markers, no padding rows in the hex view.
@@ -3550,10 +3840,255 @@ pub(crate) fn format_llm_line(llm: &crate::interpret::Interpretation, color: boo
     )
 }
 
+fn terminal_safe_text(text: &str) -> String {
+    crate::deptree::strip_ansi(text)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn terminal_identity_tokens(text: &str) -> Vec<String> {
+    let mut normalized = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            normalized.extend(ch.to_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+    normalized.split_whitespace().map(str::to_owned).collect()
+}
+
+fn terminal_label_contains_identity(label: &str, identity: &str) -> bool {
+    let label = Path::new(label)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(label);
+    let label = terminal_identity_tokens(label);
+    let identity = terminal_identity_tokens(identity);
+    !identity.is_empty()
+        && label
+            .windows(identity.len())
+            .any(|candidate| candidate == identity.as_slice())
+}
+
+fn terminal_identity_summary(report: &cleave::AnalysisReport, label: &str) -> Option<String> {
+    let identity = report.files.first()?.identity.as_ref()?;
+    let (what, title) = if let Some(claim) = &identity.title {
+        (claim.value.clone(), true)
+    } else if let Some(claim) = &identity.name {
+        let mut name = claim.value.clone();
+        if let Some(version) = &identity.version {
+            name.push(' ');
+            name.push_str(&version.value);
+        }
+        (name, false)
+    } else if let Some(claim) = &identity.identifier {
+        (claim.value.clone(), false)
+    } else {
+        return None;
+    };
+    let what = terminal_safe_text(&what);
+    if what.is_empty() {
+        return None;
+    }
+
+    let detail = identity
+        .organization
+        .as_ref()
+        .map(|c| c.value.as_str())
+        .or_else(|| identity.producer.as_ref().map(|c| c.value.as_str()))
+        .map(terminal_safe_text)
+        .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case(&what));
+
+    // A package name/version already spelled by its filename contributes
+    // nothing. Compare semantic tokens so archive punctuation and suffixes do
+    // not defeat the check (`nordpass 1.0.2` == `nordpass-1.0.2.tgz`). A
+    // document title or identity carrying producer information still earns the
+    // line because it adds a useful claim about the artifact.
+    if !title && detail.is_none() && terminal_label_contains_identity(label, &what) {
+        return None;
+    }
+
+    let what = if title { format!("“{what}”") } else { what };
+    Some(detail.map_or(what.clone(), |d| format!("{what} · {d}")))
+}
+
+fn terminal_finding_path(path: &str) -> String {
+    if let Some(decoded) = decoded_region_display_path(path) {
+        return decoded;
+    }
+    let path = collapse_decoded_dup(path);
+    let leaf = path.rsplit(ARCHIVE_DELIMITER).next().unwrap_or(&path);
+    let name = leaf.rsplit('/').next().unwrap_or(leaf);
+    terminal_safe_text(name)
+}
+
+fn terminal_note_anchor(file: &cleave::FileAnalysis, finding_id: &str) -> Option<String> {
+    for line in &file.context {
+        let Some(note) = line.notes.iter().find(|n| n.id.as_str() == finding_id) else {
+            continue;
+        };
+        if let Some(base_line) = line.line {
+            let relative = note.off.saturating_sub(line.loc);
+            let upto = usize::try_from(relative)
+                .unwrap_or(usize::MAX)
+                .min(line.data.len());
+            let added = line.data[..upto].iter().filter(|&&b| b == b'\n').count();
+            let added = u64::try_from(added).unwrap_or(u64::MAX);
+            return Some(format!(":{}", base_line.saturating_add(added)));
+        }
+        // Byte offsets are precise but add little triage value in the compact
+        // trait grid. Keep source lines when available; otherwise the filename
+        // is the useful anchor.
+        return None;
+    }
+    None
+}
+
+fn terminal_finding_location(
+    report: &cleave::AnalysisReport,
+    file: &cleave::FileAnalysis,
+    finding: &cleave::Finding,
+) -> String {
+    let by_id: std::collections::HashMap<u32, &cleave::FileAnalysis> =
+        report.files.iter().map(|f| (f.id, f)).collect();
+    let primary_id = report.files.first().map(|f| f.id);
+    if let Some(source) = file
+        .composite_sources
+        .get(finding.id.as_str())
+        .and_then(|sources| {
+            sources
+                .iter()
+                .find(|s| s.line.is_some() || s.offset.is_some())
+                .or_else(|| sources.first())
+        })
+        && let Some(source_file) = by_id.get(&source.file)
+    {
+        if Some(source_file.id) == primary_id {
+            return source
+                .line
+                .map_or_else(String::new, |line| format!("line {line}"));
+        }
+        let mut location = terminal_finding_path(&source_file.path);
+        if let Some(line) = source.line {
+            location.push_str(&format!(":{line}"));
+        }
+        return location;
+    }
+
+    if Some(file.id) == primary_id {
+        return terminal_note_anchor(file, finding.id.as_str())
+            .map_or_else(String::new, |anchor| {
+                format!("line {}", anchor.trim_start_matches(':'))
+            });
+    }
+
+    let mut location = terminal_finding_path(&file.path);
+    if let Some(anchor) = terminal_note_anchor(file, finding.id.as_str()) {
+        location.push_str(&anchor);
+    }
+    location
+}
+
+fn terminal_top_traits(report: &cleave::AnalysisReport) -> Vec<crate::output::TerminalTrait> {
+    let mut deepest: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for file in &report.files {
+        for finding in file.findings.iter().filter(|f| f.src.is_none()) {
+            deepest
+                .entry(finding.id.as_str())
+                .and_modify(|depth| *depth = (*depth).max(file.depth))
+                .or_insert(file.depth);
+        }
+    }
+
+    let mut ranked: Vec<(&cleave::FileAnalysis, &cleave::Finding)> = report
+        .files
+        .iter()
+        .flat_map(|file| {
+            let deepest = &deepest;
+            file.findings.iter().filter_map(move |finding| {
+                (finding.src.is_none()
+                    && finding.crit >= cleave::Criticality::Notable
+                    && deepest
+                        .get(finding.id.as_str())
+                        .is_none_or(|depth| *depth == file.depth))
+                .then_some((file, finding))
+            })
+        })
+        .collect();
+    // Prefer conclusions made at the artifact's shallower layers: a CHM-level
+    // dropper conclusion summarizes its embedded HTML primitive, for example.
+    // Confidence resolves peers at the same layer. Within one severity, take one
+    // conclusion from each behavioral family before spending another row on a
+    // close sibling. A weaker tier never displaces an available stronger one.
+    ranked.sort_by(|(file_a, a), (file_b, b)| {
+        b.crit
+            .rank()
+            .cmp(&a.crit.rank())
+            .then_with(|| file_a.depth.cmp(&file_b.depth))
+            .then_with(|| b.conf.total_cmp(&a.conf))
+    });
+
+    let mut selected = Vec::with_capacity(3);
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_families = std::collections::HashSet::new();
+    for criticality in [
+        cleave::Criticality::Hostile,
+        cleave::Criticality::Suspicious,
+        cleave::Criticality::Notable,
+    ] {
+        for diversify in [true, false] {
+            for &(file, finding) in &ranked {
+                if finding.crit != criticality {
+                    continue;
+                }
+                let full_id = finding.id.as_str();
+                let base_id = full_id.split_once("::").map_or(full_id, |(base, _)| base);
+                if seen_ids.contains(base_id) {
+                    continue;
+                }
+                let family = trait_family(full_id);
+                if diversify && seen_families.contains(family) {
+                    continue;
+                }
+                let description = if finding.desc.is_empty() {
+                    base_id
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(base_id)
+                        .replace('-', " ")
+                } else {
+                    terminal_safe_text(finding.desc.as_str())
+                };
+                if description.is_empty() {
+                    continue;
+                }
+                seen_ids.insert(base_id);
+                seen_families.insert(family);
+                selected.push(crate::output::TerminalTrait {
+                    criticality: finding.crit,
+                    description,
+                    location: terminal_finding_location(report, file, finding),
+                });
+                // A hostile conclusion is sufficient for triage. Additional
+                // rows at the same or weaker severity only repeat support for
+                // a verdict the first row already makes unambiguously.
+                if criticality == cleave::Criticality::Hostile || selected.len() == 3 {
+                    return selected;
+                }
+            }
+        }
+    }
+    selected
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_terminal_context(
     report: &cleave::AnalysisReport,
-    tiny_opts: &cleave::output::TinyOpts,
     decision: &Decision,
     reasons: &[Reason],
     interpretation: Option<&crate::interpret::Interpretation>,
@@ -3562,10 +4097,10 @@ fn render_terminal_context(
     bloom_mark: Option<crate::output::BloomMark>,
     member_evals: &MemberEvals,
 ) -> String {
-    // The card frame, top-down: verdict rule → what (📦 name · TYPE · size) →
-    // why (✨ interpretation, --llm only) → identity (🧬/🚩 hash), a blank
-    // line, then cleave's headerless body (📄 member blocks). Plain (piped)
-    // output keeps the same information as unframed grep-able lines.
+    // The card frame, top-down: verdict rule → artifact → optional claimed
+    // identity → SHA-256 → optional model reason → the three
+    // strongest traits across the whole artifact. Plain (piped) output keeps the
+    // same information as unframed grep-able lines.
     let root = report.files.first();
     let file_type = root.map(|f| f.file_type.as_str()).unwrap_or_default();
     let size = root.map_or(0, |f| f.size);
@@ -3578,7 +4113,6 @@ fn render_terminal_context(
     if is_container
         && let Some(cards) = render_archive_cards(
             report,
-            tiny_opts,
             decision,
             interpretation,
             sha256,
@@ -3622,27 +4156,29 @@ fn render_terminal_context(
         is_container,
     ));
     head.push('\n');
-    if let Some(interp) = crate::output::terminal_interpretation(interpretation, 1) {
-        head.push_str(&interp);
-        head.push('\n');
-    } else if let Some(trailer) = crate::output::terminal_trailer(reasons) {
-        // Without an LLM the SHAP reasons take the "why" slot, dim.
-        head.push(' ');
-        head.push_str(&trailer);
+    if let Some(identity) = terminal_identity_summary(report, label)
+        .as_deref()
+        .and_then(crate::output::terminal_identity_line)
+    {
+        head.push_str(&identity);
         head.push('\n');
     }
     if let Some(hash) = crate::output::terminal_hash_line(sha256, bloom_mark) {
         head.push_str(&hash);
         head.push('\n');
     }
-
-    let body = cleave::output::format_context_badged(
-        report,
-        tiny_opts,
-        cleave::output::HeaderBadge::default(),
-    );
-    if !body.trim().is_empty() {
+    if let Some(interp) = crate::output::terminal_interpretation(interpretation, 1) {
+        head.push_str(&interp);
         head.push('\n');
+    } else if let Some(trailer) = crate::output::terminal_trailer(reasons) {
+        // Without an LLM, keep the model's compact explanation in the same slot.
+        head.push_str(&trailer);
+        head.push('\n');
+    }
+
+    let traits = terminal_top_traits(report);
+    let body = crate::output::terminal_trait_rows(&traits, cleave::output::terminal_width());
+    if !body.trim().is_empty() {
         head.push_str(&body);
     }
     // Flush ending: the next card (or the footer) supplies the separator.
@@ -3697,7 +4233,6 @@ fn top_package_id(file: &cleave::FileAnalysis, roots: &[(u32, &str)]) -> Option<
 #[allow(clippy::too_many_arguments)]
 fn render_archive_cards(
     report: &cleave::AnalysisReport,
-    tiny_opts: &cleave::output::TinyOpts,
     decision: &Decision,
     interpretation: Option<&crate::interpret::Interpretation>,
     sha256: &str,
@@ -3760,15 +4295,6 @@ fn render_archive_cards(
 
     // Banner tally over every package; the cards below spell out only the
     // suspicious+ ones.
-    let (mut hostile, mut suspicious, mut clean) = (0, 0, 0);
-    for pkg in &packages {
-        match pkg.decision.class {
-            Classification::Hostile => hostile += 1,
-            Classification::Suspicious => suspicious += 1,
-            Classification::Benign => clean += 1,
-        }
-    }
-
     // Worst first, so the reader meets the most dangerous package immediately.
     packages.sort_by(|a, b| {
         if decision_outranks(&a.decision, &b.decision) {
@@ -3829,7 +4355,7 @@ fn render_archive_cards(
     let file_type = root.map(|f| f.file_type.as_str()).unwrap_or_default();
     let size = root.map_or(0, |f| f.size);
 
-    // ── Banner: verdict rule → 📦 name · TYPE · size → inside tally → hash ──
+    // ── Banner: verdict rule → 📦 name · TYPE · size → hash ──
     let mut out = String::from("\n");
     if color {
         out.push_str(&crate::output::terminal_rule(
@@ -3854,126 +4380,69 @@ fn render_archive_cards(
         label, file_type, size, true,
     ));
     out.push('\n');
-    if let Some(interp) = crate::output::terminal_interpretation(interpretation, 1) {
-        out.push_str(&interp);
-        out.push('\n');
-    }
-    let inside = crate::output::terminal_inside_summary(hostile, suspicious, clean);
-    if !inside.is_empty() {
-        out.push_str(&inside);
+    if let Some(identity) = terminal_identity_summary(report, label)
+        .as_deref()
+        .and_then(crate::output::terminal_identity_line)
+    {
+        out.push_str(&identity);
         out.push('\n');
     }
     if let Some(hash) = crate::output::terminal_hash_line(sha256, bloom_mark) {
         out.push_str(&hash);
         out.push('\n');
     }
+    if let Some(interp) = crate::output::terminal_interpretation(interpretation, 1) {
+        out.push_str(&interp);
+        out.push('\n');
+    }
 
-    // ── One card per notable package, worst first ──
-    let render_card = |pkg: &Package| -> String {
+    // Decoded regions are children of the named artifact, not sibling packages.
+    // Give them a compact branch tree; real archive members retain the stronger
+    // package cards used for grab-bag archives.
+    let embedded_tree = notable.iter().all(|pkg| {
+        by_id
+            .get(&pkg.id)
+            .is_some_and(|file| decoded_region_display_path(&file.path).is_some())
+    });
+
+    // ── One independently notable child, worst first ──
+    let render_child = |pkg: &Package, last: bool| -> String {
         let file = by_id.get(&pkg.id);
         let name = file.map_or_else(String::new, |f| package_display_path(&f.path));
         let ptype = file.map(|f| f.file_type.as_str()).unwrap_or_default();
         let psize = file.map_or(0, |f| f.size);
         let member_ids: std::collections::HashSet<u32> = pkg.members.iter().copied().collect();
 
-        // Curate the members shown: a card is a triage summary, not a dump. Keep
-        // the highest-scoring files (score already weights by criticality) plus
-        // the package container and any member a composite trail points at (so
-        // `↳` legs still resolve), and collapse the quiet remainder to a count —
-        // one busy package (a wheel of dozens of modules) must not dominate.
-        const CARD_FILES: usize = 6;
-        let group: Vec<&cleave::FileAnalysis> = report
-            .files
-            .iter()
-            .filter(|f| member_ids.contains(&f.id))
-            .collect();
-        let trail_refs: std::collections::HashSet<u32> = group
-            .iter()
-            .flat_map(|f| f.composite_sources.values().flatten())
-            .map(|s| s.file)
-            .collect();
-        let mut ranked: Vec<&cleave::FileAnalysis> = group
-            .iter()
-            .copied()
-            .filter(|f| !f.findings.is_empty())
-            .collect();
-        ranked.sort_by_key(|f| std::cmp::Reverse(f.score));
-        let mut keep: std::collections::HashSet<u32> =
-            ranked.iter().take(CARD_FILES).map(|f| f.id).collect();
-        keep.insert(pkg.id);
-        keep.extend(&trail_refs);
-        let hidden = ranked.iter().filter(|f| !keep.contains(&f.id)).count();
-
+        // Rank over every member in the package, then spend exactly three rows
+        // on its strongest distinct traits. A large package reads like one
+        // artifact instead of a transcript of its member traversal.
         let mut view = report.clone();
-        view.files.retain(|f| keep.contains(&f.id));
+        view.files.retain(|f| member_ids.contains(&f.id));
         for f in &mut view.files {
             f.path = collapse_decoded_dup(&f.path);
         }
-        let mut body = cleave::output::format_context_badged(
-            &view,
-            tiny_opts,
-            cleave::output::HeaderBadge::default(),
+        let traits = terminal_top_traits(&view);
+        let rows = crate::output::terminal_trait_rows(
+            &traits,
+            cleave::output::terminal_width().saturating_sub(2),
         );
-        // Note the members we didn't spell out, so the card is honest about being
-        // a summary rather than silently dropping files. Exactly one blank line
-        // sets it off — trim any trailing blanks cleave left first so the spacing
-        // is uniform across cards.
-        if hidden > 0 {
-            while body.ends_with('\n') {
-                body.pop();
-            }
-            let plural = if hidden == 1 { "file" } else { "files" };
-            let count = thousands(hidden);
-            if color {
-                let _ = std::fmt::Write::write_fmt(
-                    &mut body,
-                    format_args!("\n\n \x1b[38;2;110;110;110m+{count} quieter {plural}\x1b[0m"),
-                );
-            } else {
-                body.push_str(&format!("\n\n +{count} quieter {plural}"));
-            }
+        if embedded_tree {
+            crate::output::terminal_embedded_branch(
+                &pkg.decision.class,
+                &name,
+                ptype,
+                psize,
+                &rows,
+                last,
+            )
+        } else {
+            crate::output::terminal_card(&pkg.decision.class, &name, ptype, psize, &rows)
         }
-        // Three cleanups so the card shows *context*, not bookkeeping:
-        //  - drop the package's own `📄 <name>` member line (the card header names
-        //    it; its findings still render beneath),
-        //  - drop composite `↳ file, file, …` trails — a card names the package
-        //    once, and the contributing members render their own code context
-        //    below (they are force-kept in the view), so the file list is noise,
-        //  - strip the package path prefix from member lines, so a card headed
-        //    `vexium-kit-10.0.2.tgz` shows `package/index.js`, not the full path.
-        let self_header = format!("{name} \u{00b7}");
-        let body: String = body
-            .lines()
-            .filter(|line| {
-                let visible = crate::deptree::strip_ansi(line);
-                let trimmed = visible.trim_start();
-                let self_ref = trimmed.starts_with('\u{1f4c4}') && visible.contains(&self_header);
-                let trail = trimmed.starts_with('\u{21b3}');
-                !self_ref && !trail
-            })
-            .map(|line| {
-                if name.is_empty() {
-                    line.to_string()
-                } else {
-                    line.replace(&format!("{name}/"), "")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        // No separate summary line: the card leads with cleave's top finding,
-        // which already states the package's worst behavior — a `why` here only
-        // duplicated or contradicted it.
-        crate::output::terminal_card(
-            &pkg.decision.class,
-            &name,
-            ptype,
-            psize,
-            body.trim_end_matches('\n'),
-        )
     };
 
-    // The archive's own card leads when it earned one — its own hostility is the
-    // headline, the packages it carried are the detail.
+    // The root's own conclusion belongs directly beneath the root metadata in a
+    // decoded tree. A second card repeating the root filename would imply a
+    // sibling object where none exists.
     if archive_card && let Some((rid, root)) = root_id.zip(report.files.first()) {
         // The archive's own findings, and the member files their cross-package
         // trails point at — the members must stay in the view so those `↳` legs
@@ -3996,40 +4465,36 @@ fn render_archive_cards(
         if let Some(v) = view.files.iter_mut().find(|f| f.id == rid) {
             v.findings.retain(|f| own.contains(f.id.as_str()));
         }
-        // Keep only the root's block: its findings render first, before any
-        // member's `📄` header (the members are present only to resolve trails).
-        let full = cleave::output::format_context_badged(
-            &view,
-            tiny_opts,
-            cleave::output::HeaderBadge::default(),
+        let traits = terminal_top_traits(&view);
+        let rows = crate::output::terminal_trait_rows(
+            &traits,
+            cleave::output::terminal_width().saturating_sub(2),
         );
-        let body: String = full
-            .lines()
-            .take_while(|line| {
-                !crate::deptree::strip_ansi(line)
-                    .trim_start()
-                    .starts_with('\u{1f4c4}')
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !body.trim().is_empty() {
-            out.push('\n');
-            out.push_str(&crate::output::terminal_card(
-                &decision.class,
-                label,
-                file_type,
-                size,
-                body.trim_end_matches('\n'),
-            ));
+        if !rows.trim().is_empty() {
+            if embedded_tree {
+                out.push_str(&rows);
+                out.push('\n');
+            } else {
+                out.push('\n');
+                out.push_str(&crate::output::terminal_card(
+                    &decision.class,
+                    label,
+                    file_type,
+                    size,
+                    &rows,
+                ));
+            }
         }
     }
 
-    for pkg in &notable {
-        out.push('\n');
-        out.push_str(&render_card(pkg));
+    for (index, pkg) in notable.iter().enumerate() {
+        if !embedded_tree {
+            out.push('\n');
+        }
+        out.push_str(&render_child(pkg, index + 1 == notable.len()));
     }
 
-    // Note the quiet packages we didn't spell out, so the tally above is honest.
+    // Note quiet packages omitted from the detailed cards.
     let omitted = packages.len().saturating_sub(notable.len());
     if omitted > 0 {
         let plural = if omitted == 1 { "package" } else { "packages" };
@@ -4047,21 +4512,6 @@ fn render_archive_cards(
         out.pop();
     }
     Some(out)
-}
-
-/// Group a count into thousands with commas (`4467` → `4,467`), so a large
-/// "quieter files" tail reads as a number rather than a raw digit run.
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let len = digits.len();
-    let mut out = String::with_capacity(len + len / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 /// Collapse cleave's decoded-region path duplication for display. A region
@@ -4082,19 +4532,49 @@ fn collapse_decoded_dup(path: &str) -> String {
         return path.to_string();
     };
     if !seg.is_empty()
-        && rest
-            .strip_suffix(seg)
-            .is_some_and(|before| before.ends_with("!!"))
+        && (rest == seg
+            || rest
+                .strip_suffix(seg)
+                .is_some_and(|before| before.ends_with("!!")))
     {
         return format!("{rest}{tail}");
     }
     path.to_string()
 }
 
+/// Turn cleave's decoded-region suffix into a compact relationship label.
+/// The parent artifact already owns its filename in the summary, so a direct
+/// child reads `embedded base64 @ 11096`; a decoded archive member retains only
+/// the useful member leaf: `install.js · embedded unicode escape @ 20`.
+fn decoded_region_display_path(path: &str) -> Option<String> {
+    let path = collapse_decoded_dup(path);
+    let (parent, region) = path.rsplit_once("##")?;
+    let (encoding, offset) = region.rsplit_once('@')?;
+    if encoding.is_empty() || offset.is_empty() {
+        return None;
+    }
+    let encoding = terminal_safe_text(&encoding.replace('-', " "));
+    let offset = terminal_safe_text(offset);
+    if encoding.is_empty() || offset.is_empty() {
+        return None;
+    }
+    let decoded = format!("embedded {encoding} @ {offset}");
+    if parent.contains(ARCHIVE_DELIMITER) {
+        let member = terminal_finding_path(parent);
+        if !member.is_empty() {
+            return Some(format!("{member} \u{00b7} {decoded}"));
+        }
+    }
+    Some(decoded)
+}
+
 /// The path of a package relative to the root archive: everything after the
 /// first archive delimiter, deeper nesting shown as `/`. `demo.zip!!a.tgz` →
 /// `a.tgz`; a bare root path is returned as-is.
 fn package_display_path(path: &str) -> String {
+    if let Some(decoded) = decoded_region_display_path(path) {
+        return decoded;
+    }
     path.split_once("!!")
         .map_or_else(|| path.to_string(), |(_, m)| m.replace("!!", "/"))
 }
@@ -4136,7 +4616,7 @@ pub(crate) struct ClassifiedReport {
     pub(crate) report: cleave::types::CompactReport,
     /// Fetched dependencies to mirror into hopper as their own samples.
     pub(crate) dependency_results: Vec<DepResult>,
-    /// cleave's rendered context view (annotated hex/source block).
+    /// Pre-rendered terminal card or machine/LLM context payload.
     pub(crate) rendered_context: String,
     /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
     pub(crate) interpretation: Option<crate::interpret::Interpretation>,
@@ -4145,12 +4625,70 @@ pub(crate) struct ClassifiedReport {
     pub(crate) analysis_cached: bool,
 }
 
-/// crit-4 fraction gate for the trait floor's suspicious arm. A sparse, severe
-/// dropper (an npm install-hook beacon: the embedded package.json is ~0.15, its
-/// .tgz container ~0.08) clears it; a busy benign binary with a couple of
-/// incidental crit-4 findings among hundreds (bash/sh ~0.01) does not. Measured
-/// on a /usr/bin sample — see the trait-floor prevalence check.
-const TRAIT_FLOOR_CRIT4_FRACTION: f32 = 0.05;
+/// Confident crit-5 findings the hostile arm needs — the anchor the rest of the
+/// arm corroborates. One suffices *because* it is corroborated: real malware
+/// routinely carries a single hostile trait beside supporting crit-4s
+/// (`rex-powershell`, `openclaude`, and a rhadamanthys coinminer all have
+/// exactly one), and demanding two lost all three while fixing nothing the
+/// clauses below do not already catch.
+const TRAIT_FLOOR_HOSTILE_CRIT5: u32 = 1;
+
+/// Confident severe findings (crit-5 *or* crit-4) the hostile arm needs in
+/// total. Rejects the thin pair that family diversity alone admits: a
+/// ScreenConnect RMM signature plus `pe-large-without-material-section` is two
+/// findings in two families, but a generic PE-layout anomaly is not evidence of
+/// malice, and that pair was marking a stock `libwebp.dll` hostile.
+const TRAIT_FLOOR_HOSTILE_SEVERE: u32 = 3;
+
+/// Distinct trait families the hostile arm's severe findings must span.
+/// Counting alone treats one behavior described three ways as three independent
+/// witnesses: the static-keys false positive presented as
+/// `rust-inline-hook-hijack`, `rust-hook-byte-copy`, and
+/// `rust-mprotect-hook-patch` — three findings, one directory, overlapping
+/// regexes over the same two tokens. Corroboration has to come from somewhere
+/// else in the tree to be corroboration at all.
+///
+/// Two, not more: every false positive observed is a *single*-family cluster
+/// and is already rejected here, while three would discard `darkglitch`, a
+/// Python RAT whose three hostile traits span only `backdoor/rat` and
+/// `backdoor/tasking`.
+const TRAIT_FLOOR_HOSTILE_FAMILIES: usize = 2;
+
+/// Distinct trait families the suspicious arm's crit-4 findings must span.
+/// Subsumes a count — n families need n findings — so this is the arm's only
+/// threshold.
+///
+/// Set above [`TRAIT_FLOOR_HOSTILE_FAMILIES`] deliberately. The hostile arm has
+/// a confident crit-5 anchoring it; this arm has nothing but the breadth of its
+/// own evidence, so it has to be broader to make the same claim.
+const TRAIT_FLOOR_SUSPICIOUS_FAMILIES: usize = 3;
+
+/// Trait-hierarchy depth that defines a family: `objectives/evasion/process/hook`
+/// rather than the whole leaf path or a coarser `objectives/evasion/process`.
+///
+/// Measured against both failure modes. Three deep: the static-keys cluster
+/// collapses to one family (correct — it is one behavior spelled three ways),
+/// but so does `darkglitch`, a Python RAT whose three hostile traits are
+/// genuinely distinct capabilities under `command-and-control/backdoor`
+/// (`rat/multi` and `tasking/filesystem`) — it lost its verdict entirely. Four
+/// deep separates them, and on the bad/fallout corpora depths 4, 5, 6 and
+/// full-path all agree, so this is the shallowest depth that gives up nothing.
+const TRAIT_FLOOR_FAMILY_DEPTH: usize = 4;
+
+/// The family a finding belongs to: the first [`TRAIT_FLOOR_FAMILY_DEPTH`]
+/// segments of its hierarchy path. A trait id is `path::leaf`
+/// (`objectives/evasion/process/hook/inline::rust-inline-hook-hijack`); an id
+/// carrying no path, or a shorter one, is its own family rather than joining a
+/// catch-all bucket that would let unrelated traits corroborate each other.
+fn trait_family(id: &str) -> &str {
+    let path = id.split("::").next().unwrap_or(id);
+    path.match_indices('/')
+        .nth(TRAIT_FLOOR_FAMILY_DEPTH - 1)
+        // `cut` indexes an ASCII '/', so it is a char boundary by construction;
+        // `get` keeps that fact from resting on a panic.
+        .and_then(|(cut, _)| path.get(..cut))
+        .unwrap_or(path)
+}
 
 /// Minimum cleave confidence (`c`) for a finding to count toward the trait floor.
 /// Low-confidence high-crit findings are exactly the incidental ones that fire on
@@ -4160,16 +4698,25 @@ const TRAIT_FLOOR_CRIT4_FRACTION: f32 = 0.05;
 /// no /usr/bin benign trips the crit-5 arm.
 const TRAIT_FLOOR_MIN_CONFIDENCE: f32 = 0.76;
 
-/// Confidence-filtered crit-5/crit-4 tallies plus the file's total finding count.
-/// The crit tiers count only findings with `c >= TRAIT_FLOOR_MIN_CONFIDENCE`; the
-/// total is every finding (the fraction's denominator is the file's whole activity,
-/// not just its confident severe traits).
+/// Confidence-filtered crit-5/crit-4 tallies, with the trait families each tier
+/// drew from. Only findings scoring `>= TRAIT_FLOOR_MIN_CONFIDENCE` are counted
+/// at all, so an unscored or hedged trait contributes to neither arm.
 struct TraitFloorCounts {
     hostile: u32,
     suspicious: u32,
     hostile_confidence: f32,
     suspicious_confidence: f32,
-    total: u32,
+    /// Families across both severe tiers — the hostile arm's diversity test.
+    severe_families: std::collections::HashSet<String>,
+    /// Families among the crit-4s alone — the suspicious arm's.
+    suspicious_families: std::collections::HashSet<String>,
+}
+
+impl TraitFloorCounts {
+    /// Confident severe findings across both tiers.
+    const fn severe(&self) -> u32 {
+        self.hostile + self.suspicious
+    }
 }
 
 fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCounts {
@@ -4178,22 +4725,26 @@ fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCou
         suspicious: 0,
         hostile_confidence: 0.0,
         suspicious_confidence: 0.0,
-        total: 0,
+        severe_families: std::collections::HashSet::new(),
+        suspicious_families: std::collections::HashSet::new(),
     };
     for f in findings {
-        out.total += 1;
         let conf = f.confidence;
         if conf < TRAIT_FLOOR_MIN_CONFIDENCE {
             continue;
         }
+        let family = trait_family(&f.id);
         match f.criticality {
             5 => {
                 out.hostile += 1;
                 out.hostile_confidence = out.hostile_confidence.max(conf);
+                out.severe_families.insert(family.to_string());
             }
             4 => {
                 out.suspicious += 1;
                 out.suspicious_confidence = out.suspicious_confidence.max(conf);
+                out.severe_families.insert(family.to_string());
+                out.suspicious_families.insert(family.to_string());
             }
             _ => {}
         }
@@ -4203,14 +4754,20 @@ fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCou
 
 /// Trait floor: override a model-**Benign** verdict when cleave surfaced
 /// high-criticality evidence the model did not act on:
-///   - one or more hostile (crit-5) traits → **Hostile**
-///   - two or more suspicious (crit-4) traits whose fraction clears
-///     `TRAIT_FLOOR_CRIT4_FRACTION` → **Suspicious**
+///   - a hostile (crit-5) trait, corroborated by enough further severe findings
+///     to reach [`TRAIT_FLOOR_HOSTILE_SEVERE`] across
+///     [`TRAIT_FLOOR_HOSTILE_FAMILIES`] trait families → **Hostile**
+///   - suspicious (crit-4) traits spanning
+///     [`TRAIT_FLOOR_SUSPICIOUS_FAMILIES`] families → **Suspicious**
 ///
-/// Only confident findings count (`c >= TRAIT_FLOOR_MIN_CONFIDENCE`); the crit-4
-/// fraction's denominator is the file's *total* finding count, so a sparse, severe
-/// dropper clears it while a busy benign binary with a couple of incidental
-/// crit-4s does not.
+/// Both arms count only confident findings (`c >= TRAIT_FLOOR_MIN_CONFIDENCE`),
+/// and both measure evidence by the families it comes from, so one behavior
+/// spelled several ways cannot corroborate itself.
+///
+/// This is a backstop for model misses, not a second opinion: it fires only on
+/// a model-Benign verdict, and every threshold above is deliberately set where
+/// a lone mislabeled trait — or a cluster of near-duplicate ones — cannot reach
+/// it alone.
 ///
 /// Never lowers a model verdict. Override levels are pinned to the same band
 /// boundaries used by ordinary and interpreted verdicts, so a level-only
@@ -4226,7 +4783,10 @@ fn apply_trait_floor(
         return;
     }
     let counts = trait_floor_counts(findings);
-    if counts.hostile >= 1 {
+    if counts.hostile >= TRAIT_FLOOR_HOSTILE_CRIT5
+        && counts.severe() >= TRAIT_FLOOR_HOSTILE_SEVERE
+        && counts.severe_families.len() >= TRAIT_FLOOR_HOSTILE_FAMILIES
+    {
         decision.class = Classification::Hostile;
         decision.probability = counts.hostile_confidence;
         decision.level = interpreted_level(active_level, grid_max, Classification::Hostile);
@@ -4238,31 +4798,26 @@ fn apply_trait_floor(
             path = %label,
             arm = "crit5",
             confident_hostile = counts.hostile,
+            confident_severe = counts.severe(),
+            families = counts.severe_families.len(),
             trait_confidence = format!("{:.3}", counts.hostile_confidence),
             level = ?decision.level,
-            "TRAIT FLOOR: model said benign but cleave found a confident hostile trait — escalated to hostile",
+            "TRAIT FLOOR: model said benign but cleave found corroborated hostile traits — escalated to hostile",
         );
         return;
     }
-    if counts.suspicious >= 2
-        && counts.total > 0
-        && counts.suspicious as f32 / counts.total as f32 >= TRAIT_FLOOR_CRIT4_FRACTION
-    {
+    if counts.suspicious_families.len() >= TRAIT_FLOOR_SUSPICIOUS_FAMILIES {
         decision.class = Classification::Suspicious;
         decision.probability = counts.suspicious_confidence;
         decision.level = interpreted_level(active_level, grid_max, Classification::Suspicious);
         tracing::info!(
             path = %label,
-            arm = "crit4_fraction",
+            arm = "crit4",
             confident_suspicious = counts.suspicious,
-            total_findings = counts.total,
-            crit4_fraction = format!(
-                "{:.3}",
-                counts.suspicious as f32 / counts.total as f32
-            ),
+            families = counts.suspicious_families.len(),
             trait_confidence = format!("{:.3}", counts.suspicious_confidence),
             level = ?decision.level,
-            "TRAIT FLOOR: model said benign but cleave found a sparse cluster of confident suspicious traits — escalated to suspicious",
+            "TRAIT FLOOR: model said benign but cleave found corroborated suspicious traits — escalated to suspicious",
         );
     }
 }
@@ -4844,7 +5399,6 @@ pub(crate) fn classify_report(
         });
         let mut rendered = render_terminal_context(
             &primary,
-            tiny_opts,
             &final_decision,
             &reasons,
             interpretation.as_ref(),
@@ -4858,7 +5412,6 @@ pub(crate) fn classify_report(
             &dependency_results,
             &dependency_registries,
             &report,
-            tiny_opts,
         ) {
             rendered.push_str(&fetched);
         }
@@ -5552,6 +6105,114 @@ fn render_registry_provenance(
     serde_json::Value::Object(out)
 }
 
+/// Trim a rendered provenance block down to what the grader actually reads.
+///
+/// The full block runs 5–9 KB per subject — on a small package that is ~74% of
+/// the whole render — and almost all of it is `raw`: provider response bodies
+/// and version history the LLM never uses to grade. What it does use is the
+/// package's *claimed identity* (does the observed behavior have a plausible
+/// role in what this package says it is for?) and the handful of signals that
+/// say whether that claim is worth anything.
+///
+/// `page` is recomputed from `first_published_at`/`published_at` against scan
+/// time rather than read from the record's own `age_days`. An offline
+/// `--registry-map` sidecar freezes `age_days` at *collection* time, and a
+/// corpus collected within days of publication carries `0` for everything —
+/// which would tell the grader that every long-established package is brand
+/// new, exactly inverting the signal. `downloads_recent` is likewise dropped
+/// when zero rather than reported as zero, since the sidecar path leaves it
+/// unset rather than measured.
+fn slim_provenance_for_interpret(
+    mut provenance: serde_json::Value,
+    now_secs: i64,
+) -> serde_json::Value {
+    let Some(registry) = provenance.get_mut("registry").and_then(|r| r.as_object_mut()) else {
+        return provenance;
+    };
+    registry.remove("raw");
+    if let Some(record) = registry.get("record") {
+        let slim = project_registry_record(record, now_secs);
+        registry.insert("record".to_string(), slim);
+    }
+    provenance
+}
+
+/// Identity plus the three credibility signals the prompt's coherence test names.
+///
+/// Reads the record through its serialized keys rather than the `fletch::Registry`
+/// struct: these are the wire names every consumer of the envelope already sees,
+/// and ecosystems populate different subsets of them (a gem record carries
+/// downloads but no release count; a pypi record carries both).
+fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_json::Value {
+    let get_str = |key: &str| {
+        record
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let get_i64 = |key: &str| record.get(key).and_then(serde_json::Value::as_i64);
+    let truncate = |s: &str, max: usize| {
+        if s.chars().count() <= max {
+            s.to_string()
+        } else {
+            let head: String = s.chars().take(max).collect();
+            format!("{head}…")
+        }
+    };
+
+    let mut out = serde_json::Map::new();
+    if let Some(name) = get_str("name") {
+        let eco = get_str("ecosystem").unwrap_or("");
+        let version = get_str("version").unwrap_or("");
+        let mut id = String::new();
+        if !eco.is_empty() {
+            id.push_str(eco);
+            id.push('/');
+        }
+        id.push_str(name);
+        if !version.is_empty() {
+            id.push('@');
+            id.push_str(version);
+        }
+        out.insert("n".to_string(), serde_json::json!(id));
+    }
+    if let Some(description) = get_str("description") {
+        out.insert("d".to_string(), serde_json::json!(truncate(description, 200)));
+    }
+    if let Some(author) = get_str("publisher").or_else(|| get_str("author")) {
+        out.insert("a".to_string(), serde_json::json!(truncate(author, 60)));
+    }
+    if let Some(url) = get_str("repository").or_else(|| get_str("homepage")) {
+        out.insert("u".to_string(), serde_json::json!(url));
+    }
+    // Age at scan time, from the earliest publication the record knows about.
+    if let Some(first) = get_i64("first_published_at").or_else(|| get_i64("published_at"))
+        && now_secs > first
+    {
+        out.insert("page".to_string(), serde_json::json!((now_secs - first) / 86_400));
+    }
+    if let Some(releases) = get_i64("release_count") {
+        out.insert("rel".to_string(), serde_json::json!(releases));
+    }
+    if let Some(downloads) = get_i64("downloads_total")
+        .or_else(|| get_i64("downloads_recent"))
+        .filter(|d| *d > 0)
+    {
+        out.insert("dl".to_string(), serde_json::json!(downloads));
+    }
+    if let Some(vulns) = get_i64("vulnerability_count").filter(|v| *v > 0) {
+        out.insert("v".to_string(), serde_json::json!(vulns));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Seconds since the Unix epoch, or `0` when the clock is before it.
+fn scan_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 fn remove_empty_json(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(obj) => {
@@ -5746,7 +6407,6 @@ fn render_terminal_fetch_context(
     deps: &[DepResult],
     registries: &[crate::fetch::DependencyRegistry],
     report: &cleave::AnalysisReport,
-    opts: &cleave::output::TinyOpts,
 ) -> Option<String> {
     use std::fmt::Write as _;
 
@@ -5759,9 +6419,14 @@ fn render_terminal_fetch_context(
         .collect();
     let mut visited_roots = std::collections::HashSet::new();
     let mut shown_registry_ids = std::collections::HashSet::new();
-    let mut candidate_count = 0_usize;
-    let mut shown_count = 0_usize;
     let mut out = String::new();
+    struct FetchBranch {
+        verdict: Option<(Classification, f32)>,
+        subject: String,
+        source: String,
+        body: String,
+    }
+    let mut branches = Vec::new();
 
     for rec in fetch_edges.iter().filter(|r| r.content_sha256.is_some()) {
         let content_sha = rec.content_sha256.as_deref().unwrap_or_default();
@@ -5775,7 +6440,6 @@ fn render_terminal_fetch_context(
         if !visited_roots.insert(root.id) {
             continue;
         }
-        candidate_count += 1;
         let graded = deps.iter().find(|d| d.sha256 == content_sha);
         let registry = registries.iter().find(|r| r.locator == rec.locator);
         let member_ids: std::collections::HashSet<u32> = fetched_root_by_file
@@ -5798,44 +6462,75 @@ fn render_terminal_fetch_context(
         if !hostile_finding && !hostile_verdict {
             continue;
         }
-        shown_count += 1;
 
         let subject = if rec.kind == fletch::RefKind::Dependency {
             "dependency"
         } else {
-            "URL fetch"
+            "external URL"
         };
-        match graded.and_then(|d| d.verdict) {
-            Some(verdict) => {
-                let class = verdict.class.to_string().to_ascii_lowercase();
-                let _ = writeln!(
-                    out,
-                    "\n  ↳ {:.0}% {} · {class} {subject}",
-                    verdict.probability * 100.0,
-                    rec.locator
-                );
-            }
-            None => {
-                let _ = writeln!(out, "\n  ↳ {} · {subject} · not evaluated", rec.locator);
-            }
-        }
-        write_terminal_fetch_provenance(&mut out, rec, report);
+        let verdict = graded
+            .and_then(|d| d.verdict)
+            .map(|verdict| (verdict.class, verdict.probability));
+        let source = terminal_fetch_source(rec, report);
+        let mut body = String::new();
+        let _ = writeln!(
+            body,
+            "{}",
+            crate::output::terminal_reference_locator_row(&rec.locator)
+        );
+        write_terminal_fetch_redirects(&mut body, rec);
+        let _ = writeln!(
+            body,
+            "{}",
+            crate::output::terminal_reference_hash_row(content_sha, &root.file_type, root.size,)
+        );
         let mut signals = Vec::new();
         if rec.pin_verified == Some(false) {
             signals.push("checksum mismatch");
         }
         if let Some(registry) = registry {
-            write_terminal_registry_provenance(&mut out, registry, &mut signals);
+            write_terminal_registry_provenance(&mut body, registry, &mut signals, true);
             shown_registry_ids.insert(registry.file_id);
         } else if !signals.is_empty() {
-            let _ = writeln!(out, "      signals    {}", signals.join(" · "));
+            let _ = writeln!(body, " \u{00b7}   signals  {}", signals.join(" · "));
         }
 
         let mut view = report.clone();
         view.files.retain(|file| {
             member_ids.contains(&file.id) || registry.is_some_and(|r| r.file_id == file.id)
         });
-        out.push_str(&cleave::output::format_context(&view, opts));
+        let traits = terminal_top_traits(&view);
+        let rows = crate::output::terminal_trait_rows(
+            &traits,
+            cleave::output::terminal_width().saturating_sub(3),
+        );
+        if !rows.is_empty() {
+            for row in rows.lines() {
+                let _ = writeln!(body, "{row}");
+            }
+        }
+        branches.push(FetchBranch {
+            verdict,
+            subject: subject.to_string(),
+            source,
+            body,
+        });
+    }
+
+    for (index, branch) in branches.iter().enumerate() {
+        if index == 0 {
+            out.push('\n');
+        }
+        out.push_str(&crate::output::terminal_reference_branch(
+            branch
+                .verdict
+                .as_ref()
+                .map(|(classification, probability)| (classification, *probability)),
+            &branch.subject,
+            &branch.source,
+            &branch.body,
+            index + 1 == branches.len(),
+        ));
     }
 
     for registry in registries {
@@ -5846,7 +6541,6 @@ fn render_terminal_fetch_context(
         {
             continue;
         }
-        candidate_count += 1;
         // A registry-only entry (no bytes fetched, so no verdict) is shown only
         // when the registry itself flags it hostile — a pulled version or a
         // security hold. "Older than fetch age limit" and other benign states are
@@ -5857,56 +6551,75 @@ fn render_terminal_fetch_context(
         if !hostile_signal {
             continue;
         }
-        shown_count += 1;
-        let status = registry.artifact_skip.unwrap_or("registry only");
-        let _ = writeln!(out, "\n  ↳ {} · {status}", registry.locator);
+        let status = registry
+            .artifact_skip
+            .unwrap_or("REGISTRY ONLY")
+            .to_uppercase();
+        let _ = writeln!(
+            out,
+            "\n{}",
+            crate::output::terminal_reference_status_heading(&status, "REGISTRY")
+        );
+        let _ = writeln!(
+            out,
+            "{}",
+            crate::output::terminal_reference_locator(&registry.locator)
+        );
         let mut signals = Vec::new();
-        write_terminal_registry_provenance(&mut out, registry, &mut signals);
+        write_terminal_registry_provenance(&mut out, registry, &mut signals, false);
         let mut view = report.clone();
         view.files.retain(|file| file.id == registry.file_id);
-        out.push_str(&cleave::output::format_context(&view, opts));
+        let traits = terminal_top_traits(&view);
+        let rows = crate::output::terminal_trait_rows(
+            &traits,
+            cleave::output::terminal_width().saturating_sub(3),
+        );
+        if !rows.is_empty() {
+            for row in rows.lines() {
+                let _ = writeln!(out, "   {row}");
+            }
+        }
     }
 
-    // Only footnote the omitted artifacts when something *was* shown — then the
-    // count is useful context ("and N quieter ones"). With nothing hostile to
-    // show, this line would be the entire fetch section: pure noise at the
-    // decision point, so it's dropped and the section stays silent.
-    let omitted = candidate_count.saturating_sub(shown_count);
-    if omitted > 0 && shown_count > 0 {
-        let _ = writeln!(out, "\n  {omitted} quieter fetched artifacts omitted");
-    }
+    // Nothing is footnoted for the artifacts that stayed quiet. Their count
+    // says nothing at the decision point — the streamed fetch summary already
+    // reports how many were retrieved — and a section that ends by naming what
+    // it declined to show reads as withheld evidence rather than a clean pass.
     (!out.is_empty()).then_some(out)
 }
 
-fn write_terminal_fetch_provenance(
-    out: &mut String,
+fn terminal_fetch_source(
     rec: &fletch::fetch::FetchRecord,
     report: &cleave::AnalysisReport,
-) {
-    use std::fmt::Write as _;
-
-    let source = report
+) -> String {
+    let source_file = report
         .files
         .iter()
-        .find(|file| file.sha256 == rec.source_sha256)
-        .map_or("<unknown>", |file| file.path.as_str());
-    let _ = write!(out, "      from       {source}");
-    if let Some(offset) = rec.source_offset {
-        let _ = write!(out, " @ byte {offset}");
-    }
-    out.push('\n');
+        .find(|file| file.sha256 == rec.source_sha256);
+    source_file.map_or_else(
+        || "<unknown>".to_string(),
+        |file| {
+            if file.depth == 0 {
+                "this file".to_string()
+            } else {
+                terminal_finding_path(&file.path)
+            }
+        },
+    )
+}
+
+fn write_terminal_fetch_redirects(out: &mut String, rec: &fletch::fetch::FetchRecord) {
+    use std::fmt::Write as _;
+
     if !rec.resolved_url.is_empty() && rec.resolved_url != rec.locator {
-        let _ = writeln!(out, "      resolved   {}", rec.resolved_url);
+        let _ = writeln!(out, " \u{00b7}   resolved  {}", rec.resolved_url);
     }
     if let Some(final_url) = rec
         .final_url
         .as_deref()
         .filter(|url| *url != rec.resolved_url && *url != rec.locator)
     {
-        let _ = writeln!(out, "      final      {final_url}");
-    }
-    if let Some(content_sha256) = &rec.content_sha256 {
-        let _ = writeln!(out, "      sha256     {content_sha256}");
+        let _ = writeln!(out, " \u{00b7}   final  {final_url}");
     }
 }
 
@@ -5914,10 +6627,12 @@ fn write_terminal_registry_provenance(
     out: &mut String,
     registry: &crate::fetch::DependencyRegistry,
     signals: &mut Vec<&'static str>,
+    marker_rows: bool,
 ) {
     use std::fmt::Write as _;
 
     let record = &registry.provenance.record;
+    let prefix = if marker_rows { " \u{00b7}   " } else { "    " };
     let mut summary = Vec::new();
     if let Some(age) = record.age_days {
         summary.push(format!("{age}d old"));
@@ -5934,7 +6649,7 @@ fn write_terminal_registry_provenance(
         summary.push(format!("{maintainers} {noun}"));
     }
     if !summary.is_empty() {
-        let _ = writeln!(out, "      registry   {}", summary.join(" · "));
+        let _ = writeln!(out, "{prefix}registry  {}", summary.join(" · "));
     }
     if record.version_removed == Some(true) {
         signals.push("version removed");
@@ -5952,16 +6667,16 @@ fn write_terminal_registry_provenance(
         signals.push("install script");
     }
     if let Some(deprecated) = record.deprecated.as_deref() {
-        let _ = writeln!(out, "      deprecated {deprecated}");
+        let _ = writeln!(out, "{prefix}deprecated  {deprecated}");
     }
     if !signals.is_empty() {
-        let _ = writeln!(out, "      signals    {}", signals.join(" · "));
+        let _ = writeln!(out, "{prefix}signals  {}", signals.join(" · "));
     }
     if let Some(repository) = record.repository.as_deref() {
-        let _ = writeln!(out, "      upstream   {repository}");
+        let _ = writeln!(out, "{prefix}upstream  {repository}");
     }
     for url in registry.provenance.source_urls() {
-        let _ = writeln!(out, "      metadata   {url}");
+        let _ = writeln!(out, "{prefix}metadata  {url}");
     }
 }
 
@@ -6154,6 +6869,163 @@ mod dep_subject_risk_tests {
 mod card_render_tests {
     use super::*;
 
+    fn terminal_report(value: serde_json::Value) -> cleave::AnalysisReport {
+        serde_json::from_value(value).expect("valid terminal report fixture")
+    }
+
+    #[test]
+    fn terminal_hostile_trait_stops_global_selection() {
+        let report = terminal_report(serde_json::json!({
+            "version": "3",
+            "files": [
+                {
+                    "id": 0, "path": "sample.zip", "depth": 0,
+                    "file_type": "zip", "sha256": "root", "size": 10,
+                    "findings": [
+                        {"id": "objectives/dropper::one", "desc": "Archive dropper", "conf": 0.99, "crit": "hostile"},
+                        {"id": "objectives/member::copy", "desc": "Inherited copy", "conf": 1.0, "crit": "hostile", "src": 1}
+                    ],
+                    "composite_sources": {
+                        "objectives/dropper::one": [{"file": 1, "line": 42}]
+                    }
+                },
+                {
+                    "id": 1, "path": "sample.zip!!nested/agent.py", "depth": 1,
+                    "file_type": "python", "sha256": "member", "size": 8,
+                    "findings": [
+                        {"id": "objectives/member::copy", "desc": "Remote terminal agent", "conf": 0.98, "crit": "hostile"},
+                        {"id": "micro-behaviors/evasion::one", "desc": "Hides execution", "conf": 0.9, "crit": "suspicious"},
+                        {"id": "metadata/package::one", "desc": "Routine package metadata", "conf": 1.0, "crit": "notable"}
+                    ]
+                }
+            ]
+        }));
+
+        let traits = terminal_top_traits(&report);
+        assert_eq!(traits.len(), 1);
+        assert_eq!(traits[0].description, "Archive dropper");
+        assert_eq!(traits[0].location, "agent.py:42");
+        assert!(traits.iter().all(|t| t.description != "Inherited copy"));
+    }
+
+    #[test]
+    fn terminal_non_hostile_traits_still_fill_three_rows() {
+        let report = terminal_report(serde_json::json!({
+            "version": "3",
+            "files": [{
+                "id": 0, "path": "sample.bin", "depth": 0,
+                "file_type": "binary", "sha256": "root", "size": 10,
+                "findings": [
+                    {"id": "capabilities/network::one", "desc": "Contacts remote host", "conf": 0.99, "crit": "suspicious"},
+                    {"id": "evasion/packing::one", "desc": "Packed executable", "conf": 0.98, "crit": "suspicious"},
+                    {"id": "metadata/identity::one", "desc": "Unsigned identity", "conf": 0.97, "crit": "notable"},
+                    {"id": "metadata/toolchain::one", "desc": "Compiler metadata", "conf": 0.96, "crit": "notable"}
+                ]
+            }]
+        }));
+
+        let traits = terminal_top_traits(&report);
+        assert_eq!(traits.len(), 3);
+        assert_eq!(traits[0].description, "Contacts remote host");
+        assert_eq!(traits[1].description, "Packed executable");
+        assert_eq!(traits[2].description, "Unsigned identity");
+    }
+
+    #[test]
+    fn terminal_trait_location_omits_byte_offset() {
+        let report = terminal_report(serde_json::json!({
+            "version": "3",
+            "files": [
+                {
+                    "id": 0, "path": "sample.zip", "depth": 0,
+                    "file_type": "zip", "sha256": "root", "size": 10,
+                    "findings": [
+                        {"id": "evasion/packing::one", "desc": "Packed executable", "conf": 0.99, "crit": "suspicious"}
+                    ],
+                    "composite_sources": {
+                        "evasion/packing::one": [{"file": 1, "offset": 1114110}]
+                    }
+                },
+                {
+                    "id": 1, "path": "sample.zip!!payload.exe", "depth": 1,
+                    "file_type": "pe", "sha256": "member", "size": 8
+                }
+            ]
+        }));
+
+        let traits = terminal_top_traits(&report);
+        assert_eq!(traits.len(), 1);
+        assert_eq!(traits[0].location, "payload.exe");
+        assert!(!traits[0].location.contains("@0x"));
+    }
+
+    #[test]
+    fn terminal_identity_prefers_a_document_title() {
+        let report = terminal_report(serde_json::json!({
+            "version": "3",
+            "files": [{
+                "id": 0, "path": "invoice.docx", "depth": 0,
+                "file_type": "docx", "sha256": "root", "size": 10,
+                "identity": {
+                    "title": {"value": "Quarterly Results", "source": "office.title", "verified": false},
+                    "producer": {"value": "Microsoft Word", "source": "office.app", "verified": false},
+                    "trust": "unsigned"
+                }
+            }]
+        }));
+        assert_eq!(
+            terminal_identity_summary(&report, "invoice.docx").as_deref(),
+            Some("“Quarterly Results” · Microsoft Word")
+        );
+    }
+
+    #[test]
+    fn terminal_identity_hides_name_and_version_already_in_filename() {
+        for (label, name, version) in [
+            ("nordpass-1.0.2.tgz", "nordpass", "1.0.2"),
+            (
+                "/tmp/atomscan-2.5.0-aarch64-apple-darwin.tar.gz",
+                "atomscan",
+                "2.5.0-aarch64-apple-darwin",
+            ),
+        ] {
+            let report = terminal_report(serde_json::json!({
+                "version": "3",
+                "files": [{
+                    "id": 0, "path": label, "depth": 0,
+                    "file_type": "archive", "sha256": "root", "size": 10,
+                    "identity": {
+                        "name": {"value": name, "source": "package.name", "verified": false},
+                        "version": {"value": version, "source": "package.version", "verified": false},
+                        "trust": "unsigned"
+                    }
+                }]
+            }));
+            assert_eq!(terminal_identity_summary(&report, label), None);
+        }
+    }
+
+    #[test]
+    fn terminal_identity_keeps_additional_producer_information() {
+        let report = terminal_report(serde_json::json!({
+            "version": "3",
+            "files": [{
+                "id": 0, "path": "agent-1.2.3.tgz", "depth": 0,
+                "file_type": "npm", "sha256": "root", "size": 10,
+                "identity": {
+                    "name": {"value": "agent", "source": "package.name", "verified": false},
+                    "version": {"value": "1.2.3", "source": "package.version", "verified": false},
+                    "producer": {"value": "Example Labs", "source": "package.author", "verified": false},
+                    "trust": "unsigned"
+                }
+            }]
+        }));
+        assert_eq!(
+            terminal_identity_summary(&report, "agent-1.2.3.tgz").as_deref(),
+            Some("agent 1.2.3 · Example Labs")
+        );
+    }
+
     #[test]
     fn collapse_decoded_dup_drops_the_repeated_member() {
         // A decoded region: the member repeats around the archive delimiter.
@@ -6170,6 +7042,28 @@ mod card_render_tests {
             collapse_decoded_dup("root!!pkg!!a/b.js##base64@0"),
             "root!!pkg!!a/b.js##base64@0"
         );
+        // A decoder may repeat the root itself around the delimiter.
+        assert_eq!(
+            collapse_decoded_dup("root.sh!!root.sh##base64@1"),
+            "root.sh##base64@1"
+        );
+    }
+
+    #[test]
+    fn decoded_regions_use_relationship_labels() {
+        assert_eq!(
+            decoded_region_display_path("/tmp/sample.sh##base64@11096").as_deref(),
+            Some("embedded base64 @ 11096")
+        );
+        assert_eq!(
+            decoded_region_display_path("root.zip!!scripts/install.js##unicode-escape@20")
+                .as_deref(),
+            Some("install.js \u{00b7} embedded unicode escape @ 20")
+        );
+        assert_eq!(
+            package_display_path("/tmp/sample.sh##base64@21"),
+            "embedded base64 @ 21"
+        );
     }
 
     #[test]
@@ -6180,6 +7074,19 @@ mod card_render_tests {
         assert!(tail.starts_with('\u{2026}'));
         assert!(tail.ends_with("file.json"));
         assert_eq!(tail.chars().count(), 20);
+    }
+
+    #[test]
+    fn external_fetch_note_stays_compact_and_grammatical() {
+        assert_eq!(external_fetch_note(0, 0), None);
+        assert_eq!(
+            external_fetch_note(1, 1).as_deref(),
+            Some("fetching 1 dependency · 1 URL")
+        );
+        assert_eq!(
+            external_fetch_note(0, 2).as_deref(),
+            Some("fetching 2 URLs")
+        );
     }
 }
 
@@ -7109,25 +8016,28 @@ mod dep_backref_tests {
             "sparse records must omit nulls: {ctx}"
         );
 
-        let terminal = render_terminal_fetch_context(
-            &edges,
-            &deps,
-            &registries,
-            &report,
-            &cleave::output::TinyOpts::terminal(),
-        )
-        .expect("hostile dependency is shown");
-        let provenance = terminal.find("      from       root.tgz").unwrap();
+        let terminal = render_terminal_fetch_context(&edges, &deps, &registries, &report)
+            .expect("hostile dependency is shown");
+        let terminal = crate::deptree::strip_ansi(&terminal);
+        let provenance = terminal.find("dependency from this file").unwrap();
         let finding = terminal.find("dependency package finding").unwrap();
         assert!(provenance < finding);
+        assert!(
+            terminal.contains(
+                "\n   └─ dependency from this file · HOSTILE 97%\n      🔗  pkg:test/dep@1"
+            )
+        );
+        assert!(terminal.contains("\n      ●●● dependency package finding"));
+        assert!(!terminal.contains("\n\n    ●●●"));
         assert_eq!(terminal.matches("pkg:test/dep@1").count(), 1);
         assert!(
             terminal.contains(&"d".repeat(64)),
             "hash must stay complete"
         );
+        assert!(!terminal.contains("📄"));
         assert!(!terminal.contains("transfer"));
         assert!(!terminal.contains("cache:"));
-        assert!(terminal.contains("metadata   https://registry.example/dep"));
+        assert!(terminal.contains("metadata  https://registry.example/dep"));
     }
 
     #[test]
@@ -7257,16 +8167,17 @@ mod dep_backref_tests {
             ..cleave::FileAnalysis::default()
         }];
         let mut out = String::new();
-        write_terminal_fetch_provenance(&mut out, &rec, &report);
-        assert!(out.contains("from       dropper.sh @ byte 42"));
-        assert!(out.contains(&format!("sha256     {sha}")));
+        assert_eq!(terminal_fetch_source(&rec, &report), "this file");
+        write_terminal_fetch_redirects(&mut out, &rec);
+        assert!(!out.contains("byte 42"));
+        assert!(!out.contains(&sha));
         assert!(!out.contains("resolved"));
         assert!(!out.contains("final"));
 
         rec.final_url = Some("https://cdn.example.test/stage.sh".to_string());
         out.clear();
-        write_terminal_fetch_provenance(&mut out, &rec, &report);
-        assert!(out.contains("final      https://cdn.example.test/stage.sh"));
+        write_terminal_fetch_redirects(&mut out, &rec);
+        assert!(out.contains("final  https://cdn.example.test/stage.sh"));
     }
 }
 

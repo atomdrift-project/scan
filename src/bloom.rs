@@ -30,9 +30,29 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-/// On-disk layout version. Bump on any change to the header or bit-derivation
-/// scheme; readers reject a filter whose version they do not understand.
-pub const FORMAT_VERSION: u16 = 1;
+/// On-disk layout version this build *writes*. Bump on any change to the header
+/// or bit-derivation scheme; readers reject a filter whose version they do not
+/// understand (see [`SUPPORTED_VERSIONS`]).
+///
+/// v2 added the `sighted-hostile` / `sighted-suspicious` tiers. The header
+/// layout and bit derivation are byte-identical to v1 — only [`Tier`]'s
+/// vocabulary grew — which is what lets one build read both and lets a v1
+/// bundle be published from the same key sets.
+pub const FORMAT_VERSION: u16 = 2;
+
+/// Layout versions this build can *read*, newest first.
+///
+/// Distinct from [`FORMAT_VERSION`] on purpose. Refusing to load an
+/// unrecognized layout is the fail-closed rule that keeps a future format from
+/// being silently reinterpreted, and that rule is unchanged: anything outside
+/// this list is still [`LoadError::UnsupportedVersion`]. What changed is that
+/// "recognized" is now a set rather than a single value, because v1 and v2
+/// differ only in which tier bytes may appear — a v1 filter is a v2 filter that
+/// happens to use none of the new ones, so reading it is not reinterpretation.
+///
+/// This is what lets a scan on v2 keep working against a bucket that has not
+/// been dual-published yet, and against the v1 prefix during a rollback.
+pub const SUPPORTED_VERSIONS: &[u16] = &[2, 1];
 
 /// Magic bytes identifying an Atomdrift bloom file (`"ADBL"`).
 const MAGIC: [u8; 4] = *b"ADBL";
@@ -54,6 +74,13 @@ pub enum Kind {
 }
 
 /// The trust tier a filter encodes.
+///
+/// `Bad` and the two `Sighted` tiers differ by PROVENANCE, not by strength: bad
+/// means an engine of ours measured it hostile, sighted means somebody outside
+/// says so. That is the same line beamline's API draws with `engine_version`,
+/// and the reason hopper namespaces `intel/` trait ids apart from the
+/// analyzer's own taxonomy. Keeping them apart is what lets a consumer say
+/// "cited by threat intelligence" without claiming we found anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     /// Affirmatively blessed; a hit is skip-eligible.
@@ -62,6 +89,16 @@ pub enum Tier {
     Bad,
     /// Provisionally clean (the scanner found nothing); a hint, not a skip.
     UnknownClean,
+    /// Outside claims reaching hopper's hostile floor: two or more independent
+    /// operators, or a lone operator whose report a person adjudicated
+    /// (`Confidence >= Strong`, `Floor() <= CriticalLevel`). Vetoes a good hit
+    /// exactly as `Bad` does.
+    SightedHostile,
+    /// Outside claims that stop short of the hostile floor: a lone operator
+    /// that hosts the artifact or merely predicts it (`Moderate`/`Weak`,
+    /// `Floor()` of 50/100). A hint — it does NOT veto a good hit, because one
+    /// corpus listing is a flag rather than a verdict.
+    SightedSuspicious,
 }
 
 impl Kind {
@@ -94,11 +131,16 @@ impl Kind {
 }
 
 impl Tier {
+    // Wire values are permanent: they are the `tier` header byte, and a build
+    // that reassigned one would silently load an old filter into the wrong
+    // slot. Append only.
     const fn to_u8(self) -> u8 {
         match self {
             Self::Good => 1,
             Self::Bad => 2,
             Self::UnknownClean => 3,
+            Self::SightedHostile => 4,
+            Self::SightedSuspicious => 5,
         }
     }
 
@@ -107,6 +149,8 @@ impl Tier {
             1 => Some(Self::Good),
             2 => Some(Self::Bad),
             3 => Some(Self::UnknownClean),
+            4 => Some(Self::SightedHostile),
+            5 => Some(Self::SightedSuspicious),
             _ => None,
         }
     }
@@ -118,6 +162,18 @@ impl Tier {
             Self::Good => "good",
             Self::Bad => "bad",
             Self::UnknownClean => "unknown-clean",
+            Self::SightedHostile => "sighted-hostile",
+            Self::SightedSuspicious => "sighted-suspicious",
+        }
+    }
+
+    /// The lowest format version that can carry this tier. A bundle published
+    /// at an older version must omit filters above its own.
+    #[must_use]
+    pub const fn min_format_version(self) -> u16 {
+        match self {
+            Self::Good | Self::Bad | Self::UnknownClean => 1,
+            Self::SightedHostile | Self::SightedSuspicious => 2,
         }
     }
 }
@@ -159,6 +215,10 @@ impl std::error::Error for LoadError {}
 pub struct Filter {
     kind: Kind,
     tier: Tier,
+    /// Layout version to stamp on write, and the one this filter was read
+    /// under. Carried rather than taken from [`FORMAT_VERSION`] so one build
+    /// can emit a v1 bundle for older clients from the same key sets.
+    version: u16,
     k: u32,
     /// Number of bits; always a power of two so indexing is a mask, not a `%`.
     m_bits: u64,
@@ -194,6 +254,29 @@ impl Filter {
     #[must_use]
     pub fn artifact_stem(&self) -> String {
         format!("{}-{}", self.kind.as_str(), self.tier.as_str())
+    }
+
+    /// The layout version this filter will be written as.
+    #[must_use]
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Re-stamp for an older bundle, or `None` when this filter's tier did not
+    /// exist at that version.
+    ///
+    /// Returning `None` rather than silently downgrading is the whole point: a
+    /// `sighted-*` filter has no v1 meaning, and writing one into a v1 bundle
+    /// would hand a client that cannot grade it a file it must reject — which
+    /// aborts its entire update, not just that file. The caller decides what to
+    /// do with the tiers that do not fit (fold, or drop).
+    #[must_use]
+    pub fn stamped_as(mut self, version: u16) -> Option<Self> {
+        if version < self.tier.min_format_version() || !SUPPORTED_VERSIONS.contains(&version) {
+            return None;
+        }
+        self.version = version;
+        Some(self)
     }
 
     /// True when no elements were inserted.
@@ -234,7 +317,7 @@ impl Filter {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + self.bits.len());
         out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
         out.push(self.kind.to_u8());
         out.push(self.tier.to_u8());
         out.extend_from_slice(&self.k.to_le_bytes());
@@ -258,11 +341,18 @@ impl Filter {
             return Err(LoadError::BadMagic);
         }
         let version = u16::from_le_bytes([buf[4], buf[5]]);
-        if version != FORMAT_VERSION {
+        if !SUPPORTED_VERSIONS.contains(&version) {
             return Err(LoadError::UnsupportedVersion(version));
         }
         let kind = Kind::from_u8(buf[6]).ok_or(LoadError::Corrupt("kind"))?;
         let tier = Tier::from_u8(buf[7]).ok_or(LoadError::Corrupt("tier"))?;
+        // A tier the declared version cannot carry means the file is
+        // mislabelled, not merely new: reject rather than guess which field to
+        // believe. Catches a v2 filter republished under the v1 prefix, which
+        // would otherwise reach a v1-only reader as a valid-looking `bad`.
+        if tier.min_format_version() > version {
+            return Err(LoadError::Corrupt("tier newer than declared version"));
+        }
         let k = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let m_bits = rd_u64(buf, 12);
         let n = rd_u64(buf, 20);
@@ -282,6 +372,7 @@ impl Filter {
         Ok(Self {
             kind,
             tier,
+            version,
             k,
             m_bits,
             n,
@@ -362,12 +453,14 @@ impl Builder {
         self.n += 1;
     }
 
-    /// Finalize into an immutable [`Filter`].
+    /// Finalize into an immutable [`Filter`], stamped with this build's
+    /// [`FORMAT_VERSION`]. Use [`Filter::stamped_as`] to emit an older bundle.
     #[must_use]
     pub fn build(self) -> Filter {
         Filter {
             kind: self.kind,
             tier: self.tier,
+            version: FORMAT_VERSION,
             k: self.k,
             m_bits: self.m_bits,
             n: self.n,
@@ -444,6 +537,16 @@ pub enum Label {
     Good,
     /// Catalogued bad (`bad` filters; also subtracted from good).
     Bad,
+    /// Outside claims at hopper's hostile floor (also subtracted from good).
+    SightedHostile,
+    /// Outside claims below it (also subtracted from good).
+    ///
+    /// Subtracting a claim this weak is deliberate. A bless means "skip the
+    /// full scan", and the bar for that is not "probably fine" but "nothing
+    /// anywhere has anything to say". A lone predicted claim is far too little
+    /// to convict on — which is why it gets its own tier rather than joining
+    /// `bad` — and still ample reason to spend the scan.
+    SightedSuspicious,
 }
 
 /// Streaming accumulator for a pool: keys are inserted one record at a time and
@@ -460,6 +563,10 @@ pub struct KeySets {
     bad_purl: HashSet<String>,
     good_sha: HashSet<[u8; 32]>,
     bad_sha: HashSet<[u8; 32]>,
+    sighted_hostile_purl: HashSet<String>,
+    sighted_hostile_sha: HashSet<[u8; 32]>,
+    sighted_suspicious_purl: HashSet<String>,
+    sighted_suspicious_sha: HashSet<[u8; 32]>,
 }
 
 impl KeySets {
@@ -474,6 +581,14 @@ impl KeySets {
         let (purls, shas) = match label {
             Label::Good => (&mut self.good_purl, &mut self.good_sha),
             Label::Bad => (&mut self.bad_purl, &mut self.bad_sha),
+            Label::SightedHostile => (
+                &mut self.sighted_hostile_purl,
+                &mut self.sighted_hostile_sha,
+            ),
+            Label::SightedSuspicious => (
+                &mut self.sighted_suspicious_purl,
+                &mut self.sighted_suspicious_sha,
+            ),
         };
         if let Some(key) = record.purl.and_then(|p| fletch::purl::identity(&p)) {
             purls.insert(key);
@@ -495,16 +610,38 @@ impl KeySets {
         (self.bad_purl.len(), self.bad_sha.len())
     }
 
-    /// Apply `good − bad` and build one self-describing [`Filter`] per
-    /// `(kind, tier)`. Subtracting bad from good drops a later-revoked sample
-    /// from the skip-eligible set on every rebuild. The caller writes each
-    /// filter to `<stem>.adbl` (see [`Filter::artifact_stem`]).
+    /// Apply `good − (every other tier)` and build one self-describing
+    /// [`Filter`] per `(kind, tier)`. The caller writes each filter to
+    /// `<stem>.adbl` (see [`Filter::artifact_stem`]).
+    ///
+    /// WORST POOL WINS. A key that any other tier claims is not blessed, and
+    /// the weakest claim is enough: a bless means "skip the full scan", so the
+    /// bar is not "probably fine" but "nothing anywhere has anything to say".
+    /// A lone predicted citation is far too little to convict on — which is why
+    /// `sighted-suspicious` is its own tier rather than part of `bad` — and
+    /// ample reason to spend the scan.
+    ///
+    /// This is the build-time half of the rule; [`crate::bloom_repo`] applies
+    /// the same ordering at query time. Both exist because they fail
+    /// differently: subtraction cannot help when the four files on disk were
+    /// built at different times, and the query-time rule cannot shrink a filter
+    /// that already carries a key it should not.
     #[must_use]
     pub fn into_filters(mut self, target_fp: f64) -> Vec<Filter> {
-        for k in &self.bad_purl {
+        for k in self
+            .bad_purl
+            .iter()
+            .chain(&self.sighted_hostile_purl)
+            .chain(&self.sighted_suspicious_purl)
+        {
             self.good_purl.remove(k);
         }
-        for k in &self.bad_sha {
+        for k in self
+            .bad_sha
+            .iter()
+            .chain(&self.sighted_hostile_sha)
+            .chain(&self.sighted_suspicious_sha)
+        {
             self.good_sha.remove(k);
         }
         vec![
@@ -512,7 +649,57 @@ impl KeySets {
             from_keys(Kind::Purl, Tier::Bad, &self.bad_purl, target_fp),
             from_digests(Kind::Sha256, Tier::Good, &self.good_sha, target_fp),
             from_digests(Kind::Sha256, Tier::Bad, &self.bad_sha, target_fp),
+            from_keys(
+                Kind::Purl,
+                Tier::SightedHostile,
+                &self.sighted_hostile_purl,
+                target_fp,
+            ),
+            from_digests(
+                Kind::Sha256,
+                Tier::SightedHostile,
+                &self.sighted_hostile_sha,
+                target_fp,
+            ),
+            from_keys(
+                Kind::Purl,
+                Tier::SightedSuspicious,
+                &self.sighted_suspicious_purl,
+                target_fp,
+            ),
+            from_digests(
+                Kind::Sha256,
+                Tier::SightedSuspicious,
+                &self.sighted_suspicious_sha,
+                target_fp,
+            ),
         ]
+    }
+
+    /// Build the bundle for an older format version, folding tiers that version
+    /// cannot carry into ones it can.
+    ///
+    /// v1 has no `sighted` vocabulary, so `sighted-hostile` merges into `bad` —
+    /// preserving v1's existing semantics, where a corroborated citation WAS a
+    /// bad key — and `sighted-suspicious` is dropped entirely. Dropping is the
+    /// deliberate half: a v1 client cannot tell a lone predicted claim from a
+    /// measured verdict, so folding one in would read as flatly bad.
+    ///
+    /// Returns the filters already stamped at `version`.
+    #[must_use]
+    pub fn into_filters_for(mut self, version: u16, target_fp: f64) -> Vec<Filter> {
+        if version < Tier::SightedHostile.min_format_version() {
+            self.bad_purl
+                .extend(std::mem::take(&mut self.sighted_hostile_purl));
+            self.bad_sha
+                .extend(std::mem::take(&mut self.sighted_hostile_sha));
+            self.sighted_suspicious_purl.clear();
+            self.sighted_suspicious_sha.clear();
+        }
+        self.into_filters(target_fp)
+            .into_iter()
+            .filter_map(|f| f.stamped_as(version))
+            .collect()
     }
 }
 
@@ -702,8 +889,133 @@ mod tests {
         .collect();
         assert_eq!(
             stems,
-            ["purl-good", "purl-bad", "sha256-good", "sha256-bad"]
+            [
+                "purl-good",
+                "purl-bad",
+                "sha256-good",
+                "sha256-bad",
+                "purl-sighted-hostile",
+                "sha256-sighted-hostile",
+                "purl-sighted-suspicious",
+                "sha256-sighted-suspicious",
+            ]
         );
+    }
+
+    /// A v1 bundle carries only the tiers v1 knows, and stamps v1 headers, so an
+    /// older client neither sees a file it must reject nor mistakes the bundle
+    /// for a current one.
+    #[test]
+    fn v1_projection_folds_sighted_and_drops_suspicious() {
+        let mut sets = KeySets::default();
+        let hostile = sha256(b"hostile");
+        let suspicious = sha256(b"suspicious");
+        sets.insert(
+            Label::SightedHostile,
+            Record {
+                purl: None,
+                sha256: Some(hostile),
+            },
+        );
+        sets.insert(
+            Label::SightedSuspicious,
+            Record {
+                purl: None,
+                sha256: Some(suspicious),
+            },
+        );
+
+        let v1 = sets.into_filters_for(1, 1e-6);
+        let stems: Vec<String> = v1.iter().map(Filter::artifact_stem).collect();
+        assert_eq!(
+            stems,
+            ["purl-good", "purl-bad", "sha256-good", "sha256-bad"],
+            "v1 must not carry a sighted tier"
+        );
+        assert!(v1.iter().all(|f| f.version() == 1));
+
+        let bad = v1
+            .iter()
+            .find(|f| f.artifact_stem() == "sha256-bad")
+            .expect("sha256-bad");
+        assert!(
+            bad.contains_digest(&hostile),
+            "sighted-hostile must fold into v1 bad, or v1 clients silently lose \
+             corroborated malware on cutover"
+        );
+        assert!(
+            !bad.contains_digest(&suspicious),
+            "sighted-suspicious must NOT reach v1 bad: a client that cannot grade \
+             a lone predicted claim would read it as flatly bad"
+        );
+    }
+
+    /// The same key sets at v2 keep the tiers apart.
+    #[test]
+    fn v2_projection_keeps_sighted_tiers_separate() {
+        let mut sets = KeySets::default();
+        let hostile = sha256(b"hostile");
+        sets.insert(
+            Label::SightedHostile,
+            Record {
+                purl: None,
+                sha256: Some(hostile),
+            },
+        );
+        let v2 = sets.into_filters_for(FORMAT_VERSION, 1e-6);
+        assert!(v2.iter().all(|f| f.version() == FORMAT_VERSION));
+        let bad = v2
+            .iter()
+            .find(|f| f.artifact_stem() == "sha256-bad")
+            .expect("sha256-bad");
+        assert!(!bad.contains_digest(&hostile), "v2 keeps provenance apart");
+        let sighted = v2
+            .iter()
+            .find(|f| f.artifact_stem() == "sha256-sighted-hostile")
+            .expect("sha256-sighted-hostile");
+        assert!(sighted.contains_digest(&hostile));
+    }
+
+    /// A bless must not survive a corroborated citation arriving for the same
+    /// key, even though hopper's pool already withholds one.
+    #[test]
+    fn sighted_hostile_subtracts_from_good() {
+        let mut sets = KeySets::default();
+        let d = sha256(b"both");
+        sets.insert(
+            Label::Good,
+            Record {
+                purl: None,
+                sha256: Some(d),
+            },
+        );
+        sets.insert(
+            Label::SightedHostile,
+            Record {
+                purl: None,
+                sha256: Some(d),
+            },
+        );
+        let out = sets.into_filters_for(FORMAT_VERSION, 1e-6);
+        let good = out
+            .iter()
+            .find(|f| f.artifact_stem() == "sha256-good")
+            .expect("sha256-good");
+        assert!(!good.contains_digest(&d));
+    }
+
+    /// A v2 filter republished under the v1 prefix must not read as a valid v1
+    /// file — the tier byte and the declared version have to agree.
+    #[test]
+    fn tier_newer_than_declared_version_is_rejected() {
+        let mut b = Builder::sized_for(Kind::Sha256, Tier::SightedHostile, 1, 1e-6, 0);
+        b.insert_digest(&sha256(b"x"));
+        let mut bytes = b.build().to_bytes();
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes()); // claim v1
+        assert!(matches!(
+            Filter::load(&bytes),
+            Err(LoadError::Corrupt("tier newer than declared version"))
+        ));
     }
 
     #[test]

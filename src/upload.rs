@@ -9,8 +9,8 @@
 //! stored cleave/litmus envelope (and an unknown SHA is a harmless no-op).
 //!
 //! Uploads run on a dedicated thread so blocking network I/O never stalls the
-//! analysis pool, and every failure degrades to a logged warning — a scan never
-//! fails because an upload did.
+//! analysis pool. Upload failures do not fail the scan, but they are surfaced as
+//! explicit errors so a successful local verdict cannot hide a lost renewal.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -408,8 +408,7 @@ enum Job {
 /// via [`Uploader::submit`] and flushed when the uploader is dropped.
 #[derive(Debug)]
 pub struct Uploader {
-    /// `None` once flushed, or when the uploader thread failed to spawn (uploads
-    /// then degrade to silent no-ops rather than failing the scan).
+    /// `None` once flushed, or when the uploader thread failed to spawn.
     tx: Option<std::sync::mpsc::SyncSender<Job>>,
     worker: Option<JoinHandle<()>>,
     /// Jobs accepted but not yet handled. A `SyncSender` cannot be asked its
@@ -449,8 +448,8 @@ pub struct UploadStats {
 
 impl Uploader {
     /// Start a background uploader targeting `hopper_url`, tagging every result
-    /// with `worker`. Spawn failure is non-fatal: the returned uploader silently
-    /// drops submissions so the scan still completes.
+    /// with `worker`. Spawn failure is non-fatal: the scan still completes, but
+    /// the failure is reported to stderr.
     #[must_use]
     pub fn new(hopper_url: &str, worker: String) -> Self {
         log_hopper_credential();
@@ -616,15 +615,26 @@ impl Uploader {
     }
 
     /// Queue a result for upload. Blocks briefly when the upload queue is full
-    /// (backpressure); a closed channel drops the result silently.
+    /// (backpressure); a closed channel drops the result after the uploader has
+    /// already reported its failure.
     pub fn submit(&self, sha256: String, purl: Option<String>, envelope: ScanResultEnvelope) {
         if let Some(tx) = &self.tx {
             self.pending.fetch_add(1, Ordering::Relaxed);
-            let _ = tx.send(Job::Result {
-                sha256,
-                purl,
-                envelope: Box::new(envelope),
-            });
+            let sha_for_log = sha256.clone();
+            if tx
+                .send(Job::Result {
+                    sha256,
+                    purl,
+                    envelope: Box::new(envelope),
+                })
+                .is_err()
+            {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+                tracing::error!(
+                    sha256 = %sha_for_log,
+                    "upload: uploader stopped before result could be sent to hopper"
+                );
+            }
         }
     }
 
@@ -1176,13 +1186,13 @@ fn post_upload_with_token(
                     && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
                     let body = resp.text().unwrap_or_default();
-                    tracing::warn!(
+                    tracing::error!(
                         sha256 = %sha256,
                         kind,
                         %status,
                         body = %body,
                         provenance = %crate::worker::body_excerpt(&String::from_utf8_lossy(provenance)),
-                        "upload: rejected by hopper; not retrying"
+                        "upload: hopper rejected artifact write; not retrying"
                     );
                     return false;
                 }
@@ -1193,7 +1203,7 @@ fn post_upload_with_token(
             }
         }
     }
-    tracing::warn!(sha256 = %sha256, kind, attempts = ATTEMPT_TIMEOUTS.len(), "upload: giving up after retries");
+    tracing::error!(sha256 = %sha256, kind, attempts = ATTEMPT_TIMEOUTS.len(), "upload: failed to write artifact to hopper; giving up after retries");
     false
 }
 
@@ -1312,7 +1322,8 @@ fn post_one(
                     && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
                     let body = resp.text().unwrap_or_default();
-                    tracing::warn!(sha256 = %sha256, purl, %status, body = %body, "upload: rejected by hopper; not retrying");
+                    tally.failed.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(sha256 = %sha256, purl, %status, body = %body, "upload: hopper rejected result; not retrying");
                     return;
                 }
                 // Hopper sends Retry-After when it sheds; it knows when its
@@ -1325,11 +1336,11 @@ fn post_one(
             }
         }
     }
-    tracing::warn!(
+    tracing::error!(
         sha256 = %sha256,
         purl,
         budget_s = RENEW_BUDGET.as_secs(),
-        "upload: hopper unreachable, giving up after the renewal budget",
+        "upload: failed to renew result on hopper; giving up after the renewal budget",
     );
     tally.failed.fetch_add(1, Ordering::Relaxed);
 }
@@ -1602,7 +1613,7 @@ mod tests {
         assert!(draws.iter().all(|d| (0.0..1.0).contains(d)), "out of range");
         let distinct = draws
             .iter()
-            .map(|d| (d * 1e9) as u64)
+            .map(|d| d.to_bits())
             .collect::<std::collections::HashSet<_>>();
         assert!(distinct.len() > 1, "fuzz returned a constant");
     }
