@@ -71,6 +71,53 @@ prompt and motivated it:
   reads as suspicious; dual-use hacktools (neutron, hcxdumptool) read as
   benign/suspicious; a decoy "FP-bait" binary reads as suspicious/hostile.
 
+## Removed: the archive-member escalation rule (2026-08-27)
+
+The prompt used to close its first paragraph with an absolute:
+
+> A malicious embedded archive member (a path nested under an archive, e.g.
+> `app.zip/evil.sh`) makes the whole sample hostile.
+
+It was removed. It duplicated — badly — a rule the engine already applies, and it
+only ever cost false positives:
+
+- **The engine's rule is the real one.** `worst_member` (`engine.rs`) reduces over
+  member `Decision`s with `decision_outranks` (class first, probability on ties)
+  and elevates the container to the worst of them, logging *"elevated archive
+  classification due to embedded file"*. That is a calibrated comparison of ML
+  decisions.
+- **The prompt could not do that.** The model sees only the rendered `# SEV`
+  annotations, never a member's decision, so "malicious member" degraded in
+  practice to "nested path carrying a finding" — a single `S` satisfied it.
+- **It could not add a true positive.** The elevation runs *before*
+  `interpret::interpret`, which is handed the already-elevated
+  `final_decision.{class,probability,level}`. A genuinely hostile member has
+  already moved the ML verdict by the time the LLM is asked.
+- **It outranked the hedge.** An unconditional "makes the whole sample hostile"
+  overrides the paragraph-2 instruction to verify each description against the
+  source, so the model stopped verifying and echoed the rule back as its reason.
+
+The failure that surfaced it: `github.com/bradfitz/latlong`, a Go module whose
+generated `z_gen_tables.go` embeds timezone tables as base64'd gzip. cleave
+decodes that region and renders it as a synthetic member,
+`z_gen_tables.go##base64@0xaaa`, with one `S` finding — and every package format
+(gem, whl, tgz, zip, conda) is an archive, so the "nested path" precondition is
+universally true in this corpus.
+
+Ablation, prompt otherwise unchanged (Qwen3.8-27B, `temperature 0`):
+
+| sample | rule kept | rule removed |
+|--------|-----------|--------------|
+| `latlong` (FP) | suspicious — *"Embedded base64 gzip payload"* | **benign** — *"legitimate Go library"* |
+| `pyarmor` (FP) | benign | benign |
+| `omniauth-ldap` (clean) | benign | benign |
+| `gitversion-5.1.4` (FP) | benign | benign |
+| `iamhungryrn` (**bad**) | suspicious | suspicious |
+| `darkglitch` (**bad**) | hostile — *"DarkGlitch RAT with C2 and file exfil"* | hostile — *identical reason* |
+
+No true positive moved; on `darkglitch` the reason came back byte-for-byte
+identical, so the rule was doing no work there at all.
+
 ## The adjustment algorithm (gate + blend)
 
 Beyond the prompt, these tuning points govern whether `--interpret` delivers the
