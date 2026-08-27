@@ -213,6 +213,19 @@ const ATTEMPT_TIMEOUTS: [Duration; 4] = [
     Duration::from_secs(120),
 ];
 
+/// Hopper's `maxUploadBytes` (`cmd/hopper/api.go`): artifact bytes above this
+/// are rejected outright. hopper's handler checks `Content-Length` before
+/// reading any body, but a client that starts streaming a 100+ MiB multipart
+/// body anyway loses the race to read hopper's 413 — the connection drops
+/// mid-write and reqwest surfaces it as "send failed because receiver is
+/// gone", indistinguishable from a real network fault. Checked client-side so
+/// an oversized dependency is skipped with one clear log line instead of
+/// spending 4 retries on a request that can never succeed (confirmed against
+/// hopper's `samples` table on 2026-08-27: every artifact over this size that
+/// scan attempted to upload landed with an empty `path` — the bytes never
+/// arrived — while everything under it landed clean).
+const HOPPER_MAX_UPLOAD_ARTIFACT_BYTES: u64 = 100 << 20;
+
 /// Hopper's ingestion lane header. A result renewed by `serve --hopper` is
 /// one-shot: the caller that asked for the scan is already holding the verdict
 /// in its own cache, so it will never ask again, and a renewal that does not
@@ -751,6 +764,25 @@ fn reconcile_artifacts(
             }
             continue;
         }
+        if art.size > HOPPER_MAX_UPLOAD_ARTIFACT_BYTES {
+            // hopper will reject this outright (`maxUploadBytes` in
+            // cmd/hopper/api.go) — and does so by dropping the connection
+            // mid-write rather than returning a clean 413, so attempting it
+            // would just spend the full retry budget on a guaranteed failure
+            // and log a misleading "receiver is gone". Skip the transfer, not
+            // the verdict: `sync_dependencies` still posts this dependency's
+            // result, so hopper ends up with the row the comment above
+            // describes (verdict, no bytes) — the same state a blob-cache
+            // eviction produces, and no worse than it.
+            tracing::warn!(
+                sha256 = %art.sha256,
+                file = %art.filename,
+                size = art.size,
+                limit = HOPPER_MAX_UPLOAD_ARTIFACT_BYTES,
+                "upload: artifact exceeds hopper's upload size cap; skipping bytes (verdict still posted)"
+            );
+            continue;
+        }
         let bytes = match &art.bytes {
             ArtifactBytes::File(path) => std::fs::read(path).ok(),
             // The blob cache is size-capped and swept on a timer, so a
@@ -1230,7 +1262,7 @@ fn upload_one(
         },
     );
     if ok {
-        tracing::debug!(sha256 = %art.sha256, file = %art.filename, size = art.size, "upload: artifact stored on hopper");
+        tracing::info!(sha256 = %art.sha256, file = %art.filename, size = art.size, "upload: artifact stored on hopper");
     }
 }
 
@@ -1252,7 +1284,7 @@ fn upload_provenance_only(
         || Some(Form::new().part("provenance", provenance_part(art)?)),
     );
     if ok {
-        tracing::debug!(sha256 = %art.sha256, file = %art.filename, "upload: provenance backfilled on hopper");
+        tracing::info!(sha256 = %art.sha256, file = %art.filename, "upload: provenance backfilled on hopper");
     }
 }
 
