@@ -586,25 +586,37 @@ mod trait_floor_tests {
     }
 
     #[test]
-    fn family_is_the_first_four_hierarchy_segments() {
+    fn family_is_the_first_two_hierarchy_segments() {
         assert_eq!(
             trait_family("objectives/evasion/process/hook/inline::rust-inline-hook-hijack"),
-            "objectives/evasion/process/hook"
+            "objectives/evasion"
         );
         // One behavior spelled several ways shares a family...
         assert_eq!(
             trait_family("objectives/evasion/process/hook/inline::rust-inline-hook-hijack"),
             trait_family("objectives/evasion/process/hook/inline::rust-hook-byte-copy"),
         );
-        // ...while genuinely distinct capabilities under one objective do not.
-        // This pair is `darkglitch`, which a shallower family wrongly collapsed.
-        assert_ne!(
-            trait_family("objectives/command-and-control/backdoor/rat/multi::a"),
-            trait_family("objectives/command-and-control/backdoor/tasking/filesystem::b"),
+        // ...and so does one behavior restated under sibling techniques, which
+        // is what a four-deep family missed: `ansible-core`'s base64
+        // decode-and-execute counted once per subdirectory it was spelled in,
+        // and three such counts cleared a diversity test meant to require three
+        // independent witnesses.
+        assert_eq!(
+            trait_family("objectives/anti-static/obfuscation/string/reconstruct::a"),
+            trait_family("objectives/anti-static/obfuscation/eval/scripting::b"),
         );
+        // Distinct objectives stay distinct.
         assert_ne!(
             trait_family("objectives/evasion/process/hook/inline::a"),
             trait_family("objectives/supply-chain/install-hook/npm::b"),
+        );
+        // The accepted cost: `darkglitch`'s two genuinely distinct backdoor
+        // capabilities now share a family, so a verdict resting on that pair
+        // alone no longer clears the diversity test. See
+        // [`TRAIT_FLOOR_FAMILY_DEPTH`].
+        assert_eq!(
+            trait_family("objectives/command-and-control/backdoor/rat/multi::a"),
+            trait_family("objectives/command-and-control/backdoor/tasking/filesystem::b"),
         );
         // A short or path-less id is its own family, never a shared bucket.
         assert_eq!(
@@ -671,15 +683,66 @@ mod trait_floor_tests {
     }
 
     #[test]
-    fn a_crit5_corroborated_across_families_escalates_to_hostile_band() {
+    fn two_crit5_corroborated_across_families_escalates_to_hostile_band() {
         let mut d = benign();
-        // One anchor plus two independent severe findings — `rex-powershell`.
-        let mut ts = spread(5, 0.98, 1);
-        ts.extend([finding("evasion", 4, 0.8), finding("execution", 4, 0.94)]);
+        // Two anchors plus a further severe finding.
+        let mut ts = spread(5, 0.98, 2);
+        ts.extend([finding("execution", 4, 0.94)]);
         apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
         assert_eq!(d.class, Classification::Hostile);
         assert_eq!(d.probability, 0.98);
         assert_eq!(d.level, Some(50));
+    }
+
+    #[test]
+    fn a_lone_crit5_beside_crit4s_no_longer_reaches_the_hostile_arm() {
+        // The `rex-powershell` shape, and the one `ansible-core` fired on: a
+        // single crit-5 anchor with two crit-4s beside it. An accepted
+        // regression — see [`TRAIT_FLOOR_HOSTILE_CRIT5`]. It does not go
+        // unremarked, only unblocked: the suspicious arm still has it.
+        let mut d = benign();
+        let mut ts = spread(5, 0.98, 1);
+        ts.extend([finding("evasion", 4, 0.8), finding("execution", 4, 0.94)]);
+        apply_trait_floor(&mut d, &ts, Some(50), 100, "test");
+        assert_ne!(d.class, Classification::Hostile);
+    }
+
+    #[test]
+    fn recognized_software_needs_one_more_anchor_before_the_hostile_arm() {
+        let evidence = || {
+            let mut ts = spread(5, 0.98, 2);
+            ts.extend([finding("execution", 4, 0.94)]);
+            ts
+        };
+        // Two anchors clear the arm for a sample cleave cannot name...
+        let mut unknown = benign();
+        apply_trait_floor(&mut unknown, &evidence(), Some(50), 100, "test");
+        assert_eq!(unknown.class, Classification::Hostile);
+
+        // ...and the same evidence does not, once it can. Blocking a named
+        // application on evidence this thin is what promoted `ansible-core`.
+        let mut known = benign();
+        let mut with_id = evidence();
+        with_id.push(cleave::types::CompactTrait {
+            id: "well-known/app/infrastructure/ansible::module-utils-path".to_string(),
+            criticality: 1,
+            confidence: 0.95,
+            ..cleave::types::CompactTrait::default()
+        });
+        apply_trait_floor(&mut known, &with_id, Some(50), 100, "test");
+        assert_ne!(known.class, Classification::Hostile);
+
+        // Recognizing a sample as *malware* is not recognition that holds back.
+        let mut named_malware = benign();
+        let mut with_malware_id = evidence();
+        with_malware_id.push(cleave::types::CompactTrait {
+            id: "well-known/malware/rat/darkglitch::tasking".to_string(),
+            criticality: 1,
+            confidence: 0.95,
+            ..cleave::types::CompactTrait::default()
+        });
+        apply_trait_floor(&mut named_malware, &with_malware_id, Some(50), 100, "test");
+        assert_eq!(named_malware.class, Classification::Hostile);
     }
 
     #[test]
@@ -4626,12 +4689,25 @@ pub(crate) struct ClassifiedReport {
 }
 
 /// Confident crit-5 findings the hostile arm needs — the anchor the rest of the
-/// arm corroborates. One suffices *because* it is corroborated: real malware
-/// routinely carries a single hostile trait beside supporting crit-4s
-/// (`rex-powershell`, `openclaude`, and a rhadamanthys coinminer all have
-/// exactly one), and demanding two lost all three while fixing nothing the
-/// clauses below do not already catch.
-const TRAIT_FLOOR_HOSTILE_CRIT5: u32 = 1;
+/// arm corroborates.
+///
+/// Was `1`, on the reasoning that one suffices *because* it is corroborated:
+/// real malware routinely carries a single hostile trait beside supporting
+/// crit-4s (`rex-powershell`, `openclaude`, and a rhadamanthys coinminer all
+/// have exactly one), and an earlier attempt at two lost all three.
+///
+/// Raised to `2` (2026-08-27) after the single-anchor arm was observed marking
+/// model-clean legitimate packages hostile on one trait that describes the
+/// package's own function: `ansible-core` on a PowerShell base64-exec trait —
+/// which is how its Windows connection plugin works — with `confident_hostile=1,
+/// severe=3, families=3`, and Cherry Studio (`v2.0.9.tar.gz`) at `1/4/4`. Both
+/// fired the arm at its exact minimum. A single crit-5 is one witness however
+/// many crit-4s sit beside it, and the crit-4s in both cases were describing the
+/// same legitimate behavior from other angles.
+///
+/// The named regressions above are the known cost; re-measure them alongside the
+/// gauntlet missed-sample pool before relaxing this again.
+const TRAIT_FLOOR_HOSTILE_CRIT5: u32 = 2;
 
 /// Confident severe findings (crit-5 *or* crit-4) the hostile arm needs in
 /// total. Rejects the thin pair that family diversity alone admits: a
@@ -4663,17 +4739,27 @@ const TRAIT_FLOOR_HOSTILE_FAMILIES: usize = 2;
 /// own evidence, so it has to be broader to make the same claim.
 const TRAIT_FLOOR_SUSPICIOUS_FAMILIES: usize = 3;
 
-/// Trait-hierarchy depth that defines a family: `objectives/evasion/process/hook`
-/// rather than the whole leaf path or a coarser `objectives/evasion/process`.
+/// Trait-hierarchy depth that defines a family: `objectives/anti-static` rather
+/// than a leaf path or the finer `objectives/anti-static/obfuscation/string`.
+/// One definition, used by both arms.
 ///
-/// Measured against both failure modes. Three deep: the static-keys cluster
-/// collapses to one family (correct — it is one behavior spelled three ways),
-/// but so does `darkglitch`, a Python RAT whose three hostile traits are
-/// genuinely distinct capabilities under `command-and-control/backdoor`
-/// (`rat/multi` and `tasking/filesystem`) — it lost its verdict entirely. Four
-/// deep separates them, and on the bad/fallout corpora depths 4, 5, 6 and
-/// full-path all agree, so this is the shallowest depth that gives up nothing.
-const TRAIT_FLOOR_FAMILY_DEPTH: usize = 4;
+/// Was four (`objectives/evasion/process/hook`), chosen as the shallowest depth
+/// that gave nothing up: at three, the static-keys cluster correctly collapsed to
+/// one family, but so did `darkglitch` — a Python RAT whose three hostile traits
+/// are genuinely distinct capabilities under `command-and-control/backdoor`
+/// (`rat/multi` and `tasking/filesystem`) — and it lost its verdict entirely.
+///
+/// Shallowed to two (2026-08-27). Four proved too fine to be corroboration on the
+/// gauntlet false-positive pool: `ansible-core` reached the hostile arm with
+/// three "independent" families that are all one idea — a PowerShell base64
+/// decode-and-execute, which is how its Windows connection plugin works, counted
+/// once per subdirectory it was spelled in. Two makes a family a *kind* of
+/// behavior rather than a technique, so restating one behavior at different
+/// depths can no longer corroborate itself.
+///
+/// The darkglitch class of verdict is the known cost, and it is the thing to
+/// re-measure first if the missed-sample pool regresses.
+const TRAIT_FLOOR_FAMILY_DEPTH: usize = 2;
 
 /// The family a finding belongs to: the first [`TRAIT_FLOOR_FAMILY_DEPTH`]
 /// segments of its hierarchy path. A trait id is `path::leaf`
@@ -4717,6 +4803,36 @@ impl TraitFloorCounts {
     const fn severe(&self) -> u32 {
         self.hostile + self.suspicious
     }
+}
+
+/// `well-known/` subtrees that positively identify a sample as a *named piece of
+/// software* rather than as a threat. `malware/` and `unwanted/` are pointedly
+/// absent: those recognizers identify a sample too, but identifying it as
+/// malware is not a reason to hold back.
+const KNOWN_SOFTWARE_PREFIXES: [&str; 5] = [
+    "well-known/app/",
+    "well-known/lib/",
+    "well-known/tool/",
+    "well-known/game/",
+    "well-known/dual-use/",
+];
+
+/// Whether cleave confidently recognized this sample as a named application,
+/// library, tool or known dual-use utility.
+///
+/// Used to raise — never to waive — the hostile arm's anchor requirement. A
+/// sample cleave can name is one whose hostile traits are far more likely to be
+/// describing the program's own advertised function: `ansible-core`'s PowerShell
+/// base64-exec *is* its Windows connection plugin, and eight
+/// `well-known/app/infrastructure` Ansible recognizers fire on the same render
+/// while the floor promotes it to hostile on that one trait.
+fn identified_as_known_software(findings: &[cleave::types::CompactTrait]) -> bool {
+    findings.iter().any(|f| {
+        f.confidence >= TRAIT_FLOOR_MIN_CONFIDENCE
+            && KNOWN_SOFTWARE_PREFIXES
+                .iter()
+                .any(|prefix| f.id.starts_with(prefix))
+    })
 }
 
 fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCounts {
@@ -4783,7 +4899,19 @@ fn apply_trait_floor(
         return;
     }
     let counts = trait_floor_counts(findings);
-    if counts.hostile >= TRAIT_FLOOR_HOSTILE_CRIT5
+    // Recognized software has to clear a higher anchor before the floor will
+    // *block* it. Not an exemption — one extra confident crit-5, which a genuine
+    // compromise adding its own hostile behavior still reaches, while a lone
+    // trait describing the program's own advertised function no longer promotes
+    // a model-clean sample straight past review. Falling short here drops
+    // through to the suspicious arm below, which is where "a human should look"
+    // belongs.
+    let required_crit5 = if identified_as_known_software(findings) {
+        TRAIT_FLOOR_HOSTILE_CRIT5.saturating_add(1)
+    } else {
+        TRAIT_FLOOR_HOSTILE_CRIT5
+    };
+    if counts.hostile >= required_crit5
         && counts.severe() >= TRAIT_FLOOR_HOSTILE_SEVERE
         && counts.severe_families.len() >= TRAIT_FLOOR_HOSTILE_FAMILIES
     {
