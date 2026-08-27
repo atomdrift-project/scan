@@ -1453,6 +1453,7 @@ fn main() -> Result<()> {
     // analysis thread's stack without a debugger (lldb/gdb can't attach in the
     // production jails). Must precede the SIGUSR1 thread below.
     scan::thread_dump::install();
+    scan::heap_profile::install();
 
     // Dump all analysis-thread backtraces on SIGUSR1 (Linux equivalent of BSD
     // SIGINFO / Ctrl-T), captured in-process — works in jails where ptrace is
@@ -1475,6 +1476,7 @@ fn main() -> Result<()> {
                 // In-process capture: no debugger, works in jails. See
                 // `scan::thread_dump`.
                 scan::thread_dump::dump_all_threads();
+                scan::heap_profile::dump_on_signal();
             }
         });
 
