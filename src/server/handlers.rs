@@ -1660,6 +1660,9 @@ async fn run_file_analysis(
         .in_flight
         .get(&request_id)
         .map(|r| r.phase.clone());
+    // A policy-specific `--follow` override must not land in the shared
+    // corpus, same rule every other route's artifact mirroring follows.
+    let uploader = request_follow.persist.then(|| state.uploader.clone()).flatten();
     let handle = tokio::task::spawn_blocking(move || {
         // Record the OS thread servicing this analysis.
         if let Some(req) = phase_state.in_flight.get(&request_id) {
@@ -1679,6 +1682,28 @@ async fn run_file_analysis(
             // /analyze-path renews results (and their dependencies) on hopper.
             false,
         );
+        // Offer the artifact — bytes only, no registry provenance — right
+        // alongside its verdict, same as every other route's bundle: after
+        // analysis, not on receipt, so hopper never carries a claimable
+        // bytes-with-no-verdict row for longer than it takes the uploader
+        // thread to drain the queue (its upload-tier claim query drains
+        // those first and ahead of everything else, so offering them earlier
+        // would race this sample onto the worker fleet for a redundant
+        // analysis). Queued before `drop(temp_dir)` below, not read yet — the
+        // background uploader thread reads the path off disk when it
+        // dequeues the job, which can still lose the temp dir on a deep
+        // queue; best-effort, same as the graceful miss dependency mirroring
+        // already tolerates on a blob-cache eviction.
+        if let (Ok(scan_result), Some(uploader)) = (&result, &uploader) {
+            uploader.submit_artifacts(crate::engine::collect_upload_artifacts(
+                &path,
+                &scan_result.sha256,
+                scan_result.size_bytes,
+                upload_collector(),
+                None,
+                None,
+            ));
+        }
         if should_clear_caches {
             cleave::clear_all_thread_caches();
         }
@@ -2086,13 +2111,14 @@ fn classify_purl(
 
     // Offer the artifact — bytes, registry record, and fetch provenance —
     // before its verdict, exactly as the CLI (`scan purl --hopper`) and the
-    // pull worker do. Hopper drops a result for a SHA it never ingested, so a
-    // renewal on its own lands nowhere: the POST is accepted and the sample
-    // stays unknown, which is invisible until something asks hopper for it.
-    //
-    // Queued, not sent: the uploader is one background thread reading a FIFO,
-    // so the artifact is already ahead of the verdict the caller submits when
-    // this returns.
+    // pull worker do. Deliberately after analysis, not on fetch: hopper's
+    // upload-tier claim query drains bytes-with-no-verdict rows first and
+    // ahead of everything else, so offering them before this process has its
+    // own verdict in hand would race the sample onto the worker fleet's claim
+    // queue for a redundant analysis. Hopper drops a result for a SHA it
+    // never ingested, so the verdict alone lands nowhere either — queuing
+    // artifacts then result keeps the row unclaimable for only the width of
+    // the queue, not the width of an analysis.
     if let Some(uploader) = uploader {
         uploader.submit_artifacts(crate::engine::collect_upload_artifacts(
             std::path::Path::new(&name),
@@ -2135,6 +2161,8 @@ fn classify_url(
         follow,
         deps_for_upload,
     )?;
+    // See the matching comment in `classify_purl` on why this waits for the
+    // verdict rather than firing on fetch.
     if let Some(uploader) = uploader {
         uploader.submit_artifacts(crate::engine::collect_upload_artifacts(
             std::path::Path::new(&name),

@@ -213,18 +213,36 @@ const ATTEMPT_TIMEOUTS: [Duration; 4] = [
     Duration::from_secs(120),
 ];
 
+/// Per-attempt request timeouts for `/api/upload`, separate from
+/// [`ATTEMPT_TIMEOUTS`] because that table's 120s ceiling was sized for the
+/// small JSON verdicts `post_one` sends, not for streaming a multi-GiB
+/// artifact — with `HOPPER_MAX_UPLOAD_ARTIFACT_BYTES` raised to 8 GiB
+/// (2026-08-27), a legitimate transfer on a merely mediocre link would blow
+/// through 120s and get cut off as a timeout rather than a real failure.
+/// The final ceiling matches hopper's own `uploadBodyTimeout` (30 min, same
+/// change) — no point the client giving up before the server would have.
+const UPLOAD_ATTEMPT_TIMEOUTS: [Duration; 4] = [
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(600),
+    Duration::from_secs(1800),
+];
+
 /// Hopper's `maxUploadBytes` (`cmd/hopper/api.go`): artifact bytes above this
 /// are rejected outright. hopper's handler checks `Content-Length` before
-/// reading any body, but a client that starts streaming a 100+ MiB multipart
-/// body anyway loses the race to read hopper's 413 — the connection drops
-/// mid-write and reqwest surfaces it as "send failed because receiver is
-/// gone", indistinguishable from a real network fault. Checked client-side so
-/// an oversized dependency is skipped with one clear log line instead of
-/// spending 4 retries on a request that can never succeed (confirmed against
-/// hopper's `samples` table on 2026-08-27: every artifact over this size that
-/// scan attempted to upload landed with an empty `path` — the bytes never
-/// arrived — while everything under it landed clean).
-const HOPPER_MAX_UPLOAD_ARTIFACT_BYTES: u64 = 100 << 20;
+/// reading any body, but a client that starts streaming an oversized
+/// multipart body anyway loses the race to read hopper's 413 — the
+/// connection drops mid-write and reqwest surfaces it as "send failed
+/// because receiver is gone", indistinguishable from a real network fault.
+/// Checked client-side so an oversized dependency is skipped with one clear
+/// log line instead of spending 4 retries on a request that can never
+/// succeed (confirmed against hopper's `samples` table on 2026-08-27: every
+/// artifact over the then-100-MiB cap that scan attempted to upload landed
+/// with an empty `path` — the bytes never arrived — while everything under
+/// it landed clean). Raised to 8 GiB alongside hopper's own cap the same
+/// day; keep the two in sync — this can only shrink the set of artifacts
+/// scan bothers attempting, never rescue one hopper would reject.
+const HOPPER_MAX_UPLOAD_ARTIFACT_BYTES: u64 = 8 << 30;
 
 /// Hopper's ingestion lane header. A result renewed by `serve --hopper` is
 /// one-shot: the caller that asked for the scan is already holding the verdict
@@ -1195,7 +1213,7 @@ fn post_upload_with_token(
     token: Option<&str>,
     build_form: impl Fn() -> Option<reqwest::blocking::multipart::Form>,
 ) -> bool {
-    for (attempt, timeout) in ATTEMPT_TIMEOUTS.into_iter().enumerate() {
+    for (attempt, timeout) in UPLOAD_ATTEMPT_TIMEOUTS.into_iter().enumerate() {
         if attempt > 0 {
             std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
         }
@@ -1235,7 +1253,7 @@ fn post_upload_with_token(
             }
         }
     }
-    tracing::error!(sha256 = %sha256, kind, attempts = ATTEMPT_TIMEOUTS.len(), "upload: failed to write artifact to hopper; giving up after retries");
+    tracing::error!(sha256 = %sha256, kind, attempts = UPLOAD_ATTEMPT_TIMEOUTS.len(), "upload: failed to write artifact to hopper; giving up after retries");
     false
 }
 
@@ -1818,6 +1836,73 @@ mod tests {
                 .contains("authorization: bearer test-secret\r\n"),
             "request headers: {request}"
         );
+    }
+
+    /// An artifact over `HOPPER_MAX_UPLOAD_ARTIFACT_BYTES` must never reach
+    /// `/api/upload` at all — hopper would reject it outright, and the
+    /// connection-drop that rejection produces looks identical to a real
+    /// network fault (see the constant's doc comment). `reconcile_artifacts`
+    /// is expected to skip straight past it after the `/api/known` probe
+    /// reports it missing, rather than attempting and retrying a doomed
+    /// upload.
+    #[test]
+    fn oversized_artifact_skips_the_byte_upload() {
+        let known_listener = TcpListener::bind("127.0.0.1:0").expect("bind known server");
+        let known_addr = known_listener.local_addr().expect("known address");
+        let known_server = std::thread::spawn(move || {
+            let (mut stream, _) = known_listener.accept().expect("accept known");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = br#"{"known":[],"current":[]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            stream.write_all(head.as_bytes()).expect("write head");
+            stream.write_all(body).expect("write body");
+        });
+
+        // Bound but never accepted: a wrongly-attempted byte upload would
+        // connect here, which the accept() below catches. Nonblocking so a
+        // bug that skips the size check fails the assertion instead of
+        // hanging the test for the full upload retry budget.
+        let upload_listener = TcpListener::bind("127.0.0.1:0").expect("bind upload server");
+        let upload_addr = upload_listener.local_addr().expect("upload address");
+        upload_listener
+            .set_nonblocking(true)
+            .expect("nonblocking upload listener");
+
+        let known_url = Route::new(&[format!("http://{known_addr}")], "/api/known");
+        let upload_url = Route::new(&[format!("http://{upload_addr}")], "/api/upload");
+
+        let art = UploadArtifact {
+            sha256: "d".repeat(64),
+            size: HOPPER_MAX_UPLOAD_ARTIFACT_BYTES + 1,
+            filename: "huge.bin".to_string(),
+            bytes: ArtifactBytes::File(PathBuf::from("/nonexistent/huge.bin")),
+            sidecar: b"{}".to_vec(),
+            backfill: false,
+        };
+
+        let mut seen = HashSet::new();
+        let current = reconcile_artifacts(
+            &reqwest::blocking::Client::new(),
+            &known_url,
+            &upload_url,
+            None,
+            &mut seen,
+            vec![art],
+            None,
+        );
+        assert!(current.is_empty());
+        known_server.join().expect("known server thread");
+
+        match upload_listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // nothing connected — correct
+            Ok(_) => panic!("oversized artifact triggered a byte upload attempt"),
+            Err(e) => panic!("unexpected accept error: {e}"),
+        }
     }
 
     /// A dependency's upload artifact loads its bytes lazily from the fetch cache
