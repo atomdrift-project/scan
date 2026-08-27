@@ -119,15 +119,22 @@ and shared across every deploy level**.
 ### Deriving the verdict
 
 The hostile/suspicious/benign label is *not* stored — the consumer
-derives it from `lvl` and the active level `N` (default `50`):
+derives it from `lvl` and the active level `N`. `N` defaults to the model
+bundle's own `default_severity_level` (`25` on current bundles; see
+`DEFAULT_SEVERITY_LEVEL`):
 
-- **hostile** when `lvl <= N` (default: `lvl <= 50`),
-- **suspicious** when `lvl <= min(grid_max, 4 × N)` (default: `lvl <= 200`) —
-  the L×4 rule gives the suspicious band a 4× wider FP budget that
-  catches more "maybe-bad" files,
-- **benign** otherwise. Note a file with, say, `lvl = 500` is benign
-  under the default caps yet still reports `lvl = 500`; raising `-l` is
-  what turns the same envelope into a suspicious or hostile verdict.
+- **hostile** when `lvl <= N` (default: `lvl <= 25`),
+- **suspicious** when `lvl <= min(grid_max, 3000)` (default: `lvl <= 3000`).
+  The suspicious ceiling is a **flat constant** (`SUSPICIOUS_LEVEL_CEILING`,
+  mirrored as `SUSPICIOUS_CEILING` in `server/decision.rs`), *not* a multiple of
+  `N` — it does not move when the operator changes `-l`. It is currently set
+  wide (an EXPERIMENTAL 2026-07 widening to surface the weak-signal tail), which
+  knowingly re-admits a low-precision band; see the note on the constant before
+  relying on it.
+- **benign** otherwise. Note a file with, say, `lvl = 5000` is benign
+  under the default caps yet still reports `lvl = 5000`. Raising `-l` moves
+  the *hostile* line only: it can turn that same envelope hostile, but the
+  suspicious ceiling stays where it is.
 
 The Atomdrift Scan CLI/server applies these caps internally to pick exit codes
 and terminal output; downstream consumers reading stored envelopes
