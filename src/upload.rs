@@ -1092,6 +1092,50 @@ fn bytes_match_digest(bytes: &[u8], sha256: &str, locator: &str) -> bool {
     true
 }
 
+/// Look up whether hopper already holds real content for a purl coordinate —
+/// synchronously, for `scan purl`/`scan url`'s registry-metadata fallback
+/// (`crate::pkg::run`), which has no async runtime to bridge into
+/// [`crate::server::corpus::Corpus`]'s async reader the server side of this
+/// same fix uses. Returns the sha256 of the sample hopper already has
+/// analyzed under this purl, if any; `None` on any failure or absence — the
+/// caller's fallback is to post nothing, never to guess.
+#[must_use]
+pub(crate) fn known_sha_for_purl(
+    client: &reqwest::blocking::Client,
+    hopper_url: &str,
+    purl: &str,
+) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct LookupResponse {
+        #[serde(default)]
+        sha256: Option<String>,
+    }
+    let mut encoded = String::with_capacity(purl.len() + 8);
+    for byte in purl.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    for base in endpoints(hopper_url) {
+        let url = format!("{base}/v1/lookup?purl={encoded}");
+        match authed(client.get(&url)).send() {
+            Ok(resp) if resp.status().is_success() => {
+                return resp.json::<LookupResponse>().ok().and_then(|r| r.sha256);
+            }
+            Ok(resp) => {
+                tracing::warn!(endpoint = %base, status = %resp.status(), "upload: purl lookup non-success");
+            }
+            Err(e) => {
+                tracing::warn!(endpoint = %base, error = %error_chain(&e), "upload: purl lookup failed");
+            }
+        }
+    }
+    None
+}
+
 /// What `/api/known` reported for one probe batch.
 #[derive(Default)]
 struct KnownSets {

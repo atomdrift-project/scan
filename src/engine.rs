@@ -2685,6 +2685,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
             None,
             None,
             true,
+            None,
         );
         let summary = tally.summary(scan_start);
         if is_terminal {
@@ -2732,6 +2733,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
                 None,
                 None,
                 false,
+                None,
             );
         }
     })?;
@@ -2760,6 +2762,13 @@ pub fn run_bytes(
     config: &ScanConfig,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     root_fetch: Option<&fletch::fetch::FetchRecord>,
+    // `Some(purl)` when `bytes` is a registry-metadata document standing in
+    // for a package that couldn't be fetched (`pkg.rs`'s two fallback
+    // branches) — never a real artifact. Its bytes hash differently on every
+    // fetch, so `record_file_result` must not post this run's own sha256 to
+    // hopper; see `HopperRoute`'s doc comment for the full story (the
+    // server-side twin of this fix).
+    registry_fallback_purl: Option<&str>,
 ) -> Result<ScanSummary> {
     // Deliberately no `prefetch_cleave_resources()` here. This one-shot single-
     // artifact path (`pkg:`/`url`) never fans out across rayon, and its analyses
@@ -2816,6 +2825,7 @@ pub fn run_bytes(
         // The url/purl the operator named — the fetched artifact itself, not a
         // dependency of it.
         true,
+        registry_fallback_purl,
     );
     drop(uploader);
 
@@ -2932,6 +2942,7 @@ fn record_file_result(
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     root_fetch: Option<&fletch::fetch::FetchRecord>,
     named: bool,
+    registry_fallback_purl: Option<&str>,
 ) {
     // Bloom verdict, re-derived from the root sha cleave computed. A file cleave
     // skipped at our request (a stale known-good, or fast-mode unknown) arrives as
@@ -3030,20 +3041,61 @@ fn record_file_result(
             // are sent — an error envelope has an empty file type, which hopper
             // treats as a delete. `into_envelope` consumes `r`, so it goes last.
             if let Some(uploader) = uploader {
-                let sha256 = r.sha256.clone();
-                let size = r.size_bytes;
-                let deps = std::mem::take(&mut r.dependency_results);
-                let envelope = r.into_envelope();
-                upload_scan_result(
-                    uploader,
-                    file_path,
-                    sha256,
-                    size,
-                    root_registry,
-                    root_fetch,
-                    deps,
-                    envelope,
-                );
+                if let Some(purl) = registry_fallback_purl {
+                    // `file_path`'s bytes are the registry's own JSON record
+                    // standing in for a package that couldn't be fetched — not
+                    // a real artifact, and it hashes differently on every
+                    // fetch (see the fallback's own doc comment in `pkg.rs`).
+                    // Posting `r.sha256` here would mint hopper an unbounded
+                    // stream of never-deduplicating rows, exactly the bug
+                    // fixed server-side in `classify_purl`/`HopperRoute`. This
+                    // is that fix's CLI twin: redirect onto real content
+                    // hopper already holds for the purl, or post nothing.
+                    let client = reqwest::blocking::Client::new();
+                    if let Some(hopper_url) = config.hopper()
+                        && let Some(real_sha) =
+                            crate::upload::known_sha_for_purl(&client, hopper_url, purl)
+                    {
+                        let now = now_rfc3339();
+                        let collector = format!("scan+{}", crate::upload::default_worker_name());
+                        let filename = file_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("file")
+                            .to_string();
+                        let sidecar = match root_registry {
+                            Some(provenance) => crate::provenance::build_sidecar_from_provenance(
+                                &filename, &real_sha, 0, &collector, &now, "", purl, provenance,
+                            ),
+                            None => crate::provenance::build_sidecar(
+                                &filename, &real_sha, 0, &collector, &now, "", purl, None, &[],
+                            ),
+                        };
+                        uploader.submit_artifacts(vec![crate::upload::UploadArtifact {
+                            sha256: real_sha,
+                            size: 0,
+                            filename,
+                            bytes: crate::upload::ArtifactBytes::File(std::path::PathBuf::new()),
+                            sidecar,
+                            backfill: true,
+                        }]);
+                    }
+                } else {
+                    let sha256 = r.sha256.clone();
+                    let size = r.size_bytes;
+                    let deps = std::mem::take(&mut r.dependency_results);
+                    let envelope = r.into_envelope();
+                    upload_scan_result(
+                        uploader,
+                        file_path,
+                        sha256,
+                        size,
+                        root_registry,
+                        root_fetch,
+                        deps,
+                        envelope,
+                    );
+                }
             }
         }
         Err(e) => {
@@ -3800,6 +3852,7 @@ pub fn run_paths(
                 root_registry,
                 None,
                 named,
+                None,
             );
         };
 
