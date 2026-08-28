@@ -598,9 +598,61 @@ mod trait_floor_tests {
         // must not panic.
         let render = "== PRIMARY x ==\n# S 4:2 naïve café résumé (micro-behaviors/data/encode::y)\n  körper\n";
         assert!(recategorize_annotations(render).contains("Possible data/encode — naïve café résumé"));
+        // `well-known/` keeps its full depth: the family name is the finding.
+        assert_eq!(
+            recategorize_annotation(
+                "// S Owhit new-tab wallpaper extension identity (well-known/unwanted/newtab-wallpaper-adware/owhit::identity)"
+            )
+            .as_deref(),
+            Some("// Possible unwanted/newtab-wallpaper-adware/owhit — Owhit new-tab wallpaper extension identity"),
+        );
+        // ...while an objectives/ path is still cut to two, so a technique
+        // taxonomy does not turn into a wall of near-identical labels.
+        assert_eq!(
+            trait_category("objectives/evasion/process/injection/hollowing::x"),
+            "evasion/process"
+        );
+        assert_eq!(
+            trait_category("well-known/malware/dropper/nemucod/obfuscation::y"),
+            "malware/dropper/nemucod/obfuscation"
+        );
+
         // Non-annotation lines pass through untouched.
         assert_eq!(recategorize_annotation("  let x = 1;"), None);
         assert_eq!(recategorize_annotation("# H no trait id here"), None);
+    }
+
+    #[test]
+    fn recategorizing_covers_every_annotation_the_render_can_emit() {
+        // `interpret::parse_annotation` decides what *is* an annotation, over the
+        // marker set `// -- #` and the grades `HSNBCF`. Anything it admits and
+        // this does not reaches the grader with its grade letter intact — the one
+        // thing presenting observations instead of verdicts exists to prevent.
+        assert_eq!(
+            recategorize_annotation("-- C .NET set_Item reference (micro-behaviors/data/manipulation::setter)")
+                .as_deref(),
+            Some("-- Possible data/manipulation — .NET set_Item reference"),
+        );
+        assert_eq!(
+            recategorize_annotation("// F 9:1 packed section (metadata/binary/packer::upx)").as_deref(),
+            // The `line:col` pointer survives ahead of the category — it locates
+            // the finding rather than grading it.
+            Some("// 9:1 Possible binary/packer — packed section"),
+        );
+        // A third-party signature has no prose and no parenthesized id: the path
+        // *is* the body. Left alone, `// H Detects Quasar RAT (third_party/…)`
+        // and its bare cousin were the loudest grades still leaking through.
+        assert_eq!(
+            recategorize_annotation("// H third_party/elastic/Linux_Trojan_Ladvix/linux/trojan/ladvix")
+                .as_deref(),
+            Some("// Possible elastic/Linux_Trojan_Ladvix"),
+        );
+        assert_eq!(
+            recategorize_annotation("// H Detects Quasar RAT (third_party/SigBase/Quasar/RAT)").as_deref(),
+            Some("// Possible SigBase/Quasar — Detects Quasar RAT"),
+        );
+        // A parenthetical that is prose, not a trait id, still leaves the line be.
+        assert_eq!(recategorize_annotation("# S writes a file (see below)"), None);
     }
 
     #[test]
@@ -6450,27 +6502,44 @@ pub(crate) fn recategorize_annotations(rendered: &str) -> String {
 fn recategorize_annotation(line: &str) -> Option<String> {
     let indent_len = line.len() - line.trim_start().len();
     let (indent, rest) = line.split_at(indent_len);
-    let (comment, rest) = rest
-        .strip_prefix("// ")
-        .map(|r| ("//", r))
-        .or_else(|| rest.strip_prefix("# ").map(|r| ("#", r)))?;
+    // The marker set must match `interpret::parse_annotation`, which is what
+    // decides a line *is* an annotation: any marker it recognizes and this one
+    // does not passes through with its grade letter intact, which is precisely
+    // what recategorizing is meant to prevent.
+    let (comment, rest) = ["//", "--", "#"]
+        .into_iter()
+        .find_map(|m| Some((m, rest.strip_prefix(m)?.strip_prefix(' ')?)))?;
     // `SEV ` — one grade letter then a space. Parsed by chars rather than byte
     // offsets: an annotation body can open with a multi-byte character, and
     // splitting at a computed byte index lands inside it and panics (observed on
     // browser-extension samples whose descriptions begin with 'ü').
     let mut head = rest.chars();
     let sev = head.next()?;
-    if !matches!(sev, 'H' | 'S' | 'N' | 'B') || head.next() != Some(' ') {
+    // `C` and `F` belong here too — same reason as the marker set above.
+    if !matches!(sev, 'H' | 'S' | 'N' | 'B' | 'C' | 'F') || head.next() != Some(' ') {
         return None;
     }
     // `sev` is ASCII and the char after it is a space, so this index is a
     // boundary by construction; `get` keeps that from resting on a panic.
     let rest = rest.get(sev.len_utf8() + 1..)?;
-    // The trait id is the trailing parenthesized group; without one there is no
-    // category to name and the line is left alone.
+    // A third-party signature carries no prose: the id *is* the body, unwrapped —
+    // `// H third_party/elastic/Linux_Trojan_Ladvix/linux/trojan/ladvix`. Naming
+    // its category is the whole rewrite; there is no description to keep.
+    if !rest.contains('(') && !rest.contains(char::is_whitespace) && rest.contains('/') {
+        return Some(format!("{indent}{comment} Possible {}", trait_category(rest)));
+    }
+    // Otherwise the trait id is the trailing parenthesized group; without one
+    // there is no category to name and the line is left alone.
     let open = rest.rfind(" (")?;
     let inner = rest[open + 2..].strip_suffix(')')?;
-    if inner.contains('(') || inner.contains(')') || !inner.contains("::") {
+    // A trait id is a slash path, optionally with a `::rule` suffix — never prose.
+    // Requiring `::` alone would exempt every `third_party/` signature, which is
+    // where the loudest grades live: `// H Detects Quasar RAT (third_party/…)`
+    // would keep its H and reach the grader as a verdict.
+    if inner.contains('(') || inner.contains(')') || inner.contains(char::is_whitespace) {
+        return None;
+    }
+    if !inner.contains("::") && !inner.contains('/') {
         return None;
     }
     let body = &rest[..open];
@@ -6494,11 +6563,27 @@ fn recategorize_annotation(line: &str) -> Option<String> {
 /// Broad on purpose — it should place the match, not characterize it.
 fn trait_category(trait_id: &str) -> String {
     let path = trait_id.split("::").next().unwrap_or(trait_id);
-    let mut parts = path.split('/').filter(|p| !p.is_empty()).skip(1);
-    match (parts.next(), parts.next()) {
-        (Some(a), Some(b)) => format!("{a}/{b}"),
-        (Some(a), None) => a.to_string(),
-        _ => "pattern".to_string(),
+    let mut parts = path.split('/').filter(|p| !p.is_empty());
+    let Some(namespace) = parts.next() else {
+        return "pattern".to_string();
+    };
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        return namespace.to_string();
+    }
+    // `well-known/` is the exception: its depth is not a taxonomy of technique,
+    // it is an *identity* — `unwanted/newtab-wallpaper-adware/owhit` names the
+    // family, and the family is the whole finding. Truncating it to two
+    // components throws away the only part that decides the verdict, which is how
+    // a Chrome extension cleave had already recognized as newtab wallpaper adware
+    // reached the grader as an unremarkable observation and was cleared.
+    if namespace == "well-known" {
+        return rest.join("/");
+    }
+    match rest.as_slice() {
+        [a, b, ..] => format!("{a}/{b}"),
+        [a] => (*a).to_string(),
+        [] => "pattern".to_string(),
     }
 }
 
