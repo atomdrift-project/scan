@@ -118,6 +118,7 @@ fn full_result_serializes_identically() {
         interpretation: Some(Interpretation {
             grade: None,
             outcome: Classification::Hostile,
+            corroborated: true,
             blended: 0.873_21,
             interpretation: "imports base64 and writes to sys.modules".to_string(),
             model: "claude-test".to_string(),

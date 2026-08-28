@@ -39,9 +39,48 @@ def _leading_loc(tail):
         end = len(tail) - len(tail.lstrip('0123456789:'))
     return tail[:end] if (end >= len(tail) or tail[end] == ' ') else ""
 
+def _category(trait_id):
+    """Mirror `engine.rs::trait_category`: two path components below the
+    namespace, except `well-known/` where the depth is the identity."""
+    path = trait_id.split("::")[0]
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return "pattern"
+    ns, rest = parts[0], parts[1:]
+    if not rest:
+        return ns
+    if ns == "well-known":
+        return "/".join(rest)
+    return "/".join(rest[:2])
+
+# Acceptance mirrors `engine.rs::recategorize_annotation`: `#`/`//` only, a single
+# H/S/N/B grade, an optional `line:col` or `@offset` pointer that survives the
+# rewrite, and a trailing parenthesized trait id containing `::`.
+CATEGORIZED = re.compile(r'^(\s*)(#|//|--) ([HSNBCF]) (?:((?:\d+:\d+|@\S+)) )?(.*?) \((\S*[/:]\S*)\)$')
+
+# A third-party signature line carries no prose — the trait path is the body.
+BARE_SIG = re.compile(r'^(\s*)(#|//|--) ([HSNBCF]) (\S*/\S*)$')
+
 def transform(text, template):
     if template in ("full", "described"):
         return text
+    if template == "categorized":
+        # Mirrors `engine.rs::recategorize_annotations`: drop the severity letter,
+        # keep the location and the prose, prefix the trait's broad family.
+        out = []
+        for ln in text.split("\n"):
+            m = CATEGORIZED.match(ln)
+            if not m:
+                b = BARE_SIG.match(ln)
+                if b:
+                    out.append(f"{b.group(1)}{b.group(2)} Possible {_category(b.group(4))}")
+                else:
+                    out.append(ln)
+                continue
+            indent, marker, _sev, loc, desc, trait = m.groups()
+            loc = f"{loc} " if loc else ""
+            out.append(f"{indent}{marker} {loc}Possible {_category(trait)} — {desc}")
+        return "\n".join(out)
     out = []
     for ln in text.split("\n"):
         m = ANNOT.match(ln)
@@ -95,11 +134,24 @@ RAW_PROMPT = ('You classify a software sample by reading excerpts of its own sou
     'source, shown unaltered; blank lines separate distinct windows. Binary regions render as printable '
     'text with C-style escapes.\n' + _TAIL)
 
+CATEGORIZED_PROMPT = (
+    'You classify a software sample from cleave static-analysis findings. Grade the whole sample as '
+    'benign (ordinary, legitimate), suspicious (unusual or evasive, warrants review), or hostile '
+    '(almost certainly malicious) — judging behavior and intent, not file type.\n'
+    'A finding is announced on its own comment line — `# LINE:COL Possible <category> — <desc>` — placed '
+    'immediately BEFORE the source line it describes. The `category` names the broad family of pattern '
+    'that matched and `desc` describes it; together they are the analyzer\'s interpretation of a pattern '
+    '— what the code COULD be doing, not a confirmed detection, and they carry no severity: the analyzer '
+    'is not telling you how bad it is, and a category alone is never evidence of malice. False positives '
+    'are possible, so verify each description against the actual source and judge the code yourself, '
+    'discounting any description it does not support.\n' + _TAIL)
+
 def system_prompt(template):
     return {"full": FULL_PROMPT, "described": DESCRIBED_PROMPT, "pointer": POINTER_PROMPT,
-            "elevated": POINTER_PROMPT, "raw": RAW_PROMPT}[template]
+            "elevated": POINTER_PROMPT, "raw": RAW_PROMPT,
+            "categorized": CATEGORIZED_PROMPT}[template]
 
-TEMPLATES = ["described", "full", "pointer", "elevated", "raw"]
+TEMPLATES = ["described", "categorized", "full", "pointer", "elevated", "raw"]
 
 # ── corpus / labels / capture ──────────────────────────────────────────────────
 def sha256(path):
@@ -136,14 +188,30 @@ def load_labels(path):
     return labels
 
 def find_bin():
-    for c in ("out/atomscan", "target/release/atomscan", "out/scan", "target/release/scan"):
-        if os.path.exists(c):
-            return c
-    sys.exit("no scan binary found (build with `cargo build --release`)")
+    # Newest wins. A stale `out/` binary predating the flags or traits under test
+    # scores a different engine than the one being tuned, and says nothing about it.
+    found = [c for c in ("out/atomscan", "target/release/atomscan", "out/scan",
+                         "target/release/scan") if os.path.exists(c)]
+    if not found:
+        sys.exit("no scan binary found (build with `cargo build --release`)")
+    return max(found, key=lambda c: os.stat(c).st_mtime)
 
-def capture(corpus, dump_dir, bin_path, timeout):
+def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
     os.makedirs(dump_dir, exist_ok=True)
-    env = dict(os.environ, SCAN_NO_UPDATE="1", SCAN_INTERPRET_DUMP_DIR=dump_dir)
+    # `--follow=none`: a fetched dependency is network state, so the render it
+    # produces differs run to run — the exact thing an A/B must hold fixed. It is
+    # also how gauntlet scans, so these renders match what production grades.
+    env = dict(os.environ, SCAN_NO_UPDATE="1", SCAN_INTERPRET_DUMP_DIR=dump_dir,
+               SCAN_FOLLOW="none")
+    if registry_map:
+        # The env var, not `--registry-map`: the flag lives on the `path`
+        # subcommand, and capture runs the bare `scan <path>` form.
+        env["SCAN_REGISTRY_MAP"] = os.path.abspath(registry_map)
+    # Registry provenance materially changes the render — package age, publish
+    # cadence, name/repository agreement. Without it every registry-dependent
+    # trait is invisible to scoring and supply-chain rules cannot be validated at
+    # all: a clone-and-rename package reads as a faithful copy of something
+    # legitimate, because that is exactly what its bytes are.
     # No --interpret needed: the dump hook fires whenever SCAN_INTERPRET_DUMP_DIR
     # is set, so capture makes zero LLM calls. A per-scan timeout guards against a
     # pathological sample wedging the whole run — renders dumped before the kill
@@ -162,6 +230,9 @@ def capture(corpus, dump_dir, bin_path, timeout):
         rp = os.path.join(dump_dir, sha256(p) + ".render")
         if os.path.exists(rp):
             renders[rel] = open(rp, encoding="utf-8", errors="replace").read().rstrip("\n")
+    if not renders:
+        print("# WARNING: capture produced no renders — check the scan binary, the corpus "
+              "path, and --capture-timeout", file=sys.stderr)
     return renders
 
 # ── LLM ────────────────────────────────────────────────────────────────────────
@@ -190,6 +261,7 @@ def main():
     ap.add_argument("--bin", default=None, help="scan binary (default: out/atomscan)")
     ap.add_argument("--capture-timeout", type=int, default=1800,
                     help="seconds before the capture scan is killed (a bad sample can't wedge the run)")
+    ap.add_argument("--registry-map", default=None, help="registry provenance map passed to the capture scan")
     ap.add_argument("--dump-dir", default=None, help="render cache dir (default: <corpus>/.interpret-renders)")
     ap.add_argument("--emit-labels", action="store_true", help="print a labels template for --corpus and exit")
     args = ap.parse_args()
@@ -204,7 +276,7 @@ def main():
     dump_dir = args.dump_dir or os.path.join(args.corpus.rstrip("/") + ".interpret-renders")
     bin_path = args.bin or find_bin()
     print(f"# capturing renders via {bin_path} (SCAN_INTERPRET_DUMP_DIR) …", file=sys.stderr)
-    renders = capture(args.corpus, dump_dir, bin_path, args.capture_timeout)
+    renders = capture(args.corpus, dump_dir, bin_path, args.capture_timeout, args.registry_map)
     print(f"# captured {len(renders)} renders", file=sys.stderr)
 
     labels = load_labels(args.labels) if args.labels else {}
