@@ -559,6 +559,49 @@ fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade, ev: Evidence) -> (Clas
     }
 }
 
+/// What cleave's own findings say about a sample, read from the structured
+/// report.
+///
+/// These two questions used to be answered by scanning the *render* for `H`/`S`
+/// annotation letters. The render is a prompt, not a database: it is truncated
+/// to the highest-scoring members, deduplicated across the archive, and — the
+/// case that motivated this type — it drops composites evaluated at container
+/// scope entirely, listing only the atomic legs they were built from. So a
+/// package whose single suspicious finding was a cross-file composite rendered
+/// with no `S` at all and was silently withdrawn from the gate (measured on
+/// localstack-core, whose `aws-instance-launch-with-user-data` never reached the
+/// LLM). The same coupling had already cost seven true positives once, when an
+/// upstream change to the annotation letters withdrew them from the gate.
+///
+/// The render is still the right input for [`render_mostly_readable`] and
+/// [`addresses_the_analyzer`], which ask about the bytes the model will see.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FindingSeverity {
+    /// cleave surfaced a suspicious- or hostile-criticality finding.
+    pub elevated: bool,
+    /// cleave surfaced a hostile-criticality finding.
+    pub hostile: bool,
+}
+
+impl FindingSeverity {
+    /// Read the highest criticality cleave reached anywhere in the report.
+    #[must_use]
+    pub fn from_report(report: &cleave::AnalysisReport) -> Self {
+        let mut out = Self::default();
+        for file in &report.files {
+            for finding in &file.findings {
+                if finding.crit >= cleave::Criticality::Hostile {
+                    return Self { elevated: true, hostile: true };
+                }
+                if finding.crit >= cleave::Criticality::Suspicious {
+                    out.elevated = true;
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Interpret a sample, blending the ML verdict with a local LLM's opinion.
 /// Returns `None` (never an error) when below the gate or on any failure.
 #[must_use]
@@ -568,6 +611,7 @@ pub fn interpret(
     ml_class: Classification,
     ml_prob: f32,
     levels: LevelContext,
+    findings: FindingSeverity,
 ) -> Option<Interpretation> {
     if context.trim().is_empty() {
         return None;
@@ -585,7 +629,12 @@ pub fn interpret(
     // finding left in the render). Gating that out publishes a hostile verdict
     // with no interpretation and no error trace; anything the scan itself calls
     // non-benign must reach the LLM.
+    //
+    // `findings` is authoritative here and the render scan is only a backstop:
+    // admission is cheap and a miss is expensive, so either saying "elevated" is
+    // enough. See [`FindingSeverity`] for why the render alone was not.
     if !levels.ml_admits(cfg.min_level)
+        && !findings.elevated
         && !has_elevated_finding(context)
         && matches!(ml_class, Classification::Benign)
     {
@@ -597,7 +646,7 @@ pub fn interpret(
     let ev = Evidence {
         readable: render_mostly_readable(context),
         analyzer_directed: addresses_the_analyzer(context),
-        hostile_finding: has_hostile_finding(context),
+        hostile_finding: findings.hostile || has_hostile_finding(context),
         levels,
     };
     let analyzer_directed = ev.analyzer_directed;
