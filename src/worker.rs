@@ -120,6 +120,72 @@ fn cleave_concurrency(slots: usize) -> usize {
     cleave_concurrency_from(slots, rayon::current_num_threads(), override_value)
 }
 
+/// Jobs at or below this many bytes take the small lane of [`CleaveGate`]
+/// instead of the whale gate. `SCAN_SMALL_JOB_MB` overrides; `0` disables the
+/// lane (every job takes the whale gate, the pre-lane behavior).
+fn small_job_bytes() -> u64 {
+    const DEFAULT: u64 = 1024 * 1024;
+    std::env::var("SCAN_SMALL_JOB_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(DEFAULT, |mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// Small-lane width: a quarter of the pool, 1..=8. Small jobs are cheap and
+/// mostly single-threaded, so a few of them alongside one whale barely touch
+/// the pool the whale is fanning out across; `SCAN_SMALL_LANE` overrides.
+fn small_lane_from(pool: usize, override_value: Option<usize>) -> usize {
+    override_value
+        .filter(|&v| v > 0)
+        .unwrap_or_else(|| (pool.max(1) / 4).clamp(1, 8))
+}
+
+/// The two admission lanes around the blocking cleave classify.
+///
+/// The whale gate (`cleave_concurrency`) exists to keep memory-bandwidth-heavy
+/// archive analyses from co-residing; on hosts below 32 threads it is *one*.
+/// Behind that one permit every claimed job used to queue — a 2 KB manifest
+/// waited for whichever member of the current archive was slowest, and the
+/// pool idled meanwhile. Measured on the 21-file `stuck` set (16 threads):
+/// ~6 s of a 20 s run was small files serialized behind archives. Letting
+/// only *small* jobs bypass the gate recovers that without the whale
+/// co-residency that a wider gate brings (which measured +55% wall and
+/// +1.9 GB on the whale-heavy long run — the pool starves).
+#[derive(Debug)]
+struct CleaveGate {
+    whale: Arc<Semaphore>,
+    small: Arc<Semaphore>,
+    small_max_bytes: u64,
+}
+
+impl CleaveGate {
+    fn new(whale_slots: usize, small_slots: usize, small_max_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            whale: Arc::new(Semaphore::new(whale_slots)),
+            small: Arc::new(Semaphore::new(small_slots)),
+            small_max_bytes,
+        })
+    }
+
+    /// Whether a job of `size` bytes takes the small lane.
+    fn is_small(&self, size: u64) -> bool {
+        self.small_max_bytes > 0 && size <= self.small_max_bytes
+    }
+
+    /// Acquire the lane for a job of `size` bytes.
+    async fn admit(
+        &self,
+        size: u64,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        let lane = if self.is_small(size) {
+            &self.small
+        } else {
+            &self.whale
+        };
+        Arc::clone(lane).acquire_owned().await
+    }
+}
+
 /// Pure gate sizing — `pool` is the Rayon thread count, `override_value` is
 /// `SCAN_CLEAVE_CONCURRENCY` when set.
 fn cleave_concurrency_from(slots: usize, pool: usize, override_value: Option<usize>) -> usize {
@@ -1001,6 +1067,40 @@ enum PrefetchData {
     Spooled(SpooledPayload),
 }
 
+/// Leading bytes of a staged payload for the admission gate's archive sniff
+/// (see `admission::looks_like_archive_bytes`). Best effort and cheap: an
+/// in-memory payload is sliced, a spooled or local file has its first
+/// `SNIFF_BYTES` read. The local path is `data_root/path` *unverified* — the
+/// sha check happens later in `run_job`; a wrong file here only skews an
+/// estimate. `None` when nothing is at hand.
+fn admission_sniff(
+    data: &std::result::Result<PrefetchData, PrefetchError>,
+    data_root: Option<&Path>,
+    job_path: &str,
+) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let n = crate::admission::SNIFF_BYTES;
+    let path = match data {
+        Ok(PrefetchData::Memory(bytes)) => return Some(bytes[..bytes.len().min(n)].to_vec()),
+        Ok(PrefetchData::Spooled(spooled)) => spooled.path.to_path_buf(),
+        Ok(PrefetchData::Local) => data_root?.join(job_path),
+        Err(_) => return None,
+    };
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; n];
+    let mut filled = 0;
+    while filled < n {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(k) => filled += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    head.truncate(filled);
+    Some(head)
+}
+
 impl PrefetchData {
     /// Bytes this payload holds in RAM while staged (spooled and local payloads
     /// cost no buffer memory).
@@ -1115,12 +1215,8 @@ impl SpoolState {
         if self.dir.is_dir() {
             return Ok(());
         }
-        std::fs::create_dir_all(&self.dir).map_err(|e| {
-            format!(
-                "cannot create spool dir {}: {e}",
-                self.dir.display()
-            )
-        })
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("cannot create spool dir {}: {e}", self.dir.display()))
     }
 
     /// Create the spool directory and clear leftovers from crashed runs.
@@ -1516,7 +1612,20 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // Worker tasks (`slots`) claim and stage jobs; the cleave gate separately
     // bounds simultaneous memory-bandwidth-heavy analyses.
     let cleave_slots = cleave_concurrency(slots);
-    let cleave_gate = Arc::new(Semaphore::new(cleave_slots));
+    let small_lane = small_lane_from(
+        rayon::current_num_threads(),
+        std::env::var("SCAN_SMALL_LANE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok()),
+    );
+    let small_bytes = small_job_bytes();
+    let cleave_gate = CleaveGate::new(cleave_slots, small_lane, small_bytes);
+    tracing::info!(
+        small_lane,
+        small_job_mb = small_bytes / (1024 * 1024),
+        "small-job lane: jobs at or below the size limit bypass the cleave gate \
+         (SCAN_SMALL_LANE / SCAN_SMALL_JOB_MB)",
+    );
     // Slot count bounds concurrency but not memory: a slot analysing a huge
     // archive holds it (plus expanded members) resident while a slot analysing a
     // 4 KB script holds nothing. This gate pauses admission on live memory
@@ -2081,8 +2190,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                                     tracing::info!(
                                         rss_before_mb = before / 1024 / 1024,
                                         rss_after_mb = after / 1024 / 1024,
-                                        reclaimed_mb =
-                                            before.saturating_sub(after) / 1024 / 1024,
+                                        reclaimed_mb = before.saturating_sub(after) / 1024 / 1024,
                                         "idle: returned retained allocator pages to the OS",
                                     );
                                 }
@@ -2292,12 +2400,14 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 }
                 let _analyzing_guard = AnalyzingGuard(Arc::clone(&analyzing));
 
+                let head = admission_sniff(&pj.data, data_root.as_deref(), &pj.job.path);
                 let admission_guard = admission
                     .admit(
                         Arc::from(pj.job.sha256.as_str()),
                         Arc::from(pj.job.path.as_str()),
                         Arc::from(pj.job.file_type.as_str()),
                         pj.job.size_bytes,
+                        head.as_deref(),
                     )
                     .await;
 
@@ -2853,7 +2963,7 @@ async fn run_job(
     data_root: Option<&Path>,
     job: &ClaimJob,
     resources: &Arc<ModelResources>,
-    cleave_gate: Arc<Semaphore>,
+    cleave_gate: Arc<CleaveGate>,
     slow_rule_ms: u64,
     spool: &Arc<SpoolState>,
     prefetched: std::result::Result<PrefetchData, PrefetchError>,
@@ -3129,8 +3239,9 @@ async fn run_job(
     // earlier (or on the dispatch loop) pinned the gate across hopper downloads
     // and froze every other slot behind one whale's preamble.
     let gate_wait_start = Instant::now();
-    let cleave_permit = Arc::clone(&cleave_gate)
-        .acquire_owned()
+    let small_lane = cleave_gate.is_small(input_size);
+    let cleave_permit = cleave_gate
+        .admit(input_size)
         .await
         .map_err(|_closed| "cleave analysis gate closed".to_string())?;
     let gate_wait = gate_wait_start.elapsed();
@@ -3139,6 +3250,7 @@ async fn run_job(
             sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
             file = %job.path,
             wait_ms = crate::duration_ms(gate_wait),
+            small_lane,
             "analysis admitted to cleave after waiting for nested-work gate",
         );
     }
@@ -4263,7 +4375,11 @@ mod tests {
     #[tokio::test]
     async fn prefetch_one_rejects_jobs_over_max_job_bytes() {
         // Rejected before any download, so the unreachable base_url is never hit.
-        let job = claim_job(&sha256_hex(b"huge"), "samples/huge.bin", (MAX_JOB_BYTES + 1) as i64);
+        let job = claim_job(
+            &sha256_hex(b"huge"),
+            "samples/huge.bin",
+            (MAX_JOB_BYTES + 1) as i64,
+        );
         let pj = prefetch_one(
             reqwest::Client::new(),
             Arc::from("http://127.0.0.1:1"),
@@ -4682,7 +4798,9 @@ mod tests {
             disk_headroom_bytes: 0,
         };
         assert!(!dir.exists());
-        spool.try_reserve(1024).expect("reserve should heal the dir");
+        spool
+            .try_reserve(1024)
+            .expect("reserve should heal the dir");
         assert!(dir.is_dir(), "try_reserve should have recreated the dir");
         assert_eq!(spool.used.load(Ordering::Acquire), 1024);
     }
@@ -5057,6 +5175,15 @@ mod tests {
 
     #[test]
     fn cleave_concurrency_scales_with_pool_and_respects_slot_cap() {
+        assert_eq!(small_lane_from(16, None), 4);
+        assert_eq!(small_lane_from(128, None), 8);
+        assert_eq!(small_lane_from(2, None), 1);
+        assert_eq!(small_lane_from(16, Some(2)), 2);
+        assert_eq!(small_lane_from(16, Some(0)), 4);
+        let gate = CleaveGate::new(1, 4, 1024 * 1024);
+        assert!(gate.is_small(1024 * 1024));
+        assert!(!gate.is_small(1024 * 1024 + 1));
+        assert!(!CleaveGate::new(1, 4, 0).is_small(1), "0 disables the lane");
         assert_eq!(cleave_concurrency_from(16, 32, None), 2);
         assert_eq!(cleave_concurrency_from(16, 8, None), 1);
         assert_eq!(cleave_concurrency_from(2, 64, None), 2);

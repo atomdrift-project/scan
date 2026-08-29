@@ -1388,10 +1388,7 @@ pub(crate) fn orchestrate(
                     reporter.finish(&records);
                     return (records, dependencies, dependency_registries);
                 }
-                batch_payloads += fetched
-                    .iter()
-                    .filter(|r| delivered_bytes(r))
-                    .count();
+                batch_payloads += fetched.iter().filter(|r| delivered_bytes(r)).count();
                 batch.push(GroupWork {
                     source_sha,
                     selected,
@@ -2613,10 +2610,24 @@ fn age_gate(
 /// read); `None` is memoized too, so an unsupported ecosystem or an unresolved
 /// package isn't re-attempted for every file that names it. Lives for the
 /// process, fronting the on-disk blob cache.
-fn registry_memo() -> &'static RwLock<HashMap<String, Option<Registry>>> {
-    static MEMO: OnceLock<RwLock<HashMap<String, Option<Registry>>>> = OnceLock::new();
-    MEMO.get_or_init(|| RwLock::new(HashMap::new()))
+fn registry_memo() -> &'static RwLock<lru::LruCache<String, Option<Registry>>> {
+    static MEMO: OnceLock<RwLock<lru::LruCache<String, Option<Registry>>>> = OnceLock::new();
+    MEMO.get_or_init(|| RwLock::new(lru::LruCache::new(REGISTRY_MEMO_CAPACITY)))
 }
+
+/// Entries the registry memo keeps. It was an unbounded `HashMap` keyed by
+/// raw PURL/URL — one entry per distinct dependency locator a worker ever
+/// resolved, forever — which on a days-old fetching worker is hundreds of MB
+/// of `Registry` records (a big packument's `release_times` alone is
+/// 40-80 KB). Dependency sets cluster in time, so an LRU of a few thousand
+/// serves the same hit rate; a miss falls through to fletch's blob cache.
+const REGISTRY_MEMO_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(4096) {
+    Some(n) => n,
+    None => std::num::NonZeroUsize::MIN,
+};
+
+/// Release-cadence window `Registry::with_age` looks back over (48 h).
+const RELEASE_CADENCE_WINDOW_SECS: u64 = 172_800;
 
 /// Look up each declared dependency's registry record and raw provider snapshot,
 /// returning one slot per input ref in `selected` order. A non-dependency ref,
@@ -2637,11 +2648,13 @@ fn lookup_registries(
     // network — and misses that still need a lookup.
     let mut misses: Vec<usize> = Vec::new();
     {
+        // `peek`, not `get`: a read lock cannot bump LRU order, and a memo
+        // hit is cheap enough that recency-on-read is not worth a write lock.
         let memo = registry_memo()
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         for i in (0..selected.len()).filter(|&i| selected[i].kind == RefKind::Dependency) {
-            match memo.get(&locator_key(&selected[i])) {
+            match memo.peek(&locator_key(&selected[i])) {
                 // Stored un-aged; stamp the age signals from this scan's clock.
                 Some(hit) => records[i] = hit.clone().map(|reg| reg.with_age(now)),
                 None => misses.push(i),
@@ -2691,16 +2704,28 @@ fn lookup_registries(
             Some((record, sources)) => {
                 records[i] = Some(record.clone().with_age(now));
                 fresh_sources.insert(i, sources);
+                // Keep only the release times `with_age` can still count from
+                // any later clock: a release older than the cadence window at
+                // memo time can never fall inside it again. Bounds the one
+                // unbounded field a memoized record carries.
+                let mut record = record;
+                record
+                    .release_times
+                    .retain(|&t| now.saturating_sub(t) <= RELEASE_CADENCE_WINDOW_SECS);
                 writes.push((locator_key(&selected[i]), Some(record)));
             }
             None => writes.push((locator_key(&selected[i]), None)),
         }
     }
     // One short critical section: nothing but the batch insert runs under the lock.
-    registry_memo()
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .extend(writes);
+    {
+        let mut memo = registry_memo()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (key, value) in writes {
+            memo.put(key, value);
+        }
+    }
 
     records
         .into_iter()
