@@ -1363,11 +1363,27 @@ fn main() -> Result<()> {
     scan::heap_profile::warn_if_debug_allocator();
 
     const RAYON_FALLBACK_THREADS: usize = 4;
-    // Physical cores, matching cleave's own pool. Logical SMT siblings
-    // (32 on this 16-core host) oversubscribe archive-member analysis:
-    // S2 dropped 56.6 s → 51.8 s at 16 threads.
-    let detected_cores =
-        cleave::memory_tracker::physical_cpu_count().or_else(cleave::memory_tracker::cpu_count);
+    // Pool width depends on the host's shape. On a wide host, physical cores
+    // win: logical SMT siblings (32 on a 16-core host) oversubscribe
+    // archive-member analysis, and S2 dropped 56.6 s → 51.8 s at 16 threads.
+    // On a small SMT host the opposite holds: the pool is the only
+    // parallelism there is, and it idles whenever the one admitted archive is
+    // in a serial phase (tar/gzip read). Measured 2026-08-30 on a 4c/8t AMD
+    // Ryzen 3400G over the 121-job poppy worker benchmark: 4 threads 34:13,
+    // 5 → 32:47, 6 → 31:15, 8 → 27:43 (−19%), peak RSS flat (4.3–4.6 GB),
+    // outputs identical. The wider pool is taken only where that class of
+    // sibling exists: x86 SMT from AMD or Intel, below SMALL_HOST_CORES
+    // physical cores. Apple silicon never qualifies — its extra "logical"
+    // capacity is efficiency cores, certified not to help this workload —
+    // and any other vendor or a host with no SMT keeps physical cores.
+    const SMALL_HOST_CORES: usize = 8;
+    let physical = cleave::memory_tracker::physical_cpu_count();
+    let logical = cleave::memory_tracker::cpu_count();
+    let detected_cores = match (physical, logical) {
+        (Some(p), Some(l)) if p < SMALL_HOST_CORES && l > p && smt_pool_vendor() => Some(l),
+        (Some(p), _) => Some(p),
+        (None, l) => l,
+    };
     let rayon_threads = std::env::var("CLEAVE_RAYON_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1935,6 +1951,7 @@ fn main() -> Result<()> {
                 level: envelope_level,
                 nice,
                 exit_if_empty,
+                no_update,
                 interpret: interpret_cfg.clone(),
                 fetch: worker_fetch_policy,
                 zip_passwords: cli.zip_passwords.clone().into(),
@@ -2105,6 +2122,28 @@ fn git_head(dir: &Path) -> Option<(String, i64)> {
 /// this is the performance-core count via `hw.perflevel0.physicalcpu`).
 /// Platforms where `sysmem` has no physical-core signal fall back to half
 /// the logical CPUs — identical to the physical count on 2-way SMT.
+/// Whether this host's SMT siblings are the kind the small-host pool policy
+/// was measured on: x86 hyperthreads from AMD (measured) or Intel (same
+/// design). Apple silicon and unknown vendors return false.
+fn smt_pool_vendor() -> bool {
+    if cfg!(target_vendor = "apple") || !cfg!(target_arch = "x86_64") {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+            return info.contains("AuthenticAMD") || info.contains("GenuineIntel");
+        }
+        return false;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // x86_64 FreeBSD/Windows/illumos hosts: AMD/Intel is the only x86 SMT
+        // there is; the arch check above already excludes everything else.
+        true
+    }
+}
+
 fn default_workers() -> NonZeroUsize {
     if let Some(cores) = cleave::memory_tracker::physical_cpu_count() {
         return NonZeroUsize::new(std::cmp::max(2, cores)).unwrap_or(NonZeroUsize::MIN);

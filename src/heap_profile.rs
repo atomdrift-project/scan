@@ -41,11 +41,26 @@ fn prepare_profile_dir(dir: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(not(target_os = "freebsd"))]
+/// Linux with the bundled tikv-jemalloc built for profiling (`jemalloc-prof`
+/// feature): dumps go through the same `prof.dump` mallctl, on the `_rjem_`
+/// prefixed symbol. Profiling must also be switched on at runtime
+/// (`_RJEM_MALLOC_CONF=prof:true,...`) or the dump is an empty profile.
+#[cfg(all(feature = "jemalloc-prof", target_os = "linux"))]
+fn prepare_profile_dir(dir: &std::path::Path) -> bool {
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        tracing::warn!(path = %dir.display(), %error, "cannot create heap profile directory");
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(not(any(target_os = "freebsd", all(feature = "jemalloc-prof", target_os = "linux"))))]
 fn prepare_profile_dir(dir: &std::path::Path) -> bool {
     tracing::warn!(
         path = %dir.display(),
-        "SCAN_HEAP_PROFILE_DIR is ignored: native mallctl heap dumps are only supported on FreeBSD"
+        "SCAN_HEAP_PROFILE_DIR is ignored: heap dumps need FreeBSD's libc jemalloc or a \
+         `--features jemalloc-prof` build on Linux"
     );
     false
 }
@@ -105,8 +120,48 @@ pub fn dump_on_signal() {
         }
     }
 
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(all(feature = "jemalloc-prof", target_os = "linux"))]
+    {
+        let Some(path) = path.to_str() else {
+            tracing::warn!(path = %path.display(), "heap profile path is not valid UTF-8");
+            return;
+        };
+        match dump_tikv(path) {
+            Ok(()) => tracing::info!(path = %path, "jemalloc heap profile written"),
+            Err(error) => tracing::warn!(%error, path = %path, "jemalloc heap profile failed"),
+        }
+    }
+
+    #[cfg(not(any(target_os = "freebsd", all(feature = "jemalloc-prof", target_os = "linux"))))]
     let _ = path;
+}
+
+/// `prof.dump` against the bundled tikv-jemalloc (Linux, `jemalloc-prof`).
+#[cfg(all(feature = "jemalloc-prof", target_os = "linux"))]
+fn dump_tikv(path: &str) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::ptr;
+
+    let c_path = CString::new(std::path::Path::new(path).as_os_str().as_bytes())
+        .map_err(|_nul_error| "heap profile path contains NUL".to_string())?;
+    let mut filename = c_path.as_ptr();
+    // SAFETY: `prof.dump` reads one `const char *` from `newp`; the CString
+    // outlives the call and the pointer-to-pointer matches `newlen`.
+    let status = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"prof.dump".as_ptr().cast(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            (&mut filename as *mut *const std::ffi::c_char).cast(),
+            size_of::<*const std::ffi::c_char>(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!("mallctl prof.dump returned errno {status}"))
+    }
 }
 
 /// Read allocator counters, when the host exposes native jemalloc.

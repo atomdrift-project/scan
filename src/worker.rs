@@ -685,6 +685,8 @@ pub struct WorkerConfig {
     /// Unlike `max_jobs`, this does not depend on knowing the job count and
     /// cannot wedge the dispatch loop on a blocked claim.
     pub exit_if_empty: bool,
+    /// `--no-update`: never fetch new models/traits, at startup or in-run.
+    pub no_update: bool,
     /// FPR severity level (0..=10000) that produced the thresholds, or `None` when
     /// manual thresholds were supplied. Folded into `ml.lvl` in the envelope.
     pub level: Option<u16>,
@@ -1725,11 +1727,18 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         None => {
             let handle: ResourceHandle =
                 Arc::new(RwLock::new(load_model_resources(&resource_config)?));
-            spawn_resource_renewal_task(
-                Arc::clone(&handle),
-                resource_config,
-                Arc::clone(&shutdown),
-            );
+            // `--no-update` pins the on-disk rules for the whole run, not only
+            // at startup: a benchmark or A/B whose trait set swaps mid-run is
+            // comparing two rule sets, not two builds.
+            if config.no_update {
+                tracing::info!("--no-update: in-run model/traits renewal disabled");
+            } else {
+                spawn_resource_renewal_task(
+                    Arc::clone(&handle),
+                    resource_config,
+                    Arc::clone(&shutdown),
+                );
+            }
             handle
         }
     };
@@ -2136,18 +2145,29 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
                     let active_slots = analyzing.load(Ordering::Relaxed);
                     let available_slots = slots.saturating_sub(active_slots);
-                    let heap = crate::heap_profile::stats();
+                    // FreeBSD reads libc jemalloc via mallctl; everywhere else the
+                    // bundled tikv-jemalloc answers through cleave's ctl wrapper.
+                    let heap = crate::heap_profile::stats().map(|s| (s.allocated as u64, s.active as u64, s.resident as u64, s.retained as u64))
+                        .or_else(|| cleave::memory_tracker::jemalloc_stats().map(|s| (s.allocated, s.active, s.resident, s.retained)));
                     let (regex_scratch_bytes, regex_scratch_budget_bytes) =
                         cleave::regex_scratch_usage();
+                    let [regex_str, regex_raw] = cleave::regex_store_usage();
                     cleave::persist_regex_warm_memo();
                     tracing::info!(
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
-                        jemalloc_allocated_mb = heap.map(|stats| stats.allocated / (1024 * 1024)),
-                        jemalloc_active_mb = heap.map(|stats| stats.active / (1024 * 1024)),
-                        jemalloc_resident_mb = heap.map(|stats| stats.resident / (1024 * 1024)),
-                        jemalloc_retained_mb = heap.map(|stats| stats.retained / (1024 * 1024)),
+                        jemalloc_allocated_mb = heap.map(|stats| stats.0 / (1024 * 1024)),
+                        jemalloc_active_mb = heap.map(|stats| stats.1 / (1024 * 1024)),
+                        jemalloc_resident_mb = heap.map(|stats| stats.2 / (1024 * 1024)),
+                        jemalloc_retained_mb = heap.map(|stats| stats.3 / (1024 * 1024)),
                         regex_scratch_mb = regex_scratch_bytes / (1024 * 1024),
                         regex_scratch_budget_mb = regex_scratch_budget_bytes / (1024 * 1024),
+                        regex_str_mb = regex_str.1 / (1024 * 1024),
+                        regex_str_budget_mb = regex_str.2 / (1024 * 1024),
+                        regex_str_entries = regex_str.0,
+                        regex_str_evictions = regex_str.3,
+                        regex_raw_mb = regex_raw.1 / (1024 * 1024),
+                        regex_raw_budget_mb = regex_raw.2 / (1024 * 1024),
+                        regex_raw_evictions = regex_raw.3,
                         queued_prefetch_jobs = outstanding.load(Ordering::Relaxed),
                         prefetch_buffer_mb = queued_bytes.load(Ordering::Relaxed) / (1024 * 1024),
                         active_slots,
