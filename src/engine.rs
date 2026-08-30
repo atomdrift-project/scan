@@ -4308,10 +4308,29 @@ fn terminal_finding_location(
     location
 }
 
+/// Whether a finding belongs to the file that lists it.
+///
+/// `src` alone is not the test. It marks an *inherited copy* — the finding was
+/// located in a member below and that member will report it — but a cross-file
+/// composite carries source provenance too (`composite_sources` records the
+/// members it drew from) while being native to no member at all: it exists only
+/// on the container. Filtering on `src.is_none()` therefore dropped every
+/// container-scope conclusion from this summary, so localstack-core's
+/// `aws-instance-launch-with-user-data` was absent from the terminal view while
+/// sitting in the JSON. cleave's `select_ids` and `compact.rs` draw the same
+/// distinction.
+fn finding_is_native(file: &cleave::FileAnalysis, finding: &cleave::Finding) -> bool {
+    finding.src.is_none() || file.composite_sources.contains_key(finding.id.as_str())
+}
+
 fn terminal_top_traits(report: &cleave::AnalysisReport) -> Vec<crate::output::TerminalTrait> {
     let mut deepest: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
     for file in &report.files {
-        for finding in file.findings.iter().filter(|f| f.src.is_none()) {
+        for finding in file
+            .findings
+            .iter()
+            .filter(|f| finding_is_native(file, f))
+        {
             deepest
                 .entry(finding.id.as_str())
                 .and_modify(|depth| *depth = (*depth).max(file.depth))
@@ -4325,7 +4344,7 @@ fn terminal_top_traits(report: &cleave::AnalysisReport) -> Vec<crate::output::Te
         .flat_map(|file| {
             let deepest = &deepest;
             file.findings.iter().filter_map(move |finding| {
-                (finding.src.is_none()
+                (finding_is_native(file, finding)
                     && finding.crit >= cleave::Criticality::Notable
                     && deepest
                         .get(finding.id.as_str())
@@ -5724,6 +5743,9 @@ pub(crate) fn classify_report(
                 active: model.active_level(),
                 grid_max: model.grid_max(),
             },
+            // cleave's own verdict, read from the structured report rather than
+            // re-parsed out of the render it produced. See `FindingSeverity`.
+            crate::interpret::FindingSeverity::from_report(&report),
         )?;
         if let Some(grade) = interp.grade {
             tracing::info!(

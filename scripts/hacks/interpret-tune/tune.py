@@ -196,6 +196,16 @@ def find_bin():
         sys.exit("no scan binary found (build with `cargo build --release`)")
     return max(found, key=lambda c: os.stat(c).st_mtime)
 
+def load_renders(dump_dir, corpus):
+    """Renders already on disk, keyed by corpus-relative path. Dumps are named by
+    content hash, so they survive a corpus move and are shared across runs."""
+    renders = {}
+    for rel, path in corpus_files(corpus):
+        rp = os.path.join(dump_dir, sha256(path) + ".render")
+        if os.path.exists(rp):
+            renders[rel] = open(rp, encoding="utf-8", errors="replace").read().rstrip("\n")
+    return renders
+
 def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
     os.makedirs(dump_dir, exist_ok=True)
     # `--follow=none`: a fetched dependency is network state, so the render it
@@ -225,11 +235,7 @@ def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
         proc.wait()
         print(f"# WARNING: capture scan exceeded {timeout}s and was killed; "
               f"proceeding with renders dumped so far", file=sys.stderr)
-    renders = {}
-    for rel, p in corpus_files(corpus):
-        rp = os.path.join(dump_dir, sha256(p) + ".render")
-        if os.path.exists(rp):
-            renders[rel] = open(rp, encoding="utf-8", errors="replace").read().rstrip("\n")
+    renders = load_renders(dump_dir, corpus)
     if not renders:
         print("# WARNING: capture produced no renders — check the scan binary, the corpus "
               "path, and --capture-timeout", file=sys.stderr)
@@ -262,6 +268,8 @@ def main():
     ap.add_argument("--capture-timeout", type=int, default=1800,
                     help="seconds before the capture scan is killed (a bad sample can't wedge the run)")
     ap.add_argument("--registry-map", default=None, help="registry provenance map passed to the capture scan")
+    ap.add_argument("--reuse-renders", action="store_true",
+                    help="grade the renders already in --dump-dir instead of rescanning the corpus")
     ap.add_argument("--dump-dir", default=None, help="render cache dir (default: <corpus>/.interpret-renders)")
     ap.add_argument("--emit-labels", action="store_true", help="print a labels template for --corpus and exit")
     args = ap.parse_args()
@@ -275,9 +283,18 @@ def main():
     templates = [t.strip() for t in args.templates.split(",") if t.strip()]
     dump_dir = args.dump_dir or os.path.join(args.corpus.rstrip("/") + ".interpret-renders")
     bin_path = args.bin or find_bin()
-    print(f"# capturing renders via {bin_path} (SCAN_INTERPRET_DUMP_DIR) …", file=sys.stderr)
-    renders = capture(args.corpus, dump_dir, bin_path, args.capture_timeout, args.registry_map)
-    print(f"# captured {len(renders)} renders", file=sys.stderr)
+    # Capture is the expensive half — tens of minutes over a real corpus — and it
+    # is the half that does not change when the question is which prompt to use.
+    # Reuse lets the same renders be graded again, which is also the only way two
+    # arms are compared over identical input rather than two scans of it.
+    cached = load_renders(dump_dir, args.corpus) if args.reuse_renders else {}
+    if cached:
+        print(f"# reusing {len(cached)} renders from {dump_dir}", file=sys.stderr)
+        renders = cached
+    else:
+        print(f"# capturing renders via {bin_path} (SCAN_INTERPRET_DUMP_DIR) …", file=sys.stderr)
+        renders = capture(args.corpus, dump_dir, bin_path, args.capture_timeout, args.registry_map)
+        print(f"# captured {len(renders)} renders", file=sys.stderr)
 
     labels = load_labels(args.labels) if args.labels else {}
     keys = sorted(renders)
@@ -289,12 +306,21 @@ def main():
         futs = {ex.submit(ask, args.endpoint, args.model, system_prompt(t),
                           transform(renders[rel], t), args.timeout): (rel, t, run)
                 for (rel, t, run) in jobs}
+        errors = []
         for fut in cf.as_completed(futs):
             rel, t, run = futs[fut]
             try:
                 results[(rel, t, run)] = fut.result()
-            except Exception:
+            except Exception as exc:
                 results[(rel, t, run)] = "E"
+                errors.append(f"{rel} [{t}]: {type(exc).__name__}: {exc}")
+    # A failed call scores as a miss, so a dead endpoint reads as a model that
+    # got everything wrong — a clean-looking table over a run that never happened.
+    # Say so, loudly, with the first reason.
+    if errors:
+        print(f"# WARNING: {len(errors)} of {len(jobs)} grading calls failed — the agreement "
+              f"numbers below are over the remainder, not the corpus", file=sys.stderr)
+        print(f"#   first failure: {errors[0]}", file=sys.stderr)
 
     def majority(rel, t):
         votes = [results[(rel, t, r)] for r in range(args.runs)]
