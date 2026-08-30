@@ -70,10 +70,18 @@ const ARCHIVE_ESTIMATE_MULTIPLIER: u64 = 64;
 /// even if no release wakes us).
 const REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Host available memory the gate refuses to eat into: 10% of RAM, at least
-/// 1 GiB. Mirrors cleave's member-walk pressure floor so the two gates agree
-/// on what "no room" means. `SCAN_HOST_FLOOR_MB` overrides (0 disables the
-/// host check).
+/// Host available memory the gate refuses to eat into: 1/16 of RAM (6.25%),
+/// at least 1 GiB — 2 GiB on a 32 GiB host, 8 GiB on 128 GiB.
+///
+/// The floor guards against the kernel's reclaim/paging storm, not against
+/// allocation failure (Windows fails allocations on the commit limit, which
+/// the pagefile backs; Linux overcommits). Windows starts trimming working
+/// sets and paging hard below roughly 1 GiB available, and `ullAvailPhys` /
+/// `MemAvailable` both count reclaimable cache as available, so 1 GiB of
+/// headroom above that threshold is the real margin. An earlier 10% floor
+/// left ~3 GiB idle on a 32 GiB desktop where the `--max-rss-gb` ceiling
+/// (85%) already bounds this process. `SCAN_HOST_FLOOR_MB` overrides
+/// (0 disables the host check).
 fn host_floor_bytes() -> u64 {
     if let Some(mb) = std::env::var("SCAN_HOST_FLOOR_MB")
         .ok()
@@ -82,7 +90,7 @@ fn host_floor_bytes() -> u64 {
         return mb.saturating_mul(MIB);
     }
     let total = cleave::memory_tracker::total_memory().unwrap_or(16 * 1024 * MIB);
-    (total / 10).max(1024 * MIB)
+    (total / 16).max(1024 * MIB)
 }
 
 /// Live available host memory in bytes, or `None` where the platform has no

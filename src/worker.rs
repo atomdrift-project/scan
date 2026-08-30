@@ -1703,6 +1703,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // analysis triggers a cold compile on a rayon worker, which deadlocks the
     // pool. See cleave::shared_resources::yara_engine for the contract.
     cleave::prefetch_shared_resources(true);
+    // Then build every YARA bucket on a few background threads: buckets load
+    // lazily per file type, and without this the first archive that touches
+    // a PE member pays the ~3 s `pe` bucket JIT inside its analysis.
+    cleave::prewarm_yara_buckets_background(true);
 
     let resource_config = Arc::new(ResourceConfig {
         model_dir: config.model_dir.clone(),
@@ -2135,6 +2139,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     let heap = crate::heap_profile::stats();
                     let (regex_scratch_bytes, regex_scratch_budget_bytes) =
                         cleave::regex_scratch_usage();
+                    cleave::persist_regex_warm_memo();
                     tracing::info!(
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                         jemalloc_allocated_mb = heap.map(|stats| stats.allocated / (1024 * 1024)),
@@ -2490,6 +2495,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // hopper re-leases anything left running. `--exit-if-empty` waits unbounded.
     if exit_if_empty {
         while workers.join_next().await.is_some() {}
+        cleave::persist_regex_warm_memo();
         tracing::info!("all in-flight jobs finished (batch drain), exiting");
     } else {
         let drain = async { while workers.join_next().await.is_some() {} };
