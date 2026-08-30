@@ -381,16 +381,27 @@ impl MemoryAdmission {
                     }
                 });
                 paused = true;
+                // Reclaim only when memory is actually short (host floor or
+                // process RSS). A `Reserved` refusal is the predictive cap —
+                // the sum of pessimistic per-job estimates — and says nothing
+                // about live pressure; clearing there wiped ~1.2 GB of
+                // compiled trait regexes (44k engines) on every pause, which
+                // then recompiled while the queue drained. Measured on the
+                // poppy worker benchmark: 8 such pauses per run at 2–3.8 GB
+                // used against an 11 GB ceiling.
+                //
                 // Clearing the caches only moves memory back to the allocator.
                 // This gate re-polls *live process memory*, so unless those pages
                 // also go back to the OS the pause sees no improvement and waits
                 // out the full re-poll for nothing.
-                let reclaim = tokio::task::spawn_blocking(|| {
-                    cleave::clear_all_thread_caches();
-                    crate::allocator::trim();
-                });
-                if let Err(e) = reclaim.await {
-                    tracing::warn!(error = %e, "cache-clear task failed");
+                if matches!(refusal, Some(Refusal::Host { .. } | Refusal::Rss { .. })) {
+                    let reclaim = tokio::task::spawn_blocking(|| {
+                        cleave::clear_all_thread_caches();
+                        crate::allocator::trim();
+                    });
+                    if let Err(e) = reclaim.await {
+                        tracing::warn!(error = %e, "cache-clear task failed");
+                    }
                 }
             }
             // Wait for a release, but wake periodically to re-poll live usage

@@ -1319,6 +1319,7 @@ fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
         slow_rule_ms: state.slow_rule_ms,
         max_jobs: None,
         exit_if_empty: false,
+        no_update: true,
         level: None,
         nice: 0,
         interpret: state.interpret.clone(),
