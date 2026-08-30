@@ -282,6 +282,30 @@ fn display_probability(raw: f32, threshold: f32) -> f32 {
     }
 }
 
+/// Level-derived confidence for DISPLAY, or `None` when the level carries no
+/// confidence worth showing.
+///
+/// [`level_confidence`] maps a negative level — "cleared no calibrated level
+/// at all" — onto `Some(0)`. That is a defensible wire value, but rendering it
+/// prints ` BENIGN    0% `, which reads as *maximum* confidence in benign. The
+/// model never said that. It said the sample cleared no calibrated level,
+/// which is the same state as carrying no level marker: unknown, not certain.
+///
+/// The failure this fixes: an npm package with a raw probability of 0.998
+/// against a higher cutoff rendered as `BENIGN[0%]` directly above cleave's
+/// own hostile finding for the same file. Returning `None` routes those
+/// through the existing no-level path — the threshold-relative percentage —
+/// so the badge shows how near the cutoff the sample actually sat.
+///
+/// Display-only by construction: the JSON `conf` field keeps calling
+/// [`level_confidence`], so the machine-readable shape is unchanged.
+fn display_confidence(level: Option<i32>) -> Option<u8> {
+    match level {
+        Some(n) if n < 0 => None,
+        other => level_confidence(other),
+    }
+}
+
 /// Color percentage text to match the classification band.
 fn colored_pct(probability: f32, classification: &Classification, threshold: f32) -> String {
     let pct = format!(
@@ -303,7 +327,7 @@ fn colored_conf_or_pct(
     threshold: f32,
     level: Option<i32>,
 ) -> String {
-    match level_confidence(level) {
+    match display_confidence(level) {
         Some(conf) => {
             let (_, _, accent) = indicator_colors(probability, classification, threshold);
             fg(accent, &format!("{:>4}", format!("{conf}%")))
@@ -351,7 +375,7 @@ pub(crate) fn terminal_badge(
 ) -> (String, usize) {
     // ` ` + 7-char word + ` ` + 4-char percentage + ` `.
     const BADGE_WIDTH: usize = 14;
-    let pct = level_confidence(level).map_or_else(
+    let pct = display_confidence(level).map_or_else(
         || {
             format!(
                 "{:.0}%",
@@ -1807,6 +1831,48 @@ mod tests {
         let thr = 0.80_f32;
         assert!((display_probability(thr, thr) - 0.5).abs() < 1e-6);
         assert!(display_probability(0.79, thr) < 0.5);
+    }
+
+    #[test]
+    fn display_confidence_is_absent_for_unflagged_levels() {
+        // Every level that is actually on the grid keeps its confidence: 0 is
+        // the tightest and most certain, higher levels are looser and less so.
+        assert_eq!(display_confidence(Some(0)), Some(100));
+        assert_eq!(display_confidence(Some(5)), Some(95));
+        // No level marker at all → no level-derived confidence. Unchanged.
+        assert_eq!(display_confidence(None), None);
+        // A negative level means the sample cleared no calibrated level. The
+        // wire value stays 0 (consumers of the JSON `conf` field see no change)
+        // but the display must not reuse it: 0% renders as certainty, and the
+        // model expressed absence.
+        assert_eq!(level_confidence(Some(-1)), Some(0));
+        assert_eq!(display_confidence(Some(-1)), None);
+        assert_eq!(display_confidence(Some(-7)), None);
+    }
+
+    #[test]
+    fn unflagged_badge_reports_distance_to_cutoff_not_zero() {
+        // Regression: an npm package whose raw probability was 0.998 against a
+        // higher cutoff rendered as `BENIGN[0%]`, printed directly above
+        // cleave's own hostile finding for the same file. Zero asserted a
+        // certainty the model never expressed. The honest number is how near
+        // the deciding cutoff the sample actually sat — here, right on it.
+        //
+        // Asserted with `contains` so the test holds in both the plain and the
+        // colored badge form.
+        let (unflagged, _) = terminal_badge(&Classification::Benign, 0.998, 0.999, Some(-1));
+        assert!(
+            unflagged.contains("BENIGN") && unflagged.contains("50%"),
+            "unflagged badge should show the threshold-relative percentage, got {unflagged:?}"
+        );
+
+        // A level that IS on the grid still reports its calibrated confidence,
+        // so the fix does not disturb the flagged path.
+        let (flagged, _) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Some(0));
+        assert!(
+            flagged.contains("HOSTILE") && flagged.contains("100%"),
+            "flagged badge should keep the level-derived confidence, got {flagged:?}"
+        );
     }
 
     #[test]
