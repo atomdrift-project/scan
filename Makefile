@@ -65,6 +65,18 @@ BIND ?=
 ALLOWED_DIRS ?=
 MEMORY_MAX ?=
 
+# IDLE caps the embedded idle worker: analysis slots `serve` may spend on
+# hopper queue work while no request is in flight. Unset keeps the server's own
+# default (half of --workers, rounded down). 0 turns background claiming off
+# entirely, so the host only ever works on interactive requests:
+#
+#   make deploy IDLE=0
+#
+# The cap is half the slots either way — the server clamps a larger IDLE — and
+# the idle worker is off regardless when HOPPER is unset, since there would be
+# nothing to claim from.
+IDLE ?=
+
 # HOPPER=none is the deliberate opt-out. It collapses to an empty HOPPER here,
 # before the export, so the deploy scripts see "unset" and emit no --hopper —
 # they must never receive the literal string as a URL.
@@ -73,7 +85,7 @@ override HOPPER :=
 HOPPER_OPTOUT := 1
 endif
 
-export HOPPER BIND ALLOWED_DIRS MEMORY_MAX
+export HOPPER BIND ALLOWED_DIRS MEMORY_MAX IDLE
 # ALLOW_CIDR and TOKEN_SRC are deliberately NOT declared here. They default
 # with `${VAR-default}` (unset) rather than `${VAR:-default}` (unset or empty),
 # because empty is a meaningful value: no CIDR allow-list, and no

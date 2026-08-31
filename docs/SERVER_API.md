@@ -153,8 +153,16 @@ proxy provides the ingress; set `0.0.0.0:49999` to listen on every interface),
 `TOKEN_SRC=` (default `~/.tok/scan`; set empty to deploy without
 authentication), `ALLOW_CIDR=` (default `10.0.0.0/8`; set empty to omit),
 `LLM=` / `LLM_URL=` (`local`, `openrouter`, or a base URL), `LLM_MODEL=`
-(required for OpenRouter), `WORKERS=`, `MEMORY_MAX=`. `make uninstall-server`
-tears the unit down.
+(required for OpenRouter), `WORKERS=`, `MEMORY_MAX=`, `IDLE=`. `make
+uninstall-server` tears the unit down.
+
+`IDLE=` caps the embedded idle worker — the analysis slots `serve` spends on
+hopper queue work while no request is in flight. Left unset it keeps the server
+default of half the slots; `make deploy IDLE=0` turns background claiming off,
+so the host only ever works on interactive requests. It applies on both
+platforms (the jail stores it as `scan_idle_slots` in rc.conf, changeable in
+place with `bastille sysrc`), and it is inert without `HOPPER=`, since there
+would be nothing to claim from.
 
 `ALLOW_CIDR=` and `TOKEN_SRC=` treat *empty* as a deliberate choice — no CIDR
 allow-list, no authentication — so unlike the others they are not declared in
