@@ -30,6 +30,11 @@
 #   ALLOW_CIDR  extra CIDR allow-list (--allow-cidr); empty skips the flag
 #                                                                (default: 10.0.0.0/8)
 #   WORKERS     concurrency (--workers)                          (default: server auto)
+#   IDLE        analysis slots the embedded idle worker may spend on hopper
+#               queue work (--idle-worker-slots); 0 disables background
+#               claiming entirely. Capped at half of WORKERS by the server, and
+#               inert without HOPPER.
+#                                                                (default: server auto = half of WORKERS)
 #   ALLOWED_DIRS  comma-separated /analyze-path roots            (default: unset)
 #   HOPPER      hopper base URL, or several comma-separated in preference
 #               order: put the replica first and the primary behind it, and a
@@ -74,6 +79,10 @@ BIND="${BIND:-127.0.0.1:49999}"
 ALLOW_CIDR="${ALLOW_CIDR-10.0.0.0/8}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/scan}"
 WORKERS="${WORKERS:-}"
+# Empty means "unset" here rather than a meaningful value: the server's own
+# default (half the slots) applies. IDLE=0 is a real value — background
+# claiming off — so it must survive as the string "0" and reach --idle-worker-slots.
+IDLE="${IDLE:-}"
 ALLOWED_DIRS="${ALLOWED_DIRS:-}"
 HOPPER="${HOPPER:-}"
 MAX_RSS_GB="${MAX_RSS_GB:--1}"
@@ -105,6 +114,11 @@ trap '[ -n "$TMP_UNIT" ] && rm -f "$TMP_UNIT"' EXIT
 [ "$(uname -s)" = "Linux" ]          || die "this script is for Linux"
 command -v systemctl >/dev/null 2>&1 || die "systemctl not found (systemd required)"
 command -v rizin     >/dev/null 2>&1 || die "rizin not found — install from https://rizin.re first"
+
+case "${IDLE}" in
+    '') ;;
+    *[!0-9]*) die "IDLE must be a non-negative integer (got '${IDLE}')" ;;
+esac
 
 # Privilege escalation: prefer doas, fall back to sudo.
 if   command -v doas >/dev/null 2>&1; then SUDO=doas
@@ -378,6 +392,9 @@ if [ -n "${ALLOWED_DIRS}" ]; then
 fi
 if [ -n "${HOPPER}" ]; then
     exec_args="${exec_args} --hopper ${HOPPER}"
+fi
+if [ -n "${IDLE}" ]; then
+    exec_args="${exec_args} --idle-worker-slots ${IDLE}"
 fi
 # Pass the path, never the token. atomscan refuses to start if the file is
 # missing or empty, so a lost token fails loudly instead of opening the API.

@@ -14,6 +14,11 @@
 #   HOPPER_TOKEN_FILE  hopper API token, installed into the jail whenever the
 #                 file exists — HOPPER need not be set, so turning renewal on
 #                 later needs nothing else.                 (default: ~/.tok/hopper)
+#   IDLE          analysis slots the embedded idle worker may spend on hopper
+#                 queue work (`serve --idle-worker-slots`); 0 disables
+#                 background claiming entirely. Stored in the jail's rc.conf as
+#                 scan_idle_slots; capped at half the slots by the server, and
+#                 inert without HOPPER.       (default: unset = half the slots)
 #
 # Cloudflare Tunnel (optional):
 #   CLOUDFLARED   "auto" installs and supervises a connector in the run jail
@@ -34,6 +39,10 @@ CLOUDFLARED="${CLOUDFLARED:-auto}"
 # Not a secret, so unlike the tokens it may live in the jail's rc.conf; the
 # rc.d below reads it as $scan_hopper.
 HOPPER="${HOPPER:-}"
+# Also not a secret, so it too lives in the jail's rc.conf, read below as
+# $scan_idle_slots. Empty means "unset" — the server's own default applies —
+# while IDLE=0 is a real value that must reach --idle-worker-slots as "0".
+IDLE="${IDLE:-}"
 
 # The tunnel token must never reach the `set -x` trace, argv, or the jail's
 # rc.conf. Capture it here, unset it, and move it into the jail through the
@@ -96,6 +105,11 @@ install_missing_build_packages() {
         doas bastille pkg "$BUILD" install -y "$@"
     fi
 }
+
+case "$IDLE" in
+    '') ;;
+    *[!0-9]*) die "IDLE must be a non-negative integer (got '$IDLE')" ;;
+esac
 
 # Verify jails are accessible
 doas bastille cmd "$BUILD" true || die "build jail '$BUILD' not accessible"
@@ -278,10 +292,18 @@ esac
 # secret, so it comes from rc.conf (the deploy sets it with sysrc from HOPPER=);
 # empty omits the flag. Its bearer token is a file, /home/scan/.tok/hopper,
 # which atomscan finds through the scan user's HOME.
+#
+# --idle-worker-slots caps the embedded idle worker, which fills otherwise-idle
+# analysis capacity with hopper queue work and pauses the moment a request
+# arrives. Empty omits the flag and leaves the server default (half the slots);
+# scan_idle_slots=0 turns background claiming off.
 : ${scan_hopper:=""}
 _hopper=""
 [ -n "$scan_hopper" ] && _hopper="--hopper ${scan_hopper}"
-command_args="-n ${scan_nice} ${_protect} /usr/sbin/daemon -c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --token-file /home/scan/.tok/scan --interpret --llm http://interpret:8000/v1 ${_hopper}"
+: ${scan_idle_slots:=""}
+_idle=""
+[ -n "$scan_idle_slots" ] && _idle="--idle-worker-slots ${scan_idle_slots}"
+command_args="-n ${scan_nice} ${_protect} /usr/sbin/daemon -c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --token-file /home/scan/.tok/scan --interpret --llm http://interpret:8000/v1 ${_hopper} ${_idle}"
 
 run_rc_command "$1"
 EOF
@@ -296,6 +318,10 @@ doas bastille sysrc "$RUN" scan_enable=YES
 # `sysrc -x`: the rc.d treats both the same, and this needs no flag forwarded
 # through `bastille sysrc`.
 doas bastille sysrc "$RUN" scan_hopper="$HOPPER"
+# Same reasoning: written unconditionally, empty when IDLE is unset, so
+# dropping the variable restores the server default instead of silently keeping
+# the previous cap.
+doas bastille sysrc "$RUN" scan_idle_slots="$IDLE"
 doas bastille service "$RUN" scan stop 2>/dev/null || true
 doas bastille cmd "$RUN" pkill -9 -F /var/run/scan.pid 2>/dev/null || true
 doas bastille service "$RUN" scan start
