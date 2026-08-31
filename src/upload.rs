@@ -153,13 +153,29 @@ fn resolve_credential(env: Option<&str>, path: Option<&std::path::Path>) -> Opti
     })
 }
 
+/// Point this process at `hopper_url`: report where the bearer token came from,
+/// and arm the fleet-shared dependency precheck against that same host.
+///
+/// Both halves belong to one decision — "this is the hopper we talk to" — and
+/// every entry point that reaches hopper calls this, so
+/// [`crate::corpus_precheck`]'s "the hopper you submit to is the hopper you ask"
+/// holds by construction. It used to hold only by each caller remembering, and
+/// the pull worker did not: it logged the credential and never armed the
+/// precheck, so it re-analyzed and re-mirrored dependencies the corpus already
+/// held at this analyzer version — which hopper records as "result renewed with
+/// no analyzer change; the re-analysis learned nothing".
+pub fn use_hopper(hopper_url: &str) {
+    log_hopper_credential();
+    crate::corpus_precheck::configure(hopper_url);
+}
+
 /// Log where the hopper credential came from, or warn that there is none.
 ///
 /// Hopper requires `Authorization: Bearer <token>` on every route and does not
 /// exempt loopback, so an unauthenticated worker or `--hopper` upload is
 /// rejected with 401 on every request. Say so once at startup rather than
 /// leaving an operator to infer it from a retry loop.
-pub fn log_hopper_credential() {
+fn log_hopper_credential() {
     match credential() {
         Some(credential) => {
             tracing::info!(source = %credential.origin, "hopper API token loaded");
@@ -483,10 +499,7 @@ impl Uploader {
     /// the failure is reported to stderr.
     #[must_use]
     pub fn new(hopper_url: &str, worker: String) -> Self {
-        log_hopper_credential();
-        // Submitting results here implies the corpus is authoritative for this
-        // process; arm the dependency precheck against the same hopper.
-        crate::corpus_precheck::configure(hopper_url);
+        use_hopper(hopper_url);
         // One entry per address `--hopper` named, in preference order. A retry
         // walks down the list, so a replica that stops answering costs the
         // first attempt and the primary takes the rest — the verdict lands
