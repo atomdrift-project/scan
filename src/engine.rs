@@ -4342,11 +4342,7 @@ fn finding_is_native(file: &cleave::FileAnalysis, finding: &cleave::Finding) -> 
 fn terminal_top_traits(report: &cleave::AnalysisReport) -> Vec<crate::output::TerminalTrait> {
     let mut deepest: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
     for file in &report.files {
-        for finding in file
-            .findings
-            .iter()
-            .filter(|f| finding_is_native(file, f))
-        {
+        for finding in file.findings.iter().filter(|f| finding_is_native(file, f)) {
             deepest
                 .entry(finding.id.as_str())
                 .and_modify(|depth| *depth = (*depth).max(file.depth))

@@ -191,13 +191,17 @@ fn llm_source(interpretation: Option<&crate::interpret::Interpretation>) -> Opti
 /// routing hint in the body; HTTP-aware callers get the standard header too.
 fn rendered_response(status: StatusCode, body: &serde_json::Value) -> Response {
     let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
-        .then(|| body.get("retry_after_secs").and_then(serde_json::Value::as_u64))
+        .then(|| {
+            body.get("retry_after_secs")
+                .and_then(serde_json::Value::as_u64)
+        })
         .flatten();
     let mut resp = (status, Json(body)).into_response();
     if let Some(secs) = retry_after
         && let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string())
     {
-        resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, v);
     }
     resp
 }
@@ -213,7 +217,9 @@ fn acquire_analysis_permit(
     size_hint: Option<u64>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, serde_json::Value)> {
     let Some(lanes) = &state.lanes else {
-        return Arc::clone(&state.slots).try_acquire_owned().map_err(|_| {
+        return Arc::clone(&state.slots)
+            .try_acquire_owned()
+            .map_err(|_no_permit| {
             let max = state.max_concurrent_tasks;
             (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -230,7 +236,7 @@ fn acquire_analysis_permit(
         // idle server, short enough that a single-server caller still lands.
         (&lanes.whale, "whale", 30u32)
     };
-    Arc::clone(lane).try_acquire_owned().map_err(|_| {
+    Arc::clone(lane).try_acquire_owned().map_err(|_no_permit| {
         (
             StatusCode::TOO_MANY_REQUESTS,
             serde_json::json!({
@@ -1606,7 +1612,12 @@ pub(super) async fn analyze(
             "received file, starting analysis",
         );
         let publisher = state.flights.publisher(attachment.flight());
-        match claim_slot(&state, request_id, attachment.flight().key(), Some(file_size as u64)) {
+        match claim_slot(
+            &state,
+            request_id,
+            attachment.flight().key(),
+            Some(file_size as u64),
+        ) {
             Err(outcome) => publisher.publish(outcome),
             Ok((resources, permit)) => {
                 let follow = resources.fetch;
@@ -2636,6 +2647,9 @@ pub(super) async fn analyze_path(
     )
 }
 
+// The analysis permit is moved into the `RequestGuard` below, which holds it
+// for the life of the request; clippy reads the move as a droppable temporary.
+#[allow(clippy::significant_drop_tightening)]
 async fn analyze_path_inner(
     state: Arc<AppState>,
     request_id: u64,
@@ -2704,12 +2718,15 @@ async fn analyze_path_inner(
                 size_bytes = file_size,
                 "rejecting: at capacity"
             );
-            let retry_after = body.get("retry_after_secs").and_then(serde_json::Value::as_u64);
+            let retry_after = body
+                .get("retry_after_secs")
+                .and_then(serde_json::Value::as_u64);
             let mut resp = (status, Json(body)).into_response();
             if let Some(secs) = retry_after
                 && let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string())
             {
-                resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, v);
             }
             return resp;
         }
@@ -3376,7 +3393,12 @@ async fn v1_analyze_bytes(
     if leads {
         tracing::info!(id = request_id, sha256 = %sha, size_bytes = bytes.len(), filename = %filename, "--> POST /v1/analyze (bytes)");
         let publisher = state.flights.publisher(attachment.flight());
-        match claim_slot(state, request_id, attachment.flight().key(), Some(bytes.len() as u64)) {
+        match claim_slot(
+            state,
+            request_id,
+            attachment.flight().key(),
+            Some(bytes.len() as u64),
+        ) {
             Err(outcome) => publisher.publish(outcome),
             Ok((resources, permit)) => match stage_upload(request_id, &filename, &bytes).await {
                 Err(outcome) => publisher.publish(outcome),

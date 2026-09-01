@@ -2182,8 +2182,19 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     let available_slots = slots.saturating_sub(active_slots);
                     // FreeBSD reads libc jemalloc via mallctl; everywhere else the
                     // bundled tikv-jemalloc answers through cleave's ctl wrapper.
-                    let heap = crate::heap_profile::stats().map(|s| (s.allocated as u64, s.active as u64, s.resident as u64, s.retained as u64))
-                        .or_else(|| cleave::memory_tracker::jemalloc_stats().map(|s| (s.allocated, s.active, s.resident, s.retained)));
+                    let heap = crate::heap_profile::stats()
+                        .map(|s| {
+                            (
+                                s.allocated as u64,
+                                s.active as u64,
+                                s.resident as u64,
+                                s.retained as u64,
+                            )
+                        })
+                        .or_else(|| {
+                            cleave::memory_tracker::jemalloc_stats()
+                                .map(|s| (s.allocated, s.active, s.resident, s.retained))
+                        });
                     let (regex_scratch_bytes, regex_scratch_budget_bytes) =
                         cleave::regex_scratch_usage();
                     let [regex_str, regex_raw] = cleave::regex_store_usage();

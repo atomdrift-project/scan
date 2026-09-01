@@ -1359,11 +1359,12 @@ pub(crate) fn orchestrate(
                 let mut real_iter = dep_fetched_real.into_iter();
                 let dep_fetched: Vec<FetchRecord> = dep_selected
                     .iter()
-                    .map(|r| match corpus_hits.get(&locator_str(&r.locator)) {
-                        Some(sha) => corpus_hit_record(r, &source_sha, sha),
-                        None => real_iter
-                            .next()
-                            .expect("fetched records must align with non-corpus-hit refs"),
+                    .filter_map(|r| match corpus_hits.get(&locator_str(&r.locator)) {
+                        Some(sha) => Some(corpus_hit_record(r, &source_sha, sha)),
+                        // fletch emits one record per reference it selects as a
+                        // fetch target; anything it declines has no record and
+                        // drops out here, exactly as in the regrouping below.
+                        None => real_iter.next(),
                     })
                     .collect();
                 if !corpus_hits.is_empty() {
