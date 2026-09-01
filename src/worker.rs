@@ -2216,6 +2216,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         completed = completed.load(Ordering::Acquire),
                         corpus_checks = crate::corpus_precheck::counters().0,
                         corpus_skips = crate::corpus_precheck::counters().1,
+                        purl_checks = crate::corpus_precheck::purl_counters().0,
+                        purl_skips = crate::corpus_precheck::purl_counters().1,
                         // Why this worker is (or is not) claiming. `poll_age_s`
                         // far above the poll cadence means the loop is wedged;
                         // `last_claim=0` with a fresh `poll_age_s` and non-zero
@@ -5343,7 +5345,7 @@ mod tests {
             tx.send(staged_pj(sha, 10)).unwrap();
         }
         drop(tx);
-        let jobs = Arc::new(JobSource::new(rx, false));
+        let jobs = Arc::new(JobSource::new(rx, DispatchOrder::Fifo));
         let got = Arc::new(AtomicUsize::new(0));
         let mut set = JoinSet::new();
         for _ in 0..4 {
@@ -5377,7 +5379,7 @@ mod tests {
         tx.send(staged_pj("sibling", 10)).unwrap();
         drop(tx);
 
-        let jobs = Arc::new(JobSource::new(rx, false));
+        let jobs = Arc::new(JobSource::new(rx, DispatchOrder::Fifo));
         let cleave = Arc::new(Semaphore::new(1));
         let analyzing = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
@@ -5445,7 +5447,7 @@ mod tests {
         tx.send(staged_pj("ok", 10)).unwrap();
         drop(tx);
 
-        let jobs = Arc::new(JobSource::new(rx, false));
+        let jobs = Arc::new(JobSource::new(rx, DispatchOrder::Fifo));
         let cleave = Arc::new(Semaphore::new(2));
         let analyzing = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));

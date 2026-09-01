@@ -41,6 +41,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 static CHECKS: AtomicU64 = AtomicU64::new(0);
 /// Analyses skipped because the corpus already held a benign, fresh verdict.
 static SKIPS: AtomicU64 = AtomicU64::new(0);
+/// PURLs asked of hopper by the pre-fetch batch negotiation.
+static PURL_CHECKS: AtomicU64 = AtomicU64::new(0);
+/// PURLs whose fetch+analysis were skipped on hopper's standing verdict.
+static PURL_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// Consecutive transport failures. At [`BREAKER_LIMIT`] the precheck disables
 /// itself for the life of the process: a dead replica must cost one log line,
 /// not a per-dependency connect timeout inside the analysis pipeline.
@@ -214,6 +218,108 @@ fn verdict_stands(rec: &Record, my_traits: Option<&str>, max_age_s: u64, now: u6
 
 /// (lookups attempted, analyses skipped) since process start, for the worker
 /// summary line.
+/// Batch PURL negotiation: which of these dependency PURLs does hopper hold a
+/// standing verdict for? Returns `purl → content sha256` for every entry that
+/// satisfies the same two rules as [`skip_reanalysis`] — the caller skips the
+/// FETCH as well as the analysis for those, which the per-sha precheck cannot
+/// (a registry PURL's content sha is only learned by downloading it). Batched
+/// 50 to a request (hopper's documented cap). An answer with no usable sha is
+/// dropped — the fetch-edge (`source → content sha`) must stay recordable — so
+/// the dependency falls through to a normal fetch. Fail-open everywhere, and
+/// `SCAN_PURL_PRECHECK=0` disables just this half.
+pub(crate) fn precheck_purls(
+    purls: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(p) = instance() else { return out };
+    if purls.is_empty()
+        || FAILURES.load(Ordering::Relaxed) >= BREAKER_LIMIT
+        || std::env::var("SCAN_PURL_PRECHECK").as_deref() == Ok("0")
+    {
+        return out;
+    }
+    PURL_CHECKS.fetch_add(purls.len() as u64, Ordering::Relaxed);
+    for chunk in purls.chunks(50) {
+        let mut req = p.client.get(&p.lookup_url);
+        for purl in chunk {
+            req = req.query(&[("purl", purl.as_str())]);
+        }
+        if let Some(token) = crate::upload::bearer_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = match req.send() {
+            Ok(r) => {
+                FAILURES.store(0, Ordering::Relaxed);
+                r
+            }
+            Err(e) => {
+                let n = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == BREAKER_LIMIT {
+                    tracing::warn!(
+                        error = %e,
+                        "purl precheck: {BREAKER_LIMIT} consecutive transport failures;                          disabling for the rest of this process"
+                    );
+                }
+                continue;
+            }
+        };
+        if resp.status() != reqwest::StatusCode::OK {
+            continue;
+        }
+        let Ok(value) = resp.json::<serde_json::Value>() else {
+            continue;
+        };
+        // One purl answers with one object, several with a list in the order
+        // asked; tolerate both, and prefer the answer's own `purl` field over
+        // positional matching when present.
+        let items: Vec<&serde_json::Value> = match value.as_array() {
+            Some(list) => list.iter().collect(),
+            None => vec![&value],
+        };
+        for (i, item) in items.iter().enumerate() {
+            let rec = Record {
+                fires_at: item.get("fires_at").and_then(serde_json::Value::as_i64),
+                analyzed_at: item
+                    .get("analyzed_at")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                traits_version: item
+                    .get("traits_version")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            };
+            if !verdict_stands(&rec, local_traits(), p.max_age.as_secs(), now_epoch()) {
+                continue;
+            }
+            let Some(sha) = item
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+            else {
+                continue;
+            };
+            let purl = item
+                .get("purl")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| chunk.get(i).cloned());
+            if let Some(purl) = purl {
+                PURL_SKIPS.fetch_add(1, Ordering::Relaxed);
+                out.insert(purl, sha.to_ascii_lowercase());
+            }
+        }
+    }
+    out
+}
+
+/// `(purl_checks, purl_skips)` lifetime counters for the batch negotiation.
+pub(crate) fn purl_counters() -> (u64, u64) {
+    (
+        PURL_CHECKS.load(Ordering::Relaxed),
+        PURL_SKIPS.load(Ordering::Relaxed),
+    )
+}
+
 pub(crate) fn counters() -> (u64, u64) {
     (
         CHECKS.load(Ordering::Relaxed),

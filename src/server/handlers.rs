@@ -187,10 +187,66 @@ fn llm_source(interpretation: Option<&crate::interpret::Interpretation>) -> Opti
 ///
 /// Followers claim neither: riding the leader's run rather than taking a slot
 /// of their own is the whole point of sharing it.
+/// Render an `Outcome::Rendered` to HTTP. Slot-lane rejections carry their
+/// routing hint in the body; HTTP-aware callers get the standard header too.
+fn rendered_response(status: StatusCode, body: &serde_json::Value) -> Response {
+    let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
+        .then(|| body.get("retry_after_secs").and_then(serde_json::Value::as_u64))
+        .flatten();
+    let mut resp = (status, Json(body)).into_response();
+    if let Some(secs) = retry_after
+        && let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string())
+    {
+        resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+    }
+    resp
+}
+
+/// One analysis permit under whichever admission scheme is active. With slot
+/// lanes on, a full lane is a fast 429 with a Retry-After hint rather than a
+/// queue: a whale's wait behind another whale is minutes, so the caller (or
+/// hopper) should route it to an idle server; without lanes this is the flat
+/// try-acquire it always was. `size_hint` is the declared payload size —
+/// `None` (an unfetched PURL/URL) classes as a whale, the safe direction.
+fn acquire_analysis_permit(
+    state: &Arc<AppState>,
+    size_hint: Option<u64>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, serde_json::Value)> {
+    let Some(lanes) = &state.lanes else {
+        return Arc::clone(&state.slots).try_acquire_owned().map_err(|_| {
+            let max = state.max_concurrent_tasks;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({ "error": format!("At capacity ({max}/{max} active analyses)") }),
+            )
+        });
+    };
+    let small = size_hint.is_some_and(|size| size <= lanes.small_max_bytes);
+    let (lane, label, retry_after_secs) = if small {
+        // A small analysis is seconds; the retry hint is "come right back".
+        (&lanes.small, "small", 5u32)
+    } else {
+        // A whale analysis is minutes; long enough for a router to prefer an
+        // idle server, short enough that a single-server caller still lands.
+        (&lanes.whale, "whale", 30u32)
+    };
+    Arc::clone(lane).try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            serde_json::json!({
+                "error": format!("{label} lane at capacity"),
+                "lane": label,
+                "retry_after_secs": retry_after_secs,
+            }),
+        )
+    })
+}
+
 fn claim_slot(
     state: &Arc<AppState>,
     request_id: u64,
     key: &FlightKey,
+    size_hint: Option<u64>,
 ) -> Result<
     (
         Arc<super::ModelResources>,
@@ -225,13 +281,12 @@ fn claim_slot(
     // waits — and the queued analysis still runs after somebody else has
     // already answered, which is the duplicate work single-flight exists to
     // prevent.
-    let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
-        let max = state.max_concurrent_tasks;
-        tracing::warn!(id = request_id, key = %key, max, "rejecting: at capacity");
-        return Err(Outcome::rendered(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("At capacity ({max}/{max} active analyses)"),
-        ));
+    let permit = match acquire_analysis_permit(state, size_hint) {
+        Ok(permit) => permit,
+        Err((status, body)) => {
+            tracing::warn!(id = request_id, key = %key, "rejecting: at capacity");
+            return Err(Outcome::Rendered { status, body });
+        }
     };
     Ok((resources, permit))
 }
@@ -358,7 +413,7 @@ fn flight_response(outcome: &Outcome, elapsed_ms: u64, shared: bool, key: &Fligh
             resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
             resp
         }
-        Outcome::Rendered { status, body } => (*status, Json(body)).into_response(),
+        Outcome::Rendered { status, body } => rendered_response(*status, body),
     };
     if shared {
         resp.extensions_mut().insert(super::access::Shared);
@@ -474,7 +529,7 @@ pub(super) async fn health(
     let max_rss_mb = state.max_rss_bytes.map(|n| n.get() / 1024 / 1024);
     let active_tasks = state
         .max_concurrent_tasks
-        .saturating_sub(state.slots.available_permits());
+        .saturating_sub(state.available_analysis_permits());
     let overloaded = match (rss_bytes, state.max_rss_bytes) {
         (Some(rss), Some(limit)) => rss > limit.get(),
         _ => false,
@@ -642,7 +697,7 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
 /// uses to ration work, rather than a second dialect of the same idea.
 pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
     let in_flight = state.in_flight.len();
-    let free = state.slots.available_permits();
+    let free = state.available_analysis_permits();
     let uploads = state.uploader.as_ref().map(|u| u.stats());
     let started = state.jobs_started.load(Ordering::Relaxed);
     let completed = state.jobs_completed.load(Ordering::Relaxed);
@@ -1551,7 +1606,7 @@ pub(super) async fn analyze(
             "received file, starting analysis",
         );
         let publisher = state.flights.publisher(attachment.flight());
-        match claim_slot(&state, request_id, attachment.flight().key()) {
+        match claim_slot(&state, request_id, attachment.flight().key(), Some(file_size as u64)) {
             Err(outcome) => publisher.publish(outcome),
             Ok((resources, permit)) => {
                 let follow = resources.fetch;
@@ -1809,7 +1864,7 @@ pub(super) async fn analyze_purl(
     if leads {
         tracing::info!(id = request_id, purl = %purl, "--> POST /analyze-purl");
         let publisher = state.flights.publisher(attachment.flight());
-        match claim_slot(&state, request_id, attachment.flight().key()) {
+        match claim_slot(&state, request_id, attachment.flight().key(), None) {
             Err(outcome) => publisher.publish(outcome),
             Ok((resources, permit)) => {
                 let follow = resources.fetch;
@@ -2640,19 +2695,24 @@ async fn analyze_path_inner(
     );
 
     // Claim a slot — same RAII semaphore pattern as /analyze.
-    let Ok(permit) = Arc::clone(&state.slots).try_acquire_owned() else {
-        let max = state.max_concurrent_tasks;
-        tracing::warn!(
-            id = request_id,
-            filename = %filename,
-            size_bytes = file_size,
-            max,
-            "rejecting: at capacity"
-        );
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("At capacity ({max}/{max} active analyses)"),
-        );
+    let permit = match acquire_analysis_permit(&state, Some(file_size)) {
+        Ok(permit) => permit,
+        Err((status, body)) => {
+            tracing::warn!(
+                id = request_id,
+                filename = %filename,
+                size_bytes = file_size,
+                "rejecting: at capacity"
+            );
+            let retry_after = body.get("retry_after_secs").and_then(serde_json::Value::as_u64);
+            let mut resp = (status, Json(body)).into_response();
+            if let Some(secs) = retry_after
+                && let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string())
+            {
+                resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            }
+            return resp;
+        }
     };
 
     let slow_rule_ms = state.slow_rule_ms;
@@ -2935,7 +2995,7 @@ pub(super) async fn memory_stats(State(state): State<Arc<AppState>>) -> Json<ser
             "jemalloc": jemalloc,
         },
         "server": {
-            "active_tasks": state.max_concurrent_tasks.saturating_sub(state.slots.available_permits()),
+            "active_tasks": state.max_concurrent_tasks.saturating_sub(state.available_analysis_permits()),
             "stuck_orphans": state.stuck_orphans.load(Ordering::Relaxed),
             "max_concurrent_tasks": state.max_concurrent_tasks,
             "requests_total": state.next_request_id.load(Ordering::Relaxed),
@@ -3316,7 +3376,7 @@ async fn v1_analyze_bytes(
     if leads {
         tracing::info!(id = request_id, sha256 = %sha, size_bytes = bytes.len(), filename = %filename, "--> POST /v1/analyze (bytes)");
         let publisher = state.flights.publisher(attachment.flight());
-        match claim_slot(state, request_id, attachment.flight().key()) {
+        match claim_slot(state, request_id, attachment.flight().key(), Some(bytes.len() as u64)) {
             Err(outcome) => publisher.publish(outcome),
             Ok((resources, permit)) => match stage_upload(request_id, &filename, &bytes).await {
                 Err(outcome) => publisher.publish(outcome),
@@ -3575,7 +3635,7 @@ pub(super) async fn v1_analyze(
         if leads {
             tracing::info!(id = request_id, url = %url, "--> POST /v1/analyze");
             let publisher = state.flights.publisher(attachment.flight());
-            match claim_slot(&state, request_id, attachment.flight().key()) {
+            match claim_slot(&state, request_id, attachment.flight().key(), None) {
                 Err(outcome) => publisher.publish(outcome),
                 Ok((resources, permit)) => {
                     let flight = Arc::clone(attachment.flight());
@@ -3721,7 +3781,7 @@ pub(super) async fn v1_analyze(
     if leads {
         tracing::info!(id = request_id, purl = %purl, "--> POST /v1/analyze");
         let publisher = state.flights.publisher(attachment.flight());
-        match claim_slot(&state, request_id, attachment.flight().key()) {
+        match claim_slot(&state, request_id, attachment.flight().key(), None) {
             Err(outcome) => publisher.publish(outcome),
             Ok((resources, permit)) => {
                 let flight = Arc::clone(attachment.flight());
@@ -3848,7 +3908,7 @@ fn v1_outcome_response(
         // A refusal keeps its status: the caller's router uses it to send the
         // work somewhere that can take it, which a decision in a 200 body
         // cannot be made to do.
-        Outcome::Rendered { status, body } => (*status, Json(body)).into_response(),
+        Outcome::Rendered { status, body } => rendered_response(*status, body),
     };
     // Which question this answer answers. The caller resolved a policy before
     // asking, but only this server knows what it applied on top of its own
