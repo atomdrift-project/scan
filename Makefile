@@ -392,6 +392,9 @@ deploy-worker: check-hopper-token ensure-llm-token kill-scan
 		         fi ;; \
 		OpenBSD) ./scripts/worker/worker-openbsd.sh "$(URL)" ;; \
 		SunOS)   ./scripts/worker/worker-omnios.sh "$(URL)" ;; \
+		MINGW*|MSYS*) \
+		         if command -v pwsh >/dev/null 2>&1; then ps=pwsh; else ps=powershell; fi; \
+		         "$$ps" -NoProfile -ExecutionPolicy Bypass -File scripts/worker/worker-windows.ps1 -Url "$(URL)" ;; \
 		*) echo "error: no deploy-worker target for $$(uname -s)"; exit 1 ;; \
 	esac
 
@@ -438,6 +441,9 @@ uninstall-worker:
 		           echo "error: unsupported Linux"; exit 1; \
 		         fi ;; \
 		OpenBSD) ./scripts/worker/uninstall-openbsd.sh ;; \
+		MINGW*|MSYS*) \
+		         if command -v pwsh >/dev/null 2>&1; then ps=pwsh; else ps=powershell; fi; \
+		         "$$ps" -NoProfile -ExecutionPolicy Bypass -File scripts/worker/uninstall-windows.ps1 ;; \
 		*) echo "error: no uninstall-worker target for $$(uname -s)"; exit 1 ;; \
 	esac
 
