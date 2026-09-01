@@ -108,7 +108,7 @@ LLM_MODEL ?=
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: pgo-train bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -141,8 +141,18 @@ check-cargo:
 		exit 1; \
 	}
 
+# Profile-guided optimization. When the local profile exists (`make pgo-train`
+# writes it; it is untracked — ~100 MB and host-generated), release builds use
+# it: measured 2026-08-31 on the poppy worker benchmark, wall −8% / CPU −11%
+# with byte-identical output. Without the file the build is exactly as before.
+# rustc prints "no profile data available" warnings for cold functions under
+# profile-use; they are expected and harmless.
+PGO_PROFDATA ?= build/pgo/atomscan.profdata
+PGO_FLAGS = $(if $(wildcard $(PGO_PROFDATA)),-C profile-use=$(abspath $(PGO_PROFDATA)),)
+
 release: check-cargo $(OUT_DIR)
-	$(CARGO) build --release
+	@if [ -n "$(PGO_FLAGS)" ]; then echo "release: PGO enabled ($(PGO_PROFDATA))"; else echo "release: no PGO profile at $(PGO_PROFDATA) — run 'make pgo-train' to create one"; fi
+	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$$RUSTFLAGS $(PGO_FLAGS)" cargo build --release
 	cp target/release/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
@@ -175,11 +185,28 @@ kill-scan:
 # Fat LTO + single codegen unit. Multi-minute link, marginal runtime win
 # over the default release profile. Use for container/tarball builds.
 release-lto: check-cargo $(OUT_DIR)
-	$(CARGO) build --profile release-lto
+	@if [ -n "$(PGO_FLAGS)" ]; then echo "release-lto: PGO enabled ($(PGO_PROFDATA))"; fi
+	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$$RUSTFLAGS $(PGO_FLAGS)" cargo build --profile release-lto
 	cp target/release-lto/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
 	fi
+
+# Regenerate the PGO profile: build an instrumented release, scan the training
+# corpus with it (analysis pipeline only, fetch off), merge the counters. The
+# training set defaults to the quarter-size worker benchmark corpus; any
+# representative directory works — PGO only needs the hot paths exercised.
+# Requires rustup's llvm-tools (`rustup component add llvm-tools`).
+PGO_TRAIN_PATH ?= $(BENCHMARK_ROOT)/poppy-q
+pgo-train: check-cargo
+	@[ -e "$(PGO_TRAIN_PATH)" ] || { echo "error: training corpus not found: $(PGO_TRAIN_PATH) (set PGO_TRAIN_PATH)"; exit 1; }
+	@lp=$$(find ~/.rustup -name llvm-profdata | head -1); [ -n "$$lp" ] || { echo "error: llvm-profdata not found — run: rustup component add llvm-tools"; exit 1; }
+	rm -rf /tmp/scan-pgo-train && mkdir -p /tmp/scan-pgo-train build/pgo
+	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="-C profile-generate=/tmp/scan-pgo-train" cargo build --release
+	@echo "pgo-train: scanning $(PGO_TRAIN_PATH) with the instrumented binary (slow: ~2x)"
+	SCAN_FETCH=none SCAN_NO_ANALYSIS_CACHE=1 CLEAVE_SKIP_CACHE=1 target/release/$(BINARY) -f json "$(PGO_TRAIN_PATH)" > /dev/null || true
+	$$(find ~/.rustup -name llvm-profdata | head -1) merge -o $(PGO_PROFDATA) /tmp/scan-pgo-train/*.profraw
+	@echo "✓ PGO profile: $(PGO_PROFDATA) — subsequent 'make release' builds use it"
 
 install: release
 	@set -e; \
