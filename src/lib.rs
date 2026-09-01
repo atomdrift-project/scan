@@ -32,7 +32,7 @@ pub mod analysis_cache;
 pub mod analyzer;
 pub mod auto_update;
 pub mod bench_hopper;
-pub mod bloom;
+
 pub mod bloom_build;
 pub mod bloom_repo;
 pub mod bloom_update;

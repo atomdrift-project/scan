@@ -285,6 +285,7 @@ dependencies = [
  "axum",
  "backtrace",
  "base64 0.22.1",
+ "burton",
  "bytes",
  "clap",
  "cleave",
@@ -617,6 +618,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 dependencies = [
  "allocator-api2",
+]
+
+[[package]]
+name = "burton"
+version = "0.1.0"
+source = "git+https://github.com/atomdrift-project/burton.git#07e852e4889cc1140353c6718b0779ec17d50991"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+ "toml 0.8.23",
 ]
 
 [[package]]

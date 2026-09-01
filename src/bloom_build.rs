@@ -1,35 +1,24 @@
-//! Producer side: turn a labelled good/bad pool into a publishable bloom bundle.
+//! Reading the labelled pool export that a bloom bundle is built from.
 //!
-//! The input is NDJSON, one pool record per line — the decoupled contract a
-//! hopper export fills (`{ "purl": "pkg:npm/x@1", "sha256": "<hex>", "label":
-//! "good" }`). Either `purl` or `sha256` may be absent; `label` is one of
-//! `good`, `bad`, `sighted-hostile`, `sighted-suspicious` and is taken
-//! verbatim. The *policy* — which rows earn which label, and how outside claims
-//! are graded — lives in whatever produces the export, not here; this module
-//! only does the set algebra and serialization.
+//! The input is NDJSON, one record per line — the decoupled contract a hopper
+//! export fills:
 //!
-//! [`read_pool`] parses the stream; [`crate::bloom::KeySets::into_filters_for`]
-//! builds the filters for a target layout version (with
-//! `good − (bad ∪ sighted-hostile)` subtraction, and folding tiers an older
-//! version cannot carry); [`write_bundle`] writes each `<stem>.adbl` plus a
-//! `bloom.toml` manifest naming every artifact, its sha256, its layout version,
-//! and its element count — the input the download flow verifies against,
-//! mirroring the model `versions.toml`.
+//! ```text
+//! {"purl": "pkg:npm/x@1", "sha256": "<64 hex>", "label": "good"}
+//! ```
+//!
+//! Either `purl` or `sha256` may be absent. `label` is one of `good`, `bad`,
+//! `sighted-hostile`, `sighted-suspicious`, and is taken verbatim: the policy
+//! deciding which rows earn which label lives in whatever produces the export.
+//!
+//! Everything downstream of here — set algebra, sizing, serialization, and the
+//! pre-publish safety checks — is [`burton`].
 
-use std::collections::BTreeMap;
 use std::io::BufRead;
-use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-// Manifest derives both Serialize (producer writes bloom.toml) and Deserialize
-// (the download flow and the installed sidecar read it back).
-
-use crate::bloom::{Filter, KeySets, Label, Record, Tier, parse_sha256_hex};
-
-/// `bloom.toml` schema version; bump on an incompatible manifest layout change.
-pub const MANIFEST_SCHEMA: u32 = 1;
+use anyhow::{Context, Result};
+use burton::{KeySets, Record, Tier, parse_sha256_hex};
+use serde::Deserialize;
 
 /// One line of the NDJSON pool export.
 #[derive(Debug, Deserialize)]
@@ -50,22 +39,33 @@ pub struct PoolStats {
     pub malformed: u64,
     /// Records whose `sha256` was present but not a 64-char hex digest.
     pub bad_sha: u64,
-    /// Records carrying a label this build does not know (counted and DROPPED).
-    /// Non-zero means the producer is ahead of the builder — see [`read_pool`].
+    /// Records whose `purl` was present but would not canonicalize, and so
+    /// contributed no key. A degenerate string must never become a matchable
+    /// filter bit.
+    pub bad_purl: u64,
+    /// Records carrying a label this build does not know: counted and DROPPED.
+    /// Non-zero means the producer is ahead of the builder.
     pub other_label: u64,
 }
 
-/// Stream an NDJSON pool into a [`KeySets`] accumulator, returning it with
-/// ingest diagnostics. Records are inserted as they are parsed — never buffered
-/// — so peak memory is the deduplicated key sets alone, independent of row
-/// count. Malformed lines are counted and skipped, never fatal: one bad row must
-/// not abort a 25M-row build.
+/// Stream an NDJSON pool into a [`KeySets`] accumulator.
+///
+/// Records are inserted as they are parsed and never buffered, so peak memory
+/// is the deduplicated key sets alone, independent of row count. Malformed
+/// lines are counted and skipped rather than fatal: one bad row must not abort
+/// a 25M-row build.
+///
+/// PURLs are canonicalized here, by the same function the scanner uses, so the
+/// producer and the consumer cannot disagree about what a key looks like. The
+/// scheme is recorded in the bundle under that name; see
+/// [`crate::bloom_repo::KEY_SCHEME`].
 ///
 /// # Errors
 /// Propagates only underlying read errors from `reader`.
 pub fn read_pool(reader: impl BufRead) -> Result<(KeySets, PoolStats)> {
-    let mut sets = KeySets::default();
+    let mut sets = KeySets::new();
     let mut stats = PoolStats::default();
+
     for line in reader.lines() {
         let line = line.context("reading pool line")?;
         let line = line.trim();
@@ -73,11 +73,13 @@ pub fn read_pool(reader: impl BufRead) -> Result<(KeySets, PoolStats)> {
             continue;
         }
         stats.records += 1;
+
         let Ok(rec) = serde_json::from_str::<PoolRecord>(line) else {
             stats.malformed += 1;
             continue;
         };
-        let sha = match rec.sha256.as_deref().map(parse_sha256_hex) {
+
+        let sha256 = match rec.sha256.as_deref().map(parse_sha256_hex) {
             Some(Some(digest)) => Some(digest),
             Some(None) => {
                 stats.bad_sha += 1;
@@ -85,472 +87,108 @@ pub fn read_pool(reader: impl BufRead) -> Result<(KeySets, PoolStats)> {
             }
             None => None,
         };
-        if rec.purl.is_none() && sha.is_none() {
+        let purl = match rec.purl.as_deref().map(crate::bloom_repo::purl_key) {
+            Some(Some(key)) => Some(key),
+            Some(None) => {
+                stats.bad_purl += 1;
+                None
+            }
+            None => None,
+        };
+        if purl.is_none() && sha256.is_none() {
             continue; // nothing to key on
         }
-        // Label strings are the producer's contract (hopper's bloom_pool.sql).
-        // An unrecognized one is COUNTED AND DROPPED, which is silent data loss
-        // if a producer starts emitting a tier this build predates — the reason
-        // the pool query carries a note to land the builder change first.
-        let label = match rec.label.as_str() {
-            "good" => Label::Good,
-            "bad" => Label::Bad,
-            "sighted-hostile" => Label::SightedHostile,
-            "sighted-suspicious" => Label::SightedSuspicious,
+
+        // Label strings are the producer's contract. An unrecognized one is
+        // counted and dropped, which is silent data loss if a producer starts
+        // emitting a tier this build predates — hence the count, and hence the
+        // rule that the builder change lands first.
+        let tier = match rec.label.as_str() {
+            "good" => Tier::Good,
+            "bad" => Tier::Bad,
+            "sighted-hostile" => Tier::SightedHostile,
+            "sighted-suspicious" => Tier::SightedSuspicious,
             _ => {
                 stats.other_label += 1;
                 continue;
             }
         };
-        sets.insert(
-            label,
-            Record {
-                purl: rec.purl,
-                sha256: sha,
-            },
-        );
+        sets.insert(tier, Record { purl, sha256 });
     }
     Ok((sets, stats))
-}
-
-/// One filter artifact's entry in `bloom.toml`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Entry {
-    /// File name relative to the bundle, e.g. `purl-good.adbl`.
-    pub file: String,
-    /// Lowercase hex SHA-256 of the file, verified on download.
-    pub sha256: String,
-    /// On-disk [`FORMAT_VERSION`] the file was written with.
-    pub format_version: u16,
-    /// Element count (informational).
-    pub n: u64,
-}
-
-/// The `bloom.toml` manifest: the contract between publish and download.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Manifest {
-    /// Manifest layout version ([`MANIFEST_SCHEMA`]).
-    pub schema: u32,
-    /// Build date (`YYYY-MM-DD`), stamped by the caller for reproducibility.
-    pub built: String,
-    /// One entry per filter, keyed by artifact stem (`purl-good`, …).
-    pub filter: BTreeMap<String, Entry>,
-}
-
-/// Write each filter to `<dir>/<stem>.adbl` and a `bloom.toml` manifest naming
-/// them, returning the manifest. `built` is the build date the caller supplies.
-///
-/// # Errors
-/// Returns an error if `dir` cannot be written or the manifest cannot be
-/// serialized.
-pub fn write_bundle(dir: &Path, filters: &[Filter], built: &str) -> Result<Manifest> {
-    let mut entries = BTreeMap::new();
-    for filter in filters {
-        let stem = filter.artifact_stem();
-        let file = format!("{stem}.adbl");
-        let bytes = filter.to_bytes();
-        std::fs::write(dir.join(&file), &bytes).with_context(|| format!("writing {file}"))?;
-        entries.insert(
-            stem,
-            Entry {
-                file,
-                sha256: hex_sha256(&bytes),
-                // The filter's OWN version, not this build's. A bundle
-                // projected down for older clients writes v1 headers, and
-                // bloom.sh derives the upload prefix from this field — stamping
-                // the constant here would publish a v1 bundle to the v2 path.
-                format_version: filter.version(),
-                n: filter.len(),
-            },
-        );
-    }
-    let manifest = Manifest {
-        schema: MANIFEST_SCHEMA,
-        built: built.to_owned(),
-        filter: entries,
-    };
-    let text = toml::to_string(&manifest).context("serializing bloom.toml")?;
-    std::fs::write(dir.join("bloom.toml"), text).context("writing bloom.toml")?;
-    Ok(manifest)
-}
-
-/// Lowercase hex SHA-256 of `bytes`.
-fn hex_sha256(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-// --- Build-time safety checks -----------------------------------------------
-//
-// A bloom is published unattended (hourly), so a poisoned or hollow build would
-// otherwise ship straight to clients. These checks run on the freshly-built
-// filters *before* the bundle is written, so a violation fails loud and leaves
-// the last good build untouched.
-
-/// A digest that must never be classified into a given tier. A handful of these
-/// catch the catastrophic mislabel — a known-bad sample blessed `good`, a
-/// ubiquitous benign one catalogued `bad` — that a silent rebuild would carry
-/// all the way to a `skip` verdict.
-struct Canary {
-    /// 64-char lowercase hex SHA-256.
-    sha256: &'static str,
-    /// The tier this digest must *not* appear in.
-    forbidden: Tier,
-}
-
-/// Fixed canaries, checked on every build. Seeded with the one universally-true
-/// assertion; extend with catalogued hashes (known-bad that must not be `good`,
-/// or ubiquitous known-good that must not be `bad`) as they come up.
-const CANARIES: &[Canary] = &[
-    // The EICAR test file is benign by construction, but every scanner is
-    // expected to treat it as hostile — so it must never be blessed `good`.
-    Canary {
-        sha256: "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
-        forbidden: Tier::Good,
-    },
-];
-
-/// Previous counts below this are too small for ratio bounds to mean anything
-/// (a few bad PURLs swing wildly build to build), so only the cliff-to-empty
-/// guard applies to them.
-const RATIO_FLOOR: u64 = 1_000;
-/// Fail if a filter shrinks below this fraction of its previous size...
-const MAX_SHRINK: f64 = 0.5;
-/// ...or grows beyond this multiple of it. Both catch a corrupt pool export (an
-/// empty query, a label flip dumping one tier into the other) without anyone
-/// maintaining per-filter expected counts.
-const MAX_GROWTH: f64 = 3.0;
-
-/// Read a previously-built `bloom.toml` from `dir`, if one is present, so a new
-/// build can be sized against it. A missing or unparseable manifest means "no
-/// baseline" — the first build has nothing to compare against.
-#[must_use]
-pub fn read_prev_manifest(dir: &Path) -> Option<Manifest> {
-    let text = std::fs::read_to_string(dir.join("bloom.toml")).ok()?;
-    toml::from_str(&text).ok()
-}
-
-/// Fail loudly if a freshly-built bundle looks poisoned or truncated:
-///
-/// * a [`CANARIES`] digest — or any caller-supplied known-good digest — landed
-///   on the wrong side of the good/bad split, or
-/// * a filter's element count collapsed or exploded relative to `prev`.
-///
-/// `host_good` is `(label, digest)` for artifacts the caller vouches for as
-/// ubiquitously benign (e.g. the build host's `/bin/ls`); each must be absent
-/// from `sha256-bad`. Pass an empty slice to skip that check.
-///
-/// `accept_unusual` downgrades the ratio bounds from fatal to a logged warning,
-/// for the one case they cannot distinguish from a corrupt export: an operator
-/// deliberately changing a tier's rule, where a large step IS the change. It is
-/// deliberately narrow and covers ONLY the shrink/growth ratios:
-///
-/// * the canaries (1) and caller-vouched digests (2) stay fatal, because no
-///   rule change can make a poisoned build acceptable;
-/// * the collapse-to-zero guard stays fatal, because that is an empty query or
-///   a dropped arm rather than a policy the operator chose.
-///
-/// Every breach it waves through is printed, so a run that used the override
-/// still says what it accepted.
-///
-/// # Errors
-/// Returns the first violation found, with enough context to act on it.
-pub fn verify_build(
-    filters: &[Filter],
-    prev: Option<&Manifest>,
-    host_good: &[(String, [u8; 32])],
-    accept_unusual: bool,
-) -> Result<()> {
-    let find = |stem: &str| filters.iter().find(|f| f.artifact_stem() == stem);
-
-    // 1. Fixed canaries: a known digest must not be in its forbidden tier.
-    for c in CANARIES {
-        let digest = parse_sha256_hex(c.sha256)
-            .with_context(|| format!("canary {} is not valid sha256 hex", c.sha256))?;
-        let stem = format!("sha256-{}", c.forbidden.as_str());
-        if find(&stem).is_some_and(|f| f.contains_digest(&digest)) {
-            bail!(
-                "SAFETY: canary {} is present in {stem} but must never be {}; \
-                 refusing to publish a poisoned bloom",
-                c.sha256,
-                c.forbidden.as_str()
-            );
-        }
-    }
-
-    // 2. Caller-vouched known-good digests must not be catalogued bad.
-    if let Some(bad) = find("sha256-bad") {
-        for (label, digest) in host_good {
-            if bad.contains_digest(digest) {
-                bail!(
-                    "SAFETY: known-good {label} is present in sha256-bad; \
-                     refusing to publish a poisoned bloom"
-                );
-            }
-        }
-    }
-
-    // 3. Row-count sanity against the previous build, if there is one.
-    let Some(prev) = prev else { return Ok(()) };
-    for f in filters {
-        let stem = f.artifact_stem();
-        let Some(was) = prev.filter.get(&stem).map(|e| e.n) else {
-            continue;
-        };
-        let now = f.len();
-        // Not covered by `accept_unusual`. A tier that had rows and now has
-        // none is an empty query or a dropped arm, never a policy change worth
-        // shipping — and publishing it would revoke every key in that tier at
-        // once.
-        if was > 0 && now == 0 {
-            bail!("SAFETY: {stem} collapsed to 0 rows (was {was}); refusing to publish");
-        }
-        if was >= RATIO_FLOOR {
-            let ratio = now as f64 / was as f64;
-            let breach = if ratio < MAX_SHRINK {
-                Some(format!(
-                    "shrank to {now} rows from {was} ({:.0}% of previous, floor {:.0}%)",
-                    ratio * 100.0,
-                    MAX_SHRINK * 100.0
-                ))
-            } else if ratio > MAX_GROWTH {
-                Some(format!(
-                    "grew to {now} rows from {was} ({ratio:.1}x previous, ceiling {MAX_GROWTH:.1}x)"
-                ))
-            } else {
-                None
-            };
-            if let Some(what) = breach {
-                if !accept_unusual {
-                    bail!(
-                        "SAFETY: {stem} {what}; refusing to publish. \
-                         If this is a deliberate tier-rule change, re-run with \
-                         --accept-unusual-growth (or SCAN_BLOOM_ACCEPT_UNUSUAL_GROWTH=1)"
-                    );
-                }
-                // Loud on purpose. The override exists for a rule change the
-                // operator made on purpose; it must not also quietly absorb the
-                // corrupt-export case it was built to catch, so every breach it
-                // waves through is named in the build log.
-                eprintln!("ACCEPTED UNUSUAL: {stem} {what} — accepted by explicit override");
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    // Only the tests still name the constant directly; the writer stamps each
-    // filter's own version so a projected-down bundle stays self-consistent.
-    use crate::bloom::FORMAT_VERSION;
+
+    const CLEAN: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn read(lines: &[&str]) -> (KeySets, PoolStats) {
+        read_pool(lines.join("\n").as_bytes()).unwrap()
+    }
 
     #[test]
-    fn read_pool_partitions_and_counts() {
-        let input = concat!(
-            r#"{"purl":"pkg:npm/good@1","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","label":"good"}"#,
-            "\n",
-            r#"{"purl":"pkg:npm/evil@1","label":"bad"}"#,
-            "\n",
-            "\n",                  // blank line ignored
-            r#"{"label":"good"}"#, // no purl/sha → contributes nothing
-            "\n",
-            r#"{"sha256":"nothex","label":"bad"}"#, // bad sha, no purl → nothing, counted
-            "\n",
-            r#"{"purl":"pkg:npm/x@1","label":"review"}"#, // other label
-            "\n",
-            "not json at all",
-            "\n",
+    fn partitions_by_label_and_counts_what_it_dropped() {
+        let (sets, stats) = read(
+            &[
+                r#"{"purl":"pkg:npm/good@1","sha256":"$C","label":"good"}"#,
+                r#"{"purl":"pkg:npm/bad@1","label":"bad"}"#,
+                r#"{"purl":"pkg:npm/seen@1","label":"sighted-hostile"}"#,
+                r#"{"purl":"pkg:npm/maybe@1","label":"sighted-suspicious"}"#,
+                r#"{"purl":"pkg:npm/future@1","label":"tier-from-the-future"}"#,
+                r#"{"purl":"pkg:npm/shortsha@1","sha256":"abc","label":"good"}"#,
+                r#"{"purl":"not a purl","label":"good"}"#,
+                "not json at all",
+                "",
+            ]
+            .iter()
+            .map(|l| l.replace("$C", CLEAN))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
         );
-        let (sets, stats) = read_pool(input.as_bytes()).unwrap();
-        assert_eq!(sets.good_counts(), (1, 1), "one good purl + one good sha");
-        assert_eq!(sets.bad_counts(), (1, 0), "one bad purl, no bad sha");
-        assert_eq!(stats.records, 6, "six non-blank lines");
+
+        assert_eq!(stats.records, 8);
         assert_eq!(stats.malformed, 1);
         assert_eq!(stats.bad_sha, 1);
+        assert_eq!(stats.bad_purl, 1);
         assert_eq!(stats.other_label, 1);
+
+        assert_eq!(sets.counts(Tier::Good), (2, 1), "good purls / shas");
+        assert_eq!(sets.counts(Tier::Bad), (1, 0));
+        assert_eq!(sets.counts(Tier::SightedHostile), (1, 0));
+        assert_eq!(sets.counts(Tier::SightedSuspicious), (1, 0));
     }
 
     #[test]
-    fn write_bundle_round_trips_through_manifest_and_loader() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (sets, _) = read_pool(
-            concat!(
-                r#"{"purl":"pkg:npm/good@1","label":"good"}"#,
-                "\n",
-                r#"{"purl":"pkg:npm/evil@1","label":"bad"}"#,
-                "\n",
-            )
-            .as_bytes(),
+    fn a_row_with_nothing_to_key_on_is_skipped() {
+        let (sets, stats) = read(&[r#"{"label":"good"}"#]);
+        assert_eq!(stats.records, 1);
+        assert_eq!(sets.counts(Tier::Good), (0, 0));
+    }
+
+    #[test]
+    fn keys_land_in_the_form_the_scanner_looks_them_up_by() {
+        let (sets, _) = read(&[r#"{"purl":"pkg:NPM/left-pad@1.3.0?arch=x86_64","label":"good"}"#]);
+        let filters = sets.into_filters(1e-9);
+        let dir = tempfile::tempdir().unwrap();
+        burton::build::write_bundle(
+            dir.path(),
+            &filters,
+            "2026-08-31",
+            crate::bloom_repo::KEY_SCHEME,
         )
         .unwrap();
-        let filters = sets.into_filters(1e-9);
-        let manifest = write_bundle(tmp.path(), &filters, "2026-06-26").unwrap();
 
-        assert_eq!(manifest.schema, MANIFEST_SCHEMA);
-        assert_eq!(manifest.built, "2026-06-26");
-        // Every entry's recorded sha256 matches the bytes actually on disk.
-        for (stem, entry) in &manifest.filter {
-            let bytes = std::fs::read(tmp.path().join(&entry.file)).unwrap();
-            assert_eq!(entry.sha256, hex_sha256(&bytes), "{stem} sha256 mismatch");
-            assert_eq!(entry.format_version, FORMAT_VERSION);
-        }
-        // bloom.toml exists and the bundle loads back through the consumer path.
-        assert!(tmp.path().join("bloom.toml").is_file());
-        let lk = crate::bloom_repo::Lookup::load_from(tmp.path());
+        let lk = crate::bloom_repo::Lookup::load_from(dir.path());
+        // The type is lowercased and artifact-selection qualifiers are dropped,
+        // so an SBOM-stamped spelling and the bare coordinate are one key.
         assert_eq!(
-            lk.decide_purl("pkg:npm/good@1"),
+            lk.decide_purl("pkg:npm/left-pad@1.3.0"),
             crate::bloom_repo::Decision::Skip
         );
-        assert_eq!(
-            lk.decide_purl("pkg:npm/evil@1"),
-            crate::bloom_repo::Decision::KnownBad
-        );
-    }
-
-    /// EICAR's sha256, the seeded canary that must never be classified good.
-    const EICAR: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
-
-    /// Build the four filters from `(label, sha256)` digests, no PURLs.
-    fn filters_from(digests: &[(Label, [u8; 32])]) -> Vec<Filter> {
-        let mut sets = KeySets::default();
-        for (label, d) in digests {
-            sets.insert(
-                *label,
-                Record {
-                    purl: None,
-                    sha256: Some(*d),
-                },
-            );
-        }
-        sets.into_filters(1e-9)
-    }
-
-    fn manifest_with(counts: &[(&str, u64)]) -> Manifest {
-        let filter = counts
-            .iter()
-            .map(|(stem, n)| {
-                (
-                    (*stem).to_owned(),
-                    Entry {
-                        file: format!("{stem}.adbl"),
-                        sha256: String::new(),
-                        format_version: FORMAT_VERSION,
-                        n: *n,
-                    },
-                )
-            })
-            .collect();
-        Manifest {
-            schema: MANIFEST_SCHEMA,
-            built: "2026-01-01".to_owned(),
-            filter,
-        }
-    }
-
-    #[test]
-    fn verify_passes_a_clean_build() {
-        let filters = filters_from(&[(Label::Good, [1; 32]), (Label::Bad, [2; 32])]);
-        verify_build(&filters, None, &[], false).unwrap();
-    }
-
-    #[test]
-    fn verify_rejects_eicar_in_good() {
-        let eicar = parse_sha256_hex(EICAR).unwrap();
-        let filters = filters_from(&[(Label::Good, eicar)]);
-        let err = verify_build(&filters, None, &[], false)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("canary") && err.contains("sha256-good"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn verify_rejects_known_good_in_bad() {
-        let d = [0xab; 32];
-        let filters = filters_from(&[(Label::Bad, d)]);
-        let err = verify_build(&filters, None, &[("/bin/ls".to_owned(), d)], false)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("/bin/ls") && err.contains("sha256-bad"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn verify_rejects_a_count_cliff() {
-        // 100 good shas now, 10_000 before → 1% of previous, well under the floor.
-        let now: Vec<_> = (0..100u8).map(|i| (Label::Good, [i; 32])).collect();
-        let filters = filters_from(&now);
-        let prev = manifest_with(&[("sha256-good", 10_000)]);
-        let err = verify_build(&filters, Some(&prev), &[], false)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("sha256-good") && err.contains("shrank"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn verify_rejects_unusual_growth_without_the_override() {
-        let now: Vec<_> = (0..=255u8).map(|i| (Label::Good, [i; 32])).collect();
-        let filters = filters_from(&now);
-        let prev = manifest_with(&[("sha256-good", 1_000)]);
-        let err = verify_build(&filters, Some(&prev), &[], false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("shrank") || err.contains("grew"), "{err}");
-        assert!(err.contains("--accept-unusual-growth"), "{err}");
-    }
-
-    #[test]
-    fn override_waves_through_a_ratio_breach() {
-        let now: Vec<_> = (0..=255u8).map(|i| (Label::Good, [i; 32])).collect();
-        let filters = filters_from(&now);
-        let prev = manifest_with(&[("sha256-good", 1_000)]);
-        verify_build(&filters, Some(&prev), &[], true).unwrap();
-    }
-
-    /// The override is for a deliberate rule change, never for a poisoned
-    /// build: a canary in the wrong tier stays fatal with it set.
-    #[test]
-    fn override_does_not_wave_through_a_canary() {
-        let eicar = parse_sha256_hex(EICAR).unwrap();
-        let filters = filters_from(&[(Label::Good, eicar)]);
-        let err = verify_build(&filters, None, &[], true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("canary"), "{err}");
-    }
-
-    /// Nor for a tier that emptied out — that is a dropped arm, not a policy.
-    #[test]
-    fn override_does_not_wave_through_a_collapse() {
-        let filters = filters_from(&[(Label::Bad, [7; 32])]);
-        let prev = manifest_with(&[("sha256-good", 5_000)]);
-        let err = verify_build(&filters, Some(&prev), &[], true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("collapsed to 0 rows"), "{err}");
-    }
-
-    #[test]
-    fn verify_ignores_small_filter_swings() {
-        // A handful of bad PURLs/shas is below RATIO_FLOOR, so a 1→3 jump is fine.
-        let filters = filters_from(&[(Label::Bad, [9; 32])]);
-        let prev = manifest_with(&[("sha256-bad", 3)]);
-        verify_build(&filters, Some(&prev), &[], false).unwrap();
     }
 }

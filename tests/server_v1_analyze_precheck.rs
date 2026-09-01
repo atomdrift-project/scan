@@ -211,6 +211,50 @@ async fn a_held_verdict_answers_without_analyzing() -> Result<()> {
     Ok(())
 }
 
+/// A policy the operator did not configure is still a question the corpus can
+/// answer.
+///
+/// This guards the rule that cost the fleet its corpus. Sharing used to require
+/// the request's policy to equal this server's own default — and beamline
+/// resolves `references` for a PURL while an unflagged server defaults to
+/// `dependencies,references`, so no ordinary request ever matched. Every
+/// verdict was treated as private to its caller: not read from the index, not
+/// offered to hopper, not answerable from what the corpus already held. The
+/// analysis was correct and nothing was kept.
+///
+/// `follow=none` differs from any default this server can be started with, so a
+/// 200 here can only mean the precheck ran for a policy that is not the
+/// configured one. Under the old rule this analyzed instead, and answered
+/// non-200 against the empty model directory.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "blocked: build_app with --hopper builds a blocking reqwest client, which panics under any tokio runtime. Pre-existing; see the module comment."]
+async fn a_policy_the_operator_did_not_configure_still_reads_the_corpus() -> Result<()> {
+    let (base, asked) = stub_corpus(Holds::Verdict).await?;
+    let app = app_with_corpus(Some(&base)).await?;
+    let (status, body) = analyze(
+        app,
+        "/v1/analyze?purl=npm%2Fleft-pad%401.3.0&follow=none",
+        "",
+    )
+    .await?;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a non-default policy did not consult the corpus, so it analyzed: {body}",
+    );
+    assert_eq!(
+        body["engine_version"], "corpus-probe",
+        "the answer did not come from the corpus: {body}",
+    );
+    assert_eq!(
+        asked.count.load(Ordering::SeqCst),
+        1,
+        "the corpus was not asked exactly once"
+    );
+    Ok(())
+}
+
 /// An upload is asked about by the digest of the bytes in hand — the identity —
 /// so re-sending an artifact the fleet has already seen costs nothing either.
 #[tokio::test(flavor = "multi_thread")]

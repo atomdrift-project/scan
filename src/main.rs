@@ -359,8 +359,10 @@ struct Cli {
     ///   `references`   — packages and URLs named by install/download commands;
     ///   `ci-actions`   — third-party actions referenced by CI configuration.
     /// `all` selects every category; `none` analyzes only the requested artifact.
-    /// A bare `--follow` and the default follow dependencies and references but
-    /// not CI actions. The old `--fetch` flag and `deps`, `packages`, `urls`, and
+    /// A bare `--follow` follows dependencies and references but not CI actions,
+    /// and so does an absent one for an interactive scan. `serve` and `worker`
+    /// default to `all` instead: they populate the shared corpus, where a
+    /// category nobody followed is one nobody ever learns. The old `--fetch` flag and `deps`, `packages`, `urls`, and
     /// `ci` values remain accepted as aliases. Also settable via `SCAN_FOLLOW`;
     /// `SCAN_FETCH` remains a compatibility alias.
     #[arg(
@@ -718,6 +720,30 @@ fn default_cli_follow_policy() -> scan::fetch::FetchPolicy {
         urls: true,
         packages: true,
         deps: true,
+        ..scan::fetch::FetchPolicy::default()
+    }
+}
+
+/// The follow selection a `serve` or `worker` process uses when the operator
+/// named none: everything, CI actions included.
+///
+/// These are cache-population roles. They scan on behalf of everybody, and the
+/// corpus they fill is asked about artifacts nobody has looked at yet — so a
+/// category left unfollowed is one the corpus never learns about, for every
+/// consumer, until somebody notices and restarts the fleet with a wider flag.
+/// The narrower interactive default exists to keep one person's scan fast,
+/// which is not what a service is for.
+///
+/// Widest-by-default also settles which verdict wins. Hopper holds one verdict
+/// per artifact and the last writer takes the row, so a fleet whose members
+/// follow different amounts lets a narrow answer overwrite a wide one. When
+/// every server follows everything, there is no narrower answer to lose to.
+fn default_service_follow_policy() -> scan::fetch::FetchPolicy {
+    scan::fetch::FetchPolicy {
+        urls: true,
+        packages: true,
+        deps: true,
+        ci: true,
         ..scan::fetch::FetchPolicy::default()
     }
 }
@@ -1295,8 +1321,16 @@ fn main() -> Result<()> {
     // consulted by every registry lookup. `None` keeps the tiered defaults.
     scan::fetch::set_registry_ttl(cli.registry_ttl);
     let scans_for_other_hosts = command_scans_for_other_hosts(cli.command.as_ref());
+    // An unflagged `serve` follows everything; an unflagged interactive scan
+    // follows only what an installed artifact can reach. See
+    // [`default_service_follow_policy`].
+    let default_follow = if scans_for_other_hosts {
+        default_service_follow_policy
+    } else {
+        default_cli_follow_policy
+    };
     let fetch_policy = with_knobs(
-        cli.follow.unwrap_or_else(default_cli_follow_policy),
+        cli.follow.unwrap_or_else(default_follow),
         scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
         scans_for_other_hosts,
     );
@@ -1306,7 +1340,7 @@ fn main() -> Result<()> {
     // fresh-risk window that keeps an interactive scan fast is exactly the wrong
     // default there — it discards the long tail the cache most wants.
     let worker_fetch_policy = with_knobs(
-        cli.follow.unwrap_or_else(default_cli_follow_policy),
+        cli.follow.unwrap_or_else(default_service_follow_policy),
         WORKER_MAX_DEP_AGE_DAYS,
         true,
     );
@@ -2563,7 +2597,8 @@ fn run_scan_paths(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy, default_cli_follow_policy,
+        Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy,
+        command_scans_for_other_hosts, default_cli_follow_policy, default_service_follow_policy,
         is_expected_yara_cache_mismatch, redact_zip_passwords, resolve_hopper_value,
         resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
     };
@@ -2619,6 +2654,59 @@ mod tests {
         assert_eq!(policy.max_url_fetches, scan::fetch::DEFAULT_MAX_URL_FETCHES);
         assert_eq!(policy.max_url_fetches, 4);
         Ok(())
+    }
+
+    /// A service follows everything it can reach, because the corpus it fills
+    /// is asked about artifacts nobody has looked at yet: a category left
+    /// unfollowed is one nobody ever learns about.
+    #[test]
+    fn serve_and_worker_follow_everything_by_default() {
+        let service = default_service_follow_policy();
+        assert!(
+            service.urls && service.packages && service.deps && service.ci,
+            "a cache-population role must follow every category"
+        );
+
+        // The interactive default stays narrow: CI actions never reach an
+        // installed artifact, so one person's scan should not pay for them.
+        let interactive = default_cli_follow_policy();
+        assert!(
+            !interactive.ci,
+            "the interactive default must not widen with the service one"
+        );
+        assert_ne!(
+            (
+                interactive.urls,
+                interactive.packages,
+                interactive.deps,
+                interactive.ci
+            ),
+            (service.urls, service.packages, service.deps, service.ci),
+            "the two defaults are deliberately different; if they converge, say so on purpose"
+        );
+    }
+
+    /// The roles that get the wide default are exactly the ones that scan on
+    /// behalf of other hosts. Keeping the two in step is what stops a new
+    /// service subcommand from quietly populating the corpus with a narrow
+    /// verdict.
+    #[test]
+    fn the_wide_default_covers_every_service_role() {
+        for args in [
+            vec!["scan", "serve"],
+            vec!["scan", "worker", "--url", "http://hopper.invalid"],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("service command should parse");
+            assert!(
+                command_scans_for_other_hosts(cli.command.as_ref()),
+                "{args:?} scans for other hosts and must take the wide follow default"
+            );
+        }
+        let interactive = Cli::try_parse_from(["scan", "/tmp/a"]).expect("path scan should parse");
+        assert!(
+            !command_scans_for_other_hosts(interactive.command.as_ref()),
+            "an interactive path scan keeps the narrow default"
+        );
     }
 
     #[test]

@@ -256,3 +256,33 @@ async fn a_fast_analysis_is_still_one_json_object() -> Result<()> {
     assert_eq!(parsed["decision"], "allow");
     Ok(())
 }
+
+/// The applied policy is reported back, because the caller has to file the
+/// answer under the question it actually answers.
+///
+/// Scan applies the requested selection on top of its own configuration, so
+/// what ran is knowable only here. A caller left guessing files under what it
+/// asked for, and the two disagree the moment either default moves — which is
+/// exactly how a fleet ends up analysing correctly and recording nothing.
+///
+/// `follow=none` is asserted rather than the default because its name does not
+/// depend on how this server was started.
+#[tokio::test]
+async fn the_applied_follow_policy_is_reported_back() -> Result<()> {
+    let app = app().await?;
+    let req = loopback(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/analyze?purl=npm%2Fleft-pad%401.3.0&follow=none")
+            .body(Body::empty())?,
+    );
+    let res = tokio::time::timeout(std::time::Duration::from_secs(20), app.oneshot(req))
+        .await
+        .context("the route did not answer")??;
+    let reported = res
+        .headers()
+        .get("X-Scan-Follow")
+        .context("the response did not say which policy produced it")?;
+    assert_eq!(reported, "none");
+    Ok(())
+}

@@ -589,7 +589,8 @@ mod trait_floor_tests {
     fn recategorizing_an_annotation_survives_multibyte_descriptions() {
         // A description opening with a multi-byte character used to split the
         // severity off at a computed byte index, landing inside the character.
-        let line = "  // H über-loader resolves imports (objectives/anti-static/obfuscation/string::x)";
+        let line =
+            "  // H über-loader resolves imports (objectives/anti-static/obfuscation/string::x)";
         assert_eq!(
             recategorize_annotation(line).as_deref(),
             Some("  // Possible anti-static/obfuscation — über-loader resolves imports"),
@@ -597,7 +598,9 @@ mod trait_floor_tests {
         // Multi-byte content anywhere else is fine too, and a whole render of it
         // must not panic.
         let render = "== PRIMARY x ==\n# S 4:2 naïve café résumé (micro-behaviors/data/encode::y)\n  körper\n";
-        assert!(recategorize_annotations(render).contains("Possible data/encode — naïve café résumé"));
+        assert!(
+            recategorize_annotations(render).contains("Possible data/encode — naïve café résumé")
+        );
         // `well-known/` keeps its full depth: the family name is the finding.
         assert_eq!(
             recategorize_annotation(
@@ -629,12 +632,15 @@ mod trait_floor_tests {
         // this does not reaches the grader with its grade letter intact — the one
         // thing presenting observations instead of verdicts exists to prevent.
         assert_eq!(
-            recategorize_annotation("-- C .NET set_Item reference (micro-behaviors/data/manipulation::setter)")
-                .as_deref(),
+            recategorize_annotation(
+                "-- C .NET set_Item reference (micro-behaviors/data/manipulation::setter)"
+            )
+            .as_deref(),
             Some("-- Possible data/manipulation — .NET set_Item reference"),
         );
         assert_eq!(
-            recategorize_annotation("// F 9:1 packed section (metadata/binary/packer::upx)").as_deref(),
+            recategorize_annotation("// F 9:1 packed section (metadata/binary/packer::upx)")
+                .as_deref(),
             // The `line:col` pointer survives ahead of the category — it locates
             // the finding rather than grading it.
             Some("// 9:1 Possible binary/packer — packed section"),
@@ -643,16 +649,22 @@ mod trait_floor_tests {
         // *is* the body. Left alone, `// H Detects Quasar RAT (third_party/…)`
         // and its bare cousin were the loudest grades still leaking through.
         assert_eq!(
-            recategorize_annotation("// H third_party/elastic/Linux_Trojan_Ladvix/linux/trojan/ladvix")
-                .as_deref(),
+            recategorize_annotation(
+                "// H third_party/elastic/Linux_Trojan_Ladvix/linux/trojan/ladvix"
+            )
+            .as_deref(),
             Some("// Possible elastic/Linux_Trojan_Ladvix"),
         );
         assert_eq!(
-            recategorize_annotation("// H Detects Quasar RAT (third_party/SigBase/Quasar/RAT)").as_deref(),
+            recategorize_annotation("// H Detects Quasar RAT (third_party/SigBase/Quasar/RAT)")
+                .as_deref(),
             Some("// Possible SigBase/Quasar — Detects Quasar RAT"),
         );
         // A parenthetical that is prose, not a trait id, still leaves the line be.
-        assert_eq!(recategorize_annotation("# S writes a file (see below)"), None);
+        assert_eq!(
+            recategorize_annotation("# S writes a file (see below)"),
+            None
+        );
     }
 
     #[test]
@@ -1302,8 +1314,7 @@ mod envelope_tests {
             // interpreted verdicts of differing strength no longer collapse onto
             // one number.
             let alone = interpreted_level(Some(deploy), grid_max, Suspicious, false).unwrap();
-            let corroborated =
-                interpreted_level(Some(deploy), grid_max, Suspicious, true).unwrap();
+            let corroborated = interpreted_level(Some(deploy), grid_max, Suspicious, true).unwrap();
             assert!(
                 i32::from(deploy) < corroborated && corroborated < alone && alone < ceiling,
                 "deploy {deploy}: expected deploy < {corroborated} < {alone} < {ceiling}",
@@ -1343,7 +1354,10 @@ mod envelope_tests {
             Some(ceiling)
         );
         // Benign is the clean marker regardless of grid (even in manual mode).
-        assert_eq!(interpreted_level(Some(25), grid_max, Benign, false), Some(-1));
+        assert_eq!(
+            interpreted_level(Some(25), grid_max, Benign, false),
+            Some(-1)
+        );
         assert_eq!(interpreted_level(None, 0, Benign, false), Some(-1));
         // Manual-threshold mode (no grid): no synthetic hostile/suspicious level.
         assert_eq!(interpreted_level(None, 0, Hostile, true), None);
@@ -1620,9 +1634,7 @@ fn softened_level(ml_level: Option<i32>, active_level: Option<u16>, grid_max: u1
     }
     // No level to scale by (manual-threshold mode) falls back to the midpoint.
     let fraction = match ml_level {
-        Some(lvl) if lvl > 0 && active > 0 => {
-            (f64::from(lvl) / f64::from(active)).clamp(0.0, 1.0)
-        }
+        Some(lvl) if lvl > 0 && active > 0 => (f64::from(lvl) / f64::from(active)).clamp(0.0, 1.0),
         _ => 0.5,
     };
     let placed = f64::from(floor) * (f64::from(ceiling) / f64::from(floor)).powf(fraction);
@@ -2574,27 +2586,23 @@ fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
     let fast = config.mode() == Mode::Fast;
     Some(cleave::SkipPredicate(Arc::new(
         move |sha_hex: &str, path: &Path| {
-            let Some(digest) = crate::bloom::parse_sha256_hex(sha_hex) else {
+            let Some(digest) = burton::parse_sha256_hex(sha_hex) else {
                 return false;
             };
-            match lookup.decide_sha256(&digest) {
-                // Known-good is trusted and skipped, unless the file was created,
-                // status-changed, or modified within the last 48h — a fresh
-                // known-good is analyzed on its own merits (recent activity, and a
-                // guard against a bloom false-positive on a freshly planted file),
-                // so cleave analyzes it once here rather than skipping then
-                // re-analyzing in `record_file_result`.
-                BloomDecision::Skip => {
-                    !file_touched_within(path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now())
-                }
-                BloomDecision::Unknown => fast,
-                // Every adverse tier is analyzed, including the weakest: a
-                // lone outside citation cannot convict, but it is ample reason
-                // to spend the scan rather than trust a bless.
-                BloomDecision::KnownBad
-                | BloomDecision::SightedHostile
-                | BloomDecision::SightedSuspicious
-                | BloomDecision::Conflicted => false,
+            let decision = lookup.decide(&burton::Artifact::sha256(&digest));
+            // Known-good is trusted and skipped, unless the file was created,
+            // status-changed, or modified within the last 48h — a fresh
+            // known-good is analyzed on its own merits (recent activity, and a
+            // guard against a bloom false positive on a freshly planted file),
+            // so cleave analyzes it once here rather than skipping and then
+            // re-analyzing in `record_file_result`.
+            //
+            // Every other decision is analyzed, adverse or not: in fast mode an
+            // unknown is skipped as well, which is what fast mode means.
+            if decision.may_skip() {
+                !file_touched_within(path, KNOWN_GOOD_RESCAN_SECS, SystemTime::now())
+            } else {
+                fast && decision == BloomDecision::Unknown
             }
         },
     )))
@@ -3008,7 +3016,7 @@ fn record_file_result(
     // Resolve the bloom decision from the sha cleave computed.
     let decision = if let Some(lookup) = config.bloom()
         && let Ok(report) = &cleave_result
-        && let Some(digest) = crate::bloom::parse_sha256_hex(&report.target.sha256)
+        && let Some(digest) = burton::parse_sha256_hex(&report.target.sha256)
     {
         Some(lookup.decide_sha256(&digest))
     } else {
@@ -3120,7 +3128,15 @@ fn record_file_result(
                                 &filename, &real_sha, 0, &collector, &now, "", purl, provenance,
                             ),
                             None => crate::provenance::build_sidecar(
-                                &filename, &real_sha, 0, &collector, &now, "", purl, None, &[],
+                                &filename,
+                                &real_sha,
+                                0,
+                                &collector,
+                                &now,
+                                "",
+                                purl,
+                                None,
+                                &[],
                             ),
                         };
                         uploader.submit_artifacts(vec![crate::upload::UploadArtifact {
@@ -5223,8 +5239,12 @@ fn apply_trait_floor(
         decision.probability = counts.suspicious_confidence;
         // The crit-4 arm by definition lacked the crit-5 anchor, but a lone
         // confident hostile trait may still be present and is corroboration.
-        decision.level =
-            interpreted_level(active_level, grid_max, Classification::Suspicious, counts.hostile > 0);
+        decision.level = interpreted_level(
+            active_level,
+            grid_max,
+            Classification::Suspicious,
+            counts.hostile > 0,
+        );
         tracing::info!(
             path = %label,
             arm = "crit4",
@@ -6548,12 +6568,18 @@ fn recategorize_annotation(line: &str) -> Option<String> {
     // `// H third_party/elastic/Linux_Trojan_Ladvix/linux/trojan/ladvix`. Naming
     // its category is the whole rewrite; there is no description to keep.
     if !rest.contains('(') && !rest.contains(char::is_whitespace) && rest.contains('/') {
-        return Some(format!("{indent}{comment} Possible {}", trait_category(rest)));
+        return Some(format!(
+            "{indent}{comment} Possible {}",
+            trait_category(rest)
+        ));
     }
     // Otherwise the trait id is the trailing parenthesized group; without one
     // there is no category to name and the line is left alone.
     let open = rest.rfind(" (")?;
-    let inner = rest[open + 2..].strip_suffix(')')?;
+    // `open` indexes a two-byte ASCII " (", so both edges are boundaries by
+    // construction; `get` says so without resting on a panic, the same way the
+    // severity split above does.
+    let inner = rest.get(open + 2..)?.strip_suffix(')')?;
     // A trait id is a slash path, optionally with a `::rule` suffix — never prose.
     // Requiring `::` alone would exempt every `third_party/` signature, which is
     // where the loudest grades live: `// H Detects Quasar RAT (third_party/…)`
@@ -6564,20 +6590,25 @@ fn recategorize_annotation(line: &str) -> Option<String> {
     if !inner.contains("::") && !inner.contains('/') {
         return None;
     }
-    let body = &rest[..open];
+    let body = rest.get(..open)?;
     // `LOC ` (a `line:col` or `@offset`) stays; it is a pointer, not a verdict.
     let (loc, desc) = match body.split_once(' ') {
         Some((head, tail))
-            if head.starts_with('@') || head.split_once(':').is_some_and(|(a, b)| {
-                !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit())
-            }) =>
+            if head.starts_with('@')
+                || head.split_once(':').is_some_and(|(a, b)| {
+                    !a.is_empty()
+                        && a.chars().all(|c| c.is_ascii_digit())
+                        && b.chars().all(|c| c.is_ascii_digit())
+                }) =>
         {
             (format!("{head} "), tail)
         }
         _ => (String::new(), body),
     };
     let category = trait_category(inner);
-    Some(format!("{indent}{comment} {loc}Possible {category} — {desc}"))
+    Some(format!(
+        "{indent}{comment} {loc}Possible {category} — {desc}"
+    ))
 }
 
 /// The family a trait belongs to: the two path components below its namespace,
@@ -6767,7 +6798,10 @@ fn slim_provenance_for_interpret(
     mut provenance: serde_json::Value,
     now_secs: i64,
 ) -> serde_json::Value {
-    let Some(registry) = provenance.get_mut("registry").and_then(|r| r.as_object_mut()) else {
+    let Some(registry) = provenance
+        .get_mut("registry")
+        .and_then(|r| r.as_object_mut())
+    else {
         return provenance;
     };
     // `raw` is deliberately kept: two render tests pin that provider-only fields
@@ -6822,7 +6856,10 @@ fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_j
         out.insert("n".to_string(), serde_json::json!(id));
     }
     if let Some(description) = get_str("description") {
-        out.insert("d".to_string(), serde_json::json!(truncate(description, 200)));
+        out.insert(
+            "d".to_string(),
+            serde_json::json!(truncate(description, 200)),
+        );
     }
     if let Some(author) = get_str("publisher").or_else(|| get_str("author")) {
         out.insert("a".to_string(), serde_json::json!(truncate(author, 60)));

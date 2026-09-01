@@ -22,6 +22,13 @@ pub(super) struct DecisionCache<K> {
     lru: Mutex<LruCache<K, Decision>>,
 }
 
+impl<K> std::fmt::Debug for DecisionCache<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never take the lock to print: a Debug impl must not be able to block.
+        f.debug_struct("DecisionCache").finish_non_exhaustive()
+    }
+}
+
 impl<K: Eq + Hash> DecisionCache<K> {
     pub(super) fn new(entries: usize) -> Self {
         let cap = NonZeroUsize::new(entries).unwrap_or(NonZeroUsize::MIN);
@@ -82,14 +89,14 @@ mod tests {
                 Decision::Unknown
             })
         };
-        run(1);
-        run(2);
-        run(3); // evicts 1
+        let _ = run(1);
+        let _ = run(2);
+        let _ = run(3); // evicts 1
         let after_fill = computes.load(Ordering::SeqCst);
         assert_eq!(after_fill, 3);
-        run(1); // miss — 1 was evicted
+        let _ = run(1); // miss — 1 was evicted
         assert_eq!(computes.load(Ordering::SeqCst), after_fill + 1);
-        run(3); // still hot
+        let _ = run(3); // still hot
         assert_eq!(computes.load(Ordering::SeqCst), after_fill + 1);
     }
 

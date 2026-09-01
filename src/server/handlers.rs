@@ -869,7 +869,7 @@ fn lookup_by_url(raw: &str) -> Response {
 }
 
 fn lookup_by_sha(state: &AppState, sha256: &str) -> Response {
-    let Some(digest) = crate::bloom::parse_sha256_hex(sha256) else {
+    let Some(digest) = burton::parse_sha256_hex(sha256) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid sha256");
     };
     let sha = sha256.to_ascii_lowercase();
@@ -896,7 +896,7 @@ fn lookup_by_sha(state: &AppState, sha256: &str) -> Response {
 /// about. That check costs nothing here — the index already returns the digest
 /// it resolved to.
 fn lookup_by_both(state: &AppState, sha256: &str, raw: &str) -> Response {
-    let Some(digest) = crate::bloom::parse_sha256_hex(sha256) else {
+    let Some(digest) = burton::parse_sha256_hex(sha256) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid sha256");
     };
     let purl = match normalize_pkg_purl(raw) {
@@ -913,7 +913,7 @@ fn lookup_by_both(state: &AppState, sha256: &str, raw: &str) -> Response {
     let decision = crate::bloom_repo::global()
         .as_deref()
         .map_or(crate::bloom_repo::Decision::Unknown, |lk| {
-            lk.memo_sha256(&digest).merge(lk.memo_purl(&purl))
+            lk.decide_any(Some(&purl), Some(&digest))
         });
 
     let index = crate::lookup::global();
@@ -1676,7 +1676,10 @@ async fn run_file_analysis(
         .map(|r| r.phase.clone());
     // A policy-specific `--follow` override must not land in the shared
     // corpus, same rule every other route's artifact mirroring follows.
-    let uploader = request_follow.persist.then(|| state.uploader.clone()).flatten();
+    let uploader = request_follow
+        .persist
+        .then(|| state.uploader.clone())
+        .flatten();
     let handle = tokio::task::spawn_blocking(move || {
         // Record the OS thread servicing this analysis.
         if let Some(req) = phase_state.in_flight.get(&request_id) {
@@ -3349,10 +3352,18 @@ async fn v1_analyze_bytes(
         asked: asked.map(str::to_owned),
         is_url: false,
     };
+    let follow_name = request_follow.policy.follow_name();
     match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
         Ok(outcome) => {
             let elapsed = crate::duration_ms(request_start.elapsed());
-            v1_outcome_response(&outcome, &named, budget, elapsed, !leads)
+            v1_outcome_response(
+                &outcome,
+                &named,
+                budget,
+                elapsed,
+                !leads,
+                follow_name.as_deref(),
+            )
         }
         Err(_) => {
             tracing::info!(id = request_id, sha256 = %sha, "answering as a stream");
@@ -3363,6 +3374,7 @@ async fn v1_analyze_bytes(
                 named,
                 budget,
                 request_start,
+                follow_name,
             )
         }
     }
@@ -3463,11 +3475,33 @@ pub(super) async fn v1_analyze(
         Ok(policy) => policy,
         Err((code, message)) => return v1_error(StatusCode::BAD_REQUEST, code, &message),
     };
-    // A policy-specific result can differ from the deployment's canonical
-    // verdict, so it must not read or populate the shared index or Hopper.
+    // Everything this server analyses is filed, whatever policy produced it.
+    //
+    // This used to be `follow == state.fetch`: a result was shared only when the
+    // caller's policy happened to equal the one this box was started with. The
+    // intent was sound — the corpus holds one verdict per artifact, and a
+    // narrower verdict overwriting a wider one would under-report it — but the
+    // test was against a local default nobody coordinates. Beamline resolves
+    // `references` for a PURL while an unflagged server defaults to
+    // `dependencies,references`, so no ordinary request ever matched, and every
+    // verdict the fleet produced was dropped: no bytes offered, no dependencies
+    // mirrored, no result posted. The corpus could not grow from its own
+    // traffic.
+    //
+    // Filing everything trades that for the opposite risk — a `follow=none`
+    // verdict can now land on top of a wider one — and takes it knowingly,
+    // because a corpus that records a shallower answer than it might have is
+    // worth more than one that records nothing at all.
+    //
+    // TODO(t): Refactor the data model to allow realtime follow reassembly.
+    // Dependencies, references, and CI actions belong in their own tables
+    // rather than folded into one verdict; a caller's `follow=` is then a view
+    // assembled from what is stored, and the question of which policy owns the
+    // row stops being asked. Until then hopper is deliberately policy-blind and
+    // the last writer wins.
     let request_follow = RequestFollow {
         policy: follow,
-        persist: follow == state.fetch,
+        persist: true,
     };
     let budget = q
         .false_positive_budget
@@ -3573,10 +3607,18 @@ pub(super) async fn v1_analyze(
             subject: url,
             is_url: true,
         };
+        let follow_name = request_follow.policy.follow_name();
         return match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
             Ok(outcome) => {
                 let elapsed = crate::duration_ms(request_start.elapsed());
-                v1_outcome_response(&outcome, &about, budget, elapsed, !leads)
+                v1_outcome_response(
+                    &outcome,
+                    &about,
+                    budget,
+                    elapsed,
+                    !leads,
+                    follow_name.as_deref(),
+                )
             }
             Err(_) => {
                 tracing::info!(id = request_id, "answering as a stream");
@@ -3587,6 +3629,7 @@ pub(super) async fn v1_analyze(
                     about,
                     budget,
                     request_start,
+                    follow_name,
                 )
             }
         };
@@ -3717,10 +3760,18 @@ pub(super) async fn v1_analyze(
     // keeps `429 At capacity` a real 429 the router can act on rather than a
     // decision buried in a 200 body. Capacity is refused the moment a slot is
     // asked for, so it never reaches the streaming path.
+    let follow_name = request_follow.policy.follow_name();
     match tokio::time::timeout(V1_ANALYZE_GRACE, flight.wait()).await {
         Ok(outcome) => {
             let elapsed = crate::duration_ms(request_start.elapsed());
-            v1_outcome_response(&outcome, &about, budget, elapsed, !leads)
+            v1_outcome_response(
+                &outcome,
+                &about,
+                budget,
+                elapsed,
+                !leads,
+                follow_name.as_deref(),
+            )
         }
         Err(_) => {
             tracing::info!(id = request_id, purl = %purl, "answering as a stream");
@@ -3731,6 +3782,7 @@ pub(super) async fn v1_analyze(
                 about,
                 budget,
                 request_start,
+                follow_name,
             )
         }
     }
@@ -3758,6 +3810,7 @@ fn v1_outcome_response(
     budget: u16,
     elapsed_ms: u64,
     shared: bool,
+    follow: Option<&str>,
 ) -> Response {
     let (purl, asked) = (named.key.as_deref(), named.asked.as_deref());
     let subject = named.subject.as_str();
@@ -3778,9 +3831,17 @@ fn v1_outcome_response(
             };
             let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
+            // Whether this answer cost an analysis. The route is the same
+            // either way, but a run served from the analysis cache did no work
+            // and one that reached the pipeline did — and a caller measuring
+            // what its fleet spends cannot tell those apart from the route.
             resp.headers_mut().insert(
                 "X-Scan-Source",
-                axum::http::HeaderValue::from_static("scan:analysis"),
+                axum::http::HeaderValue::from_static(if result.analysis_cached {
+                    "scan:cached"
+                } else {
+                    "scan:analysis"
+                }),
             );
             resp
         }
@@ -3789,6 +3850,20 @@ fn v1_outcome_response(
         // cannot be made to do.
         Outcome::Rendered { status, body } => (*status, Json(body)).into_response(),
     };
+    // Which question this answer answers. The caller resolved a policy before
+    // asking, but only this server knows what it applied on top of its own
+    // configuration, and the answer has to be filed under what was measured
+    // rather than what was requested.
+    //
+    // On refusals too. A refusal files nothing, but a caller correlating a
+    // retry — or an operator asking why a fleet records nothing — should not
+    // have to infer which policy was in play from which reply it happened to
+    // get.
+    if let Some(name) = follow
+        && let Ok(value) = axum::http::HeaderValue::from_str(name)
+    {
+        resp.headers_mut().insert("X-Scan-Follow", value);
+    }
     if shared {
         resp.extensions_mut().insert(super::access::Shared);
     }
@@ -3826,6 +3901,7 @@ fn v1_streamed(
     named: Named,
     budget: u16,
     request_start: Instant,
+    follow: Option<String>,
 ) -> Response {
     let Named {
         key: purl,
@@ -3921,6 +3997,14 @@ fn v1_streamed(
         "X-Scan-Source",
         axum::http::HeaderValue::from_static("scan:analysis"),
     );
+    // See the matching header in `v1_outcome_response`. Sent on the stream's
+    // own headers, which go out before the first progress frame, so a caller
+    // knows how to file the decision before the decision arrives.
+    if let Some(name) = follow
+        && let Ok(value) = axum::http::HeaderValue::from_str(&name)
+    {
+        headers.insert("X-Scan-Follow", value);
+    }
     resp.extensions_mut().insert(if is_url {
         Subject::url(&labelled, None)
     } else {
@@ -4132,21 +4216,16 @@ async fn v1_resolve(
 /// normalized one, because that is what the index and the corpus are keyed by.
 /// The filters' opinion of an artifact named by a digest, a PURL, or both.
 ///
-/// Both keys are evidence about one artifact, so their answers merge under the
-/// same worst-pool-wins rule a single key follows — see
-/// [`crate::bloom_repo::Decision::merge`]. A caller who names both is asserting
-/// they are the same thing, and a bless on one beside a claim on the other is a
-/// contradiction rather than a coin flip.
+/// Both keys are evidence about one artifact, so both are supplied and `burton`
+/// combines them: the worst claim against either wins, and a blessing needs all
+/// of them. A caller who names both is asserting they are the same thing, so a
+/// bless on one beside a claim on the other is a contradiction, not a coin flip.
 fn bloom_decision(sha: Option<&str>, purl: Option<&str>) -> crate::bloom_repo::Decision {
     use crate::bloom_repo::Decision;
     let Some(lk) = crate::bloom_repo::global() else {
         return Decision::Unknown;
     };
-    let by_sha = sha
-        .and_then(crate::bloom::parse_sha256_hex)
-        .map_or(Decision::Unknown, |d| lk.memo_sha256(&d));
-    let by_purl = purl.map_or(Decision::Unknown, |p| lk.memo_purl(p));
-    by_sha.merge(by_purl)
+    lk.decide_any(purl, sha.and_then(burton::parse_sha256_hex).as_ref())
 }
 
 async fn v1_decide(
@@ -4180,7 +4259,7 @@ async fn v1_decide(
         None => None,
     };
     let sha = match sha {
-        Some(sha) if crate::bloom::parse_sha256_hex(sha).is_none() => {
+        Some(sha) if burton::parse_sha256_hex(sha).is_none() => {
             return Err(Box::new(v1_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_sha256",
@@ -4226,7 +4305,11 @@ async fn v1_decide(
     if let Some(verdict) = verdict.as_ref() {
         return Ok((
             V1Decision::stored(verdict, purl.as_deref(), budget).with_url(url.as_deref()),
-            "scan:analysis",
+            // Held, not produced. This used to report `scan:analysis` — the same
+            // value a fresh run reports — which made an instant index hit and a
+            // ninety-second analysis indistinguishable to anything counting
+            // cache layers, and every miss looked like a hit.
+            "scan:index",
         ));
     }
 
@@ -4870,7 +4953,9 @@ mod tests {
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
             stream
-                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .expect("write 404");
         });
 
@@ -5606,34 +5691,38 @@ mod tests {
     /// fixture coverage lives with the filters rather than with a handler.
     #[test]
     fn filters_answer_skip_known_bad_and_unknown() {
-        use crate::bloom::{Record, generate};
-        use crate::bloom_repo::{Decision, Lookup};
+        use crate::bloom_repo::{Decision, KEY_SCHEME, Lookup, purl_key};
+        use burton::{KeySets, Record, Tier};
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut good_sha = [0u8; 32];
         good_sha[0] = 1;
         let mut bad_sha = [0u8; 32];
         bad_sha[0] = 2;
-        for f in generate(
-            vec![
-                Record {
-                    purl: Some("pkg:npm/good@1".into()),
-                    sha256: Some(good_sha),
-                },
-                Record {
-                    purl: Some("pkg:npm/evil@1".into()),
-                    sha256: Some(bad_sha),
-                },
-            ],
-            vec![Record {
-                purl: Some("pkg:npm/evil@1".into()),
+
+        let mut sets = KeySets::new();
+        sets.insert(
+            Tier::Good,
+            Record {
+                purl: purl_key("pkg:npm/good@1"),
+                sha256: Some(good_sha),
+            },
+        );
+        sets.insert(
+            Tier::Bad,
+            Record {
+                purl: purl_key("pkg:npm/evil@1"),
                 sha256: Some(bad_sha),
-            }],
-            1e-9,
-        ) {
-            let path = tmp.path().join(format!("{}.adbl", f.artifact_stem()));
-            std::fs::write(path, f.to_bytes()).expect("write filter");
-        }
+            },
+        );
+        burton::build::write_bundle(
+            tmp.path(),
+            &sets.into_filters(1e-9),
+            "2026-08-31",
+            KEY_SCHEME,
+        )
+        .expect("write bundle");
+
         let lk = Lookup::load_from(tmp.path());
         assert_eq!(lk.memo_purl("pkg:npm/good@1"), Decision::Skip);
         assert_eq!(lk.memo_purl("pkg:npm/evil@1"), Decision::KnownBad);

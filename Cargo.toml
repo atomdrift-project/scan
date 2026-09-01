@@ -83,6 +83,9 @@ cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
+# The bloom allow/deny bundle format and its decision rule. Split out of scan so
+# the "worst pool wins" rule lives in one auditable place.
+burton = { git = "https://github.com/atomdrift-project/burton.git" }
 proclist = { git = "https://github.com/atomdrift-project/proclist.git" }
 # Direct handle on filefacts (already in the graph via cleave/fletch) so the
 # `ps` subcommand can tune rizin for low-latency live-process scanning:

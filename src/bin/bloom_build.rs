@@ -13,7 +13,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 
-use scan::bloom_build::{read_pool, read_prev_manifest, verify_build, write_bundle};
+use burton::Tier;
+use burton::build::{read_manifest, verify, write_bundle};
+use scan::bloom_build::read_pool;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,14 +43,14 @@ struct Args {
     fp: f64,
 
     /// On-disk layout version to emit. Defaults to this build's
-    /// [`scan::bloom::FORMAT_VERSION`].
+    /// [`burton::FORMAT_VERSION`].
     ///
     /// Publishing an older version alongside the current one is how clients that
     /// predate a tier keep receiving fresh data: the bundle is projected down
     /// (see `KeySets::into_filters_for`) rather than withheld. Run once per
     /// version over the same pool file — the pool is on disk anyway, and a
     /// second read is far cheaper than holding a second copy of the key sets.
-    #[arg(long = "format-version", default_value_t = scan::bloom::FORMAT_VERSION,
+    #[arg(long = "format-version", default_value_t = burton::FORMAT_VERSION,
           value_name = "N")]
     format_version: u16,
 
@@ -96,39 +98,50 @@ fn main() -> Result<()> {
     };
 
     let (sets, stats) = read_pool(reader)?;
-    let (good_purl, good_sha) = sets.good_counts();
-    let (bad_purl, bad_sha) = sets.bad_counts();
+    let (good_purl, good_sha) = sets.counts(Tier::Good);
+    let (bad_purl, bad_sha) = sets.counts(Tier::Bad);
     eprintln!(
         "pool: {} records — good {good_purl} purl / {good_sha} sha, bad {bad_purl} purl / {bad_sha} sha \
-         ({} malformed, {} bad-sha, {} other-label skipped)",
-        stats.records, stats.malformed, stats.bad_sha, stats.other_label,
+         ({} malformed, {} bad-sha, {} bad-purl, {} other-label skipped)",
+        stats.records, stats.malformed, stats.bad_sha, stats.bad_purl, stats.other_label,
     );
 
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("creating {}", args.out.display()))?;
     // Size the new build against the previous one (read before we overwrite it).
-    let prev = read_prev_manifest(&args.out);
+    let prev = read_manifest(&args.out);
     let filters = sets.into_filters_for(args.format_version, args.fp);
     if filters.is_empty() {
         anyhow::bail!(
             "format version {} produced no filters — is it a version this build knows? \
              (supported: {:?})",
             args.format_version,
-            scan::bloom::SUPPORTED_VERSIONS,
+            burton::SUPPORTED_VERSIONS,
         );
     }
 
     // Fail loud before writing, so a poisoned or hollow build never lands in the
     // output dir (nor reaches `make publish-bloom`).
-    verify_build(
+    let waived = verify(
         &filters,
         prev.as_ref(),
         &host_good_digests(),
         args.accept_unusual_growth,
     )
     .context("bloom safety check failed")?;
+    // Loud on purpose. The override exists for a rule change the operator made
+    // deliberately; it must not also quietly absorb the corrupt export it was
+    // built to catch, so every breach it waved through is named here.
+    for breach in &waived {
+        eprintln!("ACCEPTED UNUSUAL: {breach} — accepted by explicit override");
+    }
 
-    let manifest = write_bundle(&args.out, &filters, &args.date)?;
+    let manifest = write_bundle(
+        &args.out,
+        &filters,
+        &args.date,
+        scan::bloom_repo::KEY_SCHEME,
+    )?;
 
     for (stem, entry) in &manifest.filter {
         eprintln!(

@@ -351,6 +351,48 @@ impl FetchPolicy {
             | ((self.ci as u8) << 3)
     }
 
+    /// This selection in the customer-facing `follow` vocabulary, when it has
+    /// a name there.
+    ///
+    /// The inverse of [`Self::parse_follow`], and it exists so a caller never
+    /// has to guess which policy produced an answer: whoever files the verdict
+    /// files it under the name returned here, and a name that disagreed with
+    /// the analysis would file it under the wrong question.
+    ///
+    /// `None` for a selection the vocabulary cannot spell. `references` moves
+    /// `urls` and `packages` together, so the legacy `--follow=urls` alias can
+    /// set one without the other and leave a policy with no customer word for
+    /// it. Saying nothing is right there: an approximate name is worse than an
+    /// absent one, because the absent one falls back to the caller's own
+    /// resolution while the approximate one silently misfiles.
+    #[must_use]
+    pub(crate) fn follow_name(&self) -> Option<String> {
+        if self.urls != self.packages {
+            return None;
+        }
+        let references = self.urls;
+        if !references && !self.deps && !self.ci {
+            return Some("none".to_owned());
+        }
+        if references && self.deps && self.ci {
+            return Some("all".to_owned());
+        }
+        // Spelled in the order the customer vocabulary lists them, so one
+        // policy has exactly one name and a cache keyed by that name does not
+        // split on word order.
+        let mut parts = Vec::with_capacity(3);
+        if self.deps {
+            parts.push("dependencies");
+        }
+        if references {
+            parts.push("references");
+        }
+        if self.ci {
+            parts.push("ci-actions");
+        }
+        Some(parts.join(","))
+    }
+
     fn parse_selection(value: &str, legacy_aliases: bool) -> Result<Self, String> {
         const VALID: &str = "valid: all, dependencies, references, ci-actions, none";
         let mut policy = Self::default();
@@ -2190,37 +2232,41 @@ fn fetch_row(rec: &FetchRecord) -> FetchRow {
 
 /// A bloom verdict for a fetched artifact, as a `report_fetch` row override:
 /// every known state renders as the `known` label, distinguished by glyph —
-/// 🚩 known-bad, 🏴 conflicted (both still scanned; the flag also rides the
-/// result header), green ✓ known-good (fetched here only because a pulled/fresh
-/// exception forced a re-scan). `None` when bloom is disabled or the artifact is
-/// in neither set. Checks the fetched content's sha256 and, for a dependency, its
-/// PURL; a conflict/bad hit on either wins over a good hit.
+/// 🚩 known-bad, 🏴 conflicted, 👁 sighted by somebody else (all still scanned;
+/// the flag also rides the result header), green ✓ known-good (fetched here
+/// only because a pulled/fresh exception forced a re-scan). `None` when bloom
+/// is disabled or the artifact is in neither set.
+///
+/// The digest and the PURL both name this one artifact, so both are handed to
+/// the filters together and `burton` combines them: the worst claim against
+/// either wins, and the green tick requires every key to agree. Deciding here
+/// by hand is what once let this row show a blessed coordinate as clean while
+/// its digest was cited by threat intelligence.
 fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
     use crate::bloom_repo::Decision;
     let lookup = crate::bloom_repo::global()?;
 
-    let sha = rec
+    let digest = rec
         .content_sha256
         .as_deref()
-        .and_then(crate::bloom::parse_sha256_hex)
-        .map(|d| lookup.decide_sha256(&d));
+        .and_then(burton::parse_sha256_hex);
     let purl = rec
         .locator
         .starts_with("pkg:")
-        .then(|| lookup.decide_purl(&rec.locator));
+        .then_some(rec.locator.as_str());
+    if digest.is_none() && purl.is_none() {
+        return None;
+    }
 
-    let decisions = [sha, purl];
-    let has = |want: Decision| decisions.iter().flatten().any(|d| *d == want);
-    if has(Decision::Conflicted) {
-        return Some(('\u{1f3f4}', "known", 230, 180, 80, None)); // 🏴
+    match lookup.decide_any(purl, digest.as_ref()) {
+        Decision::Conflicted => Some(('\u{1f3f4}', "known", 230, 180, 80, None)), // 🏴
+        Decision::KnownBad => Some(('\u{1f6a9}', "known", 235, 120, 120, None)),  // 🚩
+        Decision::SightedHostile | Decision::SightedSuspicious => {
+            Some(('\u{1f441}', "known", 235, 170, 120, None)) // 👁
+        }
+        Decision::Skip => Some(('\u{2713}', "known", 80, 200, 80, None)),
+        Decision::Unknown => None,
     }
-    if has(Decision::KnownBad) {
-        return Some(('\u{1f6a9}', "known", 235, 120, 120, None)); // 🚩
-    }
-    if has(Decision::Skip) {
-        return Some(('\u{2713}', "known", 80, 200, 80, None));
-    }
-    None
 }
 
 /// The compact failure note for a failed fetch — the HTTP status when one was
@@ -2392,8 +2438,7 @@ fn resolved_purl(r: &Reference, reg: &Registry) -> Option<String> {
 /// forgo — here the record exists, so a yanked version is still caught.
 fn bloom_known_good_resolved(r: &Reference, reg: &Registry) -> bool {
     resolved_purl(r, reg).is_some_and(|purl| {
-        crate::bloom_repo::global()
-            .is_some_and(|lk| lk.decide_purl(&purl) == crate::bloom_repo::Decision::Skip)
+        crate::bloom_repo::global().is_some_and(|lk| lk.decide_purl(&purl).may_skip())
     })
 }
 
@@ -2401,8 +2446,7 @@ fn bloom_known_good_purl(r: &Reference) -> bool {
     let RefLocator::Purl(purl) = &r.locator else {
         return false;
     };
-    crate::bloom_repo::global()
-        .is_some_and(|lk| lk.decide_purl(purl) == crate::bloom_repo::Decision::Skip)
+    crate::bloom_repo::global().is_some_and(|lk| lk.decide_purl(purl).may_skip())
 }
 
 /// Skip predicate for fetched-dependency analysis: skip any member cleave is
@@ -2418,8 +2462,8 @@ fn dep_skip_predicate() -> Option<cleave::SkipPredicate> {
     let lookup = crate::bloom_repo::global()?;
     Some(cleave::SkipPredicate(std::sync::Arc::new(
         move |sha_hex: &str, _path: &Path| {
-            crate::bloom::parse_sha256_hex(sha_hex)
-                .is_some_and(|d| lookup.decide_sha256(&d) == crate::bloom_repo::Decision::Skip)
+            burton::parse_sha256_hex(sha_hex)
+                .is_some_and(|d| lookup.may_skip(&burton::Artifact::sha256(&d)))
         },
     )))
 }
@@ -4511,6 +4555,60 @@ mod tests {
         );
         assert!(FetchPolicy::parse_follow("deps").is_err());
         assert!(FetchPolicy::parse_follow("none,references").is_err());
+    }
+
+    /// `follow_name` inverts `parse_follow`. This is the property the header
+    /// rests on: a caller files an answer under the name we return, so a name
+    /// that does not parse back to the policy that produced it files the
+    /// verdict under a question nobody asked.
+    #[test]
+    fn follow_name_round_trips_through_parse_follow() {
+        for spelling in [
+            "none",
+            "dependencies",
+            "references",
+            "dependencies,references",
+            "all",
+        ] {
+            let policy = FetchPolicy::parse_follow(spelling).unwrap();
+            let name = policy
+                .follow_name()
+                .expect("vocabulary spelling has a name");
+            assert_eq!(name, spelling, "{spelling} did not round-trip");
+            assert_eq!(
+                FetchPolicy::parse_follow(&name).unwrap().selection_bits(),
+                policy.selection_bits(),
+                "{spelling} reparsed to a different selection",
+            );
+        }
+
+        // `ci-actions` implies `dependencies`, so its canonical name says so
+        // rather than echoing the shorthand back.
+        let actions = FetchPolicy::parse_follow("ci-actions").unwrap();
+        assert_eq!(
+            actions.follow_name().as_deref(),
+            Some("dependencies,ci-actions")
+        );
+        assert_eq!(
+            FetchPolicy::parse_follow("dependencies,ci-actions")
+                .unwrap()
+                .selection_bits(),
+            actions.selection_bits(),
+        );
+
+        // The full set is spelled `all`, not enumerated, so one policy has one
+        // name.
+        let every = FetchPolicy::parse_follow("dependencies,references,ci-actions").unwrap();
+        assert_eq!(every.follow_name().as_deref(), Some("all"));
+
+        // A legacy alias can set half of `references`, which the customer
+        // vocabulary cannot spell. Unnameable is reported, never approximated.
+        let half = FetchPolicy {
+            urls: true,
+            packages: false,
+            ..FetchPolicy::default()
+        };
+        assert_eq!(half.follow_name(), None);
 
         // Legacy CLI values remain aliases for existing scripts.
         assert_eq!(
