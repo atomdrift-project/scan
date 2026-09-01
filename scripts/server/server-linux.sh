@@ -270,9 +270,13 @@ fi
 
 if ! getent passwd "${SERVICE_USER}" >/dev/null; then
     log "Creating service user '${SERVICE_USER}'"
-    $SUDO useradd --system --home-dir "${STATE_HOME}" --no-create-home \
-                 --shell /usr/sbin/nologin \
-                 --comment "Atomdrift Scan server" "${SERVICE_USER}"
+    # useradd lives in /usr/sbin on Debian and derivatives, a directory absent
+    # from a non-root PATH. doas (unlike sudo) forwards the caller's PATH
+    # unchanged, so name the sbin directories explicitly rather than rely on it.
+    $SUDO env PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH" \
+        useradd --system --home-dir "${STATE_HOME}" --no-create-home \
+                --shell /usr/sbin/nologin \
+                --comment "Atomdrift Scan server" "${SERVICE_USER}"
 fi
 
 # Pre-create state dir so an early failure doesn't leave us without one. The
