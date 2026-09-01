@@ -227,9 +227,7 @@ fn verdict_stands(rec: &Record, my_traits: Option<&str>, max_age_s: u64, now: u6
 /// dropped — the fetch-edge (`source → content sha`) must stay recordable — so
 /// the dependency falls through to a normal fetch. Fail-open everywhere, and
 /// `SCAN_PURL_PRECHECK=0` disables just this half.
-pub(crate) fn precheck_purls(
-    purls: &[String],
-) -> std::collections::HashMap<String, String> {
+pub(crate) fn precheck_purls(purls: &[String]) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let Some(p) = instance() else { return out };
     if purls.is_empty()

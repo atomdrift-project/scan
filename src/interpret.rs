@@ -159,7 +159,11 @@ pub fn llm_base_url(target: &str) -> String {
     match target {
         "local" => DEFAULT_BASE_URL.to_string(),
         "openrouter" => OPENROUTER_BASE_URL.to_string(),
-        other => other.to_string(),
+        // Trailing slashes are dropped here so every message and request works
+        // from one spelling of the endpoint: `http://host/` and `http://host`
+        // must not read as two different targets, or a diagnostic ends up
+        // naming a `http://host//models` nobody asked for.
+        other => other.trim_end().trim_end_matches('/').to_string(),
     }
 }
 
@@ -730,7 +734,10 @@ impl FindingSeverity {
         for file in &report.files {
             for finding in &file.findings {
                 if finding.crit >= cleave::Criticality::Hostile {
-                    return Self { elevated: true, hostile: true };
+                    return Self {
+                        elevated: true,
+                        hostile: true,
+                    };
                 }
                 if finding.crit >= cleave::Criticality::Suspicious {
                     out.elevated = true;
@@ -844,7 +851,9 @@ pub fn interpret(
         // A cache hit is keyed on the whole chain, so it names the primary:
         // which endpoint answered originally is not recorded, and the verdict
         // is the list's, not one host's.
-        return Some(blended(&cfg.model, ml_class, ml_prob, grade, v.reason, ev, true));
+        return Some(blended(
+            &cfg.model, ml_class, ml_prob, grade, v.reason, ev, true,
+        ));
     }
 
     // Health gate: only send work to a healthy endpoint. If it's currently down,
@@ -1522,27 +1531,40 @@ fn probe_endpoint(cfg: &InterpretConfig) -> bool {
 /// OpenAI endpoint): pick the served model whose id implies the most parameters
 /// (`…-32B` over `…-8B`; MoE `8x7B` counted as 56B), keeping the first-listed on
 /// a tie and falling back to the first entry when no id encodes a size. The
-/// choice is logged at INFO. Returns `None` when the endpoint is unreachable or
-/// lists nothing; there is no hardcoded fallback, so the caller reports that
-/// instead of guessing a name. Skipped entirely when the user pins
-/// `--llm-model`.
-#[must_use]
-pub fn discover_model(base_url: &str, api_key: Option<&str>) -> Option<String> {
+/// choice is logged at INFO. Skipped entirely when the user pins `--llm-model`.
+///
+/// # Errors
+///
+/// When the endpoint cannot be reached, answers with a non-2xx status, does not
+/// speak the OpenAI model-list shape, or serves nothing. There is no hardcoded
+/// fallback, so the error says which of those it was — the three have different
+/// fixes (start the server, add a key or the missing `/v1`, pin `--llm-model`)
+/// and a caller cannot distinguish them from a bare `None`.
+pub fn discover_model(base_url: &str, api_key: Option<&str>) -> Result<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(HEALTH_PROBE_TIMEOUT)
         .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
         .build()
-        .ok()?;
+        .context("building the HTTP client")?;
     let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let keyed = api_key.is_some_and(|k| !k.is_empty());
     let mut req = client.get(&url);
     if let Some(key) = api_key.filter(|k| !k.is_empty()) {
         req = req.bearer_auth(key);
     }
-    let resp = req.send().ok()?;
-    if !resp.status().is_success() {
-        return None;
+    let resp = req
+        .send()
+        .map_err(|e| anyhow!("GET {url} failed ({e}); is the endpoint running?"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "GET {url} returned {status}{}",
+            status_hint(status, base_url, keyed)
+        ));
     }
-    let list: ModelList = resp.json().ok()?;
+    let list: ModelList = resp
+        .json()
+        .map_err(|e| anyhow!("GET {url} did not answer with an OpenAI model list ({e})"))?;
     // Only replace on a strictly larger inferred size, so equal-size models keep
     // the endpoint's listing order (first wins).
     let mut best: Option<(f64, String)> = None;
@@ -1552,9 +1574,33 @@ pub fn discover_model(base_url: &str, api_key: Option<&str>) -> Option<String> {
             best = Some((size, entry.id));
         }
     }
-    let chosen = best.map(|(_, id)| id)?;
+    let chosen = best
+        .map(|(_, id)| id)
+        .ok_or_else(|| anyhow!("GET {url} listed no models"))?;
     tracing::info!(model = %chosen, endpoint = %base_url, "selected LLM model");
-    Some(chosen)
+    Ok(chosen)
+}
+
+/// The actionable half of a failed `{base}/models`: what an operator would have
+/// to change to get a 200. Only the two statuses that have one fix each — a
+/// missing `/v1` on the base URL, and a missing or rejected key — earn a hint;
+/// anything else stands on the status code alone rather than guessing.
+fn status_hint(status: reqwest::StatusCode, base_url: &str, keyed: bool) -> String {
+    let base = base_url.trim_end_matches('/');
+    match status {
+        reqwest::StatusCode::NOT_FOUND if !base.ends_with("/v1") => {
+            format!(" — an OpenAI-compatible base URL usually ends in /v1; try --llm {base}/v1")
+        }
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            if keyed {
+                " — the endpoint rejected the key (--llm-key, SCAN_LLM_KEY, or ~/.tok/llm)"
+                    .to_string()
+            } else {
+                " — the endpoint wants a key: --llm-key, SCAN_LLM_KEY, or ~/.tok/llm".to_string()
+            }
+        }
+        _ => String::new(),
+    }
 }
 
 /// Infer a model's parameter count in billions from its id, for choosing the
@@ -1901,11 +1947,63 @@ mod tests {
             llm_base_url("https://example.test/v1"),
             "https://example.test/v1"
         );
+        // A trailing slash is not a second endpoint: it is trimmed here so no
+        // request or diagnostic ever names `https://example.test//models`.
+        assert_eq!(
+            llm_base_url("https://example.test/"),
+            "https://example.test"
+        );
+        assert_eq!(
+            llm_base_url("https://example.test/v1//"),
+            "https://example.test/v1"
+        );
         assert!(is_openrouter_endpoint("openrouter"));
         assert!(is_openrouter_endpoint(OPENROUTER_BASE_URL));
         assert!(is_openrouter_endpoint("https://openrouter.ai/api/v1/"));
         assert!(!is_openrouter_endpoint(DEFAULT_BASE_URL));
         assert!(!is_openrouter_endpoint("http://10.9.8.149:8000/v1"));
+    }
+
+    #[test]
+    fn status_hint_names_the_one_fix_for_each_status() {
+        use reqwest::StatusCode;
+        // A 404 on a base URL with no `/v1` is the common paste of a bare host.
+        let hint = status_hint(StatusCode::NOT_FOUND, "https://llm.example.test", false);
+        assert!(hint.contains("--llm https://llm.example.test/v1"), "{hint}");
+        // With `/v1` already there, a 404 means something else — no guess.
+        assert!(
+            status_hint(StatusCode::NOT_FOUND, "https://llm.example.test/v1", false).is_empty()
+        );
+        // A key that was never sent and one that was rejected read differently.
+        assert!(
+            status_hint(
+                StatusCode::UNAUTHORIZED,
+                "https://llm.example.test/v1",
+                false
+            )
+            .contains("wants a key")
+        );
+        assert!(
+            status_hint(
+                StatusCode::UNAUTHORIZED,
+                "https://llm.example.test/v1",
+                true
+            )
+            .contains("rejected the key")
+        );
+        assert!(
+            status_hint(StatusCode::BAD_GATEWAY, "https://llm.example.test/v1", true).is_empty()
+        );
+    }
+
+    #[test]
+    fn discover_model_reports_why_it_failed() {
+        // A closed port is unreachable, not "listed none".
+        let err = discover_model("http://127.0.0.1:1/v1", None)
+            .expect_err("nothing serves port 1")
+            .to_string();
+        assert!(err.contains("http://127.0.0.1:1/v1/models"), "{err}");
+        assert!(err.contains("is the endpoint running?"), "{err}");
     }
 
     #[test]
@@ -1968,15 +2066,14 @@ mod tests {
             vec![None, Some("qwen/qwen3.8-27b".to_string())]
         );
         // Short and long lists are padded/truncated rather than misaligned.
-        assert_eq!(llm_models(Some("a,b"), 3), vec![
-            Some("a".to_string()),
-            Some("b".to_string()),
-            None
-        ]);
-        assert_eq!(llm_models(Some("a,b,c"), 2), vec![
-            Some("a".to_string()),
-            Some("b".to_string())
-        ]);
+        assert_eq!(
+            llm_models(Some("a,b"), 3),
+            vec![Some("a".to_string()), Some("b".to_string()), None]
+        );
+        assert_eq!(
+            llm_models(Some("a,b,c"), 2),
+            vec![Some("a".to_string()), Some("b".to_string())]
+        );
     }
 
     /// A one-shot OpenAI-compatible server: answers `n` requests with `status`
@@ -2042,7 +2139,10 @@ mod tests {
         let live_seen = live_h.join().expect("fallback thread");
         assert!(dead_seen[0].contains("Bearer wrong"));
         assert!(live_seen[0].contains("Bearer right"), "per-endpoint key");
-        assert!(live_seen[0].contains("fallback-model"), "per-endpoint model");
+        assert!(
+            live_seen[0].contains("fallback-model"),
+            "per-endpoint model"
+        );
     }
 
     /// A working primary must not spend the fallback — an OpenRouter tail is
@@ -2084,7 +2184,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = request(&cfg, "user").err().expect("all endpoints refused");
+        let err = request(&cfg, "user").expect_err("all endpoints refused");
         let text = format!("{:#}", err.into_inner());
         assert!(text.contains("500"), "unexpected error: {text}");
         dead_h.join().expect("thread");

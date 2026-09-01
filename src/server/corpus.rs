@@ -689,6 +689,14 @@ mod tests {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // On macOS/BSD an accepted socket inherits the listener's
+                        // non-blocking flag, so a request still in flight reads as
+                        // `WouldBlock` and the fixture answers and closes with the
+                        // request unread — which sends an RST and fails the client's
+                        // read. Serve each connection blocking (bounded, so a client
+                        // that never sends cannot wedge the join on drop).
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                         let _ = stream.read(&mut [0u8; 2048]);
                         let (status, body) = response(request);
                         request += 1;

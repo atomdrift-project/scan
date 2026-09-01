@@ -663,22 +663,27 @@ impl Cli {
                     }
                 }
             } else {
-                match pinned.or_else(|| {
-                    scan::interpret::discover_model(&base_url, api_key.as_deref())
-                }) {
+                match pinned {
                     Some(m) => m,
-                    None => {
-                        let why = format!(
-                            "no LLM model available: {base_url}/models listed none (or was \
-                             unreachable). Start the endpoint, or name a model with \
-                             --llm-model (env: SCAN_LLM_MODEL)"
-                        );
-                        if single {
-                            anyhow::bail!("{why}");
+                    None => match scan::interpret::discover_model(&base_url, api_key.as_deref()) {
+                        Ok(m) => m,
+                        // Say which of the several ways discovery can fail this
+                        // was — an unreachable host, a 404 from a base URL
+                        // missing its /v1, a rejected key and an endpoint
+                        // serving nothing all need different fixes, and only
+                        // pinning a model is common to all of them.
+                        Err(e) => {
+                            let why = format!(
+                                "no LLM model available from {base_url}: {e}. Fix the endpoint, \
+                                 or name a model with --llm-model (env: SCAN_LLM_MODEL)"
+                            );
+                            if single {
+                                anyhow::bail!("{why}");
+                            }
+                            skipped.push(why);
+                            continue;
                         }
-                        skipped.push(why);
-                        continue;
-                    }
+                    },
                 }
             };
             resolved.push(LlmEndpoint {
@@ -3278,7 +3283,10 @@ mod tests {
             // sent to OpenRouter, nor the reverse.
             assert_eq!(cfg.api_key.as_deref(), Some("sk-vllm"));
             assert_eq!(cfg.fallbacks.len(), 1);
-            assert_eq!(cfg.fallbacks[0].base_url, scan::interpret::OPENROUTER_BASE_URL);
+            assert_eq!(
+                cfg.fallbacks[0].base_url,
+                scan::interpret::OPENROUTER_BASE_URL
+            );
             assert_eq!(cfg.fallbacks[0].model, "qwen/qwen3.8-27b");
             assert_eq!(cfg.fallbacks[0].api_key.as_deref(), Some("sk-openrouter"));
             Ok(())

@@ -55,7 +55,10 @@ fn prepare_profile_dir(dir: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(not(any(target_os = "freebsd", all(feature = "jemalloc-prof", target_os = "linux"))))]
+#[cfg(not(any(
+    target_os = "freebsd",
+    all(feature = "jemalloc-prof", target_os = "linux")
+)))]
 fn prepare_profile_dir(dir: &std::path::Path) -> bool {
     tracing::warn!(
         path = %dir.display(),
@@ -132,7 +135,10 @@ pub fn dump_on_signal() {
         }
     }
 
-    #[cfg(not(any(target_os = "freebsd", all(feature = "jemalloc-prof", target_os = "linux"))))]
+    #[cfg(not(any(
+        target_os = "freebsd",
+        all(feature = "jemalloc-prof", target_os = "linux")
+    )))]
     let _ = path;
 }
 
