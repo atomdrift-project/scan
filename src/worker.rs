@@ -934,6 +934,24 @@ fn sjf_max_staged_wait() -> Duration {
 /// SJF policy matches the historical dispatcher: sweep the prefetch channel
 /// into a reorder window, prefer the smallest sample, age out long-waiters
 /// after [`SJF_MAX_STAGED_WAIT`]. `SCAN_SJF=0` restores FIFO.
+/// Order in which staged jobs dispatch to worker slots (`SCAN_SJF`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DispatchOrder {
+    /// Hopper handout order, unreordered (`SCAN_SJF=0`).
+    Fifo,
+    /// Smallest staged job first (default): protects small-job latency when a
+    /// stream mixes sizes — a 2 KB manifest should not wait out an archive.
+    Smallest,
+    /// Largest staged job first (`SCAN_SJF=big`): LPT-style makespan trim for
+    /// batch drains. The longest job bounds a batch's wall clock from below,
+    /// so starting it as early as it is seen overlaps it with everything
+    /// else; smallest-first provably ends the batch on the biggest job alone
+    /// (measured: a 56 MB tgz ran solo for the last ~6 min of a 26-min
+    /// 121-job drain). Latency-hostile on a live queue — meant for
+    /// `--exit-if-empty` style batch runs.
+    Largest,
+}
+
 struct JobSource {
     state: AsyncMutex<JobSourceState>,
 }
@@ -941,23 +959,23 @@ struct JobSource {
 struct JobSourceState {
     rx: mpsc::UnboundedReceiver<PrefetchedJob>,
     reorder: Vec<(PrefetchedJob, Instant)>,
-    sjf: bool,
+    order: DispatchOrder,
 }
 
 impl JobSource {
-    fn new(rx: mpsc::UnboundedReceiver<PrefetchedJob>, sjf: bool) -> Self {
+    fn new(rx: mpsc::UnboundedReceiver<PrefetchedJob>, order: DispatchOrder) -> Self {
         Self {
             state: AsyncMutex::new(JobSourceState {
                 rx,
                 reorder: Vec::new(),
-                sjf,
+                order,
             }),
         }
     }
 
     async fn recv(&self) -> Option<PrefetchedJob> {
         let mut state = self.state.lock().await;
-        if !state.sjf {
+        if state.order == DispatchOrder::Fifo {
             return state.rx.recv().await;
         }
         // SJF via `&mut state` field access (not two simultaneous &mut borrows
@@ -972,7 +990,8 @@ impl JobSource {
                 state.reorder.push((pj, Instant::now()));
             }
         }
-        pick_sjf_from_reorder(&mut state.reorder)
+        let order = state.order;
+        pick_sjf_from_reorder(&mut state.reorder, order)
     }
 }
 
@@ -993,10 +1012,13 @@ async fn next_smallest_staged(
             reorder.push((pj, Instant::now()));
         }
     }
-    pick_sjf_from_reorder(reorder)
+    pick_sjf_from_reorder(reorder, DispatchOrder::Smallest)
 }
 
-fn pick_sjf_from_reorder(reorder: &mut Vec<(PrefetchedJob, Instant)>) -> Option<PrefetchedJob> {
+fn pick_sjf_from_reorder(
+    reorder: &mut Vec<(PrefetchedJob, Instant)>,
+    order: DispatchOrder,
+) -> Option<PrefetchedJob> {
     let now = Instant::now();
     let max_wait = sjf_max_staged_wait();
     let aged = reorder
@@ -1006,11 +1028,14 @@ fn pick_sjf_from_reorder(reorder: &mut Vec<(PrefetchedJob, Instant)>) -> Option<
         .min_by_key(|(_, (_, staged_at))| *staged_at)
         .map(|(i, _)| i);
     let idx = aged.or_else(|| {
-        reorder
+        let sized = reorder
             .iter()
             .enumerate()
-            .min_by_key(|(_, (pj, _))| pj.job.size_bytes.max(0))
-            .map(|(i, _)| i)
+            .map(|(i, (pj, _))| (i, pj.job.size_bytes.max(0)));
+        match order {
+            DispatchOrder::Largest => sized.max_by_key(|&(_, size)| size).map(|(i, _)| i),
+            _ => sized.min_by_key(|&(_, size)| size).map(|(i, _)| i),
+        }
     })?;
     Some(reorder.swap_remove(idx).0)
 }
@@ -1829,8 +1854,13 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // 7-point depth sweep put the knee at 1.75–2× with nothing gained beyond.
     // `SCAN_SJF=0` restores FIFO dispatch; `SCAN_PREFETCH_DEPTH` overrides
     // the slots multiplier in either mode.
-    let sjf = std::env::var("SCAN_SJF").ok().is_none_or(|v| v != "0");
-    let jobs = Arc::new(JobSource::new(rx, sjf));
+    let dispatch_order = match std::env::var("SCAN_SJF").ok().as_deref() {
+        Some("0") => DispatchOrder::Fifo,
+        Some("big") => DispatchOrder::Largest,
+        _ => DispatchOrder::Smallest,
+    };
+    let sjf = dispatch_order != DispatchOrder::Fifo;
+    let jobs = Arc::new(JobSource::new(rx, dispatch_order));
     let depth_factor = std::env::var("SCAN_PREFETCH_DEPTH")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -1852,14 +1882,18 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     } else {
         ((slots as f64 * depth_factor).ceil() as usize).max(1)
     };
-    if sjf {
-        tracing::info!(
+    match dispatch_order {
+        DispatchOrder::Smallest => tracing::info!(
             target_depth,
             max_staged_wait_s = sjf_max_staged_wait().as_secs(),
-            "size-aware dispatch: smallest staged job first (SCAN_SJF=0 for FIFO)",
-        );
-    } else {
-        tracing::info!(target_depth, "FIFO dispatch (SCAN_SJF=0)");
+            "size-aware dispatch: smallest staged job first (SCAN_SJF=0 for FIFO, SCAN_SJF=big for batch LPT)",
+        ),
+        DispatchOrder::Largest => tracing::info!(
+            target_depth,
+            max_staged_wait_s = sjf_max_staged_wait().as_secs(),
+            "size-aware dispatch: LARGEST staged job first (batch LPT; latency-hostile on a live queue)",
+        ),
+        DispatchOrder::Fifo => tracing::info!(target_depth, "FIFO dispatch (SCAN_SJF=0)"),
     }
 
     // Poll telemetry shared between the prefetcher (writer) and the heartbeat
@@ -2532,6 +2566,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             }
         }
     }
+    // End-of-run engine attribution (per-trait eval time under
+    // CLEAVE_TRAIT_TIMING=1, raw-gate stats under CLEAVE_PHASE_STATS=1, regex
+    // store churn). The CLI logs these per scan; a worker logs them once at
+    // drain so a benchmark run ends with the aggregate.
+    cleave::log_scan_stats();
     Ok(())
 }
 
