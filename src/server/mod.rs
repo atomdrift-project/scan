@@ -650,6 +650,47 @@ pub struct ModelResources {
 }
 
 #[derive(Debug)]
+/// See `AppState::lanes`.
+pub(super) struct SlotLanes {
+    pub(super) whale: Arc<tokio::sync::Semaphore>,
+    pub(super) small: Arc<tokio::sync::Semaphore>,
+    /// Jobs at or below this size take the small lane (`SCAN_SMALL_JOB_MB`,
+    /// the same knob the worker's cleave gate reads). Unknown size — a PURL
+    /// or URL analysis whose payload has not been fetched yet — is a whale:
+    /// those are almost always packages, and mis-classing a whale as small
+    /// is the expensive direction.
+    pub(super) small_max_bytes: u64,
+}
+
+impl SlotLanes {
+    fn from_env(max_concurrent: usize) -> Option<Self> {
+        if std::env::var("SCAN_SLOT_LANES").as_deref() != Ok("1") {
+            return None;
+        }
+        let whale_permits = (1 + max_concurrent / 8).min(max_concurrent);
+        let small_permits = max_concurrent.saturating_sub(whale_permits).max(1);
+        let small_max_bytes = std::env::var("SCAN_SMALL_JOB_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(1024 * 1024, |mb| mb.saturating_mul(1024 * 1024));
+        tracing::info!(
+            whale_permits,
+            small_permits,
+            small_max_mb = small_max_bytes / (1024 * 1024),
+            "slot lanes enabled: class-aware admission (SCAN_SLOT_LANES)"
+        );
+        Some(Self {
+            whale: Arc::new(tokio::sync::Semaphore::new(whale_permits)),
+            small: Arc::new(tokio::sync::Semaphore::new(small_permits)),
+            small_max_bytes,
+        })
+    }
+
+    pub(super) fn available(&self) -> usize {
+        self.whale.available_permits() + self.small.available_permits()
+    }
+}
+
 struct AppState {
     max_upload_bytes: usize,
     /// Maximum RSS before rejecting requests; `None` disables throttling.
@@ -683,6 +724,18 @@ struct AppState {
     /// the analysis completes or when the orphan-cleanup task gives up. RAII
     /// semantics mean the slot is always released — even on panic or runtime shutdown.
     slots: Arc<tokio::sync::Semaphore>,
+    /// Class-aware admission (`SCAN_SLOT_LANES=1`): the flat `slots` semaphore
+    /// treats every analysis as equal, but a large archive fans out across the
+    /// whole shared rayon pool while a small file uses roughly one thread — so
+    /// `--workers` flat slots either under-admit smalls or co-schedule whales
+    /// that then fight for the pool (measured +55% wall on whale co-residency).
+    /// The lanes mirror the worker's cleave gate at the front door: smalls
+    /// (`< small_max_bytes`, the worker's 1 MiB small-job line) get most
+    /// permits, whales get few, and a full lane answers 429 + Retry-After
+    /// instead of queueing — a whale's queue wait is minutes, so the fleet
+    /// routes it to an idle server; a small's wait is seconds, so callers just
+    /// retry. `None` = lanes disabled, flat admission as before.
+    lanes: Option<SlotLanes>,
     /// Tasks stuck past the grace period — still occupying a slot until the
     /// blocking thread finally returns. Tracked for observability only.
     stuck_orphans: AtomicUsize,
@@ -772,6 +825,14 @@ struct AppState {
 }
 
 impl AppState {
+    /// Free analysis capacity across whichever admission scheme is active.
+    pub(super) fn available_analysis_permits(&self) -> usize {
+        match &self.lanes {
+            Some(lanes) => lanes.available(),
+            None => self.slots.available_permits(),
+        }
+    }
+
     fn next_request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -830,6 +891,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         resources: RwLock::new(None),
         next_request_id: AtomicU64::new(1),
         slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+        lanes: SlotLanes::from_env(max_concurrent),
         stuck_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
         analysis_timeout_secs: config.analysis_timeout_secs(),
@@ -1060,7 +1122,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let available = watchdog.slots.available_permits();
+                let available = watchdog.available_analysis_permits();
                 let active = watchdog.max_concurrent_tasks.saturating_sub(available);
                 let stuck = watchdog.stuck_orphans.load(Ordering::Relaxed);
 

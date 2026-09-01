@@ -1325,8 +1325,28 @@ pub(crate) fn orchestrate(
                         .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
                     max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
                 };
-                let dep_fetched = fetch_references_with(
-                    &dep_selected,
+                // Pre-fetch PURL negotiation: hopper may hold a standing
+                // verdict (same rules as the per-sha corpus precheck) for a
+                // registry dependency whose content sha we would otherwise
+                // only learn by downloading it. One batched lookup up front
+                // skips the download, the analysis, and the re-upload for
+                // every such PURL; the answer's sha still records the fetch
+                // edge. Anything unanswered fetches exactly as before.
+                let purl_candidates: Vec<String> = dep_selected
+                    .iter()
+                    .filter(|r| {
+                        matches!(r.locator, RefLocator::Purl(_)) && r.content_sha256.is_none()
+                    })
+                    .map(|r| locator_str(&r.locator))
+                    .collect();
+                let corpus_hits = crate::corpus_precheck::precheck_purls(&purl_candidates);
+                let dep_to_fetch: Vec<Reference> = dep_selected
+                    .iter()
+                    .filter(|r| !corpus_hits.contains_key(&locator_str(&r.locator)))
+                    .cloned()
+                    .collect();
+                let dep_fetched_real = fetch_references_with(
+                    &dep_to_fetch,
                     &source_sha,
                     false,
                     &res.net,
@@ -1334,6 +1354,25 @@ pub(crate) fn orchestrate(
                     dep_budget,
                     &on_fetched,
                 );
+                // Reassemble in dep_selected order: downstream zips records
+                // against the selected refs positionally.
+                let mut real_iter = dep_fetched_real.into_iter();
+                let dep_fetched: Vec<FetchRecord> = dep_selected
+                    .iter()
+                    .map(|r| match corpus_hits.get(&locator_str(&r.locator)) {
+                        Some(sha) => corpus_hit_record(r, &source_sha, sha),
+                        None => real_iter
+                            .next()
+                            .expect("fetched records must align with non-corpus-hit refs"),
+                    })
+                    .collect();
+                if !corpus_hits.is_empty() {
+                    tracing::info!(
+                        skipped = corpus_hits.len(),
+                        asked = purl_candidates.len(),
+                        "purl precheck: hopper verdicts stand; skipped fetch+analysis+upload"
+                    );
+                }
                 let (dep_spent, dep_bytes) = live_fetch_usage(&dep_fetched);
                 charge_total_budget(dep_spent, dep_bytes);
                 file_bytes_remaining = file_bytes_remaining.saturating_sub(dep_bytes);
@@ -1943,6 +1982,43 @@ fn skip_state(reg: &Registry, now: u64, reason: SkipReason) -> DepState {
 /// Compacted from a borrow: no clone of the report, and no strip pass (the raw is
 /// never fed to a model here, and a single dependency never nears the body
 /// limit). Returns `None` when there is nothing to upload.
+/// The record a corpus-satisfied dependency gets instead of a download: no
+/// bytes, no budget charge, hopper's sha as `content_sha256` so the fetch
+/// edge (`source → content`) is still recorded. `Outcome::Skipped` with a
+/// content sha never occurs naturally (a real skip never learned one), and
+/// [`analyze_payload`] keys on exactly that pair to produce the same
+/// "verdict stands in hopper" result as the per-sha precheck — without the
+/// second lookup roundtrip.
+/// The string a [`RefLocator`] is keyed by everywhere a record carries it.
+fn locator_str(locator: &RefLocator) -> String {
+    match locator {
+        RefLocator::Purl(p) | RefLocator::Url(p) | RefLocator::Path(p) => p.clone(),
+    }
+}
+
+fn corpus_hit_record(r: &Reference, source_sha: &str, sha: &str) -> FetchRecord {
+    FetchRecord {
+        source_sha256: source_sha.to_string(),
+        source_offset: Some(r.offset),
+        kind: r.kind,
+        locator: locator_str(&r.locator),
+        resolved_url: String::new(),
+        final_url: None,
+        redirects: Vec::new(),
+        status: None,
+        headers: Vec::new(),
+        fetched_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        content_sha256: Some(sha.to_string()),
+        size: None,
+        cached: true,
+        stale: false,
+        pin_verified: None,
+        outcome: Outcome::Skipped,
+    }
+}
+
 fn capture_dependency(rec: &FetchRecord, analyzed: &Analyzed) -> Option<FetchedDependency> {
     let sub = analyzed.sub.as_ref()?;
     if analyzed.content_sha.is_empty() {
@@ -3331,6 +3407,17 @@ fn analyze_payload(
     if !delivered_bytes(rec) {
         return None;
     }
+    // Corpus-satisfied PURL (see `corpus_hit_record`): the verdict already
+    // stands in hopper; produce the same skip the per-sha precheck would,
+    // without re-asking.
+    if matches!(rec.outcome, Outcome::Skipped) {
+        return rec.content_sha256.clone().map(|content_sha| Analyzed {
+            sub: None,
+            content_sha,
+            next_from_bytes: Vec::new(),
+        });
+    }
+
     let content_sha = rec.content_sha256.clone().unwrap_or_default();
 
     // Warm-cache hit: reuse the prior analysis of these exact bytes, skipping the

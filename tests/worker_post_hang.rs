@@ -302,6 +302,7 @@ async fn sibling_jobs_complete_while_one_result_post_hangs() {
     });
 
     let config = WorkerConfig {
+        no_update: true,
         // Standalone worker under test; no host server to defer to.
         embedded: None,
         hopper_url: format!("http://{addr}"),
@@ -315,6 +316,7 @@ async fn sibling_jobs_complete_while_one_result_post_hangs() {
         slow_rule_ms: 4000,
         max_jobs: None,
         // Do not exit_if_empty: the hanging post never finishes, so drain
+        // Do not
         // would wait forever. The test aborts the worker after siblings post.
         exit_if_empty: false,
         level: None,
