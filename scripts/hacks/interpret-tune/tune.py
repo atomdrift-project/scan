@@ -242,12 +242,32 @@ def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
     return renders
 
 # ── LLM ────────────────────────────────────────────────────────────────────────
-def ask(endpoint, model, system, user, timeout):
+def llm_key():
+    """Bearer token for the endpoint, the same way atomscan resolves it.
+
+    Our vLLM requires one, so a run without it scores every sample as a miss
+    (401) and reads as a catastrophic template. SCAN_LLM_KEY wins over the file
+    for a one-off against someone else's endpoint."""
+    env = os.environ.get("SCAN_LLM_KEY", "").strip()
+    if env:
+        return env
+    try:
+        with open(os.path.expanduser("~/.tok/llm")) as fh:
+            for line in fh:
+                if line.strip():
+                    return line.strip()
+    except OSError:
+        pass
+    return None
+
+def ask(endpoint, model, system, user, timeout, key=None):
     body = json.dumps({"model": model, "messages": [{"role": "system", "content": system},
                        {"role": "user", "content": user}], "temperature": 0.0, "max_tokens": 64,
                        "stream": False, "chat_template_kwargs": {"enable_thinking": False}}).encode()
-    req = urllib.request.Request(endpoint.rstrip("/") + "/chat/completions", body,
-                                 {"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(endpoint.rstrip("/") + "/chat/completions", body, headers)
     r = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
     m = r["choices"][0]["message"]
     txt = (m.get("content") or m.get("reasoning_content") or "")
@@ -302,9 +322,13 @@ def main():
     # jobs: (rel, template, run)
     jobs = [(rel, t, run) for rel in keys for t in templates for run in range(args.runs)]
     results = {}
+    key = llm_key()
+    if key is None:
+        print("# WARNING: no bearer token (SCAN_LLM_KEY or ~/.tok/llm) — an endpoint "
+              "that requires one will refuse every call below", file=sys.stderr)
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(ask, args.endpoint, args.model, system_prompt(t),
-                          transform(renders[rel], t), args.timeout): (rel, t, run)
+                          transform(renders[rel], t), args.timeout, key): (rel, t, run)
                 for (rel, t, run) in jobs}
         errors = []
         for fut in cf.as_completed(futs):

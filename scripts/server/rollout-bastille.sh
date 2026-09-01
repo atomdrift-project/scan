@@ -6,6 +6,9 @@
 #   - "interpret" must have an entry in /etc/hosts on this host, pointing at the
 #     OpenAI-compatible LLM endpoint (vLLM) that --interpret sends samples to.
 #     The entry is copied into the run jail, which has no resolver of its own.
+#   - The endpoint requires a bearer token. LLM_TOKEN_FILE (default ~/.tok/llm)
+#     is installed into the jail whenever it exists; without it the jail serves
+#     on ML alone, since every interpret call is refused with 401.
 #
 # Hopper (optional):
 #   HOPPER        hopper base URL. When set, the server renews every analyzed
@@ -51,6 +54,10 @@ set +x
 TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
 unset CF_TUNNEL_TOKEN
 set -x
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=scripts/server/lib/freebsd-rcd.sh
+. "$SCRIPT_DIR/lib/freebsd-rcd.sh"
 
 TUNNEL_SERVICE=scan_tunnel
 TUNNEL_TOKEN_JAIL_PATH=/usr/local/etc/atomdrift/cloudflared-token
@@ -236,77 +243,44 @@ elif [ -n "$HOPPER" ] && ! doas test -s "$HOPPER_TOKEN_DST"; then
     log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; result renewal on $HOPPER will be rejected"
 fi
 
+# --- LLM endpoint token ------------------------------------------------------
+#
+# The interpret endpoint requires `Authorization: Bearer <token>`; atomscan
+# reads it from $HOME/.tok/llm inside the jail. Moved through the filesystem
+# like the tokens above, so the `set -x` trace cannot echo it.
+#
+# Installed whenever the operator has one. Without it the jail still serves —
+# the second-opinion pass just 401s and every verdict falls back to ML alone,
+# which is silent at runtime, so warn here where it is actionable.
+LLM_TOKEN_SRC="${LLM_TOKEN_FILE:-${HOME}/.tok/llm}"
+LLM_TOKEN_DST="$BASTILLE_DIR/$RUN/root/home/scan/.tok/llm"
+if [ -s "$LLM_TOKEN_SRC" ]; then
+    log "Installing LLM endpoint token"
+    doas install -m 0600 "$LLM_TOKEN_SRC" "$LLM_TOKEN_DST"
+    doas bastille cmd "$RUN" chown scan:scan /home/scan/.tok/llm
+    doas bastille cmd "$RUN" chmod 0600 /home/scan/.tok/llm
+elif ! doas test -s "$LLM_TOKEN_DST"; then
+    log "WARNING: no LLM token at $LLM_TOKEN_SRC; the interpret endpoint will reject the second-opinion pass with 401"
+fi
+
 log "Creating rc.d service"
 doas bastille cmd "$RUN" mkdir -p /usr/local/etc/rc.d
-doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/scan >/dev/null <<'EOF'
-#!/bin/sh
 
-# PROVIDE: scan
-# REQUIRE: LOGIN DAEMON NETWORKING
-# KEYWORD: shutdown
-
-. /etc/rc.subr
-
-name="scan"
-rcvar="scan_enable"
-
-load_rc_config $name
-
-: ${scan_enable:="NO"}
-: ${scan_logfile:="/var/log/scan.log"}
-
-pidfile="/var/run/${name}.pid"
-# Scheduling priority: the server is the reason this jail exists, so it wins
-# every CPU contest on the host. -20 is the strongest nice(1) level; rc runs as
-# root, so it is allowed, and daemon(8)/atomscan and every analysis child
-# (rizin, cleave) inherit it across the setuid to scan. Realtime (rtprio) is
-# deliberately not used: a CPU-bound analysis at realtime priority can starve
-# sshd and lock the box out. Override with scan_nice= in rc.conf.
-: ${scan_nice:="-20"}
-
-# nice(1) execs daemon(8), so procname must be set explicitly or rc.subr would
-# look for /usr/bin/nice when matching the pidfile for status/stop.
-command="/usr/bin/nice"
-procname="/usr/sbin/daemon"
-
-# OOM priority. FreeBSD has no oom_score_adj; protect(1) sets P_PROTECTED,
-# which exempts the process from the swap-exhaustion killer. The flag is
-# inherited across fork and survives daemon(8)'s setuid to scan. Protection is
-# all-or-nothing, so this puts the server *above* an unprotected sshd rather
-# than just below it; protect the host's sshd too if you want that ordering:
-#   doas protect -p "$(pgrep -o sshd)"
-: ${scan_protect:="YES"}
-_protect=""
-case "$scan_protect" in
-[Yy][Ee][Ss] | [Tt][Rr][Uu][Ee] | 1) _protect="/usr/bin/protect" ;;
-esac
-# --interpret adds a local-LLM second opinion, blended with the ML verdict and
-# kept in the envelope's `llm` section. --llm points at the vLLM endpoint on the
-# "interpret" host; the model defaults to atomscan's DEFAULT_MODEL, which is what
-# that endpoint serves.
-# --token-file requires `Authorization: Bearer <token>` on every route except
-# /_/health, including from loopback. atomscan refuses to start if the file is
-# missing or empty, so a lost token fails loudly instead of opening the API.
+# The service definition is shared with the native host deploy
+# (scripts/server/server-freebsd.sh) through lib/freebsd-rcd.sh, so daemon(8)
+# supervision, jemalloc tuning, scheduling priority and the bounded stop stay
+# identical in the jail and on a bare host.
 #
-# --hopper renews every analyzed result on a hopper instance. The URL is not a
-# secret, so it comes from rc.conf (the deploy sets it with sysrc from HOPPER=);
-# empty omits the flag. Its bearer token is a file, /home/scan/.tok/hopper,
-# which atomscan finds through the scan user's HOME.
-#
-# --idle-worker-slots caps the embedded idle worker, which fills otherwise-idle
-# analysis capacity with hopper queue work and pauses the moment a request
-# arrives. Empty omits the flag and leaves the server default (half the slots);
-# scan_idle_slots=0 turns background claiming off.
-: ${scan_hopper:=""}
-_hopper=""
-[ -n "$scan_hopper" ] && _hopper="--hopper ${scan_hopper}"
-: ${scan_idle_slots:=""}
-_idle=""
-[ -n "$scan_idle_slots" ] && _idle="--idle-worker-slots ${scan_idle_slots}"
-command_args="-n ${scan_nice} ${_protect} /usr/sbin/daemon -c -f -P ${pidfile} -r -o ${scan_logfile} -u scan /usr/local/bin/atomscan -u serve --bind 0.0.0.0:49999 --allow-cidr 10.0.0.0/8 --token-file /home/scan/.tok/scan --interpret --llm http://interpret:8000/v1 ${_hopper} ${_idle}"
-
-run_rc_command "$1"
-EOF
+# 0.0.0.0 is the jail's own address space, so binding every interface here
+# exposes only the jail; the CIDR allow-list is what actually gates callers.
+# The LLM endpoint is the "interpret" entry copied into the jail's /etc/hosts
+# above — the jail has no resolver of its own. --hopper and
+# --idle-worker-slots are not baked in: they come from the jail's rc.conf,
+# written with sysrc below.
+scan_server_rcd_script /usr/local/bin/atomscan \
+    "$(scan_server_args "0.0.0.0:49999" "10.0.0.0/8" "/home/scan/.tok/scan")" \
+    "http://interpret:8000/v1" "" "/home/scan" \
+    | doas bastille cmd "$RUN" tee /usr/local/etc/rc.d/scan >/dev/null
 
 doas bastille cmd "$RUN" chmod 755 /usr/local/etc/rc.d/scan
 

@@ -9,6 +9,8 @@
 #   WORKERS            concurrency (--workers)                   (default: worker auto)
 #   LLM                OpenAI-compatible LLM endpoint (SCAN_LLM)
 #   HOPPER_TOKEN_FILE  hopper API token to install on the run host
+#   LLM_TOKEN_FILE     bearer token for the LLM endpoint, which requires one
+#                                                                (default: ~/.tok/llm)
 #                                                                (default: ~/.tok/hopper)
 
 set -ex
@@ -21,7 +23,7 @@ URL="$3"
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
-LLM="${LLM:-http://10.9.8.149:8000/v1}"
+LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
 worker_args="worker --url $URL --interpret"
 [ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
 # The service account's home on the run host. The unit runs with
@@ -89,6 +91,23 @@ if [ -s "$HOPPER_TOKEN_SRC" ]; then
 elif ! rssh "$RSUDO test -s $STATE_HOME/.tok/hopper"; then
     # Not fatal: a hopper deployed without --token-file needs no client token.
     log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; this worker cannot claim work from an authenticated hopper"
+fi
+
+# --- LLM endpoint token ------------------------------------------------------
+#
+# Our vLLM endpoint requires `Authorization: Bearer <token>`; the worker reads
+# it from $HOME/.tok/llm. Streamed over the SSH channel on stdin,
+# never on argv or in a unit file, both world-readable on the run host.
+#
+# Not fatal when absent: every interpret call is refused with 401 and the
+# verdict falls back to ML alone. That is silent at runtime, so warn here.
+LLM_TOKEN_SRC="${LLM_TOKEN_FILE:-${HOME}/.tok/llm}"
+if [ -s "$LLM_TOKEN_SRC" ]; then
+    rssh "$RSUDO sh -c 'umask 077; cat > $STATE_HOME/.tok/llm && \
+          chown scan:scan $STATE_HOME/.tok/llm'" < "$LLM_TOKEN_SRC"
+    log "Installed LLM endpoint token at $RUN:$STATE_HOME/.tok/llm"
+elif ! rssh "$RSUDO test -s $STATE_HOME/.tok/llm"; then
+    log "WARNING: no LLM token at $LLM_TOKEN_SRC; $LLM will refuse the second-opinion pass with 401"
 fi
 
 log "Installing runtime dependencies on $RUN"

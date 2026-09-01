@@ -6,6 +6,8 @@
 #   WORKERS            concurrency (--workers)                   (default: worker auto)
 #   LLM                OpenAI-compatible LLM endpoint (SCAN_LLM)
 #   HOPPER_TOKEN_FILE  hopper API token to install in the run jail
+#   LLM_TOKEN_FILE     bearer token for the LLM endpoint, which requires one
+#                                                                (default: ~/.tok/llm)
 #                                                                (default: ~/.tok/hopper)
 
 set -ex
@@ -21,7 +23,7 @@ URL="$3"
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
-LLM="${LLM:-http://10.9.8.149:8000/v1}"
+LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -99,6 +101,25 @@ if [ -s "$HOPPER_TOKEN_SRC" ]; then
 elif ! doas test -s "$HOPPER_TOKEN_DST"; then
     # Not fatal: a hopper deployed without --token-file needs no client token.
     log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; this worker cannot claim work from an authenticated hopper"
+fi
+
+# --- LLM endpoint token ------------------------------------------------------
+#
+# Our vLLM endpoint requires `Authorization: Bearer <token>`; the worker reads
+# it from $HOME/.tok/llm. Never an argument or an rc.conf value:
+# argv is visible in ps(1) and rc.conf is world-readable.
+#
+# Not fatal when absent: every interpret call is refused with 401 and the
+# verdict falls back to ML alone. That is silent at runtime, so warn here.
+LLM_TOKEN_SRC="${LLM_TOKEN_FILE:-${HOME}/.tok/llm}"
+LLM_TOKEN_DST="$BASTILLE_DIR/$RUN/root/home/scan/.tok/llm"
+if [ -s "$LLM_TOKEN_SRC" ]; then
+    doas bastille cmd "$RUN" install -d -m 0700 -o scan -g scan /home/scan/.tok
+    doas install -m 0600 "$LLM_TOKEN_SRC" "$LLM_TOKEN_DST"
+    doas bastille cmd "$RUN" chown scan:scan /home/scan/.tok/llm
+    log "Installed LLM endpoint token at $RUN:/home/scan/.tok/llm"
+elif ! doas test -s "$LLM_TOKEN_DST"; then
+    log "WARNING: no LLM token at $LLM_TOKEN_SRC; $LLM will refuse the second-opinion pass with 401"
 fi
 
 log "Installing binary"

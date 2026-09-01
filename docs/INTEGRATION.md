@@ -142,7 +142,44 @@ generally, and ~9B is enough if that is what fits.
 
 Point it elsewhere with `--llm`, `--llm-model`, `--llm-key`. `--llm openrouter`
 uses `https://openrouter.ai/api/v1`; the key is `--llm-key`, `SCAN_LLM_KEY`, or
-`~/.tok/openrouter`, and `--llm-model` is required. Control which samples
+`~/.tok/openrouter`, and `--llm-model` is required.
+
+An endpoint that requires a bearer token — ours does — is authenticated without
+any flag: put the token in `~/.tok/llm` (mode 0600, first non-empty line) and
+atomscan sends it on every request. `--llm-key` and `SCAN_LLM_KEY` override the
+file. `~/.tok/llm` is *our* endpoint's credential and is never sent to
+OpenRouter, which takes `~/.tok/openrouter` or nothing. Without a token the
+endpoint answers 401, which costs the second opinion but not the scan: the
+verdict falls back to ML alone and the reason appears in the `llm` section.
+The deploy scripts install `~/.tok/llm` into the service account's home, so
+servers and workers pick it up the same way.
+
+### Failing over between endpoints
+
+Comma-separate `--llm` to name a chain, tried in order — the shape the deploy
+scripts install by default:
+
+```bash
+atomscan --llm 'https://llm.isotope13.ai/v1,openrouter' \
+         --llm-model ',qwen/qwen3.8-27b' ./project
+```
+
+The first endpoint that answers wins, so an outage on our own box costs a retry
+rather than the second opinion, and the billed public API is only reached when
+the free one cannot answer — put the endpoint you would rather not pay for
+last. Any refusal moves to the next: unreachable, timeout, 5xx, or a 4xx such
+as the 401 from a host we hold no token for. The `llm` section names the model
+that actually graded, not the one configured first.
+
+Each link resolves independently. `--llm-model` pairs with `--llm`
+positionally — a blank slot asks that endpoint what it serves, and a single
+name (no comma) applies to the whole chain — and each takes its own key, so the
+example above discovers `Qwen/Qwen3.8-27B` on our vLLM with `~/.tok/llm` and
+sends `qwen/qwen3.8-27b` to OpenRouter with `~/.tok/openrouter`. A link that
+cannot be used (no key, or an OpenRouter slot with no model, whose catalog is
+never auto-selected) is dropped with a warning while the rest carry on; only
+when *nothing* is usable does the scan stop, and a lone endpoint with a
+problem is still an error rather than a silent no-op. Control which samples
 qualify with `--llm-min-level`: a sample is sent when ML fires at or below that
 FP level — the model's own per-route cutoff — or when cleave surfaced a
 suspicious/hostile finding, whichever comes first. It defaults to the model's

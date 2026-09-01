@@ -129,6 +129,10 @@ By default, atomscan sends the interpreted evidence (not the original file) to `
 
 No model is hardcoded: unless you pass `--llm-model`, atomscan asks the endpoint which models it serves and uses the largest one it lists. We recommend serving `Qwen/Qwen3.8-27B`.
 
+If the endpoint requires a bearer token, put it in `~/.tok/llm` (mode 0600) and atomscan sends it automatically; `--llm-key` and `SCAN_LLM_KEY` override that file.
+
+`--llm` also takes a comma-separated failover chain, tried in order — `--llm 'https://llm.isotope13.ai/v1,openrouter'` grades on your own endpoint and reaches for the billed one only when it cannot answer.
+
 ```bash
 atomscan --llm ./project
 atomscan --llm http://model-host:8000/v1 --llm-model my-model ./project

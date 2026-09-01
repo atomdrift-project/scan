@@ -304,7 +304,10 @@ struct Cli {
     /// OpenAI-compatible endpoint at http://localhost:8000/v1). TARGET may be
     /// `local`, `openrouter` (https://openrouter.ai/api/v1; key from `--llm-key`,
     /// `SCAN_LLM_KEY`, or `~/.tok/openrouter`; `--llm-model` is required), or an
-    /// explicit OpenAI-compatible base URL. (env: SCAN_LLM)
+    /// explicit OpenAI-compatible base URL. Endpoints that require a bearer
+    /// token take it from `~/.tok/llm` when that file exists. Comma-separate
+    /// several to fail over in order, e.g.
+    /// `https://llm.isotope13.ai/v1,openrouter`. (env: SCAN_LLM)
     #[arg(
         long,
         global = true,
@@ -315,12 +318,16 @@ struct Cli {
     llm: Option<String>,
 
     /// LLM model name, e.g. Qwen/Qwen3.8-27B. Defaults to the largest model the
-    /// endpoint itself reports serving; nothing is hardcoded (env:
-    /// SCAN_LLM_MODEL)
+    /// endpoint itself reports serving; nothing is hardcoded. With a
+    /// comma-separated `--llm` chain, comma-separate one name per endpoint in
+    /// the same order (a blank slot discovers, a single name applies to all)
+    /// (env: SCAN_LLM_MODEL)
     #[arg(long, global = true, value_name = "NAME")]
     llm_model: Option<String>,
 
-    /// LLM bearer token (env: SCAN_LLM_KEY); omit for local endpoints
+    /// LLM bearer token (env: SCAN_LLM_KEY). Defaults to `~/.tok/llm` when that
+    /// file exists (`~/.tok/openrouter` for OpenRouter); omit for an endpoint
+    /// that needs no key
     #[arg(long, global = true, value_name = "KEY")]
     llm_key: Option<String>,
 
@@ -568,8 +575,8 @@ impl Cli {
     /// when interpretation is not requested.
     fn interpret_config(&self) -> Result<Option<scan::interpret::InterpretConfig>> {
         use scan::interpret::{
-            DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY, is_openrouter_endpoint, llm_base_url,
-            openrouter_key_from_home,
+            DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY, LlmEndpoint, is_openrouter_endpoint,
+            llm_key_from_home, llm_models, llm_targets, openrouter_key_from_home,
         };
         let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
             flag.clone()
@@ -582,55 +589,118 @@ impl Cli {
         if target.is_none() && !self.interpret {
             return Ok(None);
         }
-        // Resolve the target to a base URL: `local` (also the bare-flag default)
+        // Resolve the target to base URLs: `local` (also the bare-flag default)
         // maps to the local endpoint; `openrouter` is the public API; anything
-        // else is an OpenAI-compatible base URL.
-        let base_url = match target.as_deref() {
-            None | Some("local") => DEFAULT_BASE_URL.to_string(),
-            Some(name) => llm_base_url(name),
+        // else is an OpenAI-compatible base URL. A comma-separated target is a
+        // failover chain, tried in order.
+        let targets = match target.as_deref() {
+            None => vec![DEFAULT_BASE_URL.to_string()],
+            Some(raw) => llm_targets(raw),
         };
-        let mut api_key = from_env(&self.llm_key, "SCAN_LLM_KEY");
-        if api_key.is_none() && is_openrouter_endpoint(&base_url) {
-            api_key = openrouter_key_from_home();
+        if targets.is_empty() {
+            anyhow::bail!("--llm (env: SCAN_LLM) names no endpoint");
         }
-        let openrouter = is_openrouter_endpoint(&base_url);
-        if openrouter && api_key.is_none() {
-            anyhow::bail!(
-                "OpenRouter requires a key: --llm-key, SCAN_LLM_KEY, or ~/.tok/openrouter"
-            );
+        let pinned = llm_models(
+            from_env(&self.llm_model, "SCAN_LLM_MODEL").as_deref(),
+            targets.len(),
+        );
+        // An explicit key wins, and applies to every endpoint in the chain —
+        // it is the operator naming one credential. Otherwise each endpoint
+        // resolves its own, and only its own: `~/.tok/openrouter` for
+        // OpenRouter, `~/.tok/llm` for everything else — our own vLLM requires
+        // one, and a host that has the file authenticates without any flag.
+        // Absent a file, the request goes out unauthenticated, which is still
+        // right for an endpoint that wants no key.
+        let explicit_key = from_env(&self.llm_key, "SCAN_LLM_KEY");
+
+        // One endpoint must work; the rest are a cushion. So a config problem
+        // is fatal when it is the only endpoint (a misconfigured `--llm` must
+        // not be silent), and a warning when others remain — an OpenRouter
+        // fallback with no model pinned, or a primary that is down at startup,
+        // should cost that entry, not the scan.
+        let single = targets.len() == 1;
+        let mut resolved: Vec<LlmEndpoint> = Vec::with_capacity(targets.len());
+        let mut skipped: Vec<String> = Vec::new();
+        for (base_url, pinned) in targets.into_iter().zip(pinned) {
+            let openrouter = is_openrouter_endpoint(&base_url);
+            // `~/.tok/llm` is *our* endpoint's token and must never travel to
+            // a third party, so OpenRouter takes its own file or nothing —
+            // sending the vLLM key there would hand a working credential to an
+            // unrelated host and read as a plain 401 when it did.
+            let api_key = explicit_key.clone().or_else(|| {
+                if openrouter {
+                    openrouter_key_from_home()
+                } else {
+                    llm_key_from_home()
+                }
+            });
+            if openrouter && api_key.is_none() {
+                let why =
+                    "OpenRouter requires a key: --llm-key, SCAN_LLM_KEY, or ~/.tok/openrouter";
+                if single {
+                    anyhow::bail!("{why}");
+                }
+                skipped.push(format!("{base_url}: {why}"));
+                continue;
+            }
+            // A pinned model wins; otherwise take what the endpoint says it
+            // serves. OpenRouter's catalog is large and billed — never
+            // auto-pick. Nothing else is hardcoded: if an endpoint lists no
+            // model there is nothing sensible to send, and a guessed name
+            // would surface as an opaque server-side error mid-scan instead of
+            // here.
+            let model = if openrouter {
+                let why = "OpenRouter requires --llm-model (env: SCAN_LLM_MODEL); \
+                           the catalog is not auto-selected";
+                match pinned {
+                    Some(m) => m,
+                    None if single => anyhow::bail!("{why}"),
+                    None => {
+                        skipped.push(format!("{base_url}: {why}"));
+                        continue;
+                    }
+                }
+            } else {
+                match pinned.or_else(|| {
+                    scan::interpret::discover_model(&base_url, api_key.as_deref())
+                }) {
+                    Some(m) => m,
+                    None => {
+                        let why = format!(
+                            "no LLM model available: {base_url}/models listed none (or was \
+                             unreachable). Start the endpoint, or name a model with \
+                             --llm-model (env: SCAN_LLM_MODEL)"
+                        );
+                        if single {
+                            anyhow::bail!("{why}");
+                        }
+                        skipped.push(why);
+                        continue;
+                    }
+                }
+            };
+            resolved.push(LlmEndpoint {
+                base_url,
+                model,
+                api_key,
+            });
         }
-        // A pinned model wins; otherwise take what the endpoint says it serves.
-        // OpenRouter's catalog is large and billed — never auto-pick. Nothing
-        // else is hardcoded: if a local endpoint lists no model there is
-        // nothing sensible to send, and a guessed name would surface as an
-        // opaque server-side error mid-scan instead of here.
-        let model = from_env(&self.llm_model, "SCAN_LLM_MODEL");
-        let model = if openrouter {
-            model.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OpenRouter requires --llm-model (env: SCAN_LLM_MODEL); \
-                     the catalog is not auto-selected"
-                )
-            })?
-        } else {
-            model
-                .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no LLM model available: {base_url}/models listed none (or was \
-                         unreachable). Start the endpoint, or name a model with \
-                         --llm-model (env: SCAN_LLM_MODEL)"
-                    )
-                })?
-        };
+        for why in &skipped {
+            tracing::warn!("LLM endpoint unusable, dropped from the failover chain: {why}");
+        }
+        let mut resolved = resolved.into_iter();
+        let primary = resolved.next().ok_or_else(|| {
+            anyhow::anyhow!("no usable LLM endpoint:\n  {}", skipped.join("\n  "))
+        })?;
         Ok(Some(scan::interpret::InterpretConfig {
-            base_url,
-            model,
-            api_key,
+            base_url: primary.base_url,
+            model: primary.model,
+            api_key: primary.api_key,
             min_level: self.llm_min_level,
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
                 .unwrap_or(NonZeroUsize::MIN),
+            fallbacks: resolved.collect(),
         }))
     }
 }
@@ -3063,6 +3133,200 @@ mod tests {
                 "sk-test",
             ])?;
             assert_eq!(worker.llm.as_deref(), Some("openrouter"));
+            Ok(())
+        })
+    }
+
+    /// `~/.tok/llm` authenticates *our* endpoint. Handing it to OpenRouter
+    /// would send a live credential to a third party, and arrive there as an
+    /// ordinary 401 that says nothing about what leaked.
+    #[test]
+    fn the_vllm_token_is_never_sent_to_openrouter() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tok = dir.path().join(".tok");
+        std::fs::create_dir(&tok)?;
+        std::fs::write(tok.join("llm"), "sk-vllm\n")?;
+        with_isolated_llm_env(Some(dir.path()), || {
+            // Alone, OpenRouter without its own key is the same hard error it
+            // has always been — not a silent borrow of the vLLM token.
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "openrouter",
+                "--llm-model",
+                "qwen/qwen3.8-27b",
+                "/tmp/a",
+            ])?;
+            let err = cli
+                .interpret_config()
+                .expect_err("~/.tok/llm must not satisfy OpenRouter");
+            assert!(err.to_string().contains("~/.tok/openrouter"), "{err}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn llm_failover_chain_resolves_each_endpoint_separately() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tok = dir.path().join(".tok");
+        std::fs::create_dir(&tok)?;
+        std::fs::write(tok.join("llm"), "sk-vllm\n")?;
+        std::fs::write(tok.join("openrouter"), "sk-openrouter\n")?;
+        with_isolated_llm_env(Some(dir.path()), || {
+            // The shape we deploy by default. Both models pinned so the test
+            // resolves without touching the network.
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "https://llm.isotope13.ai/v1,openrouter",
+                "--llm-model",
+                "Qwen/Qwen3.8-27B,qwen/qwen3.8-27b",
+                "/tmp/a",
+            ])?;
+            let cfg = cli.interpret_config()?.context("chain should resolve")?;
+            assert_eq!(cfg.base_url, "https://llm.isotope13.ai/v1");
+            assert_eq!(cfg.model, "Qwen/Qwen3.8-27B");
+            // Each endpoint takes its own token file: the vLLM key must not be
+            // sent to OpenRouter, nor the reverse.
+            assert_eq!(cfg.api_key.as_deref(), Some("sk-vllm"));
+            assert_eq!(cfg.fallbacks.len(), 1);
+            assert_eq!(cfg.fallbacks[0].base_url, scan::interpret::OPENROUTER_BASE_URL);
+            assert_eq!(cfg.fallbacks[0].model, "qwen/qwen3.8-27b");
+            assert_eq!(cfg.fallbacks[0].api_key.as_deref(), Some("sk-openrouter"));
+            Ok(())
+        })
+    }
+
+    /// A fallback that cannot be used is dropped, not fatal: the primary is
+    /// what the scan actually needs.
+    #[test]
+    fn an_unusable_fallback_is_dropped_but_the_primary_stands() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tok = dir.path().join(".tok");
+        std::fs::create_dir(&tok)?;
+        std::fs::write(tok.join("llm"), "sk-vllm\n")?;
+        with_isolated_llm_env(Some(dir.path()), || {
+            // No ~/.tok/openrouter and no model for the OpenRouter slot, so it
+            // cannot be called; the same config with OpenRouter *alone* is a
+            // hard error (see openrouter_alias_requires_model_and_key).
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "https://llm.isotope13.ai/v1,openrouter",
+                "--llm-model",
+                "Qwen/Qwen3.8-27B",
+                "/tmp/a",
+            ])?;
+            let cfg = cli.interpret_config()?.context("primary should stand")?;
+            assert_eq!(cfg.base_url, "https://llm.isotope13.ai/v1");
+            assert!(
+                cfg.fallbacks.is_empty(),
+                "an OpenRouter slot with no key must not be kept: {:?}",
+                cfg.fallbacks
+            );
+            Ok(())
+        })
+    }
+
+    /// ...but losing every endpoint is fatal, and says why for each.
+    #[test]
+    fn a_chain_with_no_usable_endpoint_is_an_error() -> Result<()> {
+        let empty_home = tempfile::tempdir()?;
+        with_isolated_llm_env(Some(empty_home.path()), || {
+            // Port 1 refuses immediately, so discovery fails without a wait;
+            // the OpenRouter slot has neither key nor model.
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "http://127.0.0.1:1/v1,openrouter",
+                "/tmp/a",
+            ])?;
+            let err = cli
+                .interpret_config()
+                .expect_err("no endpoint is usable here");
+            let text = err.to_string();
+            assert!(text.contains("no usable LLM endpoint"), "{text}");
+            assert!(text.contains("127.0.0.1:1"), "{text}");
+            assert!(text.contains("OpenRouter"), "{text}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn llm_key_falls_back_to_tok_llm_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tok = dir.path().join(".tok");
+        std::fs::create_dir(&tok)?;
+        std::fs::write(tok.join("llm"), "sk-vllm-file\n")?;
+        with_isolated_llm_env(Some(dir.path()), || {
+            // A pinned model keeps this off the network: an unpinned one would
+            // probe the endpoint for its catalog.
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "http://interpret:8000/v1",
+                "--llm-model",
+                "Qwen/Qwen3.8-27B",
+                "/tmp/a",
+            ])?;
+            let cfg = cli
+                .interpret_config()?
+                .context("~/.tok/llm should supply the key")?;
+            assert_eq!(cfg.api_key.as_deref(), Some("sk-vllm-file"));
+
+            // An explicit key still wins over the file.
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "http://interpret:8000/v1",
+                "--llm-model",
+                "Qwen/Qwen3.8-27B",
+                "--llm-key",
+                "sk-flag",
+                "/tmp/a",
+            ])?;
+            let cfg = cli.interpret_config()?.context("explicit key")?;
+            assert_eq!(cfg.api_key.as_deref(), Some("sk-flag"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn openrouter_prefers_its_own_tok_file_over_tok_llm() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tok = dir.path().join(".tok");
+        std::fs::create_dir(&tok)?;
+        std::fs::write(tok.join("llm"), "sk-vllm-file\n")?;
+        std::fs::write(tok.join("openrouter"), "sk-openrouter-file\n")?;
+        with_isolated_llm_env(Some(dir.path()), || {
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "openrouter",
+                "--llm-model",
+                "qwen/qwen3.8-27b",
+                "/tmp/a",
+            ])?;
+            let cfg = cli.interpret_config()?.context("openrouter key")?;
+            assert_eq!(cfg.api_key.as_deref(), Some("sk-openrouter-file"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn no_tok_llm_file_leaves_the_endpoint_unauthenticated() -> Result<()> {
+        let empty_home = tempfile::tempdir()?;
+        with_isolated_llm_env(Some(empty_home.path()), || {
+            let cli = Cli::try_parse_from([
+                "atomscan",
+                "--llm",
+                "http://interpret:8000/v1",
+                "--llm-model",
+                "Qwen/Qwen3.8-27B",
+                "/tmp/a",
+            ])?;
+            let cfg = cli.interpret_config()?.context("local target")?;
+            assert_eq!(cfg.api_key, None);
             Ok(())
         })
     }

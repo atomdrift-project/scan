@@ -8,6 +8,8 @@
 #   WORKERS            concurrency (--workers)                   (default: worker auto)
 #   LLM                OpenAI-compatible LLM endpoint (SCAN_LLM)
 #   HOPPER_TOKEN_FILE  hopper API token to install for the service user
+#   LLM_TOKEN_FILE     bearer token for the LLM endpoint, which requires one
+#                                                                (default: ~/.tok/llm)
 #                                                                (default: ~/.tok/hopper)
 
 set -ex
@@ -18,7 +20,7 @@ URL="$1"
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
-LLM="${LLM:-http://10.9.8.149:8000/v1}"
+LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
 
 BINARY=atomscan
 INSTALL_DIR=/usr/local/share/atomdrift/scan
@@ -109,6 +111,25 @@ if [ -s "$HOPPER_TOKEN_SRC" ]; then
 elif ! $SUDO test -s "$HOPPER_TOKEN_DST"; then
     # Not fatal: a hopper deployed without --token-file needs no client token.
     log "WARNING: no hopper API token at $HOPPER_TOKEN_SRC; this worker cannot claim work from an authenticated hopper"
+fi
+
+# --- LLM endpoint token ------------------------------------------------------
+#
+# Our vLLM endpoint requires `Authorization: Bearer <token>`; the worker reads
+# it from $HOME/.tok/llm. Never an argument or a plist
+# EnvironmentVariables entry: argv is visible in ps(1) and the plist is
+# world-readable.
+#
+# Not fatal when absent: every interpret call is refused with 401 and the
+# verdict falls back to ML alone. That is silent at runtime, so warn here.
+LLM_TOKEN_SRC="${LLM_TOKEN_FILE:-${HOME}/.tok/llm}"
+LLM_TOKEN_DST="$STATE_HOME/.tok/llm"
+if [ -s "$LLM_TOKEN_SRC" ]; then
+    $SUDO cmp -s "$LLM_TOKEN_SRC" "$LLM_TOKEN_DST" 2>/dev/null || restart_needed=1
+    $SUDO install -m 0600 -o "$SERVICE_USER" "$LLM_TOKEN_SRC" "$LLM_TOKEN_DST"
+    log "Installed LLM endpoint token at $LLM_TOKEN_DST"
+elif ! $SUDO test -s "$LLM_TOKEN_DST"; then
+    log "WARNING: no LLM token at $LLM_TOKEN_SRC; $LLM will refuse the second-opinion pass with 401"
 fi
 
 log "Installing binary"
