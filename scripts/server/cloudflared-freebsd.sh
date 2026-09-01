@@ -141,7 +141,11 @@ rcvar="${SERVICE_NAME}_enable"
 load_rc_config \$name
 
 : \${${SERVICE_NAME}_enable:="NO"}
-: \${${SERVICE_NAME}_user:="$TUNNEL_USER"}
+# Deliberately NOT named ${SERVICE_NAME}_user: rc.subr treats \${name}_user as a
+# magic knob and wraps the whole command in su(1), so daemon(8) itself would run
+# as the connector's account and fail to write the root-owned pidfile in
+# /var/run. daemon(8) -u below does the privilege drop, after the pidfile.
+: \${${SERVICE_NAME}_run_user:="$TUNNEL_USER"}
 : \${${SERVICE_NAME}_token_file:="$TOKEN_FILE"}
 : \${${SERVICE_NAME}_logfile:="$TUNNEL_LOG"}
 
@@ -150,7 +154,7 @@ command="/usr/sbin/daemon"
 # The token is read from a file rather than passed as an argument so it never
 # appears in ps(1) output. -r -R 5 supervises the connector: a crash or a lost
 # edge connection is restarted, paced 5s apart.
-command_args="-c -f -r -R 5 -P \${pidfile} -o \${${SERVICE_NAME}_logfile} -u \${${SERVICE_NAME}_user} /usr/bin/env HOME=$TUNNEL_HOME $CLOUDFLARED_BIN tunnel --no-autoupdate run --token-file \${${SERVICE_NAME}_token_file}"
+command_args="-c -f -r -R 5 -P \${pidfile} -o \${${SERVICE_NAME}_logfile} -u \${${SERVICE_NAME}_run_user} /usr/bin/env HOME=$TUNNEL_HOME $CLOUDFLARED_BIN tunnel --no-autoupdate run --token-file \${${SERVICE_NAME}_token_file}"
 
 run_rc_command "\$1"
 EOF
