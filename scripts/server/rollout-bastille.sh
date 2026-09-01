@@ -422,7 +422,11 @@ rcvar="${TUNNEL_SERVICE}_enable"
 load_rc_config \$name
 
 : \${${TUNNEL_SERVICE}_enable:="NO"}
-: \${${TUNNEL_SERVICE}_user:="$TUNNEL_USER"}
+# Deliberately NOT named ${TUNNEL_SERVICE}_user: rc.subr treats \${name}_user as
+# a magic knob and wraps the whole command in su(1), so daemon(8) itself would
+# run as the connector's account and fail to write the root-owned pidfile in
+# /var/run. daemon(8) -u below does the privilege drop, after the pidfile.
+: \${${TUNNEL_SERVICE}_run_user:="$TUNNEL_USER"}
 : \${${TUNNEL_SERVICE}_token_file:="$TUNNEL_TOKEN_JAIL_PATH"}
 : \${${TUNNEL_SERVICE}_logfile:="$TUNNEL_LOG"}
 
@@ -430,7 +434,7 @@ pidfile="/var/run/\${name}.pid"
 command="/usr/sbin/daemon"
 # The token is read from a file rather than passed as an argument so it never
 # appears in ps(1) output.
-command_args="-c -f -r -R 5 -P \${pidfile} -o \${${TUNNEL_SERVICE}_logfile} -u \${${TUNNEL_SERVICE}_user} /usr/bin/env HOME=$TUNNEL_HOME /usr/local/bin/cloudflared tunnel --no-autoupdate run --token-file \${${TUNNEL_SERVICE}_token_file}"
+command_args="-c -f -r -R 5 -P \${pidfile} -o \${${TUNNEL_SERVICE}_logfile} -u \${${TUNNEL_SERVICE}_run_user} /usr/bin/env HOME=$TUNNEL_HOME /usr/local/bin/cloudflared tunnel --no-autoupdate run --token-file \${${TUNNEL_SERVICE}_token_file}"
 
 run_rc_command "\$1"
 EOF
