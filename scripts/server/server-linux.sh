@@ -44,11 +44,17 @@
 #                      (HOPPER need not be set)               (default: ~/.tok/hopper)
 #   MAX_RSS_GB  pause threshold (--max-rss-gb)                   (default: -1 = off; systemd MemoryMax handles OOM)
 #   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, 80%, infinity)     (default: 80%)
-#   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target (SCAN_LLM)
-#                                                                (default: http://10.9.8.149:8000/v1;
+#   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target; comma-separate
+#                  several to fail over in order (SCAN_LLM)
+#                                                                (default: https://llm.isotope13.ai/v1,openrouter;
 #                                                                 `openrouter` → https://openrouter.ai/api/v1)
-#   LLM_MODEL      pinned model (SCAN_LLM_MODEL); required for OpenRouter
-#   SCAN_LLM_KEY   OpenRouter key if ~/.tok/openrouter is absent
+#   LLM_MODEL      pinned model (SCAN_LLM_MODEL); required for OpenRouter. Pairs
+#                  positionally with a comma-separated LLM chain; a blank slot
+#                  asks that endpoint what it serves
+#                                                    (default: ,qwen/qwen3.8-27b)
+#   SCAN_LLM_KEY   LLM bearer token, overriding the file below
+#   LLM_TOKEN_FILE LLM endpoint bearer token, installed whenever the file
+#                  exists; our vLLM requires one    (default: ~/.tok/llm)
 #   CLOUDFLARED    Cloudflare Tunnel: "auto" installs and supervises cloudflared
 #                  only when CF_TUNNEL_TOKEN is passed or a token from an
 #                  earlier deploy is on disk, so a host reached over the LAN
@@ -97,8 +103,8 @@ NICE="${NICE:--20}"
 if [ -z "${LLM:-}" ] && [ -n "${LLM_URL:-}" ]; then
     LLM=$LLM_URL
 fi
-LLM="${LLM:-http://10.9.8.149:8000/v1}"
-LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-}}"
+LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
+LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-,qwen/qwen3.8-27b}}"
 CLOUDFLARED="${CLOUDFLARED:-auto}"
 CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE:-/etc/atomdrift/scan/cloudflared-token}"
 
@@ -338,14 +344,40 @@ elif [ -n "${HOPPER}" ] && ! $SUDO test -s "$hopper_token_dst"; then
 fi
 
 # OpenRouter: copy the operator key into the service home as well.
+# The LLM target may be a comma-separated failover chain, so OpenRouter can sit
+# anywhere in it. Anywhere is enough to need its key installed here; only when
+# it is the *whole* chain is a missing key or model fatal, because then there is
+# no other endpoint left to grade with.
 openrouter_target() {
+    _or_rest="$LLM"
+    while [ -n "$_or_rest" ]; do
+        _or_one=${_or_rest%%,*}
+        case "$_or_rest" in
+            *,*) _or_rest=${_or_rest#*,} ;;
+            *)   _or_rest="" ;;
+        esac
+        case "$(printf '%s' "$_or_one" | tr -d '[:space:]')" in
+            openrouter|https://openrouter.ai/*|http://openrouter.ai/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# OpenRouter and nothing else — the case where its key and model are required
+# rather than merely useful.
+openrouter_only() {
     case "$LLM" in
-        openrouter|https://openrouter.ai/*|http://openrouter.ai/*) return 0 ;;
-        *) return 1 ;;
+        *,*) return 1 ;;
     esac
+    openrouter_target
 }
 if openrouter_target; then
-    [ -n "$LLM_MODEL" ] || die "OpenRouter deploy requires LLM_MODEL= (e.g. qwen/qwen3.8-27b)"
+    if [ -z "$LLM_MODEL" ]; then
+        if openrouter_only; then
+            die "OpenRouter deploy requires LLM_MODEL= (e.g. qwen/qwen3.8-27b)"
+        fi
+        log "WARNING: no LLM_MODEL for the OpenRouter link in $LLM; its catalog is never auto-selected, so that link is dropped from the chain"
+    fi
     dst="${STATE_HOME}/.tok/openrouter"
     src="${HOME}/.tok/openrouter"
     if [ -n "${SCAN_LLM_KEY:-}" ]; then
@@ -356,9 +388,47 @@ if openrouter_target; then
     elif [ -s "$src" ]; then
         $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$src" "$dst"
     else
-        die "OpenRouter deploy needs a key in $src (or SCAN_LLM_KEY)"
+        if openrouter_only; then
+            die "OpenRouter deploy needs a key in $src (or SCAN_LLM_KEY)"
+        fi
+        log "WARNING: no OpenRouter key in $src (or SCAN_LLM_KEY); that link is dropped from the chain"
+        dst=""
     fi
-    log "Installed OpenRouter token at ${dst}"
+    # Only on a branch that actually installed one.
+    if [ -n "$dst" ]; then
+        log "Installed OpenRouter token at ${dst}"
+    fi
+fi
+
+# --- LLM endpoint token ------------------------------------------------------
+# Our vLLM endpoint requires `Authorization: Bearer <token>`; atomscan reads it
+# from $HOME/.tok/llm, so it has to land in the service home like the others.
+# A file rather than argv or a unit-file Environment= line, for the same reason
+# as the tokens above: ps(1) output and /etc/systemd/system are world-readable.
+#
+# Installed whenever the operator has one, regardless of which endpoint this
+# deploy targets: the target is switchable on a later deploy, and the file is
+# inert against an endpoint that wants no key.
+llm_token_src="${LLM_TOKEN_FILE:-${HOME}/.tok/llm}"
+llm_token_dst="${STATE_HOME}/.tok/llm"
+if [ -n "${SCAN_LLM_KEY:-}" ] && ! openrouter_target; then
+    # An explicit key on the deploy is the operator overriding the file.
+    tmp=$(mktemp)
+    chmod 0600 "$tmp"
+    printf '%s\n' "$SCAN_LLM_KEY" > "$tmp"
+    $SUDO cmp -s "$tmp" "$llm_token_dst" 2>/dev/null || token_changed=1
+    $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$tmp" "$llm_token_dst"
+    rm -f "$tmp"
+    log "Installed LLM endpoint token at ${llm_token_dst}"
+elif [ -s "$llm_token_src" ]; then
+    $SUDO cmp -s "$llm_token_src" "$llm_token_dst" 2>/dev/null || token_changed=1
+    $SUDO install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
+        "$llm_token_src" "$llm_token_dst"
+    log "Installed LLM endpoint token at ${llm_token_dst}"
+elif [ -n "$LLM" ] && ! openrouter_target && ! $SUDO test -s "$llm_token_dst"; then
+    # Not fatal: a missing key only costs the second opinion, and the ML verdict
+    # still stands. But it is silent at runtime, so say it loudly here.
+    log "WARNING: no LLM token at ${llm_token_src}; ${LLM} will reject the second-opinion pass with 401"
 fi
 
 # --- Binary -----------------------------------------------------------------

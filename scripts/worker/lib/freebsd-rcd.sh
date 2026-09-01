@@ -53,7 +53,7 @@ scan_worker_args() {
 scan_rcd_script() {
 	_lrs_bin="$1"
 	_lrs_worker_args="$2"
-	_lrs_llm="${3:-http://10.9.8.149:8000/v1}"
+	_lrs_llm="${3:-https://llm.isotope13.ai/v1,openrouter}"
 	# Basename for the force-kill sweep in scan_worker_stop; matches pkill -x's
 	# comm comparison (e.g. /usr/local/bin/atomscan -> atomscan).
 	_lrs_binname=$(basename "$_lrs_bin")

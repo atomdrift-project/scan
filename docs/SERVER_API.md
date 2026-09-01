@@ -100,14 +100,23 @@ credential — but a valid token there upgrades the response, see below.
 `make deploy` (alias of `make deploy-server`) installs a long-lived
 `atomscan serve`:
 
-- **FreeBSD.** Bastille build jail + run jail, rc.d service
-  (`scripts/server/rollout-bastille.sh`).
+- **FreeBSD.** Native host install, rc.d service `scan`
+  (`scripts/server/server-freebsd.sh`). Same shape as `make deploy-worker` on
+  FreeBSD: unprivileged `scan` user, `daemon(8)` supervision with a bounded
+  stop, `nice -20` plus `protect(1)`, traits under the service account's home.
+  The service definition is shared with the jailed deploy through
+  `scripts/server/lib/freebsd-rcd.sh`.
 - **Linux (systemd).** Native host install, unit `scan.service`
   (`scripts/server/server-linux.sh`). Same shape as
   `make deploy-worker` on Linux: unprivileged `scan` user, `MemoryMax=`,
   traits under the deployed state directory (by default
   `/var/lib/atomdrift/scan`; the systemd installer resolves symlinked mounts
   such as `/var/lib/atomdrift` → `/data/atomdrift`).
+
+`make deploy-jail` is the FreeBSD alternative: a Bastille build jail plus a run
+jail (`scripts/server/rollout-bastille.sh`), for when the server should be
+isolated from the host rather than installed on it. `make uninstall-server`
+removes the native service, `make uninstall-jail` the jailed one.
 
 Both paths install an API token. It is read from `~/.tok/scan` on the
 deploying host — generated there on first deploy if absent — and copied into
@@ -141,20 +150,28 @@ service account's own `~/.tok/hopper` (`HOPPER_TOKEN_FILE=` overrides the
 source), whether or not `HOPPER=` is set — so turning renewal on later needs
 nothing else in place. The file is inert while `--hopper` is off.
 
-On FreeBSD the URL lands in the jail's `rc.conf` as `scan_hopper`, so it can
-also be changed in place — `bastille sysrc <jail> scan_hopper=<url>` plus a
-service restart — without a redeploy. Dropping `HOPPER=` from a later deploy is
-now refused rather than silently clearing it; `HOPPER=none` clears it
-explicitly, so renewal stops on purpose rather than by omission.
+On FreeBSD the URL lands in `rc.conf` as `scan_hopper`, so it can also be
+changed in place — `sysrc scan_hopper=<url>` (`bastille sysrc <jail>
+scan_hopper=<url>` for the jailed deploy) plus a service restart — without a
+redeploy. Dropping `HOPPER=` from a later deploy is now refused rather than
+silently clearing it; `HOPPER=none` clears it explicitly, so renewal stops on
+purpose rather than by omission.
 
-Linux overrides (passed through the environment): `BIND=` (default
-`127.0.0.1:49999`, on the assumption that a Cloudflare tunnel or another local
-proxy provides the ingress; set `0.0.0.0:49999` to listen on every interface),
-`TOKEN_SRC=` (default `~/.tok/scan`; set empty to deploy without
-authentication), `ALLOW_CIDR=` (default `10.0.0.0/8`; set empty to omit),
-`LLM=` / `LLM_URL=` (`local`, `openrouter`, or a base URL), `LLM_MODEL=`
-(required for OpenRouter), `WORKERS=`, `MEMORY_MAX=`, `IDLE=`. `make
-uninstall-server` tears the unit down.
+Overrides (passed through the environment), shared by the Linux and FreeBSD
+host installs: `BIND=` (default `127.0.0.1:49999`, on the assumption that a
+Cloudflare tunnel or another local proxy provides the ingress; set
+`0.0.0.0:49999` to listen on every interface), `TOKEN_SRC=` (default
+`~/.tok/scan`; set empty to deploy without authentication), `ALLOW_CIDR=`
+(default `10.0.0.0/8`; set empty to omit), `LLM=` / `LLM_URL=` (`local`,
+`openrouter`, or a base URL), `LLM_MODEL=` (required for OpenRouter),
+`WORKERS=`, `ALLOWED_DIRS=`, `IDLE=`, `CLOUDFLARED=` / `CF_TUNNEL_TOKEN=`.
+`make uninstall-server` tears the service down.
+
+Memory is capped differently per platform, because FreeBSD has no cgroup to
+fall back on: Linux passes `MEMORY_MAX=` to systemd's `MemoryMax=` and turns
+the in-process throttle off, while FreeBSD keeps the in-process throttle on and
+takes `MAX_RSS_GB=` (default `0`, which auto-resolves to the process memory
+limit). FreeBSD also takes `NICE=`, stored in `rc.conf` as `scan_nice`.
 
 `IDLE=` caps the embedded idle worker — the analysis slots `serve` spends on
 hopper queue work while no request is in flight. Left unset it keeps the server
@@ -169,10 +186,15 @@ allow-list, no authentication — so unlike the others they are not declared in
 the Makefile, where they would be exported empty on every deploy. Pass them on
 the command line when you mean them.
 
-The FreeBSD jail keeps `--bind 0.0.0.0:49999` with `--allow-cidr 10.0.0.0/8`,
-since it is reached over the network rather than through a tunnel, and always
-requires a token. `HOPPER=` / `HOPPER_TOKEN_FILE=` apply there too; the other
-overrides above are Linux-only.
+The jailed deploy (`make deploy-jail`) is the exception: it keeps `--bind
+0.0.0.0:49999` with `--allow-cidr 10.0.0.0/8` — inside a jail that is the
+jail's own address, and it is reached over the network rather than through a
+tunnel — and always requires a token. `HOPPER=`, `HOPPER_TOKEN_FILE=`, `IDLE=`
+and the `CLOUDFLARED=` knobs apply there too; the other overrides above are
+for the host installs.
+
+On FreeBSD the service logs to `/var/log/scan.log` (`service scan status`,
+`tail -f /var/log/scan.log`) rather than to journald.
 
 ## Endpoints
 

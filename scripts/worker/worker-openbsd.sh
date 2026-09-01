@@ -14,9 +14,11 @@ URL="$1"
 
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 # HOPPER_TOKEN_FILE names the hopper API token to install (default: ~/.tok/hopper).
+# LLM_TOKEN_FILE names the bearer token for the LLM endpoint, which requires one
+# (default: ~/.tok/llm).
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
-LLM="${LLM:-http://10.9.8.149:8000/v1}"
+LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
 BINARY=atomscan
 BIN_DIR="$HOME/bin"
 LOG="$HOME/.local/share/atomdrift/scan/scan-worker.log"
@@ -64,6 +66,26 @@ elif [ "$HOPPER_TOKEN_SRC" != "$HOPPER_TOKEN_DST" ]; then
     cmp -s "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST" 2>/dev/null || restart_needed=1
     install -m 0600 "$HOPPER_TOKEN_SRC" "$HOPPER_TOKEN_DST"
     log "Installed hopper API token at $HOPPER_TOKEN_DST"
+fi
+
+# --- LLM endpoint token ------------------------------------------------------
+#
+# Our vLLM endpoint requires `Authorization: Bearer <token>`; the worker reads
+# it from $HOME/.tok/llm. The cron job below runs as this same user, so
+# ~/.tok/llm is read in place; an LLM_TOKEN_FILE pointing elsewhere is copied
+# there, because cron does not carry the deploy environment.
+#
+# Not fatal when absent: every interpret call is refused with 401 and the
+# verdict falls back to ML alone. That is silent at runtime, so warn here.
+LLM_TOKEN_SRC="${LLM_TOKEN_FILE:-$HOME/.tok/llm}"
+LLM_TOKEN_DST="$HOME/.tok/llm"
+if [ ! -s "$LLM_TOKEN_SRC" ]; then
+    log "WARNING: no LLM token at $LLM_TOKEN_SRC; $LLM will refuse the second-opinion pass with 401"
+elif [ "$LLM_TOKEN_SRC" != "$LLM_TOKEN_DST" ]; then
+    mkdir -p "$HOME/.tok" && chmod 700 "$HOME/.tok"
+    cmp -s "$LLM_TOKEN_SRC" "$LLM_TOKEN_DST" 2>/dev/null || restart_needed=1
+    install -m 0600 "$LLM_TOKEN_SRC" "$LLM_TOKEN_DST"
+    log "Installed LLM endpoint token at $LLM_TOKEN_DST"
 fi
 
 log "Installing binary"

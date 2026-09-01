@@ -330,3 +330,8 @@ The harness is `hacks/interpret-tune/tune.py`; the workflow is:
 Rebuilds are only needed to ship a prompt change (edit
 `interpret.rs::SYSTEM_PROMPT`) — the whole sweep runs against the LLM endpoint
 directly.
+
+The endpoint requires a bearer token. `tune.py` reads it from `~/.tok/llm`
+(`SCAN_LLM_KEY` overrides) and warns when it finds neither, which matters here:
+a refused call scores as a miss, so an unauthenticated sweep reads as a model
+that got the whole corpus wrong rather than as a run that never happened.

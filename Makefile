@@ -40,9 +40,19 @@ URL ?= http://10.9.8.10:8081/
 HOPPER_TOKEN_FILE ?= $(HOME)/.tok/hopper
 export HOPPER_TOKEN_FILE
 
+# The LLM endpoint's bearer token. Our vLLM requires one on every /v1 route, so
+# a deploy without it drops that endpoint from the failover chain and grades on
+# whatever is left (OpenRouter, or nothing). `atomscan` reads it from
+# `~/.tok/llm` in its own home (`SCAN_LLM_KEY` overrides); the deploy scripts
+# copy this file into the service account's home, since a supervised service
+# does not share the operator's. Exported so a command-line override reaches
+# them.
+LLM_TOKEN_FILE ?= $(HOME)/.tok/llm
+export LLM_TOKEN_FILE
+
 # --- `make deploy` / `make deploy-server` knobs ------------------------------
-# Read by scripts/server/server-linux.sh (Linux) and
-# scripts/server/rollout-bastille.sh (FreeBSD); see docs/SERVER_API.md.
+# Read by scripts/server/server-linux.sh (Linux), server-freebsd.sh (FreeBSD)
+# and rollout-bastille.sh (`make deploy-jail`); see docs/SERVER_API.md.
 #
 #   make deploy HOPPER=https://hops.isotope13.ai
 #
@@ -97,18 +107,24 @@ export HOPPER BIND ALLOWED_DIRS MEMORY_MAX IDLE
 
 # LLM second-opinion pass for `make worker` (matches the deploy scripts'
 # defaults). LLM / LLM_URL is exported as SCAN_LLM (`local`, `openrouter`, or a
-# base URL). LLM_MODEL is SCAN_LLM_MODEL (required for OpenRouter). The
+# base URL). LLM_MODEL is SCAN_LLM_MODEL (required for OpenRouter). The endpoint
+# requires a bearer token; atomscan reads it from ~/.tok/llm, and the deploy
+# scripts install that file for the service account (LLM_TOKEN_FILE overrides). The
 # benchmark/profile targets deliberately omit interpret so LLM
 # round-trips don't distort wall/RSS measurements.
-LLM ?= http://10.9.8.149:8000/v1
-LLM_MODEL ?=
+# Comma-separated is a failover chain, tried in order: our own vLLM first, the
+# billed public API only when it cannot answer. LLM_MODEL pairs positionally
+# with it — an empty first slot asks our endpoint what it serves, while
+# OpenRouter's catalog is never auto-selected and so must be named.
+LLM ?= https://llm.isotope13.ai/v1,openrouter
+LLM_MODEL ?= ,qwen/qwen3.8-27b
 
 # Scrub GNU make's jobserver from cargo's environment. Without this, build
 # scripts that spawn their own `make` (e.g. tikv-jemalloc-sys) inherit a
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: pgo-train bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: pgo-train ensure-llm-token bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-jail uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -255,7 +271,7 @@ tarball: release
 # outer invocation's `-j`/`--jobserver-*` flags plus command-line `URL=` into
 # the env, which tikv-jemalloc-sys's build.rs re-passes to its bundled `make`,
 # producing `*** No rule to make target '-j'` inside the jemalloc build.
-deploy-server deploy-worker deploy-jail-worker deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
+deploy-server deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
 
 deploy: deploy-server
 
@@ -266,20 +282,48 @@ deploy: deploy-server
 # so the token stays out of the repository and out of ps(1) on the deploy host.
 CLOUDFLARED ?= auto
 
-# Long-lived `atomscan serve`. FreeBSD: Bastille build+run jails. Linux: native
-# systemd unit (`scan.service`). Override BIND=, ALLOW_CIDR=, LLM= / LLM_URL=,
-# LLM_MODEL=, MEMORY_MAX=, CLOUDFLARED= (see scripts/server/server-linux.sh).
+# Long-lived `atomscan serve`, installed natively on this host: a FreeBSD rc.d
+# service (`service scan`) or a systemd unit (`scan.service`). Override BIND=,
+# ALLOW_CIDR=, LLM= / LLM_URL=, LLM_MODEL=, MEMORY_MAX= (Linux), MAX_RSS_GB=
+# (FreeBSD), CLOUDFLARED= — see scripts/server/server-freebsd.sh and
+# scripts/server/server-linux.sh. For a jailed FreeBSD server use `make
+# deploy-jail`.
+# Put the LLM key where the deploy scripts look for it, if it is not there
+# already. They copy $(LLM_TOKEN_FILE) into the service account's home; this
+# only covers the case where the operator has the key in the environment and no
+# file yet, which is how a fresh host gets one. Never overwrites: a file already
+# on disk is the operator's, and clobbering it would silently rotate the fleet's
+# credential on an unrelated deploy.
+#
+# Deliberately not fatal, unlike check-hopper-token. A worker without a hopper
+# token is a silent no-op; a scan without an LLM key still scans — it loses the
+# second opinion on that endpoint and falls through to the rest of the chain.
+ensure-llm-token:
+	@if [ -s "$(LLM_TOKEN_FILE)" ]; then exit 0; fi; \
+	if [ -n "$${SCAN_LLM_KEY:-}" ]; then \
+		umask 077; mkdir -p "$$(dirname "$(LLM_TOKEN_FILE)")"; \
+		printf '%s\n' "$${SCAN_LLM_KEY}" > "$(LLM_TOKEN_FILE)"; \
+		chmod 600 "$(LLM_TOKEN_FILE)"; \
+		echo "installed the LLM endpoint token at $(LLM_TOKEN_FILE)"; \
+	else \
+		echo "warning: no LLM token at $(LLM_TOKEN_FILE) and SCAN_LLM_KEY unset."; \
+		echo "         An endpoint that requires one will refuse this deploy's"; \
+		echo "         second-opinion pass with 401; the chain falls through to"; \
+		echo "         whatever else \$$LLM names. Write the token to that file"; \
+		echo "         or pass SCAN_LLM_KEY=<token> to install it."; \
+	fi
+
 deploy-server: export CLOUDFLARED := $(CLOUDFLARED)
-deploy-server: check-hopper-url
+deploy-server: check-hopper-url ensure-llm-token
 	git pull
 	@case "$$(uname -s)" in \
-		FreeBSD) ./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)" ;; \
+		FreeBSD) ./scripts/server/server-freebsd.sh ;; \
 		Linux)   if command -v systemctl >/dev/null 2>&1; then \
 		           ./scripts/server/server-linux.sh; \
 		         else \
 		           echo "error: unsupported Linux (systemd required for server deploy)"; exit 1; \
 		         fi ;; \
-		*) echo "error: no deploy-server target for $$(uname -s) (FreeBSD/bastille or Linux/systemd)"; exit 1 ;; \
+		*) echo "error: no deploy-server target for $$(uname -s) (FreeBSD/rc.d or Linux/systemd)"; exit 1 ;; \
 	esac
 
 # Refuse to start a worker without a hopper credential. Hopper requires
@@ -330,7 +374,7 @@ check-hopper-url:
 	echo "       make deploy HOPPER=none    # deliberately file nothing"; \
 	exit 1
 
-deploy-worker: check-hopper-token kill-scan
+deploy-worker: check-hopper-token ensure-llm-token kill-scan
 	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker URL=<url> [BUILD=<host>] [WORKER_RUN=<host>]"; exit 1; }
 	git stash
 	git pull
@@ -365,7 +409,7 @@ deploy-jail-worker:
 
 uninstall-server:
 	@case "$$(uname -s)" in \
-		FreeBSD) ./scripts/server/uninstall-bastille.sh "$(SERVER_RUN)" ;; \
+		FreeBSD) ./scripts/server/uninstall-freebsd.sh ;; \
 		Linux)   if command -v systemctl >/dev/null 2>&1; then \
 		           ./scripts/server/uninstall-linux.sh; \
 		         else \
@@ -432,8 +476,22 @@ uninstall-worker-nodes:
 	@[ -n "$(NODES)" ] || { echo "Usage: make uninstall-worker-nodes NODES=\"node1 node2\""; exit 1; }
 	./scripts/worker/uninstall-nodes.sh $(NODES)
 
-rollout-bastille: check-hopper-url
+# Jailed server deploy: builds in a Bastille build jail and runs the rc.d
+# service inside a separate run jail. Use this instead of deploy-server when
+# isolating the server in a jail; deploy-server installs natively on the host.
+deploy-jail: check-hopper-url
 	./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)"
+
+# Remove the jailed server service (counterpart to deploy-jail).
+uninstall-jail:
+	@case "$$(uname -s)" in \
+		FreeBSD) ./scripts/server/uninstall-bastille.sh "$(SERVER_RUN)" ;; \
+		*) echo "error: jail server deployments are FreeBSD/bastille-only; run from a FreeBSD host"; exit 1 ;; \
+	esac
+
+# Historical name for deploy-jail; kept so existing muscle memory and scripts
+# keep working.
+rollout-bastille: deploy-jail
 
 benchmark: release
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
