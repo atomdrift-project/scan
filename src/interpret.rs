@@ -679,9 +679,7 @@ fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade, ev: Evidence) -> (Clas
         // the LLM independently graded the sample hostile, with ML the lone
         // outlier. Escalation-only, so a sample still cannot corroborate its own
         // clearing, and `may_cross` still has to admit the crossing.
-        Ordering::Greater
-            if target == Classification::Hostile && ev.hostile_finding =>
-        {
+        Ordering::Greater if target == Classification::Hostile && ev.hostile_finding => {
             let class = if ev.may_cross(ml, target) {
                 target
             } else {
@@ -1056,7 +1054,11 @@ fn is_member_header(line: &str) -> bool {
     let Some(kind) = fields.next() else {
         return false;
     };
-    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+    if kind.is_empty()
+        || !kind
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
         return false;
     }
     fields.next().is_some_and(|size| {
@@ -2551,7 +2553,10 @@ mod tests {
         }
         render.push_str("  pkg.whl/lib/native.dll\tpe 400KB 9\n");
         for _ in 0..80 {
-            render.push_str(concat!(r"  0000: MZ\x90\x00\x03\x00\x00\x00\x04\x00\xff\xff", "\n"));
+            render.push_str(concat!(
+                r"  0000: MZ\x90\x00\x03\x00\x00\x00\x04\x00\xff\xff",
+                "\n"
+            ));
         }
         assert!(
             render_mostly_readable(&render),
@@ -2561,7 +2566,10 @@ mod tests {
         // A sample that really is one packed binary still has nothing to read.
         let mut packed = String::from("dropper.exe\tpe 400KB 9\n");
         for _ in 0..80 {
-            packed.push_str(concat!(r"  0000: MZ\x90\x00\x03\x00\x00\x00\x04\x00\xff\xff", "\n"));
+            packed.push_str(concat!(
+                r"  0000: MZ\x90\x00\x03\x00\x00\x00\x04\x00\xff\xff",
+                "\n"
+            ));
         }
         assert!(!render_mostly_readable(&packed));
 

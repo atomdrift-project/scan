@@ -3,7 +3,7 @@
 //! Mirrors [`crate::model_update`]: fetch `bloom.toml`, download each filter at
 //! `<base>/bloom/v<N>/<file>`, verify its sha256, validate it loads (the
 //! version gate fails closed on a layout outside
-//! [`crate::bloom::SUPPORTED_VERSIONS`]) and matches its declared identity, then
+//! [`burton::SUPPORTED_VERSIONS`]) and matches its declared identity, then
 //! atomically swap the whole set into place. Validation happens on the staged
 //! copy *before* the swap, so a broken or partial download never replaces the
 //! live filters.
@@ -22,8 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::bloom::{Filter, SUPPORTED_VERSIONS};
-use crate::bloom_build::Manifest;
+use burton::{Filter, Manifest, SUPPORTED_VERSIONS};
 
 /// Public update bucket base. Bloom artifacts live under a format-versioned
 /// prefix beneath `bloom/` (`<base>/bloom/v<FORMAT_VERSION>/bloom.toml`,
@@ -215,8 +214,8 @@ fn install(dir: &Path, manifest: &Manifest, prefix: &str) -> Result<()> {
 
         // Validate before staging: it must load (FORMAT_VERSION gate) and its
         // header identity must match the file name the manifest gave it.
-        let filter = Filter::load(&bytes).with_context(|| format!("validating {}", entry.file))?;
-        let want = format!("{}.adbl", filter.artifact_stem());
+        let filter = Filter::load(bytes).with_context(|| format!("validating {}", entry.file))?;
+        let want = format!("{}.adbl", filter.stem());
         if want != entry.file {
             bail!(
                 "bloom filter {} identifies as {want}; refusing to install",
@@ -224,7 +223,9 @@ fn install(dir: &Path, manifest: &Manifest, prefix: &str) -> Result<()> {
             );
         }
 
-        std::fs::write(staging.join(&entry.file), &bytes)
+        // Written from the validated filter, so the bytes that land in staging
+        // are exactly the bytes that passed the checks above.
+        std::fs::write(staging.join(&entry.file), filter.as_bytes())
             .with_context(|| format!("writing {}", entry.file))?;
     }
 

@@ -4183,16 +4183,23 @@ mod tests {
             ],
             ..FileSummary::default()
         };
-        let lookup: HashMap<String, usize> =
-            [("agg:attack_tactic_count".to_string(), 0)].into_iter().collect();
+        let lookup: HashMap<String, usize> = [("agg:attack_tactic_count".to_string(), 0)]
+            .into_iter()
+            .collect();
         let mut vec = vec![0.0f32; 1];
         write_aggregate_features(
             &FindingSummary::default(),
             std::slice::from_ref(&hostile),
-            &mut FeatureWriter { vec: &mut vec, lookup: &lookup },
+            &mut FeatureWriter {
+                vec: &mut vec,
+                lookup: &lookup,
+            },
         );
         // The unusable ID is skipped; the well-formed one still counts.
-        assert_eq!(vec[0], 1.0, "expected only the ASCII technique to yield a tactic prefix");
+        assert_eq!(
+            vec[0], 1.0,
+            "expected only the ASCII technique to yield a tactic prefix"
+        );
     }
 
     #[test]
