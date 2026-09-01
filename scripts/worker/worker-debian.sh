@@ -46,13 +46,19 @@ remote_sudo='if command -v doas >/dev/null 2>&1; then echo doas; elif command -v
 BSUDO=$(bssh "$remote_sudo"); [ -n "$BSUDO" ] || die "need doas or sudo on build host '$BUILD'"
 RSUDO=$(rssh "$remote_sudo"); [ -n "$RSUDO" ] || die "need doas or sudo on run host '$RUN'"
 
+# useradd lives in /usr/sbin on Debian, a directory absent from a non-root
+# PATH; doas (unlike sudo) forwards the caller's PATH unchanged. Prefixed to
+# the useradd calls below so the remote shell expands $PATH on the far host.
+# shellcheck disable=SC2016  # $PATH is expanded remotely, not here.
+SBIN_PATH='env PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH'
+
 log "Installing build dependencies on $BUILD"
 bssh "$BSUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
       $BSUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         cargo rustc git pkg-config build-essential clang lld sccache ca-certificates"
 
 log "Ensuring build user exists on $BUILD"
-bssh "id -u scan >/dev/null 2>&1 || $BSUDO useradd -m -s /bin/sh -c 'Atomdrift Scan Build' scan"
+bssh "id -u scan >/dev/null 2>&1 || $BSUDO $SBIN_PATH useradd -m -s /bin/sh -c 'Atomdrift Scan Build' scan"
 
 log "Syncing source to build host (excluding target/, out/, .git)"
 bssh "$BSUDO -u scan mkdir -p /home/scan/scan"
@@ -72,7 +78,7 @@ bssh "$BSUDO cat /home/scan/scan/out/atomscan.tgz" \
     | rssh "$RSUDO tee /tmp/atomscan.tgz >/dev/null"
 
 log "Ensuring run user exists on $RUN"
-rssh "id -u scan >/dev/null 2>&1 || $RSUDO useradd -r -s /usr/sbin/nologin -d $STATE_HOME -M -c 'Atomdrift Scan Worker' scan"
+rssh "id -u scan >/dev/null 2>&1 || $RSUDO $SBIN_PATH useradd -r -s /usr/sbin/nologin -d $STATE_HOME -M -c 'Atomdrift Scan Worker' scan"
 rssh "$RSUDO install -d -m 0750 -o scan -g scan $STATE_HOME && \
       $RSUDO install -d -m 0700 -o scan -g scan $STATE_HOME/.tok"
 
