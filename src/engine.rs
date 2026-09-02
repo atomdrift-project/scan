@@ -4076,6 +4076,15 @@ pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
 /// only for the top-level file), so to attribute an embedded hit, scan the
 /// extracted member directly — it then becomes the top-level file.
 pub(crate) fn write_extra_diagnostics(out: &mut dyn std::io::Write, r: &ScanResult) {
+    // Lead with the level, as `output::print_extra` does. It is the only place
+    // the loose tail above the suspicious ceiling (L3000..=L25000) is legible:
+    // those files grade benign, so nothing else in this render names the rung
+    // they fired on.
+    let _ = writeln!(
+        out,
+        "  level: {}",
+        crate::output::format_level(r.level),
+    );
     if !r.model_scores.is_empty() {
         let _ = writeln!(
             out,
@@ -4118,7 +4127,18 @@ pub(crate) fn write_tiny(out: &mut dyn std::io::Write, r: &ScanResult) {
         .bloom_mark
         .map_or_else(String::new, |m| format!(" bloom={}", m.tiny_str()));
     let verdict = if matches!(r.classification, Classification::Benign) {
-        format!("scan {class} confidence={:.3}{bloom}\n", r.probability)
+        // Benign is not always "fired nowhere": everything above the suspicious
+        // ceiling (L3000) grades benign while still carrying the rung it fired
+        // on, up to the grid max (L25000). Report that rung — dropping it hid
+        // the whole loose tail from the LLM-facing render. A file that fired at
+        // no level (`-1`) has nothing to report and keeps the bare line.
+        match r.level {
+            Some(lvl) if lvl >= 0 => format!(
+                "scan {class} confidence={:.3} fp-level=L{lvl}{bloom}\n",
+                r.probability,
+            ),
+            _ => format!("scan {class} confidence={:.3}{bloom}\n", r.probability),
+        }
     } else {
         let fp_level = r.level.map_or_else(|| "-".to_string(), |n| format!("L{n}"));
         format!(

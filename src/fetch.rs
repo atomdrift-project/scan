@@ -1657,7 +1657,104 @@ pub(crate) fn orchestrate(
         worklist = next;
     }
     reporter.finish(&records);
+    attribute_reference_outcomes(report, &records);
     (records, dependencies, dependency_registries)
+}
+
+/// Record, on each file that declared a reference, what became of the
+/// references it declared.
+///
+/// A resolved payload needs nothing here: `merge_payload` already grafts it
+/// into the tree as a child of its declaring file, so its findings are reachable
+/// from the declarer. An **unresolved** reference produces no payload and
+/// therefore no node — which left the most interesting outcome of a follow the
+/// one thing no trait could see.
+///
+/// It is worth seeing. A manifest naming a dependency the registry no longer
+/// serves is pointing at something that was withdrawn, and packages get
+/// withdrawn for reasons: the VS Code marketplace pulls extensions for malware,
+/// npm unpublishes for the same. The declaring package is often still installed
+/// everywhere, still pointing at it.
+///
+/// Attributed by `source_sha256`, the edge's declaring endpoint, so the facts
+/// land on the manifest that made the claim rather than on the archive root.
+/// Emitted as ordinary `references.*` metrics and values, so an ordinary
+/// file-scoped trait reads them — no new composite scope required.
+fn attribute_reference_outcomes(report: &mut AnalysisReport, records: &[FetchRecord]) {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Tally {
+        declared: u64,
+        unresolved: Vec<String>,
+    }
+
+    let mut touched: Vec<String> = Vec::new();
+    let mut by_source: BTreeMap<&str, Tally> = BTreeMap::new();
+    for rec in records {
+        if rec.source_sha256.is_empty() {
+            continue;
+        }
+        let tally = by_source.entry(rec.source_sha256.as_str()).or_default();
+        tally.declared += 1;
+        if matches!(rec.outcome, Outcome::Unresolved) {
+            tally.unresolved.push(rec.locator.clone());
+        }
+    }
+
+    for file in &mut report.files {
+        let Some(tally) = by_source.get(file.sha256.as_str()) else {
+            continue;
+        };
+        let metrics = file
+            .filefacts_metrics
+            .get_or_insert_with(Default::default);
+        metrics.insert(
+            "references.declared_count".to_string(),
+            tally.declared as f64,
+        );
+        metrics.insert(
+            "references.unresolved_count".to_string(),
+            tally.unresolved.len() as f64,
+        );
+        // Editor-marketplace removals get their own count, because they do not
+        // mean what a registry 404 means. npm serves a 404 for a private name,
+        // a typo, or a package that moved; the VS Code and Open VSX galleries
+        // *remove* extensions, and removal is what they do to malware. A rule
+        // convicting on the first would be noise and on the second is not.
+        //
+        // Two fixed keys rather than one per ecosystem: the metric catalog
+        // checks exact names, so a key built from whatever PURL type happened
+        // to appear could never be declared, and an undeclared key validates
+        // against nothing. An archive member also carries no values tree for a
+        // `type: value` list to read, so a metric is the only surface that
+        // survives member retention.
+        let extension_unresolved = tally
+            .unresolved
+            .iter()
+            .filter(|l| l.starts_with("pkg:vscode/") || l.starts_with("pkg:openvsx/"))
+            .count();
+        metrics.insert(
+            "references.unresolved_extension_count".to_string(),
+            extension_unresolved as f64,
+        );
+        touched.push(file.sha256.clone());
+    }
+
+    // Trait evaluation already ran, before the follow phase that produced these
+    // facts. Re-run it for just the files whose facts changed, so the rules that
+    // read `references.*` get their pass.
+    for sha in touched {
+        match cleave::graft_reference_outcome_traits(report, &sha, &AnalysisOptions::default()) {
+            Ok(0) => {}
+            Err(e) => tracing::warn!(sha = %sha, "reference-outcome pass failed: {e:#}"),
+            Ok(n) => tracing::debug!(
+                grafted = n,
+                sha = %sha,
+                "reference-outcome traits fired on a declaring file"
+            ),
+        }
+    }
 }
 
 /// Where the fetch phase's progress is surfaced.
