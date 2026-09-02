@@ -1,5 +1,14 @@
 //! Atomdrift Scan (`atomscan`) — ML-powered malware classification CLI.
 
+// Doc comments on `clap` structs are user-facing `--help` text, so they carry
+// `[EXPERIMENTAL]` tags, bare URLs, and `<URL>` placeholders that rustdoc would
+// otherwise read as broken links or markup.
+#![allow(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::bare_urls,
+    rustdoc::invalid_html_tags
+)]
+
 /// jemalloc, plus the compile-time tuning it reads at initialization.
 ///
 /// Allocator and configuration share one `cfg` so they cannot drift apart: a
@@ -734,7 +743,7 @@ impl Cli {
 /// CI — GitHub Actions run only on a runner and never land in an installed
 /// artifact, so auditing them is an explicit
 /// `--follow=ci-actions`/`--follow=all` opt-in.
-/// Keep [`FetchPolicy::default`] offline for the library API.
+/// Keep `FetchPolicy::default` offline for the library API.
 ///
 /// Must agree with the `default_missing_value` on `Cli::follow`, so a bare
 /// `--follow` and an absent one select the same targets.
@@ -772,7 +781,7 @@ fn default_service_follow_policy() -> scan::fetch::FetchPolicy {
 }
 
 /// Publish the known-good/known-bad filters process-wide, so
-/// [`scan::fetch::age_gate`] can skip a dependency whose coordinate is already
+/// `scan::fetch::age_gate` can skip a dependency whose coordinate is already
 /// vouched. This is deliberately separate from `ScanConfig::with_bloom`, which
 /// additionally lets the bloom short-circuit the *scan target* itself: every
 /// mode wants the dependency skip, but only a bulk walk wants its own input

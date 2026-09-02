@@ -1,7 +1,7 @@
 //! Best-effort upload of scan results to a hopper instance.
 //!
 //! Mirrors the pull-based worker's `/api/result` contract — the same
-//! [`ResultPayload`] wire shape, the same zstd-compressed envelope — but driven
+//! `ResultPayload` wire shape, the same zstd-compressed envelope — but driven
 //! by a local `scan path` run instead of a poll loop. `scan path --hopper=<url>`
 //! uses it to *renew* a sample hopper has already ingested with this build's
 //! traits and model: hopper's `/api/result` is a lease-free `UPDATE ... WHERE
@@ -684,7 +684,7 @@ impl Uploader {
 
     /// Queue artifacts (the scanned file and any fetched dependency archives) for
     /// content reconciliation: hopper is asked which it lacks, and only those are
-    /// uploaded with their provenance. Submit before the matching [`submit`] so a
+    /// uploaded with their provenance. Submit before the matching [`Self::submit`] so a
     /// new top-level file's row exists before its verdict lands.
     pub fn submit_artifacts(&self, artifacts: Vec<UploadArtifact>) {
         if artifacts.is_empty() {
@@ -698,8 +698,8 @@ impl Uploader {
 
     /// Queue fetched dependencies to mirror into hopper as their own samples:
     /// bytes (only if hopper lacks them) + provenance, then each dependency's
-    /// verdict. Submit after the root [`submit_artifacts`] and before the root
-    /// [`submit`] so the dependencies' rows exist before any verdict — the root's
+    /// verdict. Submit after the root [`Self::submit_artifacts`] and before the root
+    /// [`Self::submit`] so the dependencies' rows exist before any verdict — the root's
     /// or their own — lands.
     pub fn submit_dependencies(
         &self,

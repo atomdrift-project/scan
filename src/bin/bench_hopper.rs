@@ -12,6 +12,9 @@
 //!
 //! Lives in its own process so its (tiny) memory never lands in the worker's
 //! RSS measurement.
+// Doc comments on `clap` structs are user-facing `--help` text (e.g.
+// `shuffle[:seed]`), which rustdoc would otherwise read as broken links.
+#![allow(rustdoc::broken_intra_doc_links)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;

@@ -8,7 +8,7 @@
 //! failed — as it completes. Transitive dependencies surfaced by a later hop
 //! append to the list, so the tree grows to the full graph as it is walked.
 //!
-//! This is the counterpart to [`crate::engine::Progress`]: that bar owns the
+//! This is the counterpart to `crate::engine::Progress`: that bar owns the
 //! terminal for a multi-file scan (one line, a file-count denominator), so the
 //! tree steps aside there and the fetch log streams above the bar instead (see
 //! [`crate::fetch`]). The tree takes over only when no bar is live — a lone

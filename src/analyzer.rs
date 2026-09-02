@@ -4,9 +4,8 @@
 //!
 //! This is the recommended entry point for embedding litmus in other
 //! processes (proxies, daemons, fuzz harnesses). The lower-level
-//! [`Model`](crate::model::Model), [`ExtractContext`](crate::features::ExtractContext),
-//! [`ShapImportance`](crate::explain::ShapImportance), and
-//! [`ScanConfig`](crate::ScanConfig) types remain available for callers
+//! [`Model`], [`ExtractContext`], [`ShapImportance`], and [`ScanConfig`]
+//! types remain available for callers
 //! that need finer control or want to share components across multiple
 //! analyzers.
 //!
@@ -154,7 +153,7 @@ impl Analyzer {
     }
 
     /// Scan a payload that already lives on disk, returning the same
-    /// [`ScanResult`] as [`scan_bytes`]. cleave memory-maps the file, so peak
+    /// [`ScanResult`] as [`Self::scan_bytes`]. cleave memory-maps the file, so peak
     /// resident memory stays bounded no matter how large the payload is — use
     /// this for streamed-to-disk responses too big to buffer whole in RAM.
     ///

@@ -4,7 +4,7 @@
 //! exactly, using the same feature_spec.json vocabulary to produce identical
 //! feature vectors.
 //!
-//! Feature assignment uses [`FeatureWriter`] which maps feature names to indices
+//! Feature assignment uses `FeatureWriter` which maps feature names to indices
 //! via the spec's `feature_names` list. Features not in the spec (disabled groups)
 //! are silently skipped — no errors, no wasted space.
 

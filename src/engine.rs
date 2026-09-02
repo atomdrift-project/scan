@@ -196,7 +196,7 @@ impl ScanConfig {
 
     /// Set the external-reference fetch policy: which kinds of reference
     /// (registry packages, bare URLs) discovered in analyzed files to fetch,
-    /// re-analyze, and graft into the report. The default [`FetchPolicy`]
+    /// re-analyze, and graft into the report. The default [`FetchPolicy`](crate::fetch::FetchPolicy)
     /// selects nothing and disables fetching.
     #[must_use]
     pub const fn with_fetch(mut self, policy: crate::fetch::FetchPolicy) -> Self {
@@ -2671,7 +2671,7 @@ pub(crate) fn detection_counts(config: &ScanConfig) -> DetectionCounts {
 /// Run a scan against a file or directory tree.
 ///
 /// A file path is analyzed directly. A directory path is walked once by
-/// [`discover_files`] to learn the file count upfront (for the progress bar and
+/// `discover_files` to learn the file count upfront (for the progress bar and
 /// ETA), then the discovered list is analyzed in parallel via
 /// [`cleave::scan_paths`], with results streamed as they complete.
 ///
@@ -3821,7 +3821,7 @@ fn sha256_file_hex(path: &Path) -> Option<String> {
 ///
 /// Explicit files are analyzed together as one parallel batch (via
 /// [`cleave::scan_files`]); each directory argument is streamed through cleave's
-/// recursive walker. Both feed a single shared [`Tally`], so the returned
+/// recursive walker. Both feed a single shared `Tally`, so the returned
 /// [`ScanSummary`] aggregates across every path. Results print in completion
 /// order, not argument order.
 ///
@@ -4080,11 +4080,7 @@ pub(crate) fn write_extra_diagnostics(out: &mut dyn std::io::Write, r: &ScanResu
     // the loose tail above the suspicious ceiling (L3000..=L25000) is legible:
     // those files grade benign, so nothing else in this render names the rung
     // they fired on.
-    let _ = writeln!(
-        out,
-        "  level: {}",
-        crate::output::format_level(r.level),
-    );
+    let _ = writeln!(out, "  level: {}", crate::output::format_level(r.level),);
     if !r.model_scores.is_empty() {
         let _ = writeln!(
             out,
@@ -9540,7 +9536,7 @@ impl ScanResult {
     }
 
     /// Zero-copy envelope view over `&self`. Use this on the JSON output hot
-    /// path (e.g. [`crate::scan`] and [`crate::ps`] `emit_result`) — it avoids
+    /// path (e.g. the `scan` and [`crate::ps`] `emit_result` paths) — it avoids
     /// cloning the cleave report and all owned string fields. Prefer
     /// [`Self::into_envelope`] when the caller can give up ownership.
     #[must_use]

@@ -34,7 +34,7 @@
 //!
 //! Several otherwise-qualifying publishers host third-party uploads on one
 //! subdomain — Mozilla's add-ons, Arch's AUR, the Go module proxy, Maven
-//! Central. [`THIRD_PARTY`] carves those back out and is checked first, so the
+//! Central. `THIRD_PARTY` carves those back out and is checked first, so the
 //! parent domain stays usable without opening a hole.
 //!
 //! The cost of a wrong entry is asymmetric: a missing domain wastes one HTTP

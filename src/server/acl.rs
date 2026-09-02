@@ -158,9 +158,9 @@ impl TokenDigest {
     /// secret.
     ///
     /// # Errors
-    /// Returns an error if the token is shorter than [`MIN_TOKEN_LEN`] bytes,
+    /// Returns an error if the token is shorter than `MIN_TOKEN_LEN` bytes,
     /// or if it contains a character that cannot be sent in an `Authorization`
-    /// header (see [`is_token68_byte`]).
+    /// header (see `is_token68_byte`).
     pub fn new(token: &str) -> Result<Self, String> {
         let len = token.len();
         if len < MIN_TOKEN_LEN {

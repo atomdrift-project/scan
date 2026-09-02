@@ -1623,7 +1623,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// Parse a `YYYY-MM-DD` date as a UTC-midnight Unix timestamp (seconds).
-/// Returns `None` for any malformed field. Inverse of [`civil_from_days`]
+/// Returns `None` for any malformed field. Inverse of `civil_from_days`
 /// (Howard Hinnant's `days_from_civil`).
 #[must_use]
 pub fn parse_ymd(s: &str) -> Option<i64> {

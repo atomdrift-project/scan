@@ -40,7 +40,7 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// Documented `--llm-min-level` default: the model's own grid ceiling, so the
 /// literal here is only what the `--help` text prints. The gate resolves the
 /// real value from [`LevelContext::grid_max`] at call time — see
-/// [`LevelContext::ml_admits`] — which is why this is a doc constant and not a
+/// `LevelContext::ml_admits` — which is why this is a doc constant and not a
 /// fallback.
 pub const DEFAULT_MIN_LEVEL_LABEL: &str = "the model's grid ceiling";
 /// Default per-request timeout, in seconds.
@@ -770,8 +770,8 @@ fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade, ev: Evidence) -> (Clas
 /// LLM). The same coupling had already cost seven true positives once, when an
 /// upstream change to the annotation letters withdrew them from the gate.
 ///
-/// The render is still the right input for [`render_mostly_readable`] and
-/// [`addresses_the_analyzer`], which ask about the bytes the model will see.
+/// The render is still the right input for `render_mostly_readable` and
+/// `addresses_the_analyzer`, which ask about the bytes the model will see.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FindingSeverity {
     /// cleave surfaced a suspicious- or hostile-criticality finding.
