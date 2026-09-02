@@ -344,6 +344,23 @@ struct Cli {
     )]
     llm_min_level: Option<u16>,
 
+    /// Raw ML probability at or above which a sample reaches the LLM even when
+    /// the calibrated level grid never placed it (`lvl == -1`) — the case where
+    /// `--llm-min-level` cannot admit at any cutoff.
+    ///
+    /// A volume control, not a precision one. On marketplace extensions the
+    /// benign and malicious probability distributions overlap heavily, so
+    /// lowering this buys grid-blind malicious samples at roughly one benign
+    /// sample each. Raise it to opt out.
+    #[arg(
+        long,
+        global = true,
+        alias = "interpret-min-prob",
+        value_name = "P",
+        default_value_t = scan::interpret::DEFAULT_LLM_MIN_PROB,
+    )]
+    llm_min_prob: f32,
+
     /// Per-request LLM timeout, in seconds
     #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
     llm_timeout: u64,
@@ -704,6 +721,7 @@ impl Cli {
             model: primary.model,
             api_key: primary.api_key,
             min_level: self.llm_min_level,
+            min_prob: self.llm_min_prob,
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
                 .unwrap_or(NonZeroUsize::MIN),
