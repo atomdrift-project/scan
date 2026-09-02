@@ -707,6 +707,17 @@ pub struct WorkerConfig {
     pub embedded: Option<Embedded>,
 }
 
+/// Reports one finished idle analysis as `(size_bytes, micros)`.
+///
+/// The idle worker analyses real artifacts on capacity the server is not
+/// using, which makes it the only measurement of this host that the router's
+/// own choices did not select. Interactive timings cannot say how fast a
+/// worker is, only how fast it was on whatever it was sent; a server nobody
+/// routes to reports nothing at all and stays unroutable. Queue work is drawn
+/// from the same hopper by every server, so these are comparable across the
+/// fleet in the way request timings are not.
+pub type IdleCompletion = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
 /// Wiring for a worker running inside a serve process, filling idle capacity
 /// with queue work.
 ///
@@ -738,6 +749,9 @@ pub struct Embedded {
     pub started_at: Instant,
     /// How long after an analysis request the idle worker must remain quiet.
     pub quiet_period: Duration,
+    /// Where to report finished analyses, so spare-capacity work becomes the
+    /// routing evidence this host would otherwise never produce.
+    pub on_complete: Option<IdleCompletion>,
 }
 
 // ModelResources carries no Debug, and dumping a model bundle into a log line
@@ -2417,6 +2431,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let admission = Arc::clone(&admission);
         let cleave_gate = Arc::clone(&cleave_gate);
         let shutdown = Arc::clone(&shutdown);
+        let on_complete = config.embedded.as_ref().and_then(|e| e.on_complete.clone());
         workers.spawn(async move {
             loop {
                 if shutdown.load(Ordering::Relaxed) {
@@ -2495,6 +2510,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     slow_rule_ms,
                     &spool,
                     pj.data,
+                    on_complete.as_ref(),
                 )
                 .await;
                 drop(admission_guard);
@@ -3046,6 +3062,7 @@ async fn run_job(
     slow_rule_ms: u64,
     spool: &Arc<SpoolState>,
     prefetched: std::result::Result<PrefetchData, PrefetchError>,
+    on_complete: Option<&IdleCompletion>,
 ) -> Result<
     (
         crate::engine::ScanResultEnvelope,
@@ -3439,6 +3456,20 @@ async fn run_job(
     match result {
         Ok(Ok(mut scan_result)) => {
             let deps = std::mem::take(&mut scan_result.dependency_results);
+            // Fresh analyses only, the rule the request path already applies to
+            // its own figures: a replay from cleave's cache is real work avoided
+            // and predicts nothing about the next unseen artifact. Reported here
+            // rather than at the call site because this is the last point that
+            // holds the duration, the size and the cache flag at once -
+            // `into_envelope` drops the flag, which is not serialized.
+            if let Some(report) = on_complete
+                && !scan_result.analysis_cached
+            {
+                report(
+                    u64::try_from(job.size_bytes).unwrap_or(0),
+                    u64::try_from(elapsed_ms).unwrap_or(0).saturating_mul(1_000),
+                );
+            }
             Ok((scan_result.into_envelope(), deps, elapsed_ms))
         }
         Ok(Err(e)) => Err(format!("{e:#}")),
