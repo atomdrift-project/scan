@@ -31,7 +31,7 @@
 //! Off by default. Enabled, it is an online step performed after the offline
 //! analysis; failures degrade gracefully to "no fetches".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, PoisonError, RwLock};
@@ -987,6 +987,8 @@ pub(crate) fn orchestrate(
     // not pay that: `None` here means "not yet opened".
     let mut acache: Option<Option<AnalysisCache>> = None;
     let mut records = Vec::new();
+    // (declaring file sha) -> (registry records materialized, of which security-held)
+    let mut registry_outcomes: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     // Standalone reports for each fetched dependency, captured before the payload
     // is grafted into the merged report. Uploaded to hopper as their own samples.
     let mut dependencies: Vec<FetchedDependency> = Vec::new();
@@ -1549,6 +1551,20 @@ pub(crate) fn orchestrate(
                     let reg = &provenance.record;
                     if let Some(sub) = sub {
                         let findings = sub_findings(&sub);
+                        // Every registry record we materialized for this file is a
+                        // reference whose outcome the declarer should carry. Tallied
+                        // here rather than from `g.fetched` because the two travel
+                        // separately: a dependency resolved without a live download
+                        // still yields a registry document, so attributing only from
+                        // fetch records left the commonest case with no outcome at
+                        // all.
+                        let tally = registry_outcomes
+                            .entry(g.source_sha.clone())
+                            .or_insert((0u64, 0u64));
+                        tally.0 += 1;
+                        if findings.iter().any(|f| f.id.contains("registry-security-hold-record")) {
+                            tally.1 += 1;
+                        }
                         // A skipped dependency has no artifact upload and only
                         // appears in provenance output when its registry node is
                         // notable. Drop its raw provider document immediately when
@@ -1657,7 +1673,7 @@ pub(crate) fn orchestrate(
         worklist = next;
     }
     reporter.finish(&records);
-    attribute_reference_outcomes(report, &records);
+    attribute_reference_outcomes(report, &records, &registry_outcomes);
     (records, dependencies, dependency_registries)
 }
 
@@ -1680,8 +1696,11 @@ pub(crate) fn orchestrate(
 /// land on the manifest that made the claim rather than on the archive root.
 /// Emitted as ordinary `references.*` metrics and values, so an ordinary
 /// file-scoped trait reads them — no new composite scope required.
-fn attribute_reference_outcomes(report: &mut AnalysisReport, records: &[FetchRecord]) {
-    use std::collections::BTreeMap;
+fn attribute_reference_outcomes(
+    report: &mut AnalysisReport,
+    records: &[FetchRecord],
+    registry_outcomes: &BTreeMap<String, (u64, u64)>,
+) {
 
     #[derive(Default)]
     struct Tally {
@@ -1702,19 +1721,25 @@ fn attribute_reference_outcomes(report: &mut AnalysisReport, records: &[FetchRec
         }
     }
 
+    // One pass, two sources. A reference can leave a fetch record, a registry
+    // document, or both, and the declarer should carry its outcome either way --
+    // reading only the fetch records meant a dependency resolved without a live
+    // download was attributed nothing at all.
     for file in &mut report.files {
-        let Some(tally) = by_source.get(file.sha256.as_str()) else {
+        let fetched = by_source.get(file.sha256.as_str());
+        let registry = registry_outcomes.get(file.sha256.as_str());
+        if fetched.is_none() && registry.is_none() {
             continue;
-        };
-        let metrics = file.filefacts_metrics.get_or_insert_with(Default::default);
-        metrics.insert(
-            "references.declared_count".to_string(),
-            tally.declared as f64,
-        );
-        metrics.insert(
-            "references.unresolved_count".to_string(),
-            tally.unresolved.len() as f64,
-        );
+        }
+        let declared = fetched.map_or(0, |t| t.declared).max(registry.map_or(0, |r| r.0));
+        let unresolved = fetched.map_or(0, |t| t.unresolved.len() as u64);
+        let held = registry.map_or(0, |r| r.1);
+        let metrics = file
+            .filefacts_metrics
+            .get_or_insert_with(Default::default);
+        metrics.insert("references.declared_count".to_string(), declared as f64);
+        metrics.insert("references.unresolved_count".to_string(), unresolved as f64);
+        metrics.insert("references.security_hold_count".to_string(), held as f64);
         // Editor-marketplace removals get their own count, because they do not
         // mean what a registry 404 means. npm serves a 404 for a private name,
         // a typo, or a package that moved; the VS Code and Open VSX galleries
@@ -1727,11 +1752,12 @@ fn attribute_reference_outcomes(report: &mut AnalysisReport, records: &[FetchRec
         // against nothing. An archive member also carries no values tree for a
         // `type: value` list to read, so a metric is the only surface that
         // survives member retention.
-        let extension_unresolved = tally
-            .unresolved
-            .iter()
-            .filter(|l| l.starts_with("pkg:vscode/") || l.starts_with("pkg:openvsx/"))
-            .count();
+        let extension_unresolved = fetched.map_or(0, |t| {
+            t.unresolved
+                .iter()
+                .filter(|l| l.starts_with("pkg:vscode/") || l.starts_with("pkg:openvsx/"))
+                .count()
+        });
         metrics.insert(
             "references.unresolved_extension_count".to_string(),
             extension_unresolved as f64,
