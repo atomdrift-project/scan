@@ -104,6 +104,43 @@ impl std::fmt::Debug for LlmEndpoint {
     }
 }
 
+/// Default raw-probability floor for sending a sample to the LLM, independent
+/// of the calibrated level grid.
+///
+/// This is a **volume** control, not a precision one, and the measurements say
+/// so. Measured on the ide_extensions corpus (81 malicious samples the grid
+/// never placed) against 12 benign marketplace extensions, the two populations
+/// do not separate anywhere: at every threshold in the usable range a *larger*
+/// fraction of the benign set is admitted than of the malicious one. The score
+/// is largely reading "how much interesting behaviour is present", and the
+/// grid-blind malicious population is mostly skeleton squatters with none,
+/// while the benign set is AI-coding extensions that read workspaces and call
+/// LLM APIs (`Anthropic.claude-code` 0.42, `dscodegpt` 0.64).
+///
+/// 0.04 is the efficient point rather than a separating one. Benign admission
+/// is flat at 11/12 across the whole span 0.04..0.09 — there is exactly one
+/// benign sample in it — so every threshold above 0.04 in that range gives up
+/// malicious coverage (80% -> 62%) for no benign saving at all. Below 0.04 the
+/// last benign sample joins at 0.0398, a thousandth away, so 0.04 and "no
+/// floor" are near-equivalent in practice.
+///
+/// Expect ~92% of extensions to reach the LLM at this setting. Raise it to cut
+/// volume, understanding that the first real benign reduction is at 0.095 and
+/// costs a fifth of the malicious coverage.
+///
+/// What it is genuinely for: a file the grid cannot place at all (`lvl == -1`),
+/// where `ml_admits` is false at every cutoff, leaving ML no way to ask for a
+/// second opinion. Selectivity comes from the elevated-finding path instead.
+///
+/// Note the polarity, which differs from the `DEFAULT_MIN_PROB` floor removed
+/// in "interpret: gate on level, not probability". That one was a hard **AND**
+/// (`if ml_prob < min_prob { return None }`), so it could veto a sample the
+/// findings path had already admitted — the failure the commit message calls
+/// out, where a container carries a member's hostile class but its own raw
+/// score sits near zero. This one is an **OR** admission alongside the level,
+/// finding, and class tests: it can only ever send more, never block.
+pub const DEFAULT_LLM_MIN_PROB: f32 = 0.04;
+
 /// Configuration for the interpretation pass. Present on a [`crate::ScanConfig`]
 /// only when `--interpret` is set.
 #[derive(Clone)]
@@ -123,6 +160,11 @@ pub struct InterpretConfig {
     /// anywhere on the calibrated grid. Files that fire only above the cutoff (or
     /// never) reach the LLM solely through the bypasses in [`interpret`].
     pub min_level: Option<u16>,
+    /// Raw-probability floor at or above which ML alone sends a sample to the
+    /// LLM, independent of the calibrated level grid. Covers files the grid
+    /// never placed (`lvl == -1`) but that still score well above the benign
+    /// mass. See the gate in [`interpret`].
+    pub min_prob: f32,
     /// Per-request timeout.
     pub timeout: Duration,
     /// Cap on concurrent in-flight requests (protects a single local GPU).
@@ -281,6 +323,7 @@ impl Default for InterpretConfig {
             model: String::new(),
             api_key: None,
             min_level: None,
+            min_prob: DEFAULT_LLM_MIN_PROB,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
                 .unwrap_or(NonZeroUsize::MIN),
@@ -506,6 +549,17 @@ impl LevelContext {
     /// ML abstains and the caller's remaining admissions — an elevated cleave
     /// finding, a non-benign class — carry the decision. Nothing is lost: with
     /// operator-set thresholds, a score above them already lands as non-benign.
+    /// Whether the calibration placed this file at *any* level at all.
+    ///
+    /// Broader than [`Self::ml_admits`], which additionally requires the fired
+    /// level to sit at or below a cutoff. Being placed anywhere is itself the
+    /// signal: on the ide_extensions corpus no benign extension is placed at
+    /// all, so `lvl != -1` costs nothing and admits 41 of 123 malicious samples
+    /// — far more selective than any probability floor on that population.
+    fn ml_placed(self) -> bool {
+        self.fired.is_some()
+    }
+
     fn ml_admits(self, min_level: Option<u16>) -> bool {
         let cutoff = i32::from(min_level.unwrap_or(self.grid_max));
         matches!(self.fired, Some(fired) if (0..=cutoff).contains(&fired))
@@ -779,7 +833,26 @@ pub fn interpret(
     // `findings` is authoritative here and the render scan is only a backstop:
     // admission is cheap and a miss is expensive, so either saying "elevated" is
     // enough. See [`FindingSeverity`] for why the render alone was not.
+    // A raw-probability floor is a fourth admission, and it exists because the
+    // level grid can be silent on a file the model is not actually comfortable
+    // with. `ml_admits` needs a *fired* level, so a sample the calibration never
+    // placed (`lvl == -1`) is inadmissible at every cutoff — including a sample
+    // scoring 0.19, which is two orders of magnitude above the benign mass and
+    // plainly worth a second opinion. That is the exact shape of an editor
+    // extension whose payload is a small, unobfuscated recon-and-eval chain: too
+    // little mass for the grid, more than enough for a reader.
+    //
+    // Deliberately a floor on the raw score rather than another level knob: the
+    // point is to cover the case where there is no level to reason about.
+    // Two independent ML admissions, because they fail on different files. A
+    // placed level is the precise one — nothing benign in the measured corpus
+    // is placed at all — but it is silent for the 82 samples the grid never
+    // reached. The probability floor covers those at a known volume cost. See
+    // [`DEFAULT_LLM_MIN_PROB`].
+    let prob_admits = ml_prob >= cfg.min_prob;
     if !levels.ml_admits(cfg.min_level)
+        && !levels.ml_placed()
+        && !prob_admits
         && !findings.elevated
         && !has_elevated_finding(context)
         && matches!(ml_class, Classification::Benign)

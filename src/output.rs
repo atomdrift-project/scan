@@ -1076,7 +1076,7 @@ pub(crate) fn format_route_scores(scores: &[RouteScore]) -> String {
 
 /// Render a matched operating-point level for display: `L0`, `L50`, or `—`
 /// when the file fired at no calibrated level (benign past the loosest row).
-fn format_level(level: Option<i32>) -> String {
+pub(crate) fn format_level(level: Option<i32>) -> String {
     level.map_or_else(|| "\u{2014}".to_string(), |n| format!("L{n}"))
 }
 
