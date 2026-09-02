@@ -10,7 +10,7 @@
 //!
 //! `<N>` is resolved rather than assumed: the newest published prefix this build
 //! can read wins, so one bucket can serve a bundle per format version and a
-//! client takes the best one it understands. See [`fetch_manifest`].
+//! client takes the best one it understands. See `fetch_manifest`.
 //!
 //! No signing: the filters carry only a versioned layout and per-file sha256,
 //! not an authenticity claim — trust is HTTPS to our own bucket. The base URL is

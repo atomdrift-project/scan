@@ -291,7 +291,7 @@ fn bloom_dir() -> PathBuf {
 }
 
 /// The directory the updater installs into: `SCAN_BLOOM_DIR` if set, else the
-/// canonical data path. [`bloom_dir`] resolves to the same place, its `bloom/`
+/// canonical data path. `bloom_dir` resolves to the same place, its `bloom/`
 /// dev fallback aside, so installed filters are found.
 #[must_use]
 pub fn install_dir() -> PathBuf {

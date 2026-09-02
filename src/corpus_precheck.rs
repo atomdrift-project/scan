@@ -16,7 +16,7 @@
 //!      same analyzer learns nothing — hopper logs exactly that when it
 //!      happens — so this skips ANY verdict, hostile included.
 //!   2. BENIGN AND FRESH: `fires_at == -1`, analyzed within the last 30 days
-//!      (see [`DEFAULT_MAX_AGE_DAYS`] for why that long), regardless of
+//!      (see `DEFAULT_MAX_AGE_DAYS` for why that long), regardless of
 //!      analyzer version. The coarse rule that keeps working through a
 //!      mixed-version fleet or a release that just bumped every traits hash:
 //!      dependency universes are overwhelmingly benign.
@@ -25,13 +25,13 @@
 //! different analyzer, unreachable — falls through to a normal analysis:
 //! fail-open, never fail-closed.
 //!
-//! Enabled automatically whenever `--hopper` is: [`configure`] is called with
+//! Enabled automatically whenever `--hopper` is: `configure` is called with
 //! the process's own hopper URL when the uploader is built, so there is no
 //! second setting to keep in sync — the hopper you submit to is the hopper you
 //! ask. (Hopper serves `/v1/lookup` from an in-memory pool on both the primary
 //! and the read replica, so whichever the process talks to answers cheaply.)
 //! No `--hopper`, no precheck. Auth reuses the process's hopper bearer token
-//! (see [`crate::upload::bearer_token`]).
+//! (see `crate::upload::bearer_token`).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

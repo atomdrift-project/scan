@@ -351,7 +351,7 @@ fn load_evaluation_severity_thresholds(model_dir: &Path, level: u16) -> Option<T
 /// severity metadata.
 ///
 /// Suspicious is derived in level-space (see
-/// [`capped_suspicious_level`]) — there is no probability-space
+/// `capped_suspicious_level`) — there is no probability-space
 /// fallback.
 ///
 /// # Errors

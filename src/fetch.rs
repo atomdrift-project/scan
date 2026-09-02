@@ -1706,9 +1706,7 @@ fn attribute_reference_outcomes(report: &mut AnalysisReport, records: &[FetchRec
         let Some(tally) = by_source.get(file.sha256.as_str()) else {
             continue;
         };
-        let metrics = file
-            .filefacts_metrics
-            .get_or_insert_with(Default::default);
+        let metrics = file.filefacts_metrics.get_or_insert_with(Default::default);
         metrics.insert(
             "references.declared_count".to_string(),
             tally.declared as f64,

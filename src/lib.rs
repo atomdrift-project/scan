@@ -155,7 +155,7 @@ pub enum OutputFormat {
     Json,
     /// Compact, context-centric text for feeding a local LLM: a litmus verdict
     /// line (gate, confidence, matched FP level) followed by cleave's annotated
-    /// context. See [`crate::output::format_tiny`].
+    /// context. See `crate::engine::write_tiny`.
     Tiny,
     /// The LLM payload: byte-for-byte the user message a live `--interpret`
     /// query sends — cleave's sanitized tiny render, finding annotations

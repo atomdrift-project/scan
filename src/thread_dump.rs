@@ -9,7 +9,7 @@
 //! Mechanism (Linux/FreeBSD): every analysis thread (the rayon pool workers and
 //! the `spawn_blocking` analysis threads) registers its OS thread id via
 //! [`register_self`]. On `SIGUSR1` the handler thread calls [`dump_all_threads`],
-//! which signals each registered thread with `SIGUSR2`; the [`on_capture`]
+//! which signals each registered thread with `SIGUSR2`; the `on_capture`
 //! handler — running on the target thread — walks its own stack with
 //! [`backtrace::trace_unsynchronized`] and stores raw instruction pointers into a
 //! preallocated slot (no allocation, no locks: async-signal-safe). The

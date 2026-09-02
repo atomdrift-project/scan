@@ -117,7 +117,7 @@ fn notify(latest: &str, url: Option<&str>, installed: &str) {
 /// Run the update notice for an interactive command.
 ///
 /// A fresh (<24h) cache is used without any network access. Otherwise the
-/// manifest is fetched once (bounded by [`FETCH_TIMEOUT`]), the cache is
+/// manifest is fetched once (bounded by `FETCH_TIMEOUT`), the cache is
 /// refreshed, and a notice is printed if a newer release exists. Any network or
 /// parse failure is logged at debug level and otherwise ignored — the check is
 /// strictly best-effort and never blocks or fails a command.
