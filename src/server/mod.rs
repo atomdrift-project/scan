@@ -767,6 +767,24 @@ struct AppState {
     /// before it dispatches, so the useful answer is per bucket.
     job_buckets: [JobBucket; SIZE_BUCKETS.len()],
     job_types: [JobBucket; PURL_TYPE_NAMES.len()],
+    /// The same per-size figures for work the idle worker did, kept apart
+    /// from the request ones because they are not the same measurement.
+    ///
+    /// Request timings say how fast this server was on whatever a router chose
+    /// to send it, which makes them useless for deciding whether that router
+    /// chose well: a server nobody dispatches to reports nothing and stays
+    /// unroutable, and one sent only small work looks fast at everything. Idle
+    /// work is claimed from the same hopper queue by every server and is not
+    /// selected by anybody's routing, so these are comparable across a fleet in
+    /// the way request timings are not.
+    ///
+    /// Kept separate rather than merged: the idle worker stands down while
+    /// interactive requests are in flight, so this is uncontended speed while
+    /// `job_buckets` is speed under whatever load the server was carrying. Both
+    /// are worth having, and averaging them together would describe neither.
+    /// An `Arc` because the reporter outlives this borrow and must not hold the
+    /// state that holds the reporter.
+    idle_job_buckets: Arc<[JobBucket; SIZE_BUCKETS.len()]>,
     /// The blended average, aged like the others. Separate from
     /// `jobs_completed`, which stays a true lifetime count for reporting: one
     /// answers "how fast is this server now", the other "how much has it done".
@@ -906,6 +924,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         last_analyze_request_ms: Arc::new(AtomicU64::new(0)),
         job_buckets: Default::default(),
         job_types: Default::default(),
+        idle_job_buckets: Arc::new(Default::default()),
         job_overall: Default::default(),
         job_cached: Default::default(),
         lookups: Default::default(),
@@ -1388,6 +1407,12 @@ fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
         fetch: state.fetch,
         zip_passwords: state.zip_passwords.clone(),
         embedded: Some(crate::worker::Embedded {
+            on_complete: Some({
+                let buckets = Arc::clone(&state.idle_job_buckets);
+                Arc::new(move |size_bytes: u64, micros: u64| {
+                    buckets[size_bucket(size_bytes)].record(micros);
+                })
+            }),
             pause,
             shutdown: Arc::clone(&state.shutdown),
             resources,

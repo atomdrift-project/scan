@@ -811,6 +811,30 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
             })
             .collect::<serde_json::Map<String, serde_json::Value>>(),
 
+        // The same split, for analyses the idle worker ran on spare capacity.
+        //
+        // This is the figure to rank a fleet on. Request timings are selected by
+        // the router being judged - a server it avoids reports nothing and stays
+        // avoided, and one it sends only small work to looks fast at everything.
+        // Idle work comes off the shared hopper queue, so every server is
+        // measured on the same population, and a server with no traffic produces
+        // the most of it rather than the least.
+        //
+        // Uncontended by construction: the idle worker stands down while
+        // interactive requests are in flight. Read it as this host's capability,
+        // and `avg_job_ms_by_size` as what it delivered under real load.
+        "avg_job_ms_by_size_idle": super::SIZE_BUCKET_NAMES
+            .iter()
+            .zip(state.idle_job_buckets.iter())
+            .map(|(name, b)| {
+                let n = b.count.load(Ordering::Relaxed);
+                let ms = (n > 0).then(|| b.micros.load(Ordering::Relaxed) / n / 1_000);
+                ((*name).to_string(), serde_json::json!({
+                    "jobs": n, "avg_ms": ms, "recent": b.recent_json(),
+                }))
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+
         // Memory headroom. A server near its ceiling is about to pause
         // admission; a router should move away before that, not discover it by
         // timing out.
@@ -3946,6 +3970,20 @@ fn v1_outcome_response(
     {
         resp.headers_mut().insert("X-Scan-Follow", value);
     }
+    // The normalized coordinate, so a caching caller can file one entry per
+    // artifact rather than one per spelling.
+    //
+    // The body is spelled with `asked` on purpose: an answer should come back
+    // in the words the question was put in. But a cache keyed on those words
+    // holds `v4.4.0+incompatible` and `v4.4.0%2Bincompatible` as two packages
+    // and buys the same analysis twice. Only this server knows they are one
+    // coordinate, because only this server ran them through the normalizer,
+    // so it is this server that has to say so.
+    if let Some(key) = named.key.as_deref()
+        && let Ok(value) = axum::http::HeaderValue::from_str(key)
+    {
+        resp.headers_mut().insert("X-Scan-Purl", value);
+    }
     if shared {
         resp.extensions_mut().insert(super::access::Shared);
     }
@@ -3998,6 +4036,9 @@ fn v1_streamed(
     // digest in the purl field.
     let labelled_locator = asked.clone().unwrap_or_else(|| subject.clone());
     let labelled = subject.clone();
+    // Taken before the stream task moves the coordinate: the response headers
+    // are assembled below, after the spawn, but describe the same request.
+    let canonical = purl.clone();
     tokio::spawn(async move {
         // Held for the life of the stream: an attachment dropped early would
         // tell the flight nobody is waiting on this analysis while somebody is.
@@ -4086,6 +4127,14 @@ fn v1_streamed(
         && let Ok(value) = axum::http::HeaderValue::from_str(&name)
     {
         headers.insert("X-Scan-Follow", value);
+    }
+    // See `v1_outcome_response`. Sent on the stream for the same reason the
+    // follow policy is: these headers go out before the first progress frame,
+    // so a caller knows how to file the decision before the decision arrives.
+    if let Some(key) = canonical.as_deref()
+        && let Ok(value) = axum::http::HeaderValue::from_str(key)
+    {
+        headers.insert("X-Scan-Purl", value);
     }
     resp.extensions_mut().insert(if is_url {
         Subject::url(&labelled, None)
