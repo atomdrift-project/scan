@@ -1524,13 +1524,25 @@ fn main() -> Result<()> {
         .thread_name(|i| format!("rayon-{i}"))
         // Register each pool worker for the SIGUSR1 in-process thread dump, so a
         // wedge can be backtraced without a debugger (lldb/gdb can't attach in
-        // the production jails).
-        .start_handler(|_| scan::thread_dump::register_self())
+        // the production jails). Each worker also steps its own scheduling
+        // priority one notch below normal (see `lower_pool_thread_priority`).
+        .start_handler(|_| {
+            scan::thread_dump::register_self();
+            lower_pool_thread_priority();
+        })
         .build_global()
     {
         tracing::warn!(error = %e, "failed to install global rayon pool; using default");
     }
     let active_threads = rayon::current_num_threads();
+    // A pool worker that spawns rizin runs other pending pool jobs while the
+    // child computes, instead of parking for the whole disassembly (see
+    // `filefacts::rizin::set_wait_idle_hook`). Off the pool the hook has
+    // nothing to run and the wait sleeps as before.
+    filefacts::rizin::set_wait_idle_hook(|| {
+        rayon::current_thread_index().is_some()
+            && rayon::yield_now() == Some(rayon::Yield::Executed)
+    });
     // A pool smaller than the detected core count is a resource downgrade that
     // oversubscribes the worker slots — surface it loudly so it is diagnosable
     // from a single log line.
@@ -2224,6 +2236,49 @@ fn git_head(dir: &Path) -> Option<(String, i64)> {
     let commit: String = fields.next()?.chars().take(9).collect();
     let epoch: i64 = fields.next()?.parse().ok()?;
     Some((commit, epoch))
+}
+
+/// Run the calling rayon worker one scheduling notch below normal.
+///
+/// The pool saturates every core, and the analysis it drives also spawns
+/// external CPU-bound helpers — rizin's `aaa` on a stripped ELF runs 10–30 s
+/// single-threaded — whose caller sits parked in the pool until they finish.
+/// Those helpers are on the critical path of the archive that owns them, yet
+/// they share cores as equals with sixteen workers that could just as well
+/// run later. Measured on the npm corpus: a 3 MB arm64 `.so` whose rizin pass
+/// takes 26 s alone stretched to ~50 s inside a saturated scan. Demoting the
+/// workers lets the scheduler hand such helpers a whole core the moment they
+/// become runnable; total pool throughput is unchanged because the demoted
+/// threads still own every idle cycle. Windows and Linux support a per-thread
+/// priority; elsewhere this is a no-op (FreeBSD's `setpriority` acts on the
+/// whole process, which the worker already nices).
+fn lower_pool_thread_priority() {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> *mut core::ffi::c_void;
+            fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
+        }
+        const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+        // SAFETY: both calls take the pseudo-handle of the calling thread and
+        // touch no memory we own.
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: setpriority on the calling thread's tid (PRIO_PROCESS with a
+        // tid is Linux's per-thread nice); no memory effects. Raising the nice
+        // value never needs privilege, and a failure just leaves the thread at
+        // its inherited priority.
+        unsafe {
+            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            let current = libc::getpriority(libc::PRIO_PROCESS, tid);
+            libc::setpriority(libc::PRIO_PROCESS, tid, (current + 1).min(19));
+        }
+    }
 }
 
 /// Default worker count: at least 2, and the physical core count from
