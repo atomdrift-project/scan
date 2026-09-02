@@ -1717,33 +1717,27 @@ fn attribute_reference_outcomes(report: &mut AnalysisReport, records: &[FetchRec
             "references.unresolved_count".to_string(),
             tally.unresolved.len() as f64,
         );
-        // Per-ecosystem counts, so a rule can key on where the reference pointed
-        // rather than only on the fact that something failed. A marketplace
-        // removal and an npm 404 do not mean the same thing, and an archive
-        // member carries no values tree for a `type: value` list to read — a
-        // metric is the surface that survives member retention.
-        let mut per_type: BTreeMap<String, u64> = BTreeMap::new();
-        for locator in &tally.unresolved {
-            let Some(rest) = locator.strip_prefix("pkg:") else {
-                continue;
-            };
-            let ecosystem: String = rest
-                .split('/')
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-                .collect();
-            if !ecosystem.is_empty() {
-                *per_type.entry(ecosystem).or_default() += 1;
-            }
-        }
-        for (ecosystem, count) in per_type {
-            metrics.insert(
-                format!("references.unresolved_{ecosystem}_count"),
-                count as f64,
-            );
-        }
+        // Editor-marketplace removals get their own count, because they do not
+        // mean what a registry 404 means. npm serves a 404 for a private name,
+        // a typo, or a package that moved; the VS Code and Open VSX galleries
+        // *remove* extensions, and removal is what they do to malware. A rule
+        // convicting on the first would be noise and on the second is not.
+        //
+        // Two fixed keys rather than one per ecosystem: the metric catalog
+        // checks exact names, so a key built from whatever PURL type happened
+        // to appear could never be declared, and an undeclared key validates
+        // against nothing. An archive member also carries no values tree for a
+        // `type: value` list to read, so a metric is the only surface that
+        // survives member retention.
+        let extension_unresolved = tally
+            .unresolved
+            .iter()
+            .filter(|l| l.starts_with("pkg:vscode/") || l.starts_with("pkg:openvsx/"))
+            .count();
+        metrics.insert(
+            "references.unresolved_extension_count".to_string(),
+            extension_unresolved as f64,
+        );
         touched.push(file.sha256.clone());
     }
 
