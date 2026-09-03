@@ -55,6 +55,15 @@ pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 /// Response token budget — a one-line grade+reason needs very little.
 const MAX_TOKENS: u32 = 64;
 
+/// Floor applied to the token budget for an `openrouter/auto`-routed request.
+/// The model behind `auto` varies per call and some ignore `reasoning:
+/// {effort: "low"}`, spending 50-200+ tokens on hidden chain-of-thought
+/// before the visible answer — observed up to ~180 on real endpoints. A
+/// budget too small for that leaves nothing for the answer itself and the
+/// reply truncates to empty. This only raises the floor, never lowers an
+/// already-larger caller-supplied budget.
+const OPENROUTER_AUTO_MIN_TOKENS: u32 = 512;
+
 /// How often to re-probe an endpoint that is currently unhealthy, while a caller
 /// waits for it to recover.
 const HEALTH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -1503,7 +1512,8 @@ fn chat_once(
     // everywhere observed, and (unlike sending no `reasoning` field at all)
     // keeps the model from spending the whole completion budget thinking and
     // returning truncated or empty `content`.
-    let reasoning = openrouter.then_some(if cfg.model == OPENROUTER_DEFAULT_MODEL {
+    let auto_routed = cfg.model == OPENROUTER_DEFAULT_MODEL;
+    let reasoning = openrouter.then_some(if auto_routed {
         ReasoningParam {
             enabled: None,
             effort: Some("low"),
@@ -1514,6 +1524,14 @@ fn chat_once(
             effort: None,
         }
     });
+    // `effort: "low"` above is only a hint some providers ignore, so also
+    // widen the budget itself — never shrink a caller's larger request — so
+    // an auto-routed model that reasons anyway still has room left to answer.
+    let max_tokens = if auto_routed {
+        max_tokens.max(OPENROUTER_AUTO_MIN_TOKENS)
+    } else {
+        max_tokens
+    };
     let body = ChatRequest {
         model: cfg.model,
         messages: [
