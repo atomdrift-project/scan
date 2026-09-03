@@ -94,6 +94,11 @@ type Sha256IdentityBuildHasher = BuildHasherDefault<Sha256IdentityHasher>;
 
 static NEXT_ANALYSIS_ID: AtomicU64 = AtomicU64::new(1);
 static BLOCKING_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Second opinions run after the ML verdict was posted (two-phase post), and
+/// the optional ones skipped because the LLM backlog was full.
+static LLM_DEFERRED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static LLM_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static LLM_REPOSTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLOCKING_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Cadence for the dedicated `/api/heartbeat` check-in. Fixed and independent of
@@ -107,9 +112,21 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// gate bounds memory-bandwidth-heavy cleave executions. Within that gate,
 /// cleave gives only a bounded subset of sibling analyses access to nested
 /// Rayon work while the other admitted analyses make serial progress. The
-/// default scales with the pool (1/16, at least 1: eight analyses on the
-/// 128-thread FreeBSD worker) and never exceeds `slots`;
+/// default is the pool itself (at least 2) and never exceeds `slots`;
 /// `SCAN_CLEAVE_CONCURRENCY` remains an explicit production override.
+///
+/// Was 1/16 (one permit on a 16-thread host). Measured on the production
+/// worker 2026-09-03: with one whale permit the pool ran at 2-3 of 16 cores
+/// and every summary showed 11 of 16 slots queued behind it, because the
+/// permit is held through the dependency fetch and (until [`CpuLease`]) the
+/// LLM round trip, both network waits. A whale's own Rayon fan-out is bounded
+/// by cleave's inner-work owner cap, and memory co-residency is already
+/// guarded by [`crate::admission::MemoryAdmission`], so this lane no longer
+/// needs to be the memory backstop it was sized as. 4 whale + 8 small permits
+/// measured 5.3-5.4 cores; 8 measured 9-10; 12 measured 12.0 (75% of the pool);
+/// 16 — every thread — measured 16.3, the pool saturated, at a 17.5 GB peak on
+/// a 32 GB box with no memory-pressure warnings. Memory is the admission
+/// gate's job (`admission.rs`), not this lane's.
 ///
 /// Each worker waits on this gate *after* taking a job and *only* around the
 /// blocking classify — never on a shared dispatch loop.
@@ -131,13 +148,16 @@ fn small_job_bytes() -> u64 {
         .map_or(DEFAULT, |mb| mb.saturating_mul(1024 * 1024))
 }
 
-/// Small-lane width: a quarter of the pool, 1..=8. Small jobs are cheap and
-/// mostly single-threaded, so a few of them alongside one whale barely touch
-/// the pool the whale is fanning out across; `SCAN_SMALL_LANE` overrides.
+/// Small-lane width: the pool, 2..=64. Small jobs are cheap and mostly
+/// single-threaded, so a pool's worth of them alongside the whales barely
+/// touches the threads the whales are fanning out across; the ceiling keeps
+/// a 128-thread host from running 128 blocking analyses on top of its own
+/// fan-out. `SCAN_SMALL_LANE` overrides. (Was a quarter, 1..=8: four permits
+/// on a 16-thread host, each held for a 6-25 s LLM wait — see [`CpuLease`].)
 fn small_lane_from(pool: usize, override_value: Option<usize>) -> usize {
     override_value
         .filter(|&v| v > 0)
-        .unwrap_or_else(|| (pool.max(1) / 4).clamp(1, 8))
+        .unwrap_or_else(|| pool.max(1).clamp(2, 64))
 }
 
 /// The two admission lanes around the blocking cleave classify.
@@ -186,12 +206,22 @@ impl CleaveGate {
     }
 }
 
+/// How many analyses may be past memory admission at once (see the tail
+/// hand-off in [`run`]): twice the slots, at least the slots, `SCAN_TAILS`
+/// overrides.
+fn tail_cap_from(slots: usize, override_value: Option<usize>) -> usize {
+    let slots = slots.max(1);
+    override_value
+        .filter(|&v| v > 0)
+        .map_or(slots.saturating_mul(2), |v| v.max(slots))
+}
+
 /// Pure gate sizing — `pool` is the Rayon thread count, `override_value` is
 /// `SCAN_CLEAVE_CONCURRENCY` when set.
 fn cleave_concurrency_from(slots: usize, pool: usize, override_value: Option<usize>) -> usize {
     let slots = slots.max(1);
     override_value.filter(|&value| value > 0).map_or_else(
-        || (pool.max(1) / 16).clamp(1, slots),
+        || pool.max(1).clamp(2.min(slots), slots),
         |value| value.min(slots),
     )
 }
@@ -1661,6 +1691,42 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     );
     let small_bytes = small_job_bytes();
     let cleave_gate = CleaveGate::new(cleave_slots, small_lane, small_bytes);
+    // A slot's work ends at memory admission; what follows — the cleave-gate
+    // wait, the analysis, the LLM round trip, the hopper post — runs as a
+    // detached tail so the slot can claim the next job while this one waits
+    // on the network. Tails are bounded here, not by the slot count: a tail
+    // past its CPU work holds only its report, so twice the slots is cheap,
+    // and without a bound a saturated LLM endpoint would grow the backlog
+    // without limit. `SCAN_TAILS` overrides.
+    let tail_cap = tail_cap_from(slots, std::env::var("SCAN_TAILS").ok().and_then(|v| v.parse().ok()));
+    let tails = Arc::new(Semaphore::new(tail_cap));
+    // Two-phase post: a tail posts its ML verdict as soon as the analysis is
+    // done, then runs the LLM second opinion and re-posts only if that changes
+    // anything. The backlog waiting for the endpoint is bounded here: a
+    // `Required` admission (one that can change a verdict) waits for room,
+    // an `Optional` one is skipped when there is none, so a saturated
+    // endpoint serves the cases that matter. Four times the client's
+    // in-flight cap keeps it fed without letting a slow endpoint pile up
+    // reports without limit. `SCAN_LLM_BACKLOG` overrides.
+    let llm_backlog = std::env::var("SCAN_LLM_BACKLOG")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or_else(|| {
+            // The same knob the LLM client reads for its in-flight cap.
+            std::env::var("SCAN_LLM_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or_else(|| crate::interpret::default_max_concurrency().get())
+                .saturating_mul(4)
+        });
+    let llm_queue = Arc::new(Semaphore::new(llm_backlog));
+    tracing::info!(llm_backlog, "two-phase post: LLM second opinions run after the ML verdict is posted (SCAN_LLM_BACKLOG)");
+    tracing::info!(
+        tail_cap,
+        "detached tails: analyses past memory admission run off their slot (SCAN_TAILS)",
+    );
     tracing::info!(
         small_lane,
         small_job_mb = small_bytes / (1024 * 1024),
@@ -1829,11 +1895,14 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let heartbeat_tools = available_tools.clone();
     let heartbeat_name = url_encode(&name);
 
-    let big_worker = cleave::memory_tracker::total_memory().unwrap_or(0) >= 16 * 1024 * 1024 * 1024;
-    let max_buffer_bytes: usize = if big_worker {
-        1024 * 1024 * 1024 // 1 GiB on systems with >= 16 GiB RAM
-    } else {
-        512 * 1024 * 1024 // 512 MiB otherwise
+    // Staged-payload budget: 1/16 of RAM, 512 MiB..=8 GiB. It bounds what the
+    // prefetcher holds ahead of the slots, and the slot count now scales with
+    // cores (3x), so a fixed 1 GiB starved a large box while 1/16 of a 16 GB
+    // one is the 1 GiB it always had.
+    let max_buffer_bytes: usize = {
+        const MIB: u64 = 1024 * 1024;
+        let total = cleave::memory_tracker::total_memory().unwrap_or(16 * 1024 * MIB);
+        usize::try_from((total / 16).clamp(512 * MIB, 8 * 1024 * MIB)).unwrap_or(1024 * 1024 * 1024)
     };
     // Largest file this worker will accept, advertised to hopper on /api/next so
     // it never routes files no worker can analyze. Every worker takes up to
@@ -2239,6 +2308,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         blocking_finished_total = finished,
                         inflight_blocking = started.saturating_sub(finished),
                         completed = completed.load(Ordering::Acquire),
+                        llm_deferred = LLM_DEFERRED_TOTAL.load(Ordering::Relaxed),
+                        llm_skipped = LLM_SKIPPED_TOTAL.load(Ordering::Relaxed),
+                        llm_reposted = LLM_REPOSTED_TOTAL.load(Ordering::Relaxed),
                         corpus_checks = crate::corpus_precheck::counters().0,
                         corpus_skips = crate::corpus_precheck::counters().1,
                         purl_checks = crate::corpus_precheck::purl_counters().0,
@@ -2430,6 +2502,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let spool = Arc::clone(&spool);
         let admission = Arc::clone(&admission);
         let cleave_gate = Arc::clone(&cleave_gate);
+        let tails = Arc::clone(&tails);
+        let llm_queue = Arc::clone(&llm_queue);
         let shutdown = Arc::clone(&shutdown);
         let on_complete = config.embedded.as_ref().and_then(|e| e.on_complete.clone());
         workers.spawn(async move {
@@ -2471,7 +2545,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     Ok(snapshot) => snapshot,
                     Err(failure) => {
                         metrics.record_error(&failure);
-                        post_result(&client, &base_url, &name, &pj.job.sha256, Err(failure)).await;
+                        post_result(&client, &base_url, &name, &pj.job.sha256, Err(failure), false).await;
                         metrics.complete(pj.queue_id);
                         completed.fetch_add(1, Ordering::Release);
                         continue;
@@ -2499,49 +2573,84 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     )
                     .await;
 
-                let result = run_job(
-                    &client,
-                    &base_url,
-                    local_index.get(),
-                    data_root.as_deref(),
-                    &pj.job,
-                    &snapshot,
-                    Arc::clone(&cleave_gate),
-                    slow_rule_ms,
-                    &spool,
-                    pj.data,
-                    on_complete.as_ref(),
-                )
-                .await;
-                drop(admission_guard);
-                drop(_analyzing_guard);
+                // The slot is done once the job is admitted: everything from
+                // the cleave-gate wait to the hopper post runs as a detached
+                // tail, bounded by `tails`, and this slot goes back to claiming.
+                // On the production worker the tail is mostly waiting — the
+                // LLM round trip, dependency fetches — and holding the slot
+                // through it left the pool at 2-3 of 16 cores.
+                let Ok(tail_permit) = Arc::clone(&tails).acquire_owned().await else {
+                    break;
+                };
+                let client = client.clone();
+                let base_url = Arc::clone(&base_url);
+                let name = Arc::clone(&name);
+                let local_index = Arc::clone(&local_index);
+                let data_root = data_root.clone();
+                let cleave_gate = Arc::clone(&cleave_gate);
+                let spool = Arc::clone(&spool);
+                let on_complete = on_complete.clone();
+                let metrics = Arc::clone(&metrics);
+                let completed = Arc::clone(&completed);
+                let llm_queue = Arc::clone(&llm_queue);
+                tokio::spawn(async move {
+                    let _tail_permit = tail_permit;
+                    let _analyzing_guard = _analyzing_guard;
+                    let result = run_job(
+                        &client,
+                        &base_url,
+                        local_index.get(),
+                        data_root.as_deref(),
+                        &pj.job,
+                        &snapshot,
+                        cleave_gate,
+                        slow_rule_ms,
+                        &spool,
+                        pj.data,
+                        on_complete.as_ref(),
+                        admission_guard,
+                    )
+                    .await;
 
-                if let Err(ref e) = result {
-                    tracing::warn!(
-                        worker_id,
-                        sha256 = %pj.job.sha256,
-                        file = %pj.job.path,
-                        file_type = %pj.job.file_type,
-                        size = pj.job.size_bytes,
-                        error = %e,
-                        "analysis failed",
-                    );
-                    metrics.record_error(&e.to_string());
-                }
-                // Hopper I/O (including dep mirroring) runs with this worker
-                // busy on post only — siblings keep analyzing.
-                post_result(&client, &base_url, &name, &pj.job.sha256, result).await;
-                metrics.complete(pj.queue_id);
-                let n = completed.fetch_add(1, Ordering::Release) + 1;
-                if n.is_multiple_of(100) {
-                    // Clearing cleave's caches returns memory to the allocator;
-                    // the trim is what returns it to the OS, which is the half
-                    // the admission gate can actually see.
-                    tokio::task::spawn_blocking(|| {
-                        cleave::clear_all_thread_caches();
-                        crate::allocator::trim();
-                    });
-                }
+                    if let Err(ref e) = result {
+                        tracing::warn!(
+                            worker_id,
+                            sha256 = %pj.job.sha256,
+                            file = %pj.job.path,
+                            file_type = %pj.job.file_type,
+                            size = pj.job.size_bytes,
+                            error = %e,
+                            "analysis failed",
+                        );
+                        metrics.record_error(&e.to_string());
+                    }
+                    // Phase 1: post the ML verdict now. Keep a copy only when a
+                    // second opinion is pending, so a possible re-post has
+                    // something to amend.
+                    let (phase1, later) = match result {
+                        Ok((sr, deps, ms)) => {
+                            let later = sr.pending_llm.is_some().then(|| (sr.clone(), ms));
+                            (Ok((sr.into_envelope(), deps, ms)), later)
+                        }
+                        Err(e) => (Err(e), None),
+                    };
+                    post_result(&client, &base_url, &name, &pj.job.sha256, phase1, false).await;
+                    metrics.complete(pj.queue_id);
+                    let n = completed.fetch_add(1, Ordering::Release) + 1;
+                    if n.is_multiple_of(100) {
+                        // Clearing cleave's caches returns memory to the
+                        // allocator; the trim is what returns it to the OS,
+                        // which is the half the admission gate can actually see.
+                        tokio::task::spawn_blocking(|| {
+                            cleave::clear_all_thread_caches();
+                            crate::allocator::trim();
+                        });
+                    }
+                    // Phase 2: the second opinion, off the completion path.
+                    if let Some((sr, ms)) = later {
+                        second_opinion(sr, ms, &llm_queue, &snapshot, &client, &base_url, &name, &pj.job.sha256).await;
+                    }
+                });
             }
         });
     }
@@ -2582,7 +2691,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         cleave::persist_regex_warm_memo();
         tracing::info!("all in-flight jobs finished (batch drain), exiting");
     } else {
-        let drain = async { while workers.join_next().await.is_some() {} };
+        // Slots stop claiming, then every detached tail finishes (or the
+        // deadline abandons them, exactly as it abandoned in-flight slots).
+        let drain = async {
+            while workers.join_next().await.is_some() {}
+            let _all = tails.acquire_many(u32::try_from(tail_cap).unwrap_or(u32::MAX)).await;
+        };
         match tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_SECS), drain).await {
             Ok(()) => tracing::info!("all in-flight jobs finished, exiting"),
             Err(_) => {
@@ -3063,9 +3177,12 @@ async fn run_job(
     spool: &Arc<SpoolState>,
     prefetched: std::result::Result<PrefetchData, PrefetchError>,
     on_complete: Option<&IdleCompletion>,
+    // Held until the lease fires or this returns: the reservation covers the
+    // analysis, not the LLM wait that follows it.
+    admission: crate::admission::AdmissionGuard,
 ) -> Result<
     (
-        crate::engine::ScanResultEnvelope,
+        crate::engine::ScanResult,
         Vec<crate::engine::DepResult>,
         i64,
     ),
@@ -3384,10 +3501,18 @@ async fn run_job(
         // set we want. See `crate::crash_dump`.
         let _inflight =
             crate::crash_dump::register(analysis_id, thread_id, &sha_short2, &label_for_blocking);
-        // Keep the nested-work permit on this blocking thread for the whole
-        // classify/fetch/graft. Dropping it from the async frame on cancel
-        // would admit another tree while this one still owns Rayon workers.
-        let _cleave_permit = cleave_permit;
+        // The nested-work permit stays on this blocking thread through
+        // classify/fetch/graft — dropping it from the async frame on cancel
+        // would admit another tree while this one still owns Rayon workers —
+        // and is handed to `classify_report` as a lease it releases right
+        // before the LLM round trip, so the pool is not idle for a network
+        // wait — together with the memory reservation, which the analysis no
+        // longer needs either. If classify bails earlier the unused lease
+        // drops both.
+        let cpu_lease: Option<crate::engine::CpuLease> = Some(Box::new(move || {
+            drop(cleave_permit);
+            drop(admission);
+        }));
         // Spooled payloads take the same file-path route as local files, so a
         // multi-GiB sample is memory-mapped rather than held in RAM. The
         // spooled payload is moved into this closure and dropped when it
@@ -3404,6 +3529,7 @@ async fn run_job(
                 Some(&phase),
                 root_registry.as_ref(),
                 true,
+                cpu_lease,
             ),
             (Some(PrefetchData::Spooled(spooled)), _) => classify_file(
                 &spooled.path,
@@ -3415,6 +3541,7 @@ async fn run_job(
                 Some(&phase),
                 root_registry.as_ref(),
                 true,
+                cpu_lease,
             ),
             (_, Some(path)) => classify_file(
                 path,
@@ -3426,6 +3553,7 @@ async fn run_job(
                 Some(&phase),
                 root_registry.as_ref(),
                 true,
+                cpu_lease,
             ),
             (None | Some(PrefetchData::Local), None) => Err(anyhow::anyhow!(
                 "no downloaded bytes and no local path for {label_for_blocking}"
@@ -3470,7 +3598,7 @@ async fn run_job(
                     u64::try_from(elapsed_ms).unwrap_or(0).saturating_mul(1_000),
                 );
             }
-            Ok((scan_result.into_envelope(), deps, elapsed_ms))
+            Ok((scan_result, deps, elapsed_ms))
         }
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(e) => Err(format!("task join error: {e}")),
@@ -3478,6 +3606,55 @@ async fn run_job(
 }
 
 /// Post the result back to hopper with retry on transient failures.
+/// Phase 2 of the two-phase post: the LLM second opinion, run after the ML
+/// verdict is already on hopper, re-posting only if it changed anything.
+/// `Required` admissions wait for backlog room; `Optional` ones are skipped
+/// when there is none.
+#[allow(clippy::too_many_arguments)] // one linear tail; a struct would only rename the same eight things
+#[allow(clippy::significant_drop_tightening)] // the backlog permit spans the blocking call by design
+async fn second_opinion(
+    mut sr: crate::engine::ScanResult,
+    ms: i64,
+    llm_queue: &Arc<Semaphore>,
+    resources: &Arc<ModelResources>,
+    client: &reqwest::Client,
+    base_url: &str,
+    worker: &str,
+    sha256: &str,
+) {
+    // Phase 2: the second opinion, off the completion path.
+        let admission = sr.pending_llm.as_ref().map(|p| p.admission);
+        let permit = match admission {
+        Some(crate::interpret::LlmAdmission::Required) => {
+            Arc::clone(llm_queue).acquire_owned().await.ok()
+        }
+        Some(crate::interpret::LlmAdmission::Optional) => {
+            let p = Arc::clone(llm_queue).try_acquire_owned().ok();
+            if p.is_none() {
+                LLM_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            p
+        }
+        None => None,
+    };
+    let Some(_permit) = permit else {
+        return;
+    };
+    LLM_DEFERRED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let resources = Arc::clone(resources);
+    let amended = tokio::task::spawn_blocking(move || {
+        let changed = resources.interpret.as_ref().is_some_and(|cfg| {
+            crate::engine::apply_pending_interpretation(&mut sr, cfg, &resources.model)
+        });
+        changed.then_some(sr)
+    })
+    .await;
+    if let Ok(Some(sr)) = amended {
+        LLM_REPOSTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        post_result(client, base_url, worker, sha256, Ok((sr.into_envelope(), Vec::new(), ms)), true).await;
+    }
+}
+
 async fn post_result(
     client: &reqwest::Client,
     url: &str,
@@ -3491,6 +3668,8 @@ async fn post_result(
         ),
         String,
     >,
+    // Second post of a two-phase result: the LLM amended what was posted.
+    renewal: bool,
 ) {
     // The hopper base URL, captured before `url` is shadowed by the result
     // endpoint below — fetched dependencies are mirrored against the same base.
@@ -3508,7 +3687,11 @@ async fn post_result(
             } else {
                 "hostile"
             };
-            tracing::info!(sha256 = %sha256, duration_ms, verdict, "analysis complete");
+            if renewal {
+                tracing::info!(sha256 = %sha256, verdict, "LLM amended the posted verdict");
+            } else {
+                tracing::info!(sha256 = %sha256, duration_ms, verdict, "analysis complete");
+            }
             if !deps.is_empty() {
                 dep_sync = Some((
                     deps,
@@ -5285,19 +5468,31 @@ mod tests {
 
     #[test]
     fn cleave_concurrency_scales_with_pool_and_respects_slot_cap() {
-        assert_eq!(small_lane_from(16, None), 4);
-        assert_eq!(small_lane_from(128, None), 8);
-        assert_eq!(small_lane_from(2, None), 1);
+        assert_eq!(small_lane_from(16, None), 16);
+        assert_eq!(small_lane_from(128, None), 64);
+        assert_eq!(small_lane_from(2, None), 2);
         assert_eq!(small_lane_from(16, Some(2)), 2);
-        assert_eq!(small_lane_from(16, Some(0)), 4);
+        assert_eq!(small_lane_from(16, Some(0)), 16);
         let gate = CleaveGate::new(1, 4, 1024 * 1024);
         assert!(gate.is_small(1024 * 1024));
         assert!(!gate.is_small(1024 * 1024 + 1));
         assert!(!CleaveGate::new(1, 4, 0).is_small(1), "0 disables the lane");
-        assert_eq!(cleave_concurrency_from(16, 32, None), 2);
-        assert_eq!(cleave_concurrency_from(16, 8, None), 1);
+        assert_eq!(cleave_concurrency_from(16, 32, None), 16);
+        assert_eq!(cleave_concurrency_from(16, 16, None), 16);
+        assert_eq!(cleave_concurrency_from(16, 8, None), 8);
         assert_eq!(cleave_concurrency_from(2, 64, None), 2);
         assert_eq!(cleave_concurrency_from(0, 32, None), 1);
+    }
+
+    #[test]
+    fn tail_cap_is_twice_the_slots_and_never_below_them() {
+        assert_eq!(tail_cap_from(48, None), 96);
+        assert_eq!(tail_cap_from(1, None), 2);
+        assert_eq!(tail_cap_from(0, None), 2);
+        assert_eq!(tail_cap_from(48, Some(200)), 200);
+        // An override below the slot count would leave slots waiting on tails.
+        assert_eq!(tail_cap_from(48, Some(10)), 48);
+        assert_eq!(tail_cap_from(48, Some(0)), 96);
     }
 
     #[test]
@@ -5305,7 +5500,7 @@ mod tests {
         assert_eq!(cleave_concurrency_from(4, 32, Some(64)), 4);
         assert_eq!(cleave_concurrency_from(16, 32, Some(2)), 2);
         // Zero / bogus overrides fall back to the pool formula.
-        assert_eq!(cleave_concurrency_from(16, 32, Some(0)), 2);
+        assert_eq!(cleave_concurrency_from(16, 32, Some(0)), 16);
     }
 
     #[test]

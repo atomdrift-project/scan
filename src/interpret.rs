@@ -52,6 +52,25 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Default cap on concurrent in-flight LLM requests.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 
+/// In-flight LLM calls when nothing is configured: one per physical core,
+/// never fewer than [`DEFAULT_MAX_CONCURRENCY`] and never more than 16.
+///
+/// The floor protects a single local GPU; the ceiling protects a shared
+/// endpoint from one large worker. In between it tracks the box, because
+/// the worker's analysis rate does: with the second opinion off the
+/// completion path (see the worker's two-phase post) a cap that lags the
+/// core count only turns routine files into `Optional` skips, but the
+/// `Required` ones still queue behind it. Measured 2026-09-03 on 16 cores
+/// against a vLLM endpoint: 4 in flight throttled the whole worker to ~15
+/// analyses/min; 16 did not.
+#[must_use]
+pub fn default_max_concurrency() -> NonZeroUsize {
+    let cores = cleave::memory_tracker::physical_cpu_count()
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get() / 2))
+        .unwrap_or(DEFAULT_MAX_CONCURRENCY);
+    NonZeroUsize::new(cores.clamp(DEFAULT_MAX_CONCURRENCY, 16)).unwrap_or(NonZeroUsize::MIN)
+}
+
 /// Response token budget — a one-line grade+reason needs very little.
 const MAX_TOKENS: u32 = 64;
 
@@ -338,8 +357,7 @@ impl Default for InterpretConfig {
             min_level: None,
             min_prob: DEFAULT_LLM_MIN_PROB,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
-                .unwrap_or(NonZeroUsize::MIN),
+            max_concurrency: default_max_concurrency(),
             fallbacks: Vec::new(),
         }
     }
@@ -815,6 +833,47 @@ impl FindingSeverity {
     }
 }
 
+/// Why a sample is admitted to the LLM, for a caller that runs the second
+/// opinion off the analysis path and must ration a saturated endpoint.
+///
+/// `Required` is every admission that can change a verdict: an elevated
+/// cleave finding, a non-benign ML class, or a raw score above the
+/// probability floor. `Optional` is the routine case — ML placed the file on
+/// its grid but nothing else says so — where the second opinion is context
+/// for the reader rather than a correction. Under load a worker serves
+/// `Required` first and skips `Optional`; unloaded, both run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmAdmission {
+    /// Can change the verdict: never skipped.
+    Required,
+    /// Context for the reader: skipped when the endpoint is saturated.
+    Optional,
+}
+
+/// The gate of [`interpret`], answered without running the model: `None`
+/// when the sample is not admitted at all.
+#[must_use]
+pub fn admission(
+    cfg: &InterpretConfig,
+    ml_class: Classification,
+    ml_prob: f32,
+    levels: LevelContext,
+    findings: FindingSeverity,
+    context: &str,
+) -> Option<LlmAdmission> {
+    if ml_prob >= cfg.min_prob
+        || findings.elevated
+        || has_elevated_finding(context)
+        || !matches!(ml_class, Classification::Benign)
+    {
+        return Some(LlmAdmission::Required);
+    }
+    if levels.ml_admits(cfg.min_level) || levels.ml_placed() {
+        return Some(LlmAdmission::Optional);
+    }
+    None
+}
+
 /// Interpret a sample, blending the ML verdict with a local LLM's opinion.
 /// Returns `None` (never an error) when below the gate or on any failure.
 #[must_use]
@@ -862,16 +921,7 @@ pub fn interpret(
     // is placed at all — but it is silent for the 82 samples the grid never
     // reached. The probability floor covers those at a known volume cost. See
     // [`DEFAULT_LLM_MIN_PROB`].
-    let prob_admits = ml_prob >= cfg.min_prob;
-    if !levels.ml_admits(cfg.min_level)
-        && !levels.ml_placed()
-        && !prob_admits
-        && !findings.elevated
-        && !has_elevated_finding(context)
-        && matches!(ml_class, Classification::Benign)
-    {
-        return None;
-    }
+    admission(cfg, ml_class, ml_prob, levels, findings, context)?;
     // Everything that bounds how far the LLM's opinion may move the verdict,
     // computed from the exact bytes the model will see plus where ML placed the
     // file on the calibrated FP axis. See `blend`.

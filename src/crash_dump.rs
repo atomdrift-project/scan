@@ -257,6 +257,7 @@ mod imp {
     pub struct Guard;
     /// Record an analysis as in flight. No-op here: there is no crash-dump
     /// registry or signal handler to feed on non-unix targets.
+    #[must_use]
     pub fn register(_id: u64, _thread_id: u64, _sha: &str, _file: &str) -> Guard {
         Guard
     }

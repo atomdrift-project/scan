@@ -126,6 +126,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                         None, // local validation fixtures have no acquisition fetch record
                         None, // validation consumes ML verdicts only; no bloom flag
                         None,
+                        None, // no admission gate
                     );
                     let classify_elapsed = classify_started.elapsed();
                     if analysis_elapsed > SLOW_FIXTURE_THRESHOLD
