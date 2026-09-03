@@ -705,6 +705,7 @@ mod tests {
             attack: None,
             from: Vec::new(),
             ev: vec![[2048, 16]],
+            uses: Vec::new(),
             dep: None,
         };
         let note = |off: u64| Note {

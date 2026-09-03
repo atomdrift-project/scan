@@ -1562,7 +1562,10 @@ pub(crate) fn orchestrate(
                             .entry(g.source_sha.clone())
                             .or_insert((0u64, 0u64));
                         tally.0 += 1;
-                        if findings.iter().any(|f| f.id.contains("registry-security-hold-record")) {
+                        if findings
+                            .iter()
+                            .any(|f| f.id.contains("registry-security-hold-record"))
+                        {
                             tally.1 += 1;
                         }
                         // A skipped dependency has no artifact upload and only
@@ -1701,7 +1704,6 @@ fn attribute_reference_outcomes(
     records: &[FetchRecord],
     registry_outcomes: &BTreeMap<String, (u64, u64)>,
 ) {
-
     #[derive(Default)]
     struct Tally {
         declared: u64,
@@ -1731,12 +1733,12 @@ fn attribute_reference_outcomes(
         if fetched.is_none() && registry.is_none() {
             continue;
         }
-        let declared = fetched.map_or(0, |t| t.declared).max(registry.map_or(0, |r| r.0));
+        let declared = fetched
+            .map_or(0, |t| t.declared)
+            .max(registry.map_or(0, |r| r.0));
         let unresolved = fetched.map_or(0, |t| t.unresolved.len() as u64);
         let held = registry.map_or(0, |r| r.1);
-        let metrics = file
-            .filefacts_metrics
-            .get_or_insert_with(Default::default);
+        let metrics = file.filefacts_metrics.get_or_insert_with(Default::default);
         metrics.insert("references.declared_count".to_string(), declared as f64);
         metrics.insert("references.unresolved_count".to_string(), unresolved as f64);
         metrics.insert("references.security_hold_count".to_string(), held as f64);
