@@ -605,7 +605,7 @@ impl Cli {
     /// when interpretation is not requested.
     fn interpret_config(&self) -> Result<Option<scan::interpret::InterpretConfig>> {
         use scan::interpret::{
-            DEFAULT_BASE_URL, DEFAULT_MAX_CONCURRENCY, LlmEndpoint, is_openrouter_endpoint,
+            DEFAULT_BASE_URL, LlmEndpoint, is_openrouter_endpoint,
             llm_key_from_home, llm_models, llm_targets, openrouter_key_from_home,
         };
         let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
@@ -728,8 +728,13 @@ impl Cli {
             min_level: self.llm_min_level,
             min_prob: self.llm_min_prob,
             timeout: std::time::Duration::from_secs(self.llm_timeout),
-            max_concurrency: NonZeroUsize::new(DEFAULT_MAX_CONCURRENCY)
-                .unwrap_or(NonZeroUsize::MIN),
+            // `SCAN_LLM_CONCURRENCY` overrides the in-flight cap; the default
+            // scales with the box (see `interpret::default_max_concurrency`).
+            max_concurrency: std::env::var("SCAN_LLM_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .and_then(NonZeroUsize::new)
+                .unwrap_or_else(scan::interpret::default_max_concurrency),
             fallbacks: resolved.collect(),
         }))
     }
@@ -2331,9 +2336,20 @@ fn smt_pool_vendor() -> bool {
     }
 }
 
+/// Default slot count: three times the physical cores.
+///
+/// A slot spends most of its life waiting, not computing: the hopper
+/// claim/prefetch round trips, the dependency fetch, and the LLM second
+/// opinion are all network. Measured on the 16-core production worker
+/// (2026-09-03): with 16 slots the pool never exceeded ~5 busy cores however
+/// the cleave gate was sized, because every slot was parked in one of those
+/// waits; 32 slots reached 5, 48 reached 9. Memory is bounded separately by
+/// `admission::MemoryAdmission`, so extra slots cost only their prefetched
+/// payload, and that buffer has its own budget.
 fn default_workers() -> NonZeroUsize {
     if let Some(cores) = cleave::memory_tracker::physical_cpu_count() {
-        return NonZeroUsize::new(std::cmp::max(2, cores)).unwrap_or(NonZeroUsize::MIN);
+        return NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3)))
+            .unwrap_or(NonZeroUsize::MIN);
     }
     let cores = cleave::memory_tracker::cpu_count().unwrap_or_else(|| {
         tracing::warn!(
@@ -2342,7 +2358,9 @@ fn default_workers() -> NonZeroUsize {
         );
         4
     });
-    NonZeroUsize::new(std::cmp::max(2, cores / 2)).unwrap_or(NonZeroUsize::MIN)
+    // Logical count only: half of it approximates the physical cores, so the
+    // same three-per-core default is 1.5x the logical count.
+    NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3) / 2)).unwrap_or(NonZeroUsize::MIN)
 }
 
 struct WorkerStartupDiagnostics<'a> {

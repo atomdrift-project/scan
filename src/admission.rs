@@ -50,12 +50,28 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MIB: u64 = 1024 * 1024;
 
 /// Assumed peak resident footprint of a small, non-archive analysis.
-const DEFAULT_FLAT_ESTIMATE_BYTES: u64 = 512 * 1024 * 1024;
+///
+/// 256 MiB, down from 512. Measured on the production worker 2026-09-03 with
+/// 48 slots: reservations summed to 25.7-26.0 GB against the 26 GB ceiling
+/// and paused admission ~200 times per 10-minute run, while the process's
+/// real working set peaked at 15.3 GB. Most of that gap was this floor: a
+/// 4 KB manifest or a 100 KB script reserved half a gigabyte. The RSS check
+/// in `try_reserve` remains the reactive backstop for a real overrun.
+const DEFAULT_FLAT_ESTIMATE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Minimum reservation for archive-shaped jobs. Archives decompress and each
 /// source member can spawn a tree-sitter parse tree, so their true peak is often
 /// far above on-disk size.
-const MIN_ARCHIVE_ESTIMATE_BYTES: u64 = 1536 * 1024 * 1024;
+///
+/// 512 MiB, down from 1.5 GiB, and the multiplier below 16x, down from 64x
+/// (2026-09-03). The old figures summed to the 26 GB ceiling at ~20 archives
+/// in flight while the process peaked at 14 GB, so the estimate — not memory
+/// — was the throughput ceiling. At these figures, with every pool thread
+/// admitted, the worker measured a 17.5 GB peak on a 32 GB box with no
+/// memory-pressure warnings and the pool saturated. The RSS ceiling and the
+/// host floor stay as the reactive backstops for the archive this does not
+/// fit.
+const MIN_ARCHIVE_ESTIMATE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Upper bound for the size-scaled archive estimate. Jobs larger than the
 /// ceiling still run via the one-job forward-progress hatch.
@@ -64,7 +80,7 @@ const MAX_ARCHIVE_ESTIMATE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// On-disk archive bytes are a weak lower bound for in-memory member state; this
 /// multiplier is intentionally pessimistic for large bundles while still letting
 /// small package archives co-reside.
-const ARCHIVE_ESTIMATE_MULTIPLIER: u64 = 64;
+const ARCHIVE_ESTIMATE_MULTIPLIER: u64 = 16;
 
 /// Re-poll interval while waiting for memory to free (bounds feedback latency
 /// even if no release wakes us).

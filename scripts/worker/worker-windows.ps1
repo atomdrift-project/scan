@@ -23,6 +23,7 @@
 #               RSS throttling stays ON rather than the systemd-style -1.)
 #   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target (SCAN_LLM)
 #   LLM_MODEL      pinned model (SCAN_LLM_MODEL); required for OpenRouter
+#   LLM_CONCURRENCY in-flight LLM calls (SCAN_LLM_CONCURRENCY; default 4, vLLM takes 16)
 #   SCAN_LLM_KEY   OpenRouter key if ~/.tok/openrouter is absent
 #   HOPPER_TOKEN_FILE  hopper API token to install for the service (default: ~/.tok/hopper)
 #   LLM_TOKEN_FILE     bearer token for the LLM endpoint            (default: ~/.tok/llm)
@@ -41,6 +42,7 @@ param(
     [string]$DataDir,
     [string]$Workers,
     [string]$MaxRssGb,
+    [string]$LlmConcurrency,
     [string]$Llm,
     [string]$LlmModel,
     [string]$HopperTokenFile,
@@ -221,6 +223,9 @@ if ($ServicePhase) {
             "SCAN_LLM=$Llm"
         )
         if ($LlmModel)    { $svcEnv += "SCAN_LLM_MODEL=$LlmModel" }
+        # In-flight LLM calls (default 4 in the binary). The endpoint is vLLM,
+        # which batches; 16 measured 9 busy cores vs 3 at the default here.
+        if ($LlmConcurrency) { $svcEnv += "SCAN_LLM_CONCURRENCY=$LlmConcurrency" }
         if ($ServicePath) { $svcEnv += "PATH=$ServicePath" }
         & $nssm set $ServiceName AppEnvironmentExtra @svcEnv | Out-Null
 
@@ -280,6 +285,7 @@ foreach ($helper in '7z', 'upx', 'innoextract') {
 $DataDir  = $env:DATA_DIR
 $Workers  = $env:WORKERS
 $MaxRssGb = $env:MAX_RSS_GB
+$LlmConcurrency = $env:LLM_CONCURRENCY
 $Llm      = $env:LLM
 if (-not $Llm) { $Llm = $env:LLM_URL }
 if (-not $Llm) { $Llm = 'https://llm.isotope13.ai/v1,openrouter' }
@@ -321,6 +327,7 @@ if ($LlmModel)  { $fwd += @('-LlmModel', "`"$LlmModel`"") }
 if ($DataDir)   { $fwd += @('-DataDir', "`"$DataDir`"") }
 if ($Workers)   { $fwd += @('-Workers', "`"$Workers`"") }
 if ($MaxRssGb)  { $fwd += @('-MaxRssGb', "`"$MaxRssGb`"") }
+if ($LlmConcurrency) { $fwd += @('-LlmConcurrency', "`"$LlmConcurrency`"") }
 if ($orKeyFile) { $fwd += @('-OpenRouterKeyFile', "`"$orKeyFile`"") }
 
 $psExe = (Get-Process -Id $PID).Path

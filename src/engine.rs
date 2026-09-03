@@ -1267,6 +1267,7 @@ mod envelope_tests {
             embedded_files: MemberEvals::new(),
             rendered_context: String::new(),
             interpretation: None,
+            pending_llm: None,
             dependency_results: Vec::new(),
             bloom_mark: None,
             hopper_route: HopperRoute::Normal,
@@ -1742,6 +1743,8 @@ pub struct ScanResult {
     /// Serialized as the response `llm` section; `None` when interpretation was
     /// disabled or gated out.
     pub interpretation: Option<crate::interpret::Interpretation>,
+    /// A second opinion still to run; see [`PendingLlm`]. Never serialized.
+    pub pending_llm: Option<PendingLlm>,
     /// Whether cleave replayed this analysis from its on-disk cache instead of
     /// running the pipeline. Not serialized — it describes how this run reached
     /// the verdict, not the verdict — but it is what tells an operator whether a
@@ -4981,6 +4984,9 @@ pub(crate) struct ClassifiedReport {
     pub(crate) rendered_context: String,
     /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
     pub(crate) interpretation: Option<crate::interpret::Interpretation>,
+    /// Set instead of `interpretation` when the caller runs the LLM step
+    /// itself; see [`PendingLlm`].
+    pub(crate) pending_llm: Option<PendingLlm>,
     /// Whether cleave replayed this analysis from its on-disk cache rather than
     /// running the pipeline. See [`ScanResult::analysis_cached`].
     pub(crate) analysis_cached: bool,
@@ -5292,6 +5298,182 @@ pub(crate) struct OutputNeeds {
     pub deps_for_upload: bool,
 }
 
+/// Fold an LLM interpretation into the verdict: the three ways a second
+/// opinion may move class, probability and level. Shared by the inline
+/// path in [`classify_report`] and the deferred one in
+/// [`apply_pending_interpretation`], so both land on the same answer.
+fn blend_interpretation(
+    label: &str,
+    model: &Model,
+    interp: &crate::interpret::Interpretation,
+    class: &mut Classification,
+    probability: &mut f32,
+    lvl: &mut Option<i32>,
+) {
+    // Adopt the blended verdict as the effective one when the LLM out-read ML
+    // (escalating a missed threat, or clearing an ML false positive). The `ml`
+    // section reflects litmus's final answer; the LLM's raw grade + rationale
+    // stay in the `llm` section. The interpreted level is pinned to the target
+    // band's loosest rung (see `interpreted_level`): the active hostile level for
+    // an escalation, the suspicious ceiling for a hold/downgrade, L-1 for benign.
+    if interp.grade.is_some()
+        && interp.outcome as u8 != *class as u8
+    {
+        // INFO, not WARN: an LLM override of the ML verdict is normal operation,
+        // not a fault. (It also kept surfacing as the last stderr line a caller
+        // grabbed when a slow run was externally killed, making a benign shift look
+        // like a crash cause.)
+        tracing::info!(
+            path = %label,
+            ml = ?*class,
+            outcome = ?interp.outcome,
+            grade = interp.grade.map_or("?", crate::interpret::LlmGrade::as_str),
+            conf = format!("{:.4}", interp.blended),
+            reason = %interp.interpretation,
+            "LLM interpretation shifted the verdict",
+        );
+        let ml_class = *class;
+        let ml_level = *lvl;
+        *class = interp.outcome;
+        *probability = interp.blended;
+        *lvl = if ml_class == Classification::Hostile
+            && interp.outcome == Classification::Suspicious
+        {
+            // A cleared hostile is placed by how deep ML fired, not pinned to the
+            // band's edge: the level ML reached is the budget for how far one
+            // contrary opinion may move it.
+            softened_level(ml_level, model.active_level(), model.grid_max())
+        } else {
+            interpreted_level(
+                model.active_level(),
+                model.grid_max(),
+                interp.outcome,
+                interp.corroborated,
+            )
+        };
+    } else if interp.grade == Some(crate::interpret::LlmGrade::Benign)
+        && *class == Classification::Hostile
+        && *lvl == Some(0)
+    {
+        // `may_cross` refused to move a verdict off the grid's tightest budget on
+        // one contrary opinion, and that stands — but the disagreement is still
+        // evidence, so the verdict gives up the depth it cannot justify and sits
+        // on the weakest hostile rung instead. Still blocked, still reviewed.
+        let weakened = model.active_level().map(i32::from);
+        tracing::info!(
+            path = %label,
+            from = 0,
+            to = ?weakened,
+            reason = %interp.interpretation,
+            "LLM cleared an L0 hostile — held in band, moved to the weakest rung",
+        );
+        *lvl = weakened;
+    } else if interp.grade == Some(crate::interpret::LlmGrade::Hostile)
+        && *class == Classification::Hostile
+        && let Some(level) = *lvl
+        && level > 0
+    {
+        // Both detectors independently said hostile, so the class does not move —
+        // but agreement is still evidence, and leaving the verdict on the rung ML
+        // happened to stop at understates it. Halve the level: deeper into the
+        // hostile band, bounded at 0, and never out of it.
+        //
+        // What it refines is usually already an assertion rather than a
+        // measurement: a floor-driven hostile is pinned to the *weakest* hostile
+        // rung by `interpreted_level`, which is why every L25 in the gauntlet
+        // missed pool carries a floor probability (0.98/0.99) rather than a model
+        // one. On a genuinely swept level it does overwrite measured data, and a
+        // stricter deploy than this one will read the halved value as hostile
+        // where the sweep alone would have said suspicious.
+        let strengthened = level / 2;
+        tracing::info!(
+            path = %label,
+            from = level,
+            to = strengthened,
+            "both detectors agree hostile — verdict moved deeper into the band",
+        );
+        *lvl = Some(strengthened);
+    }
+}
+
+/// Hands the caller's CPU admission back before the LLM round trip.
+///
+/// The worker admits an analysis through a gate sized for the Rayon pool
+/// and holds that permit on the blocking thread for the whole classify.
+/// The LLM second opinion at the end of [`classify_report`] is a 2-8 s
+/// network wait that needs no CPU, and on the production worker it was the
+/// majority of every permit's lifetime: 16 slots, 5 permits, ~2 of 16 cores
+/// busy. Calling the lease there lets the next analysis start its CPU work
+/// while this one waits on the endpoint. `None` for callers with no gate.
+pub(crate) type CpuLease = Box<dyn FnOnce() + Send>;
+
+/// An LLM second opinion the caller has agreed to run itself, after the
+/// analysis has been posted with its ML verdict. Produced by
+/// [`classify_report`] instead of calling the model when a [`CpuLease`] is
+/// given: that caller owns the post-CPU tail and can post the ML result now
+/// and the LLM's amendment later ([`apply_pending_interpretation`]), so the
+/// endpoint's latency stops sitting on the completion path.
+#[derive(Debug, Clone)]
+pub struct PendingLlm {
+    /// The sanitized render the model reads.
+    pub ctx: String,
+    /// Whether this one may be skipped when the endpoint is saturated.
+    pub admission: crate::interpret::LlmAdmission,
+    /// cleave's own severity, read once from the typed report.
+    pub findings: crate::interpret::FindingSeverity,
+}
+
+/// Run a deferred second opinion and fold it into `result` exactly as
+/// [`classify_report`] would have inline. Returns whether anything changed
+/// and therefore needs re-posting: the LLM section itself is new information,
+/// so any interpretation counts. `false` when nothing was pending, the gate
+/// declined, or the endpoint failed.
+pub(crate) fn apply_pending_interpretation(
+    result: &mut ScanResult,
+    cfg: &crate::interpret::InterpretConfig,
+    model: &Model,
+) -> bool {
+    let Some(pending) = result.pending_llm.take() else {
+        return false;
+    };
+    let Some(interp) = crate::interpret::interpret(
+        cfg,
+        &pending.ctx,
+        result.classification,
+        result.probability,
+        crate::interpret::LevelContext {
+            fired: result.level,
+            active: model.active_level(),
+            grid_max: model.grid_max(),
+        },
+        pending.findings,
+    ) else {
+        return false;
+    };
+    if let Some(grade) = interp.grade {
+        tracing::info!(
+            file = %result.path,
+            sha256 = %result.sha256,
+            grade = grade.as_str(),
+            outcome = %interp.outcome,
+            conf = format!("{:.4}", interp.blended),
+            cached = interp.cached,
+            interpretation = %interp.interpretation,
+            "LLM interpretation",
+        );
+    }
+    blend_interpretation(
+        &result.path,
+        model,
+        &interp,
+        &mut result.classification,
+        &mut result.probability,
+        &mut result.level,
+    );
+    result.interpretation = Some(interp);
+    true
+}
+
 /// Run the full cleave-finalize + model inference pipeline on a report.
 /// This is the single authoritative inference path used by scan, ps, and the server.
 #[allow(clippy::needless_pass_by_value)] // Arc clones at call sites are negligible; ownership simplifies callers.
@@ -5327,6 +5509,7 @@ pub(crate) fn classify_report(
     // dependency fetch+analysis, the expensive half, was repeatedly
     // misattributed to featurization during triage.
     phase: Option<&cleave::PhaseTracker>,
+    cpu_lease: Option<CpuLease>,
 ) -> Result<ClassifiedReport> {
     // Read before the pipeline consumes `report`: whether cleave produced this
     // analysis or replayed it from its cache is the difference between a
@@ -5757,8 +5940,46 @@ pub(crate) fn classify_report(
             let _ = std::fs::write(dir.join(format!("{sha256}.render")), ctx);
         }
     }
+    // CPU work is done: featurized, scored, dependencies graded. What follows
+    // is a network wait (the LLM) and light rendering. Give the admission
+    // permit back now so the pool is not idle for the round trip.
+    // A caller that gave a lease owns the tail: it posts the ML verdict now
+    // and runs the LLM step from `pending_llm` afterwards.
+    let owner_runs_llm = cpu_lease.is_some();
+    if let Some(release) = cpu_lease {
+        release();
+    }
+    // Census label for the round trip. Without it the wait was reported as
+    // "features+model", which hid that the pool was idle for the network.
+    if let (Some(p), true) = (phase, interpret.is_some() && !owner_runs_llm) {
+        p.set("interpret");
+    }
     let interpret_start = Instant::now();
-    let interpretation = interpret.and_then(|cfg| {
+    let mut pending_llm: Option<PendingLlm> = None;
+    let interpretation = if owner_runs_llm
+        && let (Some(cfg), Some(ctx)) = (interpret, llm_ctx.as_deref())
+    {
+        let findings = crate::interpret::FindingSeverity::from_report(&report);
+        pending_llm = crate::interpret::admission(
+            cfg,
+            final_decision.class,
+            final_decision.probability,
+            crate::interpret::LevelContext {
+                fired: final_decision.level,
+                active: model.active_level(),
+                grid_max: model.grid_max(),
+            },
+            findings,
+            ctx,
+        )
+        .map(|admission| PendingLlm {
+            ctx: ctx.to_string(),
+            admission,
+            findings,
+        });
+        None
+    } else {
+        interpret.and_then(|cfg| {
         // The gate lives in `interpret::interpret`: it runs when ML fired at or
         // below the cutoff level OR cleave surfaced a suspicious/hostile finding ML
         // under-weighted (so an ML-blind packed binary still gets a second
@@ -5792,97 +6013,21 @@ pub(crate) fn classify_report(
             );
         }
         Some(interp)
-    });
+        })
+    };
     // Dominant suspect for a slow contended run: the LLM round-trip (queue wait +
     // generation) against a shared endpoint. Zero when `--interpret` is off or gated.
     let interpret_ms = crate::duration_ms(interpret_start.elapsed());
 
-    // Adopt the blended verdict as the effective one when the LLM out-read ML
-    // (escalating a missed threat, or clearing an ML false positive). The `ml`
-    // section reflects litmus's final answer; the LLM's raw grade + rationale
-    // stay in the `llm` section. The interpreted level is pinned to the target
-    // band's loosest rung (see `interpreted_level`): the active hostile level for
-    // an escalation, the suspicious ceiling for a hold/downgrade, L-1 for benign.
-    if let Some(interp) = &interpretation
-        && interp.grade.is_some()
-        && interp.outcome as u8 != final_decision.class as u8
-    {
-        // INFO, not WARN: an LLM override of the ML verdict is normal operation,
-        // not a fault. (It also kept surfacing as the last stderr line a caller
-        // grabbed when a slow run was externally killed, making a benign shift look
-        // like a crash cause.)
-        tracing::info!(
-            path = %label,
-            ml = ?final_decision.class,
-            outcome = ?interp.outcome,
-            grade = interp.grade.map_or("?", crate::interpret::LlmGrade::as_str),
-            conf = format!("{:.4}", interp.blended),
-            reason = %interp.interpretation,
-            "LLM interpretation shifted the verdict",
+    if let Some(interp) = &interpretation {
+        blend_interpretation(
+            label,
+            model,
+            interp,
+            &mut final_decision.class,
+            &mut final_decision.probability,
+            &mut final_decision.level,
         );
-        let ml_class = final_decision.class;
-        let ml_level = final_decision.level;
-        final_decision.class = interp.outcome;
-        final_decision.probability = interp.blended;
-        final_decision.level = if ml_class == Classification::Hostile
-            && interp.outcome == Classification::Suspicious
-        {
-            // A cleared hostile is placed by how deep ML fired, not pinned to the
-            // band's edge: the level ML reached is the budget for how far one
-            // contrary opinion may move it.
-            softened_level(ml_level, model.active_level(), model.grid_max())
-        } else {
-            interpreted_level(
-                model.active_level(),
-                model.grid_max(),
-                interp.outcome,
-                interp.corroborated,
-            )
-        };
-    } else if let Some(interp) = &interpretation
-        && interp.grade == Some(crate::interpret::LlmGrade::Benign)
-        && final_decision.class == Classification::Hostile
-        && final_decision.level == Some(0)
-    {
-        // `may_cross` refused to move a verdict off the grid's tightest budget on
-        // one contrary opinion, and that stands — but the disagreement is still
-        // evidence, so the verdict gives up the depth it cannot justify and sits
-        // on the weakest hostile rung instead. Still blocked, still reviewed.
-        let weakened = model.active_level().map(i32::from);
-        tracing::info!(
-            path = %label,
-            from = 0,
-            to = ?weakened,
-            reason = %interp.interpretation,
-            "LLM cleared an L0 hostile — held in band, moved to the weakest rung",
-        );
-        final_decision.level = weakened;
-    } else if let Some(interp) = &interpretation
-        && interp.grade == Some(crate::interpret::LlmGrade::Hostile)
-        && final_decision.class == Classification::Hostile
-        && let Some(level) = final_decision.level
-        && level > 0
-    {
-        // Both detectors independently said hostile, so the class does not move —
-        // but agreement is still evidence, and leaving the verdict on the rung ML
-        // happened to stop at understates it. Halve the level: deeper into the
-        // hostile band, bounded at 0, and never out of it.
-        //
-        // What it refines is usually already an assertion rather than a
-        // measurement: a floor-driven hostile is pinned to the *weakest* hostile
-        // rung by `interpreted_level`, which is why every L25 in the gauntlet
-        // missed pool carries a floor probability (0.98/0.99) rather than a model
-        // one. On a genuinely swept level it does overwrite measured data, and a
-        // stricter deploy than this one will read the halved value as hostile
-        // where the sweep alone would have said suspicious.
-        let strengthened = level / 2;
-        tracing::info!(
-            path = %label,
-            from = level,
-            to = strengthened,
-            "both detectors agree hostile — verdict moved deeper into the band",
-        );
-        final_decision.level = Some(strengthened);
     }
 
     // Render cleave's context view now, while the typed (finalized) report is in
@@ -5980,6 +6125,7 @@ pub(crate) fn classify_report(
             render_ms,
             total_ms: crate::duration_ms(classify_start.elapsed()),
         },
+        pending_llm,
         classification: final_decision.class,
         probability: final_decision.probability,
         threshold: final_decision.threshold,
@@ -8941,6 +9087,7 @@ pub(crate) fn process_report(
         root_fetch,
         bloom_mark,
         None,
+        None, // no admission gate on the CLI path
     )?;
 
     // Per-file phase timing (CLI path only — serve logs its own per-sample line).
@@ -8999,6 +9146,7 @@ pub(crate) fn process_report(
         embedded_files: cr.embedded_files,
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
+        pending_llm: cr.pending_llm,
         analysis_cached: cr.analysis_cached,
         dependency_results: cr.dependency_results,
         bloom_mark,

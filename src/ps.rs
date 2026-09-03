@@ -426,6 +426,7 @@ fn build_result(
         None, // process images have no package acquisition fetch record
         bloom_mark,
         None,
+        None, // no admission gate
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
@@ -456,6 +457,7 @@ fn build_result(
         embedded_files: cr.embedded_files,
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
+        pending_llm: cr.pending_llm,
         dependency_results: cr.dependency_results,
         bloom_mark,
         hopper_route: crate::engine::HopperRoute::Normal,

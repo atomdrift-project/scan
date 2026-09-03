@@ -1788,6 +1788,7 @@ async fn run_file_analysis(
             // /analyze returns the envelope and discards the result — only
             // /analyze-path renews results (and their dependencies) on hopper.
             false,
+            None,
         );
         // Offer the artifact — bytes only, no registry provenance — right
         // alongside its verdict, same as every other route's bundle: after
@@ -2257,6 +2258,7 @@ fn classify_purl(
             registry_provenance.as_ref(),
             follow,
             deps_for_upload,
+            None,
         )?;
         result.hopper_route = hopper_route;
         return Ok(result);
@@ -2289,6 +2291,7 @@ fn classify_purl(
                     registry_provenance.as_ref(),
                     follow,
                     deps_for_upload,
+                    None,
                 )?;
                 result.hopper_route = hopper_route;
                 return Ok(result);
@@ -2307,6 +2310,7 @@ fn classify_purl(
         registry_provenance.as_ref(),
         follow,
         deps_for_upload,
+        None,
     )?;
 
     // Offer the artifact — bytes, registry record, and fetch provenance —
@@ -2360,6 +2364,7 @@ fn classify_url(
         None,
         follow,
         deps_for_upload,
+        None,
     )?;
     // See the matching comment in `classify_purl` on why this waits for the
     // verdict rather than firing on fetch.
@@ -2399,6 +2404,7 @@ pub(crate) fn classify_file(
     phase: Option<&cleave::PhaseTracker>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     deps_for_upload: bool,
+    cpu_lease: Option<crate::engine::CpuLease>,
 ) -> anyhow::Result<ScanResult> {
     classify_file_with_follow(
         path,
@@ -2411,6 +2417,7 @@ pub(crate) fn classify_file(
         root_registry,
         resources.fetch,
         deps_for_upload,
+        cpu_lease,
     )
 }
 
@@ -2426,6 +2433,7 @@ fn classify_file_with_follow(
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     follow: crate::fetch::FetchPolicy,
     deps_for_upload: bool,
+    cpu_lease: Option<crate::engine::CpuLease>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
@@ -2461,6 +2469,7 @@ fn classify_file_with_follow(
         root_registry,
         follow,
         deps_for_upload,
+        cpu_lease,
     )
 }
 
@@ -2479,6 +2488,7 @@ pub(crate) fn classify_bytes(
     phase: Option<&cleave::PhaseTracker>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     deps_for_upload: bool,
+    cpu_lease: Option<crate::engine::CpuLease>,
 ) -> anyhow::Result<ScanResult> {
     classify_bytes_with_follow(
         data,
@@ -2490,6 +2500,7 @@ pub(crate) fn classify_bytes(
         root_registry,
         resources.fetch,
         deps_for_upload,
+        cpu_lease,
     )
 }
 
@@ -2504,6 +2515,7 @@ fn classify_bytes_with_follow(
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     follow: crate::fetch::FetchPolicy,
     deps_for_upload: bool,
+    cpu_lease: Option<crate::engine::CpuLease>,
 ) -> anyhow::Result<ScanResult> {
     use anyhow::Context as _;
 
@@ -2531,6 +2543,7 @@ fn classify_bytes_with_follow(
         root_registry,
         follow,
         deps_for_upload,
+        cpu_lease,
     )
 }
 
@@ -2548,6 +2561,7 @@ fn finish_classify(
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     follow: crate::fetch::FetchPolicy,
     deps_for_upload: bool,
+    cpu_lease: Option<crate::engine::CpuLease>,
 ) -> anyhow::Result<ScanResult> {
     // If the timeout fired while cleave was running, bail now rather than
     // burning CPU on feature extraction and model inference for a result
@@ -2588,6 +2602,7 @@ fn finish_classify(
         None, // uploaded bytes have no scan-side acquisition fetch record
         None, // server returns JSON; the inline terminal bloom flag doesn't apply
         phase,
+        cpu_lease,
     )?;
 
     Ok(scan_result_from(label, cr, resources))
@@ -2624,6 +2639,7 @@ fn scan_result_from(
         embedded_files: cr.embedded_files,
         rendered_context: cr.rendered_context,
         interpretation: cr.interpretation,
+        pending_llm: cr.pending_llm,
         dependency_results: cr.dependency_results,
         bloom_mark: None,
         hopper_route: crate::engine::HopperRoute::Normal,
@@ -2823,6 +2839,7 @@ async fn analyze_path_inner(
             phase_tracker.as_ref(),
             root_registry.as_ref(), // caller-supplied, the server-side `--registry-map` equivalent
             deps_for_upload,        // dependencies ride the hopper renewal below
+            None,
         );
         if should_clear_caches {
             cleave::clear_all_thread_caches();
