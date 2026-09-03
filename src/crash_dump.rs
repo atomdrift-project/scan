@@ -255,8 +255,12 @@ mod imp {
     /// No-op guard on non-unix targets; the registry and handler are unix-only.
     #[derive(Debug)]
     pub struct Guard;
+    /// Record an analysis as in flight. No-op here: there is no crash-dump
+    /// registry or signal handler to feed on non-unix targets.
     pub fn register(_id: u64, _thread_id: u64, _sha: &str, _file: &str) -> Guard {
         Guard
     }
+    /// Install the crash-dump handler. No-op here: non-unix targets have
+    /// no `SIGABRT` to hook.
     pub fn install() {}
 }
