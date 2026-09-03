@@ -37,6 +37,10 @@ use crate::model::Classification;
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
 /// Named `--llm openrouter` / `SCAN_LLM=openrouter` target.
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+/// Model OpenRouter resolves to when `--llm-model` names none: its own
+/// auto-router, which picks a suitable model per request rather than a fixed
+/// one we would otherwise have to hardcode from its large, billed catalog.
+pub const OPENROUTER_DEFAULT_MODEL: &str = "openrouter/auto";
 /// Documented `--llm-min-level` default: the model's own grid ceiling, so the
 /// literal here is only what the `--help` text prints. The gate resolves the
 /// real value from [`LevelContext::grid_max`] at call time — see
@@ -1297,14 +1301,22 @@ struct ChatRequest<'a> {
     reasoning: Option<ReasoningParam>,
 }
 
+/// Either disables reasoning outright (for a pinned model we know accepts
+/// that) or, when the underlying model isn't known in advance, caps it to
+/// `low` effort instead: some providers reject `enabled: false` ("reasoning
+/// is mandatory for this endpoint"), but all observed ones accept `effort`
+/// and it still leaves the completion's token budget mostly for the answer.
 #[derive(Serialize)]
-struct ChatTemplateKwargs {
-    enable_thinking: bool,
+struct ReasoningParam {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]
-struct ReasoningParam {
-    enabled: bool,
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]
@@ -1482,6 +1494,26 @@ fn chat_once(
     max_tokens: u32,
 ) -> std::result::Result<String, CallError> {
     let openrouter = is_openrouter_endpoint(cfg.base_url);
+    // A pinned model is one we know accepts disabling reasoning outright, so
+    // it gets `enabled: false` as before. `openrouter/auto` (the default when
+    // none is pinned) routes each request to a model we can't predict, and
+    // some providers reject `enabled: false` outright ("Reasoning is
+    // mandatory for this endpoint and cannot be disabled") rather than
+    // ignoring it — but capping it to `effort: "low"` instead is accepted
+    // everywhere observed, and (unlike sending no `reasoning` field at all)
+    // keeps the model from spending the whole completion budget thinking and
+    // returning truncated or empty `content`.
+    let reasoning = openrouter.then_some(if cfg.model == OPENROUTER_DEFAULT_MODEL {
+        ReasoningParam {
+            enabled: None,
+            effort: Some("low"),
+        }
+    } else {
+        ReasoningParam {
+            enabled: Some(false),
+            effort: None,
+        }
+    });
     let body = ChatRequest {
         model: cfg.model,
         messages: [
@@ -1500,7 +1532,7 @@ fn chat_once(
         chat_template_kwargs: (!openrouter).then_some(ChatTemplateKwargs {
             enable_thinking: false,
         }),
-        reasoning: openrouter.then_some(ReasoningParam { enabled: false }),
+        reasoning,
     };
 
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
