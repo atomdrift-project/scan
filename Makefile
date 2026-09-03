@@ -1,4 +1,41 @@
 SHELL := /bin/sh
+
+# --- Windows bootstrap ------------------------------------------------------
+# GNU Make for Windows resolves `/bin/sh` (and every bare command a recipe or
+# a `$(shell ...)` call runs, e.g. the `awk` two lines down) by searching PATH
+# for the .exe; a fresh shell has no reason to have Git's `usr/bin` (sh, awk,
+# grep, ...) on PATH, so that search fails and make silently falls back to
+# cmd.exe for recipes -- every POSIX line in this file then breaks, with
+# "CreateProcess ... failed" or a cmd syntax error as the only clue. Rather
+# than requiring a PATH/HOME already set up by hand (a PowerShell-profile
+# edit, easy to forget or to make in the wrong profile -- Windows PowerShell
+# 5.1 and PowerShell 7 do not share one), find Git for Windows here and
+# export what recipes need, so `make` just works from a stock shell.
+ifeq ($(OS),Windows_NT)
+  nullstring :=
+  space := $(nullstring) $(nullstring)
+  # The two real-world install roots: the admin-installed default, and the
+  # per-user one the installer uses without admin rights. `$(wildcard)`
+  # splits its argument on whitespace, so the embedded space in "Program
+  # Files" must be backslash-escaped for the existence check; the value kept
+  # in WIN_GIT_ROOT has the real space back, since SHELL/PATH are plain
+  # strings and are never re-split by make.
+  WIN_GIT_CAND1_RAW := C:/Program Files/Git
+  WIN_GIT_CAND1_ESC := $(subst $(space),\$(space),$(WIN_GIT_CAND1_RAW))
+  WIN_GIT_CAND2_RAW := $(subst \,/,$(LOCALAPPDATA))/Programs/Git
+  WIN_GIT_CAND2_ESC := $(subst $(space),\$(space),$(WIN_GIT_CAND2_RAW))
+  WIN_GIT_ROOT_2 := $(if $(wildcard $(WIN_GIT_CAND2_ESC)/usr/bin/sh.exe),$(WIN_GIT_CAND2_RAW),)
+  WIN_GIT_ROOT := $(if $(wildcard $(WIN_GIT_CAND1_ESC)/usr/bin/sh.exe),$(WIN_GIT_CAND1_RAW),$(WIN_GIT_ROOT_2))
+  ifeq ($(WIN_GIT_ROOT),)
+    $(error Git for Windows not found at "$(WIN_GIT_CAND1_RAW)" or "$(WIN_GIT_CAND2_RAW)" -- install it (https://git-scm.com/download/win), or if it lives elsewhere, add its usr/bin to PATH yourself)
+  endif
+  SHELL := $(WIN_GIT_ROOT)/usr/bin/sh.exe
+  export PATH := $(WIN_GIT_ROOT)/usr/bin;$(PATH)
+  # `?=` only: an already-set HOME (Git Bash sets its own) is never overridden.
+  HOME ?= $(USERPROFILE)
+  export HOME
+endif
+
 # The CLI command is `atomscan` — the cargo bin, the build artifact, and the
 # installed binary all share this name. `scan` is not a safe global command name
 # (avast ships its own /usr/bin/scan), so we no longer install one. The product
