@@ -312,8 +312,9 @@ struct Cli {
     /// section and shown inline). Given with no value, uses a local model (an
     /// OpenAI-compatible endpoint at http://localhost:8000/v1). TARGET may be
     /// `local`, `openrouter` (https://openrouter.ai/api/v1; key from `--llm-key`,
-    /// `SCAN_LLM_KEY`, or `~/.tok/openrouter`; `--llm-model` is required), or an
-    /// explicit OpenAI-compatible base URL. Endpoints that require a bearer
+    /// `SCAN_LLM_KEY`, or `~/.tok/openrouter`; defaults to `openrouter/auto`
+    /// unless `--llm-model` names one), or an explicit OpenAI-compatible base
+    /// URL. Endpoints that require a bearer
     /// token take it from `~/.tok/llm` when that file exists. Comma-separate
     /// several to fail over in order, e.g.
     /// `https://llm.isotope13.ai/v1,openrouter`. (env: SCAN_LLM)
@@ -327,9 +328,10 @@ struct Cli {
     llm: Option<String>,
 
     /// LLM model name, e.g. Qwen/Qwen3.8-27B. Defaults to the largest model the
-    /// endpoint itself reports serving; nothing is hardcoded. With a
-    /// comma-separated `--llm` chain, comma-separate one name per endpoint in
-    /// the same order (a blank slot discovers, a single name applies to all)
+    /// endpoint itself reports serving, or `openrouter/auto` for an OpenRouter
+    /// endpoint; nothing else is hardcoded. With a comma-separated `--llm`
+    /// chain, comma-separate one name per endpoint in the same order (a blank
+    /// slot discovers/defaults, a single name applies to all)
     /// (env: SCAN_LLM_MODEL)
     #[arg(long, global = true, value_name = "NAME")]
     llm_model: Option<String>,
@@ -672,22 +674,16 @@ impl Cli {
                 continue;
             }
             // A pinned model wins; otherwise take what the endpoint says it
-            // serves. OpenRouter's catalog is large and billed — never
-            // auto-pick. Nothing else is hardcoded: if an endpoint lists no
+            // serves. OpenRouter's catalog is large and billed, so nothing
+            // from it is guessed — but OpenRouter itself ships a stable
+            // `openrouter/auto` alias that picks a suitable model per
+            // request, so that's the default rather than a hard error.
+            // Nothing else is hardcoded: if a non-OpenRouter endpoint lists no
             // model there is nothing sensible to send, and a guessed name
             // would surface as an opaque server-side error mid-scan instead of
             // here.
             let model = if openrouter {
-                let why = "OpenRouter requires --llm-model (env: SCAN_LLM_MODEL); \
-                           the catalog is not auto-selected";
-                match pinned {
-                    Some(m) => m,
-                    None if single => anyhow::bail!("{why}"),
-                    None => {
-                        skipped.push(format!("{base_url}: {why}"));
-                        continue;
-                    }
-                }
+                pinned.unwrap_or_else(|| scan::interpret::OPENROUTER_DEFAULT_MODEL.to_string())
             } else {
                 match pinned {
                     Some(m) => m,
@@ -3223,7 +3219,7 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_alias_requires_model_and_key() -> Result<()> {
+    fn openrouter_alias_requires_key_and_defaults_model() -> Result<()> {
         let empty_home = tempfile::tempdir()?;
         with_isolated_llm_env(Some(empty_home.path()), || {
             let missing_key = Cli::try_parse_from([
@@ -3250,13 +3246,10 @@ mod tests {
                 "sk-test",
                 "/tmp/a",
             ])?;
-            let err = missing_model
-                .interpret_config()
-                .expect_err("openrouter without a model must fail");
-            assert!(
-                err.to_string().contains("--llm-model"),
-                "unexpected error: {err}"
-            );
+            let cfg = missing_model
+                .interpret_config()?
+                .context("openrouter without a pinned model should default to auto")?;
+            assert_eq!(cfg.model, scan::interpret::OPENROUTER_DEFAULT_MODEL);
 
             let cli = Cli::try_parse_from([
                 "atomscan",
@@ -3384,9 +3377,10 @@ mod tests {
         std::fs::create_dir(&tok)?;
         std::fs::write(tok.join("llm"), "sk-vllm\n")?;
         with_isolated_llm_env(Some(dir.path()), || {
-            // No ~/.tok/openrouter and no model for the OpenRouter slot, so it
-            // cannot be called; the same config with OpenRouter *alone* is a
-            // hard error (see openrouter_alias_requires_model_and_key).
+            // No ~/.tok/openrouter, so the OpenRouter slot cannot be called
+            // (its model would default to `openrouter/auto`, but the missing
+            // key still drops it); the same config with OpenRouter *alone* is
+            // a hard error (see openrouter_alias_requires_key_and_defaults_model).
             let cli = Cli::try_parse_from([
                 "atomscan",
                 "--llm",
