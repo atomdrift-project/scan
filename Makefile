@@ -1,16 +1,19 @@
 SHELL := /bin/sh
 
 # --- Windows bootstrap ------------------------------------------------------
-# GNU Make for Windows resolves `/bin/sh` (and every bare command a recipe or
-# a `$(shell ...)` call runs, e.g. the `awk` two lines down) by searching PATH
-# for the .exe; a fresh shell has no reason to have Git's `usr/bin` (sh, awk,
-# grep, ...) on PATH, so that search fails and make silently falls back to
-# cmd.exe for recipes -- every POSIX line in this file then breaks, with
+# GNU Make for Windows resolves `/bin/sh` (used for every recipe below, e.g.
+# `check-hopper-token`'s POSIX `if`/`then`) by searching PATH for `sh.exe`; a
+# fresh shell has no reason to have Git's `usr/bin` (sh, awk, grep, ...) on
+# PATH, so that search fails and make silently falls back to cmd.exe, which
+# cannot parse this file's recipes -- every one then breaks, with
 # "CreateProcess ... failed" or a cmd syntax error as the only clue. Rather
 # than requiring a PATH/HOME already set up by hand (a PowerShell-profile
 # edit, easy to forget or to make in the wrong profile -- Windows PowerShell
-# 5.1 and PowerShell 7 do not share one), find Git for Windows here and
-# export what recipes need, so `make` just works from a stock shell.
+# 5.1 and PowerShell 7 do not share one), find Git for Windows here and put
+# its `usr/bin` on PATH ourselves, so `/bin/sh`'s own PATH search succeeds
+# and `make` just works from a stock shell. (Leave SHELL itself alone: an
+# absolute override here once made a `$(shell ...)` call's own argument
+# splitting misbehave -- see the PACKAGE comment below.)
 ifeq ($(OS),Windows_NT)
   nullstring :=
   space := $(nullstring) $(nullstring)
@@ -29,7 +32,6 @@ ifeq ($(OS),Windows_NT)
   ifeq ($(WIN_GIT_ROOT),)
     $(error Git for Windows not found at "$(WIN_GIT_CAND1_RAW)" or "$(WIN_GIT_CAND2_RAW)" -- install it (https://git-scm.com/download/win), or if it lives elsewhere, add its usr/bin to PATH yourself)
   endif
-  SHELL := $(WIN_GIT_ROOT)/usr/bin/sh.exe
   export PATH := $(WIN_GIT_ROOT)/usr/bin;$(PATH)
   # `?=` only: an already-set HOME (Git Bash sets its own) is never overridden.
   HOME ?= $(USERPROFILE)
@@ -44,7 +46,29 @@ BINARY = atomscan
 # Cargo package name, which is not always the binary name (scan's package is
 # `atomdrift-scan` but ships `atomscan`). Read from Cargo.toml so `cut-release`
 # passes the right `-p` without a second place to keep in sync.
-PACKAGE := $(shell awk -F'"' '/^name = /{print $$2; exit}' Cargo.toml)
+#
+# Windows needs a different invocation: GNU Make's Windows port runs a
+# "simple" `$(shell ...)` command through its own naive, double-quote-only
+# command-line splitter instead of a real shell, so the single quotes below
+# (needed for awk's `-F'"'` and the `{print $2; exit}` script) get shredded
+# into separate, garbled arguments -- a harmless but alarming
+# "awk: cmd. line:1: = / ^ syntax error" on every invocation. Wrapping the
+# whole thing as one double-quoted argument to `sh -c "..."` makes that
+# splitter treat it as a single opaque string (it doesn't do variable
+# expansion, just quote-grouping), so real Git-Bash `sh` receives the
+# original, unmangled script and parses it correctly.
+#
+# This exact wrapper must stay Windows-only: routed through a *real* shell
+# (any actual POSIX system, or `$(shell)` on a non-Windows make) it is wrong
+# -- a real shell expands `$2` inside the outer double quotes before the
+# inner `sh -c` ever sees it, printing the whole matched line instead of the
+# second field.
+ifeq ($(OS),Windows_NT)
+  PACKAGE := $(shell sh -c "awk -F'\"' '/^name = /{print $$2; exit}' Cargo.toml")
+else
+  PACKAGE := $(shell awk -F'"' '/^name = /{print $$2; exit}' Cargo.toml)
+endif
+
 OUT_DIR = out
 BUILD ?= build
 SERVER_RUN ?= scan
