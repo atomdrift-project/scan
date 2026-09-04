@@ -161,7 +161,20 @@ tracing = "0.1"
 # pathological inputs that turns into a CPU livelock spending 100% in
 # tracing's directive memcmp/TLS lookups. Without the bridge, those calls
 # are no-ops at the `log!` macro site.
+#
+# `default-features = false` here is NOT sufficient on its own: cleave and stng
+# both depend on `tracing-subscriber` with default features, and Cargo unifies
+# features across the graph, so `tracing-log/log-tracer` comes back and
+# `SubscriberInitExt::init()` installs the bridge anyway. Measured 2026-09-04 on
+# a wedged worker: 819 of 2030 samples on the one running Rayon thread were in
+# `LogTracer::log` -> `dispatcher::get_default` -> `EnvFilter::enabled`, driven
+# by goblin's per-entry `warn!` in the permissive PE import walker. `main` closes
+# that hole at runtime with `log::set_max_level(Off)`; see `init_tracing`.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi", "smallvec", "std"] }
+# Direct handle on the `log` facade (already in the graph via reqwest and
+# goblin) purely so `main` can silence the `log` -> `tracing` bridge that
+# feature unification re-arms. Never used to emit.
+log = "0.4"
 tar = "0.4.46"
 
 # Transitive-only pin, not a dep we use. tinyvec 1.13.0 (published 2026-09-03)
