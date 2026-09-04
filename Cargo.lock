@@ -316,6 +316,7 @@ dependencies = [
  "terminal-colorsaurus",
  "tikv-jemalloc-sys",
  "tikv-jemallocator",
+ "tinyvec",
  "tokio",
  "toml 0.8.23",
  "tower",
