@@ -66,7 +66,11 @@ pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 #[must_use]
 pub fn default_max_concurrency() -> NonZeroUsize {
     let cores = cleave::memory_tracker::physical_cpu_count()
-        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get() / 2))
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .map(|n| n.get() / 2)
+        })
         .unwrap_or(DEFAULT_MAX_CONCURRENCY);
     NonZeroUsize::new(cores.clamp(DEFAULT_MAX_CONCURRENCY, 16)).unwrap_or(NonZeroUsize::MIN)
 }

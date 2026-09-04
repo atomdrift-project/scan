@@ -5316,9 +5316,7 @@ fn blend_interpretation(
     // stay in the `llm` section. The interpreted level is pinned to the target
     // band's loosest rung (see `interpreted_level`): the active hostile level for
     // an escalation, the suspicious ceiling for a hold/downgrade, L-1 for benign.
-    if interp.grade.is_some()
-        && interp.outcome as u8 != *class as u8
-    {
+    if interp.grade.is_some() && interp.outcome as u8 != *class as u8 {
         // INFO, not WARN: an LLM override of the ML verdict is normal operation,
         // not a fault. (It also kept surfacing as the last stderr line a caller
         // grabbed when a slow run was externally killed, making a benign shift look
@@ -5956,65 +5954,64 @@ pub(crate) fn classify_report(
     }
     let interpret_start = Instant::now();
     let mut pending_llm: Option<PendingLlm> = None;
-    let interpretation = if owner_runs_llm
-        && let (Some(cfg), Some(ctx)) = (interpret, llm_ctx.as_deref())
-    {
-        let findings = crate::interpret::FindingSeverity::from_report(&report);
-        pending_llm = crate::interpret::admission(
-            cfg,
-            final_decision.class,
-            final_decision.probability,
-            crate::interpret::LevelContext {
-                fired: final_decision.level,
-                active: model.active_level(),
-                grid_max: model.grid_max(),
-            },
-            findings,
-            ctx,
-        )
-        .map(|admission| PendingLlm {
-            ctx: ctx.to_string(),
-            admission,
-            findings,
-        });
-        None
-    } else {
-        interpret.and_then(|cfg| {
-        // The gate lives in `interpret::interpret`: it runs when ML fired at or
-        // below the cutoff level OR cleave surfaced a suspicious/hostile finding ML
-        // under-weighted (so an ML-blind packed binary still gets a second
-        // opinion); it returns `None` when gated out or on any failure.
-        let interp = crate::interpret::interpret(
-            cfg,
-            llm_ctx.as_deref()?,
-            final_decision.class,
-            final_decision.probability,
-            // Where ML placed this file on the calibrated FP axis, which is what
-            // bounds how far the LLM may move the band (see `interpret::blend`).
-            crate::interpret::LevelContext {
-                fired: final_decision.level,
-                active: model.active_level(),
-                grid_max: model.grid_max(),
-            },
-            // cleave's own verdict, read from the structured report rather than
-            // re-parsed out of the render it produced. See `FindingSeverity`.
-            crate::interpret::FindingSeverity::from_report(&report),
-        )?;
-        if let Some(grade) = interp.grade {
-            tracing::info!(
-                file = %label,
-                sha256 = %sha256,
-                grade = grade.as_str(),
-                outcome = %interp.outcome,
-                conf = format!("{:.4}", interp.blended),
-                cached = interp.cached,
-                interpretation = %interp.interpretation,
-                "LLM interpretation",
-            );
-        }
-        Some(interp)
-        })
-    };
+    let interpretation =
+        if owner_runs_llm && let (Some(cfg), Some(ctx)) = (interpret, llm_ctx.as_deref()) {
+            let findings = crate::interpret::FindingSeverity::from_report(&report);
+            pending_llm = crate::interpret::admission(
+                cfg,
+                final_decision.class,
+                final_decision.probability,
+                crate::interpret::LevelContext {
+                    fired: final_decision.level,
+                    active: model.active_level(),
+                    grid_max: model.grid_max(),
+                },
+                findings,
+                ctx,
+            )
+            .map(|admission| PendingLlm {
+                ctx: ctx.to_string(),
+                admission,
+                findings,
+            });
+            None
+        } else {
+            interpret.and_then(|cfg| {
+                // The gate lives in `interpret::interpret`: it runs when ML fired at or
+                // below the cutoff level OR cleave surfaced a suspicious/hostile finding ML
+                // under-weighted (so an ML-blind packed binary still gets a second
+                // opinion); it returns `None` when gated out or on any failure.
+                let interp = crate::interpret::interpret(
+                    cfg,
+                    llm_ctx.as_deref()?,
+                    final_decision.class,
+                    final_decision.probability,
+                    // Where ML placed this file on the calibrated FP axis, which is what
+                    // bounds how far the LLM may move the band (see `interpret::blend`).
+                    crate::interpret::LevelContext {
+                        fired: final_decision.level,
+                        active: model.active_level(),
+                        grid_max: model.grid_max(),
+                    },
+                    // cleave's own verdict, read from the structured report rather than
+                    // re-parsed out of the render it produced. See `FindingSeverity`.
+                    crate::interpret::FindingSeverity::from_report(&report),
+                )?;
+                if let Some(grade) = interp.grade {
+                    tracing::info!(
+                        file = %label,
+                        sha256 = %sha256,
+                        grade = grade.as_str(),
+                        outcome = %interp.outcome,
+                        conf = format!("{:.4}", interp.blended),
+                        cached = interp.cached,
+                        interpretation = %interp.interpretation,
+                        "LLM interpretation",
+                    );
+                }
+                Some(interp)
+            })
+        };
     // Dominant suspect for a slow contended run: the LLM round-trip (queue wait +
     // generation) against a shared endpoint. Zero when `--interpret` is off or gated.
     let interpret_ms = crate::duration_ms(interpret_start.elapsed());

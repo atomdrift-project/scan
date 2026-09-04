@@ -605,8 +605,8 @@ impl Cli {
     /// when interpretation is not requested.
     fn interpret_config(&self) -> Result<Option<scan::interpret::InterpretConfig>> {
         use scan::interpret::{
-            DEFAULT_BASE_URL, LlmEndpoint, is_openrouter_endpoint,
-            llm_key_from_home, llm_models, llm_targets, openrouter_key_from_home,
+            DEFAULT_BASE_URL, LlmEndpoint, is_openrouter_endpoint, llm_key_from_home, llm_models,
+            llm_targets, openrouter_key_from_home,
         };
         let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
             flag.clone()
@@ -1457,6 +1457,28 @@ fn main() -> Result<()> {
                     .with_filter(quiet_expected_yara_cache),
             )
             .init();
+    }
+
+    // Silence the `log` -> `tracing` bridge that `init()` just installed.
+    //
+    // Cargo.toml asks for `tracing-subscriber` without default features exactly
+    // so this bridge is never built, but cleave and stng both take it *with*
+    // defaults and feature unification wins, so `SubscriberInitExt::init()`
+    // installs a `LogTracer` regardless. Every `log!()` in every dependency then
+    // pays a tracing dispatcher lookup plus an `EnvFilter` directive walk.
+    //
+    // That is not a rounding error on hostile input. goblin's permissive PE
+    // import walker emits one `warn!` per bad-RVA lookup-table entry, and a
+    // forged import directory drives that loop into the millions: on the worker
+    // wedged 2026-09-04, 40% of the only running Rayon thread's samples were in
+    // the bridge rather than in the parse. `set_max_level(Off)` makes those call
+    // sites no-ops at the macro, which is what the dependency comment intends.
+    //
+    // An operator who asked for logs still gets them: `--verbose` or an explicit
+    // `RUST_LOG` leaves the bridge at its default level, so a dependency's `log`
+    // output remains reachable when it is actually wanted.
+    if !cli.verbose && std::env::var_os("RUST_LOG").is_none() {
+        log::set_max_level(log::LevelFilter::Off);
     }
 
     // Resolved after logging is up: with no hardcoded default, the model comes

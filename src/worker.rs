@@ -1698,7 +1698,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // past its CPU work holds only its report, so twice the slots is cheap,
     // and without a bound a saturated LLM endpoint would grow the backlog
     // without limit. `SCAN_TAILS` overrides.
-    let tail_cap = tail_cap_from(slots, std::env::var("SCAN_TAILS").ok().and_then(|v| v.parse().ok()));
+    let tail_cap = tail_cap_from(
+        slots,
+        std::env::var("SCAN_TAILS")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+    );
     let tails = Arc::new(Semaphore::new(tail_cap));
     // Two-phase post: a tail posts its ML verdict as soon as the analysis is
     // done, then runs the LLM second opinion and re-posts only if that changes
@@ -1722,7 +1727,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 .saturating_mul(4)
         });
     let llm_queue = Arc::new(Semaphore::new(llm_backlog));
-    tracing::info!(llm_backlog, "two-phase post: LLM second opinions run after the ML verdict is posted (SCAN_LLM_BACKLOG)");
+    tracing::info!(
+        llm_backlog,
+        "two-phase post: LLM second opinions run after the ML verdict is posted (SCAN_LLM_BACKLOG)"
+    );
     tracing::info!(
         tail_cap,
         "detached tails: analyses past memory admission run off their slot (SCAN_TAILS)",
@@ -2109,6 +2117,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             let tick_interval =
                 breadcrumb_interval.map_or(wedge_check, |interval| wedge_check.min(interval));
             let mut last_summary = Instant::now();
+            // Stall detection state: the completion counter as of the previous
+            // summary, and when it last moved. See the POOL STALLED block.
+            let mut last_finished_seen = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
+            let mut progress_since = Instant::now();
             #[cfg(feature = "cleave-breadcrumbs")]
             let mut last_breadcrumb = Instant::now();
             while !shutdown.load(Ordering::Relaxed) {
@@ -2331,6 +2343,64 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         "worker summary",
                     );
 
+                    // Derived stall verdict.
+                    //
+                    // Every input is already on the summary line above, but the
+                    // conclusion is what an operator actually needs: slots full and
+                    // `blocking_finished_total` not moving means nothing is
+                    // completing at all. The per-slot census cannot say that — it
+                    // names the *coordinator* thread of each analysis and the stage
+                    // it entered, and the coordinators are precisely where the work
+                    // is not. They are parked on a Rayon latch; the work is on the
+                    // Rayon pool, which the census never names.
+                    //
+                    // So a stall is also the one moment worth spending a breadcrumb
+                    // snapshot on: each line names the analyzer and member a Rayon
+                    // worker is actually inside, which is the only view that points
+                    // at a runaway leaf. Wedged 2026-09-04, that would have read
+                    // `analyzer=pe` and named the member, instead of the census's
+                    // `stage="fetch+graft"` — true of the coordinator, and useless.
+                    //
+                    // Gated on `stuck_warn_secs` (the census's own threshold) rather
+                    // than a single summary, so one slow whale with the slots full
+                    // is not reported as a stall.
+                    if finished != last_finished_seen || active_slots == 0 {
+                        progress_since = now;
+                    }
+                    last_finished_seen = finished;
+                    let no_progress = now.duration_since(progress_since);
+                    if active_slots > 0 && no_progress.as_secs() >= stuck_warn_secs {
+                        tracing::warn!(
+                            no_progress_ms = crate::duration_ms(no_progress),
+                            completed_total = finished,
+                            active_slots,
+                            inflight_blocking = started.saturating_sub(finished),
+                            // Near zero with the slots full is the tell: the pool is
+                            // parked on latches, not grinding. Near one means a
+                            // single runaway leaf is holding it.
+                            cpu_cores_busy = format!("{cpu_cores_busy:.1}"),
+                            rayon_threads = global_rayon_threads,
+                            "POOL STALLED: no analysis has completed for the stuck \
+                             threshold; the Rayon pool is not making progress. Any \
+                             breadcrumbs below name the analyzer and member each \
+                             Rayon worker is inside — a runaway leaf is among them",
+                        );
+                        #[cfg(feature = "cleave-breadcrumbs")]
+                        for crumb in cleave::breadcrumb::snapshot()
+                            .into_iter()
+                            .take(CENSUS_MAX_LINES)
+                        {
+                            tracing::warn!(
+                                rayon_index = ?crumb.rayon_index,
+                                thread_id = crumb.thread_id,
+                                analyzer = crumb.analyzer,
+                                target = %crumb.target,
+                                age_ms = crate::duration_ms(crumb.age),
+                                "POOL STALLED breadcrumb",
+                            );
+                        }
+                    }
+
                     // Idle with memory still held: hand the allocator's retained
                     // pages back to the OS. This matters because the admission
                     // gate rations intake on *live process memory*, so pages the
@@ -2545,7 +2615,15 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     Ok(snapshot) => snapshot,
                     Err(failure) => {
                         metrics.record_error(&failure);
-                        post_result(&client, &base_url, &name, &pj.job.sha256, Err(failure), false).await;
+                        post_result(
+                            &client,
+                            &base_url,
+                            &name,
+                            &pj.job.sha256,
+                            Err(failure),
+                            false,
+                        )
+                        .await;
                         metrics.complete(pj.queue_id);
                         completed.fetch_add(1, Ordering::Release);
                         continue;
@@ -2648,7 +2726,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     }
                     // Phase 2: the second opinion, off the completion path.
                     if let Some((sr, ms)) = later {
-                        second_opinion(sr, ms, &llm_queue, &snapshot, &client, &base_url, &name, &pj.job.sha256).await;
+                        second_opinion(
+                            sr,
+                            ms,
+                            &llm_queue,
+                            &snapshot,
+                            &client,
+                            &base_url,
+                            &name,
+                            &pj.job.sha256,
+                        )
+                        .await;
                     }
                 });
             }
@@ -2695,7 +2783,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         // deadline abandons them, exactly as it abandoned in-flight slots).
         let drain = async {
             while workers.join_next().await.is_some() {}
-            let _all = tails.acquire_many(u32::try_from(tail_cap).unwrap_or(u32::MAX)).await;
+            let _all = tails
+                .acquire_many(u32::try_from(tail_cap).unwrap_or(u32::MAX))
+                .await;
         };
         match tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_SECS), drain).await {
             Ok(()) => tracing::info!("all in-flight jobs finished, exiting"),
@@ -3623,8 +3713,8 @@ async fn second_opinion(
     sha256: &str,
 ) {
     // Phase 2: the second opinion, off the completion path.
-        let admission = sr.pending_llm.as_ref().map(|p| p.admission);
-        let permit = match admission {
+    let admission = sr.pending_llm.as_ref().map(|p| p.admission);
+    let permit = match admission {
         Some(crate::interpret::LlmAdmission::Required) => {
             Arc::clone(llm_queue).acquire_owned().await.ok()
         }
@@ -3651,7 +3741,15 @@ async fn second_opinion(
     .await;
     if let Ok(Some(sr)) = amended {
         LLM_REPOSTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        post_result(client, base_url, worker, sha256, Ok((sr.into_envelope(), Vec::new(), ms)), true).await;
+        post_result(
+            client,
+            base_url,
+            worker,
+            sha256,
+            Ok((sr.into_envelope(), Vec::new(), ms)),
+            true,
+        )
+        .await;
     }
 }
 
