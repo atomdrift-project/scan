@@ -92,12 +92,12 @@ pub struct ServerConfig {
     idle_worker_slots: usize,
 }
 
-/// Default per-request analysis timeout: 20 minutes. Covers cold cleave scans
+/// Default per-request analysis timeout: 34 minutes. Covers cold cleave scans
 /// of large archives — and fetch-enabled scans whose dependency analysis can
 /// far outlast the sample's own — while still preventing a pathological input
 /// from pinning a slot forever. Override with `--analysis-timeout` /
 /// [`ServerConfig::with_analysis_timeout`].
-pub const DEFAULT_ANALYSIS_TIMEOUT_SECS: u64 = 1200;
+pub const DEFAULT_ANALYSIS_TIMEOUT_SECS: u64 = 2040;
 
 /// After the most recent `/analyze` request, keep the embedded hopper worker
 /// paused for this long before it starts claiming queue work again.

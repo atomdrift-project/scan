@@ -1494,45 +1494,37 @@ pub(crate) fn orchestrate(
             // Per-group results, aligned with `batch`.
             type BatchRegistrySubs = Vec<Vec<Option<AnalysisReport>>>;
             type BatchAnalyzed = Vec<Vec<Option<Analyzed>>>;
-            let (registry_subs, analyzed): (BatchRegistrySubs, BatchAnalyzed) = {
-                use rayon::prelude::*;
-                rayon::join(
-                    || {
-                        batch
-                            .par_iter()
-                            .map(|g| {
-                                g.registries
-                                    .par_iter()
-                                    .map(|(_, provenance, _)| {
-                                        registry_node(&provenance.record, &registry_opts)
-                                    })
-                                    .collect()
-                            })
-                            .collect()
-                    },
-                    || {
-                        batch
-                            .par_iter()
-                            .map(|g| {
-                                let on_analyzed = |i: usize| {
-                                    if let (Some(r), Some(rec)) =
-                                        (g.selected.get(i), g.fetched.get(i))
-                                    {
-                                        reporter.analyzed(r, rec);
-                                    }
-                                };
-                                analyze_payloads(
-                                    &g.fetched,
-                                    &res.cache,
-                                    &opts,
-                                    acache_ref,
-                                    &on_analyzed,
-                                )
-                            })
-                            .collect()
-                    },
-                )
+            // Both halves dispatch full cleave analyses, so they fan out only
+            // while the pool has headroom (see `payload_fanout_allowed`).
+            // Saturated, the batch runs inline on this blocking thread — the
+            // shape cleave's own nesting throttle is written for.
+            let registries_of = |g: &GroupWork| -> Vec<Option<AnalysisReport>> {
+                g.registries
+                    .iter()
+                    .map(|(_, provenance, _)| registry_node(&provenance.record, &registry_opts))
+                    .collect()
             };
+            let payloads_of = |g: &GroupWork| -> Vec<Option<Analyzed>> {
+                let on_analyzed = |i: usize| {
+                    if let (Some(r), Some(rec)) = (g.selected.get(i), g.fetched.get(i)) {
+                        reporter.analyzed(r, rec);
+                    }
+                };
+                analyze_payloads(&g.fetched, &res.cache, &opts, acache_ref, &on_analyzed)
+            };
+            let (registry_subs, analyzed): (BatchRegistrySubs, BatchAnalyzed) =
+                if payload_fanout_allowed() {
+                    use rayon::prelude::*;
+                    rayon::join(
+                        || batch.par_iter().map(&registries_of).collect(),
+                        || batch.par_iter().map(&payloads_of).collect(),
+                    )
+                } else {
+                    (
+                        batch.iter().map(&registries_of).collect(),
+                        batch.iter().map(&payloads_of).collect(),
+                    )
+                };
 
             // Merge serially — groups in order, registry records before payloads
             // within a group, both in materialization order — because
@@ -3468,6 +3460,35 @@ fn sub_findings(sub: &AnalysisReport) -> Vec<Finding> {
         .collect()
 }
 
+/// Whether this batch may fan its payload analyses across the Rayon pool.
+///
+/// Each fetched payload is a full cleave analysis, and cleave bounds how many
+/// analyses fan out at once on the assumption that the throttled ones make
+/// serial progress on their own blocking threads (see
+/// [`cleave::pool_has_headroom`]). Dispatching them from `par_iter` breaks
+/// that: a throttled payload analysis occupies a Rayon worker instead of
+/// freeing one, and the dispatcher sits blocked-and-stealing on top. Measured
+/// on a wedged worker 2026-09-04, that left every pool thread carrying 15-29
+/// nested blocked joins with frames from unrelated analyses interleaved — one
+/// runaway leaf then pinned the whole pool rather than one thread.
+///
+/// So fan out only when the pool has headroom — a lone analysis, or a scan
+/// draining its queue, which are exactly the cases where fanning out is what
+/// keeps the pool busy. Under saturation the payloads run inline on the
+/// blocking thread that owns this batch, which is both the shape cleave's
+/// throttle expects and no loss of machine utilization: the sibling analyses
+/// already have every core.
+///
+/// `SCAN_PAYLOAD_FANOUT` overrides: `always` restores the unconditional
+/// fan-out, `never` forces inline.
+fn payload_fanout_allowed() -> bool {
+    match std::env::var("SCAN_PAYLOAD_FANOUT").ok().as_deref() {
+        Some("always") => true,
+        Some("never") => false,
+        _ => cleave::pool_has_headroom(),
+    }
+}
+
 /// The product of analyzing one fetched payload: the finalized sub-report to
 /// graft (absent if the payload couldn't be analyzed) and the next-hop
 /// references found in its own bytes. Produced off the report so the expensive
@@ -3502,16 +3523,17 @@ fn analyze_payloads(
     acache: Option<&AnalysisCache>,
     on_analyzed: &(dyn Fn(usize) + Sync),
 ) -> Vec<Option<Analyzed>> {
-    use rayon::prelude::*;
-    fetched
-        .par_iter()
-        .enumerate()
-        .map(|(i, rec)| {
-            let a = analyze_payload(rec, cache, opts, acache);
-            on_analyzed(i);
-            a
-        })
-        .collect()
+    let one = |(i, rec): (usize, &FetchRecord)| {
+        let a = analyze_payload(rec, cache, opts, acache);
+        on_analyzed(i);
+        a
+    };
+    if payload_fanout_allowed() {
+        use rayon::prelude::*;
+        fetched.par_iter().enumerate().map(one).collect()
+    } else {
+        fetched.iter().enumerate().map(one).collect()
+    }
 }
 
 /// Analyze a fetched payload's bytes (the expensive, report-independent half of
