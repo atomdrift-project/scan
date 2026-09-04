@@ -101,6 +101,43 @@ static LLM_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LLM_REPOSTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLOCKING_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 const RESOURCE_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// What the progress watchdog concluded from one summary tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallVerdict {
+    /// Something completed, or there is nothing in flight to complete.
+    Progressing,
+    /// Slots are occupied and nothing has completed for the stuck threshold.
+    Stalled,
+    /// Stalled for so long that the pool will not recover; exit.
+    Abort,
+}
+
+/// Classify one summary tick. `no_progress` is how long the worker has shown no
+/// sign of life at all — nothing completed, no analysis changed stage, and none
+/// started — and `abort_secs` of 0 disables the abort.
+///
+/// Idle is never a stall: with no slots occupied there is nothing to complete,
+/// so a worker waiting on an empty queue must not be mistaken for a wedged one.
+fn stall_verdict(
+    active_slots: usize,
+    no_progress: Duration,
+    warn_secs: u64,
+    abort_secs: u64,
+) -> StallVerdict {
+    if active_slots == 0 || no_progress.as_secs() < warn_secs {
+        return StallVerdict::Progressing;
+    }
+    if abort_secs > 0 && no_progress.as_secs() >= abort_secs.max(warn_secs) {
+        return StallVerdict::Abort;
+    }
+    StallVerdict::Stalled
+}
+
+/// Exit status when the worker gives up on a wedged Rayon pool (see the stall
+/// abort in the summary ticker). `EX_TEMPFAIL`: the condition is transient and
+/// a restart is the correct response, and it sits well clear of the verdict
+/// codes (1 hostile, 2 suspicious) and the scan-error codes.
+const STALL_ABORT_EXIT_CODE: i32 = 75;
 /// Cadence for the dedicated `/api/heartbeat` check-in. Fixed and independent of
 /// the work-claim poll so a busy worker — prefetch buffer full, never polling
 /// `/api/next` — still reports liveness, RSS, load, and queue depth on time.
@@ -1037,6 +1074,21 @@ impl JobSource {
         let order = state.order;
         pick_sjf_from_reorder(&mut state.reorder, order)
     }
+
+    /// Take every staged job, leaving the source empty.
+    ///
+    /// Staged work lives in two places — the channel and the SJF reorder
+    /// window — so both are emptied under the one lock. Nothing here has begun
+    /// analysis: these jobs never entered the rayon pool, so shedding them
+    /// releases no pool worker, no memory reservation, and no lock.
+    async fn drain_staged(&self) -> Vec<PrefetchedJob> {
+        let mut state = self.state.lock().await;
+        let mut staged: Vec<PrefetchedJob> = state.reorder.drain(..).map(|(pj, _)| pj).collect();
+        while let Ok(pj) = state.rx.try_recv() {
+            staged.push(pj);
+        }
+        staged
+    }
 }
 
 /// Test-facing SJF picker over a bare channel + reorder window. Production
@@ -1691,10 +1743,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     );
     let small_bytes = small_job_bytes();
     let cleave_gate = CleaveGate::new(cleave_slots, small_lane, small_bytes);
-    // A slot's work ends at memory admission; what follows — the cleave-gate
-    // wait, the analysis, the LLM round trip, the hopper post — runs as a
-    // detached tail so the slot can claim the next job while this one waits
-    // on the network. Tails are bounded here, not by the slot count: a tail
+    // A slot's work ends at dispatch; what follows — the cleave-gate wait, the
+    // memory reservation, the analysis, the LLM round trip, the hopper post —
+    // runs as a detached tail so the slot can claim the next job while this one
+    // waits on the network. Tails are bounded here, not by the slot count: a tail
     // past its CPU work holds only its report, so twice the slots is cheap,
     // and without a bound a saturated LLM endpoint would grow the backlog
     // without limit. `SCAN_TAILS` overrides.
@@ -2008,13 +2060,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
     let prefetch_task = tokio::spawn(
         Prefetcher {
-            pause: config.embedded.as_ref().map(|e| Arc::clone(&e.pause)),
-            last_analyze_request_ms: config
+            interactive: config
                 .embedded
                 .as_ref()
-                .map(|e| Arc::clone(&e.last_analyze_request_ms)),
-            activity_started_at: config.embedded.as_ref().map(|e| e.started_at),
-            quiet_period: config.embedded.as_ref().map(|e| e.quiet_period),
+                .map(InteractiveSignals::from_embedded),
             client: client.clone(),
             base_url: Arc::clone(&base_url),
             data_dir: data_dir.clone(),
@@ -2107,6 +2156,25 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .map_or(300, |s| s.max(1));
+            // Pool-wide deadness is a different question from one slow slot, and
+            // deserves its own clock: `stuck_warn_secs` above flags an individual
+            // analysis that is taking a long time (useful early signal, kept at
+            // its shorter default), while these two ask whether the *worker* has
+            // shown any sign of life at all — see `stall_verdict`.
+            //
+            // 15 minutes to warn, 30 to exit. Both are far longer than a healthy
+            // worker ever goes silent (files normally finish inside a minute), so
+            // reaching the abort means the pool is dead rather than busy.
+            // `SCAN_STALL_WARN_SECS` / `SCAN_STALL_ABORT_SECS` tune them;
+            // `SCAN_STALL_ABORT_SECS=0` warns forever and never exits.
+            let stall_warn_secs = std::env::var("SCAN_STALL_WARN_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map_or(900, |s| s.max(1));
+            let stall_abort_secs = std::env::var("SCAN_STALL_ABORT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1800);
             // Cap census lines so a saturated worker can't flood the log; oldest
             // first means the most-stuck slots always appear.
             const CENSUS_MAX_LINES: usize = 64;
@@ -2361,15 +2429,33 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     // `analyzer=pe` and named the member, instead of the census's
                     // `stage="fetch+graft"` — true of the coordinator, and useless.
                     //
-                    // Gated on `stuck_warn_secs` (the census's own threshold) rather
-                    // than a single summary, so one slow whale with the slots full
-                    // is not reported as a stall.
-                    if finished != last_finished_seen || active_slots == 0 {
+                    // Gated on `stall_warn_secs` rather than a single summary, so
+                    // one slow whale with the slots full is not reported as a stall.
+                    // Liveness is broader than "an analysis finished". A single
+                    // whale legitimately holding every slot completes nothing for
+                    // a long time while making steady progress, and killing that
+                    // worker would be a false positive on a healthy machine — the
+                    // one failure mode that would discredit the abort below.
+                    //
+                    // So a stage transition counts as progress too: a working
+                    // analysis walks archive:zip -> features+model -> done, while
+                    // a wedged one sits on one stage (the 2026-09-04 census showed
+                    // the same stage for hours). A slot the previous tick had not
+                    // seen counts as well — new analyses starting means the worker
+                    // is admitting work, which a wedged pool cannot do.
+                    let stage_moved = census.iter().any(|entry| {
+                        stage_since
+                            .get(&entry.analysis_id)
+                            .is_none_or(|(seen, _)| *seen != entry.phase.get())
+                    });
+                    if finished != last_finished_seen || active_slots == 0 || stage_moved {
                         progress_since = now;
                     }
                     last_finished_seen = finished;
                     let no_progress = now.duration_since(progress_since);
-                    if active_slots > 0 && no_progress.as_secs() >= stuck_warn_secs {
+                    let verdict =
+                        stall_verdict(active_slots, no_progress, stall_warn_secs, stall_abort_secs);
+                    if verdict != StallVerdict::Progressing {
                         tracing::warn!(
                             no_progress_ms = crate::duration_ms(no_progress),
                             completed_total = finished,
@@ -2380,9 +2466,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                             // single runaway leaf is holding it.
                             cpu_cores_busy = format!("{cpu_cores_busy:.1}"),
                             rayon_threads = global_rayon_threads,
-                            "POOL STALLED: no analysis has completed for the stuck \
-                             threshold; the Rayon pool is not making progress. Any \
-                             breadcrumbs below name the analyzer and member each \
+                            stall_warn_secs,
+                            "POOL STALLED: nothing has completed, changed stage, or started for \
+                             the stall threshold; the Rayon pool is not making progress. \
+                             Any breadcrumbs below name the analyzer and member each \
                              Rayon worker is inside — a runaway leaf is among them",
                         );
                         #[cfg(feature = "cleave-breadcrumbs")]
@@ -2398,6 +2485,60 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                                 age_ms = crate::duration_ms(crumb.age),
                                 "POOL STALLED breadcrumb",
                             );
+                        }
+
+                        // Escalation: a pool this wedged does not recover.
+                        //
+                        // Rayon cannot preempt a running job, so once the
+                        // workers' stacks have woven into one dependency chain
+                        // behind a runaway leaf (2026-09-04: 11 of 12 threads
+                        // with byte-identical stacks 32 minutes apart), nothing
+                        // in-process can clear it. Cancellation is cooperative
+                        // and a third-party parser never checks it. The only
+                        // remaining lever is the process.
+                        //
+                        // Exiting is safe because hopper's claims are in-memory
+                        // with expiring per-claim leases, and it resets a
+                        // worker's claims when the process re-registers — its
+                        // own comment records the reasoning: losing claim state
+                        // costs "wasted CPU, not corruption", because a repeat
+                        // analysis is idempotent. `MaxClaimAttempts = 8` then
+                        // stops a file that wedges workers from being handed
+                        // out forever, so a poison sample cannot drive a restart
+                        // loop.
+                        //
+                        // Dump every analysis thread's stack first. That is the
+                        // artifact that names the runaway leaf, and having it in
+                        // the log is the difference between a five-minute
+                        // diagnosis and attaching a sampler to a live process.
+                        if verdict == StallVerdict::Abort {
+                            for entry in census.iter().take(CENSUS_MAX_LINES) {
+                                let phase = entry.phase.get();
+                                tracing::error!(
+                                    analysis_id = entry.analysis_id,
+                                    sha256 = %entry.sha,
+                                    file = %entry.file,
+                                    size_bytes = entry.size_bytes,
+                                    thread_id = entry.thread_id.load(Ordering::Relaxed),
+                                    stuck_for_ms =
+                                        crate::duration_ms(now.duration_since(entry.started)),
+                                    stage = if phase.is_empty() { "(starting)" } else { &phase },
+                                    "STALL ABORT slot: in flight when the worker gave up",
+                                );
+                            }
+                            crate::thread_dump::dump_all_threads();
+                            tracing::error!(
+                                no_progress_ms = crate::duration_ms(no_progress),
+                                stall_abort_secs,
+                                completed_total = finished,
+                                active_slots,
+                                exit_code = STALL_ABORT_EXIT_CODE,
+                                "STALL ABORT: nothing has completed, changed stage, or started for \
+                                 the abort threshold and a wedged Rayon pool cannot recover in \
+                                 process; exiting so the supervisor can restart. Claims expire \
+                                 hopper-side and the in-flight samples above are handed out again",
+                            );
+                            std::process::exit(STALL_ABORT_EXIT_CODE);
                         }
                     }
 
@@ -2576,6 +2717,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let llm_queue = Arc::clone(&llm_queue);
         let shutdown = Arc::clone(&shutdown);
         let on_complete = config.embedded.as_ref().and_then(|e| e.on_complete.clone());
+        let interactive = config
+            .embedded
+            .as_ref()
+            .map(InteractiveSignals::from_embedded);
         workers.spawn(async move {
             loop {
                 if shutdown.load(Ordering::Relaxed) {
@@ -2597,6 +2742,55 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 let staged_bytes = pj.data.as_ref().map_or(0, PrefetchData::staged_mem_bytes);
                 queued_bytes.fetch_sub(staged_bytes, Ordering::Release);
                 outstanding.fetch_sub(1, Ordering::Release);
+
+                // Interactive work has arrived: shed everything staged rather
+                // than starting it. A staged job has not entered the rayon pool,
+                // so dropping it frees a pool worker's worth of contention at no
+                // unwind cost — the pool, not the slot, is what an interactive
+                // request actually competes for. Running analyses are left
+                // alone; killing those would abandon real work for no gain.
+                if interactive.as_ref().is_some_and(InteractiveSignals::busy) {
+                    let mut shed = vec![pj];
+                    shed.extend(jobs.drain_staged().await);
+                    let mut shed_bytes = staged_bytes;
+                    for extra in shed.iter().skip(1) {
+                        let bytes = extra
+                            .data
+                            .as_ref()
+                            .map_or(0, PrefetchData::staged_mem_bytes);
+                        queued_bytes.fetch_sub(bytes, Ordering::Release);
+                        outstanding.fetch_sub(1, Ordering::Release);
+                        shed_bytes += bytes;
+                    }
+                    // Name every file. A silent shed and a stalled queue look
+                    // identical from the outside, and the whole point of the
+                    // experiment is being able to tell them apart.
+                    for job in &shed {
+                        tracing::warn!(
+                            sha256 = %job.job.sha256,
+                            path = %job.job.path,
+                            file_type = %job.job.file_type,
+                            size_bytes = job.job.size_bytes,
+                            "shed staged job: interactive request in flight",
+                        );
+                    }
+                    let busy = analyzing.load(Ordering::Acquire);
+                    tracing::warn!(
+                        worker_id,
+                        dropped = shed.len(),
+                        slots_analyzing = busy,
+                        slots_total = slots,
+                        slots_free = slots.saturating_sub(busy),
+                        shed_bytes,
+                        "shedding staged queue work to serve interactive requests",
+                    );
+                    let shas: Vec<String> = shed.iter().map(|job| job.job.sha256.clone()).collect();
+                    release_claims(&client, &base_url, &name, &shas).await;
+                    for job in &shed {
+                        metrics.complete(job.queue_id);
+                    }
+                    continue;
+                }
 
                 let snapshot: std::result::Result<Arc<ModelResources>, String> =
                     match resources.read() {
@@ -2640,18 +2834,19 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 }
                 let _analyzing_guard = AnalyzingGuard(Arc::clone(&analyzing));
 
-                let head = admission_sniff(&pj.data, data_root.as_deref(), &pj.job.path);
-                let admission_guard = admission
-                    .admit(
-                        Arc::from(pj.job.sha256.as_str()),
-                        Arc::from(pj.job.path.as_str()),
-                        Arc::from(pj.job.file_type.as_str()),
-                        pj.job.size_bytes,
-                        head.as_deref(),
-                    )
-                    .await;
+                // Sniffed here, where the staged payload is at hand; the
+                // reservation itself is taken in `run_job` once the nested-work
+                // gate admits the job.
+                let admission_guard = PendingAdmission {
+                    gate: Arc::clone(&admission),
+                    sha256: Arc::from(pj.job.sha256.as_str()),
+                    path: Arc::from(pj.job.path.as_str()),
+                    file_type: Arc::from(pj.job.file_type.as_str()),
+                    size_bytes: pj.job.size_bytes,
+                    head: admission_sniff(&pj.data, data_root.as_deref(), &pj.job.path),
+                };
 
-                // The slot is done once the job is admitted: everything from
+                // The slot is done once the job is dispatched: everything from
                 // the cleave-gate wait to the hopper post runs as a detached
                 // tail, bounded by `tails`, and this slot goes back to claiming.
                 // On the production worker the tail is mostly waiting — the
@@ -2840,43 +3035,59 @@ struct Prefetcher {
     /// reported at WARN. A field rather than an env read inside the poll loop so
     /// the escalation is exercisable from a test. See [`DEFAULT_IDLE_WARN_SECS`].
     idle_warn_after: Duration,
-    /// Raised while the host server has interactive work in flight. The
-    /// prefetcher is the single place work enters this worker, so gating here
-    /// stops the whole pipeline at one point: staged jobs finish, slots drain,
-    /// and nothing new is claimed until the flag clears.
-    pause: Option<Arc<AtomicBool>>,
-    /// Elapsed-time marker for the most recent host `/analyze` request.
-    last_analyze_request_ms: Option<Arc<AtomicU64>>,
-    /// Host clock anchor for interpreting `last_analyze_request_ms`.
-    activity_started_at: Option<Instant>,
-    /// Quiet period after host analysis traffic.
-    quiet_period: Option<Duration>,
+    /// Host-server activity signals, when this worker is embedded in one.
+    /// `None` for a standalone worker, which has nothing to defer to.
+    interactive: Option<InteractiveSignals>,
 }
 
-impl Prefetcher {
-    fn recently_saw_analyze_request(&self) -> bool {
-        let (Some(last), Some(started_at), Some(quiet_period)) = (
-            self.last_analyze_request_ms.as_ref(),
-            self.activity_started_at,
-            self.quiet_period,
-        ) else {
-            return false;
-        };
-        let last_ms = last.load(Ordering::Acquire);
+/// Whether the host server is serving interactive work right now.
+///
+/// Two signals, because neither alone covers the window: `pause` brackets
+/// exactly the requests that hold a slot, and `last_analyze_request_ms` also
+/// covers requests rejected before they acquire one, plus the quiet period
+/// after the last of them. Shared by the prefetcher (which stops claiming) and
+/// the dispatch loop (which sheds what was already staged).
+#[derive(Clone)]
+struct InteractiveSignals {
+    pause: Arc<AtomicBool>,
+    last_analyze_request_ms: Arc<AtomicU64>,
+    started_at: Instant,
+    quiet_period: Duration,
+}
+
+impl InteractiveSignals {
+    fn from_embedded(embedded: &Embedded) -> Self {
+        Self {
+            pause: Arc::clone(&embedded.pause),
+            last_analyze_request_ms: Arc::clone(&embedded.last_analyze_request_ms),
+            started_at: embedded.started_at,
+            quiet_period: embedded.quiet_period,
+        }
+    }
+
+    /// True while a request is in flight, or within `quiet_period` of the most
+    /// recent one.
+    fn busy(&self) -> bool {
+        if self.pause.load(Ordering::Relaxed) {
+            return true;
+        }
+        let last_ms = self.last_analyze_request_ms.load(Ordering::Acquire);
         if last_ms == 0 {
             return false;
         }
         let now_ms = u64::try_from(
-            started_at
+            self.started_at
                 .elapsed()
                 .as_millis()
                 .min(u128::from(u64::MAX.saturating_sub(1))),
         )
         .unwrap_or(u64::MAX.saturating_sub(1))
         .saturating_add(1);
-        u128::from(now_ms.saturating_sub(last_ms)) < quiet_period.as_millis()
+        u128::from(now_ms.saturating_sub(last_ms)) < self.quiet_period.as_millis()
     }
+}
 
+impl Prefetcher {
     /// Build the `/api/next` URL, attaching the live signals hopper uses to
     /// ration work: traits version, current RSS, 1-minute load, and tools.
     fn poll_url(&self, count: usize) -> String {
@@ -2937,18 +3148,13 @@ impl Prefetcher {
             // what is already staged or running: that work is real, and hopper
             // redispatches a claim that dies anyway. Responsiveness comes from
             // the slots the server keeps for itself, not from killing jobs.
-            let interactive = self
-                .pause
+            if self
+                .interactive
                 .as_ref()
-                .is_some_and(|p| p.load(Ordering::Relaxed));
-            let recently_active = self.recently_saw_analyze_request();
-            if interactive || recently_active {
+                .is_some_and(InteractiveSignals::busy)
+            {
                 if !paused_logged {
-                    tracing::debug!(
-                        interactive,
-                        recently_active,
-                        "idle worker paused: recent interactive analysis activity"
-                    );
+                    tracing::debug!("idle worker paused: recent interactive analysis activity");
                     paused_logged = true;
                 }
                 self.poll_state.buffer_room.store(0, Ordering::Release);
@@ -3244,6 +3450,41 @@ async fn fetch_payload(
     }
 }
 
+/// A memory reservation that has not been taken yet.
+///
+/// The gate's estimate predicts what an analysis costs while it *runs*, so the
+/// reservation is taken where the analysis starts — after the nested-work gate
+/// — rather than on the dispatch loop. Charging at dispatch made every job
+/// queued behind the Rayon gate hold a full reservation while doing nothing:
+/// on the production worker, `inflight_blocking` sat at the gate's own limit
+/// (12, the pool size) while the admission gate reported 56-60 reservations,
+/// so roughly four fifths of the committed memory belonged to jobs parked in
+/// the CPU queue. The sniffed `head` is captured on the dispatch loop, where
+/// the staged payload is still at hand.
+struct PendingAdmission {
+    gate: Arc<crate::admission::MemoryAdmission>,
+    sha256: Arc<str>,
+    path: Arc<str>,
+    file_type: Arc<str>,
+    size_bytes: i64,
+    head: Option<Vec<u8>>,
+}
+
+impl PendingAdmission {
+    /// Commit the reservation, waiting out any memory-pressure pause.
+    async fn reserve(self) -> crate::admission::AdmissionGuard {
+        self.gate
+            .admit(
+                self.sha256,
+                self.path,
+                self.file_type,
+                self.size_bytes,
+                self.head.as_deref(),
+            )
+            .await
+    }
+}
+
 /// Analyze a single job. Returns (ml, raw, duration_ms) or an error string.
 ///
 /// Resolution order for the sample bytes: the local index when it is available,
@@ -3267,9 +3508,10 @@ async fn run_job(
     spool: &Arc<SpoolState>,
     prefetched: std::result::Result<PrefetchData, PrefetchError>,
     on_complete: Option<&IdleCompletion>,
-    // Held until the lease fires or this returns: the reservation covers the
-    // analysis, not the LLM wait that follows it.
-    admission: crate::admission::AdmissionGuard,
+    // Taken once the nested-work gate admits this job and held until the lease
+    // fires or this returns: the reservation covers the analysis, not the queue
+    // wait before it nor the LLM wait after it.
+    admission: PendingAdmission,
 ) -> Result<
     (
         crate::engine::ScanResult,
@@ -3548,6 +3790,9 @@ async fn run_job(
         .await
         .map_err(|_closed| "cleave analysis gate closed".to_string())?;
     let gate_wait = gate_wait_start.elapsed();
+    // Only now does this job cost memory. Reserving before the gate above
+    // priced every queued job as if it were already expanding an archive.
+    let admission = admission.reserve().await;
     if gate_wait >= Duration::from_secs(1) {
         tracing::info!(
             sha256 = %job.sha256.get(..12).unwrap_or(&job.sha256),
@@ -3750,6 +3995,38 @@ async fn second_opinion(
             true,
         )
         .await;
+    }
+}
+
+/// Hand claims back to hopper without a result, so the queue can re-dispatch
+/// them immediately.
+///
+/// Best-effort: hopper reclaims an unreleased claim anyway once its lease stops
+/// being renewed, so a failure here costs latency in the queue, not work. Both
+/// counts are logged either way — a release that silently stopped working would
+/// otherwise look exactly like one that worked.
+async fn release_claims(client: &reqwest::Client, base_url: &str, worker: &str, shas: &[String]) {
+    if shas.is_empty() {
+        return;
+    }
+    let mut url = format!("{base_url}/api/release?worker=");
+    url_encode_into(worker, &mut url);
+    url.push_str("&shas=");
+    url.push_str(&shas.join(","));
+    match authed(client.post(&url)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!(count = shas.len(), "released claims back to hopper");
+        }
+        Ok(resp) => tracing::warn!(
+            status = %resp.status(),
+            count = shas.len(),
+            "release rejected; claims will wait for their lease to expire",
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            count = shas.len(),
+            "release request failed; claims will wait for their lease to expire",
+        ),
     }
 }
 
@@ -4390,6 +4667,62 @@ fn poll_request_context(url: &str, error_text: &str, is_connect: bool) -> String
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    #[test]
+    fn idle_slots_are_never_a_stall() {
+        // A worker waiting on an empty queue has nothing to complete; mistaking
+        // that for a wedge would exit every idle worker on the fleet.
+        assert_eq!(
+            stall_verdict(0, Duration::from_secs(9999), 300, 900),
+            StallVerdict::Progressing
+        );
+    }
+
+    #[test]
+    fn stall_warns_before_it_aborts() {
+        // The shipped defaults: 15 minutes to warn, 30 to exit.
+        let warn = 900;
+        let abort = 1800;
+        assert_eq!(
+            stall_verdict(4, Duration::from_secs(899), warn, abort),
+            StallVerdict::Progressing
+        );
+        assert_eq!(
+            stall_verdict(4, Duration::from_secs(900), warn, abort),
+            StallVerdict::Stalled
+        );
+        assert_eq!(
+            stall_verdict(4, Duration::from_secs(1799), warn, abort),
+            StallVerdict::Stalled
+        );
+        assert_eq!(
+            stall_verdict(4, Duration::from_secs(1800), warn, abort),
+            StallVerdict::Abort
+        );
+    }
+
+    #[test]
+    fn zero_abort_threshold_disables_the_exit() {
+        // The escape hatch: warn forever, never exit.
+        assert_eq!(
+            stall_verdict(4, Duration::from_secs(86_400), 900, 0),
+            StallVerdict::Stalled
+        );
+    }
+
+    #[test]
+    fn abort_can_never_fire_before_the_warn_it_escalates() {
+        // An operator who sets the abort below the warn gets one Stalled tick
+        // first, not a silent exit with no warning in the log above it.
+        assert_eq!(
+            stall_verdict(4, Duration::from_secs(10), 900, 5),
+            StallVerdict::Progressing
+        );
+        assert_eq!(
+            stall_verdict(4, Duration::from_secs(900), 900, 5),
+            StallVerdict::Abort
+        );
+    }
     use super::*;
     use std::io::Write;
 
@@ -4991,7 +5324,6 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(
             Prefetcher {
-                pause: None,
                 client: reqwest::Client::new(),
                 base_url: Arc::from(format!("http://127.0.0.1:{port}").as_str()),
                 data_dir: None,
@@ -5006,11 +5338,8 @@ mod tests {
                 metrics: Arc::new(WorkerMetrics::new()),
                 poll_state: Arc::new(PollState::default()),
                 exit_if_empty,
-                // Standalone prefetcher: no embedded server to defer to, so the
-                // quiet-period signals upstream added are all absent.
-                last_analyze_request_ms: None,
-                activity_started_at: None,
-                quiet_period: None,
+                // Standalone prefetcher: no embedded server to defer to.
+                interactive: None,
                 // Far below the 1 s poll cadence, so the second empty poll trips it.
                 idle_warn_after: Duration::from_millis(10),
             }
@@ -5323,10 +5652,7 @@ mod tests {
         let handle = tokio::spawn(
             Prefetcher {
                 // Standalone worker: nothing to defer to.
-                pause: None,
-                last_analyze_request_ms: None,
-                activity_started_at: None,
-                quiet_period: None,
+                interactive: None,
                 client: reqwest::Client::new(),
                 base_url: Arc::from(format!("http://127.0.0.1:{port}").as_str()),
                 data_dir: None,
@@ -5427,6 +5753,73 @@ mod tests {
             mem_threshold_bytes,
             disk_headroom_bytes: 0,
         })
+    }
+
+    /// The shed gate reads both signals, not just the in-flight flag: a request
+    /// rejected before it takes a slot only ever moves the timestamp.
+    #[test]
+    fn interactive_is_busy_while_paused_and_through_the_quiet_period() {
+        let signals = InteractiveSignals {
+            pause: Arc::new(AtomicBool::new(false)),
+            last_analyze_request_ms: Arc::new(AtomicU64::new(0)),
+            started_at: Instant::now(),
+            quiet_period: Duration::from_secs(7),
+        };
+        assert!(!signals.busy(), "a fresh idle server is not busy");
+
+        signals.pause.store(true, Ordering::Release);
+        assert!(signals.busy(), "an in-flight request makes it busy");
+        signals.pause.store(false, Ordering::Release);
+        assert!(
+            !signals.busy(),
+            "the flag clearing ends the in-flight signal"
+        );
+
+        // A request that never took a slot: only the marker moves. It reads as
+        // busy until the quiet period elapses.
+        let now_ms = u64::try_from(signals.started_at.elapsed().as_millis()).unwrap() + 1;
+        signals
+            .last_analyze_request_ms
+            .store(now_ms, Ordering::Release);
+        assert!(signals.busy(), "within the quiet period after a request");
+
+        signals
+            .last_analyze_request_ms
+            .store(now_ms.saturating_sub(8_000), Ordering::Release);
+        assert!(!signals.busy(), "past the quiet period, claiming resumes");
+    }
+
+    /// Shedding must empty both places staged work lives — the channel and the
+    /// SJF reorder window — or a job survives the shed and runs anyway.
+    #[tokio::test]
+    async fn drain_staged_empties_the_channel_and_the_reorder_window() {
+        let (tx, rx) = mpsc::unbounded_channel::<PrefetchedJob>();
+        let source = JobSource::new(rx, DispatchOrder::Smallest);
+        for sha in ["a", "b", "c"] {
+            tx.send(staged_pj(sha, 4 * 1024)).unwrap();
+        }
+        // One recv pulls all three into the reorder window and returns one, so
+        // the remaining two are held there rather than in the channel.
+        assert!(source.recv().await.is_some());
+        tx.send(staged_pj("d", 4 * 1024)).unwrap();
+
+        let mut shed: Vec<String> = source
+            .drain_staged()
+            .await
+            .into_iter()
+            .map(|pj| pj.job.sha256)
+            .collect();
+        shed.sort();
+        assert_eq!(
+            shed.len(),
+            3,
+            "two from the window plus one from the channel"
+        );
+        assert!(
+            source.drain_staged().await.is_empty(),
+            "the source is empty after a drain"
+        );
+        drop(tx);
     }
 
     #[tokio::test]

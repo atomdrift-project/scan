@@ -10,9 +10,14 @@
 //! a ceiling (the resolved `--max-rss-gb`, default 85% of RAM). Two checks gate
 //! each new job, both keyed on signals every supported platform exposes:
 //!
+//! The reservation is taken where the analysis begins — after the worker's
+//! nested-work gate admits the job — not when the job is dispatched, so a job
+//! still queued for a Rayon slot is not charged for memory it is not yet using.
+//!
 //! * **Predictive** — each in-flight analysis reserves an estimated footprint.
 //!   Archive-shaped jobs reserve more than flat files because they expand into
-//!   member reports and parse trees. A burst commits its full reservation the
+//!   member reports and parse trees — the same flat baseline, plus a slope on
+//!   on-disk size. A burst commits its full reservation the
 //!   instant it is admitted, so the gate closes *before* archives expand, not
 //!   after.
 //! * **Reactive** — this process's live RSS must leave room for the next
@@ -27,8 +32,8 @@
 //! Archive detection uses the job's path suffix and hopper's `file_type`, and
 //! — when the payload is at hand — its leading bytes: hopper hands out
 //! suffix-less names (`v1`, a bare sha, `tool@v3.2.0`) for tarballs and zips
-//! that would otherwise be reserved as 512 MiB flat files and expand into
-//! several GB of member analysis.
+//! that would otherwise be reserved as flat files and expand into several GB
+//! of member analysis.
 //!
 //! One always-admit hatch (when nothing is in flight) guarantees forward
 //! progress even on a host too small to fit a single slot's estimate.
@@ -49,7 +54,7 @@ use tokio::sync::Notify;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MIB: u64 = 1024 * 1024;
 
-/// Assumed peak resident footprint of a small, non-archive analysis.
+/// Assumed peak resident footprint of any analysis, before archive expansion.
 ///
 /// 256 MiB, down from 512. Measured on the production worker 2026-09-03 with
 /// 48 slots: reservations summed to 25.7-26.0 GB against the 26 GB ceiling
@@ -59,28 +64,30 @@ const MIB: u64 = 1024 * 1024;
 /// in `try_reserve` remains the reactive backstop for a real overrun.
 const DEFAULT_FLAT_ESTIMATE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Minimum reservation for archive-shaped jobs. Archives decompress and each
-/// source member can spawn a tree-sitter parse tree, so their true peak is often
-/// far above on-disk size.
-///
-/// 512 MiB, down from 1.5 GiB, and the multiplier below 16x, down from 64x
-/// (2026-09-03). The old figures summed to the 26 GB ceiling at ~20 archives
-/// in flight while the process peaked at 14 GB, so the estimate — not memory
-/// — was the throughput ceiling. At these figures, with every pool thread
-/// admitted, the worker measured a 17.5 GB peak on a 32 GB box with no
-/// memory-pressure warnings and the pool saturated. The RSS ceiling and the
-/// host floor stay as the reactive backstops for the archive this does not
-/// fit.
-const MIN_ARCHIVE_ESTIMATE_BYTES: u64 = 512 * 1024 * 1024;
-
 /// Upper bound for the size-scaled archive estimate. Jobs larger than the
 /// ceiling still run via the one-job forward-progress hatch.
-const MAX_ARCHIVE_ESTIMATE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+///
+/// 4 GiB, down from 10 GiB (2026-09-04). Nothing reached the old cap: it was
+/// loose enough that two 500 MB container tarballs priced themselves at 9.4
+/// and 7.4 GB and took 31% of a 54 GB ceiling between them.
+const MAX_ARCHIVE_ESTIMATE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// On-disk archive bytes are a weak lower bound for in-memory member state; this
 /// multiplier is intentionally pessimistic for large bundles while still letting
 /// small package archives co-reside.
-const ARCHIVE_ESTIMATE_MULTIPLIER: u64 = 16;
+///
+/// 8x, down from 16x, and applied as a *slope* on top of the flat estimate
+/// rather than on top of a separate 512 MiB archive floor (2026-09-04). The
+/// floor was the larger error of the two: on a 60-slot 54 GB worker, 34
+/// archives sat at or just above it for 17 GB of reservations — 18 of them
+/// files that round to 0 MB on disk, each pricing itself at half a gigabyte —
+/// while the whole process held 15.9 GB resident. Being archive-shaped now
+/// changes only how fast the estimate grows with size, not where it starts,
+/// which is the part that actually tracks member state. Re-priced against
+/// that same 60-slot snapshot the reservations total ~27 GB, still a ~1.7x
+/// margin over live RSS, with the RSS ceiling and host floor unchanged behind
+/// it.
+const ARCHIVE_ESTIMATE_MULTIPLIER: u64 = 8;
 
 /// Re-poll interval while waiting for memory to free (bounds feedback latency
 /// even if no release wakes us).
@@ -163,11 +170,10 @@ fn dynamic_estimate_bytes(
 ) -> u64 {
     let bytes = u64::try_from(on_disk_bytes).unwrap_or(0);
     if looks_like_archive(path, file_type) || head.is_some_and(looks_like_archive_bytes) {
-        let scaled = bytes
+        bytes
             .saturating_mul(ARCHIVE_ESTIMATE_MULTIPLIER)
-            .saturating_add(MIN_ARCHIVE_ESTIMATE_BYTES)
-            .min(MAX_ARCHIVE_ESTIMATE_BYTES);
-        scaled.max(MIN_ARCHIVE_ESTIMATE_BYTES)
+            .saturating_add(DEFAULT_FLAT_ESTIMATE_BYTES)
+            .min(MAX_ARCHIVE_ESTIMATE_BYTES)
     } else {
         DEFAULT_FLAT_ESTIMATE_BYTES
     }
@@ -278,7 +284,6 @@ impl MemoryAdmission {
                 None => tracing::info!(
                     ceiling_gb = ceiling_bytes as f64 / GIB,
                     flat_estimate_gb = DEFAULT_FLAT_ESTIMATE_BYTES as f64 / GIB,
-                    min_archive_estimate_gb = MIN_ARCHIVE_ESTIMATE_BYTES as f64 / GIB,
                     max_archive_estimate_gb = MAX_ARCHIVE_ESTIMATE_BYTES as f64 / GIB,
                     archive_multiplier = ARCHIVE_ESTIMATE_MULTIPLIER,
                     "live memory admission enabled with dynamic estimates",
@@ -731,7 +736,6 @@ mod tests {
         let flat = dynamic_estimate_bytes("v1", "data", 37 * 1024 * 1024, None);
         assert_eq!(flat, DEFAULT_FLAT_ESTIMATE_BYTES);
         let sniffed = dynamic_estimate_bytes("v1", "data", 37 * 1024 * 1024, Some(b"\x1f\x8b\x08"));
-        assert!(sniffed >= MIN_ARCHIVE_ESTIMATE_BYTES);
         assert!(sniffed > flat);
     }
 
@@ -803,7 +807,7 @@ mod tests {
     fn dynamic_estimate_scales_archives_by_size() {
         let small_zip = dynamic_estimate_bytes("pkg.zip", "data", 10 * 1024 * 1024, None);
         let big_zip = dynamic_estimate_bytes("pkg.zip", "data", 100 * 1024 * 1024, None);
-        assert!(small_zip >= MIN_ARCHIVE_ESTIMATE_BYTES);
+        assert!(small_zip > DEFAULT_FLAT_ESTIMATE_BYTES);
         assert!(big_zip > small_zip);
         assert!(big_zip <= MAX_ARCHIVE_ESTIMATE_BYTES);
         assert_eq!(

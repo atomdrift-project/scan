@@ -16,10 +16,13 @@
 //! coordinator then symbolizes those pointers (allocation is fine here, off the
 //! signal path) and writes them to stderr.
 //!
-//! It is strictly operator-triggered (never automatic), so its blast radius is a
-//! manual diagnostic on an already-wedged process. On platforms without per-thread
-//! signalling (macOS) it prints a pointer to the breadcrumb/wait-channel census
-//! instead.
+//! Triggered two ways, both on an already-wedged process so the blast radius is
+//! the same: by an operator sending `SIGUSR1`, and automatically by the worker's
+//! stall abort immediately before it exits (see `STALL_ABORT_EXIT_CODE`) — the
+//! stacks are the artifact that names the runaway leaf, and a process about to
+//! die is exactly when they are worth capturing. It is never called on a healthy
+//! process. On platforms without per-thread signalling (macOS) it prints a
+//! pointer to the breadcrumb/wait-channel census instead.
 
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
