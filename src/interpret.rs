@@ -1462,6 +1462,16 @@ impl CallError {
             Self::Transport(e) | Self::BadReply(e) => e,
         }
     }
+
+    /// Which half of the split this failure fell on — the one thing a reader
+    /// of a fall-over warning cannot infer from the message: `transport` trips
+    /// the endpoint's breaker, `bad-reply` leaves it closed.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Transport(_) => "transport",
+            Self::BadReply(_) => "bad-reply",
+        }
+    }
 }
 
 /// POST the prebuilt user message with scan's grading prompt and parse
@@ -1535,7 +1545,12 @@ fn chat_raw(
                     tracing::warn!(
                         endpoint = %at.base_url,
                         next = %attempts[i + 1].base_url,
-                        "LLM endpoint failed, falling over: {}",
+                        kind = e.kind(),
+                        // `{:#}` walks the source chain: plain `{}` prints only
+                        // the outermost context ("posting to <url>") and drops
+                        // the cause that says *why*, which is the whole reason
+                        // this line exists.
+                        "LLM endpoint failed, falling over: {:#}",
                         e.inner(),
                     );
                 }
