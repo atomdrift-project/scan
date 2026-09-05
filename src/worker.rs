@@ -213,9 +213,11 @@ struct CleaveGate {
     whale: Arc<Semaphore>,
     small: Arc<Semaphore>,
     small_max_bytes: u64,
-    /// The server's per-core permits, when this worker is embedded in one.
-    /// Both feed the same rayon pool, so an analysis here occupies a core the
-    /// server would otherwise offer — and the server's `slots_free` says so.
+    /// A core budget, when this worker is embedded in a server. Both feed the
+    /// same rayon pool, so this bounds how much of it pull work may occupy;
+    /// the server keeps its own permits and a reserve the worker cannot
+    /// reach, so its `slots_free` describes what it can start rather than
+    /// what the worker happens to be holding.
     cpu: Option<Arc<Semaphore>>,
 }
 
@@ -832,8 +834,14 @@ pub struct Embedded {
     pub pause: Arc<AtomicBool>,
     /// The host's shutdown flag, so one signal stops both.
     pub shutdown: Arc<AtomicBool>,
-    /// The server's per-core permits; see `CleaveGate::cpu`.
+    /// Cores this worker may occupy at once; see `CleaveGate::cpu`. A budget
+    /// of its own, sized by the server below its own pool.
     pub cpu: Arc<Semaphore>,
+    /// Jobs claimed and not yet finished, shared with the server so `/_/stats`
+    /// can publish it as `background_in_flight`: load the router should rank
+    /// a box by, and discount before calling the box saturated, because it is
+    /// the load this worker sheds the moment a request arrives.
+    pub in_progress: Arc<AtomicUsize>,
     /// The server's already-loaded models.
     pub resources: Arc<ModelResources>,
     /// Elapsed-time marker for the most recent analysis request.
@@ -854,6 +862,7 @@ impl std::fmt::Debug for Embedded {
         f.debug_struct("Embedded")
             .field("paused", &self.pause.load(Ordering::Relaxed))
             .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .field("in_progress", &self.in_progress.load(Ordering::Relaxed))
             .field("quiet_period", &self.quiet_period)
             .finish_non_exhaustive()
     }
@@ -2015,9 +2024,22 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let (tx, rx) = mpsc::unbounded_channel::<PrefetchedJob>();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let outstanding = Arc::new(AtomicUsize::new(0));
-    // Workers currently inside admit/analyze (not posting). Heartbeat/summary
-    // use this instead of a slot semaphore.
-    let analyzing = Arc::new(AtomicUsize::new(0));
+    // Jobs claimed and not yet finished, tails included. The heartbeat reports
+    // it as `active`: every one of them still holds its hopper claim until the
+    // result is posted. When embedded, the server reads the same counter, so
+    // the router sees this box's idle work as one number rather than
+    // inferring it from load.
+    let analyzing = config.embedded.as_ref().map_or_else(
+        || Arc::new(AtomicUsize::new(0)),
+        |e| Arc::clone(&e.in_progress),
+    );
+    // Slots occupied: jobs between claim and hand-off to a tail. Bounded by
+    // `slots`, where `analyzing` is bounded by slots plus tails — so this,
+    // not `analyzing`, is what the summary measures against the slot total.
+    // Reporting the other read `active_slots=72` on a 24-slot worker
+    // (2026-09-05), which looked like a leak and was three bounded counts
+    // summed.
+    let dispatching = Arc::new(AtomicUsize::new(0));
     // Size-aware dispatch (default on): the smallest staged job dispatches
     // first instead of FIFO, so tiny samples stop queueing behind multi-minute
     // archives — on the realworld benchmark with hopper's size-interleaved
@@ -2128,6 +2150,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // ticker reading the shared counters.
     {
         let analyzing = Arc::clone(&analyzing);
+        let dispatching = Arc::clone(&dispatching);
         let completed = Arc::clone(&completed);
         let outstanding = Arc::clone(&outstanding);
         let queued_bytes = Arc::clone(&queued_bytes);
@@ -2372,8 +2395,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
                     let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
                     let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
-                    let active_slots = analyzing.load(Ordering::Relaxed);
+                    let active_slots = dispatching.load(Ordering::Relaxed);
                     let available_slots = slots.saturating_sub(active_slots);
+                    let in_progress = analyzing.load(Ordering::Relaxed);
                     // FreeBSD reads libc jemalloc via mallctl; everywhere else the
                     // bundled tikv-jemalloc answers through cleave's ctl wrapper.
                     let heap = crate::heap_profile::stats()
@@ -2412,6 +2436,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         prefetch_buffer_mb = queued_bytes.load(Ordering::Relaxed) / (1024 * 1024),
                         active_slots,
                         available_slots,
+                        in_progress,
                         cpu_cores_busy = format!("{cpu_cores_busy:.1}"),
                         load1 = system_load_avg().map(|load| format!("{load:.1}")),
                         rayon_threads = global_rayon_threads,
@@ -2739,6 +2764,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let queued_bytes = Arc::clone(&queued_bytes);
         let outstanding = Arc::clone(&outstanding);
         let analyzing = Arc::clone(&analyzing);
+        let dispatching = Arc::clone(&dispatching);
         let completed = Arc::clone(&completed);
         let metrics = Arc::clone(&metrics);
         let spool = Arc::clone(&spool);
@@ -2805,11 +2831,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                             "shed staged job: interactive request in flight",
                         );
                     }
-                    let busy = analyzing.load(Ordering::Acquire);
+                    let busy = dispatching.load(Ordering::Acquire);
                     tracing::warn!(
                         worker_id,
                         dropped = shed.len(),
                         slots_analyzing = busy,
+                        in_progress = analyzing.load(Ordering::Acquire),
                         slots_total = slots,
                         slots_free = slots.saturating_sub(busy),
                         shed_bytes,
@@ -2864,6 +2891,11 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     }
                 }
                 let _analyzing_guard = AnalyzingGuard(Arc::clone(&analyzing));
+                // The slot is held until the hand-off below; this guard stays
+                // in the loop body while `_analyzing_guard` moves into the
+                // tail, which is exactly the difference between the two counts.
+                dispatching.fetch_add(1, Ordering::Release);
+                let _slot_guard = AnalyzingGuard(Arc::clone(&dispatching));
 
                 // Sniffed here, where the staged payload is at hand; the
                 // reservation itself is taken in `run_job` once the nested-work

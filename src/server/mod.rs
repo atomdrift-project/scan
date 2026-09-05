@@ -357,6 +357,28 @@ impl ServerConfig {
 }
 
 #[cfg(test)]
+mod idle_worker_cores_tests {
+    use super::idle_worker_cores;
+
+    /// The idle worker never gets the whole pool, and never zero of it.
+    #[test]
+    fn idle_worker_leaves_a_reserve_for_interactive_work() {
+        assert_eq!(idle_worker_cores(16), 12);
+        assert_eq!(idle_worker_cores(128), 96);
+        assert_eq!(idle_worker_cores(2), 1);
+        assert_eq!(idle_worker_cores(1), 1);
+        for cores in 1..=256 {
+            let budget = idle_worker_cores(cores);
+            assert!(budget >= 1, "cores={cores}");
+            assert!(
+                cores == 1 || budget < cores,
+                "cores={cores} budget={budget}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod config_tests {
     use super::*;
@@ -802,6 +824,13 @@ struct AppState {
     /// Analysis slots the idle worker may use; the rest are the interactive
     /// reserve. Zero disables it.
     idle_worker_slots: usize,
+    /// Cores the idle worker may occupy at once — its own budget, below the
+    /// server's, so the server can always start an analysis. See
+    /// [`idle_worker_cores`].
+    idle_worker_cores: usize,
+    /// Pull-queue analyses the idle worker has in progress; published on
+    /// `/_/stats` as `background_in_flight`.
+    idle_in_progress: Arc<AtomicUsize>,
     /// Raised once the HTTP server stops, so the idle worker winds down with it
     /// rather than outliving the thing it exists to fill the gaps of.
     shutdown: Arc<AtomicBool>,
@@ -927,6 +956,22 @@ impl AppState {
 /// Useful for integration tests that need the app without binding to a port.
 ///
 /// # Errors
+/// Cores the embedded idle worker may occupy: the pool less a quarter, and
+/// never all of it.
+///
+/// The server's interactive analyses and the idle worker's pull jobs feed one
+/// rayon pool. The idle worker must not be able to fill it, or the server's
+/// `slots_free` reads zero and the router stops sending — and the worker only
+/// stands aside for requests that arrive. A quarter held back keeps the
+/// server able to start on a saturated box; rayon absorbs the brief
+/// oversubscription while the worker pauses (`IDLE_WORKER_QUIET_SECS`), which
+/// it does within a tick of the first request. `pool.max(1)` cores yields one
+/// core for a one-core budget rather than zero, which would deadlock the
+/// worker's cleave gate.
+fn idle_worker_cores(cores: usize) -> usize {
+    cores.saturating_sub(cores.div_ceil(4)).max(1)
+}
+
 /// Returns an error if the router cannot be assembled or background resource
 /// initialization cannot be scheduled.
 pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
@@ -936,7 +981,13 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     // CPU-bound cleave + ONNX work overlaps poorly across many threads, so a
     // smaller pool typically delivers higher aggregate throughput than 1/core.
     let max_concurrent = config.workers();
-    tracing::info!(max_concurrent, "concurrency limit set");
+    let cores = crate::worker::cleave_concurrency(max_concurrent);
+    tracing::info!(
+        max_concurrent,
+        cores,
+        idle_worker_cores = idle_worker_cores(cores),
+        "concurrency limit set"
+    );
 
     let state = Arc::new(AppState {
         max_upload_bytes: config.max_body_size(),
@@ -959,9 +1010,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         next_request_id: AtomicU64::new(1),
         slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         lanes: SlotLanes::from_env(max_concurrent),
-        cpu: Arc::new(tokio::sync::Semaphore::new(
-            crate::worker::cleave_concurrency(max_concurrent),
-        )),
+        cpu: Arc::new(tokio::sync::Semaphore::new(cores)),
+        idle_worker_cores: idle_worker_cores(cores),
+        idle_in_progress: Arc::new(AtomicUsize::new(0)),
         stuck_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
         analysis_timeout_secs: config.analysis_timeout_secs(),
@@ -1467,7 +1518,18 @@ fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
             }),
             pause,
             shutdown: Arc::clone(&state.shutdown),
-            cpu: Arc::clone(&state.cpu),
+            // Its own core budget, deliberately not `state.cpu`. When the
+            // idle worker drew from the server's pool it held every permit
+            // whenever hopper had work, `available_analysis_permits` read
+            // zero, `/_/stats` said `slots_free=0` with nothing in flight,
+            // and beamline — correctly reading that as "at capacity" —
+            // stopped sending. The worker yields to interactive traffic,
+            // but only traffic that arrives, so the report starved the very
+            // requests that would have made it true. Measured 2026-09-05:
+            // three of the fleet's four servers unroutable for hours while
+            // idle on the interactive path. See `idle_worker_cores`.
+            cpu: Arc::new(tokio::sync::Semaphore::new(state.idle_worker_cores)),
+            in_progress: Arc::clone(&state.idle_in_progress),
             resources,
             last_analyze_request_ms: Arc::clone(&state.last_analyze_request_ms),
             started_at: state.started_at,
