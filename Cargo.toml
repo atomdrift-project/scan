@@ -177,7 +177,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 log = "0.4"
 tar = "0.4.46"
 
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 # In-process all-thread backtraces for the SIGUSR1 wedge dump (ptrace-free, so
