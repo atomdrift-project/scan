@@ -220,6 +220,21 @@ pub const LLM_GATE_PREFIXES: &[&str] = &[
     // revision newer than the one the fleet had installed, so it admitted
     // nothing on the fleet at all (2026-09-05).
     "micro-behaviors/communications/http/upload::*curl*",
+    // A marketplace/registry publisher that is not the owner of the repository
+    // the package points at — the shape of a squatted or impersonated
+    // extension, which is otherwise invisible: the code is usually lifted
+    // wholesale from the project it impersonates, so nothing in it reads as
+    // hostile and no other rule fires. 25 malicious against 1 benign over the
+    // 1071-sample corpus, and every one of those 25 that another rule already
+    // caught means this costs nothing to add: measured marginal +1 malicious,
+    // +0 benign, +0 mixed (2026-09-05).
+    //
+    // A glob, and a narrow one. The sibling `npm-name-repo-mismatch` in this
+    // same family is the opposite trade — +0 malicious for +18 benign, because
+    // monorepos, forks and scoped renames all disagree with their repository —
+    // so `*mismatch*` would have been 1:18. Publisher-is-not-repo-owner is the
+    // specific claim worth reading.
+    "metadata/package/manifest/repository::*publisher-repo-owner-mismatch",
     "micro-behaviors/communications/http/url/scheme::cleartext-http-url",
     "micro-behaviors/communications/http/url/query::query-serializer-call",
     "micro-behaviors/communications/http/cookies::document-cookie-split-iterate",
