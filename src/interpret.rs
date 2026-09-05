@@ -891,6 +891,22 @@ pub fn admission(
 /// Interpret a sample, blending the ML verdict with a local LLM's opinion.
 /// Returns `None` (never an error) when below the gate or on any failure.
 #[must_use]
+/// Who is asking for an LLM slot.
+///
+/// The permits are one pool per process, and the two kinds of caller do not
+/// deserve equal turns at it: a serve request has a client on the line, while
+/// a queue job — a worker's, or serve's own idle puller — has nobody waiting.
+/// Measured on galadriel (2026-09-05): a 96-slot idle puller held all 16
+/// permits ~120s each against a saturated endpoint, and serve requests queued
+/// ~600s for a slot before paying the timeout themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LlmCaller {
+    /// An interactive scan or a serve request: someone is waiting.
+    Foreground,
+    /// Queue work: a worker job, or serve's embedded idle worker.
+    Background,
+}
+
 pub fn interpret(
     cfg: &InterpretConfig,
     context: &str,
@@ -898,6 +914,7 @@ pub fn interpret(
     ml_prob: f32,
     levels: LevelContext,
     findings: FindingSeverity,
+    caller: LlmCaller,
 ) -> Option<Interpretation> {
     if context.trim().is_empty() {
         return None;
@@ -1029,7 +1046,7 @@ pub fn interpret(
         ));
     }
 
-    let _permit = Permit::acquire(cfg.max_concurrency);
+    let _permit = Permit::acquire(cfg.max_concurrency, caller);
     match request(cfg, user) {
         Ok((grade, reason, model)) => {
             health().set(true);
@@ -1541,13 +1558,61 @@ fn chat_raw(
         .context("building LLM HTTP client")
         .map_err(CallError::Transport)?;
 
+    chat_raw_with(breakers(), cfg, &client, system, user, max_tokens)
+}
+
+fn chat_raw_with(
+    breakers: &Breakers,
+    cfg: &InterpretConfig,
+    client: &reqwest::blocking::Client,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> std::result::Result<(String, String), CallError> {
     let attempts = cfg.attempts();
     let last = attempts.len() - 1;
     let mut err = None;
     for (i, at) in attempts.iter().enumerate() {
-        match chat_once(&client, *at, system, user, max_tokens) {
-            Ok(content) => return Ok((content, at.model.to_string())),
+        let admit = breakers.admit(at.base_url);
+        if admit == Admit::Skip {
+            // Debug, not warn: this fires on every call for the whole cooldown,
+            // and the opening already said what happened.
+            tracing::debug!(endpoint = %at.base_url, "LLM endpoint skipped: breaker open");
+            err = Some(CallError::Transport(anyhow!(
+                "{} skipped: breaker open after repeated transport failures",
+                at.base_url
+            )));
+            continue;
+        }
+        match chat_once(client, *at, system, user, max_tokens) {
+            Ok(content) => {
+                if breakers.answered(at.base_url) {
+                    tracing::info!(endpoint = %at.base_url, "LLM endpoint breaker closed");
+                }
+                return Ok((content, at.model.to_string()));
+            }
             Err(e) => {
+                match e {
+                    CallError::Transport(_) => {
+                        if breakers.failed(at.base_url) {
+                            tracing::warn!(
+                                endpoint = %at.base_url,
+                                cooldown_secs = breakers.cooldown.as_secs(),
+                                "LLM endpoint breaker opened after {BREAKER_TRIP_AFTER} \
+                                 consecutive transport failures; skipping it until a probe \
+                                 succeeds"
+                            );
+                        } else if admit == Admit::Probe {
+                            tracing::info!(
+                                endpoint = %at.base_url,
+                                "LLM endpoint probe failed; breaker stays open"
+                            );
+                        }
+                    }
+                    CallError::BadReply(_) => {
+                        breakers.answered(at.base_url);
+                    }
+                }
                 if i < last {
                     // Worth a warning, not an error: the pass has not failed
                     // yet. Silence here would make a fleet quietly billing
@@ -1978,14 +2043,26 @@ static SEM: OnceLock<Sem> = OnceLock::new();
 /// RAII permit; releases its slot on drop.
 struct Permit;
 
+/// Permits background work may never take: the last quarter of the pool, at
+/// least one, stays free for foreground callers. A serve request then queues
+/// only behind other requests, never behind the puller. A pool of one has no
+/// quarter to reserve; there, background work simply takes turns.
+fn foreground_reserve(max: usize) -> usize {
+    if max < 2 { 0 } else { (max / 4).max(1) }
+}
+
 impl Permit {
-    fn acquire(max: NonZeroUsize) -> Self {
+    fn acquire(max: NonZeroUsize, caller: LlmCaller) -> Self {
         let sem = SEM.get_or_init(|| Sem {
             count: Mutex::new(max.get()),
             cv: Condvar::new(),
         });
+        let floor = match caller {
+            LlmCaller::Foreground => 0,
+            LlmCaller::Background => foreground_reserve(max.get()),
+        };
         let mut count = sem.count.lock().unwrap_or_else(PoisonError::into_inner);
-        while *count == 0 {
+        while *count <= floor {
             count = sem.cv.wait(count).unwrap_or_else(PoisonError::into_inner);
         }
         *count -= 1;
@@ -1999,9 +2076,117 @@ impl Drop for Permit {
             {
                 let mut count = sem.count.lock().unwrap_or_else(PoisonError::into_inner);
                 *count += 1;
-            } // release the lock before waking a waiter
-            sem.cv.notify_one();
+            } // release the lock before waking waiters
+            // All of them, not one: a background waiter woken while the count
+            // sits inside the foreground reserve goes straight back to sleep,
+            // and the foreground waiter it was woken instead of would hang.
+            sem.cv.notify_all();
         }
+    }
+}
+
+// ── per-endpoint breaker ────────────────────────────────────────────────────
+// The health gate below is chain-wide: it asks whether *any* endpoint answers.
+// It cannot see the case this breaker exists for — a dead primary in front of
+// a live fallback — where the chain is healthy and every call still pays the
+// primary's timeout before the fallback grades. Measured 2026-09-05 with the
+// LLM host saturated: every serve request spent the full timeout on
+// llm.isotope13.ai and then ~2s on OpenRouter, and the requests it had
+// abandoned were still prefilled on the host after the client was gone.
+//
+// So each endpoint carries its own breaker. Consecutive transport failures
+// open it; while open the endpoint is skipped outright and the next one in
+// the chain is tried at once. After the cooldown exactly one call probes it,
+// and that call's outcome closes the breaker or re-arms the cooldown.
+
+/// How long a tripped endpoint is skipped before one request probes it again.
+pub const BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
+/// Consecutive transport failures that trip an endpoint's breaker. One is a
+/// blip; three in a row against a chain that answers in seconds is an outage.
+const BREAKER_TRIP_AFTER: u32 = 3;
+
+#[derive(Default)]
+struct BreakerState {
+    consecutive_failures: u32,
+    /// When the breaker opened; `None` while closed.
+    opened_at: Option<Instant>,
+    /// A half-open probe is in flight: other callers keep skipping until it
+    /// reports back.
+    probing: bool,
+}
+
+/// What the breaker says to do with an endpoint right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admit {
+    /// Closed: send.
+    Send,
+    /// Open past its cooldown and nobody probing yet: this call is the probe.
+    Probe,
+    /// Open: skip it.
+    Skip,
+}
+
+/// Per-endpoint breakers, keyed by base URL. Tests build their own so the
+/// process-wide instance never carries one test's failures into another.
+pub(crate) struct Breakers {
+    inner: Mutex<HashMap<String, BreakerState>>,
+    cooldown: Duration,
+}
+
+static BREAKERS: OnceLock<Breakers> = OnceLock::new();
+
+fn breakers() -> &'static Breakers {
+    BREAKERS.get_or_init(|| Breakers::new(BREAKER_COOLDOWN))
+}
+
+impl Breakers {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            cooldown,
+        }
+    }
+
+    fn admit(&self, endpoint: &str) -> Admit {
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let st = g.entry(endpoint.to_string()).or_default();
+        match st.opened_at {
+            None => Admit::Send,
+            Some(at) if !st.probing && at.elapsed() >= self.cooldown => {
+                st.probing = true;
+                Admit::Probe
+            }
+            Some(_) => Admit::Skip,
+        }
+    }
+
+    /// The endpoint answered. Any HTTP response counts, a refusal included: a
+    /// 4xx is the model's problem, not the transport's, and it proves the host
+    /// is there. Returns whether this closed an open breaker.
+    fn answered(&self, endpoint: &str) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let st = g.entry(endpoint.to_string()).or_default();
+        let was_open = st.opened_at.is_some();
+        *st = BreakerState::default();
+        was_open
+    }
+
+    /// A transport failure (unreachable, timeout, 5xx). Returns whether this
+    /// call opened the breaker; a failed probe re-arms the cooldown instead.
+    fn failed(&self, endpoint: &str) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let st = g.entry(endpoint.to_string()).or_default();
+        st.consecutive_failures += 1;
+        st.probing = false;
+        if st.opened_at.is_some() {
+            st.opened_at = Some(Instant::now());
+            return false;
+        }
+        if st.consecutive_failures >= BREAKER_TRIP_AFTER {
+            st.opened_at = Some(Instant::now());
+            return true;
+        }
+        false
     }
 }
 

@@ -602,6 +602,23 @@ struct Cli {
     command: Option<Commands>,
 }
 
+/// The LLM timeout a mode gets when `--llm-timeout` is not given.
+///
+/// `serve` holds a caller on the line and fails over almost at once; `worker`
+/// has only a queue behind it and can wait longer; an interactive scan would
+/// rather wait than lose the grade. Takes the command by reference because
+/// `main` moves the subcommand out of `Cli` before the config is built — the
+/// old inline match on `self.command` saw `None` there and handed every daemon
+/// the interactive 120s, which is how a 2s serve timeout shipped without ever
+/// running.
+fn daemon_llm_timeout_secs(command: Option<&Commands>) -> u64 {
+    match command {
+        Some(Commands::Serve { .. }) => scan::interpret::DEFAULT_SERVE_TIMEOUT_SECS,
+        Some(Commands::Worker { .. }) => scan::interpret::DEFAULT_WORKER_TIMEOUT_SECS,
+        _ => scan::interpret::DEFAULT_TIMEOUT_SECS,
+    }
+}
+
 impl Cli {
     /// Build the LLM interpretation config from `--llm` (or the legacy
     /// `--interpret`) and the `--llm-*` flags, falling back to env vars. `None`
@@ -734,13 +751,10 @@ impl Cli {
             // endpoint. `serve` has a caller on the line and fails over almost
             // at once; `worker` has only a queue behind it and can wait longer;
             // an interactive scan would rather wait than lose the grade.
-            timeout: std::time::Duration::from_secs(self.llm_timeout.unwrap_or(
-                match self.command {
-                    Some(Commands::Serve { .. }) => scan::interpret::DEFAULT_SERVE_TIMEOUT_SECS,
-                    Some(Commands::Worker { .. }) => scan::interpret::DEFAULT_WORKER_TIMEOUT_SECS,
-                    _ => scan::interpret::DEFAULT_TIMEOUT_SECS,
-                },
-            )),
+            timeout: std::time::Duration::from_secs(
+                self.llm_timeout
+                    .unwrap_or_else(|| daemon_llm_timeout_secs(self.command.as_ref())),
+            ),
             // `SCAN_LLM_CONCURRENCY` overrides the in-flight cap; the default
             // scales with the box (see `interpret::default_max_concurrency`).
             max_concurrency: std::env::var("SCAN_LLM_CONCURRENCY")
@@ -1411,6 +1425,12 @@ fn main() -> Result<()> {
             }
         }
     };
+
+    // Resolved here, while the subcommand is still in hand: `interpret_config()`
+    // below reads `cli.command`, which the `take()` above has already emptied.
+    if cli.llm_timeout.is_none() {
+        cli.llm_timeout = Some(daemon_llm_timeout_secs(Some(&command)));
+    }
 
     let is_serve = matches!(command, Commands::Serve { .. } | Commands::Worker { .. });
     // Reclaim stale/oversized caches (stng strings+r2, scan analysis+interpret,
@@ -3577,5 +3597,41 @@ mod tests {
             assert_eq!(cfg.api_key.as_deref(), Some("sk-from-file"));
             Ok(())
         })
+    }
+
+    /// The daemon timeouts are resolved from the subcommand *before* `main`
+    /// moves it out of `Cli`. Pinned because the first version matched on
+    /// `self.command` after that move and every daemon silently got the
+    /// interactive 120s.
+    #[test]
+    fn daemon_llm_timeout_follows_the_subcommand() -> Result<()> {
+        let mut serve = Cli::try_parse_from(["atomscan", "serve"])?;
+        let serve_cmd = serve.command.take().context("serve subcommand expected")?;
+        assert_eq!(
+            daemon_llm_timeout_secs(Some(&serve_cmd)),
+            scan::interpret::DEFAULT_SERVE_TIMEOUT_SECS
+        );
+        // What `interpret_config()` sees after the move: no subcommand at all.
+        // `main` compensates by filling `llm_timeout` in first; here the bare
+        // helper must fall back to the interactive default rather than guess.
+        assert!(serve.command.is_none());
+        assert_eq!(
+            daemon_llm_timeout_secs(None),
+            scan::interpret::DEFAULT_TIMEOUT_SECS
+        );
+
+        let mut worker = Cli::try_parse_from(["atomscan", "worker", "--url", "http://127.0.0.1:1"])?;
+        let worker_cmd = worker.command.take().context("worker subcommand expected")?;
+        assert_eq!(
+            daemon_llm_timeout_secs(Some(&worker_cmd)),
+            scan::interpret::DEFAULT_WORKER_TIMEOUT_SECS
+        );
+
+        let mut path = Cli::try_parse_from(["atomscan", "/tmp/a"])?;
+        assert_eq!(
+            daemon_llm_timeout_secs(path.command.take().as_ref()),
+            scan::interpret::DEFAULT_TIMEOUT_SECS
+        );
+        Ok(())
     }
 }
