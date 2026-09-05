@@ -74,6 +74,12 @@ pub const DEFAULT_WORKER_TIMEOUT_SECS: u64 = 15;
 /// 14 admitted requests in a 128-request run failed both hops). An attempt
 /// against OpenRouter therefore gets at least this long, whatever the mode.
 pub const OPENROUTER_MIN_TIMEOUT_SECS: u64 = 30;
+/// How long to wait for a TCP+TLS connection to an LLM endpoint before failing
+/// over to the next one. This, not the request timeout, is the fast path past
+/// a dead or unreachable host: a connection either opens in a moment or nobody
+/// is answering, and the breaker counts it either way. Keeping it separate is
+/// what lets the request timeout be sized for a live endpoint that is slow.
+pub const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Default cap on concurrent in-flight LLM requests.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
@@ -1875,6 +1881,7 @@ fn chat_raw(
         .unwrap_or(cfg.timeout);
     let client = reqwest::blocking::Client::builder()
         .timeout(ceiling)
+        .connect_timeout(LLM_CONNECT_TIMEOUT.min(ceiling))
         .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building LLM HTTP client")

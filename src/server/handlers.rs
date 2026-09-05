@@ -699,6 +699,7 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
         // that never appeared.
         "idle_worker": {
             "slots": state.idle_worker_slots,
+            "cores": state.idle_worker_cores,
             "hopper": state.hopper.is_some(),
             "started": state.idle_worker_started.load(Ordering::Relaxed),
             "paused": state
@@ -752,6 +753,13 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "slots": state.max_concurrent_tasks,
         "slots_free": free,
         "in_flight": in_flight,
+        // Pull-queue analyses running on this box. Not capacity — the idle
+        // worker holds no permit the interactive path needs and stops claiming
+        // the moment a request lands — but real load, which a router should
+        // rank against and discount before calling the box saturated. Without
+        // it, load1 alone made a server full of sheddable work look identical
+        // to one full of requests (2026-09-05). See beamline's `foregroundPressure`.
+        "background_in_flight": state.idle_in_progress.load(Ordering::Relaxed),
         // The basis `slots` was sized on, so a caller can read `load1` against
         // the right denominator. `/_/info` reports logical CPUs; slots are
         // sized on physical, and halving the denominator would halve the
@@ -888,6 +896,7 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         // Whether spare capacity is genuinely spare.
         "idle_worker": {
             "slots": state.idle_worker_slots,
+            "cores": state.idle_worker_cores,
             "started": state.idle_worker_started.load(Ordering::Relaxed),
             "paused": state
                 .idle_pause
