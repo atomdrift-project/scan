@@ -313,6 +313,73 @@ clearing purposes either way.
 bit-reproducible; a borderline file can flip grade run-to-run. The prompt-hash
 verdict cache pins the first verdict in production; score 3× when validating.
 
+## Prompt size: where the tokens went (2026-09-05)
+
+Measured with `hacks/prompt-study.py` over the 113 renderable of the 128 most
+recent PURLs beamline asked the fleet for (`atomscan -f interpret purl …`,
+tokenized by the fleet's own vLLM). Median payload 2,652 tokens, p90 6,742,
+max 54,000.
+
+| share of all prompt tokens | |
+|---|---|
+| provenance JSON | 40% |
+| — of which `registry.raw` provider documents | **30%** |
+| hex byte windows inside members | 13% |
+| findings, source context, headers | ~47% |
+
+- `raw` was a packument projection (`time`, `dist`, `versions`, `_rev`,
+  `maintainers`, …) repeated per subject: 53–60% of an npm/gem/cargo payload,
+  24% of a pypi one. Every identity signal in it is summarised by the record
+  fletch derives from it, so `slim_provenance_for_interpret` now drops `raw`
+  and `project_registry_record` keeps the *whole* identity in words —
+  title, description, publisher/author/email domain, maintainers, repository,
+  both download counts, package and version age, release cadence,
+  `latest_version`, and the registry's own flags (install scripts, security
+  holds, removed/deprecated versions). ~90–220 tokens where `raw` was
+  ~1,000–1,400. A dependency-confusion placeholder now reads
+  `"description":"security holding package","maintainers":0,"downloads_recent":10`.
+- The outliers are structural: a 39 MB jar inside a wheel fanning out to 83
+  `.class` members (17.7k tokens), and a bundled OpenSSL dylib whose 14
+  findings each carry a hex window (16.5k). Those are cleave-side (nested
+  archive fan-out, `TinyOpts::tiny()` inheriting `full_context: true`).
+- **Byte windows stay.** Removing them (`tune.py --templates nohex`) cut ~19%
+  of tokens and turned a known-bad PE (`fffmpeg.exe`) hostile→benign on the
+  shipped prompt while every finding line remained: the rows are the evidence
+  the model grades from, the `// N …` descriptions are hints. The point of the
+  pass is to catch what the rules miss, so cut hinting and metadata, never
+  evidence.
+
+The A/B for the `raw` drop ran on two samples from each of `~/data/benchmark`'s
+`compendium-clean`, `compendium-dirty`, `scan-purls` and `mspd` pools (highest
+ML probability plus one borderline per pool, identity via `--registry-map`),
+majority of 3 runs on the fleet's Qwen3.8-27B:
+
+| arm | exact | mean tokens |
+|---|---|---|
+| `described` (shipped, `raw` kept) | 6/8 | 4,041 |
+| `noraw` | **7/8** | 3,388 |
+| `pointer` (bare markers, less hinting) | 6/8 | 3,181 |
+| `raw` (no annotations) | 6/8 | 2,951 |
+
+The sample `noraw` fixes is `node-ipc@11.1.0` — the clean release of the
+protestware package — which grades *hostile, flapping* with the packument's
+version history in front of the model and benign without it; the low-hint arms
+call it hostile too. The one miss every arm shares, a VS Code extension with no
+registry record and only notable-level metadata findings, is a baseline blind
+spot rather than a render effect. The same corpus was then scanned for real
+(`atomscan --interpret`, old binary vs new, 3 runs each, no analysis cache) as
+the authoritative check: **7/8 → 7/8, every grade identical across all six
+runs, no flapping**, with the same single miss — at 14% fewer prompt tokens
+over the corpus (up to 49% on a small package, where `raw` was most of the
+payload; binaries and samples without a registry record are unchanged). Two traps that harness run exposed, now guarded by
+`engine.rs` tests (`interpret_provenance_carries_identity_and_drops_provider_documents`,
+`interpret_render_keeps_byte_windows_as_evidence`): the render's first line and
+`provenance=` carry the sample *path*, so a corpus laid out by pool name tells
+the model which pool it is grading (lay samples out as `s1/…sN/<basename>`);
+and capture runs `SCAN_FOLLOW=none`, which also skips the `*.forage.json`
+sidecars — identity comes from `--registry-map`, built with
+`fletch registry <purl>` keyed by sha256.
+
 ## Validating / tuning on a new batch
 
 The harness is `hacks/interpret-tune/tune.py`; the workflow is:
