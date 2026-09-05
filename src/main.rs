@@ -1600,7 +1600,7 @@ fn main() -> Result<()> {
     // production with 4 large archives in flight). Stacks are virtual memory;
     // only pages actually touched are committed, so the cost of the extra
     // headroom is address space, not RSS.
-    const RAYON_STACK_MB: usize = 256;
+    const RAYON_STACK_MB: usize = scan::RAYON_STACK_MB;
     if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
         .stack_size(RAYON_STACK_MB * 1024 * 1024)

@@ -183,6 +183,12 @@ pub enum Mode {
     Slow,
 }
 
+/// Stack size for every analysis thread pool, in MiB. cleave's archive
+/// analysis is nested-parallel and deep; 256 MB is what the global rayon pool
+/// has always used, and the small pool (`server::small_pool_for`) must match it
+/// or a member that recurses fine on one pool overflows on the other.
+pub const RAYON_STACK_MB: usize = 256;
+
 #[cfg(test)]
 mod archive_password_tests {
     use super::ArchivePasswords;

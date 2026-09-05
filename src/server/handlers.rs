@@ -2556,8 +2556,17 @@ fn classify_bytes_with_follow(
         ..Default::default()
     };
     crate::engine::add_zip_passwords(&mut opts, resources.zip_passwords.as_slice());
-    let report = cleave::analyze_bytes_shared(data, label, &opts)
-        .with_context(|| format!("cleave analysis of {label}"))?;
+    // A small payload analyzes on its own pool so its inner joins never queue
+    // behind a whale's members in the global injector (see `small_pool_for`).
+    // `install` blocks this thread until the analysis returns, exactly as the
+    // inline call did; only where the nested work lands changes.
+    let size = data.len() as u64;
+    let analyze = move || cleave::analyze_bytes_shared(data, label, &opts);
+    let report = match super::small_pool_for(size) {
+        Some(pool) => pool.install(analyze),
+        None => analyze(),
+    }
+    .with_context(|| format!("cleave analysis of {label}"))?;
     finish_classify(
         label,
         report,
