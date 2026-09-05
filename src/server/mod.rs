@@ -36,7 +36,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::signal;
 
@@ -716,6 +716,103 @@ pub struct ModelResources {
     pub(crate) zip_passwords: crate::ArchivePasswords,
 }
 
+/// Payloads at or below this many bytes count as small — for the slot lanes
+/// and for [`small_pool_for`] alike. `SCAN_SMALL_JOB_MB`, the same knob the
+/// worker's cleave gate reads; 1 MiB unless set.
+fn small_job_max_bytes() -> u64 {
+    std::env::var("SCAN_SMALL_JOB_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(1024 * 1024, |mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// Threads for the small-analysis pool on a host with this many physical
+/// cores: an eighth of them, never fewer than two (one thread cannot pipeline
+/// a member window against its own producer) and never more than sixteen.
+/// 4 cores → 2, 32 → 4, 64 → 8, 128 → 16.
+#[must_use]
+pub(crate) fn small_pool_threads(physical_cores: usize) -> usize {
+    (physical_cores / 8).clamp(2, 16)
+}
+
+struct SmallPool {
+    pool: rayon::ThreadPool,
+    max_bytes: u64,
+}
+
+/// A second rayon pool for small analyses: the bulkhead that keeps a
+/// 300-byte package from queueing behind a 40 MB one.
+///
+/// Every server analysis runs on a tokio blocking thread, so each inner
+/// `par_iter` it issues — string extraction in stng, a member-window flush in
+/// cleave — is *injected* into the global pool from outside, and rayon
+/// workers take injected work only once their own deques are empty. While a
+/// whale's thousands of member tasks are queued they never are. Measured
+/// 2026-09-05 at concurrency 8 over 128 real PURLs: a package that analyzes
+/// in 0.3s alone waited 16.8s in `Registry::in_worker_cold` for a worker, and
+/// the p90 sat at 5.2–5.8s whether or not the LLM pass ran at all. Inside a
+/// pool of its own, a small analysis's joins run on that pool's workers
+/// through their local deques and never touch the injector.
+///
+/// Sized by [`small_pool_threads`] on the same stacks as the global pool. It
+/// oversubscribes the CPU by that many threads while a whale saturates the
+/// global pool — which is the point: the small work must not wait for it.
+/// `SCAN_SMALL_POOL_THREADS` overrides the size (0 disables the pool);
+/// `SCAN_SMALL_JOB_MB` says what counts as small. Built on first use.
+static SMALL_POOL: OnceLock<Option<SmallPool>> = OnceLock::new();
+
+fn build_small_pool() -> Option<SmallPool> {
+    let threads = match std::env::var("SCAN_SMALL_POOL_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(0) => {
+            tracing::info!("small analysis pool disabled (SCAN_SMALL_POOL_THREADS=0)");
+            return None;
+        }
+        Some(n) => n,
+        None => small_pool_threads(
+            cleave::memory_tracker::physical_cpu_count()
+                .or_else(|| {
+                    std::thread::available_parallelism()
+                        .ok()
+                        .map(|n| n.get() / 2)
+                })
+                .unwrap_or(4),
+        ),
+    };
+    let max_bytes = small_job_max_bytes();
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
+        .thread_name(|i| format!("rayon-small-{i}"))
+        .build()
+    {
+        Ok(pool) => {
+            tracing::info!(
+                threads,
+                small_max_mb = max_bytes / (1024 * 1024),
+                "small analysis pool ready: payloads at or below the cap run on their own rayon pool"
+            );
+            Some(SmallPool { pool, max_bytes })
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to build the small analysis pool; small payloads share the global pool");
+            None
+        }
+    }
+}
+
+/// The pool a payload of `bytes` should analyze on, or `None` for the global
+/// pool (a whale, or the small pool disabled).
+pub(crate) fn small_pool_for(bytes: u64) -> Option<&'static rayon::ThreadPool> {
+    SMALL_POOL
+        .get_or_init(build_small_pool)
+        .as_ref()
+        .filter(|p| bytes <= p.max_bytes)
+        .map(|p| &p.pool)
+}
+
 #[derive(Debug)]
 /// See `AppState::lanes`.
 pub(super) struct SlotLanes {
@@ -736,10 +833,7 @@ impl SlotLanes {
         }
         let whale_permits = (1 + max_concurrent / 8).min(max_concurrent);
         let small_permits = max_concurrent.saturating_sub(whale_permits).max(1);
-        let small_max_bytes = std::env::var("SCAN_SMALL_JOB_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map_or(1024 * 1024, |mb| mb.saturating_mul(1024 * 1024));
+        let small_max_bytes = small_job_max_bytes();
         tracing::info!(
             whale_permits,
             small_permits,
@@ -1747,5 +1841,22 @@ mod job_bucket_recent_tests {
         }
         assert_eq!(b.count.load(std::sync::atomic::Ordering::Relaxed), 5);
         assert_eq!(b.recent_json()["samples"], 5);
+    }
+}
+
+#[cfg(test)]
+mod small_pool_tests {
+    /// The small pool scales with the host and never outgrows what a whale
+    /// leaves: an eighth of the cores, floor two, ceiling sixteen.
+    #[test]
+    fn small_pool_threads_scale_from_laptop_to_workstation() {
+        assert_eq!(super::small_pool_threads(1), 2);
+        assert_eq!(super::small_pool_threads(4), 2);
+        assert_eq!(super::small_pool_threads(8), 2);
+        assert_eq!(super::small_pool_threads(16), 2);
+        assert_eq!(super::small_pool_threads(32), 4);
+        assert_eq!(super::small_pool_threads(64), 8);
+        assert_eq!(super::small_pool_threads(128), 16);
+        assert_eq!(super::small_pool_threads(256), 16);
     }
 }
