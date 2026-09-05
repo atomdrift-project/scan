@@ -1145,6 +1145,33 @@ fn cores_busy(
     (total > 0).then(|| cpus as f64 * busy as f64 / total as f64)
 }
 
+/// The idle worker's own rayon pool, `threads` wide, or `None` (and the global
+/// pool) if it cannot be built. Same stacks as the global pool, so a member
+/// analysis that fits there fits here.
+///
+/// This is what makes the core budget a budget in threads: without it a
+/// permit bounded how many analyses started and nothing bounded how many
+/// threads they fanned out on, and a server analysis's own fan-out — injected
+/// into the global pool from a blocking thread — waited behind all of it.
+/// See `CleaveGate::pool` in worker.rs for the measurement.
+fn idle_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
+        .thread_name(|i| format!("rayon-idle-{i}"))
+        .build()
+    {
+        Ok(pool) => {
+            tracing::info!(threads, "idle worker analyses run on their own rayon pool");
+            Some(Arc::new(pool))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to build the idle worker's rayon pool; it shares the global pool");
+            None
+        }
+    }
+}
+
 /// Cores the embedded idle worker may occupy: half the pool, and never none.
 ///
 /// Half is the stated intent for background work, and this is the number
@@ -1725,6 +1752,7 @@ fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
             // idle on the interactive path. See `idle_worker_cores`.
             cpu: Arc::clone(&state.idle_cpu),
             in_progress: Arc::clone(&state.idle_in_progress),
+            pool: idle_pool(state.idle_worker_cores),
             resources,
             last_analyze_request_ms: Arc::clone(&state.last_analyze_request_ms),
             started_at: state.started_at,

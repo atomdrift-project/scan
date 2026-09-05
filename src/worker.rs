@@ -213,12 +213,23 @@ struct CleaveGate {
     whale: Arc<Semaphore>,
     small: Arc<Semaphore>,
     small_max_bytes: u64,
-    /// A core budget, when this worker is embedded in a server. Both feed the
-    /// same rayon pool, so this bounds how much of it pull work may occupy;
-    /// the server keeps its own permits and a reserve the worker cannot
-    /// reach, so its `slots_free` describes what it can start rather than
-    /// what the worker happens to be holding.
+    /// A core budget, when this worker is embedded in a server: how many
+    /// classifies may run at once. The server keeps its own permits and a
+    /// reserve the worker cannot reach, so its `slots_free` describes what it
+    /// can start rather than what the worker happens to be holding.
     cpu: Option<Arc<Semaphore>>,
+    /// The rayon pool those classifies fan out on, when embedded: the
+    /// worker's own, sized to its core budget, never the server's global
+    /// pool. A permit bounds how many analyses start; it does not bound the
+    /// threads each one fans out to, and 64 permits on a 128-thread pool kept
+    /// every thread busy (2026-09-05). Worse, a server analysis runs on a
+    /// blocking thread and its `par_iter` work is *injected* into the global
+    /// pool, which rayon workers take only when their own deques are empty —
+    /// never, while pull work fills them. Measured: one repository analyzed
+    /// in 30s on an idle server and 784s on rdu2 beside its pull worker. A
+    /// pool of its own is the same bulkhead the server already gives small
+    /// analyses (`small_pool_for`), pointed the other way.
+    pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 /// A lane's permit, and the core behind it when the gate shares one.
@@ -233,12 +244,14 @@ impl CleaveGate {
         small_slots: usize,
         small_max_bytes: u64,
         cpu: Option<Arc<Semaphore>>,
+        pool: Option<Arc<rayon::ThreadPool>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             whale: Arc::new(Semaphore::new(whale_slots)),
             small: Arc::new(Semaphore::new(small_slots)),
             small_max_bytes,
             cpu,
+            pool,
         })
     }
 
@@ -838,10 +851,14 @@ pub struct Embedded {
     /// of its own, sized by the server below its own pool.
     pub cpu: Arc<Semaphore>,
     /// Jobs claimed and not yet finished, shared with the server so `/_/stats`
-    /// can publish it as `background_in_flight`: load the router should rank
+    /// can publish the cores this worker holds: load the router should rank
     /// a box by, and discount before calling the box saturated, because it is
     /// the load this worker sheds the moment a request arrives.
     pub in_progress: Arc<AtomicUsize>,
+    /// The rayon pool this worker's analyses fan out on; see
+    /// `CleaveGate::pool`. `None` falls back to the global pool, which is the
+    /// behavior that starved the server's own analyses.
+    pub pool: Option<Arc<rayon::ThreadPool>>,
     /// The server's already-loaded models.
     pub resources: Arc<ModelResources>,
     /// Elapsed-time marker for the most recent analysis request.
@@ -863,6 +880,10 @@ impl std::fmt::Debug for Embedded {
             .field("paused", &self.pause.load(Ordering::Relaxed))
             .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
             .field("in_progress", &self.in_progress.load(Ordering::Relaxed))
+            .field(
+                "pool_threads",
+                &self.pool.as_ref().map(|p| p.current_num_threads()),
+            )
             .field("quiet_period", &self.quiet_period)
             .finish_non_exhaustive()
     }
@@ -1782,6 +1803,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         small_lane,
         small_bytes,
         config.embedded.as_ref().map(|e| Arc::clone(&e.cpu)),
+        config.embedded.as_ref().and_then(|e| e.pool.clone()),
     );
     // A slot's work ends at dispatch; what follows — the cleave-gate wait, the
     // memory reservation, the analysis, the LLM round trip, the hopper post —
@@ -3866,9 +3888,11 @@ async fn run_job(
         );
     }
 
+    let idle_pool = cleave_gate.pool.clone();
     let handle = tokio::task::spawn_blocking(move || {
         // Runs on a tokio blocking thread; cleave's `par_iter` fan-out work-steals
-        // across the shared global rayon pool. Lifecycle logs report `thread_id` —
+        // across the worker's own rayon pool when embedded (`idle_pool`), else
+        // the shared global one. Lifecycle logs report `thread_id` —
         // the blocking thread an operator samples to find a wedged analysis; the
         // CPU work itself runs on the rayon pool threads.
         let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3917,7 +3941,12 @@ async fn run_job(
         // returns, deleting the spool file and releasing its budget.
         // The worker's whole job is posting results (dependencies included)
         // back to hopper, so dependency capture is always on.
-        let result = match (payload, local.as_ref()) {
+        //
+        // On the worker's own rayon pool when it has one: `install` runs the
+        // closure on a pool thread, so every `par_iter` inside it joins on
+        // that pool's deques and never enters the global injector. See
+        // `CleaveGate::pool` for what happens without this.
+        let classify = || match (payload, local.as_ref()) {
             (Some(PrefetchData::Memory(data)), _) => classify_bytes(
                 data,
                 &label_for_blocking,
@@ -3956,6 +3985,10 @@ async fn run_job(
             (None | Some(PrefetchData::Local), None) => Err(anyhow::anyhow!(
                 "no downloaded bytes and no local path for {label_for_blocking}"
             )),
+        };
+        let result = match idle_pool.as_deref() {
+            Some(pool) => pool.install(classify),
+            None => classify(),
         };
         let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let inflight_blocking = BLOCKING_STARTED_TOTAL
@@ -6027,11 +6060,11 @@ mod tests {
         assert_eq!(small_lane_from(2, None), 2);
         assert_eq!(small_lane_from(16, Some(2)), 2);
         assert_eq!(small_lane_from(16, Some(0)), 16);
-        let gate = CleaveGate::new(1, 4, 1024 * 1024, None);
+        let gate = CleaveGate::new(1, 4, 1024 * 1024, None, None);
         assert!(gate.is_small(1024 * 1024));
         assert!(!gate.is_small(1024 * 1024 + 1));
         assert!(
-            !CleaveGate::new(1, 4, 0, None).is_small(1),
+            !CleaveGate::new(1, 4, 0, None, None).is_small(1),
             "0 disables the lane"
         );
         assert_eq!(cleave_concurrency_from(16, 32, None), 16);
