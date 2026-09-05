@@ -416,7 +416,12 @@ ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
 ProtectProc=invisible
-ProcSubset=pid
+# ProcSubset=pid is deliberately absent. It hides every /proc file that is not a
+# process directory, including /proc/stat, which the server reads to report
+# machine-wide cores busy to the router (cpu_busy_cores on /_/stats). With it
+# set the field was null on every Linux box (2026-09-05) and routing fell back
+# to the load average, which counts disk waits as load. ProtectProc=invisible
+# still hides other processes; /proc/stat is world-readable kernel counters.
 UMask=0077
 
 # Process hardening. MemoryDenyWriteExecute is intentionally omitted because
