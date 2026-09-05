@@ -2155,12 +2155,48 @@ fn capture_dependency(rec: &FetchRecord, analyzed: &Analyzed) -> Option<FetchedD
     })
 }
 
+/// The artifact could not be retrieved: the registry refused it, the locator
+/// resolved to no URL, or the budget ran out before it was reached.
+///
+/// A distinct type rather than a message, because the difference between "this
+/// artifact is not available" and "this server is broken" decides an HTTP
+/// status, and a status decides what every caller upstream does next. Beamline
+/// reads a 5xx as a sick worker: it opens that worker's circuit breaker, moves
+/// the request to the next one, and reports `unavailable` once the fleet is
+/// exhausted — so a package nobody can download used to eject healthy workers
+/// from the pool and arrive at poppy as an outage rather than a download
+/// failure. Classifying that on a substring of a `Debug`-formatted outcome is
+/// how it went unnoticed; the type cannot be reworded by accident.
+#[derive(Debug)]
+pub struct Unretrievable {
+    /// What was asked for: the resolved URL, or the locator when there was
+    /// none to resolve.
+    pub target: String,
+    /// How the fetch ended. Carried so a caller can tell a refusal apart from
+    /// a budget stop without re-parsing the message.
+    pub outcome: Outcome,
+}
+
+impl std::fmt::Display for Unretrievable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The wording predates the type and is what the logs and the `scan`
+        // CLI have always shown for this failure. Kept verbatim.
+        write!(
+            f,
+            "fetch retrieved nothing for {}: {:?}",
+            self.target, self.outcome
+        )
+    }
+}
+
+impl std::error::Error for Unretrievable {}
+
 /// Fetch a single external reference — a `pkg:` PURL or a URL — and return its
 /// bytes, a filename for cleave's type detection, and the fetch record. Powers
 /// the `pkg`/`url` subcommands: one artifact, pulled and handed to the scanner.
 /// On a terminal (`progress`), logs the live/cache outcome and resolved URL,
-/// matching `--fetch`. Errors if the client/cache is unavailable or nothing was
-/// retrieved (unresolved, failed, skipped).
+/// matching `--fetch`. Errors if the client/cache is unavailable
+/// ([`anyhow::Error`]) or nothing was retrieved ([`Unretrievable`]).
 pub fn fetch_one(
     locator: RefLocator,
     progress: bool,
@@ -2195,7 +2231,11 @@ pub fn fetch_one(
         } else {
             rec.resolved_url.as_str()
         };
-        anyhow::bail!("fetch retrieved nothing for {target}: {:?}", rec.outcome);
+        return Err(Unretrievable {
+            target: target.to_string(),
+            outcome: rec.outcome.clone(),
+        }
+        .into());
     }
     let bytes = res
         .cache

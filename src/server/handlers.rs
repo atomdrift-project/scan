@@ -138,7 +138,15 @@ fn analysis_error_body(error: &anyhow::Error) -> (StatusCode, serde_json::Value)
     // Classify over the whole chain, not just the root cause: "unsupported file
     // type" is often a middle link wrapped around an io error, and classifying
     // on the root alone reports those as 500.
-    let status = classify_analysis_error(&detail);
+    //
+    // An artifact that could not be retrieved is answered from the type rather
+    // than from any wording, because that verdict is the one this fleet cannot
+    // afford to get wrong: see [`crate::fetch::Unretrievable`].
+    let status = if error.downcast_ref::<crate::fetch::Unretrievable>().is_some() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        classify_analysis_error(&detail)
+    };
     let body = if detail == message {
         serde_json::json!({ "error": message })
     } else {
@@ -2354,8 +2362,10 @@ fn classify_url(
     if let Some(p) = phase {
         p.set("url:payload");
     }
-    let (bytes, name, rec) = crate::fetch::fetch_one(RefLocator::Url(url.to_owned()), false)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // Propagated as-is: `anyhow!` on an `anyhow::Error` rebuilds it from its
+    // `Display`, which drops the chain and with it the `Unretrievable` a URL
+    // fetch failure has to be recognized by.
+    let (bytes, name, rec) = crate::fetch::fetch_one(RefLocator::Url(url.to_owned()), false)?;
     let result = classify_bytes_with_follow(
         bytes::Bytes::from(bytes),
         &name,
@@ -5793,6 +5803,48 @@ mod tests {
             classify_analysis_error("cleave analysis of x.tgz: truncated gzip stream"),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+    }
+
+    /// An artifact the registry would not serve is a 422, not a 500. Beamline
+    /// reads a 5xx as a sick worker — it opens the breaker and retries the
+    /// fleet — so answering a plain 404 from a package host with a server
+    /// fault ejected healthy workers and reached poppy as an outage instead of
+    /// a download failure.
+    #[test]
+    fn unretrievable_artifact_is_422_not_500() {
+        let error = anyhow::Error::new(crate::fetch::Unretrievable {
+            target: "https://proxy.golang.org/gitlab.com/!nebulous!labs/!sia/@v/v1.5.5-rc2.zip"
+                .to_string(),
+            outcome: fletch::fetch::Outcome::Failed("http status 404".to_string()),
+        });
+        let (status, _) = super::analysis_error_body(&error);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Recognized by type, through whatever context the analysis wrapped it in
+    /// — the message alone says nothing a substring rule would catch.
+    #[test]
+    fn unretrievable_survives_added_context() {
+        use anyhow::Context as _;
+
+        let error = Err::<(), _>(anyhow::Error::new(crate::fetch::Unretrievable {
+            target: "https://proxy.golang.org/example.com/m/@v/v1.0.0.zip".to_string(),
+            outcome: fletch::fetch::Outcome::Unresolved,
+        }))
+        .context("analyzing pkg:golang/example.com/m@v1.0.0")
+        .unwrap_err();
+        let (status, _) = super::analysis_error_body(&error);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The rest of the chain still classifies as it did: a fault this server
+    /// is responsible for stays a 500, so a real outage is not quietly
+    /// downgraded into "that package is unavailable".
+    #[test]
+    fn a_server_fault_is_still_500() {
+        let error = anyhow::anyhow!("fetch unavailable: HTTP client could not be initialized");
+        let (status, _) = super::analysis_error_body(&error);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// A request without `registry` still parses — the field is optional, so
