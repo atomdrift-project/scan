@@ -51,15 +51,30 @@ pub const DEFAULT_MIN_LEVEL_LABEL: &str = "the model's grid ceiling";
 /// Default per-request timeout, in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Default per-request timeout for `serve`, in seconds. A request-facing
-/// daemon holds a caller on the line, so it fails over almost immediately: an
-/// endpoint that has not answered in two seconds costs the next one in the
-/// chain, or the second opinion entirely.
-pub const DEFAULT_SERVE_TIMEOUT_SECS: u64 = 2;
+/// daemon holds a caller on the line, so it fails over quickly — but not
+/// faster than an answer can arrive. Two seconds was tried (2026-09-05) and
+/// sat *below* the floor of any real completion: an interpret-sized prompt
+/// (~6k tokens) takes ~2.4s on an idle local vLLM, so every call timed out,
+/// the fallback was charged the same two seconds, and a 291-byte package
+/// spent 4s learning nothing. Five seconds clears an idle origin with margin
+/// and still bounds a saturated one to a cost the breaker then removes.
+pub const DEFAULT_SERVE_TIMEOUT_SECS: u64 = 5;
 /// Default per-request timeout for `worker`, in seconds. No caller is waiting
 /// on a queue job, so a worker can afford to let a slow endpoint finish rather
 /// than spend the chain — but still far short of [`DEFAULT_TIMEOUT_SECS`], so
 /// one wedged endpoint cannot stall the queue.
 pub const DEFAULT_WORKER_TIMEOUT_SECS: u64 = 15;
+/// Floor on the per-request timeout for an OpenRouter endpoint, in seconds.
+///
+/// The mode timeouts above are sized for the local origin, one hop away. A
+/// hosted route is a different animal: the `auto` route picks a provider per
+/// call, cold providers take seconds to first token, and a 6k-token prompt was
+/// measured at 0.5–1.7s warm and far longer cold. Cutting it at the origin's
+/// budget turned the fallback into a second guaranteed failure (measured: all
+/// 14 admitted requests in a 128-request run failed both hops). An attempt
+/// against OpenRouter therefore gets at least this long, whatever the mode.
+pub const OPENROUTER_MIN_TIMEOUT_SECS: u64 = 30;
+
 /// Default cap on concurrent in-flight LLM requests.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 
@@ -1848,8 +1863,18 @@ fn chat_raw(
     user: &str,
     max_tokens: u32,
 ) -> std::result::Result<(String, String), CallError> {
+    // The client carries the *longest* attempt timeout in the chain; each
+    // request then tightens it to its own endpoint's budget. A client-level
+    // timeout is the ceiling reqwest enforces regardless of the request's, so
+    // set at the origin's budget it would silently re-cap the fallback.
+    let ceiling = cfg
+        .attempts()
+        .iter()
+        .map(|at| attempt_timeout(cfg, at.base_url))
+        .max()
+        .unwrap_or(cfg.timeout);
     let client = reqwest::blocking::Client::builder()
-        .timeout(cfg.timeout)
+        .timeout(ceiling)
         .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building LLM HTTP client")
@@ -1881,7 +1906,14 @@ fn chat_raw_with(
             )));
             continue;
         }
-        match chat_once(client, *at, system, user, max_tokens) {
+        match chat_once(
+            client,
+            *at,
+            attempt_timeout(cfg, at.base_url),
+            system,
+            user,
+            max_tokens,
+        ) {
             Ok(content) => {
                 if breakers.answered(at.base_url) {
                     tracing::info!(endpoint = %at.base_url, "LLM endpoint breaker closed");
@@ -1936,9 +1968,22 @@ fn chat_raw_with(
 
 /// POST a system+user prompt to one endpoint and return the model's reply text,
 /// classifying failures for the caller's health accounting.
+/// How long one attempt against `base_url` may take: the mode's timeout for
+/// the local origin, and at least [`OPENROUTER_MIN_TIMEOUT_SECS`] for a hosted
+/// route that cannot answer on the origin's budget.
+fn attempt_timeout(cfg: &InterpretConfig, base_url: &str) -> Duration {
+    if is_openrouter_endpoint(base_url) {
+        cfg.timeout
+            .max(Duration::from_secs(OPENROUTER_MIN_TIMEOUT_SECS))
+    } else {
+        cfg.timeout
+    }
+}
+
 fn chat_once(
     client: &reqwest::blocking::Client,
     cfg: Attempt<'_>,
+    timeout: Duration,
     system: &str,
     user: &str,
     max_tokens: u32,
@@ -2000,7 +2045,9 @@ fn chat_once(
         url = %url,
         "LLM request\n--- system ---\n{system}\n--- user ---\n{user}",
     );
-    let mut req = client.post(&url).json(&body);
+    // Per request, not per client: the client is shared across the chain and
+    // its own timeout is the origin's, which a hosted fallback outlives.
+    let mut req = client.post(&url).json(&body).timeout(timeout);
     if let Some(key) = cfg.api_key.filter(|k| !k.is_empty()) {
         req = req.bearer_auth(key);
     }
@@ -3114,6 +3161,34 @@ mod tests {
         assert_eq!(head, FAMILY);
         let sibling = "micro-behaviors/communications/http/download::curl-upload-file";
         assert_ne!(sibling.split("::").next().unwrap(), FAMILY);
+    }
+
+    /// The origin gets the mode's budget; a hosted route gets at least the
+    /// OpenRouter floor, whichever mode asked. An interactive scan's longer
+    /// patience is kept, not shortened, by the floor.
+    #[test]
+    fn openrouter_attempts_get_the_floor_and_the_origin_gets_the_mode_budget() {
+        let serve = InterpretConfig {
+            timeout: Duration::from_secs(DEFAULT_SERVE_TIMEOUT_SECS),
+            ..Default::default()
+        };
+        assert_eq!(
+            attempt_timeout(&serve, "http://127.0.0.1:8000/v1"),
+            Duration::from_secs(DEFAULT_SERVE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            attempt_timeout(&serve, "https://openrouter.ai/api/v1"),
+            Duration::from_secs(OPENROUTER_MIN_TIMEOUT_SECS)
+        );
+        let interactive = InterpretConfig {
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            ..Default::default()
+        };
+        assert_eq!(
+            attempt_timeout(&interactive, "https://openrouter.ai/api/v1"),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            "a longer mode budget is never cut down to the floor"
+        );
     }
 
     /// The breaker's state machine, with the clock under test control.

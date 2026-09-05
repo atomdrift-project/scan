@@ -375,7 +375,7 @@ struct Cli {
     /// Per-request LLM timeout, in seconds. Once it elapses the endpoint is
     /// treated as a refusal and the next one in the `--llm` chain is tried.
     ///
-    /// [default: 120; 2 under `serve`, 15 under `worker`]
+    /// [default: 120; 5 under `serve`, 15 under `worker`; an OpenRouter hop always gets at least 30]
     #[arg(long, global = true, value_name = "SECS")]
     llm_timeout: Option<u64>,
 
