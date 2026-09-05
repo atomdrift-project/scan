@@ -357,6 +357,32 @@ impl ServerConfig {
 }
 
 #[cfg(test)]
+mod cpu_busy_tests {
+    use super::cores_busy;
+    use cleave::memory_tracker::CpuTime;
+
+    #[test]
+    fn cores_busy_is_the_busy_share_of_the_machine() {
+        let a = CpuTime {
+            busy: 1000,
+            idle: 3000,
+        };
+        let b = CpuTime {
+            busy: 1300,
+            idle: 3100,
+        };
+        // 300 busy of 400 elapsed ticks on 16 CPUs: twelve cores' worth.
+        assert_eq!(cores_busy(a, b, 16), Some(12.0));
+        assert_eq!(cores_busy(a, a, 16), None, "no elapsed ticks, no answer");
+        assert_eq!(
+            cores_busy(b, a, 16),
+            None,
+            "a counter that ran backwards is not a reading"
+        );
+    }
+}
+
+#[cfg(test)]
 mod idle_worker_cores_tests {
     use super::idle_worker_cores;
 
@@ -925,6 +951,8 @@ struct AppState {
     /// Pull-queue analyses the idle worker has in progress; published on
     /// `/_/stats` as `background_in_flight`.
     idle_in_progress: Arc<AtomicUsize>,
+    /// Machine-wide cores busy between consecutive `/_/stats` reads.
+    cpu_busy: CpuBusy,
     /// Raised once the HTTP server stops, so the idle worker winds down with it
     /// rather than outliving the thing it exists to fill the gaps of.
     shutdown: Arc<AtomicBool>,
@@ -1050,6 +1078,52 @@ impl AppState {
 /// Useful for integration tests that need the app without binding to a port.
 ///
 /// # Errors
+/// Cores busy across the whole machine, averaged between two reads of
+/// `/_/stats`.
+///
+/// The router polls stats every few seconds, so each poll sees the mean over
+/// the interval since the last one — the window that matters for deciding
+/// where the next analysis goes. Derived from the kernel's cumulative CPU
+/// counters rather than the load average because the load average is not the
+/// same number on every platform: Linux counts threads blocked on disk, FreeBSD
+/// does not, and a scan host does a great deal of disk. `None` until two
+/// reads exist, and on platforms with no counters; the caller then falls back
+/// to `load1`.
+#[derive(Default)]
+pub(super) struct CpuBusy {
+    last: std::sync::Mutex<Option<(Instant, cleave::memory_tracker::CpuTime, Option<f64>)>>,
+}
+
+impl CpuBusy {
+    /// Logical cores busy since the previous call, or the previous answer if
+    /// the counters have not moved, or `None` with nothing to compare yet.
+    pub(super) fn sample(&self) -> Option<f64> {
+        let now = cleave::memory_tracker::cpu_time()?;
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let mut last = self.last.lock().ok()?;
+        let busy = match *last {
+            Some((_, prev, previous)) => cores_busy(prev, now, cpus).or(previous),
+            None => None,
+        };
+        *last = Some((Instant::now(), now, busy));
+        busy
+    }
+}
+
+/// `Δbusy / (Δbusy + Δidle)` of the machine, times its logical CPUs. `None`
+/// when the counters have not advanced (two reads inside one tick) or ran
+/// backwards (a counter reset), so the caller keeps its previous answer.
+fn cores_busy(
+    prev: cleave::memory_tracker::CpuTime,
+    now: cleave::memory_tracker::CpuTime,
+    cpus: usize,
+) -> Option<f64> {
+    let busy = now.busy.checked_sub(prev.busy)?;
+    let idle = now.idle.checked_sub(prev.idle)?;
+    let total = busy.checked_add(idle)?;
+    (total > 0).then(|| cpus as f64 * busy as f64 / total as f64)
+}
+
 /// Cores the embedded idle worker may occupy: the pool less a quarter, and
 /// never all of it.
 ///
@@ -1107,6 +1181,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         cpu: Arc::new(tokio::sync::Semaphore::new(cores)),
         idle_worker_cores: idle_worker_cores(cores),
         idle_in_progress: Arc::new(AtomicUsize::new(0)),
+        cpu_busy: CpuBusy::default(),
         stuck_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
         analysis_timeout_secs: config.analysis_timeout_secs(),

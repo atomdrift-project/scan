@@ -26,6 +26,10 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+// `/_/stats` is one `serde_json::json!` literal, and the macro recurses once
+// per key; the default limit of 128 was crossed when two more keys landed
+// there (2026-09-05).
+#![recursion_limit = "512"]
 pub mod admission;
 pub mod allocator;
 pub mod analysis_cache;

@@ -772,6 +772,14 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         // that is true and the impression is wrong, and only `load1` against a
         // real core count corrects it.
         "physical_cpus": cleave::memory_tracker::physical_cpu_count(),
+        // Logical cores the whole machine kept busy since the previous poll,
+        // from the kernel's CPU counters. Preferred over `load1` by a router
+        // because it means the same thing on every platform: Linux's load
+        // average counts threads blocked on disk and FreeBSD's does not, so
+        // the same download-heavy analysis reads as pressure on one host and
+        // not the other. `null` until two polls exist or where the platform
+        // has no counters; `load1` stays for that case.
+        "cpu_busy_cores": state.cpu_busy.sample(),
         "overloaded": state.overloaded_since.lock().is_ok_and(|g| g.is_some()),
         "stuck_orphans": state.stuck_orphans.load(Ordering::Relaxed),
 
