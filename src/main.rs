@@ -355,14 +355,14 @@ struct Cli {
     )]
     llm_min_level: Option<u16>,
 
-    /// Raw ML probability at or above which a sample reaches the LLM even when
-    /// the calibrated level grid never placed it (`lvl == -1`) — the case where
-    /// `--llm-min-level` cannot admit at any cutoff.
+    /// Raw ML probability at or above which a sample reaches the LLM, whatever
+    /// the calibrated level grid and cleave findings say.
     ///
-    /// A volume control, not a precision one. On marketplace extensions the
-    /// benign and malicious probability distributions overlap heavily, so
-    /// lowering this buys grid-blind malicious samples at roughly one benign
-    /// sample each. Raise it to opt out.
+    /// One of several independent admissions, so it can only send more, never
+    /// block. The default sits on a measured elbow: malicious admission is flat
+    /// across 0.46..0.57 while benign admission keeps falling through it.
+    /// Lowering it buys the overlap region at roughly 50 benign samples per
+    /// malicious one; raising it sheds about four benign per malicious.
     #[arg(
         long,
         global = true,

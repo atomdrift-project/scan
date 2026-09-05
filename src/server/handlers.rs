@@ -142,7 +142,10 @@ fn analysis_error_body(error: &anyhow::Error) -> (StatusCode, serde_json::Value)
     // An artifact that could not be retrieved is answered from the type rather
     // than from any wording, because that verdict is the one this fleet cannot
     // afford to get wrong: see [`crate::fetch::Unretrievable`].
-    let status = if error.downcast_ref::<crate::fetch::Unretrievable>().is_some() {
+    let status = if error
+        .downcast_ref::<crate::fetch::Unretrievable>()
+        .is_some()
+    {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {
         classify_analysis_error(&detail)
@@ -5690,6 +5693,11 @@ mod tests {
             error: error.map(str::to_string),
             analyzer_directed: false,
             cached,
+            before: crate::interpret::MlVerdict {
+                class: crate::Classification::Benign,
+                prob: 0.1,
+                lvl: None,
+            },
         };
         assert_eq!(super::llm_source(None), None, "no pass ran");
         assert_eq!(super::llm_source(Some(&pass(false, None))), Some("queried"));
