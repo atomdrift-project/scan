@@ -494,12 +494,36 @@ struct InFlightRequest {
 /// cancellation to the blocking thread and removes the in-flight entry, ensuring
 /// neither the semaphore slot nor the dashmap entry leaks even if axum cancels
 /// the handler mid-flight.
+/// What an admitted analysis holds: a request slot and a core.
+///
+/// Slots are sized for a request's whole life, most of which is waiting on
+/// the network; cores are sized to the rayon pool, the only capacity an
+/// analysis really contends for. Reporting slots alone told the router
+/// `slots_free=48` on a box whose 16 cores were all busy (2026-09-04), and
+/// the analysis it sent there waited five minutes to start.
+pub(super) struct AnalysisPermit {
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    _cpu: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AnalysisPermit {
+    pub(super) fn new(
+        slot: tokio::sync::OwnedSemaphorePermit,
+        cpu: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            _slot: slot,
+            _cpu: cpu,
+        }
+    }
+}
+
 pub(super) struct RequestGuard {
     request_id: u64,
     state: Arc<AppState>,
     cancellation: Arc<AtomicBool>,
-    /// Held here so the semaphore permit is released when the guard drops.
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    /// Held here so the slot and core are released when the guard drops.
+    _permit: AnalysisPermit,
 }
 
 impl RequestGuard {
@@ -507,7 +531,7 @@ impl RequestGuard {
         request_id: u64,
         state: Arc<AppState>,
         cancellation: Arc<AtomicBool>,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: AnalysisPermit,
     ) -> Self {
         state.jobs_started.fetch_add(1, Ordering::Relaxed);
         if let Some(pause) = &state.idle_pause {
@@ -519,6 +543,27 @@ impl RequestGuard {
             cancellation,
             _permit: permit,
         }
+    }
+}
+
+impl RequestGuard {
+    /// Keep the slot and core until a timed-out blocking task returns.
+    ///
+    /// A blocking thread cannot be stopped, only asked: the cancellation flag,
+    /// which cleave polls between members. Until it answers it is still using
+    /// a core, so handing its permits back at the timeout is how a node
+    /// reports capacity it does not have — 14 such orphans beside
+    /// `slots_free=48` on one box. The guard follows the thread out instead,
+    /// and `stuck_orphans` counts threads still running, not timeouts there
+    /// have ever been.
+    pub(super) fn follow<T: Send + 'static>(self, task: tokio::task::JoinHandle<T>) {
+        self.cancellation.store(true, Ordering::Release);
+        self.state.stuck_orphans.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let _ = task.await;
+            self.state.stuck_orphans.fetch_sub(1, Ordering::Relaxed);
+            drop(self);
+        });
     }
 }
 
@@ -724,6 +769,9 @@ struct AppState {
     /// the analysis completes or when the orphan-cleanup task gives up. RAII
     /// semantics mean the slot is always released — even on panic or runtime shutdown.
     slots: Arc<tokio::sync::Semaphore>,
+    /// One permit per rayon thread, shared with the idle worker: every analysis
+    /// in this process, whoever asked for it, runs on the same pool.
+    cpu: Arc<tokio::sync::Semaphore>,
     /// Class-aware admission (`SCAN_SLOT_LANES=1`): the flat `slots` semaphore
     /// treats every analysis as equal, but a large archive fans out across the
     /// whole shared rayon pool while a small file uses roughly one thread — so
@@ -843,12 +891,13 @@ struct AppState {
 }
 
 impl AppState {
-    /// Free analysis capacity across whichever admission scheme is active.
+    /// Analyses this server can start right now: a slot and a core for each.
     pub(super) fn available_analysis_permits(&self) -> usize {
-        match &self.lanes {
+        let slots = match &self.lanes {
             Some(lanes) => lanes.available(),
             None => self.slots.available_permits(),
-        }
+        };
+        slots.min(self.cpu.available_permits())
     }
 
     fn next_request_id(&self) -> u64 {
@@ -910,6 +959,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         next_request_id: AtomicU64::new(1),
         slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         lanes: SlotLanes::from_env(max_concurrent),
+        cpu: Arc::new(tokio::sync::Semaphore::new(
+            crate::worker::cleave_concurrency(max_concurrent),
+        )),
         stuck_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
         analysis_timeout_secs: config.analysis_timeout_secs(),
@@ -1415,6 +1467,7 @@ fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
             }),
             pause,
             shutdown: Arc::clone(&state.shutdown),
+            cpu: Arc::clone(&state.cpu),
             resources,
             last_analyze_request_ms: Arc::clone(&state.last_analyze_request_ms),
             started_at: state.started_at,

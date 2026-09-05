@@ -167,7 +167,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 ///
 /// Each worker waits on this gate *after* taking a job and *only* around the
 /// blocking classify — never on a shared dispatch loop.
-fn cleave_concurrency(slots: usize) -> usize {
+pub(crate) fn cleave_concurrency(slots: usize) -> usize {
     let override_value = std::env::var("SCAN_CLEAVE_CONCURRENCY")
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
@@ -213,14 +213,30 @@ struct CleaveGate {
     whale: Arc<Semaphore>,
     small: Arc<Semaphore>,
     small_max_bytes: u64,
+    /// The server's per-core permits, when this worker is embedded in one.
+    /// Both feed the same rayon pool, so an analysis here occupies a core the
+    /// server would otherwise offer — and the server's `slots_free` says so.
+    cpu: Option<Arc<Semaphore>>,
+}
+
+/// A lane's permit, and the core behind it when the gate shares one.
+struct CleavePermit {
+    _lane: tokio::sync::OwnedSemaphorePermit,
+    _cpu: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl CleaveGate {
-    fn new(whale_slots: usize, small_slots: usize, small_max_bytes: u64) -> Arc<Self> {
+    fn new(
+        whale_slots: usize,
+        small_slots: usize,
+        small_max_bytes: u64,
+        cpu: Option<Arc<Semaphore>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             whale: Arc::new(Semaphore::new(whale_slots)),
             small: Arc::new(Semaphore::new(small_slots)),
             small_max_bytes,
+            cpu,
         })
     }
 
@@ -229,17 +245,25 @@ impl CleaveGate {
         self.small_max_bytes > 0 && size <= self.small_max_bytes
     }
 
-    /// Acquire the lane for a job of `size` bytes.
+    /// Acquire the lane for a job of `size` bytes, and a core if shared.
     async fn admit(
         &self,
         size: u64,
-    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+    ) -> std::result::Result<CleavePermit, tokio::sync::AcquireError> {
         let lane = if self.is_small(size) {
             &self.small
         } else {
             &self.whale
         };
-        Arc::clone(lane).acquire_owned().await
+        let lane = Arc::clone(lane).acquire_owned().await?;
+        let cpu = match &self.cpu {
+            Some(cpu) => Some(Arc::clone(cpu).acquire_owned().await?),
+            None => None,
+        };
+        Ok(CleavePermit {
+            _lane: lane,
+            _cpu: cpu,
+        })
     }
 }
 
@@ -808,6 +832,8 @@ pub struct Embedded {
     pub pause: Arc<AtomicBool>,
     /// The host's shutdown flag, so one signal stops both.
     pub shutdown: Arc<AtomicBool>,
+    /// The server's per-core permits; see `CleaveGate::cpu`.
+    pub cpu: Arc<Semaphore>,
     /// The server's already-loaded models.
     pub resources: Arc<ModelResources>,
     /// Elapsed-time marker for the most recent analysis request.
@@ -1742,7 +1768,12 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             .and_then(|v| v.parse::<usize>().ok()),
     );
     let small_bytes = small_job_bytes();
-    let cleave_gate = CleaveGate::new(cleave_slots, small_lane, small_bytes);
+    let cleave_gate = CleaveGate::new(
+        cleave_slots,
+        small_lane,
+        small_bytes,
+        config.embedded.as_ref().map(|e| Arc::clone(&e.cpu)),
+    );
     // A slot's work ends at dispatch; what follows — the cleave-gate wait, the
     // memory reservation, the analysis, the LLM round trip, the hopper post —
     // runs as a detached tail so the slot can claim the next job while this one
@@ -5964,10 +5995,13 @@ mod tests {
         assert_eq!(small_lane_from(2, None), 2);
         assert_eq!(small_lane_from(16, Some(2)), 2);
         assert_eq!(small_lane_from(16, Some(0)), 16);
-        let gate = CleaveGate::new(1, 4, 1024 * 1024);
+        let gate = CleaveGate::new(1, 4, 1024 * 1024, None);
         assert!(gate.is_small(1024 * 1024));
         assert!(!gate.is_small(1024 * 1024 + 1));
-        assert!(!CleaveGate::new(1, 4, 0).is_small(1), "0 disables the lane");
+        assert!(
+            !CleaveGate::new(1, 4, 0, None).is_small(1),
+            "0 disables the lane"
+        );
         assert_eq!(cleave_concurrency_from(16, 32, None), 16);
         assert_eq!(cleave_concurrency_from(16, 16, None), 16);
         assert_eq!(cleave_concurrency_from(16, 8, None), 8);

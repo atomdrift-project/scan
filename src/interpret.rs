@@ -49,6 +49,16 @@ pub const OPENROUTER_DEFAULT_MODEL: &str = "openrouter/auto";
 pub const DEFAULT_MIN_LEVEL_LABEL: &str = "the model's grid ceiling";
 /// Default per-request timeout, in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Default per-request timeout for `serve`, in seconds. A request-facing
+/// daemon holds a caller on the line, so it fails over almost immediately: an
+/// endpoint that has not answered in two seconds costs the next one in the
+/// chain, or the second opinion entirely.
+pub const DEFAULT_SERVE_TIMEOUT_SECS: u64 = 2;
+/// Default per-request timeout for `worker`, in seconds. No caller is waiting
+/// on a queue job, so a worker can afford to let a slow endpoint finish rather
+/// than spend the chain — but still far short of [`DEFAULT_TIMEOUT_SECS`], so
+/// one wedged endpoint cannot stall the queue.
+pub const DEFAULT_WORKER_TIMEOUT_SECS: u64 = 15;
 /// Default cap on concurrent in-flight LLM requests.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 

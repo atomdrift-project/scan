@@ -17,9 +17,11 @@
 #   MAX_RSS_GB  pause threshold (--max-rss-gb)                 (default: -1 = off; systemd MemoryMax handles OOM)
 #   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, 80%, infinity)     (default: 80%)
 #   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target (SCAN_LLM)
-#                                                                (default: https://llm.isotope13.ai/v1,openrouter;
+#                                                                (default: the Makefile's LLM,
+#                                                                 exported on every deploy;
 #                                                                 `openrouter` → https://openrouter.ai/api/v1)
-#   LLM_MODEL      pinned model (SCAN_LLM_MODEL); required for OpenRouter
+#   LLM_MODEL      pinned model (SCAN_LLM_MODEL); unset leaves atomscan's default
+#                  (largest served model, or openrouter/auto for OpenRouter)
 #   SCAN_LLM_KEY   OpenRouter key if ~/.tok/openrouter is absent
 #   HOPPER_TOKEN_FILE  hopper API token to install for the service user
 #   LLM_TOKEN_FILE     bearer token for the LLM endpoint, which requires one
@@ -40,14 +42,24 @@ UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 
 DATA_DIR="${DATA_DIR:-}"
 WORKERS="${WORKERS:-}"
+# -1 is a deliberate departure from atomscan's default (0 = auto-resolve):
+# under systemd, MemoryMax= is the enforcement, and in-process throttling would
+# only turn a leak into a paused worker instead of a restart.
 MAX_RSS_GB="${MAX_RSS_GB:--1}"
 MEMORY_MAX="${MEMORY_MAX:-80%}"
 # LLM_URL is an alias for LLM (SCAN_LLM): `local`, `openrouter`, or a base URL.
 if [ -z "${LLM:-}" ] && [ -n "${LLM_URL:-}" ]; then
     LLM=$LLM_URL
 fi
-LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
-LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-,qwen/qwen3.8-27b}}"
+# LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
+# No default here on purpose: the site's failover chain is defined once, in
+# the Makefile (LLM ?=), which exports it to every deploy script. Unset leaves
+# atomscan's own default.
+LLM="${LLM:-}"
+# Deliberately no default. atomscan picks the model itself — the largest one a
+# vLLM/Ollama endpoint reports, `openrouter/auto` for OpenRouter — and only an
+# operator's explicit pin is passed through.
+LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-}}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
@@ -248,8 +260,9 @@ fi
 # OpenRouter: copy the operator key into the service home as well.
 # The LLM target may be a comma-separated failover chain, so OpenRouter can sit
 # anywhere in it. Anywhere is enough to need its key installed here; only when
-# it is the *whole* chain is a missing key or model fatal, because then there is
-# no other endpoint left to grade with.
+# it is the *whole* chain is a missing key fatal, because then there is no
+# other endpoint left to grade with. There is no model check to match: an
+# unpinned OpenRouter slot is `openrouter/auto` in the binary.
 openrouter_target() {
     _or_rest="$LLM"
     while [ -n "$_or_rest" ]; do
@@ -265,7 +278,7 @@ openrouter_target() {
     return 1
 }
 
-# OpenRouter and nothing else — the case where its key and model are required
+# OpenRouter and nothing else — the case where its key is required
 # rather than merely useful.
 openrouter_only() {
     case "$LLM" in
@@ -274,12 +287,6 @@ openrouter_only() {
     openrouter_target
 }
 if openrouter_target; then
-    if [ -z "$LLM_MODEL" ]; then
-        if openrouter_only; then
-            die "OpenRouter deploy requires LLM_MODEL= (e.g. qwen/qwen3.8-27b)"
-        fi
-        log "WARNING: no LLM_MODEL for the OpenRouter link in $LLM; its catalog is never auto-selected, so that link is dropped from the chain"
-    fi
     dst="${STATE_HOME}/.tok/openrouter"
     src="${HOME}/.tok/openrouter"
     if [ -n "${SCAN_LLM_KEY:-}" ]; then

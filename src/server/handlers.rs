@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::Builder as TempBuilder;
 
@@ -39,22 +39,22 @@ enum AnalysisOutcome {
     Ok(anyhow::Result<Box<crate::engine::ScanResult>>),
     /// Task join failed (panic, runtime shutdown, etc.).
     JoinError(tokio::task::JoinError),
-    /// Task exceeded the configured timeout. Slot is released; the blocking
-    /// thread keeps running until cleave observes the cancellation flag.
+    /// Task exceeded the configured timeout. The blocking thread keeps running
+    /// until cleave observes the cancellation flag, and keeps its slot and
+    /// core until then (`RequestGuard::follow`).
     Timeout(u64),
 }
 
 /// Await a blocking analysis task with an optional per-request timeout.
 ///
-/// On timeout, sets the cancellation flag (so cleave will exit at its next
-/// checkpoint), increments `stuck_orphans` for observability, and returns
-/// `Timeout`. The blocking task is **not** aborted — tokio can't force-stop
-/// a blocking thread — but the HTTP slot is released so new work can land.
+/// The guard is dropped here on completion. On timeout it follows the
+/// blocking task instead — tokio cannot stop a blocking thread, only ask it
+/// via the cancellation flag — so the thread's slot and core stay accounted
+/// for as long as it runs.
 async fn await_with_timeout(
-    handle: tokio::task::JoinHandle<anyhow::Result<crate::engine::ScanResult>>,
+    mut handle: tokio::task::JoinHandle<anyhow::Result<crate::engine::ScanResult>>,
     timeout_secs: u64,
-    cancellation: &AtomicBool,
-    stuck_orphans: &AtomicUsize,
+    guard: super::RequestGuard,
 ) -> AnalysisOutcome {
     if timeout_secs == 0 {
         return match handle.await {
@@ -62,12 +62,11 @@ async fn await_with_timeout(
             Err(e) => AnalysisOutcome::JoinError(e),
         };
     }
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), &mut handle).await {
         Ok(Ok(r)) => AnalysisOutcome::Ok(r.map(Box::new)),
         Ok(Err(e)) => AnalysisOutcome::JoinError(e),
         Err(_) => {
-            cancellation.store(true, Ordering::Release);
-            stuck_orphans.fetch_add(1, Ordering::Relaxed);
+            guard.follow(handle);
             AnalysisOutcome::Timeout(timeout_secs)
         }
     }
@@ -215,6 +214,22 @@ fn rendered_response(status: StatusCode, body: &serde_json::Value) -> Response {
 fn acquire_analysis_permit(
     state: &Arc<AppState>,
     size_hint: Option<u64>,
+) -> Result<super::AnalysisPermit, (StatusCode, serde_json::Value)> {
+    let slot = acquire_slot(state, size_hint)?;
+    // A slot without a core is a queue, and the router was promised a
+    // refusal rather than a wait.
+    let cpu = Arc::clone(&state.cpu).try_acquire_owned().map_err(|_no_permit| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            serde_json::json!({ "error": "At capacity (every core busy)", "retry_after_secs": 30 }),
+        )
+    })?;
+    Ok(super::AnalysisPermit::new(slot, cpu))
+}
+
+fn acquire_slot(
+    state: &Arc<AppState>,
+    size_hint: Option<u64>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, serde_json::Value)> {
     let Some(lanes) = &state.lanes else {
         return Arc::clone(&state.slots)
@@ -253,13 +268,7 @@ fn claim_slot(
     request_id: u64,
     key: &FlightKey,
     size_hint: Option<u64>,
-) -> Result<
-    (
-        Arc<super::ModelResources>,
-        tokio::sync::OwnedSemaphorePermit,
-    ),
-    Outcome,
-> {
+) -> Result<(Arc<super::ModelResources>, super::AnalysisPermit), Outcome> {
     let resources = match state.resources.read() {
         Ok(lock) => match lock.as_ref() {
             Some(r) => Arc::clone(r),
@@ -1718,13 +1727,17 @@ struct RequestFollow {
 
 /// Run one uploaded-file analysis on behalf of every request attached to
 /// `flight`. Takes the staged upload and deletes it on the way out.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the guard is moved into await_with_timeout; the lint cannot see a move through .await"
+)]
 async fn run_file_analysis(
     state: Arc<AppState>,
     request_id: u64,
     upload: Upload,
     flight: &Arc<Flight>,
     resources: Arc<super::ModelResources>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: super::AnalysisPermit,
     request_follow: RequestFollow,
 ) -> Outcome {
     let Upload {
@@ -1819,18 +1832,9 @@ async fn run_file_analysis(
         result
     });
 
-    // Bounded by the configured per-request timeout. On timeout we signal
-    // cancellation and report 504 — the blocking thread continues until cleave
-    // notices the flag, but the slot is freed and `stuck_orphans` is
-    // incremented so an operator can see zombie work.
-    let result = await_with_timeout(
-        handle,
-        state.analysis_timeout_secs,
-        &cancellation,
-        &state.stuck_orphans,
-    )
-    .await;
-    drop(guard);
+    // Bounded by the configured per-request timeout. On timeout we report 504
+    // and the guard follows the blocking thread until cleave notices the flag.
+    let result = await_with_timeout(handle, state.analysis_timeout_secs, guard).await;
 
     // Handles the case where drop(temp_dir) above didn't run.
     if let Err(e) = tokio::fs::remove_dir_all(&temp_dir_path).await {
@@ -1945,13 +1949,17 @@ pub(super) async fn analyze_purl(
 }
 
 /// Run one PURL analysis on behalf of every request attached to `flight`.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the guard is moved into await_with_timeout; the lint cannot see a move through .await"
+)]
 async fn run_purl_analysis(
     state: Arc<AppState>,
     request_id: u64,
     purl: &str,
     flight: &Arc<Flight>,
     resources: Arc<super::ModelResources>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: super::AnalysisPermit,
     request_follow: RequestFollow,
 ) -> Outcome {
     let started = Instant::now();
@@ -2013,14 +2021,7 @@ async fn run_purl_analysis(
         result
     });
 
-    let result = await_with_timeout(
-        handle,
-        state.analysis_timeout_secs,
-        &cancellation,
-        &state.stuck_orphans,
-    )
-    .await;
-    drop(guard);
+    let result = await_with_timeout(handle, state.analysis_timeout_secs, guard).await;
 
     flight_outcome(
         result,
@@ -2035,13 +2036,17 @@ async fn run_purl_analysis(
 /// Run one exact-URL analysis on behalf of every request attached to `flight`.
 /// Unlike a PURL, the URL is fetched verbatim; the resulting ScanResult carries
 /// the SHA-256 that Beamline uses to alias this URL to the canonical artifact.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the guard is moved into await_with_timeout; the lint cannot see a move through .await"
+)]
 async fn run_url_analysis(
     state: Arc<AppState>,
     request_id: u64,
     url: &str,
     flight: &Arc<Flight>,
     resources: Arc<super::ModelResources>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: super::AnalysisPermit,
     request_follow: RequestFollow,
 ) -> Outcome {
     let started = Instant::now();
@@ -2071,7 +2076,6 @@ async fn run_url_analysis(
     let cancel_flag = Arc::clone(&cancellation);
     let slow_rule_ms = state.slow_rule_ms;
     let analysis_timeout_secs = state.analysis_timeout_secs;
-    let stuck_orphans = &state.stuck_orphans;
     let handle = tokio::task::spawn_blocking({
         let url = url.to_owned();
         let uploader = if request_follow.persist {
@@ -2101,9 +2105,7 @@ async fn run_url_analysis(
             result
         }
     });
-    let result =
-        await_with_timeout(handle, analysis_timeout_secs, &cancellation, stuck_orphans).await;
-    drop(guard);
+    let result = await_with_timeout(handle, analysis_timeout_secs, guard).await;
     flight_outcome(
         result,
         request_id,
@@ -2848,15 +2850,7 @@ async fn analyze_path_inner(
     });
 
     // Await to completion, bounded by the configured per-request timeout.
-    // See `analyze` for the timeout-drop-slot semantics.
-    let result = await_with_timeout(
-        handle,
-        state.analysis_timeout_secs,
-        &cancellation,
-        &state.stuck_orphans,
-    )
-    .await;
-    drop(guard);
+    let result = await_with_timeout(handle, state.analysis_timeout_secs, guard).await;
 
     let elapsed_ms = crate::duration_ms(request_start.elapsed());
 

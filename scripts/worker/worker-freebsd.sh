@@ -19,7 +19,7 @@
 #   DATA_DIR            local sample root (--data-dir)           (default: unset)
 #   WORKERS             concurrency (--workers)                  (default: worker auto)
 #   MAX_RSS_GB          pause threshold (--max-rss-gb)            (default: 0 = auto)
-#   LLM                 OpenAI-compatible LLM endpoint (SCAN_LLM) (default: https://llm.isotope13.ai/v1,openrouter)
+#   LLM                 OpenAI-compatible LLM endpoint (SCAN_LLM) (default: the Makefile's LLM, exported on every deploy)
 #   LLM_TOKEN_FILE      bearer token for that endpoint, which requires one
 #                                                              (default: ~/.tok/llm)
 
@@ -31,7 +31,11 @@ URL="${1:-}"
 DATA_DIR="${DATA_DIR:-}"
 WORKERS="${WORKERS:-}"
 MAX_RSS_GB="${MAX_RSS_GB:-0}"
-LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
+# LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
+# No default here on purpose: the site's failover chain is defined once, in
+# the Makefile (LLM ?=), which exports it to every deploy script. Unset leaves
+# atomscan's own default.
+LLM="${LLM:-}"
 
 BINARY=atomscan
 BIN_PATH=/usr/local/bin/${BINARY}

@@ -26,7 +26,10 @@ URL="${1:-}"
 # Optional: cap concurrent analysis slots (--workers). Unset = worker auto.
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
-LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
+# No default here on purpose: the site's failover chain is defined once, in
+# the Makefile (LLM ?=), which exports it to every deploy script. Unset leaves
+# atomscan's own default.
+LLM="${LLM:-}"
 worker_args="worker --url $URL --interpret"
 [ -n "$WORKERS" ] && worker_args="$worker_args --workers $WORKERS"
 

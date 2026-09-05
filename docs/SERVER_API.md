@@ -158,20 +158,21 @@ silently clearing it; `HOPPER=none` clears it explicitly, so renewal stops on
 purpose rather than by omission.
 
 Overrides (passed through the environment), shared by the Linux and FreeBSD
-host installs: `BIND=` (default `127.0.0.1:49999`, on the assumption that a
+host installs: `BIND=` (unset leaves atomscan's own default, `127.0.0.1:49999`, on the assumption that a
 Cloudflare tunnel or another local proxy provides the ingress; set
 `0.0.0.0:49999` to listen on every interface), `TOKEN_SRC=` (default
 `~/.tok/scan`; set empty to deploy without authentication), `ALLOW_CIDR=`
 (default `10.0.0.0/8`; set empty to omit), `LLM=` / `LLM_URL=` (`local`,
-`openrouter`, or a base URL), `LLM_MODEL=` (required for OpenRouter),
+`openrouter`, or a base URL), `LLM_MODEL=` (unset leaves atomscan's default:
+the largest served model, or `openrouter/auto` for OpenRouter),
 `WORKERS=`, `ALLOWED_DIRS=`, `IDLE=`, `CLOUDFLARED=` / `CF_TUNNEL_TOKEN=`.
 `make uninstall-server` tears the service down.
 
 Memory is capped differently per platform, because FreeBSD has no cgroup to
 fall back on: Linux passes `MEMORY_MAX=` to systemd's `MemoryMax=` and turns
 the in-process throttle off, while FreeBSD keeps the in-process throttle on and
-takes `MAX_RSS_GB=` (default `0`, which auto-resolves to the process memory
-limit). FreeBSD also takes `NICE=`, stored in `rc.conf` as `scan_nice`.
+takes `MAX_RSS_GB=` (unset leaves atomscan's default, which auto-resolves to
+the process memory limit). FreeBSD also takes `NICE=`, stored in `rc.conf` as `scan_nice`.
 
 `IDLE=` caps the embedded idle worker — the analysis slots `serve` spends on
 hopper queue work while no request is in flight. Left unset it keeps the server

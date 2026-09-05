@@ -372,9 +372,12 @@ struct Cli {
     )]
     llm_min_prob: f32,
 
-    /// Per-request LLM timeout, in seconds
-    #[arg(long, global = true, default_value_t = scan::interpret::DEFAULT_TIMEOUT_SECS, value_name = "SECS")]
-    llm_timeout: u64,
+    /// Per-request LLM timeout, in seconds. Once it elapses the endpoint is
+    /// treated as a refusal and the next one in the `--llm` chain is tried.
+    ///
+    /// [default: 120; 2 under `serve`, 15 under `worker`]
+    #[arg(long, global = true, value_name = "SECS")]
+    llm_timeout: Option<u64>,
 
     /// Additional passwords to try for encrypted ZIP/7z archives. Repeat the
     /// option to provide more than one; cleave's common defaults remain active.
@@ -727,7 +730,17 @@ impl Cli {
             api_key: primary.api_key,
             min_level: self.llm_min_level,
             min_prob: self.llm_min_prob,
-            timeout: std::time::Duration::from_secs(self.llm_timeout),
+            // A daemon must not hold a job for two minutes behind a wedged
+            // endpoint. `serve` has a caller on the line and fails over almost
+            // at once; `worker` has only a queue behind it and can wait longer;
+            // an interactive scan would rather wait than lose the grade.
+            timeout: std::time::Duration::from_secs(self.llm_timeout.unwrap_or(
+                match self.command {
+                    Some(Commands::Serve { .. }) => scan::interpret::DEFAULT_SERVE_TIMEOUT_SECS,
+                    Some(Commands::Worker { .. }) => scan::interpret::DEFAULT_WORKER_TIMEOUT_SECS,
+                    _ => scan::interpret::DEFAULT_TIMEOUT_SECS,
+                },
+            )),
             // `SCAN_LLM_CONCURRENCY` overrides the in-flight cap; the default
             // scales with the box (see `interpret::default_max_concurrency`).
             max_concurrency: std::env::var("SCAN_LLM_CONCURRENCY")

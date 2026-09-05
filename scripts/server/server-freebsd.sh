@@ -26,9 +26,10 @@
 # Environment overrides:
 #   TOKEN_SRC   token file to install (empty disables authentication)
 #                                                                (default: ~/.tok/scan)
-#   BIND        listen address (--bind)                          (default: 127.0.0.1:49999,
-#                                                                 i.e. reachable only through
-#                                                                 a local tunnel or proxy)
+#   BIND        listen address (--bind)                          (default: unset = atomscan's
+#                                                                 own, 127.0.0.1:49999, i.e.
+#                                                                 reachable only through a
+#                                                                 local tunnel or proxy)
 #   ALLOW_CIDR  extra CIDR allow-list (--allow-cidr); empty skips the flag
 #                                                                (default: 10.0.0.0/8)
 #   WORKERS     concurrency (--workers)                          (default: server auto)
@@ -44,21 +45,24 @@
 #               Stored in rc.conf as scan_hopper.                (default: unset)
 #   HOPPER_TOKEN_FILE  hopper API token, installed whenever the file exists
 #                      (HOPPER need not be set)                  (default: ~/.tok/hopper)
-#   MAX_RSS_GB  pause threshold (--max-rss-gb); 0 auto-resolves to the process
-#               memory limit. Unlike the systemd deploy there is no cgroup cap
-#               to fall back on here, so in-process throttling stays on.
-#                                                                (default: 0 = auto)
+#   MAX_RSS_GB  pause threshold (--max-rss-gb). Unlike the systemd deploy
+#               there is no cgroup cap to fall back on here, so in-process
+#               throttling stays on at atomscan's default, which auto-resolves
+#               to the process memory limit.
+#                                                                (default: unset = auto)
 #   NICE        scheduling priority, stored in rc.conf as scan_nice
 #                                                                (default: rc.d default, -20)
 #   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target — comma-separate
 #               several to fail over in order — stored in
 #               rc.conf as scan_llm; empty turns the second-opinion pass off
-#                                                                (default: https://llm.isotope13.ai/v1,openrouter;
+#                                                                (default: the Makefile's LLM,
+#                                                                 exported on every deploy;
 #                                                                 `openrouter` → https://openrouter.ai/api/v1)
-#   LLM_MODEL      pinned model (scan_llm_model); required for OpenRouter. Pairs
-#                  positionally with a comma-separated LLM chain; a blank slot
-#                  asks that endpoint what it serves
-#                                                    (default: ,qwen/qwen3.8-27b)
+#   LLM_MODEL      pinned model (scan_llm_model). Pairs positionally with a
+#                  comma-separated LLM chain; a blank slot leaves that endpoint
+#                  on atomscan's own default: the largest model it serves, or
+#                  `openrouter/auto` for OpenRouter
+#                                                                (default: unset)
 #   SCAN_LLM_KEY   LLM bearer token, overriding the file below
 #   LLM_TOKEN_FILE LLM endpoint bearer token, installed whenever the file
 #                  exists; our vLLM requires one    (default: ~/.tok/llm)
@@ -86,10 +90,11 @@ PIDFILE=/var/run/${SERVICE_NAME}.pid
 # ALLOW_CIDR= and — deliberately, on a host they trust — authentication with
 # TOKEN_SRC=.
 #
-# BIND defaults to loopback: the intended exposure is a Cloudflare tunnel (or
-# another local proxy) terminating on this host. Set BIND=0.0.0.0:49999 to
-# listen on every interface, and pair it with ALLOW_CIDR.
-BIND="${BIND:-127.0.0.1:49999}"
+# Deliberately no default: unset leaves atomscan's own, loopback, so the
+# intended exposure is a Cloudflare tunnel (or another local proxy) terminating
+# on this host. Set BIND=0.0.0.0:49999 to listen on every interface, and pair
+# it with ALLOW_CIDR.
+BIND="${BIND:-}"
 ALLOW_CIDR="${ALLOW_CIDR-10.0.0.0/8}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/scan}"
 WORKERS="${WORKERS:-}"
@@ -99,14 +104,23 @@ WORKERS="${WORKERS:-}"
 IDLE="${IDLE:-}"
 ALLOWED_DIRS="${ALLOWED_DIRS:-}"
 HOPPER="${HOPPER:-}"
-MAX_RSS_GB="${MAX_RSS_GB:-0}"
+# Deliberately no default: unset leaves atomscan's own (auto-resolve), and the
+# flag is only passed when an operator names a value.
+MAX_RSS_GB="${MAX_RSS_GB:-}"
 NICE="${NICE:-}"
 # LLM_URL is an alias for LLM (SCAN_LLM): `local`, `openrouter`, or a base URL.
 if [ -z "${LLM:-}" ] && [ -n "${LLM_URL:-}" ]; then
 	LLM=$LLM_URL
 fi
-LLM="${LLM-https://llm.isotope13.ai/v1,openrouter}"
-LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-,qwen/qwen3.8-27b}}"
+# LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
+# No default here on purpose: the site's failover chain is defined once, in
+# the Makefile (LLM ?=), which exports it to every deploy script. Unset leaves
+# atomscan's own default.
+LLM="${LLM:-}"
+# Deliberately no default. atomscan picks the model itself — the largest one a
+# vLLM/Ollama endpoint reports, `openrouter/auto` for OpenRouter — and only an
+# operator's explicit pin is passed through.
+LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-}}"
 CLOUDFLARED="${CLOUDFLARED:-auto}"
 CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE:-/usr/local/etc/atomdrift/cloudflared-token}"
 
@@ -298,8 +312,9 @@ fi
 # service home, where atomscan finds it through HOME.
 # The LLM target may be a comma-separated failover chain, so OpenRouter can sit
 # anywhere in it. Anywhere is enough to need its key installed here; only when
-# it is the *whole* chain is a missing key or model fatal, because then there is
-# no other endpoint left to grade with.
+# it is the *whole* chain is a missing key fatal, because then there is no
+# other endpoint left to grade with. There is no model check to match: an
+# unpinned OpenRouter slot is `openrouter/auto` in the binary.
 openrouter_target() {
 	_or_rest="$LLM"
 	while [ -n "$_or_rest" ]; do
@@ -315,7 +330,7 @@ openrouter_target() {
 	return 1
 }
 
-# OpenRouter and nothing else — the case where its key and model are required
+# OpenRouter and nothing else — the case where its key is required
 # rather than merely useful.
 openrouter_only() {
 	case "$LLM" in
@@ -324,12 +339,6 @@ openrouter_only() {
 	openrouter_target
 }
 if openrouter_target; then
-	if [ -z "$LLM_MODEL" ]; then
-		if openrouter_only; then
-			die "OpenRouter deploy requires LLM_MODEL= (e.g. qwen/qwen3.8-27b)"
-		fi
-		log "WARNING: no LLM_MODEL for the OpenRouter link in $LLM; its catalog is never auto-selected, so that link is dropped from the chain"
-	fi
 	dst="${SERVICE_HOME}/.tok/openrouter"
 	src="${HOME}/.tok/openrouter"
 	if [ -n "${SCAN_LLM_KEY:-}" ]; then

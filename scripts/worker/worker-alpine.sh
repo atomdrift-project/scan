@@ -19,7 +19,10 @@ URL="$1"
 # (default: ~/.tok/llm).
 WORKERS="${WORKERS:-}"
 # LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
-LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
+# No default here on purpose: the site's failover chain is defined once, in
+# the Makefile (LLM ?=), which exports it to every deploy script. Unset leaves
+# atomscan's own default.
+LLM="${LLM:-}"
 BINARY=atomscan
 BIN_DIR="$HOME/bin"
 LOG="$HOME/.local/share/atomdrift/scan/scan-worker.log"
