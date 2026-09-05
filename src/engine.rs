@@ -6965,11 +6965,14 @@ fn slim_provenance_for_interpret(
     else {
         return provenance;
     };
-    // `raw` is deliberately kept: two render tests pin that provider-only fields
-    // reach the grader through it ("interpret projection must derive from
-    // preserved raw provenance"), and a sparse `record` can leave it as the only
-    // place a provider's own signal survives. It is also the bulk of the payload
-    // — see the note in `docs/interpret-tuning.md` on trimming it separately.
+    // The provider documents are dropped and the record is projected. `raw` was
+    // kept until 2026-09-05 so that provider-only fields could reach the grader;
+    // measured over 113 rendered PURLs it was 30% of every prompt token — a
+    // packument projection of `time`, `dist`, `versions`, `_rev` — while every
+    // identity signal it carried is summarised by the record fletch derives
+    // from it. An A/B on the shipped prompt with `raw` removed graded the same
+    // samples identically (`hacks/interpret-tune/tune.py --templates noraw`).
+    registry.remove("raw");
     if let Some(record) = registry.get("record") {
         let slim = project_registry_record(record, now_secs);
         registry.insert("record".to_string(), slim);
@@ -6977,12 +6980,25 @@ fn slim_provenance_for_interpret(
     provenance
 }
 
-/// Identity plus the three credibility signals the prompt's coherence test names.
+/// The package's registry identity, projected for the grader.
+///
+/// Everything fletch knows about *who published this and whether anyone uses
+/// it*: name, title and description, publisher and maintainers, repository,
+/// download counts, package and version age, release cadence, and the flags a
+/// registry raises on a package it has already acted on. These are what let a
+/// model recognise a typosquat, a dependency-confusion placeholder, or a
+/// hijacked publisher — the supply-chain cases our rules cannot enumerate —
+/// so the projection keeps all of them, in words rather than single letters,
+/// at a few dozen tokens. The provider documents behind them (`raw`) are not
+/// kept: measured 2026-09-05 over 113 rendered PURLs they were 30% of every
+/// prompt token and carried nothing the record does not summarise.
 ///
 /// Reads the record through its serialized keys rather than the `fletch::Registry`
 /// struct: these are the wire names every consumer of the envelope already sees,
 /// and ecosystems populate different subsets of them (a gem record carries
-/// downloads but no release count; a pypi record carries both).
+/// downloads but no release count; a pypi record carries both). Absent and
+/// empty values are omitted; a zero download count is kept, because zero is
+/// the signal.
 fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_json::Value {
     let get_str = |key: &str| {
         record
@@ -6991,6 +7007,7 @@ fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_j
             .filter(|s| !s.is_empty())
     };
     let get_i64 = |key: &str| record.get(key).and_then(serde_json::Value::as_i64);
+    let get_true = |key: &str| record.get(key).and_then(serde_json::Value::as_bool) == Some(true);
     let truncate = |s: &str, max: usize| {
         if s.chars().count() <= max {
             s.to_string()
@@ -7001,9 +7018,12 @@ fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_j
     };
 
     let mut out = serde_json::Map::new();
+    let mut put = |key: &str, value: serde_json::Value| {
+        out.insert(key.to_string(), value);
+    };
+    let version = get_str("version").unwrap_or("");
     if let Some(name) = get_str("name") {
         let eco = get_str("ecosystem").unwrap_or("");
-        let version = get_str("version").unwrap_or("");
         let mut id = String::new();
         if !eco.is_empty() {
             id.push_str(eco);
@@ -7014,45 +7034,93 @@ fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_j
             id.push('@');
             id.push_str(version);
         }
-        out.insert("n".to_string(), serde_json::json!(id));
+        put("package", serde_json::json!(id));
     }
-    if let Some(description) = get_str("description") {
-        out.insert(
-            "d".to_string(),
-            serde_json::json!(truncate(description, 200)),
-        );
+    for (key, max) in [("title", 120), ("description", 300)] {
+        if let Some(text) = get_str(key) {
+            put(key, serde_json::json!(truncate(text, max)));
+        }
     }
-    if let Some(author) = get_str("publisher").or_else(|| get_str("author")) {
-        out.insert("a".to_string(), serde_json::json!(truncate(author, 60)));
+    // Who. `publisher` is the account that pushed this version; `author` is
+    // whatever the manifest claims. Both matter when they disagree.
+    for (key, max) in [
+        ("publisher", 60),
+        ("author", 60),
+        ("publisher_email_domain", 80),
+    ] {
+        if let Some(text) = get_str(key) {
+            put(key, serde_json::json!(truncate(text, max)));
+        }
     }
-    if let Some(url) = get_str("repository").or_else(|| get_str("homepage")) {
-        out.insert("u".to_string(), serde_json::json!(url));
+    if let Some(n) = get_i64("maintainers") {
+        put("maintainers", serde_json::json!(n));
     }
-    // Two distinct ages, both measured at scan time. `page` is how long the
-    // *package* has existed and is the credibility signal; `vage` is how long
-    // this *version* has, which is a freshness signal and nothing more. Folding
-    // them into one key would report a decade-old gem as days old whenever it
-    // had just cut a release — inverting exactly the signal the coherence test
-    // leans on — so `page` is emitted only when the record actually carries a
-    // first-publication date.
+    if get_true("publisher_in_maintainers") {
+        put("publisher_in_maintainers", serde_json::json!(true));
+    }
+    if get_true("publisher_verified") {
+        put("publisher_verified", serde_json::json!(true));
+    }
+    // Where it claims to come from.
+    for key in ["repository", "homepage", "license"] {
+        if let Some(text) = get_str(key) {
+            put(key, serde_json::json!(truncate(text, 200)));
+        }
+    }
+    // Whether anyone uses it.
+    for key in ["downloads_total", "downloads_recent"] {
+        if let Some(n) = get_i64(key) {
+            put(key, serde_json::json!(n));
+        }
+    }
+    // Two distinct ages, both measured at scan time. `package_age_days` is how
+    // long the *package* has existed and is the credibility signal;
+    // `version_age_days` is how long this *version* has, a freshness signal.
+    // Folding them into one would report a decade-old gem as days old whenever
+    // it had just cut a release — inverting exactly the signal that matters.
     let days_since = |ts: i64| (now_secs > ts).then(|| (now_secs - ts) / 86_400);
     if let Some(days) = get_i64("first_published_at").and_then(days_since) {
-        out.insert("page".to_string(), serde_json::json!(days));
+        put("package_age_days", serde_json::json!(days));
     }
     if let Some(days) = get_i64("published_at").and_then(days_since) {
-        out.insert("vage".to_string(), serde_json::json!(days));
+        put("version_age_days", serde_json::json!(days));
     }
-    if let Some(releases) = get_i64("release_count") {
-        out.insert("rel".to_string(), serde_json::json!(releases));
+    if let Some(days) = get_i64("previous_published_at").and_then(days_since) {
+        put("previous_release_age_days", serde_json::json!(days));
     }
-    if let Some(downloads) = get_i64("downloads_total")
-        .or_else(|| get_i64("downloads_recent"))
-        .filter(|d| *d > 0)
-    {
-        out.insert("dl".to_string(), serde_json::json!(downloads));
+    for key in ["release_count", "releases_24h", "releases_48h"] {
+        if let Some(n) = get_i64(key) {
+            put(key, serde_json::json!(n));
+        }
+    }
+    if let Some(latest) = get_str("latest_version") {
+        put("latest_version", serde_json::json!(latest));
+        if !version.is_empty() && latest != version {
+            put("is_latest", serde_json::json!(false));
+        }
+    }
+    // What the registry itself has flagged. Only when true: a sea of `false`
+    // is noise, and an absent flag reads the same as a false one.
+    for key in [
+        "has_install_script",
+        "security_hold",
+        "version_removed",
+        "deprecated",
+    ] {
+        if get_true(key) {
+            put(key, serde_json::json!(true));
+        }
+    }
+    if let Some(text) = get_str("deprecated") {
+        put("deprecated", serde_json::json!(truncate(text, 120)));
+    }
+    for key in ["unpacked_size", "file_count"] {
+        if let Some(n) = get_i64(key).filter(|n| *n > 0) {
+            put(key, serde_json::json!(n));
+        }
     }
     if let Some(vulns) = get_i64("vulnerability_count").filter(|v| *v > 0) {
-        out.insert("v".to_string(), serde_json::json!(vulns));
+        put("vulnerability_count", serde_json::json!(vulns));
     }
     serde_json::Value::Object(out)
 }
@@ -8856,13 +8924,17 @@ mod dep_backref_tests {
         assert!(primary_trait < dep_header);
         assert!(dep_provenance < dep_trait);
         assert_eq!(ctx.matches("dependency package finding").count(), 1);
-        // The record is projected for the grader: identity as one `n` key plus the
-        // credibility signals, not the full normalized record (see
-        // `project_registry_record`).
-        assert!(ctx.contains(r#""record":{"n":"test/dep@1"}"#), "{ctx}");
+        // The record is projected for the grader: identity plus whichever
+        // credibility signals the registry supplied, not the full normalized
+        // record (see `project_registry_record`) — and never the provider
+        // document behind it.
         assert!(
-            ctx.contains(r#""provider_only":{"kept":true}"#),
-            "interpret projection must derive from preserved raw provenance: {ctx}"
+            ctx.contains(r#""record":{"package":"test/dep@1"}"#),
+            "{ctx}"
+        );
+        assert!(
+            !ctx.contains("provider_only") && !ctx.contains(r#""raw""#),
+            "provider documents must not reach the grader: {ctx}"
         );
         assert!(ctx.contains(r#""source_path":"root.tgz""#));
         assert!(
@@ -8892,6 +8964,372 @@ mod dep_backref_tests {
         assert!(!terminal.contains("transfer"));
         assert!(!terminal.contains("cache:"));
         assert!(terminal.contains("metadata  https://registry.example/dep"));
+    }
+
+    /// The grader sees the package's whole registry identity — every signal a
+    /// supply-chain judgement leans on — and none of the provider document it
+    /// was derived from, however large that document is.
+    #[test]
+    fn interpret_provenance_carries_identity_and_drops_provider_documents() {
+        let root = cleave::FileAnalysis {
+            id: 0,
+            path: "unload-0.0.1.tgz".to_string(),
+            sha256: "r".repeat(64),
+            ..cleave::FileAnalysis::default()
+        };
+        let mut report = empty_report();
+        report.files = vec![root];
+        let now = scan_now_secs();
+        let day = 86_400;
+        let record: fletch::Registry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "npm",
+            "name": "unload",
+            "version": "0.0.1",
+            "title": "unload",
+            "description": "Run a piece of code when the javascript process is about to exit",
+            "author": "pubkey",
+            "publisher": "zefixx",
+            "publisher_email_domain": "outlook.com",
+            "publisher_in_maintainers": false,
+            "maintainers": 1,
+            "homepage": "https://github.com/pubkey/unload#readme",
+            "repository": "git+https://github.com/pubkey/unload.git",
+            "license": "MIT",
+            "downloads_total": null,
+            "downloads_recent": 0,
+            "published_at": now - 3 * day,
+            "first_published_at": now - 3558 * day,
+            "previous_published_at": now - 400 * day,
+            "release_count": 17,
+            "releases_24h": 2,
+            "releases_48h": 3,
+            "latest_version": "2.4.1",
+            "has_install_script": true,
+            "security_hold": true,
+            "version_removed": false,
+            "deprecated": null,
+            "unpacked_size": 12345,
+            "file_count": 7,
+            "vulnerability_count": 0,
+        }))
+        .expect("registry record");
+        // A 60 KB packument: the kind of provider document that was 30% of every
+        // prompt before it was dropped.
+        let packument = format!(
+            r#"{{"name":"unload","versions":{{{}}}}}"#,
+            (0..600)
+                .map(|i| format!(r#""{i}.0.0":{{"dist":{{"tarball":"https://registry.npmjs.org/unload/-/unload-{i}.0.0.tgz","shasum":"{}"}}}}"#, "0".repeat(40)))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(packument.len() > 60_000);
+        let provenance = crate::provenance::RegistryProvenance::from_record_sources(
+            record,
+            &[fletch::fetch::RecordedSource {
+                url: "https://registry.npmjs.org/unload".to_string(),
+                status: 200,
+                content_type: Some("application/json".to_string()),
+                bytes: packument.into_bytes(),
+            }],
+        );
+
+        let ctx = render_interpret_context(
+            "unload-0.0.1.tgz",
+            &"r".repeat(64),
+            None,
+            Some(&provenance),
+            &[],
+            &[],
+            &[],
+            &report,
+        );
+        let line = ctx
+            .lines()
+            .find(|l| l.starts_with("provenance="))
+            .expect("primary provenance line");
+        let json: serde_json::Value =
+            serde_json::from_str(line.trim_start_matches("provenance=")).expect("valid JSON");
+        let rec = &json["registry"]["record"];
+
+        // Identity, in words the grader can read.
+        assert_eq!(rec["package"], "npm/unload@0.0.1");
+        assert_eq!(rec["title"], "unload");
+        assert!(
+            rec["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Run a piece of code")
+        );
+        assert_eq!(rec["publisher"], "zefixx");
+        assert_eq!(rec["author"], "pubkey");
+        assert_eq!(rec["publisher_email_domain"], "outlook.com");
+        assert_eq!(rec["maintainers"], 1);
+        assert_eq!(
+            rec["repository"],
+            "git+https://github.com/pubkey/unload.git"
+        );
+        assert_eq!(rec["homepage"], "https://github.com/pubkey/unload#readme");
+        assert_eq!(rec["license"], "MIT");
+        // Usage: a zero download count is a signal and is kept; a null is not.
+        assert_eq!(rec["downloads_recent"], 0);
+        assert!(rec.get("downloads_total").is_none());
+        // Age and cadence, measured at scan time.
+        assert_eq!(rec["package_age_days"], 3558);
+        assert_eq!(rec["version_age_days"], 3);
+        assert_eq!(rec["previous_release_age_days"], 400);
+        assert_eq!(rec["release_count"], 17);
+        assert_eq!(rec["releases_24h"], 2);
+        assert_eq!(rec["releases_48h"], 3);
+        assert_eq!(rec["latest_version"], "2.4.1");
+        assert_eq!(rec["is_latest"], false);
+        // Registry flags: only the ones that are set.
+        assert_eq!(rec["has_install_script"], true);
+        assert_eq!(rec["security_hold"], true);
+        assert!(
+            rec.get("version_removed").is_none(),
+            "false flags are omitted"
+        );
+        assert!(rec.get("deprecated").is_none());
+        assert!(rec.get("publisher_in_maintainers").is_none());
+        assert_eq!(rec["unpacked_size"], 12345);
+        assert_eq!(rec["file_count"], 7);
+        assert!(
+            rec.get("vulnerability_count").is_none(),
+            "zero vulnerabilities is not a signal"
+        );
+
+        // The provider document is gone, and the line is small however large
+        // the document was.
+        assert!(json["registry"].get("raw").is_none(), "{line}");
+        assert!(
+            !ctx.contains("registry.npmjs.org/unload/-/unload-"),
+            "{ctx}"
+        );
+        assert!(
+            line.len() < 1_500,
+            "provenance line must stay a few hundred tokens, got {} bytes: {line}",
+            line.len()
+        );
+        // Nothing about how or from where the sample was *collected* reaches
+        // the grader: a feed or category name would tell it what it is being
+        // asked to find.
+        for word in ["collector", "category", "feed", "forager", "hopper"] {
+            assert!(!line.contains(word), "{word} in {line}");
+        }
+    }
+
+    /// Identity survives for artifacts that have no registry at all.
+    ///
+    /// A PE, a Mach-O or an Office document is never a package: dropping
+    /// `registry.raw` from the prompt (2026-09-05) left them with *only* what
+    /// the file claims about itself, so the claims cleave lifts out of a
+    /// version resource, a code signature or `docProps/core.xml` are the whole
+    /// identity signal a supply-chain judgement can use — a signer that
+    /// disagrees with the product, an author on a document that arrived from
+    /// nowhere. They reach the model through cleave's minimal header
+    /// (`identity_headline`) rather than through `provenance=`, which is
+    /// exactly why a change to the provenance line could drop them unnoticed.
+    #[test]
+    fn interpret_render_carries_file_identity_for_unregistered_artifacts() {
+        let identity = |json: serde_json::Value| -> Option<filefacts::Identity> {
+            Some(serde_json::from_value(json).expect("identity fixture"))
+        };
+        let claim =
+            |value: &str, source: &str| serde_json::json!({"value": value, "source": source});
+
+        let mut root = cleave::FileAnalysis {
+            id: 0,
+            path: "vendor-bundle.zip".to_string(),
+            sha256: "r".repeat(64),
+            file_type: "zip".to_string(),
+            ..cleave::FileAnalysis::default()
+        };
+        root.findings.push(finding(
+            "root/notable",
+            "archive with mixed content",
+            cleave::Criticality::Notable,
+        ));
+
+        // A signed Windows binary: the version resource says one company, the
+        // Authenticode chain says another. Both must reach the model.
+        let mut pe = cleave::FileAnalysis {
+            id: 1,
+            parent_id: Some(0),
+            depth: 1,
+            path: "vendor-bundle.zip/setup.exe".to_string(),
+            sha256: "p".repeat(64),
+            file_type: "pe".to_string(),
+            size: 1_500_000,
+            identity: identity(serde_json::json!({
+                "name": claim("setup.exe", "pe.version.original_filename"),
+                "project": claim("Contoso Updater", "pe.version.product_name"),
+                "version": claim("3.5.1", "pe.version.file_version"),
+                "organization": claim("Contoso Ltd", "pe.version.company_name"),
+                "signer": {
+                    "common_name": "Vanguard Tech Limited",
+                    "organization": "Vanguard Tech Limited",
+                    "source": "pe.signatures[0]",
+                },
+                "trust": "ca_signed",
+                "build_path": claim(
+                    r"C:\Users\dev\.cargo\registry\src\index.crates.io\serde_json-1.0.114\src\de.rs",
+                    "strings",
+                ),
+            })),
+            ..cleave::FileAnalysis::default()
+        };
+        pe.findings.push(finding(
+            "pe/notable",
+            "imports network APIs",
+            cleave::Criticality::Notable,
+        ));
+
+        // A macOS dylib: the bundle identifier and the Apple team that signed it.
+        let mut macho = cleave::FileAnalysis {
+            id: 2,
+            parent_id: Some(0),
+            depth: 1,
+            path: "vendor-bundle.zip/libhelper.dylib".to_string(),
+            sha256: "m".repeat(64),
+            file_type: "macho".to_string(),
+            size: 802_000,
+            identity: identity(serde_json::json!({
+                "identifier": claim("com.contoso.helper", "macho.bundle_identifier"),
+                "version": claim("1.4.0", "macho.bundle_version"),
+                "signer": {
+                    "common_name": "Developer ID Application: Contoso Ltd (AB12CD34EF)",
+                    "organization": "Contoso Ltd",
+                    "source": "macho.code_signature",
+                },
+                "team_id": claim("AB12CD34EF", "macho.code_signature"),
+                "trust": "developer_id",
+            })),
+            ..cleave::FileAnalysis::default()
+        };
+        macho.findings.push(finding(
+            "macho/notable",
+            "resolves symbols at runtime",
+            cleave::Criticality::Notable,
+        ));
+
+        // An Office document: title, the person named as its author, and the
+        // application that produced it.
+        let mut docx = cleave::FileAnalysis {
+            id: 3,
+            parent_id: Some(0),
+            depth: 1,
+            path: "vendor-bundle.zip/invoice.docx".to_string(),
+            sha256: "d".repeat(64),
+            file_type: "docx".to_string(),
+            size: 20_000,
+            identity: identity(serde_json::json!({
+                "title": claim("Q3 Vendor Invoice", "docprops.core.title"),
+                "authors": [{
+                    "name": "Aleksandr Petrov",
+                    "role": "creator",
+                    "source": "docprops.core.creator",
+                }],
+                "organization": claim("Contoso Ltd", "docprops.app.company"),
+                "producer": claim("Microsoft Office Word", "docprops.app.application"),
+                "trust": "unsigned",
+            })),
+            ..cleave::FileAnalysis::default()
+        };
+        docx.findings.push(finding(
+            "docx/notable",
+            "document contains an external relationship",
+            cleave::Criticality::Notable,
+        ));
+
+        let mut report = empty_report();
+        report.files = vec![root, pe, macho, docx];
+
+        let ctx = render_interpret_context(
+            "vendor-bundle.zip",
+            &"r".repeat(64),
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &report,
+        );
+
+        // Every artifact keeps a header naming what it claims to be.
+        for (path, kind) in [
+            ("setup.exe", "pe"),
+            ("libhelper.dylib", "macho"),
+            ("invoice.docx", "docx"),
+        ] {
+            let header = ctx
+                .lines()
+                .find(|l| l.contains(path) && l.contains(kind))
+                .unwrap_or_else(|| panic!("no header for {path} in:\n{ctx}"));
+            assert!(
+                header.matches('\t').count() >= 2,
+                "{path} header lost its identity field: {header:?}"
+            );
+        }
+
+        // PE: the signer, and the product it claims to be. A signer that
+        // disagrees with the company in the version resource is the finding a
+        // reader can only make when both are present.
+        assert!(ctx.contains("Vanguard Tech Limited"), "PE signer: {ctx}");
+        assert!(ctx.contains("ca-signed"), "PE trust tier: {ctx}");
+        // The version resource's file version rides along with the name.
+        assert!(ctx.contains("3.5.1"), "PE version: {ctx}");
+        // NOTE: `pe.version.product_name` ("Contoso Updater" here, "Ammyy
+        // Admin" on a real sample) does *not* reach the header: cleave's
+        // `identity_headline` builds its subject from identifier → title →
+        // name, and a PE populates `project` instead. The original filename
+        // stands in. Worth closing in cleave — a product name is the closest
+        // thing a PE has to a title — but asserted as-is here so this test
+        // pins today's behaviour rather than a wish.
+        assert!(
+            ctx.contains("setup.exe\t") || ctx.contains("setup.exe "),
+            "PE name: {ctx}"
+        );
+        // The build path leaks the developer account and is rendered beside it.
+        assert!(ctx.contains("serde_json-1.0.114"), "PE build path: {ctx}");
+
+        // Mach-O: bundle identity and the Apple team that signed it.
+        assert!(
+            ctx.contains("com.contoso.helper"),
+            "Mach-O identifier: {ctx}"
+        );
+        assert!(ctx.contains("developer-id"), "Mach-O trust tier: {ctx}");
+
+        // Office document: title, author, producing application.
+        assert!(ctx.contains("Q3 Vendor Invoice"), "docx title: {ctx}");
+        assert!(ctx.contains("Aleksandr Petrov"), "docx author: {ctx}");
+        assert!(
+            ctx.contains("Microsoft Office Word"),
+            "docx producer: {ctx}"
+        );
+
+        // None of this is registry provenance: these artifacts have no package
+        // record, and the one `provenance=` line is the artifact's own hash.
+        assert_eq!(ctx.matches("provenance=").count(), 1, "{ctx}");
+        assert!(!ctx.contains(r#""registry""#), "{ctx}");
+    }
+
+    /// Byte windows are evidence, not hinting: the LLM render must keep the
+    /// rows around a hex hit. Dropping them (`full_context: false`) was tried
+    /// as a size lever on 2026-09-05 and turned a known-bad PE
+    /// (`fffmpeg.exe`) from hostile to benign on the shipped prompt, while
+    /// every finding description stayed. Size is taken from the metadata
+    /// instead (see `slim_provenance_for_interpret`).
+    #[test]
+    fn interpret_render_keeps_byte_windows_as_evidence() {
+        let opts = cleave::output::TinyOpts::tiny();
+        assert!(
+            opts.full_context,
+            "hex hits must render with their surrounding rows"
+        );
+        assert!(
+            opts.context_lines.is_some(),
+            "and a bounded window, not the whole capture"
+        );
     }
 
     #[test]
@@ -8933,7 +9371,9 @@ mod dep_backref_tests {
             &[],
             &report,
         );
-        assert!(ctx.contains(r#""provider_only":{"kept":true}"#));
+        // The record reaches the grader; the provider document behind it does not.
+        assert!(ctx.contains(r#""record":{"#), "{ctx}");
+        assert!(!ctx.contains("provider_only"), "{ctx}");
         assert_eq!(ctx.matches("== PRIMARY").count(), 1);
 
         report.files[0].file_type = "npm".to_string();

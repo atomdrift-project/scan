@@ -61,10 +61,61 @@ CATEGORIZED = re.compile(r'^(\s*)(#|//|--) ([HSNBCF]) (?:((?:\d+:\d+|@\S+)) )?(.
 # A third-party signature line carries no prose — the trait path is the body.
 BARE_SIG = re.compile(r'^(\s*)(#|//|--) ([HSNBCF]) (\S*/\S*)$')
 
+# ── size arms: the shipped prompt over a smaller render ─────────────────────
+# Each mirrors a candidate change to `engine.rs::render_interpret_context`;
+# measured 2026-09-05 over 128 recorded PURLs, `registry.raw` provider documents
+# were 27% of all prompt tokens and hex byte windows another 19%.
+PROVENANCE = re.compile(r"^(\s*provenance=)(\{.*\})\s*$")
+HEX_ROW = re.compile(r"^\s+[0-9a-f]{2,}[-:] ")
+
+def _strip_raw(obj):
+    if isinstance(obj, dict):
+        return {k: _strip_raw(v) for k, v in obj.items() if k != "raw"}
+    if isinstance(obj, list):
+        return [_strip_raw(v) for v in obj]
+    return obj
+
+def drop_raw_provenance(text):
+    """`noraw`: provenance keeps `fetch` and the normalized `record`, loses every
+    `raw` provider document (packument projections, index rows)."""
+    out = []
+    for ln in text.split("\n"):
+        m = PROVENANCE.match(ln)
+        if not m:
+            out.append(ln); continue
+        try:
+            out.append(m.group(1) + json.dumps(_strip_raw(json.loads(m.group(2))), separators=(",", ":")))
+        except ValueError:
+            out.append(ln)
+    return "\n".join(out)
+
+def drop_hex_windows(text):
+    """`nohex`: binary regions keep their finding lines, lose the byte rows
+    (gutter-prefixed rows and rows of C-style escapes) — what `full_context:
+    false` in cleave's TinyOpts would do for hex hits."""
+    return "\n".join(ln for ln in text.split("\n")
+                     if not (HEX_ROW.match(ln) or ("\\x" in ln and not ln.lstrip().startswith(("#", "//")))))
+
+def _categorize(text):
+    return transform(text, "categorized")
+
+SIZE_ARMS = {"noraw": lambda t: _categorize(drop_raw_provenance(t)),
+             "nohex": lambda t: _categorize(drop_hex_windows(t)),
+             "slim": lambda t: _categorize(drop_hex_windows(drop_raw_provenance(t)))}
+
 def transform(text, template):
-    if template in ("full", "described"):
+    if template in SIZE_ARMS:
+        return SIZE_ARMS[template](text)
+    if template in ("full", "lettered"):
         return text
-    if template == "categorized":
+    # `described` is what production sends: `interpret::interpret` runs the
+    # dump-hook render through `engine.rs::recategorize_annotations` before the
+    # request, so the model sees `# Possible <category> — <desc>`, never the
+    # severity letter or the trait id. Grading the raw dump under this name
+    # (2026-09-05, `node-ipc@11.1.0`) flapped benign/hostile where the real scan
+    # was steadily benign — the letters and ids are hinting the model never
+    # gets. The old form stays available as `lettered`.
+    if template in ("described", "categorized"):
         # Mirrors `engine.rs::recategorize_annotations`: drop the severity letter,
         # keep the location and the prose, prefix the trait's broad family.
         out = []
@@ -147,11 +198,13 @@ CATEGORIZED_PROMPT = (
     'discounting any description it does not support.\n' + _TAIL)
 
 def system_prompt(template):
-    return {"full": FULL_PROMPT, "described": DESCRIBED_PROMPT, "pointer": POINTER_PROMPT,
-            "elevated": POINTER_PROMPT, "raw": RAW_PROMPT,
+    if template in SIZE_ARMS:
+        return DESCRIBED_PROMPT
+    return {"full": FULL_PROMPT, "described": DESCRIBED_PROMPT, "lettered": DESCRIBED_PROMPT,
+            "pointer": POINTER_PROMPT, "elevated": POINTER_PROMPT, "raw": RAW_PROMPT,
             "categorized": CATEGORIZED_PROMPT}[template]
 
-TEMPLATES = ["described", "categorized", "full", "pointer", "elevated", "raw"]
+TEMPLATES = ["described", "lettered", "categorized", "full", "pointer", "elevated", "raw"]
 
 # ── corpus / labels / capture ──────────────────────────────────────────────────
 def sha256(path):
@@ -165,6 +218,10 @@ def corpus_files(corpus):
     out = []
     for root, _, files in os.walk(corpus):
         for name in files:
+            # A `*.forage.json` sidecar is provenance for the artifact beside
+            # it — scan pairs the two itself — not a sample of its own.
+            if name.endswith(".forage.json"):
+                continue
             p = os.path.join(root, name)
             out.append((os.path.relpath(p, corpus), p))
     return sorted(out)
@@ -259,6 +316,19 @@ def llm_key():
     except OSError:
         pass
     return None
+
+def count_tokens(endpoint, model, text, key=None):
+    """Prompt tokens via the server's own tokenizer (CPU only). None if the
+    endpoint has no /tokenize (OpenRouter), so the size column is just blank."""
+    body = json.dumps({"model": model, "prompt": text}).encode()
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    try:
+        req = urllib.request.Request(endpoint.rstrip("/").removesuffix("/v1") + "/tokenize", body, headers)
+        return json.loads(urllib.request.urlopen(req, timeout=60).read()).get("count")
+    except Exception:
+        return None
 
 def ask(endpoint, model, system, user, timeout, key=None):
     body = json.dumps({"model": model, "messages": [{"role": "system", "content": system},
@@ -368,13 +438,19 @@ def main():
                     score[t][1] += 1
         print(row)
 
+    # Prompt size per arm, so a smaller render is judged on both axes at once.
+    tokens = {t: [count_tokens(args.endpoint, args.model, transform(renders[rel], t), key) for rel in keys]
+              for t in templates}
     if labels:
         n = max(score[t][2] for t in templates)
         print(f"\n== agreement over {n} labelled files (majority of {args.runs} runs) ==")
-        print(f'{"template":10} {"exact":10} {"acceptable":12}')
+        print(f'{"template":10} {"exact":10} {"acceptable":12} {"mean_tokens":12} {"max_tokens":10}')
         for t in templates:
             e, a, tn = score[t]
-            print(f'{t:10} {f"{e}/{tn}":10} {f"{a}/{tn}":12}')
+            tk = [x for x in tokens[t] if x is not None]
+            mean = f"{sum(tk)/len(tk):.0f}" if tk else "-"
+            mx = f"{max(tk)}" if tk else "-"
+            print(f'{t:10} {f"{e}/{tn}":10} {f"{a}/{tn}":12} {mean:12} {mx:10}')
 
 if __name__ == "__main__":
     main()
