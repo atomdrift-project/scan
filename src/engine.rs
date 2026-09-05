@@ -9278,26 +9278,34 @@ mod dep_backref_tests {
         assert!(ctx.contains("ca-signed"), "PE trust tier: {ctx}");
         // The version resource's file version rides along with the name.
         assert!(ctx.contains("3.5.1"), "PE version: {ctx}");
-        // NOTE: `pe.version.product_name` ("Contoso Updater" here, "Ammyy
-        // Admin" on a real sample) does *not* reach the header: cleave's
-        // `identity_headline` builds its subject from identifier → title →
-        // name, and a PE populates `project` instead. The original filename
-        // stands in. Worth closing in cleave — a product name is the closest
-        // thing a PE has to a title — but asserted as-is here so this test
-        // pins today's behaviour rather than a wish.
+        // What the binary claims about *itself*. The headline can name only
+        // one party and picks the signature, so these reach the reader on
+        // cleave's `claims` line — and the disagreement between the claimed
+        // "Contoso Ltd" and the signing "Vanguard Tech Limited" is a signal
+        // that exists only because both are rendered.
         assert!(
-            ctx.contains("setup.exe\t") || ctx.contains("setup.exe "),
-            "PE name: {ctx}"
+            ctx.contains(r#"product="Contoso Updater""#),
+            "PE product name: {ctx}"
+        );
+        assert!(
+            ctx.contains(r#"company="Contoso Ltd""#),
+            "PE company: {ctx}"
         );
         // The build path leaks the developer account and is rendered beside it.
         assert!(ctx.contains("serde_json-1.0.114"), "PE build path: {ctx}");
 
-        // Mach-O: bundle identity and the Apple team that signed it.
+        // Mach-O: bundle identity, the Apple team, and the bundle version —
+        // which the headline drops whenever the identifier is the subject.
         assert!(
             ctx.contains("com.contoso.helper"),
             "Mach-O identifier: {ctx}"
         );
         assert!(ctx.contains("developer-id"), "Mach-O trust tier: {ctx}");
+        assert!(ctx.contains(r#"team="AB12CD34EF""#), "Mach-O team: {ctx}");
+        assert!(
+            ctx.contains(r#"version="1.4.0""#),
+            "Mach-O bundle version: {ctx}"
+        );
 
         // Office document: title, author, producing application.
         assert!(ctx.contains("Q3 Vendor Invoice"), "docx title: {ctx}");
@@ -9305,6 +9313,13 @@ mod dep_backref_tests {
         assert!(
             ctx.contains("Microsoft Office Word"),
             "docx producer: {ctx}"
+        );
+        // The company the document claims, which its author outranked in the
+        // headline: a document authored outside the company it names is the
+        // same shape of tell as the PE above.
+        assert!(
+            ctx.contains(r#"company="Contoso Ltd""#),
+            "docx company: {ctx}"
         );
 
         // None of this is registry provenance: these artifacts have no package

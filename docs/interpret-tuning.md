@@ -349,6 +349,34 @@ max 54,000.
   pass is to catch what the rules miss, so cut hinting and metadata, never
   evidence.
 
+### File identity: every claim, not the headline's three
+
+A PE, a Mach-O or an Office document is never a package, so dropping `raw`
+left them with only what the file says about itself. That arrives through
+cleave's minimal header (`identity_headline`) rather than `provenance=`, and
+the headline names *one* subject, *one* responsible party and a trust tier —
+so the other half of every pair was being discarded, and the other half is
+routinely the interesting one. cleave `3c5bd9d2` now renders the remainder as
+labelled pairs, because the disagreements are the point:
+
+- a signed PE claiming `company="Contoso Ltd"` in its version resource while
+  its Authenticode chain says `Vanguard Tech Limited`, with the chain's own
+  `subject`/`issuer`/`at` beside it (`fffmpeg.exe`: SSL.com intermediate,
+  London org, signed 2024-03-12);
+- an Office document whose `company` lost to its author, plus every party
+  that touched it rather than the first;
+- a Mach-O's `team` and bundle `version`, both dropped whenever the bundle
+  identifier was the subject;
+- a VS Code extension that previously rendered *no* identity at all and now
+  leads with `sfra-toolkit — SFRA-FAKA` plus `claims file="SFRA Toolkit"`;
+- the producing tool on anything signed, which the trust word displaced.
+
+Measured cost over the eight-sample A/B corpus: **+243 tokens (+0.9%)**, and
+nothing at all on files that carry no identity. Guarded by
+`engine.rs::interpret_render_carries_file_identity_for_unregistered_artifacts`
+(scan side, PE + Mach-O + docx through `render_interpret_context`) and five
+`output.rs` tests in cleave.
+
 The A/B for the `raw` drop ran on two samples from each of `~/data/benchmark`'s
 `compendium-clean`, `compendium-dirty`, `scan-purls` and `mspd` pools (highest
 ML probability plus one borderline per pool, identity via `--registry-map`),

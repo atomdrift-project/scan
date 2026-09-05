@@ -64,12 +64,23 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
         let problems = crate::interpret::validate_gate_prefixes(&traits_dir);
         if !problems.is_empty() {
             for problem in &problems {
-                eprintln!("FAILED {problem}");
+                eprintln!("WARNING {problem}");
             }
-            anyhow::bail!(
-                "{} LLM gate prefix(es) no longer match the installed traits tree; \
-                 resync interpret::LLM_GATE_PREFIXES with the taxonomy before deploying",
+            // A warning, not a failure. A stale prefix costs the coverage of
+            // that one prefix; refusing to start costs the whole node, and
+            // this check compares against whichever traits revision happens to
+            // be installed — which the traits auto-update can change under a
+            // running fleet, with no scan release involved. Blocking on it
+            // meant a traits publish could stop every worker from booting,
+            // which is a far worse failure than the one being guarded against.
+            // The gate is still proven against a known-good tree by
+            // `gate_prefixes_match_the_installed_traits_tree` in CI.
+            eprintln!(
+                "WARNING {} LLM gate prefix(es) match nothing in {}; \
+                 the gate still admits on criticality, probability and level, \
+                 so this narrows coverage rather than disabling it",
                 problems.len(),
+                traits_dir.display(),
             );
         }
     }
