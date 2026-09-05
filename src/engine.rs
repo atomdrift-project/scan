@@ -5407,9 +5407,9 @@ pub(crate) type CpuLease = Box<dyn FnOnce() + Send>;
 
 /// An LLM second opinion the caller has agreed to run itself, after the
 /// analysis has been posted with its ML verdict. Produced by
-/// [`classify_report`] instead of calling the model when a [`CpuLease`] is
+/// `classify_report` instead of calling the model when a `CpuLease` is
 /// given: that caller owns the post-CPU tail and can post the ML result now
-/// and the LLM's amendment later ([`apply_pending_interpretation`]), so the
+/// and the LLM's amendment later (`apply_pending_interpretation`), so the
 /// endpoint's latency stops sitting on the completion path.
 #[derive(Debug, Clone)]
 pub struct PendingLlm {

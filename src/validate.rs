@@ -54,6 +54,26 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
         );
     }
 
+    // The LLM admission gate names trait families and ids directly, so a
+    // taxonomy move breaks it silently: the prefixes still compile, match
+    // nothing, and quietly stop escalating the samples they were carrying.
+    // Check them against the installed tree whenever one resolves. Skipped
+    // along with the rest of the trait work under `--skip-traits`, and a no-op
+    // when no traits are installed — there is nothing to compare against.
+    if !skip_traits && let Ok(traits_dir) = cleave::traits_repo::try_resolve() {
+        let problems = crate::interpret::validate_gate_prefixes(&traits_dir);
+        if !problems.is_empty() {
+            for problem in &problems {
+                eprintln!("FAILED {problem}");
+            }
+            anyhow::bail!(
+                "{} LLM gate prefix(es) no longer match the installed traits tree; \
+                 resync interpret::LLM_GATE_PREFIXES with the taxonomy before deploying",
+                problems.len(),
+            );
+        }
+    }
+
     if skip_traits {
         let models_ver = crate::models_repo::version()
             .map(|v| format!("  models: {v}"))

@@ -125,6 +125,11 @@ fn full_result_serializes_identically() {
             error: None,
             analyzer_directed: true,
             cached: false,
+            before: scan::interpret::MlVerdict {
+                class: Classification::Suspicious,
+                prob: 0.612,
+                lvl: Some(85),
+            },
         }),
         pending_llm: None,
         analysis_cached: false,

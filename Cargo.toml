@@ -177,16 +177,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 log = "0.4"
 tar = "0.4.46"
 
-# Transitive-only pin, not a dep we use. tinyvec 1.13.0 (published 2026-09-03)
-# does not compile without its `std` feature: `tinyvec.rs` does
-# `use alloc::vec::{self, Vec}`, which shadows the `vec!` macro that
-# `TinyVec::heap_from_elem` calls one screen further down. Our path in is
-# unicode-normalization (via fletch -> oci-client -> olpc-cjson) and
-# tract-linalg's build script, neither of which turns `std` on, so a deploy
-# that re-resolves the lock after a git dep moves picks 1.13.0 and dies with
-# "cannot find macro `vec` in this scope". Drop this line once a fixed 1.13.x
-# is out (upstream is Lokathor/tinyvec).
-tinyvec = { version = "=1.12.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

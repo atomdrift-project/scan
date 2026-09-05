@@ -151,42 +151,181 @@ impl std::fmt::Debug for LlmEndpoint {
     }
 }
 
-/// Default raw-probability floor for sending a sample to the LLM, independent
-/// of the calibrated level grid.
+/// Default raw-probability floor for sending a sample to the LLM.
 ///
-/// This is a **volume** control, not a precision one, and the measurements say
-/// so. Measured on the ide_extensions corpus (81 malicious samples the grid
-/// never placed) against 12 benign marketplace extensions, the two populations
-/// do not separate anywhere: at every threshold in the usable range a *larger*
-/// fraction of the benign set is admitted than of the malicious one. The score
-/// is largely reading "how much interesting behaviour is present", and the
-/// grid-blind malicious population is mostly skeleton squatters with none,
-/// while the benign set is AI-coding extensions that read workspaces and call
-/// LLM APIs (`Anthropic.claude-code` 0.42, `dscodegpt` 0.64).
+/// One of several independent admissions (see [`admission`]); an **OR**, so it
+/// can only ever send more, never block. Measured over 1072 samples — 417 malicious
+/// (`mspd`, `compendium-dirty`) against 655 benign (`scan-purls`,
+/// `compendium-clean`) — this is an elbow, not a compromise. Malicious
+/// admission is flat at 395/417 across the whole span 0.4621..0.5677 while
+/// benign admission falls steadily from 169 to 150 through it, so every
+/// thousandth below 0.55 is pure volume. The first sample lost above it costs
+/// 19 benign admissions' worth of nothing, and past 0.80 the trade is roughly
+/// one benign saved per malicious given up.
 ///
-/// 0.04 is the efficient point rather than a separating one. Benign admission
-/// is flat at 11/12 across the whole span 0.04..0.09 — there is exactly one
-/// benign sample in it — so every threshold above 0.04 in that range gives up
-/// malicious coverage (80% -> 62%) for no benign saving at all. Below 0.04 the
-/// last benign sample joins at 0.0398, a thousandth away, so 0.04 and "no
-/// floor" are near-equivalent in practice.
+/// The predecessor floor was 0.04, chosen when this test carried the gate alone
+/// on a corpus where the two populations did not separate. It does not carry it
+/// alone any more: [`LLM_GATE_PREFIXES`] covers the low-probability tail with a
+/// far better exchange rate, which is what makes the higher floor affordable.
+/// Together with the criticality and level tests the whole gate reaches 94.7%
+/// of the malicious corpus on 21.8% of the benign one, against 91.1% on 47.2%
+/// for the 0.04 gate it replaces.
 ///
-/// Expect ~92% of extensions to reach the LLM at this setting. Raise it to cut
-/// volume, understanding that the first real benign reduction is at 0.095 and
-/// costs a fifth of the malicious coverage.
+/// Lower it to buy the overlap region back at about 50 benign samples per
+/// malicious one; raise it to shed roughly four benign per malicious.
+pub const DEFAULT_LLM_MIN_PROB: f32 = 0.55;
+
+/// Trait families and ids that admit a sample to the LLM on their own, at
+/// notable criticality or above.
 ///
-/// What it is genuinely for: a file the grid cannot place at all (`lvl == -1`),
-/// where `ml_admits` is false at every cutoff, leaving ML no way to ask for a
-/// second opinion. Selectivity comes from the elevated-finding path instead.
+/// These exist because the criticality and probability tests are blind in the
+/// same place: a package whose only signal is one notable finding. Each entry
+/// was selected by leave-one-out over the 1072-sample corpus described on
+/// [`DEFAULT_LLM_MIN_PROB`], keeping only prefixes that still pay on top of the
+/// anchor **and** the rest of the set. Together with
+/// [`LLM_GATE_SYNTHESIZED_PREFIXES`] they lift malicious coverage from 85.9% to
+/// 94.7% for 6.4 points of benign volume.
 ///
-/// Note the polarity, which differs from the `DEFAULT_MIN_PROB` floor removed
-/// in "interpret: gate on level, not probability". That one was a hard **AND**
-/// (`if ml_prob < min_prob { return None }`), so it could veto a sample the
-/// findings path had already admitted — the failure the commit message calls
-/// out, where a container carries a member's hostile class but its own raw
-/// score sits near zero. This one is an **OR** admission alongside the level,
-/// finding, and class tests: it can only ever send more, never block.
-pub const DEFAULT_LLM_MIN_PROB: f32 = 0.04;
+/// An entry is either a family (matching every id at or below it) or one exact
+/// `family::leaf` id. Note how narrow they are. The obvious wide families do
+/// not survive: at family level `micro-behaviors/communications/http/url`
+/// admits 52% of the benign corpus for six malicious samples, because nearly
+/// every package builds a URL, so only its `scheme` and `query` leaves are
+/// listed. Two more were dropped outright once the floor moved to 0.55 —
+/// `micro-behaviors/communications/ip/direct` became fully redundant (zero
+/// marginal samples either way) and `metadata/binary/anomaly` bought one
+/// malicious sample for six benign. Prefer measuring a candidate over adding
+/// one that reads plausible.
+///
+/// Every id here is declared in the cleave traits tree, which is what lets
+/// [`validate_gate_prefixes`] prove the taxonomy has not moved underneath them.
+pub const LLM_GATE_PREFIXES: &[&str] = &[
+    // Encrypted archive members: 154 malicious against 1 benign, the single
+    // strongest prefix in the set and the reason password-protected payload
+    // droppers reach a reader at all.
+    "micro-behaviors/data/archive/member",
+    // Agent/editor config paths — where prompt-injection payloads in agent
+    // skills and editor extensions live.
+    "micro-behaviors/fs/path/application/config",
+    "micro-behaviors/communications/email/send",
+    "micro-behaviors/communications/http/upload::curl-command-remote-url",
+    "micro-behaviors/communications/http/url/scheme::cleartext-http-url",
+    "micro-behaviors/communications/http/url/query::query-serializer-call",
+    "micro-behaviors/communications/http/cookies::document-cookie-split-iterate",
+];
+
+/// Gate prefixes whose ids cleave synthesizes at analysis time rather than
+/// reading from the traits tree, so there is no directory to check them against.
+///
+/// Kept apart from [`LLM_GATE_PREFIXES`] for exactly that reason: the split is
+/// what tells [`validate_gate_prefixes`] which entries it can prove and which it
+/// must leave alone, and a tag on a single list would have said the same thing
+/// less plainly. Both lists admit identically: [`admission`] does not
+/// distinguish them.
+///
+/// `metadata/encoded-payload/*` is built by cleave's encoded-payload pass. The
+/// `url` arm was narrowed from the parent family, which held no extra malicious
+/// sample and cost three benign.
+pub const LLM_GATE_SYNTHESIZED_PREFIXES: &[&str] = &["metadata/encoded-payload/url"];
+
+/// Whether any gate prefix admits `id`.
+///
+/// A prefix carrying `::` names one exact trait and matches only itself. A
+/// prefix without it names a family and matches every id at or below it,
+/// compared against the id's head so that `.../archive/member` admits
+/// `.../archive/member::archive-encrypted-member` without also admitting a
+/// sibling family whose name merely starts with the same letters
+/// (`.../archive/members-of-interest`). A synthesized id has no `::` at all, so
+/// it is its own head and the same comparison places it.
+#[must_use]
+fn id_admits(id: &str) -> bool {
+    let head = id.split("::").next().unwrap_or(id);
+    LLM_GATE_PREFIXES
+        .iter()
+        .chain(LLM_GATE_SYNTHESIZED_PREFIXES)
+        .copied()
+        .any(|prefix| {
+            if prefix.contains("::") {
+                id == prefix
+            } else {
+                head == prefix
+                    || head
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }
+        })
+}
+
+/// Check every [`LLM_GATE_PREFIXES`] entry against an installed cleave traits
+/// tree, returning one message per broken prefix. An empty vector means the gate
+/// still matches what the matcher will emit.
+///
+/// This exists because a stale prefix fails silently and expensively. Trait ids
+/// are `<directory path>::<leaf id>`, so a taxonomy move — a family renamed, a
+/// leaf re-homed under a sibling — leaves the gate syntactically fine and
+/// matching nothing. Nobody sees an error; the samples that prefix was carrying
+/// simply stop reaching the LLM, and the loss only shows up as a coverage
+/// regression on a corpus nobody reruns. Cheap to check, so check it.
+///
+/// A family prefix must still be a directory. An exact `family::leaf` id must
+/// additionally be declared by some YAML directly in that directory.
+/// [`LLM_GATE_SYNTHESIZED_PREFIXES`] has no directory to point at and is not
+/// checked here.
+#[must_use]
+pub fn validate_gate_prefixes(traits_dir: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    for prefix in LLM_GATE_PREFIXES {
+        let (family, leaf) = match prefix.split_once("::") {
+            Some((family, leaf)) => (family, Some(leaf)),
+            None => (*prefix, None),
+        };
+        let dir = traits_dir.join(family);
+        let fault = if !dir.is_dir() {
+            format!("names no directory ({})", dir.display())
+        } else if let Some(leaf) = leaf
+            && !trait_declared(&dir, leaf)
+        {
+            format!("names no `{leaf}` trait in {}", dir.display())
+        } else {
+            continue;
+        };
+        problems.push(format!(
+            "LLM gate prefix `{prefix}` {fault}; it was renamed or moved in the \
+             traits tree and now matches nothing",
+        ));
+    }
+    problems
+}
+
+/// Whether any YAML directly in `dir` declares a trait with this `id`.
+///
+/// Line-oriented on purpose: a trait declaration is `- id: <leaf>` at any
+/// indentation, and recognizing that costs nothing next to loading a parser to
+/// answer one yes/no question. False negatives are the safe direction — they
+/// fail the check loudly rather than passing a broken prefix.
+fn trait_declared(dir: &Path, id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "yaml") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let declared = text.lines().any(|line| {
+            let rest = line.trim_start().trim_start_matches("- ").trim_start();
+            rest.strip_prefix("id:")
+                .is_some_and(|value| value.trim().trim_matches(['"', '\'']) == id)
+        });
+        if declared {
+            return true;
+        }
+    }
+    false
+}
 
 /// Configuration for the interpretation pass. Present on a [`crate::ScanConfig`]
 /// only when `--interpret` is set.
@@ -499,6 +638,40 @@ pub struct Interpretation {
     /// inferred from the timing. Not serialized: it describes how this run got
     /// its answer, not the answer.
     pub cached: bool,
+    /// The ML verdict as it stood before this interpretation was folded in.
+    ///
+    /// The blend overwrites `class`, `probability` and `lvl` in place, and the
+    /// `ml` section of the report reports litmus's *final* answer — so without
+    /// this the number the model actually produced survives only in an INFO log
+    /// line. Recorded here, in the `llm` section, because it is a fact about the
+    /// second opinion rather than a second ML reading.
+    pub before: MlVerdict,
+}
+
+/// Where ML had the sample before the LLM was consulted. Serialized as the
+/// `llm.before` object.
+#[derive(Debug, Clone, Copy)]
+pub struct MlVerdict {
+    /// The class ML decided on its own.
+    pub class: Classification,
+    /// The raw model probability, before any steer.
+    pub prob: f32,
+    /// ML's fired level. `Some(-1)` when the calibration never placed the file;
+    /// `None` in manual-threshold mode, where no level axis applies.
+    pub lvl: Option<i32>,
+}
+
+impl Serialize for MlVerdict {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = serializer.serialize_map(None)?;
+        m.serialize_entry("class", &self.class.to_string())?;
+        m.serialize_entry("prob", &self.prob)?;
+        if let Some(lvl) = self.lvl {
+            m.serialize_entry("lvl", &lvl)?;
+        }
+        m.end()
+    }
 }
 
 impl Serialize for Interpretation {
@@ -519,6 +692,11 @@ impl Serialize for Interpretation {
         }
         if let Some(e) = &self.error {
             m.serialize_entry("error", e)?;
+        }
+        // Only when a grade came back. On the error path nothing was folded in,
+        // so `ml` still holds these values and repeating them says nothing.
+        if self.grade.is_some() {
+            m.serialize_entry("before", &self.before)?;
         }
         m.end()
     }
@@ -595,15 +773,21 @@ impl LevelContext {
     /// ML abstains and the caller's remaining admissions — an elevated cleave
     /// finding, a non-benign class — carry the decision. Nothing is lost: with
     /// operator-set thresholds, a score above them already lands as non-benign.
-    /// Whether the calibration placed this file at *any* level at all.
+    /// Whether the calibration placed this file at a real level — `lvl != -1`.
     ///
     /// Broader than [`Self::ml_admits`], which additionally requires the fired
     /// level to sit at or below a cutoff. Being placed anywhere is itself the
-    /// signal: on the ide_extensions corpus no benign extension is placed at
-    /// all, so `lvl != -1` costs nothing and admits 41 of 123 malicious samples
-    /// — far more selective than any probability floor on that population.
+    /// signal: across 1072 measured samples only 4 of 655 benign are placed,
+    /// against 226 of 417 malicious, which is a better exchange rate than any
+    /// probability floor on that population.
+    ///
+    /// `Some(-1)` is ML seeing nothing and is not a placement. This used to read
+    /// `fired.is_some()`, which is true for `Some(-1)` and therefore true for
+    /// every sample whenever a level table applies at all — so this admission
+    /// was unconditional in level mode and the `Optional` tier meant nothing.
+    /// Manual-threshold mode (`None`) has no axis to read and still abstains.
     fn ml_placed(self) -> bool {
-        self.fired.is_some()
+        matches!(self.fired, Some(fired) if fired >= 0)
     }
 
     fn ml_admits(self, min_level: Option<u16>) -> bool {
@@ -824,24 +1008,47 @@ pub struct FindingSeverity {
     pub elevated: bool,
     /// cleave surfaced a hostile-criticality finding.
     pub hostile: bool,
+    /// cleave surfaced a notable-or-above finding under [`LLM_GATE_PREFIXES`].
+    ///
+    /// Separate from `elevated` because it answers a different question: not
+    /// "how bad did this look" but "is this one of the specific behaviours a
+    /// reader catches and criticality does not". It is the admission that
+    /// carries the low-probability tail — packages whose only signal is a
+    /// single notable finding — and it is why the probability floor can sit at
+    /// 0.55 instead of 0.04.
+    pub gate_trait: bool,
 }
 
 impl FindingSeverity {
-    /// Read the highest criticality cleave reached anywhere in the report.
+    /// Read the highest criticality cleave reached anywhere in the report, and
+    /// whether any finding sits under an [`LLM_GATE_PREFIXES`] entry.
     #[must_use]
     pub fn from_report(report: &cleave::AnalysisReport) -> Self {
+        Self::from_findings(report.files.iter().flat_map(|file| file.findings.iter()))
+    }
+
+    /// As [`Self::from_report`], over a bare finding sequence. The report is
+    /// only ever a container for these, and taking the findings directly is
+    /// what lets the gate be exercised against hand-built fixtures.
+    ///
+    /// Deliberately not an early return on hostile: `gate_trait` has to see
+    /// every finding, and a hostile one says nothing about whether a gate
+    /// prefix also fired. The loop is over an already-materialized report.
+    #[must_use]
+    pub fn from_findings<'a>(findings: impl IntoIterator<Item = &'a cleave::Finding>) -> Self {
         let mut out = Self::default();
-        for file in &report.files {
-            for finding in &file.findings {
-                if finding.crit >= cleave::Criticality::Hostile {
-                    return Self {
-                        elevated: true,
-                        hostile: true,
-                    };
-                }
-                if finding.crit >= cleave::Criticality::Suspicious {
-                    out.elevated = true;
-                }
+        for finding in findings {
+            if finding.crit >= cleave::Criticality::Hostile {
+                out.elevated = true;
+                out.hostile = true;
+            } else if finding.crit >= cleave::Criticality::Suspicious {
+                out.elevated = true;
+            }
+            // Notable is the floor: below it sit baseline noise and the
+            // component legs of composites, which fire on ordinary packages and
+            // would turn every prefix into a volume tax.
+            if finding.crit >= cleave::Criticality::Notable && id_admits(&finding.id) {
+                out.gate_trait = true;
             }
         }
         out
@@ -852,10 +1059,10 @@ impl FindingSeverity {
 /// opinion off the analysis path and must ration a saturated endpoint.
 ///
 /// `Required` is every admission that can change a verdict: an elevated
-/// cleave finding, a non-benign ML class, or a raw score above the
-/// probability floor. `Optional` is the routine case — ML placed the file on
-/// its grid but nothing else says so — where the second opinion is context
-/// for the reader rather than a correction. Under load a worker serves
+/// cleave finding, a finding under [`LLM_GATE_PREFIXES`], a non-benign ML
+/// class, or a raw score above the probability floor. `Optional` is the routine
+/// case — ML placed the file on its grid but nothing else says so — where the
+/// second opinion is context for the reader rather than a correction. Under load a worker serves
 /// `Required` first and skips `Optional`; unloaded, both run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmAdmission {
@@ -867,6 +1074,17 @@ pub enum LlmAdmission {
 
 /// The gate of [`interpret`], answered without running the model: `None`
 /// when the sample is not admitted at all.
+///
+/// Five independent admissions, all `OR`, because they fail on different files:
+/// a raw score at or above [`DEFAULT_LLM_MIN_PROB`]; a suspicious-or-hostile
+/// cleave finding; a notable-or-above finding under [`LLM_GATE_PREFIXES`]; the
+/// same elevation re-read from the render as a backstop; and a non-benign
+/// verdict class, which catches a container carrying a member's hostile class
+/// on its own near-zero score.
+///
+/// Measured over 1072 samples (see [`DEFAULT_LLM_MIN_PROB`]) this admits 94.7%
+/// of the malicious corpus on 21.8% of the benign one. The criticality test
+/// alone would be 79.4% on 12.2%; the prefixes buy most of the rest.
 #[must_use]
 pub fn admission(
     cfg: &InterpretConfig,
@@ -878,6 +1096,7 @@ pub fn admission(
 ) -> Option<LlmAdmission> {
     if ml_prob >= cfg.min_prob
         || findings.elevated
+        || findings.gate_trait
         || has_elevated_finding(context)
         || !matches!(ml_class, Classification::Benign)
     {
@@ -1102,6 +1321,11 @@ fn failure(
         cached: false,
         error: Some(error),
         analyzer_directed,
+        before: MlVerdict {
+            class: ml_class,
+            prob: ml_prob,
+            lvl: None,
+        },
     }
 }
 
@@ -1370,6 +1594,11 @@ fn blended(
         error: None,
         analyzer_directed: ev.analyzer_directed,
         cached,
+        before: MlVerdict {
+            class: ml_class,
+            prob: ml_prob,
+            lvl: ev.levels.fired,
+        },
     }
 }
 
@@ -2303,6 +2532,199 @@ impl Health {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// Build a finding the way cleave emits one: an id and a criticality. The
+    /// rest of `Finding` is inert for the gate.
+    fn finding(id: &str, crit: cleave::Criticality) -> cleave::Finding {
+        cleave::Finding {
+            id: id.into(),
+            crit,
+            ..Default::default()
+        }
+    }
+
+    /// A gate decision for a sample with these findings and this raw score, at
+    /// the shipped defaults and with nothing else pushing it over: benign
+    /// class, no level grid, empty render.
+    fn admits(findings: &[cleave::Finding], prob: f32) -> Option<LlmAdmission> {
+        admission(
+            &InterpretConfig::default(),
+            Classification::Benign,
+            prob,
+            LevelContext {
+                fired: Some(-1),
+                active: None,
+                grid_max: 0,
+            },
+            FindingSeverity::from_findings(findings),
+            "",
+        )
+    }
+
+    #[test]
+    fn gate_prefixes_match_ids_at_or_below_a_family() {
+        // A family prefix admits itself and anything under it.
+        assert!(id_admits(
+            "micro-behaviors/data/archive/member::archive-encrypted-member"
+        ));
+        assert!(id_admits(
+            "micro-behaviors/fs/path/application/config::claude-skills-directory"
+        ));
+        // A synthesized id has no `::` at all and is matched as its own head.
+        assert!(id_admits("metadata/encoded-payload/url"));
+        // An exact `family::leaf` prefix admits only that leaf, never a sibling
+        // in the same directory.
+        assert!(id_admits(
+            "micro-behaviors/communications/http/url/scheme::cleartext-http-url"
+        ));
+        assert!(!id_admits(
+            "micro-behaviors/communications/http/url/scheme::https-url"
+        ));
+        // A family prefix must match on a path boundary. Without that,
+        // `.../archive/member` would swallow an unrelated sibling family.
+        assert!(!id_admits(
+            "micro-behaviors/data/archive/members-of-interest::whatever"
+        ));
+        // Neighbouring families that were measured and deliberately excluded.
+        assert!(!id_admits("metadata/encoded-payload/base64"));
+        assert!(!id_admits(
+            "micro-behaviors/communications/ip/direct::literal"
+        ));
+    }
+
+    /// The skeleton the whole gate exists to separate: one ordinary package
+    /// against the four shapes that must reach a reader.
+    #[test]
+    fn gate_admits_the_shapes_it_was_measured_on() {
+        // An ordinary package. Notable findings on families nobody gated, and a
+        // raw score in the benign mass. This is the sample we are trying not to
+        // send, and it is ~78% of the benign corpus.
+        let ordinary = [
+            finding(
+                "micro-behaviors/communications/http/request/client::fetch-call",
+                cleave::Criticality::Notable,
+            ),
+            finding(
+                "metadata/file/profile/language::lang-english",
+                cleave::Criticality::Baseline,
+            ),
+        ];
+        assert_eq!(admits(&ordinary, 0.01), None);
+
+        // Same package, one suspicious finding. Criticality carries it.
+        let mut elevated = ordinary.to_vec();
+        elevated.push(finding(
+            "objectives/evasion/masquerade::config-insert",
+            cleave::Criticality::Suspicious,
+        ));
+        assert_eq!(admits(&elevated, 0.01), Some(LlmAdmission::Required));
+
+        // The case criticality misses: a password-protected payload dropper.
+        // Nothing above notable anywhere, raw score at zero, and it must still
+        // be sent — this prefix alone carries 154 of the malicious corpus.
+        let encrypted = [finding(
+            "micro-behaviors/data/archive/member::archive-encrypted-member",
+            cleave::Criticality::Notable,
+        )];
+        assert_eq!(admits(&encrypted, 0.0), Some(LlmAdmission::Required));
+
+        // The same shape one criticality lower. Component legs of composites
+        // fire on ordinary packages, so notable is the floor and this must not
+        // open the gate.
+        let component = [finding(
+            "micro-behaviors/data/archive/member::archive-encrypted-member",
+            cleave::Criticality::Component,
+        )];
+        assert_eq!(admits(&component, 0.0), None);
+
+        // No findings at all, score over the floor. The probability admission
+        // is the one that covers a file the traits never described.
+        assert_eq!(admits(&[], 0.6), Some(LlmAdmission::Required));
+        // And just under it, with nothing else, the sample is not admitted.
+        assert_eq!(admits(&[], 0.54), None);
+    }
+
+    #[test]
+    fn finding_severity_reports_every_axis_independently() {
+        // A hostile finding must not short-circuit the prefix scan: the two
+        // answers are read by different admissions and a caller downstream
+        // (`Evidence::hostile_finding`) depends on both being right.
+        let both = [
+            finding(
+                "objectives/supply-chain/trojanized::payload",
+                cleave::Criticality::Hostile,
+            ),
+            finding(
+                "micro-behaviors/communications/email/send::smtp-send",
+                cleave::Criticality::Notable,
+            ),
+        ];
+        let sev = FindingSeverity::from_findings(&both);
+        assert!(sev.hostile && sev.elevated && sev.gate_trait);
+
+        let gated_only = [finding(
+            "micro-behaviors/communications/http/cookies::document-cookie-split-iterate",
+            cleave::Criticality::Notable,
+        )];
+        let sev = FindingSeverity::from_findings(&gated_only);
+        assert!(sev.gate_trait && !sev.elevated && !sev.hostile);
+    }
+
+    /// Drift canary. Runs only where traits are installed, so it is a no-op on
+    /// a bare CI box and a real check everywhere the rules exist.
+    #[test]
+    fn gate_prefixes_still_exist_in_the_installed_traits_tree() {
+        let Ok(traits_dir) = cleave::traits_repo::try_resolve() else {
+            return;
+        };
+        let problems = validate_gate_prefixes(&traits_dir);
+        assert!(
+            problems.is_empty(),
+            "LLM gate prefixes drifted from {}: {problems:#?}",
+            traits_dir.display(),
+        );
+    }
+
+    #[test]
+    fn gate_prefix_validation_reports_a_moved_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // An empty tree: every traits-backed prefix is missing, and the
+        // synthesized list is correctly not reported at all.
+        assert_eq!(
+            validate_gate_prefixes(dir.path()).len(),
+            LLM_GATE_PREFIXES.len()
+        );
+
+        // A family that exists but no longer declares the leaf the gate names
+        // is just as broken as one that is gone, and must be reported too.
+        let family = dir
+            .path()
+            .join("micro-behaviors/communications/http/cookies");
+        std::fs::create_dir_all(&family).expect("create family");
+        std::fs::write(
+            family.join("javascript.yaml"),
+            "traits:\n  - id: some-other-cookie-trait\n    crit: notable\n",
+        )
+        .expect("write traits");
+        assert!(
+            validate_gate_prefixes(dir.path())
+                .iter()
+                .any(|p| p.contains("names no `document-cookie-split-iterate` trait")),
+            "a family missing the named leaf must be reported",
+        );
+
+        // Declare it, and that one prefix stops being a problem.
+        std::fs::write(
+            family.join("javascript.yaml"),
+            "traits:\n  - id: document-cookie-split-iterate\n    crit: notable\n",
+        )
+        .expect("write traits");
+        assert!(
+            !validate_gate_prefixes(dir.path())
+                .iter()
+                .any(|p| p.contains("document-cookie-split-iterate")),
+        );
+    }
 
     #[test]
     fn param_billions_reads_size_tokens() {
@@ -3461,6 +3883,62 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    /// The number ML actually produced has to survive the blend that overwrites
+    /// it, or the report cannot say what the second opinion changed.
+    #[test]
+    fn the_report_keeps_the_ml_verdict_the_llm_overwrote() {
+        let graded = Interpretation {
+            corroborated: false,
+            grade: Some(LlmGrade::Hostile),
+            outcome: Classification::Hostile,
+            blended: 0.94,
+            interpretation: "downloads and evals a remote script".to_string(),
+            model: "m".to_string(),
+            error: None,
+            analyzer_directed: false,
+            cached: false,
+            before: MlVerdict {
+                class: Classification::Benign,
+                prob: 0.41,
+                lvl: Some(-1),
+            },
+        };
+        let v = serde_json::to_value(&graded).expect("serialize");
+        assert_eq!(v["before"]["class"], "benign");
+        // f32 -> f64 widening, so compare within the representation error.
+        let prob = v["before"]["prob"].as_f64().expect("prob is a number");
+        assert!((prob - 0.41).abs() < 1e-6, "{prob}");
+        assert_eq!(v["before"]["lvl"], -1);
+        // The blended answer stays where it was; `before` is additive.
+        assert_eq!(v["outcome"], "hostile");
+        let conf = v["conf"].as_f64().expect("conf is a number");
+        assert!((conf - 0.94).abs() < 1e-6, "{conf}");
+
+        // Manual-threshold mode has no level axis, so the key is absent rather
+        // than carrying a number that would read as a real placement.
+        let manual = Interpretation {
+            before: MlVerdict {
+                lvl: None,
+                ..graded.before
+            },
+            ..graded.clone()
+        };
+        let v = serde_json::to_value(&manual).expect("serialize");
+        assert!(v["before"].get("lvl").is_none(), "{v}");
+
+        // Nothing was folded in on the error path, so `ml` still holds these
+        // values and repeating them under `llm` would just be noise.
+        let failed = failure(
+            "m",
+            Classification::Suspicious,
+            0.3,
+            "timeout".into(),
+            false,
+        );
+        let v = serde_json::to_value(&failed).expect("serialize");
+        assert!(v.get("before").is_none(), "{v}");
+    }
+
     #[test]
     fn interpretation_serializes_inject_flag_only_when_set() {
         let base = Interpretation {
@@ -3473,6 +3951,11 @@ mod tests {
             error: None,
             analyzer_directed: false,
             cached: false,
+            before: MlVerdict {
+                class: Classification::Hostile,
+                prob: 0.81,
+                lvl: Some(25),
+            },
         };
         // Absent when clean, so the flag's presence is itself the signal.
         let clean = serde_json::to_value(&base).expect("serialize");
