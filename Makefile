@@ -122,16 +122,18 @@ export LLM_TOKEN_FILE
 # account — hopper rejects an unauthenticated renewal with 401.
 #
 # It may name the same corpus twice, replica first and primary behind it, so a
-# replica outage costs a retry rather than a lost verdict:
+# replica outage costs a retry rather than a lost verdict. That pairing is the
+# default, so a plain `make deploy` gets it without saying so:
 #
-#   make deploy HOPPER=https://hops-ro.isotope13.ai,https://hops.isotope13.ai
+#   HOPPER = https://hops-ro.isotope13.ai,https://hops.isotope13.ai
 #
 # Lookups and renewals walk that list. The idle worker does not: it claims from
 # the primary alone, because a replica refuses worker routes with a 403.
 #
 # It is REQUIRED: `deploy-server` refuses to install a server that files
-# nothing. Pass HOPPER=none to opt out deliberately.
-HOPPER ?=
+# nothing. Pass HOPPER=none to opt out deliberately (HOPPER= — empty — also
+# clears the default and hits the same refusal).
+HOPPER ?= https://hops-ro.isotope13.ai,https://hops.isotope13.ai
 BIND ?=
 ALLOWED_DIRS ?=
 MEMORY_MAX ?=
@@ -345,6 +347,14 @@ tarball: release
 # producing `*** No rule to make target '-j'` inside the jemalloc build.
 deploy-server deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
 
+# HOPPER defaults to the server's hopper pair, and `export HOPPER` above puts it
+# in the environment of every recipe. The worker deploys have no use for it —
+# a worker is told its hopper by URL=, and nothing under scripts/worker reads
+# HOPPER — so clear it for them rather than let a server default leak into a
+# worker's environment. An explicit HOPPER= on the command line still wins,
+# per make's normal precedence; it just does nothing on this path.
+deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux: export HOPPER :=
+
 deploy: deploy-server
 
 # Cloudflare Tunnel for the server. "auto" installs and supervises a connector
@@ -437,7 +447,7 @@ check-hopper-url:
 		exit 0; \
 	fi; \
 	if [ -n "$(strip $(HOPPER))" ]; then exit 0; fi; \
-	echo "error: HOPPER is unset, so the server would run without --hopper."; \
+	echo "error: HOPPER is empty, so the server would run without --hopper."; \
 	echo "       It would answer every analysis and file none of them: the caller"; \
 	echo "       caches the verdict and hopper never sees the artifact, so the loss"; \
 	echo "       is silent until something asks hopper for a sample it should hold."; \
