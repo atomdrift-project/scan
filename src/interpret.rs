@@ -186,8 +186,11 @@ pub const DEFAULT_LLM_MIN_PROB: f32 = 0.55;
 /// [`LLM_GATE_SYNTHESIZED_PREFIXES`] they lift malicious coverage from 85.9% to
 /// 94.7% for 6.4 points of benign volume.
 ///
-/// An entry is either a family (matching every id at or below it) or one exact
-/// `family::leaf` id. Note how narrow they are. The obvious wide families do
+/// An entry is either a family (matching every id at or below it) or a
+/// `family::leaf` id, where the leaf may use `*` to match a run of characters
+/// (`family::curl-*`). Prefer a family or a glob to an exact leaf: leaf names
+/// are renamed in passing, and an exact one that stops matching costs its
+/// coverage silently. Note how narrow they are. The obvious wide families do
 /// not survive: at family level `micro-behaviors/communications/http/url`
 /// admits 52% of the benign corpus for six malicious samples, because nearly
 /// every package builds a URL, so only its `scheme` and `query` leaves are
@@ -208,7 +211,15 @@ pub const LLM_GATE_PREFIXES: &[&str] = &[
     // skills and editor extensions live.
     "micro-behaviors/fs/path/application/config",
     "micro-behaviors/communications/email/send",
-    "micro-behaviors/communications/http/upload::curl-command-remote-url",
+    // Any curl upload leaf, not one named one. The family's curl traits all
+    // describe the same act at notable-or-above — a curl invocation moving a
+    // local file or a raw body to a remote host — so they are equally worth a
+    // reader's attention, and a glob keeps admitting them through the leaf
+    // renames that an exact id stops matching silently. The exact
+    // `curl-command-remote-url` this replaced existed only in a traits
+    // revision newer than the one the fleet had installed, so it admitted
+    // nothing on the fleet at all (2026-09-05).
+    "micro-behaviors/communications/http/upload::*curl*",
     "micro-behaviors/communications/http/url/scheme::cleartext-http-url",
     "micro-behaviors/communications/http/url/query::query-serializer-call",
     "micro-behaviors/communications/http/cookies::document-cookie-split-iterate",
@@ -228,6 +239,46 @@ pub const LLM_GATE_PREFIXES: &[&str] = &[
 /// sample and cost three benign.
 pub const LLM_GATE_SYNTHESIZED_PREFIXES: &[&str] = &["metadata/encoded-payload/url"];
 
+/// Whether `pattern` matches trait leaf `id`, where `*` stands for any run of
+/// characters. A pattern without `*` is an exact name, as before.
+///
+/// Leaf ids are the most volatile part of the taxonomy — a family is a
+/// directory somebody has to move deliberately, while a leaf gets renamed in
+/// passing (`curl-upload` → `curl-upload-file`) — so a gate entry that has to
+/// name one leaf can name a shape instead: `curl-*` keeps admitting the trait
+/// through a rename that an exact id would silently stop matching.
+#[must_use]
+fn leaf_matches(pattern: &str, id: &str) -> bool {
+    let Some((first, rest)) = pattern.split_once('*') else {
+        return pattern == id;
+    };
+    let Some(mut cursor) = id.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts = rest.split('*').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            // The trailing literal must land at the very end, unless the
+            // pattern ended with `*` (in which case `part` is empty).
+            return cursor.ends_with(part);
+        }
+        if part.is_empty() {
+            continue;
+        }
+        // `find` returns a char boundary and `part.len()` is the matched
+        // slice's own byte length, so the tail always exists; `get` says that
+        // without asking the reader to take it on trust.
+        match cursor
+            .find(part)
+            .and_then(|at| cursor.get(at + part.len()..))
+        {
+            Some(tail) => cursor = tail,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Whether any gate prefix admits `id`.
 ///
 /// A prefix carrying `::` names one exact trait and matches only itself. A
@@ -245,8 +296,8 @@ fn id_admits(id: &str) -> bool {
         .chain(LLM_GATE_SYNTHESIZED_PREFIXES)
         .copied()
         .any(|prefix| {
-            if prefix.contains("::") {
-                id == prefix
+            if let Some((family, leaf)) = prefix.split_once("::") {
+                head == family && id.split("::").nth(1).is_some_and(|l| leaf_matches(leaf, l))
             } else {
                 head == prefix
                     || head
@@ -285,13 +336,15 @@ pub fn validate_gate_prefixes(traits_dir: &Path) -> Vec<String> {
         } else if let Some(leaf) = leaf
             && !trait_declared(&dir, leaf)
         {
-            format!("names no `{leaf}` trait in {}", dir.display())
+            format!("matches no trait in {}", dir.display())
         } else {
             continue;
         };
         problems.push(format!(
-            "LLM gate prefix `{prefix}` {fault}; it was renamed or moved in the \
-             traits tree and now matches nothing",
+            "LLM gate prefix `{prefix}` {fault}; either the taxonomy moved \
+             underneath it, or it was written against a different traits \
+             revision than the one installed here. Coverage for that prefix is \
+             lost until the two agree",
         ));
     }
     problems
@@ -318,7 +371,7 @@ fn trait_declared(dir: &Path, id: &str) -> bool {
         let declared = text.lines().any(|line| {
             let rest = line.trim_start().trim_start_matches("- ").trim_start();
             rest.strip_prefix("id:")
-                .is_some_and(|value| value.trim().trim_matches(['"', '\'']) == id)
+                .is_some_and(|value| leaf_matches(id, value.trim().trim_matches(['"', '\''])))
         });
         if declared {
             return true;
@@ -2716,7 +2769,8 @@ mod tests {
         assert!(
             validate_gate_prefixes(dir.path())
                 .iter()
-                .any(|p| p.contains("names no `document-cookie-split-iterate` trait")),
+                .any(|p| p.contains("document-cookie-split-iterate")
+                    && p.contains("matches no trait in")),
             "a family missing the named leaf must be reported",
         );
 
@@ -3005,6 +3059,46 @@ mod tests {
         let text = format!("{:#}", err.into_inner());
         assert!(text.contains("500"), "unexpected error: {text}");
         dead_h.join().expect("thread");
+    }
+
+    #[test]
+    fn leaf_globs_match_a_run_of_characters() {
+        assert!(leaf_matches(
+            "curl-command-remote-url",
+            "curl-command-remote-url"
+        ));
+        assert!(!leaf_matches("curl-command-remote-url", "curl-command"));
+        // A trailing glob is a prefix match.
+        assert!(leaf_matches("curl-*", "curl-upload-file"));
+        assert!(leaf_matches("curl-*", "curl-"));
+        assert!(!leaf_matches("curl-*", "shell-curl-form-file-upload"));
+        // A leading glob is a suffix match, and both is a substring match.
+        assert!(leaf_matches("*-upload", "curl-upload"));
+        assert!(leaf_matches("*curl*", "shell-curl-form-file-upload"));
+        assert!(leaf_matches("*curl*", "curl-at-tmp"));
+        assert!(!leaf_matches("*curl*", "wget-at-tmp"));
+        // Interior literals must appear in order.
+        assert!(leaf_matches("curl-*-url", "curl-command-remote-url"));
+        assert!(!leaf_matches("curl-*-url", "curl-command-remote-host"));
+        assert!(!leaf_matches("url-*-curl", "curl-command-remote-url"));
+        // A bare `*` admits anything in the family.
+        assert!(leaf_matches("*", "anything"));
+    }
+
+    /// A glob leaf admits through the family it is written under, and never
+    /// through a sibling family that happens to declare the same leaf name.
+    #[test]
+    fn a_glob_gate_entry_admits_only_within_its_own_family() {
+        const FAMILY: &str = "micro-behaviors/communications/http/upload";
+        assert!(leaf_matches("curl-*", "curl-upload-file"));
+        // What `id_admits` composes: family head must match exactly, then the
+        // leaf pattern. Spelled out here because the two halves are easy to
+        // conflate and only their conjunction is the gate.
+        let id = format!("{FAMILY}::curl-upload-file");
+        let head = id.split("::").next().unwrap();
+        assert_eq!(head, FAMILY);
+        let sibling = "micro-behaviors/communications/http/download::curl-upload-file";
+        assert_ne!(sibling.split("::").next().unwrap(), FAMILY);
     }
 
     /// The breaker's state machine, with the clock under test control.
