@@ -48,31 +48,29 @@ pub const OPENROUTER_DEFAULT_MODEL: &str = "openrouter/auto";
 /// `LevelContext::ml_admits` — which is why this is a doc constant and not a
 /// fallback.
 pub const DEFAULT_MIN_LEVEL_LABEL: &str = "the model's grid ceiling";
-/// Default per-request timeout, in seconds.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
-/// Default per-request timeout for `serve`, in seconds. A request-facing
-/// daemon holds a caller on the line, so it fails over quickly — but not
-/// faster than an answer can arrive. Two seconds was tried (2026-09-05) and
-/// sat *below* the floor of any real completion: an interpret-sized prompt
-/// (~6k tokens) takes ~2.4s on an idle local vLLM, so every call timed out,
-/// the fallback was charged the same two seconds, and a 291-byte package
-/// spent 4s learning nothing. Five seconds clears an idle origin with margin
-/// and still bounds a saturated one to a cost the breaker then removes.
-pub const DEFAULT_SERVE_TIMEOUT_SECS: u64 = 5;
-/// Default per-request timeout for `worker`, in seconds. No caller is waiting
-/// on a queue job, so a worker can afford to let a slow endpoint finish rather
-/// than spend the chain — but still far short of [`DEFAULT_TIMEOUT_SECS`], so
-/// one wedged endpoint cannot stall the queue.
-pub const DEFAULT_WORKER_TIMEOUT_SECS: u64 = 15;
+/// Default per-request timeout, in seconds, for every mode and every endpoint
+/// in the `--llm` chain: each hop gets this long, then the next is tried
+/// (60s -> failover -> 60s).
+///
+/// This used to be split by mode — 120s interactive, 15s `worker`, 5s
+/// `serve` — on the theory that a daemon must not hold a job behind a wedged
+/// endpoint. A dead host is not what the request timeout is for, though:
+/// [`LLM_CONNECT_TIMEOUT`] and the breaker take care of that in seconds. The
+/// request timeout only ever fires against a *live* endpoint that is slow,
+/// and there the short budgets bought nothing but doomed calls: at 5s a
+/// saturated origin timed out, the fallback was charged the same 5s, and the
+/// file was graded without the LLM. A minute clears a queued request on a
+/// busy vLLM and a cold OpenRouter provider alike.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Floor on the per-request timeout for an OpenRouter endpoint, in seconds.
 ///
-/// The mode timeouts above are sized for the local origin, one hop away. A
-/// hosted route is a different animal: the `auto` route picks a provider per
+/// Guards an explicit `--llm-timeout` below the default. The origin is one
+/// hop away; a hosted route is a different animal: the `auto` route picks a provider per
 /// call, cold providers take seconds to first token, and a 6k-token prompt was
 /// measured at 0.5–1.7s warm and far longer cold. Cutting it at the origin's
 /// budget turned the fallback into a second guaranteed failure (measured: all
 /// 14 admitted requests in a 128-request run failed both hops). An attempt
-/// against OpenRouter therefore gets at least this long, whatever the mode.
+/// against OpenRouter therefore gets at least this long, whatever was asked.
 pub const OPENROUTER_MIN_TIMEOUT_SECS: u64 = 30;
 /// How long to wait for a TCP+TLS connection to an LLM endpoint before failing
 /// over to the next one. This, not the request timeout, is the fast path past
@@ -1333,7 +1331,7 @@ pub fn interpret(
 
     // Health gate: only send work to a healthy endpoint. If it's currently down,
     // wait for it to recover (re-probing every `HEALTH_RETRY_INTERVAL`) up to the
-    // request timeout, rather than firing a doomed 2-minute request per file.
+    // request timeout, rather than firing a doomed minute-long request per file.
     if !health().wait_until_healthy(cfg.timeout, HEALTH_RETRY_INTERVAL, &|| probe_endpoint(cfg)) {
         let error = format!(
             "no LLM endpoint of {} became healthy within {}s",
@@ -1975,9 +1973,9 @@ fn chat_raw_with(
 
 /// POST a system+user prompt to one endpoint and return the model's reply text,
 /// classifying failures for the caller's health accounting.
-/// How long one attempt against `base_url` may take: the mode's timeout for
-/// the local origin, and at least [`OPENROUTER_MIN_TIMEOUT_SECS`] for a hosted
-/// route that cannot answer on the origin's budget.
+/// How long one attempt against `base_url` may take: the configured timeout
+/// for the local origin, and at least [`OPENROUTER_MIN_TIMEOUT_SECS`] for a
+/// hosted route that cannot answer on a short origin budget.
 fn attempt_timeout(cfg: &InterpretConfig, base_url: &str) -> Duration {
     if is_openrouter_endpoint(base_url) {
         cfg.timeout
@@ -3170,31 +3168,32 @@ mod tests {
         assert_ne!(sibling.split("::").next().unwrap(), FAMILY);
     }
 
-    /// The origin gets the mode's budget; a hosted route gets at least the
-    /// OpenRouter floor, whichever mode asked. An interactive scan's longer
-    /// patience is kept, not shortened, by the floor.
+    /// The origin gets the configured budget; a hosted route gets at least the
+    /// OpenRouter floor when that budget is set below it. The default, and any
+    /// longer budget, is kept, not shortened, by the floor.
     #[test]
-    fn openrouter_attempts_get_the_floor_and_the_origin_gets_the_mode_budget() {
-        let serve = InterpretConfig {
-            timeout: Duration::from_secs(DEFAULT_SERVE_TIMEOUT_SECS),
+    fn openrouter_attempts_get_the_floor_and_the_origin_gets_the_budget() {
+        let short = InterpretConfig {
+            timeout: Duration::from_secs(5),
             ..Default::default()
         };
         assert_eq!(
-            attempt_timeout(&serve, "http://127.0.0.1:8000/v1"),
-            Duration::from_secs(DEFAULT_SERVE_TIMEOUT_SECS)
+            attempt_timeout(&short, "http://127.0.0.1:8000/v1"),
+            Duration::from_secs(5)
         );
         assert_eq!(
-            attempt_timeout(&serve, "https://openrouter.ai/api/v1"),
+            attempt_timeout(&short, "https://openrouter.ai/api/v1"),
             Duration::from_secs(OPENROUTER_MIN_TIMEOUT_SECS)
         );
-        let interactive = InterpretConfig {
-            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            ..Default::default()
-        };
+        let default = InterpretConfig::default();
         assert_eq!(
-            attempt_timeout(&interactive, "https://openrouter.ai/api/v1"),
+            attempt_timeout(&default, "http://127.0.0.1:8000/v1"),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            attempt_timeout(&default, "https://openrouter.ai/api/v1"),
             Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            "a longer mode budget is never cut down to the floor"
+            "a longer budget is never cut down to the floor"
         );
     }
 
