@@ -2754,9 +2754,9 @@ fn run_scan_paths(
 mod tests {
     use super::{
         Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy,
-        command_scans_for_other_hosts, default_cli_follow_policy, default_service_follow_policy,
-        is_expected_yara_cache_mismatch, redact_zip_passwords, resolve_hopper_value,
-        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
+        command_scans_for_other_hosts, daemon_llm_timeout_secs, default_cli_follow_policy,
+        default_service_follow_policy, is_expected_yara_cache_mismatch, redact_zip_passwords,
+        resolve_hopper_value, resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
@@ -3620,8 +3620,12 @@ mod tests {
             scan::interpret::DEFAULT_TIMEOUT_SECS
         );
 
-        let mut worker = Cli::try_parse_from(["atomscan", "worker", "--url", "http://127.0.0.1:1"])?;
-        let worker_cmd = worker.command.take().context("worker subcommand expected")?;
+        let mut worker =
+            Cli::try_parse_from(["atomscan", "worker", "--url", "http://127.0.0.1:1"])?;
+        let worker_cmd = worker
+            .command
+            .take()
+            .context("worker subcommand expected")?;
         assert_eq!(
             daemon_llm_timeout_secs(Some(&worker_cmd)),
             scan::interpret::DEFAULT_WORKER_TIMEOUT_SECS

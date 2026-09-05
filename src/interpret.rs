@@ -22,6 +22,7 @@
 //! `temperature: 0`, JSON requested via prompt injection (not `response_format`,
 //! which local servers handle inconsistently), validated after the fact.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
@@ -2575,6 +2576,134 @@ mod tests {
         let text = format!("{:#}", err.into_inner());
         assert!(text.contains("500"), "unexpected error: {text}");
         dead_h.join().expect("thread");
+    }
+
+    /// The breaker's state machine, with the clock under test control.
+    #[test]
+    fn breaker_opens_after_consecutive_transport_failures_and_probes_once() {
+        let b = Breakers::new(Duration::from_millis(50));
+        let ep = "http://primary/v1";
+        // Below the trip count it keeps sending.
+        for _ in 0..(BREAKER_TRIP_AFTER - 1) {
+            assert!(!b.failed(ep));
+            assert_eq!(b.admit(ep), Admit::Send);
+        }
+        // An answer of any kind — a 4xx included — resets the count.
+        assert!(!b.answered(ep));
+        for _ in 0..(BREAKER_TRIP_AFTER - 1) {
+            assert!(!b.failed(ep));
+        }
+        assert_eq!(b.admit(ep), Admit::Send);
+        // The trip.
+        assert!(b.failed(ep), "the Nth consecutive failure opens it");
+        assert_eq!(b.admit(ep), Admit::Skip);
+        assert_eq!(b.admit(ep), Admit::Skip);
+        // After the cooldown exactly one caller probes; the rest keep skipping.
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(b.admit(ep), Admit::Probe);
+        assert_eq!(b.admit(ep), Admit::Skip, "one probe at a time");
+        // A failed probe re-arms the cooldown rather than reopening a new one.
+        assert!(!b.failed(ep));
+        assert_eq!(b.admit(ep), Admit::Skip);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(b.admit(ep), Admit::Probe);
+        // A successful probe closes it.
+        assert!(b.answered(ep), "closing an open breaker is reported");
+        assert_eq!(b.admit(ep), Admit::Send);
+        // Endpoints are independent.
+        assert_eq!(b.admit("http://other/v1"), Admit::Send);
+    }
+
+    /// End to end: a dead primary is paid for `BREAKER_TRIP_AFTER` times, then
+    /// skipped — every later call goes straight to the fallback — until the
+    /// cooldown elapses and one call probes it again.
+    #[test]
+    fn an_open_breaker_skips_the_dead_primary_until_the_cooldown() {
+        let calls = BREAKER_TRIP_AFTER as usize + 3;
+        let (live, live_h) = fake_llm("200 OK", GRADE_BODY, calls);
+        let cfg = InterpretConfig {
+            // Port 1 refuses at once: each attempt is a fast transport failure.
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "primary-model".to_string(),
+            api_key: None,
+            fallbacks: vec![LlmEndpoint {
+                base_url: live,
+                model: "fallback-model".to_string(),
+                api_key: None,
+            }],
+            ..Default::default()
+        };
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let breakers = Breakers::new(Duration::from_millis(200));
+        let primary = "http://127.0.0.1:1/v1";
+        for i in 0..BREAKER_TRIP_AFTER as usize {
+            let (_, model) =
+                chat_raw_with(&breakers, &cfg, &client, "s", "u", 8).expect("fallback answers");
+            assert_eq!(model, "fallback-model", "call {i}");
+        }
+        assert_eq!(
+            breakers.admit(primary),
+            Admit::Skip,
+            "tripped after the Nth failure"
+        );
+        // Skipped: the fallback still answers, and the primary is not tried.
+        let before = breakers
+            .inner
+            .lock()
+            .unwrap()
+            .get(primary)
+            .map(|s| s.consecutive_failures)
+            .unwrap_or(0);
+        chat_raw_with(&breakers, &cfg, &client, "s", "u", 8).expect("fallback answers");
+        chat_raw_with(&breakers, &cfg, &client, "s", "u", 8).expect("fallback answers");
+        let after = breakers
+            .inner
+            .lock()
+            .unwrap()
+            .get(primary)
+            .map(|s| s.consecutive_failures)
+            .unwrap_or(0);
+        assert_eq!(
+            before, after,
+            "an open breaker sends nothing to the primary"
+        );
+        // Past the cooldown one call probes the primary (and fails again).
+        std::thread::sleep(Duration::from_millis(250));
+        chat_raw_with(&breakers, &cfg, &client, "s", "u", 8).expect("fallback answers");
+        let probed = breakers
+            .inner
+            .lock()
+            .unwrap()
+            .get(primary)
+            .map(|s| s.consecutive_failures)
+            .unwrap_or(0);
+        assert_eq!(probed, after + 1, "exactly one probe after the cooldown");
+        assert_eq!(
+            breakers.admit(primary),
+            Admit::Skip,
+            "a failed probe re-arms it"
+        );
+        assert_eq!(live_h.join().expect("thread").len(), calls);
+    }
+
+    /// Background work never takes the last quarter of the permits, and a
+    /// pool too small to have a quarter reserves nothing rather than starving.
+    #[test]
+    fn foreground_reserve_is_a_quarter_at_least_one_and_never_the_whole_pool() {
+        assert_eq!(foreground_reserve(1), 0);
+        assert_eq!(foreground_reserve(2), 1);
+        assert_eq!(foreground_reserve(4), 1);
+        assert_eq!(foreground_reserve(16), 4);
+        assert_eq!(foreground_reserve(64), 16);
+        for max in 2..=64 {
+            assert!(
+                foreground_reserve(max) < max,
+                "background can still run at {max}"
+            );
+        }
     }
 
     /// The cache key must not change for a plain single-endpoint config, or
