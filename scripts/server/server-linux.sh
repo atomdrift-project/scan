@@ -75,17 +75,19 @@ BINARY=atomscan
 BIN_PATH=/usr/local/bin/${BINARY}
 STATE_HOME=/var/lib/atomdrift/scan
 UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
+DEFAULT_BIND=127.0.0.1:49999
 
 # `BIND:-` / `MEMORY_MAX:-` treat empty as unset. `ALLOW_CIDR-` / `TOKEN_SRC-`
 # (no colon) keep an explicit empty, so operators can disable the CIDR flag with
 # ALLOW_CIDR= and — deliberately, on a host they trust — authentication with
 # TOKEN_SRC=.
 #
-# Deliberately no default: unset leaves atomscan's own, loopback, so the
-# intended exposure is a Cloudflare tunnel (or another local proxy) terminating
-# on this host. Set BIND=0.0.0.0:49999 to listen on every interface, and pair
-# it with ALLOW_CIDR.
+# Deliberately no default is passed to atomscan: unset leaves atomscan's own,
+# loopback bind. The optional tunnel still needs the effective address, so keep
+# that value here in sync with the CLI default above. Set BIND=0.0.0.0:49999 to
+# listen on every interface, and pair it with ALLOW_CIDR.
 BIND="${BIND:-}"
+EFFECTIVE_BIND=${BIND:-${DEFAULT_BIND}}
 ALLOW_CIDR="${ALLOW_CIDR-10.0.0.0/8}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/scan}"
 WORKERS="${WORKERS:-}"
@@ -644,12 +646,12 @@ esac
 if [ "$want_tunnel" -eq 1 ]; then
     log "Deploying Cloudflare Tunnel"
     CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE}" \
-        ./scripts/server/cloudflared-linux.sh "http://127.0.0.1:${BIND##*:}"
+        ./scripts/server/cloudflared-linux.sh "http://127.0.0.1:${EFFECTIVE_BIND##*:}"
 else
     log "Skipping Cloudflare Tunnel (CLOUDFLARED=${CLOUDFLARED})"
 fi
 
-BASE="http://127.0.0.1:${BIND##*:}"
+BASE="http://127.0.0.1:${EFFECTIVE_BIND##*:}"
 # Every route except /_/health wants the bearer token, so fold it into the
 # examples rather than printing a header the reader has to paste in by hand.
 if [ -n "${TOKEN_SRC}" ]; then

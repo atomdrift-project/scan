@@ -84,16 +84,18 @@ BIN_PATH=/usr/local/bin/${BINARY}
 RCD_FILE=/usr/local/etc/rc.d/${SERVICE_NAME}
 LOG_FILE=/var/log/scan.log
 PIDFILE=/var/run/${SERVICE_NAME}.pid
+DEFAULT_BIND=127.0.0.1:49999
 
 # `BIND:-` / `MAX_RSS_GB:-` treat empty as unset. `ALLOW_CIDR-` / `TOKEN_SRC-`
 # (no colon) keep an explicit empty, so operators can disable the CIDR flag with
 # ALLOW_CIDR= and — deliberately, on a host they trust — authentication with
 # TOKEN_SRC=.
 #
-# Deliberately no default: unset leaves atomscan's own, loopback, so the
-# intended exposure is a Cloudflare tunnel (or another local proxy) terminating
-# on this host. Set BIND=0.0.0.0:49999 to listen on every interface, and pair
-# it with ALLOW_CIDR.
+# Deliberately no default is passed to atomscan: unset leaves atomscan's own,
+# loopback bind. The deploy still needs the effective address for its preflight,
+# health check, and optional tunnel, so keep that value here in sync with the
+# CLI default above. Set BIND=0.0.0.0:49999 to listen on every interface, and
+# pair it with ALLOW_CIDR.
 BIND="${BIND:-}"
 ALLOW_CIDR="${ALLOW_CIDR-10.0.0.0/8}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/scan}"
@@ -165,8 +167,9 @@ fi
 # sockstat only reveals another user's sockets to root
 # (security.bsd.see_other_uids), so every query goes through $SUDO; as a plain
 # user it returns nothing at all, which would read as "port free".
-PORT=${BIND##*:}
-BIND_HOST=${BIND%:*}
+EFFECTIVE_BIND=${BIND:-${DEFAULT_BIND}}
+PORT=${EFFECTIVE_BIND##*:}
+BIND_HOST=${EFFECTIVE_BIND%:*}
 case "${BIND_HOST}" in
 	''|0.0.0.0|::|'[::]'|'*') PROBE_HOST=127.0.0.1 ;;
 	*) PROBE_HOST=${BIND_HOST} ;;
@@ -200,7 +203,7 @@ if [ -n "${preflight_owner}" ] \
 	&& [ "$(printf '%s' "${preflight_owner}" | awk '{print $3}')" != "$(service_child_pid)" ]; then
 	log "port ${PORT} is already in use:"
 	log "  ${preflight_owner}"
-	die "another process owns ${BIND}; stop it, or deploy with BIND=<addr>:<free-port>"
+	die "another process owns ${EFFECTIVE_BIND}; stop it, or deploy with BIND=<addr>:<free-port>"
 fi
 
 # --- Packages ---------------------------------------------------------------
