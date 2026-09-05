@@ -5445,6 +5445,9 @@ pub(crate) fn apply_pending_interpretation(
             grid_max: model.grid_max(),
         },
         pending.findings,
+        // Deferred means nobody is on the line: a worker job, or serve's own
+        // idle puller. It takes its permit behind foreground callers.
+        crate::interpret::LlmCaller::Background,
     ) else {
         return false;
     };
@@ -5996,6 +5999,9 @@ pub(crate) fn classify_report(
                     // cleave's own verdict, read from the structured report rather than
                     // re-parsed out of the render it produced. See `FindingSeverity`.
                     crate::interpret::FindingSeverity::from_report(&report),
+                    // Inline means a caller is waiting: a serve request or an
+                    // interactive scan. It never queues behind background work.
+                    crate::interpret::LlmCaller::Foreground,
                 )?;
                 if let Some(grade) = interp.grade {
                     tracing::info!(
