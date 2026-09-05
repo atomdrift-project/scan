@@ -199,10 +199,17 @@ impl ServerConfig {
     }
 
     /// Set how many analysis slots the idle worker may use; `0` disables it.
-    /// The value is capped at half of the interactive worker slots.
+    ///
+    /// Capped at twice its core budget rather than at half the server's slots.
+    /// "Half the slots" meant half the machine when a slot was a core; since
+    /// slots were sized at three per core (2026-09-03) it meant one and a half
+    /// machines, and on a 128-core box the pull worker held 192 slots and 576
+    /// claims. A slot's work ends at dispatch, so two per core is enough
+    /// staging to keep the cores fed and no more claims than that in hand.
     #[must_use]
     pub fn with_idle_worker_slots(mut self, slots: usize) -> Self {
-        self.idle_worker_slots = slots.min(self.workers / 2);
+        let cores = idle_worker_cores(crate::worker::cleave_concurrency(self.workers));
+        self.idle_worker_slots = slots.min(cores.saturating_mul(2));
         self
     }
 
@@ -389,8 +396,9 @@ mod idle_worker_cores_tests {
     /// The idle worker never gets the whole pool, and never zero of it.
     #[test]
     fn idle_worker_leaves_a_reserve_for_interactive_work() {
-        assert_eq!(idle_worker_cores(16), 12);
-        assert_eq!(idle_worker_cores(128), 96);
+        assert_eq!(idle_worker_cores(16), 8);
+        assert_eq!(idle_worker_cores(128), 64);
+        assert_eq!(idle_worker_cores(3), 1);
         assert_eq!(idle_worker_cores(2), 1);
         assert_eq!(idle_worker_cores(1), 1);
         for cores in 1..=256 {
@@ -948,9 +956,12 @@ struct AppState {
     /// server's, so the server can always start an analysis. See
     /// [`idle_worker_cores`].
     idle_worker_cores: usize,
-    /// Pull-queue analyses the idle worker has in progress; published on
-    /// `/_/stats` as `background_in_flight`.
+    /// Pull-queue analyses the idle worker has in progress, tails included.
     idle_in_progress: Arc<AtomicUsize>,
+    /// The idle worker's core budget as a semaphore; `idle_worker_cores` less
+    /// its free permits is the cores pull work holds right now, published on
+    /// `/_/stats` as `background_in_flight`.
+    idle_cpu: Arc<tokio::sync::Semaphore>,
     /// Machine-wide cores busy between consecutive `/_/stats` reads.
     cpu_busy: CpuBusy,
     /// Raised once the HTTP server stops, so the idle worker winds down with it
@@ -1042,6 +1053,16 @@ struct AppState {
 }
 
 impl AppState {
+    /// Cores the idle worker holds at this moment: its budget less the permits
+    /// it has not taken. Bounded by the budget, unlike the in-progress count,
+    /// which includes tails waiting on the network and on rdu2 stood at 576
+    /// against 96 cores (2026-09-05) — a discount that size told the router a
+    /// fully busy box had nothing on it.
+    pub(super) fn idle_cores_held(&self) -> usize {
+        self.idle_worker_cores
+            .saturating_sub(self.idle_cpu.available_permits())
+    }
+
     /// Analyses this server can start right now: a slot and a core for each.
     pub(super) fn available_analysis_permits(&self) -> usize {
         let slots = match &self.lanes {
@@ -1124,20 +1145,24 @@ fn cores_busy(
     (total > 0).then(|| cpus as f64 * busy as f64 / total as f64)
 }
 
-/// Cores the embedded idle worker may occupy: the pool less a quarter, and
-/// never all of it.
+/// Cores the embedded idle worker may occupy: half the pool, and never none.
+///
+/// Half is the stated intent for background work, and this is the number
+/// that delivers it: a core permit is held for one blocking classify, and
+/// measured on rdu2 (2026-09-05) 96 permits kept 101 of 128 cores busy, so
+/// permits track cores closely. The old cap was on slots, which stopped
+/// meaning cores when slots were sized at three per core.
 ///
 /// The server's interactive analyses and the idle worker's pull jobs feed one
 /// rayon pool. The idle worker must not be able to fill it, or the server's
 /// `slots_free` reads zero and the router stops sending — and the worker only
-/// stands aside for requests that arrive. A quarter held back keeps the
-/// server able to start on a saturated box; rayon absorbs the brief
-/// oversubscription while the worker pauses (`IDLE_WORKER_QUIET_SECS`), which
-/// it does within a tick of the first request. `pool.max(1)` cores yields one
-/// core for a one-core budget rather than zero, which would deadlock the
-/// worker's cleave gate.
+/// stands aside for requests that arrive. Half held back keeps the server
+/// able to start on a saturated box; rayon absorbs the brief oversubscription
+/// while the worker pauses (`IDLE_WORKER_QUIET_SECS`), which it does within a
+/// tick of the first request. `.max(1)` yields one core on a one-core box
+/// rather than zero, which would deadlock the worker's cleave gate.
 fn idle_worker_cores(cores: usize) -> usize {
-    cores.saturating_sub(cores.div_ceil(4)).max(1)
+    (cores / 2).max(1)
 }
 
 /// Returns an error if the router cannot be assembled or background resource
@@ -1181,6 +1206,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         cpu: Arc::new(tokio::sync::Semaphore::new(cores)),
         idle_worker_cores: idle_worker_cores(cores),
         idle_in_progress: Arc::new(AtomicUsize::new(0)),
+        idle_cpu: Arc::new(tokio::sync::Semaphore::new(idle_worker_cores(cores))),
         cpu_busy: CpuBusy::default(),
         stuck_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
@@ -1697,7 +1723,7 @@ fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
             // requests that would have made it true. Measured 2026-09-05:
             // three of the fleet's four servers unroutable for hours while
             // idle on the interactive path. See `idle_worker_cores`.
-            cpu: Arc::new(tokio::sync::Semaphore::new(state.idle_worker_cores)),
+            cpu: Arc::clone(&state.idle_cpu),
             in_progress: Arc::clone(&state.idle_in_progress),
             resources,
             last_analyze_request_ms: Arc::clone(&state.last_analyze_request_ms),

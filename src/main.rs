@@ -1923,9 +1923,11 @@ fn main() -> Result<()> {
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
-            // Use at most half the request capacity for background work. The
-            // idle worker pauses immediately while an analysis is in flight and
-            // for a short quiet period after the latest analysis request.
+            // Ask for half the request slots for background work; the server
+            // caps that again at twice the idle worker's core budget, which is
+            // half the machine (see `ServerConfig::with_idle_worker_slots`).
+            // The idle worker pauses immediately while an analysis is in flight
+            // and for a short quiet period after the latest analysis request.
             //
             // Disabled without --hopper: there would be nothing to claim from.
             let idle_slots = match (hopper.as_deref(), idle_worker_slots) {
