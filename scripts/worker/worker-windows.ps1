@@ -22,7 +22,8 @@
 #               Unlike Linux there is no MemoryMax= backstop here, so in-process
 #               RSS throttling stays ON rather than the systemd-style -1.)
 #   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target (SCAN_LLM)
-#   LLM_MODEL      pinned model (SCAN_LLM_MODEL); required for OpenRouter
+#   LLM_MODEL      pinned model (SCAN_LLM_MODEL); unset leaves atomscan's default
+#                  (largest served model, or openrouter/auto for OpenRouter)
 #   LLM_CONCURRENCY in-flight LLM calls (SCAN_LLM_CONCURRENCY; default 4, vLLM takes 16)
 #   SCAN_LLM_KEY   OpenRouter key if ~/.tok/openrouter is absent
 #   HOPPER_TOKEN_FILE  hopper API token to install for the service (default: ~/.tok/hopper)
@@ -136,10 +137,6 @@ if ($ServicePhase) {
         }
 
         if (Test-OpenRouterTarget $Llm) {
-            if (-not $LlmModel) {
-                if (Test-OpenRouterOnly $Llm) { Die 'OpenRouter deploy requires LLM_MODEL= (e.g. qwen/qwen3.8-27b)' }
-                Log "WARNING: no LLM_MODEL for the OpenRouter link in $Llm; that link is dropped from the chain"
-            }
             $orDst = Join-Path $tokDir 'openrouter'
             $orSrc = Join-Path $env:USERPROFILE '.tok\openrouter'
             if ($OpenRouterKeyFile -and (Test-Path $OpenRouterKeyFile)) {
@@ -288,10 +285,13 @@ $MaxRssGb = $env:MAX_RSS_GB
 $LlmConcurrency = $env:LLM_CONCURRENCY
 $Llm      = $env:LLM
 if (-not $Llm) { $Llm = $env:LLM_URL }
-if (-not $Llm) { $Llm = 'https://llm.isotope13.ai/v1,openrouter' }
+# No default here on purpose: the site's failover chain is defined once, in
+# the Makefile (LLM ?=), which exports it into this process's environment.
+# Unset leaves atomscan's own default.
+# Deliberately no default: atomscan picks the model itself (largest served, or
+# openrouter/auto for OpenRouter); only an operator's explicit pin is forwarded.
 $LlmModel = $env:LLM_MODEL
 if (-not $LlmModel) { $LlmModel = $env:SCAN_LLM_MODEL }
-if (-not $LlmModel) { $LlmModel = ',qwen/qwen3.8-27b' }
 $HopperTokenFile = $env:HOPPER_TOKEN_FILE
 if (-not $HopperTokenFile) { $HopperTokenFile = Join-Path $env:USERPROFILE '.tok\hopper' }
 $LlmTokenFile = $env:LLM_TOKEN_FILE

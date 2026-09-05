@@ -12,23 +12,25 @@
 # the caller pipes the output wherever it needs to land — a local file, or
 # `bastille cmd <jail> tee`.
 
-# Compose the `serve ...` argument string. Every parameter is optional except
-# the bind address; an empty one omits its flag.
+# Compose the `serve ...` argument string. Every parameter is optional; an
+# empty one omits its flag and leaves atomscan's own default in force. That is
+# deliberate: flag defaults are defined once, in atomscan, not repeated here.
 #
 # --hopper and --idle-worker-slots are deliberately NOT here: both are
 # non-secret runtime knobs that live in rc.conf (scan_hopper, scan_idle_slots)
 # so they can be changed with sysrc(8) and a restart, without a redeploy.
 #
-# Usage: scan_server_args <bind> [allow_cidr] [token_file] [workers] [allowed_dirs] [max_rss_gb]
+# Usage: scan_server_args [bind] [allow_cidr] [token_file] [workers] [allowed_dirs] [max_rss_gb]
 scan_server_args() {
-	_ssa_bind="$1"
+	_ssa_bind="${1:-}"
 	_ssa_allow_cidr="${2:-}"
 	_ssa_token_file="${3:-}"
 	_ssa_workers="${4:-}"
 	_ssa_allowed_dirs="${5:-}"
 	_ssa_max_rss_gb="${6:-}"
 	# -u refreshes models and traits before serving; failures are non-fatal.
-	_ssa_args="-u serve --bind $_ssa_bind"
+	_ssa_args="-u serve"
+	[ -n "$_ssa_bind" ] && _ssa_args="$_ssa_args --bind $_ssa_bind"
 	[ -n "$_ssa_allow_cidr" ] && _ssa_args="$_ssa_args --allow-cidr $_ssa_allow_cidr"
 	# atomscan refuses to start if the file is missing or empty, so a lost token
 	# fails loudly instead of silently opening the API.
@@ -53,7 +55,9 @@ scan_server_args() {
 scan_server_rcd_script() {
 	_ssr_bin="$1"
 	_ssr_args="$2"
-	_ssr_llm="${3:-https://llm.isotope13.ai/v1,openrouter}"
+	# No fallback chain here: the deploy script that calls this owns that
+	# default, and an empty value must stay empty so LLM= can turn the pass off.
+	_ssr_llm="${3-}"
 	_ssr_llm_model="${4:-}"
 	_ssr_home="${5:-/home/scan}"
 	cat <<EOF
@@ -95,8 +99,8 @@ load_rc_config \$name
 # OpenAI-compatible endpoint for the LLM second-opinion pass, passed as
 # SCAN_LLM below. Empty turns the pass off without touching this script.
 : \${scan_llm:="$_ssr_llm"}
-# Pinned model (SCAN_LLM_MODEL). Empty lets atomscan ask the endpoint for the
-# largest model it serves; required for OpenRouter.
+# Pinned model (SCAN_LLM_MODEL). Empty leaves atomscan's own default: the
+# largest model the endpoint serves, or \`openrouter/auto\` for OpenRouter.
 : \${scan_llm_model:="$_ssr_llm_model"}
 
 # --hopper renews every analyzed result on a hopper instance, and defers a

@@ -142,7 +142,8 @@ generally, and ~9B is enough if that is what fits.
 
 Point it elsewhere with `--llm`, `--llm-model`, `--llm-key`. `--llm openrouter`
 uses `https://openrouter.ai/api/v1`; the key is `--llm-key`, `SCAN_LLM_KEY`, or
-`~/.tok/openrouter`, and `--llm-model` is required.
+`~/.tok/openrouter`, and `--llm-model` defaults to `openrouter/auto`, OpenRouter's
+own router — nothing else from its billed catalog is ever guessed.
 
 An endpoint that requires a bearer token — ours does — is authenticated without
 any flag: put the token in `~/.tok/llm` (mode 0600, first non-empty line) and
@@ -160,8 +161,7 @@ Comma-separate `--llm` to name a chain, tried in order — the shape the deploy
 scripts install by default:
 
 ```bash
-atomscan --llm 'https://llm.isotope13.ai/v1,openrouter' \
-         --llm-model ',qwen/qwen3.8-27b' ./project
+atomscan --llm 'https://llm.isotope13.ai/v1,openrouter' ./project
 ```
 
 The first endpoint that answers wins, so an outage on our own box costs a retry
@@ -175,9 +175,9 @@ Each link resolves independently. `--llm-model` pairs with `--llm`
 positionally — a blank slot asks that endpoint what it serves, and a single
 name (no comma) applies to the whole chain — and each takes its own key, so the
 example above discovers `Qwen/Qwen3.8-27B` on our vLLM with `~/.tok/llm` and
-sends `qwen/qwen3.8-27b` to OpenRouter with `~/.tok/openrouter`. A link that
-cannot be used (no key, or an OpenRouter slot with no model, whose catalog is
-never auto-selected) is dropped with a warning while the rest carry on; only
+sends `openrouter/auto` to OpenRouter with `~/.tok/openrouter`; adding
+`--llm-model ',qwen/qwen3.8-27b'` would pin that second slot instead. A link
+that cannot be used (no key) is dropped with a warning while the rest carry on; only
 when *nothing* is usable does the scan stop, and a lone endpoint with a
 problem is still an error rather than a silent no-op. Control which samples
 qualify with `--llm-min-level`: a sample is sent when ML fires at or below that

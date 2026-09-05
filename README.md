@@ -141,7 +141,7 @@ atomscan --llm openrouter --llm-model qwen/qwen3.8-27b ./project
 
 `--llm openrouter` talks to `https://openrouter.ai/api/v1`. The key comes from `--llm-key`, `SCAN_LLM_KEY`, or `~/.tok/openrouter` (first non-empty line). `--llm-model` defaults to `openrouter/auto` (OpenRouter's own auto-router) if omitted — the rest of the catalog is not auto-selected.
 
-Linux `make deploy` accepts the same names: `LLM=openrouter` (or `LLM_URL=openrouter`) and `LLM_MODEL=qwen/qwen3.8-27b`. The unit cannot read the operator home (`ProtectHome=true`), so the deploy script copies `~/.tok/openrouter` into the service state dir.
+Linux `make deploy` accepts the same names: `LLM=openrouter` (or `LLM_URL=openrouter`), and `LLM_MODEL=qwen/qwen3.8-27b` only to pin a model instead of `openrouter/auto`. The unit cannot read the operator home (`ProtectHome=true`), so the deploy script copies `~/.tok/openrouter` into the service state dir.
 
 ## Coverage
 

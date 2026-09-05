@@ -24,9 +24,10 @@
 # Environment overrides:
 #   TOKEN_SRC   token file to install (empty disables authentication)
 #                                                                (default: ~/.tok/scan)
-#   BIND        listen address (--bind)                          (default: 127.0.0.1:49999,
-#                                                                 i.e. reachable only through
-#                                                                 a local tunnel or proxy)
+#   BIND        listen address (--bind)                          (default: unset = atomscan's
+#                                                                 own, 127.0.0.1:49999, i.e.
+#                                                                 reachable only through a
+#                                                                 local tunnel or proxy)
 #   ALLOW_CIDR  extra CIDR allow-list (--allow-cidr); empty skips the flag
 #                                                                (default: 10.0.0.0/8)
 #   WORKERS     concurrency (--workers)                          (default: server auto)
@@ -46,12 +47,14 @@
 #   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, 80%, infinity)     (default: 80%)
 #   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target; comma-separate
 #                  several to fail over in order (SCAN_LLM)
-#                                                                (default: https://llm.isotope13.ai/v1,openrouter;
+#                                                                (default: the Makefile's LLM,
+#                                                                 exported on every deploy;
 #                                                                 `openrouter` → https://openrouter.ai/api/v1)
-#   LLM_MODEL      pinned model (SCAN_LLM_MODEL); required for OpenRouter. Pairs
-#                  positionally with a comma-separated LLM chain; a blank slot
-#                  asks that endpoint what it serves
-#                                                    (default: ,qwen/qwen3.8-27b)
+#   LLM_MODEL      pinned model (SCAN_LLM_MODEL). Pairs positionally with a
+#                  comma-separated LLM chain; a blank slot leaves that endpoint
+#                  on atomscan's own default: the largest model it serves, or
+#                  `openrouter/auto` for OpenRouter
+#                                                                (default: unset)
 #   SCAN_LLM_KEY   LLM bearer token, overriding the file below
 #   LLM_TOKEN_FILE LLM endpoint bearer token, installed whenever the file
 #                  exists; our vLLM requires one    (default: ~/.tok/llm)
@@ -78,10 +81,11 @@ UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}.service
 # ALLOW_CIDR= and — deliberately, on a host they trust — authentication with
 # TOKEN_SRC=.
 #
-# BIND defaults to loopback: the intended exposure is a Cloudflare tunnel (or
-# another local proxy) terminating on this host. Set BIND=0.0.0.0:49999 to
-# listen on every interface, and pair it with ALLOW_CIDR.
-BIND="${BIND:-127.0.0.1:49999}"
+# Deliberately no default: unset leaves atomscan's own, loopback, so the
+# intended exposure is a Cloudflare tunnel (or another local proxy) terminating
+# on this host. Set BIND=0.0.0.0:49999 to listen on every interface, and pair
+# it with ALLOW_CIDR.
+BIND="${BIND:-}"
 ALLOW_CIDR="${ALLOW_CIDR-10.0.0.0/8}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/scan}"
 WORKERS="${WORKERS:-}"
@@ -91,6 +95,9 @@ WORKERS="${WORKERS:-}"
 IDLE="${IDLE:-}"
 ALLOWED_DIRS="${ALLOWED_DIRS:-}"
 HOPPER="${HOPPER:-}"
+# -1 is a deliberate departure from atomscan's default (0 = auto-resolve):
+# under systemd, MemoryMax= is the enforcement, and in-process throttling would
+# only turn a leak into a 503 loop instead of a restart.
 MAX_RSS_GB="${MAX_RSS_GB:--1}"
 MEMORY_MAX="${MEMORY_MAX:-80%}"
 # Memory the kernel will not reclaim from the server under host-wide pressure.
@@ -103,8 +110,15 @@ NICE="${NICE:--20}"
 if [ -z "${LLM:-}" ] && [ -n "${LLM_URL:-}" ]; then
     LLM=$LLM_URL
 fi
-LLM="${LLM:-https://llm.isotope13.ai/v1,openrouter}"
-LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-,qwen/qwen3.8-27b}}"
+# LLM second-opinion pass: endpoint (exported as SCAN_LLM) + interpret gate.
+# No default here on purpose: the site's failover chain is defined once, in
+# the Makefile (LLM ?=), which exports it to every deploy script. Unset leaves
+# atomscan's own default.
+LLM="${LLM:-}"
+# Deliberately no default. atomscan picks the model itself — the largest one a
+# vLLM/Ollama endpoint reports, `openrouter/auto` for OpenRouter — and only an
+# operator's explicit pin is passed through.
+LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-}}"
 CLOUDFLARED="${CLOUDFLARED:-auto}"
 CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE:-/etc/atomdrift/scan/cloudflared-token}"
 
@@ -350,8 +364,9 @@ fi
 # OpenRouter: copy the operator key into the service home as well.
 # The LLM target may be a comma-separated failover chain, so OpenRouter can sit
 # anywhere in it. Anywhere is enough to need its key installed here; only when
-# it is the *whole* chain is a missing key or model fatal, because then there is
-# no other endpoint left to grade with.
+# it is the *whole* chain is a missing key fatal, because then there is no
+# other endpoint left to grade with. There is no model check to match: an
+# unpinned OpenRouter slot is `openrouter/auto` in the binary.
 openrouter_target() {
     _or_rest="$LLM"
     while [ -n "$_or_rest" ]; do
@@ -367,7 +382,7 @@ openrouter_target() {
     return 1
 }
 
-# OpenRouter and nothing else — the case where its key and model are required
+# OpenRouter and nothing else — the case where its key is required
 # rather than merely useful.
 openrouter_only() {
     case "$LLM" in
@@ -376,12 +391,6 @@ openrouter_only() {
     openrouter_target
 }
 if openrouter_target; then
-    if [ -z "$LLM_MODEL" ]; then
-        if openrouter_only; then
-            die "OpenRouter deploy requires LLM_MODEL= (e.g. qwen/qwen3.8-27b)"
-        fi
-        log "WARNING: no LLM_MODEL for the OpenRouter link in $LLM; its catalog is never auto-selected, so that link is dropped from the chain"
-    fi
     dst="${STATE_HOME}/.tok/openrouter"
     src="${HOME}/.tok/openrouter"
     if [ -n "${SCAN_LLM_KEY:-}" ]; then
@@ -453,8 +462,11 @@ fi
 # The server refreshes models and traits at startup, installing into the
 # already-created physical state directory. -u forces the refresh even when
 # the local copy looks current, matching the FreeBSD rc.d invocation.
-exec_args="-u serve --bind ${BIND} --traits-dir ${STATE_HOME}/traits --max-rss-gb ${MAX_RSS_GB}"
+exec_args="-u serve --traits-dir ${STATE_HOME}/traits --max-rss-gb ${MAX_RSS_GB}"
 exec_args="${exec_args} --interpret"
+if [ -n "${BIND}" ]; then
+    exec_args="${exec_args} --bind ${BIND}"
+fi
 if [ -n "${ALLOW_CIDR}" ]; then
     exec_args="${exec_args} --allow-cidr ${ALLOW_CIDR}"
 fi

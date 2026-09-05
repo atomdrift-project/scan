@@ -166,19 +166,30 @@ export HOPPER BIND ALLOWED_DIRS MEMORY_MAX IDLE
 #   make deploy ALLOW_CIDR=192.168.0.0/16
 #   make deploy TOKEN_SRC=            # deliberately unauthenticated
 
-# LLM second-opinion pass for `make worker` (matches the deploy scripts'
-# defaults). LLM / LLM_URL is exported as SCAN_LLM (`local`, `openrouter`, or a
-# base URL). LLM_MODEL is SCAN_LLM_MODEL (required for OpenRouter). The endpoint
-# requires a bearer token; atomscan reads it from ~/.tok/llm, and the deploy
-# scripts install that file for the service account (LLM_TOKEN_FILE overrides). The
-# benchmark/profile targets deliberately omit interpret so LLM
-# round-trips don't distort wall/RSS measurements.
+# LLM second-opinion pass. LLM / LLM_URL becomes SCAN_LLM (`local`,
+# `openrouter`, or a base URL). The endpoint requires a bearer token; atomscan
+# reads it from ~/.tok/llm, and the deploy scripts install that file for the
+# service account (LLM_TOKEN_FILE overrides). The benchmark/profile targets
+# deliberately omit interpret so LLM round-trips don't distort wall/RSS
+# measurements.
+#
 # Comma-separated is a failover chain, tried in order: our own vLLM first, the
-# billed public API only when it cannot answer. LLM_MODEL pairs positionally
-# with it — an empty first slot asks our endpoint what it serves, while
-# OpenRouter's catalog is never auto-selected and so must be named.
+# billed public API only when it cannot answer. This is the ONE place the
+# site's chain is defined: it is exported below, every deploy script and
+# `make worker` read it from the environment, and none of them carry a
+# fallback of their own. It is kept here rather than left to the flag default
+# because `--llm` alone means a loopback endpoint, which no dev box or deploy
+# host runs. `make deploy LLM=` exports an empty value, which the scripts pass
+# through so the pass can be turned off.
+#
+# LLM_MODEL is deliberately NOT defaulted here, nor in the deploy scripts.
+# Defaults for atomscan flags live in atomscan, in one place: unpinned, it
+# takes the largest model a vLLM/Ollama endpoint reports serving, and
+# `openrouter/auto` for OpenRouter. Pass LLM_MODEL= only to pin one; it pairs
+# positionally with a comma-separated LLM chain, and a blank slot leaves that
+# endpoint on its default.
 LLM ?= https://llm.isotope13.ai/v1,openrouter
-LLM_MODEL ?= ,qwen/qwen3.8-27b
+export LLM
 
 # Scrub GNU make's jobserver from cargo's environment. Without this, build
 # scripts that spawn their own `make` (e.g. tikv-jemalloc-sys) inherit a
@@ -579,7 +590,7 @@ worker: check-hopper-token kill-scan release
 	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>] [LLM=<endpoint>] [LLM_MODEL=<name>]"; exit 1; }
 	@# Runs as the invoking user, so atomscan finds $(HOPPER_TOKEN_FILE) on its
 	@# own; `check-hopper-token` has already established that it is there.
-	SCAN_LLM="$(LLM)" SCAN_LLM_MODEL="$(LLM_MODEL)" ./out/$(BINARY) worker --url "$(URL)" \
+	SCAN_LLM="$(LLM)" $(if $(LLM_MODEL),SCAN_LLM_MODEL="$(LLM_MODEL)",) ./out/$(BINARY) worker --url "$(URL)" \
 		--interpret \
 		$(if $(WORKERS),--workers $(WORKERS),) \
 		$(if $(NICE),--nice $(NICE),)
