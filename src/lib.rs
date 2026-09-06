@@ -189,7 +189,7 @@ pub enum Mode {
 
 /// Stack size for every analysis thread pool, in MiB. cleave's archive
 /// analysis is nested-parallel and deep; 256 MB is what the global rayon pool
-/// has always used, and the small pool (`server::small_pool_for`) must match it
+/// has always used, and the whale pools (`server::whale_lane_for`) must match it
 /// or a member that recurses fine on one pool overflows on the other.
 pub const RAYON_STACK_MB: usize = 256;
 
