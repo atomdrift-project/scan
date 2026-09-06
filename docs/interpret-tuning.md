@@ -430,3 +430,50 @@ The endpoint requires a bearer token. `tune.py` reads it from `~/.tok/llm`
 (`SCAN_LLM_KEY` overrides) and warns when it finds neither, which matters here:
 a refused call scores as a miss, so an unauthenticated sweep reads as a model
 that got the whole corpus wrong rather than as a run that never happened.
+
+## Prompt sweep on FP8 (2026-09-06)
+
+Measured on the four labelled sets (mspd 226, compendium-dirty 191,
+compendium-clean 153, scan-purls 249; renders and harness under
+`hacks/vllm-tune/`, results in `~/data/vllm-tune/`), grading the same
+rendered prompts with each candidate system prompt against the fleet's vLLM
+(Qwen3.8-27B-FP8, temperature 0). "Right side" is hostile+suspicious on the
+bad sets and benign on the clean ones. BF16-vs-BF16 repeat agreement is
+99.3–100% per set, so a one-sample move is noise.
+
+| prompt | tokens | mspd | comp-dirty | comp-clean | scan-purls |
+|---|---|---|---|---|---|
+| previous (2026-09-05) | 599 | 76.1 | 75.9 | 96.1 | 98.8 |
+| previous + signed-binary identity paragraph | 669 | 76.5 | 77.0 | 96.1 | 98.8 |
+| tightened rewrite + identity | 520 | 75.2 | 75.9 | 96.1 | 99.2 |
+| **hedge sentences verbatim, exposition cut, + identity (shipped)** | **508** | **78.8** | **77.0** | 95.4 | 98.8 |
+| minimal + identity | 348 | 83.6 | 78.0 | 94.1 | 97.6 |
+| ultra + identity | 278 | 85.8 | — | 92.8 | 97.2 |
+
+Two findings drove the choice:
+
+- **The signed-binary identity paragraph is what flips `Delfino.exe`.** A
+  CA-signed PE whose version resource claims DreamSecurity while the
+  Authenticode subject is another company, with cleave's stolen-certificate
+  rule firing, graded *suspicious* on FP8 under the previous prompt and the
+  blend de-escalated it from hostile L12 to suspicious L3000. Telling the
+  model that a signer/claim mismatch or a certificate reported stolen is
+  impersonation returns it to hostile, and costs nothing on the 402 clean
+  samples (compendium-clean includes signed proprietary software).
+- **The hedge sentences carry the clean sets; the exposition does not.**
+  Every shorter prompt that paraphrased "a category alone is never evidence
+  of malice … verify each description against the actual source" bought its
+  extra detection with false positives: +6 clean samples at 348 tokens, +7 at
+  278. Keeping those sentences word for word and cutting only the format
+  description (LINE:COL/@OFFSET semantics, the xxd gutter, blank-line
+  windows) kept the clean sets whole at 508 tokens.
+
+The one stable clean-set change under the shipped prompt is
+`@tiledesk/tiledesk-server 2.18.5` reading *suspicious* ("Obfuscated Stripe
+module in package") in both repeats — a review flag on a package that does
+ship an obfuscated module, which is what the grade means.
+
+Format decision made the same day, same harness: FP8 (`Qwen/Qwen3.8-27B-FP8`)
+agrees with BF16 at 99.0–100% per set at ~1.5× throughput; NVFP4
+(`Inferact/Qwen3.8-27B-NVFP4`) runs 2× but de-escalates 20–26 samples per
+bad set and returns unparseable replies, so it was rejected.
