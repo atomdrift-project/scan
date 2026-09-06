@@ -392,7 +392,24 @@ mod cpu_busy_tests {
 
 #[cfg(test)]
 mod idle_worker_cores_tests {
-    use super::idle_worker_cores;
+    use super::{idle_classify_permits, idle_worker_cores};
+
+    /// Outer classifies never fill the pool they run on: at most a quarter of
+    /// its threads, so fan-out and single-flight waits always have somewhere
+    /// to run. One on the smallest pools rather than zero.
+    #[test]
+    fn idle_classifies_leave_the_pool_room_to_fan_out() {
+        assert_eq!(idle_classify_permits(102), 26);
+        assert_eq!(idle_classify_permits(12), 3);
+        assert_eq!(idle_classify_permits(4), 1);
+        assert_eq!(idle_classify_permits(1), 1);
+        for threads in 2..=256 {
+            assert!(
+                idle_classify_permits(threads) * 3 <= threads + 2,
+                "threads={threads}"
+            );
+        }
+    }
 
     /// The idle worker never gets the whole pool, and never zero of it.
     #[test]
@@ -571,7 +588,11 @@ impl RequestPhase {
     pub(crate) fn set(&self, phase: &str) {
         self.0.tracker.set(phase);
         let at = self.0.started.elapsed();
-        let mut marks = self.0.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut marks = self
+            .0
+            .marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if marks.len() < PHASE_MARKS_MAX && marks.last().is_none_or(|(last, _)| last != phase) {
             marks.push((phase.to_owned(), at));
         }
@@ -924,7 +945,8 @@ fn whale_config() -> &'static WhaleConfig {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
         };
-        let threads = env_usize("SCAN_WHALE_POOL_THREADS").unwrap_or_else(|| whale_pool_threads(physical));
+        let threads =
+            env_usize("SCAN_WHALE_POOL_THREADS").unwrap_or_else(|| whale_pool_threads(physical));
         let small_threads =
             env_usize("SCAN_SMALL_POOL_THREADS").unwrap_or_else(|| small_pool_threads(physical));
         let slots = env_usize("SCAN_WHALE_SLOTS")
@@ -963,23 +985,49 @@ static WHALE_SLOTS_IN_USE: (Mutex<usize>, std::sync::Condvar) =
 struct WhaleSlot;
 
 impl WhaleSlot {
-    fn acquire(slots: usize) -> Self {
+    /// Wait for a slot, or give up (`None`) once `cancellation` is raised.
+    /// The wait used to be unconditional: a request the watchdog had already
+    /// cancelled sat here for the rest of its 30-minute budget, holding its
+    /// server slot and core, counted as an orphan the whole time (two of
+    /// them on scan-lax, 2026-09-06). A cancelled request has nothing to wait
+    /// for.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the guard is what the condvar waits on; it must live for the whole loop"
+    )]
+    fn acquire(slots: usize, cancellation: Option<&AtomicBool>) -> Option<Self> {
         let (lock, cv) = &WHALE_SLOTS_IN_USE;
-        let mut in_use = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut in_use = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *in_use >= slots {
+            if cancellation.is_some_and(|c| c.load(Ordering::Acquire)) {
+                return None;
+            }
             in_use = cv
-                .wait(in_use)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(in_use, Duration::from_secs(1))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
         *in_use += 1;
-        Self
+        Some(Self)
+    }
+
+    /// Slots in use right now, for `/_/stats`.
+    fn in_use() -> usize {
+        *WHALE_SLOTS_IN_USE
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
 impl Drop for WhaleSlot {
     fn drop(&mut self) {
         let (lock, cv) = &WHALE_SLOTS_IN_USE;
-        let mut in_use = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut in_use = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *in_use = in_use.saturating_sub(1);
         drop(in_use);
         cv.notify_one();
@@ -1025,6 +1073,11 @@ impl WhaleLane {
     }
 }
 
+/// Big-whale slots in use and available, for `/_/stats`.
+pub(crate) fn whale_slot_usage() -> (usize, usize) {
+    (WhaleSlot::in_use(), whale_config().slots)
+}
+
 /// The lane a payload of `bytes` analyzes on: a private pool sized to it —
 /// [`small_pool_threads`] wide at or below the small cap, [`whale_pool_threads`]
 /// above it, after waiting for a slot if the payload is big — or `None` (the
@@ -1040,7 +1093,22 @@ impl WhaleLane {
 /// and half of them analyze serially at concurrency 8; on a pool of their
 /// own each is parallel and exempt (`dedicated_pool`). Measured 2026-09-05
 /// over 256 PURLs: throughput 203 → 230/min, mean 1.65 → 1.35 s.
-pub(crate) fn whale_lane_for(bytes: u64) -> Option<WhaleLane> {
+///
+/// Never for pull work. The idle worker's analyses already run on a pool of
+/// their own — bounded, scheduled below the server's, and drawing on their
+/// own parallelism slots — and a lane would undo all three: a lane pool's
+/// threads are unmarked and at normal priority, and a big idle archive would
+/// take one of the few whale slots and hold it for its whole slow run.
+/// Measured 2026-09-06 on scan-lax: two of the two whale slots held by pull
+/// work, and two interactive analyses waited in `whale:lane` until their
+/// 30-minute budget ran out.
+///
+/// `cancellation` ends the wait for a big-whale slot early; `None` then, and
+/// the caller's cleave run notices the flag at its first checkpoint.
+pub(crate) fn whale_lane_for(bytes: u64, cancellation: Option<&AtomicBool>) -> Option<WhaleLane> {
+    if on_idle_pool() {
+        return None;
+    }
     let cfg = whale_config();
     let threads = if bytes <= cfg.small_max_bytes {
         cfg.small_threads
@@ -1050,7 +1118,11 @@ pub(crate) fn whale_lane_for(bytes: u64) -> Option<WhaleLane> {
     if threads == 0 {
         return None;
     }
-    let slot = (bytes > cfg.big_min_bytes).then(|| WhaleSlot::acquire(cfg.slots));
+    let slot = if bytes > cfg.big_min_bytes {
+        Some(WhaleSlot::acquire(cfg.slots, cancellation)?)
+    } else {
+        None
+    };
     match rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
@@ -1271,14 +1343,18 @@ struct AppState {
 }
 
 impl AppState {
-    /// Cores the idle worker holds at this moment: its budget less the permits
-    /// it has not taken. Bounded by the budget, unlike the in-progress count,
-    /// which includes tails waiting on the network and on rdu2 stood at 576
-    /// against 96 cores (2026-09-05) — a discount that size told the router a
-    /// fully busy box had nothing on it.
+    /// Cores the idle worker may be using at this moment: its classify
+    /// permits in use, scaled to the share of its pool each one can fan out
+    /// over, and never more than the pool. Bounded by the budget, unlike the
+    /// in-progress count, which includes tails waiting on the network and on
+    /// rdu2 stood at 576 against 96 cores (2026-09-05) — a discount that size
+    /// told the router a fully busy box had nothing on it.
     pub(super) fn idle_cores_held(&self) -> usize {
-        self.idle_worker_cores
-            .saturating_sub(self.idle_cpu.available_permits())
+        let permits = idle_classify_permits(self.idle_worker_cores);
+        let held = permits.saturating_sub(self.idle_cpu.available_permits());
+        (held * self.idle_worker_cores)
+            .div_ceil(permits.max(1))
+            .min(self.idle_worker_cores)
     }
 
     /// Analyses this server can start right now: a slot and a core for each.
@@ -1387,6 +1463,7 @@ fn idle_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
             crate::thread_dump::register_self();
             crate::thread_priority::demote_current_thread(IDLE_POOL_DEMOTION);
             cleave::mark_thread_background();
+            ON_IDLE_POOL.with(|on| on.set(true));
         })
         .build()
     {
@@ -1407,11 +1484,39 @@ fn idle_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
     }
 }
 
+thread_local! {
+    /// Set on every thread of the idle worker's pool (`idle_pool`). Read by
+    /// `whale_lane_for`: pull work never takes a whale slot or a lane pool.
+    static ON_IDLE_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the calling thread belongs to the idle worker's rayon pool.
+pub(crate) fn on_idle_pool() -> bool {
+    ON_IDLE_POOL.with(std::cell::Cell::get)
+}
+
 /// How far below the global pool the idle pool's threads are scheduled. The
 /// global pool already sits one notch below normal so rizin and friends get a
 /// core when they need one (see `lower_pool_thread_priority` in main.rs);
 /// this puts pull work well under both.
 const IDLE_POOL_DEMOTION: u8 = 10;
+
+/// Classifies the idle worker may run at once on a pool of `threads`: a
+/// quarter of them, never fewer than one.
+///
+/// Each classify is installed *onto* a pool thread (`CleaveGate::pool`) and
+/// holds that thread for its whole run, so the pool must keep threads free
+/// for what those classifies fan out to: member analyses, and the
+/// single-flight waits where one member waits on another thread's analysis
+/// of the same bytes. With one permit per thread every thread was an outer
+/// closure, nothing was left to run the work they waited on, and rdu2's
+/// pull worker wedged with 102 permits held, 102 threads blocked, stage
+/// "done" for half an hour and no CPU (2026-09-06). A quarter leaves three
+/// threads of fan-out per classify, which is the ratio the archive-heavy
+/// corpus wants anyway.
+pub(super) fn idle_classify_permits(threads: usize) -> usize {
+    threads.div_ceil(4).max(1)
+}
 
 /// Cores the embedded idle worker may occupy: four fifths of the pool, less
 /// a reserve of at least two, and never none. `SCAN_IDLE_CORES` overrides
@@ -1483,7 +1588,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         cpu: Arc::new(tokio::sync::Semaphore::new(cores)),
         idle_worker_cores: idle_worker_cores(cores),
         idle_in_progress: Arc::new(AtomicUsize::new(0)),
-        idle_cpu: Arc::new(tokio::sync::Semaphore::new(idle_worker_cores(cores))),
+        idle_cpu: Arc::new(tokio::sync::Semaphore::new(idle_classify_permits(
+            idle_worker_cores(cores),
+        ))),
         cpu_busy: CpuBusy::default(),
         stuck_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
@@ -2266,21 +2373,41 @@ mod whale_pool_tests {
         assert_eq!(super::whale_slots(128), 8);
         assert_eq!(super::whale_slots(256), 8);
         for cores in [4, 16, 64, 128] {
-            assert!(super::whale_slots(cores) * super::whale_pool_threads(cores) <= 2 * cores.max(4));
+            assert!(
+                super::whale_slots(cores) * super::whale_pool_threads(cores) <= 2 * cores.max(4)
+            );
         }
     }
 
     /// A slot is released on drop, so a waiter gets it.
+    /// A cancelled request stops waiting for a slot instead of sitting on it
+    /// for the rest of its budget.
+    #[test]
+    fn whale_slot_wait_ends_on_cancellation() {
+        let held = super::WhaleSlot::acquire(1, None).expect("no cancellation, so a slot");
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        assert!(
+            super::WhaleSlot::acquire(1, Some(&cancel)).is_none(),
+            "a cancelled waiter gives up"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(held);
+    }
+
     #[test]
     fn whale_slot_released_on_drop() {
-        let first = super::WhaleSlot::acquire(1);
+        let first = super::WhaleSlot::acquire(1, None).expect("no cancellation, so a slot");
         let (lock, _) = &super::WHALE_SLOTS_IN_USE;
         assert_eq!(*lock.lock().unwrap(), 1);
         let waiter = std::thread::spawn(|| {
-            let _second = super::WhaleSlot::acquire(1);
+            let _second = super::WhaleSlot::acquire(1, None);
         });
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(!waiter.is_finished(), "waiter should block while the slot is held");
+        assert!(
+            !waiter.is_finished(),
+            "waiter should block while the slot is held"
+        );
         drop(first);
         waiter.join().unwrap();
         assert_eq!(*lock.lock().unwrap(), 0);
