@@ -36,7 +36,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::signal;
 
@@ -532,6 +532,94 @@ mod config_tests {
 }
 
 #[derive(Debug)]
+/// A request's phase marker plus the timeline it leaves behind.
+///
+/// Wraps the [`cleave::PhaseTracker`] that `/_/requests` and the watchdog
+/// read, and records when each phase began so the completion log can say
+/// where a request's wall time went (`phases="purl:fetch=812 cleave:init=1930 …"`,
+/// milliseconds per phase, repeats summed). That is what turns a latency
+/// percentile into an attribution: fetch-bound, registry-bound or
+/// analysis-bound, per request, without a profiler attached.
+#[derive(Clone)]
+pub(crate) struct RequestPhase(Arc<RequestPhaseInner>);
+
+#[derive(Debug)]
+struct RequestPhaseInner {
+    tracker: cleave::PhaseTracker,
+    started: Instant,
+    /// `(phase, offset from `started`)` in the order the phases were entered.
+    marks: Mutex<Vec<(String, Duration)>>,
+}
+
+/// More marks than this and the request is looping, not progressing; keep the
+/// head so the timeline still shows how it started.
+const PHASE_MARKS_MAX: usize = 64;
+
+impl RequestPhase {
+    pub(crate) fn with_label(label: impl Into<String>) -> Self {
+        Self(Arc::new(RequestPhaseInner {
+            tracker: cleave::PhaseTracker::with_label(label),
+            started: Instant::now(),
+            marks: Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// Enter `phase`: updates the shared tracker and stamps the timeline.
+    pub(crate) fn set(&self, phase: &str) {
+        self.0.tracker.set(phase);
+        let at = self.0.started.elapsed();
+        let mut marks = self.0.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if marks.len() < PHASE_MARKS_MAX && marks.last().is_none_or(|(last, _)| last != phase) {
+            marks.push((phase.to_owned(), at));
+        }
+    }
+
+    /// The current phase name, as the tracker reports it.
+    pub(crate) fn get(&self) -> String {
+        self.0.tracker.get()
+    }
+
+    /// The underlying tracker, for cleave's own phase reporting.
+    pub(crate) fn tracker(&self) -> &cleave::PhaseTracker {
+        &self.0.tracker
+    }
+
+    /// Milliseconds spent in each phase, first-entered order, as
+    /// `name=ms name=ms …`. Time before the first mark is `pre`, so the
+    /// figures sum to the request's elapsed time.
+    pub(crate) fn timeline(&self) -> String {
+        let now = self.0.started.elapsed();
+        let marks = self
+            .0
+            .marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut order: Vec<String> = Vec::new();
+        let mut spent: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+        let mut account = |name: &str, dur: Duration| {
+            if !spent.contains_key(name) {
+                order.push(name.to_owned());
+            }
+            *spent.entry(name.to_owned()).or_insert(0) += dur.as_millis();
+        };
+        if let Some((_, first)) = marks.first()
+            && !first.is_zero()
+        {
+            account("pre", *first);
+        }
+        for (i, (name, at)) in marks.iter().enumerate() {
+            let end = marks.get(i + 1).map_or(now, |(_, next)| *next);
+            account(name, end.saturating_sub(*at));
+        }
+        order
+            .iter()
+            .map(|name| format!("{name}={}", spent.get(name).copied().unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 struct InFlightRequest {
     name: String,
     size_bytes: u64,
@@ -540,7 +628,7 @@ struct InFlightRequest {
     cancellation: Arc<AtomicBool>,
     /// Tracks the current analysis phase inside cleave/litmus. Updated at each
     /// major stage so `/_/requests` can report what a stuck request is doing.
-    phase: cleave::PhaseTracker,
+    phase: RequestPhase,
     /// OS thread ID of the blocking thread servicing this request (0 until started).
     thread_id: AtomicU64,
 }
@@ -751,7 +839,7 @@ pub struct ModelResources {
 }
 
 /// Payloads at or below this many bytes count as small — for the slot lanes
-/// and for [`small_pool_for`] alike. `SCAN_SMALL_JOB_MB`, the same knob the
+/// and for [`whale_lane_for`] alike. `SCAN_SMALL_JOB_MB`, the same knob the
 /// worker's cleave gate reads; 1 MiB unless set.
 fn small_job_max_bytes() -> u64 {
     std::env::var("SCAN_SMALL_JOB_MB")
@@ -760,91 +848,218 @@ fn small_job_max_bytes() -> u64 {
         .map_or(1024 * 1024, |mb| mb.saturating_mul(1024 * 1024))
 }
 
-/// Threads for the small-analysis pool on a host with this many physical
-/// cores: an eighth of them, never fewer than two (one thread cannot pipeline
+/// Threads for one whale's private pool on a host with this many physical
+/// cores: a quarter of them, never fewer than two (one thread cannot pipeline
 /// a member window against its own producer) and never more than sixteen.
-/// 4 cores → 2, 32 → 4, 64 → 8, 128 → 16.
+/// 4 cores → 2, 64 → 16, 128 → 16. Several whales in flight each get their
+/// own; the global pool keeps every core for everything else.
+#[must_use]
+pub(crate) fn whale_pool_threads(physical_cores: usize) -> usize {
+    (physical_cores / 4).clamp(2, 16)
+}
+
+/// Threads for a small payload's private pool on a host with this many
+/// physical cores: an eighth of them, 2–8. 4 cores → 2, 64 → 8, 128 → 8. A
+/// package under the small cap has few members, so a wider pool mostly idles;
+/// eight is where its p50 was best (0.29 s vs 0.44 s on 16, measured
+/// 2026-09-05 at concurrency 8 over 256 PURLs).
 #[must_use]
 pub(crate) fn small_pool_threads(physical_cores: usize) -> usize {
-    (physical_cores / 8).clamp(2, 16)
+    (physical_cores / 8).clamp(2, 8)
 }
 
-struct SmallPool {
-    pool: rayon::ThreadPool,
-    max_bytes: u64,
+/// How many *big* whales analyze at once on a host with this many physical
+/// cores; the rest wait their turn. An eighth of the cores, 1–8: 4 cores → 1,
+/// 64 → 8, 128 → 8. With [`whale_pool_threads`] that bounds whale threads at
+/// about two per physical core, oversubscribed enough to keep every core busy
+/// while a whale is in a serial phase, not so much that the global pool's
+/// small work loses its cores.
+#[must_use]
+pub(crate) fn whale_slots(physical_cores: usize) -> usize {
+    (physical_cores / 8).clamp(1, 8)
 }
 
-/// A second rayon pool for small analyses: the bulkhead that keeps a
-/// 300-byte package from queueing behind a 40 MB one.
-///
-/// Every server analysis runs on a tokio blocking thread, so each inner
-/// `par_iter` it issues — string extraction in stng, a member-window flush in
-/// cleave — is *injected* into the global pool from outside, and rayon
-/// workers take injected work only once their own deques are empty. While a
-/// whale's thousands of member tasks are queued they never are. Measured
-/// 2026-09-05 at concurrency 8 over 128 real PURLs: a package that analyzes
-/// in 0.3s alone waited 16.8s in `Registry::in_worker_cold` for a worker, and
-/// the p90 sat at 5.2–5.8s whether or not the LLM pass ran at all. Inside a
-/// pool of its own, a small analysis's joins run on that pool's workers
-/// through their local deques and never touch the injector.
-///
-/// Sized by [`small_pool_threads`] on the same stacks as the global pool. It
-/// oversubscribes the CPU by that many threads while a whale saturates the
-/// global pool — which is the point: the small work must not wait for it.
-/// `SCAN_SMALL_POOL_THREADS` overrides the size (0 disables the pool);
-/// `SCAN_SMALL_JOB_MB` says what counts as small. Built on first use.
-static SMALL_POOL: OnceLock<Option<SmallPool>> = OnceLock::new();
-
-fn build_small_pool() -> Option<SmallPool> {
-    let threads = match std::env::var("SCAN_SMALL_POOL_THREADS")
+/// Payloads above this many bytes are *big* whales, the ones that take a
+/// slot from [`whale_slots`]. `SCAN_BIG_JOB_MB`; 8 MiB unless set. Between
+/// `SCAN_SMALL_JOB_MB` and this a payload still gets a private pool, but
+/// never waits: a 2 MiB package finishes in seconds, and making it queue
+/// behind a 250 MiB one is the starvation this whole arrangement exists to
+/// prevent.
+fn big_job_min_bytes() -> u64 {
+    std::env::var("SCAN_BIG_JOB_MB")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        Some(0) => {
-            tracing::info!("small analysis pool disabled (SCAN_SMALL_POOL_THREADS=0)");
-            return None;
-        }
-        Some(n) => n,
-        None => small_pool_threads(
-            cleave::memory_tracker::physical_cpu_count()
-                .or_else(|| {
-                    std::thread::available_parallelism()
-                        .ok()
-                        .map(|n| n.get() / 2)
-                })
-                .unwrap_or(4),
-        ),
-    };
-    let max_bytes = small_job_max_bytes();
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
-        .thread_name(|i| format!("rayon-small-{i}"))
-        .build()
-    {
-        Ok(pool) => {
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(8 * 1024 * 1024, |mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// Whale-lane sizing, read once from the environment.
+struct WhaleConfig {
+    /// Threads per whale pool; `0` sends whales to the global pool instead.
+    threads: usize,
+    /// Threads per small payload's pool; `0` keeps small payloads on the
+    /// global pool.
+    small_threads: usize,
+    /// Big whales in flight at once.
+    slots: usize,
+    small_max_bytes: u64,
+    big_min_bytes: u64,
+}
+
+static WHALE_CONFIG: OnceLock<WhaleConfig> = OnceLock::new();
+
+fn whale_config() -> &'static WhaleConfig {
+    WHALE_CONFIG.get_or_init(|| {
+        let physical = cleave::memory_tracker::physical_cpu_count()
+            .or_else(|| {
+                std::thread::available_parallelism()
+                    .ok()
+                    .map(|n| n.get() / 2)
+            })
+            .unwrap_or(4);
+        let env_usize = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        };
+        let threads = env_usize("SCAN_WHALE_POOL_THREADS").unwrap_or_else(|| whale_pool_threads(physical));
+        let small_threads =
+            env_usize("SCAN_SMALL_POOL_THREADS").unwrap_or_else(|| small_pool_threads(physical));
+        let slots = env_usize("SCAN_WHALE_SLOTS")
+            .unwrap_or_else(|| whale_slots(physical))
+            .max(1);
+        let small_max_bytes = small_job_max_bytes();
+        let big_min_bytes = big_job_min_bytes().max(small_max_bytes);
+        if threads == 0 {
+            tracing::info!("whale analysis pools disabled (SCAN_WHALE_POOL_THREADS=0)");
+        } else {
             tracing::info!(
-                threads,
-                small_max_mb = max_bytes / (1024 * 1024),
-                "small analysis pool ready: payloads at or below the cap run on their own rayon pool"
+                threads_per_whale = threads,
+                threads_per_small = small_threads,
+                big_whale_slots = slots,
+                whale_over_mb = small_max_bytes / (1024 * 1024),
+                big_over_mb = big_min_bytes / (1024 * 1024),
+                "analysis lanes ready: every payload runs on a private rayon pool sized to it"
             );
-            Some(SmallPool { pool, max_bytes })
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to build the small analysis pool; small payloads share the global pool");
-            None
+        WhaleConfig {
+            threads,
+            small_threads,
+            slots,
+            small_max_bytes,
+            big_min_bytes,
         }
+    })
+}
+
+/// Big whales in flight, guarded for the slot wait. The count is the
+/// mutex's value; the condvar wakes a waiter when one finishes.
+static WHALE_SLOTS_IN_USE: (Mutex<usize>, std::sync::Condvar) =
+    (Mutex::new(0), std::sync::Condvar::new());
+
+/// One of [`whale_slots`], released on drop.
+struct WhaleSlot;
+
+impl WhaleSlot {
+    fn acquire(slots: usize) -> Self {
+        let (lock, cv) = &WHALE_SLOTS_IN_USE;
+        let mut in_use = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *in_use >= slots {
+            in_use = cv
+                .wait(in_use)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *in_use += 1;
+        Self
     }
 }
 
-/// The pool a payload of `bytes` should analyze on, or `None` for the global
-/// pool (a whale, or the small pool disabled).
-pub(crate) fn small_pool_for(bytes: u64) -> Option<&'static rayon::ThreadPool> {
-    SMALL_POOL
-        .get_or_init(build_small_pool)
-        .as_ref()
-        .filter(|p| bytes <= p.max_bytes)
-        .map(|p| &p.pool)
+impl Drop for WhaleSlot {
+    fn drop(&mut self) {
+        let (lock, cv) = &WHALE_SLOTS_IN_USE;
+        let mut in_use = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *in_use = in_use.saturating_sub(1);
+        drop(in_use);
+        cv.notify_one();
+    }
+}
+
+/// A whale's private rayon pool for the life of one analysis: the bulkhead
+/// that keeps a 40 MB package from stalling every 300-byte one that arrives
+/// while it runs, and every 2 MB one from stalling behind it.
+///
+/// Every server analysis runs on a tokio blocking thread, so each inner
+/// `par_iter` it issues — string extraction in stng, a member-window flush in
+/// cleave — is *injected* into a rayon pool from outside, and rayon workers
+/// take injected work only once their own deques are empty. While a whale's
+/// thousands of member tasks sit in those deques they never are. Measured
+/// 2026-09-05 at concurrency 8 over 128 real PURLs: a package that analyzes
+/// in 0.3s alone waited 16.8s in `Registry::in_worker_cold` for a global-pool
+/// worker, and the p90 sat at 5.2–6.9s whether or not the LLM pass ran.
+///
+/// A single *shared* whale pool was the first cut and fixed the small side
+/// (p90 4.1s), but moved the starvation into the whale pool: three 36–254 MB
+/// wheels in flight kept a 1.3 MB package waiting the whole 200s sweep, and
+/// held each other to 170s+ where alone they take 25–40s. So each whale gets
+/// its own pool ([`whale_pool_threads`] wide, dropped when the analysis
+/// returns); nothing shares an injector with a whale. Big ones
+/// (`SCAN_BIG_JOB_MB`) also take one of [`whale_slots`], so a burst of them
+/// queues instead of oversubscribing the host; the threads are cheap, the
+/// cores are the budget.
+///
+/// `SCAN_WHALE_POOL_THREADS` sets the per-whale width (0 sends whales to the
+/// global pool); `SCAN_WHALE_SLOTS` the big-whale concurrency;
+/// `SCAN_SMALL_JOB_MB` (shared with the slot lanes) says where whale starts.
+pub(crate) struct WhaleLane {
+    pool: rayon::ThreadPool,
+    /// Held for the pool's life when the payload is a big whale.
+    _slot: Option<WhaleSlot>,
+}
+
+impl WhaleLane {
+    /// Run `f` on this lane's pool, blocking until it returns.
+    pub(crate) fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+        self.pool.install(f)
+    }
+}
+
+/// The lane a payload of `bytes` analyzes on: a private pool sized to it —
+/// [`small_pool_threads`] wide at or below the small cap, [`whale_pool_threads`]
+/// above it, after waiting for a slot if the payload is big — or `None` (the
+/// global pool) when private pools are disabled for its size or fail to
+/// build. The wait is the caller's phase to report.
+///
+/// Built per analysis and dropped after it: parking idle pools for reuse
+/// (warm thread-local caches) measured as a wash, within noise on p50, p90
+/// and throughput over 256 PURLs, so the simpler form stays.
+///
+/// Small payloads got private pools too once the whales had them: on the
+/// global pool they compete for cleave's bounded inner-parallel owner slots
+/// and half of them analyze serially at concurrency 8; on a pool of their
+/// own each is parallel and exempt (`dedicated_pool`). Measured 2026-09-05
+/// over 256 PURLs: throughput 203 → 230/min, mean 1.65 → 1.35 s.
+pub(crate) fn whale_lane_for(bytes: u64) -> Option<WhaleLane> {
+    let cfg = whale_config();
+    let threads = if bytes <= cfg.small_max_bytes {
+        cfg.small_threads
+    } else {
+        cfg.threads
+    };
+    if threads == 0 {
+        return None;
+    }
+    let slot = (bytes > cfg.big_min_bytes).then(|| WhaleSlot::acquire(cfg.slots));
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
+        .thread_name(move |i| format!("rayon-lane{threads}-{i}"))
+        .build()
+    {
+        Ok(pool) => Some(WhaleLane { pool, _slot: slot }),
+        Err(e) => {
+            tracing::warn!(error = %e, bytes, "failed to build a private analysis pool; this payload shares the global pool");
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1466,6 +1681,11 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                // Flush cleave's learned regex list so the next start of this
+                // server prewarms the compiles this workload needed instead of
+                // paying them on the first requests. Cheap when nothing new
+                // compiled since the last tick.
+                tokio::task::spawn_blocking(cleave::persist_regex_warm_memo);
                 let available = watchdog.available_analysis_permits();
                 let active = watchdog.max_concurrent_tasks.saturating_sub(available);
                 let stuck = watchdog.stuck_orphans.load(Ordering::Relaxed);
@@ -1974,18 +2194,60 @@ mod job_bucket_recent_tests {
 }
 
 #[cfg(test)]
-mod small_pool_tests {
-    /// The small pool scales with the host and never outgrows what a whale
-    /// leaves: an eighth of the cores, floor two, ceiling sixteen.
+mod whale_pool_tests {
+    /// Per-whale pools scale with the host: a quarter of the cores, floor
+    /// two, ceiling sixteen — the global pool keeps every core regardless.
     #[test]
-    fn small_pool_threads_scale_from_laptop_to_workstation() {
+    fn whale_pool_threads_scale_from_laptop_to_workstation() {
+        assert_eq!(super::whale_pool_threads(1), 2);
+        assert_eq!(super::whale_pool_threads(4), 2);
+        assert_eq!(super::whale_pool_threads(8), 2);
+        assert_eq!(super::whale_pool_threads(16), 4);
+        assert_eq!(super::whale_pool_threads(64), 16);
+        assert_eq!(super::whale_pool_threads(128), 16);
+        assert_eq!(super::whale_pool_threads(256), 16);
+    }
+
+    /// Small-payload pools: an eighth of the cores, 2–8.
+    #[test]
+    fn small_pool_threads_scale_with_cores() {
         assert_eq!(super::small_pool_threads(1), 2);
         assert_eq!(super::small_pool_threads(4), 2);
-        assert_eq!(super::small_pool_threads(8), 2);
         assert_eq!(super::small_pool_threads(16), 2);
         assert_eq!(super::small_pool_threads(32), 4);
         assert_eq!(super::small_pool_threads(64), 8);
-        assert_eq!(super::small_pool_threads(128), 16);
-        assert_eq!(super::small_pool_threads(256), 16);
+        assert_eq!(super::small_pool_threads(256), 8);
+    }
+
+    /// Big-whale slots: an eighth of the cores, 1–8, so slots × threads stays
+    /// near two whale threads per core.
+    #[test]
+    fn whale_slots_scale_with_cores() {
+        assert_eq!(super::whale_slots(1), 1);
+        assert_eq!(super::whale_slots(4), 1);
+        assert_eq!(super::whale_slots(8), 1);
+        assert_eq!(super::whale_slots(16), 2);
+        assert_eq!(super::whale_slots(64), 8);
+        assert_eq!(super::whale_slots(128), 8);
+        assert_eq!(super::whale_slots(256), 8);
+        for cores in [4, 16, 64, 128] {
+            assert!(super::whale_slots(cores) * super::whale_pool_threads(cores) <= 2 * cores.max(4));
+        }
+    }
+
+    /// A slot is released on drop, so a waiter gets it.
+    #[test]
+    fn whale_slot_released_on_drop() {
+        let first = super::WhaleSlot::acquire(1);
+        let (lock, _) = &super::WHALE_SLOTS_IN_USE;
+        assert_eq!(*lock.lock().unwrap(), 1);
+        let waiter = std::thread::spawn(|| {
+            let _second = super::WhaleSlot::acquire(1);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "waiter should block while the slot is held");
+        drop(first);
+        waiter.join().unwrap();
+        assert_eq!(*lock.lock().unwrap(), 0);
     }
 }

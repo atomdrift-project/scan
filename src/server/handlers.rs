@@ -322,6 +322,7 @@ fn flight_outcome(
     result: AnalysisOutcome,
     request_id: u64,
     elapsed_ms: u64,
+    phases: &str,
     key: &FlightKey,
     state: &Arc<AppState>,
     persist: bool,
@@ -333,6 +334,7 @@ fn flight_outcome(
                 id = request_id,
                 key = %key,
                 elapsed_ms,
+                phases,
                 classification = %scan_result.classification,
                 probability = scan_result.probability,
                 analysis = analysis_source(&scan_result),
@@ -1791,7 +1793,7 @@ async fn run_file_analysis(
             size_bytes: file_size as u64,
             started_at: Instant::now(),
             cancellation: Arc::clone(&cancellation),
-            phase: cleave::PhaseTracker::with_label(format!("req#{request_id} {filename}")),
+            phase: super::RequestPhase::with_label(format!("req#{request_id} {filename}")),
             thread_id: AtomicU64::new(0),
         },
     );
@@ -1809,6 +1811,7 @@ async fn run_file_analysis(
         .in_flight
         .get(&request_id)
         .map(|r| r.phase.clone());
+    let phase_log = phase_tracker.clone();
     // A policy-specific `--follow` override must not land in the shared
     // corpus, same rule every other route's artifact mirroring follows.
     let uploader = request_follow
@@ -1877,6 +1880,7 @@ async fn run_file_analysis(
         result,
         request_id,
         crate::duration_ms(started.elapsed()),
+        &phase_log.as_ref().map_or_else(String::new, super::RequestPhase::timeline),
         flight.key(),
         &state,
         request_follow.persist,
@@ -2007,7 +2011,7 @@ async fn run_purl_analysis(
             size_bytes: 0,
             started_at: Instant::now(),
             cancellation: Arc::clone(&cancellation),
-            phase: cleave::PhaseTracker::with_label(format!("req#{request_id} {purl}")),
+            phase: super::RequestPhase::with_label(format!("req#{request_id} {purl}")),
             thread_id: AtomicU64::new(0),
         },
     );
@@ -2024,6 +2028,7 @@ async fn run_purl_analysis(
         .in_flight
         .get(&request_id)
         .map(|r| r.phase.clone());
+    let phase_log = phase_tracker.clone();
     let deps_for_upload = request_follow.persist && state.uploader.is_some();
     let uploader_for_artifacts = if request_follow.persist {
         state.uploader.clone()
@@ -2059,6 +2064,7 @@ async fn run_purl_analysis(
         result,
         request_id,
         crate::duration_ms(started.elapsed()),
+        &phase_log.as_ref().map_or_else(String::new, super::RequestPhase::timeline),
         flight.key(),
         &state,
         request_follow.persist,
@@ -2090,7 +2096,7 @@ async fn run_url_analysis(
             size_bytes: 0,
             started_at: Instant::now(),
             cancellation: Arc::clone(&cancellation),
-            phase: cleave::PhaseTracker::with_label(format!("req#{request_id} {url}")),
+            phase: super::RequestPhase::with_label(format!("req#{request_id} {url}")),
             thread_id: AtomicU64::new(0),
         },
     );
@@ -2105,6 +2111,7 @@ async fn run_url_analysis(
         .in_flight
         .get(&request_id)
         .map(|r| r.phase.clone());
+    let phase_log = phase_tracker.clone();
     let cancel_flag = Arc::clone(&cancellation);
     let slow_rule_ms = state.slow_rule_ms;
     let analysis_timeout_secs = state.analysis_timeout_secs;
@@ -2142,6 +2149,7 @@ async fn run_url_analysis(
         result,
         request_id,
         crate::duration_ms(started.elapsed()),
+        &phase_log.as_ref().map_or_else(String::new, super::RequestPhase::timeline),
         flight.key(),
         &state,
         request_follow.persist,
@@ -2253,7 +2261,7 @@ fn classify_purl(
     resources: &super::ModelResources,
     slow_rule_ms: u64,
     cancellation: Option<&Arc<AtomicBool>>,
-    phase: Option<&cleave::PhaseTracker>,
+    phase: Option<&super::RequestPhase>,
     deps_for_upload: bool,
     uploader: Option<&Arc<crate::upload::Uploader>>,
     follow: crate::fetch::FetchPolicy,
@@ -2266,9 +2274,33 @@ fn classify_purl(
     // `fetch+graft`, which is the later dependency-fetch phase inside the
     // report pipeline.
     if let Some(p) = phase {
-        p.set("purl:registry");
+        p.set("purl:fetch");
     }
-    let (registry, registry_sources) = crate::fetch::registry_with_sources(&locator);
+    // The registry lookup and the payload download overlap. Neither needs the
+    // other's answer — the record is consulted only once both are back (the
+    // removed-version short-circuit, the fallback document, provenance) — yet
+    // they ran back to back, and each is one or more registry round-trips: a
+    // packument, then a tarball; `.info`, then a module zip. Overlapping them
+    // costs one extra request in the one case the record would have skipped
+    // the download — a removed version, whose download fails anyway.
+    let (registry_lookup, fetched) = std::thread::scope(|scope| {
+        let payload = purl.to_string();
+        let download = std::thread::Builder::new()
+            .name("purl-fetch".to_string())
+            .spawn_scoped(scope, move || {
+                crate::fetch::fetch_one(RefLocator::Purl(payload), false)
+            });
+        let registry = crate::fetch::registry_with_sources(&locator);
+        let fetched = match download {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("payload fetch thread panicked"))),
+            // Could not spawn a thread: fetch inline, exactly as before.
+            Err(_) => crate::fetch::fetch_one(RefLocator::Purl(purl.to_string()), false),
+        };
+        (registry, fetched)
+    });
+    let (registry, registry_sources) = registry_lookup;
     let registry_provenance = registry.clone().map(|record| {
         crate::provenance::RegistryProvenance::from_record_sources(record, &registry_sources)
     });
@@ -2301,7 +2333,7 @@ fn classify_purl(
     if let Some(p) = phase {
         p.set("purl:payload");
     }
-    let (bytes, name, rec) = match crate::fetch::fetch_one(locator, false) {
+    let (bytes, name, rec) = match fetched {
         Ok(t) => t,
         Err(e) => match registry.as_ref().and_then(crate::fetch::registry_document) {
             Some((name, bytes)) => {
@@ -2376,7 +2408,7 @@ fn classify_url(
     resources: &super::ModelResources,
     slow_rule_ms: u64,
     cancellation: Option<&Arc<AtomicBool>>,
-    phase: Option<&cleave::PhaseTracker>,
+    phase: Option<&super::RequestPhase>,
     deps_for_upload: bool,
     uploader: Option<&Arc<crate::upload::Uploader>>,
     follow: crate::fetch::FetchPolicy,
@@ -2437,7 +2469,7 @@ pub(crate) fn classify_file(
     slow_rule_ms: u64,
     extract_dir: Option<&std::path::Path>,
     cancellation: Option<&Arc<AtomicBool>>,
-    phase: Option<&cleave::PhaseTracker>,
+    phase: Option<&super::RequestPhase>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     deps_for_upload: bool,
     cpu_lease: Option<crate::engine::CpuLease>,
@@ -2465,7 +2497,7 @@ fn classify_file_with_follow(
     slow_rule_ms: u64,
     extract_dir: Option<&std::path::Path>,
     cancellation: Option<&Arc<AtomicBool>>,
-    phase: Option<&cleave::PhaseTracker>,
+    phase: Option<&super::RequestPhase>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     follow: crate::fetch::FetchPolicy,
     deps_for_upload: bool,
@@ -2490,10 +2522,13 @@ fn classify_file_with_follow(
         slow_rule_ms,
         sample_extraction,
         cancellation: cancellation.cloned(),
-        phase: phase.cloned(),
+        phase: phase.map(super::RequestPhase::tracker).cloned(),
         ..Default::default()
     };
     crate::engine::add_zip_passwords(&mut opts, resources.zip_passwords.as_slice());
+    if let Some(p) = phase {
+        p.set("cleave:analyze");
+    }
     let report =
         cleave::analyze_file(path, &opts).with_context(|| format!("cleave analysis of {label}"))?;
     finish_classify(
@@ -2521,7 +2556,7 @@ pub(crate) fn classify_bytes(
     resources: &super::ModelResources,
     slow_rule_ms: u64,
     cancellation: Option<&Arc<AtomicBool>>,
-    phase: Option<&cleave::PhaseTracker>,
+    phase: Option<&super::RequestPhase>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     deps_for_upload: bool,
     cpu_lease: Option<crate::engine::CpuLease>,
@@ -2547,7 +2582,7 @@ fn classify_bytes_with_follow(
     resources: &super::ModelResources,
     slow_rule_ms: u64,
     cancellation: Option<&Arc<AtomicBool>>,
-    phase: Option<&cleave::PhaseTracker>,
+    phase: Option<&super::RequestPhase>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     follow: crate::fetch::FetchPolicy,
     deps_for_upload: bool,
@@ -2564,18 +2599,29 @@ fn classify_bytes_with_follow(
     let mut opts = cleave::AnalysisOptions {
         slow_rule_ms,
         cancellation: cancellation.cloned(),
-        phase: phase.cloned(),
+        phase: phase.map(super::RequestPhase::tracker).cloned(),
         ..Default::default()
     };
     crate::engine::add_zip_passwords(&mut opts, resources.zip_passwords.as_slice());
-    // A small payload analyzes on its own pool so its inner joins never queue
-    // behind a whale's members in the global injector (see `small_pool_for`).
-    // `install` blocks this thread until the analysis returns, exactly as the
-    // inline call did; only where the nested work lands changes.
+    // A whale analyzes on its own bounded pool so its members never fill the
+    // global pool's deques, which is what starves the small analyses that
+    // arrive while it runs (see `whale_lane_for`). `install` blocks this
+    // thread until the analysis returns, exactly as the inline call did; only
+    // where the nested work lands changes.
     let size = data.len() as u64;
+    if let Some(p) = phase {
+        p.set("whale:lane");
+    }
+    let lane = super::whale_lane_for(size);
+    // On its own pool the analysis is exempt from cleave's shared-pool
+    // throttles; see `AnalysisOptions::dedicated_pool`.
+    opts.dedicated_pool = lane.is_some();
+    if let Some(p) = phase {
+        p.set("cleave:analyze");
+    }
     let analyze = move || cleave::analyze_bytes_shared(data, label, &opts);
-    let report = match super::small_pool_for(size) {
-        Some(pool) => pool.install(analyze),
+    let report = match lane {
+        Some(lane) => lane.install(analyze),
         None => analyze(),
     }
     .with_context(|| format!("cleave analysis of {label}"))?;
@@ -2602,7 +2648,7 @@ fn finish_classify(
     report: cleave::AnalysisReport,
     resources: &super::ModelResources,
     cancellation: Option<&Arc<AtomicBool>>,
-    phase: Option<&cleave::PhaseTracker>,
+    phase: Option<&super::RequestPhase>,
     root_registry: Option<&crate::provenance::RegistryProvenance>,
     follow: crate::fetch::FetchPolicy,
     deps_for_upload: bool,
@@ -2613,6 +2659,9 @@ fn finish_classify(
     // nobody is waiting for.
     if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
         anyhow::bail!("analysis cancelled");
+    }
+    if let Some(p) = phase {
+        p.set("classify:report");
     }
 
     // classify_report stages its own census labels from here: "fetch+graft"
@@ -2646,7 +2695,7 @@ fn finish_classify(
         root_registry,
         None, // uploaded bytes have no scan-side acquisition fetch record
         None, // server returns JSON; the inline terminal bloom flag doesn't apply
-        phase,
+        phase.map(super::RequestPhase::tracker),
         cpu_lease,
     )?;
 
@@ -2829,7 +2878,7 @@ async fn analyze_path_inner(
             size_bytes: file_size,
             started_at: Instant::now(),
             cancellation: Arc::clone(&cancellation),
-            phase: cleave::PhaseTracker::with_label(format!("req#{request_id} {}", req.path)),
+            phase: super::RequestPhase::with_label(format!("req#{request_id} {}", req.path)),
             thread_id: AtomicU64::new(0),
         },
     );
@@ -2853,6 +2902,7 @@ async fn analyze_path_inner(
         .in_flight
         .get(&request_id)
         .map(|r| r.phase.clone());
+    let phase_log = phase_tracker.clone();
 
     // Registry provenance the caller supplied for this file, parsed before the
     // analysis thread starts so a malformed document costs nothing downstream.
@@ -2919,6 +2969,7 @@ async fn analyze_path_inner(
                 id = request_id,
                 path = %req.path,
                 elapsed_ms,
+                phases = %phase_log.as_ref().map_or_else(String::new, super::RequestPhase::timeline),
                 classification = %scan_result.classification,
                 probability = scan_result.probability,
                 analysis,

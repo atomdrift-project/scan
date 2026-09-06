@@ -6443,6 +6443,94 @@ fn dep_subject_risk(verdict: Option<Decision>, severe_finding: bool) -> (u8, i32
     }
 }
 
+/// Upper bound, in bytes, on the PRIMARY subject's rendered context before its
+/// weakest members are dropped from the prompt.
+///
+/// The render is one prompt, and the GPU pays for every token of it. Measured
+/// on the fleet's vLLM over 31k requests (2026-09-05): prompts over 20k tokens
+/// were 5.6% of requests and ~31% of all prefill, and the outliers were
+/// structural — a jar inside a wheel fanning out to 83 `.class` members, a
+/// lalsuite wheel with 163 Mach-O members each carrying a hex window — not
+/// evidence anyone reads. The render tokenizes at ~2 bytes/token on those
+/// (hex rows and JSON), so 96 KiB is roughly 32–48k tokens, past the p95 of
+/// what the model was being asked to read and under the point where one
+/// request holds the KV cache against everyone else.
+///
+/// `SCAN_INTERPRET_BUDGET_BYTES` overrides it; `0` disables the cap.
+pub(crate) const INTERPRET_PRIMARY_BUDGET_BYTES: usize = 96 * 1024;
+
+fn interpret_primary_budget() -> usize {
+    std::env::var("SCAN_INTERPRET_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(INTERPRET_PRIMARY_BUDGET_BYTES)
+}
+
+/// Render `primary` for the LLM, dropping its weakest members until the render
+/// fits in `budget` bytes. Returns the render and how many members went.
+///
+/// What may go: a member (never the root) none of whose findings reached
+/// suspicious. Everything at or above that line is the evidence the grade rests
+/// on — `docs/interpret-tuning.md`: cut hinting and metadata, never evidence —
+/// and stays whatever it costs, so an archive that is *all* suspicious members
+/// is rendered whole. Among the droppable, the ones with the least to say go
+/// first: lowest peak criticality, then fewest findings, discovery order among
+/// equals. A dropped member takes its own nested members with it, so the render
+/// never shows a child under a container it no longer lists.
+///
+/// `budget == 0` disables the cap.
+fn budget_primary_context(primary: &mut cleave::AnalysisReport, budget: usize) -> (String, usize) {
+    use cleave::output::{TinyOpts, format_context};
+
+    let mut rendered = format_context(primary, &TinyOpts::tiny());
+    if budget == 0 || rendered.len() <= budget {
+        return (rendered, 0);
+    }
+    let mut order: Vec<((cleave::Criticality, usize), u32)> = primary
+        .files
+        .iter()
+        .filter(|f| f.depth > 0 && f.id != 0)
+        .filter(|f| {
+            f.findings
+                .iter()
+                .all(|t| t.crit < cleave::Criticality::Suspicious)
+        })
+        .map(|f| {
+            let peak = f.findings.iter().map(|t| t.crit).max().unwrap_or_default();
+            ((peak, f.findings.len()), f.id)
+        })
+        .collect();
+    order.sort_by_key(|(key, _)| *key);
+
+    let mut dropped = 0usize;
+    while rendered.len() > budget && !order.is_empty() {
+        // Drop in proportion to the overshoot, so a 200-member archive converges
+        // in a handful of renders rather than two hundred.
+        let per_file = rendered.len() / primary.files.len().max(1);
+        let n = ((rendered.len() - budget) / per_file.max(1)).clamp(1, order.len());
+        let mut victims: std::collections::HashSet<u32> =
+            order.drain(..n).map(|(_, id)| id).collect();
+        // Take nested members of a victim along, however deep.
+        loop {
+            let before = victims.len();
+            for f in &primary.files {
+                if f.parent_id.is_some_and(|p| victims.contains(&p)) {
+                    victims.insert(f.id);
+                }
+            }
+            if victims.len() == before {
+                break;
+            }
+        }
+        order.retain(|(_, id)| !victims.contains(id));
+        let before = primary.files.len();
+        primary.files.retain(|f| !victims.contains(&f.id));
+        dropped += before - primary.files.len();
+        rendered = format_context(primary, &TinyOpts::tiny());
+    }
+    (rendered, dropped)
+}
+
 /// Render the package-aware user message used by `--interpret` and
 /// `--format interpret`.
 ///
@@ -6488,8 +6576,16 @@ fn render_interpret_context(
     primary
         .files
         .retain(|f| !fetched_root_by_file.contains_key(&f.id) && !registry_ids.contains(&f.id));
-    let primary_context =
-        cleave::output::format_context(&primary, &cleave::output::TinyOpts::tiny());
+    let (primary_context, members_omitted) =
+        budget_primary_context(&mut primary, interpret_primary_budget());
+    if members_omitted > 0 {
+        tracing::info!(
+            label,
+            members_omitted,
+            budget_bytes = interpret_primary_budget(),
+            "interpret render over budget; weakest members dropped"
+        );
+    }
     let _ = writeln!(out, "== PRIMARY {label} ==");
     let now_secs = scan_now_secs();
     let primary_provenance = slim_provenance_for_interpret(
@@ -6500,6 +6596,9 @@ fn render_interpret_context(
         serde_json::to_string(&primary_provenance).unwrap_or_else(|_| "{}".to_string());
     let _ = writeln!(out, "provenance={primary_provenance_line}");
     out.push_str(&primary_context);
+    if members_omitted > 0 {
+        let _ = writeln!(out, "members_omitted={members_omitted} (prompt budget)");
+    }
     // Restated after the findings. One `provenance=` line at the head of a render
     // that runs to tens of KB is not read: the grader infers identity from
     // filenames and source instead, and the registry's claim never enters the
@@ -8413,6 +8512,92 @@ mod dep_backref_tests {
         // 0: root. 1: top-3 by risk. 3: carries a notable finding.
         // 2 and 4 are quiet, low-risk members — nobody reads them again.
         assert_eq!(kept, vec![0, 1, 2, 3], "retention kept the wrong set");
+    }
+
+    /// Members with nothing suspicious to say go first; the root and any
+    /// suspicious member survive whatever the budget, and a dropped container
+    /// takes its nested members with it.
+    #[test]
+    fn interpret_render_budget_drops_weakest_members_first() {
+        use cleave::types::{Criticality, FindingKind};
+
+        let mut files = Vec::new();
+        for (id, depth, parent, crit, n) in [
+            (0u32, 0u32, None, Criticality::Notable, 1usize),
+            (1, 1, Some(0), Criticality::Suspicious, 1),
+            (2, 1, Some(0), Criticality::Notable, 3),
+            (3, 1, Some(0), Criticality::Notable, 2),
+            (4, 1, Some(0), Criticality::Notable, 1),
+            (5, 2, Some(4), Criticality::Notable, 4),
+        ] {
+            let mut fa = cleave::FileAnalysis {
+                id,
+                path: format!("m{id}.py"),
+                file_type: "python".to_string(),
+                sha256: format!("{id:064}"),
+                size: 100,
+                depth,
+                parent_id: parent,
+                ..Default::default()
+            };
+            for i in 0..n {
+                // One id per finding: the render keeps a trait id once across
+                // the whole report, so repeats would empty the members.
+                let mut f = cleave::types::Finding::new(
+                    format!("objectives/execution/shell::m{id}f{i}"),
+                    FindingKind::Capability,
+                    format!(
+                        "finding {i} on member {id}, padded so the render has weight {}",
+                        "x".repeat(64)
+                    ),
+                    0.9,
+                );
+                f.crit = crit;
+                fa.findings.push(f);
+            }
+            files.push(fa);
+        }
+        let mut report = empty_report();
+        report.files = files;
+
+        let (full, dropped) = budget_primary_context(&mut report.clone(), 0);
+        assert_eq!(dropped, 0, "budget 0 must disable the cap");
+        for id in 0..6 {
+            assert!(
+                full.contains(&format!("m{id}.py")),
+                "uncapped render lists m{id}:\n{full}"
+            );
+        }
+
+        // A budget nobody can meet still keeps the root and the suspicious
+        // member: those are never on the table.
+        let (tight, dropped) = budget_primary_context(&mut report.clone(), 1);
+        assert!(tight.contains("m0.py"), "root survives: {tight}");
+        assert!(
+            tight.contains("m1.py"),
+            "suspicious member survives: {tight}"
+        );
+        assert_eq!(dropped, 4, "every droppable member went: {tight}");
+
+        // Just over the line: the member with the least to say (one notable
+        // finding) goes first, and its nested child goes with it even though
+        // the child alone, with four findings, would have outranked m2 and m3.
+        let over = full.len() - 1;
+        let (capped, dropped) = budget_primary_context(&mut report.clone(), over);
+        assert!(capped.len() <= over, "{} > {over}", capped.len());
+        assert!(
+            !capped.contains("m4.py"),
+            "weakest member dropped first: {capped}"
+        );
+        assert!(
+            !capped.contains("m5.py"),
+            "nested member follows its container: {capped}"
+        );
+        assert!(
+            capped.contains("m2.py") && capped.contains("m3.py"),
+            "notable members kept: {capped}"
+        );
+        assert_eq!(dropped, 2);
     }
 
     /// `count_findings` reports the root file's own findings, bucketed by

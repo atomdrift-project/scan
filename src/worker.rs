@@ -3711,7 +3711,7 @@ async fn run_job(
     // Register the tracker with a descriptive label so cleave's rayon-diag
     // snapshot can name which analyses are in flight instead of just
     // reporting a count.
-    let phase = cleave::PhaseTracker::with_label(format!("{sha_short} {label}"));
+    let phase = crate::server::RequestPhase::with_label(format!("{sha_short} {label}"));
     let phase2 = phase.clone();
     // Register this analysis in the live in-flight census so the periodic worker
     // summary can report its file, size, stage, time stuck, and what it is
@@ -3723,7 +3723,7 @@ async fn run_job(
         u64::try_from(job.size_bytes).unwrap_or(0),
         Arc::from(job.file_type.as_str()),
         start,
-        phase.clone(),
+        phase.tracker().clone(),
     );
     let label2 = Arc::clone(&label);
     let label_for_blocking = Arc::clone(&label);
