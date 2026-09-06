@@ -34,6 +34,52 @@ Environment variables read at startup:
 | `CLEAVE_TRAITS_DIR`    | Traits directory. `--traits-dir` overrides.                  |
 | `CLEAVE_RAYON_THREADS` | Override rayon pool size. Default is system parallelism.     |
 | `SCAN_MODELS_REPO`   | Model repository URL.                                        |
+| `SCAN_WHALE_POOL_THREADS` | Threads in each whale's private pool (below); `0` sends whales to the global pool. Default: a quarter of the physical cores, 2–16. |
+| `SCAN_SMALL_POOL_THREADS` | Threads in a small payload's private pool; `0` keeps small payloads on the global pool. Default: an eighth of the physical cores, 2–8. |
+| `SCAN_WHALE_SLOTS` | Big whales analyzing at once; the rest wait. Default: an eighth of the physical cores, 1–8. |
+| `SCAN_SMALL_JOB_MB`  | Payloads above this many MiB are whales. Default 1. Shared with the slot lanes. |
+| `SCAN_BIG_JOB_MB`    | Payloads above this many MiB are *big* whales and take a `SCAN_WHALE_SLOTS` slot. Default 8. |
+
+Every payload analyzes on a rayon pool of its own rather than on the global
+pool: `SCAN_SMALL_POOL_THREADS` wide at or below `SCAN_SMALL_JOB_MB`,
+`SCAN_WHALE_POOL_THREADS` wide above it. Each pool is built for one
+analysis and dropped after it (reusing idle pools measured as a wash). Every analysis runs on a blocking thread, so its inner parallel work is
+injected into a rayon pool from outside, and rayon workers only take injected
+work when their own queues are empty; while one 40 MB wheel's members fill
+those queues, every package that shares the pool waits. A single shared whale
+pool was the first cut (2026-09-05, 64 cores, concurrency 8 over 128 real
+PURLs): the p90 fell from 5.3s to 4.1s, but three 36–254 MB wheels in flight
+then starved each other and any 1–5 MB package that landed on the same pool
+for the whole 200s sweep. With a private pool per whale the same sweep runs in
+53s at 145 analyses/min, p99 31s, and each whale finishes in the 25–40s it
+takes alone. Big whales (`SCAN_BIG_JOB_MB`) also take one of
+`SCAN_WHALE_SLOTS`, so a burst queues instead of oversubscribing the host;
+mid-size payloads never wait. Sized to the host: a 4-core box runs one whale
+at a time on 2 threads, a 128-core box up to eight on 16 each. A whale's
+analysis tells cleave it owns its pool (`AnalysisOptions::dedicated_pool`),
+so it neither takes one of the shared pool's bounded inner-parallel owner
+slots (`CLEAVE_INNER_PARALLEL_OWNERS`, threads/32) nor counts as in flight
+there — otherwise four whales held all four slots for 30s each and every
+small package meanwhile analyzed its members serially, 2.5× slower than
+alone. With that exemption the 128-PURL sweep's p90 is 1.7–1.9s (LLM off) at
+160 analyses/min; raising the owner cap instead (8 or 16) lowers the p50 but
+lifts the p90 to 2.3–3.1s, so the cap stays where it is. Giving small
+payloads private pools as well (8 threads each, measured better than 16 for
+them) took the 256-PURL sweep from p50 0.48s to 0.36s, mean 1.64s to 1.3s
+and 205 to 235 analyses/min; nothing on the global pool then competes for
+the owner slots at all.
+
+The server also flushes cleave's learned regex list (`regex-warm-v1.json` in
+the cache dir) every 30s, so the next start prewarms the ~24k first-use trait
+regex compiles this workload needs instead of paying them on its first
+requests.
+
+Each completed request logs `phases="purl:fetch=53 cleave:analyze=555 …"`
+(milliseconds per phase, in order) next to `elapsed_ms`, so a server log
+attributes latency without a profiler: `purl:fetch` is registry lookup and
+download (overlapped), `whale:lane` the wait for a big-whale slot,
+`cleave:analyze` the analysis proper, `classify:report` features, model and
+dependency follow-up.
 
 The listener binds before the model is loaded. While loading, every
 route returns 503 with `{"error":"server starting"}`. Poll `/_/health`
