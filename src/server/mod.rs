@@ -204,8 +204,9 @@ impl ServerConfig {
     /// "Half the slots" meant half the machine when a slot was a core; since
     /// slots were sized at three per core (2026-09-03) it meant one and a half
     /// machines, and on a 128-core box the pull worker held 192 slots and 576
-    /// claims. A slot's work ends at dispatch, so two per core is enough
-    /// staging to keep the cores fed and no more claims than that in hand.
+    /// claims. A slot's work ends at dispatch, so two per core (see
+    /// `idle_worker_cores` for the budget) is enough staging to keep the
+    /// cores fed and no more claims than that in hand.
     #[must_use]
     pub fn with_idle_worker_slots(mut self, slots: usize) -> Self {
         let cores = idle_worker_cores(crate::worker::cleave_concurrency(self.workers));
@@ -396,10 +397,12 @@ mod idle_worker_cores_tests {
     /// The idle worker never gets the whole pool, and never zero of it.
     #[test]
     fn idle_worker_leaves_a_reserve_for_interactive_work() {
-        assert_eq!(idle_worker_cores(16), 8);
-        assert_eq!(idle_worker_cores(128), 64);
+        assert_eq!(idle_worker_cores(128), 102, "a fifth reserved");
+        assert_eq!(idle_worker_cores(16), 12);
+        assert_eq!(idle_worker_cores(6), 4, "the reserve floor of two");
+        assert_eq!(idle_worker_cores(4), 2);
         assert_eq!(idle_worker_cores(3), 1);
-        assert_eq!(idle_worker_cores(2), 1);
+        assert_eq!(idle_worker_cores(2), 1, "never none");
         assert_eq!(idle_worker_cores(1), 1);
         for cores in 1..=256 {
             let budget = idle_worker_cores(cores);
@@ -1370,13 +1373,30 @@ fn cores_busy(
 /// into the global pool from a blocking thread — waited behind all of it.
 /// See `CleaveGate::pool` in worker.rs for the measurement.
 fn idle_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
+    let threads = threads.max(1);
     match rayon::ThreadPoolBuilder::new()
-        .num_threads(threads.max(1))
+        .num_threads(threads)
         .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
         .thread_name(|i| format!("rayon-idle-{i}"))
+        // Each pool thread: in the thread dump like every other worker; well
+        // below the global pool's priority, so an interactive analysis that
+        // becomes runnable takes the core; and marked background for cleave,
+        // so the parallelism owner slots it claims are its own and never the
+        // ones a server analysis needs.
+        .start_handler(|_| {
+            crate::thread_dump::register_self();
+            crate::thread_priority::demote_current_thread(IDLE_POOL_DEMOTION);
+            cleave::mark_thread_background();
+        })
         .build()
     {
         Ok(pool) => {
+            // The foreground caps are sized from the global pool — this runs
+            // on the server's main thread, where `current_num_threads` is the
+            // global pool's — and the background caps from this one. Without
+            // this the first thread to ask sizes both, and it may be an idle
+            // pool thread sizing the server's cap from an 8-thread pool.
+            cleave::set_parallel_owner_caps(rayon::current_num_threads(), threads);
             tracing::info!(threads, "idle worker analyses run on their own rayon pool");
             Some(Arc::new(pool))
         }
@@ -1387,24 +1407,39 @@ fn idle_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
     }
 }
 
-/// Cores the embedded idle worker may occupy: half the pool, and never none.
+/// How far below the global pool the idle pool's threads are scheduled. The
+/// global pool already sits one notch below normal so rizin and friends get a
+/// core when they need one (see `lower_pool_thread_priority` in main.rs);
+/// this puts pull work well under both.
+const IDLE_POOL_DEMOTION: u8 = 10;
+
+/// Cores the embedded idle worker may occupy: four fifths of the pool, less
+/// a reserve of at least two, and never none. `SCAN_IDLE_CORES` overrides
+/// for one host.
 ///
-/// Half is the stated intent for background work, and this is the number
-/// that delivers it: a core permit is held for one blocking classify, and
-/// measured on rdu2 (2026-09-05) 96 permits kept 101 of 128 cores busy, so
-/// permits track cores closely. The old cap was on slots, which stopped
-/// meaning cores when slots were sized at three per core.
+/// The budget is a budget in threads because the worker fans out on a pool
+/// of exactly this size (`idle_pool`), and it can be this generous because
+/// the pool's threads are scheduled below the server's and claim their own
+/// parallelism owner slots: an interactive analysis takes the core and the
+/// gate it needs the moment it is runnable, and pull work resumes in the
+/// gaps. The reserve of two is what guarantees a permit and a thread to
+/// *start* on when every core is busy — on a four-core box that is half of
+/// it, on 128 cores it is 26, which is more than any interactive burst those
+/// hosts have seen (peak 7 concurrent at stress concurrency 8, 2026-09-05).
 ///
-/// The server's interactive analyses and the idle worker's pull jobs feed one
-/// rayon pool. The idle worker must not be able to fill it, or the server's
-/// `slots_free` reads zero and the router stops sending — and the worker only
-/// stands aside for requests that arrive. Half held back keeps the server
-/// able to start on a saturated box; rayon absorbs the brief oversubscription
-/// while the worker pauses (`IDLE_WORKER_QUIET_SECS`), which it does within a
-/// tick of the first request. `.max(1)` yields one core on a one-core box
-/// rather than zero, which would deadlock the worker's cleave gate.
+/// Sized: 4 → 2, 6 → 4, 16 → 12, 128 → 102. `.max(1)` yields one core on a
+/// one- or two-core box rather than zero, which would deadlock the worker's
+/// cleave gate.
 fn idle_worker_cores(cores: usize) -> usize {
-    (cores / 2).max(1)
+    if let Some(forced) = std::env::var("SCAN_IDLE_CORES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+    {
+        return forced.min(cores.max(1));
+    }
+    let reserve = cores.div_ceil(5).max(2);
+    cores.saturating_sub(reserve).max(1)
 }
 
 /// Returns an error if the router cannot be assembled or background resource
