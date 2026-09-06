@@ -142,6 +142,18 @@ fn analysis_error_body(error: &anyhow::Error) -> (StatusCode, serde_json::Value)
     // An artifact that could not be retrieved is answered from the type rather
     // than from any wording, because that verdict is the one this fleet cannot
     // afford to get wrong: see [`crate::fetch::Unretrievable`].
+    if let Some(busy) = error.downcast_ref::<super::WhaleSlotBusy>() {
+        // The same shape [`acquire_slot`] refuses with before the stream
+        // starts, so a router treats both as "full, try the next worker".
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            serde_json::json!({
+                "error": busy.to_string(),
+                "lane": "whale",
+                "retry_after_secs": 30,
+            }),
+        );
+    }
     let status = if error
         .downcast_ref::<crate::fetch::Unretrievable>()
         .is_some()
@@ -916,7 +928,7 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "idle_worker": {
             "slots": state.idle_worker_slots,
             "cores": state.idle_worker_cores,
-            "classify_permits": super::idle_classify_permits(state.idle_worker_cores),
+            "pool_threads": super::idle_pool_threads(state.idle_worker_cores),
             "cores_held": state.idle_cores_held(),
             "in_progress": state.idle_in_progress.load(Ordering::Relaxed),
             "started": state.idle_worker_started.load(Ordering::Relaxed),
@@ -2626,7 +2638,7 @@ fn classify_bytes_with_follow(
     if let Some(p) = phase {
         p.set("whale:lane");
     }
-    let lane = super::whale_lane_for(size, cancellation.map(Arc::as_ref));
+    let lane = super::whale_lane_for(size)?;
     // On its own pool the analysis is exempt from cleave's shared-pool
     // throttles; see `AnalysisOptions::dedicated_pool`.
     opts.dedicated_pool = lane.is_some();
@@ -4204,6 +4216,31 @@ fn v1_streamed(
                     V1Decision::stored(&verdict, purl.as_deref(), budget)
                         .asked_about(asked.as_deref())
                 }
+            }
+            Outcome::Rendered { status, body } if *status == StatusCode::TOO_MANY_REQUESTS => {
+                // Refused after the stream began (a big whale found every
+                // slot taken). Not a decision: the stream ends without one,
+                // which a router reads as "hand this to a worker with room".
+                // A decision here would be final and wrong — the package was
+                // never looked at.
+                tracing::warn!(subject = %subject, elapsed_ms = elapsed, "streamed analysis refused; ending without a decision");
+                let mut frame = serde_json::json!({
+                    "state": "refused",
+                    "elapsed_ms": elapsed,
+                });
+                if let (Some(frame), Some(body)) = (frame.as_object_mut(), body.as_object()) {
+                    frame.extend(body.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+                let field = if is_url {
+                    "url"
+                } else if asked.is_some() {
+                    "purl"
+                } else {
+                    "sha256"
+                };
+                frame[field] = serde_json::Value::String(labelled_locator.clone());
+                v1_send(&tx, &frame).await;
+                return;
             }
             Outcome::Rendered { status, .. } => {
                 tracing::warn!(subject = %subject, status = status.as_u16(), elapsed_ms = elapsed, "streamed analysis failed");
