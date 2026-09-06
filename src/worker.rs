@@ -214,12 +214,13 @@ struct CleaveGate {
     small: Arc<Semaphore>,
     small_max_bytes: u64,
     /// How many classifies may run at once, when this worker is embedded in
-    /// a server: a quarter of its pool's threads (`idle_classify_permits` in
-    /// server/mod.rs), because each classify is installed onto a pool thread
-    /// and holds it, and the rest of the pool has to be free for what it fans
-    /// out to. The server keeps its own permits and a reserve the worker
-    /// cannot reach, so its `slots_free` describes what it can start rather
-    /// than what the worker happens to be holding.
+    /// a server: its core budget, on a pool of twice that many threads
+    /// (`idle_pool_threads` in server/mod.rs), because each classify is
+    /// installed onto a pool thread and holds it, and the other half of the
+    /// pool has to be free for what it fans out to. The server keeps its own
+    /// permits and a reserve the worker cannot reach, so its `slots_free`
+    /// describes what it can start rather than what the worker happens to be
+    /// holding.
     cpu: Option<Arc<Semaphore>>,
     /// The rayon pool those classifies fan out on, when embedded: the
     /// worker's own, sized to its core budget, never the server's global
