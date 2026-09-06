@@ -365,13 +365,7 @@ tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", bran
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 
 # TEMP (2026-09-05, uncommitted): local stng with the XOR prefilter, pending push + rev bump.
-[patch."https://github.com/atomdrift-project/stng.git"]
-stng = { path = "/home/t/stng" }
 
 # TEMP (2026-09-05, uncommitted): local cleave with AnalysisOptions::dedicated_pool, pending push + rev bump.
-[patch."https://github.com/atomdrift-project/cleave.git"]
-cleave = { path = "/home/t/cleave" }
 
 # TEMP (2026-09-05, uncommitted): local fletch with Go proxy case recovery, pending push + rev bump.
-[patch."https://github.com/atomdrift-project/fletch.git"]
-fletch = { path = "/home/t/fletch" }
