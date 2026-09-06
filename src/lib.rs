@@ -63,6 +63,7 @@ pub mod ps;
 pub mod server;
 pub mod sys;
 pub mod thread_dump;
+pub mod thread_priority;
 pub mod tools;
 pub mod traits_repo;
 pub mod update_check;
