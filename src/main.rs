@@ -1596,14 +1596,6 @@ fn main() -> Result<()> {
         tracing::warn!(error = %e, "failed to install global rayon pool; using default");
     }
     let active_threads = rayon::current_num_threads();
-    // A pool worker that spawns rizin runs other pending pool jobs while the
-    // child computes, instead of parking for the whole disassembly (see
-    // `filefacts::rizin::set_wait_idle_hook`). Off the pool the hook has
-    // nothing to run and the wait sleeps as before.
-    filefacts::rizin::set_wait_idle_hook(|| {
-        rayon::current_thread_index().is_some()
-            && rayon::yield_now() == Some(rayon::Yield::Executed)
-    });
     // A pool smaller than the detected core count is a resource downgrade that
     // oversubscribes the worker slots — surface it loudly so it is diagnosable
     // from a single log line.
