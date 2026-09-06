@@ -784,6 +784,13 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         // not the other. `null` until two polls exist or where the platform
         // has no counters; `load1` stays for that case.
         "cpu_busy_cores": state.cpu_busy.sample(),
+        // Big-whale slots: the one wait on the interactive path that is not a
+        // core or a slot, and the one that held two requests for their whole
+        // budget on 2026-09-06.
+        "whale_slots": {
+            "in_use": super::whale_slot_usage().0,
+            "max": super::whale_slot_usage().1,
+        },
         "overloaded": state.overloaded_since.lock().is_ok_and(|g| g.is_some()),
         "stuck_orphans": state.stuck_orphans.load(Ordering::Relaxed),
 
@@ -909,6 +916,7 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "idle_worker": {
             "slots": state.idle_worker_slots,
             "cores": state.idle_worker_cores,
+            "classify_permits": super::idle_classify_permits(state.idle_worker_cores),
             "cores_held": state.idle_cores_held(),
             "in_progress": state.idle_in_progress.load(Ordering::Relaxed),
             "started": state.idle_worker_started.load(Ordering::Relaxed),
@@ -1880,7 +1888,9 @@ async fn run_file_analysis(
         result,
         request_id,
         crate::duration_ms(started.elapsed()),
-        &phase_log.as_ref().map_or_else(String::new, super::RequestPhase::timeline),
+        &phase_log
+            .as_ref()
+            .map_or_else(String::new, super::RequestPhase::timeline),
         flight.key(),
         &state,
         request_follow.persist,
@@ -2064,7 +2074,9 @@ async fn run_purl_analysis(
         result,
         request_id,
         crate::duration_ms(started.elapsed()),
-        &phase_log.as_ref().map_or_else(String::new, super::RequestPhase::timeline),
+        &phase_log
+            .as_ref()
+            .map_or_else(String::new, super::RequestPhase::timeline),
         flight.key(),
         &state,
         request_follow.persist,
@@ -2149,7 +2161,9 @@ async fn run_url_analysis(
         result,
         request_id,
         crate::duration_ms(started.elapsed()),
-        &phase_log.as_ref().map_or_else(String::new, super::RequestPhase::timeline),
+        &phase_log
+            .as_ref()
+            .map_or_else(String::new, super::RequestPhase::timeline),
         flight.key(),
         &state,
         request_follow.persist,
@@ -2612,7 +2626,7 @@ fn classify_bytes_with_follow(
     if let Some(p) = phase {
         p.set("whale:lane");
     }
-    let lane = super::whale_lane_for(size);
+    let lane = super::whale_lane_for(size, cancellation.map(Arc::as_ref));
     // On its own pool the analysis is exempt from cleave's shared-pool
     // throttles; see `AnalysisOptions::dedicated_pool`.
     opts.dedicated_pool = lane.is_some();
