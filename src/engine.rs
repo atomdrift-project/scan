@@ -1244,6 +1244,7 @@ mod envelope_tests {
         ScanResult {
             v: "7",
             analysis_cached: false,
+            interpret_ms: 0,
             classification: Classification::Benign,
             probability: 0.10,
             threshold: 0.65,
@@ -1750,6 +1751,11 @@ pub struct ScanResult {
     /// the verdict, not the verdict — but it is what tells an operator whether a
     /// fast response was cached work or a fast file.
     pub analysis_cached: bool,
+    /// Wall-clock the LLM second opinion took, in milliseconds; 0 when none
+    /// ran. Not serialized. The server subtracts it from the latency it
+    /// reports to the router: the endpoint is shared by every worker, so its
+    /// slowness says nothing about which worker to pick.
+    pub interpret_ms: u64,
     /// Fetched dependencies to mirror into hopper as their own samples. Empty
     /// unless the scan fetched dependencies; consumed by the upload paths and
     /// never serialized into this result's own envelope.
@@ -9791,6 +9797,7 @@ pub(crate) fn process_report(
         interpretation: cr.interpretation,
         pending_llm: cr.pending_llm,
         analysis_cached: cr.analysis_cached,
+        interpret_ms: cr.phase_ms.interpret_ms,
         dependency_results: cr.dependency_results,
         bloom_mark,
         hopper_route: HopperRoute::Normal,
