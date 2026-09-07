@@ -113,8 +113,9 @@ enum StallVerdict {
 }
 
 /// Classify one summary tick. `no_progress` is how long the worker has shown no
-/// sign of life at all — nothing completed, no analysis changed stage, and none
-/// started — and `abort_secs` of 0 disables the abort.
+/// sign of life at all — nothing completed, no analysis changed stage, none
+/// started, and no dependency payload finished — and `abort_secs` of 0 disables
+/// the abort.
 ///
 /// Idle is never a stall: with no slots occupied there is nothing to complete,
 /// so a worker waiting on an empty queue must not be mistaken for a wedged one.
@@ -2268,6 +2269,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             // Stall detection state: the completion counter as of the previous
             // summary, and when it last moved. See the POOL STALLED block.
             let mut last_finished_seen = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
+            let mut last_deps_seen = crate::fetch::payloads_analyzed_total();
             let mut progress_since = Instant::now();
             #[cfg(feature = "cleave-breadcrumbs")]
             let mut last_breadcrumb = Instant::now();
@@ -2421,6 +2423,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
                     let started = BLOCKING_STARTED_TOTAL.load(Ordering::Relaxed);
                     let finished = BLOCKING_FINISHED_TOTAL.load(Ordering::Relaxed);
+                    let deps_analyzed = crate::fetch::payloads_analyzed_total();
                     let active_slots = dispatching.load(Ordering::Relaxed);
                     let available_slots = slots.saturating_sub(active_slots);
                     let in_progress = analyzing.load(Ordering::Relaxed);
@@ -2470,6 +2473,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         blocking_finished_total = finished,
                         inflight_blocking = started.saturating_sub(finished),
                         completed = completed.load(Ordering::Acquire),
+                        deps_analyzed_total = deps_analyzed,
                         llm_deferred = LLM_DEFERRED_TOTAL.load(Ordering::Relaxed),
                         llm_skipped = LLM_SKIPPED_TOTAL.load(Ordering::Relaxed),
                         llm_reposted = LLM_REPOSTED_TOTAL.load(Ordering::Relaxed),
@@ -2525,15 +2529,28 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     // the same stage for hours). A slot the previous tick had not
                     // seen counts as well — new analyses starting means the worker
                     // is admitting work, which a wedged pool cannot do.
+                    //
+                    // A finished dependency payload counts too. The whole
+                    // `fetch+graft` walk is one stage, and a worker fetching
+                    // transitive closures spends most of its life there: on
+                    // 2026-09-07 twelve analyses sat in that one stage for an
+                    // hour, each finishing dependency after dependency, and
+                    // the abort below killed a busy worker as a dead one.
                     let stage_moved = census.iter().any(|entry| {
                         stage_since
                             .get(&entry.analysis_id)
                             .is_none_or(|(seen, _)| *seen != entry.phase.get())
                     });
-                    if finished != last_finished_seen || active_slots == 0 || stage_moved {
+                    let deps_moved = deps_analyzed != last_deps_seen;
+                    if finished != last_finished_seen
+                        || active_slots == 0
+                        || stage_moved
+                        || deps_moved
+                    {
                         progress_since = now;
                     }
                     last_finished_seen = finished;
+                    last_deps_seen = deps_analyzed;
                     let no_progress = now.duration_since(progress_since);
                     let verdict =
                         stall_verdict(active_slots, no_progress, stall_warn_secs, stall_abort_secs);
@@ -2541,6 +2558,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         tracing::warn!(
                             no_progress_ms = crate::duration_ms(no_progress),
                             completed_total = finished,
+                            deps_analyzed_total = deps_analyzed,
                             active_slots,
                             inflight_blocking = started.saturating_sub(finished),
                             // Near zero with the slots full is the tell: the pool is
@@ -2549,8 +2567,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                             cpu_cores_busy = format!("{cpu_cores_busy:.1}"),
                             rayon_threads = global_rayon_threads,
                             stall_warn_secs,
-                            "POOL STALLED: nothing has completed, changed stage, or started for \
-                             the stall threshold; the Rayon pool is not making progress. \
+                            "POOL STALLED: nothing has completed, changed stage, started, or \
+                             finished a dependency for the stall threshold; the Rayon pool \
+                             is not making progress. \
                              Any breadcrumbs below name the analyzer and member each \
                              Rayon worker is inside — a runaway leaf is among them",
                         );
@@ -2615,8 +2634,9 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                                 completed_total = finished,
                                 active_slots,
                                 exit_code = STALL_ABORT_EXIT_CODE,
-                                "STALL ABORT: nothing has completed, changed stage, or started for \
-                                 the abort threshold and a wedged Rayon pool cannot recover in \
+                                "STALL ABORT: nothing has completed, changed stage, started, or \
+                                 finished a dependency for the abort threshold and a wedged \
+                                 Rayon pool cannot recover in \
                                  process; exiting so the supervisor can restart. Claims expire \
                                  hopper-side and the in-flight samples above are handed out again",
                             );

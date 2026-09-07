@@ -121,6 +121,19 @@ pub fn set_total_budget(max_fetches: usize, max_bytes: u64) {
     TOTAL_FETCH_BYTES.store(max_bytes, Ordering::Relaxed);
 }
 
+/// Dependency payloads whose analysis has finished, process-wide, whatever the
+/// outcome (analyzed, cache hit, corpus skip, nothing to analyze). The worker's
+/// stall ticker reads this as a liveness signal: a top-level analysis walking a
+/// large transitive closure completes nothing and changes no stage for a long
+/// time while making steady progress payload by payload, and without this
+/// counter that walk is indistinguishable from a wedged pool.
+static PAYLOADS_ANALYZED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// How many dependency payloads have finished analysis in this process.
+pub fn payloads_analyzed_total() -> u64 {
+    PAYLOADS_ANALYZED_TOTAL.load(Ordering::Relaxed)
+}
+
 /// Charge the per-execution budget for one file's live fetches, saturating at
 /// zero so a charge never wraps. Cache hits and budget-skipped edges cost
 /// nothing (the caller filters them out before charging).
@@ -3565,6 +3578,7 @@ fn analyze_payloads(
 ) -> Vec<Option<Analyzed>> {
     let one = |(i, rec): (usize, &FetchRecord)| {
         let a = analyze_payload(rec, cache, opts, acache);
+        PAYLOADS_ANALYZED_TOTAL.fetch_add(1, Ordering::Relaxed);
         on_analyzed(i);
         a
     };
