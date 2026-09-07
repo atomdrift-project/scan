@@ -371,5 +371,3 @@ dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 # TEMP (2026-09-05, uncommitted): local fletch with Go proxy case recovery, pending push + rev bump.
 
 # TEMP (2026-09-06, uncommitted): local cleave with printable tiny windows, pending push + rev bump.
-[patch."https://github.com/atomdrift-project/cleave.git"]
-cleave = { path = "/home/t/cleave" }
