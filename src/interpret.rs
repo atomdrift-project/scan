@@ -1379,17 +1379,29 @@ pub enum LlmCaller {
     Background,
 }
 
+/// Prompts up to this many bytes are "small" for queue priority: about 4k
+/// tokens, one prefill step at vLLM's 4096-token chunk. Measured 2026-09-06
+/// on the LLM-on purls sweeps: 13% of requests reach the LLM, so the fleet's
+/// p90 is set by the fastest quarter of those calls, and a 2k-token prompt
+/// queued behind a 29k-token one paid that prompt's prefill (the same calls
+/// took 2.9 s alone and 9.7 s at concurrency 8). Shortest-job-first among
+/// foreground callers costs the big prompt a little and the percentile a lot.
+const PRIORITY_SMALL_PROMPT_BYTES: usize = 16 * 1024;
+
 impl LlmCaller {
     /// The request's place in vLLM's queue (`--scheduling-policy priority`:
     /// lower is served first, 0 is the default). The permit pool above decides
     /// who gets to *send*; this decides who gets *served* once sent, which the
     /// client cannot otherwise influence — measured 2026-09-05 the queue inside
     /// vLLM averaged 69s while the permit wait was the part scan could see.
-    /// Background work yields; a request with a person behind it does not.
-    fn priority(self) -> u8 {
-        match self {
-            Self::Foreground => 0,
-            Self::Background => 1,
+    /// Background work yields; a request with a person behind it does not,
+    /// and among those a small prompt goes before a large one
+    /// ([`PRIORITY_SMALL_PROMPT_BYTES`]).
+    fn priority(self, prompt_bytes: usize) -> u8 {
+        match (self, prompt_bytes <= PRIORITY_SMALL_PROMPT_BYTES) {
+            (Self::Foreground, true) => 0,
+            (Self::Foreground, false) => 1,
+            (Self::Background, _) => 2,
         }
     }
 }
@@ -1538,7 +1550,7 @@ pub fn interpret(
     }
 
     let _permit = Permit::acquire(cfg.max_concurrency, caller);
-    match request(cfg, user, caller.priority()) {
+    match request(cfg, user, caller.priority(user.len())) {
         Ok((grade, reason, model)) => {
             health().set(true);
             if let Some(path) = &cache {
@@ -3416,6 +3428,17 @@ mod tests {
     /// refuses the tag with a 400, which costs one resend — never the sample,
     /// and never a fall-over to the next endpoint.
     #[test]
+    fn queue_priority_is_shortest_job_first_among_foreground_callers() {
+        let small = PRIORITY_SMALL_PROMPT_BYTES;
+        assert_eq!(LlmCaller::Foreground.priority(0), 0);
+        assert_eq!(LlmCaller::Foreground.priority(small), 0);
+        assert_eq!(LlmCaller::Foreground.priority(small + 1), 1);
+        // Background yields to every foreground caller, whatever its size.
+        assert_eq!(LlmCaller::Background.priority(0), 2);
+        assert_eq!(LlmCaller::Background.priority(small * 4), 2);
+    }
+
+    #[test]
     fn background_priority_is_sent_and_withdrawn_when_refused() {
         let (ok, ok_h) = fake_llm("200 OK", GRADE_BODY, 2);
         let cfg = InterpretConfig {
@@ -3432,7 +3455,7 @@ mod tests {
             "s",
             "u",
             8,
-            LlmCaller::Background.priority(),
+            LlmCaller::Background.priority(0),
         )
         .expect("answers");
         chat_raw_with(
@@ -3442,13 +3465,13 @@ mod tests {
             "s",
             "u",
             8,
-            LlmCaller::Foreground.priority(),
+            LlmCaller::Foreground.priority(0),
         )
         .expect("answers");
         let seen = ok_h.join().expect("server thread");
         assert!(
-            seen[0].contains(r#""priority":1"#),
-            "background carries priority 1: {}",
+            seen[0].contains(r#""priority":2"#),
+            "background carries priority 2: {}",
             seen[0]
         );
         assert!(
