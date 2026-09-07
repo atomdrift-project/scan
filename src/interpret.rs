@@ -421,18 +421,16 @@ fn id_strong(id: &str) -> bool {
 /// The prefix matcher behind [`id_admits`] and [`id_strong`].
 fn prefix_admits<'a>(prefixes: impl IntoIterator<Item = &'a str>, id: &str) -> bool {
     let head = id.split("::").next().unwrap_or(id);
-    prefixes
-        .into_iter()
-        .any(|prefix| {
-            if let Some((family, leaf)) = prefix.split_once("::") {
-                head == family && id.split("::").nth(1).is_some_and(|l| leaf_matches(leaf, l))
-            } else {
-                head == prefix
-                    || head
-                        .strip_prefix(prefix)
-                        .is_some_and(|rest| rest.starts_with('/'))
-            }
-        })
+    prefixes.into_iter().any(|prefix| {
+        if let Some((family, leaf)) = prefix.split_once("::") {
+            head == family && id.split("::").nth(1).is_some_and(|l| leaf_matches(leaf, l))
+        } else {
+            head == prefix
+                || head
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
+    })
 }
 
 /// Check every [`LLM_GATE_PREFIXES`] entry against an installed cleave traits
@@ -3014,7 +3012,12 @@ mod tests {
     /// findings plus `extra`, at a benign class and no level placement.
     fn admits_sized(extra: &[cleave::Finding], notable: usize, prob: f32) -> Option<LlmAdmission> {
         let mut findings: Vec<cleave::Finding> = (0..notable)
-            .map(|i| finding(&format!("micro-behaviors/communications/http/client::client-{i}"), cleave::Criticality::Notable))
+            .map(|i| {
+                finding(
+                    &format!("micro-behaviors/communications/http/client::client-{i}"),
+                    cleave::Criticality::Notable,
+                )
+            })
             .collect();
         findings.extend_from_slice(extra);
         admits(&findings, prob)
@@ -3027,57 +3030,115 @@ mod tests {
         // The same size at the cap is not.
         assert_eq!(admits_sized(&[], 300, 0.9), Some(LlmAdmission::Required));
         // A gate prefix does not outrank the veto (they sit on big benign packages)...
-        let curl = finding("micro-behaviors/communications/http/upload::curl-upload-file", cleave::Criticality::Notable);
+        let curl = finding(
+            "micro-behaviors/communications/http/upload::curl-upload-file",
+            cleave::Criticality::Notable,
+        );
         assert_eq!(admits_sized(&[curl], 301, 0.0), None);
         // ...a strong prefix does.
-        let dropper = finding("micro-behaviors/data/decode/command::base64-decode-to-file", cleave::Criticality::Notable);
-        assert_eq!(admits_sized(&[dropper], 301, 0.0), Some(LlmAdmission::Required));
+        let dropper = finding(
+            "micro-behaviors/data/decode/command::base64-decode-to-file",
+            cleave::Criticality::Notable,
+        );
+        assert_eq!(
+            admits_sized(&[dropper], 301, 0.0),
+            Some(LlmAdmission::Required)
+        );
         // So does a hostile finding.
-        let hostile = finding("objectives/exec/install-hook::postinstall-curl-bash", cleave::Criticality::Hostile);
-        assert_eq!(admits_sized(&[hostile], 301, 0.0), Some(LlmAdmission::Required));
+        let hostile = finding(
+            "objectives/exec/install-hook::postinstall-curl-bash",
+            cleave::Criticality::Hostile,
+        );
+        assert_eq!(
+            admits_sized(&[hostile], 301, 0.0),
+            Some(LlmAdmission::Required)
+        );
         // And a non-benign class.
         let big: Vec<cleave::Finding> = (0..301)
-            .map(|i| finding(&format!("micro-behaviors/x::t-{i}"), cleave::Criticality::Notable))
+            .map(|i| {
+                finding(
+                    &format!("micro-behaviors/x::t-{i}"),
+                    cleave::Criticality::Notable,
+                )
+            })
             .collect();
         let placed = |class| {
             admission(
                 &InterpretConfig::default(),
                 class,
                 0.0,
-                LevelContext { fired: Some(-1), active: None, grid_max: 0 },
+                LevelContext {
+                    fired: Some(-1),
+                    active: None,
+                    grid_max: 0,
+                },
                 FindingSeverity::from_findings(&big),
                 "",
                 "t",
             )
         };
-        assert_eq!(placed(Classification::Suspicious), Some(LlmAdmission::Required));
+        assert_eq!(
+            placed(Classification::Suspicious),
+            Some(LlmAdmission::Required)
+        );
         // A level placement is never vetoed: it drops to Optional, not None.
         let on_grid = admission(
             &InterpretConfig::default(),
             Classification::Benign,
             0.9,
-            LevelContext { fired: Some(0), active: None, grid_max: 25_000 },
+            LevelContext {
+                fired: Some(0),
+                active: None,
+                grid_max: 25_000,
+            },
             FindingSeverity::from_findings(&big),
             "",
             "t",
         );
         assert_eq!(on_grid, Some(LlmAdmission::Optional));
         // `0` disables the veto.
-        let off = InterpretConfig { benign_notable_cap: 0, ..InterpretConfig::default() };
+        let off = InterpretConfig {
+            benign_notable_cap: 0,
+            ..InterpretConfig::default()
+        };
         assert_eq!(
-            admission(&off, Classification::Benign, 0.9, LevelContext { fired: Some(-1), active: None, grid_max: 0 }, FindingSeverity::from_findings(&big), "", "t"),
+            admission(
+                &off,
+                Classification::Benign,
+                0.9,
+                LevelContext {
+                    fired: Some(-1),
+                    active: None,
+                    grid_max: 0
+                },
+                FindingSeverity::from_findings(&big),
+                "",
+                "t"
+            ),
             Some(LlmAdmission::Required)
         );
     }
 
     #[test]
     fn strong_prefixes_are_families_or_globs_that_match_renamed_leaves() {
-        assert!(id_strong("micro-behaviors/fs/path/agent-instructions::claude-global-instructions-path"));
-        assert!(id_strong("micro-behaviors/fs/path/application/config::vscode-project-tasks-path"));
-        assert!(!id_strong("micro-behaviors/fs/path/application/config::claude-config-directory"));
-        assert!(id_strong("micro-behaviors/process/create/agent::llm-api-base-url-third-party-host"));
-        assert!(!id_strong("micro-behaviors/process/create/agent::agent-function-tool-schema"));
-        assert!(id_strong("micro-behaviors/data/decode/command::base64-decode-to-file"));
+        assert!(id_strong(
+            "micro-behaviors/fs/path/agent-instructions::claude-global-instructions-path"
+        ));
+        assert!(id_strong(
+            "micro-behaviors/fs/path/application/config::vscode-project-tasks-path"
+        ));
+        assert!(!id_strong(
+            "micro-behaviors/fs/path/application/config::claude-config-directory"
+        ));
+        assert!(id_strong(
+            "micro-behaviors/process/create/agent::llm-api-base-url-third-party-host"
+        ));
+        assert!(!id_strong(
+            "micro-behaviors/process/create/agent::agent-function-tool-schema"
+        ));
+        assert!(id_strong(
+            "micro-behaviors/data/decode/command::base64-decode-to-file"
+        ));
         assert!(!id_strong("micro-behaviors/data/decode/command::tr-delete"));
     }
 

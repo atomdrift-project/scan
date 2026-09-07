@@ -910,13 +910,14 @@ tuna-once: ## One cleave-tuna cycle, then cherry-pick accepted experiments
 # --------------------------------------------------------------------------
 
 lint:
-	$(CARGO) clippy -- -D warnings
+	$(CARGO) fmt --all --check
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 # Auto-fix what clippy and rustfmt can fix on their own. Run fmt last so it
 # tidies any code clippy rewrote. Mirrors what `lint` checks.
 fix:
-	$(CARGO) clippy --fix --allow-dirty --allow-staged
-	$(CARGO) fmt
+	$(CARGO) clippy --workspace --all-targets --fix --allow-dirty --allow-staged
+	$(CARGO) fmt --all
 
 test:
 	@set -e; \

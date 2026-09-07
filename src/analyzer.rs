@@ -211,7 +211,7 @@ mod tests {
     /// `#[ignore]` by default — run with `SCAN_MODELS_DIR=... cargo test
     /// -- --ignored analyzer_loads_and_scans` to exercise it.
     #[test]
-    #[ignore]
+    #[ignore = "needs SCAN_MODELS_DIR pointing at a populated model directory"]
     fn analyzer_loads_and_scans() {
         let dir = std::env::var("SCAN_MODELS_DIR")
             .expect("set SCAN_MODELS_DIR to a populated model directory");
@@ -229,7 +229,7 @@ mod tests {
     /// when it spills large responses to disk. Same artifact requirement, so
     /// `#[ignore]` by default (see `analyzer_loads_and_scans`).
     #[test]
-    #[ignore]
+    #[ignore = "needs SCAN_MODELS_DIR pointing at a populated model directory"]
     fn scan_file_matches_scan_bytes() {
         let dir = std::env::var("SCAN_MODELS_DIR")
             .expect("set SCAN_MODELS_DIR to a populated model directory");

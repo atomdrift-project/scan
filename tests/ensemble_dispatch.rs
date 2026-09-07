@@ -12,7 +12,7 @@
 //! disk. Run with:
 //!
 //! ```sh
-//! SCAN_ONNX_BUNDLE=/home/t/azoth/filetypes/pe \
+//! SCAN_ONNX_BUNDLE=/path/to/onnx-bundle \
 //!     cargo test --test ensemble_dispatch -- --ignored
 //! ```
 
@@ -23,17 +23,13 @@ use std::path::{Path, PathBuf};
 use scan::model::Model;
 
 fn onnx_bundle() -> Option<PathBuf> {
-    let p = std::env::var("SCAN_ONNX_BUNDLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/home/t/azoth/filetypes/pe"));
+    let p = PathBuf::from(std::env::var_os("SCAN_ONNX_BUNDLE")?);
     (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
 }
 
 /// A full ensemble bundle (`general/` + `config.json` + `route_policies.json`).
 fn ensemble_bundle() -> Option<PathBuf> {
-    let p = std::env::var("AZOTH_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("../azoth"));
+    let p = PathBuf::from(std::env::var_os("AZOTH_DIR")?);
     p.join("general").is_dir().then_some(p)
 }
 
@@ -43,11 +39,11 @@ fn ensemble_bundle() -> Option<PathBuf> {
 /// not change whether the bundle loads. Gated on a real bundle:
 ///
 /// ```sh
-/// AZOTH_DIR=../azoth cargo test --test ensemble_dispatch \
+/// AZOTH_DIR=/path/to/ensemble-bundle cargo test --test ensemble_dispatch \
 ///     real_azoth_bundle_loads_grid_at_every_level -- --ignored
 /// ```
 #[test]
-#[ignore]
+#[ignore = "needs AZOTH_DIR pointing at a real ensemble bundle"]
 fn real_azoth_bundle_loads_grid_at_every_level() {
     let Some(dir) = ensemble_bundle() else {
         eprintln!("set AZOTH_DIR to a real ensemble bundle to run this test");
