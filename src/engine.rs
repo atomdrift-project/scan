@@ -5425,6 +5425,8 @@ pub struct PendingLlm {
     pub admission: crate::interpret::LlmAdmission,
     /// cleave's own severity, read once from the typed report.
     pub findings: crate::interpret::FindingSeverity,
+    /// What the gate log calls this sample (the analyzed path).
+    pub subject: String,
 }
 
 /// Run a deferred second opinion and fold it into `result` exactly as
@@ -5454,6 +5456,7 @@ pub(crate) fn apply_pending_interpretation(
         // Deferred means nobody is on the line: a worker job, or serve's own
         // idle puller. It takes its permit behind foreground callers.
         crate::interpret::LlmCaller::Background,
+        &pending.subject,
     ) else {
         return false;
     };
@@ -5977,11 +5980,13 @@ pub(crate) fn classify_report(
                 },
                 findings,
                 ctx,
+                label,
             )
             .map(|admission| PendingLlm {
                 ctx: ctx.to_string(),
                 admission,
                 findings,
+                subject: label.to_string(),
             });
             None
         } else {
@@ -6008,6 +6013,7 @@ pub(crate) fn classify_report(
                     // Inline means a caller is waiting: a serve request or an
                     // interactive scan. It never queues behind background work.
                     crate::interpret::LlmCaller::Foreground,
+                    label,
                 )?;
                 if let Some(grade) = interp.grade {
                     tracing::info!(

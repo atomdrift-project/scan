@@ -299,6 +299,59 @@ pub const LLM_GATE_PREFIXES: &[&str] = &[
 /// sample and cost three benign.
 pub const LLM_GATE_SYNTHESIZED_PREFIXES: &[&str] = &["metadata/encoded-payload/url"];
 
+/// Notable-or-above findings above which an ML-benign sample with no hostile
+/// finding is *not* sent to the LLM, whatever else admitted it. `0` disables
+/// the veto.
+///
+/// The admissions above all fire on volume: a large legitimate package
+/// accumulates notable findings until it crosses the probability floor, trips
+/// a suspicious composite, or carries one of the gate prefixes — and the LLM
+/// then reads a long prompt to move nothing. Measured 2026-09-06 over 826
+/// benchmark samples (403 benign, 423 malicious), scoring each call by whether
+/// the interpretation moved the outcome a level in the right direction: the
+/// non-placed admissions produced 118 correct shifts from 264 calls, 102 of
+/// them on benign samples. The correct shifts sit on small samples (90 of 118
+/// carry at most 100 notable findings, 7 more than 300) and the benign calls on
+/// large ones (65 of 102 above 300). This veto at 300 kept 116 of the 118
+/// shifts (118 with [`LLM_GATE_STRONG_PREFIXES`]) on 194 calls, 44 benign;
+/// 150 lost seven shifts, 500 gave back twelve benign calls for nothing.
+///
+/// A count of findings rather than prompt tokens: the token proxy lost nine
+/// shifts at the same benign volume. Level-placed samples are never vetoed —
+/// an interpretation is wanted for everything on the grid.
+pub const DEFAULT_LLM_BENIGN_NOTABLE_CAP: usize = 300;
+
+/// Gate prefixes that override the size veto ([`DEFAULT_LLM_BENIGN_NOTABLE_CAP`]).
+///
+/// The ordinary gate prefixes were chosen for coverage and several of them
+/// (`*curl*` uploads, encoded-payload URLs) sit on exactly the big benign
+/// packages the veto exists to skip, so the veto has to outrank them. These
+/// are the prefixes with (as near as the corpus can show) no benign carrier at
+/// all — 1 benign against 207 malicious across the 826 — so a sample carrying
+/// one is worth a read however large it is. Two of the entries are here for
+/// the two shifts the bare veto lost: a 580-finding Debian package the LLM
+/// called hostile off a base64-decode-to-file step, and a 571-finding agent
+/// skill that points the agent at an off-vendor API base URL.
+///
+/// Families and `family::*glob*` forms only: leaf ids get renamed in passing
+/// and an exact one stops matching silently.
+pub const LLM_GATE_STRONG_PREFIXES: &[&str] = &[
+    // Password-protected payload droppers: 154 malicious, 0 benign.
+    "micro-behaviors/data/archive/member",
+    // Publisher is not the owner of the repository it points at: 25 vs 1.
+    "metadata/package/manifest/repository::*publisher-repo-owner-mismatch",
+    // Agent instruction files (CLAUDE.md, AGENTS.md, rules): 5 vs 0.
+    "micro-behaviors/fs/path/agent-instructions",
+    // Editor/agent *project* settings and tasks — the per-repository files an
+    // extension or skill drops to run on open: 23 vs 0.
+    "micro-behaviors/fs/path/application/config::*project-*",
+    // An agent pointed at a third-party or off-vendor LLM API base URL, the
+    // shape of key interception: 2 vs 0.
+    "micro-behaviors/process/create/agent::*base-url*",
+    // Decoding a payload to a file from a shell command: 4 vs 0.
+    "micro-behaviors/data/decode/command::*to-file*",
+];
+
 /// Whether `pattern` matches trait leaf `id`, where `*` stands for any run of
 /// characters. A pattern without `*` is an exact name, as before.
 ///
@@ -350,11 +403,26 @@ fn leaf_matches(pattern: &str, id: &str) -> bool {
 /// it is its own head and the same comparison places it.
 #[must_use]
 fn id_admits(id: &str) -> bool {
+    prefix_admits(
+        LLM_GATE_PREFIXES
+            .iter()
+            .chain(LLM_GATE_SYNTHESIZED_PREFIXES)
+            .copied(),
+        id,
+    )
+}
+
+/// Whether any [`LLM_GATE_STRONG_PREFIXES`] entry admits `id`.
+#[must_use]
+fn id_strong(id: &str) -> bool {
+    prefix_admits(LLM_GATE_STRONG_PREFIXES.iter().copied(), id)
+}
+
+/// The prefix matcher behind [`id_admits`] and [`id_strong`].
+fn prefix_admits<'a>(prefixes: impl IntoIterator<Item = &'a str>, id: &str) -> bool {
     let head = id.split("::").next().unwrap_or(id);
-    LLM_GATE_PREFIXES
-        .iter()
-        .chain(LLM_GATE_SYNTHESIZED_PREFIXES)
-        .copied()
+    prefixes
+        .into_iter()
         .any(|prefix| {
             if let Some((family, leaf)) = prefix.split_once("::") {
                 head == family && id.split("::").nth(1).is_some_and(|l| leaf_matches(leaf, l))
@@ -385,7 +453,7 @@ fn id_admits(id: &str) -> bool {
 #[must_use]
 pub fn validate_gate_prefixes(traits_dir: &Path) -> Vec<String> {
     let mut problems = Vec::new();
-    for prefix in LLM_GATE_PREFIXES {
+    for prefix in LLM_GATE_PREFIXES.iter().chain(LLM_GATE_STRONG_PREFIXES) {
         let (family, leaf) = match prefix.split_once("::") {
             Some((family, leaf)) => (family, Some(leaf)),
             None => (*prefix, None),
@@ -464,6 +532,11 @@ pub struct InterpretConfig {
     /// never placed (`lvl == -1`) but that still score well above the benign
     /// mass. See the gate in [`interpret`].
     pub min_prob: f32,
+    /// Size veto: an ML-benign sample with no hostile finding and more than
+    /// this many notable-or-above findings is not sent, unless it carries a
+    /// [`LLM_GATE_STRONG_PREFIXES`] trait or ML placed it on the level grid.
+    /// `0` disables. See [`DEFAULT_LLM_BENIGN_NOTABLE_CAP`].
+    pub benign_notable_cap: usize,
     /// Per-request timeout.
     pub timeout: Duration,
     /// Cap on concurrent in-flight requests (protects a single local GPU).
@@ -623,6 +696,7 @@ impl Default for InterpretConfig {
             api_key: None,
             min_level: None,
             min_prob: DEFAULT_LLM_MIN_PROB,
+            benign_notable_cap: DEFAULT_LLM_BENIGN_NOTABLE_CAP,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_concurrency: default_max_concurrency(),
             fallbacks: Vec::new(),
@@ -1130,6 +1204,12 @@ pub struct FindingSeverity {
     /// single notable finding — and it is why the probability floor can sit at
     /// 0.55 instead of 0.04.
     pub gate_trait: bool,
+    /// cleave surfaced a notable-or-above finding under
+    /// [`LLM_GATE_STRONG_PREFIXES`]: admitted past the size veto.
+    pub strong_trait: bool,
+    /// Notable-or-above findings across the whole report — every member file,
+    /// duplicates included. The size the veto reads.
+    pub notable: usize,
 }
 
 impl FindingSeverity {
@@ -1160,8 +1240,14 @@ impl FindingSeverity {
             // Notable is the floor: below it sit baseline noise and the
             // component legs of composites, which fire on ordinary packages and
             // would turn every prefix into a volume tax.
-            if finding.crit >= cleave::Criticality::Notable && id_admits(&finding.id) {
-                out.gate_trait = true;
+            if finding.crit >= cleave::Criticality::Notable {
+                out.notable += 1;
+                if id_admits(&finding.id) {
+                    out.gate_trait = true;
+                }
+                if id_strong(&finding.id) {
+                    out.strong_trait = true;
+                }
             }
         }
         out
@@ -1171,9 +1257,10 @@ impl FindingSeverity {
 /// Why a sample is admitted to the LLM, for a caller that runs the second
 /// opinion off the analysis path and must ration a saturated endpoint.
 ///
-/// `Required` is every admission that can change a verdict: an elevated
-/// cleave finding, a finding under [`LLM_GATE_PREFIXES`], a non-benign ML
-/// class, or a raw score above the probability floor. `Optional` is the routine
+/// `Required` is every admission that can change a verdict: a hostile cleave
+/// finding, a finding under [`LLM_GATE_PREFIXES`], a non-benign ML class, or a
+/// raw score above the probability floor — unless the size veto
+/// ([`DEFAULT_LLM_BENIGN_NOTABLE_CAP`]) withholds it. `Optional` is the routine
 /// case — ML placed the file on its grid but nothing else says so — where the
 /// second opinion is context for the reader rather than a correction. Under load a worker serves
 /// `Required` first and skips `Optional`; unloaded, both run.
@@ -1206,19 +1293,74 @@ pub fn admission(
     levels: LevelContext,
     findings: FindingSeverity,
     context: &str,
+    subject: &str,
 ) -> Option<LlmAdmission> {
-    if ml_prob >= cfg.min_prob
-        || findings.elevated
-        || findings.gate_trait
-        || has_elevated_finding(context)
-        || !matches!(ml_class, Classification::Benign)
-    {
-        return Some(LlmAdmission::Required);
+    // Every admission is evaluated, not short-circuited, so the log line can
+    // say which ones fired — the question a reader asks of a skipped sample is
+    // "what would have had to be true", and a partial answer is no answer.
+    let hostile = findings.hostile || has_hostile_finding(context);
+    let benign_class = matches!(ml_class, Classification::Benign);
+    let mut reasons: Vec<&str> = Vec::new();
+    if ml_prob >= cfg.min_prob {
+        reasons.push("prob");
     }
-    if levels.ml_admits(cfg.min_level) || levels.ml_placed() {
-        return Some(LlmAdmission::Optional);
+    // Hostile, not suspicious: a suspicious-only finding was six benign calls
+    // and no shift on the measured corpus (see `DEFAULT_LLM_BENIGN_NOTABLE_CAP`).
+    if hostile {
+        reasons.push("hostile-finding");
     }
-    None
+    if findings.gate_trait {
+        reasons.push("gate-trait");
+    }
+    if findings.strong_trait {
+        reasons.push("strong-trait");
+    }
+    if !benign_class {
+        reasons.push("class");
+    }
+    let placed = levels.ml_admits(cfg.min_level) || levels.ml_placed();
+    // The size veto: see `DEFAULT_LLM_BENIGN_NOTABLE_CAP`. Only the Required
+    // tier is subject to it; a level placement below is never withheld.
+    let vetoed = cfg.benign_notable_cap > 0
+        && benign_class
+        && !hostile
+        && !findings.strong_trait
+        && findings.notable > cfg.benign_notable_cap;
+    let decision = if !reasons.is_empty() && !vetoed {
+        Some(LlmAdmission::Required)
+    } else if placed {
+        Some(LlmAdmission::Optional)
+    } else {
+        None
+    };
+    let why = match (decision, vetoed, reasons.is_empty()) {
+        (Some(LlmAdmission::Required), _, _) => "admitted",
+        (Some(LlmAdmission::Optional), true, _) => "vetoed by size, kept for its level placement",
+        (Some(LlmAdmission::Optional), false, _) => "level placement only",
+        (None, true, _) => "vetoed by size",
+        (None, false, _) => "no admission fired",
+    };
+    tracing::info!(
+        subject,
+        decision = decision.map_or("skipped", |d| match d {
+            LlmAdmission::Required => "required",
+            LlmAdmission::Optional => "optional",
+        }),
+        why,
+        admissions = %reasons.join(","),
+        ml_class = %ml_class,
+        ml_prob,
+        ml_level = levels.fired.unwrap_or(-1),
+        min_prob = cfg.min_prob,
+        hostile_finding = hostile,
+        elevated_finding = findings.elevated,
+        gate_trait = findings.gate_trait,
+        strong_trait = findings.strong_trait,
+        notable_findings = findings.notable,
+        notable_cap = cfg.benign_notable_cap,
+        "LLM gate"
+    );
+    decision
 }
 
 /// Who is asking for an LLM slot.
@@ -1254,6 +1396,7 @@ impl LlmCaller {
 
 /// Interpret a sample, blending the ML verdict with a local LLM's opinion.
 /// Returns `None` (never an error) when below the gate or on any failure.
+#[allow(clippy::too_many_arguments)] // the gate's inputs, each read by the log line; a params struct would only indirect them
 pub fn interpret(
     cfg: &InterpretConfig,
     context: &str,
@@ -1262,6 +1405,7 @@ pub fn interpret(
     levels: LevelContext,
     findings: FindingSeverity,
     caller: LlmCaller,
+    subject: &str,
 ) -> Option<Interpretation> {
     if context.trim().is_empty() {
         return None;
@@ -1299,7 +1443,7 @@ pub fn interpret(
     // is placed at all — but it is silent for the 82 samples the grid never
     // reached. The probability floor covers those at a known volume cost. See
     // [`DEFAULT_LLM_MIN_PROB`].
-    admission(cfg, ml_class, ml_prob, levels, findings, context)?;
+    admission(cfg, ml_class, ml_prob, levels, findings, context, subject)?;
     // Everything that bounds how far the LLM's opinion may move the verdict,
     // computed from the exact bytes the model will see plus where ML placed the
     // file on the calibrated FP axis. See `blend`.
@@ -1500,6 +1644,7 @@ fn is_binary_render(line: &str) -> bool {
 /// Whether the render carries a suspicious- or hostile-severity finding (an `H`
 /// or `S` marker cleave injected). The interpret gate uses this to send an
 /// ML-blind sample — low ML probability but cleave-flagged — to the LLM anyway.
+#[cfg(test)] // the gate reads `has_hostile_finding` now; kept for the render-parsing tests
 fn has_elevated_finding(rendered: &str) -> bool {
     rendered
         .lines()
@@ -2823,7 +2968,79 @@ mod tests {
             },
             FindingSeverity::from_findings(findings),
             "",
+            "test-sample",
         )
+    }
+
+    /// A gate decision for a sample carrying `notable` ordinary notable
+    /// findings plus `extra`, at a benign class and no level placement.
+    fn admits_sized(extra: &[cleave::Finding], notable: usize, prob: f32) -> Option<LlmAdmission> {
+        let mut findings: Vec<cleave::Finding> = (0..notable)
+            .map(|i| finding(&format!("micro-behaviors/communications/http/client::client-{i}"), cleave::Criticality::Notable))
+            .collect();
+        findings.extend_from_slice(extra);
+        admits(&findings, prob)
+    }
+
+    #[test]
+    fn size_veto_withholds_big_benign_samples_unless_something_strong_says_otherwise() {
+        // A big package over the floor: vetoed.
+        assert_eq!(admits_sized(&[], 301, 0.9), None);
+        // The same size at the cap is not.
+        assert_eq!(admits_sized(&[], 300, 0.9), Some(LlmAdmission::Required));
+        // A gate prefix does not outrank the veto (they sit on big benign packages)...
+        let curl = finding("micro-behaviors/communications/http/upload::curl-upload-file", cleave::Criticality::Notable);
+        assert_eq!(admits_sized(&[curl], 301, 0.0), None);
+        // ...a strong prefix does.
+        let dropper = finding("micro-behaviors/data/decode/command::base64-decode-to-file", cleave::Criticality::Notable);
+        assert_eq!(admits_sized(&[dropper], 301, 0.0), Some(LlmAdmission::Required));
+        // So does a hostile finding.
+        let hostile = finding("objectives/exec/install-hook::postinstall-curl-bash", cleave::Criticality::Hostile);
+        assert_eq!(admits_sized(&[hostile], 301, 0.0), Some(LlmAdmission::Required));
+        // And a non-benign class.
+        let big: Vec<cleave::Finding> = (0..301)
+            .map(|i| finding(&format!("micro-behaviors/x::t-{i}"), cleave::Criticality::Notable))
+            .collect();
+        let placed = |class| {
+            admission(
+                &InterpretConfig::default(),
+                class,
+                0.0,
+                LevelContext { fired: Some(-1), active: None, grid_max: 0 },
+                FindingSeverity::from_findings(&big),
+                "",
+                "t",
+            )
+        };
+        assert_eq!(placed(Classification::Suspicious), Some(LlmAdmission::Required));
+        // A level placement is never vetoed: it drops to Optional, not None.
+        let on_grid = admission(
+            &InterpretConfig::default(),
+            Classification::Benign,
+            0.9,
+            LevelContext { fired: Some(0), active: None, grid_max: 25_000 },
+            FindingSeverity::from_findings(&big),
+            "",
+            "t",
+        );
+        assert_eq!(on_grid, Some(LlmAdmission::Optional));
+        // `0` disables the veto.
+        let off = InterpretConfig { benign_notable_cap: 0, ..InterpretConfig::default() };
+        assert_eq!(
+            admission(&off, Classification::Benign, 0.9, LevelContext { fired: Some(-1), active: None, grid_max: 0 }, FindingSeverity::from_findings(&big), "", "t"),
+            Some(LlmAdmission::Required)
+        );
+    }
+
+    #[test]
+    fn strong_prefixes_are_families_or_globs_that_match_renamed_leaves() {
+        assert!(id_strong("micro-behaviors/fs/path/agent-instructions::claude-global-instructions-path"));
+        assert!(id_strong("micro-behaviors/fs/path/application/config::vscode-project-tasks-path"));
+        assert!(!id_strong("micro-behaviors/fs/path/application/config::claude-config-directory"));
+        assert!(id_strong("micro-behaviors/process/create/agent::llm-api-base-url-third-party-host"));
+        assert!(!id_strong("micro-behaviors/process/create/agent::agent-function-tool-schema"));
+        assert!(id_strong("micro-behaviors/data/decode/command::base64-decode-to-file"));
+        assert!(!id_strong("micro-behaviors/data/decode/command::tr-delete"));
     }
 
     #[test]
@@ -2876,11 +3093,18 @@ mod tests {
         ];
         assert_eq!(admits(&ordinary, 0.01), None);
 
-        // Same package, one suspicious finding. Criticality carries it.
+        // Same package, one hostile finding. Criticality carries it. A
+        // suspicious one no longer does: six benign calls and no shift.
+        let mut suspicious = ordinary.to_vec();
+        suspicious.push(finding(
+            "objectives/evasion/masquerade::config-insert",
+            cleave::Criticality::Suspicious,
+        ));
+        assert_eq!(admits(&suspicious, 0.01), None);
         let mut elevated = ordinary.to_vec();
         elevated.push(finding(
             "objectives/evasion/masquerade::config-insert",
-            cleave::Criticality::Suspicious,
+            cleave::Criticality::Hostile,
         ));
         assert_eq!(admits(&elevated, 0.01), Some(LlmAdmission::Required));
 
@@ -2957,7 +3181,7 @@ mod tests {
         // synthesized list is correctly not reported at all.
         assert_eq!(
             validate_gate_prefixes(dir.path()).len(),
-            LLM_GATE_PREFIXES.len()
+            LLM_GATE_PREFIXES.len() + LLM_GATE_STRONG_PREFIXES.len()
         );
 
         // A family that exists but no longer declares the leaf the gate names
