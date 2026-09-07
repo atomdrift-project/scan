@@ -698,6 +698,7 @@ impl RequestGuard {
         permit: AnalysisPermit,
     ) -> Self {
         state.jobs_started.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_REQUESTS.fetch_add(1, Ordering::AcqRel);
         if let Some(pause) = &state.idle_pause {
             pause.store(true, Ordering::Release);
         }
@@ -737,6 +738,7 @@ impl Drop for RequestGuard {
         // in-flight entry. The permit is released automatically via _permit.
         self.cancellation.store(true, Ordering::Release);
         self.state.in_flight.remove(&self.request_id);
+        ACTIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
         // Resume the idle worker once the last interactive request is done.
         // Checked after the removal so a concurrent arrival cannot be missed:
         // that request raised the flag before its guard existed.
@@ -913,12 +915,42 @@ fn big_job_min_bytes() -> u64 {
 }
 
 /// Whale-lane sizing, read once from the environment.
+/// Analyses admitted and not yet finished, process-wide — what a new lane
+/// shares the cores with. Kept by [`RequestGuard`].
+static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Threads a private lane of tier minimum `floor` gets when `active`
+/// requests (this one included) are in flight on a host with `physical`
+/// cores: an even share of the cores, never below the tier's floor and never
+/// above the cores. Alone (`active <= 1`) the answer is `None`: the global
+/// pool, every thread of it.
+///
+/// The tier floors (8 for small, 16 for whales) were chosen at concurrency 8
+/// and are right there — 8 for small beat 16 on p50 — but they are the whole
+/// story only when the box is full. At concurrency 1 the same 8-thread pool
+/// left 120 threads idle: purls-128 measured p90 1.63 s on the fixed widths
+/// against 1.12 s on the global pool, wall 164 → 111 s (2026-09-06). The
+/// share reproduces both ends: 64 physical cores / 8 in flight = 8 (the
+/// small floor), / 4 = 16, / 2 = 32, alone = everything.
+#[must_use]
+pub(crate) fn lane_threads(floor: usize, physical: usize, active: usize) -> Option<usize> {
+    if active <= 1 {
+        return None;
+    }
+    Some((physical / active).clamp(floor, physical.max(floor)))
+}
+
 struct WhaleConfig {
     /// Threads per whale pool; `0` sends whales to the global pool instead.
     threads: usize,
     /// Threads per small payload's pool; `0` keeps small payloads on the
     /// global pool.
     small_threads: usize,
+    /// Physical cores, the numerator of the per-request share.
+    physical: usize,
+    /// `SCAN_LANE_SHARE=0` pins every lane at its tier floor (the widths
+    /// measured at concurrency 8) instead of sharing the cores by load.
+    share: bool,
     /// Big whales in flight at once.
     slots: usize,
     small_max_bytes: u64,
@@ -950,6 +982,7 @@ fn whale_config() -> &'static WhaleConfig {
             .max(1);
         let small_max_bytes = small_job_max_bytes();
         let big_min_bytes = big_job_min_bytes().max(small_max_bytes);
+        let share = std::env::var("SCAN_LANE_SHARE").as_deref() != Ok("0");
         if threads == 0 {
             tracing::info!("whale analysis pools disabled (SCAN_WHALE_POOL_THREADS=0)");
         } else {
@@ -959,12 +992,15 @@ fn whale_config() -> &'static WhaleConfig {
                 big_whale_slots = slots,
                 whale_over_mb = small_max_bytes / (1024 * 1024),
                 big_over_mb = big_min_bytes / (1024 * 1024),
+                share,
                 "analysis lanes ready: every payload runs on a private rayon pool sized to it"
             );
         }
         WhaleConfig {
             threads,
             small_threads,
+            physical,
+            share,
             slots,
             small_max_bytes,
             big_min_bytes,
@@ -1096,21 +1132,30 @@ pub(crate) fn whale_slot_usage() -> (usize, usize) {
 /// work, and two interactive analyses waited in `whale:lane` until their
 /// 30-minute budget ran out.
 ///
-/// `cancellation` ends the wait for a big-whale slot early; `None` then, and
-/// the caller's cleave run notices the flag at its first checkpoint.
+/// A big whale with every slot taken is refused ([`WhaleSlotBusy`]) rather
+/// than queued; the handler turns that into a retry-later response.
 pub(crate) fn whale_lane_for(bytes: u64) -> Result<Option<WhaleLane>, WhaleSlotBusy> {
     if on_idle_pool() {
         return Ok(None);
     }
     let cfg = whale_config();
-    let threads = if bytes <= cfg.small_max_bytes {
+    let floor = if bytes <= cfg.small_max_bytes {
         cfg.small_threads
     } else {
         cfg.threads
     };
-    if threads == 0 {
+    if floor == 0 {
         return Ok(None);
     }
+    let threads = if cfg.share {
+        // Alone on the box, the global pool is the widest lane there is.
+        match lane_threads(floor, cfg.physical, ACTIVE_REQUESTS.load(Ordering::Acquire)) {
+            Some(threads) => threads,
+            None => return Ok(None),
+        }
+    } else {
+        floor
+    };
     let slot = if bytes > cfg.big_min_bytes {
         Some(WhaleSlot::try_acquire(cfg.slots)?)
     } else {
@@ -2332,6 +2377,7 @@ mod job_bucket_recent_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod whale_pool_tests {
     /// Per-whale pools scale with the host: a quarter of the cores, floor
     /// two, ceiling sixteen — the global pool keeps every core regardless.
@@ -2355,6 +2401,29 @@ mod whale_pool_tests {
         assert_eq!(super::small_pool_threads(32), 4);
         assert_eq!(super::small_pool_threads(64), 8);
         assert_eq!(super::small_pool_threads(256), 8);
+    }
+
+    /// Lane width follows the load: alone means the global pool, otherwise an
+    /// even share of the cores floored at the tier width.
+    #[test]
+    fn lane_threads_share_cores_by_load() {
+        assert_eq!(super::lane_threads(8, 64, 0), None);
+        assert_eq!(super::lane_threads(8, 64, 1), None);
+        assert_eq!(super::lane_threads(8, 64, 2), Some(32));
+        assert_eq!(super::lane_threads(8, 64, 4), Some(16));
+        assert_eq!(super::lane_threads(8, 64, 8), Some(8));
+        assert_eq!(
+            super::lane_threads(8, 64, 16),
+            Some(8),
+            "never below the floor"
+        );
+        assert_eq!(super::lane_threads(16, 64, 8), Some(16), "whale floor");
+        assert_eq!(super::lane_threads(2, 4, 2), Some(2));
+        assert_eq!(
+            super::lane_threads(16, 4, 2),
+            Some(16),
+            "floor above the cores stays the floor"
+        );
     }
 
     /// Big-whale slots: an eighth of the cores, 1–8, so slots × threads stays

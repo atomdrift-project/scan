@@ -23,7 +23,11 @@ pub fn demote_current_thread(steps: u8) {
         // SAFETY: PRIO_PROCESS with a tid is Linux's per-thread nice; both
         // calls touch no memory and a non-zero return is ignored by design.
         unsafe {
-            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            // A tid always fits in id_t; the fallible conversion only keeps
+            // the cast lint honest, and on failure the thread stays as it was.
+            let Ok(tid) = libc::id_t::try_from(libc::syscall(libc::SYS_gettid)) else {
+                return;
+            };
             let current = libc::getpriority(libc::PRIO_PROCESS, tid);
             libc::setpriority(
                 libc::PRIO_PROCESS,
