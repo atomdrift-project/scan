@@ -439,6 +439,7 @@ fn build_result(
         threshold: cr.threshold,
         level: cr.level,
         analysis_cached: cr.analysis_cached,
+        interpret_ms: cr.phase_ms.interpret_ms,
         version: crate::engine::model_version_string(model.info()),
         analyzed_at: crate::engine::now_rfc3339(),
         cleave,

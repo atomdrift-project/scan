@@ -371,8 +371,19 @@ fn flight_outcome(
             state
                 .job_bytes_total
                 .fetch_add(scan_result.size_bytes, Ordering::Relaxed);
-            let micros = elapsed_ms.saturating_mul(1_000);
-            state.job_micros_total.fetch_add(micros, Ordering::Relaxed);
+            state
+                .job_micros_total
+                .fetch_add(elapsed_ms.saturating_mul(1_000), Ordering::Relaxed);
+            // What the router averages is this server's own service time: the
+            // LLM phase is left out, because the endpoint is shared by the
+            // whole fleet and a contended one made every worker that asked it
+            // look slow. Measured 2026-09-06: a 128-core box restarted, its
+            // first twenty samples were probes that each waited on the
+            // endpoint, its p80 read 82s, and it took 2 of the next 128
+            // dispatches while a 4-core box took 52.
+            let micros = elapsed_ms
+                .saturating_sub(scan_result.interpret_ms)
+                .saturating_mul(1_000);
             // Routing predicts the cost of work this server has *not* done, so
             // only fresh analyses feed the figures a router reads. A cache hit
             // is real and worth reporting, but it predicts nothing about the
@@ -2741,6 +2752,7 @@ fn scan_result_from(
         threshold: cr.threshold,
         level: cr.level,
         analysis_cached: cr.analysis_cached,
+        interpret_ms: cr.phase_ms.interpret_ms,
         version: crate::engine::model_version_string(resources.model.info()),
         analyzed_at: crate::engine::now_rfc3339(),
         cleave: Some(cr.report),
