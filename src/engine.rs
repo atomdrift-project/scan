@@ -8134,9 +8134,7 @@ mod dependency_grading_tests {
     /// skip rather than fail. Mirrors the SCAN_ONNX_BUNDLE convention in
     /// tests/backend_dispatch.rs.
     fn model_bundle() -> Option<std::path::PathBuf> {
-        let p = std::env::var("SCAN_MODELS_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("/home/t/azoth/filetypes/npm"));
+        let p = std::path::PathBuf::from(std::env::var_os("SCAN_MODELS_DIR")?);
         (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
     }
 

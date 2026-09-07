@@ -11,7 +11,7 @@
 //! ONNX bundle on disk. To run:
 //!
 //! ```sh
-//! SCAN_ONNX_BUNDLE=/home/t/azoth/filetypes/pe \
+//! SCAN_ONNX_BUNDLE=/path/to/onnx-bundle \
 //!     cargo test --test backend_dispatch -- --ignored
 //! ```
 
@@ -22,9 +22,7 @@ use std::path::{Path, PathBuf};
 use scan::model::Model;
 
 fn onnx_bundle() -> Option<PathBuf> {
-    let p = std::env::var("SCAN_ONNX_BUNDLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/home/t/azoth/filetypes/pe"));
+    let p = PathBuf::from(std::env::var_os("SCAN_ONNX_BUNDLE")?);
     (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
 }
 
@@ -37,7 +35,7 @@ fn copy_bundle(src: &Path, files: &[&str]) -> tempfile::TempDir {
 }
 
 #[test]
-#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle (default: /home/t/azoth/filetypes/pe)"]
+#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle"]
 fn onnx_bundle_dispatches_to_onnx_backend() {
     let Some(src) = onnx_bundle() else {
         panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
