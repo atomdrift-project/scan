@@ -2687,12 +2687,38 @@ static SEM: OnceLock<Sem> = OnceLock::new();
 /// RAII permit; releases its slot on drop.
 struct Permit;
 
-/// Permits background work may never take: the last quarter of the pool, at
-/// least one, stays free for foreground callers. A serve request then queues
-/// only behind other requests, never behind the puller. A pool of one has no
-/// quarter to reserve; there, background work simply takes turns.
+/// In-flight LLM calls background work may hold at once, per process: a
+/// quarter of the pool, at least one, never all of it.
+/// `SCAN_LLM_BACKGROUND_CONCURRENCY` overrides the quarter.
+///
+/// It used to be the other way round — background could take everything but
+/// the last quarter — which was fine while a process competed only with
+/// itself. The fleet's workers share one GPU with serve, and vLLM splits
+/// every prefill step's token budget across *running* requests whatever
+/// their priority; priority only orders the waiting queue. Measured
+/// 2026-09-06 with the workers holding a dozen background calls each: a
+/// 761-token foreground prompt took 4.2 s at priority 0 (10 s at 1), and
+/// serve's p90 at concurrency 8 sat on the 4 s line. Nobody waits on a queue
+/// job, so background work takes the small share and drains at whatever rate
+/// the GPU leaves it.
+fn background_cap(max: usize) -> usize {
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    let over = *OVERRIDE.get_or_init(|| {
+        std::env::var("SCAN_LLM_BACKGROUND_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    });
+    let cap = over.unwrap_or((max / 4).max(1));
+    if max < 2 { max } else { cap.min(max - 1) }
+}
+
+/// Permits background work may never take: everything above
+/// [`background_cap`] stays free for foreground callers, so a serve request
+/// queues only behind other requests, never behind the puller. A pool of one
+/// reserves nothing; there, background work simply takes turns.
 fn foreground_reserve(max: usize) -> usize {
-    if max < 2 { 0 } else { (max / 4).max(1) }
+    max - background_cap(max)
 }
 
 impl Permit {
@@ -3791,15 +3817,20 @@ mod tests {
         assert_eq!(live_h.join().expect("thread").len(), calls);
     }
 
-    /// Background work never takes the last quarter of the permits, and a
-    /// pool too small to have a quarter reserves nothing rather than starving.
+    /// Background work holds at most a quarter of the permits (at least one),
+    /// and a pool too small to split reserves nothing rather than starving.
     #[test]
     fn foreground_reserve_is_a_quarter_at_least_one_and_never_the_whole_pool() {
+        assert_eq!(background_cap(1), 1);
+        assert_eq!(background_cap(2), 1);
+        assert_eq!(background_cap(4), 1);
+        assert_eq!(background_cap(16), 4);
+        assert_eq!(background_cap(64), 16);
         assert_eq!(foreground_reserve(1), 0);
         assert_eq!(foreground_reserve(2), 1);
-        assert_eq!(foreground_reserve(4), 1);
-        assert_eq!(foreground_reserve(16), 4);
-        assert_eq!(foreground_reserve(64), 16);
+        assert_eq!(foreground_reserve(4), 3);
+        assert_eq!(foreground_reserve(16), 12);
+        assert_eq!(foreground_reserve(64), 48);
         for max in 2..=64 {
             assert!(
                 foreground_reserve(max) < max,

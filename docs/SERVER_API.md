@@ -40,6 +40,8 @@ Environment variables read at startup:
 | `SCAN_WHALE_SLOTS` | Big whales analyzing at once; the rest wait. Default: an eighth of the physical cores, 1–8. |
 | `SCAN_SMALL_JOB_MB`  | Payloads above this many MiB are whales. Default 1. Shared with the slot lanes. |
 | `SCAN_BIG_JOB_MB`    | Payloads above this many MiB are *big* whales and take a `SCAN_WHALE_SLOTS` slot. Default 8. |
+| `SCAN_LLM_CONCURRENCY` | In-flight LLM calls per process (default: physical cores, 4–16). |
+| `SCAN_LLM_BACKGROUND_CONCURRENCY` | Of those, how many queue work (a worker job, serve's own puller) may hold at once; the rest are reserved for requests with a caller waiting. Default: a quarter, at least one. vLLM shares each prefill step across every running request, so this is what keeps the fleet's background calls from setting serve's latency floor. |
 | `SCAN_LLM_SYSTEM_PROMPT_FILE` | Replace the built-in LLM system prompt with this file's contents (prompt-tuning A/B). Verdict caches key on the prompt text, so an override never replays built-in verdicts. |
 | `SCAN_INTERPRET_BUDGET_BYTES` | Byte budget for the primary artifact's LLM render; over budget, low-severity member files are dropped first. Default 98304. cleave's tiny view already caps each file at 12 KiB of context windows (`CLEAVE_TINY_LEGACY_WINDOWS=1` restores the uncapped windows, `CLEAVE_TINY_NO_RELABEL=1` the pre-2026-09-06 composite handling). |
 
