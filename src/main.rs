@@ -372,6 +372,21 @@ struct Cli {
     )]
     llm_min_prob: f32,
 
+    /// Size veto for the LLM gate: an ML-benign sample with no hostile finding
+    /// and more than this many notable-or-above findings is not sent to the
+    /// LLM, unless it carries a strong gate trait or ML placed it on the level
+    /// grid. Big legitimate packages accumulate notable findings until some
+    /// admission fires, and the reader then moves nothing; on the measured
+    /// corpus the veto at 300 halved benign calls and kept every correct
+    /// shift. `0` disables it.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        default_value_t = scan::interpret::DEFAULT_LLM_BENIGN_NOTABLE_CAP,
+    )]
+    llm_benign_notable_cap: usize,
+
     /// Per-request LLM timeout, in seconds. Once it elapses the endpoint is
     /// treated as a refusal and the next one in the `--llm` chain is tried.
     ///
@@ -736,6 +751,7 @@ impl Cli {
             api_key: primary.api_key,
             min_level: self.llm_min_level,
             min_prob: self.llm_min_prob,
+            benign_notable_cap: self.llm_benign_notable_cap,
             // One budget per hop for every mode: a wedged endpoint is caught
             // by the connect timeout and the breaker, not by this.
             timeout: std::time::Duration::from_secs(self.llm_timeout),
