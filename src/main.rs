@@ -2329,7 +2329,11 @@ fn lower_pool_thread_priority() {
         // value never needs privilege, and a failure just leaves the thread at
         // its inherited priority.
         unsafe {
-            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            // A tid always fits in id_t; the fallible conversion only keeps
+            // the cast lint honest, and on failure the thread stays as it was.
+            let Ok(tid) = libc::id_t::try_from(libc::syscall(libc::SYS_gettid)) else {
+                return;
+            };
             let current = libc::getpriority(libc::PRIO_PROCESS, tid);
             libc::setpriority(libc::PRIO_PROCESS, tid, (current + 1).min(19));
         }
@@ -2350,10 +2354,8 @@ fn smt_pool_vendor() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
-            return info.contains("AuthenticAMD") || info.contains("GenuineIntel");
-        }
-        return false;
+        std::fs::read_to_string("/proc/cpuinfo")
+            .is_ok_and(|info| info.contains("AuthenticAMD") || info.contains("GenuineIntel"))
     }
     #[cfg(not(target_os = "linux"))]
     {

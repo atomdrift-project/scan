@@ -36,13 +36,21 @@ Environment variables read at startup:
 | `SCAN_MODELS_REPO`   | Model repository URL.                                        |
 | `SCAN_WHALE_POOL_THREADS` | Threads in each whale's private pool (below); `0` sends whales to the global pool. Default: a quarter of the physical cores, 2–16. |
 | `SCAN_SMALL_POOL_THREADS` | Threads in a small payload's private pool; `0` keeps small payloads on the global pool. Default: an eighth of the physical cores, 2–8. |
+| `SCAN_LANE_SHARE` | `0` pins every private pool at its tier width above. Default: a lane gets an even share of the physical cores among the requests in flight (never below its tier width), and a request alone on the box uses the global pool. |
 | `SCAN_WHALE_SLOTS` | Big whales analyzing at once; the rest wait. Default: an eighth of the physical cores, 1–8. |
 | `SCAN_SMALL_JOB_MB`  | Payloads above this many MiB are whales. Default 1. Shared with the slot lanes. |
 | `SCAN_BIG_JOB_MB`    | Payloads above this many MiB are *big* whales and take a `SCAN_WHALE_SLOTS` slot. Default 8. |
+| `SCAN_LLM_SYSTEM_PROMPT_FILE` | Replace the built-in LLM system prompt with this file's contents (prompt-tuning A/B). Verdict caches key on the prompt text, so an override never replays built-in verdicts. |
+| `SCAN_INTERPRET_BUDGET_BYTES` | Byte budget for the primary artifact's LLM render; over budget, low-severity member files are dropped first. Default 98304. cleave's tiny view already caps each file at 12 KiB of context windows (`CLEAVE_TINY_LEGACY_WINDOWS=1` restores the uncapped windows, `CLEAVE_TINY_NO_RELABEL=1` the pre-2026-09-06 composite handling). |
 
 Every payload analyzes on a rayon pool of its own rather than on the global
-pool: `SCAN_SMALL_POOL_THREADS` wide at or below `SCAN_SMALL_JOB_MB`,
-`SCAN_WHALE_POOL_THREADS` wide above it. Each pool is built for one
+pool, sized by load: an even share of the physical cores among the requests
+in flight, floored at `SCAN_SMALL_POOL_THREADS` at or below
+`SCAN_SMALL_JOB_MB` and `SCAN_WHALE_POOL_THREADS` above it; a request that
+is alone on the box runs on the global pool instead. The floors are the
+widths measured best at concurrency 8 (64 cores / 8 = 8 for small), but at
+concurrency 1 a fixed 8-thread lane left 120 threads idle: purls-128 p90
+1.63 s against 1.12 s on the global pool, wall 164 → 111 s (2026-09-06). Each pool is built for one
 analysis and dropped after it (reusing idle pools measured as a wash). Every analysis runs on a blocking thread, so its inner parallel work is
 injected into a rayon pool from outside, and rayon workers only take injected
 work when their own queues are empty; while one 40 MB wheel's members fill
