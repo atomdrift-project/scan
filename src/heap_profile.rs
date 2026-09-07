@@ -278,7 +278,7 @@ fn dump_freebsd(path: &str) -> Result<(), String> {
     }
 }
 
-/// Warn when the host's in-libc jemalloc taxes every allocation.
+/// Report what the host's in-libc jemalloc is charging for every allocation.
 ///
 /// FreeBSD builds libc's jemalloc with `--enable-debug` and `--enable-fill` on
 /// -CURRENT, so each allocation runs jemalloc's invariant assertions and both
@@ -292,31 +292,42 @@ fn dump_freebsd(path: &str) -> Result<(), String> {
 /// recovers what a different allocator would, which is why there is no bundled
 /// allocator on this platform.
 ///
-/// `opt.junk` is settable at startup; the assertions are compiled in and can
-/// only be dropped by a `MALLOC_PRODUCTION` world, so the warning names
-/// whichever remedy the host still needs.
-pub fn warn_if_debug_allocator() {
+/// The two halves are not the same size and do not have the same remedy, so
+/// they are not the same log line. Junk filling is the expensive one and is
+/// settable at startup, by `MALLOC_CONF` for one service or by an
+/// `/etc/malloc.conf` symlink for every process on the host — that one warns.
+/// The assertions are compiled in and need a `MALLOC_PRODUCTION` world, which
+/// is nothing a deploy can do; on the measurement above they are worth little
+/// beside the filling, so they are reported at info and left alone.
+pub fn report_debug_allocator() {
     #[cfg(target_os = "freebsd")]
     {
-        let junk = junk_setting().filter(|setting| *setting != "false");
         let is_debug_build = read_ctl::<bool>(b"config.debug\0") == Some(true);
-        if junk.is_none() && !is_debug_build {
-            return;
+        if let Some(junk) = junk_setting().filter(|setting| *setting != "false") {
+            tracing::warn!(
+                opt_junk = junk,
+                config_debug = is_debug_build,
+                "the system jemalloc fills every allocation and free (opt.junk), a cost \
+                 charged to whatever called malloc and invisible in any profile. Measured \
+                 on a 128-core arm64 -CURRENT host: 20% of wall-clock. To fix: add \
+                 junk:false to this service's MALLOC_CONF, or point an /etc/malloc.conf \
+                 symlink at it to cover every process on the host.",
+            );
+        } else if is_debug_build {
+            // Deliberately not a warning. Junk filling is off, which is the
+            // half that cost 20%; what is left is the assertions, and the
+            // measurement in this function's docs bounds them: with them still
+            // compiled in, junk:false scored 227.7 s where mimalloc — which
+            // carries no jemalloc assertions at all — scored 231.2 s. An
+            // operator cannot drop them without rebuilding the host, and a
+            // warning that repeats on every start with no action behind it is
+            // one that teaches people to skip warnings.
+            tracing::info!(
+                config_debug = true,
+                "the system jemalloc still carries its debug assertions; junk filling, the \
+                 costly half, is already off. A MALLOC_PRODUCTION world drops the rest.",
+            );
         }
-        // One line, not one per condition: this fires on every start on a
-        // -CURRENT host, and the operator's next move is the same either way.
-        let remedy = if junk.is_some() {
-            "add junk:false to MALLOC_CONF"
-        } else {
-            "build world with MALLOC_PRODUCTION to drop the assertions too"
-        };
-        tracing::warn!(
-            opt_junk = junk.unwrap_or("false"),
-            config_debug = is_debug_build,
-            "the system jemalloc is a debugging build, which taxes every allocation and \
-             free. Measured on a 128-core arm64 -CURRENT host: junk filling alone cost 20% \
-             of wall-clock. To fix: {remedy}.",
-        );
     }
 }
 

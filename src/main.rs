@@ -1546,7 +1546,7 @@ fn main() -> Result<()> {
     }
 
     warn_on_broken_freebsd_malloc_conf();
-    scan::heap_profile::warn_if_debug_allocator();
+    scan::heap_profile::report_debug_allocator();
 
     const RAYON_FALLBACK_THREADS: usize = 4;
     // Pool width depends on the host's shape. On a wide host, physical cores
