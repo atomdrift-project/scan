@@ -128,9 +128,10 @@ mod mimalloc_alloc {
 }
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use scan::OutputFormat;
 use scan::engine::DisplayFilter;
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -225,39 +226,46 @@ const WORKER_MAX_DEP_AGE_DAYS: u32 = 0;
 #[command(name = "atomscan")]
 #[command(version)]
 #[command(about = "Atomdrift Scan — context-free malware detection (ML + static analysis)")]
-#[command(group(
-    clap::ArgGroup::new("severity_level")
-        .args(["level"])
-        .conflicts_with_all(["threshold_suspicious", "threshold_hostile"])
-))]
+#[command(
+    after_help = "Bare paths run `path`: `atomscan ~/Downloads` is `atomscan path ~/Downloads`, \
+and takes every flag that subcommand accepts."
+)]
 struct Cli {
     /// Enable debug logging for Atomdrift Scan and cleave
-    #[arg(long)]
+    #[arg(long, global = true)]
     verbose: bool,
 
     /// Update models and traits before running (failures are non-fatal)
-    #[arg(short = 'u', long)]
+    #[arg(short = 'u', long, global = true)]
     update: bool,
 
     /// Disable the automatic rules/models refresh (on by default when the local
-    /// ruleset is over 24h stale). Also settable via `SCAN_NO_UPDATE`.
-    #[arg(long)]
+    /// ruleset is over 24h stale). Use when the local traits/models are
+    /// intentionally ahead of (or diverged from) the remote, e.g. local edits
+    /// that would block the pull. Also settable via `SCAN_NO_UPDATE`.
+    #[arg(long, global = true)]
     no_update: bool,
 
     /// Force light-background color theme
-    #[arg(long, conflicts_with = "dark")]
+    #[arg(long, global = true, conflicts_with = "dark")]
     light: bool,
 
     /// Force dark-background color theme
-    #[arg(long, conflicts_with = "light")]
+    #[arg(long, global = true, conflicts_with = "light")]
     dark: bool,
 
     /// Override model directory (default: auto-resolved from models repo)
-    #[arg(long)]
+    #[arg(long, global = true)]
     model_dir: Option<PathBuf>,
 
     /// Output format
-    #[arg(short, long, env = "SCAN_FORMAT", default_value = "terminal")]
+    #[arg(
+        short,
+        long,
+        global = true,
+        env = "SCAN_FORMAT",
+        default_value = "terminal"
+    )]
     format: OutputFormat,
 
     /// Scan mode: `fast` (bloom matching only), `balanced` (bloom short-circuits,
@@ -281,25 +289,32 @@ struct Cli {
     rizin_timeout_secs: u64,
 
     /// Override suspicious threshold (0.0-1.0); omit to use model's recommendation
-    #[arg(long)]
+    #[arg(long, global = true)]
     threshold_suspicious: Option<f32>,
 
     /// Override hostile threshold (0.0-1.0); omit to use model's recommendation
-    #[arg(long)]
+    #[arg(long, global = true)]
     threshold_hostile: Option<f32>,
 
     /// Tune thresholds for false-positive level N (0-25000, FP per 100M benigns): higher = more sensitive, noisier. Bundle decides which levels are calibrated.
-    #[arg(short = 'l', long, value_name = "N", value_parser = clap::value_parser!(u16).range(0..=25000), global = true)]
+    #[arg(
+        short = 'l',
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u16).range(0..=25000),
+        global = true,
+        conflicts_with_all = ["threshold_suspicious", "threshold_hostile"],
+    )]
     level: Option<u16>,
 
     /// Classifications to display in the terminal view: hostile, suspicious,
     /// sus, benign, all (comma-separated). The machine formats (json, tiny,
     /// interpret) emit every scanned file regardless.
-    #[arg(long, value_delimiter = ',', default_values = ["hostile", "sus"])]
+    #[arg(long, global = true, value_delimiter = ',', default_values = ["hostile", "sus"])]
     show: Vec<Show>,
 
     /// Show raw probability and SHAP feature values in terminal output
-    #[arg(long, hide = true)]
+    #[arg(long, global = true, hide = true)]
     extra: bool,
 
     /// [deprecated] Legacy on-switch for LLM interpretation; superseded by
@@ -634,9 +649,6 @@ struct Cli {
     )]
     fetch_max_total_size: u64,
 
-    /// Paths to files or directories to scan (shorthand for `scan path <paths...>`)
-    paths: Vec<PathBuf>,
-
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -854,6 +866,73 @@ fn cli_host_platform_only(cli: &Cli, scans_for_other_hosts: bool) -> bool {
 /// two flags conflict, so at most one arm can fire.
 fn cli_transitive_deps(cli: &Cli, scans_for_other_hosts: bool) -> bool {
     cli.fetch_transitive_deps || (!cli.fetch_direct_deps_only && scans_for_other_hosts)
+}
+
+/// The subcommand a bare `atomscan <path>` stands for.
+const DEFAULT_SUBCOMMAND: &str = "fs";
+
+/// Rewrite a command line so bare paths run the file scanner with every flag
+/// `fs` accepts.
+///
+/// clap resolves a flag against the command it is typed under, so `--upload`,
+/// which belongs to `fs` rather than to the top-level command, was rejected
+/// outright in the shorthand form — and a second, hand-built `Commands::Path`
+/// had to guess the rest from the environment. Inserting the subcommand the
+/// shorthand stands for makes it a true alias: one parse, one set of flags, no
+/// second construction path to keep in sync.
+///
+/// Declined when the line already names a subcommand, asks for help or version,
+/// or carries nothing that could be a path; each of those means the top-level
+/// parser, which still owns the globals, should see the line as typed.
+fn with_default_subcommand<I, T>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let Some((program, rest)) = args.split_first() else {
+        return args;
+    };
+    // Everything after `--` is a value by definition, so a subcommand name can
+    // only appear before it.
+    let named = rest
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .filter_map(|arg| arg.to_str());
+    let mut subcommands = Cli::command();
+    let subcommands: Vec<&str> = subcommands
+        .get_subcommands_mut()
+        .flat_map(|sub| {
+            std::iter::once(sub.get_name()).chain(sub.get_all_aliases().collect::<Vec<_>>())
+        })
+        .collect();
+    for arg in named {
+        if subcommands.contains(&arg)
+            || matches!(arg, "help" | "-h" | "--help" | "-V" | "--version")
+        {
+            return args;
+        }
+    }
+    // No operand means nothing to scan: let the top-level parser answer, which
+    // is what prints the help for a bare `atomscan`.
+    let mut operands = rest
+        .iter()
+        .skip_while(|arg| *arg != "--")
+        .skip(1)
+        .peekable();
+    let has_operand = operands.peek().is_some()
+        || rest
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| !arg.as_encoded_bytes().starts_with(b"-"));
+    if !has_operand {
+        return args;
+    }
+    let mut rewritten = Vec::with_capacity(args.len() + 1);
+    rewritten.push(program.clone());
+    rewritten.push(OsString::from(DEFAULT_SUBCOMMAND));
+    rewritten.extend(rest.iter().cloned());
+    rewritten
 }
 
 /// Resolve the hopper destination consistently for every scan mode. Most
@@ -1156,13 +1235,6 @@ enum Commands {
         #[arg(long, default_value = "18", allow_hyphen_values = true)]
         nice: i32,
 
-        /// Skip the startup model/traits refresh (git pull), running against
-        /// whatever rules are already on disk. Use when the local traits/models
-        /// are intentionally ahead of (or diverged from) the remote, e.g. local
-        /// edits that would block the pull.
-        #[arg(long)]
-        no_update: bool,
-
         /// Skip the strict startup trait-validation gate. Use for benchmarking
         /// or dev runs against locally-edited (possibly not-yet-valid) traits;
         /// the analysis path tolerates lint-level issues the pre-flight rejects.
@@ -1365,7 +1437,7 @@ fn main() -> Result<()> {
         // SAFETY: argument parsing happens before this process starts threads.
         unsafe { std::env::set_var("SCAN_FOLLOW_DEPTH", value) };
     }
-    let mut cli = Cli::parse();
+    let mut cli = Cli::parse_from(with_default_subcommand(std::env::args_os()));
     // Install the process-wide Rizin budget before any analysis or Rayon worker
     // can start. Filefacts owns the subprocess lifecycle; Atomscan only selects
     // the deadline through this single global configuration point.
@@ -1424,25 +1496,12 @@ fn main() -> Result<()> {
         true,
     );
 
-    // Default to a file scan when bare paths are given without a subcommand.
     // Taken, not moved, so `cli` stays whole for `interpret_config` below.
-    let command = match cli.command.take() {
-        Some(cmd) => cmd,
-        None => {
-            if !cli.paths.is_empty() {
-                Commands::Path {
-                    paths: cli.paths.clone(),
-                    hopper: resolve_hopper(None),
-                    // Bare `scan <path>` bypasses clap's per-subcommand parsing, so
-                    // read the registry-map env var here too — this is the form
-                    // cyclotron's LLM agents run.
-                    registry_map: std::env::var_os("SCAN_REGISTRY_MAP").map(PathBuf::from),
-                }
-            } else {
-                Cli::parse_from(["scan", "--help"]);
-                std::process::exit(0);
-            }
-        }
+    // Bare paths already became `fs` in `with_default_subcommand`, so a missing
+    // subcommand here means an empty command line: print the help and stop.
+    let Some(command) = cli.command.take() else {
+        Cli::parse_from(["scan", "--help"]);
+        std::process::exit(0);
     };
 
     let is_serve = matches!(command, Commands::Serve { .. } | Commands::Worker { .. });
@@ -2064,7 +2123,6 @@ fn main() -> Result<()> {
             max_jobs,
             traits_dir,
             nice,
-            no_update,
             no_validate,
             exit_if_empty,
         } => {
@@ -2116,7 +2174,7 @@ fn main() -> Result<()> {
             // disconnected environment must still start with whatever is on disk.
             // `--no-update` skips the refresh; `--no-validate` skips the strict
             // pre-flight (benchmark / local-dev against on-disk rules as-is).
-            refresh_rules_at_startup(cli.update, no_update);
+            refresh_rules_at_startup(cli.update, cli.no_update);
             let model_dir = resolve_model_dir()?;
             let envelope_level = resolve_envelope_level(&model_dir);
             let thresholds = threshold_overrides();
@@ -2162,7 +2220,7 @@ fn main() -> Result<()> {
                 level: envelope_level,
                 nice,
                 exit_if_empty,
-                no_update,
+                no_update: cli.no_update,
                 interpret: interpret_cfg.clone(),
                 fetch: worker_fetch_policy,
                 zip_passwords: cli.zip_passwords.clone().into(),
@@ -2765,10 +2823,12 @@ mod tests {
         Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy,
         command_scans_for_other_hosts, default_cli_follow_policy, default_service_follow_policy,
         is_expected_yara_cache_mismatch, redact_zip_passwords, resolve_hopper_value,
-        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
+        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb, with_default_subcommand,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
+    use scan::OutputFormat;
+    use std::ffi::OsString;
     use std::net::SocketAddr;
     use std::num::NonZeroU64;
     use std::path::PathBuf;
@@ -2790,7 +2850,8 @@ mod tests {
 
     #[test]
     fn follow_defaults_to_references_and_dependencies() -> Result<()> {
-        let cli = Cli::try_parse_from(["scan", "/tmp/a"]).context("parse should work")?;
+        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
+            .context("parse should work")?;
         assert!(
             cli.follow.is_none(),
             "absence of --follow is resolved at startup"
@@ -2803,7 +2864,7 @@ mod tests {
             "CI actions never reach an installed artifact; auditing them is opt-in"
         );
         // A bare `--follow` must select exactly what an absent one resolves to.
-        let bare = Cli::try_parse_from(["scan", "--follow", "/tmp/a"])
+        let bare = Cli::try_parse_from(with_default_subcommand(["scan", "--follow", "/tmp/a"]))
             .context("bare --follow should parse")?
             .follow
             .context("bare --follow has a default_missing_value")?;
@@ -2867,7 +2928,8 @@ mod tests {
                 "{args:?} scans for other hosts and must take the wide follow default"
             );
         }
-        let interactive = Cli::try_parse_from(["scan", "/tmp/a"]).expect("path scan should parse");
+        let interactive = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
+            .expect("path scan should parse");
         assert!(
             !command_scans_for_other_hosts(interactive.command.as_ref()),
             "an interactive path scan keeps the narrow default"
@@ -2876,15 +2938,19 @@ mod tests {
 
     #[test]
     fn old_fetch_flag_and_target_names_remain_aliases() -> Result<()> {
-        let old = Cli::try_parse_from(["scan", "--fetch=deps,packages,urls,ci", "/tmp/a"])
-            .context("legacy --fetch vocabulary should parse")?
-            .follow
-            .context("legacy --fetch should select a policy")?;
-        let new = Cli::try_parse_from([
+        let old = Cli::try_parse_from(with_default_subcommand([
+            "scan",
+            "--fetch=deps,packages,urls,ci",
+            "/tmp/a",
+        ]))
+        .context("legacy --fetch vocabulary should parse")?
+        .follow
+        .context("legacy --fetch should select a policy")?;
+        let new = Cli::try_parse_from(with_default_subcommand([
             "scan",
             "--follow=dependencies,references,ci-actions",
             "/tmp/a",
-        ])
+        ]))
         .context("canonical --follow vocabulary should parse")?
         .follow
         .context("canonical --follow should select a policy")?;
@@ -2894,15 +2960,26 @@ mod tests {
 
     #[test]
     fn rizin_timeout_defaults_to_ten_minutes_and_is_overridable() -> Result<()> {
-        let default =
-            Cli::try_parse_from(["scan", "/tmp/a"]).context("default timeout should parse")?;
+        let default = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
+            .context("default timeout should parse")?;
         assert_eq!(default.rizin_timeout_secs, DEFAULT_RIZIN_TIMEOUT_SECS);
 
-        let overridden = Cli::try_parse_from(["scan", "--rizin-timeout-secs", "42", "/tmp/a"])
-            .context("timeout override should parse")?;
+        let overridden = Cli::try_parse_from(with_default_subcommand([
+            "scan",
+            "--rizin-timeout-secs",
+            "42",
+            "/tmp/a",
+        ]))
+        .context("timeout override should parse")?;
         assert_eq!(overridden.rizin_timeout_secs, 42);
         assert!(
-            Cli::try_parse_from(["scan", "--rizin-timeout-secs", "0", "/tmp/a"]).is_err(),
+            Cli::try_parse_from(with_default_subcommand([
+                "scan",
+                "--rizin-timeout-secs",
+                "0",
+                "/tmp/a"
+            ]))
+            .is_err(),
             "zero would disable the hard deadline and must be rejected"
         );
         Ok(())
@@ -2910,7 +2987,8 @@ mod tests {
 
     #[test]
     fn dependency_platform_scope_follows_scanner_role() -> Result<()> {
-        let default = Cli::try_parse_from(["scan", "/tmp/a"]).context("default should parse")?;
+        let default = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
+            .context("default should parse")?;
         assert!(
             super::cli_host_platform_only(
                 &default,
@@ -2922,12 +3000,20 @@ mod tests {
             scan::fetch::FetchPolicy::default().host_platform_only,
             "library and CLI defaults must agree"
         );
-        let compatible = Cli::try_parse_from(["scan", "--fetch-all-platforms", "/tmp/a"])
-            .context("all-platforms opt-in should parse")?;
+        let compatible = Cli::try_parse_from(with_default_subcommand([
+            "scan",
+            "--fetch-all-platforms",
+            "/tmp/a",
+        ]))
+        .context("all-platforms opt-in should parse")?;
         assert!(!super::cli_host_platform_only(&compatible, false));
 
-        let host_only = Cli::try_parse_from(["scan", "--fetch-host-platform-only", "/tmp/a"])
-            .context("host-only opt-out should parse")?;
+        let host_only = Cli::try_parse_from(with_default_subcommand([
+            "scan",
+            "--fetch-host-platform-only",
+            "/tmp/a",
+        ]))
+        .context("host-only opt-out should parse")?;
         assert!(super::cli_host_platform_only(&host_only, true));
 
         for daemon in [
@@ -2947,13 +3033,87 @@ mod tests {
 
     #[test]
     fn bare_paths_default_to_scan_shorthand() -> Result<()> {
-        let cli = Cli::try_parse_from(["scan", "/tmp/a", "/tmp/b"]).context("parse should work")?;
-        assert_eq!(
-            cli.paths,
-            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
-        );
-        assert!(cli.command.is_none());
+        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a", "/tmp/b"]))
+            .context("parse should work")?;
+        match cli.command.context("fs subcommand expected")? {
+            Commands::Path { paths, .. } => assert_eq!(
+                paths,
+                vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+            ),
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
         Ok(())
+    }
+
+    /// The shorthand is the form operators and agents actually type, and every
+    /// flag `fs` accepts has to survive it — `--upload` was rejected outright
+    /// before the line was rewritten into a real subcommand.
+    #[test]
+    fn shorthand_accepts_every_fs_flag() -> Result<()> {
+        let cli = Cli::try_parse_from(with_default_subcommand([
+            "scan",
+            "--upload",
+            "http://hopper:8081",
+            "--registry-map",
+            "/tmp/map.json",
+            "--format",
+            "json",
+            "/tmp/a",
+        ]))
+        .context("parse should work")?;
+        assert_eq!(cli.format, OutputFormat::Json);
+        match cli.command.context("fs subcommand expected")? {
+            Commands::Path {
+                paths,
+                hopper,
+                registry_map,
+            } => {
+                assert_eq!(paths, vec![PathBuf::from("/tmp/a")]);
+                assert_eq!(hopper.as_deref(), Some("http://hopper:8081"));
+                assert_eq!(registry_map, Some(PathBuf::from("/tmp/map.json")));
+            }
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn default_subcommand_declines_lines_that_name_their_own() {
+        for line in [
+            vec!["scan", "fs", "/tmp/a"],
+            vec!["scan", "purl", "pkg:npm/left-pad@1.3.0"],
+            vec!["scan", "serve"],
+            vec!["scan", "help"],
+            vec!["scan", "--help"],
+            vec!["scan", "--version"],
+            vec!["scan"],
+            vec!["scan", "--verbose"],
+        ] {
+            assert_eq!(
+                with_default_subcommand(line.clone()),
+                line.iter().map(OsString::from).collect::<Vec<_>>(),
+                "{line:?} should reach the top-level parser as typed",
+            );
+        }
+    }
+
+    #[test]
+    fn default_subcommand_inserts_before_operands() {
+        assert_eq!(
+            with_default_subcommand(["scan", "-f", "json", "/tmp/a"]),
+            ["scan", "fs", "-f", "json", "/tmp/a"]
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+        );
+        // `--` marks the operand, so a path spelled like a flag still scans.
+        assert_eq!(
+            with_default_subcommand(["scan", "--", "-weird-name"]),
+            ["scan", "fs", "--", "-weird-name"]
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]
@@ -2975,8 +3135,8 @@ mod tests {
 
     #[test]
     fn fs_subcommand_accepts_multiple_paths() -> Result<()> {
-        let cli =
-            Cli::try_parse_from(["scan", "fs", "/tmp/a", "/tmp/b"]).context("parse should work")?;
+        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "fs", "/tmp/a", "/tmp/b"]))
+            .context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
             Commands::Path { paths, .. } => {
                 assert_eq!(
@@ -2992,8 +3152,14 @@ mod tests {
     #[test]
     fn fs_hopper_flag_and_upload_alias_parse() -> Result<()> {
         for flag in ["--hopper", "--upload"] {
-            let cli = Cli::try_parse_from(["scan", "fs", flag, "http://hopper:8081", "/tmp/a"])
-                .context("parse should work")?;
+            let cli = Cli::try_parse_from(with_default_subcommand([
+                "scan",
+                "fs",
+                flag,
+                "http://hopper:8081",
+                "/tmp/a",
+            ]))
+            .context("parse should work")?;
             match cli.command.context("fs subcommand expected")? {
                 Commands::Path { paths, hopper, .. } => {
                     assert_eq!(paths, vec![PathBuf::from("/tmp/a")]);
@@ -3036,7 +3202,8 @@ mod tests {
 
     #[test]
     fn fs_without_hopper_defaults_to_none() -> Result<()> {
-        let cli = Cli::try_parse_from(["scan", "fs", "/tmp/a"]).context("parse should work")?;
+        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "fs", "/tmp/a"]))
+            .context("parse should work")?;
         match cli.command.context("fs subcommand expected")? {
             Commands::Path { hopper, .. } => assert!(hopper.is_none()),
             other => anyhow::bail!("unexpected command: {other:?}"),
@@ -3047,7 +3214,7 @@ mod tests {
     #[test]
     fn path_subcommand_and_its_aliases_resolve() -> Result<()> {
         for name in ["path", "fs", "scan"] {
-            let cli = Cli::try_parse_from(["scan", name, "/tmp/a"])
+            let cli = Cli::try_parse_from(with_default_subcommand(["scan", name, "/tmp/a"]))
                 .with_context(|| format!("parse of `{name}` should work"))?;
             match cli
                 .command
@@ -3177,32 +3344,50 @@ mod tests {
 
     #[test]
     fn level_flag_parses_and_shortcuts_removed() -> Result<()> {
-        let cli =
-            Cli::try_parse_from(["scan", "-l", "100", "/tmp/a"]).context("-l 100 should parse")?;
+        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "-l", "100", "/tmp/a"]))
+            .context("-l 100 should parse")?;
         assert_eq!(cli.level, Some(100));
 
-        let cli = Cli::try_parse_from(["scan", "--level", "12", "/tmp/a"])
+        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "--level", "12", "/tmp/a"]))
             .context("--level 12 should parse")?;
         assert_eq!(cli.level, Some(12));
 
         // Out-of-range rejected (0..=25000, per-100M since the per-million migration).
-        assert!(Cli::try_parse_from(["scan", "-l", "25001", "/tmp/a"]).is_err());
-        // --level still conflicts with explicit thresholds.
         assert!(
-            Cli::try_parse_from(["scan", "-l", "10", "--threshold-hostile", "0.5", "/tmp/a"])
+            Cli::try_parse_from(with_default_subcommand(["scan", "-l", "25001", "/tmp/a"]))
                 .is_err()
         );
+        // --level still conflicts with explicit thresholds.
+        assert!(
+            Cli::try_parse_from(with_default_subcommand([
+                "scan",
+                "-l",
+                "10",
+                "--threshold-hostile",
+                "0.5",
+                "/tmp/a"
+            ]))
+            .is_err()
+        );
         // The numeric shortcuts and their aliases were removed.
-        assert!(Cli::try_parse_from(["scan", "-5", "/tmp/a"]).is_err());
-        assert!(Cli::try_parse_from(["scan", "--loose", "/tmp/a"]).is_err());
-        assert!(Cli::try_parse_from(["scan", "--paranoid", "/tmp/a"]).is_err());
+        assert!(Cli::try_parse_from(with_default_subcommand(["scan", "-5", "/tmp/a"])).is_err());
+        assert!(
+            Cli::try_parse_from(with_default_subcommand(["scan", "--loose", "/tmp/a"])).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(with_default_subcommand(["scan", "--paranoid", "/tmp/a"])).is_err()
+        );
         Ok(())
     }
 
     #[test]
     fn gzip_long_aliases_are_not_accepted() {
-        assert!(Cli::try_parse_from(["scan", "--fast", "/tmp/a"]).is_err());
-        assert!(Cli::try_parse_from(["scan", "--best", "/tmp/a"]).is_err());
+        assert!(
+            Cli::try_parse_from(with_default_subcommand(["scan", "--fast", "/tmp/a"])).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(with_default_subcommand(["scan", "--best", "/tmp/a"])).is_err()
+        );
     }
 
     #[test]
@@ -3232,14 +3417,14 @@ mod tests {
 
     #[test]
     fn archive_password_flag_is_repeatable_and_global() -> Result<()> {
-        let cli = Cli::try_parse_from([
+        let cli = Cli::try_parse_from(with_default_subcommand([
             "atomscan",
             "path",
             "/tmp/a",
             "--zip-password",
             "one",
             "--zip-password=two",
-        ])?;
+        ]))?;
 
         assert_eq!(cli.zip_passwords, ["one", "two"]);
         Ok(())
@@ -3263,9 +3448,18 @@ mod tests {
 
     #[test]
     fn severity_level_flags_conflict_with_each_other_and_manual_thresholds() {
-        assert!(Cli::try_parse_from(["scan", "-1", "-9", "/tmp/a"]).is_err());
         assert!(
-            Cli::try_parse_from(["scan", "-9", "--threshold-hostile", "0.90", "/tmp/a"]).is_err()
+            Cli::try_parse_from(with_default_subcommand(["scan", "-1", "-9", "/tmp/a"])).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(with_default_subcommand([
+                "scan",
+                "-9",
+                "--threshold-hostile",
+                "0.90",
+                "/tmp/a"
+            ]))
+            .is_err()
         );
     }
 
@@ -3304,14 +3498,14 @@ mod tests {
     fn openrouter_alias_requires_key_and_defaults_model() -> Result<()> {
         let empty_home = tempfile::tempdir()?;
         with_isolated_llm_env(Some(empty_home.path()), || {
-            let missing_key = Cli::try_parse_from([
+            let missing_key = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "openrouter",
                 "--llm-model",
                 "qwen/qwen3.8-27b",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let err = missing_key
                 .interpret_config()
                 .expect_err("openrouter without a key must fail");
@@ -3320,20 +3514,20 @@ mod tests {
                 "unexpected error: {err}"
             );
 
-            let missing_model = Cli::try_parse_from([
+            let missing_model = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "openrouter",
                 "--llm-key",
                 "sk-test",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let cfg = missing_model
                 .interpret_config()?
                 .context("openrouter without a pinned model should default to auto")?;
             assert_eq!(cfg.model, scan::interpret::OPENROUTER_DEFAULT_MODEL);
 
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "openrouter",
@@ -3342,7 +3536,7 @@ mod tests {
                 "--llm-key",
                 "sk-test",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let cfg = cli
                 .interpret_config()?
                 .context("openrouter with model+key should enable interpret")?;
@@ -3399,14 +3593,14 @@ mod tests {
         with_isolated_llm_env(Some(dir.path()), || {
             // Alone, OpenRouter without its own key is the same hard error it
             // has always been — not a silent borrow of the vLLM token.
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "openrouter",
                 "--llm-model",
                 "qwen/qwen3.8-27b",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let err = cli
                 .interpret_config()
                 .expect_err("~/.tok/llm must not satisfy OpenRouter");
@@ -3425,14 +3619,14 @@ mod tests {
         with_isolated_llm_env(Some(dir.path()), || {
             // The shape we deploy by default. Both models pinned so the test
             // resolves without touching the network.
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "https://llm.isotope13.ai/v1,openrouter",
                 "--llm-model",
                 "Qwen/Qwen3.8-27B,qwen/qwen3.8-27b",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let cfg = cli.interpret_config()?.context("chain should resolve")?;
             assert_eq!(cfg.base_url, "https://llm.isotope13.ai/v1");
             assert_eq!(cfg.model, "Qwen/Qwen3.8-27B");
@@ -3463,14 +3657,14 @@ mod tests {
             // (its model would default to `openrouter/auto`, but the missing
             // key still drops it); the same config with OpenRouter *alone* is
             // a hard error (see openrouter_alias_requires_key_and_defaults_model).
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "https://llm.isotope13.ai/v1,openrouter",
                 "--llm-model",
                 "Qwen/Qwen3.8-27B",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let cfg = cli.interpret_config()?.context("primary should stand")?;
             assert_eq!(cfg.base_url, "https://llm.isotope13.ai/v1");
             assert!(
@@ -3489,12 +3683,12 @@ mod tests {
         with_isolated_llm_env(Some(empty_home.path()), || {
             // Port 1 refuses immediately, so discovery fails without a wait;
             // the OpenRouter slot has neither key nor model.
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "http://127.0.0.1:1/v1,openrouter",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let err = cli
                 .interpret_config()
                 .expect_err("no endpoint is usable here");
@@ -3515,21 +3709,21 @@ mod tests {
         with_isolated_llm_env(Some(dir.path()), || {
             // A pinned model keeps this off the network: an unpinned one would
             // probe the endpoint for its catalog.
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "http://interpret:8000/v1",
                 "--llm-model",
                 "Qwen/Qwen3.8-27B",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let cfg = cli
                 .interpret_config()?
                 .context("~/.tok/llm should supply the key")?;
             assert_eq!(cfg.api_key.as_deref(), Some("sk-vllm-file"));
 
             // An explicit key still wins over the file.
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "http://interpret:8000/v1",
@@ -3538,7 +3732,7 @@ mod tests {
                 "--llm-key",
                 "sk-flag",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let cfg = cli.interpret_config()?.context("explicit key")?;
             assert_eq!(cfg.api_key.as_deref(), Some("sk-flag"));
             Ok(())
@@ -3553,14 +3747,14 @@ mod tests {
         std::fs::write(tok.join("llm"), "sk-vllm-file\n")?;
         std::fs::write(tok.join("openrouter"), "sk-openrouter-file\n")?;
         with_isolated_llm_env(Some(dir.path()), || {
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "openrouter",
                 "--llm-model",
                 "qwen/qwen3.8-27b",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let cfg = cli.interpret_config()?.context("openrouter key")?;
             assert_eq!(cfg.api_key.as_deref(), Some("sk-openrouter-file"));
             Ok(())
@@ -3571,14 +3765,14 @@ mod tests {
     fn no_tok_llm_file_leaves_the_endpoint_unauthenticated() -> Result<()> {
         let empty_home = tempfile::tempdir()?;
         with_isolated_llm_env(Some(empty_home.path()), || {
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "http://interpret:8000/v1",
                 "--llm-model",
                 "Qwen/Qwen3.8-27B",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let cfg = cli.interpret_config()?.context("local target")?;
             assert_eq!(cfg.api_key, None);
             Ok(())
@@ -3592,14 +3786,14 @@ mod tests {
         std::fs::create_dir(&tok)?;
         std::fs::write(tok.join("openrouter"), "sk-from-file\n")?;
         with_isolated_llm_env(Some(dir.path()), || {
-            let cli = Cli::try_parse_from([
+            let cli = Cli::try_parse_from(with_default_subcommand([
                 "atomscan",
                 "--llm",
                 "openrouter",
                 "--llm-model",
                 "qwen/qwen3.8-27b",
                 "/tmp/a",
-            ])?;
+            ]))?;
             let cfg = cli
                 .interpret_config()?
                 .context("tok file should supply key")?;

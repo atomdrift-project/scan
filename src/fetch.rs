@@ -2363,23 +2363,13 @@ pub(crate) fn graft_root_registry(report: &mut AnalysisReport, reg: &Registry) {
     apply_package_composites(report, &root_sha, &artifact, &registry, &opts);
 }
 
-/// Print and log a package's normalized registry metadata for the one-shot
-/// `pkg`/`url` scan path, so the operator sees the registry's own account of an
-/// artifact (age, author, popularity, deprecation) beside the scan of its bytes.
-pub fn report_registry(reg: &Registry, progress: bool) {
-    tracing::info!(
-        ecosystem = %reg.ecosystem,
-        package = %reg.name,
-        version = %reg.version,
-        age_days = reg.age_days,
-        author = reg.author.as_deref(),
-        downloads = reg.downloads_recent.or(reg.downloads_total),
-        deprecated = reg.deprecated.as_deref(),
-        "package registry metadata"
-    );
-    if !progress {
-        return;
-    }
+/// The registry's account of a package as display fields: version, age, author,
+/// popularity, rating, license, and any deprecation notice.
+///
+/// One reader for both places a scan states them — the one-shot `pkg`/`url`
+/// banner and the card of a locally collected sample — so the same package
+/// reads the same way whichever way it was reached.
+pub(crate) fn registry_summary(reg: &Registry) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     if !reg.version.is_empty() {
         parts.push(format!("v{}", reg.version.trim_start_matches('v')));
@@ -2402,6 +2392,27 @@ pub fn report_registry(reg: &Registry, progress: bool) {
     if let Some(dep) = &reg.deprecated {
         parts.push(format!("\u{26a0} {dep}"));
     }
+    parts
+}
+
+/// Print and log a package's normalized registry metadata for the one-shot
+/// `pkg`/`url` scan path, so the operator sees the registry's own account of an
+/// artifact (age, author, popularity, deprecation) beside the scan of its bytes.
+pub fn report_registry(reg: &Registry, progress: bool) {
+    tracing::info!(
+        ecosystem = %reg.ecosystem,
+        package = %reg.name,
+        version = %reg.version,
+        age_days = reg.age_days,
+        author = reg.author.as_deref(),
+        downloads = reg.downloads_recent.or(reg.downloads_total),
+        deprecated = reg.deprecated.as_deref(),
+        "package registry metadata"
+    );
+    if !progress {
+        return;
+    }
+    let parts = registry_summary(reg);
     eprintln!(
         "\n  \x1b[38;2;180;160;255m\u{24d8}\x1b[0m  \x1b[38;2;160;160;160mregistry\x1b[0m \x1b[2m{}\x1b[0m",
         reg.ecosystem
