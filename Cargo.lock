@@ -1965,7 +1965,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "1.2.0"
-source = "git+https://github.com/atomdrift-project/fletch.git#725cd2e86c48c61ab4ba73d1be494e5a7f5eebe4"
+source = "git+https://github.com/atomdrift-project/fletch.git#a009399526d59af098cc5cf665a2170552d147e0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1981,6 +1981,7 @@ dependencies = [
  "roxmltree",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
  "sha2 0.11.0",
  "tar",
  "thiserror 2.0.20",
@@ -2406,9 +2407,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.14"
+version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
+checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
 ]

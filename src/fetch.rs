@@ -782,27 +782,29 @@ fn valid_discovered_url_host(url: &str) -> bool {
 }
 
 /// Whether a discovered URL still contains a source-template placeholder.
-/// These commonly appear in documentation or client code as repository and
-/// release examples (`$REPO`, `${this.repositoryId}`, `$VERSION`); fetching
-/// them can only produce an avoidable 4xx response.
+/// These appear in documentation and client code as repository and release
+/// examples; fetching one can only produce an avoidable 4xx.
+///
+/// Three spellings, and the argument for the last two is the same: RFC 3986
+/// admits neither a bare brace nor a `%` outside a two-hex-digit escape, so an
+/// unencoded one is never a literal a server could serve — it is a slot some
+/// renderer was supposed to fill. Recognizing only the shell `$` form let a
+/// build script's `.../download/v{version}/{}` through to five certain 404s.
 fn has_unexpanded_url_placeholder(url: &str) -> bool {
-    let contains_placeholder = |part: &str| {
-        let bytes = part.as_bytes();
-        bytes.windows(2).any(|window| {
-            window[0] == b'$'
-                && (window[1] == b'{' || window[1].is_ascii_alphabetic() || window[1] == b'_')
-        })
-    };
-    if contains_placeholder(url) {
-        return true;
-    }
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    [Some(parsed.path()), parsed.query()]
-        .into_iter()
-        .flatten()
-        .any(contains_placeholder)
+    // `$VERSION`, `${this.repositoryId}`
+    let shell = url.as_bytes().windows(2).any(|pair| {
+        pair[0] == b'$' && (pair[1] == b'{' || pair[1].is_ascii_alphabetic() || pair[1] == b'_')
+    });
+    // `{version}`, `{}`
+    let brace = url.contains(['{', '}']);
+    // `%s`, `%d`, Python's `%(version)s`
+    let printf = url.split('%').skip(1).any(|after| {
+        !after
+            .as_bytes()
+            .get(..2)
+            .is_some_and(|escape| escape.iter().all(u8::is_ascii_hexdigit))
+    });
+    shell || brace || printf
 }
 
 /// Whether an IP literal is publicly routable enough to justify a discovered
@@ -901,6 +903,12 @@ fn looks_like_dropper_download_url(url: &str) -> bool {
             && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
             && !NON_PAYLOAD_URL_EXTENSIONS.contains(&extension)
     });
+    // A download route names the file that follows it, so the route word
+    // cannot also be the basename: `/repos/o/r/releases` is the listing API,
+    // not the asset, and unauthenticated it only ever answers 403.
+    if DOWNLOAD_URL_PATH_COMPONENTS.contains(&filename_lower.as_str()) {
+        return false;
+    }
     let explicit_download_path = components.iter().any(|component| {
         DOWNLOAD_URL_PATH_COMPONENTS.contains(&component.to_ascii_lowercase().as_str())
     });
@@ -1861,6 +1869,10 @@ enum Reporter {
         external_dependencies: AtomicU32,
         external_urls: AtomicU32,
         budget_notice: AtomicBool,
+        /// Rows already printed, as `outcome + target`. One dependency named by
+        /// forty manifests is one fact, and a scan of a monorepo was spending
+        /// most of its output restating it.
+        printed: std::sync::Mutex<HashSet<String>>,
     },
     Tree {
         tree: DepTree,
@@ -1880,6 +1892,7 @@ impl Reporter {
                 external_dependencies: AtomicU32::new(0),
                 external_urls: AtomicU32::new(0),
                 budget_notice: AtomicBool::new(false),
+                printed: std::sync::Mutex::new(HashSet::new()),
             },
             |tree| Self::Tree {
                 tree,
@@ -1984,8 +1997,32 @@ impl Reporter {
             if matches!(rec.outcome, Outcome::Ok) {
                 return;
             }
+            if !self.claim_row(rec) {
+                return;
+            }
             crate::engine::print_above_bar(|| report_fetch(rec));
         }
+    }
+
+    /// Whether this row is the first of its kind, claiming it if so. A row is
+    /// its outcome over its target, because that pair is the whole of what the
+    /// line says: one dependency named by forty manifests fails identically
+    /// forty times, and a scan of a monorepo was spending most of its output
+    /// restating it. Non-stream reporters never dedup — the tree already keys
+    /// its rows by locator, and `Off` prints nothing.
+    fn claim_row(&self, rec: &FetchRecord) -> bool {
+        let Self::Stream { printed, .. } = self else {
+            return true;
+        };
+        let target = if rec.resolved_url.is_empty() {
+            rec.locator.as_str()
+        } else {
+            rec.resolved_url.as_str()
+        };
+        printed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(format!("{:?}\x1f{target}", rec.outcome))
     }
 
     /// A payload finished analysis: settle its row to the final fetch glyph
@@ -4268,6 +4305,45 @@ mod tests {
         assert_eq!(label, "pin?");
     }
 
+    /// One dependency named by forty manifests fails identically forty times.
+    /// The streamed log states each distinct outcome once; the tree, which
+    /// already keys its rows by locator, and `Off`, which prints nothing, do
+    /// not filter.
+    #[test]
+    fn the_streamed_log_states_each_distinct_row_once() {
+        let stream = Reporter::Stream {
+            external_dependencies: AtomicU32::new(0),
+            external_urls: AtomicU32::new(0),
+            budget_notice: AtomicBool::new(false),
+            printed: std::sync::Mutex::new(HashSet::new()),
+        };
+
+        let mut rec = fetched_record();
+        rec.outcome = Outcome::Failed("http status 404".to_string());
+        assert!(stream.claim_row(&rec), "the first row must print");
+        assert!(!stream.claim_row(&rec), "a repeat of it must not");
+
+        // A different outcome over the same target is a different fact.
+        let mut other_outcome = rec.clone();
+        other_outcome.outcome = Outcome::UnverifiablePin;
+        assert!(stream.claim_row(&other_outcome));
+
+        // So is the same outcome over a different target.
+        let mut other_target = rec.clone();
+        other_target.resolved_url = "https://registry.test/other-1.0.0.tgz".to_string();
+        assert!(stream.claim_row(&other_target));
+
+        // A record that never resolved is keyed by its locator instead, so two
+        // unresolved locators do not collapse into one row.
+        let mut bare = rec.clone();
+        bare.resolved_url = String::new();
+        assert!(stream.claim_row(&bare));
+        assert!(!stream.claim_row(&bare));
+
+        assert!(Reporter::Off.claim_row(&rec));
+        assert!(Reporter::Off.claim_row(&rec));
+    }
+
     #[test]
     fn budget_notice_names_the_limiting_count_flag() {
         assert_eq!(
@@ -4607,7 +4683,59 @@ mod tests {
                 "unexpanded template was not recognized: {url}"
             );
         }
-        assert!(!has_unexpanded_url_placeholder(
+        // Brace templates, the form a build script or Rust `format!` leaves
+        // behind, are placeholders too.
+        for url in [
+            "https://github.com/solana-labs/solana/releases/download/v{version}/",
+            "https://github.com/anza-xyz/platform-tools/releases/download/{version}/{}",
+            "https://github.com/otter-sec/anchor/releases/download/v{version}/anchor-{target}{ext}",
+        ] {
+            assert!(
+                has_unexpanded_url_placeholder(url),
+                "unexpanded template was not recognized: {url}"
+            );
+        }
+        // printf-family templates, which reach a URL through a `format!` or an
+        // f-string that was never applied.
+        for url in [
+            "https://evil.test/download/%s/tool.tar.gz",
+            "https://evil.test/releases/%(version)s/tool.tar.gz",
+            "https://evil.test/v%d/tool.tar.gz",
+        ] {
+            assert!(
+                has_unexpanded_url_placeholder(url),
+                "unexpanded template was not recognized: {url}"
+            );
+        }
+        // A real percent-escape is not a placeholder.
+        for url in [
+            "https://github.com/atomdrift-project/scan/releases/download/v2.8.0/atomscan",
+            "https://evil.test/path%20with%20spaces/tool.tar.gz",
+            "https://registry.npmjs.org/%40scope/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            assert!(
+                !has_unexpanded_url_placeholder(url),
+                "a well-formed URL was rejected as a template: {url}"
+            );
+        }
+    }
+
+    /// A download route names the file after it. When the route word *is* the
+    /// last component the URL is a listing endpoint, and fetching it costs a
+    /// round trip to learn nothing.
+    #[test]
+    fn a_download_route_as_the_basename_is_a_listing_endpoint() {
+        for url in [
+            "https://api.github.com/repos/otter-sec/anchor/releases",
+            "https://example.test/project/downloads",
+            "https://example.test/bucket/files",
+        ] {
+            assert!(
+                !looks_like_dropper_download_url(url),
+                "listing endpoint accepted as a download: {url}"
+            );
+        }
+        assert!(looks_like_dropper_download_url(
             "https://github.com/atomdrift-project/scan/releases/download/v2.8.0/atomscan"
         ));
     }
