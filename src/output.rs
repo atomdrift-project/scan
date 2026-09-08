@@ -482,6 +482,26 @@ pub(crate) fn terminal_identity_line(identity: &str) -> Option<String> {
     })
 }
 
+/// The registry's account of the package, beneath its identity. Carries the
+/// same ⓘ glyph and the same fields the one-shot `pkg`/`url` banner prints, so
+/// a package reads the same way whether it was fetched by coordinate or scanned
+/// from a collected copy.
+pub(crate) fn terminal_registry_line(summary: &str) -> Option<String> {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return None;
+    }
+    Some(if colored::control::SHOULD_COLORIZE.should_colorize() {
+        format!(
+            "{}{}",
+            terminal_marker_prefix(1, "\u{24d8}"), // ⓘ
+            fg(palette().dim, summary)
+        )
+    } else {
+        format!("   {summary}")
+    })
+}
+
 /// One finding in the artifact-level terminal summary.
 pub(crate) struct TerminalTrait {
     pub(crate) criticality: cleave::Criticality,

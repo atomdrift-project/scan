@@ -2646,7 +2646,29 @@ fn discover_files(dir: &Path) -> Vec<PathBuf> {
         .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
         .map(|e| e.path().to_path_buf())
+        .filter(|p| !is_attached_sidecar(p))
         .collect()
+}
+
+/// Whether `path` is a collector's provenance sidecar sitting beside the
+/// artifact it describes.
+///
+/// A directory walk skips those. The sidecar is a record *about* the file next
+/// to it, not something anyone shipped: analyzing it spends a verdict on our own
+/// bookkeeping, and with `--hopper` files that bookkeeping as a sample in its own
+/// right — where it competes with the artifact it was written to describe.
+/// It is still read as provenance for that artifact (see
+/// [`crate::provenance::collector_sidecar`]), and naming one directly on the
+/// command line still scans it, which is what a scan of a suspect JSON file
+/// should do.
+fn is_attached_sidecar(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(artifact) = name.strip_suffix(crate::provenance::COLLECTOR_SIDECAR_SUFFIX) else {
+        return false;
+    };
+    !artifact.is_empty() && path.with_file_name(artifact).is_file()
 }
 
 /// The two distinct detection inventories shown in the banner. Bloom entries
@@ -3580,12 +3602,29 @@ pub(crate) fn collect_upload_artifacts(
             "",
         ),
     };
-    let sidecar = if let Some(provenance) = root_provenance {
-        crate::provenance::build_sidecar_from_provenance(
-            &root_name, sha256, size_bytes, collector, &now, url, purl, provenance,
-        )
-    } else {
-        crate::provenance::build_sidecar(
+    // A collector that fetched this file left its capture record beside it.
+    // That record holds the source URL and package identity the bytes came from
+    // — which a local scan cannot reconstruct, and which for a since-deleted
+    // package exists nowhere else — so it is uploaded as this artifact's
+    // provenance instead of the thin one built below. A fetched root has no such
+    // neighbour on disk, and an explicit `--registry-map` entry still wins.
+    let collected = root_fetch
+        .is_none()
+        .then(|| crate::provenance::collector_sidecar(file_path, &root_name, sha256, size_bytes))
+        .flatten();
+    let from_collector = collected.is_some();
+    let sidecar = match (root_provenance, collected) {
+        (Some(provenance), collected) => {
+            let supplied = crate::provenance::build_sidecar_from_provenance(
+                &root_name, sha256, size_bytes, collector, &now, url, purl, provenance,
+            );
+            match collected {
+                Some(collected) => crate::provenance::with_registry_from(&collected, &supplied),
+                None => supplied,
+            }
+        }
+        (None, Some(collected)) => collected,
+        (None, None) => crate::provenance::build_sidecar(
             &root_name,
             sha256,
             size_bytes,
@@ -3595,7 +3634,7 @@ pub(crate) fn collect_upload_artifacts(
             purl,
             None,
             &[],
-        )
+        ),
     };
     vec![UploadArtifact {
         sha256: sha256.to_string(),
@@ -3605,7 +3644,7 @@ pub(crate) fn collect_upload_artifacts(
         sidecar,
         // Registry data or a PURL identity is worth backfilling onto a sample
         // hopper already has; a plain local file's thin sidecar is not.
-        backfill: root_provenance.is_some() || !purl.is_empty(),
+        backfill: root_provenance.is_some() || from_collector || !purl.is_empty(),
     }]
 }
 
@@ -3658,6 +3697,88 @@ mod upload_artifact_tests {
             "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"
         );
         assert_eq!(sidecar["artifact"]["filename"], "lodash-4.17.21.tgz");
+    }
+
+    /// A collector's capture record is the only surviving account of where a
+    /// deleted package's bytes came from, so an upload must carry it rather than
+    /// the thin record a local scan can rebuild.
+    #[test]
+    fn local_root_uploads_the_collector_sidecar_beside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("evil-1.0.0.tgz");
+        std::fs::write(&artifact, b"bytes").expect("write artifact");
+        std::fs::write(
+            dir.path().join("evil-1.0.0.tgz.forage.json"),
+            serde_json::json!({
+                "schema_version": "1.0",
+                "artifact": {"filename": "evil-1.0.0.tgz", "sha256": "CC33", "size_bytes": 5},
+                "package": {"purl": "pkg:npm/evil@1.0.0", "ecosystem": "javascript"},
+                "fetch": {
+                    "collector": "forager",
+                    "category": "submitted",
+                    "at": "2026-09-08T10:06:05Z",
+                    "url": "https://socket.dev/npm/package/evil/files/1.0.0",
+                    "original_url": "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
+                },
+            })
+            .to_string(),
+        )
+        .expect("write sidecar");
+
+        let arts = collect_upload_artifacts(&artifact, "cc33", 5, "scan+test", None, None);
+        let art = &arts[0];
+        assert!(art.backfill, "collected provenance is worth backfilling");
+        let sidecar: serde_json::Value = serde_json::from_slice(&art.sidecar).unwrap();
+        assert_eq!(sidecar["fetch"]["collector"], "forager");
+        assert_eq!(
+            sidecar["fetch"]["url"],
+            "https://socket.dev/npm/package/evil/files/1.0.0"
+        );
+        assert_eq!(sidecar["package"]["purl"], "pkg:npm/evil@1.0.0");
+        assert_eq!(sidecar["artifact"]["sha256"], "cc33");
+        assert_eq!(sidecar["artifact"]["size_bytes"], 5);
+    }
+
+    #[test]
+    fn local_root_without_a_sidecar_still_uploads_a_thin_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("plain.bin");
+        std::fs::write(&artifact, b"bytes").expect("write artifact");
+        let arts = collect_upload_artifacts(&artifact, "dd44", 5, "scan+test", None, None);
+        assert!(!arts[0].backfill);
+        let sidecar: serde_json::Value = serde_json::from_slice(&arts[0].sidecar).unwrap();
+        assert_eq!(sidecar["fetch"]["collector"], "scan+test");
+        assert!(sidecar.get("package").is_none());
+    }
+
+    /// A directory of collected samples is the normal input, and its sidecars
+    /// describe the artifacts beside them — they are not themselves samples.
+    #[test]
+    fn directory_walk_skips_attached_sidecars_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in [
+            "evil-1.0.0.tgz",
+            "evil-1.0.0.tgz.forage.json",
+            "orphan.tgz.forage.json",
+            "notes.json",
+        ] {
+            std::fs::write(dir.path().join(name), b"{}").expect("write");
+        }
+        let mut found: Vec<String> = super::discover_files(dir.path())
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(String::from))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "evil-1.0.0.tgz".to_string(),
+                "notes.json".to_string(),
+                // Nothing on disk claims this one, so it is scanned like any
+                // other file rather than silently trusted.
+                "orphan.tgz.forage.json".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3911,9 +4032,21 @@ pub fn run_paths(
     {
         let record = |file_path: &Path, result: Result<cleave::AnalysisReport>, named: bool| {
             // Per-file provenance: match this artifact's content sha to its registry
-            // record in the map. A file with no entry simply scans without it.
-            let root_registry =
-                registry_map.and_then(|m| sha256_file_hex(file_path).and_then(|sha| m.get(&sha)));
+            // record in the map, and otherwise to the capture record a collector
+            // left beside it. Both are the registry's own account of the package,
+            // recovered without a refetch — which for a deleted release is the
+            // only way to have it at all — so a collected sample reasons over the
+            // same facts a live `purl` scan would. An explicit map still wins; a
+            // file with neither simply scans without registry provenance.
+            let sha = sha256_file_hex(file_path);
+            let mapped = registry_map
+                .zip(sha.as_deref())
+                .and_then(|(map, sha)| map.get(sha));
+            let collected = mapped
+                .is_none()
+                .then(|| crate::provenance::collector_registry(file_path, sha.as_deref()?))
+                .flatten();
+            let root_registry = mapped.or(collected.as_ref());
             record_file_result(
                 file_path,
                 result,
@@ -4230,6 +4363,34 @@ fn terminal_label_contains_identity(label: &str, identity: &str) -> bool {
             .any(|candidate| candidate == identity.as_slice())
 }
 
+/// The provenance rows a card can carry above its digest: what the artifact is,
+/// and what the registry said about it. Both are recovered from a collector's
+/// capture record or a `--registry-map`, and both are empty for a scan of a file
+/// nobody collected.
+#[derive(Debug, Default)]
+struct CardProvenance {
+    purl: Option<String>,
+    registry: Option<String>,
+}
+
+/// What the card claims this artifact *is*, in the row under its name.
+///
+/// The bytes come first: an identity cleave read out of the artifact is a
+/// property of the sample itself. A collected sample usually has none — a
+/// package tarball carries no self-description cleave admits, and its filename
+/// is just a filename — so the coordinate the collector recorded falls in
+/// behind it. Without that row a scan of a collected corpus never names the
+/// package it is judging, which is the one thing an operator needs to act on a
+/// verdict about a package that no longer exists to look up.
+fn card_identity(
+    report: &cleave::AnalysisReport,
+    label: &str,
+    collected: Option<&str>,
+) -> Option<String> {
+    terminal_identity_summary(report, label)
+        .or_else(|| collected.map(std::string::ToString::to_string))
+}
+
 fn terminal_identity_summary(report: &cleave::AnalysisReport, label: &str) -> Option<String> {
     let identity = report.files.first()?.identity.as_ref()?;
     let (what, title) = if let Some(claim) = &identity.title {
@@ -4466,6 +4627,7 @@ fn render_terminal_context(
     label: &str,
     bloom_mark: Option<crate::output::BloomMark>,
     member_evals: &MemberEvals,
+    collected: &CardProvenance,
 ) -> String {
     // The card frame, top-down: verdict rule → artifact → optional claimed
     // identity → SHA-256 → optional model reason → the three
@@ -4489,6 +4651,7 @@ fn render_terminal_context(
             label,
             bloom_mark,
             member_evals,
+            collected,
         )
     {
         return cards;
@@ -4526,11 +4689,19 @@ fn render_terminal_context(
         is_container,
     ));
     head.push('\n');
-    if let Some(identity) = terminal_identity_summary(report, label)
+    if let Some(identity) = card_identity(report, label, collected.purl.as_deref())
         .as_deref()
         .and_then(crate::output::terminal_identity_line)
     {
         head.push_str(&identity);
+        head.push('\n');
+    }
+    if let Some(registry) = collected
+        .registry
+        .as_deref()
+        .and_then(crate::output::terminal_registry_line)
+    {
+        head.push_str(&registry);
         head.push('\n');
     }
     if let Some(hash) = crate::output::terminal_hash_line(sha256, bloom_mark) {
@@ -4609,6 +4780,7 @@ fn render_archive_cards(
     label: &str,
     bloom_mark: Option<crate::output::BloomMark>,
     member_evals: &MemberEvals,
+    collected: &CardProvenance,
 ) -> Option<String> {
     let by_id: std::collections::HashMap<u32, &cleave::FileAnalysis> =
         report.files.iter().map(|f| (f.id, f)).collect();
@@ -4750,11 +4922,19 @@ fn render_archive_cards(
         label, file_type, size, true,
     ));
     out.push('\n');
-    if let Some(identity) = terminal_identity_summary(report, label)
+    if let Some(identity) = card_identity(report, label, collected.purl.as_deref())
         .as_deref()
         .and_then(crate::output::terminal_identity_line)
     {
         out.push_str(&identity);
+        out.push('\n');
+    }
+    if let Some(registry) = collected
+        .registry
+        .as_deref()
+        .and_then(crate::output::terminal_registry_line)
+    {
+        out.push_str(&registry);
         out.push('\n');
     }
     if let Some(hash) = crate::output::terminal_hash_line(sha256, bloom_mark) {
@@ -6073,6 +6253,20 @@ pub(crate) fn classify_report(
         primary.files.retain(|file| {
             fetched_root_id(file, &by_id).is_none() && !registry_ids.contains(&file.id)
         });
+        // What provenance says about this file, for the card's rows. A fetched
+        // root is skipped: `pkg`/`url` already printed the registry banner
+        // before the fetch, and its card would only repeat it.
+        let collected = if root_fetch.is_some() {
+            CardProvenance::default()
+        } else {
+            CardProvenance {
+                purl: crate::provenance::collector_purl(root_path, &sha256),
+                registry: root_registry
+                    .map(|provenance| crate::fetch::registry_summary(&provenance.record))
+                    .filter(|parts| !parts.is_empty())
+                    .map(|parts| parts.join(" \u{00b7} ")),
+            }
+        };
         let mut rendered = render_terminal_context(
             &primary,
             &final_decision,
@@ -6082,6 +6276,7 @@ pub(crate) fn classify_report(
             label,
             bloom_mark,
             &member_evals,
+            &collected,
         );
         if let Some(fetched) = render_terminal_fetch_context(
             &fetch_edges,
@@ -7901,6 +8096,49 @@ mod card_render_tests {
 
     fn terminal_report(value: serde_json::Value) -> cleave::AnalysisReport {
         serde_json::from_value(value).expect("valid terminal report fixture")
+    }
+
+    /// A collected package tarball describes itself nowhere cleave can read, so
+    /// without the capture record the card names a filename and nothing else.
+    #[test]
+    fn collected_coordinate_names_a_package_the_bytes_do_not() {
+        let report = terminal_report(serde_json::json!({
+            "version": "3",
+            "files": [{
+                "id": 0, "path": "blueai-cli-0.7.0.tgz", "depth": 0,
+                "file_type": "gzip", "sha256": "root", "size": 10, "findings": []
+            }]
+        }));
+        assert_eq!(
+            card_identity(
+                &report,
+                "blueai-cli-0.7.0.tgz",
+                Some("pkg:npm/blueai-cli@0.7.0")
+            )
+            .as_deref(),
+            Some("pkg:npm/blueai-cli@0.7.0"),
+        );
+        assert_eq!(card_identity(&report, "blueai-cli-0.7.0.tgz", None), None);
+    }
+
+    /// An identity read out of the bytes outranks one claimed about them.
+    #[test]
+    fn content_identity_outranks_the_capture_record() {
+        let report = terminal_report(serde_json::json!({
+            "version": "3",
+            "files": [{
+                "id": 0, "path": "installer.msi", "depth": 0,
+                "file_type": "msi", "sha256": "root", "size": 10, "findings": [],
+                "identity": {
+                    "title": {"value": "NordPass Installer", "source": "msi.title", "verified": false},
+                    "trust": "unsigned"
+                }
+            }]
+        }));
+        assert_eq!(
+            card_identity(&report, "installer.msi", Some("pkg:npm/evil@1.0.0")).as_deref(),
+            Some("\u{201c}NordPass Installer\u{201d}"),
+        );
     }
 
     #[test]

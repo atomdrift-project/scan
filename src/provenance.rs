@@ -10,6 +10,7 @@
 use fletch::Registry;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 
 /// The sidecar schema version hopper validates against ([`hopper.SidecarSchemaVersion`]).
 const SCHEMA_VERSION: &str = "1.0";
@@ -22,7 +23,304 @@ const SCHEMA_VERSION: &str = "1.0";
 /// same trim hopper's `Sidecar.Finalize` performs on receipt.
 const MAX_RAW_BYTES: usize = 256 << 10;
 
-/// Build a hopper provenance sidecar JSON for an artifact about to be uploaded
+/// Suffix a collector writes beside every artifact it stores: forager's
+/// `<artifact>.forage.json` capture record.
+pub const COLLECTOR_SIDECAR_SUFFIX: &str = ".forage.json";
+
+/// Largest collector sidecar worth reading. Hopper's provenance part shares a
+/// 1 MiB transport budget with the rest of the upload, and `registry.raw` is
+/// already capped well below that ([`MAX_RAW_BYTES`]), so anything larger is
+/// malformed rather than merely generous.
+const MAX_COLLECTOR_SIDECAR_BYTES: u64 = 1 << 20;
+
+/// Read the provenance sidecar a collector wrote beside `artifact`, ready to
+/// upload as this file's provenance.
+///
+/// The sidecar is capture-time evidence: the URL the bytes actually came from,
+/// the package they were published as, and the registry facts that were true
+/// when they were pulled — none of which a later local scan can reconstruct,
+/// and all of which are lost if the scanner substitutes its own thin record.
+/// A deleted package is exactly the case where that evidence is the only copy
+/// left, so it is preserved and re-sent rather than rebuilt.
+///
+/// The artifact binding is re-stated from the bytes on disk, and a sidecar
+/// claiming a different digest is refused outright: provenance describes
+/// specific bytes, and attaching one file's history to another's is worse than
+/// having none.
+///
+/// `None` when no sidecar is there, it is unreadable or oversized, or it
+/// describes different bytes — provenance enriches an upload, never gates it.
+#[must_use]
+pub fn collector_sidecar(
+    artifact: &Path,
+    filename: &str,
+    sha256: &str,
+    size_bytes: u64,
+) -> Option<Vec<u8>> {
+    let mut document = collector_document(artifact, sha256)?;
+    document["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+    document["artifact"] = serde_json::json!({
+        "filename": filename,
+        "sha256": sha256,
+        "size_bytes": size_bytes,
+    });
+    trim_registry_raw(&mut document);
+    serde_json::to_vec(&document).ok()
+}
+
+/// The package coordinate a collector recorded for these exact bytes.
+///
+/// A collected sample is a package, but nothing in the file says so: the bytes
+/// are a tarball whose name is a filename, and a deleted release cannot be
+/// looked up. The capture record is the only place the coordinate survives, so
+/// the terminal card reads it from there — it is what an operator needs in order
+/// to say which package the verdict is about.
+///
+/// Canonicalized through fletch so a malformed or hostile `purl` string cannot
+/// reach the display, and `None` whenever [`collector_document`] declines.
+#[must_use]
+pub fn collector_purl(artifact: &Path, sha256: &str) -> Option<String> {
+    let document = collector_document(artifact, sha256)?;
+    let purl = document.get("package")?.get("purl")?.as_str()?;
+    fletch::purl::normalize(purl)
+}
+
+/// The registry's account of the package, as the collector recorded it.
+///
+/// A collector that enriched its capture stored the same normalized record a
+/// live `pkg` scan looks up. Recovering it here means a collected sample
+/// reasons over — and reads as — what the registry said at capture time, which
+/// for a since-deleted release is the only version of that account left.
+///
+/// `None` when the sidecar carries no registry block, which is the ordinary
+/// case for a collector that ran without its registry helper.
+#[must_use]
+pub fn collector_registry(artifact: &Path, sha256: &str) -> Option<RegistryProvenance> {
+    let document = collector_document(artifact, sha256)?;
+    RegistryProvenance::from_json(&serde_json::to_vec(&document).ok()?)
+}
+
+/// Read and authenticate the collector sidecar beside `artifact`.
+///
+/// Shared by the upload and display paths so both agree on what counts as a
+/// usable capture record: present, small enough to be a record rather than a
+/// payload, parseable, and bound to the digest of the bytes in hand.
+fn collector_document(artifact: &Path, sha256: &str) -> Option<serde_json::Value> {
+    let mut path = artifact.as_os_str().to_os_string();
+    path.push(COLLECTOR_SIDECAR_SUFFIX);
+    let path = std::path::PathBuf::from(path);
+    if std::fs::metadata(&path).ok()?.len() > MAX_COLLECTOR_SIDECAR_BYTES {
+        tracing::warn!("ignoring oversized provenance sidecar {}", path.display());
+        return None;
+    }
+    let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?)
+        .map_err(|e| {
+            tracing::warn!(
+                "ignoring unparseable provenance sidecar {}: {e}",
+                path.display()
+            )
+        })
+        .ok()?;
+    if !document.is_object() {
+        return None;
+    }
+    let recorded = document
+        .get("artifact")
+        .and_then(|a| a.get("sha256"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !recorded.eq_ignore_ascii_case(sha256) {
+        tracing::warn!(
+            "ignoring provenance sidecar {}: it describes {recorded}, not {sha256}",
+            path.display(),
+        );
+        return None;
+    }
+    Some(document)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod collector_sidecar_tests {
+    use super::collector_sidecar;
+
+    #[test]
+    fn refuses_a_sidecar_describing_other_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("a.tgz");
+        std::fs::write(&artifact, b"bytes").expect("write");
+        std::fs::write(
+            dir.path().join("a.tgz.forage.json"),
+            br#"{"artifact":{"sha256":"beef"},"fetch":{"url":"https://x/"}}"#,
+        )
+        .expect("write");
+        assert!(collector_sidecar(&artifact, "a.tgz", "cafe", 5).is_none());
+        // Same bytes, different case: hex digests are compared, not strings.
+        assert!(collector_sidecar(&artifact, "a.tgz", "BEEF", 5).is_some());
+    }
+
+    #[test]
+    fn the_recorded_coordinate_is_canonicalized_before_display() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("a.tgz");
+        std::fs::write(&artifact, b"bytes").expect("write");
+        let write = |package: serde_json::Value| {
+            std::fs::write(
+                dir.path().join("a.tgz.forage.json"),
+                serde_json::json!({
+                    "artifact": {"sha256": "cafe"},
+                    "package": package,
+                    "fetch": {"collector": "forager"},
+                })
+                .to_string(),
+            )
+            .expect("write");
+        };
+        write(serde_json::json!({"purl": "pkg:npm/blueai-cli@0.7.0"}));
+        assert_eq!(
+            super::collector_purl(&artifact, "cafe").as_deref(),
+            Some("pkg:npm/blueai-cli@0.7.0")
+        );
+        // Nothing a collector wrote reaches the terminal unvalidated.
+        write(serde_json::json!({"purl": "not a purl"}));
+        assert!(super::collector_purl(&artifact, "cafe").is_none());
+        write(serde_json::json!({"name": "blueai-cli"}));
+        assert!(super::collector_purl(&artifact, "cafe").is_none());
+        // The digest binding gates the display exactly as it gates the upload.
+        write(serde_json::json!({"purl": "pkg:npm/blueai-cli@0.7.0"}));
+        assert!(super::collector_purl(&artifact, "beef").is_none());
+    }
+
+    /// A collector that enriched its capture carries the registry's account of
+    /// the package; recovering it is what lets a collected sample read like a
+    /// live `purl` scan of the same release.
+    #[test]
+    fn the_recorded_registry_account_is_recovered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("a.tgz");
+        std::fs::write(&artifact, b"bytes").expect("write");
+        let sidecar = dir.path().join("a.tgz.forage.json");
+        std::fs::write(
+            &sidecar,
+            serde_json::json!({
+                "artifact": {"sha256": "cafe"},
+                "fetch": {"collector": "forager"},
+                "registry": {"record": {
+                    "ecosystem": "npm", "name": "evil", "version": "1.0.0", "author": "mallory",
+                }},
+            })
+            .to_string(),
+        )
+        .expect("write");
+        let recovered = super::collector_registry(&artifact, "cafe").expect("registry record");
+        assert_eq!(recovered.record.name, "evil");
+        assert_eq!(recovered.record.author.as_deref(), Some("mallory"));
+        // A capture record without one is the ordinary case, not a failure.
+        std::fs::write(
+            &sidecar,
+            serde_json::json!({"artifact": {"sha256": "cafe"}, "fetch": {"collector": "forager"}})
+                .to_string(),
+        )
+        .expect("write");
+        assert!(super::collector_registry(&artifact, "cafe").is_none());
+    }
+
+    #[test]
+    fn absent_or_unparseable_sidecars_are_not_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("a.tgz");
+        std::fs::write(&artifact, b"bytes").expect("write");
+        assert!(collector_sidecar(&artifact, "a.tgz", "cafe", 5).is_none());
+        std::fs::write(dir.path().join("a.tgz.forage.json"), b"{not json").expect("write");
+        assert!(collector_sidecar(&artifact, "a.tgz", "cafe", 5).is_none());
+    }
+
+    /// A capture record and a registry lookup answer different questions, so a
+    /// scan given both must not spend one to keep the other.
+    #[test]
+    fn registry_facts_join_the_capture_record_without_displacing_it() {
+        let collected = serde_json::json!({
+            "artifact": {"sha256": "cafe"},
+            "package": {"purl": "pkg:npm/evil@1.0.0"},
+            "fetch": {"collector": "forager", "url": "https://socket.dev/x"},
+        })
+        .to_string();
+        let supplied = serde_json::json!({
+            "artifact": {"sha256": "cafe"},
+            "package": {"purl": "pkg:npm/other@2.0.0"},
+            "fetch": {"collector": "scan+host", "url": ""},
+            "registry": {"record": {"name": "evil"}, "status": "complete"},
+        })
+        .to_string();
+        let merged: serde_json::Value = serde_json::from_slice(&super::with_registry_from(
+            collected.as_bytes(),
+            supplied.as_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(merged["fetch"]["collector"], "forager");
+        assert_eq!(merged["fetch"]["url"], "https://socket.dev/x");
+        assert_eq!(merged["package"]["purl"], "pkg:npm/evil@1.0.0");
+        assert_eq!(merged["registry"]["record"]["name"], "evil");
+    }
+
+    #[test]
+    fn preserves_collected_fields_and_rebinds_the_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("a.tgz");
+        std::fs::write(&artifact, b"bytes").expect("write");
+        std::fs::write(
+            dir.path().join("a.tgz.forage.json"),
+            serde_json::json!({
+                "schema_version": "0.9",
+                "artifact": {"filename": "stale.tgz", "sha256": "cafe", "size_bytes": 1},
+                "fetch": {"collector": "forager", "url": "https://x/", "original_url": "https://y/"},
+            })
+            .to_string(),
+        )
+        .expect("write");
+        let bytes = collector_sidecar(&artifact, "a.tgz", "cafe", 5).expect("sidecar");
+        let sidecar: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(sidecar["schema_version"], super::SCHEMA_VERSION);
+        assert_eq!(sidecar["artifact"]["filename"], "a.tgz");
+        assert_eq!(sidecar["artifact"]["size_bytes"], 5);
+        assert_eq!(sidecar["fetch"]["collector"], "forager");
+        assert_eq!(sidecar["fetch"]["original_url"], "https://y/");
+    }
+}
+
+/// Fold supplied registry facts into a collector's capture record.
+///
+/// The two documents describe different things, so a scan handed both keeps
+/// both. The capture record says where these exact bytes came from — a CDN
+/// reconstruction, a mirror, an archive replay — and is the only account of it
+/// once the package is gone; `--registry-map` (or a worker's hopper lookup) says
+/// what the registry knew about the package. Identity, origin, and collector
+/// therefore stay as captured, and only the registry block, plus a package slot
+/// the collector did not record, are taken from `supplied`.
+#[must_use]
+pub fn with_registry_from(collected: &[u8], supplied: &[u8]) -> Vec<u8> {
+    let parsed: Option<(serde_json::Value, serde_json::Value)> = serde_json::from_slice(collected)
+        .ok()
+        .zip(serde_json::from_slice(supplied).ok());
+    let Some((mut merged, mut supplied)) = parsed else {
+        return collected.to_vec();
+    };
+    // The map was named explicitly, so its registry block wins outright — that
+    // is the whole point of passing one. A package slot is different: the
+    // collector recorded the coordinate it actually fetched, so the map only
+    // fills that in when the capture record left it out.
+    let registry = supplied["registry"].take();
+    if !registry.is_null() {
+        merged["registry"] = registry;
+    }
+    let package = supplied["package"].take();
+    if !package.is_null() && merged.get("package").is_none_or(serde_json::Value::is_null) {
+        merged["package"] = package;
+    }
+    serde_json::to_vec(&merged).unwrap_or_else(|_| collected.to_vec())
+}
+
+/// Build a hopper provenance sidecar JSON for an artifact about to be uploaded/// Build a hopper provenance sidecar JSON for an artifact about to be uploaded
 /// to `/api/upload`. Mirrors hopper's `Sidecar` Go struct field-for-field so the
 /// upload validator accepts it: `schema_version`, `artifact`, `fetch`, and —
 /// when the artifact is a fetched package — `package` + `registry{record}`.
