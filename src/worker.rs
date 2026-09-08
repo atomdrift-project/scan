@@ -6038,7 +6038,10 @@ mod tests {
     async fn sighted_job_dispatches_before_smaller_ordinary_work() {
         let mut reorder = vec![
             (staged_pj("small", 10), Instant::now()),
-            (staged_pj_tier("sighted-big", 12_400_000, TIER_SIGHTED), Instant::now()),
+            (
+                staged_pj_tier("sighted-big", 12_400_000, TIER_SIGHTED),
+                Instant::now(),
+            ),
             (staged_pj("tiny", 1), Instant::now()),
         ];
         let got = pick_sjf_from_reorder(&mut reorder, DispatchOrder::Smallest).unwrap();
