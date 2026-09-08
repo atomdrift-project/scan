@@ -589,6 +589,24 @@ struct Cli {
     )]
     fetch_max_file_size: u64,
 
+    /// [EXPERIMENTAL] Wall-clock ceiling on the fetch phase for a single
+    /// scanned artifact. Accepts a unit suffix (`90s`, `5m`, `1h`); a bare
+    /// number is seconds; `0` or `never` disables the cap. This is 5 minutes by
+    /// default. The count and size budgets bound how much a scan fetches, not
+    /// how long fetching takes — a wide tree of slow registries can hold a scan
+    /// open with every count budget still unspent. References not reached
+    /// before the cap are left unfollowed; whatever was already fetched is
+    /// analyzed and graded as usual. Also settable via `SCAN_FETCH_TIMEOUT`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "DUR",
+        default_value = "5m",
+        value_parser = scan::fetch::parse_duration,
+        env = "SCAN_FETCH_TIMEOUT"
+    )]
+    fetch_timeout: std::time::Duration,
+
     /// [EXPERIMENTAL] Maximum number of *live* fetches across the whole
     /// execution — a hard ceiling over every scanned file combined. Lifted in
     /// long-lived server modes (`serve`/`worker`), where the per-file caps bound
@@ -1369,6 +1387,7 @@ fn main() -> Result<()> {
         policy.max_file_fetches = cli.fetch_max_file_fetches;
         policy.max_url_fetches = cli.fetch_max_urls;
         policy.max_file_bytes = cli.fetch_max_file_size;
+        policy.max_duration = cli.fetch_timeout;
         policy.host_platform_only = cli_host_platform_only(&cli, scans_for_other_hosts);
         policy.transitive_deps = cli_transitive_deps(&cli, scans_for_other_hosts);
         policy

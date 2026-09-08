@@ -1172,10 +1172,38 @@ async fn next_smallest_staged(
     pick_sjf_from_reorder(reorder, DispatchOrder::Smallest)
 }
 
+/// Hopper's claim tier for work something in the world has already called
+/// malicious. Dispatched ahead of every other staged job.
+const TIER_SIGHTED: &str = "sighted";
+
 fn pick_sjf_from_reorder(
     reorder: &mut Vec<(PrefetchedJob, Instant)>,
     order: DispatchOrder,
 ) -> Option<PrefetchedJob> {
+    // A sighted job outranks both the size sort and the aging bound, oldest
+    // first among themselves.
+    //
+    // Hopper runs a priority ladder to decide this sample goes first -- the
+    // registry may withdraw the artifact, and in the 2026-09-07 Shai-Hulud
+    // reactivation it did so 4h25m after publication. Re-sorting that handout
+    // by size discards the decision one step before it takes effect. Measured
+    // 2026-09-08: a 12.4 MB sighted tarball sorted last under smallest-first
+    // and waited 15 minutes, which is the SJF aging bound expiring, not queue
+    // depth.
+    //
+    // Safe against starving the size policy because the tier is small by
+    // construction and drains: hopper caps it at half of any one poll
+    // (sightedMaxShare) and a row leaves it the moment it is analyzed. The
+    // whole population was 54 rows against a 173k backlog when this was written.
+    if let Some(idx) = reorder
+        .iter()
+        .enumerate()
+        .filter(|(_, (pj, _))| pj.job.tier == TIER_SIGHTED)
+        .min_by_key(|(_, (_, staged_at))| *staged_at)
+        .map(|(i, _)| i)
+    {
+        return Some(reorder.swap_remove(idx).0);
+    }
     let now = Instant::now();
     let max_wait = sjf_max_staged_wait();
     let aged = reorder
@@ -1216,6 +1244,11 @@ struct ClaimJob {
     /// here on the claim it already has to send.
     #[serde(default)]
     has_provenance: bool,
+    /// Which of hopper's claim tiers this job came from ("sighted",
+    /// "unanalyzed", "stale_traits", ...). Empty from a hopper that predates
+    /// sending it, which is treated as ordinary work.
+    #[serde(default)]
+    tier: String,
 }
 
 /// A job with its file data pre-downloaded (or marked for local access).
@@ -5213,6 +5246,7 @@ mod tests {
             size_bytes,
             file_type: "data".to_string(),
             has_provenance: false,
+            tier: String::new(),
         }
     }
 
@@ -5850,6 +5884,10 @@ mod tests {
     }
 
     fn staged_pj(sha: &str, size_bytes: i64) -> PrefetchedJob {
+        staged_pj_tier(sha, size_bytes, "")
+    }
+
+    fn staged_pj_tier(sha: &str, size_bytes: i64, tier: &str) -> PrefetchedJob {
         PrefetchedJob {
             job: ClaimJob {
                 sha256: sha.to_string(),
@@ -5857,6 +5895,7 @@ mod tests {
                 size_bytes,
                 file_type: "data".to_string(),
                 has_provenance: false,
+                tier: tier.to_string(),
             },
             data: Ok(PrefetchData::Local),
             queue_id: 0,
@@ -5990,6 +6029,50 @@ mod tests {
             "a"
         );
         assert!(next_smallest_staged(&mut rx, &mut reorder).await.is_none());
+    }
+
+    /// Hopper decides a sighted sample goes first; the worker must not undo that
+    /// by sorting it back down on size. A 12.4 MB sighted tarball sorted last
+    /// under smallest-first on 2026-09-08 and waited out the 900s aging bound.
+    #[tokio::test]
+    async fn sighted_job_dispatches_before_smaller_ordinary_work() {
+        let mut reorder = vec![
+            (staged_pj("small", 10), Instant::now()),
+            (staged_pj_tier("sighted-big", 12_400_000, TIER_SIGHTED), Instant::now()),
+            (staged_pj("tiny", 1), Instant::now()),
+        ];
+        let got = pick_sjf_from_reorder(&mut reorder, DispatchOrder::Smallest).unwrap();
+        assert_eq!(
+            got.job.sha256, "sighted-big",
+            "a sighted job must outrank the size sort"
+        );
+        // The rest keeps smallest-first.
+        let next = pick_sjf_from_reorder(&mut reorder, DispatchOrder::Smallest).unwrap();
+        assert_eq!(next.job.sha256, "tiny");
+    }
+
+    /// Two sighted jobs go oldest first, so the tier cannot starve within itself.
+    #[tokio::test]
+    async fn sighted_jobs_dispatch_oldest_first() {
+        let older = Instant::now() - Duration::from_secs(60);
+        let mut reorder = vec![
+            (staged_pj_tier("newer", 10, TIER_SIGHTED), Instant::now()),
+            (staged_pj_tier("older", 9_000_000, TIER_SIGHTED), older),
+        ];
+        let got = pick_sjf_from_reorder(&mut reorder, DispatchOrder::Smallest).unwrap();
+        assert_eq!(got.job.sha256, "older");
+    }
+
+    /// An unknown or absent tier is ordinary work, so an older hopper that sends
+    /// no tier field behaves exactly as before.
+    #[tokio::test]
+    async fn untagged_jobs_keep_smallest_first() {
+        let mut reorder = vec![
+            (staged_pj("big", 5_000_000), Instant::now()),
+            (staged_pj("small", 5), Instant::now()),
+        ];
+        let got = pick_sjf_from_reorder(&mut reorder, DispatchOrder::Smallest).unwrap();
+        assert_eq!(got.job.sha256, "small");
     }
 
     #[tokio::test]

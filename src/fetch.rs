@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
@@ -84,6 +84,14 @@ pub const DEFAULT_MAX_URL_FETCHES: usize = 4;
 /// Default ceiling on total bytes fetched on behalf of a single scanned file
 /// (`--fetch-max-file-size`).
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 2 * GIB;
+
+/// Default wall-clock ceiling on one artifact's whole fetch phase
+/// (`--fetch-timeout`). The count and byte budgets bound how *much* a scan
+/// pulls but not how *long* pulling takes: a wide tree of slow registries can
+/// hold a scan open for as long as it likes while every count budget still has
+/// room. Five minutes is well past what a healthy tree needs and short enough
+/// that a wedged one still returns a verdict. `0` disables the cap.
+pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default ceiling on *live* fetches across one whole execution
 /// (`--fetch-max-total-fetches`). Lifted in long-lived server modes, where each
@@ -282,6 +290,11 @@ pub struct FetchPolicy {
     /// never counted. `0` disables opportunistic URL fetching while leaving
     /// declared dependencies and command-mentioned packages unaffected.
     pub max_url_fetches: usize,
+    /// Wall-clock ceiling on the whole fetch phase for one scanned artifact
+    /// (`--fetch-timeout`). Checked at group boundaries, so a group already
+    /// downloading finishes rather than being torn mid-transfer; references not
+    /// reached by then are simply not followed. [`Duration::ZERO`] disables it.
+    pub max_duration: Duration,
     /// Ceiling on total bytes fetched on behalf of a single scanned file
     /// (`--fetch-max-file-size`). The sweep stops once retrieved bytes cross it.
     pub max_file_bytes: u64,
@@ -324,6 +337,7 @@ impl Default for FetchPolicy {
             max_file_fetches: DEFAULT_MAX_FILE_FETCHES,
             max_url_fetches: DEFAULT_MAX_URL_FETCHES,
             max_file_bytes: DEFAULT_MAX_FILE_SIZE,
+            max_duration: DEFAULT_FETCH_TIMEOUT,
             transitive_deps: false,
             host_platform_only: true,
         }
@@ -1063,6 +1077,36 @@ pub(crate) fn orchestrate(
     // The host platform, for filtering off-host native-binary dependencies.
     // Sampled once — it can't change mid-run.
     let host = host_platform();
+
+    // Wall-clock ceiling for this artifact's whole fetch phase
+    // (`--fetch-timeout`). The count and byte budgets bound how much a scan
+    // pulls, not how long pulling takes, and the two are not the same
+    // ceiling: a wide tree of slow or rate-limited registries keeps every
+    // count budget's room while holding the scan open indefinitely. Checked at
+    // group boundaries — a group already fetching finishes, so no download is
+    // torn mid-transfer and no partially-analyzed payload reaches the report —
+    // and once tripped it stays tripped, so no later hop restarts the sweep.
+    // A zero duration, or one no `Instant` can hold, means no cap.
+    let deadline = if policy.max_duration.is_zero() {
+        None
+    } else {
+        Instant::now().checked_add(policy.max_duration)
+    };
+    let timed_out = std::cell::Cell::new(false);
+    let out_of_time = || {
+        if timed_out.get() {
+            return true;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            timed_out.set(true);
+            tracing::warn!(
+                timeout_secs = policy.max_duration.as_secs(),
+                "fetch time cap reached (--fetch-timeout); remaining references not followed"
+            );
+            return true;
+        }
+        false
+    };
     // Newest-version gate: only the most recent version of a package in the
     // dependency tree is fetched and analyzed. Deep ungated trees pin dozens
     // of releases of the same packages (syn ×27, libc ×21 on the mx crate
@@ -1091,7 +1135,7 @@ pub(crate) fn orchestrate(
         .map(|f| (f.sha256.clone(), manifest_relpath(&f.path)))
         .collect();
     for hop in 0..policy.depth {
-        if worklist.is_empty() {
+        if worklist.is_empty() || out_of_time() {
             break;
         }
         // Pre-scan the whole hop so the winner is hop-wide, not
@@ -1151,9 +1195,19 @@ pub(crate) fn orchestrate(
         };
         let mut groups = std::mem::take(&mut worklist).into_iter().peekable();
         while groups.peek().is_some() {
+            if out_of_time() {
+                break;
+            }
             let mut batch: Vec<GroupWork> = Vec::new();
             let mut batch_payloads = 0usize;
             while batch_payloads < BATCH_PAYLOAD_TARGET {
+                // Re-checked per group, not per batch: one batch gathers up to
+                // `BATCH_PAYLOAD_TARGET` payloads, and stopping only at the
+                // batch edge would overrun the cap by that whole fetch set.
+                // Whatever this batch already fetched still gets analyzed below.
+                if out_of_time() {
+                    break;
+                }
                 let Some((source_sha, refs)) = groups.next() else {
                     break;
                 };
@@ -4821,6 +4875,27 @@ mod tests {
         assert_eq!(cmp("20260528.18.2", "20260101.1.1"), Greater);
         // Numeric outranks a text suffix at the same position.
         assert_eq!(cmp("1.2.3", "1.2.rc1"), Greater);
+    }
+
+    /// The fetch phase carries a wall-clock cap by default, and the two
+    /// spellings that turn it off both reach the "no deadline" branch that
+    /// `orchestrate` tests for.
+    #[test]
+    fn fetch_timeout_defaults_on_and_has_two_off_switches() {
+        assert_eq!(FetchPolicy::default().max_duration, DEFAULT_FETCH_TIMEOUT);
+        assert_eq!(DEFAULT_FETCH_TIMEOUT, Duration::from_secs(300));
+        // A selection never disturbs the ceilings around it.
+        assert_eq!(
+            FetchPolicy::parse_follow("all").unwrap().max_duration,
+            DEFAULT_FETCH_TIMEOUT
+        );
+        assert!(parse_duration("0").unwrap().is_zero());
+        assert!(
+            Instant::now()
+                .checked_add(parse_duration("never").unwrap())
+                .is_none()
+        );
+        assert_eq!(parse_duration("5m").unwrap(), DEFAULT_FETCH_TIMEOUT);
     }
 
     #[test]
