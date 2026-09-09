@@ -814,10 +814,15 @@ impl Uploader {
             cleanup_dirs,
         }) {
             Ok(()) => true,
-            Err(std::sync::mpsc::SendError(Job::Artifacts { cleanup_dirs, .. })) => {
+            Err(std::sync::mpsc::SendError(job)) => {
                 self.pending.fetch_sub(1, Ordering::Relaxed);
-                // The receiver cannot clean a job it never received.
-                cleanup_upload_dirs(cleanup_dirs);
+                // The receiver cannot clean a job it never received. `send`
+                // returns the original job on failure; handle every variant
+                // here so adding another job type does not make this match
+                // non-exhaustive.
+                if let Job::Artifacts { cleanup_dirs, .. } = job {
+                    cleanup_upload_dirs(cleanup_dirs);
+                }
                 false
             }
         }

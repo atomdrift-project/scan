@@ -1882,8 +1882,8 @@ async fn run_file_analysis(
         // thread to drain the queue. The request-scoped TempDir is deleted
         // immediately below, so durable staging must complete before handing
         // the artifact to the asynchronous uploader.
-        if let (Ok(scan_result), Some(uploader)) = (&result, &uploader) {
-            if let Err(error) =
+        if let (Ok(scan_result), Some(uploader)) = (&result, &uploader)
+            && let Err(error) =
                 uploader.submit_artifacts_durable(crate::engine::collect_upload_artifacts(
                     &path,
                     &scan_result.sha256,
@@ -1892,15 +1892,14 @@ async fn run_file_analysis(
                     None,
                     None,
                 ))
-            {
-                tracing::error!(
-                    request_id,
-                    sha256 = %scan_result.sha256,
-                    error = %error,
-                    "upload: could not stage artifact for hopper"
-                );
-                result = Err(anyhow::anyhow!(error));
-            }
+        {
+            tracing::error!(
+                request_id,
+                sha256 = %scan_result.sha256,
+                error = %error,
+                "upload: could not stage artifact for hopper"
+            );
+            result = Err(anyhow::anyhow!(error));
         }
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -3577,7 +3576,7 @@ async fn v1_analyze_bytes(
                     let uploader = Arc::clone(uploader);
                     let repair_sha = sha.clone();
                     let repair_bytes = bytes;
-                    let _ = tokio::task::spawn_blocking(move || {
+                    std::mem::drop(tokio::task::spawn_blocking(move || {
                         if let Err(error) =
                             uploader.submit_artifact_bytes_durable(artifact, &repair_bytes)
                         {
@@ -3588,7 +3587,7 @@ async fn v1_analyze_bytes(
                                 "upload: could not stage cached artifact for hopper"
                             );
                         }
-                    });
+                    }));
                 }
             }
             let mut resp = Json(decided).into_response();
