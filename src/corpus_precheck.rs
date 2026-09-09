@@ -118,13 +118,73 @@ fn instance() -> Option<&'static Precheck> {
     INSTANCE.get().and_then(|o| o.as_ref())
 }
 
-/// The three fields the policy reads. Everything else in the record is
-/// ignored, so the response shape may grow freely.
+/// The fields the policy reads, plus the verdict it may adopt. Everything else
+/// in the record is ignored, so the response shape may grow freely.
 #[derive(serde::Deserialize)]
 struct Record {
     fires_at: Option<i64>,
     analyzed_at: Option<String>,
     traits_version: Option<String>,
+    reason: Option<String>,
+    #[serde(default)]
+    findings: Vec<Finding>,
+}
+
+/// One of the corpus's strongest traits for an artifact, as `/v1/lookup`
+/// reports it: a stable id, its criticality (4 suspicious, 5 hostile), and a
+/// sentence for the findings that are not the analyzer's own.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct Finding {
+    pub id: String,
+    #[serde(default)]
+    pub desc: String,
+    pub crit: u32,
+}
+
+/// A verdict this build may adopt as its own: the corpus produced it under the
+/// analyzer we are running, so re-deriving it locally would reach the same
+/// answer. `fires_at` is the tightest false-positive budget at which the
+/// artifact grades hostile (-1 = fires at no level); grading it against a
+/// caller's budget is [`crate::server::decision::decide`]'s job, never this
+/// module's.
+#[derive(Debug, Clone)]
+pub(crate) struct Verdict {
+    pub fires_at: i64,
+    pub reason: Option<String>,
+    pub findings: Vec<Finding>,
+}
+
+/// What the corpus lets us skip, and whether it also hands us an answer.
+///
+/// The distinction is the whole point: a verdict is only ours to report when it
+/// was produced by the analyzer we are running. Anything else is evidence about
+/// someone else's judgment — good enough to skip re-deriving a benign result,
+/// not good enough to publish as this scan's finding.
+#[derive(Debug, Clone)]
+pub(crate) enum Standing {
+    /// Rule 1: the same analyzer already judged these bytes. Adopt its verdict.
+    Adopt(Verdict),
+    /// Rule 2: benign under some other analyzer, and fresh. Skip the work; there
+    /// is nothing to report, which for a benign artifact is the whole verdict.
+    SkipBenign,
+    /// Neither rule applies. Analyze.
+    Analyze,
+}
+
+impl Standing {
+    /// Whether this standing spares us the analysis at all.
+    pub(crate) const fn skips_analysis(&self) -> bool {
+        !matches!(self, Self::Analyze)
+    }
+}
+
+/// A dependency the batch PURL negotiation answered for: the content sha that
+/// records the fetch edge, and the verdict when it is ours to adopt (`None` for
+/// a rule-2 benign skip, which carries no reportable finding).
+#[derive(Debug, Clone)]
+pub(crate) struct PurlHit {
+    pub sha: String,
+    pub verdict: Option<Verdict>,
 }
 
 /// This worker's 5-char traits commit prefix — the same value the /api/next
@@ -137,14 +197,16 @@ fn local_traits() -> Option<&'static str> {
         .as_deref()
 }
 
-/// True when hopper's corpus already holds a verdict for these exact bytes
-/// that re-analysis could not improve on — same analyzer, or benign and
-/// fresh (see the module doc). Any failure — unreachable, non-200,
-/// unparseable, neither rule met — is false.
-pub(crate) fn skip_reanalysis(content_sha: &str) -> bool {
-    let Some(p) = instance() else { return false };
+/// What hopper's corpus already holds for these exact bytes: a verdict this
+/// build may adopt (same analyzer), a benign result worth skipping but not
+/// reporting, or nothing. Any failure — unreachable, non-200, unparseable,
+/// neither rule met — is [`Standing::Analyze`].
+pub(crate) fn corpus_standing(content_sha: &str) -> Standing {
+    let Some(p) = instance() else {
+        return Standing::Analyze;
+    };
     if content_sha.len() != 64 || FAILURES.load(Ordering::Relaxed) >= BREAKER_LIMIT {
-        return false;
+        return Standing::Analyze;
     }
     CHECKS.fetch_add(1, Ordering::Relaxed);
 
@@ -169,20 +231,20 @@ pub(crate) fn skip_reanalysis(content_sha: &str) -> bool {
                      disabling for the rest of this process"
                 );
             }
-            return false;
+            return Standing::Analyze;
         }
     };
     if resp.status() != reqwest::StatusCode::OK {
-        return false; // 404 unknown, 202 bytes-only, 401/5xx — all mean "scan it".
+        return Standing::Analyze; // 404 unknown, 202 bytes-only, 401/5xx — all "scan it".
     }
     let Ok(rec) = resp.json::<Record>() else {
-        return false;
+        return Standing::Analyze;
     };
-    if !verdict_stands(&rec, local_traits(), p.max_age.as_secs(), now_epoch()) {
-        return false;
+    let standing = standing_of(rec, local_traits(), p.max_age.as_secs(), now_epoch());
+    if standing.skips_analysis() {
+        SKIPS.fetch_add(1, Ordering::Relaxed);
     }
-    SKIPS.fetch_add(1, Ordering::Relaxed);
-    true
+    standing
 }
 
 fn now_epoch() -> u64 {
@@ -192,28 +254,38 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-/// The policy, pure so the tests can hold it still: rule 1 (same analyzer)
-/// or rule 2 (benign and fresh).
-fn verdict_stands(rec: &Record, my_traits: Option<&str>, max_age_s: u64, now: u64) -> bool {
+/// The policy, pure so the tests can hold it still: rule 1 (same analyzer,
+/// verdict adopted) or rule 2 (benign and fresh, work skipped).
+fn standing_of(rec: Record, my_traits: Option<&str>, max_age_s: u64, now: u64) -> Standing {
     // Rule 1: same analyzer already judged these bytes. A verdict is only a
     // dedupe key when it EXISTS — fires_at is null for a record that was
     // never classified, and traits equality on an unclassified record would
     // skip an analysis that never happened.
-    if rec.fires_at.is_some()
+    if let Some(fires_at) = rec.fires_at
         && let (Some(mine), Some(theirs)) = (my_traits, rec.traits_version.as_deref())
         && !mine.is_empty()
         && mine == theirs
     {
-        return true;
+        return Standing::Adopt(Verdict {
+            fires_at,
+            reason: rec.reason,
+            findings: rec.findings,
+        });
     }
-    // Rule 2: benign, and fresh enough that staleness is bounded.
+    // Rule 2: benign, and fresh enough that staleness is bounded. Deliberately
+    // NOT adopted: a different analyzer's judgment is not this scan's finding.
+    // It can hide nothing — the rule requires the benign sentinel.
     if rec.fires_at != Some(-1) {
-        return false;
+        return Standing::Analyze;
     }
     let Some(at) = rec.analyzed_at.as_deref().and_then(parse_rfc3339_epoch) else {
-        return false;
+        return Standing::Analyze;
     };
-    now.saturating_sub(at) <= max_age_s
+    if now.saturating_sub(at) <= max_age_s {
+        Standing::SkipBenign
+    } else {
+        Standing::Analyze
+    }
 }
 
 /// (lookups attempted, analyses skipped) since process start, for the worker
@@ -227,7 +299,7 @@ fn verdict_stands(rec: &Record, my_traits: Option<&str>, max_age_s: u64, now: u6
 /// dropped — the fetch-edge (`source → content sha`) must stay recordable — so
 /// the dependency falls through to a normal fetch. Fail-open everywhere, and
 /// `SCAN_PURL_PRECHECK=0` disables just this half.
-pub(crate) fn precheck_purls(purls: &[String]) -> std::collections::HashMap<String, String> {
+pub(crate) fn precheck_purls(purls: &[String]) -> std::collections::HashMap<String, PurlHit> {
     let mut out = std::collections::HashMap::new();
     let Some(p) = instance() else { return out };
     if purls.is_empty()
@@ -275,20 +347,14 @@ pub(crate) fn precheck_purls(purls: &[String]) -> std::collections::HashMap<Stri
             None => vec![&value],
         };
         for (i, item) in items.iter().enumerate() {
-            let rec = Record {
-                fires_at: item.get("fires_at").and_then(serde_json::Value::as_i64),
-                analyzed_at: item
-                    .get("analyzed_at")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-                traits_version: item
-                    .get("traits_version")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-            };
-            if !verdict_stands(&rec, local_traits(), p.max_age.as_secs(), now_epoch()) {
+            let Ok(rec) = serde_json::from_value::<Record>((*item).clone()) else {
                 continue;
-            }
+            };
+            let verdict = match standing_of(rec, local_traits(), p.max_age.as_secs(), now_epoch()) {
+                Standing::Adopt(v) => Some(v),
+                Standing::SkipBenign => None,
+                Standing::Analyze => continue,
+            };
             let Some(sha) = item
                 .get("sha256")
                 .and_then(serde_json::Value::as_str)
@@ -303,7 +369,13 @@ pub(crate) fn precheck_purls(purls: &[String]) -> std::collections::HashMap<Stri
                 .or_else(|| chunk.get(i).cloned());
             if let Some(purl) = purl {
                 PURL_SKIPS.fetch_add(1, Ordering::Relaxed);
-                out.insert(purl, sha.to_ascii_lowercase());
+                out.insert(
+                    purl,
+                    PurlHit {
+                        sha: sha.to_ascii_lowercase(),
+                        verdict,
+                    },
+                );
             }
         }
     }
@@ -421,68 +493,89 @@ mod tests {
             fires_at: fires,
             analyzed_at: at.map(String::from),
             traits_version: tv.map(String::from),
+            reason: None,
+            findings: Vec::new(),
         };
         let now = parse_rfc3339_epoch("2026-08-24T00:00:00Z").unwrap();
         let week = 7 * 86_400;
         let fresh = Some("2026-08-23T00:00:00Z"); // 1 day old
         let stale = Some("2026-08-01T00:00:00Z"); // 23 days old
+        let standing = |r: Record, mine: Option<&str>| standing_of(r, mine, week, now);
 
-        // Rule 1: same analyzer skips any verdict, hostile included, any age.
-        assert!(verdict_stands(
-            &rec(Some(3), Some("b8c1c"), stale),
-            Some("b8c1c"),
-            week,
-            now
-        ));
+        // Rule 1: the same analyzer's verdict is adopted, hostile included, at
+        // any age — it is the verdict this build would have computed.
+        let adopted = standing(rec(Some(3), Some("b8c1c"), stale), Some("b8c1c"));
+        assert!(
+            matches!(&adopted, Standing::Adopt(v) if v.fires_at == 3),
+            "expected the stored verdict, got {adopted:?}"
+        );
         // ...but never on a record with no verdict at all.
-        assert!(!verdict_stands(
-            &rec(None, Some("b8c1c"), fresh),
-            Some("b8c1c"),
-            week,
-            now
+        assert!(matches!(
+            standing(rec(None, Some("b8c1c"), fresh), Some("b8c1c")),
+            Standing::Analyze
         ));
-        // ...and never across analyzers for a non-benign verdict.
-        assert!(!verdict_stands(
-            &rec(Some(3), Some("f6eaa"), fresh),
-            Some("b8c1c"),
-            week,
-            now
+        // A non-benign verdict from a DIFFERENT analyzer is neither adopted nor
+        // skipped: it is not ours to report, and rule 2 does not cover it.
+        assert!(matches!(
+            standing(rec(Some(3), Some("f6eaa"), fresh), Some("b8c1c")),
+            Standing::Analyze
         ));
         // Empty-string traits (the member-row gap) must not match anything.
-        assert!(!verdict_stands(
-            &rec(Some(3), Some(""), fresh),
-            Some(""),
-            week,
-            now
+        assert!(matches!(
+            standing(rec(Some(3), Some(""), fresh), Some("")),
+            Standing::Analyze
         ));
 
-        // Rule 2: benign and fresh skips across analyzers...
-        assert!(verdict_stands(
-            &rec(Some(-1), Some("f6eaa"), fresh),
-            Some("b8c1c"),
-            week,
-            now
+        // Rule 2: benign and fresh skips the work across analyzers, and adopts
+        // nothing — there is no finding to carry.
+        assert!(matches!(
+            standing(rec(Some(-1), Some("f6eaa"), fresh), Some("b8c1c")),
+            Standing::SkipBenign
         ));
         // ...including when the stored row has no traits at all.
-        assert!(verdict_stands(
-            &rec(Some(-1), None, fresh),
-            Some("b8c1c"),
-            week,
-            now
+        assert!(matches!(
+            standing(rec(Some(-1), None, fresh), Some("b8c1c")),
+            Standing::SkipBenign
         ));
         // ...but not stale, and not without a timestamp.
-        assert!(!verdict_stands(
-            &rec(Some(-1), None, stale),
-            Some("b8c1c"),
-            week,
-            now
+        assert!(matches!(
+            standing(rec(Some(-1), None, stale), Some("b8c1c")),
+            Standing::Analyze
         ));
-        assert!(!verdict_stands(
-            &rec(Some(-1), None, None),
-            Some("b8c1c"),
-            week,
-            now
+        assert!(matches!(
+            standing(rec(Some(-1), None, None), Some("b8c1c")),
+            Standing::Analyze
         ));
+        // A benign verdict from our own analyzer is adopted, not merely skipped:
+        // "clean, and we can say so" outranks "clean enough not to re-run".
+        assert!(matches!(
+            standing(rec(Some(-1), Some("b8c1c"), fresh), Some("b8c1c")),
+            Standing::Adopt(_)
+        ));
+    }
+
+    /// The adopted verdict carries what a reader needs: the level, the sentence,
+    /// and the findings behind it.
+    #[test]
+    fn an_adopted_verdict_keeps_the_findings() {
+        let rec: Record = serde_json::from_str(
+            r#"{"sha256":"ab","fires_at":2,"traits_version":"b8c1c",
+                "analyzed_at":"2026-08-23T23:00:44Z","reason":"steals credentials",
+                "findings":[{"id":"objectives/exfil::env","crit":5},
+                            {"id":"feed/osv","desc":"cited by OSV","crit":4}]}"#,
+        )
+        .expect("parse");
+        let now = parse_rfc3339_epoch("2026-08-24T00:00:00Z").unwrap();
+        let v = match standing_of(rec, Some("b8c1c"), 7 * 86_400, now) {
+            Standing::Adopt(v) => Some(v),
+            _ => None,
+        }
+        .expect("the same analyzer must adopt");
+        assert_eq!(v.fires_at, 2);
+        assert_eq!(v.reason.as_deref(), Some("steals credentials"));
+        assert_eq!(v.findings.len(), 2);
+        assert_eq!(v.findings[0].crit, 5);
+        assert_eq!(v.findings[1].desc, "cited by OSV");
     }
 
     #[test]
@@ -496,5 +589,6 @@ mod tests {
         .expect("parse");
         assert_eq!(rec.fires_at, Some(-1));
         assert!(rec.analyzed_at.is_some());
+        assert!(rec.findings.is_empty());
     }
 }

@@ -216,22 +216,9 @@ const UPLOAD_QUEUE_DEPTH: usize = 16;
 /// bounds it near 10 MB). See the clear in the uploader loop.
 const SEEN_SHAS_MAX: usize = 100_000;
 
-/// Per-attempt request timeouts, escalating. hopper's slow spells are usually
-/// brief, so early attempts fail fast and get another try rather than pinning
-/// the uploader for the full 120s ceiling each time; the final attempt keeps
-/// the old ceiling so a genuinely slow-but-alive hopper still lands the write.
-/// Indexed by attempt and clamped to the last entry, so a long retry budget
-/// keeps the 120s ceiling rather than running out of table.
-const ATTEMPT_TIMEOUTS: [Duration; 4] = [
-    Duration::from_secs(15),
-    Duration::from_secs(30),
-    Duration::from_secs(60),
-    Duration::from_secs(120),
-];
-
 /// Per-attempt request timeouts for `/api/upload`, separate from
-/// [`ATTEMPT_TIMEOUTS`] because that table's 120s ceiling was sized for the
-/// small JSON verdicts `post_one` sends, not for streaming a multi-GiB
+/// [`REQUEST_TIMEOUT`] because that ceiling was sized for the small JSON
+/// verdicts `post_one` sends, not for streaming a multi-GiB
 /// artifact — with `HOPPER_MAX_UPLOAD_ARTIFACT_BYTES` raised to 8 GiB
 /// (2026-08-27), a legitimate transfer on a merely mediocre link would blow
 /// through 120s and get cut off as a timeout rather than a real failure.
@@ -292,6 +279,25 @@ const RENEW_MIN_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Request timeout per POST. Matches the worker so a wedged hopper can't pin an
 /// uploader thread indefinitely.
+///
+/// One ceiling for every attempt, deliberately: `/api/result` is not a request
+/// a client can abandon cheaply. Hopper writes the parent and every archive
+/// member in one transaction, and runs it on a context *detached* from the
+/// request (`context.WithoutCancel`, `resultStoreTimeout` = 10 min in its
+/// `api.go`) precisely so a client that gives up cannot discard completed
+/// analysis. Timing out early therefore cancels nothing — it leaves the first
+/// store running, holding one of hopper's few reserved renewal slots, and sends
+/// a second copy of the same result to contend with it on the same rows. The
+/// escalating 15s/30s/60s table this replaces was built on the opposite
+/// assumption ("slow spells are brief, so fail fast and try again") and made
+/// every store slower than 15 seconds look like a network fault.
+///
+/// Slower than 15 seconds is ordinary: hopper buckets its store phase out to
+/// 60s (`hopper.result_phase.seconds`), and a loaded broker is slower still —
+/// smaug's log for 2026-09-07/08 carries 1,509 ingestion sheds and 712 slow
+/// slot-waits in 23 hours. The `send failed ... operation timed out` this
+/// fixes was one such store: hopper accepted and committed it, and a later
+/// attempt landed a second copy of the same verdict.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Hopper's `validWorkerName` cap (`maxWorkerNameLen` in api.go).
@@ -1396,11 +1402,7 @@ fn post_one(
                 None => break,
             }
         }
-        // The table is indexed by attempt and clamped, so a long budget keeps
-        // retrying at the 120s ceiling instead of running off the end.
-        let timeout = ATTEMPT_TIMEOUTS[attempt.min(ATTEMPT_TIMEOUTS.len() - 1)];
         let mut request = authed(client.post(result_url.at(attempt)))
-            .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             // Claim hopper's reserved lane: this renewal is one-shot, and the
             // caller is already holding the verdict in its cache.

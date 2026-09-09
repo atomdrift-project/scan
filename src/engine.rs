@@ -5761,7 +5761,12 @@ pub(crate) fn classify_report(
         p.set("fetch+graft");
     }
     let fetch_start = Instant::now();
-    let (fetch_edges, fetched_deps, dependency_registries) = crate::fetch::orchestrate(
+    let crate::fetch::FetchOutcome {
+        records: fetch_edges,
+        dependencies: fetched_deps,
+        registries: dependency_registries,
+        adopted: adopted_verdicts,
+    } = crate::fetch::orchestrate(
         &mut report,
         root_path,
         fetch,
@@ -6005,7 +6010,7 @@ pub(crate) fn classify_report(
     // onto the file that declared it (request: the manifest names the bad
     // dependency at its byte). Keyed by content sha so it matches the
     // retrieved payload node.
-    let dep_backrefs: Vec<DepBackref> = member_evals
+    let mut dep_backrefs: Vec<DepBackref> = member_evals
         .values()
         .filter(|ef| {
             matches!(
@@ -6024,14 +6029,63 @@ pub(crate) fn classify_report(
                 dep_sha: ef.sha256.clone(),
                 dep_type: ef.file_type.clone(),
                 class: ef.classification,
+                detail: None,
             })
         })
         .collect();
 
+    // Dependencies whose verdict came from hopper's corpus never reached the
+    // embedded pass — nothing was analyzed — so they have no eval to be filtered
+    // above. They are still this scan's answer for those bytes (the corpus
+    // produced them under the analyzer this build runs), and a hostile one is
+    // precisely what the backref exists to surface, so they are pinned the same
+    // way and counted in the same elevation.
+    let adopted: Vec<(Decision, &String, &crate::corpus_precheck::Verdict)> = adopted_verdicts
+        .iter()
+        .filter_map(|(sha, v)| {
+            let d = adopted_decision(v.fires_at, model.active_level(), model.grid_max())?;
+            Some((d, sha, v))
+        })
+        .collect();
+    dep_backrefs.extend(adopted.iter().filter_map(|(d, sha, v)| {
+        if !matches!(
+            d.class,
+            Classification::Suspicious | Classification::Hostile
+        ) {
+            return None;
+        }
+        let &(src_sha, src_off, source_len, locator) = fetched_by_content.get(sha.as_str())?;
+        Some(DepBackref {
+            source_sha: src_sha.to_string(),
+            source_offset: src_off,
+            source_len,
+            locator: locator.to_string(),
+            dep_sha: (*sha).clone(),
+            dep_type: compact
+                .files
+                .iter()
+                .find(|f| f.sha == **sha)
+                .map_or_else(String::new, |f| f.file_type.clone()),
+            class: d.class,
+            detail: adopted_detail(v),
+        })
+    }));
+
     // Elevate the container by its worst member, exactly as before — derived
-    // from the table instead of tracked during the loop.
+    // from the table instead of tracked during the loop — and by any adopted
+    // dependency verdict, so a hostile dependency weighs the same whether this
+    // scan computed the verdict or the corpus handed it over.
     let max_decision = worst_member(&member_evals)
+        .into_iter()
+        .chain(adopted.into_iter().map(|(d, ..)| d))
         .filter(|worst| decision_outranks(worst, &decision))
+        .reduce(|best, d| {
+            if decision_outranks(&d, &best) {
+                d
+            } else {
+                best
+            }
+        })
         .unwrap_or(decision);
 
     // If an embedded file's decision outranks the parent, elevate.
@@ -6529,6 +6583,12 @@ struct DepBackref {
     dep_sha: String,
     dep_type: String,
     class: Classification,
+    /// Why, in the corpus's own words, when this verdict was adopted rather than
+    /// computed here — the stored reason, else its strongest finding. `None` for
+    /// a dependency this scan analyzed itself: its traits are already in the
+    /// report, a `!!`-path away, and repeating one in the backref prose would be
+    /// the same fact twice.
+    detail: Option<String>,
 }
 
 /// Pin a fetched dependency's verdict onto the file that declared it — a synthetic
@@ -6554,10 +6614,16 @@ fn inject_dependency_backref(report: &mut cleave::types::CompactReport, backref:
         Classification::Hostile => (5u8, "Malicious"),
         _ => (4u8, "Suspicious"),
     };
-    let desc = format!(
-        "{sev} dependency: {} | {}",
-        backref.locator, backref.dep_sha
-    );
+    let desc = match &backref.detail {
+        Some(detail) => format!(
+            "{sev} dependency: {} | {} — {detail}",
+            backref.locator, backref.dep_sha
+        ),
+        None => format!(
+            "{sev} dependency: {} | {}",
+            backref.locator, backref.dep_sha
+        ),
+    };
     let dep = cleave::types::CompactDep {
         locator: backref.locator.clone(),
         sha: backref.dep_sha.clone(),
@@ -8704,6 +8770,70 @@ mod dep_backref_tests {
         f
     }
 
+    /// A verdict adopted from the corpus is graded by the model's own
+    /// level rule — the one line that must never be re-implemented — and carries
+    /// the level onward, with no probability to fabricate.
+    #[test]
+    fn an_adopted_verdict_is_graded_by_the_model_level_rule() {
+        let grid_max = 25_000;
+        // Fires at a level tighter than this deploy's budget: hostile.
+        let d = adopted_decision(2, Some(25), grid_max).expect("graded");
+        assert_eq!(d.class, Classification::Hostile);
+        assert_eq!(d.level, Some(2));
+        assert_eq!(d.probability, 0.0, "no model ran; nothing to report");
+        // Fires only far above the budget, inside the suspicious band.
+        assert_eq!(
+            adopted_decision(200, Some(25), grid_max)
+                .expect("graded")
+                .class,
+            Classification::Suspicious
+        );
+        // The benign sentinel is the absence of a level, never the tightest one.
+        let clean = adopted_decision(-1, Some(25), grid_max).expect("graded");
+        assert_eq!(clean.class, Classification::Benign);
+        assert_eq!(clean.level, Some(-1));
+        // Manual-threshold mode has no level table, so there is no honest class.
+        assert!(adopted_decision(2, None, grid_max).is_none());
+    }
+
+    /// The backref names a package as malicious, so it has to say what for. A
+    /// dependency skipped on the corpus's word has no traits in this report to
+    /// point at — the reason, else its worst finding, is all the evidence there
+    /// is.
+    #[test]
+    fn an_adopted_backref_carries_its_evidence() {
+        use crate::corpus_precheck::{Finding, Verdict};
+        let finding = |id: &str, desc: &str, crit: u32| Finding {
+            id: id.to_string(),
+            desc: desc.to_string(),
+            crit,
+        };
+        let verdict = |reason: Option<&str>, findings: Vec<Finding>| Verdict {
+            fires_at: 2,
+            reason: reason.map(String::from),
+            findings,
+        };
+        assert_eq!(
+            adopted_detail(&verdict(Some("steals credentials"), Vec::new())).as_deref(),
+            Some("steals credentials")
+        );
+        // No sentence: the strongest finding stands in, preferring its prose.
+        assert_eq!(
+            adopted_detail(&verdict(
+                None,
+                vec![
+                    finding("feed/osv", "cited by OSV", 4),
+                    finding("objectives/exfil::env", "", 5),
+                ],
+            ))
+            .as_deref(),
+            Some("objectives/exfil::env")
+        );
+        // Nothing to say is said as nothing, not as an empty clause.
+        assert_eq!(adopted_detail(&verdict(Some("  "), Vec::new())), None);
+        assert_eq!(adopted_detail(&verdict(None, Vec::new())), None);
+    }
+
     fn backref(class: Classification) -> DepBackref {
         DepBackref {
             source_sha: "s".repeat(64),
@@ -8713,6 +8843,7 @@ mod dep_backref_tests {
             dep_sha: "d".repeat(64),
             dep_type: "javascript".to_string(),
             class,
+            detail: None,
         }
     }
 
@@ -9925,6 +10056,51 @@ mod dep_backref_tests {
 
 /// Returns `true` when `candidate` should replace `current` as the dominant
 /// decision: higher class wins; on ties, higher probability wins.
+/// The decision an adopted corpus verdict carries at this deploy's level.
+///
+/// `fires_at` is the same measured quantity [`Decision::level`] holds — the
+/// tightest false-positive budget at which these bytes grade hostile — so the
+/// rule that turns it into a class is the model's own [`verdict_for_level`],
+/// never a second implementation of it. There is no probability: no model ran
+/// here. `class` is what elevation and the backref read, and `level` is what
+/// travels onward, so the missing score costs nothing but a tie-break, which
+/// an adopted verdict should lose anyway.
+///
+/// `None` in manual-threshold mode, where no level table applies and no honest
+/// class can be derived — the same answer `decide` gives for that case.
+fn adopted_decision(fires_at: i64, active_level: Option<u16>, grid_max: u16) -> Option<Decision> {
+    let level = i32::try_from(fires_at).ok()?;
+    let class = if level < 0 {
+        Classification::Benign
+    } else {
+        let fired = u16::try_from(level).ok()?;
+        crate::model::verdict_for_level(fired, active_level?, grid_max)
+    };
+    Some(Decision {
+        class,
+        probability: 0.0,
+        threshold: 0.0,
+        level: Some(level),
+    })
+}
+
+/// What an adopted verdict says for itself: the corpus's own sentence, else the
+/// id of its strongest finding. A dependency skipped on the corpus's word has no
+/// traits in this report to point at, so without this the backref would name a
+/// malicious package and offer nothing behind the claim.
+fn adopted_detail(v: &crate::corpus_precheck::Verdict) -> Option<String> {
+    if let Some(reason) = v.reason.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        return Some(reason.to_string());
+    }
+    v.findings.iter().max_by_key(|f| f.crit).map(|f| {
+        if f.desc.is_empty() {
+            f.id.clone()
+        } else {
+            f.desc.clone()
+        }
+    })
+}
+
 fn decision_outranks(candidate: &Decision, current: &Decision) -> bool {
     match (candidate.class as u8).cmp(&(current.class as u8)) {
         std::cmp::Ordering::Greater => true,
