@@ -572,16 +572,18 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
 
     // Keep the reading measure composed on very wide terminals, but respect a
     // narrow terminal so these rows never become an accidental second line.
-    let width = terminal_width.min(100);
+    let width = terminal_width.min(160);
     let fixed = 5usize; // leading space + 3-cell marker rail + 1-cell gutter
     let available = width.saturating_sub(fixed);
     let max_location = traits
         .iter()
-        .map(|t| t.location.chars().count())
+        .map(|t| UnicodeWidthStr::width(t.location.as_str()))
         .max()
         .unwrap_or(0);
     let location_width = if available >= 28 && max_location > 0 {
-        max_location.min(36).min(available.saturating_sub(20))
+        max_location
+            .min(available / 2)
+            .min(available.saturating_sub(20))
     } else {
         0
     };
@@ -601,13 +603,17 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
                 return format!("{prefix}{description}");
             }
             let location = truncate_terminal_location(&t.location, location_width);
-            let padding = " ".repeat(description_width.saturating_sub(description.chars().count()));
+            let padding = " ".repeat(
+                description_width.saturating_sub(UnicodeWidthStr::width(description.as_str())),
+            );
+            let location_padding = " "
+                .repeat(location_width.saturating_sub(UnicodeWidthStr::width(location.as_str())));
             let location = if color {
                 fg(p.dim, &location)
             } else {
                 location
             };
-            format!("{prefix}{description}{padding}  {location}")
+            format!("{prefix}{description}{padding}  {location_padding}{location}")
         })
         .collect::<Vec<_>>()
         .join("\n")
