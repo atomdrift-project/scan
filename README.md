@@ -1,6 +1,5 @@
 # Atomdrift Scan
 
-[![CI](https://github.com/atomdrift-project/scan/actions/workflows/ci.yml/badge.svg)](https://github.com/atomdrift-project/scan/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/atomdrift-project/scan)](https://github.com/atomdrift-project/scan/releases/latest)
 [![License](https://img.shields.io/github/license/atomdrift-project/scan)](LICENSE)
 
