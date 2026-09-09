@@ -8,7 +8,7 @@ Atomdrift Scan is a modern ML-based malware scanner designed to detect 0-day att
 
 It's designed to be deterministic, fast, and flexible, and embeddable in any workflow or security tool you have in mind, and can operate against files, archives, URLs, PURLs, or processes. 
 
-As of August 2026, Atomdrift Scan has a [82% 0-day detection rate](https://atomdrift.org/compare/), +18% ahead of any other scanner: commercial or open.
+As of September 2026, Atomdrift Scan has a [98% 0-day detection rate](https://atomdrift.org/compare/), +34% ahead of any other scanner: commercial or open.
 
 <p align="center">
   <img src="media/screenshot.png" alt="Atomdrift Scan terminal output" width="760">
