@@ -974,6 +974,17 @@ pub(crate) struct DependencyRegistry {
     pub artifact_skip: Option<&'static str>,
 }
 
+/// What one fetch phase produced: the edges it recorded, the dependencies it
+/// captured for upload, the registry documents it materialized, and the corpus
+/// verdicts it adopted in place of analyzing bytes (keyed by content sha).
+#[derive(Default)]
+pub(crate) struct FetchOutcome {
+    pub(crate) records: Vec<FetchRecord>,
+    pub(crate) dependencies: Vec<FetchedDependency>,
+    pub(crate) registries: Vec<DependencyRegistry>,
+    pub(crate) adopted: HashMap<String, crate::corpus_precheck::Verdict>,
+}
+
 /// Discover, fetch, and graft, following references up to `policy.depth` hops.
 /// Mutates `report.files` in place with one node per fetched payload (and any
 /// extracted members) and returns the fetch edge log plus the standalone report
@@ -993,16 +1004,12 @@ pub(crate) fn orchestrate(
     progress: bool,
     capture_deps: bool,
     zip_passwords: &[String],
-) -> (
-    Vec<FetchRecord>,
-    Vec<FetchedDependency>,
-    Vec<DependencyRegistry>,
-) {
+) -> FetchOutcome {
     if !policy.enabled() {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return FetchOutcome::default();
     }
     let Some(res) = shared_resources() else {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return FetchOutcome::default();
     };
 
     // Analyze fetched payloads with the same bloom short-circuit the top-level
@@ -1022,6 +1029,10 @@ pub(crate) fn orchestrate(
     // not pay that: `None` here means "not yet opened".
     let mut acache: Option<Option<AnalysisCache>> = None;
     let mut records = Vec::new();
+    // Verdicts adopted from hopper's corpus instead of being computed here,
+    // keyed by content sha. The caller turns each into this dependency's
+    // evaluation, exactly as if it had been analyzed locally.
+    let mut adopted: HashMap<String, crate::corpus_precheck::Verdict> = HashMap::new();
     // (declaring file sha) -> (registry records materialized, of which security-held)
     let mut registry_outcomes: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     // Standalone reports for each fetched dependency, captured before the payload
@@ -1185,6 +1196,11 @@ pub(crate) fn orchestrate(
             selected: Vec<Reference>,
             registries: Vec<GatedDep>,
             fetched: Vec<FetchRecord>,
+            /// Verdicts the batch PURL negotiation adopted, keyed by the content
+            /// sha of the dependency they describe. These skipped the fetch
+            /// entirely, so nothing downstream can re-derive them: the merge
+            /// pass pairs them back onto their records here.
+            corpus: HashMap<String, crate::corpus_precheck::Verdict>,
         }
         // Caps the payloads held un-merged at once: enough to keep every core
         // busy across many small groups without holding a whole hop's analyzed
@@ -1366,6 +1382,7 @@ pub(crate) fn orchestrate(
                         selected,
                         registries,
                         fetched: Vec::new(),
+                        corpus: HashMap::new(),
                     });
                     continue;
                 }
@@ -1422,6 +1439,12 @@ pub(crate) fn orchestrate(
                     .filter(|r| !corpus_hits.contains_key(&locator_str(&r.locator)))
                     .cloned()
                     .collect();
+                // Keyed by content sha for the merge pass, which sees records
+                // rather than locators.
+                let group_corpus: HashMap<String, crate::corpus_precheck::Verdict> = corpus_hits
+                    .values()
+                    .filter_map(|hit| hit.verdict.clone().map(|v| (hit.sha.clone(), v)))
+                    .collect();
                 let dep_fetched_real = fetch_references_with(
                     &dep_to_fetch,
                     &source_sha,
@@ -1437,7 +1460,7 @@ pub(crate) fn orchestrate(
                 let dep_fetched: Vec<FetchRecord> = dep_selected
                     .iter()
                     .filter_map(|r| match corpus_hits.get(&locator_str(&r.locator)) {
-                        Some(sha) => Some(corpus_hit_record(r, &source_sha, sha)),
+                        Some(hit) => Some(corpus_hit_record(r, &source_sha, &hit.sha)),
                         // fletch emits one record per reference it selects as a
                         // fetch target; anything it declines has no record and
                         // drops out here, exactly as in the regrouping below.
@@ -1545,7 +1568,12 @@ pub(crate) fn orchestrate(
                     }
                     records.extend(fetched);
                     reporter.finish(&records);
-                    return (records, dependencies, dependency_registries);
+                    return FetchOutcome {
+                        records,
+                        dependencies,
+                        registries: dependency_registries,
+                        adopted,
+                    };
                 }
                 batch_payloads += fetched.iter().filter(|r| delivered_bytes(r)).count();
                 batch.push(GroupWork {
@@ -1553,6 +1581,7 @@ pub(crate) fn orchestrate(
                     selected,
                     registries,
                     fetched,
+                    corpus: group_corpus,
                 });
             }
 
@@ -1728,7 +1757,18 @@ pub(crate) fn orchestrate(
                         if capture_deps && let Some(dep) = capture_dependency(rec, &payload) {
                             dependencies.push(dep);
                         }
-                        next.extend(merge_payload(report, rec, payload));
+                        // The verdict this dependency arrives with, from either
+                        // negotiation: the per-sha precheck puts it on the
+                        // payload, the batch PURL answer in the group's map.
+                        let verdict = payload.corpus.clone().or_else(|| {
+                            rec.content_sha256
+                                .as_deref()
+                                .and_then(|sha| g.corpus.get(sha).cloned())
+                        });
+                        if let (Some(v), Some(sha)) = (&verdict, rec.content_sha256.as_deref()) {
+                            adopted.insert(sha.to_string(), v.clone());
+                        }
+                        next.extend(merge_payload(report, rec, payload, verdict.as_ref()));
                     }
                 }
                 records.extend(g.fetched);
@@ -1744,7 +1784,12 @@ pub(crate) fn orchestrate(
     }
     reporter.finish(&records);
     attribute_reference_outcomes(report, &records, &registry_outcomes);
-    (records, dependencies, dependency_registries)
+    FetchOutcome {
+        records,
+        dependencies,
+        registries: dependency_registries,
+        adopted,
+    }
 }
 
 /// Record, on each file that declared a reference, what became of the
@@ -1991,9 +2036,27 @@ impl Reporter {
             return;
         }
         if !terminal_fetch_row_visible(rec) {
+            match &rec.outcome {
+                Outcome::Failed(why) => tracing::debug!(
+                    locator = %rec.locator,
+                    url = %rec.resolved_url,
+                    status = ?failure_status(rec),
+                    why,
+                    "fetch: artifact absent from its registry"
+                ),
+                Outcome::Skipped if rec.content_sha256.is_some() => tracing::debug!(
+                    locator = %rec.locator,
+                    content_sha = ?rec.content_sha256,
+                    "fetch: verdict already stands in the corpus"
+                ),
+                _ => {}
+            }
             return;
         }
         if let Self::Stream { .. } = self {
+            // The streamed log is the attention channel: successes are carried
+            // by the aggregate header and the final summary, and only failures
+            // and pin trouble earn a line.
             if matches!(rec.outcome, Outcome::Ok) {
                 return;
             }
@@ -2033,18 +2096,30 @@ impl Reporter {
         }
     }
 
-    /// A dependency was skipped at the age gate. Only the *meaningful* skips —
-    /// a withdrawn version, or a known-good coordinate — are surfaced; an aged-out
-    /// dep (the common case, only a metadata lookup ran) is dropped entirely, in
-    /// both the stream and the tree. The tree wasn't told about aged-outs
-    /// (`announce` sees only the kept set), so it adds a row here for the skips it
-    /// does surface.
+    /// A dependency was skipped at the age gate. An aged-out dep (the common
+    /// case, only a metadata lookup ran) is dropped entirely, in both the stream
+    /// and the tree; a withdrawn version is surfaced in both; a known-good
+    /// coordinate reaches the tree but not the streamed log. The tree wasn't
+    /// told about aged-outs (`announce` sees only the kept set), so it adds a
+    /// row here for the skips it does surface.
     fn skipped(&self, r: &Reference, reg: &Registry, now: u64, reason: SkipReason) {
         if matches!(reason, SkipReason::AgedOut) {
             return;
         }
         match self {
             Self::Off => {}
+            // A known-good coordinate is the common case in any real lockfile —
+            // hundreds of them, each saying the same nothing-to-see — so the
+            // streamed log keeps only the withdrawn versions, which are a
+            // finding. The tree still shows both: its rows are bounded and
+            // rewritten in place.
+            Self::Stream { .. } if matches!(reason, SkipReason::KnownGood) => {
+                tracing::debug!(
+                    locator = %locator_key(r),
+                    age_days = reg.age_secs(now).unwrap_or(0) / 86_400,
+                    "fetch: known-good dependency skipped"
+                );
+            }
             Self::Stream { .. } => {
                 crate::engine::print_above_bar(|| report_skip(r, reg, now, reason))
             }
@@ -2497,11 +2572,47 @@ fn report_fetch(rec: &FetchRecord) {
 }
 
 /// Whether one fetch outcome deserves a terminal row. An unresolved locator
-/// produced no bytes and carries no actionable failure detail; retain its
-/// [`FetchRecord`] for machine output and diagnostics, but keep the default
-/// human view quiet.
+/// produced no bytes and carries no actionable failure detail, and a non-target
+/// reference (a source repo, an unclassified string) was never going to be
+/// fetched at all — a row for either says nothing about the artifact being
+/// scanned. Retain their [`FetchRecord`]s for machine output and diagnostics,
+/// but keep the default human view quiet.
+///
+///
+/// A corpus hit (see [`corpus_hit_record`]) is quiet for the same reason: the
+/// fleet already judged those bytes, so there is nothing here to look at.
 fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
-    !matches!(rec.outcome, Outcome::Unresolved)
+    match rec.outcome {
+        Outcome::Unresolved | Outcome::Skipped => false,
+        Outcome::Failed(_) => !artifact_absent(rec),
+        _ => true,
+    }
+}
+
+/// Whether a failed fetch failed because the artifact is simply not there:
+/// `404` (never published, or a name the registry doesn't carry) or `410`
+/// (withdrawn). Neither says anything about the artifact being scanned — a
+/// manifest naming a package no registry ever had is a fact about the manifest
+/// — and a large lockfile produces them by the dozen, so they are recorded and
+/// logged at debug rather than printed. Every other failure (transport,
+/// timeout, `5xx`, a `403` that may be an authenticated mirror) is a fetch that
+/// *should* have worked, and stays visible.
+fn artifact_absent(rec: &FetchRecord) -> bool {
+    matches!(failure_status(rec), Some(404 | 410))
+}
+
+/// The HTTP status behind a failure. Fletch records the code when the fetch
+/// reached the network; a record that predates that (a cached one, an older
+/// fletch) carries it only in the error text it built from the same code —
+/// `http status 404`.
+fn failure_status(rec: &FetchRecord) -> Option<u16> {
+    if let Some(status) = rec.status {
+        return Some(status);
+    }
+    let Outcome::Failed(why) = &rec.outcome else {
+        return None;
+    };
+    why.strip_prefix("http status ")?.trim().parse().ok()
 }
 
 /// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
@@ -2558,6 +2669,8 @@ fn fetch_row(rec: &FetchRecord) -> FetchRow {
             120,
             Some("unresolved".to_string()),
         ),
+        // Never rendered — every `Skipped` is hidden (see
+        // `terminal_fetch_row_visible`) — but the match must still name it.
         Outcome::Skipped => (
             '\u{00b7}',
             "skip",
@@ -2619,7 +2732,7 @@ fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
 /// The compact failure note for a failed fetch — the HTTP status when one was
 /// seen (the common, informative case), else the transport reason trimmed.
 fn failure_detail(rec: &FetchRecord, why: &str) -> String {
-    rec.status.map_or_else(
+    failure_status(rec).map_or_else(
         || {
             why.split(['\n', ':'])
                 .next()
@@ -3652,6 +3765,12 @@ struct Analyzed {
     sub: Option<AnalysisReport>,
     content_sha: String,
     next_from_bytes: Vec<(String, Vec<Reference>)>,
+    /// The corpus verdict adopted in place of analyzing these bytes — set only
+    /// when hopper's stored verdict came from the analyzer this build is
+    /// running (see [`crate::corpus_precheck::Standing`]). `None` for an
+    /// ordinary analysis and for a rule-2 benign skip, which carries no
+    /// reportable finding.
+    corpus: Option<crate::corpus_precheck::Verdict>,
 }
 
 /// Analyze the bytes of fetched payloads on cleave's shared rayon pool, one slot
@@ -3713,10 +3832,13 @@ fn analyze_payload(
     // stands in hopper; produce the same skip the per-sha precheck would,
     // without re-asking.
     if matches!(rec.outcome, Outcome::Skipped) {
+        // The verdict for this one rides the batch's PURL answer, which the
+        // merge pass pairs back on by content sha (`GroupWork::corpus`).
         return rec.content_sha256.clone().map(|content_sha| Analyzed {
             sub: None,
             content_sha,
             next_from_bytes: Vec::new(),
+            corpus: None,
         });
     }
 
@@ -3739,6 +3861,7 @@ fn analyze_payload(
             sub: hit.sub,
             content_sha,
             next_from_bytes: hit.next,
+            corpus: None,
         });
     }
 
@@ -3750,17 +3873,29 @@ fn analyze_payload(
     // skipped payload merges like a benign analysis that found nothing: no
     // sub-report to graft, no next-hop references, and — because it never
     // enters the envelope — no member fan-out or renewal on hopper's side.
-    if !content_sha.is_empty() && crate::corpus_precheck::skip_reanalysis(&content_sha) {
-        tracing::debug!(
-            locator = %rec.locator,
-            content_sha = %content_sha,
-            "corpus precheck: verdict stands in hopper; skipping re-analysis"
-        );
-        return Some(Analyzed {
-            sub: None,
-            content_sha,
-            next_from_bytes: Vec::new(),
-        });
+    if !content_sha.is_empty() {
+        let standing = crate::corpus_precheck::corpus_standing(&content_sha);
+        if standing.skips_analysis() {
+            let corpus = match standing {
+                // Same analyzer: its verdict is the one this scan would have
+                // computed, so it is carried through as this dependency's
+                // result rather than dropped on the floor.
+                crate::corpus_precheck::Standing::Adopt(v) => Some(v),
+                _ => None,
+            };
+            tracing::debug!(
+                locator = %rec.locator,
+                content_sha = %content_sha,
+                adopted = corpus.is_some(),
+                "corpus precheck: verdict stands in hopper; skipping re-analysis"
+            );
+            return Some(Analyzed {
+                sub: None,
+                content_sha,
+                next_from_bytes: Vec::new(),
+                corpus,
+            });
+        }
     }
 
     let bytes = cache.load(&rec.locator)?;
@@ -3799,6 +3934,7 @@ fn analyze_payload(
 
     Some(Analyzed {
         sub,
+        corpus: None,
         content_sha,
         next_from_bytes,
     })
@@ -3810,13 +3946,55 @@ fn analyze_payload(
 /// content_sha256`) is the authoritative link; ids and depth are renumbered so
 /// the grafted nodes are a well-formed subtree that never collides with the main
 /// report's. Must run serially — it reads and extends `report.files`.
+/// Give a dependency whose verdict came from the corpus the same node a fetched
+/// payload gets from [`merge_payload`]: attached to the file that declared it,
+/// named by its locator, marked [`Rel::Fetched`] and carrying the URL it came
+/// from. It has no members and no traits of its own — nothing was analyzed here
+/// — so it is the identity a verdict hangs on, not an analysis result.
+fn append_adopted_node(report: &mut AnalysisReport, rec: &FetchRecord, content_sha: &str) {
+    let (parent_id, parent_depth) = report
+        .files
+        .iter()
+        .find(|f| f.sha256 == rec.source_sha256)
+        .map_or((0, 0), |f| (f.id, f.depth));
+    let id = report.files.iter().map(|f| f.id).max().map_or(0, |m| m + 1);
+    let via = if rec.resolved_url.is_empty() {
+        rec.locator.clone()
+    } else {
+        rec.final_url
+            .clone()
+            .unwrap_or_else(|| rec.resolved_url.clone())
+    };
+    report.files.push(cleave::types::FileAnalysis {
+        id,
+        parent_id: Some(parent_id),
+        depth: parent_depth + 1,
+        path: rec.locator.clone(),
+        sha256: content_sha.to_string(),
+        size: rec.size.unwrap_or(0),
+        rel: cleave::types::Rel::Fetched,
+        via: (!via.is_empty()).then_some(via),
+        ..cleave::types::FileAnalysis::default()
+    });
+}
+
 fn merge_payload(
     report: &mut AnalysisReport,
     rec: &FetchRecord,
     analyzed: Analyzed,
+    adopted: Option<&crate::corpus_precheck::Verdict>,
 ) -> Vec<(String, Vec<Reference>)> {
     let mut next = analyzed.next_from_bytes;
     let Some(sub) = analyzed.sub else {
+        // Nothing was analyzed, but the corpus handed us this dependency's
+        // verdict. Give it the node a grafted payload would have had, so the
+        // adopted result has somewhere to live: the tree shows the dependency,
+        // `ml.files` can carry its grade, and the backref pass can find it by
+        // content sha. Without a node an adopted verdict would be invisible —
+        // the hole this whole path exists to close.
+        if adopted.is_some() && !analyzed.content_sha.is_empty() {
+            append_adopted_node(report, rec, &analyzed.content_sha);
+        }
         return next;
     };
 
@@ -4061,6 +4239,7 @@ mod tests {
             sub: Some(report),
             content_sha: "d".repeat(64),
             next_from_bytes: Vec::new(),
+            corpus: None,
         }
     }
 
@@ -4148,7 +4327,7 @@ mod tests {
             }]
         }))
         .expect("parent report");
-        merge_payload(&mut parent, &rec, payload);
+        merge_payload(&mut parent, &rec, payload, None);
         let fetched = parent
             .files
             .iter()
@@ -4279,6 +4458,100 @@ mod tests {
         rec.outcome = Outcome::Failed("transport".to_string());
         assert!(terminal_fetch_row_visible(&rec));
         assert!(matches!(done_state(&rec), DepState::Done { .. }));
+    }
+
+    /// Neither `Skipped` reaches the human view: a reference that was never a
+    /// fetch target says nothing about the scanned artifact, and a corpus hit is
+    /// bytes the fleet already judged. Both stay in the record and the log.
+    #[test]
+    fn skipped_fetches_stay_out_of_the_terminal_view() {
+        let mut rec = fetched_record();
+        rec.outcome = Outcome::Skipped;
+        rec.content_sha256 = None;
+        assert!(!terminal_fetch_row_visible(&rec));
+        assert!(matches!(done_state(&rec), DepState::Hidden));
+
+        // A corpus hit — the other `Skipped` — is equally quiet.
+        rec.content_sha256 = Some("d".repeat(64));
+        assert!(!terminal_fetch_row_visible(&rec));
+        assert!(matches!(done_state(&rec), DepState::Hidden));
+    }
+
+    /// A 404 says the coordinate names nothing the registry carries — a fact
+    /// about the manifest, not the artifact being scanned — and a big lockfile
+    /// produces them by the dozen. A failure that should have worked stays.
+    #[test]
+    fn absent_artifacts_stay_out_of_the_terminal_view() {
+        let mut rec = fetched_record();
+        rec.outcome = Outcome::Failed("http status 404".to_string());
+        rec.status = Some(404);
+        assert!(!terminal_fetch_row_visible(&rec));
+        assert!(matches!(done_state(&rec), DepState::Hidden));
+
+        rec.status = Some(503);
+        assert!(terminal_fetch_row_visible(&rec));
+
+        // The same 404 as an older record spells it: in the message only.
+        rec.status = None;
+        assert!(!terminal_fetch_row_visible(&rec));
+
+        rec.outcome = Outcome::Failed("connection reset".to_string());
+        assert!(terminal_fetch_row_visible(&rec), "transport failure");
+    }
+
+    /// A dependency whose verdict came from the corpus is never analyzed, so it
+    /// has no subtree to graft — but it must still appear in the tree, or the
+    /// adopted verdict has nothing to hang on and the dependency reads as
+    /// though it were never there.
+    #[test]
+    fn an_adopted_verdict_gives_its_dependency_a_node() {
+        let parent = || -> AnalysisReport {
+            serde_json::from_value(serde_json::json!({
+                "version": "3",
+                "files": [{
+                    "id": 0, "path": "package.json", "depth": 0,
+                    "file_type": "package_json", "sha256": "s".repeat(64), "size": 100u64
+                }],
+            }))
+            .expect("parent report")
+        };
+        let mut rec = fetched_record();
+        rec.locator = "pkg:npm/zaboodle@1.49".to_string();
+        rec.source_sha256 = "s".repeat(64);
+        rec.outcome = Outcome::Skipped;
+        let analyzed = || Analyzed {
+            sub: None,
+            content_sha: "d".repeat(64),
+            next_from_bytes: Vec::new(),
+            corpus: None,
+        };
+        let verdict = crate::corpus_precheck::Verdict {
+            fires_at: 2,
+            reason: None,
+            findings: Vec::new(),
+        };
+
+        let mut adopted = parent();
+        merge_payload(&mut adopted, &rec, analyzed(), Some(&verdict));
+        let node = adopted
+            .files
+            .iter()
+            .find(|f| f.sha256 == "d".repeat(64))
+            .expect("the adopted dependency is in the tree");
+        assert_eq!(node.path, "pkg:npm/zaboodle@1.49", "named by its locator");
+        assert_eq!(node.rel, cleave::types::Rel::Fetched);
+        assert_eq!(
+            node.parent_id,
+            Some(0),
+            "hangs off the file that declared it"
+        );
+        assert_eq!(node.depth, 1);
+
+        // Nothing adopted (a rule-2 benign skip, or an ordinary empty payload)
+        // adds nothing: there is no verdict for a node to carry.
+        let mut bare = parent();
+        merge_payload(&mut bare, &rec, analyzed(), None);
+        assert_eq!(bare.files.len(), 1);
     }
 
     /// Regression for the silent-skip bug: `UnverifiablePin` delivers bytes just
@@ -5463,7 +5736,9 @@ mod tests {
                     sub: Some(sub_report("index.js")),
                     content_sha: "d".repeat(64),
                     next_from_bytes: Vec::new(),
+                    corpus: None,
                 },
+                None,
             );
         }
 
