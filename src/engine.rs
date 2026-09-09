@@ -4946,6 +4946,52 @@ fn render_archive_cards(
         out.push('\n');
     }
 
+    // Ordinary archive members are files, not independent packages. Keep their
+    // strongest findings in one aligned grid; reserve cards for nested
+    // containers. The archive-level verdict may be inherited from these same
+    // members, so it must not force the package-card layout.
+    if notable.iter().all(|pkg| {
+        pkg.members.len() == 1
+            && by_id
+                .get(&pkg.id)
+                .is_some_and(|file| decoded_region_display_path(&file.path).is_none())
+    }) {
+        let mut traits = Vec::new();
+        for pkg in notable.iter().take(3) {
+            let file = by_id.get(&pkg.id)?;
+            let mut view = report.clone();
+            view.files.retain(|f| f.id == pkg.id);
+            if let Some(mut finding) = terminal_top_traits(&view).into_iter().next() {
+                let path = terminal_safe_text(&package_display_path(&file.path));
+                finding.location = finding
+                    .location
+                    .strip_prefix("line ")
+                    .map_or_else(|| path.clone(), |line| format!("{path}:{line}"));
+                traits.push(finding);
+            }
+        }
+        out.push_str(&crate::output::terminal_trait_rows(
+            &traits,
+            cleave::output::terminal_width(),
+        ));
+        out.push('\n');
+        let additional = notable.len().saturating_sub(traits.len());
+        let clean = packages.len().saturating_sub(notable.len());
+        let mut omitted = Vec::new();
+        if additional > 0 {
+            let noun = if additional == 1 { "file" } else { "files" };
+            omitted.push(format!("{additional} additional affected {noun}"));
+        }
+        if clean > 0 {
+            let noun = if clean == 1 { "file" } else { "files" };
+            omitted.push(format!("{clean} clean {noun} omitted"));
+        }
+        if !omitted.is_empty() {
+            out.push_str(&format!("\n {}\n", omitted.join(" · ")));
+        }
+        return Some(out);
+    }
+
     // Decoded regions are children of the named artifact, not sibling packages.
     // Give them a compact branch tree; real archive members retain the stronger
     // package cards used for grab-bag archives.
