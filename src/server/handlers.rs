@@ -3686,10 +3686,12 @@ async fn v1_analyze_bytes(
                 attachment,
                 flight,
                 named,
-                budget,
-                request_start,
-                follow_name,
-                q.full,
+                V1Framing {
+                    budget,
+                    started: request_start,
+                    follow: follow_name,
+                    full: q.full,
+                },
             )
         }
     }
@@ -4088,10 +4090,12 @@ pub(super) async fn v1_analyze(
                     attachment,
                     flight,
                     about,
-                    budget,
-                    request_start,
-                    follow_name,
-                    q.full,
+                    V1Framing {
+                        budget,
+                        started: request_start,
+                        follow: follow_name,
+                        full: q.full,
+                    },
                 )
             }
         };
@@ -4243,10 +4247,12 @@ pub(super) async fn v1_analyze(
                 attachment,
                 flight,
                 about,
-                budget,
-                request_start,
-                follow_name,
-                q.full,
+                V1Framing {
+                    budget,
+                    started: request_start,
+                    follow: follow_name,
+                    full: q.full,
+                },
             )
         }
     }
@@ -4395,16 +4401,30 @@ fn v1_outcome_response(
 /// of `unavailable` rather than a 5xx. That is the v1 contract either way — a
 /// caller reads `decision`, not the status line — and the alternative on this
 /// path is not a truthful 504 but a severed connection and no answer at all.
+/// The per-request framing a streamed answer renders with: the budget the
+/// decision cites, the clock its `elapsed_ms` fields count from, the follow
+/// policy named on its headers, and whether the terminal frame is the full
+/// report or the verdict.
+struct V1Framing {
+    budget: u16,
+    started: Instant,
+    follow: Option<String>,
+    full: bool,
+}
+
 fn v1_streamed(
     state: Arc<AppState>,
     attachment: super::flight::Attachment,
     flight: Arc<Flight>,
     named: Named,
-    budget: u16,
-    request_start: Instant,
-    follow: Option<String>,
-    full: bool,
+    framing: V1Framing,
 ) -> Response {
+    let V1Framing {
+        budget,
+        started: request_start,
+        follow,
+        full,
+    } = framing;
     let Named {
         key: purl,
         asked,
