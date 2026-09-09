@@ -17,8 +17,8 @@ As of August 2026, Atomdrift Scan has a [82% 0-day detection rate](https://atomd
 How does Atomdrift get such great results? First, it covers more ground than any other scanner:
 
 - 100+ supported file formats: from C source to ELF to PDF
-- 100,000+ detection rules covering malware on every platform from AIX to iOS to Windows
-- 4,000,000+ hashes for known good/badware
+- 125,000+ detection rules covering malware on every platform from AIX to iOS to Windows
+- 15,000,000+ hashes for known good/badware
 - Integrated AST analysis using [tree-sitter](https://tree-sitter.github.io/)
 - Automated binary reverse engineering via [rizin](https://rizin.re/)
 
