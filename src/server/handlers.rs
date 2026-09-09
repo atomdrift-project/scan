@@ -3331,6 +3331,10 @@ pub(super) struct V1LookupQuery {
     /// result is reusable only when it was produced by this worker's traits;
     /// otherwise the immutable sample bytes are fetched and analyzed here.
     refresh: bool,
+    /// Return the complete scan envelope instead of the compact v1 decision.
+    /// A full envelope cannot be reconstructed from the verdict index, so this
+    /// also bypasses decision-only fast paths.
+    full: bool,
     /// Which references discovered inside the root artifact the caller wants
     /// followed. Repeated keys and comma-separated values are both accepted.
     /// Empty means use the deployment policy.
@@ -3383,6 +3387,7 @@ impl V1LookupQuery {
             force: false,
             fresh: false,
             refresh: false,
+            full: false,
             follow: Vec::new(),
         };
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
@@ -3406,6 +3411,7 @@ impl V1LookupQuery {
                 // This is intentionally stricter than the older boolean
                 // spellings: `refresh=1` is the one public wire contract.
                 "refresh" => q.refresh = value.as_ref() == "1",
+                "full" => q.full = value.as_ref() == "1",
                 "follow" => q.follow.push(value.into_owned()),
                 // Unknown parameters are ignored, so a caller can carry their
                 // own tracing keys through without us rejecting the request.
@@ -3542,7 +3548,7 @@ async fn v1_analyze_bytes(
     // these bytes, which is why the caller sent them, and `unavailable` means
     // we could not find out — turning either into an answer would report on
     // work never done.
-    if !q.force && !q.refresh && request_follow.persist {
+    if !q.full && !q.force && !q.refresh && request_follow.persist {
         if let Ok((decided, source)) = v1_decide(state, Some(&sha), None, None, budget, q.fresh)
             .await
             .map(|(d, source)| (d.asked_about(asked), source))
@@ -3670,6 +3676,7 @@ async fn v1_analyze_bytes(
                 elapsed,
                 !leads,
                 follow_name.as_deref(),
+                q.full,
             )
         }
         Err(_) => {
@@ -3682,6 +3689,7 @@ async fn v1_analyze_bytes(
                 budget,
                 request_start,
                 follow_name,
+                q.full,
             )
         }
     }
@@ -3901,7 +3909,8 @@ pub(super) async fn v1_analyze(
         // traits version. It is the cheapest and most reliable answer, and a
         // refresh must not turn a valid Scan-local result into a Hopper
         // dependency merely to prove what Scan already knows.
-        if let Some(index) = crate::lookup::global()
+        if !q.full
+            && let Some(index) = crate::lookup::global()
             && let Some(verdict) = index.get_sha(&sha)
         {
             let elapsed = crate::duration_ms(request_start.elapsed());
@@ -3925,7 +3934,8 @@ pub(super) async fn v1_analyze(
         };
 
         let (reached, source) = corpus.known_fresh_with_source(Some(&sha), None).await;
-        if let Reached::Record(record) = reached
+        if !q.full
+            && let Reached::Record(record) = reached
             && matching_traits_version(
                 record.traits_version.as_deref(),
                 crate::corpus_precheck::local_traits(),
@@ -4068,6 +4078,7 @@ pub(super) async fn v1_analyze(
                     elapsed,
                     !leads,
                     follow_name.as_deref(),
+                    q.full,
                 )
             }
             Err(_) => {
@@ -4080,6 +4091,7 @@ pub(super) async fn v1_analyze(
                     budget,
                     request_start,
                     follow_name,
+                    q.full,
                 )
             }
         };
@@ -4133,7 +4145,7 @@ pub(super) async fn v1_analyze(
     // this, which is the whole reason the caller is here, and `unavailable`
     // means we could not find out — turning that into a refusal to work would
     // make a corpus outage look like an answer. Both fall through and run.
-    if !q.force && !q.refresh && request_follow.persist {
+    if !q.full && !q.force && !q.refresh && request_follow.persist {
         if let Ok((decided, source)) =
             v1_resolve(&state, None, Some(&req.purl), None, budget, q.fresh).await
             && decided.is_answerable()
@@ -4221,6 +4233,7 @@ pub(super) async fn v1_analyze(
                 elapsed,
                 !leads,
                 follow_name.as_deref(),
+                q.full,
             )
         }
         Err(_) => {
@@ -4233,6 +4246,7 @@ pub(super) async fn v1_analyze(
                 budget,
                 request_start,
                 follow_name,
+                q.full,
             )
         }
     }
@@ -4253,6 +4267,24 @@ struct Named {
     is_url: bool,
 }
 
+/// A successful full v1 response keeps the ordinary terminal marker while
+/// exposing the complete scan envelope at the same top level.
+#[derive(serde::Serialize)]
+struct V1FullResult {
+    status: &'static str,
+    #[serde(flatten)]
+    envelope: crate::engine::ScanResultEnvelope,
+}
+
+impl V1FullResult {
+    fn from_scan(result: &crate::engine::ScanResult) -> Self {
+        Self {
+            status: "analyzed",
+            envelope: result.to_envelope(),
+        }
+    }
+}
+
 /// A finished analysis, as a decision.
 fn v1_outcome_response(
     outcome: &Outcome,
@@ -4261,6 +4293,7 @@ fn v1_outcome_response(
     elapsed_ms: u64,
     shared: bool,
     follow: Option<&str>,
+    full: bool,
 ) -> Response {
     let (purl, asked) = (named.key.as_deref(), named.asked.as_deref());
     let subject = named.subject.as_str();
@@ -4272,14 +4305,18 @@ fn v1_outcome_response(
             // one shape or neither is trustworthy.
             // The verdict is stored under the normalized key; only the answer
             // going back out is spelled the caller's way.
-            let verdict_key = (!named.is_url).then_some(purl).flatten();
-            let verdict = crate::lookup::Verdict::from_scan(result, verdict_key);
-            let decided = if named.is_url {
-                V1Decision::stored(&verdict, None, budget).asked_about_url(asked)
+            let mut resp = if full {
+                Json(V1FullResult::from_scan(result)).into_response()
             } else {
-                V1Decision::stored(&verdict, purl, budget).asked_about(asked)
+                let verdict_key = (!named.is_url).then_some(purl).flatten();
+                let verdict = crate::lookup::Verdict::from_scan(result, verdict_key);
+                let decided = if named.is_url {
+                    V1Decision::stored(&verdict, None, budget).asked_about_url(asked)
+                } else {
+                    V1Decision::stored(&verdict, purl, budget).asked_about(asked)
+                };
+                Json(decided).into_response()
             };
-            let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed_ms.into());
             // Whether this answer cost an analysis. The route is the same
             // either way, but a run served from the analysis cache did no work
@@ -4366,6 +4403,7 @@ fn v1_streamed(
     budget: u16,
     request_start: Instant,
     follow: Option<String>,
+    full: bool,
 ) -> Response {
     let Named {
         key: purl,
@@ -4419,6 +4457,11 @@ fn v1_streamed(
         let elapsed = crate::duration_ms(request_start.elapsed());
         let decided = match outcome.as_ref() {
             Outcome::Report(result) => {
+                if full {
+                    let response = V1FullResult::from_scan(result);
+                    v1_send(&tx, &response).await;
+                    return;
+                }
                 // As on the unstreamed path: an upload has no locator, and the
                 // digest is not one.
                 let verdict_key = (!is_url).then_some(purl.as_deref()).flatten();
@@ -5699,6 +5742,17 @@ mod tests {
             let raw = format!(
                 "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&refresh={value}"
             );
+            assert!(!q(&raw));
+        }
+    }
+
+    #[test]
+    fn full_has_one_unambiguous_wire_spelling() {
+        use super::V1LookupQuery;
+        let q = |raw: &str| -> bool { V1LookupQuery::parse(Some(raw)).full };
+        assert!(q("purl=pkg:npm/left-pad@1.3.0&full=1"));
+        for value in ["", "0", "true", "yes", "2"] {
+            let raw = format!("purl=pkg:npm/left-pad@1.3.0&full={value}");
             assert!(!q(&raw));
         }
     }
