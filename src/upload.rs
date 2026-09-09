@@ -9,8 +9,11 @@
 //! stored cleave/litmus envelope (and an unknown SHA is a harmless no-op).
 //!
 //! Uploads run on a dedicated thread so blocking network I/O never stalls the
-//! analysis pool. Upload failures do not fail the scan, but they are surfaced as
-//! explicit errors so a successful local verdict cannot hide a lost renewal.
+//! analysis pool. Network upload failures do not fail the local scan, but they
+//! are surfaced as explicit errors so a successful local verdict cannot hide a
+//! lost renewal. Failure to hand request-owned bytes to the uploader is
+//! different: that is reported as a failed request rather than returning a
+//! result known not to be persisted.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -444,7 +447,13 @@ enum Job {
     },
     /// Ensure hopper has these artifacts' bytes+provenance, uploading only the
     /// ones it's missing.
-    Artifacts(Vec<UploadArtifact>),
+    Artifacts {
+        artifacts: Vec<UploadArtifact>,
+        /// Durable staging directories owned by this job. They must outlive
+        /// the analysis request's temporary upload directory and are removed
+        /// after reconciliation, including when hopper already knows the SHA.
+        cleanup_dirs: Vec<PathBuf>,
+    },
     /// Mirror fetched dependencies into hopper as their own samples: bytes (only
     /// if missing) + provenance, then the verdict scan computed for each.
     Dependencies {
@@ -571,7 +580,10 @@ impl Uploader {
                                 },
                             );
                         }
-                        Job::Artifacts(artifacts) => {
+                        Job::Artifacts {
+                            artifacts,
+                            cleanup_dirs,
+                        } => {
                             reconcile_artifacts(
                                 &client,
                                 &known_url,
@@ -580,6 +592,7 @@ impl Uploader {
                                 &mut seen,
                                 artifacts,
                             );
+                            cleanup_upload_dirs(cleanup_dirs);
                         }
                         Job::Dependencies {
                             deps,
@@ -674,12 +687,84 @@ impl Uploader {
     /// uploaded with their provenance. Submit before the matching [`Self::submit`] so a
     /// new top-level file's row exists before its verdict lands.
     pub fn submit_artifacts(&self, artifacts: Vec<UploadArtifact>) {
+        self.enqueue_artifacts(artifacts, Vec::new());
+    }
+
+    /// Copy file-backed artifacts into a staging directory owned by the
+    /// uploader, then queue them for reconciliation.
+    ///
+    /// Server uploads are initially held in a request-scoped [`tempfile::TempDir`].
+    /// The analysis request is allowed to delete that directory as soon as the
+    /// verdict is ready, while this uploader may still be waiting behind other
+    /// jobs. Keeping an independent on-disk copy makes the handoff reliable
+    /// without retaining a potentially large upload in memory or reading it
+    /// before `/api/known` says hopper needs it.
+    pub fn submit_artifacts_durable(
+        &self,
+        mut artifacts: Vec<UploadArtifact>,
+    ) -> Result<(), String> {
         if artifacts.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Some(tx) = &self.tx {
-            self.pending.fetch_add(1, Ordering::Relaxed);
-            let _ = tx.send(Job::Artifacts(artifacts));
+
+        let staging = tempfile::Builder::new()
+            .prefix("scan-upload-")
+            .tempdir()
+            .map_err(|error| format!("create durable upload staging directory: {error}"))?;
+        for (index, artifact) in artifacts.iter_mut().enumerate() {
+            let ArtifactBytes::File(source) = &artifact.bytes else {
+                continue;
+            };
+            let filename = source
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .map_or_else(
+                    || format!("artifact-{index}"),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+            let destination = staging.path().join(format!("{index}-{filename}"));
+            std::fs::copy(source, &destination).map_err(|error| {
+                format!(
+                    "copy {} into durable upload staging: {error}",
+                    source.display()
+                )
+            })?;
+            artifact.bytes = ArtifactBytes::File(destination);
+        }
+
+        // `keep` transfers directory ownership from TempDir to the queued job.
+        // The paths stored in `artifacts` remain valid after this call.
+        let staging_path = staging.keep();
+        if self.enqueue_artifacts(artifacts, vec![staging_path]) {
+            Ok(())
+        } else {
+            Err("uploader stopped before durable artifacts could be queued".to_string())
+        }
+    }
+
+    /// Persist one already-built artifact from bytes supplied by the caller,
+    /// then queue it for reconciliation. This is used when Scan has a local
+    /// verdict and can answer immediately, but Hopper may not yet have the
+    /// artifact row that the verdict belongs to.
+    pub fn submit_artifact_bytes_durable(
+        &self,
+        mut artifact: UploadArtifact,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let staging = tempfile::Builder::new()
+            .prefix("scan-upload-")
+            .tempdir()
+            .map_err(|error| format!("create durable upload staging directory: {error}"))?;
+        let destination = staging.path().join("artifact");
+        std::fs::write(&destination, bytes)
+            .map_err(|error| format!("write durable upload staging file: {error}"))?;
+        artifact.bytes = ArtifactBytes::File(destination);
+
+        let staging_path = staging.keep();
+        if self.enqueue_artifacts(vec![artifact], vec![staging_path]) {
+            Ok(())
+        } else {
+            Err("uploader stopped before durable artifact could be queued".to_string())
         }
     }
 
@@ -704,6 +789,37 @@ impl Uploader {
                 version,
                 analyzed_at,
             });
+        }
+    }
+
+    /// Queue an artifact batch and ensure any owned staging directories are
+    /// reclaimed if the queue is unavailable or closed.
+    fn enqueue_artifacts(
+        &self,
+        artifacts: Vec<UploadArtifact>,
+        cleanup_dirs: Vec<PathBuf>,
+    ) -> bool {
+        if artifacts.is_empty() {
+            cleanup_upload_dirs(cleanup_dirs);
+            return true;
+        }
+        let Some(tx) = &self.tx else {
+            cleanup_upload_dirs(cleanup_dirs);
+            return false;
+        };
+
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        match tx.send(Job::Artifacts {
+            artifacts,
+            cleanup_dirs,
+        }) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::SendError(Job::Artifacts { cleanup_dirs, .. })) => {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+                // The receiver cannot clean a job it never received.
+                cleanup_upload_dirs(cleanup_dirs);
+                false
+            }
         }
     }
 }
@@ -814,6 +930,18 @@ fn reconcile_artifacts(
             continue;
         };
         upload_one(client, upload_url, &art, &bytes);
+    }
+}
+
+/// Remove uploader-owned staging directories after a job has been fully
+/// reconciled. Failure is logged but does not turn a completed upload into a
+/// failed scan; the directory is temporary and the next service cleanup can
+/// remove an orphan left by an unusual filesystem error.
+fn cleanup_upload_dirs(dirs: Vec<PathBuf>) {
+    for dir in dirs {
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %error, "upload: durable staging cleanup failed");
+        }
     }
 }
 

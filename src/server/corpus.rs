@@ -100,6 +100,8 @@ pub(crate) struct CorpusRecord {
     #[serde(default)]
     pub engine_version: Option<String>,
     #[serde(default)]
+    pub traits_version: Option<String>,
+    #[serde(default)]
     pub analyzed_at: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
@@ -187,6 +189,77 @@ impl Corpus {
         self.bases.join(", ")
     }
 
+    /// Read immutable sample bytes from Hopper's authoritative side.
+    ///
+    /// The response is accumulated only up to Scan's configured upload limit;
+    /// callers pass that limit so this path has the same memory bound as a
+    /// direct `/v1/analyze` upload. Sample bytes are immutable, so a replica
+    /// miss can simply fall through to the next configured address.
+    pub(crate) async fn sample(&self, sha: &str, max_bytes: usize) -> Result<bytes::Bytes, String> {
+        let path = format!("/api/file/{sha}");
+        let mut last = "Hopper did not serve the sample".to_string();
+        for base in self.order_at(Instant::now()) {
+            let mut request = self
+                .client
+                .get(format!("{base}{path}"))
+                .timeout(Duration::from_secs(5 * 60));
+            if let Some(token) = crate::upload::hopper_token() {
+                request = request.bearer_auth(token);
+            }
+            let mut response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    last = format!("Hopper sample request failed: {error}");
+                    self.note_at(base, false, Instant::now());
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                last = format!("Hopper sample request returned {}", response.status());
+                if response.status().is_server_error() {
+                    self.note_at(base, false, Instant::now());
+                }
+                // A replica may know the row but not have the backing file.
+                // Unlike a lookup 404, that is not an authoritative absence:
+                // let the next configured address (normally the primary) try.
+                continue;
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > max_bytes as u64)
+            {
+                return Err(format!("Hopper sample exceeds the {max_bytes} byte limit"));
+            }
+            let mut body = bytes::BytesMut::new();
+            let mut complete = false;
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if body.len().saturating_add(chunk.len()) > max_bytes {
+                            return Err(format!(
+                                "Hopper sample exceeds the {max_bytes} byte limit"
+                            ));
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => {
+                        complete = true;
+                        break;
+                    }
+                    Err(error) => {
+                        last = format!("Hopper sample download failed: {error}");
+                        break;
+                    }
+                }
+            }
+            if complete && !body.is_empty() {
+                self.note_at(base, true, Instant::now());
+                return Ok(body.freeze());
+            }
+        }
+        Err(last)
+    }
+
     /// The addresses to try, in order.
     ///
     /// A rested head goes last rather than being dropped: if everything behind
@@ -217,6 +290,26 @@ impl Corpus {
         sha: Option<&str>,
         purl: Option<&str>,
     ) -> (Reached, Option<CorpusSource>) {
+        self.known_with_source_inner(sha, purl, false).await
+    }
+
+    /// Ask Hopper's authoritative side even when the preferred endpoint is a
+    /// replica. Used by an explicit refresh, where accepting replication lag
+    /// would defeat the caller's read-after-write request.
+    pub(crate) async fn known_fresh_with_source(
+        &self,
+        sha: Option<&str>,
+        purl: Option<&str>,
+    ) -> (Reached, Option<CorpusSource>) {
+        self.known_with_source_inner(sha, purl, true).await
+    }
+
+    async fn known_with_source_inner(
+        &self,
+        sha: Option<&str>,
+        purl: Option<&str>,
+        fresh: bool,
+    ) -> (Reached, Option<CorpusSource>) {
         let mut query = Vec::with_capacity(2);
         if let Some(sha) = sha {
             query.push(format!("sha256={sha}"));
@@ -233,7 +326,7 @@ impl Corpus {
         // hopper's own read-after-write hatch and a no-op on the primary, which
         // has no relay to forward to — so this is safe to send to whichever
         // address answers.
-        let force_primary = self.preferred_is_stale().await;
+        let force_primary = fresh || self.preferred_is_stale().await;
         if force_primary {
             path.push_str("&fresh=1");
         }
@@ -532,6 +625,15 @@ mod tests {
         assert!(Corpus::new(Some(" , , ")).is_none());
     }
 
+    #[test]
+    fn lookup_records_retain_the_traits_version() {
+        let record: CorpusRecord = serde_json::from_str(
+            r#"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","traits_version":"abc12"}"#,
+        )
+        .expect("corpus record");
+        assert_eq!(record.traits_version.as_deref(), Some("abc12"));
+    }
+
     /// Reads belong on the replica; the primary is where they fall back to.
     #[test]
     fn the_replica_leads() {
@@ -757,6 +859,33 @@ mod tests {
             Reached::Record(_)
         ));
         assert_eq!(*lock(&attempts), 2);
+    }
+
+    #[tokio::test]
+    async fn sample_bytes_fall_through_a_replica_miss_and_stay_bounded() {
+        let replica = endpoint("404 Not Found", r#"{"error":"not found"}"#);
+        let primary = endpoint("200 OK", "hello");
+        let c = corpus(&format!("{replica},{primary}"));
+        assert_eq!(
+            c.sample(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                5,
+            )
+            .await
+            .expect("primary bytes"),
+            bytes::Bytes::from_static(b"hello"),
+        );
+
+        let c = corpus(&primary);
+        assert!(
+            c.sample(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                4,
+            )
+            .await
+            .expect_err("over-limit response")
+            .contains("byte limit")
+        );
     }
 
     /// A replica beyond the four-hour window cannot be believed about an absence.
