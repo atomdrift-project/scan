@@ -458,10 +458,21 @@ impl Index {
     /// them within one ruleset namespace has nothing new to say. Best-effort —
     /// the caller already holds the answer, so any failure here is silent.
     pub(crate) fn put(&self, verdict: &Verdict) {
+        self.store(verdict, false);
+    }
+
+    /// Replace a verdict during an explicit refresh. The digest remains the
+    /// identity, but the caller has deliberately asked to renew the judgment
+    /// and the in-process index must not keep serving the pre-refresh value.
+    pub(crate) fn replace(&self, verdict: &Verdict) {
+        self.store(verdict, true);
+    }
+
+    fn store(&self, verdict: &Verdict, overwrite: bool) {
         let Some(sha) = normalize_sha(&verdict.sha256) else {
             return;
         };
-        if self.get_sha(&sha).is_some() {
+        if !overwrite && self.get_sha(&sha).is_some() {
             return;
         }
         let Ok(json) = serde_json::to_vec(verdict) else {
@@ -685,6 +696,21 @@ mod tests {
         assert_eq!(kept.hits.len(), 1, "findings are not overwritten");
         assert!(kept.why.is_some(), "interpretation is not overwritten");
         assert_eq!(kept.purl.as_deref(), Some("pkg:npm/evil@1.0.0"));
+        std::fs::remove_dir_all(&idx.dir).ok();
+    }
+
+    #[test]
+    fn an_explicit_refresh_replaces_the_local_verdict() {
+        let idx = temp_index();
+        let sha = "d".repeat(64);
+        idx.put(&verdict(&sha));
+        let mut refreshed = verdict(&sha);
+        refreshed.why = Some("updated".to_string());
+        idx.replace(&refreshed);
+        assert_eq!(
+            idx.get_sha(&sha).and_then(|v| v.why),
+            Some("updated".to_string())
+        );
         std::fs::remove_dir_all(&idx.dir).ok();
     }
 

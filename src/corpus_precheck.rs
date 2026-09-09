@@ -190,7 +190,7 @@ pub(crate) struct PurlHit {
 /// This worker's 5-char traits commit prefix — the same value the /api/next
 /// heartbeat sends, truncated the way hopper truncates, so string equality
 /// against a stored `traits_version` means "same analyzer".
-fn local_traits() -> Option<&'static str> {
+pub(crate) fn local_traits() -> Option<&'static str> {
     static TRAITS: OnceLock<Option<String>> = OnceLock::new();
     TRAITS
         .get_or_init(|| cleave::traits_repo::version().map(|v| v.chars().take(5).collect()))

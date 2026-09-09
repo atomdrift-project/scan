@@ -337,7 +337,7 @@ fn flight_outcome(
     phases: &str,
     key: &FlightKey,
     state: &Arc<AppState>,
-    persist: bool,
+    request_follow: RequestFollow,
 ) -> Outcome {
     let uploader = state.uploader.as_ref();
     match result {
@@ -355,7 +355,7 @@ fn flight_outcome(
                 // uploader thread, whose own line reports whether it landed;
                 // `disabled` means the server was started without --hopper and
                 // the answer lives only in this process's index.
-                hopper = if !persist {
+                hopper = if !request_follow.persist {
                     "policy-specific"
                 } else if uploader.is_some() {
                     "queued"
@@ -402,8 +402,8 @@ fn flight_outcome(
             {
                 state.job_types[super::purl_type_bucket(purl)].record(micros);
             }
-            if persist {
-                index_verdict(&scan_result, key.purl());
+            if request_follow.persist {
+                index_verdict(&scan_result, key.purl(), request_follow.refresh);
             }
             // Renew the verdict on hopper too, so it outlives this process and
             // this request. A caller that hangs up — or a proxy that gives up
@@ -422,7 +422,7 @@ fn flight_outcome(
                 crate::engine::HopperRoute::Redirect(sha) => Some(sha.clone()),
                 crate::engine::HopperRoute::Normal => Some(scan_result.sha256.clone()),
             };
-            if persist
+            if request_follow.persist
                 && let Some(uploader) = uploader
                 && let Some(hopper_sha) = hopper_sha
             {
@@ -480,11 +480,15 @@ fn flight_response(outcome: &Outcome, elapsed_ms: u64, shared: bool, key: &Fligh
 /// use (a `create_dir_all` plus a prune of stale ruleset namespaces), which has
 /// no business happening on the reactor. Best-effort — a lookup that misses is
 /// a normal answer, so nothing here is worth failing a request over.
-fn index_verdict(result: &crate::engine::ScanResult, purl: Option<&str>) {
+fn index_verdict(result: &crate::engine::ScanResult, purl: Option<&str>, refresh: bool) {
     let verdict = crate::lookup::Verdict::from_scan(result, purl);
     tokio::task::spawn_blocking(move || {
         if let Some(index) = crate::lookup::global() {
-            index.put(&verdict);
+            if refresh {
+                index.replace(&verdict);
+            } else {
+                index.put(&verdict);
+            }
         }
     });
 }
@@ -1741,6 +1745,7 @@ pub(super) async fn analyze(
                             RequestFollow {
                                 policy: follow,
                                 persist: true,
+                                refresh: false,
                             },
                         )
                         .await,
@@ -1788,6 +1793,7 @@ struct Upload {
 struct RequestFollow {
     policy: crate::fetch::FetchPolicy,
     persist: bool,
+    refresh: bool,
 }
 
 /// Run one uploaded-file analysis on behalf of every request attached to
@@ -1854,7 +1860,7 @@ async fn run_file_analysis(
         if let Some(req) = phase_state.in_flight.get(&request_id) {
             req.thread_id.store(current_thread_id(), Ordering::Relaxed);
         }
-        let result = classify_file_with_follow(
+        let mut result = classify_file_with_follow(
             &path,
             &filename,
             &resources,
@@ -1873,23 +1879,28 @@ async fn run_file_analysis(
         // alongside its verdict, same as every other route's bundle: after
         // analysis, not on receipt, so hopper never carries a claimable
         // bytes-with-no-verdict row for longer than it takes the uploader
-        // thread to drain the queue (its upload-tier claim query drains
-        // those first and ahead of everything else, so offering them earlier
-        // would race this sample onto the worker fleet for a redundant
-        // analysis). Queued before `drop(temp_dir)` below, not read yet — the
-        // background uploader thread reads the path off disk when it
-        // dequeues the job, which can still lose the temp dir on a deep
-        // queue; best-effort, same as the graceful miss dependency mirroring
-        // already tolerates on a blob-cache eviction.
+        // thread to drain the queue. The request-scoped TempDir is deleted
+        // immediately below, so durable staging must complete before handing
+        // the artifact to the asynchronous uploader.
         if let (Ok(scan_result), Some(uploader)) = (&result, &uploader) {
-            uploader.submit_artifacts(crate::engine::collect_upload_artifacts(
-                &path,
-                &scan_result.sha256,
-                scan_result.size_bytes,
-                upload_collector(),
-                None,
-                None,
-            ));
+            if let Err(error) =
+                uploader.submit_artifacts_durable(crate::engine::collect_upload_artifacts(
+                    &path,
+                    &scan_result.sha256,
+                    scan_result.size_bytes,
+                    upload_collector(),
+                    None,
+                    None,
+                ))
+            {
+                tracing::error!(
+                    request_id,
+                    sha256 = %scan_result.sha256,
+                    error = %error,
+                    "upload: could not stage artifact for hopper"
+                );
+                result = Err(anyhow::anyhow!(error));
+            }
         }
         if should_clear_caches {
             cleave::clear_all_thread_caches();
@@ -1916,7 +1927,7 @@ async fn run_file_analysis(
             .map_or_else(String::new, super::RequestPhase::timeline),
         flight.key(),
         &state,
-        request_follow.persist,
+        request_follow,
     )
 }
 
@@ -1993,6 +2004,7 @@ pub(super) async fn analyze_purl(
                             RequestFollow {
                                 policy: follow,
                                 persist: true,
+                                refresh: false,
                             },
                         )
                         .await,
@@ -2102,7 +2114,7 @@ async fn run_purl_analysis(
             .map_or_else(String::new, super::RequestPhase::timeline),
         flight.key(),
         &state,
-        request_follow.persist,
+        request_follow,
     )
 }
 
@@ -2189,7 +2201,7 @@ async fn run_url_analysis(
             .map_or_else(String::new, super::RequestPhase::timeline),
         flight.key(),
         &state,
-        request_follow.persist,
+        request_follow,
     )
 }
 
@@ -3026,7 +3038,7 @@ async fn analyze_path_inner(
             // response body first so the (possibly large) envelope moves to the
             // uploader without a clone; the renewal runs off the executor since
             // collect_upload_artifacts reads sidecars from disk.
-            index_verdict(&scan_result, None);
+            index_verdict(&scan_result, None, false);
             let sha256 = scan_result.sha256.clone();
             let size = scan_result.size_bytes;
             let deps = std::mem::take(&mut scan_result.dependency_results);
@@ -3316,6 +3328,10 @@ pub(super) struct V1LookupQuery {
     /// Spelled to match hopper's own escape hatch (`?fresh=1`), so one word
     /// means the same thing at both hops.
     fresh: bool,
+    /// Bypass outer verdict caches and reconcile a SHA with Hopper. Hopper's
+    /// result is reusable only when it was produced by this worker's traits;
+    /// otherwise the immutable sample bytes are fetched and analyzed here.
+    refresh: bool,
     /// Which references discovered inside the root artifact the caller wants
     /// followed. Repeated keys and comma-separated values are both accepted.
     /// Empty means use the deployment policy.
@@ -3327,6 +3343,12 @@ pub(super) struct V1LookupQuery {
 /// something must never be reached by an ambiguous value.
 fn affirmative(value: &str) -> bool {
     matches!(value, "1" | "true" | "yes")
+}
+
+fn matching_traits_version(stored: Option<&str>, local: Option<&str>) -> bool {
+    stored
+        .zip(local)
+        .is_some_and(|(stored, local)| stored == local)
 }
 
 /// `X-Hopper-Fresh`, the header spelling of `?fresh=1`.
@@ -3361,6 +3383,7 @@ impl V1LookupQuery {
             bad_budget: None,
             force: false,
             fresh: false,
+            refresh: false,
             follow: Vec::new(),
         };
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
@@ -3381,6 +3404,9 @@ impl V1LookupQuery {
                 // an ambiguous value must not silently change which layer
                 // answers.
                 "fresh" => q.fresh = affirmative(value.as_ref()),
+                // This is intentionally stricter than the older boolean
+                // spellings: `refresh=1` is the one public wire contract.
+                "refresh" => q.refresh = value.as_ref() == "1",
                 "follow" => q.follow.push(value.into_owned()),
                 // Unknown parameters are ignored, so a caller can carry their
                 // own tracing keys through without us rejecting the request.
@@ -3517,7 +3543,7 @@ async fn v1_analyze_bytes(
     // these bytes, which is why the caller sent them, and `unavailable` means
     // we could not find out — turning either into an answer would report on
     // work never done.
-    if !q.force && request_follow.persist {
+    if !q.force && !q.refresh && request_follow.persist {
         if let Ok((decided, source)) = v1_decide(state, Some(&sha), None, None, budget, q.fresh)
             .await
             .map(|(d, source)| (d.asked_about(asked), source))
@@ -3532,6 +3558,39 @@ async fn v1_analyze_bytes(
                 kind = if decided.is_verdict() { "verdict" } else { "derived" },
                 "--> POST /v1/analyze (bytes; answered from what we already knew; no slot spent)"
             );
+            // A local Scan verdict is not enough to satisfy a persisted upload:
+            // the original analysis may have lost its request-scoped bytes
+            // before the asynchronous Hopper uploader read them. Reconcile
+            // the artifact in the background even on this fast path, so a
+            // cached answer can repair that missing Hopper row without paying
+            // for another Scan analysis.
+            if let Some(uploader) = state.uploader.as_ref() {
+                let artifacts = crate::engine::collect_upload_artifacts(
+                    std::path::Path::new(&filename),
+                    &sha,
+                    bytes.len() as u64,
+                    upload_collector(),
+                    None,
+                    None,
+                );
+                if let Some(artifact) = artifacts.into_iter().next() {
+                    let uploader = Arc::clone(uploader);
+                    let repair_sha = sha.clone();
+                    let repair_bytes = bytes;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(error) =
+                            uploader.submit_artifact_bytes_durable(artifact, &repair_bytes)
+                        {
+                            tracing::error!(
+                                id = request_id,
+                                sha256 = %repair_sha,
+                                error = %error,
+                                "upload: could not stage cached artifact for hopper"
+                            );
+                        }
+                    });
+                }
+            }
             let mut resp = Json(decided).into_response();
             resp.headers_mut().insert("X-Total-Ms", elapsed.into());
             resp.headers_mut().insert(
@@ -3692,16 +3751,35 @@ pub(super) async fn v1_analyze(
     let request_start = Instant::now();
     let q = V1LookupQuery::parse(raw.0.as_deref()).with_fresh_header(&headers);
 
-    if !q.purl.is_empty() && !q.url.is_empty() {
+    let locator_count = usize::from(!q.purl.is_empty())
+        + usize::from(!q.url.is_empty())
+        + usize::from(q.sha256.is_some());
+    if locator_count > 1 {
         return v1_error(
             StatusCode::BAD_REQUEST,
             "multiple_locators",
-            "Use ?purl= or ?url=, not both.",
+            "Use ?purl=, ?url=, or ?sha256=, not more than one.",
+        );
+    }
+    if let Some(raw_sha) = q.sha256.as_deref()
+        && burton::parse_sha256_hex(raw_sha).is_none()
+    {
+        return v1_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_sha256",
+            "sha256 must be 64 hexadecimal characters.",
+        );
+    }
+    if q.sha256.is_some() && !q.refresh {
+        return v1_error(
+            StatusCode::BAD_REQUEST,
+            "refresh_required",
+            "?sha256= on /v1/analyze requires refresh=1.",
         );
     }
 
-    // Two ways to name an artifact, and the artifact itself is one of them: a
-    // caller holding bytes nobody has published — a build output, something
+    // A locator can name an artifact, and the artifact itself is another way
+    // in: a caller holding bytes nobody has published — a build output, something
     // pulled from a mirror, a file off disk — has nothing to locate them by.
     //
     // Which one is meant is decided by what arrived, not by a header the caller
@@ -3751,6 +3829,7 @@ pub(super) async fn v1_analyze(
     let request_follow = RequestFollow {
         policy: follow,
         persist: true,
+        refresh: q.refresh,
     };
     let budget = q
         .false_positive_budget
@@ -3771,6 +3850,13 @@ pub(super) async fn v1_analyze(
         );
     };
     if !bytes.is_empty() {
+        if q.refresh || q.sha256.is_some() {
+            return v1_error(
+                StatusCode::BAD_REQUEST,
+                "sha256_with_body",
+                "Use either ?sha256=&refresh=1 or an uploaded artifact, not both.",
+            );
+        }
         if !q.url.is_empty() {
             return v1_error(
                 StatusCode::BAD_REQUEST,
@@ -3784,6 +3870,122 @@ pub(super) async fn v1_analyze(
             &q,
             headers,
             bytes,
+            request_start,
+            request_follow,
+        )
+        .await;
+    }
+    if q.refresh {
+        if !q.purl.is_empty() || !q.url.is_empty() {
+            return v1_error(
+                StatusCode::BAD_REQUEST,
+                "multiple_locators",
+                "refresh=1 names exactly one artifact with ?sha256=.",
+            );
+        }
+        let Some(raw_sha) = q.sha256.as_deref() else {
+            return v1_error(
+                StatusCode::BAD_REQUEST,
+                "missing_sha256",
+                "refresh=1 requires ?sha256=.",
+            );
+        };
+        if burton::parse_sha256_hex(raw_sha).is_none() {
+            return v1_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_sha256",
+                "sha256 must be 64 hexadecimal characters.",
+            );
+        }
+        let sha = raw_sha.to_ascii_lowercase();
+        // The local index is already namespaced by the currently loaded
+        // traits version. It is the cheapest and most reliable answer, and a
+        // refresh must not turn a valid Scan-local result into a Hopper
+        // dependency merely to prove what Scan already knows.
+        if let Some(index) = crate::lookup::global()
+            && let Some(verdict) = index.get_sha(&sha)
+        {
+            let elapsed = crate::duration_ms(request_start.elapsed());
+            let mut resp = Json(V1Decision::stored(&verdict, None, budget)).into_response();
+            resp.headers_mut().insert("X-Total-Ms", elapsed.into());
+            resp.headers_mut().insert(
+                "X-Scan-Source",
+                axum::http::HeaderValue::from_static("scan:index"),
+            );
+            resp.extensions_mut().insert(Subject::sha256(&sha));
+            tracing::info!(id = request_id, sha256 = %sha, "refresh answered from Scan's current local index");
+            return resp;
+        }
+
+        let Some(corpus) = state.corpus.as_ref() else {
+            return v1_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hopper_unavailable",
+                "refresh requires a configured Hopper corpus.",
+            );
+        };
+
+        let (reached, source) = corpus.known_fresh_with_source(Some(&sha), None).await;
+        if let Reached::Record(record) = reached
+            && matching_traits_version(
+                record.traits_version.as_deref(),
+                crate::corpus_precheck::local_traits(),
+            )
+        {
+            let decided = V1Decision::corpus(&record, Some(&sha), None, budget);
+            let elapsed = crate::duration_ms(request_start.elapsed());
+            let mut resp = Json(decided).into_response();
+            resp.headers_mut().insert("X-Total-Ms", elapsed.into());
+            resp.headers_mut().insert(
+                "X-Scan-Source",
+                axum::http::HeaderValue::from_static(match source {
+                    Some(corpus::CorpusSource::Replica) => "scan:replica",
+                    Some(corpus::CorpusSource::Primary) => "scan:primary",
+                    None => "none",
+                }),
+            );
+            if let Some(name) = request_follow.policy.follow_name()
+                && let Ok(value) = axum::http::HeaderValue::from_str(&name)
+            {
+                resp.headers_mut().insert("X-Scan-Follow", value);
+            }
+            resp.extensions_mut().insert(Subject::sha256(&sha));
+            tracing::info!(id = request_id, sha256 = %sha, traits_version = ?record.traits_version, "refresh answered from Hopper at the current traits version");
+            return resp;
+        }
+
+        let fetched = match corpus.sample(&sha, state.max_upload_bytes).await {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                tracing::warn!(id = request_id, sha256 = %sha, error = %message, "refresh could not fetch sample bytes from Hopper");
+                return v1_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "sample_unavailable",
+                    &message,
+                );
+            }
+        };
+        let fetched_sha = format!("{:x}", Sha256::digest(&fetched));
+        if fetched_sha != sha {
+            tracing::error!(id = request_id, sha256 = %sha, fetched_sha256 = %fetched_sha, "Hopper returned bytes with the wrong digest");
+            return v1_error(
+                StatusCode::BAD_GATEWAY,
+                "sample_digest_mismatch",
+                "Hopper returned bytes that do not match the requested SHA-256.",
+            );
+        }
+        let mut fetched_headers = headers;
+        let short_sha: String = sha.chars().take(12).collect();
+        if let Ok(value) = axum::http::HeaderValue::from_str(&format!("refresh-{short_sha}")) {
+            fetched_headers.insert("x-filename", value);
+        }
+        tracing::info!(id = request_id, sha256 = %sha, size_bytes = fetched.len(), "Hopper verdict missing or stale; analyzing fetched bytes");
+        return v1_analyze_bytes(
+            &state,
+            request_id,
+            &q,
+            fetched_headers,
+            fetched,
             request_start,
             request_follow,
         )
@@ -3932,7 +4134,7 @@ pub(super) async fn v1_analyze(
     // this, which is the whole reason the caller is here, and `unavailable`
     // means we could not find out — turning that into a refusal to work would
     // make a corpus outage look like an answer. Both fall through and run.
-    if !q.force && request_follow.persist {
+    if !q.force && !q.refresh && request_follow.persist {
         if let Ok((decided, source)) =
             v1_resolve(&state, None, Some(&req.purl), None, budget, q.fresh).await
             && decided.is_answerable()
@@ -5488,6 +5690,31 @@ mod tests {
     }
 
     #[test]
+    fn refresh_has_one_unambiguous_wire_spelling() {
+        use super::V1LookupQuery;
+        let q = |raw: &str| -> bool { V1LookupQuery::parse(Some(raw)).refresh };
+        assert!(q(
+            "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&refresh=1"
+        ));
+        for value in ["", "0", "true", "yes", "2"] {
+            let raw = format!(
+                "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&refresh={value}"
+            );
+            assert!(!q(&raw));
+        }
+    }
+
+    #[test]
+    fn refresh_reuses_only_an_explicit_matching_traits_version() {
+        use super::matching_traits_version;
+        assert!(matching_traits_version(Some("abc12"), Some("abc12")));
+        assert!(!matching_traits_version(Some("old00"), Some("abc12")));
+        assert!(!matching_traits_version(None, Some("abc12")));
+        assert!(!matching_traits_version(Some("abc12"), None));
+        assert!(!matching_traits_version(None, None));
+    }
+
+    #[test]
     fn follow_policy_repeats_union_and_overrides_the_server_default() {
         use super::{V1LookupQuery, v1_follow_policy};
         use crate::fetch::FetchPolicy;
@@ -5546,6 +5773,7 @@ mod tests {
             purl: Some("pkg:npm/evil@1.0.0".into()),
             fires_at: Some(3),
             engine_version: Some("2.8.0".into()),
+            traits_version: None,
             analyzed_at: Some("2026-08-01T00:00:00Z".into()),
             reason: Some("Reverse shell in postinstall.".into()),
             findings: vec![CorpusFinding {
@@ -5780,6 +6008,7 @@ mod tests {
             purl: Some("pkg:cargo/tokio@1.40.0".into()),
             fires_at: Some(-1),
             engine_version: Some("2.8.0".into()),
+            traits_version: None,
             analyzed_at: Some("2026-08-01T00:00:00Z".into()),
             reason: None,
             findings: (0..10)
