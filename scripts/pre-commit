@@ -5,9 +5,14 @@
 #   1. Cargo.toml has no active local path overrides ([patch] entries pointing
 #      at a sibling checkout via `path = "../..."`). These build against an
 #      unpublished local crate and must never be committed.
-#   2. `make lint` passes (clippy with -D warnings).
-#   3. `make test` passes.
+#   2. `make test` passes.
+#   3. `make lint` passes (clippy with -D warnings).
 #   4. `atomscan validate` exits cleanly (model loads and benign fixtures stay benign).
+#
+# Test runs BEFORE lint on purpose: `cargo test` fully builds the dependency
+# tree (rlibs), which clippy then reuses, so `make lint` re-checks only scan
+# itself. Lint-first throws that away — clippy's metadata-only pass produces
+# nothing `cargo test` can build on, and the dep tree gets paid for twice.
 #
 # Bypass intentionally with `git commit --no-verify`.
 
@@ -24,11 +29,11 @@ if grep -nE '^[[:space:]]*[^#].*path[[:space:]]*=[[:space:]]*"\.\.' Cargo.toml; 
 	exit 1
 fi
 
-echo "pre-commit: running make lint..."
-make lint
-
 echo "pre-commit: running make test..."
 make test
+
+echo "pre-commit: running make lint..."
+make lint
 
 # 4. Build the CLI and run `atomscan validate`. This loads the deployed model and
 # verifies the benign fixtures stay benign — a degraded or drifted bundle, or a
