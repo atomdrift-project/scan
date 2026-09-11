@@ -49,7 +49,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.10.0"
+version = "2.11.0"
 default-run = "atomscan"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable. Drives the
@@ -304,11 +304,16 @@ opt-level = 3
 [profile.dev.package.aho-corasick]
 opt-level = 3
 
+# wasmtime/cranelift at O2, not O3: O3's extra compile minutes on these two are
+# the single largest cold-build cost, and the runtime difference is single-digit
+# percent on scan's workload (YARA rules, not JIT throughput — the JIT compiles
+# rules to native code once, and cranelift optimizes that output at its own
+# settings regardless of how cranelift itself was built).
 [profile.dev.package.wasmtime]
-opt-level = 3
+opt-level = 2
 
 [profile.dev.package.cranelift-codegen]
-opt-level = 3
+opt-level = 2
 
 [profile.dev.package.regalloc2]
 opt-level = 3
@@ -332,15 +337,19 @@ name = "atomscan"
 path = "src/main.rs"
 
 # Mock hopper for self-contained worker benchmarks (see `make worker-benchmark`).
+# test = false: no #[test] lives here, and without this every `cargo test`
+# links a full debug harness binary (~200 MB, ~30 s) for nothing.
 [[bin]]
 name = "scan-bench-hopper"
 path = "src/bin/bench_hopper.rs"
+test = false
 
 # Bloom filter producer: builds known-good/known-bad filters from a labelled
 # pool export and writes a publishable bundle (see `make publish-bloom`).
 [[bin]]
 name = "scan-bloom-build"
 path = "src/bin/bloom_build.rs"
+test = false
 
 [patch.crates-io]
 # illumos support for tree-sitter's vendored endian.h. In 0.26.11 the only
