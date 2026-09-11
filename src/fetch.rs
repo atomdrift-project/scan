@@ -1157,6 +1157,17 @@ pub(crate) fn orchestrate(
         if worklist.is_empty() || out_of_time() {
             break;
         }
+        // Build-host code runs before the package's runtime entry point.
+        // Stable ordering preserves deterministic ties and existing budgets.
+        for (_, refs) in &mut worklist {
+            refs.sort_by_key(dependency_execution_priority);
+        }
+        worklist.sort_by_key(|(_, refs)| {
+            refs.iter()
+                .map(dependency_execution_priority)
+                .min()
+                .unwrap_or(3)
+        });
         // Pre-scan the whole hop so the winner is hop-wide, not
         // first-group-wins: every fetchable versioned reference bids, and the
         // running cross-hop maximum only rises.
@@ -2975,7 +2986,26 @@ fn superseded_by_pin(r: &Reference, pinned: &HashSet<String>) -> bool {
     let RefLocator::Purl(p) = &r.locator else {
         return false;
     };
-    versioned_purl(p).is_none() && pinned.contains(p.as_str())
+    // Constrained Cargo/Python manifests are reconciled with their own lock;
+    // an unrelated package's pin cannot satisfy their requirement.
+    !p.contains("version_requirement=")
+        && versioned_purl(p).is_none()
+        && pinned.contains(p.as_str())
+}
+
+fn dependency_execution_priority(reference: &Reference) -> u8 {
+    if reference.source.contains("build-dependencies")
+        || reference.source.contains("build-system.requires")
+        || reference.source.contains("proc-macro")
+    {
+        0
+    } else if reference.kind == RefKind::Command {
+        1
+    } else if reference.source.contains("dev-dependencies") {
+        3
+    } else {
+        2
+    }
 }
 
 /// Lenient, numeric-aware version ordering: the string splits into components
@@ -3023,6 +3053,22 @@ fn age_gate(
     res: &Resources,
     now: u64,
 ) -> (Vec<Reference>, Vec<GatedDep>) {
+    // Never age-gate a manifest range using today's unrelated latest release.
+    // Unresolvable references bypass registry gating and retain the normal
+    // unresolved fetch outcome, making incomplete coverage visible.
+    let mut unresolved = Vec::new();
+    let selected: Vec<Reference> = selected
+        .into_iter()
+        .filter_map(
+            |r| match fletch::fetch::resolve_declared_reference(&r, &res.net, &res.cache) {
+                Some(exact) => Some(exact),
+                None => {
+                    unresolved.push(r);
+                    None
+                }
+            },
+        )
+        .collect();
     // `None` ceiling (the `--max-dep-age 0` opt-out) gates nothing, but registry
     // records are still looked up and materialized.
     let max_age =
@@ -3103,6 +3149,7 @@ fn age_gate(
             None => keep.push(r),
         }
     }
+    keep.extend(unresolved);
     (keep, registries)
 }
 
@@ -3469,6 +3516,32 @@ fn collect_references(
         // both from facts the report already carries — so every archive member,
         // not just the root, contributes its references without re-extraction.
         let mut refs = find::references_from_facts(&view.values, &view.references);
+        // A co-located lockfile is authoritative; do not borrow pins from
+        // other bundled packages. Workspace-only locks remain explicit range
+        // resolution until workspace ownership can be established.
+        if let Some((directory, _)) = file.path.rsplit_once('/') {
+            let lock_name = if file.path.ends_with("/Cargo.toml") {
+                Some("Cargo.lock")
+            } else if file.path.ends_with("/pyproject.toml") {
+                Some("poetry.lock")
+            } else {
+                None
+            };
+            if let Some(lock_name) = lock_name {
+                let lock_path = format!("{directory}/{lock_name}");
+                if let Some(lock) = report
+                    .files
+                    .iter()
+                    .find(|f| f.path == lock_path)
+                    .and_then(|f| f.filefacts.as_ref())
+                {
+                    refs = refs
+                        .iter()
+                        .map(|r| fletch::fetch::prefer_lock_pin(r, &lock.references))
+                        .collect();
+                }
+            }
+        }
         // Module-load calls from the member's retained AST symbols — the
         // facts-only import vector, so `require("undeclared-pkg")` inside an
         // archive member is hunted without re-extracting its discarded bytes.
@@ -3549,6 +3622,28 @@ fn collect_references(
         };
         if !hunted.is_empty() {
             merge_into_root(&mut groups, &root.sha256, hunted);
+        }
+    }
+    // Filefacts owns Go's module/workspace semantics. Include raw root hunts
+    // in the inputs so they cannot reintroduce an unreconciled declaration.
+    let go_members: Vec<_> = report.files.iter().map(|file| {
+        let references = groups.iter().find(|(sha, _)| sha == &file.sha256)
+            .map_or(&[][..], |(_, refs)| refs.as_slice());
+        filefacts::ReferenceMember {path: &file.path, references}
+    }).collect();
+    let go_context = filefacts::go_dependency_context(&go_members);
+    for (sha, refs) in &mut groups {
+        let contexts: Vec<_> = report.files.iter().filter(|f| &f.sha256 == sha)
+            .filter_map(|f| go_context.get(&f.path)).collect();
+        if !contexts.is_empty() {
+            // Identical manifest bytes may occur under different workspaces.
+            // Keep every contextual edge; never let the last path win.
+            refs.clear();
+            for resolved in contexts {
+                for reference in resolved {
+                    if !refs.contains(reference) { refs.push(reference.clone()); }
+                }
+            }
         }
     }
     groups
@@ -3704,6 +3799,10 @@ fn merge_into_root(
     };
     let mut seen: HashSet<String> = group.iter().map(locator_key).collect();
     for r in hunted {
+        if r.kind == RefKind::Undefined {
+            if !group.contains(&r) { group.push(r); }
+            continue;
+        }
         if seen.insert(locator_key(&r)) {
             group.push(r);
         }
@@ -5489,6 +5588,42 @@ mod tests {
         // The hop rule never *adds* a kind the selection left out.
         let urls: FetchPolicy = "urls".parse().unwrap();
         assert!(!urls.wants_at(RefKind::Dependency, 0));
+    }
+
+    #[test]
+    fn collect_go_references_uses_owner_replacement_and_not_checksum_history() {
+        let input = [
+            ("p.zip!!go.mod", "module app\nrequire example.test/lib v1.0.0\nreplace example.test/lib => example.test/fork v2.0.0\n"),
+            ("p.zip!!go.sum", "example.test/fork v2.0.0/go.mod h1:METADATA\nexample.test/fork v2.0.0 h1:EXACT\nexample.test/lib v9.0.0 h1:HISTORY\n"),
+        ];
+        let files: Vec<_> = input.iter().enumerate().map(|(i, (path, text))| {
+            let parsed = filefacts::open_with_path(Path::new(path.rsplit("!!").next().unwrap()), text.as_bytes()).unwrap();
+            serde_json::json!({"id":i,"path":path,"depth":1,"file_type":"go_mod","sha256":format!("{i:064x}"),"size":text.len(),"filefacts":{"references":parsed.references(),"values":parsed.values()}})
+        }).collect();
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":files})).unwrap();
+        let groups = collect_references(&report, Path::new("/nonexistent"), CiRefs::Skip);
+        let dependencies: Vec<_> = groups.iter().flat_map(|(_, refs)| refs).filter(|r| r.kind == RefKind::Dependency).collect();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].locator, RefLocator::Purl("pkg:golang/example.test/fork@v2.0.0".into()));
+        assert_eq!(dependencies[0].pinned_hash.as_ref().unwrap().value, "EXACT");
+    }
+
+    #[test]
+    fn collect_go_references_keeps_identical_manifests_in_distinct_workspaces() {
+        let input = [
+            ("p.zip!!one/go.work", "use ./app\nreplace example.test/lib => example.test/one v1.0.0\n"),
+            ("p.zip!!two/go.work", "use ./app\nreplace example.test/lib => example.test/two v1.0.0\n"),
+            ("p.zip!!one/app/go.mod", "module app\nrequire example.test/lib v1.0.0\n"),
+            ("p.zip!!two/app/go.mod", "module app\nrequire example.test/lib v1.0.0\n"),
+        ];
+        let files: Vec<_> = input.iter().enumerate().map(|(i, (path, text))| {
+            let parsed = filefacts::open_with_path(Path::new(path.rsplit("!!").next().unwrap()), text.as_bytes()).unwrap();
+            serde_json::json!({"id":i,"path":path,"depth":1,"file_type":"go_mod","sha256":format!("{:064x}",i.min(2)),"size":text.len(),"filefacts":{"references":parsed.references(),"values":parsed.values()}})
+        }).collect();
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":files})).unwrap();
+        let groups = collect_references(&report, Path::new("/nonexistent"), CiRefs::Skip);
+        let selected: HashSet<_> = groups.iter().flat_map(|(_, refs)| refs).filter(|r| r.kind == RefKind::Dependency).map(locator_key).collect();
+        assert_eq!(selected, HashSet::from(["pkg:golang/example.test/one@v1.0.0".into(), "pkg:golang/example.test/two@v1.0.0".into()]));
     }
 
     #[test]

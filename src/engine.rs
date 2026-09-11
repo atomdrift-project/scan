@@ -6519,6 +6519,9 @@ struct ArchiveMemberStub {
 /// notable trait). Far above any real installer; only a hostile archive or a
 /// pathological corpus sample reaches it.
 const MAX_IDENTITY_ONLY_NODES: usize = 4096;
+/// Quiet diagnostic rows are useful but also attacker-controlled. Keep their
+/// output bounded, and mark any elision on the root explicitly.
+const MAX_DIAGNOSTIC_ONLY_NODES: usize = 4096;
 
 pub(crate) fn apply_report_retention(report: &mut cleave::types::CompactReport) {
     if std::env::var("SCAN_KEEP_ALL_MEMBERS").as_deref() == Ok("1") {
@@ -6541,6 +6544,7 @@ pub(crate) fn apply_report_retention(report: &mut cleave::types::CompactReport) 
     let top3: std::collections::HashSet<u32> = by_risk.iter().take(3).map(|&(id, _)| id).collect();
 
     let mut identity_only = 0usize;
+    let mut diagnostic_only = 0usize;
     files.retain_mut(|f| {
         if f.depth == 0
             || f.id == 0
@@ -6550,6 +6554,20 @@ pub(crate) fn apply_report_retention(report: &mut cleave::types::CompactReport) 
             || f.file_type == "registry"
             || f.findings.iter().any(|t| t.criticality >= 3)
         {
+            return true;
+        }
+        if !f.analysis_gaps.is_empty() {
+            diagnostic_only += 1;
+            if diagnostic_only > MAX_DIAGNOSTIC_ONLY_NODES {
+                return false;
+            }
+            // A diagnostic-only listing needs its path, identity and gaps,
+            // not quiet finding payloads or metrics already used for scoring.
+            f.formula = None;
+            f.findings = Vec::new();
+            f.refs = Vec::new();
+            f.context = Vec::new();
+            f.facts = cleave::types::CompactFacts::default();
             return true;
         }
         if f.identity.as_ref().is_some_and(|i| !i.is_empty()) {
@@ -6566,6 +6584,11 @@ pub(crate) fn apply_report_retention(report: &mut cleave::types::CompactReport) 
         }
         false
     });
+    if diagnostic_only > MAX_DIAGNOSTIC_ONLY_NODES {
+        if let Some(root) = files.first() {
+            root.analysis_gaps.record(cleave::types::AnalysisGap::ReportRetentionLimited);
+        }
+    }
     if identity_only > MAX_IDENTITY_ONLY_NODES {
         tracing::warn!(
             kept = MAX_IDENTITY_ONLY_NODES,
@@ -9086,6 +9109,32 @@ mod dep_backref_tests {
     /// about: prism and hopper read these keys.
     fn wire(report: &cleave::types::CompactReport) -> serde_json::Value {
         serde_json::to_value(report).unwrap()
+    }
+
+    #[test]
+    fn diagnostic_only_retention_is_bounded_and_explicit() {
+        let mut files = Vec::new();
+        for id in 0..MAX_DIAGNOSTIC_ONLY_NODES + 10 {
+            files.push(serde_json::json!({"id":id,"path":format!("p.tar!!{id}.js"),"sha":"x","size":1,"type":"javascript","depth":1,"analysis_gaps":["flow-query-incomplete"]}));
+        }
+        let mut report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({"files": files})).unwrap();
+        apply_report_retention(&mut report);
+        assert_eq!(report.files.len(), MAX_DIAGNOSTIC_ONLY_NODES + 3);
+        assert!(report.files[0].analysis_gaps.iter().any(|g| g == cleave::types::AnalysisGap::ReportRetentionLimited));
+    }
+
+    #[test]
+    fn retention_keeps_incomplete_quiet_members() {
+        let mut report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({"files": [
+            {"id":0,"path":"p.tar","sha":"0","size":1,"type":"tar"},
+            {"id":1,"path":"p.tar!!a","sha":"1","size":1,"type":"data","depth":1},
+            {"id":2,"path":"p.tar!!b","sha":"2","size":1,"type":"data","depth":1},
+            {"id":3,"path":"p.tar!!incomplete.js","sha":"3","size":1,"type":"javascript","depth":1,"analysis_gaps":["flow-query-incomplete"]},
+            {"id":4,"path":"p.tar!!quiet.js","sha":"4","size":1,"type":"javascript","depth":1}
+        ]})).unwrap();
+        apply_report_retention(&mut report);
+        assert!(report.files.iter().any(|f| f.id == 3 && !f.analysis_gaps.is_empty()));
+        assert!(!report.files.iter().any(|f| f.id == 4));
     }
 
     #[test]
