@@ -74,6 +74,7 @@
 # Environment overrides:
 #   DAYS          how far back a check-in still counts        (default 7)
 #   BATCH         workers deployed concurrently, 0 for all    (default 0)
+#   SERVER_BATCH  servers one at a time (1) or all at once (0) (default 1)
 #   HOSTS         space-separated hosts, skipping discovery   (default: ask hopper)
 #   SKIP          space-separated hosts to leave alone        (default: none)
 #   PHASES        which phases to run, of `hopper workers servers`
@@ -104,6 +105,8 @@ DAYS="${DAYS:-7}"
 # time -- so a smaller number bought nothing but a longer wall clock. Set a
 # positive BATCH to cap it again, e.g. to spare a busy hopper.
 BATCH="${BATCH:-0}"
+# Servers stay one at a time unless told otherwise; see Phase 2 for why.
+SERVER_BATCH="${SERVER_BATCH:-1}"
 HOSTS="${HOSTS:-}"
 SKIP="${SKIP:-}"
 PHASES="${PHASES:-hopper workers servers}"
@@ -137,6 +140,11 @@ esac
 
 case "$BATCH" in
 *[!0-9]* | '') die "BATCH must be a whole number (0 for all at once), got '$BATCH'" ;;
+esac
+
+case "$SERVER_BATCH" in
+0 | 1) ;;
+*) die "SERVER_BATCH must be 1 (one at a time) or 0 (all at once), got '$SERVER_BATCH'" ;;
 esac
 
 # A typo here would otherwise read as "that phase is switched off" and quietly
@@ -337,10 +345,15 @@ if [ -n "$workers" ]; then
 fi
 for host in $servers; do
 	pin=$(pin_for "$host")
-	if [ -n "$pin" ]; then
-		note "server  (one at a time): $host — health, then pin $pin.$PIN_DOMAIN"
+	if [ "$SERVER_BATCH" -eq 1 ]; then
+		how="one at a time"
 	else
-		note "server  (one at a time): $host — health only, no scan-* alias in /etc/hosts"
+		how="ALL AT ONCE"
+	fi
+	if [ -n "$pin" ]; then
+		note "server  ($how): $host — health, then pin $pin.$PIN_DOMAIN"
+	else
+		note "server  ($how): $host — health only, no scan-* alias in /etc/hosts"
 	fi
 done
 [ -z "$DRY_RUN" ] || { log "DRY_RUN set; stopping before the first connection"; exit 0; }
@@ -853,16 +866,27 @@ if [ -n "$workers" ]; then
 	run_batch "$batch"
 fi
 
-# --- Phase 2: servers, one at a time, each gated ----------------------------
+# --- Phase 2: servers -------------------------------------------------------
+#
+# One at a time by default, each proving itself healthy before the next is
+# touched, because they are what callers reach and taking two down at once is
+# an outage.
+#
+# SERVER_BATCH=0 (`make rollout-servers-fast`) gives that up and rolls the whole
+# tier together. It is the right call in exactly two situations -- every server
+# is already broken, so there is no working capacity left to protect, or the
+# window is one where the tier may go down anyway -- and the wrong call the rest
+# of the time. What it does NOT give up is the gate: every server is still
+# health-checked and pin-queried afterwards, so a bad build is still caught. It
+# is only the sequencing, and therefore the blast radius, that is traded away.
 
-for host in $servers; do
-	log "Server $host"
-	connect "$host" || continue
-	deploy_host "$host"
-	[ "$(field "$host" 2)" = "ok" ] || {
-		warn "$host: deploy failed; not gating, and not moving on"
-		break
-	}
+# gate_server <host> — the two questions a redeployed server must answer.
+# Exit 0: came back, or had nothing to be asked. Exit 1: did not come back, and
+# the chain should stop. Exit 2: something is wrong with this host, but nothing
+# that says the NEXT server is at risk -- recorded, and the chain goes on.
+# All three have already recorded their own outcome.
+gate_server() {
+	host="$1"
 
 	# Gate only on what was actually deployed. The roster is a snapshot of the
 	# last check-in, so a host that has since been turned back into a worker --
@@ -875,23 +899,62 @@ for host in $servers; do
 	*worker* | *adhoc* | *hopper*)
 		note "$host: roster said server, but this host runs no server — nothing to gate"
 		record "$host" "$(field "$host" 2)" "$(field "$host" 3)" "$(field "$host" 4)" worker-only
-		continue
+		return 0
 		;;
 	*)
 		warn "$host: roster says server, but nothing was deployed here"
 		record "$host" "$(field "$host" 2)" "$(field "$host" 3)" "$(field "$host" 4)" "no-server"
-		continue
+		return 2
 		;;
 	esac
 
 	if await_health "$host" && await_pin "$host"; then
 		record "$host" ok "$(field "$host" 3)" "$(field "$host" 4)" healthy
-	else
-		record "$host" ok "$(field "$host" 3)" "$(field "$host" 4)" UNHEALTHY
-		warn "stopping: $host did not come back healthy, and the next server is not worth risking"
-		break
+		return 0
 	fi
-done
+	record "$host" ok "$(field "$host" 3)" "$(field "$host" 4)" UNHEALTHY
+	return 1
+}
+
+if [ "$SERVER_BATCH" -eq 1 ]; then
+	for host in $servers; do
+		log "Server $host"
+		connect "$host" || continue
+		deploy_host "$host"
+		[ "$(field "$host" 2)" = "ok" ] || {
+			warn "$host: deploy failed; not gating, and not moving on"
+			break
+		}
+		gate_server "$host"
+		case "$?" in
+		0 | 2) ;;
+		*)
+			warn "stopping: $host did not come back healthy, and the next server is not worth risking"
+			break
+			;;
+		esac
+	done
+elif [ -n "$servers" ]; then
+	log "Opening connections — touch your YubiKey when prompted"
+	for host in $servers; do connect "$host" || true; done
+
+	warn "SERVER_BATCH=0: every server goes down together — the tier is offline until they return"
+	log "Deploying $(echo "$servers" | wc -w | tr -d ' ') servers in parallel"
+	for host in $servers; do
+		[ -f "$work/$host.status" ] || deploy_host "$host" &
+	done
+	wait
+
+	# Gating after the fact rather than between deploys. Nothing is protected
+	# by stopping now -- they have all already been restarted -- so every
+	# server is asked, and each answer is recorded rather than ending the run.
+	log "Checking the tier came back"
+	for host in $servers; do
+		[ "$(field "$host" 2)" = "ok" ] || continue
+		gate_server "$host"
+		[ "$?" -ne 1 ] || warn "$host: did not come back healthy"
+	done
+fi
 
 # --- Summary ----------------------------------------------------------------
 

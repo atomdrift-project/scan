@@ -198,7 +198,7 @@ export LLM
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: pgo-train ensure-llm-token bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-jail uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout rollout-workers rollout-servers rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: pgo-train ensure-llm-token bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-jail uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout rollout-workers rollout-servers rollout-servers-fast rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -598,6 +598,13 @@ rollout-workers: ## Redeploy only the workers (and the hopper host), never the s
 
 rollout-servers: ## Redeploy only the dedicated servers, one at a time, each health-gated
 	PHASES="servers" ./scripts/rollout.sh
+
+# Every server at once. This takes the whole serving tier down together, so it
+# is for when there is no working capacity left to protect — a bad build already
+# out everywhere — or a window where the tier may go down anyway. The health and
+# pin checks still run afterwards; only the sequencing is given up.
+rollout-servers-fast: ## Redeploy all servers SIMULTANEOUSLY — takes the serving tier down at once
+	PHASES="servers" SERVER_BATCH=0 ./scripts/rollout.sh
 
 uninstall-server-nodes:
 	@[ -n "$(NODES)" ] || { echo "Usage: make uninstall-server-nodes NODES=\"node1 node2\""; exit 1; }
