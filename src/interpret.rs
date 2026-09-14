@@ -254,7 +254,7 @@ pub const LLM_GATE_PREFIXES: &[&str] = &[
     "micro-behaviors/data/archive/member",
     // Agent/editor config paths — where prompt-injection payloads in agent
     // skills and editor extensions live.
-    "micro-behaviors/fs/path/application/config",
+    "micro-behaviors/fs/path/config/app",
     "micro-behaviors/communications/email/send",
     // Any curl upload leaf, not one named one. The family's curl traits all
     // describe the same act at notable-or-above — a curl invocation moving a
@@ -279,10 +279,10 @@ pub const LLM_GATE_PREFIXES: &[&str] = &[
     // monorepos, forks and scoped renames all disagree with their repository —
     // so `*mismatch*` would have been 1:18. Publisher-is-not-repo-owner is the
     // specific claim worth reading.
-    "metadata/package/manifest/repository::*publisher-repo-owner-mismatch",
+    "metadata/package/repository::vsix-publisher-repo-owner-mismatch",
     "micro-behaviors/communications/http/url/scheme::cleartext-http-url",
     "micro-behaviors/communications/http/url/query::query-serializer-call",
-    "micro-behaviors/communications/http/cookies::document-cookie-split-iterate",
+    "micro-behaviors/communications/http/cookie-store::document-cookie-split-iterate",
 ];
 
 /// Gate prefixes whose ids cleave synthesizes at analysis time rather than
@@ -339,12 +339,12 @@ pub const LLM_GATE_STRONG_PREFIXES: &[&str] = &[
     // Password-protected payload droppers: 154 malicious, 0 benign.
     "micro-behaviors/data/archive/member",
     // Publisher is not the owner of the repository it points at: 25 vs 1.
-    "metadata/package/manifest/repository::*publisher-repo-owner-mismatch",
+    "metadata/package/repository::vsix-publisher-repo-owner-mismatch",
     // Agent instruction files (CLAUDE.md, AGENTS.md, rules): 5 vs 0.
     "micro-behaviors/fs/path/agent-instructions",
     // Editor/agent *project* settings and tasks — the per-repository files an
     // extension or skill drops to run on open: 23 vs 0.
-    "micro-behaviors/fs/path/application/config::*project-*",
+    "micro-behaviors/fs/path/config/app::*project-*",
     // An agent pointed at a third-party or off-vendor LLM API base URL, the
     // shape of key interception: 2 vs 0.
     "micro-behaviors/process/create/agent::*base-url*",
@@ -3125,10 +3125,10 @@ mod tests {
             "micro-behaviors/fs/path/agent-instructions::claude-global-instructions-path"
         ));
         assert!(id_strong(
-            "micro-behaviors/fs/path/application/config::vscode-project-tasks-path"
+            "micro-behaviors/fs/path/config/app::vscode-project-tasks-path"
         ));
         assert!(!id_strong(
-            "micro-behaviors/fs/path/application/config::claude-config-directory"
+            "micro-behaviors/fs/path/config/app::claude-config-directory"
         ));
         assert!(id_strong(
             "micro-behaviors/process/create/agent::llm-api-base-url-third-party-host"
@@ -3149,7 +3149,7 @@ mod tests {
             "micro-behaviors/data/archive/member::archive-encrypted-member"
         ));
         assert!(id_admits(
-            "micro-behaviors/fs/path/application/config::claude-skills-directory"
+            "micro-behaviors/fs/path/config/app::claude-skills-directory"
         ));
         // A synthesized id has no `::` at all and is matched as its own head.
         assert!(id_admits("metadata/encoded-payload/url"));
@@ -3251,7 +3251,7 @@ mod tests {
         assert!(sev.hostile && sev.elevated && sev.gate_trait);
 
         let gated_only = [finding(
-            "micro-behaviors/communications/http/cookies::document-cookie-split-iterate",
+            "micro-behaviors/communications/http/cookie-store::document-cookie-split-iterate",
             cleave::Criticality::Notable,
         )];
         let sev = FindingSeverity::from_findings(&gated_only);
@@ -3287,7 +3287,7 @@ mod tests {
         // is just as broken as one that is gone, and must be reported too.
         let family = dir
             .path()
-            .join("micro-behaviors/communications/http/cookies");
+            .join("micro-behaviors/communications/http/cookie-store");
         std::fs::create_dir_all(&family).expect("create family");
         std::fs::write(
             family.join("javascript.yaml"),

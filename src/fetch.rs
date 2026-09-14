@@ -3626,22 +3626,37 @@ fn collect_references(
     }
     // Filefacts owns Go's module/workspace semantics. Include raw root hunts
     // in the inputs so they cannot reintroduce an unreconciled declaration.
-    let go_members: Vec<_> = report.files.iter().map(|file| {
-        let references = groups.iter().find(|(sha, _)| sha == &file.sha256)
-            .map_or(&[][..], |(_, refs)| refs.as_slice());
-        filefacts::ReferenceMember {path: &file.path, references}
-    }).collect();
+    let go_members: Vec<_> = report
+        .files
+        .iter()
+        .map(|file| {
+            let references = groups
+                .iter()
+                .find(|(sha, _)| sha == &file.sha256)
+                .map_or(&[][..], |(_, refs)| refs.as_slice());
+            filefacts::ReferenceMember {
+                path: &file.path,
+                references,
+            }
+        })
+        .collect();
     let go_context = filefacts::go_dependency_context(&go_members);
     for (sha, refs) in &mut groups {
-        let contexts: Vec<_> = report.files.iter().filter(|f| &f.sha256 == sha)
-            .filter_map(|f| go_context.get(&f.path)).collect();
+        let contexts: Vec<_> = report
+            .files
+            .iter()
+            .filter(|f| &f.sha256 == sha)
+            .filter_map(|f| go_context.get(&f.path))
+            .collect();
         if !contexts.is_empty() {
             // Identical manifest bytes may occur under different workspaces.
             // Keep every contextual edge; never let the last path win.
             refs.clear();
             for resolved in contexts {
                 for reference in resolved {
-                    if !refs.contains(reference) { refs.push(reference.clone()); }
+                    if !refs.contains(reference) {
+                        refs.push(reference.clone());
+                    }
                 }
             }
         }
@@ -3800,7 +3815,9 @@ fn merge_into_root(
     let mut seen: HashSet<String> = group.iter().map(locator_key).collect();
     for r in hunted {
         if r.kind == RefKind::Undefined {
-            if !group.contains(&r) { group.push(r); }
+            if !group.contains(&r) {
+                group.push(r);
+            }
             continue;
         }
         if seen.insert(locator_key(&r)) {
@@ -5593,37 +5610,75 @@ mod tests {
     #[test]
     fn collect_go_references_uses_owner_replacement_and_not_checksum_history() {
         let input = [
-            ("p.zip!!go.mod", "module app\nrequire example.test/lib v1.0.0\nreplace example.test/lib => example.test/fork v2.0.0\n"),
-            ("p.zip!!go.sum", "example.test/fork v2.0.0/go.mod h1:METADATA\nexample.test/fork v2.0.0 h1:EXACT\nexample.test/lib v9.0.0 h1:HISTORY\n"),
+            (
+                "p.zip!!go.mod",
+                "module app\nrequire example.test/lib v1.0.0\nreplace example.test/lib => example.test/fork v2.0.0\n",
+            ),
+            (
+                "p.zip!!go.sum",
+                "example.test/fork v2.0.0/go.mod h1:METADATA\nexample.test/fork v2.0.0 h1:EXACT\nexample.test/lib v9.0.0 h1:HISTORY\n",
+            ),
         ];
         let files: Vec<_> = input.iter().enumerate().map(|(i, (path, text))| {
             let parsed = filefacts::open_with_path(Path::new(path.rsplit("!!").next().unwrap()), text.as_bytes()).unwrap();
             serde_json::json!({"id":i,"path":path,"depth":1,"file_type":"go_mod","sha256":format!("{i:064x}"),"size":text.len(),"filefacts":{"references":parsed.references(),"values":parsed.values()}})
         }).collect();
-        let report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":files})).unwrap();
+        let report: AnalysisReport =
+            serde_json::from_value(serde_json::json!({"version":"3","files":files})).unwrap();
         let groups = collect_references(&report, Path::new("/nonexistent"), CiRefs::Skip);
-        let dependencies: Vec<_> = groups.iter().flat_map(|(_, refs)| refs).filter(|r| r.kind == RefKind::Dependency).collect();
+        let dependencies: Vec<_> = groups
+            .iter()
+            .flat_map(|(_, refs)| refs)
+            .filter(|r| r.kind == RefKind::Dependency)
+            .collect();
         assert_eq!(dependencies.len(), 1);
-        assert_eq!(dependencies[0].locator, RefLocator::Purl("pkg:golang/example.test/fork@v2.0.0".into()));
+        assert_eq!(
+            dependencies[0].locator,
+            RefLocator::Purl("pkg:golang/example.test/fork@v2.0.0".into())
+        );
         assert_eq!(dependencies[0].pinned_hash.as_ref().unwrap().value, "EXACT");
     }
 
     #[test]
     fn collect_go_references_keeps_identical_manifests_in_distinct_workspaces() {
         let input = [
-            ("p.zip!!one/go.work", "use ./app\nreplace example.test/lib => example.test/one v1.0.0\n"),
-            ("p.zip!!two/go.work", "use ./app\nreplace example.test/lib => example.test/two v1.0.0\n"),
-            ("p.zip!!one/app/go.mod", "module app\nrequire example.test/lib v1.0.0\n"),
-            ("p.zip!!two/app/go.mod", "module app\nrequire example.test/lib v1.0.0\n"),
+            (
+                "p.zip!!one/go.work",
+                "use ./app\nreplace example.test/lib => example.test/one v1.0.0\n",
+            ),
+            (
+                "p.zip!!two/go.work",
+                "use ./app\nreplace example.test/lib => example.test/two v1.0.0\n",
+            ),
+            (
+                "p.zip!!one/app/go.mod",
+                "module app\nrequire example.test/lib v1.0.0\n",
+            ),
+            (
+                "p.zip!!two/app/go.mod",
+                "module app\nrequire example.test/lib v1.0.0\n",
+            ),
         ];
         let files: Vec<_> = input.iter().enumerate().map(|(i, (path, text))| {
             let parsed = filefacts::open_with_path(Path::new(path.rsplit("!!").next().unwrap()), text.as_bytes()).unwrap();
             serde_json::json!({"id":i,"path":path,"depth":1,"file_type":"go_mod","sha256":format!("{:064x}",i.min(2)),"size":text.len(),"filefacts":{"references":parsed.references(),"values":parsed.values()}})
         }).collect();
-        let report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":files})).unwrap();
+        let report: AnalysisReport =
+            serde_json::from_value(serde_json::json!({"version":"3","files":files})).unwrap();
         let groups = collect_references(&report, Path::new("/nonexistent"), CiRefs::Skip);
-        let selected: HashSet<_> = groups.iter().flat_map(|(_, refs)| refs).filter(|r| r.kind == RefKind::Dependency).map(locator_key).collect();
-        assert_eq!(selected, HashSet::from(["pkg:golang/example.test/one@v1.0.0".into(), "pkg:golang/example.test/two@v1.0.0".into()]));
+        let selected: HashSet<_> = groups
+            .iter()
+            .flat_map(|(_, refs)| refs)
+            .filter(|r| r.kind == RefKind::Dependency)
+            .map(locator_key)
+            .collect();
+        assert_eq!(
+            selected,
+            HashSet::from([
+                "pkg:golang/example.test/one@v1.0.0".into(),
+                "pkg:golang/example.test/two@v1.0.0".into()
+            ])
+        );
     }
 
     #[test]

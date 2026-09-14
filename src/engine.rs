@@ -6584,10 +6584,11 @@ pub(crate) fn apply_report_retention(report: &mut cleave::types::CompactReport) 
         }
         false
     });
-    if diagnostic_only > MAX_DIAGNOSTIC_ONLY_NODES {
-        if let Some(root) = files.first() {
-            root.analysis_gaps.record(cleave::types::AnalysisGap::ReportRetentionLimited);
-        }
+    if diagnostic_only > MAX_DIAGNOSTIC_ONLY_NODES
+        && let Some(root) = files.first()
+    {
+        root.analysis_gaps
+            .record(cleave::types::AnalysisGap::ReportRetentionLimited);
     }
     if identity_only > MAX_IDENTITY_ONLY_NODES {
         tracing::warn!(
@@ -9117,10 +9118,16 @@ mod dep_backref_tests {
         for id in 0..MAX_DIAGNOSTIC_ONLY_NODES + 10 {
             files.push(serde_json::json!({"id":id,"path":format!("p.tar!!{id}.js"),"sha":"x","size":1,"type":"javascript","depth":1,"analysis_gaps":["flow-query-incomplete"]}));
         }
-        let mut report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({"files": files})).unwrap();
+        let mut report: cleave::types::CompactReport =
+            serde_json::from_value(serde_json::json!({"files": files})).unwrap();
         apply_report_retention(&mut report);
         assert_eq!(report.files.len(), MAX_DIAGNOSTIC_ONLY_NODES + 3);
-        assert!(report.files[0].analysis_gaps.iter().any(|g| g == cleave::types::AnalysisGap::ReportRetentionLimited));
+        assert!(
+            report.files[0]
+                .analysis_gaps
+                .iter()
+                .any(|g| g == cleave::types::AnalysisGap::ReportRetentionLimited)
+        );
     }
 
     #[test]
@@ -9133,7 +9140,12 @@ mod dep_backref_tests {
             {"id":4,"path":"p.tar!!quiet.js","sha":"4","size":1,"type":"javascript","depth":1}
         ]})).unwrap();
         apply_report_retention(&mut report);
-        assert!(report.files.iter().any(|f| f.id == 3 && !f.analysis_gaps.is_empty()));
+        assert!(
+            report
+                .files
+                .iter()
+                .any(|f| f.id == 3 && !f.analysis_gaps.is_empty())
+        );
         assert!(!report.files.iter().any(|f| f.id == 4));
     }
 

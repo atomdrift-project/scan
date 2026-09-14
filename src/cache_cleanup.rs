@@ -56,6 +56,7 @@ fn budgets() -> Vec<Budget> {
         roots: scan_roots,
         max_age: stng::cache_sweep::max_age_from_env("SCAN_CACHE_TTL_DAYS"),
         max_bytes: stng::cache_sweep::max_bytes_from_env("SCAN_CACHE_MAX_BYTES"),
+        max_entries: stng::cache_sweep::max_entries_from_env("SCAN_CACHE_MAX_ENTRIES"),
     });
 
     // fletch's blob cache. scan is the fetcher's main driver, but links fletch at
@@ -75,6 +76,7 @@ fn budgets() -> Vec<Budget> {
                 "FLETCH_CACHE_MAX_BYTES",
                 FLETCH_CACHE_MAX_BYTES_DEFAULT,
             ),
+            max_entries: stng::cache_sweep::max_entries_from_env("FLETCH_CACHE_MAX_ENTRIES"),
         });
     }
 
