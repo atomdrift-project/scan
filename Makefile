@@ -198,7 +198,7 @@ export LLM
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: pgo-train ensure-llm-token bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-jail uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: pgo-train ensure-llm-token bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-jail uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout rollout-workers rollout-servers rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -555,6 +555,49 @@ deploy-workers:
 deploy-workers-tmux:
 	URL="$(URL)" WORKER_NODES="$(WORKER_NODES)" HOPPER_NODE="$(HOPPER_NODE)" STAGGER="$(STAGGER)" \
 		./scripts/worker/deploy-workers-tmux.sh
+
+# Roll the whole fleet: every host that checked in with hopper over the last
+# DAYS days, rediscovered each run rather than kept in a list here.
+#
+# Workers first, BATCH at a time — though each batch authenticates one host at a
+# time, so a YubiKey touch or password prompt is never contended. Then the
+# servers, one at a time, each proving itself healthy (its own /_/health, then a
+# pinned beamline lookup over the public edge) before the next is touched. A
+# server that does not come back healthy stops the roll where it stands.
+#
+# Each host is redeployed as whatever it is already installed as: `make deploy`
+# for a server, `make stop-worker && make deploy-worker` for a worker.
+#
+# Every knob is an environment variable the script documents, and make exports a
+# command-line assignment straight into the recipe, so any of them works here:
+#
+#   make rollout DRY_RUN=1                 # print the plan, connect to nothing
+#   make rollout DAYS=3 BATCH=4
+#   make rollout SKIP="Mac.lan" URL=...
+#
+# See scripts/rollout.sh for the full list.
+# Hosts the rollout leaves alone, whatever hopper's roster says.
+#
+# The roster is check-ins, so it cannot tell "retired" from "quiet": a host that
+# stopped answering SSH keeps its row until `last_seen` ages past DAYS, and
+# until then every rollout spends its connect timeout on a machine that is not
+# coming back. Mac.lan has been that host. Clear it (`make rollout SKIP=`) to
+# try it again.
+SKIP ?= Mac.lan
+export SKIP
+
+rollout: ## Redeploy every scan host hopper has seen in the last DAYS days
+	./scripts/rollout.sh
+
+# The two halves of `rollout`, for when only one of them needs moving. Between
+# them they still cover the whole fleet: the hopper host rides with the workers
+# because it is a worker box that also happens to serve the queue, and a worker
+# rollout wants the queue restarted ahead of it either way.
+rollout-workers: ## Redeploy only the workers (and the hopper host), never the servers
+	PHASES="hopper workers" ./scripts/rollout.sh
+
+rollout-servers: ## Redeploy only the dedicated servers, one at a time, each health-gated
+	PHASES="servers" ./scripts/rollout.sh
 
 uninstall-server-nodes:
 	@[ -n "$(NODES)" ] || { echo "Usage: make uninstall-server-nodes NODES=\"node1 node2\""; exit 1; }

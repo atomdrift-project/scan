@@ -331,9 +331,18 @@ if ($LlmConcurrency) { $fwd += @('-LlmConcurrency', "`"$LlmConcurrency`"") }
 if ($orKeyFile) { $fwd += @('-OpenRouterKeyFile', "`"$orKeyFile`"") }
 
 $psExe = (Get-Process -Id $PID).Path
+
+# Both launches go through Start-Process so there is ONE quoting convention.
+# $fwd carries its values already quoted, which is what Start-Process needs: it
+# joins ArgumentList with spaces and quotes nothing itself, so a path with a
+# space would otherwise arrive as two arguments. Splatting (`& $psExe @fwd`)
+# is the opposite -- PowerShell quotes each element for you -- so the marks
+# survived into the value, and -RepoRoot reached the service phase as
+# `"C:\src\scan"` with Set-Location dying on a drive named '"C'. This branch is
+# the one a deploy over SSH takes, where the session is already elevated.
 if (Test-Elevated) {
-    & $psExe @fwd
-    exit $LASTEXITCODE
+    $p = Start-Process $psExe -ArgumentList $fwd -Wait -NoNewWindow -PassThru
+    exit $p.ExitCode
 }
 
 Log 'Elevating for service install (UAC prompt)'
