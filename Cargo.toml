@@ -83,6 +83,9 @@ cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
+# Keep the scan/fletch API pair aligned while the dependency helpers are
+# developed locally; switch back to the published git revision after the
+# matching fletch commit is pushed.
 # The bloom allow/deny bundle format and its decision rule. Split out of scan so
 # the "worst pool wins" rule lives in one auditable place.
 burton = { git = "https://github.com/atomdrift-project/burton.git" }
