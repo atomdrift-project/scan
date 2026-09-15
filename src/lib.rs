@@ -61,6 +61,7 @@ pub mod pkg;
 pub mod provenance;
 pub mod ps;
 pub mod server;
+pub mod suspend;
 pub mod sys;
 pub mod thread_dump;
 pub mod thread_priority;

