@@ -576,40 +576,68 @@ trap 'cleanup' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# probe <target> <command> — run one command on a host and hand back what it
+# said, with ssh's own complaints appended to that host's connect log.
+#
+# `-t` is what makes the answer worth reading twice: a pty is one channel, so
+# the remote's stderr comes back down it alongside its stdout and there is no
+# separating them here. Everything this returns is therefore a claim, not a
+# fact; uname_is decides which claims to believe.
+probe() {
+	# shellcheck disable=SC2086 # SSH_OPTS is deliberately word-split
+	ssh -t $SSH_OPTS "$1" "$2" 2>>"$work/$host.connect" | tr -d '\r\n'
+}
+
+# uname_is <answer> — true when a kernel named itself, which is the only reply
+# that proves a shell able to run this deploy answered. Merely getting something
+# back proves nothing: cmd.exe's "'uname' is not recognized" and zsh's
+# "command not found: C:\Program Files\Git\bin\bash.exe" both arrive looking
+# exactly like output. That is how grima, a Windows box, was taken for a POSIX
+# one and died on "'sh' is not recognized", and how the Mac mini was taken for
+# Windows and had Git Bash's path handed to zsh.
+uname_is() {
+	case "$1" in
+	*Darwin* | *Linux* | *BSD* | *SunOS* | *AIX* | *MINGW* | *MSYS* | *CYGWIN*) return 0 ;;
+	esac
+	return 1
+}
+
 # connect <host> — open the multiplexed master, which is the one moment
 # authentication happens. Returns non-zero if the host cannot be reached.
 connect() {
-	target=$(ssh_target "$1")
+	host="$1"
+	target=$(ssh_target "$host")
 	printf '    %s ... ' "$target"
 	# ssh's own stderr is kept, not discarded: the reason a host is unreachable
 	# is the whole value of this line. Throwing it away once turned a local
 	# misconfiguration into twelve hosts that all looked dead.
-	# The probe asks `uname -s` and judges the ANSWER, not the exit status.
-	# cmd.exe reports "'x' is not recognized" on stderr and still exits 0, so
-	# a command that merely succeeds proves nothing -- that is how a Windows
-	# host passed as a POSIX one and its deploy died on "'sh' is not
-	# recognized". A shell that names itself is a shell that can run this.
-	# shellcheck disable=SC2086 # SSH_OPTS is deliberately word-split
-	if [ -n "$(ssh -t $SSH_OPTS "$target" 'uname -s' 2>"$work/$1.connect" |
-		tr -d '\r\n')" ]; then
-		echo "sh -s" >"$work/$1.shell"
-		echo "connected"
-		return 0
-	fi
+	#
+	# Asked twice, because this is where authentication happens and a security
+	# key that mis-signs once -- no askpass binary, a mistyped passphrase, a
+	# touch that never came -- says nothing about the host. The mini failed
+	# exactly that way, fell through to the Windows probe, and was deployed to
+	# as a Windows box for the rest of the run.
+	attempt=1
+	while [ "$attempt" -le 2 ]; do
+		if uname_is "$(probe "$target" 'uname -s')"; then
+			echo "sh -s" >"$work/$host.shell"
+			echo "connected"
+			return 0
+		fi
+		attempt=$((attempt + 1))
+	done
 	# Not unreachable, just answering as cmd.exe. Git for Windows ships the
 	# shell the rest of this script is written for, so ask for it by path
 	# before writing the host off. What answered is remembered here, so the
 	# deploy is piped into the same shell the probe passed through.
-	# shellcheck disable=SC2086 # SSH_OPTS is deliberately word-split
-	if [ -n "$(ssh -t $SSH_OPTS "$target" "\"$WIN_SH\" -c \"uname -s\"" \
-		2>>"$work/$1.connect" | tr -d '\r\n')" ]; then
-		printf '"%s" -s\n' "$WIN_SH" >"$work/$1.shell"
+	if uname_is "$(probe "$target" "\"$WIN_SH\" -c \"uname -s\"")"; then
+		printf '"%s" -s\n' "$WIN_SH" >"$work/$host.shell"
 		echo "connected (git bash)"
 		return 0
 	fi
 	echo "UNREACHABLE"
-	sed 's/^/        /' "$work/$1.connect" >&2
-	record "$1" UNREACHABLE 0s -- --
+	sed 's/^/        /' "$work/$host.connect" >&2
+	record "$host" UNREACHABLE 0s -- --
 	return 1
 }
 
