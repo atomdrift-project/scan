@@ -190,6 +190,11 @@ pub(super) struct Worker {
 }
 
 impl Worker {
+    /// Whether a worker process is alive right now.
+    pub(super) fn is_running(&self) -> bool {
+        self.current.read().is_ok_and(|g| g.is_some())
+    }
+
     /// Suspend the worker, if one is running right now.
     fn freeze(&self) -> std::io::Result<()> {
         match self.current.read() {
@@ -215,6 +220,16 @@ impl Worker {
     /// already counted (and the check below freezes it). A request *ending* in
     /// between thaws a child that was never frozen, which costs nothing.
     fn replace(&self, busy: &Busy) {
+        // Retire the outgoing worker *before* starting its replacement. Both
+        // live in the same control group, and the primitives that make this
+        // design a guarantee act on membership rather than on a pid: the old
+        // worker's `Drop` kills its whole cgroup, so a replacement started
+        // first is simply killed along with it. Measured on galadriel
+        // (2026-09-15): the supervisor restarted, logged the new pid, and the
+        // new worker was dead before its first poll — then looped, forever.
+        if let Ok(mut guard) = self.current.write() {
+            *guard = None;
+        }
         let spawned = worker_command(&self.hopper, &self.name, &self.cache).and_then(Idle::spawn);
         let started = match spawned {
             Ok(worker) => {

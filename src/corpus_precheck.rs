@@ -97,10 +97,24 @@ pub(crate) fn configure(hopper_base_url: &str) {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MAX_AGE_DAYS);
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .ok()?;
+        // Built on a thread of its own, because `configure` is called from
+        // `Uploader::new` and every `--hopper` mode reaches that from inside a
+        // tokio runtime — `serve` does it while building its router.
+        //
+        // A blocking client owns a runtime. Recent reqwest refuses to build one
+        // inside another, and the `Err` it returns drops the half-built runtime
+        // right there, which tokio turns into "Cannot drop a runtime in a
+        // context where blocking is not allowed" — a panic on the startup path
+        // that took `serve` down before it bound a port. Constructing off-thread
+        // keeps both the success and the failure path out of async context.
+        let client = std::thread::spawn(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+        })
+        .join()
+        .ok()?
+        .ok()?;
         tracing::info!(
             url = %base,
             max_age_days = days,

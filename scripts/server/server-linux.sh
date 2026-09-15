@@ -533,9 +533,23 @@ ${LLM_MODEL_LINE}
 # stuck/leaking server is killed and Restart=always brings it back, instead
 # of looping on 503-from-RSS. Override MAX_RSS_GB at install time to
 # re-enable in-process throttling.
+# Delegation. The server runs a companion `atomscan worker` in its own process
+# to fill spare capacity, and freezes it for the whole of every request so an
+# arriving analysis gets the entire machine. The freeze is a cgroup-v2 control
+# (cgroup.freeze / cgroup.kill), which acts on membership and so cannot be
+# escaped by a child that calls setsid — rizin and friends included. Delegation
+# is what lets this unit create and write that subtree as ${SERVICE_USER}.
+#
+# Without it the server logs that it could not place the worker under a control
+# group it can freeze, and runs on with no background work rather than running
+# work it cannot stop.
+Delegate=yes
+
 MemoryMax=${MEMORY_MAX}
 MemoryLow=${MEMORY_LOW}
-TasksMax=4096
+# Two processes share this now — the server and its companion worker — and each
+# runs a rayon pool sized to the host's cores. 4096 was comfortable for one.
+TasksMax=8192
 
 # OOM priority. Under host-wide memory pressure the kernel picks its victim by
 # oom_score_adj; -900 puts the server behind almost everything else but still

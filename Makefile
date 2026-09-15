@@ -138,16 +138,24 @@ BIND ?=
 ALLOWED_DIRS ?=
 MEMORY_MAX ?=
 
-# IDLE caps the embedded idle worker: analysis slots `serve` may spend on
-# hopper queue work while no request is in flight. Unset keeps the server's own
-# default (half of --workers, rounded down). 0 turns background claiming off
-# entirely, so the host only ever works on interactive requests:
+# IDLE switches the companion pull worker on or off. `serve` runs it as its own
+# `atomscan worker` process and freezes it — kernel-enforced, covering every
+# child it has spawned — for the whole of each request, so an arriving analysis
+# gets the entire machine. 0 turns it off, and the host only ever works on
+# interactive requests:
 #
 #   make deploy IDLE=0
 #
-# The cap is half the slots either way — the server clamps a larger IDLE — and
-# the idle worker is off regardless when HOPPER is unset, since there would be
-# nothing to claim from.
+# Any non-zero value means the same thing. It was once a slot count, and the
+# name is kept because deploys and muscle memory use it, but the worker is a
+# separate process now and sizes itself the way every standalone worker does —
+# three slots per physical core, a rayon pool the width of the cores, an RSS
+# ceiling resolved from the cgroup or sysctl basis — which already spans the
+# fleet from six cores to 128.
+#
+# Off regardless when HOPPER is unset, since there would be nothing to claim
+# from. On Linux the unit needs Delegate=yes for the freeze to work; the deploy
+# writes it.
 IDLE ?=
 
 # HOPPER=none is the deliberate opt-out. It collapses to an empty HOPPER here,

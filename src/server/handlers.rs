@@ -727,11 +727,9 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
         // does not, and until this existed the only evidence was a log line
         // that never appeared.
         "idle_worker": {
-            "slots": state.idle_worker_slots,
-            "cores": state.idle_worker_cores,
+            "running": state.idle_worker_running(),
+            "frozen": state.is_busy(),
             "hopper": state.hopper.is_some(),
-            "started": state.idle_worker_started.load(Ordering::Relaxed),
-            "paused": state.is_busy(),
             "interactive_in_flight": state.in_flight.len(),
         },
     }))
@@ -779,15 +777,18 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "slots": state.max_concurrent_tasks,
         "slots_free": free,
         "in_flight": in_flight,
-        // Cores the pull worker holds on this box. Not capacity — it holds no
-        // permit the interactive path needs and stops claiming the moment a
-        // request lands — but real load, which a router should rank against
-        // and subtract before calling the box saturated. Without it, load
-        // alone made a server full of sheddable work look identical to one
-        // full of requests (2026-09-05). Cores held, not jobs in progress: a
-        // job in its tail is waiting on the LLM or hopper and occupies
-        // nothing. See beamline's `foregroundPressure`.
-        "background_in_flight": state.idle_cores_held(),
+        // Cores of this box's load that will not be there when a request
+        // arrives, for a router to subtract before calling the box saturated.
+        // Without it, load alone made a server full of sheddable work look
+        // identical to one full of requests (2026-09-05).
+        //
+        // The companion worker is frozen for the whole of every request, so
+        // what it sheds is not a fraction of the machine but all of it: this
+        // reports the physical core count while a worker is running and
+        // unfrozen, and zero otherwise. Over-subtracting only clamps the
+        // router's pressure term at zero, which is the correct reading for a
+        // box whose only load steps aside. See beamline's `foregroundPressure`.
+        "background_in_flight": state.sheddable_cores(),
         // The basis `slots` was sized on, so a caller can read `load1` against
         // the right denominator. `/_/info` reports logical CPUs; slots are
         // sized on physical, and halving the denominator would halve the
@@ -884,28 +885,6 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
 
         // The same split, for analyses the idle worker ran on spare capacity.
         //
-        // This is the figure to rank a fleet on. Request timings are selected by
-        // the router being judged - a server it avoids reports nothing and stays
-        // avoided, and one it sends only small work to looks fast at everything.
-        // Idle work comes off the shared hopper queue, so every server is
-        // measured on the same population, and a server with no traffic produces
-        // the most of it rather than the least.
-        //
-        // Uncontended by construction: the idle worker stands down while
-        // interactive requests are in flight. Read it as this host's capability,
-        // and `avg_job_ms_by_size` as what it delivered under real load.
-        "avg_job_ms_by_size_idle": super::SIZE_BUCKET_NAMES
-            .iter()
-            .zip(state.idle_job_buckets.iter())
-            .map(|(name, b)| {
-                let n = b.count.load(Ordering::Relaxed);
-                let ms = (n > 0).then(|| b.micros.load(Ordering::Relaxed) / n / 1_000);
-                ((*name).to_string(), serde_json::json!({
-                    "jobs": n, "avg_ms": ms, "recent": b.recent_json(),
-                }))
-            })
-            .collect::<serde_json::Map<String, serde_json::Value>>(),
-
         // Memory headroom. A server near its ceiling is about to pause
         // admission; a router should move away before that, not discover it by
         // timing out.
@@ -936,15 +915,12 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
             "uploaded": u.uploaded,
         })),
 
-        // Whether spare capacity is genuinely spare.
+        // Whether spare capacity is genuinely spare. The worker is a separate
+        // process now, so there is no core budget or pool to report: it is
+        // either running or not, and either frozen or not.
         "idle_worker": {
-            "slots": state.idle_worker_slots,
-            "cores": state.idle_worker_cores,
-            "pool_threads": super::idle_pool_threads(state.idle_worker_cores),
-            "cores_held": state.idle_cores_held(),
-            "in_progress": state.idle_in_progress.load(Ordering::Relaxed),
-            "started": state.idle_worker_started.load(Ordering::Relaxed),
-            "paused": state.is_busy(),
+            "running": state.idle_worker_running(),
+            "frozen": state.is_busy(),
         },
     }))
     .into_response()
