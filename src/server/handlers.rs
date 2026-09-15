@@ -731,10 +731,7 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
             "cores": state.idle_worker_cores,
             "hopper": state.hopper.is_some(),
             "started": state.idle_worker_started.load(Ordering::Relaxed),
-            "paused": state
-                .idle_pause
-                .as_ref()
-                .is_some_and(|p| p.load(Ordering::Relaxed)),
+            "paused": state.is_busy(),
             "interactive_in_flight": state.in_flight.len(),
         },
     }))
@@ -947,10 +944,7 @@ pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
             "cores_held": state.idle_cores_held(),
             "in_progress": state.idle_in_progress.load(Ordering::Relaxed),
             "started": state.idle_worker_started.load(Ordering::Relaxed),
-            "paused": state
-                .idle_pause
-                .as_ref()
-                .is_some_and(|p| p.load(Ordering::Relaxed)),
+            "paused": state.is_busy(),
         },
     }))
     .into_response()
@@ -1571,7 +1565,8 @@ pub(super) async fn analyze(
     mut multipart: axum::extract::Multipart,
 ) -> Response {
     let request_id = request_id.0.get();
-    state.note_analyze_request();
+    // Freezes the companion worker for the whole handler, upload included.
+    let _busy = state.enter_busy();
     let request_start = Instant::now();
 
     tracing::info!(id = request_id, "--> POST /analyze");
@@ -1948,7 +1943,8 @@ pub(super) async fn analyze_purl(
     Json(req): Json<AnalyzePurlRequest>,
 ) -> Response {
     let request_id = request_id.0.get();
-    state.note_analyze_request();
+    // Freezes the companion worker for the whole handler, upload included.
+    let _busy = state.enter_busy();
     let request_start = Instant::now();
 
     let purl = match normalize_pkg_purl(&req.purl) {
@@ -2817,7 +2813,8 @@ pub(super) async fn analyze_path(
     Extension(request_id): Extension<RequestId>,
     Json(req): Json<AnalyzePathRequest>,
 ) -> Response {
-    state.note_analyze_request();
+    // Freezes the companion worker for the whole handler, upload included.
+    let _busy = state.enter_busy();
     // Attached around the whole handler rather than at each return: this route
     // rejects from several places — not found, not under an allowed dir, under
     // memory pressure — and a rejected path is the one an operator most needs

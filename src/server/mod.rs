@@ -22,6 +22,7 @@ mod corpus;
 mod decision;
 mod flight;
 mod handlers;
+mod idle;
 mod latency;
 
 pub use acl::{Cidr, TokenDigest, parse_cidr_list};
@@ -688,6 +689,9 @@ pub(super) struct RequestGuard {
     cancellation: Arc<AtomicBool>,
     /// Held here so the slot and core are released when the guard drops.
     _permit: AnalysisPermit,
+    /// Keeps the idle worker frozen for the whole analysis, which outlives the
+    /// handler whenever the client hangs up before it finishes.
+    _busy: idle::BusyToken,
 }
 
 impl RequestGuard {
@@ -699,14 +703,13 @@ impl RequestGuard {
     ) -> Self {
         state.jobs_started.fetch_add(1, Ordering::Relaxed);
         ACTIVE_REQUESTS.fetch_add(1, Ordering::AcqRel);
-        if let Some(pause) = &state.idle_pause {
-            pause.store(true, Ordering::Release);
-        }
+        let busy = state.enter_busy();
         Self {
             request_id,
             state,
             cancellation,
             _permit: permit,
+            _busy: busy,
         }
     }
 }
@@ -739,14 +742,9 @@ impl Drop for RequestGuard {
         self.cancellation.store(true, Ordering::Release);
         self.state.in_flight.remove(&self.request_id);
         ACTIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
-        // Resume the idle worker once the last interactive request is done.
-        // Checked after the removal so a concurrent arrival cannot be missed:
-        // that request raised the flag before its guard existed.
-        if let Some(pause) = &self.state.idle_pause
-            && self.state.in_flight.is_empty()
-        {
-            pause.store(false, Ordering::Release);
-        }
+        // `_busy` thaws the worker here if this was the last holder. It is not
+        // conditional on `in_flight` being empty: the counter already knows,
+        // and it also counts the handlers that have not reached an analysis yet.
     }
 }
 
@@ -1363,11 +1361,13 @@ struct AppState {
     /// Driven from [`RequestGuard`] rather than polled: the guard already
     /// brackets exactly the window that matters, and a poller would either lag
     /// a request's arrival or spin.
-    idle_pause: Option<Arc<AtomicBool>>,
+    /// Requests outstanding, and the worker they freeze. See [`idle::Busy`].
+    busy: Arc<idle::Busy>,
+    /// The companion pull worker, when one is running.
+    idle_worker: Option<Arc<idle::Worker>>,
     /// Monotonic elapsed-time marker for the most recent analysis request.
     /// Unlike `idle_pause`, this also covers requests that are rejected before
     /// they acquire an analysis slot.
-    last_analyze_request_ms: Arc<AtomicU64>,
     /// Analyses in progress, so concurrent requests for the same artifact
     /// share one run instead of each taking a slot. See [`flight`].
     flights: Arc<flight::Flights>,
@@ -1404,15 +1404,22 @@ impl AppState {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Record activity from one of the analysis endpoints. The marker is
-    /// elapsed milliseconds plus one so zero can mean "no request yet".
-    pub(super) fn note_analyze_request(&self) {
-        let elapsed_ms = self.started_at.elapsed().as_millis();
-        let marker = u64::try_from(elapsed_ms)
-            .unwrap_or(u64::MAX.saturating_sub(1))
-            .saturating_add(1);
-        self.last_analyze_request_ms
-            .store(marker, Ordering::Release);
+    /// Mark the server busy until the returned token drops, freezing the
+    /// companion worker for exactly that window.
+    ///
+    /// Taken at handler entry — before the memory check, before the multipart
+    /// parse, before the upload streams — because the cores have to be free by
+    /// the time the analysis wants them, not by the time it starts. The
+    /// previous design raised its flag only once an analysis existed and
+    /// covered the gap with a blanket seven-second quiet period that any
+    /// request re-armed, including cache hits that did no work at all.
+    pub(super) fn enter_busy(&self) -> idle::BusyToken {
+        self.busy.enter(self.idle_worker.as_ref())
+    }
+
+    /// Whether a request is outstanding right now.
+    pub(super) fn is_busy(&self) -> bool {
+        self.busy.is_busy()
     }
 }
 
@@ -1473,55 +1480,6 @@ fn cores_busy(
     (total > 0).then(|| cpus as f64 * busy as f64 / total as f64)
 }
 
-/// The idle worker's own rayon pool, `threads` wide, or `None` (and the global
-/// pool) if it cannot be built. Same stacks as the global pool, so a member
-/// analysis that fits there fits here.
-///
-/// This is what makes the core budget a budget in threads: without it a
-/// permit bounded how many analyses started and nothing bounded how many
-/// threads they fanned out on, and a server analysis's own fan-out — injected
-/// into the global pool from a blocking thread — waited behind all of it.
-/// See `CleaveGate::pool` in worker.rs for the measurement.
-fn idle_pool(threads: usize) -> Option<Arc<rayon::ThreadPool>> {
-    let threads = threads.max(1);
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
-        .thread_name(|i| format!("rayon-idle-{i}"))
-        // Each pool thread: in the thread dump like every other worker; well
-        // below the global pool's priority, so an interactive analysis that
-        // becomes runnable takes the core; and marked background for cleave,
-        // so the parallelism owner slots it claims are its own and never the
-        // ones a server analysis needs.
-        .start_handler(|_| {
-            crate::thread_dump::register_self();
-            crate::thread_priority::demote_current_thread(IDLE_POOL_DEMOTION);
-            cleave::mark_thread_background();
-            ON_IDLE_POOL.with(|on| on.set(true));
-        })
-        .build()
-    {
-        Ok(pool) => {
-            // The foreground caps are sized from the global pool — this runs
-            // on the server's main thread, where `current_num_threads` is the
-            // global pool's — and the background caps from this one. Without
-            // this the first thread to ask sizes both, and it may be an idle
-            // pool thread sizing the server's cap from an 8-thread pool.
-            cleave::set_parallel_owner_caps(rayon::current_num_threads(), threads);
-            tracing::info!(
-                threads,
-                classify_permits = threads / 2,
-                "idle worker analyses run on their own rayon pool"
-            );
-            Some(Arc::new(pool))
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to build the idle worker's rayon pool; it shares the global pool");
-            None
-        }
-    }
-}
-
 thread_local! {
     /// Set on every thread of the idle worker's pool (`idle_pool`). Read by
     /// `whale_lane_for`: pull work never takes a whale slot or a lane pool.
@@ -1532,12 +1490,6 @@ thread_local! {
 pub(crate) fn on_idle_pool() -> bool {
     ON_IDLE_POOL.with(std::cell::Cell::get)
 }
-
-/// How far below the global pool the idle pool's threads are scheduled. The
-/// global pool already sits one notch below normal so rizin and friends get a
-/// core when they need one (see `lower_pool_thread_priority` in main.rs);
-/// this puts pull work well under both.
-const IDLE_POOL_DEMOTION: u8 = 10;
 
 /// Threads in the idle worker's pool for a core budget of `cores`: twice the
 /// budget.
@@ -1607,6 +1559,24 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         "concurrency limit set"
     );
 
+    // Built before the literal because the idle worker needs both: it is
+    // frozen by `busy` and wound down by `shutdown`.
+    let busy = Arc::new(idle::Busy::default());
+    let shutdown = Arc::new(AtomicBool::new(false));
+    // Started before the models load, not after: it is its own process and
+    // loads its own, so there is nothing here for it to wait on.
+    let idle_worker = if config.idle_worker_slots() > 0 {
+        idle::start(
+            config.hopper(),
+            &crate::upload::default_worker_name(),
+            &busy,
+            &shutdown,
+        )
+    } else {
+        tracing::info!("idle worker disabled: --idle-worker-slots is 0");
+        None
+    };
+
     let state = Arc::new(AppState {
         max_upload_bytes: config.max_body_size(),
         max_rss_bytes: config.max_rss_bytes(),
@@ -1642,9 +1612,8 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         in_flight: dashmap::DashMap::new(),
         hopper: config.hopper().map(str::to_owned),
         idle_worker_slots: config.idle_worker_slots(),
-        shutdown: Arc::new(AtomicBool::new(false)),
+        shutdown,
         idle_worker_started: AtomicBool::new(false),
-        last_analyze_request_ms: Arc::new(AtomicU64::new(0)),
         job_buckets: Default::default(),
         job_types: Default::default(),
         idle_job_buckets: Arc::new(Default::default()),
@@ -1657,8 +1626,8 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         job_micros_total: AtomicU64::new(0),
         // Decided here because AppState lives behind an Arc and cannot be
         // amended later. The worker itself starts once the models are loaded.
-        idle_pause: (config.idle_worker_slots() > 0 && config.hopper().is_some())
-            .then(|| Arc::new(AtomicBool::new(false))),
+        busy,
+        idle_worker,
         // Start the background uploader once when --hopper is set, so every
         // analyzed result (parent and members) is renewed on hopper without
         // blocking the analyze response. Said once here rather than on every
@@ -1824,7 +1793,6 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
                             // self-deadlock that would wedge the server the
                             // moment an idle worker was actually configured.
                             drop(lock);
-                            spawn_idle_worker(&bg, &loaded);
                         }
                         Err(e) => tracing::error!("resources lock poisoned during init: {e}"),
                     }
@@ -2074,101 +2042,6 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 /// abandoned — that work is real, and a claim that dies is redispatched by
 /// hopper anyway — so promptness comes from the slots held back for requests,
 /// not from killing work mid-flight.
-fn spawn_idle_worker(state: &Arc<AppState>, resources: &Arc<ModelResources>) {
-    // Every exit says why. The first cut returned silently on three separate
-    // paths, so a worker that never started was indistinguishable from one that
-    // started and found nothing to do — and the only way to tell them apart was
-    // to read the source.
-    let Some(hopper) = state.hopper.clone() else {
-        tracing::info!("idle worker disabled: no --hopper to claim work from");
-        return;
-    };
-    // `--hopper` may name several addresses, replica first. Reads and renewals
-    // take that whole list; a worker may not. Claiming work is the primary's
-    // route alone, so this takes the one address rather than the string — which
-    // a URL parser reads as a single very strange hostname.
-    let Some(hopper) = crate::upload::worker_endpoint(&hopper) else {
-        tracing::info!("idle worker disabled: --hopper names no address");
-        return;
-    };
-    let Some(slots) = std::num::NonZeroUsize::new(state.idle_worker_slots) else {
-        tracing::info!("idle worker disabled: --idle-worker-slots is 0");
-        return;
-    };
-    let Some(pause) = state.idle_pause.clone() else {
-        tracing::warn!(
-            slots = slots.get(),
-            "idle worker not started: no pause flag, so it could not yield to \
-             requests — refusing rather than competing with them",
-        );
-        return;
-    };
-    let resources = Arc::clone(resources);
-
-    tracing::info!(
-        slots = slots.get(),
-        reserved_for_requests = state.max_concurrent_tasks.saturating_sub(slots.get()),
-        hopper = %hopper,
-        "idle worker: filling spare capacity with hopper queue work",
-    );
-    state.idle_worker_started.store(true, Ordering::Release);
-
-    let config = crate::worker::WorkerConfig {
-        hopper_url: hopper,
-        name: format!("{}-idle", crate::upload::default_worker_name()),
-        workers: slots,
-        poll_secs: 30,
-        // Memory is the host's to manage: the server already bounds its own
-        // concurrency, and a second RSS ceiling here would pause the worker on
-        // the server's own footprint.
-        max_rss_gb: 0,
-        model_dir: state.model_dir.clone(),
-        thresholds: None,
-        data_dir: None,
-        slow_rule_ms: state.slow_rule_ms,
-        max_jobs: None,
-        exit_if_empty: false,
-        no_update: true,
-        level: None,
-        nice: 0,
-        interpret: state.interpret.clone(),
-        fetch: state.fetch,
-        zip_passwords: state.zip_passwords.clone(),
-        embedded: Some(crate::worker::Embedded {
-            on_complete: Some({
-                let buckets = Arc::clone(&state.idle_job_buckets);
-                Arc::new(move |size_bytes: u64, micros: u64| {
-                    buckets[size_bucket(size_bytes)].record(micros);
-                })
-            }),
-            pause,
-            shutdown: Arc::clone(&state.shutdown),
-            // Its own core budget, deliberately not `state.cpu`. When the
-            // idle worker drew from the server's pool it held every permit
-            // whenever hopper had work, `available_analysis_permits` read
-            // zero, `/_/stats` said `slots_free=0` with nothing in flight,
-            // and beamline — correctly reading that as "at capacity" —
-            // stopped sending. The worker yields to interactive traffic,
-            // but only traffic that arrives, so the report starved the very
-            // requests that would have made it true. Measured 2026-09-05:
-            // three of the fleet's four servers unroutable for hours while
-            // idle on the interactive path. See `idle_worker_cores`.
-            cpu: Arc::clone(&state.idle_cpu),
-            in_progress: Arc::clone(&state.idle_in_progress),
-            pool: idle_pool(idle_pool_threads(state.idle_worker_cores)),
-            resources,
-            last_analyze_request_ms: Arc::clone(&state.last_analyze_request_ms),
-            started_at: state.started_at,
-            quiet_period: Duration::from_secs(IDLE_WORKER_QUIET_SECS),
-        }),
-    };
-    tokio::spawn(async move {
-        if let Err(e) = crate::worker::run(config).await {
-            tracing::warn!(error = %e, "idle worker stopped");
-        }
-    });
-}
-
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = signal::ctrl_c().await {
