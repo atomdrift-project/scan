@@ -498,6 +498,25 @@ if [ -n "$LLM_MODEL" ]; then
     LLM_MODEL_LINE="Environment=SCAN_LLM_MODEL=${LLM_MODEL}"
 fi
 
+# ProtectControlGroups= and Delegate=yes pull in opposite directions: the first
+# remounts /sys/fs/cgroup read-only inside the unit's namespace, and the second
+# exists so the service can write its own subtree. The server needs that write
+# to place its companion worker in a cgroup it can freeze, and without it logs
+# "Read-only file system (os error 30)" every ten seconds and runs with no
+# background work (measured on uruk-hai, 2026-09-15).
+#
+# systemd 256 added `private`, which resolves it properly: a private cgroup
+# namespace with the unit's own subtree writable, keeping the protection for
+# everything else. Older systemd has no such option, so it trades the
+# protection for the delegation rather than silently losing the worker.
+SYSTEMD_MAJOR="$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | tr -cd '0-9')"
+if [ -n "${SYSTEMD_MAJOR}" ] && [ "${SYSTEMD_MAJOR}" -ge 256 ]; then
+	PROTECT_CGROUPS=private
+else
+	PROTECT_CGROUPS=no
+	log "systemd ${SYSTEMD_MAJOR:-unknown} has no ProtectControlGroups=private; using 'no' so Delegate= can work"
+fi
+
 cat >"$TMP_UNIT" <<EOF
 [Unit]
 Description=Atomdrift Scan HTTP classification server
@@ -586,7 +605,7 @@ PrivateMounts=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
-ProtectControlGroups=true
+ProtectControlGroups=${PROTECT_CGROUPS}
 ProtectClock=true
 ProtectHostname=true
 ProtectProc=invisible
