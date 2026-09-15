@@ -23,9 +23,12 @@
 //!     own subtree before exec, and `PROC_REAP_KILL` delivers a signal to
 //!     every descendant however they have rearranged their process groups.
 //!
-//! Everything else (macOS, for development) falls back to signalling the
+//! Every other unix (macOS, for development) falls back to signalling the
 //! process group. That is best-effort and deliberately not the production
-//! story; the fleet is Linux and FreeBSD.
+//! story; the fleet is Linux and FreeBSD. Windows has neither a real primitive
+//! nor a best-effort one -- a job object can terminate, never suspend -- so it
+//! declines to run an idle worker at all rather than report a freeze it did
+//! not perform.
 //!
 //! Freezing is preferred to killing because it costs nothing: `SIGCONT` resumes
 //! a half-finished analysis where it stopped, so the latency win does not buy
@@ -360,7 +363,7 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 mod imp {
     use super::io;
     use std::os::unix::process::CommandExt;
@@ -412,6 +415,56 @@ mod imp {
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+mod imp {
+    use super::io;
+    use std::process::Command;
+
+    /// Windows has no primitive this module can honestly use. A job object is
+    /// the right shape — membership, not a process group — but it can only
+    /// terminate a job, never suspend one, and suspending is the whole point:
+    /// freezing costs nothing because `SIGCONT` resumes a half-finished
+    /// analysis where it stopped. There is no supported per-job equivalent.
+    ///
+    /// So this platform declines rather than pretends. A worker that reports
+    /// itself frozen and goes on holding every core would cost exactly the
+    /// latency this module exists to protect, and would do it silently.
+    /// `Idle::spawn` fails, the supervisor logs why, and the server serves
+    /// requests with no idle worker beside it — which is what a Windows box
+    /// does today in any case: the fleet runs `atomscan worker` there, never
+    /// `serve`.
+    #[derive(Debug)]
+    pub(super) struct Control;
+
+    fn unsupported() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no idle worker on Windows: nothing here can suspend a process tree by membership",
+        )
+    }
+
+    pub(super) fn prepare(_cmd: &mut Command) -> io::Result<Control> {
+        Err(unsupported())
+    }
+
+    // Unreachable in practice -- `prepare` is what every caller goes through,
+    // and no `Control` exists without it -- but the platform arms are one
+    // interface and this one answers the same way throughout.
+    pub(super) fn freeze(_control: &Control, _pid: u32) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(super) fn thaw(_control: &Control, _pid: u32) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(super) fn kill(_control: &Control, _pid: u32) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(super) fn release(_control: &Control) {}
 }
 
 #[cfg(test)]
