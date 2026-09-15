@@ -33,7 +33,10 @@
 #   1. Its own GET /_/health, asked over the SSH connection already open.
 #      `status` must be `ok`, and `uptime_secs` must be small -- a large uptime
 #      means the service never actually restarted and we are reading the
-#      process we thought we replaced.
+#      process we thought we replaced. The exception is a deploy that reported
+#      changing nothing: a host already at the rolled-out commit is meant to
+#      keep the process it has, and its uptime is then an answer rather than a
+#      symptom.
 #   2. A pinned beamline lookup, from here, over the public edge. `X-Beamline-Pin`
 #      names one backend and beamline never substitutes another, so this proves
 #      the whole path -- edge, tunnel, server -- came back, and that what came
@@ -119,6 +122,10 @@ DRY_RUN="${DRY_RUN:-}"
 # cmd.exe, which has neither `sh` nor `true`, so a host that cannot run the
 # latter is asked again through this before being called dead.
 WIN_SH="${WIN_SH:-C:\\Program Files\\Git\\bin\\bash.exe}"
+# How to name that shell to cmd.exe, which is what answers SSH there. The
+# quoting survives as written only because the probe below asks for no pty;
+# see `probe`.
+win_cmd() { printf '"%s" %s' "$WIN_SH" "$1"; }
 
 HEALTH_ADDR="${HEALTH_ADDR:-127.0.0.1:49999}"
 HEALTH_WAIT="${HEALTH_WAIT:-300}"
@@ -420,10 +427,12 @@ unit_live() {
 	esac
 }
 
+# launchd is deliberately not in this list. A Mac runs its worker by hand,
+# always, so a plist there is the leftover of an install that should not have
+# happened rather than a second way of running one; the adhoc arm removes it.
 worker_unit=""
 for f in /etc/systemd/system/scan-worker.service \
-	/usr/local/etc/rc.d/scan-worker \
-	/Library/LaunchDaemons/com.atomdrift.scan-worker.plist; do
+	/usr/local/etc/rc.d/scan-worker; do
 	if unit_live "$f"; then worker_unit="$f"; break; fi
 done
 server_unit=""
@@ -451,9 +460,9 @@ done
 [ -d "$HOME/hopper" ] || hopper_unit=""
 
 # The Macs run their workers by hand rather than under launchd, so a Darwin box
-# carrying no unit is not a host with nothing installed -- it is a host whose
-# worker is just a process someone started. Every other platform reaching this
-# point genuinely has nothing to redeploy.
+# is adhoc whatever else is installed on it: its worker is a process someone
+# started, not a service. Every other platform reaching this point with no unit
+# genuinely has nothing to redeploy.
 adhoc=""
 [ "$(uname -s)" != Darwin ] || adhoc=yes
 
@@ -499,9 +508,20 @@ elif [ -n "$adhoc" ] && [ -z "$hopper_unit" ]; then
 	# way it was started, detached from this SSH session. All three descriptors
 	# are redirected, not just stdout -- a child holding the pipe open would
 	# keep ssh waiting here until the worker exited, which is never.
-	echo "rollout: adhoc worker (macOS, no launchd unit), hopper $URL_FALLBACK"
+	echo "rollout: adhoc worker (macOS), hopper $URL_FALLBACK"
 	git stash
 	git pull
+	# A launchd daemon on a Mac is a leftover, and leaving it in place is worse
+	# than either shape alone: it and the process started below claim from the
+	# same queue, on the same box, and it is the one that comes back at boot.
+	# The mini was deployed as a `worker` for exactly this reason.
+	for plist in /Library/LaunchDaemons/com.atomdrift.scan-worker.plist \
+		/Library/LaunchDaemons/com.atomdrift.ascan-worker.plist; do
+		[ -f "$plist" ] || continue
+		echo "rollout: removing leftover launchd worker $plist — macOS workers are adhoc"
+		"$mk" uninstall-worker || rc=1
+		break
+	done
 	if "$mk" kill-scan && "$mk" release; then
 		# Started through `make worker`, not by running the binary directly:
 		# the LLM failover chain (and the hopper token check) is defined once,
@@ -577,24 +597,34 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # probe <target> <command> — run one command on a host and hand back what it
-# said, with ssh's own complaints appended to that host's connect log.
+# said on stdout, with its stderr and ssh's own complaints appended to that
+# host's connect log.
 #
-# `-t` is what makes the answer worth reading twice: a pty is one channel, so
-# the remote's stderr comes back down it alongside its stdout and there is no
-# separating them here. Everything this returns is therefore a claim, not a
-# fact; uname_is decides which claims to believe.
+# Deliberately without `-t`, and both halves of this function depend on that.
+# A pty is one channel, so the remote's stderr comes back down it alongside its
+# stdout: cmd.exe's "'uname' is not recognized" arrived here looking exactly
+# like an answer, which is how a Windows box was taken for a POSIX one. A pty
+# also mangles the quoting on the way in -- `"C:\Program Files\Git\bin\bash.exe"`
+# reaches cmd as `C:\Program`, with or without the second pair of quotes that
+# `cmd /c` is documented to strip. Measured on grima, 2026-09-15: with no pty,
+# the same two commands separate cleanly and the path survives as written.
+#
+# Nothing is lost by dropping it. A pty on the far end has never been what makes
+# a YubiKey touch or a passphrase prompt work -- ssh asks for those locally, on
+# its own tty, before the remote has any say.
 probe() {
-	# shellcheck disable=SC2086 # SSH_OPTS is deliberately word-split
-	ssh -t $SSH_OPTS "$1" "$2" 2>>"$work/$host.connect" | tr -d '\r\n'
+	# shellcheck disable=SC2086,SC2029 # SSH_OPTS is deliberately word-split,
+	# and the command is deliberately built here rather than on the remote
+	ssh $SSH_OPTS "$1" "$2" 2>>"$work/$host.connect" | tr -d '\r\n'
 }
 
 # uname_is <answer> — true when a kernel named itself, which is the only reply
-# that proves a shell able to run this deploy answered. Merely getting something
-# back proves nothing: cmd.exe's "'uname' is not recognized" and zsh's
-# "command not found: C:\Program Files\Git\bin\bash.exe" both arrive looking
-# exactly like output. That is how grima, a Windows box, was taken for a POSIX
-# one and died on "'sh' is not recognized", and how the Mac mini was taken for
-# Windows and had Git Bash's path handed to zsh.
+# that proves a shell able to run this deploy answered. An exit status does not:
+# cmd.exe reports "'x' is not recognized" and still exits 0, which is how grima,
+# a Windows box, was taken for a POSIX one and died on "'sh' is not recognized".
+# Nor does merely having said something, for as long as anything but a working
+# shell can reach this -- under a pty it was zsh's "command not found:
+# C:\Program Files\Git\bin\bash.exe" that made the Mac mini look like Windows.
 uname_is() {
 	case "$1" in
 	*Darwin* | *Linux* | *BSD* | *SunOS* | *AIX* | *MINGW* | *MSYS* | *CYGWIN*) return 0 ;;
@@ -619,22 +649,29 @@ connect() {
 	# as a Windows box for the rest of the run.
 	attempt=1
 	while [ "$attempt" -le 2 ]; do
-		if uname_is "$(probe "$target" 'uname -s')"; then
+		answer=$(probe "$target" 'uname -s')
+		if uname_is "$answer"; then
 			echo "sh -s" >"$work/$host.shell"
 			echo "connected"
 			return 0
 		fi
+		# Kept, because a host written off for what it SAID is unexplainable
+		# without it: ssh's own stderr shows a connection that worked, and the
+		# reply that failed to convince us is otherwise thrown away.
+		printf 'sh probe answered: %s\n' "${answer:-<nothing>}" >>"$work/$host.connect"
 		attempt=$((attempt + 1))
 	done
 	# Not unreachable, just answering as cmd.exe. Git for Windows ships the
 	# shell the rest of this script is written for, so ask for it by path
 	# before writing the host off. What answered is remembered here, so the
 	# deploy is piped into the same shell the probe passed through.
-	if uname_is "$(probe "$target" "\"$WIN_SH\" -c \"uname -s\"")"; then
-		printf '"%s" -s\n' "$WIN_SH" >"$work/$host.shell"
+	answer=$(probe "$target" "$(win_cmd '-c "uname -s"')")
+	if uname_is "$answer"; then
+		win_cmd -s >"$work/$host.shell"
 		echo "connected (git bash)"
 		return 0
 	fi
+	printf 'git bash probe answered: %s\n' "${answer:-<nothing>}" >>"$work/$host.connect"
 	echo "UNREACHABLE"
 	sed 's/^/        /' "$work/$host.connect" >&2
 	record "$host" UNREACHABLE 0s -- --
@@ -783,9 +820,12 @@ $(sed 's/^/    /' "$logfile" | tail -15)
 
 # await_health <host> — poll the server's own /_/health over the SSH connection
 # already open until it reports ok. A large uptime_secs is a failure, not a
-# pass: it means we are reading the process the deploy was supposed to replace.
+# pass: it means we are reading the process the deploy was supposed to replace
+# -- unless the deploy reported changing nothing, in which case that process is
+# exactly what is supposed to still be running.
 await_health() {
 	host="$1"
+	logfile="$work/$host.log"
 	deadline=$(($(date +%s) + HEALTH_WAIT))
 	last="unreachable"
 	while :; do
@@ -798,6 +838,25 @@ await_health() {
 		[ -n "$status" ] && last="$status"
 		if [ "$status" = "ok" ]; then
 			if [ -n "$uptime" ] && [ "$uptime" -gt "$HEALTH_UPTIME" ]; then
+				# Unless the deploy said it left the service alone on purpose.
+				# A host already running the commit being rolled out gets a new
+				# binary, a new unit and a new process from none of it, so the
+				# uptime it reports is the right answer rather than evidence of
+				# a restart that failed: galadriel, already at HEAD, was read as
+				# "did not come back" and stopped the roll before four servers
+				# that had nothing wrong with them. What a no-op deploy still
+				# has to prove is that the service it declined to touch is
+				# serving, which is this check, and the pinned query after it.
+				# `No changes;` is the whole marker, not the sentence after
+				# it: every deploy arm says it, and they do not agree on what
+				# follows ("leaving service running" on Linux, "$SERVICE_NAME
+				# already running" on FreeBSD). Matching the full Linux
+				# sentence would have left uruk-hai failing exactly the way
+				# galadriel did.
+				if grep -q "No changes;" "$logfile" 2>/dev/null; then
+					note "$host: /_/health ok — deploy changed nothing, so the ${uptime}s uptime is expected"
+					return 0
+				fi
 				warn "$host: healthy but uptime is ${uptime}s — the service did not restart"
 				return 1
 			fi
