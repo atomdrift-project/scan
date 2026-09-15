@@ -214,49 +214,19 @@ struct CleaveGate {
     whale: Arc<Semaphore>,
     small: Arc<Semaphore>,
     small_max_bytes: u64,
-    /// How many classifies may run at once, when this worker is embedded in
-    /// a server: its core budget, on a pool of twice that many threads
-    /// (`idle_pool_threads` in server/mod.rs), because each classify is
-    /// installed onto a pool thread and holds it, and the other half of the
-    /// pool has to be free for what it fans out to. The server keeps its own
-    /// permits and a reserve the worker cannot reach, so its `slots_free`
-    /// describes what it can start rather than what the worker happens to be
-    /// holding.
-    cpu: Option<Arc<Semaphore>>,
-    /// The rayon pool those classifies fan out on, when embedded: the
-    /// worker's own, sized to its core budget, never the server's global
-    /// pool. A permit bounds how many analyses start; it does not bound the
-    /// threads each one fans out to, and 64 permits on a 128-thread pool kept
-    /// every thread busy (2026-09-05). Worse, a server analysis runs on a
-    /// blocking thread and its `par_iter` work is *injected* into the global
-    /// pool, which rayon workers take only when their own deques are empty —
-    /// never, while pull work fills them. Measured: one repository analyzed
-    /// in 30s on an idle server and 784s on rdu2 beside its pull worker. A
-    /// pool of its own is the same bulkhead the server already gives small
-    /// analyses (`small_pool_for`), pointed the other way.
-    pool: Option<Arc<rayon::ThreadPool>>,
 }
 
-/// A lane's permit, and the core behind it when the gate shares one.
+/// A lane's permit.
 struct CleavePermit {
     _lane: tokio::sync::OwnedSemaphorePermit,
-    _cpu: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl CleaveGate {
-    fn new(
-        whale_slots: usize,
-        small_slots: usize,
-        small_max_bytes: u64,
-        cpu: Option<Arc<Semaphore>>,
-        pool: Option<Arc<rayon::ThreadPool>>,
-    ) -> Arc<Self> {
+    fn new(whale_slots: usize, small_slots: usize, small_max_bytes: u64) -> Arc<Self> {
         Arc::new(Self {
             whale: Arc::new(Semaphore::new(whale_slots)),
             small: Arc::new(Semaphore::new(small_slots)),
             small_max_bytes,
-            cpu,
-            pool,
         })
     }
 
@@ -265,7 +235,7 @@ impl CleaveGate {
         self.small_max_bytes > 0 && size <= self.small_max_bytes
     }
 
-    /// Acquire the lane for a job of `size` bytes, and a core if shared.
+    /// Acquire the lane for a job of `size` bytes.
     async fn admit(
         &self,
         size: u64,
@@ -276,14 +246,7 @@ impl CleaveGate {
             &self.whale
         };
         let lane = Arc::clone(lane).acquire_owned().await?;
-        let cpu = match &self.cpu {
-            Some(cpu) => Some(Arc::clone(cpu).acquire_owned().await?),
-            None => None,
-        };
-        Ok(CleavePermit {
-            _lane: lane,
-            _cpu: cpu,
-        })
+        Ok(CleavePermit { _lane: lane })
     }
 }
 
@@ -813,85 +776,6 @@ pub struct WorkerConfig {
     pub fetch: crate::fetch::FetchPolicy,
     /// Additional passwords to try for encrypted archives.
     pub zip_passwords: crate::ArchivePasswords,
-    /// Set when this worker runs inside `atomscan serve` rather than as its own
-    /// process. See [`Embedded`].
-    pub embedded: Option<Embedded>,
-}
-
-/// Reports one finished idle analysis as `(size_bytes, micros)`.
-///
-/// The idle worker analyses real artifacts on capacity the server is not
-/// using, which makes it the only measurement of this host that the router's
-/// own choices did not select. Interactive timings cannot say how fast a
-/// worker is, only how fast it was on whatever it was sent; a server nobody
-/// routes to reports nothing at all and stays unroutable. Queue work is drawn
-/// from the same hopper by every server, so these are comparable across the
-/// fleet in the way request timings are not.
-pub type IdleCompletion = Arc<dyn Fn(u64, u64) + Send + Sync>;
-
-/// Wiring for a worker running inside a serve process, filling idle capacity
-/// with queue work.
-///
-/// Three things change when embedded, and each is a correctness issue rather
-/// than a preference:
-///
-///   - **Signals and nice belong to the host.** Installing a second SIGTERM
-///     handler, or renicing the process, would reach the server's own request
-///     handling.
-///   - **The models are already loaded.** Loading a second copy would double
-///     the resident set of the largest thing in the process, on hosts we size
-///     deliberately.
-///   - **Interactive work comes first.** `pause` is raised while a user request
-///     is in flight; the prefetcher stops claiming and the queue drains. It
-///     does not abandon a job already running — that work is real and a claim
-///     that dies is redispatched by hopper anyway — so responsiveness comes
-///     from leaving slots free, not from killing work mid-flight.
-#[derive(Clone)]
-pub struct Embedded {
-    /// Raised by the server while interactive requests are in flight.
-    pub pause: Arc<AtomicBool>,
-    /// The host's shutdown flag, so one signal stops both.
-    pub shutdown: Arc<AtomicBool>,
-    /// Cores this worker may occupy at once; see `CleaveGate::cpu`. A budget
-    /// of its own, sized by the server below its own pool.
-    pub cpu: Arc<Semaphore>,
-    /// Jobs claimed and not yet finished, shared with the server so `/_/stats`
-    /// can publish the cores this worker holds: load the router should rank
-    /// a box by, and discount before calling the box saturated, because it is
-    /// the load this worker sheds the moment a request arrives.
-    pub in_progress: Arc<AtomicUsize>,
-    /// The rayon pool this worker's analyses fan out on; see
-    /// `CleaveGate::pool`. `None` falls back to the global pool, which is the
-    /// behavior that starved the server's own analyses.
-    pub pool: Option<Arc<rayon::ThreadPool>>,
-    /// The server's already-loaded models.
-    pub resources: Arc<ModelResources>,
-    /// Elapsed-time marker for the most recent analysis request.
-    pub last_analyze_request_ms: Arc<AtomicU64>,
-    /// Same monotonic clock anchor used to produce the request marker.
-    pub started_at: Instant,
-    /// How long after an analysis request the idle worker must remain quiet.
-    pub quiet_period: Duration,
-    /// Where to report finished analyses, so spare-capacity work becomes the
-    /// routing evidence this host would otherwise never produce.
-    pub on_complete: Option<IdleCompletion>,
-}
-
-// ModelResources carries no Debug, and dumping a model bundle into a log line
-// would help nobody; report the state an operator can act on.
-impl std::fmt::Debug for Embedded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Embedded")
-            .field("paused", &self.pause.load(Ordering::Relaxed))
-            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
-            .field("in_progress", &self.in_progress.load(Ordering::Relaxed))
-            .field(
-                "pool_threads",
-                &self.pool.as_ref().map(|p| p.current_num_threads()),
-            )
-            .field("quiet_period", &self.quiet_period)
-            .finish_non_exhaustive()
-    }
 }
 
 /// Settings that must survive every model load and periodic renewal unchanged.
@@ -1134,21 +1018,6 @@ impl JobSource {
         }
         let order = state.order;
         pick_sjf_from_reorder(&mut state.reorder, order)
-    }
-
-    /// Take every staged job, leaving the source empty.
-    ///
-    /// Staged work lives in two places — the channel and the SJF reorder
-    /// window — so both are emptied under the one lock. Nothing here has begun
-    /// analysis: these jobs never entered the rayon pool, so shedding them
-    /// releases no pool worker, no memory reservation, and no lock.
-    async fn drain_staged(&self) -> Vec<PrefetchedJob> {
-        let mut state = self.state.lock().await;
-        let mut staged: Vec<PrefetchedJob> = state.reorder.drain(..).map(|(pj, _)| pj).collect();
-        while let Ok(pj) = state.rx.try_recv() {
-            staged.push(pj);
-        }
-        staged
     }
 }
 
@@ -1811,11 +1680,7 @@ impl WorkerMetrics {
 
 /// Run the worker loop. Blocks until cancelled.
 pub async fn run(config: WorkerConfig) -> Result<()> {
-    // nice(2) is process-wide: renicing here would slow the server's own
-    // request handling, not just this worker.
-    if config.embedded.is_none() {
-        apply_nice(config.nice);
-    }
+    apply_nice(config.nice);
     // Arc<str> so every per-job dispatch clones an atomic refcount rather than
     // reallocating the worker name for each `tokio::spawn`.
     let name: Arc<str> = Arc::from(config.name.as_str());
@@ -1836,13 +1701,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
             .and_then(|v| v.parse::<usize>().ok()),
     );
     let small_bytes = small_job_bytes();
-    let cleave_gate = CleaveGate::new(
-        cleave_slots,
-        small_lane,
-        small_bytes,
-        config.embedded.as_ref().map(|e| Arc::clone(&e.cpu)),
-        config.embedded.as_ref().and_then(|e| e.pool.clone()),
-    );
+    let cleave_gate = CleaveGate::new(cleave_slots, small_lane, small_bytes);
     // A slot's work ends at dispatch; what follows — the cleave-gate wait, the
     // memory reservation, the analysis, the LLM round trip, the hopper post —
     // runs as a detached tail so the slot can claim the next job while this one
@@ -1904,13 +1763,10 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     );
     // Embedded: share the host's shutdown flag and leave its signal handler
     // alone. A second handler on the same signals would race the first.
-    let shutdown = match &config.embedded {
-        Some(embedded) => Arc::clone(&embedded.shutdown),
-        None => {
-            let flag = Arc::new(AtomicBool::new(false));
-            install_shutdown_handler(Arc::clone(&flag));
-            flag
-        }
+    let shutdown = {
+        let flag = Arc::new(AtomicBool::new(false));
+        install_shutdown_handler(Arc::clone(&flag));
+        flag
     };
 
     // Phase 2 thread model: `slots` long-lived worker tasks pull jobs; the one
@@ -1985,12 +1841,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         fetch: config.fetch,
         zip_passwords: config.zip_passwords.clone(),
     });
-    let resources: ResourceHandle = match &config.embedded {
-        // Share the server's models rather than loading a second copy, and
-        // leave renewal to the host: its /_/reload owns the handle, and two
-        // renewal tasks would reload the same directory on different clocks.
-        Some(embedded) => Arc::new(RwLock::new(Arc::clone(&embedded.resources))),
-        None => {
+    let resources: ResourceHandle = {
+        {
             let handle: ResourceHandle =
                 Arc::new(RwLock::new(load_model_resources(&resource_config)?));
             // `--no-update` pins the on-disk rules for the whole run, not only
@@ -2086,13 +1938,8 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     let outstanding = Arc::new(AtomicUsize::new(0));
     // Jobs claimed and not yet finished, tails included. The heartbeat reports
     // it as `active`: every one of them still holds its hopper claim until the
-    // result is posted. When embedded, the server reads the same counter, so
-    // the router sees this box's idle work as one number rather than
-    // inferring it from load.
-    let analyzing = config.embedded.as_ref().map_or_else(
-        || Arc::new(AtomicUsize::new(0)),
-        |e| Arc::clone(&e.in_progress),
-    );
+    // result is posted.
+    let analyzing = Arc::new(AtomicUsize::new(0));
     // Slots occupied: jobs between claim and hand-off to a tail. Bounded by
     // `slots`, where `analyzing` is bounded by slots plus tails — so this,
     // not `analyzing`, is what the summary measures against the slot total.
@@ -2133,11 +1980,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // would wait out the lease before redispatching it to a worker that could
     // have started immediately. Claiming only what it is about to analyze keeps
     // the queue honest.
-    let target_depth = if config.embedded.is_some() {
-        1
-    } else {
-        ((slots as f64 * depth_factor).ceil() as usize).max(1)
-    };
+    let target_depth = ((slots as f64 * depth_factor).ceil() as usize).max(1);
     match dispatch_order {
         DispatchOrder::Smallest => tracing::info!(
             target_depth,
@@ -2173,10 +2016,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 
     let prefetch_task = tokio::spawn(
         Prefetcher {
-            interactive: config
-                .embedded
-                .as_ref()
-                .map(InteractiveSignals::from_embedded),
             client: client.clone(),
             base_url: Arc::clone(&base_url),
             data_dir: data_dir.clone(),
@@ -2852,11 +2691,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         let tails = Arc::clone(&tails);
         let llm_queue = Arc::clone(&llm_queue);
         let shutdown = Arc::clone(&shutdown);
-        let on_complete = config.embedded.as_ref().and_then(|e| e.on_complete.clone());
-        let interactive = config
-            .embedded
-            .as_ref()
-            .map(InteractiveSignals::from_embedded);
         workers.spawn(async move {
             loop {
                 if shutdown.load(Ordering::Relaxed) {
@@ -2878,56 +2712,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 let staged_bytes = pj.data.as_ref().map_or(0, PrefetchData::staged_mem_bytes);
                 queued_bytes.fetch_sub(staged_bytes, Ordering::Release);
                 outstanding.fetch_sub(1, Ordering::Release);
-
-                // Interactive work has arrived: shed everything staged rather
-                // than starting it. A staged job has not entered the rayon pool,
-                // so dropping it frees a pool worker's worth of contention at no
-                // unwind cost — the pool, not the slot, is what an interactive
-                // request actually competes for. Running analyses are left
-                // alone; killing those would abandon real work for no gain.
-                if interactive.as_ref().is_some_and(InteractiveSignals::busy) {
-                    let mut shed = vec![pj];
-                    shed.extend(jobs.drain_staged().await);
-                    let mut shed_bytes = staged_bytes;
-                    for extra in shed.iter().skip(1) {
-                        let bytes = extra
-                            .data
-                            .as_ref()
-                            .map_or(0, PrefetchData::staged_mem_bytes);
-                        queued_bytes.fetch_sub(bytes, Ordering::Release);
-                        outstanding.fetch_sub(1, Ordering::Release);
-                        shed_bytes += bytes;
-                    }
-                    // Name every file. A silent shed and a stalled queue look
-                    // identical from the outside, and the whole point of the
-                    // experiment is being able to tell them apart.
-                    for job in &shed {
-                        tracing::warn!(
-                            sha256 = %job.job.sha256,
-                            path = %job.job.path,
-                            file_type = %job.job.file_type,
-                            size_bytes = job.job.size_bytes,
-                            "shed staged job: interactive request in flight",
-                        );
-                    }
-                    let busy = dispatching.load(Ordering::Acquire);
-                    tracing::warn!(
-                        worker_id,
-                        dropped = shed.len(),
-                        slots_analyzing = busy,
-                        in_progress = analyzing.load(Ordering::Acquire),
-                        slots_total = slots,
-                        slots_free = slots.saturating_sub(busy),
-                        shed_bytes,
-                        "shedding staged queue work to serve interactive requests",
-                    );
-                    let shas: Vec<String> = shed.iter().map(|job| job.job.sha256.clone()).collect();
-                    release_claims(&client, &base_url, &name, &shas).await;
-                    for job in &shed {
-                        metrics.complete(job.queue_id);
-                    }
-                    continue;
-                }
 
                 let snapshot: std::result::Result<Arc<ModelResources>, String> =
                     match resources.read() {
@@ -3004,7 +2788,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                 let data_root = data_root.clone();
                 let cleave_gate = Arc::clone(&cleave_gate);
                 let spool = Arc::clone(&spool);
-                let on_complete = on_complete.clone();
                 let metrics = Arc::clone(&metrics);
                 let completed = Arc::clone(&completed);
                 let llm_queue = Arc::clone(&llm_queue);
@@ -3022,7 +2805,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                         slow_rule_ms,
                         &spool,
                         pj.data,
-                        on_complete.as_ref(),
                         admission_guard,
                     )
                     .await;
@@ -3177,56 +2959,6 @@ struct Prefetcher {
     /// reported at WARN. A field rather than an env read inside the poll loop so
     /// the escalation is exercisable from a test. See [`DEFAULT_IDLE_WARN_SECS`].
     idle_warn_after: Duration,
-    /// Host-server activity signals, when this worker is embedded in one.
-    /// `None` for a standalone worker, which has nothing to defer to.
-    interactive: Option<InteractiveSignals>,
-}
-
-/// Whether the host server is serving interactive work right now.
-///
-/// Two signals, because neither alone covers the window: `pause` brackets
-/// exactly the requests that hold a slot, and `last_analyze_request_ms` also
-/// covers requests rejected before they acquire one, plus the quiet period
-/// after the last of them. Shared by the prefetcher (which stops claiming) and
-/// the dispatch loop (which sheds what was already staged).
-#[derive(Clone)]
-struct InteractiveSignals {
-    pause: Arc<AtomicBool>,
-    last_analyze_request_ms: Arc<AtomicU64>,
-    started_at: Instant,
-    quiet_period: Duration,
-}
-
-impl InteractiveSignals {
-    fn from_embedded(embedded: &Embedded) -> Self {
-        Self {
-            pause: Arc::clone(&embedded.pause),
-            last_analyze_request_ms: Arc::clone(&embedded.last_analyze_request_ms),
-            started_at: embedded.started_at,
-            quiet_period: embedded.quiet_period,
-        }
-    }
-
-    /// True while a request is in flight, or within `quiet_period` of the most
-    /// recent one.
-    fn busy(&self) -> bool {
-        if self.pause.load(Ordering::Relaxed) {
-            return true;
-        }
-        let last_ms = self.last_analyze_request_ms.load(Ordering::Acquire);
-        if last_ms == 0 {
-            return false;
-        }
-        let now_ms = u64::try_from(
-            self.started_at
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX.saturating_sub(1))),
-        )
-        .unwrap_or(u64::MAX.saturating_sub(1))
-        .saturating_add(1);
-        u128::from(now_ms.saturating_sub(last_ms)) < self.quiet_period.as_millis()
-    }
 }
 
 impl Prefetcher {
@@ -3273,7 +3005,6 @@ impl Prefetcher {
         shutdown: Arc<AtomicBool>,
     ) {
         let mut consecutive_errors: u32 = 0;
-        let mut paused_logged = false;
         // Dry-spell tracking. `last_productive` is the last moment this worker
         // had a reason to believe hopper had work for it — a successful claim,
         // or a deliberate decision not to ask (paused, or buffer full). Measuring
@@ -3284,31 +3015,6 @@ impl Prefetcher {
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 return;
-            }
-
-            // Interactive work has priority. Stop claiming — but do not abandon
-            // what is already staged or running: that work is real, and hopper
-            // redispatches a claim that dies anyway. Responsiveness comes from
-            // the slots the server keeps for itself, not from killing jobs.
-            if self
-                .interactive
-                .as_ref()
-                .is_some_and(InteractiveSignals::busy)
-            {
-                if !paused_logged {
-                    tracing::debug!("idle worker paused: recent interactive analysis activity");
-                    paused_logged = true;
-                }
-                self.poll_state.buffer_room.store(0, Ordering::Release);
-                // Yielding to interactive work is not hopper being dry.
-                last_productive = Instant::now();
-                dry_warned_at = None;
-                interruptible_sleep(Duration::from_millis(200), &shutdown).await;
-                continue;
-            }
-            if paused_logged {
-                tracing::debug!("idle worker resumed");
-                paused_logged = false;
             }
 
             // Hold at the target depth and don't stage more bytes than the
@@ -3649,7 +3355,6 @@ async fn run_job(
     slow_rule_ms: u64,
     spool: &Arc<SpoolState>,
     prefetched: std::result::Result<PrefetchData, PrefetchError>,
-    on_complete: Option<&IdleCompletion>,
     // Taken once the nested-work gate admits this job and held until the lease
     // fires or this returns: the reservation covers the analysis, not the queue
     // wait before it nor the LLM wait after it.
@@ -3945,11 +3650,9 @@ async fn run_job(
         );
     }
 
-    let idle_pool = cleave_gate.pool.clone();
     let handle = tokio::task::spawn_blocking(move || {
         // Runs on a tokio blocking thread; cleave's `par_iter` fan-out work-steals
-        // across the worker's own rayon pool when embedded (`idle_pool`), else
-        // the shared global one. Lifecycle logs report `thread_id` —
+        // across the process-global rayon pool. Lifecycle logs report `thread_id` —
         // the blocking thread an operator samples to find a wedged analysis; the
         // CPU work itself runs on the rayon pool threads.
         let started = BLOCKING_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4043,10 +3746,7 @@ async fn run_job(
                 "no downloaded bytes and no local path for {label_for_blocking}"
             )),
         };
-        let result = match idle_pool.as_deref() {
-            Some(pool) => pool.install(classify),
-            None => classify(),
-        };
+        let result = classify();
         let finished = BLOCKING_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         let inflight_blocking = BLOCKING_STARTED_TOTAL
             .load(Ordering::Relaxed)
@@ -4078,14 +3778,6 @@ async fn run_job(
             // rather than at the call site because this is the last point that
             // holds the duration, the size and the cache flag at once -
             // `into_envelope` drops the flag, which is not serialized.
-            if let Some(report) = on_complete
-                && !scan_result.analysis_cached
-            {
-                report(
-                    u64::try_from(job.size_bytes).unwrap_or(0),
-                    u64::try_from(elapsed_ms).unwrap_or(0).saturating_mul(1_000),
-                );
-            }
             Ok((scan_result, deps, elapsed_ms))
         }
         Ok(Err(e)) => Err(format!("{e:#}")),
@@ -4148,38 +3840,6 @@ async fn second_opinion(
             true,
         )
         .await;
-    }
-}
-
-/// Hand claims back to hopper without a result, so the queue can re-dispatch
-/// them immediately.
-///
-/// Best-effort: hopper reclaims an unreleased claim anyway once its lease stops
-/// being renewed, so a failure here costs latency in the queue, not work. Both
-/// counts are logged either way — a release that silently stopped working would
-/// otherwise look exactly like one that worked.
-async fn release_claims(client: &reqwest::Client, base_url: &str, worker: &str, shas: &[String]) {
-    if shas.is_empty() {
-        return;
-    }
-    let mut url = format!("{base_url}/api/release?worker=");
-    url_encode_into(worker, &mut url);
-    url.push_str("&shas=");
-    url.push_str(&shas.join(","));
-    match authed(client.post(&url)).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            tracing::info!(count = shas.len(), "released claims back to hopper");
-        }
-        Ok(resp) => tracing::warn!(
-            status = %resp.status(),
-            count = shas.len(),
-            "release rejected; claims will wait for their lease to expire",
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            count = shas.len(),
-            "release request failed; claims will wait for their lease to expire",
-        ),
     }
 }
 
@@ -5493,7 +5153,6 @@ mod tests {
                 poll_state: Arc::new(PollState::default()),
                 exit_if_empty,
                 // Standalone prefetcher: no embedded server to defer to.
-                interactive: None,
                 // Far below the 1 s poll cadence, so the second empty poll trips it.
                 idle_warn_after: Duration::from_millis(10),
             }
@@ -5806,7 +5465,6 @@ mod tests {
         let handle = tokio::spawn(
             Prefetcher {
                 // Standalone worker: nothing to defer to.
-                interactive: None,
                 client: reqwest::Client::new(),
                 base_url: Arc::from(format!("http://127.0.0.1:{port}").as_str()),
                 data_dir: None,
@@ -5912,73 +5570,6 @@ mod tests {
             mem_threshold_bytes,
             disk_headroom_bytes: 0,
         })
-    }
-
-    /// The shed gate reads both signals, not just the in-flight flag: a request
-    /// rejected before it takes a slot only ever moves the timestamp.
-    #[test]
-    fn interactive_is_busy_while_paused_and_through_the_quiet_period() {
-        let signals = InteractiveSignals {
-            pause: Arc::new(AtomicBool::new(false)),
-            last_analyze_request_ms: Arc::new(AtomicU64::new(0)),
-            started_at: Instant::now(),
-            quiet_period: Duration::from_secs(7),
-        };
-        assert!(!signals.busy(), "a fresh idle server is not busy");
-
-        signals.pause.store(true, Ordering::Release);
-        assert!(signals.busy(), "an in-flight request makes it busy");
-        signals.pause.store(false, Ordering::Release);
-        assert!(
-            !signals.busy(),
-            "the flag clearing ends the in-flight signal"
-        );
-
-        // A request that never took a slot: only the marker moves. It reads as
-        // busy until the quiet period elapses.
-        let now_ms = u64::try_from(signals.started_at.elapsed().as_millis()).unwrap() + 1;
-        signals
-            .last_analyze_request_ms
-            .store(now_ms, Ordering::Release);
-        assert!(signals.busy(), "within the quiet period after a request");
-
-        signals
-            .last_analyze_request_ms
-            .store(now_ms.saturating_sub(8_000), Ordering::Release);
-        assert!(!signals.busy(), "past the quiet period, claiming resumes");
-    }
-
-    /// Shedding must empty both places staged work lives — the channel and the
-    /// SJF reorder window — or a job survives the shed and runs anyway.
-    #[tokio::test]
-    async fn drain_staged_empties_the_channel_and_the_reorder_window() {
-        let (tx, rx) = mpsc::unbounded_channel::<PrefetchedJob>();
-        let source = JobSource::new(rx, DispatchOrder::Smallest);
-        for sha in ["a", "b", "c"] {
-            tx.send(staged_pj(sha, 4 * 1024)).unwrap();
-        }
-        // One recv pulls all three into the reorder window and returns one, so
-        // the remaining two are held there rather than in the channel.
-        assert!(source.recv().await.is_some());
-        tx.send(staged_pj("d", 4 * 1024)).unwrap();
-
-        let mut shed: Vec<String> = source
-            .drain_staged()
-            .await
-            .into_iter()
-            .map(|pj| pj.job.sha256)
-            .collect();
-        shed.sort();
-        assert_eq!(
-            shed.len(),
-            3,
-            "two from the window plus one from the channel"
-        );
-        assert!(
-            source.drain_staged().await.is_empty(),
-            "the source is empty after a drain"
-        );
-        drop(tx);
     }
 
     #[tokio::test]
@@ -6170,13 +5761,10 @@ mod tests {
         assert_eq!(small_lane_from(2, None), 2);
         assert_eq!(small_lane_from(16, Some(2)), 2);
         assert_eq!(small_lane_from(16, Some(0)), 16);
-        let gate = CleaveGate::new(1, 4, 1024 * 1024, None, None);
+        let gate = CleaveGate::new(1, 4, 1024 * 1024);
         assert!(gate.is_small(1024 * 1024));
         assert!(!gate.is_small(1024 * 1024 + 1));
-        assert!(
-            !CleaveGate::new(1, 4, 0, None, None).is_small(1),
-            "0 disables the lane"
-        );
+        assert!(!CleaveGate::new(1, 4, 0).is_small(1), "0 disables the lane");
         assert_eq!(cleave_concurrency_from(16, 32, None), 16);
         assert_eq!(cleave_concurrency_from(16, 16, None), 16);
         assert_eq!(cleave_concurrency_from(16, 8, None), 8);

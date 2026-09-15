@@ -25,7 +25,7 @@ The defaults are deliberate. Override them only when you have a reason.
 | `--token-file`   | none               | File holding the required bearer token. See below.         |
 | `--traits-dir`   | none               | Writable cleave traits directory (sets env on launch).     |
 | `--hopper`       | none               | Hopper base URL. Every analyzed result is renewed on its `/api/result`. Needs a hopper token; see below. |
-| `--idle-worker-slots` | half of `--workers` when `--hopper` is set | Background hopper analyses while no analysis request has arrived for 7 seconds; capped at half of `--workers`, and paused immediately during active analysis requests. `0` disables. |
+| `--idle-worker-slots` | on when `--hopper` is set | Runs a companion `atomscan worker` process that claims hopper queue work, frozen by the kernel for the whole of every analysis request. Any non-zero value enables it; `0` disables. |
 
 Environment variables read at startup:
 
@@ -230,13 +230,23 @@ the in-process throttle off, while FreeBSD keeps the in-process throttle on and
 takes `MAX_RSS_GB=` (unset leaves atomscan's default, which auto-resolves to
 the process memory limit). FreeBSD also takes `NICE=`, stored in `rc.conf` as `scan_nice`.
 
-`IDLE=` caps the embedded idle worker — the analysis slots `serve` spends on
-hopper queue work while no request is in flight. Left unset it keeps the server
-default of half the slots; `make deploy IDLE=0` turns background claiming off,
-so the host only ever works on interactive requests. It applies on both
-platforms (the jail stores it as `scan_idle_slots` in rc.conf, changeable in
-place with `bastille sysrc`), and it is inert without `HOPPER=`, since there
+`IDLE=` switches the companion pull worker on or off. `serve` runs it as a
+separate `atomscan worker` process and freezes it for the whole of each
+request, so an arriving analysis gets the entire machine; `make deploy IDLE=0`
+turns background claiming off, so the host only ever works on interactive
+requests. Any non-zero value means the same thing — it was once a slot count,
+but the worker sizes itself the way every standalone worker does. It applies on
+both platforms (the jail stores it as `scan_idle_slots` in rc.conf, changeable
+in place with `bastille sysrc`), and it is inert without `HOPPER=`, since there
 would be nothing to claim from.
+
+The freeze is kernel-enforced and acts on cgroup or reaper *membership*, not on
+a process group, so nothing escapes it — including the external analyzers a
+worker spawns, whose process behaviour is not ours to rely on. On Linux the
+unit needs `Delegate=yes`, which `make deploy` writes; without it the server
+says so at startup and runs with no background work rather than running work it
+cannot stop. On FreeBSD the worker acquires reaper status for its own subtree
+and needs nothing from `rc.d`.
 
 `ALLOW_CIDR=` and `TOKEN_SRC=` treat *empty* as a deliberate choice — no CIDR
 allow-list, no authentication — so unlike the others they are not declared in

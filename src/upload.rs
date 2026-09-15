@@ -523,10 +523,21 @@ impl Uploader {
         let result_url = Route::new(&bases, "/api/result");
         let known_url = Route::new(&bases, "/api/known");
         let upload_url = Route::new(&bases, "/api/upload");
-        let client = reqwest::blocking::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        // Off-thread, because `serve` builds its uploader from inside its
+        // tokio runtime and a blocking client owns a runtime of its own.
+        // Recent reqwest refuses to construct one inside another and drops the
+        // half-built runtime on the way out, which tokio reports as "Cannot
+        // drop a runtime in a context where blocking is not allowed" — a panic
+        // before the server ever bound its port. The fallback is built on the
+        // same thread for the same reason. See `corpus_precheck::configure`.
+        let client = std::thread::spawn(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        })
+        .join()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
         let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(UPLOAD_QUEUE_DEPTH);
         let pending = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicUsize::new(0));

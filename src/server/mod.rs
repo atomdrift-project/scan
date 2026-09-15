@@ -60,6 +60,9 @@ pub struct ServerConfig {
     allowed_dirs: Vec<PathBuf>,
     extract_dir: Option<PathBuf>,
     workers: usize,
+    /// Non-zero enables the companion pull worker; see
+    /// [`ServerConfig::with_idle_worker_slots`].
+    idle_worker_slots: usize,
     allow_cidrs: Vec<Cidr>,
     /// Bearer token required on every route except `/_/health`; `None`
     /// disables authentication. Only the digest is kept — see [`TokenDigest`].
@@ -78,19 +81,6 @@ pub struct ServerConfig {
     hopper: Option<String>,
     /// Additional passwords to try for encrypted archives.
     zip_passwords: crate::ArchivePasswords,
-    /// Analysis slots the idle worker may use. `0` disables it. The value is
-    /// capped at half of `workers`, leaving the other half for interactive
-    /// analyses.
-    ///
-    /// Idle capacity is otherwise wasted: a scan server spends most of its life
-    /// waiting for the next request while hopper holds a queue of work. The
-    /// worker fills that gap and pauses the moment a request arrives.
-    ///
-    /// Deliberately fewer than `max_concurrent_tasks`: the difference is the
-    /// interactive reserve. Pausing stops new claims but does not abandon a job
-    /// already running, so without slots held back a request could still queue
-    /// behind background work — the reserve is what keeps the answer prompt.
-    idle_worker_slots: usize,
 }
 
 /// Default per-request analysis timeout: 34 minutes. Covers cold cleave scans
@@ -99,10 +89,6 @@ pub struct ServerConfig {
 /// from pinning a slot forever. Override with `--analysis-timeout` /
 /// [`ServerConfig::with_analysis_timeout`].
 pub const DEFAULT_ANALYSIS_TIMEOUT_SECS: u64 = 2040;
-
-/// After the most recent `/analyze` request, keep the embedded hopper worker
-/// paused for this long before it starts claiming queue work again.
-pub const IDLE_WORKER_QUIET_SECS: u64 = 7;
 
 impl ServerConfig {
     /// Create a server configuration.
@@ -199,19 +185,15 @@ impl ServerConfig {
         self
     }
 
-    /// Set how many analysis slots the idle worker may use; `0` disables it.
+    /// Enable or disable the companion pull worker; `0` disables it.
     ///
-    /// Capped at twice its core budget rather than at half the server's slots.
-    /// "Half the slots" meant half the machine when a slot was a core; since
-    /// slots were sized at three per core (2026-09-03) it meant one and a half
-    /// machines, and on a 128-core box the pull worker held 192 slots and 576
-    /// claims. A slot's work ends at dispatch, so two per core (see
-    /// `idle_worker_cores` for the budget) is enough staging to keep the
-    /// cores fed and no more claims than that in hand.
+    /// Retained as a count because `--idle-worker-slots` and the deploy's
+    /// `IDLE=` have meant one for a long time, but the worker is its own
+    /// process now and sizes itself like any standalone worker, so every
+    /// non-zero value means the same thing.
     #[must_use]
     pub fn with_idle_worker_slots(mut self, slots: usize) -> Self {
-        let cores = idle_worker_cores(crate::worker::cleave_concurrency(self.workers));
-        self.idle_worker_slots = slots.min(cores.saturating_mul(2));
+        self.idle_worker_slots = slots;
         self
     }
 
@@ -388,44 +370,6 @@ mod cpu_busy_tests {
             None,
             "a counter that ran backwards is not a reading"
         );
-    }
-}
-
-#[cfg(test)]
-mod idle_worker_cores_tests {
-    use super::{idle_pool_threads, idle_worker_cores};
-
-    /// Outer classifies never fill the pool they run on: the pool is twice
-    /// the permit count, so fan-out and single-flight waits always have half
-    /// of it. Never fewer than two threads.
-    #[test]
-    fn idle_pool_is_twice_its_classify_permits() {
-        assert_eq!(idle_pool_threads(102), 204);
-        assert_eq!(idle_pool_threads(12), 24);
-        assert_eq!(idle_pool_threads(1), 2);
-        for cores in 1..=256 {
-            assert!(idle_pool_threads(cores) >= 2 * cores, "cores={cores}");
-        }
-    }
-
-    /// The idle worker never gets the whole pool, and never zero of it.
-    #[test]
-    fn idle_worker_leaves_a_reserve_for_interactive_work() {
-        assert_eq!(idle_worker_cores(128), 102, "a fifth reserved");
-        assert_eq!(idle_worker_cores(16), 12);
-        assert_eq!(idle_worker_cores(6), 4, "the reserve floor of two");
-        assert_eq!(idle_worker_cores(4), 2);
-        assert_eq!(idle_worker_cores(3), 1);
-        assert_eq!(idle_worker_cores(2), 1, "never none");
-        assert_eq!(idle_worker_cores(1), 1);
-        for cores in 1..=256 {
-            let budget = idle_worker_cores(cores);
-            assert!(budget >= 1, "cores={cores}");
-            assert!(
-                cores == 1 || budget < cores,
-                "cores={cores} budget={budget}"
-            );
-        }
     }
 }
 
@@ -1133,9 +1077,6 @@ pub(crate) fn whale_slot_usage() -> (usize, usize) {
 /// A big whale with every slot taken is refused ([`WhaleSlotBusy`]) rather
 /// than queued; the handler turns that into a retry-later response.
 pub(crate) fn whale_lane_for(bytes: u64) -> Result<Option<WhaleLane>, WhaleSlotBusy> {
-    if on_idle_pool() {
-        return Ok(None);
-    }
     let cfg = whale_config();
     let floor = if bytes <= cfg.small_max_bytes {
         cfg.small_threads
@@ -1275,19 +1216,6 @@ struct AppState {
     /// Hopper root, kept so the idle worker can claim from the same instance
     /// the uploader renews to.
     hopper: Option<String>,
-    /// Analysis slots the idle worker may use; the rest are the interactive
-    /// reserve. Zero disables it.
-    idle_worker_slots: usize,
-    /// Cores the idle worker may occupy at once — its own budget, below the
-    /// server's, so the server can always start an analysis. See
-    /// [`idle_worker_cores`].
-    idle_worker_cores: usize,
-    /// Pull-queue analyses the idle worker has in progress, tails included.
-    idle_in_progress: Arc<AtomicUsize>,
-    /// The idle worker's core budget as a semaphore; `idle_worker_cores` less
-    /// its free permits is the cores pull work holds right now, published on
-    /// `/_/stats` as `background_in_flight`.
-    idle_cpu: Arc<tokio::sync::Semaphore>,
     /// Machine-wide cores busy between consecutive `/_/stats` reads.
     cpu_busy: CpuBusy,
     /// Raised once the HTTP server stops, so the idle worker winds down with it
@@ -1303,24 +1231,6 @@ struct AppState {
     /// before it dispatches, so the useful answer is per bucket.
     job_buckets: [JobBucket; SIZE_BUCKETS.len()],
     job_types: [JobBucket; PURL_TYPE_NAMES.len()],
-    /// The same per-size figures for work the idle worker did, kept apart
-    /// from the request ones because they are not the same measurement.
-    ///
-    /// Request timings say how fast this server was on whatever a router chose
-    /// to send it, which makes them useless for deciding whether that router
-    /// chose well: a server nobody dispatches to reports nothing and stays
-    /// unroutable, and one sent only small work looks fast at everything. Idle
-    /// work is claimed from the same hopper queue by every server and is not
-    /// selected by anybody's routing, so these are comparable across a fleet in
-    /// the way request timings are not.
-    ///
-    /// Kept separate rather than merged: the idle worker stands down while
-    /// interactive requests are in flight, so this is uncontended speed while
-    /// `job_buckets` is speed under whatever load the server was carrying. Both
-    /// are worth having, and averaging them together would describe neither.
-    /// An `Arc` because the reporter outlives this borrow and must not hold the
-    /// state that holds the reporter.
-    idle_job_buckets: Arc<[JobBucket; SIZE_BUCKETS.len()]>,
     /// The blended average, aged like the others. Separate from
     /// `jobs_completed`, which stays a true lifetime count for reporting: one
     /// answers "how fast is this server now", the other "how much has it done".
@@ -1351,10 +1261,6 @@ struct AppState {
     jobs_completed: AtomicU64,
     job_bytes_total: AtomicU64,
     job_micros_total: AtomicU64,
-    /// Set once the idle worker has actually been spawned. Published on
-    /// `/_/info`: "configured" and "running" are different states, and the gap
-    /// between them is exactly where a silent early return hides.
-    idle_worker_started: AtomicBool,
     /// Raised while any interactive request is in flight, so an embedded idle
     /// worker stops claiming queue work. `None` when no idle worker is running.
     ///
@@ -1381,16 +1287,6 @@ struct AppState {
 }
 
 impl AppState {
-    /// Cores the idle worker holds at this moment: its budget less the
-    /// classify permits it has not taken. Bounded by the budget, unlike the
-    /// in-progress count, which includes tails waiting on the network and on
-    /// rdu2 stood at 576 against 96 cores (2026-09-05) — a discount that size
-    /// told the router a fully busy box had nothing on it.
-    pub(super) fn idle_cores_held(&self) -> usize {
-        self.idle_worker_cores
-            .saturating_sub(self.idle_cpu.available_permits())
-    }
-
     /// Analyses this server can start right now: a slot and a core for each.
     pub(super) fn available_analysis_permits(&self) -> usize {
         let slots = match &self.lanes {
@@ -1417,9 +1313,28 @@ impl AppState {
         self.busy.enter(self.idle_worker.as_ref())
     }
 
-    /// Whether a request is outstanding right now.
+    /// Whether a request is outstanding right now. While one is, the
+    /// companion worker is frozen.
     pub(super) fn is_busy(&self) -> bool {
         self.busy.is_busy()
+    }
+
+    /// Whether a companion worker process is alive right now.
+    pub(super) fn idle_worker_running(&self) -> bool {
+        self.idle_worker.as_ref().is_some_and(|w| w.is_running())
+    }
+
+    /// Cores of this box's current load that a request will not queue behind,
+    /// published as `background_in_flight`.
+    ///
+    /// All of them, or none: the worker is frozen for the whole of every
+    /// request, so there is no partial answer to give.
+    pub(super) fn sheddable_cores(&self) -> usize {
+        if self.idle_worker_running() && !self.is_busy() {
+            cleave::memory_tracker::physical_cpu_count().unwrap_or(0)
+        } else {
+            0
+        }
     }
 }
 
@@ -1480,68 +1395,6 @@ fn cores_busy(
     (total > 0).then(|| cpus as f64 * busy as f64 / total as f64)
 }
 
-thread_local! {
-    /// Set on every thread of the idle worker's pool (`idle_pool`). Read by
-    /// `whale_lane_for`: pull work never takes a whale slot or a lane pool.
-    static ON_IDLE_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether the calling thread belongs to the idle worker's rayon pool.
-pub(crate) fn on_idle_pool() -> bool {
-    ON_IDLE_POOL.with(std::cell::Cell::get)
-}
-
-/// Threads in the idle worker's pool for a core budget of `cores`: twice the
-/// budget.
-///
-/// Each classify is installed *onto* a pool thread (`CleaveGate::pool`) and
-/// holds it for its whole run, so the pool must keep threads free for what
-/// those classifies fan out to: member analyses, and the single-flight waits
-/// where one member waits on another thread's analysis of the same bytes.
-/// With one thread per permit every thread was an outer closure, nothing was
-/// left to run the work they waited on, and rdu2's pull worker wedged with
-/// 102 permits held, 102 threads blocked, stage "done" for half an hour and
-/// no CPU (2026-09-06). A quarter of the threads as permits was the first
-/// fix and starved the other way: 26 classifies of small packages kept 53 of
-/// 128 cores busy with 190 claimed jobs waiting for a permit and 244,000
-/// more in hopper's queue. So the permits stay at the core budget — one
-/// classify per budgeted core, which is what a classify costs — and the pool
-/// is twice that, so outer closures can never take more than half of it.
-/// The extra threads only run when a classify fans out, and they are demoted
-/// below the server's like the rest of the pool.
-pub(super) fn idle_pool_threads(cores: usize) -> usize {
-    cores.saturating_mul(2).max(2)
-}
-
-/// Cores the embedded idle worker may occupy: four fifths of the pool, less
-/// a reserve of at least two, and never none. `SCAN_IDLE_CORES` overrides
-/// for one host.
-///
-/// The budget is a budget in threads because the worker fans out on a pool
-/// of exactly this size (`idle_pool`), and it can be this generous because
-/// the pool's threads are scheduled below the server's and claim their own
-/// parallelism owner slots: an interactive analysis takes the core and the
-/// gate it needs the moment it is runnable, and pull work resumes in the
-/// gaps. The reserve of two is what guarantees a permit and a thread to
-/// *start* on when every core is busy — on a four-core box that is half of
-/// it, on 128 cores it is 26, which is more than any interactive burst those
-/// hosts have seen (peak 7 concurrent at stress concurrency 8, 2026-09-05).
-///
-/// Sized: 4 → 2, 6 → 4, 16 → 12, 128 → 102. `.max(1)` yields one core on a
-/// one- or two-core box rather than zero, which would deadlock the worker's
-/// cleave gate.
-fn idle_worker_cores(cores: usize) -> usize {
-    if let Some(forced) = std::env::var("SCAN_IDLE_CORES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-    {
-        return forced.min(cores.max(1));
-    }
-    let reserve = cores.div_ceil(5).max(2);
-    cores.saturating_sub(reserve).max(1)
-}
-
 /// Returns an error if the router cannot be assembled or background resource
 /// initialization cannot be scheduled.
 pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
@@ -1552,12 +1405,7 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
     // smaller pool typically delivers higher aggregate throughput than 1/core.
     let max_concurrent = config.workers();
     let cores = crate::worker::cleave_concurrency(max_concurrent);
-    tracing::info!(
-        max_concurrent,
-        cores,
-        idle_worker_cores = idle_worker_cores(cores),
-        "concurrency limit set"
-    );
+    tracing::info!(max_concurrent, cores, "concurrency limit set");
 
     // Built before the literal because the idle worker needs both: it is
     // frozen by `busy` and wound down by `shutdown`.
@@ -1599,9 +1447,6 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         lanes: SlotLanes::from_env(max_concurrent),
         cpu: Arc::new(tokio::sync::Semaphore::new(cores)),
-        idle_worker_cores: idle_worker_cores(cores),
-        idle_in_progress: Arc::new(AtomicUsize::new(0)),
-        idle_cpu: Arc::new(tokio::sync::Semaphore::new(idle_worker_cores(cores))),
         cpu_busy: CpuBusy::default(),
         stuck_orphans: AtomicUsize::new(0),
         max_concurrent_tasks: max_concurrent,
@@ -1611,12 +1456,9 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
         flights: Arc::new(flight::Flights::default()),
         in_flight: dashmap::DashMap::new(),
         hopper: config.hopper().map(str::to_owned),
-        idle_worker_slots: config.idle_worker_slots(),
         shutdown,
-        idle_worker_started: AtomicBool::new(false),
         job_buckets: Default::default(),
         job_types: Default::default(),
-        idle_job_buckets: Arc::new(Default::default()),
         job_overall: Default::default(),
         job_cached: Default::default(),
         lookups: Default::default(),

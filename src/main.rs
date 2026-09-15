@@ -2206,7 +2206,6 @@ fn main() -> Result<()> {
             );
             let config = scan::worker::WorkerConfig {
                 // Standalone: owns its signals, its nice value, and its models.
-                embedded: None,
                 hopper_url: url,
                 name,
                 workers,
