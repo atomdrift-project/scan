@@ -1329,9 +1329,18 @@ impl AppState {
     ///
     /// All of them, or none: the worker is frozen for the whole of every
     /// request, so there is no partial answer to give.
+    ///
+    /// Counted in *logical* cores, because that is the unit `cpu_busy_cores`
+    /// is in — a router subtracts one from the other, and the two must agree.
+    /// Reporting physical cores here read correctly on a host without SMT and
+    /// wrongly on one with it: ionos measured `cpu_busy_cores=10.7` against
+    /// `physical_cpus=6` with its worker busy, so subtracting 6 left 0.78 of
+    /// phantom foreground load, and a fully saturated worker would have left
+    /// exactly 1.0 — beamline's `HOST_PRESSURE_LIMIT`, past which the box is
+    /// dropped from routing for work that steps aside the moment it arrives.
     pub(super) fn sheddable_cores(&self) -> usize {
         if self.idle_worker_running() && !self.is_busy() {
-            cleave::memory_tracker::physical_cpu_count().unwrap_or(0)
+            std::thread::available_parallelism().map_or(0, std::num::NonZero::get)
         } else {
             0
         }
