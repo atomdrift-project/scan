@@ -1777,6 +1777,12 @@ mod tests {
                 location: "fourth.txt".to_string(),
             },
         ];
+        // Assert on the plain rendering, whatever the environment thinks about
+        // colour: `CLICOLOR_FORCE` outranks the tty check, so on a host that
+        // sets it these rows arrive wrapped in escapes and every prefix and
+        // suffix assertion below reads a different string than the one under
+        // test.
+        colored::control::set_override(false);
         let rendered = terminal_trait_rows(&traits, 72);
         assert_eq!(rendered.lines().count(), 3);
         assert!(rendered.lines().next().unwrap().contains("…"));
@@ -1786,6 +1792,8 @@ mod tests {
 
     #[test]
     fn embedded_branch_uses_two_lines_without_a_closing_rule() {
+        // See `terminal_trait_grid_is_three_rows_and_keeps_location_tail`.
+        colored::control::set_override(false);
         let body = " \u{25cf}\u{25cf}\u{25cf} Payload behavior";
         let rendered = terminal_embedded_branch(
             &Classification::Hostile,
