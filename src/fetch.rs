@@ -61,6 +61,43 @@ pub const DEFAULT_FETCH_DEPTH: u8 = 2;
 /// yanked, and the byte scan's cost isn't worth it. `0` disables the gate.
 pub const DEFAULT_MAX_DEP_AGE_DAYS: u32 = 7;
 
+/// Dependency age ceiling for `worker` mode: `0` — no gate, fetch every
+/// resolvable dependency.
+///
+/// An interactive scan gates at [`DEFAULT_MAX_DEP_AGE_DAYS`] because
+/// a fresh release is where a supply-chain compromise shows up and the operator is
+/// waiting. A worker is the opposite trade: it runs unattended to populate the
+/// shared corpus, and every dependency it resolves lands in hopper carrying a
+/// package coordinate — the raw material known-good bloom coverage is built from.
+/// Gating those out means the cache never learns the long tail that real scans
+/// keep re-resolving.
+pub const WORKER_MAX_DEP_AGE_DAYS: u32 = 0;
+
+/// The follow selection a `serve` or `worker` process uses when the operator
+/// named none: everything, CI actions included.
+///
+/// These are cache-population roles. They scan on behalf of everybody, and the
+/// corpus they fill is asked about artifacts nobody has looked at yet — so a
+/// category left unfollowed is one the corpus never learns about, for every
+/// consumer, until somebody notices and restarts the fleet with a wider flag.
+/// The narrower interactive default exists to keep one person's scan fast,
+/// which is not what a service is for.
+///
+/// Widest-by-default also settles which verdict wins. Hopper holds one verdict
+/// per artifact and the last writer takes the row, so a fleet whose members
+/// follow different amounts lets a narrow answer overwrite a wide one. When
+/// every server follows everything, there is no narrower answer to lose to.
+#[must_use]
+pub fn default_service_follow_policy() -> FetchPolicy {
+    FetchPolicy {
+        urls: true,
+        packages: true,
+        deps: true,
+        ci: true,
+        ..FetchPolicy::default()
+    }
+}
+
 /// 1024-based size units, the basis for every `--fetch-max-*-size` ceiling.
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;

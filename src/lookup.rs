@@ -30,11 +30,11 @@ use serde::{Deserialize, Serialize};
 
 /// Findings kept per verdict. The wire view serves the worst few; the rest are
 /// headroom so the projection can widen without re-analyzing everything.
-const MAX_STORED_HITS: usize = 10;
+pub const MAX_STORED_HITS: usize = 10;
 
 /// Criticality floor for a stored finding: 3 notable, 4 suspicious, 5 hostile.
 /// Anything below is baseline noise that no consumer gates on.
-const MIN_HIT_CRIT: u8 = 3;
+pub const MIN_HIT_CRIT: u8 = 3;
 
 /// Verdicts memoized in process, ahead of the on-disk read.
 const MEMO_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
@@ -47,7 +47,7 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One finding, flattened to what a consumer gates on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Hit {
+pub struct Hit {
     /// Stable trait identifier (`objectives/execution/shell/bash`).
     pub id: String,
     /// Criticality ordinal: 3 notable, 4 suspicious, 5 hostile.
@@ -127,7 +127,15 @@ impl Verdict {
 ///
 /// Mirrors what a consumer would pick out of `raw` itself, so a served verdict
 /// and a freshly rendered envelope agree on which findings matter.
-fn collect_hits(report: &cleave::types::CompactReport, purl: Option<&str>) -> Vec<Hit> {
+/// The worst findings in a report, most critical first.
+///
+/// One selection rule, shared by everything that reports findings, so two
+/// consumers never disagree about which ones matter. Notable and above
+/// ([`MIN_HIT_CRIT`]), native matches only, deduplicated, capped at
+/// [`MAX_STORED_HITS`]. `purl` names the package a finding belongs to when
+/// the artifact was fetched by coordinate.
+#[must_use]
+pub fn collect_hits(report: &cleave::types::CompactReport, purl: Option<&str>) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for file in &report.files {
