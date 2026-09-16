@@ -15,7 +15,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
@@ -776,6 +776,271 @@ pub struct WorkerConfig {
     pub fetch: crate::fetch::FetchPolicy,
     /// Additional passwords to try for encrypted archives.
     pub zip_passwords: crate::ArchivePasswords,
+}
+
+// ---------------------------------------------------------------------------
+// Startup resolution.
+//
+// A worker's memory ceiling, slot count, model bundle and operating point are
+// resolved the same way whichever binary starts it. They live here rather than
+// in a CLI's `main` so a second one cannot drift from the first.
+// ---------------------------------------------------------------------------
+
+/// One gigabyte, the unit `--max-rss-gb` is given in.
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// The memory signal a worker sizes its RSS ceiling against.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerMemoryBasis {
+    /// The memory signal this basis was taken from.
+    pub bytes: u64,
+    /// Where that signal came from, for the startup log.
+    pub source: &'static str,
+}
+
+/// The host's total memory, or a conservative fallback when it cannot be
+/// read. Cgroup-aware via cleave.
+#[must_use]
+pub fn worker_memory_basis() -> WorkerMemoryBasis {
+    if let Some(bytes) = cleave::memory_tracker::total_memory() {
+        return WorkerMemoryBasis {
+            bytes,
+            source: "cleave_total_memory",
+        };
+    }
+    WorkerMemoryBasis {
+        bytes: 16 * GIB,
+        source: "fallback_16g",
+    }
+}
+
+/// User-supplied resolution policy for `--max-rss-gb`.
+///
+/// The CLI accepts an `i64` so a negative value can opt out, but the three
+/// possible behaviours are encoded in the type system from this point on so
+/// that downstream code cannot accidentally treat "disabled" as "ceiling = 0".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxRssPolicy {
+    /// `--max-rss-gb=-1`: disable in-process RSS throttling entirely. Use when
+    /// an external supervisor (systemd `MemoryMax=`, jail rctl, etc.) already
+    /// enforces a hard memory cap.
+    Disabled,
+    /// `--max-rss-gb=0`: auto-resolve the ceiling from the platform's memory
+    /// signal (cgroup limits, /proc/meminfo, or a conservative fallback).
+    Auto,
+    /// `--max-rss-gb=N` (N > 0): explicit ceiling in gigabytes.
+    Explicit(NonZeroU64),
+}
+
+impl MaxRssPolicy {
+    /// Read the `--max-rss-gb` flag's three behaviours out of its `i64`.
+    #[must_use]
+    pub fn from_cli(raw: i64) -> Self {
+        match raw {
+            n if n < 0 => Self::Disabled,
+            0 => Self::Auto,
+            // The previous arms exclude n <= 0, so `cast_unsigned` is
+            // value-preserving and `NonZeroU64::new` always returns `Some`.
+            // `unwrap_or(MIN)` documents that the fallback is unreachable.
+            n => Self::Explicit(NonZeroU64::new(n.cast_unsigned()).unwrap_or(NonZeroU64::MIN)),
+        }
+    }
+}
+
+/// The RSS ceiling in gigabytes, from the `--max-rss-gb` flag as given.
+/// Zero means throttling is off.
+#[must_use]
+pub fn resolve_worker_max_rss_gb(raw_max_rss_gb: i64) -> u64 {
+    match MaxRssPolicy::from_cli(raw_max_rss_gb) {
+        MaxRssPolicy::Disabled => 0,
+        // 85% of the cgroup-aware memory basis, with a one-GiB floor. Slot
+        // count scales with cores, so larger hosts need a proportionate ceiling.
+        MaxRssPolicy::Auto => std::cmp::max(1, (worker_memory_basis().bytes * 85 / 100) / GIB),
+        MaxRssPolicy::Explicit(gb) => gb.get(),
+    }
+}
+
+/// Default slot count: three times the physical cores.
+///
+/// A slot spends most of its life waiting, not computing: the hopper
+/// claim/prefetch round trips, the dependency fetch, and the LLM second
+/// opinion are all network. Measured on the 16-core production worker
+/// (2026-09-03): with 16 slots the pool never exceeded ~5 busy cores however
+/// the cleave gate was sized, because every slot was parked in one of those
+/// waits; 32 slots reached 5, 48 reached 9. Memory is bounded separately by
+/// `admission::MemoryAdmission`, so extra slots cost only their prefetched
+/// payload, and that buffer has its own budget.
+#[must_use]
+pub fn default_workers() -> NonZeroUsize {
+    if let Some(cores) = cleave::memory_tracker::physical_cpu_count() {
+        return NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3)))
+            .unwrap_or(NonZeroUsize::MIN);
+    }
+    let cores = cleave::memory_tracker::cpu_count().unwrap_or_else(|| {
+        tracing::warn!(
+            fallback = 4,
+            "CPU count detection failed; defaulting worker basis to 4 cores",
+        );
+        4
+    });
+    // Logical count only: half of it approximates the physical cores, so the
+    // same three-per-core default is 1.5x the logical count.
+    NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3) / 2)).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// What a caller supplies to start a worker, before resolution.
+///
+/// [`WorkerConfig`] is the resolved form: every field settled, every default
+/// taken. This is the unresolved one — the shape a command line hands over,
+/// with `None` meaning "take the sensible default" rather than "off".
+/// [`Startup::resolve`] turns one into the other, and is the only place those
+/// defaults are decided, so two binaries starting a worker start it the same
+/// way.
+#[derive(Debug)]
+pub struct Startup {
+    /// Hopper's base URL. A worker uses one address, not the comma list
+    /// `serve` accepts — a replica refuses worker routes outright, so an
+    /// earlier address is not a fallback.
+    pub hopper_url: String,
+    /// Worker name. `None` takes the hostname.
+    pub name: Option<String>,
+    /// Concurrent analysis slots. `None` takes [`default_workers`].
+    pub workers: Option<NonZeroUsize>,
+    /// Seconds between claim polls when hopper has no work.
+    pub poll_secs: u64,
+    /// The `--max-rss-gb` flag as given: negative disables in-process
+    /// throttling, zero auto-resolves from the host, positive is a ceiling in
+    /// gigabytes. See [`MaxRssPolicy`].
+    pub max_rss_gb: i64,
+    /// Nice value for the analysis threads.
+    pub nice: i32,
+    /// A sample tree this worker can read directly, skipping the download.
+    pub data_dir: Option<PathBuf>,
+    /// Stop after this many jobs. `None` runs until killed.
+    pub max_jobs: Option<u64>,
+    /// Exit rather than idle when hopper has nothing to claim.
+    pub exit_if_empty: bool,
+    /// Model bundle. `None` resolves the installed one.
+    pub model_dir: Option<PathBuf>,
+    /// Operating point in false positives per 100M. `None` takes the bundle's
+    /// own default, then [`crate::model::DEFAULT_SEVERITY_LEVEL`]. Ignored
+    /// when `thresholds` is set, which bypasses the level grid entirely.
+    pub level: Option<u16>,
+    /// Manual probability cutoffs, bypassing the level grid.
+    pub thresholds: Option<Thresholds>,
+    /// Traits bundle override.
+    pub traits_dir: Option<PathBuf>,
+    /// Force the startup refresh even when the local copy looks current
+    /// (`-u`/`--update`).
+    pub update: bool,
+    /// Skip the startup model and traits refresh.
+    pub no_update: bool,
+    /// Skip the trait-validation gate. A worker that starts with an
+    /// incomplete rule set reports benign verdicts it has not earned, so this
+    /// is for local work against on-disk rules, not for a fleet.
+    pub no_validate: bool,
+    /// Per-rule time budget before cleave logs a slow rule.
+    pub slow_rule_ms: u64,
+    /// The LLM second opinion, when one is configured.
+    pub interpret: Option<crate::interpret::InterpretConfig>,
+    /// Whether to follow the references a sample declares.
+    pub fetch: crate::fetch::FetchPolicy,
+    /// Passwords to try against encrypted archives.
+    pub zip_passwords: crate::ArchivePasswords,
+}
+
+impl Startup {
+    /// Settle every default and prove the rule set is complete.
+    ///
+    /// Resolves the model bundle, the operating point, the slot count and the
+    /// memory ceiling, then runs the trait-validation gate unless
+    /// [`Startup::no_validate`] waives it. The gate is the load-bearing part:
+    /// a worker running a partial rule set answers benign for samples it
+    /// never really examined, and does it quietly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model bundle cannot be resolved, or when the
+    /// trait-validation gate fails.
+    pub fn resolve(self) -> anyhow::Result<WorkerConfig> {
+        use anyhow::Context as _;
+
+        // Order is load-bearing and is why the refresh lives here rather than
+        // at the call site. The override has to be applied first, or the
+        // refresh installs into the default directory while `--traits-dir`
+        // points at an empty one — and a daemon started that way comes up,
+        // reports healthy, and fails every analysis.
+        if let Some(dir) = self.traits_dir.as_ref() {
+            cleave::traits_repo::set_override_dir(Some(dir.into()));
+        }
+        crate::refresh_rules_at_startup(self.update, self.no_update);
+
+        let model_dir = match self.model_dir {
+            Some(dir) => dir,
+            None => crate::models_repo::model_dir().context("failed to resolve model directory")?,
+        };
+
+        // Manual cutoffs bypass the level grid, so no level applies then and
+        // the envelope reports `null` rather than a number nobody measured.
+        let level = if self.thresholds.is_some() {
+            None
+        } else {
+            Some(
+                self.level
+                    .or_else(|| crate::model::model_default_level(&model_dir))
+                    .unwrap_or(crate::model::DEFAULT_SEVERITY_LEVEL),
+            )
+        };
+
+        if self.no_validate {
+            tracing::warn!(
+                "--no-validate: skipping the trait-validation gate; running \
+                 against on-disk rules as-is",
+            );
+        } else {
+            let validate_config = crate::ScanConfig::new(
+                model_dir.clone(),
+                crate::OutputFormat::Terminal,
+                self.thresholds,
+                crate::DisplayFilter::alerts_only(),
+                self.slow_rule_ms,
+                false,
+            )?
+            .with_level(level)
+            .with_zip_passwords(self.zip_passwords.clone());
+            crate::validate::run(&validate_config, false)
+                .context("worker startup validation failed")?;
+        }
+
+        Ok(WorkerConfig {
+            hopper_url: self.hopper_url,
+            name: self.name.unwrap_or_else(default_worker_name),
+            workers: self.workers.unwrap_or_else(default_workers),
+            poll_secs: self.poll_secs,
+            max_rss_gb: resolve_worker_max_rss_gb(self.max_rss_gb),
+            model_dir,
+            thresholds: self.thresholds,
+            data_dir: self.data_dir,
+            slow_rule_ms: self.slow_rule_ms,
+            max_jobs: self.max_jobs,
+            exit_if_empty: self.exit_if_empty,
+            no_update: self.no_update,
+            level,
+            nice: self.nice,
+            interpret: self.interpret,
+            fetch: self.fetch,
+            zip_passwords: self.zip_passwords,
+        })
+    }
+}
+
+/// This host's name, or `"unknown"` when it cannot be read.
+#[must_use]
+pub fn default_worker_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Settings that must survive every model load and periodic renewal unchanged.

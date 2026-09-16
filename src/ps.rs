@@ -434,6 +434,8 @@ fn build_result(
 
     Ok(ScanResult {
         v: "7",
+        model: cr.model,
+        floor: cr.floor,
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,

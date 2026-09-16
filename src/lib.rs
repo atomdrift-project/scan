@@ -41,6 +41,7 @@ pub mod bloom_build;
 pub mod bloom_repo;
 pub mod bloom_update;
 pub mod cache_cleanup;
+pub mod cli;
 pub mod corpus_precheck;
 pub mod crash_dump;
 pub mod deptree;
@@ -61,6 +62,7 @@ pub mod output;
 pub mod pkg;
 pub mod provenance;
 pub mod ps;
+pub mod runtime;
 pub mod server;
 pub mod suspend;
 pub mod sys;
@@ -195,6 +197,41 @@ pub enum Mode {
 /// has always used, and the whale pools (`server::whale_lane_for`) must match it
 /// or a member that recurses fine on one pool overflows on the other.
 pub const RAYON_STACK_MB: usize = 256;
+
+/// Refresh the model and traits bundles before a daemon starts serving.
+///
+/// Long-lived daemons pick up new rules on restart, so this runs once at
+/// startup rather than on a timer. Failures are warned about and not fatal: a
+/// worker in a disconnected environment must still start with whatever is on
+/// disk. `force` updates even when the local copy looks current; `no_update`
+/// skips the step entirely.
+///
+/// This is also the step that populates a `--traits-dir` pointing at an empty
+/// state directory on a fresh deploy. Without it a server starts, reports
+/// healthy, and fails every analysis on a traits path that was never created.
+pub fn refresh_rules_at_startup(force: bool, no_update: bool) {
+    if no_update {
+        tracing::warn!("--no-update: skipping startup model/traits refresh");
+        return;
+    }
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let dir = models_repo::install_target();
+            if let Err(e) = model_update::update(&dir, force, false) {
+                tracing::warn!(dir = %dir.display(), error = %e, "model update failed");
+            }
+        });
+        s.spawn(|| {
+            if let Err(e) = traits_repo::update(force, false) {
+                tracing::warn!(
+                    dir = %cleave::traits_repo::install_target().display(),
+                    error = format!("{e:#}"),
+                    "traits update failed",
+                );
+            }
+        });
+    });
+}
 
 #[cfg(test)]
 mod archive_password_tests {

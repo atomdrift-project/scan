@@ -129,8 +129,11 @@ mod mimalloc_alloc {
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use scan::OutputFormat;
 use scan::engine::DisplayFilter;
+use scan::worker::{
+    MaxRssPolicy, default_worker_name, default_workers, resolve_worker_max_rss_gb,
+    worker_memory_basis,
+};
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -192,41 +195,14 @@ where
     }
 }
 
-use scan::memory::{
-    MaxRssPolicy, cgroup_memory_diagnostics, log_max_rss_resolution,
-    proc_memtotal_mb, resolve_process_max_rss_bytes, resolve_worker_max_rss_gb,
-    worker_memory_basis,
-};
+use scan::memory::{cgroup_memory_diagnostics, log_max_rss_resolution, proc_memtotal_mb};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
-const DEFAULT_RIZIN_TIMEOUT_SECS: u64 = 10 * 60;
-
-/// Classification values accepted by `--show`.
-#[derive(Clone, clap::ValueEnum)]
-enum Show {
-    Hostile,
-    #[value(name = "sus", alias = "suspicious")]
-    Sus,
-    Benign,
-    All,
-}
 
 /// Warn threshold for a single slow cleave rule (ms); was the `--slow-rule-ms`
 /// flag, now a fixed advisory default.
 const DEFAULT_SLOW_RULE_MS: u64 = 4000;
-
-/// Dependency age ceiling for `worker` mode: `0` — no gate, fetch every
-/// resolvable dependency.
-///
-/// An interactive scan gates at [`scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS`] because
-/// a fresh release is where a supply-chain compromise shows up and the operator is
-/// waiting. A worker is the opposite trade: it runs unattended to populate the
-/// shared corpus, and every dependency it resolves lands in hopper carrying a
-/// package coordinate — the raw material known-good bloom coverage is built from.
-/// Gating those out means the cache never learns the long tail that real scans
-/// keep re-resolving.
-const WORKER_MAX_DEP_AGE_DAYS: u32 = 0;
 
 #[derive(Parser)]
 #[command(name = "atomscan")]
@@ -237,570 +213,11 @@ const WORKER_MAX_DEP_AGE_DAYS: u32 = 0;
 and takes every flag that subcommand accepts."
 )]
 struct Cli {
-    /// Enable debug logging for Atomdrift Scan and cleave
-    #[arg(long, global = true)]
-    verbose: bool,
-
-    /// Update models and traits before running (failures are non-fatal)
-    #[arg(short = 'u', long, global = true)]
-    update: bool,
-
-    /// Disable the automatic rules/models refresh (on by default when the local
-    /// ruleset is over 24h stale). Use when the local traits/models are
-    /// intentionally ahead of (or diverged from) the remote, e.g. local edits
-    /// that would block the pull. Also settable via `SCAN_NO_UPDATE`.
-    #[arg(long, global = true)]
-    no_update: bool,
-
-    /// Force light-background color theme
-    #[arg(long, global = true, conflicts_with = "dark")]
-    light: bool,
-
-    /// Force dark-background color theme
-    #[arg(long, global = true, conflicts_with = "light")]
-    dark: bool,
-
-    /// Override model directory (default: auto-resolved from models repo)
-    #[arg(long, global = true)]
-    model_dir: Option<PathBuf>,
-
-    /// Output format
-    #[arg(
-        short,
-        long,
-        global = true,
-        env = "SCAN_FORMAT",
-        default_value = "terminal"
-    )]
-    format: OutputFormat,
-
-    /// Scan mode: `fast` (bloom matching only), `balanced` (bloom short-circuits,
-    /// then full scan), or `slow` (no bloom; always full scan). Workers are
-    /// always slow.
-    #[arg(long, global = true, default_value = "balanced")]
-    mode: scan::Mode,
-
-    /// Hard wall-clock limit for each Rizin subprocess, in seconds. On expiry
-    /// Atomscan kills and reaps Rizin before releasing the analysis worker; on
-    /// Unix it also kills the complete process group. Also settable via
-    /// `SCAN_RIZIN_TIMEOUT_SECS`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SECS",
-        env = "SCAN_RIZIN_TIMEOUT_SECS",
-        default_value_t = DEFAULT_RIZIN_TIMEOUT_SECS,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    rizin_timeout_secs: u64,
-
-    /// Override suspicious threshold (0.0-1.0); omit to use model's recommendation
-    #[arg(long, global = true)]
-    threshold_suspicious: Option<f32>,
-
-    /// Override hostile threshold (0.0-1.0); omit to use model's recommendation
-    #[arg(long, global = true)]
-    threshold_hostile: Option<f32>,
-
-    /// Tune thresholds for false-positive level N (0-25000, FP per 100M benigns): higher = more sensitive, noisier. Bundle decides which levels are calibrated.
-    #[arg(
-        short = 'l',
-        long,
-        value_name = "N",
-        value_parser = clap::value_parser!(u16).range(0..=25000),
-        global = true,
-        conflicts_with_all = ["threshold_suspicious", "threshold_hostile"],
-    )]
-    level: Option<u16>,
-
-    /// Classifications to display in the terminal view: hostile, suspicious,
-    /// sus, benign, all (comma-separated). The machine formats (json, tiny,
-    /// interpret) emit every scanned file regardless.
-    #[arg(long, global = true, value_delimiter = ',', default_values = ["hostile", "sus"])]
-    show: Vec<Show>,
-
-    /// Show raw probability and SHAP feature values in terminal output
-    #[arg(long, global = true, hide = true)]
-    extra: bool,
-
-    /// [deprecated] Legacy on-switch for LLM interpretation; superseded by
-    /// `--llm`. Kept for compatibility (env: SCAN_INTERPRET).
-    #[arg(long, global = true, env = "SCAN_INTERPRET", hide = true)]
-    interpret: bool,
-
-    /// [optional] Enable additional LLM interpretation of analyzed samples: a
-    /// second opinion blended with the ML verdict (stored in the `llm` JSON
-    /// section and shown inline). Given with no value, uses a local model (an
-    /// OpenAI-compatible endpoint at http://localhost:8000/v1). TARGET may be
-    /// `local`, `openrouter` (https://openrouter.ai/api/v1; key from `--llm-key`,
-    /// `SCAN_LLM_KEY`, or `~/.tok/openrouter`; defaults to `openrouter/auto`
-    /// unless `--llm-model` names one), or an explicit OpenAI-compatible base
-    /// URL. Endpoints that require a bearer
-    /// token take it from `~/.tok/llm` when that file exists. Comma-separate
-    /// several to fail over in order, e.g.
-    /// `https://llm.isotope13.ai/v1,openrouter`. (env: SCAN_LLM)
-    #[arg(
-        long,
-        global = true,
-        value_name = "TARGET",
-        num_args = 0..=1,
-        default_missing_value = "local",
-    )]
-    llm: Option<String>,
-
-    /// LLM model name, e.g. Qwen/Qwen3.8-27B. Defaults to the largest model the
-    /// endpoint itself reports serving, or `openrouter/auto` for an OpenRouter
-    /// endpoint; nothing else is hardcoded. With a comma-separated `--llm`
-    /// chain, comma-separate one name per endpoint in the same order (a blank
-    /// slot discovers/defaults, a single name applies to all)
-    /// (env: SCAN_LLM_MODEL)
-    #[arg(long, global = true, value_name = "NAME")]
-    llm_model: Option<String>,
-
-    /// LLM bearer token (env: SCAN_LLM_KEY). Defaults to `~/.tok/llm` when that
-    /// file exists (`~/.tok/openrouter` for OpenRouter); omit for an endpoint
-    /// that needs no key
-    #[arg(long, global = true, value_name = "KEY")]
-    llm_key: Option<String>,
-
-    /// Loosest FP level (0-25000, per 100M benigns) at which ML alone sends a
-    /// sample to the LLM; higher = more samples. Defaults to the model's grid
-    /// ceiling — anything ML flagged at any level. Files cleave flagged
-    /// suspicious/hostile are sent regardless of this cutoff.
-    #[arg(
-        long,
-        global = true,
-        alias = "interpret-min-level",
-        value_parser = clap::value_parser!(u16).range(0..=25000),
-        value_name = "N",
-    )]
-    llm_min_level: Option<u16>,
-
-    /// Raw ML probability at or above which a sample reaches the LLM, whatever
-    /// the calibrated level grid and cleave findings say.
-    ///
-    /// One of several independent admissions, so it can only send more, never
-    /// block. The default sits on a measured elbow: malicious admission is flat
-    /// across 0.46..0.57 while benign admission keeps falling through it.
-    /// Lowering it buys the overlap region at roughly 50 benign samples per
-    /// malicious one; raising it sheds about four benign per malicious.
-    #[arg(
-        long,
-        global = true,
-        alias = "interpret-min-prob",
-        value_name = "P",
-        default_value_t = scan::interpret::DEFAULT_LLM_MIN_PROB,
-    )]
-    llm_min_prob: f32,
-
-    /// Size veto for the LLM gate: an ML-benign sample with no hostile finding
-    /// and more than this many notable-or-above findings is not sent to the
-    /// LLM, unless it carries a strong gate trait or ML placed it on the level
-    /// grid. Big legitimate packages accumulate notable findings until some
-    /// admission fires, and the reader then moves nothing; on the measured
-    /// corpus the veto at 300 halved benign calls and kept every correct
-    /// shift. `0` disables it.
-    #[arg(
-        long,
-        global = true,
-        value_name = "N",
-        default_value_t = scan::interpret::DEFAULT_LLM_BENIGN_NOTABLE_CAP,
-    )]
-    llm_benign_notable_cap: usize,
-
-    /// Per-request LLM timeout, in seconds. Once it elapses the endpoint is
-    /// treated as a refusal and the next one in the `--llm` chain is tried.
-    ///
-    /// Applies to every mode and every hop in the chain; an OpenRouter hop
-    /// always gets at least 30.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SECS",
-        default_value_t = scan::interpret::DEFAULT_TIMEOUT_SECS
-    )]
-    llm_timeout: u64,
-
-    /// Additional passwords to try for encrypted ZIP/7z archives. Repeat the
-    /// option to provide more than one; cleave's common defaults remain active.
-    #[arg(long = "zip-password", value_name = "PASSWORD", global = true)]
-    zip_passwords: Vec<String>,
-
-    /// [EXPERIMENTAL] Follow references discovered inside the requested
-    /// artifact, analyze their payloads, and fold them into the verdict:
-    ///   `dependencies` — manifest and lockfile dependencies;
-    ///   `references`   — packages and URLs named by install/download commands;
-    ///   `ci-actions`   — third-party actions referenced by CI configuration.
-    /// `all` selects every category; `none` analyzes only the requested artifact.
-    /// A bare `--follow` follows dependencies and references but not CI actions,
-    /// and so does an absent one for an interactive scan. `serve` and `worker`
-    /// default to `all` instead: they populate the shared corpus, where a
-    /// category nobody followed is one nobody ever learns. The old `--fetch` flag and `deps`, `packages`, `urls`, and
-    /// `ci` values remain accepted as aliases. Also settable via `SCAN_FOLLOW`;
-    /// `SCAN_FETCH` remains a compatibility alias.
-    #[arg(
-        long = "follow",
-        visible_alias = "fetch",
-        global = true,
-        value_name = "TARGETS",
-        num_args = 0..=1,
-        require_equals = true,
-        // A bare `--follow` selects the artifact's own reachable code, not CI:
-        // `--follow=all` (or `--follow=ci-actions`) is the explicit opt-in for GitHub
-        // Actions, which run only in CI and never reach an installed artifact.
-        // Keep in lockstep with `default_cli_follow_policy`, which resolves an
-        // absent `--follow` to the same targets.
-        default_missing_value = "references,dependencies",
-        env = "SCAN_FOLLOW"
-    )]
-    follow: Option<scan::fetch::FetchPolicy>,
-
-    /// [EXPERIMENTAL] How many hops of references to follow when `--follow` is on:
-    /// `1` fetches only what the scanned files reference, `2` also follows
-    /// references found inside those payloads (reaching a stage-3 `curl | bash`
-    /// dropper), and so on. Also settable via `SCAN_FOLLOW_DEPTH`; the old
-    /// `--fetch-depth` and `SCAN_FETCH_DEPTH` names remain aliases.
-    #[arg(
-        long = "follow-depth",
-        visible_alias = "fetch-depth",
-        global = true,
-        value_name = "N",
-        default_value_t = scan::fetch::DEFAULT_FETCH_DEPTH,
-        env = "SCAN_FOLLOW_DEPTH"
-    )]
-    fetch_depth: u8,
-
-    /// [EXPERIMENTAL] Skip fetching a declared dependency whose registry publish
-    /// date is older than this many days — the cheap provenance lookup runs
-    /// first, and only recent (freshest-risk) releases are pulled and scanned.
-    /// Applies to declared dependencies only; URLs are never age-gated. `0`
-    /// disables the gate (fetch every resolvable dependency). A dependency whose
-    /// age can't be determined is always fetched. Also settable via
-    /// `SCAN_FETCH_MAX_AGE`.
-    ///
-    /// Unset, the ceiling depends on the mode: an interactive scan wants a
-    /// fresh-risk window ([`scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS`]), while a
-    /// worker is a cache-population role and takes every resolvable dependency
-    /// ([`WORKER_MAX_DEP_AGE_DAYS`]). Optional rather than defaulted so an
-    /// explicit `--fetch-max-age` still wins in both.
-    #[arg(long, global = true, value_name = "DAYS", env = "SCAN_FETCH_MAX_AGE")]
-    fetch_max_age: Option<u32>,
-
-    /// [EXPERIMENTAL] Fetch and scan native-binary dependencies for every
-    /// platform, not just the host's. This is automatic in `serve` and
-    /// `worker`, which scan on behalf of other machines; interactive scans
-    /// stay host-only for latency unless this flag is passed. Also settable via
-    /// `SCAN_FETCH_ALL_PLATFORMS`.
-    #[arg(
-        long,
-        global = true,
-        env = "SCAN_FETCH_ALL_PLATFORMS",
-        conflicts_with = "fetch_host_platform_only"
-    )]
-    fetch_all_platforms: bool,
-
-    /// [EXPERIMENTAL] Fetch only native-binary dependencies matching this
-    /// host's OS and architecture. This is the interactive default and an
-    /// explicit completeness opt-out for `serve` / `worker`. Also settable
-    /// via `SCAN_FETCH_HOST_PLATFORM_ONLY`.
-    #[arg(
-        long,
-        global = true,
-        env = "SCAN_FETCH_HOST_PLATFORM_ONLY",
-        conflicts_with = "fetch_all_platforms"
-    )]
-    fetch_host_platform_only: bool,
-
-    /// [EXPERIMENTAL] Follow declared dependencies past the first hop — the
-    /// dependencies of a fetched dependency, out to `--fetch-depth`. This is
-    /// automatic in `serve` and `worker`, which populate the shared corpus;
-    /// an interactive scan stops declared dependencies at the first hop, since
-    /// the transitive tail costs a registry lookup each and is almost entirely
-    /// old releases the age gate then discards. URLs and command-mentioned
-    /// packages — the dropper chain — are followed at every hop either way.
-    /// Also settable via `SCAN_FETCH_TRANSITIVE_DEPS`.
-    #[arg(
-        long,
-        global = true,
-        env = "SCAN_FETCH_TRANSITIVE_DEPS",
-        conflicts_with = "fetch_direct_deps_only"
-    )]
-    fetch_transitive_deps: bool,
-
-    /// [EXPERIMENTAL] Follow declared dependencies for one hop only. This is the
-    /// interactive default and an explicit completeness opt-out for `serve` /
-    /// `worker`. Also settable via `SCAN_FETCH_DIRECT_DEPS_ONLY`.
-    #[arg(
-        long,
-        global = true,
-        env = "SCAN_FETCH_DIRECT_DEPS_ONLY",
-        conflicts_with = "fetch_transitive_deps"
-    )]
-    fetch_direct_deps_only: bool,
-
-    /// [EXPERIMENTAL] How long to trust cached *mutable* registry metadata before
-    /// revalidating. Accepts a unit suffix (`90s`, `30m`, `4h`, `2d`) — a bare
-    /// number is seconds; `never` caches indefinitely (offline/air-gapped). This
-    /// bounds the two mutable tiers: a pinned version's packument (whose yank
-    /// status can change after publish) and a `latest`/versionless lookup.
-    /// Unset keeps the defaults — 4h pinned, 1h unpinned. A released version's
-    /// immutable file list is never re-checked regardless. Also settable via
-    /// `SCAN_REGISTRY_TTL`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "DUR",
-        value_parser = scan::fetch::parse_duration,
-        env = "SCAN_REGISTRY_TTL"
-    )]
-    registry_ttl: Option<std::time::Duration>,
-
-    /// [EXPERIMENTAL] Size cap for a single downloaded artifact. Accepts a unit
-    /// suffix (`256M`, `2G`, `512K`); a bare number is bytes. A response larger
-    /// than this is abandoned, so one artifact can't dominate a run. Also
-    /// settable via `SCAN_FETCH_MAX_SIZE`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SIZE",
-        default_value = "256M",
-        value_parser = scan::fetch::parse_bytes,
-        env = "SCAN_FETCH_MAX_SIZE"
-    )]
-    fetch_max_size: u64,
-
-    /// [EXPERIMENTAL] Maximum number of *live* dependency/package fetches
-    /// triggered by a single scanned file. This is 100 by default. Cache hits
-    /// are always served and never counted, so a warm re-run is never throttled.
-    /// References past the cap are recorded as budget-exceeded, never silently
-    /// dropped. Also settable via `SCAN_FETCH_MAX_FILE_FETCHES`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "N",
-        default_value_t = scan::fetch::DEFAULT_MAX_FILE_FETCHES,
-        env = "SCAN_FETCH_MAX_FILE_FETCHES"
-    )]
-    fetch_max_file_fetches: usize,
-
-    /// [EXPERIMENTAL] Maximum number of *live* opportunistic raw-URL fetches
-    /// triggered by a single scanned file. This is 4 by default. URL references
-    /// declared as dependencies or command-mentioned packages use the larger
-    /// `--fetch-max-file-fetches` cap instead. Also settable via
-    /// `SCAN_FETCH_MAX_URLS`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "N",
-        default_value_t = scan::fetch::DEFAULT_MAX_URL_FETCHES,
-        env = "SCAN_FETCH_MAX_URLS"
-    )]
-    fetch_max_urls: usize,
-
-    /// [EXPERIMENTAL] Maximum total bytes fetched on behalf of a single scanned
-    /// file. Accepts a unit suffix (`2G`); a bare number is bytes. Also settable
-    /// via `SCAN_FETCH_MAX_FILE_SIZE`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SIZE",
-        default_value = "2G",
-        value_parser = scan::fetch::parse_bytes,
-        env = "SCAN_FETCH_MAX_FILE_SIZE"
-    )]
-    fetch_max_file_size: u64,
-
-    /// [EXPERIMENTAL] Wall-clock ceiling on the fetch phase for a single
-    /// scanned artifact. Accepts a unit suffix (`90s`, `5m`, `1h`); a bare
-    /// number is seconds; `0` or `never` disables the cap. This is 5 minutes by
-    /// default. The count and size budgets bound how much a scan fetches, not
-    /// how long fetching takes — a wide tree of slow registries can hold a scan
-    /// open with every count budget still unspent. References not reached
-    /// before the cap are left unfollowed; whatever was already fetched is
-    /// analyzed and graded as usual. Also settable via `SCAN_FETCH_TIMEOUT`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "DUR",
-        default_value = "5m",
-        value_parser = scan::fetch::parse_duration,
-        env = "SCAN_FETCH_TIMEOUT"
-    )]
-    fetch_timeout: std::time::Duration,
-
-    /// [EXPERIMENTAL] Maximum number of *live* fetches across the whole
-    /// execution — a hard ceiling over every scanned file combined. Lifted in
-    /// long-lived server modes (`serve`/`worker`), where the per-file caps bound
-    /// each job instead. Also settable via `SCAN_FETCH_MAX_TOTAL_FETCHES`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "N",
-        default_value_t = scan::fetch::DEFAULT_MAX_TOTAL_FETCHES,
-        env = "SCAN_FETCH_MAX_TOTAL_FETCHES"
-    )]
-    fetch_max_total_fetches: usize,
-
-    /// [EXPERIMENTAL] Maximum total bytes fetched across the whole execution.
-    /// Accepts a unit suffix (`10G`); a bare number is bytes. Lifted in
-    /// long-lived server modes (`serve`/`worker`). Also settable via
-    /// `SCAN_FETCH_MAX_TOTAL_SIZE`.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SIZE",
-        default_value = "10G",
-        value_parser = scan::fetch::parse_bytes,
-        env = "SCAN_FETCH_MAX_TOTAL_SIZE"
-    )]
-    fetch_max_total_size: u64,
+    #[command(flatten)]
+    global: scan::cli::GlobalArgs,
 
     #[command(subcommand)]
     command: Option<Commands>,
-}
-
-impl Cli {
-    /// Build the LLM interpretation config from `--llm` (or the legacy
-    /// `--interpret`) and the `--llm-*` flags, falling back to env vars. `None`
-    /// when interpretation is not requested.
-    fn interpret_config(&self) -> Result<Option<scan::interpret::InterpretConfig>> {
-        use scan::interpret::{
-            DEFAULT_BASE_URL, LlmEndpoint, is_openrouter_endpoint, llm_key_from_home, llm_models,
-            llm_targets, openrouter_key_from_home,
-        };
-        let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
-            flag.clone()
-                .or_else(|| std::env::var(key).ok())
-                .filter(|s| !s.is_empty())
-        };
-        // `--llm [TARGET]` / SCAN_LLM (the bare flag defaults TARGET to `local`)
-        // or the legacy `--interpret` flag turns the pass on.
-        let target = from_env(&self.llm, "SCAN_LLM");
-        if target.is_none() && !self.interpret {
-            return Ok(None);
-        }
-        // Resolve the target to base URLs: `local` (also the bare-flag default)
-        // maps to the local endpoint; `openrouter` is the public API; anything
-        // else is an OpenAI-compatible base URL. A comma-separated target is a
-        // failover chain, tried in order.
-        let targets = match target.as_deref() {
-            None => vec![DEFAULT_BASE_URL.to_string()],
-            Some(raw) => llm_targets(raw),
-        };
-        if targets.is_empty() {
-            anyhow::bail!("--llm (env: SCAN_LLM) names no endpoint");
-        }
-        let pinned = llm_models(
-            from_env(&self.llm_model, "SCAN_LLM_MODEL").as_deref(),
-            targets.len(),
-        );
-        // An explicit key wins, and applies to every endpoint in the chain —
-        // it is the operator naming one credential. Otherwise each endpoint
-        // resolves its own, and only its own: `~/.tok/openrouter` for
-        // OpenRouter, `~/.tok/llm` for everything else — our own vLLM requires
-        // one, and a host that has the file authenticates without any flag.
-        // Absent a file, the request goes out unauthenticated, which is still
-        // right for an endpoint that wants no key.
-        let explicit_key = from_env(&self.llm_key, "SCAN_LLM_KEY");
-
-        // One endpoint must work; the rest are a cushion. So a config problem
-        // is fatal when it is the only endpoint (a misconfigured `--llm` must
-        // not be silent), and a warning when others remain — an OpenRouter
-        // fallback with no model pinned, or a primary that is down at startup,
-        // should cost that entry, not the scan.
-        let single = targets.len() == 1;
-        let mut resolved: Vec<LlmEndpoint> = Vec::with_capacity(targets.len());
-        let mut skipped: Vec<String> = Vec::new();
-        for (base_url, pinned) in targets.into_iter().zip(pinned) {
-            let openrouter = is_openrouter_endpoint(&base_url);
-            // `~/.tok/llm` is *our* endpoint's token and must never travel to
-            // a third party, so OpenRouter takes its own file or nothing —
-            // sending the vLLM key there would hand a working credential to an
-            // unrelated host and read as a plain 401 when it did.
-            let api_key = explicit_key.clone().or_else(|| {
-                if openrouter {
-                    openrouter_key_from_home()
-                } else {
-                    llm_key_from_home()
-                }
-            });
-            if openrouter && api_key.is_none() {
-                let why =
-                    "OpenRouter requires a key: --llm-key, SCAN_LLM_KEY, or ~/.tok/openrouter";
-                if single {
-                    anyhow::bail!("{why}");
-                }
-                skipped.push(format!("{base_url}: {why}"));
-                continue;
-            }
-            // A pinned model wins; otherwise take what the endpoint says it
-            // serves. OpenRouter's catalog is large and billed, so nothing
-            // from it is guessed — but OpenRouter itself ships a stable
-            // `openrouter/auto` alias that picks a suitable model per
-            // request, so that's the default rather than a hard error.
-            // Nothing else is hardcoded: if a non-OpenRouter endpoint lists no
-            // model there is nothing sensible to send, and a guessed name
-            // would surface as an opaque server-side error mid-scan instead of
-            // here.
-            let model = if openrouter {
-                pinned.unwrap_or_else(|| scan::interpret::OPENROUTER_DEFAULT_MODEL.to_string())
-            } else {
-                match pinned {
-                    Some(m) => m,
-                    None => match scan::interpret::discover_model(&base_url, api_key.as_deref()) {
-                        Ok(m) => m,
-                        // Say which of the several ways discovery can fail this
-                        // was — an unreachable host, a 404 from a base URL
-                        // missing its /v1, a rejected key and an endpoint
-                        // serving nothing all need different fixes, and only
-                        // pinning a model is common to all of them.
-                        Err(e) => {
-                            let why = format!(
-                                "no LLM model available from {base_url}: {e}. Fix the endpoint, \
-                                 or name a model with --llm-model (env: SCAN_LLM_MODEL)"
-                            );
-                            if single {
-                                anyhow::bail!("{why}");
-                            }
-                            skipped.push(why);
-                            continue;
-                        }
-                    },
-                }
-            };
-            resolved.push(LlmEndpoint {
-                base_url,
-                model,
-                api_key,
-            });
-        }
-        for why in &skipped {
-            tracing::warn!("LLM endpoint unusable, dropped from the failover chain: {why}");
-        }
-        let mut resolved = resolved.into_iter();
-        let primary = resolved.next().ok_or_else(|| {
-            anyhow::anyhow!("no usable LLM endpoint:\n  {}", skipped.join("\n  "))
-        })?;
-        Ok(Some(scan::interpret::InterpretConfig {
-            base_url: primary.base_url,
-            model: primary.model,
-            api_key: primary.api_key,
-            min_level: self.llm_min_level,
-            min_prob: self.llm_min_prob,
-            benign_notable_cap: self.llm_benign_notable_cap,
-            // One budget per hop for every mode: a wedged endpoint is caught
-            // by the connect timeout and the breaker, not by this.
-            timeout: std::time::Duration::from_secs(self.llm_timeout),
-            // `SCAN_LLM_CONCURRENCY` overrides the in-flight cap; the default
-            // scales with the box (see `interpret::default_max_concurrency`).
-            max_concurrency: std::env::var("SCAN_LLM_CONCURRENCY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .and_then(NonZeroUsize::new)
-                .unwrap_or_else(scan::interpret::default_max_concurrency),
-            fallbacks: resolved.collect(),
-        }))
-    }
 }
 
 /// The binary's online default: everything the artifact itself reaches, but not
@@ -820,30 +237,6 @@ fn default_cli_follow_policy() -> scan::fetch::FetchPolicy {
     }
 }
 
-/// The follow selection a `serve` or `worker` process uses when the operator
-/// named none: everything, CI actions included.
-///
-/// These are cache-population roles. They scan on behalf of everybody, and the
-/// corpus they fill is asked about artifacts nobody has looked at yet — so a
-/// category left unfollowed is one the corpus never learns about, for every
-/// consumer, until somebody notices and restarts the fleet with a wider flag.
-/// The narrower interactive default exists to keep one person's scan fast,
-/// which is not what a service is for.
-///
-/// Widest-by-default also settles which verdict wins. Hopper holds one verdict
-/// per artifact and the last writer takes the row, so a fleet whose members
-/// follow different amounts lets a narrow answer overwrite a wide one. When
-/// every server follows everything, there is no narrower answer to lose to.
-fn default_service_follow_policy() -> scan::fetch::FetchPolicy {
-    scan::fetch::FetchPolicy {
-        urls: true,
-        packages: true,
-        deps: true,
-        ci: true,
-        ..scan::fetch::FetchPolicy::default()
-    }
-}
-
 /// Publish the known-good/known-bad filters process-wide, so
 /// `scan::fetch::age_gate` can skip a dependency whose coordinate is already
 /// vouched. This is deliberately separate from `ScanConfig::with_bloom`, which
@@ -852,7 +245,7 @@ fn default_service_follow_policy() -> scan::fetch::FetchPolicy {
 /// answered from a bless.
 ///
 /// `--mode slow` means "consult no filters", so it publishes nothing. Note this
-/// reads the operator's `cli.mode` rather than the effective mode: `serve` and
+/// reads the operator's `cli.global.mode` rather than the effective mode: `serve` and
 /// `worker` force themselves slow so a submitted job is always analyzed on its
 /// own merits, and that internal choice must not also switch off their
 /// dependency skip — only an explicit `--mode slow` does.
@@ -860,18 +253,6 @@ fn publish_bloom_filters(mode: scan::Mode) {
     if mode != scan::Mode::Slow {
         scan::bloom_repo::set_global(std::sync::Arc::new(scan::bloom_repo::Lookup::load()));
     }
-}
-
-fn cli_host_platform_only(cli: &Cli, scans_for_other_hosts: bool) -> bool {
-    cli.fetch_host_platform_only || (!cli.fetch_all_platforms && !scans_for_other_hosts)
-}
-
-/// Whether declared dependencies are followed past the first hop. Corpus-facing
-/// modes take the transitive tail by default; an interactive scan stops at the
-/// artifact's own declared dependencies. Either default is overridable, and the
-/// two flags conflict, so at most one arm can fire.
-fn cli_transitive_deps(cli: &Cli, scans_for_other_hosts: bool) -> bool {
-    cli.fetch_transitive_deps || (!cli.fetch_direct_deps_only && scans_for_other_hosts)
 }
 
 /// The subcommand a bare `atomscan <path>` stands for.
@@ -1322,41 +703,6 @@ fn threshold_overrides_for_model(
     }
 }
 
-/// `SCAN_NO_ANALYSIS_CACHE=1` — one switch that disables every cache of our
-/// own analysis across the stack: filefacts file metadata, stng extracted
-/// strings, cleave analysis results, and scan's analysis envelope + LLM
-/// verdicts. Download caches (fletch registry metadata) and rule-compilation
-/// caches (YARA, trait mapper) stay on — they hold inputs, not analysis.
-///
-/// Implemented by filling in each layer's own env var, so per-layer semantics
-/// stay defined in one place and child processes inherit the policy. Only
-/// unset vars are filled in: a per-layer var the operator set explicitly
-/// always wins over the umbrella.
-fn propagate_no_analysis_cache() {
-    let on = std::env::var("SCAN_NO_ANALYSIS_CACHE")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    if !on {
-        return;
-    }
-    // CLEAVE_SKIP_CACHE=1 also drags cleave's YARA rule-compilation cache with
-    // it (legacy behavior); pin that cache back on — recompiling rules costs
-    // 4-18s per process and compiles rules, not sample analysis.
-    let defaults = [
-        ("FILEFACTS_CACHE", "0"),
-        ("STNG_STRING_CACHE", "0"),
-        ("CLEAVE_SKIP_CACHE", "1"),
-        ("CLEAVE_SKIP_YARA_CACHE", "0"),
-        ("SCAN_ANALYSIS_CACHE", "0"),
-    ];
-    for (key, value) in defaults {
-        if std::env::var_os(key).is_none() {
-            // SAFETY: called from the top of main before any thread is
-            // spawned, so no concurrent environment access can race this.
-            unsafe { std::env::set_var(key, value) };
-        }
-    }
-}
-
 /// Refresh models and traits before a long-lived daemon starts serving.
 ///
 /// `force` is `-u/--update`: re-fetch even when the local copy looks current.
@@ -1366,30 +712,6 @@ fn propagate_no_analysis_cache() {
 /// up on whatever is already on disk. It runs *after* `--traits-dir` has been
 /// applied, so a pinned traits directory is the one that gets installed into —
 /// which is also how that directory comes to exist on a fresh deploy.
-fn refresh_rules_at_startup(force: bool, no_update: bool) {
-    if no_update {
-        tracing::warn!("--no-update: skipping startup model/traits refresh");
-        return;
-    }
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let dir = scan::models_repo::install_target();
-            if let Err(e) = scan::model_update::update(&dir, force, false) {
-                tracing::warn!(dir = %dir.display(), error = %e, "model update failed");
-            }
-        });
-        s.spawn(|| {
-            if let Err(e) = scan::traits_repo::update(force, false) {
-                tracing::warn!(
-                    dir = %cleave::traits_repo::install_target().display(),
-                    error = format!("{e:#}"),
-                    "traits update failed",
-                );
-            }
-        });
-    });
-}
-
 fn main() -> Result<()> {
     #[cfg(all(
         unix,
@@ -1412,82 +734,43 @@ fn main() -> Result<()> {
     unsafe {
         mimalloc_alloc::route_tree_sitter_through_mimalloc()
     };
-    propagate_no_analysis_cache();
-    // Block SIGUSR1 process-wide before spawning any threads so they all inherit
-    // the blocked mask; the dedicated sigusr1 thread below consumes it via sigwait.
-    #[cfg(unix)]
-    unsafe {
-        let mut mask: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        libc::sigaddset(&mut mask, libc::SIGUSR1);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
-    }
-    // Allow a forked debugger to ptrace us under yama.ptrace_scope=1.
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
-    }
+    // SAFETY: still the first statements of `main`. No thread has been
+    // spawned and nothing has read the environment yet.
+    unsafe { scan::runtime::install() };
 
-    // Preserve the old deployment variable while teaching new configurations
-    // the same vocabulary as the HTTP API. The canonical variable wins when
-    // both are present. This runs before clap or any worker thread starts.
-    if std::env::var_os("SCAN_FOLLOW").is_none()
-        && let Some(value) = std::env::var_os("SCAN_FETCH")
-    {
-        // SAFETY: argument parsing happens before this process starts threads.
-        unsafe { std::env::set_var("SCAN_FOLLOW", value) };
-    }
-    if std::env::var_os("SCAN_FOLLOW_DEPTH").is_none()
-        && let Some(value) = std::env::var_os("SCAN_FETCH_DEPTH")
-    {
-        // SAFETY: argument parsing happens before this process starts threads.
-        unsafe { std::env::set_var("SCAN_FOLLOW_DEPTH", value) };
-    }
     let mut cli = Cli::parse_from(with_default_subcommand(std::env::args_os()));
     // Install the process-wide Rizin budget before any analysis or Rayon worker
     // can start. Filefacts owns the subprocess lifecycle; Atomscan only selects
     // the deadline through this single global configuration point.
-    filefacts::rizin::set_timeout_secs(cli.rizin_timeout_secs);
-    let selected_severity_level = cli.level;
-    let threshold_suspicious = cli.threshold_suspicious;
-    let threshold_hostile = cli.threshold_hostile;
+    filefacts::rizin::set_timeout_secs(cli.global.rizin_timeout_secs);
+    let selected_severity_level = cli.global.level;
+    let threshold_suspicious = cli.global.threshold_suspicious;
+    let threshold_hostile = cli.global.threshold_hostile;
     // The selection comes from `--follow`; the hop count from `--follow-depth`,
     // the dependency age ceiling from `--fetch-max-age`, and the per-file ceilings
     // from `--fetch-max-file-*` (each its own flag/env). When `--follow`/`SCAN_FOLLOW`
     // is unset, the binary defaults to dependencies and executable references
     // in every mode (CI actions remain opt-in). An explicit selection is honored
-    // verbatim in both; the knobs always apply.
-    let with_knobs = |mut policy: scan::fetch::FetchPolicy,
-                      default_max_age: u32,
-                      scans_for_other_hosts: bool| {
-        policy.depth = cli.fetch_depth;
-        policy.max_dep_age_days = cli.fetch_max_age.unwrap_or(default_max_age);
-        policy.max_file_fetches = cli.fetch_max_file_fetches;
-        policy.max_url_fetches = cli.fetch_max_urls;
-        policy.max_file_bytes = cli.fetch_max_file_size;
-        policy.max_duration = cli.fetch_timeout;
-        policy.host_platform_only = cli_host_platform_only(&cli, scans_for_other_hosts);
-        policy.transitive_deps = cli_transitive_deps(&cli, scans_for_other_hosts);
-        policy
-    };
+    // verbatim in both; the knobs always apply. `GlobalArgs::fetch_policy` owns
+    // that mapping so every front-end applies the flags identically.
     // The per-fetch size ceiling is enforced in the HTTP layer, so it's a
     // process-global rather than a per-policy field — set it once here and every
     // mode (interactive scan and worker alike) honors `--fetch-max-size`.
-    scan::fetch::set_max_fetch_bytes(cli.fetch_max_size);
+    scan::fetch::set_max_fetch_bytes(cli.global.fetch_max_size);
     // Registry-metadata staleness bound: a process-global for the same reason,
     // consulted by every registry lookup. `None` keeps the tiered defaults.
-    scan::fetch::set_registry_ttl(cli.registry_ttl);
+    scan::fetch::set_registry_ttl(cli.global.registry_ttl);
     let scans_for_other_hosts = command_scans_for_other_hosts(cli.command.as_ref());
     // An unflagged `serve` follows everything; an unflagged interactive scan
     // follows only what an installed artifact can reach. See
-    // [`default_service_follow_policy`].
+    // [`scan::fetch::default_service_follow_policy`].
     let default_follow = if scans_for_other_hosts {
-        default_service_follow_policy
+        scan::fetch::default_service_follow_policy
     } else {
         default_cli_follow_policy
     };
-    let fetch_policy = with_knobs(
-        cli.follow.unwrap_or_else(default_follow),
+    let fetch_policy = cli.global.fetch_policy(
+        cli.global.follow.unwrap_or_else(default_follow),
         scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
         scans_for_other_hosts,
     );
@@ -1496,9 +779,11 @@ fn main() -> Result<()> {
     // package coordinate, which is what later grows known-good bloom coverage. The
     // fresh-risk window that keeps an interactive scan fast is exactly the wrong
     // default there — it discards the long tail the cache most wants.
-    let worker_fetch_policy = with_knobs(
-        cli.follow.unwrap_or_else(default_service_follow_policy),
-        WORKER_MAX_DEP_AGE_DAYS,
+    let worker_fetch_policy = cli.global.fetch_policy(
+        cli.global
+            .follow
+            .unwrap_or_else(scan::fetch::default_service_follow_policy),
+        scan::fetch::WORKER_MAX_DEP_AGE_DAYS,
         true,
     );
 
@@ -1517,14 +802,21 @@ fn main() -> Result<()> {
     scan::cache_cleanup::start(is_serve);
     // Long-lived server modes never short-circuit on bloom filters: every job is
     // analyzed on its own merits. Force slow mode there regardless of `--mode`.
-    let effective_mode = if is_serve { scan::Mode::Slow } else { cli.mode };
+    let effective_mode = if is_serve {
+        scan::Mode::Slow
+    } else {
+        cli.global.mode
+    };
     // Per-execution fetch ceiling: a hard cap across the whole invocation. The
     // long-lived server modes (`serve`/`worker`) scan unboundedly many jobs over
     // their lifetime, so they're exempt — each job is bounded by `--fetch-max-file-*`
     // instead. A one-shot scan gets the full `--fetch-max-total-*` (the budget
     // defaults to unlimited, so leaving it unset in server mode lifts it).
     if !is_serve {
-        scan::fetch::set_total_budget(cli.fetch_max_total_fetches, cli.fetch_max_total_size);
+        scan::fetch::set_total_budget(
+            cli.global.fetch_max_total_fetches,
+            cli.global.fetch_max_total_size,
+        );
     }
     // RUST_LOG (when set) wins over the mode-derived defaults, so profiling
     // runs can surface targeted modules (e.g. `cleave::mem_profile=info`)
@@ -1533,7 +825,7 @@ fn main() -> Result<()> {
     // main.rs (rule refresh, authentication, LLM configuration) are not in the
     // `scan` library and were being filtered out of the daemons' logs.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if cli.verbose {
+        if cli.global.verbose {
             tracing_subscriber::EnvFilter::new("atomscan=debug,scan=debug,cleave=debug")
         } else if is_serve {
             tracing_subscriber::EnvFilter::new("atomscan=info,scan=info,cleave=warn")
@@ -1545,7 +837,7 @@ fn main() -> Result<()> {
     // source. That expected maintenance path is not an operator-facing error;
     // filter only its exact event. Explicit diagnostics still show it.
     let quiet_expected_yara_cache = ExpectedYaraCacheFilter {
-        hide: !cli.verbose && std::env::var_os("RUST_LOG").is_none(),
+        hide: !cli.global.verbose && std::env::var_os("RUST_LOG").is_none(),
     };
     if is_serve {
         tracing_subscriber::registry()
@@ -1588,14 +880,14 @@ fn main() -> Result<()> {
     // An operator who asked for logs still gets them: `--verbose` or an explicit
     // `RUST_LOG` leaves the bridge at its default level, so a dependency's `log`
     // output remains reachable when it is actually wanted.
-    if !cli.verbose && std::env::var_os("RUST_LOG").is_none() {
+    if !cli.global.verbose && std::env::var_os("RUST_LOG").is_none() {
         log::set_max_level(log::LevelFilter::Off);
     }
 
     // Resolved after logging is up: with no hardcoded default, the model comes
     // from the endpoint's own listing, so which one was picked has to be
     // visible rather than swallowed by an uninitialized subscriber.
-    let interpret_cfg = cli.interpret_config()?;
+    let interpret_cfg = cli.global.interpret_config()?;
     if let Some(cfg) = &interpret_cfg {
         tracing::info!(
             endpoint = %cfg.base_url,
@@ -1718,7 +1010,7 @@ fn main() -> Result<()> {
     // Terminal theme detection is only needed for scan/ps with terminal output.
     // The OSC color-scheme query blocks on a TTY response and hangs in any
     // environment that doesn't reply (SSH, some tmux configs, worker daemons).
-    let needs_terminal_theme = cli.format == scan::OutputFormat::Terminal
+    let needs_terminal_theme = cli.global.format == scan::OutputFormat::Terminal
         && matches!(
             command,
             Commands::Path { .. }
@@ -1727,9 +1019,9 @@ fn main() -> Result<()> {
                 | Commands::Url { .. }
                 | Commands::Purl { .. }
         );
-    if cli.light {
+    if cli.global.light {
         scan::output::set_theme(scan::output::Theme::Light);
-    } else if cli.dark {
+    } else if cli.global.dark {
         scan::output::set_theme(scan::output::Theme::Dark);
     } else if needs_terminal_theme {
         scan::output::detect_theme();
@@ -1821,17 +1113,17 @@ fn main() -> Result<()> {
             | Commands::Purl { .. }
     ) {
         scan::auto_update::refresh_if_stale(
-            cli.update,
-            cli.no_update,
+            cli.global.update,
+            cli.global.no_update,
             effective_mode,
-            cli.format == scan::OutputFormat::Terminal,
+            cli.global.format == scan::OutputFormat::Terminal,
         );
     }
 
     // Resolve model directory lazily — update-rules and version don't need it,
     // and eagerly resolving triggers auto-clone before those commands can run.
     let resolve_model_dir = || -> Result<PathBuf> {
-        match &cli.model_dir {
+        match &cli.global.model_dir {
             Some(d) => Ok(d.clone()),
             None => scan::models_repo::model_dir().context("failed to resolve model directory"),
         }
@@ -1862,27 +1154,22 @@ fn main() -> Result<()> {
             )
         }
     };
-    let all = cli.show.iter().any(|s| matches!(s, Show::All));
-    let filter = DisplayFilter::new(
-        all || cli.show.iter().any(|s| matches!(s, Show::Hostile)),
-        all || cli.show.iter().any(|s| matches!(s, Show::Sus)),
-        all || cli.show.iter().any(|s| matches!(s, Show::Benign)),
-    );
+    let filter = cli.global.display_filter();
     let new_scan_config = |hopper| -> Result<scan::ScanConfig> {
         let model_dir = resolve_model_dir()?;
         let envelope_level = resolve_envelope_level(&model_dir);
         Ok(scan::ScanConfig::new(
             model_dir,
-            cli.format,
+            cli.global.format,
             threshold_overrides(),
             filter,
             DEFAULT_SLOW_RULE_MS,
-            cli.extra,
+            cli.global.extra,
         )?
         .with_level(envelope_level)
         .with_interpret(interpret_cfg.clone())
         .with_fetch(fetch_policy)
-        .with_zip_passwords(cli.zip_passwords.clone())
+        .with_zip_passwords(cli.global.zip_passwords.clone())
         .with_hopper(resolve_hopper(hopper)))
     };
 
@@ -1938,12 +1225,12 @@ fn main() -> Result<()> {
         // opts out of consulting them at all.
         Commands::Url { url, hopper } => {
             let config = new_scan_config(hopper)?;
-            publish_bloom_filters(cli.mode);
+            publish_bloom_filters(cli.global.mode);
             exit_for_summary(&scan::pkg::run_url(&url, &config)?);
         }
         Commands::Purl { purl, hopper } => {
             let config = new_scan_config(hopper)?;
-            publish_bloom_filters(cli.mode);
+            publish_bloom_filters(cli.global.mode);
             exit_for_summary(&scan::pkg::run_pkg(&purl, &config)?);
         }
         Commands::Serve {
@@ -1961,93 +1248,40 @@ fn main() -> Result<()> {
             analysis_timeout,
         } => {
             let hopper = resolve_hopper(hopper);
-            if let Some(p) = traits_dir.as_ref() {
-                cleave::traits_repo::set_override_dir(Some(p.into()));
-            }
             // Same contract as the worker: refresh on restart. This is also the
             // step that populates a `--traits-dir` pointing at an empty state
             // directory on a fresh deploy — without it the server starts, reports
             // healthy, and fails every analysis on a traits path that never
             // got created.
-            refresh_rules_at_startup(cli.update, cli.no_update);
-            let dirs: Vec<std::path::PathBuf> = allowed_dirs
-                .unwrap_or_default()
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    let p = std::path::PathBuf::from(s);
-                    // Canonicalize allowed dirs at startup so symlink-resolved
-                    // request paths match correctly in starts_with checks.
-                    p.canonicalize().unwrap_or(p)
-                })
-                .collect();
-            let workers = workers.unwrap_or_else(default_workers).get();
-            let allow_cidrs = match allow_cidr {
-                Some(s) => scan::server::parse_cidr_list(&s)
-                    .map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?,
-                None => Vec::new(),
-            };
-            // Fail closed: an operator who asked for authentication must never
-            // get an open server because the token file went missing.
-            let auth_digest = match token_file {
-                Some(ref path) => {
-                    let token = scan::interpret::read_token_file(path).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--token-file {}: missing, empty, or unreadable",
-                            path.display()
-                        )
-                    })?;
-                    let digest = scan::server::TokenDigest::new(&token)
-                        .map_err(|e| anyhow::anyhow!("--token-file {}: {e}", path.display()))?;
-                    // Name the file the running process actually read: after a
-                    // rotation the token in a file and the token in memory can
-                    // differ, and the 401 that follows is otherwise unreadable.
-                    tracing::info!(
-                        token_file = %path.display(),
-                        "bearer authentication enabled (token is read once, at startup)",
-                    );
-                    Some(digest)
-                }
-                None => None,
-            };
-            let max_rss_bytes = resolve_process_max_rss_bytes(max_rss_gb);
-            log_max_rss_resolution("server", MaxRssPolicy::from_cli(max_rss_gb), max_rss_bytes);
-            let model_dir = resolve_model_dir()?;
-            let envelope_level = resolve_envelope_level(&model_dir);
-            let thresholds = threshold_overrides();
-            // Ask for half the request slots for background work; the server
-            // caps that again at twice the idle worker's core budget, which is
-            // half the machine (see `ServerConfig::with_idle_worker_slots`).
-            // The idle worker pauses immediately while an analysis is in flight
-            // and for a short quiet period after the latest analysis request.
-            //
-            // Disabled without --hopper: there would be nothing to claim from.
-            let idle_slots = match (hopper.as_deref(), idle_worker_slots) {
-                (None, _) => 0,
-                (Some(_), Some(n)) => n.min(workers / 2),
-                (Some(_), None) => workers / 2,
-            };
-
-            let config = scan::server::ServerConfig::new(
+            log_max_rss_resolution(
+                "server",
+                MaxRssPolicy::from_cli(max_rss_gb),
+                scan::server::resolve_process_max_rss_bytes(max_rss_gb),
+            );
+            let config = scan::server::Startup {
                 bind,
-                max_size_mb.saturating_mul(1024 * 1024),
-                max_rss_bytes,
-                model_dir,
-                thresholds,
-                DEFAULT_SLOW_RULE_MS,
-                dirs,
-                extract_dir.map(std::path::PathBuf::from),
+                max_size_mb,
+                max_rss_gb,
+                allowed_dirs,
+                extract_dir: extract_dir.map(std::path::PathBuf::from),
                 workers,
-                allow_cidrs,
-            )?
-            .with_level(envelope_level)
-            .with_auth_token(auth_digest)
-            .with_interpret(interpret_cfg.clone())
-            .with_fetch(fetch_policy)
-            .with_zip_passwords(cli.zip_passwords.clone())
-            .with_hopper(hopper.clone())
-            .with_idle_worker_slots(idle_slots)
-            .with_analysis_timeout(analysis_timeout);
+                allow_cidr,
+                token_file,
+                traits_dir,
+                update: cli.global.update,
+                no_update: cli.global.no_update,
+                hopper: hopper.clone(),
+                idle_worker_slots,
+                analysis_timeout_secs: analysis_timeout,
+                model_dir: cli.global.model_dir.clone(),
+                level: selected_severity_level,
+                thresholds: threshold_overrides_for_model(threshold_suspicious, threshold_hostile),
+                slow_rule_ms: DEFAULT_SLOW_RULE_MS,
+                interpret: interpret_cfg.clone(),
+                fetch: fetch_policy,
+                zip_passwords: cli.global.zip_passwords.clone().into(),
+            }
+            .resolve()?;
             if let Some(url) = hopper.as_deref() {
                 eprintln!("Renewing results on hopper at {url}");
             }
@@ -2057,7 +1291,7 @@ fn main() -> Result<()> {
             // Serve never bloom-skips an /analyze job (Mode::Slow), but the
             // membership endpoint and the --fetch dependency gate read the
             // process-wide handle. Missing files fail closed (no skip).
-            publish_bloom_filters(cli.mode);
+            publish_bloom_filters(cli.global.mode);
             eprintln!("Starting Atomdrift Scan server on http://{bind} ...");
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -2113,10 +1347,10 @@ fn main() -> Result<()> {
                 thresholds,
                 DisplayFilter::alerts_only(),
                 DEFAULT_SLOW_RULE_MS,
-                cli.extra,
+                cli.global.extra,
             )?
             .with_level(envelope_level)
-            .with_zip_passwords(cli.zip_passwords.clone());
+            .with_zip_passwords(cli.global.zip_passwords.clone());
             scan::validate::run(&config, skip_traits)?;
         }
         Commands::Worker {
@@ -2132,9 +1366,6 @@ fn main() -> Result<()> {
             no_validate,
             exit_if_empty,
         } => {
-            if let Some(p) = traits_dir.as_ref() {
-                cleave::traits_repo::set_override_dir(Some(p.into()));
-            }
             // Claimed jobs are always analyzed in full (worker mode forces
             // `Mode::Slow`, and `ScanConfig` never gets `with_bloom`), but the
             // *dependency* gate in `fetch::age_gate` consults the process-wide
@@ -2143,7 +1374,7 @@ fn main() -> Result<()> {
             // artifact fetch+scan, keeping only the registry-metadata node.
             // Publishing the filters here enables that skip without touching
             // the job-level always-scan guarantee.
-            publish_bloom_filters(cli.mode);
+            publish_bloom_filters(cli.global.mode);
             // Accept the comma list `serve --hopper` takes, so one deploy
             // variable can feed both, but keep only the primary: a replica
             // refuses worker routes with a 403 whether or not its relay is on,
@@ -2153,15 +1384,13 @@ fn main() -> Result<()> {
             let Some(url) = scan::upload::worker_endpoint(&url) else {
                 anyhow::bail!("--url names no hopper address");
             };
-            let workers = workers.unwrap_or_else(default_workers);
-            let name = name.unwrap_or_else(|| {
-                hostname::get()
-                    .ok()
-                    .and_then(|h| h.into_string().ok())
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
             let raw_max_rss_gb = max_rss_gb;
-            let max_rss_gb = resolve_worker_max_rss_gb(raw_max_rss_gb);
+            // Resolved twice over: once here for the startup log, and again
+            // inside `Startup::resolve`, which is where the value that reaches
+            // the worker is settled. Both call the same function.
+            let resolved_max_rss_gb = resolve_worker_max_rss_gb(raw_max_rss_gb);
+            let workers = workers.unwrap_or_else(default_workers);
+            let name = name.unwrap_or_else(default_worker_name);
             log_worker_startup_diagnostics(&WorkerStartupDiagnostics {
                 argv: redact_zip_passwords(std::env::args()),
                 hopper_url: &url,
@@ -2169,7 +1398,7 @@ fn main() -> Result<()> {
                 workers: workers.get(),
                 poll_secs,
                 raw_max_rss_gb,
-                resolved_max_rss_gb: max_rss_gb,
+                resolved_max_rss_gb,
                 data_dir: data_dir.as_deref(),
                 max_jobs,
                 traits_dir: traits_dir.as_deref(),
@@ -2180,56 +1409,38 @@ fn main() -> Result<()> {
             // disconnected environment must still start with whatever is on disk.
             // `--no-update` skips the refresh; `--no-validate` skips the strict
             // pre-flight (benchmark / local-dev against on-disk rules as-is).
-            refresh_rules_at_startup(cli.update, cli.no_update);
-            let model_dir = resolve_model_dir()?;
-            let envelope_level = resolve_envelope_level(&model_dir);
-            let thresholds = threshold_overrides();
-            if no_validate {
-                tracing::warn!(
-                    "--no-validate: skipping the trait-validation gate; running \
-                     against on-disk rules as-is",
-                );
-            } else {
-                let validate_config = scan::ScanConfig::new(
-                    model_dir.clone(),
-                    scan::OutputFormat::Terminal,
-                    thresholds,
-                    DisplayFilter::alerts_only(),
-                    DEFAULT_SLOW_RULE_MS,
-                    cli.extra,
-                )?
-                .with_level(envelope_level)
-                .with_zip_passwords(cli.zip_passwords.clone());
-                if let Err(e) = scan::validate::run(&validate_config, false) {
-                    eprintln!("Worker startup validation failed: {e:#}");
-                    process::exit(1);
-                }
-            }
             log_max_rss_resolution(
                 "worker",
                 MaxRssPolicy::from_cli(raw_max_rss_gb),
-                max_rss_gb.saturating_mul(GIB),
+                resolved_max_rss_gb.saturating_mul(GIB),
             );
-            let config = scan::worker::WorkerConfig {
+            // Every default this worker runs on is settled in one place, so a
+            // second binary starting one cannot drift from this one.
+            let config = scan::worker::Startup {
                 // Standalone: owns its signals, its nice value, and its models.
                 hopper_url: url,
-                name,
-                workers,
+                name: Some(name),
+                workers: Some(workers),
                 poll_secs,
-                max_rss_gb,
+                max_rss_gb: raw_max_rss_gb,
+                nice,
                 data_dir,
                 max_jobs,
-                model_dir,
-                thresholds,
-                slow_rule_ms: DEFAULT_SLOW_RULE_MS,
-                level: envelope_level,
-                nice,
                 exit_if_empty,
-                no_update: cli.no_update,
+                traits_dir,
+                update: cli.global.update,
+                model_dir: cli.global.model_dir.clone(),
+                level: selected_severity_level,
+                thresholds: threshold_overrides_for_model(threshold_suspicious, threshold_hostile),
+                no_update: cli.global.no_update,
+                no_validate,
+                slow_rule_ms: DEFAULT_SLOW_RULE_MS,
                 interpret: interpret_cfg.clone(),
                 fetch: worker_fetch_policy,
-                zip_passwords: cli.zip_passwords.clone().into(),
-            };
+                zip_passwords: cli.global.zip_passwords.clone().into(),
+            }
+            .resolve()
+            .inspect_err(|e| eprintln!("Worker startup failed: {e:#}"))?;
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2237,7 +1448,7 @@ fn main() -> Result<()> {
         }
         Commands::Version => {
             let bloom = scan::bloom_repo::installed_manifest();
-            if cli.format == scan::OutputFormat::Json {
+            if cli.global.format == scan::OutputFormat::Json {
                 let bloom_json = bloom.as_ref().map(|m| {
                     let filters: serde_json::Map<String, serde_json::Value> = m
                         .filter
@@ -2463,33 +1674,6 @@ fn smt_pool_vendor() -> bool {
     }
 }
 
-/// Default slot count: three times the physical cores.
-///
-/// A slot spends most of its life waiting, not computing: the hopper
-/// claim/prefetch round trips, the dependency fetch, and the LLM second
-/// opinion are all network. Measured on the 16-core production worker
-/// (2026-09-03): with 16 slots the pool never exceeded ~5 busy cores however
-/// the cleave gate was sized, because every slot was parked in one of those
-/// waits; 32 slots reached 5, 48 reached 9. Memory is bounded separately by
-/// `admission::MemoryAdmission`, so extra slots cost only their prefetched
-/// payload, and that buffer has its own budget.
-fn default_workers() -> NonZeroUsize {
-    if let Some(cores) = cleave::memory_tracker::physical_cpu_count() {
-        return NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3)))
-            .unwrap_or(NonZeroUsize::MIN);
-    }
-    let cores = cleave::memory_tracker::cpu_count().unwrap_or_else(|| {
-        tracing::warn!(
-            fallback = 4,
-            "CPU count detection failed; defaulting worker basis to 4 cores",
-        );
-        4
-    });
-    // Logical count only: half of it approximates the physical cores, so the
-    // same three-per-core default is 1.5x the logical count.
-    NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3) / 2)).unwrap_or(NonZeroUsize::MIN)
-}
-
 struct WorkerStartupDiagnostics<'a> {
     argv: Vec<String>,
     hopper_url: &'a str,
@@ -2635,14 +1819,14 @@ fn run_scan_paths(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        Cli, Commands, DEFAULT_RIZIN_TIMEOUT_SECS, GIB, MaxRssPolicy,
-        command_scans_for_other_hosts, default_cli_follow_policy, default_service_follow_policy,
+        Cli, Commands, GIB, MaxRssPolicy, command_scans_for_other_hosts, default_cli_follow_policy,
         is_expected_yara_cache_mismatch, redact_zip_passwords, resolve_hopper_value,
-        resolve_process_max_rss_bytes, resolve_worker_max_rss_gb, with_default_subcommand,
+        with_default_subcommand,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
     use scan::OutputFormat;
+    use scan::cli::DEFAULT_RIZIN_TIMEOUT_SECS;
     use std::ffi::OsString;
     use std::net::SocketAddr;
     use std::num::NonZeroU64;
@@ -2668,7 +1852,7 @@ mod tests {
         let cli = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
             .context("parse should work")?;
         assert!(
-            cli.follow.is_none(),
+            cli.global.follow.is_none(),
             "absence of --follow is resolved at startup"
         );
 
@@ -2681,6 +1865,7 @@ mod tests {
         // A bare `--follow` must select exactly what an absent one resolves to.
         let bare = Cli::try_parse_from(with_default_subcommand(["scan", "--follow", "/tmp/a"]))
             .context("bare --follow should parse")?
+            .global
             .follow
             .context("bare --follow has a default_missing_value")?;
         assert_eq!(
@@ -2702,7 +1887,7 @@ mod tests {
     /// unfollowed is one nobody ever learns about.
     #[test]
     fn serve_and_worker_follow_everything_by_default() {
-        let service = default_service_follow_policy();
+        let service = scan::fetch::default_service_follow_policy();
         assert!(
             service.urls && service.packages && service.deps && service.ci,
             "a cache-population role must follow every category"
@@ -2759,6 +1944,7 @@ mod tests {
             "/tmp/a",
         ]))
         .context("legacy --fetch vocabulary should parse")?
+        .global
         .follow
         .context("legacy --fetch should select a policy")?;
         let new = Cli::try_parse_from(with_default_subcommand([
@@ -2767,6 +1953,7 @@ mod tests {
             "/tmp/a",
         ]))
         .context("canonical --follow vocabulary should parse")?
+        .global
         .follow
         .context("canonical --follow should select a policy")?;
         assert_eq!(old, new);
@@ -2777,7 +1964,10 @@ mod tests {
     fn rizin_timeout_defaults_to_ten_minutes_and_is_overridable() -> Result<()> {
         let default = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
             .context("default timeout should parse")?;
-        assert_eq!(default.rizin_timeout_secs, DEFAULT_RIZIN_TIMEOUT_SECS);
+        assert_eq!(
+            default.global.rizin_timeout_secs,
+            DEFAULT_RIZIN_TIMEOUT_SECS
+        );
 
         let overridden = Cli::try_parse_from(with_default_subcommand([
             "scan",
@@ -2786,7 +1976,7 @@ mod tests {
             "/tmp/a",
         ]))
         .context("timeout override should parse")?;
-        assert_eq!(overridden.rizin_timeout_secs, 42);
+        assert_eq!(overridden.global.rizin_timeout_secs, 42);
         assert!(
             Cli::try_parse_from(with_default_subcommand([
                 "scan",
@@ -2805,10 +1995,11 @@ mod tests {
         let default = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
             .context("default should parse")?;
         assert!(
-            super::cli_host_platform_only(
-                &default,
-                super::command_scans_for_other_hosts(default.command.as_ref())
-            ),
+            default
+                .global
+                .host_platform_only(super::command_scans_for_other_hosts(
+                    default.command.as_ref()
+                )),
             "interactive scans optimize for the current host"
         );
         assert!(
@@ -2821,7 +2012,7 @@ mod tests {
             "/tmp/a",
         ]))
         .context("all-platforms opt-in should parse")?;
-        assert!(!super::cli_host_platform_only(&compatible, false));
+        assert!(!compatible.global.host_platform_only(false));
 
         let host_only = Cli::try_parse_from(with_default_subcommand([
             "scan",
@@ -2829,7 +2020,7 @@ mod tests {
             "/tmp/a",
         ]))
         .context("host-only opt-out should parse")?;
-        assert!(super::cli_host_platform_only(&host_only, true));
+        assert!(host_only.global.host_platform_only(true));
 
         for daemon in [
             Cli::try_parse_from(["scan", "serve"]).context("serve should parse")?,
@@ -2839,7 +2030,7 @@ mod tests {
             let role = super::command_scans_for_other_hosts(daemon.command.as_ref());
             assert!(role);
             assert!(
-                !super::cli_host_platform_only(&daemon, role),
+                !daemon.global.host_platform_only(role),
                 "serve/worker scan on behalf of other hosts"
             );
         }
@@ -2876,7 +2067,7 @@ mod tests {
             "/tmp/a",
         ]))
         .context("parse should work")?;
-        assert_eq!(cli.format, OutputFormat::Json);
+        assert_eq!(cli.global.format, OutputFormat::Json);
         match cli.command.context("fs subcommand expected")? {
             Commands::Path {
                 paths,
@@ -3098,18 +2289,6 @@ mod tests {
     }
 
     #[test]
-    fn max_rss_semantics_match_for_disabled_and_explicit_values() {
-        assert_eq!(resolve_process_max_rss_bytes(-1), 0);
-        assert_eq!(resolve_worker_max_rss_gb(-1), 0);
-
-        assert_eq!(resolve_process_max_rss_bytes(3), 3 * GIB);
-        assert_eq!(resolve_worker_max_rss_gb(3), 3);
-
-        assert!(resolve_process_max_rss_bytes(0) > 0);
-        assert!(resolve_worker_max_rss_gb(0) > 0);
-    }
-
-    #[test]
     fn max_rss_policy_classifies_cli_inputs() {
         assert_eq!(MaxRssPolicy::from_cli(-1), MaxRssPolicy::Disabled);
         assert_eq!(MaxRssPolicy::from_cli(i64::MIN), MaxRssPolicy::Disabled);
@@ -3161,11 +2340,11 @@ mod tests {
     fn level_flag_parses_and_shortcuts_removed() -> Result<()> {
         let cli = Cli::try_parse_from(with_default_subcommand(["scan", "-l", "100", "/tmp/a"]))
             .context("-l 100 should parse")?;
-        assert_eq!(cli.level, Some(100));
+        assert_eq!(cli.global.level, Some(100));
 
         let cli = Cli::try_parse_from(with_default_subcommand(["scan", "--level", "12", "/tmp/a"]))
             .context("--level 12 should parse")?;
-        assert_eq!(cli.level, Some(12));
+        assert_eq!(cli.global.level, Some(12));
 
         // Out-of-range rejected (0..=25000, per-100M since the per-million migration).
         assert!(
@@ -3241,7 +2420,7 @@ mod tests {
             "--zip-password=two",
         ]))?;
 
-        assert_eq!(cli.zip_passwords, ["one", "two"]);
+        assert_eq!(cli.global.zip_passwords, ["one", "two"]);
         Ok(())
     }
 
@@ -3322,6 +2501,7 @@ mod tests {
                 "/tmp/a",
             ]))?;
             let err = missing_key
+                .global
                 .interpret_config()
                 .expect_err("openrouter without a key must fail");
             assert!(
@@ -3338,6 +2518,7 @@ mod tests {
                 "/tmp/a",
             ]))?;
             let cfg = missing_model
+                .global
                 .interpret_config()?
                 .context("openrouter without a pinned model should default to auto")?;
             assert_eq!(cfg.model, scan::interpret::OPENROUTER_DEFAULT_MODEL);
@@ -3353,6 +2534,7 @@ mod tests {
                 "/tmp/a",
             ]))?;
             let cfg = cli
+                .global
                 .interpret_config()?
                 .context("openrouter with model+key should enable interpret")?;
             assert_eq!(cfg.base_url, scan::interpret::OPENROUTER_BASE_URL);
@@ -3375,8 +2557,11 @@ mod tests {
                 "sk-test",
                 "serve",
             ])?;
-            assert_eq!(serve.llm.as_deref(), Some("openrouter"));
-            let cfg = serve.interpret_config()?.context("serve inherits --llm")?;
+            assert_eq!(serve.global.llm.as_deref(), Some("openrouter"));
+            let cfg = serve
+                .global
+                .interpret_config()?
+                .context("serve inherits --llm")?;
             assert_eq!(cfg.base_url, scan::interpret::OPENROUTER_BASE_URL);
 
             let worker = Cli::try_parse_from([
@@ -3391,7 +2576,7 @@ mod tests {
                 "--llm-key",
                 "sk-test",
             ])?;
-            assert_eq!(worker.llm.as_deref(), Some("openrouter"));
+            assert_eq!(worker.global.llm.as_deref(), Some("openrouter"));
             Ok(())
         })
     }
@@ -3417,6 +2602,7 @@ mod tests {
                 "/tmp/a",
             ]))?;
             let err = cli
+                .global
                 .interpret_config()
                 .expect_err("~/.tok/llm must not satisfy OpenRouter");
             assert!(err.to_string().contains("~/.tok/openrouter"), "{err}");
@@ -3442,7 +2628,10 @@ mod tests {
                 "Qwen/Qwen3.8-27B,qwen/qwen3.8-27b",
                 "/tmp/a",
             ]))?;
-            let cfg = cli.interpret_config()?.context("chain should resolve")?;
+            let cfg = cli
+                .global
+                .interpret_config()?
+                .context("chain should resolve")?;
             assert_eq!(cfg.base_url, "https://llm.isotope13.ai/v1");
             assert_eq!(cfg.model, "Qwen/Qwen3.8-27B");
             // Each endpoint takes its own token file: the vLLM key must not be
@@ -3480,7 +2669,10 @@ mod tests {
                 "Qwen/Qwen3.8-27B",
                 "/tmp/a",
             ]))?;
-            let cfg = cli.interpret_config()?.context("primary should stand")?;
+            let cfg = cli
+                .global
+                .interpret_config()?
+                .context("primary should stand")?;
             assert_eq!(cfg.base_url, "https://llm.isotope13.ai/v1");
             assert!(
                 cfg.fallbacks.is_empty(),
@@ -3505,6 +2697,7 @@ mod tests {
                 "/tmp/a",
             ]))?;
             let err = cli
+                .global
                 .interpret_config()
                 .expect_err("no endpoint is usable here");
             let text = err.to_string();
@@ -3533,6 +2726,7 @@ mod tests {
                 "/tmp/a",
             ]))?;
             let cfg = cli
+                .global
                 .interpret_config()?
                 .context("~/.tok/llm should supply the key")?;
             assert_eq!(cfg.api_key.as_deref(), Some("sk-vllm-file"));
@@ -3548,7 +2742,7 @@ mod tests {
                 "sk-flag",
                 "/tmp/a",
             ]))?;
-            let cfg = cli.interpret_config()?.context("explicit key")?;
+            let cfg = cli.global.interpret_config()?.context("explicit key")?;
             assert_eq!(cfg.api_key.as_deref(), Some("sk-flag"));
             Ok(())
         })
@@ -3570,7 +2764,7 @@ mod tests {
                 "qwen/qwen3.8-27b",
                 "/tmp/a",
             ]))?;
-            let cfg = cli.interpret_config()?.context("openrouter key")?;
+            let cfg = cli.global.interpret_config()?.context("openrouter key")?;
             assert_eq!(cfg.api_key.as_deref(), Some("sk-openrouter-file"));
             Ok(())
         })
@@ -3588,7 +2782,7 @@ mod tests {
                 "Qwen/Qwen3.8-27B",
                 "/tmp/a",
             ]))?;
-            let cfg = cli.interpret_config()?.context("local target")?;
+            let cfg = cli.global.interpret_config()?.context("local target")?;
             assert_eq!(cfg.api_key, None);
             Ok(())
         })
@@ -3610,6 +2804,7 @@ mod tests {
                 "/tmp/a",
             ]))?;
             let cfg = cli
+                .global
                 .interpret_config()?
                 .context("tok file should supply key")?;
             assert_eq!(cfg.api_key.as_deref(), Some("sk-from-file"));

@@ -60,6 +60,15 @@ fn assert_envelopes_identical(result: ScanResult, case: &str) {
 fn full_result_serializes_identically() {
     let result = ScanResult {
         v: "8",
+        // The model's own reading, before the trait floor. Not serialized, so
+        // it does not participate in the parity this test measures.
+        model: scan::model::Decision {
+            class: Classification::Hostile,
+            probability: 0.873_21,
+            threshold: 0.5,
+            level: Some(50),
+        },
+        floor: None,
         classification: Classification::Hostile,
         probability: 0.873_21,
         threshold: 0.5,
@@ -90,6 +99,7 @@ fn full_result_serializes_identically() {
         embedded_files: scan::engine::MemberEvals::from([(
             1,
             EmbeddedFile {
+                floor: None,
                 id: 1,
                 sha256: "a".repeat(64),
                 path: "a/_utilities.py".to_string(),
@@ -149,6 +159,14 @@ fn full_result_serializes_identically() {
 fn minimal_result_serializes_identically() {
     let result = ScanResult {
         v: "8",
+        // Not serialized; see the note in `full_result_serializes_identically`.
+        model: scan::model::Decision {
+            class: Classification::Benign,
+            probability: 0.01,
+            threshold: 0.5,
+            level: Some(-1),
+        },
+        floor: None,
         classification: Classification::Benign,
         probability: 0.01,
         threshold: 0.5,

@@ -34,7 +34,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, post};
 use std::net::SocketAddr;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -81,6 +81,195 @@ pub struct ServerConfig {
     hopper: Option<String>,
     /// Additional passwords to try for encrypted archives.
     zip_passwords: crate::ArchivePasswords,
+}
+
+/// What a caller supplies to start a server, before resolution.
+///
+/// [`ServerConfig`] is the resolved form. This is the unresolved one — the
+/// shape a command line hands over, with `None` meaning "take the default"
+/// rather than "off". [`Startup::resolve`] settles every default in one
+/// place, so two binaries serving this API serve it identically.
+#[derive(Debug)]
+pub struct Startup {
+    /// Address to listen on.
+    pub bind: SocketAddr,
+    /// Largest request body accepted, in megabytes.
+    pub max_size_mb: usize,
+    /// The `--max-rss-gb` flag as given: negative disables in-process
+    /// throttling, zero takes the cgroup-aware limit, positive is a ceiling.
+    pub max_rss_gb: i64,
+    /// Comma-separated directories `/analyze-path` may read. Empty means the
+    /// route refuses every request, which is the safe default.
+    pub allowed_dirs: Option<String>,
+    /// Where archive members are extracted for the caller to fetch.
+    pub extract_dir: Option<PathBuf>,
+    /// Concurrent request slots. `None` takes the worker default.
+    pub workers: Option<NonZeroUsize>,
+    /// Comma-separated CIDRs allowed to reach non-loopback routes.
+    pub allow_cidr: Option<String>,
+    /// File holding the bearer token. `None` disables authentication.
+    pub token_file: Option<PathBuf>,
+    /// Traits bundle override.
+    pub traits_dir: Option<PathBuf>,
+    /// Force the startup refresh even when the local copy looks current
+    /// (`-u`/`--update`).
+    pub update: bool,
+    /// Skip the startup model and traits refresh.
+    pub no_update: bool,
+    /// Hopper API root. Enables result renewal, corpus deferral, and the
+    /// companion idle worker.
+    pub hopper: Option<String>,
+    /// Slots for the companion idle worker. `None` takes half the request
+    /// slots; ignored without `hopper`, since there would be nothing to claim.
+    pub idle_worker_slots: Option<usize>,
+    /// Per-request analysis timeout in seconds. Zero disables.
+    pub analysis_timeout_secs: u64,
+    /// Model bundle. `None` resolves the installed one.
+    pub model_dir: Option<PathBuf>,
+    /// Operating point. `None` takes the bundle's own default.
+    pub level: Option<u16>,
+    /// Manual probability cutoffs, bypassing the level grid.
+    pub thresholds: Option<Thresholds>,
+    /// Per-rule time budget before cleave logs a slow rule.
+    pub slow_rule_ms: u64,
+    /// The LLM second opinion, when one is configured.
+    pub interpret: Option<crate::interpret::InterpretConfig>,
+    /// Whether to follow the references a sample declares. Off by default: a
+    /// server driving outbound fetches is an SSRF-shaped exposure, so turning
+    /// it on is an explicit operator decision.
+    pub fetch: crate::fetch::FetchPolicy,
+    /// Passwords to try against encrypted archives.
+    pub zip_passwords: crate::ArchivePasswords,
+}
+
+impl Startup {
+    /// Settle every default and read the bearer token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model bundle cannot be resolved, a CIDR does
+    /// not parse, or `token_file` is set but missing, empty or unreadable.
+    /// That last one fails closed on purpose: an operator who asked for
+    /// authentication must never get an open server because a file went away.
+    pub fn resolve(self) -> anyhow::Result<ServerConfig> {
+        use anyhow::Context as _;
+
+        // Order is load-bearing and is why the refresh lives here rather than
+        // at the call site. The override has to be applied first, or the
+        // refresh installs into the default directory while `--traits-dir`
+        // points at an empty one — and a server started that way comes up,
+        // reports healthy, and fails every analysis.
+        if let Some(dir) = self.traits_dir.as_ref() {
+            cleave::traits_repo::set_override_dir(Some(dir.into()));
+        }
+        crate::refresh_rules_at_startup(self.update, self.no_update);
+
+        // Canonicalized at startup so symlink-resolved request paths match in
+        // the `starts_with` checks `/analyze-path` gates on.
+        let allowed_dirs: Vec<PathBuf> = self
+            .allowed_dirs
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let path = PathBuf::from(s);
+                path.canonicalize().unwrap_or(path)
+            })
+            .collect();
+
+        let workers = self
+            .workers
+            .unwrap_or_else(crate::worker::default_workers)
+            .get();
+
+        let allow_cidrs = match self.allow_cidr {
+            Some(ref list) => {
+                parse_cidr_list(list).map_err(|e| anyhow::anyhow!("--allow-cidr: {e}"))?
+            }
+            None => Vec::new(),
+        };
+
+        let auth_digest = match self.token_file {
+            Some(ref path) => {
+                let token = crate::interpret::read_token_file(path).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--token-file {}: missing, empty, or unreadable",
+                        path.display()
+                    )
+                })?;
+                let digest = TokenDigest::new(&token)
+                    .map_err(|e| anyhow::anyhow!("--token-file {}: {e}", path.display()))?;
+                // Name the file the running process actually read: after a
+                // rotation the token in a file and the token in memory can
+                // differ, and the 401 that follows is otherwise unreadable.
+                tracing::info!(
+                    token_file = %path.display(),
+                    "bearer authentication enabled (token is read once, at startup)",
+                );
+                Some(digest)
+            }
+            None => None,
+        };
+
+        let model_dir = match self.model_dir {
+            Some(dir) => dir,
+            None => crate::models_repo::model_dir().context("failed to resolve model directory")?,
+        };
+        // Manual cutoffs bypass the level grid, so no level applies then.
+        let level = if self.thresholds.is_some() {
+            None
+        } else {
+            Some(
+                self.level
+                    .or_else(|| crate::model::model_default_level(&model_dir))
+                    .unwrap_or(crate::model::DEFAULT_SEVERITY_LEVEL),
+            )
+        };
+
+        // Half the request slots for background work, capped again inside
+        // `with_idle_worker_slots`. Disabled without hopper: nothing to claim.
+        let idle_slots = match (self.hopper.as_deref(), self.idle_worker_slots) {
+            (None, _) => 0,
+            (Some(_), Some(n)) => n.min(workers / 2),
+            (Some(_), None) => workers / 2,
+        };
+
+        Ok(ServerConfig::new(
+            self.bind,
+            self.max_size_mb.saturating_mul(1024 * 1024),
+            resolve_process_max_rss_bytes(self.max_rss_gb),
+            model_dir,
+            self.thresholds,
+            self.slow_rule_ms,
+            allowed_dirs,
+            self.extract_dir,
+            workers,
+            allow_cidrs,
+        )?
+        .with_level(level)
+        .with_auth_token(auth_digest)
+        .with_interpret(self.interpret)
+        .with_fetch(self.fetch)
+        .with_zip_passwords(self.zip_passwords)
+        .with_hopper(self.hopper)
+        .with_idle_worker_slots(idle_slots)
+        .with_analysis_timeout(self.analysis_timeout_secs))
+    }
+}
+
+/// The server's RSS ceiling in bytes, from the `--max-rss-gb` flag as given.
+///
+/// Distinct from the worker's, which resolves to whole gigabytes: a server
+/// takes the cgroup-aware limit outright rather than 85% of the host's total,
+/// because it is sized against its container and not against the machine.
+#[must_use]
+pub fn resolve_process_max_rss_bytes(raw_max_rss_gb: i64) -> u64 {
+    use crate::worker::MaxRssPolicy;
+    match MaxRssPolicy::from_cli(raw_max_rss_gb) {
+        MaxRssPolicy::Disabled => 0,
+        MaxRssPolicy::Auto => cleave::memory_tracker::memory_limit(),
+        MaxRssPolicy::Explicit(gb) => gb.get().saturating_mul(1024 * 1024 * 1024),
+    }
 }
 
 /// Default per-request analysis timeout: 34 minutes. Covers cold cleave scans
@@ -2185,5 +2374,29 @@ mod whale_pool_tests {
         assert!(again.is_ok(), "the slot is free again after drop");
         drop(again);
         assert_eq!(super::WhaleSlot::in_use(), 0);
+    }
+}
+
+#[cfg(test)]
+mod max_rss_tests {
+    use super::resolve_process_max_rss_bytes;
+    use crate::worker::resolve_worker_max_rss_gb;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A server and a worker read `--max-rss-gb` with the same vocabulary,
+    /// differing only in the unit they answer in. They are resolved by two
+    /// functions in two modules, so the agreement is asserted rather than
+    /// assumed.
+    #[test]
+    fn max_rss_semantics_match_for_disabled_and_explicit_values() {
+        assert_eq!(resolve_process_max_rss_bytes(-1), 0);
+        assert_eq!(resolve_worker_max_rss_gb(-1), 0);
+
+        assert_eq!(resolve_process_max_rss_bytes(3), 3 * GIB);
+        assert_eq!(resolve_worker_max_rss_gb(3), 3);
+
+        assert!(resolve_process_max_rss_bytes(0) > 0);
+        assert!(resolve_worker_max_rss_gb(0) > 0);
     }
 }

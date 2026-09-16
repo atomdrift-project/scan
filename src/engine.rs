@@ -409,6 +409,7 @@ mod manifest_tests {
             ]
         }));
         let member = |id: u64, path: &str, prob: f32, level: i32| EmbeddedFile {
+            floor: None,
             id,
             sha256: String::new(),
             path: path.to_string(),
@@ -965,6 +966,101 @@ mod trait_floor_tests {
     }
 
     #[test]
+    fn the_reported_floor_names_the_arm_and_its_evidence() {
+        // Two anchors plus a further severe finding, across three families.
+        let mut ts = spread(5, 0.98, 2);
+        ts.extend([finding("execution", 4, 0.94)]);
+        let floor = trait_floor(&ts, Classification::Benign, Some(50), 100)
+            .expect("corroborated crit-5 evidence must reach the hostile arm");
+
+        assert_eq!(floor.arm, FloorArm::Crit5);
+        assert_eq!(floor.class, Classification::Hostile);
+        assert_eq!(floor.confidence, 0.98);
+        assert_eq!(floor.level, Some(50));
+        assert_eq!(floor.hostile, 2);
+        assert_eq!(floor.suspicious, 1);
+        assert_eq!(floor.severe(), 3);
+        // The hostile arm's diversity test spans both severe tiers.
+        assert_eq!(floor.families, 3);
+    }
+
+    #[test]
+    fn the_reported_floor_counts_the_suspicious_arms_own_families() {
+        let floor = trait_floor(&spread(4, 0.9, 3), Classification::Benign, Some(50), 100)
+            .expect("three confident crit-4 families must reach the suspicious arm");
+
+        assert_eq!(floor.arm, FloorArm::Crit4);
+        assert_eq!(floor.class, Classification::Suspicious);
+        assert_eq!(floor.hostile, 0);
+        assert_eq!(floor.suspicious, 3);
+        assert_eq!(floor.families, 3);
+    }
+
+    #[test]
+    fn nothing_to_add_is_reported_as_nothing_not_as_benign() {
+        // A caller reading the floor separately from the model must be able to
+        // tell "the floor was silent" from "the floor said benign" — it never
+        // says benign, and a silent floor must not be read as a clean bill.
+        assert!(trait_floor(&spread(4, 0.9, 2), Classification::Benign, Some(50), 100).is_none());
+        assert!(trait_floor(&[], Classification::Benign, Some(50), 100).is_none());
+    }
+
+    #[test]
+    fn the_floor_declines_a_verdict_the_model_already_reached() {
+        for already in [Classification::Suspicious, Classification::Hostile] {
+            assert!(
+                trait_floor(&spread(4, 0.9, 5), already, Some(50), 100).is_none(),
+                "the floor is a backstop for model misses, not a second opinion"
+            );
+        }
+    }
+
+    #[test]
+    fn applying_the_floor_agrees_with_reporting_it() {
+        // `apply_trait_floor` is the in-place form of `trait_floor`, and scan's
+        // own paths take the first while consumers take the second. A drift
+        // between them would give two callers two different verdicts on one
+        // artifact, so it is pinned across every shape the arms distinguish.
+        let mut shapes = vec![
+            Vec::new(),
+            spread(4, 0.9, 2),
+            spread(4, 0.9, 3),
+            spread(4, 0.9, 5),
+            spread(5, 0.98, 1),
+            spread(5, 0.98, 2),
+            spread(5, 0.5, 3),
+            clustered(5, 0.98, 3),
+            clustered(4, 0.93, 4),
+        ];
+        let mut corroborated = spread(5, 0.98, 2);
+        corroborated.extend([finding("execution", 4, 0.94)]);
+        shapes.push(corroborated);
+
+        for findings in shapes {
+            let mut applied = benign();
+            apply_trait_floor(&mut applied, &findings, Some(50), 100, "test");
+            let reported = trait_floor(&findings, Classification::Benign, Some(50), 100);
+
+            match reported {
+                Some(floor) => {
+                    assert_eq!(applied.class, floor.class);
+                    assert_eq!(applied.probability, floor.confidence);
+                    assert_eq!(applied.level, floor.level);
+                }
+                None => {
+                    let untouched = benign();
+                    assert_eq!(
+                        applied.class, untouched.class,
+                        "a silent floor changes nothing"
+                    );
+                    assert_eq!(applied.probability, untouched.probability);
+                    assert_eq!(applied.level, untouched.level);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn floors_on_the_root_files_own_findings() {
         // `root_findings` is what the classify path passes: a report's findings
         // live on files[0], never at report level.
@@ -1243,6 +1339,13 @@ mod envelope_tests {
     pub(super) fn base_result() -> ScanResult {
         ScanResult {
             v: "7",
+            model: Decision {
+                class: Classification::Benign,
+                probability: 0.10,
+                threshold: 0.65,
+                level: Some(-1),
+            },
+            floor: None,
             analysis_cached: false,
             interpret_ms: 0,
             classification: Classification::Benign,
@@ -1448,6 +1551,7 @@ mod envelope_tests {
             .unwrap(),
         );
         let member = |id: u64, path: &str, level: Option<i32>, prob: f32| EmbeddedFile {
+            floor: None,
             id,
             sha256: String::new(),
             path: path.to_string(),
@@ -1643,6 +1747,31 @@ fn softened_level(ml_level: Option<i32>, active_level: Option<u16>, grid_max: u1
     Some((placed.round() as i32).clamp(floor, ceiling))
 }
 
+/// Place a synthesized verdict inside its band, the way an interpreted one is
+/// placed.
+///
+/// A verdict that did not come from the model has no measured firing level, but
+/// a consumer that reads only the number still has to land in the right band.
+/// This produces the level that decodes back to `outcome` under the same rules
+/// the model's own verdicts obey — the deploy level for hostile, and a point
+/// inside the suspicious band for suspicious, lower when something else
+/// corroborates it.
+///
+/// `None` in manual-threshold mode, where no calibrated level applies.
+#[must_use]
+pub fn synthesized_level(
+    model: &Model,
+    outcome: Classification,
+    corroborated: bool,
+) -> Option<i32> {
+    interpreted_level(
+        model.active_level(),
+        model.grid_max(),
+        outcome,
+        corroborated,
+    )
+}
+
 #[allow(clippy::cast_possible_truncation)] // bounded by `ceiling` (<= grid_max)
 fn interpreted_level(
     active_level: Option<u16>,
@@ -1775,6 +1904,25 @@ pub struct ScanResult {
     /// artifact — hashes differently on every fetch and would otherwise mint
     /// hopper a fresh, never-deduplicating row each time it fires.
     pub hopper_route: HopperRoute,
+    /// What the model alone concluded, across the root and every member,
+    /// before the trait floor and before any interpretation.
+    ///
+    /// [`classification`](Self::classification) is the verdict; this is the
+    /// model's share of it. The two differ exactly when the floor fired on
+    /// whichever file decided the verdict. Not serialized: the envelope
+    /// reports one verdict, and this is for a caller that reports the model
+    /// and the floor as separate opinions rather than as one number.
+    ///
+    /// Recovering it is cheap because the floor fires only on a model-Benign
+    /// decision — so on a file it raised, the model's own reading was benign,
+    /// and everywhere else the stored decision is already the model's.
+    pub model: Decision,
+    /// The gravest trait-floor firing anywhere in this artifact, if any.
+    ///
+    /// `None` means the floor had nothing to add, never that it found the
+    /// artifact clean — the floor has no way to say benign. Not serialized,
+    /// for the same reason as [`model`](Self::model).
+    pub floor: Option<FloorDecision>,
 }
 
 /// See [`ScanResult::hopper_route`].
@@ -1890,6 +2038,188 @@ fn worst_member(evals: &MemberEvals) -> Option<Decision> {
         })
 }
 
+/// The worst verdict the *model alone* reached across an archive's members.
+///
+/// Members the trait floor raised contribute nothing here, and correctly so:
+/// the floor fires only on a model-Benign decision, so on those members the
+/// model's own reading was benign. Everywhere else the stored verdict is the
+/// model's, untouched. `None` means no member was scored at all, which is not
+/// the same as every member being clean.
+fn worst_member_model(evals: &MemberEvals) -> Option<Decision> {
+    evals
+        .values()
+        .filter(|member| member.floor.is_none())
+        .map(EmbeddedFile::decision)
+        .reduce(|best, d| {
+            if decision_outranks(&d, &best) {
+                d
+            } else {
+                best
+            }
+        })
+}
+
+/// The gravest trait-floor firing anywhere in an archive.
+fn worst_member_floor(evals: &MemberEvals) -> Option<FloorDecision> {
+    evals
+        .values()
+        .filter_map(|member| member.floor)
+        .reduce(FloorDecision::worse_of)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod model_and_floor_tests {
+    use super::*;
+
+    fn floor(class: Classification, confidence: f32) -> FloorDecision {
+        FloorDecision {
+            class,
+            confidence,
+            level: Some(50),
+            arm: FloorArm::Crit5,
+            hostile: 2,
+            suspicious: 1,
+            families: 3,
+        }
+    }
+
+    fn member(
+        id: u64,
+        class: Classification,
+        prob: f32,
+        fired: Option<FloorDecision>,
+    ) -> EmbeddedFile {
+        EmbeddedFile {
+            id,
+            sha256: String::new(),
+            path: format!("member-{id}"),
+            file_type: "js".to_string(),
+            classification: class,
+            probability: prob,
+            threshold: 0.5,
+            level: Some(25),
+            model_scores: Vec::new(),
+            skipped_models: Vec::new(),
+            formula: String::new(),
+            top_findings: Vec::new(),
+            floor: fired,
+        }
+    }
+
+    fn evals(members: Vec<EmbeddedFile>) -> MemberEvals {
+        members.into_iter().map(|m| (m.id, m)).collect()
+    }
+
+    #[test]
+    fn a_floored_member_contributes_nothing_to_the_models_own_reading() {
+        // The member's stored verdict is hostile, but the floor put it there —
+        // so the model's reading of that member was benign, and a caller
+        // reporting the model separately must not be handed the floor's work
+        // as if the model had done it.
+        let table = evals(vec![member(
+            1,
+            Classification::Hostile,
+            0.98,
+            Some(floor(Classification::Hostile, 0.98)),
+        )]);
+        assert_eq!(
+            worst_member(&table).map(|d| d.class),
+            Some(Classification::Hostile)
+        );
+        assert!(
+            worst_member_model(&table).is_none(),
+            "every member was floored, so the model convicted nobody"
+        );
+    }
+
+    #[test]
+    fn an_unfloored_member_is_the_models_own_reading() {
+        let table = evals(vec![member(1, Classification::Hostile, 0.98, None)]);
+        assert_eq!(
+            worst_member_model(&table).map(|d| d.class),
+            Some(Classification::Hostile)
+        );
+    }
+
+    #[test]
+    fn the_model_is_read_across_members_the_floor_left_alone() {
+        let table = evals(vec![
+            member(
+                1,
+                Classification::Hostile,
+                0.99,
+                Some(floor(Classification::Hostile, 0.99)),
+            ),
+            member(2, Classification::Suspicious, 0.70, None),
+            member(3, Classification::Benign, 0.01, None),
+        ]);
+        // The verdict comes from the floored member; the model's own worst
+        // reading is the suspicious one it reached unaided.
+        assert_eq!(
+            worst_member(&table).map(|d| d.class),
+            Some(Classification::Hostile)
+        );
+        assert_eq!(
+            worst_member_model(&table).map(|d| d.class),
+            Some(Classification::Suspicious)
+        );
+    }
+
+    #[test]
+    fn the_gravest_firing_wins_and_corroboration_breaks_a_tie() {
+        let table = evals(vec![
+            member(
+                1,
+                Classification::Suspicious,
+                0.80,
+                Some(floor(Classification::Suspicious, 0.80)),
+            ),
+            member(
+                2,
+                Classification::Hostile,
+                0.90,
+                Some(floor(Classification::Hostile, 0.90)),
+            ),
+            member(
+                3,
+                Classification::Hostile,
+                0.95,
+                Some(floor(Classification::Hostile, 0.95)),
+            ),
+        ]);
+        let worst = worst_member_floor(&table).expect("three members fired");
+        assert_eq!(worst.class, Classification::Hostile);
+        assert_eq!(worst.confidence, 0.95);
+    }
+
+    #[test]
+    fn no_firing_anywhere_reports_nothing_rather_than_benign() {
+        // The floor has no way to say benign, so its absence must stay absent.
+        let table = evals(vec![member(1, Classification::Benign, 0.01, None)]);
+        assert!(worst_member_floor(&table).is_none());
+    }
+
+    #[test]
+    fn worse_of_is_commutative_over_firings() {
+        let cases = [
+            floor(Classification::Suspicious, 0.80),
+            floor(Classification::Suspicious, 0.95),
+            floor(Classification::Hostile, 0.80),
+            floor(Classification::Hostile, 0.95),
+        ];
+        for a in cases {
+            for b in cases {
+                assert_eq!(
+                    a.worse_of(b),
+                    b.worse_of(a),
+                    "a summary must not depend on member ordering"
+                );
+            }
+        }
+    }
+}
+
 /// A file embedded within an archive or self-extracting executable.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddedFile {
@@ -1926,6 +2256,15 @@ pub struct EmbeddedFile {
     pub formula: String,
     /// Top findings for this embedded file.
     pub top_findings: Vec<TopFinding>,
+    /// What the trait floor did to this member, if it fired.
+    ///
+    /// Not serialized: `ml.files` is a stable wire shape with consumers that
+    /// were not compiled against this field. It exists so a caller reporting
+    /// the model and the floor as separate opinions can tell which of them
+    /// convicted a member — `classification` above is the floored verdict and
+    /// no longer says which produced it.
+    #[serde(skip)]
+    pub floor: Option<FloorDecision>,
 }
 
 impl EmbeddedFile {
@@ -3340,7 +3679,7 @@ fn score_embedded_files(
         .map(|&ef| {
             // Cancellation: skip the expensive work; the post-pass bail
             // below surfaces the cancellation before results are used.
-            let (ef_decision, ef_model_scores, ef_skipped_models) =
+            let (ef_decision, ef_model_scores, ef_skipped_models, ef_floor) =
                 if cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
                     (
                         Decision {
@@ -3351,6 +3690,7 @@ fn score_embedded_files(
                         },
                         Vec::new(),
                         Vec::new(),
+                        None,
                     )
                 } else {
                     let ef_parsed = crate::features::ParsedReport::from_compact_file(ef, needs);
@@ -3373,14 +3713,14 @@ fn score_embedded_files(
                     // package.json) scores above the crit-4 fraction gate even when
                     // the container's findings dilute it; the floored member then
                     // elevates the container below.
-                    apply_trait_floor(
+                    let ef_floor = apply_trait_floor(
                         &mut ef_decision,
                         &ef.findings,
                         model.active_level(),
                         model.grid_max(),
                         if ef.path.is_empty() { label } else { &ef.path },
                     );
-                    (ef_decision, ef_model_scores, ef_skipped_models)
+                    (ef_decision, ef_model_scores, ef_skipped_models, ef_floor)
                 };
 
             let rel_path = ef
@@ -3408,6 +3748,7 @@ fn score_embedded_files(
                 skipped_models: ef_skipped_models,
                 formula: ef.formula.clone().unwrap_or_default(),
                 top_findings: ef_top_findings,
+                floor: ef_floor,
             }
         })
         .collect()
@@ -5193,6 +5534,12 @@ pub(crate) struct PhaseTimings {
 /// Produced by `classify_report`, consumed when building a `ScanResult`.
 pub(crate) struct ClassifiedReport {
     pub(crate) phase_ms: PhaseTimings,
+    /// What the model alone reached, before the trait floor. See
+    /// [`ScanResult::model`].
+    pub(crate) model: Decision,
+    /// The gravest trait-floor firing anywhere in the artifact. See
+    /// [`ScanResult::floor`].
+    pub(crate) floor: Option<FloorDecision>,
     pub(crate) classification: Classification,
     pub(crate) probability: f32,
     pub(crate) threshold: f32,
@@ -5418,6 +5765,82 @@ fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCou
     out
 }
 
+/// Which arm of the trait floor fired.
+///
+/// The two arms answer different questions — "this is malicious" versus "a
+/// human should look" — and they are reached by different evidence, so a
+/// consumer that reports or meters the floor wants to tell them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloorArm {
+    /// A confident hostile (crit-5) anchor, corroborated across families.
+    Crit5,
+    /// Confident suspicious (crit-4) traits spanning enough families.
+    Crit4,
+}
+
+impl FloorArm {
+    /// Stable identifier for logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Crit5 => "crit5",
+            Self::Crit4 => "crit4",
+        }
+    }
+}
+
+/// What the trait floor concluded, on the occasions it concludes anything.
+///
+/// Returned rather than applied, so a caller can record that the floor — not
+/// the model — is what convicted an artifact. [`apply_trait_floor`] is the
+/// in-place form scan's own paths use.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FloorDecision {
+    /// The class the floor raises the verdict to.
+    pub class: Classification,
+    /// Confidence of the trait evidence that carried it, in `[0, 1]`. This is
+    /// cleave's confidence in its own match, not a model probability.
+    pub confidence: f32,
+    /// Synthetic level placing the override inside its band, or `None` under
+    /// manual thresholds.
+    pub level: Option<i32>,
+    /// Which arm fired.
+    pub arm: FloorArm,
+    /// Confident crit-5 findings counted.
+    pub hostile: u32,
+    /// Confident crit-4 findings counted.
+    pub suspicious: u32,
+    /// Trait families the firing arm measured its evidence across.
+    pub families: usize,
+}
+
+impl FloorDecision {
+    /// Confident severe findings across both tiers.
+    #[must_use]
+    pub const fn severe(&self) -> u32 {
+        self.hostile + self.suspicious
+    }
+
+    /// The worse of two firings, for summarizing an archive by its members.
+    ///
+    /// The graver class wins; between two of the same class, the better
+    /// corroborated one does.
+    #[must_use]
+    pub fn worse_of(self, other: Self) -> Self {
+        match (self.class as u8).cmp(&(other.class as u8)) {
+            std::cmp::Ordering::Greater => self,
+            std::cmp::Ordering::Less => other,
+            std::cmp::Ordering::Equal => {
+                if other.confidence > self.confidence {
+                    other
+                } else {
+                    self
+                }
+            }
+        }
+    }
+}
+
 /// Trait floor: override a model-**Benign** verdict when cleave surfaced
 /// high-criticality evidence the model did not act on:
 ///   - a hostile (crit-5) trait, corroborated by enough further severe findings
@@ -5435,18 +5858,19 @@ fn trait_floor_counts(findings: &[cleave::types::CompactTrait]) -> TraitFloorCou
 /// a lone mislabeled trait — or a cluster of near-duplicate ones — cannot reach
 /// it alone.
 ///
-/// Never lowers a model verdict. Override levels are pinned to the same band
+/// Never lowers a model verdict, and `None` here means "the floor had nothing
+/// to add", never "benign". Override levels are pinned to the same band
 /// boundaries used by ordinary and interpreted verdicts, so a level-only
 /// downstream consumer cannot reinterpret the override as another class.
-fn apply_trait_floor(
-    decision: &mut Decision,
+#[must_use]
+pub fn trait_floor(
     findings: &[cleave::types::CompactTrait],
+    model_class: Classification,
     active_level: Option<u16>,
     grid_max: u16,
-    label: &str,
-) {
-    if decision.class != Classification::Benign {
-        return;
+) -> Option<FloorDecision> {
+    if model_class != Classification::Benign {
+        return None;
     }
     let counts = trait_floor_counts(findings);
     // Recognized software has to clear a higher anchor before the floor will
@@ -5465,46 +5889,78 @@ fn apply_trait_floor(
         && counts.severe() >= TRAIT_FLOOR_HOSTILE_SEVERE
         && counts.severe_families.len() >= TRAIT_FLOOR_HOSTILE_FAMILIES
     {
-        decision.class = Classification::Hostile;
-        decision.probability = counts.hostile_confidence;
-        decision.level = interpreted_level(active_level, grid_max, Classification::Hostile, true);
-        // The model graded this benign yet cleave is confident it carries a
-        // hostile (crit-5) trait — a model gap worth investigating. INFO keeps
-        // it visible in serve/worker mode (scan=info) without spamming default
-        // CLI runs (scan=warn).
-        tracing::info!(
-            path = %label,
-            arm = "crit5",
-            confident_hostile = counts.hostile,
-            confident_severe = counts.severe(),
-            families = counts.severe_families.len(),
-            trait_confidence = format!("{:.3}", counts.hostile_confidence),
-            level = ?decision.level,
-            "TRAIT FLOOR: model said benign but cleave found corroborated hostile traits — escalated to hostile",
-        );
-        return;
+        return Some(FloorDecision {
+            class: Classification::Hostile,
+            confidence: counts.hostile_confidence,
+            level: interpreted_level(active_level, grid_max, Classification::Hostile, true),
+            arm: FloorArm::Crit5,
+            hostile: counts.hostile,
+            suspicious: counts.suspicious,
+            // The hostile arm's diversity test spans both severe tiers.
+            families: counts.severe_families.len(),
+        });
     }
     if counts.suspicious_families.len() >= TRAIT_FLOOR_SUSPICIOUS_FAMILIES {
-        decision.class = Classification::Suspicious;
-        decision.probability = counts.suspicious_confidence;
-        // The crit-4 arm by definition lacked the crit-5 anchor, but a lone
-        // confident hostile trait may still be present and is corroboration.
-        decision.level = interpreted_level(
-            active_level,
-            grid_max,
-            Classification::Suspicious,
-            counts.hostile > 0,
-        );
-        tracing::info!(
-            path = %label,
-            arm = "crit4",
-            confident_suspicious = counts.suspicious,
-            families = counts.suspicious_families.len(),
-            trait_confidence = format!("{:.3}", counts.suspicious_confidence),
-            level = ?decision.level,
-            "TRAIT FLOOR: model said benign but cleave found corroborated suspicious traits — escalated to suspicious",
-        );
+        return Some(FloorDecision {
+            class: Classification::Suspicious,
+            confidence: counts.suspicious_confidence,
+            // The crit-4 arm by definition lacked the crit-5 anchor, but a lone
+            // confident hostile trait may still be present and is corroboration.
+            level: interpreted_level(
+                active_level,
+                grid_max,
+                Classification::Suspicious,
+                counts.hostile > 0,
+            ),
+            arm: FloorArm::Crit4,
+            hostile: counts.hostile,
+            suspicious: counts.suspicious,
+            // The suspicious arm measures diversity among the crit-4s alone.
+            families: counts.suspicious_families.len(),
+        });
     }
+    None
+}
+
+/// Apply [`trait_floor`] to a decision in place, and say so in the log.
+///
+/// The model graded these benign yet cleave is confident they carry severe
+/// traits — a model gap worth investigating. INFO keeps it visible in
+/// serve/worker mode (`scan=info`) without spamming default CLI runs
+/// (`scan=warn`).
+///
+/// Returns what the floor did, so a caller reporting the model and the floor
+/// as separate opinions can tell which of them convicted a file. Callers that
+/// only want the verdict ignore it. Because the floor fires only on a
+/// model-Benign decision, "the floor fired here" is also the whole record of
+/// what the model said: benign.
+fn apply_trait_floor(
+    decision: &mut Decision,
+    findings: &[cleave::types::CompactTrait],
+    active_level: Option<u16>,
+    grid_max: u16,
+    label: &str,
+) -> Option<FloorDecision> {
+    let floor = trait_floor(findings, decision.class, active_level, grid_max)?;
+    decision.class = floor.class;
+    decision.probability = floor.confidence;
+    decision.level = floor.level;
+    // One static message with the arm as a field, so an aggregator groups the
+    // floor's firings together and facets them, rather than needing to know
+    // both arms' wordings. Every count either arm logged before is here.
+    tracing::info!(
+        path = %label,
+        arm = floor.arm.as_str(),
+        escalated_to = %floor.class,
+        confident_hostile = floor.hostile,
+        confident_suspicious = floor.suspicious,
+        confident_severe = floor.severe(),
+        families = floor.families,
+        trait_confidence = format!("{:.3}", floor.confidence),
+        level = ?floor.level,
+        "TRAIT FLOOR: model said benign but cleave found corroborated severe traits",
+    );
+    Some(floor)
 }
 
 /// Which optional output surfaces the caller will read. `classify_report`
@@ -5976,7 +6432,12 @@ pub(crate) fn classify_report(
     // Trait floor: a screaming cleave signal the model graded benign is escalated
     // to suspicious (off-grid synthetic level). Applied per-file so an archive
     // member's evidence elevates its container via decision_outranks below.
-    apply_trait_floor(
+    //
+    // The pre-floor decision is kept so the result can report the model and
+    // the floor as separate opinions. It is only ever read; the verdict below
+    // is computed exactly as before.
+    let root_model_decision = decision;
+    let root_floor = apply_trait_floor(
         &mut decision,
         root_findings(&compact),
         model.active_level(),
@@ -6116,6 +6577,28 @@ pub(crate) fn classify_report(
             detail: adopted_detail(v),
         })
     }));
+
+    // The same fold, over the model's own readings: members the floor raised
+    // are excluded because on those the model said benign, and the root's
+    // pre-floor decision stands in for the root. Adopted corpus verdicts count
+    // as model evidence — they are another scan's verdict, not this artifact's
+    // traits. Purely observational; `max_decision` below is unchanged.
+    let model_decision = worst_member_model(&member_evals)
+        .into_iter()
+        .chain(adopted.iter().map(|(d, ..)| *d))
+        .filter(|candidate| decision_outranks(candidate, &root_model_decision))
+        .reduce(|best, d| {
+            if decision_outranks(&d, &best) {
+                d
+            } else {
+                best
+            }
+        })
+        .unwrap_or(root_model_decision);
+    let artifact_floor = match (root_floor, worst_member_floor(&member_evals)) {
+        (Some(root), Some(member)) => Some(root.worse_of(member)),
+        (floor, None) | (None, floor) => floor,
+    };
 
     // Elevate the container by its worst member, exactly as before — derived
     // from the table instead of tracked during the loop — and by any adopted
@@ -6436,6 +6919,8 @@ pub(crate) fn classify_report(
             total_ms: crate::duration_ms(classify_start.elapsed()),
         },
         pending_llm,
+        model: model_decision,
+        floor: artifact_floor,
         classification: final_decision.class,
         probability: final_decision.probability,
         threshold: final_decision.threshold,
@@ -10298,6 +10783,8 @@ pub(crate) fn process_report(
 
     Ok(ScanResult {
         v: "7",
+        model: cr.model,
+        floor: cr.floor,
         classification: cr.classification,
         probability: cr.probability,
         threshold: cr.threshold,
@@ -10722,7 +11209,8 @@ pub struct ScanResultEnvelope {
 /// stored result records which engine produced it. Distinct from `version` (the
 /// ML model) and `raw.tv` (the traits-repo commit); together they pin the build
 /// that generated a report, which is otherwise unrecoverable from the JSON.
-pub(crate) const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// This scan build, as it is stamped onto every verdict it produces.
+pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The `ml` section of the response envelope.
 #[derive(Debug, serde::Serialize)]
