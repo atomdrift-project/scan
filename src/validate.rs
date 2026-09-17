@@ -73,8 +73,9 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
             // running fleet, with no scan release involved. Blocking on it
             // meant a traits publish could stop every worker from booting,
             // which is a far worse failure than the one being guarded against.
-            // The gate is still proven against a known-good tree by
-            // `gate_prefixes_match_the_installed_traits_tree` in CI.
+            // This command is the only place the installed tree is checked:
+            // the test suite deliberately asserts nothing about it, since trait
+            // definitions are validated in the traits repo, not here.
             eprintln!(
                 "WARNING {} LLM gate prefix(es) match nothing in {}; \
                  the gate still admits on criticality, probability and level, \
