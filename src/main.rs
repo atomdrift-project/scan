@@ -200,10 +200,6 @@ use scan::memory::{cgroup_memory_diagnostics, log_max_rss_resolution, proc_memto
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-/// Warn threshold for a single slow cleave rule (ms); was the `--slow-rule-ms`
-/// flag, now a fixed advisory default.
-const DEFAULT_SLOW_RULE_MS: u64 = 4000;
-
 #[derive(Parser)]
 #[command(name = "atomscan")]
 #[command(version)]
@@ -675,34 +671,6 @@ fn warn_on_broken_freebsd_malloc_conf() {
     );
 }
 
-fn threshold_overrides_for_model(
-    threshold_suspicious: Option<f32>,
-    threshold_hostile: Option<f32>,
-) -> Option<scan::model::Thresholds> {
-    // Level mode resolves the verdict from the model's level grid — the
-    // per-file level sweep plus the active level's hostile/suspicious cutoffs —
-    // so no explicit thresholds are loaded here; `Model::load` keeps its
-    // level-independent defaults and the active level is passed separately.
-    //
-    // Only manual `--threshold-*` overrides produce a Thresholds. We do NOT
-    // derive a suspicious cutoff: the level-space lookup needs a level table and
-    // a known level, neither of which applies when the operator picks
-    // `--threshold-hostile` directly. Collapsing suspicious to hostile means
-    // `classify` never returns Suspicious — the operator gets hostile-vs-benign
-    // verdicts only, which is what we want for manual mode.
-    match (threshold_suspicious, threshold_hostile) {
-        (None, None) => None,
-        (sus, hos) => {
-            let hostile = hos.unwrap_or(scan::model::Thresholds::FALLBACK_HOSTILE);
-            let suspicious = sus.unwrap_or(hostile);
-            Some(scan::model::Thresholds {
-                suspicious,
-                hostile,
-            })
-        }
-    }
-}
-
 /// Refresh models and traits before a long-lived daemon starts serving.
 ///
 /// `force` is `-u/--update`: re-fetch even when the local copy looks current.
@@ -1128,8 +1096,7 @@ fn main() -> Result<()> {
             None => scan::models_repo::model_dir().context("failed to resolve model directory"),
         }
     };
-    let threshold_overrides =
-        || threshold_overrides_for_model(threshold_suspicious, threshold_hostile);
+    let threshold_overrides = || cli.global.thresholds();
     // The envelope's `ml.lvl` encodes the FPR severity that produced the
     // resolved thresholds (or the `-1` benign sentinel — see engine::level_confidence).
     // Manual `--threshold-*` overrides bypass the levels table entirely, so we
@@ -1163,7 +1130,7 @@ fn main() -> Result<()> {
             cli.global.format,
             threshold_overrides(),
             filter,
-            DEFAULT_SLOW_RULE_MS,
+            scan::cli::DEFAULT_SLOW_RULE_MS,
             cli.global.extra,
         )?
         .with_level(envelope_level)
@@ -1275,8 +1242,8 @@ fn main() -> Result<()> {
                 analysis_timeout_secs: analysis_timeout,
                 model_dir: cli.global.model_dir.clone(),
                 level: selected_severity_level,
-                thresholds: threshold_overrides_for_model(threshold_suspicious, threshold_hostile),
-                slow_rule_ms: DEFAULT_SLOW_RULE_MS,
+                thresholds: cli.global.thresholds(),
+                slow_rule_ms: scan::cli::DEFAULT_SLOW_RULE_MS,
                 interpret: interpret_cfg.clone(),
                 fetch: fetch_policy,
                 zip_passwords: cli.global.zip_passwords.clone().into(),
@@ -1346,7 +1313,7 @@ fn main() -> Result<()> {
                 scan::OutputFormat::Terminal,
                 thresholds,
                 DisplayFilter::alerts_only(),
-                DEFAULT_SLOW_RULE_MS,
+                scan::cli::DEFAULT_SLOW_RULE_MS,
                 cli.global.extra,
             )?
             .with_level(envelope_level)
@@ -1431,10 +1398,10 @@ fn main() -> Result<()> {
                 update: cli.global.update,
                 model_dir: cli.global.model_dir.clone(),
                 level: selected_severity_level,
-                thresholds: threshold_overrides_for_model(threshold_suspicious, threshold_hostile),
+                thresholds: cli.global.thresholds(),
                 no_update: cli.global.no_update,
                 no_validate,
-                slow_rule_ms: DEFAULT_SLOW_RULE_MS,
+                slow_rule_ms: scan::cli::DEFAULT_SLOW_RULE_MS,
                 interpret: interpret_cfg.clone(),
                 fetch: worker_fetch_policy,
                 zip_passwords: cli.global.zip_passwords.clone().into(),

@@ -27,6 +27,11 @@ use anyhow::Result;
 
 use crate::OutputFormat;
 
+/// Warn threshold for a single slow cleave rule (ms); was the `--slow-rule-ms`
+/// flag, now a fixed advisory default. Shared, so every binary running this
+/// analysis stack warns at the same point rather than each picking a number.
+pub const DEFAULT_SLOW_RULE_MS: u64 = 4000;
+
 /// Default hard wall-clock limit for each Rizin subprocess, in seconds.
 pub const DEFAULT_RIZIN_TIMEOUT_SECS: u64 = 10 * 60;
 
@@ -677,6 +682,32 @@ impl GlobalArgs {
         policy.host_platform_only = self.host_platform_only(scans_for_other_hosts);
         policy.transitive_deps = self.transitive_deps(scans_for_other_hosts);
         policy
+    }
+
+    /// Manual probability cutoffs, when the operator named either.
+    ///
+    /// `None` is the ordinary path: the verdict comes from the model's level
+    /// grid — the per-file level sweep plus the active level's cutoffs — so no
+    /// explicit thresholds are loaded and `Model::load` keeps its
+    /// level-independent defaults.
+    ///
+    /// Given only `--threshold-hostile`, the suspicious cutoff collapses onto
+    /// it rather than being derived. The level-space lookup a suspicious band
+    /// needs wants a level table and a known level, and neither applies once an
+    /// operator picks a probability directly — so manual mode answers
+    /// hostile-versus-benign, which is what it is for.
+    #[must_use]
+    pub fn thresholds(&self) -> Option<crate::model::Thresholds> {
+        match (self.threshold_suspicious, self.threshold_hostile) {
+            (None, None) => None,
+            (suspicious, hostile) => {
+                let hostile = hostile.unwrap_or(crate::model::Thresholds::FALLBACK_HOSTILE);
+                Some(crate::model::Thresholds {
+                    suspicious: suspicious.unwrap_or(hostile),
+                    hostile,
+                })
+            }
+        }
     }
 
     /// The display filter selected by `--show`.
