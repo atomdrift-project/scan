@@ -6567,7 +6567,7 @@ mod pick_verdict_tests {
 
 #[cfg(test)]
 mod streamed_failure_reason_tests {
-    use super::{unretrievable_reason, V1Decision};
+    use super::{V1Decision, unretrievable_reason};
     use axum::http::StatusCode;
 
     /// The line this draws is the one [`analysis_error_body`] already draws for
