@@ -4387,6 +4387,23 @@ struct V1Framing {
     full: bool,
 }
 
+/// The `reason` a streamed failure carries, when the status says the artifact
+/// itself could not be obtained rather than that this fleet fell over.
+///
+/// 422 is what [`analysis_error_body`] renders for [`crate::fetch::Unretrievable`];
+/// 413 is an artifact past the size limit. Both are facts about the package
+/// that will not change if the caller retries against a healthier worker, and
+/// both are what poppy files under download failures rather than its error
+/// rate. Every other status — 500, 504, 429, a worker starting up — is about
+/// us, and stays an unqualified outage.
+fn unretrievable_reason(status: StatusCode) -> Option<&'static str> {
+    match status {
+        StatusCode::UNPROCESSABLE_ENTITY => Some("unretrievable"),
+        StatusCode::PAYLOAD_TOO_LARGE => Some("too_large"),
+        _ => None,
+    }
+}
+
 fn v1_streamed(
     state: Arc<AppState>,
     attachment: super::flight::Attachment,
@@ -4495,10 +4512,35 @@ fn v1_streamed(
             }
             Outcome::Rendered { status, .. } => {
                 tracing::warn!(subject = %subject, status = status.as_u16(), elapsed_ms = elapsed, "streamed analysis failed");
+                // An artifact nobody can download is not an outage, and the
+                // difference is already drawn on the unstreamed path:
+                // [`analysis_error_body`] answers [`crate::fetch::Unretrievable`]
+                // with 422 for exactly the reason its own comment gives — "a
+                // package nobody can download used to eject healthy workers
+                // from the pool and arrive at poppy as an outage rather than a
+                // download failure".
+                //
+                // Collapsing every rendered status into a bare `unavailable`
+                // put that back for every streamed caller, which is all of
+                // them: poppy asks with `Accept: application/x-ndjson`, so it
+                // never saw the 422 and scored a dead package as a beamline
+                // outage. On 2026-09-17 one deleted GitHub repo — whose twelve
+                // versions proxy.golang.org still lists from cache and can no
+                // longer serve — paged the fleet that way.
+                //
+                // The decision stays `unavailable`: we still did not answer,
+                // and a caller must not read an assessment into it. What
+                // changes is that `reason` now says whose failure it was, which
+                // beamline already relays verbatim.
+                let reason = unretrievable_reason(*status);
                 if is_url {
-                    V1Decision::unavailable(None, None).asked_about_url(asked.as_deref())
+                    V1Decision::unavailable(None, None)
+                        .asked_about_url(asked.as_deref())
+                        .because(reason)
                 } else {
-                    V1Decision::unavailable(None, purl.as_deref()).asked_about(asked.as_deref())
+                    V1Decision::unavailable(None, purl.as_deref())
+                        .asked_about(asked.as_deref())
+                        .because(reason)
                 }
             }
         };
@@ -5140,6 +5182,15 @@ impl V1Decision {
     /// So the field answers "the package you asked about" and the caller's
     /// bytes are returned unaltered. `sha256` remains the identity, and it is
     /// the field to compare when two spellings must be proven to be one thing.
+    /// Attach the reason an `unavailable` came about. `None` leaves the
+    /// decision exactly as it was, so the common outage keeps its bare shape.
+    fn because(mut self, reason: Option<&'static str>) -> Self {
+        if let Some(reason) = reason {
+            self.reason = Some(reason.to_owned());
+        }
+        self
+    }
+
     fn asked_about(mut self, asked: Option<&str>) -> Self {
         if let Some(asked) = asked {
             self.purl = Some(asked.to_owned());
@@ -6511,5 +6562,61 @@ mod pick_verdict_tests {
     #[test]
     fn neither_key_known_is_no_verdict() {
         assert!(pick_verdict(None, || None, SHA).is_none());
+    }
+}
+
+#[cfg(test)]
+mod streamed_failure_reason_tests {
+    use super::{unretrievable_reason, V1Decision};
+    use axum::http::StatusCode;
+
+    /// The line this draws is the one [`analysis_error_body`] already draws for
+    /// unstreamed callers: an artifact nobody can download is the package's
+    /// failure, and everything else is ours. Poppy only ever reads the stream,
+    /// so until this existed a dead package reached it as an outage and went
+    /// into the fleet error rate — which is how one deleted Go repo paged the
+    /// fleet on 2026-09-17.
+    #[test]
+    fn only_the_artifacts_own_failures_are_named() {
+        assert_eq!(
+            unretrievable_reason(StatusCode::UNPROCESSABLE_ENTITY),
+            Some("unretrievable"),
+        );
+        assert_eq!(
+            unretrievable_reason(StatusCode::PAYLOAD_TOO_LARGE),
+            Some("too_large"),
+        );
+
+        // Ours. These stay an unqualified outage, because retrying them against
+        // a healthier worker is exactly the right thing for a caller to do.
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert_eq!(unretrievable_reason(status), None, "status {status}");
+        }
+    }
+
+    /// `because` qualifies an unavailable without promoting it: the decision is
+    /// still that we did not answer, so nothing may read an assessment from it.
+    #[test]
+    fn a_reason_qualifies_but_does_not_become_a_verdict() {
+        let bare = V1Decision::unavailable(None, Some("pkg:golang/example.com/x@v1.0.0"));
+        assert_eq!(bare.reason, None);
+
+        let named = V1Decision::unavailable(None, Some("pkg:golang/example.com/x@v1.0.0"))
+            .because(unretrievable_reason(StatusCode::UNPROCESSABLE_ENTITY));
+        assert_eq!(named.reason.as_deref(), Some("unretrievable"));
+        assert_eq!(named.decision, super::decision::Decision::Unavailable);
+        assert_eq!(named.severity, None);
+        assert_eq!(named.fires_at, None);
+        assert!(named.findings.is_empty());
+
+        // No reason leaves the decision byte-for-byte what it was.
+        let untouched = V1Decision::unavailable(None, None).because(None);
+        assert_eq!(untouched.reason, None);
     }
 }
