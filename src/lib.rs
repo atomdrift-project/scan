@@ -53,6 +53,7 @@ pub mod hosts;
 pub mod inflight;
 pub mod interpret;
 pub mod lookup;
+pub mod memory;
 pub mod model;
 pub mod model_update;
 pub mod models_repo;
