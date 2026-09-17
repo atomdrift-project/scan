@@ -26,12 +26,16 @@
 //! is the right basis there. Only this process's own ceiling is clamped here.
 
 use std::num::NonZeroU64;
+// Paths are only walked where cgroups exist -- and under test, which exercises
+// that walk against a temporary tree on every platform.
+#[cfg(any(target_os = "linux", test))]
 use std::path::{Path, PathBuf};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
 /// Root of the cgroup-v2 hierarchy. A parameter in tests, a constant in life.
+#[cfg(target_os = "linux")]
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// User-supplied resolution policy for `--max-rss-gb`.
@@ -83,7 +87,9 @@ pub struct WorkerMemoryBasis {
 /// Smallest memory limit along a cgroup-v2 path, walking `start` up to `root`.
 ///
 /// Split out from [`cgroup_memory_limit_bytes`] so the hierarchy walk is
-/// testable without a real `/sys/fs/cgroup`.
+/// testable without a real `/sys/fs/cgroup` -- which is why it is compiled
+/// under `test` on every platform, and only on Linux otherwise.
+#[cfg(any(target_os = "linux", test))]
 fn cgroup_limit_under(root: &Path, start: &Path) -> Option<u64> {
     let mut dir = start.to_path_buf();
     let mut limit: Option<u64> = None;
@@ -122,6 +128,7 @@ pub fn cgroup_memory_limit_bytes() -> Option<u64> {
     cgroup_limit_under(Path::new(CGROUP_ROOT), &cgroup_v2_path()?)
 }
 
+/// No cgroups off Linux, so nothing clamps the host's memory here.
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn cgroup_memory_limit_bytes() -> Option<u64> {
@@ -278,6 +285,8 @@ pub fn cgroup_v2_path() -> Option<PathBuf> {
     None
 }
 
+/// Contents of a cgroup file, trimmed, or `None` when absent or empty.
+#[cfg(any(target_os = "linux", test))]
 fn read_trimmed(path: PathBuf) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -285,6 +294,8 @@ fn read_trimmed(path: PathBuf) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// A cgroup memory file's value in MiB, for the diagnostics log.
+#[cfg(target_os = "linux")]
 fn memory_value_mb(value: Option<&str>) -> Option<u64> {
     memory_value_bytes(value).map(|b| b / MIB)
 }
@@ -318,6 +329,7 @@ pub fn proc_memtotal_mb() -> Result<u64, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -380,7 +392,10 @@ mod tests {
         tree.write("", "memory.max", "100");
         tree.write("a", "memory.max", "50");
         tree.write("a/b", "memory.max", "900");
-        assert_eq!(cgroup_limit_under(&tree.path(""), &tree.path("a/b")), Some(50));
+        assert_eq!(
+            cgroup_limit_under(&tree.path(""), &tree.path("a/b")),
+            Some(50)
+        );
     }
 
     #[test]
@@ -388,7 +403,10 @@ mod tests {
         let tree = TempTree::new("high");
         tree.write("a", "memory.max", "900");
         tree.write("a", "memory.high", "17");
-        assert_eq!(cgroup_limit_under(&tree.path(""), &tree.path("a")), Some(17));
+        assert_eq!(
+            cgroup_limit_under(&tree.path(""), &tree.path("a")),
+            Some(17)
+        );
     }
 
     #[test]

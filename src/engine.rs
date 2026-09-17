@@ -3055,20 +3055,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let ctrlc_flag = Arc::clone(&cancellation);
-    let _ = ctrlc::set_handler(move || {
-        if ctrlc_flag.load(Ordering::Relaxed) {
-            // Second ctrl-c: reap rizin workers, then hard exit. Cleave runs
-            // each rizin in its own process group, so SIGINT on the terminal
-            // never reaches them — without an explicit SIGKILL here, every
-            // in-flight child would outlive us as an orphan.
-            cleave::kill_all_rizin_groups();
-            std::process::exit(130);
-        }
-        crate::engine::print_above_bar(|| eprintln!("\nInterrupted — finishing current file…"));
-        ctrlc_flag.store(true, Ordering::Relaxed);
-    });
+    let cancellation = crate::interrupt::arm("Interrupted — finishing current file…");
     // scan consumes only the compact projection of member nodes; let cleave
     // drop fold-time fields that exist solely for the full v3 schema.
     cleave::set_compact_member_retention(true);
@@ -4313,17 +4300,7 @@ pub fn run_paths(
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
 
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let ctrlc_flag = Arc::clone(&cancellation);
-    let _ = ctrlc::set_handler(move || {
-        if ctrlc_flag.load(Ordering::Relaxed) {
-            // Second ctrl-c: reap rizin workers, then hard exit. See `run`.
-            cleave::kill_all_rizin_groups();
-            std::process::exit(130);
-        }
-        crate::engine::print_above_bar(|| eprintln!("\nInterrupted — finishing current file…"));
-        ctrlc_flag.store(true, Ordering::Relaxed);
-    });
+    let cancellation = crate::interrupt::arm("Interrupted — finishing current file…");
 
     cleave::set_compact_member_retention(true); // compact projection only
     let mut cleave_opts = cleave::AnalysisOptions {

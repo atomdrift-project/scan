@@ -130,10 +130,7 @@ mod mimalloc_alloc {
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use scan::engine::DisplayFilter;
-use scan::worker::{
-    MaxRssPolicy, default_worker_name, default_workers, resolve_worker_max_rss_gb,
-    worker_memory_basis,
-};
+use scan::worker::{default_worker_name, default_workers};
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -195,7 +192,10 @@ where
     }
 }
 
-use scan::memory::{cgroup_memory_diagnostics, log_max_rss_resolution, proc_memtotal_mb};
+use scan::memory::{
+    MaxRssPolicy, cgroup_memory_diagnostics, log_max_rss_resolution, proc_memtotal_mb,
+    resolve_process_max_rss_bytes, resolve_worker_max_rss_gb, worker_memory_basis,
+};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -1223,7 +1223,7 @@ fn main() -> Result<()> {
             log_max_rss_resolution(
                 "server",
                 MaxRssPolicy::from_cli(max_rss_gb),
-                scan::server::resolve_process_max_rss_bytes(max_rss_gb),
+                resolve_process_max_rss_bytes(max_rss_gb),
             );
             let config = scan::server::Startup {
                 bind,

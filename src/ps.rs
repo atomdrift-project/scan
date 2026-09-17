@@ -184,20 +184,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load(config.model_dir()).ok();
     let ctx = ExtractContext::new(model.spec());
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let ctrlc_flag = Arc::clone(&cancellation);
-    let _ = ctrlc::set_handler(move || {
-        if ctrlc_flag.load(Ordering::Relaxed) {
-            // Second ctrl-c: reap rizin workers, then hard exit. Cleave runs
-            // each rizin in its own process group, so SIGINT on the terminal
-            // never reaches them — without an explicit SIGKILL here, every
-            // in-flight child would outlive us as an orphan.
-            cleave::kill_all_rizin_groups();
-            std::process::exit(130);
-        }
-        eprintln!("\nInterrupted — finishing current process…");
-        ctrlc_flag.store(true, Ordering::Relaxed);
-    });
+    let cancellation = crate::interrupt::arm("Interrupted — finishing current process…");
     cleave::set_compact_member_retention(true); // compact projection only
     let mut cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
