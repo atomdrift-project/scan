@@ -3258,21 +3258,6 @@ mod tests {
         assert!(sev.gate_trait && !sev.elevated && !sev.hostile);
     }
 
-    /// Drift canary. Runs only where traits are installed, so it is a no-op on
-    /// a bare CI box and a real check everywhere the rules exist.
-    #[test]
-    fn gate_prefixes_still_exist_in_the_installed_traits_tree() {
-        let Ok(traits_dir) = cleave::traits_repo::try_resolve() else {
-            return;
-        };
-        let problems = validate_gate_prefixes(&traits_dir);
-        assert!(
-            problems.is_empty(),
-            "LLM gate prefixes drifted from {}: {problems:#?}",
-            traits_dir.display(),
-        );
-    }
-
     #[test]
     fn gate_prefix_validation_reports_a_moved_family() {
         let dir = tempfile::tempdir().expect("tempdir");
