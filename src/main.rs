@@ -2687,16 +2687,80 @@ struct WorkerMemoryBasis {
     source: &'static str,
 }
 
-fn worker_memory_basis() -> WorkerMemoryBasis {
-    if let Some(bytes) = cleave::memory_tracker::total_memory() {
-        return WorkerMemoryBasis {
-            bytes,
-            source: "cleave_total_memory",
-        };
+/// Most restrictive memory limit that applies to this process, walking the
+/// cgroup-v2 hierarchy from its own cgroup up to the root.
+///
+/// The limit that actually binds a process is the minimum over every ancestor,
+/// not the value on its own cgroup. That distinction is load-bearing here: the
+/// server runs its companion worker in a DELEGATED child cgroup
+/// (`scan.service/idle`) which carries no limit of its own, so reading only
+/// [`cgroup_v2_path`] finds nothing while the `MemoryMax=` on the parent unit is
+/// exactly what OOM-kills it.
+///
+/// `memory.high` is included because a throttle the worker can never outrun is a
+/// ceiling in practice. Both files read `max` when unset, which
+/// [`memory_value_bytes`] maps to `None`.
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    let root = PathBuf::from("/sys/fs/cgroup");
+    let mut dir = cgroup_v2_path()?;
+    let mut limit: Option<u64> = None;
+    loop {
+        for file in ["memory.max", "memory.high"] {
+            if let Some(bytes) = memory_value_bytes(read_trimmed(dir.join(file)).as_deref()) {
+                limit = Some(limit.map_or(bytes, |current: u64| current.min(bytes)));
+            }
+        }
+        if dir == root || !dir.starts_with(&root) {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
     }
-    WorkerMemoryBasis {
-        bytes: 16 * GIB,
-        source: "fallback_16g",
+    limit
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    None
+}
+
+/// Memory the worker may size itself against.
+///
+/// `cleave::memory_tracker::total_memory()` is host `MemTotal` and is
+/// cgroup-blind, so on a shared host it hands the worker a budget covering the
+/// whole machine. galadriel, 2026-09-17: a 251 GiB host resolved a 213 GiB
+/// ceiling for a worker sharing the box with a 32 GB `shared_buffers` PostgreSQL
+/// replica and vllm. The admission controller then did precisely what it was
+/// told and filled that budget — 576 concurrent analyses, ~50 GB RSS climbing —
+/// until the cgroup OOM-killed it every ~20 minutes. It was never a leak; the
+/// budget was a lie.
+///
+/// Clamping to the supervisor's limit makes `MemoryMax=` shape the budget rather
+/// than merely truncate it. Note the sibling `available_memory()` already honours
+/// cgroup headroom — this uses the one function of the pair that did not.
+fn worker_memory_basis() -> WorkerMemoryBasis {
+    let host = cleave::memory_tracker::total_memory();
+    let cgroup = cgroup_memory_limit_bytes();
+    match (host, cgroup) {
+        (Some(host), Some(cgroup)) if cgroup < host => WorkerMemoryBasis {
+            bytes: cgroup,
+            source: "cgroup_memory_limit",
+        },
+        (Some(host), _) => WorkerMemoryBasis {
+            bytes: host,
+            source: "cleave_total_memory",
+        },
+        (None, Some(cgroup)) => WorkerMemoryBasis {
+            bytes: cgroup,
+            source: "cgroup_memory_limit",
+        },
+        (None, None) => WorkerMemoryBasis {
+            bytes: 16 * GIB,
+            source: "fallback_16g",
+        },
     }
 }
 
