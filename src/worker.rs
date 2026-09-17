@@ -15,7 +15,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
@@ -29,6 +29,7 @@ use tokio::task::JoinSet;
 
 use crate::explain::ShapImportance;
 use crate::features::ExtractContext;
+use crate::memory::resolve_worker_max_rss_gb;
 use crate::model::{Model, Thresholds};
 use crate::server::{ModelResources, classify_bytes, classify_file};
 use crate::system_load_avg;
@@ -786,79 +787,10 @@ pub struct WorkerConfig {
 // in a CLI's `main` so a second one cannot drift from the first.
 // ---------------------------------------------------------------------------
 
-/// One gigabyte, the unit `--max-rss-gb` is given in.
-const GIB: u64 = 1024 * 1024 * 1024;
-
-/// The memory signal a worker sizes its RSS ceiling against.
-#[derive(Debug, Clone, Copy)]
-pub struct WorkerMemoryBasis {
-    /// The memory signal this basis was taken from.
-    pub bytes: u64,
-    /// Where that signal came from, for the startup log.
-    pub source: &'static str,
-}
-
-/// The host's total memory, or a conservative fallback when it cannot be
-/// read. Cgroup-aware via cleave.
-#[must_use]
-pub fn worker_memory_basis() -> WorkerMemoryBasis {
-    if let Some(bytes) = cleave::memory_tracker::total_memory() {
-        return WorkerMemoryBasis {
-            bytes,
-            source: "cleave_total_memory",
-        };
-    }
-    WorkerMemoryBasis {
-        bytes: 16 * GIB,
-        source: "fallback_16g",
-    }
-}
-
-/// User-supplied resolution policy for `--max-rss-gb`.
-///
-/// The CLI accepts an `i64` so a negative value can opt out, but the three
-/// possible behaviours are encoded in the type system from this point on so
-/// that downstream code cannot accidentally treat "disabled" as "ceiling = 0".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaxRssPolicy {
-    /// `--max-rss-gb=-1`: disable in-process RSS throttling entirely. Use when
-    /// an external supervisor (systemd `MemoryMax=`, jail rctl, etc.) already
-    /// enforces a hard memory cap.
-    Disabled,
-    /// `--max-rss-gb=0`: auto-resolve the ceiling from the platform's memory
-    /// signal (cgroup limits, /proc/meminfo, or a conservative fallback).
-    Auto,
-    /// `--max-rss-gb=N` (N > 0): explicit ceiling in gigabytes.
-    Explicit(NonZeroU64),
-}
-
-impl MaxRssPolicy {
-    /// Read the `--max-rss-gb` flag's three behaviours out of its `i64`.
-    #[must_use]
-    pub fn from_cli(raw: i64) -> Self {
-        match raw {
-            n if n < 0 => Self::Disabled,
-            0 => Self::Auto,
-            // The previous arms exclude n <= 0, so `cast_unsigned` is
-            // value-preserving and `NonZeroU64::new` always returns `Some`.
-            // `unwrap_or(MIN)` documents that the fallback is unreachable.
-            n => Self::Explicit(NonZeroU64::new(n.cast_unsigned()).unwrap_or(NonZeroU64::MIN)),
-        }
-    }
-}
-
-/// The RSS ceiling in gigabytes, from the `--max-rss-gb` flag as given.
-/// Zero means throttling is off.
-#[must_use]
-pub fn resolve_worker_max_rss_gb(raw_max_rss_gb: i64) -> u64 {
-    match MaxRssPolicy::from_cli(raw_max_rss_gb) {
-        MaxRssPolicy::Disabled => 0,
-        // 85% of the cgroup-aware memory basis, with a one-GiB floor. Slot
-        // count scales with cores, so larger hosts need a proportionate ceiling.
-        MaxRssPolicy::Auto => std::cmp::max(1, (worker_memory_basis().bytes * 85 / 100) / GIB),
-        MaxRssPolicy::Explicit(gb) => gb.get(),
-    }
-}
+// The memory ceiling itself is resolved by `crate::memory`, which is
+// cgroup-aware. A second copy lived here and was not: it sized a worker
+// against a shared host's whole RAM and the cgroup OOM-killed it every ~20
+// minutes. One home only -- see that module's docs.
 
 /// Default slot count: three times the physical cores.
 ///
@@ -910,7 +842,7 @@ pub struct Startup {
     pub poll_secs: u64,
     /// The `--max-rss-gb` flag as given: negative disables in-process
     /// throttling, zero auto-resolves from the host, positive is a ceiling in
-    /// gigabytes. See [`MaxRssPolicy`].
+    /// gigabytes. See [`crate::memory::MaxRssPolicy`].
     pub max_rss_gb: i64,
     /// Nice value for the analysis threads.
     pub nice: i32,

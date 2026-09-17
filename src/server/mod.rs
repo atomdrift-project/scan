@@ -29,6 +29,7 @@ pub use acl::{Cidr, TokenDigest, parse_cidr_list};
 pub(crate) use handlers::classify_bytes;
 pub(crate) use handlers::classify_file;
 
+use crate::memory::resolve_process_max_rss_bytes;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
@@ -254,21 +255,6 @@ impl Startup {
         .with_hopper(self.hopper)
         .with_idle_worker_slots(idle_slots)
         .with_analysis_timeout(self.analysis_timeout_secs))
-    }
-}
-
-/// The server's RSS ceiling in bytes, from the `--max-rss-gb` flag as given.
-///
-/// Distinct from the worker's, which resolves to whole gigabytes: a server
-/// takes the cgroup-aware limit outright rather than 85% of the host's total,
-/// because it is sized against its container and not against the machine.
-#[must_use]
-pub fn resolve_process_max_rss_bytes(raw_max_rss_gb: i64) -> u64 {
-    use crate::worker::MaxRssPolicy;
-    match MaxRssPolicy::from_cli(raw_max_rss_gb) {
-        MaxRssPolicy::Disabled => 0,
-        MaxRssPolicy::Auto => cleave::memory_tracker::memory_limit(),
-        MaxRssPolicy::Explicit(gb) => gb.get().saturating_mul(1024 * 1024 * 1024),
     }
 }
 
@@ -2379,15 +2365,14 @@ mod whale_pool_tests {
 
 #[cfg(test)]
 mod max_rss_tests {
-    use super::resolve_process_max_rss_bytes;
-    use crate::worker::resolve_worker_max_rss_gb;
+    use crate::memory::{resolve_process_max_rss_bytes, resolve_worker_max_rss_gb};
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
     /// A server and a worker read `--max-rss-gb` with the same vocabulary,
-    /// differing only in the unit they answer in. They are resolved by two
-    /// functions in two modules, so the agreement is asserted rather than
-    /// assumed.
+    /// differing only in the unit they answer in. Asserted from the server's
+    /// side because `Startup::resolve` above is what feeds one of them, and a
+    /// divergence would show up as a container sized by the wrong rule.
     #[test]
     fn max_rss_semantics_match_for_disabled_and_explicit_values() {
         assert_eq!(resolve_process_max_rss_bytes(-1), 0);

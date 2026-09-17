@@ -53,6 +53,7 @@ pub mod heap_profile;
 pub mod hosts;
 pub mod inflight;
 pub mod interpret;
+mod interrupt;
 pub mod lookup;
 pub mod memory;
 pub mod model;
