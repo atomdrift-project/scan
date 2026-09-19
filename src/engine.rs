@@ -3049,7 +3049,7 @@ pub(crate) fn detection_counts(config: &ScanConfig) -> DetectionCounts {
 /// Returns an error if the target path does not exist, model artifacts cannot
 /// be loaded, or `cleave` analysis fails for the overall scan operation.
 pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
-    prefetch_cleave_resources();
+    prefetch_cleave_resources(path.is_dir());
 
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
 
@@ -4294,7 +4294,7 @@ pub fn run_paths(
     config: &ScanConfig,
     registry_map: Option<&std::collections::HashMap<String, crate::provenance::RegistryProvenance>>,
 ) -> Result<ScanSummary> {
-    prefetch_cleave_resources();
+    prefetch_cleave_resources(bulk_scan(paths));
 
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load(config.model_dir()).ok();
@@ -10837,7 +10837,7 @@ pub fn scan_bytes(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
-    prefetch_cleave_resources();
+    prefetch_cleave_resources(false);
 
     cleave::set_compact_member_retention(true); // compact projection only
     let mut cleave_opts = cleave::AnalysisOptions {
@@ -10882,7 +10882,7 @@ pub fn scan_file(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
-    prefetch_cleave_resources();
+    prefetch_cleave_resources(false);
 
     cleave::set_compact_member_retention(true); // compact projection only
     let mut cleave_opts = cleave::AnalysisOptions {
@@ -10906,11 +10906,23 @@ pub fn scan_file(
     )
 }
 
-fn prefetch_cleave_resources() {
+fn prefetch_cleave_resources(bulk: bool) {
     // Keep cleave's cold-start work off rayon workers where possible. Cleave's
     // loaders are worker-safe, but these library entry points are also used by
     // pkg/url scans and fetched payload analysis where visible latency matters.
-    cleave::prefetch_shared_resources(true);
+    //
+    // `bulk` skips the regex prewarm: a directory or many-file scan amortizes
+    // lazy compilation over thousands of members and only builds the patterns
+    // its file types reach, where the prewarm compiles the whole memo (~58k
+    // programs, ~1.5 GB) up front. A single file keeps it — first-use compiles
+    // would otherwise dominate its wall.
+    cleave::prefetch_shared_resources_with(true, !bulk);
+}
+
+/// Whether a target list is a bulk scan for [`prefetch_cleave_resources`]:
+/// any directory, or a file list long enough to amortize lazy compilation.
+fn bulk_scan(paths: &[PathBuf]) -> bool {
+    paths.len() >= 8 || paths.iter().any(|p| p.is_dir())
 }
 
 /// Extract a small set of human-facing findings relevant to the classification.
