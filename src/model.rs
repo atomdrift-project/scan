@@ -877,7 +877,10 @@ impl TractOnnxBackend {
     }
 }
 
-#[derive(Debug)]
+/// Class-score accumulator size kept on the stack. The route models are
+/// binary; anything wider falls back to a heap vector.
+const FAST_TREE_STACK_CLASSES: usize = 8;
+
 struct FastTreeBackend {
     n_features: usize,
     n_classes: usize,
@@ -887,6 +890,13 @@ struct FastTreeBackend {
     base_values: Vec<f32>,
     post_transform: FastPostTransform,
     binary_result_layout: bool,
+    /// The logistic post-transform kernel, built once at load. The factory
+    /// behind `tract_linalg::ops().sigmoid_f32` allocates a fresh boxed op on
+    /// every call, and this runs once per route per embedded member — tens of
+    /// thousands of times in a directory scan — to transform `n_classes`
+    /// floats. `ElementWise<f32>` is `Send + Sync`, so one instance serves
+    /// every thread. `None` unless `post_transform` is `Logistic`.
+    sigmoid: Option<Box<dyn tract_linalg::element_wise::ElementWise<f32>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -920,6 +930,17 @@ enum FastTreeNode {
         start: usize,
         end: usize,
     },
+}
+
+impl std::fmt::Debug for FastTreeBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FastTreeBackend")
+            .field("n_features", &self.n_features)
+            .field("n_classes", &self.n_classes)
+            .field("trees", &self.trees.len())
+            .field("post_transform", &self.post_transform)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FastTreeBackend {
@@ -1067,6 +1088,10 @@ impl FastTreeBackend {
             base_values,
             post_transform,
             binary_result_layout,
+            sigmoid: match post_transform {
+                FastPostTransform::Logistic => Some((tract_linalg::ops().sigmoid_f32)()),
+                FastPostTransform::None | FastPostTransform::Softmax => None,
+            },
         })
     }
 
@@ -1079,7 +1104,18 @@ impl FastTreeBackend {
             );
         }
 
-        let mut scores = vec![0.0f32; self.n_classes];
+        // Class counts are tiny (2 for the binary route models). Keeping the
+        // accumulator on the stack for the common case avoids a heap
+        // allocation per prediction on a path that runs once per route per
+        // embedded member.
+        let mut score_buf = [0.0f32; FAST_TREE_STACK_CLASSES];
+        let mut score_heap;
+        let scores: &mut [f32] = if self.n_classes <= FAST_TREE_STACK_CLASSES {
+            &mut score_buf[..self.n_classes]
+        } else {
+            score_heap = vec![0.0f32; self.n_classes];
+            &mut score_heap[..]
+        };
         for &root in &self.trees {
             let mut node_idx = root;
             loop {
@@ -1112,25 +1148,27 @@ impl FastTreeBackend {
             }
         }
 
-        for (score, base) in scores.iter_mut().zip(&self.base_values) {
+        for (score, base) in scores.iter_mut().zip(self.base_values.iter()) {
             *score += *base;
         }
         match self.post_transform {
             FastPostTransform::None => {}
             FastPostTransform::Logistic => {
-                (tract_linalg::ops().sigmoid_f32)()
-                    .run(&mut scores)
-                    .context("ONNX sigmoid post-transform failed")?;
+                if let Some(sigmoid) = &self.sigmoid {
+                    sigmoid
+                        .run(scores)
+                        .context("ONNX sigmoid post-transform failed")?;
+                }
             }
             FastPostTransform::Softmax => {
                 let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
-                for score in &mut scores {
+                for score in scores.iter_mut() {
                     *score = (*score - max).exp();
                     sum += *score;
                 }
                 if sum != 0.0 {
-                    for score in &mut scores {
+                    for score in scores.iter_mut() {
                         *score /= sum;
                     }
                 }
@@ -1380,10 +1418,21 @@ impl Backend {
         // Average member predictions in f64 to keep the rounding noise-floor
         // below f32 precision even for K up to a few dozen seeds. The K=1
         // path is mathematically identical to a direct `models[0].predict`.
-        let sum = rayon::iter::once(&self.first)
-            .chain(self.rest.par_iter())
-            .map(|m| m.predict(features).map(f64::from))
-            .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))?;
+        //
+        // Summed serially, in member order. This used to be a rayon
+        // `try_reduce` over the members, which is the wrong shape for the
+        // work: a bundle carries 3 seeds, each seed's ONNX call is
+        // microseconds, and this runs once per route per *embedded member* —
+        // tens of thousands of times in a directory scan, nested inside the
+        // per-member `par_iter` which is itself nested inside the per-path
+        // pool. Fanning 3 microsecond tasks out at that depth costs more in
+        // job/latch/epoch traffic than the calls themselves, and the churn is
+        // charged to every worker in the pool. Serial order is also
+        // deterministic, which a parallel reduce's association order is not.
+        let mut sum = f64::from(self.first.predict(features)?);
+        for m in &self.rest {
+            sum += f64::from(m.predict(features)?);
+        }
         // Every member emits f32 probabilities; f64 only keeps ensemble
         // summation stable before returning to the public f32 surface.
         #[allow(clippy::cast_possible_truncation)]

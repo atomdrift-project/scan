@@ -205,7 +205,7 @@ mimalloc = { version = "0.1", default-features = false }
 # retained segments back to the OS. mimalloc has no background purge thread, so
 # an idle worker never does this on its own — and its RSS gates its own intake.
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
-tree-sitter = "0.27"
+tree-sitter = "0.28"
 
 # Keep this list in lockstep with the three cfg blocks in src/main.rs: the
 # `#[global_allocator]` static, `mod jemalloc_conf`, and the startup call to
@@ -225,7 +225,7 @@ tikv-jemalloc-sys = "0.7"
 # trees under the same decay policies as everything else. The version must
 # stay in lockstep with filefacts's; `links = "tree-sitter-language"` makes
 # any divergence a loud resolve error rather than a silent dual copy.
-tree-sitter = "0.27"
+tree-sitter = "0.28"
 
 [features]
 # Keep the per-member Rayon breadcrumbs compiled into release workers. They are
@@ -369,6 +369,8 @@ test = false
 # tops out at 0.26.11 — so this patch is load-bearing for resolution, not only
 # for the fix, and cleave/filefacts carry an identical block for their own
 # standalone builds. Remove all three once a release carries it.
+# TEMP (2026-09-19, perf-cyclotron): fork master (0.28, carries the per-pattern
+# state cap) plus the unpushed per-pattern-exceeded increment in the working tree.
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 
@@ -383,3 +385,8 @@ dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 # TEMP (2026-09-05, uncommitted): local fletch with Go proxy case recovery, pending push + rev bump.
 
 # TEMP (2026-09-06, uncommitted): local cleave with printable tiny windows, pending push + rev bump.
+
+# TEMP (2026-09-19, perf-cyclotron): local cleave worktree for the cyclotron wall-clock work.
+
+# TEMP (2026-09-19, perf-cyclotron): local filefacts carrying the targeted Go
+# pclntab analysis script (`aa; aac; aalg` in place of `aaa`), pending push.
