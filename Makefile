@@ -349,6 +349,17 @@ tarball: release
 	tar -czf $(OUT_DIR)/$(BINARY).tgz -C $(OUT_DIR) $(BINARY)
 	@echo "Tarball: $(OUT_DIR)/$(BINARY).tgz"
 
+# Bring the checkout up to date before a deploy. Deploy hosts are checkouts,
+# not workspaces, so what has to hold here is "the tree is the upstream
+# branch" -- and `git pull` cannot promise that: when main has been
+# force-pushed it aborts with "Not possible to fast-forward", taking the whole
+# deploy (and, from `make rollout`, the whole fleet) down with it. Fetching and
+# resetting reaches the same commit either way, and discards exactly the local
+# commits and edits a deploy host is not supposed to have. Untracked files --
+# build artifacts, caches, token files -- are left alone.
+SYNC_REPO = git fetch --prune && \
+	git reset --hard "$$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || echo origin/main)"
+
 # Clear MAKEFLAGS for deploy recipes: GNU Make would otherwise inject the
 # outer invocation's `-j`/`--jobserver-*` flags plus command-line `URL=` into
 # the env, which tikv-jemalloc-sys's build.rs re-passes to its bundled `make`,
@@ -405,7 +416,7 @@ ensure-llm-token:
 
 deploy-server: export CLOUDFLARED := $(CLOUDFLARED)
 deploy-server: check-hopper-url ensure-llm-token
-	git pull
+	$(SYNC_REPO)
 	@case "$$(uname -s)" in \
 		FreeBSD) ./scripts/server/server-freebsd.sh ;; \
 		Linux)   if command -v systemctl >/dev/null 2>&1; then \
@@ -466,8 +477,7 @@ check-hopper-url:
 
 deploy-worker: check-hopper-token ensure-llm-token kill-scan
 	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker URL=<url> [BUILD=<host>] [WORKER_RUN=<host>]"; exit 1; }
-	git stash
-	git pull
+	$(SYNC_REPO)
 	@case "$$(uname -s)" in \
 		Darwin)  ./scripts/worker/worker-macos.sh "$(URL)" ;; \
 		FreeBSD) ./scripts/worker/worker-freebsd.sh "$(URL)" ;; \
@@ -493,8 +503,7 @@ deploy-worker: check-hopper-token ensure-llm-token kill-scan
 # isolating the worker in a jail; deploy-worker installs natively on the host.
 deploy-jail-worker:
 	@[ -n "$(URL)" ] || { echo "Usage: make deploy-jail-worker URL=<url> [BUILD=<jail>] [WORKER_RUN=<jail>]"; exit 1; }
-	git stash
-	git pull
+	$(SYNC_REPO)
 	@case "$$(uname -s)" in \
 		FreeBSD) ./scripts/worker/worker-bastille.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)" ;; \
 		*) echo "error: jail worker deployments are FreeBSD/bastille-only; run from a FreeBSD host"; exit 1 ;; \
