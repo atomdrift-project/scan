@@ -406,6 +406,20 @@ export PATH
 mk=make
 command -v gmake >/dev/null 2>&1 && mk=gmake
 
+# Bring a checkout up to date. Deploy hosts are checkouts, not workspaces, so
+# what has to hold is "the tree is the upstream branch" -- and `git pull`
+# cannot promise that: when main has been force-pushed it aborts with "Not
+# possible to fast-forward", which from here fails the host and, on the hopper,
+# halts the rollout before a single worker is touched. Fetching and resetting
+# reaches the same commit either way, and discards exactly the local commits
+# and edits a deploy host is not supposed to have. Untracked files -- build
+# artifacts, caches, token files -- are left alone.
+sync_repo() {
+	upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) ||
+		upstream=origin/main
+	git fetch --prune && git reset --hard "$upstream"
+}
+
 # Installed services are the ground truth for what this host runs. The roster
 # says which phase it belongs to; this says what to run once we are here.
 #
@@ -475,7 +489,7 @@ rc=0
 
 if [ -n "$hopper_unit" ]; then
 	echo "rollout: hopper ($hopper_unit) — deploys hopper and its scan worker together"
-	( cd "$HOME/hopper" && git pull --ff-only && "$mk" deploy ) || rc=1
+	( cd "$HOME/hopper" && sync_repo && "$mk" deploy ) || rc=1
 	# hopper's deploy owns the worker on this box; do not redeploy it twice.
 	worker_unit=""
 fi
@@ -509,8 +523,7 @@ elif [ -n "$adhoc" ] && [ -z "$hopper_unit" ]; then
 	# are redirected, not just stdout -- a child holding the pipe open would
 	# keep ssh waiting here until the worker exited, which is never.
 	echo "rollout: adhoc worker (macOS), hopper $URL_FALLBACK"
-	git stash
-	git pull
+	sync_repo
 	# A launchd daemon on a Mac is a leftover, and leaving it in place is worse
 	# than either shape alone: it and the process started below claim from the
 	# same queue, on the same box, and it is the one that comes back at boot.
