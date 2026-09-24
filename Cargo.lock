@@ -1967,7 +1967,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "1.3.0"
-source = "git+https://github.com/atomdrift-project/fletch.git#a828ca9acd0f861aafc55024fa2a4b74dcb5f1ff"
+source = "git+https://github.com/atomdrift-project/fletch.git#5ea54ec27e806bea22fe17624a8ef7f0dabc5d91"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
