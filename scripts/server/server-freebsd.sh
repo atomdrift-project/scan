@@ -66,14 +66,9 @@
 #   SCAN_LLM_KEY   LLM bearer token, overriding the file below
 #   LLM_TOKEN_FILE LLM endpoint bearer token, installed whenever the file
 #                  exists; our vLLM requires one    (default: ~/.tok/llm)
-#   CLOUDFLARED    Cloudflare Tunnel: "auto" installs and supervises cloudflared
-#                  only when CF_TUNNEL_TOKEN is passed or a token from an
-#                  earlier deploy is on disk, so a host reached over the LAN
-#                  needs no extra flags. 1 requires it, 0 skips it even with a
-#                  token present.                                (default: auto)
-#   CF_TUNNEL_TOKEN       tunnel token; needed once, then stored
-#   CF_TUNNEL_TOKEN_FILE  where it is stored
-#                                    (default: /usr/local/etc/atomdrift/cloudflared-token)
+#
+# The Cloudflare Tunnel is not part of this deploy: `make deploy-tunnel`
+# (scripts/server/cloudflared-freebsd.sh) installs it once, separately.
 
 set -eu
 
@@ -92,10 +87,10 @@ DEFAULT_BIND=127.0.0.1:49999
 # TOKEN_SRC=.
 #
 # Deliberately no default is passed to atomscan: unset leaves atomscan's own,
-# loopback bind. The deploy still needs the effective address for its preflight,
-# health check, and optional tunnel, so keep that value here in sync with the
-# CLI default above. Set BIND=0.0.0.0:49999 to listen on every interface, and
-# pair it with ALLOW_CIDR.
+# loopback bind. The deploy still needs the effective address for its preflight
+# and health check, so keep that value here in sync with the CLI default above.
+# Set BIND=0.0.0.0:49999 to listen on every interface, and pair it with
+# ALLOW_CIDR.
 BIND="${BIND:-}"
 ALLOW_CIDR="${ALLOW_CIDR-10.0.0.0/8}"
 TOKEN_SRC="${TOKEN_SRC-${HOME}/.tok/scan}"
@@ -123,8 +118,6 @@ LLM="${LLM:-}"
 # vLLM/Ollama endpoint reports, `openrouter/auto` for OpenRouter — and only an
 # operator's explicit pin is passed through.
 LLM_MODEL="${LLM_MODEL:-${SCAN_LLM_MODEL:-}}"
-CLOUDFLARED="${CLOUDFLARED:-auto}"
-CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE:-/usr/local/etc/atomdrift/cloudflared-token}"
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { printf '==> %s\n' "$*"; }
@@ -545,29 +538,6 @@ log "Server healthy: $(http_get "${BASE}/_/health")"
 
 $SUDO service "${SERVICE_NAME}" status || true
 
-# --- Cloudflare Tunnel (optional) -------------------------------------------
-#
-# Started only after the server is up: a connector that advertises an origin
-# which is not yet serving hands Cloudflare a 502 window on every deploy.
-case "$CLOUDFLARED" in
-	0|no|NO) want_tunnel=0 ;;
-	auto)
-		want_tunnel=0
-		if [ -n "${CF_TUNNEL_TOKEN:-}" ] || $SUDO test -s "${CF_TUNNEL_TOKEN_FILE}"; then
-			want_tunnel=1
-		fi
-		;;
-	*) want_tunnel=1 ;;
-esac
-
-if [ "$want_tunnel" -eq 1 ]; then
-	log "Deploying Cloudflare Tunnel"
-	CF_TUNNEL_TOKEN_FILE="${CF_TUNNEL_TOKEN_FILE}" \
-		"$SCRIPT_DIR/cloudflared-freebsd.sh" "${BASE}"
-else
-	log "Skipping Cloudflare Tunnel (CLOUDFLARED=${CLOUDFLARED})"
-fi
-
 # Every route except /_/health wants the bearer token, so fold it into the
 # examples rather than printing a header the reader has to paste in by hand.
 if [ -n "${TOKEN_SRC}" ]; then
@@ -588,6 +558,3 @@ log "         filters. Lookups never analyze — send bytes or a PURL for that."
 log "Analyze: curl -sS ${auth} -H 'Content-Type: application/json' \\"
 log "              -d '{\"purl\":\"pkg:npm/left-pad@1.3.0\"}' ${BASE}/analyze-purl"
 log "         curl -sS ${auth} -F file=@sample.bin ${BASE}/analyze"
-if [ "$want_tunnel" -eq 1 ]; then
-	log "Tunnel:  service scan_tunnel status"
-fi

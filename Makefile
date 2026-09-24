@@ -206,7 +206,7 @@ export LLM
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: pgo-train ensure-llm-token bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-jail uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout rollout-workers rollout-servers rollout-servers-fast rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: pgo-train ensure-llm-token bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-tunnel deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-jail uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout rollout-workers rollout-servers rollout-servers-fast rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -376,19 +376,12 @@ deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-worke
 
 deploy: deploy-server
 
-# Cloudflare Tunnel for the server. "auto" installs and supervises a connector
-# only when CF_TUNNEL_TOKEN is passed or a token from an earlier deploy is on
-# disk, so a server reached over the LAN needs no extra flags; 0 skips it, 1
-# requires it. CF_TUNNEL_TOKEN is read from the environment, never from here,
-# so the token stays out of the repository and out of ps(1) on the deploy host.
-CLOUDFLARED ?= auto
-
 # Long-lived `atomscan serve`, installed natively on this host: a FreeBSD rc.d
 # service (`service scan`) or a systemd unit (`scan.service`). Override BIND=,
 # ALLOW_CIDR=, LLM= / LLM_URL=, LLM_MODEL=, MEMORY_MAX= (Linux), MAX_RSS_GB=
-# (FreeBSD), CLOUDFLARED= — see scripts/server/server-freebsd.sh and
+# (FreeBSD) — see scripts/server/server-freebsd.sh and
 # scripts/server/server-linux.sh. For a jailed FreeBSD server use `make
-# deploy-jail`.
+# deploy-jail`. The Cloudflare Tunnel is separate: `make deploy-tunnel`.
 # Put the LLM key where the deploy scripts look for it, if it is not there
 # already. They copy $(LLM_TOKEN_FILE) into the service account's home; this
 # only covers the case where the operator has the key in the environment and no
@@ -414,7 +407,6 @@ ensure-llm-token:
 		echo "         or pass SCAN_LLM_KEY=<token> to install it."; \
 	fi
 
-deploy-server: export CLOUDFLARED := $(CLOUDFLARED)
 deploy-server: check-hopper-url ensure-llm-token
 	$(SYNC_REPO)
 	@case "$$(uname -s)" in \
@@ -425,6 +417,28 @@ deploy-server: check-hopper-url ensure-llm-token
 		           echo "error: unsupported Linux (systemd required for server deploy)"; exit 1; \
 		         fi ;; \
 		*) echo "error: no deploy-server target for $$(uname -s) (FreeBSD/rc.d or Linux/systemd)"; exit 1 ;; \
+	esac
+
+# Cloudflare Tunnel connector for a host-installed server, kept apart from
+# deploy-server: the tunnel is set up once, while the server is redeployed all
+# the time, and a connector problem (a rotated token, a second connector owned
+# by Cloudflare's own package) should never fail or bounce a server deploy.
+# Idempotent — an active, unchanged connector is left alone. The tunnel and its
+# ingress live in the Cloudflare dashboard; this only installs the connector.
+#
+#   CF_TUNNEL_TOKEN='...' make deploy-tunnel   # first time, or after rotation
+#   make deploy-tunnel                         # reuse the stored token
+#
+# CF_TUNNEL_TOKEN is read from the environment, never from here, so the token
+# stays out of the repository and out of ps(1). The origin follows BIND= (its
+# port), the same as deploy-server. The jailed deploy manages its own connector
+# inside the run jail; see rollout-bastille.sh.
+deploy-tunnel:
+	@bind="$${BIND:-127.0.0.1:49999}"; origin="http://127.0.0.1:$${bind##*:}"; \
+	case "$$(uname -s)" in \
+		FreeBSD) ./scripts/server/cloudflared-freebsd.sh "$$origin" ;; \
+		Linux)   ./scripts/server/cloudflared-linux.sh "$$origin" ;; \
+		*) echo "error: no deploy-tunnel target for $$(uname -s) (FreeBSD/rc.d or Linux/systemd)"; exit 1 ;; \
 	esac
 
 # Refuse to start a worker without a hopper credential. Hopper requires
