@@ -8,11 +8,11 @@
 # --bind address, which server-freebsd.sh keeps on loopback for exactly this
 # reason.
 #
-# First deployment:
-#   CF_TUNNEL_TOKEN='...' make deploy-server
+# Run through `make deploy-tunnel`, never as part of a server deploy:
+#   CF_TUNNEL_TOKEN='...' make deploy-tunnel
 #
-# Later deployments reuse the stored token, so CF_TUNNEL_TOKEN is only needed
-# again when the tunnel is rotated.
+# Later runs reuse the stored token, so CF_TUNNEL_TOKEN is only needed again
+# when the tunnel is rotated. An active, unchanged connector is left alone.
 #
 # The token is written to a root-owned file the connector's own account can
 # read, and handed to cloudflared with --token-file, so it never reaches argv
@@ -59,6 +59,14 @@ elif command -v sudo >/dev/null 2>&1; then
 	SUDO=sudo
 else
 	die "need doas or sudo"
+fi
+
+# One connector per host. net/cloudflared's own rc.d/cloudflared runs one when
+# enabled; a second one here would either duplicate it or, with a stale token,
+# retry beside it indefinitely.
+if [ "$($SUDO sysrc -n cloudflared_enable 2>/dev/null || true)" = "YES" ] \
+	|| $SUDO service cloudflared onestatus >/dev/null 2>&1; then
+	die "rc.d/cloudflared already runs a connector on this host; manage the tunnel there, or disable it before installing $SERVICE_NAME"
 fi
 
 # A token on the command line wins; otherwise an already-installed token keeps
@@ -168,9 +176,6 @@ else
 fi
 
 $SUDO sysrc "${SERVICE_NAME}_enable=YES" >/dev/null
-# The port's own connector would otherwise come up alongside ours at boot, as
-# root, against a config file nothing here maintains.
-$SUDO sysrc cloudflared_enable=NO >/dev/null
 
 $SUDO sh -c "[ -e '$TUNNEL_LOG' ] || install -m 0640 -o $TUNNEL_USER -g wheel /dev/null '$TUNNEL_LOG'"
 
@@ -203,6 +208,10 @@ for _ in $(jot 30 1); do
 done
 if [ "$registered" -ne 1 ]; then
 	$SUDO tail -n 50 "$TUNNEL_LOG" >&2 || true
+	if $SUDO tail -c "+$((LOG_OFFSET + 1))" "$TUNNEL_LOG" 2>/dev/null \
+		| grep -q "Invalid tunnel secret"; then
+		die "the stored Cloudflare Tunnel token was rejected (tunnel rotated?); rerun with CF_TUNNEL_TOKEN set"
+	fi
 	die "cloudflared did not register a tunnel connection within 30 seconds"
 fi
 

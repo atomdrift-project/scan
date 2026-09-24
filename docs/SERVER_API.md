@@ -221,8 +221,15 @@ Cloudflare tunnel or another local proxy provides the ingress; set
 (default `10.0.0.0/8`; set empty to omit), `LLM=` / `LLM_URL=` (`local`,
 `openrouter`, or a base URL), `LLM_MODEL=` (unset leaves atomscan's default:
 the largest served model, or `openrouter/auto` for OpenRouter),
-`WORKERS=`, `ALLOWED_DIRS=`, `IDLE=`, `CLOUDFLARED=` / `CF_TUNNEL_TOKEN=`.
+`WORKERS=`, `ALLOWED_DIRS=`, `IDLE=`.
 `make uninstall-server` tears the service down.
+
+The Cloudflare Tunnel connector is a separate, one-time step rather than part
+of every deploy: `CF_TUNNEL_TOKEN=<token> make deploy-tunnel` installs it
+(`scan-tunnel` under systemd, `scan_tunnel` under rc.d), and later runs reuse
+the stored token and leave an active, unchanged connector alone. Rerun it with
+a new `CF_TUNNEL_TOKEN=` after rotating the tunnel. It refuses to install
+beside a connector Cloudflare's own `cloudflared` service already runs.
 
 Memory is capped differently per platform, because FreeBSD has no cgroup to
 fall back on: Linux passes `MEMORY_MAX=` to systemd's `MemoryMax=` and turns
@@ -256,9 +263,10 @@ the command line when you mean them.
 The jailed deploy (`make deploy-jail`) is the exception: it keeps `--bind
 0.0.0.0:49999` with `--allow-cidr 10.0.0.0/8` — inside a jail that is the
 jail's own address, and it is reached over the network rather than through a
-tunnel — and always requires a token. `HOPPER=`, `HOPPER_TOKEN_FILE=`, `IDLE=`
-and the `CLOUDFLARED=` knobs apply there too; the other overrides above are
-for the host installs.
+tunnel — and always requires a token. `HOPPER=`, `HOPPER_TOKEN_FILE=` and
+`IDLE=` apply there too, and the jail keeps its own tunnel knobs
+(`CLOUDFLARED=` / `CF_TUNNEL_TOKEN=`), since its connector lives inside the run
+jail; the other overrides above are for the host installs.
 
 On FreeBSD the service logs to `/var/log/scan.log` (`service scan status`,
 `tail -f /var/log/scan.log`) rather than to journald.

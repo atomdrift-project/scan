@@ -8,11 +8,11 @@
 # --bind address, which server-linux.sh keeps on loopback for exactly this
 # reason.
 #
-# First deployment:
-#   CF_TUNNEL_TOKEN='...' make deploy-server
+# Run through `make deploy-tunnel`, never as part of a server deploy:
+#   CF_TUNNEL_TOKEN='...' make deploy-tunnel
 #
-# Later deployments reuse the stored token, so CF_TUNNEL_TOKEN is only needed
-# again when the tunnel is rotated.
+# Later runs reuse the stored token, so CF_TUNNEL_TOKEN is only needed again
+# when the tunnel is rotated. An active, unchanged connector is left alone.
 #
 # The token is written to a root-only file and handed to the connector through
 # a systemd credential, so it never reaches argv, the unit file, or the
@@ -49,6 +49,13 @@ command -v systemctl >/dev/null 2>&1 || die "systemctl not found (systemd requir
 if   command -v doas >/dev/null 2>&1; then SUDO=doas
 elif command -v sudo >/dev/null 2>&1; then SUDO=sudo
 else die "need doas or sudo"
+fi
+
+# One connector per host. Cloudflare's own package (or `cloudflared service
+# install`) runs one as cloudflared.service; a second one here would either
+# duplicate it or, with a stale token, crash-loop beside it indefinitely.
+if $SUDO systemctl is-active --quiet cloudflared.service; then
+    die "cloudflared.service already runs a connector on this host; manage the tunnel there, or disable it before installing ${SERVICE_NAME}"
 fi
 
 # A token on the command line wins; otherwise an already-installed token keeps
@@ -222,6 +229,10 @@ fi
 if ! $SUDO systemctl restart "${SERVICE_NAME}.service"; then
     $SUDO systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
     $SUDO journalctl -u "${SERVICE_NAME}" -n 50 --no-pager || true
+    if $SUDO journalctl -u "${SERVICE_NAME}" -n 50 --no-pager 2>/dev/null \
+        | grep -q "Invalid tunnel secret"; then
+        die "${SERVICE_NAME} failed to start: the stored token was rejected (tunnel rotated?); rerun with CF_TUNNEL_TOKEN set"
+    fi
     die "${SERVICE_NAME} failed to start"
 fi
 
