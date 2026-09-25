@@ -400,6 +400,11 @@ ${LLM_MODEL_LINE}
 # at install time to re-enable in-process throttling.
 MemoryMax=${MEMORY_MAX}
 TasksMax=4096
+# systemd's default soft open-file limit is 1024, a hidden ceiling on how many
+# analyses can be in flight: each holds several descriptors. Past it every
+# open() fails (see runtime::raise_open_file_limit, which atomscan also applies
+# itself at startup); this makes the ceiling explicit.
+LimitNOFILE=1048576
 # A killed analysis subprocess (rizin OOM, etc.) must not bring the worker down.
 OOMPolicy=continue
 

@@ -66,14 +66,58 @@ fn propagate_follow_aliases() {
     }
 }
 
+/// Raise the soft open-file limit as far as the hard limit allows.
+///
+/// systemd starts every service at a soft `RLIMIT_NOFILE` of 1024 (the hard
+/// limit is 524288), and unlike Go, Rust's runtime never lifts it. A worker
+/// holds several descriptors per in-flight analysis — the sample, its extracted
+/// members, rizin's pipes — so 1024 is a ceiling on concurrency that nothing
+/// reports. uruk-hai's idle worker sat pinned at exactly 1024 with ~1,170
+/// analyses in flight (2026-09-25), logging ~680 EMFILE errors a minute, and
+/// every symptom was somewhere else: each file the process tried to open
+/// failed, so `traits_repo::version()` read no sidecar (every report went out
+/// without `rev`, hopper could not skip re-posts, and the dashboard showed no
+/// traits), `/proc/self` was unreadable (no RSS), and `TempDir`'s drop, which
+/// ignores errors, could not remove what it extracted — 66k leaked
+/// `cleave-archive-*` dirs exhausted the tmpfs's inodes and turned every new
+/// extraction into "No space left on device".
+///
+/// Tries the hard limit first; where the kernel refuses it (Linux caps at
+/// `fs.nr_open` even when the hard limit is unlimited, macOS at
+/// `kern.maxfilesperproc`) it falls back to smaller ceilings. Never lowers the
+/// limit. Children inherit it, which is what covers the server's idle worker.
+fn raise_open_file_limit() {
+    #[cfg(unix)]
+    // SAFETY: getrlimit/setrlimit read and write only the struct passed in.
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        for target in [lim.rlim_max, 1 << 20, 10_240] {
+            if target <= lim.rlim_cur || target > lim.rlim_max {
+                continue;
+            }
+            let raised = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: lim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                return;
+            }
+        }
+    }
+}
+
 /// Establish the process-wide state the analysis stack expects.
 ///
 /// Blocks `SIGUSR1` so every later thread inherits the blocked mask and the
 /// dedicated handler can consume it by `sigwait` — without this the default
 /// disposition kills the process on a thread dump. Permits a forked debugger
 /// to attach under `yama.ptrace_scope=1`, which is what makes a live stack
-/// obtainable from a wedged worker. Then settles the environment the
-/// downstream crates read.
+/// obtainable from a wedged worker. Lifts the open-file limit (see
+/// [`raise_open_file_limit`]). Then settles the environment the downstream
+/// crates read.
 ///
 /// # Safety
 ///
@@ -100,6 +144,7 @@ pub unsafe fn install() {
         libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
     }
 
+    raise_open_file_limit();
     propagate_no_analysis_cache();
     propagate_follow_aliases();
 }
@@ -112,4 +157,35 @@ pub unsafe fn install() {
 pub fn install_diagnostics() {
     crate::crash_dump::install();
     crate::thread_dump::install();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::raise_open_file_limit;
+
+    fn nofile() -> (libc::rlim_t, libc::rlim_t) {
+        // SAFETY: getrlimit writes only the struct passed in.
+        unsafe {
+            let mut lim: libc::rlimit = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim), 0);
+            (lim.rlim_cur, lim.rlim_max)
+        }
+    }
+
+    #[test]
+    fn open_file_limit_is_raised_never_lowered() {
+        let (before, hard) = nofile();
+        raise_open_file_limit();
+        let (after, hard_after) = nofile();
+        assert!(after >= before, "soft limit lowered: {before} -> {after}");
+        assert_eq!(hard, hard_after, "the hard limit is not ours to change");
+        // Where there was headroom, some of it must have been taken: staying at
+        // a low soft limit is exactly the failure this exists to prevent.
+        if hard > before && before < 10_240 {
+            assert!(
+                after > before,
+                "soft limit left at {before} under a hard limit of {hard}"
+            );
+        }
+    }
 }

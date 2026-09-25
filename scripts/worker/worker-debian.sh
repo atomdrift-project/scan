@@ -142,6 +142,9 @@ Group=scan
 ExecStart=/usr/local/bin/atomscan $worker_args
 Restart=on-failure
 RestartSec=5
+# systemd's default soft open-file limit (1024) caps in-flight analyses; see
+# scripts/worker/worker-linux.sh.
+LimitNOFILE=1048576
 StandardOutput=append:/var/log/scan-worker.log
 StandardError=append:/var/log/scan-worker.log
 
