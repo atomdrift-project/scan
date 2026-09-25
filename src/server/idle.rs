@@ -106,13 +106,30 @@ impl Drop for BusyToken {
 /// `hopper` is the primary address only. Claiming is a worker route and a
 /// replica answers those with 403, so the comma list the server takes for
 /// lookups and renewals cannot be passed through here.
-fn worker_command(hopper: &str, name: &str, cache_dir: &PathBuf) -> std::io::Result<Command> {
+///
+/// `traits_dir` is the server's own `--traits-dir`, and it has to be passed
+/// explicitly: the server applies it as an in-process override
+/// (`cleave::traits_repo::set_override_dir`), not an environment variable, so a
+/// child inherits nothing. Without it the worker re-resolves traits on its own
+/// and reaches the same tree only if its working directory happens to hold a
+/// `traits/` — the version it reports on every result then depends on that
+/// accident rather than on the deploy.
+fn worker_command(
+    hopper: &str,
+    name: &str,
+    cache_dir: &PathBuf,
+    traits_dir: Option<&std::path::Path>,
+) -> std::io::Result<Command> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("worker")
         .arg("--url")
         .arg(hopper)
         .arg("--name")
-        .arg(name)
+        .arg(name);
+    if let Some(dir) = traits_dir {
+        cmd.arg("--traits-dir").arg(dir);
+    }
+    cmd
         // The server owns updating. Two processes refreshing the same traits
         // checkout and models directory would race each other over a git tree,
         // and the worker's copy is the server's copy. The embedded worker set
@@ -133,8 +150,8 @@ fn worker_command(hopper: &str, name: &str, cache_dir: &PathBuf) -> std::io::Res
         // shared, which is worth having because the server fetches the same
         // artifacts the worker has already pulled.
         .env("XDG_CACHE_HOME", cache_dir)
-        // Everything else — the hopper token, the LLM endpoint, the traits
-        // directory, the models directory — is inherited.
+        // Everything else — the hopper token, the LLM endpoint, the models
+        // directory, the open-file limit — is inherited.
         .stdin(std::process::Stdio::null());
 
     #[cfg(target_os = "linux")]
@@ -230,7 +247,9 @@ impl Worker {
         if let Ok(mut guard) = self.current.write() {
             *guard = None;
         }
-        let spawned = worker_command(&self.hopper, &self.name, &self.cache).and_then(Idle::spawn);
+        let traits_dir = cleave::traits_repo::override_dir();
+        let spawned = worker_command(&self.hopper, &self.name, &self.cache, traits_dir.as_deref())
+            .and_then(Idle::spawn);
         let started = match spawned {
             Ok(worker) => {
                 tracing::info!(pid = worker.pid(), worker = %self.name, "idle worker started");
@@ -376,7 +395,8 @@ mod tests {
     #[test]
     fn the_command_passes_only_what_must_differ() {
         let dir = PathBuf::from("/tmp/scan-idle-test");
-        let cmd = worker_command("http://hopper.example", "host-idle", &dir).expect("command");
+        let cmd =
+            worker_command("http://hopper.example", "host-idle", &dir, None).expect("command");
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -400,5 +420,29 @@ mod tests {
             .and_then(|(_, v)| v)
             .expect("the worker must not share the server's analysis cache");
         assert_eq!(cache, dir.as_os_str());
+    }
+
+    /// The server's `--traits-dir` is an in-process override, invisible to a
+    /// child, so it must be on the command line. Measured on uruk-hai
+    /// (2026-09-25): the server ran `--traits-dir …/traits` and its idle worker
+    /// was spawned without it.
+    #[test]
+    fn the_command_forwards_the_servers_traits_dir() {
+        let dir = PathBuf::from("/tmp/scan-idle-test");
+        let traits = PathBuf::from("/var/lib/atomdrift/scan/traits");
+        let cmd = worker_command("http://hopper.example", "host-idle", &dir, Some(&traits))
+            .expect("command");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let at = args
+            .iter()
+            .position(|a| a == "--traits-dir")
+            .expect("the traits dir must be forwarded");
+        assert_eq!(
+            args.get(at + 1).map(String::as_str),
+            Some("/var/lib/atomdrift/scan/traits")
+        );
     }
 }

@@ -44,7 +44,8 @@
 #   HOPPER_TOKEN_FILE  hopper API token, installed whenever the file exists
 #                      (HOPPER need not be set)               (default: ~/.tok/hopper)
 #   MAX_RSS_GB  pause threshold (--max-rss-gb)                   (default: -1 = off; systemd MemoryMax handles OOM)
-#   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, 80%, infinity)     (default: 80%)
+#   MEMORY_MAX  systemd MemoryMax= (e.g. 16G, 80%, infinity)     (default: 80% of RAM, capped at 128G)
+#   MEMORY_LOW  systemd MemoryLow=                               (default: half the MemoryMax default)
 #   LLM / LLM_URL  OpenAI-compatible LLM endpoint or named target; comma-separate
 #                  several to fail over in order (SCAN_LLM)
 #                                                                (default: the Makefile's LLM,
@@ -96,7 +97,21 @@ HOPPER="${HOPPER:-}"
 # under systemd, MemoryMax= is the enforcement, and in-process throttling would
 # only turn a leak into a 503 loop instead of a restart.
 MAX_RSS_GB="${MAX_RSS_GB:--1}"
-MEMORY_MAX="${MEMORY_MAX:-80%}"
+# Default: 80% of RAM, but never more than 128G. A percentage alone scaled with
+# the host and handed uruk-hai (250G) a 215G ceiling, which the idle worker
+# filled — 2,368 trips of MemoryMax in a day (2026-09-25), each a reclaim stall
+# for the server beside it — while nothing scan does needs more than 128G.
+# MemoryLow then follows the cap (half of it) rather than RAM: 50% of 250G was
+# 125G, i.e. almost the entire allowance shielded from host-wide reclaim.
+# An explicit MEMORY_MAX / MEMORY_LOW still wins.
+MEMORY_MAX_CAP_MB=$((128 * 1024))
+if [ -z "${MEMORY_MAX:-}" ]; then
+    mem_total_mb=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+    mem_max_mb=$((mem_total_mb * 80 / 100))
+    [ "$mem_max_mb" -gt "$MEMORY_MAX_CAP_MB" ] && mem_max_mb=$MEMORY_MAX_CAP_MB
+    MEMORY_MAX="${mem_max_mb}M"
+    MEMORY_LOW="${MEMORY_LOW:-$((mem_max_mb / 2))M}"
+fi
 # Memory the kernel will not reclaim from the server under host-wide pressure.
 # Best-effort (MemoryLow, not MemoryMin) so it cannot deadlock the host.
 MEMORY_LOW="${MEMORY_LOW:-50%}"
@@ -510,6 +525,22 @@ else
 	log "systemd ${SYSTEMD_MAJOR:-unknown} has no ProtectControlGroups=private; using 'no' so Delegate= can work"
 fi
 
+# Temp space. PrivateTmp=true is private in name only: the directory is a
+# subdirectory of the host's /tmp, so it draws on the host tmpfs's inode and
+# size budget. On uruk-hai (2026-09-25) scan's leaked extraction dirs used all
+# 1,048,576 of the host /tmp's inodes, and promoter — a different service —
+# crash-looped 272 times on "create scratch dir: no space left on device".
+# A tmpfs instance of scan's own confines any such leak to scan, is charged
+# to this unit's MemoryMax, and is discarded on every restart. systemd 256
+# spells that PrivateTmp=disconnected; older systemd gets the same from
+# TemporaryFileSystem= (with /var/tmp too, which ProtectSystem=strict would
+# otherwise leave read-only).
+if [ -n "${SYSTEMD_MAJOR}" ] && [ "${SYSTEMD_MAJOR}" -ge 256 ]; then
+	TMP_ISOLATION="PrivateTmp=disconnected"
+else
+	TMP_ISOLATION="TemporaryFileSystem=/tmp:mode=1777,nosuid,nodev /var/tmp:mode=1777,nosuid,nodev"
+fi
+
 cat >"$TMP_UNIT" <<EOF
 [Unit]
 Description=Atomdrift Scan HTTP classification server
@@ -562,6 +593,13 @@ MemoryLow=${MEMORY_LOW}
 # Two processes share this now — the server and its companion worker — and each
 # runs a rayon pool sized to the host's cores. 4096 was comfortable for one.
 TasksMax=8192
+# systemd's default soft open-file limit is 1024. The companion worker holds
+# several descriptors per in-flight analysis, and on a large host it pinned at
+# exactly 1024 (uruk-hai, 2026-09-25): every open() failed, so reports went out
+# with no traits version, RSS went unreported, and leaked extraction dirs ran
+# /tmp out of inodes. atomscan also lifts its own soft limit at startup
+# (runtime::raise_open_file_limit); this makes the ceiling explicit here.
+LimitNOFILE=1048576
 
 # OOM priority. Under host-wide memory pressure the kernel picks its victim by
 # oom_score_adj; -900 puts the server behind almost everything else but still
@@ -592,7 +630,7 @@ OOMPolicy=continue
 # Filesystem isolation.
 ProtectSystem=strict
 ProtectHome=true
-PrivateTmp=true
+${TMP_ISOLATION}
 PrivateDevices=true
 PrivateMounts=true
 ProtectKernelTunables=true
