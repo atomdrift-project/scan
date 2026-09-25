@@ -13,6 +13,17 @@ elif command -v sudo >/dev/null 2>&1; then SUDO=sudo
 else echo "error: need doas or sudo" >&2; exit 1
 fi
 
+# The idle worker's unit first: it is PartOf= the server, but removing it
+# explicitly also covers a host where only it is left.
+IDLE_UNIT_FILE=/etc/systemd/system/${SERVICE_NAME}-idle.service
+if command -v systemctl >/dev/null 2>&1 && [ -f "$IDLE_UNIT_FILE" ]; then
+    log "Stopping and disabling ${SERVICE_NAME}-idle"
+    $SUDO systemctl disable --now "${SERVICE_NAME}-idle.service" 2>/dev/null || true
+    log "Removing ${IDLE_UNIT_FILE}"
+    $SUDO rm -f "$IDLE_UNIT_FILE"
+    $SUDO systemctl daemon-reload
+fi
+
 if command -v systemctl >/dev/null 2>&1 && [ -f "$UNIT_FILE" ]; then
     log "Stopping and disabling ${SERVICE_NAME}"
     $SUDO systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
