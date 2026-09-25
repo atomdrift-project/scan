@@ -31,11 +31,11 @@
 #   ALLOW_CIDR  extra CIDR allow-list (--allow-cidr); empty skips the flag
 #                                                                (default: 10.0.0.0/8)
 #   WORKERS     concurrency (--workers)                          (default: server auto)
-#   IDLE        analysis slots the embedded idle worker may spend on hopper
-#               queue work (--idle-worker-slots); 0 disables background
-#               claiming entirely. Capped at half of WORKERS by the server, and
-#               inert without HOPPER.
-#                                                                (default: server auto = half of WORKERS)
+#   IDLE        0 disables the idle worker (background hopper queue work);
+#               any other value, or unset, installs it as its own unit,
+#               scan-idle.service, at idle CPU/IO priority. Inert without HOPPER.
+#                                                                (default: enabled)
+#   IDLE_MEMORY_MAX  MemoryMax= of scan-idle.service              (default: half the MemoryMax default)
 #   ALLOWED_DIRS  comma-separated /analyze-path roots            (default: unset)
 #   HOPPER      hopper base URL, or several comma-separated in preference
 #               order: put the replica first and the primary behind it, and a
@@ -105,13 +105,29 @@ MAX_RSS_GB="${MAX_RSS_GB:--1}"
 # 125G, i.e. almost the entire allowance shielded from host-wide reclaim.
 # An explicit MEMORY_MAX / MEMORY_LOW still wins.
 MEMORY_MAX_CAP_MB=$((128 * 1024))
+mem_total_mb=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+mem_max_mb=$((mem_total_mb * 80 / 100))
+[ "$mem_max_mb" -gt "$MEMORY_MAX_CAP_MB" ] && mem_max_mb=$MEMORY_MAX_CAP_MB
 if [ -z "${MEMORY_MAX:-}" ]; then
-    mem_total_mb=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
-    mem_max_mb=$((mem_total_mb * 80 / 100))
-    [ "$mem_max_mb" -gt "$MEMORY_MAX_CAP_MB" ] && mem_max_mb=$MEMORY_MAX_CAP_MB
     MEMORY_MAX="${mem_max_mb}M"
     MEMORY_LOW="${MEMORY_LOW:-$((mem_max_mb / 2))M}"
 fi
+# The idle worker is background work in its own unit (see scan-idle.service
+# below), so it gets its own, smaller ceiling rather than a share the server
+# has to compete for: half of the server's. "The server's" is the one systemd
+# actually applies, drop-ins included, when that is tighter — galadriel pins
+# scan.service to 64G with a host drop-in, and the worker used to live inside
+# that, so it must not get more than half of it now that it lives outside.
+idle_basis_mb=$mem_max_mb
+effective_max=$(systemctl show "${SERVICE_NAME:-scan}.service" -p MemoryMax --value 2>/dev/null || true)
+case "$effective_max" in
+    ''|infinity|*[!0-9]*) ;;
+    *) effective_mb=$((effective_max / 1048576))
+       if [ "$effective_mb" -gt 0 ] && [ "$effective_mb" -lt "$idle_basis_mb" ]; then
+           idle_basis_mb=$effective_mb
+       fi ;;
+esac
+IDLE_MEMORY_MAX="${IDLE_MEMORY_MAX:-$((idle_basis_mb / 2))M}"
 # Memory the kernel will not reclaim from the server under host-wide pressure.
 # Best-effort (MemoryLow, not MemoryMin) so it cannot deadlock the host.
 MEMORY_LOW="${MEMORY_LOW:-50%}"
@@ -488,9 +504,20 @@ if [ -n "${ALLOWED_DIRS}" ]; then
 fi
 if [ -n "${HOPPER}" ]; then
     exec_args="${exec_args} --hopper ${HOPPER}"
+    # The idle worker runs as scan-idle.service, never as the server's child.
+    # As a child it lived in this unit's cgroup and inherited its CPUWeight=,
+    # IOWeight= and Nice= — the server's, set so it wins every contest on the
+    # host — and the kernel shares CPU between cgroups by weight whatever the
+    # processes inside are niced to. So background work ran at the highest
+    # priority on the box: ~106 of uruk-hai's 128 cores, promoter-scan stalled
+    # 31% of the time, and on galadriel an even split with postgres's replica
+    # apply (2026-09-25). A unit of its own is the only way to rank it below
+    # everything while the server stays above everything.
+    exec_args="${exec_args} --idle-worker-slots 0"
 fi
-if [ -n "${IDLE}" ]; then
-    exec_args="${exec_args} --idle-worker-slots ${IDLE}"
+IDLE_ENABLED=0
+if [ -n "${HOPPER}" ] && [ "${IDLE}" != "0" ]; then
+    IDLE_ENABLED=1
 fi
 # Pass the path, never the token. atomscan refuses to start if the file is
 # missing or empty, so a lost token fails loudly instead of opening the API.
@@ -506,23 +533,20 @@ if [ -n "$LLM_MODEL" ]; then
     LLM_MODEL_LINE="Environment=SCAN_LLM_MODEL=${LLM_MODEL}"
 fi
 
-# ProtectControlGroups= and Delegate=yes pull in opposite directions: the first
-# remounts /sys/fs/cgroup read-only inside the unit's namespace, and the second
-# exists so the service can write its own subtree. The server needs that write
-# to place its companion worker in a cgroup it can freeze, and without it logs
-# "Read-only file system (os error 30)" every ten seconds and runs with no
-# background work (measured on uruk-hai, 2026-09-15).
-#
-# systemd 256 added `private`, which resolves it properly: a private cgroup
-# namespace with the unit's own subtree writable, keeping the protection for
-# everything else. Older systemd has no such option, so it trades the
-# protection for the delegation rather than silently losing the worker.
 SYSTEMD_MAJOR="$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | tr -cd '0-9')"
-if [ -n "${SYSTEMD_MAJOR}" ] && [ "${SYSTEMD_MAJOR}" -ge 256 ]; then
-	PROTECT_CGROUPS=private
+
+# The server used to need Delegate=yes and a writable cgroup tree to freeze its
+# companion worker. That worker is scan-idle.service now, so the server's
+# cgroup view goes back to read-only everywhere (it only reads its own limits).
+PROTECT_CGROUPS=yes
+
+# CPUWeight=idle (cgroup cpu.idle): CPU only when nothing unmarked in the unit's
+# cgroup or its siblings — every other unit in system.slice — wants it. Older
+# systemd has no "idle" and gets the minimum weight instead.
+if [ -n "${SYSTEMD_MAJOR}" ] && [ "${SYSTEMD_MAJOR}" -ge 252 ]; then
+	IDLE_CPU_WEIGHT=idle
 else
-	PROTECT_CGROUPS=no
-	log "systemd ${SYSTEMD_MAJOR:-unknown} has no ProtectControlGroups=private; using 'no' so Delegate= can work"
+	IDLE_CPU_WEIGHT=1
 fi
 
 # Temp space. PrivateTmp=true is private in name only: the directory is a
@@ -575,26 +599,13 @@ ${LLM_MODEL_LINE}
 # throttling (--max-rss-gb=-1) and let MemoryMax do the enforcement: a
 # stuck/leaking server is killed and Restart=always brings it back, instead
 # of looping on 503-from-RSS. Override MAX_RSS_GB at install time to
-# re-enable in-process throttling.
-# Delegation. The server runs a companion `atomscan worker` in its own process
-# to fill spare capacity, and freezes it for the whole of every request so an
-# arriving analysis gets the entire machine. The freeze is a cgroup-v2 control
-# (cgroup.freeze / cgroup.kill), which acts on membership and so cannot be
-# escaped by a child that calls setsid — rizin and friends included. Delegation
-# is what lets this unit create and write that subtree as ${SERVICE_USER}.
-#
-# Without it the server logs that it could not place the worker under a control
-# group it can freeze, and runs on with no background work rather than running
-# work it cannot stop.
-Delegate=yes
-
+# re-enable in-process throttling. The idle worker is not in this cgroup; it has
+# its own unit and ceiling (scan-idle.service).
 MemoryMax=${MEMORY_MAX}
 MemoryLow=${MEMORY_LOW}
-# Two processes share this now — the server and its companion worker — and each
-# runs a rayon pool sized to the host's cores. 4096 was comfortable for one.
 TasksMax=8192
-# systemd's default soft open-file limit is 1024. The companion worker holds
-# several descriptors per in-flight analysis, and on a large host it pinned at
+# systemd's default soft open-file limit is 1024. A worker holds several
+# descriptors per in-flight analysis, and on a large host it pinned at
 # exactly 1024 (uruk-hai, 2026-09-25): every open() failed, so reports went out
 # with no traits version, RSS went unreported, and leaked extraction dirs ran
 # /tmp out of inodes. atomscan also lifts its own soft limit at startup
@@ -678,24 +689,152 @@ else
     unit_changed=1
 fi
 
+# --- Idle worker unit -------------------------------------------------------
+#
+# Background hopper queue work, ranked below everything else on the host. It
+# is the same `atomscan worker` the server used to spawn as its child, with
+# the same identity: the `<hostname>-idle` name is how hopper's roster — and
+# so `make rollout` — tells a server host from a worker host.
+
+IDLE_SERVICE=${SERVICE_NAME}-idle
+IDLE_UNIT_FILE=/etc/systemd/system/${IDLE_SERVICE}.service
+idle_unit_changed=0
+if [ "$IDLE_ENABLED" -eq 1 ]; then
+    IDLE_NAME="$(hostname)-idle"
+    # Claiming is a primary-only route (a replica answers it 403), so the
+    # worker gets the last address in HOPPER, as the server's child did.
+    IDLE_HOPPER=$(printf '%s' "${HOPPER}" | awk -F, '{ gsub(/[[:space:]]/, "", $NF); print $NF }')
+    TMP_IDLE_UNIT=$(mktemp -t scan-idle.service.XXXXXX)
+    cat >"$TMP_IDLE_UNIT" <<EOF
+[Unit]
+Description=Atomdrift Scan idle worker (hopper queue work at idle priority)
+Documentation=https://github.com/atomdrift-project/scan
+After=network-online.target ${SERVICE_NAME}.service
+Wants=network-online.target
+# Restarted and stopped along with the server. The server owns traits and model
+# updates (this worker runs --no-update), so its restart is when new rules land.
+PartOf=${SERVICE_NAME}.service
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+ReadWritePaths=${STATE_HOME}
+WorkingDirectory=${STATE_HOME}
+# --nice 0: systemd's Nice= below stands; the worker's own default would try to
+# lower it again and fail. --traits-dir is the server's tree, the one its
+# startup refresh keeps current.
+ExecStart=${BIN_PATH} worker --url ${IDLE_HOPPER} --name ${IDLE_NAME} --traits-dir ${STATE_HOME}/traits --no-update --no-validate --max-rss-gb -1 --nice 0
+Restart=always
+RestartSec=10s
+TimeoutStopSec=30s
+
+Environment=HOME=${STATE_HOME}
+# Its own cache root: cleave's analysis cache is single-writer SQLite, and the
+# server's request path must never wait on this worker's write lock.
+Environment=XDG_CACHE_HOME=${STATE_HOME}/.cache/atomdrift/scan-idle
+Environment=SCAN_LLM=${LLM}
+${LLM_MODEL_LINE}
+
+# Priority: the bottom of the host, CPU and disk alike, so it only ever spends
+# capacity nothing else wants — the server, postgres, promoter included.
+CPUWeight=${IDLE_CPU_WEIGHT}
+IOWeight=1
+IOSchedulingClass=idle
+Nice=19
+MemoryMax=${IDLE_MEMORY_MAX}
+TasksMax=8192
+LimitNOFILE=1048576
+# Under host-wide memory pressure, this goes before the server (-900) does.
+OOMScoreAdjust=500
+OOMPolicy=continue
+
+ProtectSystem=strict
+ProtectHome=true
+${TMP_ISOLATION}
+PrivateDevices=true
+PrivateMounts=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=yes
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+UMask=0077
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if $SUDO cmp -s "$TMP_IDLE_UNIT" "$IDLE_UNIT_FILE" 2>/dev/null; then
+        log "Idle worker unit unchanged"
+    else
+        log "Writing ${IDLE_UNIT_FILE}"
+        $SUDO install -m 0644 -o root -g root "$TMP_IDLE_UNIT" "$IDLE_UNIT_FILE"
+        idle_unit_changed=1
+    fi
+    rm -f "$TMP_IDLE_UNIT"
+elif [ -f "$IDLE_UNIT_FILE" ]; then
+    log "Idle worker disabled (IDLE=0 or no HOPPER); removing ${IDLE_UNIT_FILE}"
+    $SUDO systemctl disable --now "${IDLE_SERVICE}.service" >/dev/null 2>&1 || true
+    $SUDO rm -f "$IDLE_UNIT_FILE"
+    idle_unit_changed=1
+fi
+
 # --- Activate ---------------------------------------------------------------
 
-[ "$unit_changed" -eq 1 ] && $SUDO systemctl daemon-reload
+if [ "$unit_changed" -eq 1 ] || [ "$idle_unit_changed" -eq 1 ]; then
+    $SUDO systemctl daemon-reload
+fi
 
 # enable --now is idempotent and starts the service on first deploy.
 $SUDO systemctl enable --now "${SERVICE_NAME}.service" >/dev/null
+# Enabled here, started only after the server below: on the deploy that
+# introduces this unit, the running server still has the old embedded worker,
+# and two `<hostname>-idle` workers must never claim side by side.
+[ "$IDLE_ENABLED" -eq 1 ] && $SUDO systemctl enable "${IDLE_SERVICE}.service" >/dev/null
 
+server_restarted=0
 if [ "$binary_changed" -eq 1 ] || [ "$unit_changed" -eq 1 ] || [ "$token_changed" -eq 1 ]; then
     log "Restarting ${SERVICE_NAME}"
     if ! $SUDO systemctl restart "${SERVICE_NAME}.service"; then
         $SUDO systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
         die "service failed to start; see: journalctl -u ${SERVICE_NAME} -n 50"
     fi
+    server_restarted=1
 else
     log "No changes; leaving service running"
 fi
 
+if [ "$IDLE_ENABLED" -eq 1 ]; then
+    # A server restart already restarted a running worker (PartOf=); an
+    # unchanged server with a changed worker unit restarts just the worker;
+    # otherwise `start` is a no-op for one already running.
+    if [ "$server_restarted" -eq 0 ] && [ "$idle_unit_changed" -eq 1 ]; then
+        log "Restarting ${IDLE_SERVICE}"
+        $SUDO systemctl restart "${IDLE_SERVICE}.service"
+    else
+        $SUDO systemctl start "${IDLE_SERVICE}.service"
+    fi
+fi
+
 $SUDO systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+if [ "$IDLE_ENABLED" -eq 1 ]; then
+    $SUDO systemctl --no-pager --full status "${IDLE_SERVICE}.service" || true
+fi
 
 BASE="http://127.0.0.1:${EFFECTIVE_BIND##*:}"
 # Every route except /_/health wants the bearer token, so fold it into the
