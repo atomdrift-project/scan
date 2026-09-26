@@ -1775,17 +1775,7 @@ fn run_scan_paths(
     // any of those workers is the first to hit `yara_engine()`, the init's
     // internal par_iter deadlocks against its peers parked on the OnceLock.
     // Prefetching from main (non-rayon) fills the OnceLock safely.
-    //
-    // The regex prewarm is for first-file latency on a long-lived process;
-    // a directory scan amortizes lazy compilation over thousands of members
-    // and only builds the patterns its file types reach. Skipping it there
-    // took a 12.5k-member module zip from 4.6 GB to 3.1 GB peak at equal
-    // wall. Explicit file lists keep it: a single small file otherwise spends
-    // most of its wall in first-use compiles.
-    // `paths` may already be the expanded file list of a directory the
-    // operator named, so a directory is not the only bulk signal.
-    let bulk = paths.len() >= 8 || paths.iter().any(|p| p.is_dir());
-    cleave::prefetch_shared_resources_with(true, !bulk);
+    scan::engine::prefetch_cleave_resources();
 
     // Explicit files are analyzed as one parallel batch and each directory is
     // streamed; run_paths shares one model load and verdict tally across all.

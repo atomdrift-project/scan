@@ -43,7 +43,7 @@ fn sha256_file(path: &std::path::Path) -> Result<String> {
 pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // Warm cleave's YARA engine + capability mapper off the rayon pool before
     // any scan fires rayon work. See `run_scan_paths` for why this matters.
-    cleave::prefetch_shared_resources(true);
+    crate::engine::prefetch_cleave_resources();
 
     // Tune rizin for live-process scanning. Unlike a filesystem scan (where we
     // want every architecture and tolerate minutes of deep analysis), `ps` is
@@ -175,7 +175,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 
     if is_terminal {
         // Detection rules already resident in memory — no extra loading.
-        // `prefetch_shared_resources` above has fully built the YARA engine and
+        // `prefetch_cleave_resources` above has fully built the YARA engine and
         // capability mapper; the bloom signatures were loaded with the config.
         output::print_banner(crate::engine::detection_counts(config));
     }
