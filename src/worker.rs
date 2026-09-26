@@ -2023,7 +2023,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // — otherwise the prefetch warms an engine nobody uses and the first real
     // analysis triggers a cold compile on a rayon worker, which deadlocks the
     // pool. See cleave::shared_resources::yara_engine for the contract.
-    cleave::prefetch_shared_resources(true);
+    crate::engine::prefetch_cleave_resources();
     // Then build every YARA bucket on a few background threads: buckets load
     // lazily per file type, and without this the first archive that touches
     // a PE member pays the ~3 s `pe` bucket JIT inside its analysis.
@@ -2514,7 +2514,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
                     let (regex_scratch_bytes, regex_scratch_budget_bytes) =
                         cleave::regex_scratch_usage();
                     let [regex_str, regex_raw] = cleave::regex_store_usage();
-                    cleave::persist_regex_warm_memo();
                     tracing::info!(
                         rss_mb = cleave::memory_tracker::current_rss().map(|rss| rss / 1024 / 1024),
                         jemalloc_allocated_mb = heap.map(|stats| stats.0 / (1024 * 1024)),
@@ -3092,7 +3091,6 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
     // hopper re-leases anything left running. `--exit-if-empty` waits unbounded.
     if exit_if_empty {
         while workers.join_next().await.is_some() {}
-        cleave::persist_regex_warm_memo();
         tracing::info!("all in-flight jobs finished (batch drain), exiting");
     } else {
         // Slots stop claiming, then every detached tail finishes (or the

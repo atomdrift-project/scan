@@ -3049,7 +3049,7 @@ pub(crate) fn detection_counts(config: &ScanConfig) -> DetectionCounts {
 /// Returns an error if the target path does not exist, model artifacts cannot
 /// be loaded, or `cleave` analysis fails for the overall scan operation.
 pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
-    prefetch_cleave_resources(path.is_dir());
+    prefetch_cleave_resources();
 
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
 
@@ -4294,7 +4294,7 @@ pub fn run_paths(
     config: &ScanConfig,
     registry_map: Option<&std::collections::HashMap<String, crate::provenance::RegistryProvenance>>,
 ) -> Result<ScanSummary> {
-    prefetch_cleave_resources(bulk_scan(paths));
+    prefetch_cleave_resources();
 
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load(config.model_dir()).ok();
@@ -10837,7 +10837,7 @@ pub fn scan_bytes(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
-    prefetch_cleave_resources(false);
+    prefetch_cleave_resources();
 
     cleave::set_compact_member_retention(true); // compact projection only
     let mut cleave_opts = cleave::AnalysisOptions {
@@ -10882,7 +10882,7 @@ pub fn scan_file(
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
-    prefetch_cleave_resources(false);
+    prefetch_cleave_resources();
 
     cleave::set_compact_member_retention(true); // compact projection only
     let mut cleave_opts = cleave::AnalysisOptions {
@@ -10906,23 +10906,21 @@ pub fn scan_file(
     )
 }
 
-fn prefetch_cleave_resources(bulk: bool) {
-    // Keep cleave's cold-start work off rayon workers where possible. Cleave's
-    // loaders are worker-safe, but these library entry points are also used by
-    // pkg/url scans and fetched payload analysis where visible latency matters.
-    //
-    // `bulk` skips the regex prewarm: a directory or many-file scan amortizes
-    // lazy compilation over thousands of members and only builds the patterns
-    // its file types reach, where the prewarm compiles the whole memo (~58k
-    // programs, ~1.5 GB) up front. A single file keeps it — first-use compiles
-    // would otherwise dominate its wall.
-    cleave::prefetch_shared_resources_with(true, !bulk);
-}
-
-/// Whether a target list is a bulk scan for [`prefetch_cleave_resources`]:
-/// any directory, or a file list long enough to amortize lazy compilation.
-fn bulk_scan(paths: &[PathBuf]) -> bool {
-    paths.len() >= 8 || paths.iter().any(|p| p.is_dir())
+/// Warm cleave's YARA engine and capability mapper from a non-rayon thread,
+/// so the first analysis cannot race a rayon worker into the one-time init.
+/// Every scan entry point calls this before its first analysis.
+///
+/// It never asks cleave for its regex prewarm. That compiles every pattern in
+/// cleave's warm memo, the union of everything any scan sharing the cache has
+/// ever compiled (~79k programs on 2026-09-25), when a scan only needs the few
+/// its file types reach, compiled lazily on first use. Measured that day on a
+/// quiet host: a one-shot 12-byte file went from 4.9 GiB peak and 44-48 s CPU
+/// to 0.8 GiB and 7-8 s, an 80 KB npm package from 4.9 GiB and ~50 s CPU to
+/// 1.5 GiB and 14 s, both faster in wall. A long-lived server answering 100
+/// mixed files, sequentially or four at a time, saw no first-request or
+/// throughput gain from it, only 2.6-2.8 GiB more peak RSS.
+pub fn prefetch_cleave_resources() {
+    cleave::prefetch_shared_resources_with(true, false);
 }
 
 /// Extract a small set of human-facing findings relevant to the classification.

@@ -1858,11 +1858,6 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                // Flush cleave's learned regex list so the next start of this
-                // server prewarms the compiles this workload needed instead of
-                // paying them on the first requests. Cheap when nothing new
-                // compiled since the last tick.
-                tokio::task::spawn_blocking(cleave::persist_regex_warm_memo);
                 let available = watchdog.available_analysis_permits();
                 let active = watchdog.max_concurrent_tasks.saturating_sub(available);
                 let stuck = watchdog.stuck_orphans.load(Ordering::Relaxed);
@@ -1964,10 +1959,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // the listener binds. The first request's analysis spawns rayon work; if
     // one of those rayon workers is the first to hit `yara_engine()`, init's
     // internal par_iter deadlocks against its peers parked on the OnceLock.
-    // Prefetching from a non-rayon thread here avoids the race entirely —
-    // `prefetch_shared_resources` returns immediately and does the work in a
-    // `std::thread::spawn`, so it doesn't delay startup.
-    cleave::prefetch_shared_resources(true);
+    // Prefetching from a non-rayon thread here avoids the race entirely.
+    crate::engine::prefetch_cleave_resources();
 
     // Server mode processes many files over a long lifetime. Configure jemalloc
     // to aggressively return freed pages to the OS, preventing multi-GB RSS

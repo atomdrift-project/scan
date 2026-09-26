@@ -47,7 +47,7 @@ impl Analyzer {
     /// Load model + feature spec + SHAP table from `model_dir` and prepare
     /// for repeated scans.
     ///
-    /// Also runs [`cleave::prefetch_shared_resources`] before returning —
+    /// Also runs [`crate::engine::prefetch_cleave_resources`] before returning —
     /// this satisfies cleave's "warm me on a non-rayon thread first"
     /// requirement so downstream callers don't have to think about it. The
     /// call is idempotent; future re-invocations short-circuit.
@@ -79,7 +79,7 @@ impl Analyzer {
         .with_level(Some(crate::model::DEFAULT_SEVERITY_LEVEL));
         // Warm cleave's globals from this (non-rayon) thread so the first
         // analysis cannot race into a deadlock against rayon workers.
-        cleave::prefetch_shared_resources(true);
+        crate::engine::prefetch_cleave_resources();
         Ok(Self {
             model_dir,
             model,
