@@ -137,7 +137,7 @@ mod imp {
     /// a high `oom_score_adj` on the child, so the kernel picks the worker as
     /// its victim and never the server.
     pub(super) fn prepare(cmd: &mut Command) -> io::Result<Control> {
-        let dir = own_cgroup()?.join("idle");
+        let dir = own_cgroup()?.join(cgroup_name());
         match fs::create_dir(&dir) {
             Ok(()) => {}
             // A previous worker's cgroup, left by a server that did not exit
@@ -203,10 +203,36 @@ mod imp {
         Ok(())
     }
 
+    /// The server runs one worker, so one fixed name. Tests spawn several at
+    /// once — from one process under `cargo test`, from several under nextest —
+    /// and a shared cgroup would let one test freeze or kill another's child.
+    #[cfg(not(test))]
+    fn cgroup_name() -> String {
+        "idle".to_owned()
+    }
+
+    #[cfg(test)]
+    fn cgroup_name() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!("idle-test-{}-{n}", std::process::id())
+    }
+
     /// Remove the worker's cgroup. Fails harmlessly while it still holds
     /// processes, which is why every caller kills and reaps first.
     pub(super) fn release(control: &Control) {
         let _ = fs::remove_dir(&control.dir);
+        // A killed grandchild outside our wait can still be exiting. Production
+        // reuses its one cgroup, but each test's is unique and would pile up.
+        #[cfg(test)]
+        for _ in 0..100 {
+            if !control.dir.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = fs::remove_dir(&control.dir);
+        }
     }
 
     /// This process's cgroup v2 directory, from the `0::` line of
