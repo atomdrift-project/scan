@@ -669,6 +669,71 @@ mod trait_floor_tests {
     }
 
     #[test]
+    fn recategorizing_a_suppression_hides_the_grade_and_the_conclusion() {
+        // Withheld, `//` form, repeated suppressor with `@N` spans: the grade and
+        // the withheld conclusion go, the suppressor stays once, spans are dropped.
+        assert_eq!(
+            recategorize_annotation(
+                "// S withheld objectives/supply-chain/install-hook/package/manifest::no-repo-with-hooks by metadata/package/freeform::pkg-skeleton-small @30; metadata/package/freeform::conventional-version @30; metadata/package/freeform::pkg-skeleton-small @30,41"
+            )
+            .as_deref(),
+            Some(
+                "// Possible benign context — ruled out by: package/freeform (pkg-skeleton-small), package/freeform (conventional-version)"
+            ),
+        );
+        // Downgraded reads differently from withheld.
+        assert_eq!(
+            recategorize_annotation(
+                "// S downgraded objectives/supply-chain/install-hook/scripts/declaration::sparse-package-install-hook by metadata/package/freeform::pkg-skeleton-small @30"
+            )
+            .as_deref(),
+            Some("// Possible benign context — weakened by: package/freeform (pkg-skeleton-small)"),
+        );
+        // `#` form, indented, hex spans, a `+N more` tail, a recognized tool and a
+        // micro-behavior (leaves kept) and a bare condition-kind leg.
+        assert_eq!(
+            recategorize_annotation(
+                "  # H withheld well-known/malware/stealer/x::family by well-known/tool/sysadmin/chocolatey::official-profile-provisioner @1a2b; micro-behaviors/communications/http/services/telegram::telegram-api-host @426,558; text, +2 more"
+            )
+            .as_deref(),
+            Some(
+                "  # Possible benign context — ruled out by: tool/sysadmin/chocolatey (official-profile-provisioner), communications/http (telegram-api-host), text"
+            ),
+        );
+        // No legs at all: still no grade and no conclusion id.
+        assert_eq!(
+            recategorize_annotation("-- N withheld objectives/evasion/process/injection::x")
+                .as_deref(),
+            Some("-- Possible benign context — a pattern here was ruled out"),
+        );
+        // Multi-byte text around a suppression must not panic or be misparsed.
+        assert_eq!(
+            recategorize_annotation(
+                "  // S withheld objectives/x/y::über by metadata/file/naïve::café @3"
+            )
+            .as_deref(),
+            Some("  // Possible benign context — ruled out by: file/naïve (café)"),
+        );
+        // Ordinary lines that merely use the verbs are untouched.
+        assert_eq!(recategorize_annotation("# N withheld the payment"), None);
+        assert_eq!(
+            recategorize_annotation("// S withheld ümlaut prose here"),
+            None
+        );
+        assert_eq!(
+            recategorize_annotation("  // withheld objectives/x::y by metadata/a::b"),
+            None
+        );
+        assert_eq!(recategorize_annotation("// +3 more suppressed"), None);
+        // A whole render keeps its other lines byte for byte.
+        let render = "code();\n// B downgraded objectives/a/b::c by metadata/d/e::f\nmore();\n";
+        assert_eq!(
+            recategorize_annotations(render),
+            "code();\n// Possible benign context — weakened by: d/e (f)\nmore();\n"
+        );
+    }
+
+    #[test]
     fn family_is_the_first_two_hierarchy_segments() {
         assert_eq!(
             trait_family("objectives/evasion/process/hook/inline::rust-inline-hook-hijack"),
@@ -7391,10 +7456,11 @@ fn render_interpret_context(
             "interpret render over budget; weakest members dropped"
         );
     }
-    let _ = writeln!(out, "== PRIMARY {label} ==");
+    let shown = interpret_display_name(label);
+    let _ = writeln!(out, "== PRIMARY {shown} ==");
     let now_secs = scan_now_secs();
     let primary_provenance = slim_provenance_for_interpret(
-        primary_provenance(label, sha256, root_fetch, root_registry, &mut raw_seen),
+        primary_provenance(shown, sha256, root_fetch, root_registry, &mut raw_seen),
         now_secs,
     );
     let primary_provenance_line =
@@ -7629,6 +7695,9 @@ fn recategorize_annotation(line: &str) -> Option<String> {
     // `sev` is ASCII and the char after it is a space, so this index is a
     // boundary by construction; `get` keeps that from resting on a panic.
     let rest = rest.get(sev.len_utf8() + 1..)?;
+    if let Some(body) = recategorize_suppression(rest) {
+        return Some(format!("{indent}{comment} {body}"));
+    }
     // A third-party signature carries no prose: the id *is* the body, unwrapped —
     // `// H third_party/elastic/Linux_Trojan_Ladvix/linux/trojan/ladvix`. Naming
     // its category is the whole rewrite; there is no description to keep.
@@ -7674,6 +7743,72 @@ fn recategorize_annotation(line: &str) -> Option<String> {
     Some(format!(
         "{indent}{comment} {loc}Possible {category} — {desc}"
     ))
+}
+
+/// The body of a suppression line, rewritten to name only what did the
+/// suppressing; `None` when `rest` (the text after `SEV `) is not one.
+///
+/// cleave lists the conclusions it matched but withheld or demoted as
+/// `withheld <id> by <leg> @spans; <leg>…[, +N more]`. There is no trailing
+/// parenthesized id, so the category rewrite never saw these lines, and both
+/// the grade and the suppressed conclusion's id reached the grader verbatim —
+/// measured on a benign package graded suspicious for "postinstall hook without
+/// repository", echoing the withheld `…::no-repo-with-hooks`. The suppressed id
+/// is dropped outright; the legs survive, because that a pattern was ruled out,
+/// and by what, is benign counterweight the grader should weigh. Byte spans are
+/// internal and go too.
+fn recategorize_suppression(rest: &str) -> Option<String> {
+    let (verb, rest) = rest.split_once(' ')?;
+    let outcome = match verb {
+        "withheld" | "suppressed" => "ruled out",
+        "downgraded" => "weakened",
+        _ => return None,
+    };
+    let (id, legs) = match rest.split_once(' ') {
+        Some((id, tail)) => (id, tail.strip_prefix("by ")?),
+        None => (rest, ""),
+    };
+    if !id.contains('/') {
+        return None;
+    }
+    let mut named: Vec<String> = Vec::new();
+    for leg in legs.split(';') {
+        // A leg is `<id>[ @spans]`; the last may trail `, +N more`.
+        let Some(leg_id) = leg.split_whitespace().next() else {
+            continue;
+        };
+        let leg_id = leg_id.trim_end_matches(',');
+        if leg_id.is_empty() {
+            continue;
+        }
+        // The leaf is kept only where the namespace is descriptive rather than a
+        // conclusion: `metadata/` facts, `micro-behaviors/` observations and
+        // recognized tools, apps and libraries are the benign context itself,
+        // whereas an `objectives/` leaf would name a verdict all over again. A
+        // bare `communications/http` says too little to weigh as context.
+        let descriptive = leg_id.starts_with("metadata/")
+            || leg_id.starts_with("micro-behaviors/")
+            || leg_id
+                .strip_prefix("well-known/")
+                .and_then(|r| r.split_once('/'))
+                .is_some_and(|(kind, _)| matches!(kind, "tool" | "app" | "lib"));
+        let category = trait_category(leg_id);
+        let label = match leg_id.split_once("::") {
+            Some((_, leaf)) if descriptive && !leaf.is_empty() => format!("{category} ({leaf})"),
+            _ => category,
+        };
+        if !named.contains(&label) {
+            named.push(label);
+        }
+    }
+    Some(if named.is_empty() {
+        format!("Possible benign context — a pattern here was {outcome}")
+    } else {
+        format!(
+            "Possible benign context — {outcome} by: {}",
+            named.join(", ")
+        )
+    })
 }
 
 /// The family a trait belongs to: the two path components below its namespace,
@@ -7744,6 +7879,22 @@ fn provenance_has_notable_match(
                         .is_some_and(|sources| sources.iter().any(|s| s.file == registry_id))
             })
     })
+}
+
+/// The name the grader is shown for a scanned file: its last path component.
+///
+/// The directories above a file are the operator's filing, not evidence about
+/// it. A corpus sorted into `hostile/` or `benign/`, or a download placed under
+/// a folder an attacker named, would otherwise hand the model its verdict. A
+/// URL is kept whole: where a fetched artifact came from is part of what it is.
+fn interpret_display_name(label: &str) -> &str {
+    if label.contains("://") {
+        return label;
+    }
+    label
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(label)
 }
 
 fn primary_provenance(
@@ -10478,6 +10629,46 @@ mod dep_backref_tests {
             opts.context_lines.is_some(),
             "and a bounded window, not the whole capture"
         );
+    }
+
+    #[test]
+    fn interpret_shows_the_grader_a_filename_not_its_directories() {
+        assert_eq!(
+            interpret_display_name("/corpus/hostile/2024/x.whl"),
+            "x.whl"
+        );
+        assert_eq!(
+            interpret_display_name(r"C:\\samples\\benign\\setup.exe"),
+            "setup.exe"
+        );
+        assert_eq!(interpret_display_name("dir/sub/"), "sub");
+        assert_eq!(interpret_display_name("plain.js"), "plain.js");
+        assert_eq!(
+            interpret_display_name("https://example.test/a/b.png"),
+            "https://example.test/a/b.png"
+        );
+
+        let mut report = empty_report();
+        report.files = vec![cleave::FileAnalysis {
+            id: 0,
+            path: "/corpus/samples/benign/x.whl".to_string(),
+            file_type: "whl".to_string(),
+            sha256: "a".repeat(64),
+            ..cleave::FileAnalysis::default()
+        }];
+        let ctx = render_interpret_context(
+            "/corpus/samples/benign/x.whl",
+            &"a".repeat(64),
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &report,
+        );
+        assert!(ctx.contains("== PRIMARY x.whl =="), "{ctx}");
+        assert!(ctx.contains(r#""path":"x.whl""#), "{ctx}");
+        assert!(!ctx.contains("samples/benign"), "{ctx}");
     }
 
     #[test]
