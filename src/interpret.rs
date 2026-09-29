@@ -1651,25 +1651,27 @@ fn is_binary_render(line: &str) -> bool {
     printable * 100 < s.chars().count() * 75
 }
 
-/// Whether the render carries a suspicious- or hostile-severity finding (an `H`
-/// or `S` marker cleave injected). The interpret gate uses this to send an
+/// Whether the render carries a live suspicious- or hostile-severity finding (an
+/// `H` or `S` marker cleave injected; suppression records excluded, see
+/// [`live_grade`]). The interpret gate uses this to send an
 /// ML-blind sample — low ML probability but cleave-flagged — to the LLM anyway.
 #[cfg(test)] // the gate reads `has_hostile_finding` now; kept for the render-parsing tests
 fn has_elevated_finding(rendered: &str) -> bool {
     rendered
         .lines()
-        .filter_map(parse_annotation)
+        .filter_map(live_grade)
         .any(|sev| matches!(sev, 'H' | 'S'))
 }
 
-/// Whether cleave surfaced a *hostile* (`H`) finding. Stricter than
+/// Whether cleave surfaced a live *hostile* (`H`) finding (suppression records
+/// excluded, see [`live_grade`]). Stricter than
 /// [`has_elevated_finding`], and used for a different job: this is the
 /// independent corroboration that lets an LLM escalation cross a band ML's own
 /// score is nowhere near (see [`Evidence::may_cross`]).
 fn has_hostile_finding(rendered: &str) -> bool {
     rendered
         .lines()
-        .filter_map(parse_annotation)
+        .filter_map(live_grade)
         .any(|sev| sev == 'H')
 }
 
@@ -1830,6 +1832,34 @@ fn parse_annotation(line: &str) -> Option<char> {
         None | Some(' ') => Some(sev),
         _ => None,
     }
+}
+
+/// The grade of a *live* finding annotation: [`parse_annotation`], minus the
+/// suppression records cleave renders in the same grammar —
+/// `// H withheld <id> by <leg> @spans` or `# S downgraded <id> by …`.
+///
+/// The letter on a suppression line is the grade the conclusion *would* have
+/// carried had benign context not ruled it out, so counting it as evidence
+/// inverts its meaning: a package whose only `H` was withheld by a test-fixture
+/// leg read as cleave-corroborated hostile, earning the gate's hostile
+/// admission (past the size veto) and [`Evidence::may_cross`]'s two-rung
+/// escalation. Every grade-keyed decision reads this, never `parse_annotation`.
+///
+/// A `downgraded` line contributes nothing either, not a grade one tier lower:
+/// cleave keeps a downgraded trait as an ordinary finding at its demoted
+/// criticality, rendered as its own annotation line, and the suppression
+/// record repeats the *original* grade. The live line already carries the
+/// lowered grade, so crediting the record at any tier would double-count it.
+///
+/// The verb must be followed by a trait-id path, the shape cleave emits and
+/// `engine::recategorize_suppression` requires, so a live finding whose prose
+/// happens to open with one of these words keeps its grade.
+fn live_grade(line: &str) -> Option<char> {
+    let sev = parse_annotation(line)?;
+    let mut words = line.split_whitespace().skip(2);
+    let suppression = matches!(words.next(), Some("withheld" | "suppressed" | "downgraded"))
+        && words.next().is_some_and(|id| id.contains('/'));
+    (!suppression).then_some(sev)
 }
 
 /// Remove ANSI CSI escape sequences (`ESC [ … <final>`).
@@ -4457,6 +4487,86 @@ mod tests {
         assert!(has_elevated_finding("// S encrypted loader\ncode();\n"));
         assert!(!has_hostile_finding("// N conventional version\ncode();\n"));
         assert!(!has_hostile_finding("// Hostile is a variable name\n"));
+    }
+
+    /// A render whose only elevated lines are suppression records: the grade on
+    /// each is what the conclusion *would* have carried, not what it does.
+    const SUPPRESSED_ONLY: &str = "\
+pkg/index.js\tjs 2KB 3
+// N 1:1 fetch() call (micro-behaviors/communications/http/client::fetch)
+// H withheld objectives/exfil/x::y by metadata/pkg/test-fixture::z @30
+# S downgraded objectives/exec/hook::postinstall by metadata/pkg/repo::has-repo
+-- S suppressed objectives/c2/beacon::poll
+fetch(url);
+";
+
+    #[test]
+    fn suppression_records_are_not_findings() {
+        for line in [
+            "// H withheld objectives/exfil/x::y by metadata/pkg/test-fixture::z @30",
+            "  # H downgraded objectives/a::b",
+            "-- S suppressed objectives/a::b by micro-behaviors/c::d; metadata/e::f, +2 more",
+        ] {
+            // Still an annotation (so the readability gate skips it as non-source)…
+            assert!(parse_annotation(line).is_some(), "{line}");
+            // …but it carries no grade into any decision.
+            assert_eq!(live_grade(line), None, "{line}");
+        }
+        // A live finding whose prose opens with a verb keeps its grade: the
+        // suppression shape needs a trait-id path after the verb.
+        assert_eq!(live_grade("// H withheld payload is decrypted"), Some('H'));
+        assert_eq!(
+            live_grade("// S 3:1 downgraded TLS (objectives/a::b)"),
+            Some('S')
+        );
+        assert_eq!(
+            live_grade("// H drops a payload (objectives/a::b)"),
+            Some('H')
+        );
+
+        assert!(!has_hostile_finding(SUPPRESSED_ONLY));
+        assert!(!has_elevated_finding(SUPPRESSED_ONLY));
+        // The live line beside a suppression still counts.
+        let mixed = format!("{SUPPRESSED_ONLY}// H drops a payload (objectives/a::b)\n");
+        assert!(has_hostile_finding(&mixed));
+    }
+
+    #[test]
+    fn suppressed_hostile_neither_admits_nor_corroborates() {
+        let levels = LevelContext {
+            fired: Some(-1),
+            active: None,
+            grid_max: 0,
+        };
+        let gate = |render: &str| {
+            admission(
+                &InterpretConfig::default(),
+                Classification::Benign,
+                0.0,
+                levels,
+                FindingSeverity::default(),
+                render,
+                "t",
+            )
+        };
+        // Nothing else admits this sample, so the withheld `H` was the only door.
+        assert_eq!(gate(SUPPRESSED_ONLY), None);
+        // Control: the same render with a live `H` is admitted.
+        let live = SUPPRESSED_ONLY.replace("// H withheld", "// H 2:1 exfiltrates");
+        assert_eq!(gate(&live), Some(LlmAdmission::Required));
+
+        // Corroboration: ML suspicious far below the hostile boundary (L5000), the
+        // LLM grading hostile. Only a cleave `H` earns that crossing, and a
+        // withheld one is not an `H`.
+        let blended_class = |render: &str| {
+            let ev = Evidence {
+                hostile_finding: FindingSeverity::default().hostile || has_hostile_finding(render),
+                ..ev_at(5000)
+            };
+            blend(Classification::Suspicious, 0.3, LlmGrade::Hostile, ev).0
+        };
+        assert_eq!(blended_class(SUPPRESSED_ONLY), Classification::Suspicious);
+        assert_eq!(blended_class(&live), Classification::Hostile);
     }
 
     #[test]

