@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 use crate::OutputFormat;
 use crate::engine::{Progress, ScanConfig, ScanResult, ScanSummary};
 use crate::explain::ShapImportance;
-use crate::features::ExtractContext;
 use crate::model::{Classification, Model};
 use crate::output;
 
@@ -28,6 +27,45 @@ struct ProcessGroup {
     deleted: bool,
     /// Precomputed SHA256 hex digest.
     sha256: String,
+}
+
+/// Rizin's size gate for a live-process scan.
+const PS_RIZIN_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// Rizin tuning for live-process scanning, put back when dropped.
+///
+/// Unlike a filesystem scan (where we want every architecture and tolerate
+/// minutes of deep analysis), `ps` is interactive and dominated by a few giant
+/// signed apps (Electron/Bun binaries can be 100–215 MB). Two shape/size caps
+/// keep it responsive without changing verdicts materially:
+///   - native-arch-only: a universal binary's non-host slice never runs here,
+///     so don't pay full `aaa` on it (roughly halves fat-binary cost).
+///   - 100 MB size gate: skip rizin on the giants entirely — disassembling a
+///     signed 200 MB app is never worth blocking the scan on.
+///
+/// Both are process-global, and `scan sys` runs a file scan right after this
+/// one, which must not inherit them. The process timeout is configured once by
+/// the CLI (`--rizin-timeout-secs`) and is not touched here.
+struct PsRizinLimits {
+    native_arch_only: bool,
+}
+
+impl PsRizinLimits {
+    fn apply() -> Self {
+        let native_arch_only = filefacts::rizin::native_arch_only();
+        filefacts::rizin::set_native_arch_only(true);
+        filefacts::rizin::set_max_bytes(PS_RIZIN_MAX_BYTES);
+        Self { native_arch_only }
+    }
+}
+
+impl Drop for PsRizinLimits {
+    fn drop(&mut self) {
+        filefacts::rizin::set_native_arch_only(self.native_arch_only);
+        // filefacts has no getter for the size gate. Nothing else in this
+        // process sets it, so its default — 0, no gate — is what was there.
+        filefacts::rizin::set_max_bytes(0);
+    }
 }
 
 /// Compute SHA256 of a file, reading from the given path.
@@ -45,20 +83,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // any scan fires rayon work. See `run_scan_paths` for why this matters.
     crate::engine::prefetch_cleave_resources();
 
-    // Tune rizin for live-process scanning. Unlike a filesystem scan (where we
-    // want every architecture and tolerate minutes of deep analysis), `ps` is
-    // interactive and dominated by a few giant signed apps (Electron/Bun
-    // binaries can be 100–215 MB). Two shape/size caps keep it responsive without
-    // changing verdicts materially:
-    //   - native-arch-only: a universal binary's non-host slice never runs here,
-    //     so don't pay full `aaa` on it (roughly halves fat-binary cost).
-    //   - 100 MB size gate: skip rizin on the giants entirely — disassembling a
-    //     signed 200 MB app is never worth blocking the scan on.
-    // The process timeout is configured once by the CLI (ten minutes by
-    // default, overridable with `--rizin-timeout-secs`) so the operator's
-    // explicit deadline applies consistently to every scan mode.
-    filefacts::rizin::set_native_arch_only(true);
-    filefacts::rizin::set_max_bytes(100 * 1024 * 1024);
+    let _rizin_limits = PsRizinLimits::apply();
 
     let scan_start = Instant::now();
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
@@ -182,8 +207,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 
     // Load model and scan each unique binary.
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
-    let shap = ShapImportance::load(config.model_dir()).ok();
-    let ctx = ExtractContext::new(model.spec());
+    let shap = ShapImportance::load(config.model_dir())?;
     let cancellation = crate::interrupt::arm("Interrupted — finishing current process…");
     cleave::set_compact_member_retention(true); // compact projection only
     let mut cleave_opts = cleave::AnalysisOptions {
@@ -278,14 +302,12 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         }
 
         match build_result(
-            &group.path,
             report,
-            &ctx,
+            group,
             &model,
             shap.as_ref(),
             config,
-            group,
-            Some(&cancellation),
+            Some(cancellation.as_ref()),
         ) {
             Ok(result) => {
                 match result.classification {
@@ -365,17 +387,15 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 }
 
 /// Build a ScanResult from a cleave report, injecting pids and deleted state.
-#[allow(clippy::too_many_arguments)]
 fn build_result(
-    display_path: &std::path::Path,
     report: cleave::AnalysisReport,
-    ctx: &ExtractContext,
+    group: &ProcessGroup,
     model: &Model,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
-    group: &ProcessGroup,
-    cancellation: Option<&Arc<AtomicBool>>,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<ScanResult> {
+    let display_path = group.path.as_path();
     // The bloom flag for a known-bad/conflicted process image, re-derived from the
     // executable's sha256 (known-good is short-circuited before we ever scan, so it
     // never reaches here). Drives the inline 🚩/🏴 in the terminal header.
@@ -383,75 +403,42 @@ fn build_result(
         .bloom()
         .and_then(|lk| burton::parse_sha256_hex(&group.sha256).map(|d| lk.decide_sha256(&d)))
         .and_then(crate::output::BloomMark::from_decision);
+    let label = display_path.display().to_string();
     let cr = crate::engine::classify_report(
-        &display_path.display().to_string(),
         report,
-        ctx,
-        model,
-        shap,
-        cancellation,
-        &crate::engine::tiny_opts_for(config),
-        config.interpret(),
-        display_path,
-        config.fetch_policy(),
-        config.zip_passwords(),
-        crate::engine::OutputNeeds {
-            // Matching scan's `--format interpret`: the live LLM query's user
-            // message, byte-for-byte, without the system prompt.
-            llm_view: matches!(config.format(), OutputFormat::Interpret),
-            fetch_progress: false, // machine-readable output; no live fetch log
-            render_context: matches!(
-                config.format(),
-                OutputFormat::Tiny | OutputFormat::Interpret
-            ),
-            // `--show=all` with JSON: list every member of an archive-backed image.
-            list_all_members: config.filter().is_all()
-                && matches!(config.format(), OutputFormat::Json),
-            deps_for_upload: false, // ps has no hopper renewal
+        crate::engine::ClassifyRequest {
+            shap,
+            cancellation,
+            tiny_opts: crate::engine::tiny_opts_for(config),
+            interpret: config.interpret(),
+            fetch: config.fetch_policy(),
+            zip_passwords: config.zip_passwords(),
+            needs: crate::engine::OutputNeeds {
+                // Matching scan's `--format interpret`: the live LLM query's user
+                // message, byte-for-byte, without the system prompt.
+                llm_view: matches!(config.format(), OutputFormat::Interpret),
+                fetch_progress: false, // machine-readable output; no live fetch log
+                render_context: matches!(
+                    config.format(),
+                    OutputFormat::Tiny | OutputFormat::Interpret
+                ),
+                // `--show=all` with JSON: list every member of an archive-backed image.
+                list_all_members: config.filter().is_all()
+                    && matches!(config.format(), OutputFormat::Json),
+                deps_for_upload: false, // ps has no hopper renewal
+            },
+            bloom_mark,
+            ..crate::engine::ClassifyRequest::new(&label, display_path, model)
         },
-        None, // process images carry no fetched-package registry metadata
-        None, // process images have no package acquisition fetch record
-        bloom_mark,
-        None,
-        None, // no admission gate
     )?;
     let is_json = matches!(config.format(), OutputFormat::Json);
 
-    let cleave = if is_json { Some(cr.report) } else { None };
-
-    Ok(ScanResult {
-        v: "7",
-        model: cr.model,
-        floor: cr.floor,
-        classification: cr.classification,
-        probability: cr.probability,
-        threshold: cr.threshold,
-        level: cr.level,
-        analysis_cached: cr.analysis_cached,
-        interpret_ms: cr.phase_ms.interpret_ms,
-        version: crate::engine::model_version_string(model.info()),
-        analyzed_at: crate::engine::now_rfc3339(),
-        cleave,
-        pids: Some(group.pids.clone()),
-        deleted: group.deleted.then_some(true),
-        path: display_path.display().to_string(),
-        finding_counts: cr.finding_counts,
-        formula: cr.formula,
-        reasons: cr.reasons,
-        top_findings: cr.top_findings,
-        model_scores: cr.model_scores,
-        skipped_models: cr.skipped_models,
-        file_type: cr.file_type,
-        size_bytes: cr.size_bytes,
-        sha256: group.sha256.clone(),
-        embedded_files: cr.embedded_files,
-        rendered_context: cr.rendered_context,
-        interpretation: cr.interpretation,
-        pending_llm: cr.pending_llm,
-        dependency_results: cr.dependency_results,
-        bloom_mark,
-        hopper_route: crate::engine::HopperRoute::Normal,
-    })
+    let mut result = cr.into_scan_result(label, model, is_json);
+    result.pids = Some(group.pids.clone());
+    result.deleted = group.deleted.then_some(true);
+    result.sha256.clone_from(&group.sha256);
+    result.bloom_mark = bloom_mark;
+    Ok(result)
 }
 
 /// Emit a single result with PID annotations.
@@ -482,7 +469,9 @@ fn emit_result(
             let Ok(mut out) = stdout.lock() else {
                 return;
             };
-            crate::engine::write_tiny(&mut *out, r);
+            if let Err(e) = crate::engine::write_tiny(&mut *out, r) {
+                tracing::error!(path = %r.path, "failed to write scan result: {e}");
+            }
         }
         // The LLM payload verbatim — no verdict line, no PID annotations.
         OutputFormat::Interpret => {
@@ -504,5 +493,22 @@ fn is_root() -> bool {
     #[cfg(not(unix))]
     {
         false // Conservative: always show the warning on non-unix
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PsRizinLimits;
+
+    /// `scan sys` runs a file scan after the process scan; the caps the process
+    /// scan sets must not leak into it.
+    #[test]
+    fn rizin_limits_are_restored_after_the_process_scan() {
+        let before = filefacts::rizin::native_arch_only();
+        {
+            let _limits = PsRizinLimits::apply();
+            assert!(filefacts::rizin::native_arch_only());
+        }
+        assert_eq!(filefacts::rizin::native_arch_only(), before);
     }
 }

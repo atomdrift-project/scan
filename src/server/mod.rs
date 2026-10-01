@@ -1,87 +1,184 @@
 //! HTTP API server for litmus malware classification.
 //!
-//! Accepts file uploads via multipart/form-data, runs cleave static analysis
-//! and ONNX model inference, and returns a unified JSON result including
-//! classification, SHAP explanations, and the full cleave report.
+//! Accepts artifacts — uploaded bytes, a package URL, an exact URL, or a local
+//! path — runs cleave static analysis and the model, and answers with the
+//! classification: the full scan envelope on the legacy routes, a decision on
+//! `/v1`.
 //!
 //! Routes:
-//!   GET  /_/health      — liveness check
+//!   GET  /_/health      — liveness (public; detail only when trusted)
+//!   GET  /_/info        — build and capacity, for sizing a client
+//!   GET  /_/stats       — live routing signals
+//!   GET  /_/memory, /_/requests, /_/threads — diagnostics
+//!   POST /_/reload      — reload the model bundle from disk (admin)
+//!   POST /_/update      — pull models and traits, then reload (admin)
 //!   GET  /lookup        — stored verdict by ?sha256= or ?purl= (no slot)
-//!   POST /analyze       — upload a file, receive full classification JSON
+//!   GET  /status        — whether an analysis of an artifact is running
+//!   POST /analyze       — upload a file, receive the scan envelope
 //!   POST /analyze-purl  — fetch a PURL (registry provenance included) and analyze
 //!   POST /analyze-path  — analyze a local path (loopback)
-//!   POST /_/reload      — hot-reload model from disk
+//!   GET  /v1/lookup     — decisions for one or many artifacts (no slot)
+//!   POST /v1/analyze    — a decision, streamed if the analysis is slow
 //!
-//! [`ServerConfig`] keeps the public server surface intentionally small:
-//! validated thresholds are supplied up front, and callers use accessors
-//! rather than mutating fields after construction.
+//! [`ServerConfig`] is plain data: [`Startup::resolve`] builds it from a
+//! command line, and [`build_app`] validates it before anything starts.
 
 mod access;
 mod acl;
+mod analyze;
 mod corpus;
 mod decision;
+mod diag;
+mod error;
 mod flight;
 mod handlers;
 mod idle;
 mod latency;
+mod v1;
 
 pub use acl::{Cidr, TokenDigest, parse_cidr_list};
-pub(crate) use handlers::classify_bytes;
-pub(crate) use handlers::classify_file;
 
-use crate::memory::resolve_process_max_rss_bytes;
+use crate::analysis::{ACTIVE_REQUESTS, ModelResources, RequestPhase};
+
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, post};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 use tokio::signal;
+use tokio::sync::{Notify, Semaphore, watch};
+
+use error::ApiError;
 
 use crate::explain::ShapImportance;
-use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
 
-/// Immutable configuration for the HTTP API server.
+/// How the HTTP API server runs, settled before it starts.
 ///
-/// Construct with [`ServerConfig::new`] so thresholds are validated before the
-/// listener starts and background resource loading begins.
+/// Plain data: build one with struct update syntax over [`Default`], or
+/// resolve one from a command line with [`Startup::resolve`].
+/// [`build_app`] validates it.
+///
+/// ```
+/// use scan::server::ServerConfig;
+///
+/// let config = ServerConfig {
+///     model_dir: "/path/to/models".into(),
+///     workers: 2,
+///     ..ServerConfig::default()
+/// };
+/// assert!(config.validate().is_ok());
+/// ```
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    bind: SocketAddr,
-    max_body_size: usize,
-    max_rss_bytes: Option<NonZeroU64>,
-    model_dir: PathBuf,
-    thresholds: Option<Thresholds>,
-    slow_rule_ms: u64,
-    allowed_dirs: Vec<PathBuf>,
-    extract_dir: Option<PathBuf>,
-    workers: usize,
-    /// Non-zero enables the companion pull worker; see
-    /// [`ServerConfig::with_idle_worker_slots`].
-    idle_worker_slots: usize,
-    allow_cidrs: Vec<Cidr>,
-    /// Bearer token required on every route except `/_/health`; `None`
-    /// disables authentication. Only the digest is kept — see [`TokenDigest`].
-    auth_digest: Option<TokenDigest>,
-    level: Option<u16>,
-    /// Per-request analysis timeout in seconds. 0 disables.
-    analysis_timeout_secs: u64,
-    interpret: Option<crate::interpret::InterpretConfig>,
-    /// External-reference fetch policy. Off by default: an upload server driving
-    /// outbound fetches is an SSRF-shaped exposure (the transport's resolver
-    /// guards internal IPs, but enabling it is an explicit operator decision).
-    fetch: crate::fetch::FetchPolicy,
-    /// hopper master API root (`--hopper`); when set, every analyzed result —
-    /// parent and members — is renewed on hopper's `/api/result`. `None` disables
-    /// upload, leaving the server a pure analyze service.
-    hopper: Option<String>,
-    /// Additional passwords to try for encrypted archives.
-    zip_passwords: crate::ArchivePasswords,
+    /// Address to listen on.
+    pub bind: SocketAddr,
+    /// Largest request body accepted, in bytes.
+    pub max_body_size: usize,
+    /// RSS past which requests are refused. `None` disables in-process
+    /// throttling, for when a supervisor such as systemd `MemoryMax=` enforces
+    /// a hard cap already.
+    pub max_rss_bytes: Option<NonZeroU64>,
+    /// Model bundle directory.
+    pub model_dir: PathBuf,
+    /// Manual probability cutoffs. `None` takes the bundle's level grid.
+    pub thresholds: Option<Thresholds>,
+    /// The operating point (0..=10000) the verdict thresholds come from.
+    /// `None` with manual thresholds.
+    pub level: Option<u16>,
+    /// Per-rule time budget before cleave logs a slow rule.
+    pub slow_rule_ms: u64,
+    /// Directories `/analyze-path` may read. Empty refuses every request.
+    pub allowed_dirs: Vec<PathBuf>,
+    /// Where cleave extracts archive members for `/analyze-path` callers.
+    pub extract_dir: Option<PathBuf>,
+    /// Concurrent analyses; at least one. Past it requests are refused, not
+    /// queued.
+    pub workers: usize,
+    /// Non-zero runs the companion pull worker beside the server (needs
+    /// `hopper`). Kept as a count because `--idle-worker-slots` has always
+    /// been one; the worker sizes itself.
+    pub idle_worker_slots: usize,
+    /// Peer networks besides loopback allowed to connect. `/analyze-path` is
+    /// loopback-only regardless.
+    pub allow_cidrs: Vec<Cidr>,
+    /// Digest of the bearer token required on every route but `/_/health`;
+    /// `None` leaves the API open. Loopback is not exempt: behind a Cloudflare
+    /// tunnel every remote request arrives over loopback.
+    pub auth_digest: Option<TokenDigest>,
+    /// Per-request analysis timeout in seconds. Zero disables it.
+    pub analysis_timeout_secs: u64,
+    /// The LLM second opinion, when one is configured.
+    pub interpret: Option<crate::interpret::InterpretConfig>,
+    /// Which references a sample declares are followed. Off by default: an
+    /// upload server driving outbound fetches is an SSRF-shaped exposure, so
+    /// turning it on is an explicit operator decision.
+    pub fetch: crate::fetch::FetchPolicy,
+    /// Hopper API root(s). Enables result renewal, corpus deferral, and the
+    /// companion idle worker.
+    pub hopper: Option<String>,
+    /// Passwords to try against encrypted archives.
+    pub zip_passwords: crate::ArchivePasswords,
+    /// Class-aware admission (`SCAN_SLOT_LANES=1`): payloads at or below this
+    /// many bytes take the small lane. `None` keeps flat admission.
+    pub slot_lanes: Option<u64>,
+}
+
+impl Default for ServerConfig {
+    /// The `serve` command line's defaults, except `model_dir`, which has
+    /// none: a caller always names one.
+    fn default() -> Self {
+        Self {
+            bind: SocketAddr::from(([127, 0, 0, 1], 49999)),
+            max_body_size: 100 * 1024 * 1024,
+            max_rss_bytes: None,
+            model_dir: PathBuf::new(),
+            thresholds: None,
+            level: None,
+            slow_rule_ms: crate::cli::DEFAULT_SLOW_RULE_MS,
+            allowed_dirs: Vec::new(),
+            extract_dir: None,
+            workers: 1,
+            idle_worker_slots: 0,
+            allow_cidrs: Vec::new(),
+            auth_digest: None,
+            analysis_timeout_secs: DEFAULT_ANALYSIS_TIMEOUT_SECS,
+            interpret: None,
+            fetch: crate::fetch::FetchPolicy::default(),
+            hopper: None,
+            zip_passwords: crate::ArchivePasswords::default(),
+            slot_lanes: None,
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Check what plain data cannot enforce by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid manual thresholds or zero workers.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(t) = &self.thresholds {
+            t.validate()
+                .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
+        }
+        if self.workers == 0 {
+            anyhow::bail!("workers must be >= 1");
+        }
+        Ok(())
+    }
+
+    /// The hopper root, or `None` when none is set or it is blank.
+    fn hopper(&self) -> Option<&str> {
+        self.hopper.as_deref().filter(|s| !s.trim().is_empty())
+    }
 }
 
 /// What a caller supplies to start a server, before resolution.
@@ -96,9 +193,8 @@ pub struct Startup {
     pub bind: SocketAddr,
     /// Largest request body accepted, in megabytes.
     pub max_size_mb: usize,
-    /// The `--max-rss-gb` flag as given: negative disables in-process
-    /// throttling, zero takes the cgroup-aware limit, positive is a ceiling.
-    pub max_rss_gb: i64,
+    /// The process RSS ceiling (`--max-rss-gb`).
+    pub max_rss: crate::memory::MaxRssPolicy,
     /// Comma-separated directories `/analyze-path` may read. Empty means the
     /// route refuses every request, which is the safe default.
     pub allowed_dirs: Option<String>,
@@ -110,13 +206,6 @@ pub struct Startup {
     pub allow_cidr: Option<String>,
     /// File holding the bearer token. `None` disables authentication.
     pub token_file: Option<PathBuf>,
-    /// Traits bundle override.
-    pub traits_dir: Option<PathBuf>,
-    /// Force the startup refresh even when the local copy looks current
-    /// (`-u`/`--update`).
-    pub update: bool,
-    /// Skip the startup model and traits refresh.
-    pub no_update: bool,
     /// Hopper API root. Enables result renewal, corpus deferral, and the
     /// companion idle worker.
     pub hopper: Option<String>,
@@ -125,45 +214,24 @@ pub struct Startup {
     pub idle_worker_slots: Option<usize>,
     /// Per-request analysis timeout in seconds. Zero disables.
     pub analysis_timeout_secs: u64,
-    /// Model bundle. `None` resolves the installed one.
-    pub model_dir: Option<PathBuf>,
-    /// Operating point. `None` takes the bundle's own default.
-    pub level: Option<u16>,
-    /// Manual probability cutoffs, bypassing the level grid.
-    pub thresholds: Option<Thresholds>,
-    /// Per-rule time budget before cleave logs a slow rule.
-    pub slow_rule_ms: u64,
-    /// The LLM second opinion, when one is configured.
-    pub interpret: Option<crate::interpret::InterpretConfig>,
-    /// Whether to follow the references a sample declares. Off by default: a
-    /// server driving outbound fetches is an SSRF-shaped exposure, so turning
-    /// it on is an explicit operator decision.
-    pub fetch: crate::fetch::FetchPolicy,
-    /// Passwords to try against encrypted archives.
-    pub zip_passwords: crate::ArchivePasswords,
+    /// Rules, model and analysis settings, shared with the pull worker.
+    /// Fetching is off by default: a server driving outbound fetches is an
+    /// SSRF-shaped exposure, so turning it on is an operator decision.
+    pub rules: crate::worker::RulesStartup,
 }
 
 impl Startup {
-    /// Settle every default and read the bearer token.
+    /// Settle every default, read the bearer token, and validate the result.
     ///
     /// # Errors
     ///
     /// Returns an error when the model bundle cannot be resolved, a CIDR does
-    /// not parse, or `token_file` is set but missing, empty or unreadable.
-    /// That last one fails closed on purpose: an operator who asked for
-    /// authentication must never get an open server because a file went away.
+    /// not parse, the thresholds or worker count are invalid, or `token_file`
+    /// is set but missing, empty or unreadable. That last one fails closed on
+    /// purpose: an operator who asked for authentication must never get an
+    /// open server because a file went away.
     pub fn resolve(self) -> anyhow::Result<ServerConfig> {
-        use anyhow::Context as _;
-
-        // Order is load-bearing and is why the refresh lives here rather than
-        // at the call site. The override has to be applied first, or the
-        // refresh installs into the default directory while `--traits-dir`
-        // points at an empty one — and a server started that way comes up,
-        // reports healthy, and fails every analysis.
-        if let Some(dir) = self.traits_dir.as_ref() {
-            cleave::traits_repo::set_override_dir(Some(dir.into()));
-        }
-        crate::refresh_rules_at_startup(self.update, self.no_update);
+        let rules = self.rules.resolve()?;
 
         // Canonicalized at startup so symlink-resolved request paths match in
         // the `starts_with` checks `/analyze-path` gates on.
@@ -212,315 +280,47 @@ impl Startup {
             None => None,
         };
 
-        let model_dir = match self.model_dir {
-            Some(dir) => dir,
-            None => crate::models_repo::model_dir().context("failed to resolve model directory")?,
-        };
-        // Manual cutoffs bypass the level grid, so no level applies then.
-        let level = if self.thresholds.is_some() {
-            None
-        } else {
-            Some(
-                self.level
-                    .or_else(|| crate::model::model_default_level(&model_dir))
-                    .unwrap_or(crate::model::DEFAULT_SEVERITY_LEVEL),
-            )
-        };
-
-        // Half the request slots for background work, capped again inside
-        // `with_idle_worker_slots`. Disabled without hopper: nothing to claim.
-        let idle_slots = match (self.hopper.as_deref(), self.idle_worker_slots) {
+        let hopper = self.hopper.filter(|s| !s.trim().is_empty());
+        // Half the request slots for background work. Disabled without
+        // hopper: nothing to claim.
+        let idle_worker_slots = match (hopper.as_deref(), self.idle_worker_slots) {
             (None, _) => 0,
             (Some(_), Some(n)) => n.min(workers / 2),
             (Some(_), None) => workers / 2,
         };
 
-        Ok(ServerConfig::new(
-            self.bind,
-            self.max_size_mb.saturating_mul(1024 * 1024),
-            resolve_process_max_rss_bytes(self.max_rss_gb),
-            model_dir,
-            self.thresholds,
-            self.slow_rule_ms,
+        let config = ServerConfig {
+            bind: self.bind,
+            max_body_size: self.max_size_mb.saturating_mul(1024 * 1024),
+            max_rss_bytes: self.max_rss.process_ceiling(),
+            model_dir: rules.model_dir,
+            thresholds: rules.thresholds,
+            level: rules.level,
+            slow_rule_ms: rules.slow_rule_ms,
             allowed_dirs,
-            self.extract_dir,
+            extract_dir: self.extract_dir,
             workers,
+            idle_worker_slots,
             allow_cidrs,
-        )?
-        .with_level(level)
-        .with_auth_token(auth_digest)
-        .with_interpret(self.interpret)
-        .with_fetch(self.fetch)
-        .with_zip_passwords(self.zip_passwords)
-        .with_hopper(self.hopper)
-        .with_idle_worker_slots(idle_slots)
-        .with_analysis_timeout(self.analysis_timeout_secs))
+            auth_digest,
+            analysis_timeout_secs: self.analysis_timeout_secs,
+            interpret: rules.interpret,
+            fetch: rules.fetch,
+            hopper,
+            zip_passwords: rules.zip_passwords,
+            slot_lanes: (std::env::var("SCAN_SLOT_LANES").as_deref() == Ok("1"))
+                .then(crate::analysis::small_job_max_bytes),
+        };
+        config.validate()?;
+        Ok(config)
     }
 }
 
 /// Default per-request analysis timeout: 34 minutes. Covers cold cleave scans
 /// of large archives — and fetch-enabled scans whose dependency analysis can
 /// far outlast the sample's own — while still preventing a pathological input
-/// from pinning a slot forever. Override with `--analysis-timeout` /
-/// [`ServerConfig::with_analysis_timeout`].
+/// from pinning a slot forever. Override with `--analysis-timeout`.
 pub const DEFAULT_ANALYSIS_TIMEOUT_SECS: u64 = 2040;
-
-impl ServerConfig {
-    /// Create a server configuration.
-    ///
-    /// `thresholds` may be `None` to use the model's recommended thresholds
-    /// from `evaluation.json`, or `Some(t)` to override with explicit values.
-    ///
-    /// `max_body_size` and `max_rss_bytes` are byte counts. A `max_rss_bytes`
-    /// of `0` disables in-process RSS throttling — the server will not reject
-    /// requests on memory pressure (use this when an external supervisor like
-    /// systemd `MemoryMax=` already enforces a hard cap).
-    ///
-    /// `workers` is the maximum number of concurrent analyses; requests beyond
-    /// this are rejected with 503 by the per-handler hard gate.
-    ///
-    /// `allow_cidrs` lists peer networks (in addition to loopback) that may
-    /// reach the server. The `/analyze-path` endpoint is always restricted
-    /// to loopback regardless of this list.
-    ///
-    /// # Example
-    /// ```
-    /// use scan::server::ServerConfig;
-    ///
-    /// let config = ServerConfig::new(
-    ///     "127.0.0.1:49999".parse()?,
-    ///     100 * 1024 * 1024,
-    ///     8 * 1024 * 1024 * 1024,
-    ///     "/path/to/models",
-    ///     None,
-    ///     4_000,
-    ///     vec![],
-    ///     None,
-    ///     2,
-    ///     vec![],
-    /// )?;
-    ///
-    /// assert_eq!(config.max_body_size(), 100 * 1024 * 1024);
-    /// # Ok::<(), anyhow::Error>(())
-    /// ```
-    #[allow(clippy::too_many_arguments)] // ServerConfig is plumbed once at startup; a builder would add ceremony for no real benefit.
-    pub fn new(
-        bind: SocketAddr,
-        max_body_size: usize,
-        max_rss_bytes: u64,
-        model_dir: impl Into<PathBuf>,
-        thresholds: Option<Thresholds>,
-        slow_rule_ms: u64,
-        allowed_dirs: Vec<PathBuf>,
-        extract_dir: Option<PathBuf>,
-        workers: usize,
-        allow_cidrs: Vec<Cidr>,
-    ) -> anyhow::Result<Self> {
-        if let Some(ref t) = thresholds {
-            t.validate()
-                .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
-        }
-        if workers == 0 {
-            return Err(anyhow::anyhow!("workers must be >= 1"));
-        }
-        Ok(Self {
-            bind,
-            max_body_size,
-            max_rss_bytes: NonZeroU64::new(max_rss_bytes),
-            model_dir: model_dir.into(),
-            thresholds,
-            slow_rule_ms,
-            allowed_dirs,
-            extract_dir,
-            workers,
-            allow_cidrs,
-            auth_digest: None,
-            level: None,
-            analysis_timeout_secs: DEFAULT_ANALYSIS_TIMEOUT_SECS,
-            interpret: None,
-            fetch: crate::fetch::FetchPolicy::default(),
-            hopper: None,
-            zip_passwords: crate::ArchivePasswords::default(),
-            idle_worker_slots: 0,
-        })
-    }
-
-    /// Attach a hopper master API root (`--hopper`); when set, the server renews
-    /// every analyzed result (parent and members) on hopper's `/api/result`.
-    #[must_use]
-    pub fn with_hopper(mut self, hopper: Option<String>) -> Self {
-        self.hopper = hopper.filter(|s| !s.trim().is_empty());
-        self
-    }
-
-    /// Add passwords to try when cleave encounters encrypted archives.
-    #[must_use]
-    pub fn with_zip_passwords(mut self, passwords: impl Into<crate::ArchivePasswords>) -> Self {
-        self.zip_passwords = passwords.into();
-        self
-    }
-
-    /// Enable or disable the companion pull worker; `0` disables it.
-    ///
-    /// Retained as a count because `--idle-worker-slots` and the deploy's
-    /// `IDLE=` have meant one for a long time, but the worker is its own
-    /// process now and sizes itself like any standalone worker, so every
-    /// non-zero value means the same thing.
-    #[must_use]
-    pub fn with_idle_worker_slots(mut self, slots: usize) -> Self {
-        self.idle_worker_slots = slots;
-        self
-    }
-
-    /// Analysis slots available to the idle worker.
-    #[must_use]
-    pub fn idle_worker_slots(&self) -> usize {
-        self.idle_worker_slots
-    }
-
-    /// The configured hopper upload root, or `None` when `--hopper` was not set.
-    #[must_use]
-    pub fn hopper(&self) -> Option<&str> {
-        self.hopper.as_deref()
-    }
-
-    /// Attach an LLM interpretation config (`--interpret`); `None` disables it.
-    #[must_use]
-    pub fn with_interpret(mut self, interpret: Option<crate::interpret::InterpretConfig>) -> Self {
-        self.interpret = interpret;
-        self
-    }
-
-    /// Set the external-reference fetch policy (off by default). Enabling it on
-    /// the server makes uploaded samples drive outbound fetches.
-    #[must_use]
-    pub const fn with_fetch(mut self, policy: crate::fetch::FetchPolicy) -> Self {
-        self.fetch = policy;
-        self
-    }
-
-    /// The server's external-reference fetch policy.
-    #[must_use]
-    pub(crate) const fn fetch(&self) -> crate::fetch::FetchPolicy {
-        self.fetch
-    }
-
-    /// LLM interpretation config, or `None` when `--interpret` was not set.
-    #[must_use]
-    pub fn interpret(&self) -> Option<&crate::interpret::InterpretConfig> {
-        self.interpret.as_ref()
-    }
-
-    /// Attach the FPR severity level (0..=10000) that produced the resolved
-    /// thresholds. Folded into `ml.lvl` in the JSON envelope.
-    #[must_use]
-    pub const fn with_level(mut self, level: Option<u16>) -> Self {
-        self.level = level;
-        self
-    }
-
-    /// Set the per-request analysis timeout in seconds (`--analysis-timeout`).
-    /// 0 disables the timeout. Defaults to [`DEFAULT_ANALYSIS_TIMEOUT_SECS`].
-    #[must_use]
-    pub const fn with_analysis_timeout(mut self, secs: u64) -> Self {
-        self.analysis_timeout_secs = secs;
-        self
-    }
-
-    /// Per-request analysis timeout in seconds. 0 = disabled.
-    #[must_use]
-    pub const fn analysis_timeout_secs(&self) -> u64 {
-        self.analysis_timeout_secs
-    }
-
-    /// Severity level (0..=10000) used to pick thresholds, or `None` for manual
-    /// thresholds.
-    #[must_use]
-    pub const fn level(&self) -> Option<u16> {
-        self.level
-    }
-
-    /// Directory for extracting archive members.
-    #[must_use]
-    pub fn extract_dir(&self) -> Option<&std::path::Path> {
-        self.extract_dir.as_deref()
-    }
-
-    /// Address the HTTP server binds to.
-    #[must_use]
-    pub const fn bind(&self) -> SocketAddr {
-        self.bind
-    }
-
-    /// Maximum request body size in bytes.
-    #[must_use]
-    pub const fn max_body_size(&self) -> usize {
-        self.max_body_size
-    }
-
-    /// Maximum RSS before rejecting requests, or `None` when in-process RSS
-    /// throttling is disabled (constructed with `0`).
-    #[must_use]
-    pub const fn max_rss_bytes(&self) -> Option<NonZeroU64> {
-        self.max_rss_bytes
-    }
-
-    /// Directory containing model artifacts.
-    #[must_use]
-    pub fn model_dir(&self) -> &std::path::Path {
-        &self.model_dir
-    }
-
-    /// Explicit threshold overrides, if any. `None` means use model defaults.
-    #[must_use]
-    pub const fn thresholds(&self) -> Option<Thresholds> {
-        self.thresholds
-    }
-
-    /// Warn when a single cleave rule exceeds this duration in milliseconds.
-    #[must_use]
-    pub const fn slow_rule_ms(&self) -> u64 {
-        self.slow_rule_ms
-    }
-
-    /// Directories allowed for `/analyze-path` requests.
-    #[must_use]
-    pub fn allowed_dirs(&self) -> &[PathBuf] {
-        &self.allowed_dirs
-    }
-
-    /// Maximum number of concurrent analyses.
-    #[must_use]
-    pub const fn workers(&self) -> usize {
-        self.workers
-    }
-
-    /// Networks (in addition to loopback) allowed to connect to the server.
-    /// `/analyze-path` is always restricted to loopback regardless.
-    #[must_use]
-    pub fn allow_cidrs(&self) -> &[Cidr] {
-        &self.allow_cidrs
-    }
-
-    /// Require `Authorization: Bearer <token>` on every route except
-    /// `/_/health` (`--token-file`). `None` leaves the API unauthenticated.
-    ///
-    /// Loopback peers are **not** exempt: behind a Cloudflare tunnel,
-    /// `cloudflared` connects over loopback, so every remote request arrives
-    /// with a loopback peer address.
-    #[must_use]
-    pub const fn with_auth_token(mut self, digest: Option<TokenDigest>) -> Self {
-        self.auth_digest = digest;
-        self
-    }
-
-    /// Digest of the required bearer token, or `None` when the API is
-    /// unauthenticated.
-    #[must_use]
-    pub const fn auth_digest(&self) -> Option<TokenDigest> {
-        self.auth_digest
-    }
-}
 
 #[cfg(test)]
 mod cpu_busy_tests {
@@ -546,220 +346,71 @@ mod cpu_busy_tests {
             "a counter that ran backwards is not a reading"
         );
     }
+
+    /// A second reader inside the window gets the standing answer instead of
+    /// resetting the window to the few milliseconds since the first.
+    #[test]
+    fn a_second_reader_does_not_shrink_the_window() {
+        let busy = super::CpuBusy::default();
+        let Some(first) = cleave::memory_tracker::cpu_time() else {
+            return; // No counters on this platform: nothing to window.
+        };
+        let at = std::time::Instant::now();
+        *super::lock(&busy.last) = Some(super::CpuSample {
+            at,
+            counters: first,
+            busy: Some(3.5),
+        });
+        assert_eq!(busy.sample(), Some(3.5));
+        let kept = super::lock(&busy.last).as_ref().map(|s| s.at);
+        assert_eq!(kept, Some(at), "an early read moved the window");
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod config_tests {
     use super::*;
 
     #[test]
     fn server_config_rejects_invalid_thresholds() {
-        let result = ServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], 8081)),
-            100 * 1024 * 1024,
-            8 * 1024 * 1024 * 1024,
-            "/tmp/models",
-            Some(Thresholds {
+        let config = ServerConfig {
+            thresholds: Some(Thresholds {
                 suspicious: -0.1,
                 hostile: 0.9,
             }),
-            4_000,
-            vec![],
-            None,
-            2,
-            vec![],
-        );
-
-        assert!(result.is_err());
+            ..ServerConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]
-    fn server_config_accepts_none_thresholds() {
-        let result = ServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], 8081)),
-            100 * 1024 * 1024,
-            8 * 1024 * 1024 * 1024,
-            "/tmp/models",
-            None,
-            4_000,
-            vec![],
-            None,
-            2,
-            vec![],
-        );
-
-        assert!(result.is_ok());
+    fn server_config_accepts_the_defaults() {
+        let config = ServerConfig::default();
+        assert!(config.validate().is_ok());
+        assert!(config.level.is_none());
+        assert!(config.max_rss_bytes.is_none());
     }
 
     #[test]
     fn server_config_rejects_zero_workers() {
-        let result = ServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], 8081)),
-            100 * 1024 * 1024,
-            8 * 1024 * 1024 * 1024,
-            "/tmp/models",
-            None,
-            4_000,
-            vec![],
-            None,
-            0,
-            vec![],
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn server_config_level_defaults_to_none() {
-        let config = ServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], 8081)),
-            100 * 1024 * 1024,
-            8 * 1024 * 1024 * 1024,
-            "/tmp/models",
-            None,
-            4_000,
-            vec![],
-            None,
-            2,
-            vec![],
-        )
-        .expect("valid config");
-        assert!(config.level().is_none());
-    }
-
-    #[test]
-    fn server_config_with_level_persists() {
-        let config = ServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], 8081)),
-            100 * 1024 * 1024,
-            8 * 1024 * 1024 * 1024,
-            "/tmp/models",
-            None,
-            4_000,
-            vec![],
-            None,
-            2,
-            vec![],
-        )
-        .expect("valid config")
-        .with_level(Some(5));
-        assert_eq!(config.level(), Some(5));
-    }
-
-    #[test]
-    fn server_config_keeps_archive_passwords() {
-        let config = ServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], 8081)),
-            100 * 1024 * 1024,
-            8 * 1024 * 1024 * 1024,
-            "/tmp/models",
-            None,
-            4_000,
-            vec![],
-            None,
-            2,
-            vec![],
-        )
-        .expect("valid config")
-        .with_zip_passwords(vec!["private".to_string()]);
-        assert_eq!(config.zip_passwords.as_slice(), ["private"]);
-    }
-}
-
-#[derive(Debug)]
-/// A request's phase marker plus the timeline it leaves behind.
-///
-/// Wraps the [`cleave::PhaseTracker`] that `/_/requests` and the watchdog
-/// read, and records when each phase began so the completion log can say
-/// where a request's wall time went (`phases="purl:fetch=812 cleave:init=1930 …"`,
-/// milliseconds per phase, repeats summed). That is what turns a latency
-/// percentile into an attribution: fetch-bound, registry-bound or
-/// analysis-bound, per request, without a profiler attached.
-#[derive(Clone)]
-pub(crate) struct RequestPhase(Arc<RequestPhaseInner>);
-
-#[derive(Debug)]
-struct RequestPhaseInner {
-    tracker: cleave::PhaseTracker,
-    started: Instant,
-    /// `(phase, offset from `started`)` in the order the phases were entered.
-    marks: Mutex<Vec<(String, Duration)>>,
-}
-
-/// More marks than this and the request is looping, not progressing; keep the
-/// head so the timeline still shows how it started.
-const PHASE_MARKS_MAX: usize = 64;
-
-impl RequestPhase {
-    pub(crate) fn with_label(label: impl Into<String>) -> Self {
-        Self(Arc::new(RequestPhaseInner {
-            tracker: cleave::PhaseTracker::with_label(label),
-            started: Instant::now(),
-            marks: Mutex::new(Vec::new()),
-        }))
-    }
-
-    /// Enter `phase`: updates the shared tracker and stamps the timeline.
-    pub(crate) fn set(&self, phase: &str) {
-        self.0.tracker.set(phase);
-        let at = self.0.started.elapsed();
-        let mut marks = self
-            .0
-            .marks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if marks.len() < PHASE_MARKS_MAX && marks.last().is_none_or(|(last, _)| last != phase) {
-            marks.push((phase.to_owned(), at));
-        }
-    }
-
-    /// The current phase name, as the tracker reports it.
-    pub(crate) fn get(&self) -> String {
-        self.0.tracker.get()
-    }
-
-    /// The underlying tracker, for cleave's own phase reporting.
-    pub(crate) fn tracker(&self) -> &cleave::PhaseTracker {
-        &self.0.tracker
-    }
-
-    /// Milliseconds spent in each phase, first-entered order, as
-    /// `name=ms name=ms …`. Time before the first mark is `pre`, so the
-    /// figures sum to the request's elapsed time.
-    pub(crate) fn timeline(&self) -> String {
-        let now = self.0.started.elapsed();
-        let marks = self
-            .0
-            .marks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let mut order: Vec<String> = Vec::new();
-        let mut spent: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
-        let mut account = |name: &str, dur: Duration| {
-            if !spent.contains_key(name) {
-                order.push(name.to_owned());
-            }
-            *spent.entry(name.to_owned()).or_insert(0) += dur.as_millis();
+        let config = ServerConfig {
+            workers: 0,
+            ..ServerConfig::default()
         };
-        if let Some((_, first)) = marks.first()
-            && !first.is_zero()
-        {
-            account("pre", *first);
-        }
-        for (i, (name, at)) in marks.iter().enumerate() {
-            let end = marks.get(i + 1).map_or(now, |(_, next)| *next);
-            account(name, end.saturating_sub(*at));
-        }
-        order
-            .iter()
-            .map(|name| format!("{name}={}", spent.get(name).copied().unwrap_or(0)))
-            .collect::<Vec<_>>()
-            .join(" ")
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_blank_hopper_is_no_hopper() {
+        let config = ServerConfig {
+            hopper: Some("  ".into()),
+            ..ServerConfig::default()
+        };
+        assert_eq!(config.hopper(), None);
     }
 }
 
+/// One admitted analysis, as `/_/requests` and the watchdog report it.
 struct InFlightRequest {
     name: String,
     size_bytes: u64,
@@ -773,11 +424,24 @@ struct InFlightRequest {
     thread_id: AtomicU64,
 }
 
-/// RAII guard that cleans up a request slot when the handler future completes or
-/// is dropped (e.g. on client disconnect). On drop it signals cooperative
-/// cancellation to the blocking thread and removes the in-flight entry, ensuring
-/// neither the semaphore slot nor the dashmap entry leaks even if axum cancels
-/// the handler mid-flight.
+impl InFlightRequest {
+    fn new(
+        name: &str,
+        size_bytes: u64,
+        cancellation: Arc<AtomicBool>,
+        phase: RequestPhase,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            size_bytes,
+            started_at: Instant::now(),
+            cancellation,
+            phase,
+            thread_id: AtomicU64::new(0),
+        }
+    }
+}
+
 /// What an admitted analysis holds: a request slot and a core.
 ///
 /// Slots are sized for a request's whole life, most of which is waiting on
@@ -802,6 +466,10 @@ impl AnalysisPermit {
     }
 }
 
+/// RAII guard over one admitted analysis. On drop — the analysis finished, or
+/// the handler future was dropped on a client disconnect — it signals
+/// cooperative cancellation to the blocking thread and removes the in-flight
+/// entry, so neither the permits nor the entry can leak.
 pub(super) struct RequestGuard {
     request_id: u64,
     state: Arc<AppState>,
@@ -814,26 +482,70 @@ pub(super) struct RequestGuard {
 }
 
 impl RequestGuard {
+    /// Register an admitted analysis on `/_/requests` and hold its capacity
+    /// until the guard drops.
     fn new(
+        state: &Arc<AppState>,
         request_id: u64,
-        state: Arc<AppState>,
-        cancellation: Arc<AtomicBool>,
+        entry: InFlightRequest,
         permit: AnalysisPermit,
     ) -> Self {
-        state.jobs_started.fetch_add(1, Ordering::Relaxed);
+        let cancellation = Arc::clone(&entry.cancellation);
+        state.in_flight.insert(request_id, entry);
+        state.jobs.started.fetch_add(1, Ordering::Relaxed);
         ACTIVE_REQUESTS.fetch_add(1, Ordering::AcqRel);
-        let busy = state.enter_busy();
         Self {
             request_id,
-            state,
+            state: Arc::clone(state),
             cancellation,
             _permit: permit,
-            _busy: busy,
+            _busy: state.enter_busy(),
         }
     }
-}
 
-impl RequestGuard {
+    /// Run `work` on a blocking thread, bounded by `--analysis-timeout`.
+    ///
+    /// The guard is dropped when the work returns. On timeout it follows the
+    /// blocking task instead — tokio cannot stop a blocking thread, only ask it
+    /// via the cancellation flag — so the thread's slot and core stay
+    /// accounted for as long as it runs.
+    pub(super) async fn run(
+        self,
+        work: impl FnOnce() -> anyhow::Result<crate::engine::ScanResult> + Send + 'static,
+    ) -> AnalysisOutcome {
+        let state = Arc::clone(&self.state);
+        let id = self.request_id;
+        let mut handle = tokio::task::spawn_blocking(move || {
+            if let Some(entry) = state.in_flight.get(&id) {
+                entry
+                    .thread_id
+                    .store(crate::thread_dump::os_thread_id(), Ordering::Relaxed);
+            }
+            let result = work();
+            // A long-lived server returns its thread-local caches now and then.
+            if id.is_multiple_of(100) {
+                cleave::clear_all_thread_caches();
+            }
+            result
+        });
+        let timeout_secs = self.state.config.analysis_timeout_secs;
+        let joined = if timeout_secs == 0 {
+            handle.await
+        } else {
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), &mut handle).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    self.follow(handle);
+                    return AnalysisOutcome::Timeout(timeout_secs);
+                }
+            }
+        };
+        match joined {
+            Ok(result) => AnalysisOutcome::Ok(result.map(Box::new)),
+            Err(e) => AnalysisOutcome::JoinError(e),
+        }
+    }
+
     /// Keep the slot and core until a timed-out blocking task returns.
     ///
     /// A blocking thread cannot be stopped, only asked: the cancellation flag,
@@ -843,10 +555,11 @@ impl RequestGuard {
     /// `slots_free=48` on one box. The guard follows the thread out instead,
     /// and `stuck_orphans` counts threads still running, not timeouts there
     /// have ever been.
-    pub(super) fn follow<T: Send + 'static>(self, task: tokio::task::JoinHandle<T>) {
+    fn follow<T: Send + 'static>(self, task: tokio::task::JoinHandle<T>) {
         self.cancellation.store(true, Ordering::Release);
         self.state.stuck_orphans.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
+        let tasks = Arc::clone(&self.state.tasks);
+        tasks.spawn(async move {
             let _ = task.await;
             self.state.stuck_orphans.fetch_sub(1, Ordering::Relaxed);
             drop(self);
@@ -856,15 +569,28 @@ impl RequestGuard {
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        // Signal the blocking thread to stop cooperatively, then remove the
-        // in-flight entry. The permit is released automatically via _permit.
+        // The permit is released with `_permit`; `_busy` thaws the worker if
+        // this was the last holder.
         self.cancellation.store(true, Ordering::Release);
         self.state.in_flight.remove(&self.request_id);
         ACTIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
-        // `_busy` thaws the worker here if this was the last holder. It is not
-        // conditional on `in_flight` being empty: the counter already knows,
-        // and it also counts the handlers that have not reached an analysis yet.
     }
+}
+
+/// Outcome of a blocking analysis awaited with a bound.
+///
+/// `Ok` boxes the `ScanResult` (≈376 B) so the idle-path variants — `Timeout`
+/// and `JoinError` — don't carry that much padding each.
+#[derive(Debug)]
+pub(super) enum AnalysisOutcome {
+    /// Task completed (inner `Result` is the analyzer's result).
+    Ok(anyhow::Result<Box<crate::engine::ScanResult>>),
+    /// Task join failed (panic, runtime shutdown, etc.).
+    JoinError(tokio::task::JoinError),
+    /// Task exceeded the configured timeout. The blocking thread keeps running
+    /// until cleave observes the cancellation flag, and keeps its slot and
+    /// core until then.
+    Timeout(u64),
 }
 
 /// Upper bounds, in bytes, of each size bucket; the last is open-ended.
@@ -910,21 +636,22 @@ impl JobBucket {
         }
     }
 
-    /// The windowed view, in milliseconds, for `/_/stats`.
-    pub(crate) fn recent_json(&self) -> serde_json::Value {
-        let s = self.recent.summary();
-        serde_json::json!({
-            "samples": s.samples,
-            "p80_ms": s.p80_micros.map(|us| us / 1_000),
-            "mean_ms": s.mean_micros.map(|us| us / 1_000),
-        })
+    /// Samples in the aged totals, and their mean in milliseconds.
+    pub(crate) fn mean_ms(&self) -> (u64, Option<u64>) {
+        let n = self.count.load(Ordering::Relaxed);
+        let ms = (n > 0).then(|| self.micros.load(Ordering::Relaxed) / n / 1_000);
+        (n, ms)
     }
-}
 
-/// How much recent history the windowed estimates cover, for `/_/stats`. A
-/// consumer that knows the window can tell "quiet worker" from "stale reading".
-pub(crate) fn latency_window_secs() -> u64 {
-    latency::WINDOW.as_secs()
+    /// The windowed view, in milliseconds, for `/_/stats`.
+    pub(crate) fn recent(&self) -> diag::Recent {
+        let s = self.recent.summary();
+        diag::Recent {
+            samples: s.samples,
+            p80_ms: s.p80_micros.map(|us| us / 1_000),
+            mean_ms: s.mean_micros.map(|us| us / 1_000),
+        }
+    }
 }
 
 /// PURL types tracked separately on `/_/stats`, plus a catch-all.
@@ -958,444 +685,19 @@ pub(crate) fn size_bucket(size: u64) -> usize {
         .unwrap_or(SIZE_BUCKETS.len() - 1)
 }
 
-#[derive(Debug)]
-/// The loaded model bundle an analysis runs against: thresholds, the ML
-/// ensemble, and the optional LLM and fetch policies attached to it.
+/// Analyses this server has begun and completed, and the figures a router
+/// reads to choose it.
 ///
-/// Public because [`crate::worker::Embedded`] carries one — an idle worker
-/// running inside a serve process shares the server's already-loaded models
-/// rather than loading a second copy of the largest thing in the process.
-pub struct ModelResources {
-    pub(crate) model: Model,
-    pub(crate) shap: Option<ShapImportance>,
-    pub(crate) ctx: ExtractContext,
-    /// LLM interpretation config (`--interpret`); `None` disables the pass.
-    pub(crate) interpret: Option<crate::interpret::InterpretConfig>,
-    /// External-reference fetch policy; default (empty) disables fetching.
-    pub(crate) fetch: crate::fetch::FetchPolicy,
-    /// Additional passwords to try for encrypted archives.
-    pub(crate) zip_passwords: crate::ArchivePasswords,
-}
-
-/// Payloads at or below this many bytes count as small — for the slot lanes
-/// and for [`whale_lane_for`] alike. `SCAN_SMALL_JOB_MB`, the same knob the
-/// worker's cleave gate reads; 1 MiB unless set.
-fn small_job_max_bytes() -> u64 {
-    std::env::var("SCAN_SMALL_JOB_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or(1024 * 1024, |mb| mb.saturating_mul(1024 * 1024))
-}
-
-/// Threads for one whale's private pool on a host with this many physical
-/// cores: a quarter of them, never fewer than two (one thread cannot pipeline
-/// a member window against its own producer) and never more than sixteen.
-/// 4 cores → 2, 64 → 16, 128 → 16. Several whales in flight each get their
-/// own; the global pool keeps every core for everything else.
-#[must_use]
-pub(crate) fn whale_pool_threads(physical_cores: usize) -> usize {
-    (physical_cores / 4).clamp(2, 16)
-}
-
-/// Threads for a small payload's private pool on a host with this many
-/// physical cores: an eighth of them, 2–8. 4 cores → 2, 64 → 8, 128 → 8. A
-/// package under the small cap has few members, so a wider pool mostly idles;
-/// eight is where its p50 was best (0.29 s vs 0.44 s on 16, measured
-/// 2026-09-05 at concurrency 8 over 256 PURLs).
-#[must_use]
-pub(crate) fn small_pool_threads(physical_cores: usize) -> usize {
-    (physical_cores / 8).clamp(2, 8)
-}
-
-/// How many *big* whales analyze at once on a host with this many physical
-/// cores; the rest wait their turn. An eighth of the cores, 1–8: 4 cores → 1,
-/// 64 → 8, 128 → 8. With [`whale_pool_threads`] that bounds whale threads at
-/// about two per physical core, oversubscribed enough to keep every core busy
-/// while a whale is in a serial phase, not so much that the global pool's
-/// small work loses its cores.
-#[must_use]
-pub(crate) fn whale_slots(physical_cores: usize) -> usize {
-    (physical_cores / 8).clamp(1, 8)
-}
-
-/// Payloads above this many bytes are *big* whales, the ones that take a
-/// slot from [`whale_slots`]. `SCAN_BIG_JOB_MB`; 8 MiB unless set. Between
-/// `SCAN_SMALL_JOB_MB` and this a payload still gets a private pool, but
-/// never waits: a 2 MiB package finishes in seconds, and making it queue
-/// behind a 250 MiB one is the starvation this whole arrangement exists to
-/// prevent.
-fn big_job_min_bytes() -> u64 {
-    std::env::var("SCAN_BIG_JOB_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or(8 * 1024 * 1024, |mb| mb.saturating_mul(1024 * 1024))
-}
-
-/// Whale-lane sizing, read once from the environment.
-/// Analyses admitted and not yet finished, process-wide — what a new lane
-/// shares the cores with. Kept by [`RequestGuard`].
-static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
-
-/// Threads a private lane of tier minimum `floor` gets when `active`
-/// requests (this one included) are in flight on a host with `physical`
-/// cores: an even share of the cores, never below the tier's floor and never
-/// above the cores. Alone (`active <= 1`) the answer is `None`: the global
-/// pool, every thread of it.
-///
-/// The tier floors (8 for small, 16 for whales) were chosen at concurrency 8
-/// and are right there — 8 for small beat 16 on p50 — but they are the whole
-/// story only when the box is full. At concurrency 1 the same 8-thread pool
-/// left 120 threads idle: purls-128 measured p90 1.63 s on the fixed widths
-/// against 1.12 s on the global pool, wall 164 → 111 s (2026-09-06). The
-/// share reproduces both ends: 64 physical cores / 8 in flight = 8 (the
-/// small floor), / 4 = 16, / 2 = 32, alone = everything.
-#[must_use]
-pub(crate) fn lane_threads(floor: usize, physical: usize, active: usize) -> Option<usize> {
-    if active <= 1 {
-        return None;
-    }
-    Some((physical / active).clamp(floor, physical.max(floor)))
-}
-
-struct WhaleConfig {
-    /// Threads per whale pool; `0` sends whales to the global pool instead.
-    threads: usize,
-    /// Threads per small payload's pool; `0` keeps small payloads on the
-    /// global pool.
-    small_threads: usize,
-    /// Physical cores, the numerator of the per-request share.
-    physical: usize,
-    /// `SCAN_LANE_SHARE=0` pins every lane at its tier floor (the widths
-    /// measured at concurrency 8) instead of sharing the cores by load.
-    share: bool,
-    /// Big whales in flight at once.
-    slots: usize,
-    small_max_bytes: u64,
-    big_min_bytes: u64,
-}
-
-static WHALE_CONFIG: OnceLock<WhaleConfig> = OnceLock::new();
-
-fn whale_config() -> &'static WhaleConfig {
-    WHALE_CONFIG.get_or_init(|| {
-        let physical = cleave::memory_tracker::physical_cpu_count()
-            .or_else(|| {
-                std::thread::available_parallelism()
-                    .ok()
-                    .map(|n| n.get() / 2)
-            })
-            .unwrap_or(4);
-        let env_usize = |key: &str| {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-        };
-        let threads =
-            env_usize("SCAN_WHALE_POOL_THREADS").unwrap_or_else(|| whale_pool_threads(physical));
-        let small_threads =
-            env_usize("SCAN_SMALL_POOL_THREADS").unwrap_or_else(|| small_pool_threads(physical));
-        let slots = env_usize("SCAN_WHALE_SLOTS")
-            .unwrap_or_else(|| whale_slots(physical))
-            .max(1);
-        let small_max_bytes = small_job_max_bytes();
-        let big_min_bytes = big_job_min_bytes().max(small_max_bytes);
-        let share = std::env::var("SCAN_LANE_SHARE").as_deref() != Ok("0");
-        if threads == 0 {
-            tracing::info!("whale analysis pools disabled (SCAN_WHALE_POOL_THREADS=0)");
-        } else {
-            tracing::info!(
-                threads_per_whale = threads,
-                threads_per_small = small_threads,
-                big_whale_slots = slots,
-                whale_over_mb = small_max_bytes / (1024 * 1024),
-                big_over_mb = big_min_bytes / (1024 * 1024),
-                share,
-                "analysis lanes ready: every payload runs on a private rayon pool sized to it"
-            );
-        }
-        WhaleConfig {
-            threads,
-            small_threads,
-            physical,
-            share,
-            slots,
-            small_max_bytes,
-            big_min_bytes,
-        }
-    })
-}
-
-/// Big whales in flight.
-static WHALE_SLOTS_IN_USE: AtomicUsize = AtomicUsize::new(0);
-
-/// One of [`whale_slots`], released on drop.
-struct WhaleSlot;
-
-/// Every big-whale slot is taken. Surfaced as 429 so the router places the
-/// analysis on a worker with a free slot instead of queueing it here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WhaleSlotBusy {
-    slots: usize,
-}
-
-impl std::fmt::Display for WhaleSlotBusy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "whale lane at capacity ({0}/{0} big analyses in flight)",
-            self.slots
-        )
-    }
-}
-
-impl std::error::Error for WhaleSlotBusy {}
-
-impl WhaleSlot {
-    /// Take a slot now or refuse. This never waits: a request that reaches
-    /// here is already streaming, so a queue is invisible to the router and
-    /// the request sits behind whatever holds the slot for that whale's
-    /// whole run (three wheels of 17–78 MB on 4-core scan-pdx, 2026-09-06:
-    /// one held the only slot for 34 minutes and the other two timed out
-    /// behind it while three other workers had room). A refusal ends the
-    /// stream in milliseconds and the router tries the next worker.
-    fn try_acquire(slots: usize) -> Result<Self, WhaleSlotBusy> {
-        WHALE_SLOTS_IN_USE
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |in_use| {
-                (in_use < slots).then_some(in_use + 1)
-            })
-            .map(|_| Self)
-            .map_err(|_full| WhaleSlotBusy { slots })
-    }
-
-    /// Slots in use right now, for `/_/stats`.
-    fn in_use() -> usize {
-        WHALE_SLOTS_IN_USE.load(Ordering::Acquire)
-    }
-}
-
-impl Drop for WhaleSlot {
-    fn drop(&mut self) {
-        WHALE_SLOTS_IN_USE.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// A whale's private rayon pool for the life of one analysis: the bulkhead
-/// that keeps a 40 MB package from stalling every 300-byte one that arrives
-/// while it runs, and every 2 MB one from stalling behind it.
-///
-/// Every server analysis runs on a tokio blocking thread, so each inner
-/// `par_iter` it issues — string extraction in stng, a member-window flush in
-/// cleave — is *injected* into a rayon pool from outside, and rayon workers
-/// take injected work only once their own deques are empty. While a whale's
-/// thousands of member tasks sit in those deques they never are. Measured
-/// 2026-09-05 at concurrency 8 over 128 real PURLs: a package that analyzes
-/// in 0.3s alone waited 16.8s in `Registry::in_worker_cold` for a global-pool
-/// worker, and the p90 sat at 5.2–6.9s whether or not the LLM pass ran.
-///
-/// A single *shared* whale pool was the first cut and fixed the small side
-/// (p90 4.1s), but moved the starvation into the whale pool: three 36–254 MB
-/// wheels in flight kept a 1.3 MB package waiting the whole 200s sweep, and
-/// held each other to 170s+ where alone they take 25–40s. So each whale gets
-/// its own pool ([`whale_pool_threads`] wide, dropped when the analysis
-/// returns); nothing shares an injector with a whale. Big ones
-/// (`SCAN_BIG_JOB_MB`) also take one of [`whale_slots`]; a burst of them is
-/// refused past that count ([`WhaleSlotBusy`]) so the router spreads it over
-/// the fleet instead of oversubscribing this host; the threads are cheap, the
-/// cores are the budget.
-///
-/// `SCAN_WHALE_POOL_THREADS` sets the per-whale width (0 sends whales to the
-/// global pool); `SCAN_WHALE_SLOTS` the big-whale concurrency;
-/// `SCAN_SMALL_JOB_MB` (shared with the slot lanes) says where whale starts.
-pub(crate) struct WhaleLane {
-    pool: rayon::ThreadPool,
-    /// Held for the pool's life when the payload is a big whale.
-    _slot: Option<WhaleSlot>,
-}
-
-impl WhaleLane {
-    /// Run `f` on this lane's pool, blocking until it returns.
-    pub(crate) fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
-        self.pool.install(f)
-    }
-}
-
-/// Big-whale slots in use and available, for `/_/stats`.
-pub(crate) fn whale_slot_usage() -> (usize, usize) {
-    (WhaleSlot::in_use(), whale_config().slots)
-}
-
-/// The lane a payload of `bytes` analyzes on: a private pool sized to it —
-/// [`small_pool_threads`] wide at or below the small cap, [`whale_pool_threads`]
-/// above it, after waiting for a slot if the payload is big — or `None` (the
-/// global pool) when private pools are disabled for its size or fail to
-/// build. The wait is the caller's phase to report.
-///
-/// Built per analysis and dropped after it: parking idle pools for reuse
-/// (warm thread-local caches) measured as a wash, within noise on p50, p90
-/// and throughput over 256 PURLs, so the simpler form stays.
-///
-/// Small payloads got private pools too once the whales had them: on the
-/// global pool they compete for cleave's bounded inner-parallel owner slots
-/// and half of them analyze serially at concurrency 8; on a pool of their
-/// own each is parallel and exempt (`dedicated_pool`). Measured 2026-09-05
-/// over 256 PURLs: throughput 203 → 230/min, mean 1.65 → 1.35 s.
-///
-/// Never for pull work. The idle worker's analyses already run on a pool of
-/// their own — bounded, scheduled below the server's, and drawing on their
-/// own parallelism slots — and a lane would undo all three: a lane pool's
-/// threads are unmarked and at normal priority, and a big idle archive would
-/// take one of the few whale slots and hold it for its whole slow run.
-/// Measured 2026-09-06 on scan-lax: two of the two whale slots held by pull
-/// work, and two interactive analyses waited in `whale:lane` until their
-/// 30-minute budget ran out.
-///
-/// A big whale with every slot taken is refused ([`WhaleSlotBusy`]) rather
-/// than queued; the handler turns that into a retry-later response.
-pub(crate) fn whale_lane_for(bytes: u64) -> Result<Option<WhaleLane>, WhaleSlotBusy> {
-    let cfg = whale_config();
-    let floor = if bytes <= cfg.small_max_bytes {
-        cfg.small_threads
-    } else {
-        cfg.threads
-    };
-    if floor == 0 {
-        return Ok(None);
-    }
-    let threads = if cfg.share {
-        // Alone on the box, the global pool is the widest lane there is.
-        match lane_threads(floor, cfg.physical, ACTIVE_REQUESTS.load(Ordering::Acquire)) {
-            Some(threads) => threads,
-            None => return Ok(None),
-        }
-    } else {
-        floor
-    };
-    let slot = if bytes > cfg.big_min_bytes {
-        Some(WhaleSlot::try_acquire(cfg.slots)?)
-    } else {
-        None
-    };
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
-        .thread_name(move |i| format!("rayon-lane{threads}-{i}"))
-        .build()
-    {
-        Ok(pool) => Ok(Some(WhaleLane { pool, _slot: slot })),
-        Err(e) => {
-            tracing::warn!(error = %e, bytes, "failed to build a private analysis pool; this payload shares the global pool");
-            Ok(None)
-        }
-    }
-}
-
-#[derive(Debug)]
-/// See `AppState::lanes`.
-pub(super) struct SlotLanes {
-    pub(super) whale: Arc<tokio::sync::Semaphore>,
-    pub(super) small: Arc<tokio::sync::Semaphore>,
-    /// Jobs at or below this size take the small lane (`SCAN_SMALL_JOB_MB`,
-    /// the same knob the worker's cleave gate reads). Unknown size — a PURL
-    /// or URL analysis whose payload has not been fetched yet — is a whale:
-    /// those are almost always packages, and mis-classing a whale as small
-    /// is the expensive direction.
-    pub(super) small_max_bytes: u64,
-}
-
-impl SlotLanes {
-    fn from_env(max_concurrent: usize) -> Option<Self> {
-        if std::env::var("SCAN_SLOT_LANES").as_deref() != Ok("1") {
-            return None;
-        }
-        let whale_permits = (1 + max_concurrent / 8).min(max_concurrent);
-        let small_permits = max_concurrent.saturating_sub(whale_permits).max(1);
-        let small_max_bytes = small_job_max_bytes();
-        tracing::info!(
-            whale_permits,
-            small_permits,
-            small_max_mb = small_max_bytes / (1024 * 1024),
-            "slot lanes enabled: class-aware admission (SCAN_SLOT_LANES)"
-        );
-        Some(Self {
-            whale: Arc::new(tokio::sync::Semaphore::new(whale_permits)),
-            small: Arc::new(tokio::sync::Semaphore::new(small_permits)),
-            small_max_bytes,
-        })
-    }
-
-    pub(super) fn available(&self) -> usize {
-        self.whale.available_permits() + self.small.available_permits()
-    }
-}
-
-struct AppState {
-    max_upload_bytes: usize,
-    /// Maximum RSS before rejecting requests; `None` disables throttling.
-    max_rss_bytes: Option<NonZeroU64>,
-    model_dir: PathBuf,
-    threshold_overrides: Option<Thresholds>,
-    slow_rule_ms: u64,
-    level: Option<u16>,
-    allowed_dirs: Vec<PathBuf>,
-    extract_dir: Option<PathBuf>,
-    allow_cidrs: Vec<Cidr>,
-    /// Digest of the bearer token required by the ACL middleware; `None`
-    /// disables authentication.
-    auth_digest: Option<TokenDigest>,
-    /// LLM interpretation config (`--interpret`); shared into every
-    /// [`ModelResources`] so handlers can run the pass.
-    interpret: Option<crate::interpret::InterpretConfig>,
-    /// External-reference fetch policy; shared into every [`ModelResources`].
-    fetch: crate::fetch::FetchPolicy,
-    /// Additional passwords to try for encrypted archives.
-    zip_passwords: crate::ArchivePasswords,
-    /// Process uptime anchor — captured when build_app runs, very close to
-    /// process start. /_/health reports `now - started_at` as uptime_secs.
-    started_at: Instant,
-    ready: AtomicBool,
-    init_error: RwLock<Option<String>>,
-    resources: RwLock<Option<Arc<ModelResources>>>,
-    next_request_id: AtomicU64,
-    /// Semaphore with max_concurrent_tasks permits. Each analysis handler acquires
-    /// one OwnedSemaphorePermit before starting work; the permit is dropped when
-    /// the analysis completes or when the orphan-cleanup task gives up. RAII
-    /// semantics mean the slot is always released — even on panic or runtime shutdown.
-    slots: Arc<tokio::sync::Semaphore>,
-    /// One permit per rayon thread, shared with the idle worker: every analysis
-    /// in this process, whoever asked for it, runs on the same pool.
-    cpu: Arc<tokio::sync::Semaphore>,
-    /// Class-aware admission (`SCAN_SLOT_LANES=1`): the flat `slots` semaphore
-    /// treats every analysis as equal, but a large archive fans out across the
-    /// whole shared rayon pool while a small file uses roughly one thread — so
-    /// `--workers` flat slots either under-admit smalls or co-schedule whales
-    /// that then fight for the pool (measured +55% wall on whale co-residency).
-    /// The lanes mirror the worker's cleave gate at the front door: smalls
-    /// (`< small_max_bytes`, the worker's 1 MiB small-job line) get most
-    /// permits, whales get few, and a full lane answers 429 + Retry-After
-    /// instead of queueing — a whale's queue wait is minutes, so the fleet
-    /// routes it to an idle server; a small's wait is seconds, so callers just
-    /// retry. `None` = lanes disabled, flat admission as before.
-    lanes: Option<SlotLanes>,
-    /// Tasks stuck past the grace period — still occupying a slot until the
-    /// blocking thread finally returns. Tracked for observability only.
-    stuck_orphans: AtomicUsize,
-    /// Capacity of the slots semaphore. Requests are rejected with 503 when no
-    /// permits are available, preventing orphaned blocking tasks from piling up
-    /// and consuming unbounded memory.
-    max_concurrent_tasks: usize,
-    /// Per-request analysis timeout. `0` disables the timeout entirely.
-    analysis_timeout_secs: u64,
-    reload_lock: tokio::sync::Mutex<()>,
-    overloaded_since: std::sync::Mutex<Option<Instant>>,
-    in_flight: dashmap::DashMap<u64, InFlightRequest>,
-    /// Hopper root, kept so the idle worker can claim from the same instance
-    /// the uploader renews to.
-    hopper: Option<String>,
-    /// Machine-wide cores busy between consecutive `/_/stats` reads.
-    cpu_busy: CpuBusy,
-    /// Raised once the HTTP server stops, so the idle worker winds down with it
-    /// rather than outliving the thing it exists to fill the gaps of.
-    shutdown: Arc<AtomicBool>,
+/// Counted rather than sampled: a router wants "how big and how slow are this
+/// server's jobs, typically", and totals divided at read time answer that
+/// without keeping a window. `started` minus `completed` is also the honest
+/// count of work that went in and never came out.
+#[derive(Debug, Default)]
+pub(super) struct Jobs {
+    started: AtomicU64,
+    completed: AtomicU64,
+    bytes_total: AtomicU64,
+    micros_total: AtomicU64,
     /// Per-size-bucket completion totals, for the size-aware half of routing.
     ///
     /// One scalar average is not enough to choose a server. The 12.5s-vs-90s
@@ -1404,61 +706,178 @@ struct AppState {
     /// would brand a box "slow" when it is only slow at big inputs, and send
     /// every small package somewhere worse. A caller usually knows the size
     /// before it dispatches, so the useful answer is per bucket.
-    job_buckets: [JobBucket; SIZE_BUCKETS.len()],
-    job_types: [JobBucket; PURL_TYPE_NAMES.len()],
-    /// The blended average, aged like the others. Separate from
-    /// `jobs_completed`, which stays a true lifetime count for reporting: one
-    /// answers "how fast is this server now", the other "how much has it done".
+    by_size: [JobBucket; SIZE_BUCKETS.len()],
+    by_type: [JobBucket; PURL_TYPE_NAMES.len()],
+    /// The blended average, aged like the others. Separate from `completed`,
+    /// which stays a true lifetime count for reporting: one answers "how fast
+    /// is this server now", the other "how much has it done".
     ///
-    /// Fresh analyses only — see [`AppState::job_cached`]. So are
-    /// `job_buckets` and `job_types`.
-    job_overall: JobBucket,
-    /// Analyses answered from this server's own verdict index.
+    /// Fresh analyses only — see `cached`. So are `by_size` and `by_type`.
+    overall: JobBucket,
+    /// Analyses answered from cleave's analysis cache.
     ///
     /// Kept apart from the fresh numbers because mixing them makes every
     /// average bimodal and therefore useless for prediction: the same artifact
     /// is milliseconds on a hit and minutes on a miss. A router choosing a
     /// worker for work it has not done wants the fresh figure; blending in
     /// cache hits only tells it how lucky this server has been.
-    job_cached: JobBucket,
+    cached: JobBucket,
     /// `/lookup` service time. Near-constant — an index probe, not an analysis
     /// — and so the honest input for ordering the cheap-source race, where the
     /// analysis averages would be wrong by three orders of magnitude.
     lookups: JobBucket,
-    /// Analyses this server has begun, completed, and the totals behind their
-    /// averages.
-    ///
-    /// Counted rather than sampled: a router wants "how big and how slow are
-    /// this server's jobs, typically", and totals divided at read time answer
-    /// that without keeping a window. `started` minus `completed` is also the
-    /// honest count of work that went in and never came out.
-    jobs_started: AtomicU64,
-    jobs_completed: AtomicU64,
-    job_bytes_total: AtomicU64,
-    job_micros_total: AtomicU64,
-    /// Raised while any interactive request is in flight, so an embedded idle
-    /// worker stops claiming queue work. `None` when no idle worker is running.
-    ///
-    /// Driven from [`RequestGuard`] rather than polled: the guard already
-    /// brackets exactly the window that matters, and a poller would either lag
-    /// a request's arrival or spin.
+}
+
+impl Jobs {
+    /// Count one finished analysis. Every analyze route reports here, so
+    /// `started` minus `completed` stays the work that never came out.
+    fn finished(&self, result: &crate::engine::ScanResult, elapsed_ms: u64, purl: Option<&str>) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.bytes_total
+            .fetch_add(result.size_bytes, Ordering::Relaxed);
+        self.micros_total
+            .fetch_add(elapsed_ms.saturating_mul(1_000), Ordering::Relaxed);
+        // What the router averages is this server's own service time: the LLM
+        // phase is left out, because the endpoint is shared by the whole fleet
+        // and a contended one made every worker that asked it look slow.
+        // Measured 2026-09-06: a 128-core box restarted, its first twenty
+        // samples were probes that each waited on the endpoint, its p80 read
+        // 82s, and it took 2 of the next 128 dispatches while a 4-core box
+        // took 52.
+        let micros = elapsed_ms
+            .saturating_sub(result.interpret_ms)
+            .saturating_mul(1_000);
+        // Routing predicts the cost of work this server has *not* done, so
+        // only fresh analyses feed the figures a router reads. A cache hit is
+        // real and worth reporting, but it predicts nothing about the next
+        // unseen artifact.
+        if result.analysis_cached {
+            self.cached.record(micros);
+            return;
+        }
+        self.overall.record(micros);
+        self.by_size[size_bucket(result.size_bytes)].record(micros);
+        // By PURL type too, when the job was named by one: the only cost signal
+        // a router has before dispatch for `?purl=` work.
+        if let Some(purl) = purl {
+            self.by_type[purl_type_bucket(purl)].record(micros);
+        }
+    }
+}
+
+/// Class-aware admission, when `SCAN_SLOT_LANES=1`.
+///
+/// The flat slot semaphore treats every analysis as equal, but a large archive
+/// fans out across the whole shared rayon pool while a small file uses roughly
+/// one thread — so `--workers` flat slots either under-admit smalls or
+/// co-schedule whales that then fight for the pool (measured +55% wall on
+/// whale co-residency). The lanes mirror the worker's cleave gate at the front
+/// door: smalls get most permits, whales get few, and a full lane answers 429
+/// with Retry-After instead of queueing — a whale's queue wait is minutes, so
+/// the fleet routes it to an idle server; a small's wait is seconds, so callers
+/// just retry.
+#[derive(Debug)]
+pub(super) struct SlotLanes {
+    pub(super) whale: Arc<Semaphore>,
+    pub(super) small: Arc<Semaphore>,
+    /// Jobs at or below this size take the small lane (`SCAN_SMALL_JOB_MB`).
+    /// Unknown size — a PURL or URL analysis whose payload has not been
+    /// fetched yet — is a whale: those are almost always packages, and
+    /// mis-classing a whale as small is the expensive direction.
+    pub(super) small_max_bytes: u64,
+}
+
+impl SlotLanes {
+    fn new(max_concurrent: usize, small_max_bytes: u64) -> Self {
+        let whale_permits = (1 + max_concurrent / 8).min(max_concurrent);
+        let small_permits = max_concurrent.saturating_sub(whale_permits).max(1);
+        tracing::info!(
+            whale_permits,
+            small_permits,
+            small_max_mb = small_max_bytes / (1024 * 1024),
+            "slot lanes enabled: class-aware admission (SCAN_SLOT_LANES)"
+        );
+        Self {
+            whale: Arc::new(Semaphore::new(whale_permits)),
+            small: Arc::new(Semaphore::new(small_permits)),
+            small_max_bytes,
+        }
+    }
+
+    pub(super) fn available(&self) -> usize {
+        self.whale.available_permits() + self.small.available_permits()
+    }
+}
+
+/// Whether the model bundle is loaded.
+enum Readiness {
+    Starting,
+    /// Startup failed. The reason is logged; it is never served.
+    Failed(String),
+    Ready(Arc<ModelResources>),
+}
+
+/// How many cached-upload repairs may hold their bytes at once. Each holds up
+/// to `--max-size-mb`; a repeat past this is skipped, and the next repeat of
+/// the same artifact repairs it instead.
+const MAX_REPAIRS: usize = 4;
+
+/// How long shutdown waits for analyses no client is waiting on.
+/// Comfortably inside systemd's default 90-second stop timeout.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct AppState {
+    config: ServerConfig,
+    /// Process uptime anchor — captured when the app is built, very close to
+    /// process start. `/_/health` reports `now - started_at` as `uptime_secs`.
+    started_at: Instant,
+    readiness: RwLock<Readiness>,
+    next_request_id: AtomicU64,
+    /// One permit per `--workers` slot. Each analysis holds one for its whole
+    /// life; the permit drops with the analysis or with its orphan follower,
+    /// so a slot is always released — even on panic or runtime shutdown.
+    slots: Arc<Semaphore>,
+    /// One permit per rayon thread, shared with the idle worker: every analysis
+    /// in this process, whoever asked for it, runs on the same pool.
+    cpu: Arc<Semaphore>,
+    lanes: Option<SlotLanes>,
+    /// Tasks stuck past the timeout — still occupying a slot until the
+    /// blocking thread finally returns. Tracked for observability only.
+    stuck_orphans: AtomicUsize,
+    /// Serializes `/_/reload` and `/_/update`. The guard is moved into the
+    /// blocking work, so it is held for as long as that work runs.
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
+    overloaded_since: Mutex<Option<Instant>>,
+    in_flight: dashmap::DashMap<u64, InFlightRequest>,
+    /// Machine-wide cores busy between consecutive `/_/stats` reads.
+    cpu_busy: CpuBusy,
+    /// Raised when the server stops, so background tasks wind down with it.
+    /// Dropping the state drops the sender, which they read the same way.
+    shutdown: watch::Sender<bool>,
+    /// Work no request is waiting on — analyses whose callers hung up, their
+    /// index and upload tails — counted so shutdown can drain it.
+    tasks: Arc<Tasks>,
+    jobs: Jobs,
     /// Requests outstanding, and the worker they freeze. See [`idle::Busy`].
     busy: Arc<idle::Busy>,
     /// The companion pull worker, when one is running.
     idle_worker: Option<Arc<idle::Worker>>,
-    /// Monotonic elapsed-time marker for the most recent analysis request.
-    /// Unlike `idle_pause`, this also covers requests that are rejected before
-    /// they acquire an analysis slot.
     /// Analyses in progress, so concurrent requests for the same artifact
     /// share one run instead of each taking a slot. See [`flight`].
     flights: Arc<flight::Flights>,
+    /// Bounds the cached-upload repairs in flight; see [`MAX_REPAIRS`].
+    repairs: Arc<Semaphore>,
     /// Background hopper uploader (`--hopper`); `None` disables result renewal.
-    /// Shared across handlers; each analyzed result is queued to its own thread,
-    /// so uploads never block the analyze response.
     uploader: Option<Arc<crate::upload::Uploader>>,
     /// The corpus behind this worker's index. `None` when no hopper is
     /// configured, which leaves a lookup answering from local knowledge alone.
     corpus: Option<Arc<corpus::Corpus>>,
+}
+
+/// A poisoned lock means a panic happened while it was held. Everything kept
+/// under these locks is replaced whole, so the data stays usable.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl AppState {
@@ -1471,8 +890,93 @@ impl AppState {
         slots.min(self.cpu.available_permits())
     }
 
+    /// Analyses running now.
+    pub(super) fn active_tasks(&self) -> usize {
+        self.config
+            .workers
+            .saturating_sub(self.available_analysis_permits())
+    }
+
     fn next_request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The loaded bundle, or why there is none.
+    pub(super) fn resources(&self) -> Result<Arc<ModelResources>, ApiError> {
+        match &*self
+            .readiness
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Readiness::Ready(resources) => Ok(Arc::clone(resources)),
+            Readiness::Starting => Err(ApiError::starting()),
+            Readiness::Failed(_) => Err(ApiError::init_failed()),
+        }
+    }
+
+    /// The reason startup failed, if it did.
+    pub(super) fn init_failure(&self) -> Option<String> {
+        match &*self
+            .readiness
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Readiness::Failed(message) => Some(message.clone()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn is_ready(&self) -> bool {
+        matches!(
+            *self
+                .readiness
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+            Readiness::Ready(_)
+        )
+    }
+
+    /// Wrap a loaded model in the request-independent settings every analysis
+    /// runs with. The one place a bundle is assembled.
+    fn bundle(&self, model: Model, shap: Option<ShapImportance>) -> ModelResources {
+        ModelResources {
+            model,
+            shap,
+            interpret: self.config.interpret.clone(),
+            fetch: self.config.fetch,
+            zip_passwords: self.config.zip_passwords.clone(),
+        }
+    }
+
+    /// Serve `resources` from now on. Returns whether a bundle was already
+    /// being served.
+    fn install(&self, resources: ModelResources) -> bool {
+        let mut readiness = self
+            .readiness
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let was_ready = matches!(*readiness, Readiness::Ready(_));
+        *readiness = Readiness::Ready(Arc::new(resources));
+        was_ready
+    }
+
+    fn fail_startup(&self, message: String) {
+        tracing::error!("{message}");
+        *self
+            .readiness
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Readiness::Failed(message);
+    }
+
+    /// Refuse a request this server cannot take on: startup failed, or memory
+    /// is past the ceiling. A server still loading is refused later, where a
+    /// slot is claimed, so an answer it already holds can still be served.
+    pub(super) async fn admit_request(&self, request_id: u64) -> Result<(), ApiError> {
+        if let Some(message) = self.init_failure() {
+            tracing::error!(id = request_id, error = %message, "rejected: startup failed");
+            return Err(ApiError::init_failed());
+        }
+        self.check_memory().await
     }
 
     /// Mark the server busy until the returned token drops, freezing the
@@ -1480,10 +984,7 @@ impl AppState {
     ///
     /// Taken at handler entry — before the memory check, before the multipart
     /// parse, before the upload streams — because the cores have to be free by
-    /// the time the analysis wants them, not by the time it starts. The
-    /// previous design raised its flag only once an analysis existed and
-    /// covered the gap with a blanket seven-second quiet period that any
-    /// request re-armed, including cache hits that did no work at all.
+    /// the time the analysis wants them, not by the time it starts.
     pub(super) fn enter_busy(&self) -> idle::BusyToken {
         self.busy.enter(self.idle_worker.as_ref())
     }
@@ -1520,19 +1021,138 @@ impl AppState {
             0
         }
     }
+
+    /// When the server first went over its memory ceiling, if it still is.
+    pub(super) fn overload_mark(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        lock(&self.overloaded_since)
+    }
+
+    /// Check RSS against the ceiling, reclaiming caches once before refusing.
+    async fn check_memory(&self) -> Result<(), ApiError> {
+        // Throttling disabled: the operator delegated OOM enforcement to an
+        // external supervisor.
+        let Some(max_rss_bytes) = self.config.max_rss_bytes.map(NonZeroU64::get) else {
+            return Ok(());
+        };
+        let Some(rss) = cleave::memory_tracker::current_rss() else {
+            return Ok(());
+        };
+        if rss <= max_rss_bytes {
+            if self.overload_mark().take().is_some() {
+                tracing::info!(
+                    rss_mb = rss / 1024 / 1024,
+                    "memory recovered below threshold"
+                );
+            }
+            return Ok(());
+        }
+
+        tracing::info!(
+            rss_mb = rss / 1024 / 1024,
+            "memory pressure detected, clearing thread-local caches"
+        );
+        // Awaited before re-reading RSS: a fire-and-forget clear let the
+        // re-read run first, logged memory freed that was not, and admitted
+        // requests an overloaded worker could not service.
+        if let Err(e) = tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await {
+            tracing::warn!(error = %e, "cache-clear task failed");
+        }
+
+        let Some(rss_after) = cleave::memory_tracker::current_rss() else {
+            return Ok(());
+        };
+        if rss_after <= max_rss_bytes {
+            self.overload_mark().take();
+            tracing::info!(
+                rss_before_mb = rss / 1024 / 1024,
+                rss_after_mb = rss_after / 1024 / 1024,
+                "cache clear freed memory, accepting request"
+            );
+            return Ok(());
+        }
+
+        // Still overloaded. Never terminate; requests are refused until memory
+        // drops, and restarting is the operator's call.
+        let since = *self.overload_mark().get_or_insert_with(Instant::now);
+        tracing::warn!(
+            rss_mb = rss_after / 1024 / 1024,
+            max_rss_mb = max_rss_bytes / 1024 / 1024,
+            overloaded_secs = since.elapsed().as_secs(),
+            "server overloaded: high memory usage (even after cache clear)"
+        );
+        Err(ApiError::overloaded())
+    }
+
+    /// Stop background work, cancel what no client is waiting on, and wait a
+    /// bounded time for it to wind down — so an analysis that finished as the
+    /// server stopped still files its verdict.
+    async fn drain(&self) {
+        self.shutdown.send_replace(true);
+        for entry in &self.in_flight {
+            entry.cancellation.store(true, Ordering::Release);
+        }
+        if tokio::time::timeout(DRAIN_TIMEOUT, self.tasks.drained())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                remaining = self.tasks.live(),
+                "shutdown: background work still running after {}s; abandoning it",
+                DRAIN_TIMEOUT.as_secs()
+            );
+        }
+    }
 }
 
-/// Build the axum [`Router`] and start background resource loading.
-///
-/// The server is bound and begins accepting connections immediately.  Until
-/// model resources finish loading the health endpoint returns 503 and the
-/// analyze endpoint returns 503.  Resources load concurrently in a background
-/// task; YARA is warmed up in a separate fire-and-forget task so it does not
-/// delay readiness.
-///
-/// Useful for integration tests that need the app without binding to a port.
-///
-/// # Errors
+/// Work the server owns but no request waits on: counted so shutdown can wait
+/// for it, where a bare `tokio::spawn` would be dropped mid-write.
+#[derive(Default)]
+pub(super) struct Tasks {
+    live: AtomicUsize,
+    idle: Notify,
+}
+
+impl Tasks {
+    pub(super) fn spawn(self: &Arc<Self>, task: impl Future<Output = ()> + Send + 'static) {
+        self.live.fetch_add(1, Ordering::AcqRel);
+        let done = TaskDone(Arc::clone(self));
+        tokio::spawn(async move {
+            // Dropped on completion and on cancellation alike.
+            let _done = done;
+            task.await;
+        });
+    }
+
+    fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// Resolves once no task is running.
+    async fn drained(&self) {
+        loop {
+            // Registered before the count is read, so a task finishing in
+            // between still wakes this waiter.
+            let notified = self.idle.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if self.live() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct TaskDone(Arc<Tasks>);
+
+impl Drop for TaskDone {
+    fn drop(&mut self) {
+        if self.0.live.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
 /// Cores busy across the whole machine, averaged between two reads of
 /// `/_/stats`.
 ///
@@ -1546,21 +1166,41 @@ impl AppState {
 /// to `load1`.
 #[derive(Default)]
 pub(super) struct CpuBusy {
-    last: std::sync::Mutex<Option<(Instant, cleave::memory_tracker::CpuTime, Option<f64>)>>,
+    last: Mutex<Option<CpuSample>>,
 }
 
+struct CpuSample {
+    at: Instant,
+    counters: cleave::memory_tracker::CpuTime,
+    busy: Option<f64>,
+}
+
+/// Reads closer together than this share one window. Without it a second
+/// poller — another router, an operator's curl — reset the window for the
+/// first and handed it the few milliseconds in between.
+const CPU_BUSY_MIN_WINDOW: Duration = Duration::from_secs(1);
+
 impl CpuBusy {
-    /// Logical cores busy since the previous call, or the previous answer if
-    /// the counters have not moved, or `None` with nothing to compare yet.
+    /// Logical cores busy since the previous window closed, the standing
+    /// answer inside a window or when the counters have not moved, or `None`
+    /// with nothing to compare yet.
     pub(super) fn sample(&self) -> Option<f64> {
+        let mut last = lock(&self.last);
+        if let Some(prev) = last.as_ref()
+            && prev.at.elapsed() < CPU_BUSY_MIN_WINDOW
+        {
+            return prev.busy;
+        }
         let now = cleave::memory_tracker::cpu_time()?;
         let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        let mut last = self.last.lock().ok()?;
-        let busy = match *last {
-            Some((_, prev, previous)) => cores_busy(prev, now, cpus).or(previous),
-            None => None,
-        };
-        *last = Some((Instant::now(), now, busy));
+        let busy = last
+            .as_ref()
+            .and_then(|prev| cores_busy(prev.counters, now, cpus).or(prev.busy));
+        *last = Some(CpuSample {
+            at: Instant::now(),
+            counters: now,
+            busy,
+        });
         busy
     }
 }
@@ -1579,353 +1219,121 @@ fn cores_busy(
     (total > 0).then(|| cpus as f64 * busy as f64 / total as f64)
 }
 
-/// Returns an error if the router cannot be assembled or background resource
-/// initialization cannot be scheduled.
+/// Build the axum [`Router`] and start loading resources in the background.
+///
+/// The router answers immediately; until the model bundle loads, the health
+/// endpoint and the analyze endpoints answer 503. Useful for integration tests
+/// that need the app without binding a port. Background tasks stop when the
+/// router is dropped.
+///
+/// # Errors
+///
+/// Returns an error if the configuration is invalid.
 pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
-    tracing::info!(model_dir = %config.model_dir().display(), "starting — resources loading in background");
+    Ok(assemble(config.clone())?.0)
+}
 
-    // Concurrency limit comes from --workers (defaults to cores/2 in main.rs).
+/// The router and the state behind it. Must run inside a tokio runtime.
+fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
+    config.validate()?;
+    tracing::info!(model_dir = %config.model_dir.display(), "starting — resources loading in background");
+
     // CPU-bound cleave + ONNX work overlaps poorly across many threads, so a
     // smaller pool typically delivers higher aggregate throughput than 1/core.
-    let max_concurrent = config.workers();
+    let max_concurrent = config.workers;
     let cores = crate::worker::cleave_concurrency(max_concurrent);
     tracing::info!(max_concurrent, cores, "concurrency limit set");
 
-    // Built before the literal because the idle worker needs both: it is
-    // frozen by `busy` and wound down by `shutdown`.
+    let (shutdown, _) = watch::channel(false);
     let busy = Arc::new(idle::Busy::default());
-    let shutdown = Arc::new(AtomicBool::new(false));
     // Started before the models load, not after: it is its own process and
     // loads its own, so there is nothing here for it to wait on.
-    let idle_worker = if config.idle_worker_slots() > 0 {
+    let idle_worker = if config.idle_worker_slots > 0 {
         idle::start(
             config.hopper(),
             &crate::upload::default_worker_name(),
             &busy,
-            &shutdown,
+            shutdown.subscribe(),
         )
     } else {
         tracing::info!("idle worker disabled: --idle-worker-slots is 0");
         None
     };
 
+    // Said once here rather than on every analysis: a server nobody gave a
+    // hopper still answers, but every verdict it computes dies with the
+    // process, and that is worth one line at startup instead of silence.
+    let uploader = match config.hopper() {
+        Some(url) => Some(Arc::new(crate::upload::Uploader::new(
+            url,
+            crate::upload::default_worker_name(),
+        ))),
+        None => {
+            tracing::warn!(
+                "no --hopper configured: analyzed results are kept in this \
+                 process's verdict index only and are never uploaded",
+            );
+            None
+        }
+    };
+    let corpus = corpus::Corpus::new(config.hopper());
+    match &corpus {
+        Some(c) => tracing::info!(addresses = %c.addresses(), "lookups defer to the corpus"),
+        // Not a warning: a worker with no corpus behind it answers from its
+        // own index, which is a whole deployment rather than a broken one.
+        None => tracing::info!("no hopper configured: lookups answer from the local index alone"),
+    }
+
     let state = Arc::new(AppState {
-        max_upload_bytes: config.max_body_size(),
-        max_rss_bytes: config.max_rss_bytes(),
-        model_dir: config.model_dir().to_path_buf(),
-        threshold_overrides: config.thresholds(),
-        slow_rule_ms: config.slow_rule_ms(),
-        level: config.level(),
-        allowed_dirs: config.allowed_dirs().to_vec(),
-        extract_dir: config.extract_dir().map(PathBuf::from),
-        allow_cidrs: config.allow_cidrs().to_vec(),
-        auth_digest: config.auth_digest(),
-        interpret: config.interpret().cloned(),
-        fetch: config.fetch(),
-        zip_passwords: config.zip_passwords.clone(),
         started_at: Instant::now(),
-        ready: AtomicBool::new(false),
-        init_error: RwLock::new(None),
-        resources: RwLock::new(None),
+        readiness: RwLock::new(Readiness::Starting),
         next_request_id: AtomicU64::new(1),
-        slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
-        lanes: SlotLanes::from_env(max_concurrent),
-        cpu: Arc::new(tokio::sync::Semaphore::new(cores)),
+        slots: Arc::new(Semaphore::new(max_concurrent)),
+        lanes: config
+            .slot_lanes
+            .map(|small_max_bytes| SlotLanes::new(max_concurrent, small_max_bytes)),
+        cpu: Arc::new(Semaphore::new(cores)),
         cpu_busy: CpuBusy::default(),
         stuck_orphans: AtomicUsize::new(0),
-        max_concurrent_tasks: max_concurrent,
-        analysis_timeout_secs: config.analysis_timeout_secs(),
-        reload_lock: tokio::sync::Mutex::new(()),
-        overloaded_since: std::sync::Mutex::new(None),
+        reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+        overloaded_since: Mutex::new(None),
         flights: Arc::new(flight::Flights::default()),
         in_flight: dashmap::DashMap::new(),
-        hopper: config.hopper().map(str::to_owned),
         shutdown,
-        job_buckets: Default::default(),
-        job_types: Default::default(),
-        job_overall: Default::default(),
-        job_cached: Default::default(),
-        lookups: Default::default(),
-        jobs_started: AtomicU64::new(0),
-        jobs_completed: AtomicU64::new(0),
-        job_bytes_total: AtomicU64::new(0),
-        job_micros_total: AtomicU64::new(0),
-        // Decided here because AppState lives behind an Arc and cannot be
-        // amended later. The worker itself starts once the models are loaded.
+        tasks: Arc::new(Tasks::default()),
+        jobs: Jobs::default(),
         busy,
         idle_worker,
-        // Start the background uploader once when --hopper is set, so every
-        // analyzed result (parent and members) is renewed on hopper without
-        // blocking the analyze response. Said once here rather than on every
-        // analysis: a server nobody configured a hopper for still answers, but
-        // every verdict it computes dies with the process, and that is worth
-        // one line at startup instead of silence.
-        uploader: match config.hopper() {
-            Some(url) => Some(Arc::new(crate::upload::Uploader::new(
-                url,
-                crate::upload::default_worker_name(),
-            ))),
-            None => {
-                tracing::warn!(
-                    "no --hopper configured: analyzed results are kept in this \
-                     process's verdict index only and are never uploaded",
-                );
-                None
-            }
-        },
-        corpus: {
-            let corpus = corpus::Corpus::new(config.hopper());
-            match &corpus {
-                Some(c) => {
-                    tracing::info!(addresses = %c.addresses(), "lookups defer to the corpus")
-                }
-                // Not a warning: a worker with no corpus behind it answers from
-                // its own index, which is a whole deployment rather than a
-                // broken one.
-                None => tracing::info!(
-                    "no hopper configured: lookups answer from the local index alone"
-                ),
-            }
-            corpus
-        },
+        repairs: Arc::new(Semaphore::new(MAX_REPAIRS)),
+        uploader,
+        corpus,
+        config,
     });
 
-    // Background task: load model + SHAP + YARA concurrently, then mark ready.
-    {
-        // The idle worker fills the gaps around this server, so it winds down
-        // with it. Awaiting the signal alongside axum's own graceful shutdown
-        // is safe — signal streams deliver to every listener.
-        {
-            let stopping = Arc::clone(&state);
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                stopping.shutdown.store(true, Ordering::Release);
-            });
-        }
+    state.tasks.spawn(load_resources(Arc::clone(&state)));
+    spawn_watchdog(&state);
 
-        let bg = Arc::clone(&state);
-        let model_dir = config.model_dir().to_path_buf();
-        let model_dir_shap = config.model_dir().to_path_buf();
-        let thresholds = config.thresholds();
-        let level = config.level();
-        let slow_rule_ms = config.slow_rule_ms();
-        tokio::spawn(async move {
-            let init_start = Instant::now();
-            tracing::info!("resource loader started (model + SHAP + YARA loading concurrently)");
-
-            // Capture spawn times in the async context so each blocking closure
-            // can report queue_ms (time waiting for a thread) separately from
-            // work_ms (time actually doing I/O and parsing).
-            let model_spawned_at = Instant::now();
-            let model_task =
-                tokio::task::spawn_blocking(move || -> anyhow::Result<(Model, ExtractContext)> {
-                    let queue_ms = model_spawned_at.elapsed().as_millis();
-                    let t = Instant::now();
-                    tracing::info!(queue_ms, "loading ONNX model and feature spec");
-                    let model = Model::load(&model_dir, thresholds, level)?;
-                    let ctx = ExtractContext::new(model.spec());
-                    tracing::info!(
-                        queue_ms,
-                        work_ms = t.elapsed().as_millis(),
-                        spec_version = model.spec().version(),
-                        features = model.spec().total_features(),
-                        "ONNX model loaded",
-                    );
-                    Ok((model, ctx))
-                });
-            let shap_spawned_at = Instant::now();
-            let shap_task = tokio::task::spawn_blocking(move || {
-                let queue_ms = shap_spawned_at.elapsed().as_millis();
-                let t = Instant::now();
-                tracing::info!(queue_ms, "loading SHAP importance data");
-                match ShapImportance::load(&model_dir_shap) {
-                    Ok(shap) => {
-                        tracing::info!(
-                            queue_ms,
-                            work_ms = t.elapsed().as_millis(),
-                            "SHAP data loaded"
-                        );
-                        Some(shap)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            queue_ms,
-                            work_ms = t.elapsed().as_millis(),
-                            "SHAP data unavailable (explanations disabled): {e:#}"
-                        );
-                        None
-                    }
-                }
-            });
-            let yara_spawned_at = Instant::now();
-            let yara_task = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let queue_ms = yara_spawned_at.elapsed().as_millis();
-                let t = Instant::now();
-                tracing::info!(queue_ms, "YARA warmup started");
-                // The traits tree is the rule set every analysis runs against.
-                // Resolve it before reporting ready: a server that answers
-                // `/_/health` with "ok" while failing every analysis on a
-                // missing traits directory is worse than one that never starts.
-                let traits = cleave::traits_repo::try_resolve()?;
-                tracing::info!(dir = %traits.display(), "cleave traits resolved");
-                let opts = cleave::AnalysisOptions {
-                    slow_rule_ms,
-                    ..Default::default()
-                };
-                let _ = cleave::analyze_file(std::path::Path::new("/dev/null"), &opts);
-                tracing::info!(
-                    queue_ms,
-                    work_ms = t.elapsed().as_millis(),
-                    "YARA warmup complete",
-                );
-                Ok(())
-            });
-
-            match tokio::join!(model_task, shap_task, yara_task) {
-                (Ok(Ok((model, ctx))), Ok(shap), Ok(Ok(()))) => {
-                    let spec_version = model.spec().version();
-                    let features = model.spec().total_features();
-                    let shap_loaded = shap.is_some();
-                    tracing::info!("all resources ready, installing into AppState");
-                    match bg.resources.write() {
-                        Ok(mut lock) => {
-                            let loaded = Arc::new(ModelResources {
-                                model,
-                                shap,
-                                ctx,
-                                interpret: bg.interpret.clone(),
-                                fetch: bg.fetch,
-                                zip_passwords: bg.zip_passwords.clone(),
-                            });
-                            *lock = Some(Arc::clone(&loaded));
-                            if let Ok(mut init_error) = bg.init_error.write() {
-                                *init_error = None;
-                            }
-                            bg.ready.store(true, Ordering::Release);
-                            tracing::info!(
-                                total_ms = init_start.elapsed().as_millis(),
-                                spec_version,
-                                features,
-                                shap_loaded,
-                                "server ready",
-                            );
-                            // Idle capacity is otherwise wasted. Started here
-                            // rather than at bind time because it needs the
-                            // loaded models — the same ones, not a second copy.
-                            //
-                            // The Arc is handed over rather than read back out
-                            // of `bg.resources`: this scope still holds the
-                            // write guard, and taking a read lock under it is a
-                            // self-deadlock that would wedge the server the
-                            // moment an idle worker was actually configured.
-                            drop(lock);
-                        }
-                        Err(e) => tracing::error!("resources lock poisoned during init: {e}"),
-                    }
-                }
-                (Ok(Err(e)), _, _) => {
-                    record_init_failure(&bg, &format!("failed to load model: {e:#}"))
-                }
-                (Err(e), _, _) => {
-                    record_init_failure(&bg, &format!("model load task panicked: {e}"))
-                }
-                (_, Err(e), _) => {
-                    record_init_failure(&bg, &format!("shap load task panicked: {e}"))
-                }
-                (_, _, Ok(Err(e))) => record_init_failure(&bg, &format!("traits unavailable: {e}")),
-                (_, _, Err(e)) => {
-                    record_init_failure(&bg, &format!("yara warmup task panicked: {e}"))
-                }
-            }
-        });
-    }
-
-    // Watchdog: periodically log about stuck in-flight requests. Signals cooperative
-    // cancellation to tasks running past the cancel threshold so cleave can bail out
-    // of slow YARA rules, but never terminates the process — that is left to the
-    // operator. The threshold follows the configured analysis timeout: at least the
-    // historical 10 minutes, and always past `--analysis-timeout` itself (the request
-    // has already 504'd by then; this reaps the orphaned blocking thread). A timeout
-    // of 0 is an explicit operator opt-out of time limits, so the watchdog only logs.
-    {
-        let watchdog = Arc::clone(&state);
-        let cancel_after_secs = match config.analysis_timeout_secs() {
-            0 => None,
-            t => Some(t.max(600)),
-        };
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let available = watchdog.available_analysis_permits();
-                let active = watchdog.max_concurrent_tasks.saturating_sub(available);
-                let stuck = watchdog.stuck_orphans.load(Ordering::Relaxed);
-
-                if active == 0 {
-                    continue;
-                }
-
-                // Log details for every long-running in-flight request.
-                let now = Instant::now();
-                for entry in watchdog.in_flight.iter() {
-                    let elapsed_secs = now.duration_since(entry.started_at).as_secs();
-                    let phase = entry.phase.get();
-                    let tid = entry.thread_id.load(Ordering::Relaxed);
-                    if cancel_after_secs.is_some_and(|t| elapsed_secs >= t) {
-                        // Signal cooperative cancellation for very long tasks so
-                        // cleave can exit slow YARA rules cleanly.
-                        entry.cancellation.store(true, Ordering::Release);
-                        tracing::error!(
-                            request_id = entry.key(),
-                            name = %entry.name,
-                            elapsed_secs,
-                            phase,
-                            thread_id = tid,
-                            stuck_orphans = stuck,
-                            active_tasks = active,
-                            "watchdog: task past cancel threshold — cancellation signalled",
-                        );
-                    } else if elapsed_secs >= 120 {
-                        tracing::warn!(
-                            request_id = entry.key(),
-                            name = %entry.name,
-                            elapsed_secs,
-                            phase,
-                            thread_id = tid,
-                            stuck_orphans = stuck,
-                            active_tasks = active,
-                            "watchdog: long-running task",
-                        );
-                    }
-                }
-            }
-        });
-    }
-
-    // No ConcurrencyLimitLayer — the hard gate (active_tasks >= max_concurrent_tasks)
-    // in each handler rejects immediately with 503. No silent queuing.
-    // Hopper controls send rate via litmus-workers; litmus accepts or rejects.
-    // Middleware order: layers are applied bottom-up, so the last `.layer()`
-    // call wraps everything else and runs first per request. ACL runs before
-    // the body limit so rejected peers don't get to upload bytes.
+    // No ConcurrencyLimitLayer: each analyze handler refuses past capacity
+    // with a 429 rather than queueing. Layers apply bottom-up, so the last
+    // `.layer()` runs first per request; the ACL runs before the body limit so
+    // a rejected peer never gets to upload bytes.
     let app = Router::new()
-        .route("/_/health", get(handlers::health))
-        .route("/_/info", get(handlers::info))
-        .route("/_/stats", get(handlers::stats))
+        .route("/_/health", get(diag::health))
+        .route("/_/info", get(diag::info))
+        .route("/_/stats", get(diag::stats))
         .route("/_/reload", post(handlers::reload))
         .route("/_/update", post(handlers::update))
-        .route("/_/memory", get(handlers::memory_stats))
-        .route("/_/requests", get(handlers::requests))
-        .route("/_/threads", get(handlers::threads))
+        .route("/_/memory", get(diag::memory_stats))
+        .route("/_/requests", get(diag::requests))
+        .route("/_/threads", get(diag::threads))
         .route("/lookup", get(handlers::lookup))
         .route("/status", get(handlers::status))
-        .route("/v1/lookup", get(handlers::v1_lookup))
-        .route("/v1/analyze", post(handlers::v1_analyze))
+        .route("/v1/lookup", get(v1::v1_lookup))
+        .route("/v1/analyze", post(v1::v1_analyze))
         .route("/analyze", post(handlers::analyze))
         .route("/analyze-purl", post(handlers::analyze_purl))
         .route("/analyze-path", post(handlers::analyze_path))
-        .layer(DefaultBodyLimit::max(config.max_body_size()))
+        .layer(DefaultBodyLimit::max(state.config.max_body_size))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), acl::acl))
         // Outermost: every request gets an id and an access-log line, including
         // the ones the ACL rejects.
@@ -1933,27 +1341,179 @@ pub async fn build_app(config: &ServerConfig) -> anyhow::Result<Router> {
             Arc::clone(&state),
             access::access_log,
         ))
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
-    Ok(app)
+    Ok((app, state))
 }
 
-fn record_init_failure(state: &AppState, message: &str) {
-    state.ready.store(false, Ordering::Release);
-    if let Ok(mut init_error) = state.init_error.write() {
-        *init_error = Some(message.to_string());
-    }
-    tracing::error!("{message}");
-}
-
-/// Start the HTTP server and block until shutdown.
+/// Load the model, SHAP data and traits concurrently, then serve them.
 ///
-/// This binds the configured socket address, starts background resource
-/// loading, and serves requests until `SIGINT` or `SIGTERM`.
+/// The verdict index opens alongside: it is not needed to become ready, but
+/// opening it creates directories and prunes stale ones, which belongs here
+/// rather than on the first lookup.
+async fn load_resources(state: Arc<AppState>) {
+    let init_start = Instant::now();
+    tracing::info!("resource loader started (model + SHAP + YARA loading concurrently)");
+    let _index = tokio::task::spawn_blocking(|| crate::lookup::global().is_some());
+
+    // Each blocking closure reports queue_ms (time waiting for a thread)
+    // separately from work_ms (time actually doing I/O and parsing).
+    let spawned = Instant::now();
+    let model_dir = state.config.model_dir.clone();
+    let (thresholds, level) = (state.config.thresholds, state.config.level);
+    let model_task = tokio::task::spawn_blocking(move || -> anyhow::Result<Model> {
+        let queue_ms = spawned.elapsed().as_millis();
+        let t = Instant::now();
+        tracing::info!(queue_ms, "loading ONNX model and feature spec");
+        let model = Model::load(&model_dir, thresholds, level)?;
+        tracing::info!(
+            queue_ms,
+            work_ms = t.elapsed().as_millis(),
+            spec_version = model.spec().version(),
+            features = model.spec().total_features(),
+            "ONNX model loaded",
+        );
+        Ok(model)
+    });
+    let shap_dir = state.config.model_dir.clone();
+    let shap_task = tokio::task::spawn_blocking(move || load_shap(&shap_dir));
+    let slow_rule_ms = state.config.slow_rule_ms;
+    let yara_task = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let queue_ms = spawned.elapsed().as_millis();
+        let t = Instant::now();
+        tracing::info!(queue_ms, "YARA warmup started");
+        // The traits tree is the rule set every analysis runs against. Resolve
+        // it before reporting ready: a server that answers `/_/health` with
+        // "ok" while failing every analysis on a missing traits directory is
+        // worse than one that never starts.
+        let traits = cleave::traits_repo::try_resolve()?;
+        tracing::info!(dir = %traits.display(), "cleave traits resolved");
+        let opts = cleave::AnalysisOptions {
+            slow_rule_ms,
+            ..Default::default()
+        };
+        // A warmup: its result is not the point, the compiled rules are.
+        let _ = cleave::analyze_file(std::path::Path::new("/dev/null"), &opts);
+        tracing::info!(
+            queue_ms,
+            work_ms = t.elapsed().as_millis(),
+            "YARA warmup complete",
+        );
+        Ok(())
+    });
+
+    match tokio::join!(model_task, shap_task, yara_task) {
+        (Ok(Ok(model)), Ok(Ok(shap)), Ok(Ok(()))) => {
+            let spec_version = model.spec().version();
+            let features = model.spec().total_features();
+            let shap_loaded = shap.is_some();
+            state.install(state.bundle(model, shap));
+            tracing::info!(
+                total_ms = init_start.elapsed().as_millis(),
+                spec_version,
+                features,
+                shap_loaded,
+                "server ready",
+            );
+        }
+        (Ok(Err(e)), _, _) => state.fail_startup(format!("failed to load model: {e:#}")),
+        (Err(e), _, _) => state.fail_startup(format!("model load task panicked: {e}")),
+        (_, Ok(Err(e)), _) => state.fail_startup(format!("failed to load SHAP data: {e:#}")),
+        (_, Err(e), _) => state.fail_startup(format!("shap load task panicked: {e}")),
+        (_, _, Ok(Err(e))) => state.fail_startup(format!("traits unavailable: {e}")),
+        (_, _, Err(e)) => state.fail_startup(format!("yara warmup task panicked: {e}")),
+    }
+}
+
+/// SHAP importances; `None` when the bundle ships none. A file that is
+/// present but unreadable or stale is bad model metadata, so startup fails.
+fn load_shap(model_dir: &std::path::Path) -> anyhow::Result<Option<ShapImportance>> {
+    let t = Instant::now();
+    let shap = ShapImportance::load(model_dir)?;
+    tracing::info!(
+        work_ms = t.elapsed().as_millis(),
+        loaded = shap.is_some(),
+        "SHAP data"
+    );
+    Ok(shap)
+}
+
+/// Periodically log stuck in-flight requests, and signal cooperative
+/// cancellation to those past the cancel threshold so cleave can bail out of
+/// slow rules. Never terminates the process; that is the operator's call.
+///
+/// The threshold follows the analysis timeout: at least the historical 10
+/// minutes, and always past `--analysis-timeout` itself (the request has
+/// already 504'd by then; this reaps the orphaned blocking thread). A timeout
+/// of 0 is an explicit opt-out of time limits, so the watchdog only logs.
+///
+/// Holds the state weakly and stops on shutdown, so it never outlives the app.
+fn spawn_watchdog(state: &Arc<AppState>) {
+    let cancel_after_secs = match state.config.analysis_timeout_secs {
+        0 => None,
+        t => Some(t.max(600)),
+    };
+    let weak = Arc::downgrade(state);
+    let mut stop = state.shutdown.subscribe();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                // Shutdown raised, or the state (and with it the sender) gone.
+                _ = stop.changed() => return,
+            }
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let active = state.active_tasks();
+            if active == 0 {
+                continue;
+            }
+            let stuck = state.stuck_orphans.load(Ordering::Relaxed);
+            for entry in &state.in_flight {
+                let elapsed_secs = entry.started_at.elapsed().as_secs();
+                let phase = entry.phase.get();
+                let tid = entry.thread_id.load(Ordering::Relaxed);
+                if cancel_after_secs.is_some_and(|t| elapsed_secs >= t) {
+                    entry.cancellation.store(true, Ordering::Release);
+                    tracing::error!(
+                        request_id = entry.key(),
+                        name = %entry.name,
+                        elapsed_secs,
+                        phase,
+                        thread_id = tid,
+                        stuck_orphans = stuck,
+                        active_tasks = active,
+                        "watchdog: task past cancel threshold — cancellation signalled",
+                    );
+                } else if elapsed_secs >= 120 {
+                    tracing::warn!(
+                        request_id = entry.key(),
+                        name = %entry.name,
+                        elapsed_secs,
+                        phase,
+                        thread_id = tid,
+                        stuck_orphans = stuck,
+                        active_tasks = active,
+                        "watchdog: long-running task",
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Start the HTTP server and serve until `SIGINT` or `SIGTERM`.
+///
+/// Binds the configured address, starts background resource loading, and on
+/// a signal stops accepting, lets open requests finish, then drains the work
+/// no client is waiting on.
 ///
 /// # Errors
-/// Returns an error if the listening socket cannot be bound or the server
-/// fails while serving requests.
+/// Returns an error if the configuration is invalid, the listening socket
+/// cannot be bound, or the server fails while serving requests.
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // Warm cleave's YARA engine + capability mapper off the rayon pool before
     // the listener binds. The first request's analysis spawns rayon work; if
@@ -1967,24 +1527,21 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // growth from allocator fragmentation across thousands of analyses.
     cleave::memory_tracker::configure_jemalloc_low_memory();
 
-    // Watchdog thread: enforces the same RSS limit as check_memory_pressure on
-    // wall-clock time, independent of request traffic. This catches memory
-    // growth that happens between requests (e.g. jemalloc fragmentation or
-    // background YARA work). Skipped when throttling is disabled.
-    let _watchdog = config.max_rss_bytes().map(|limit| {
-        cleave::memory_tracker::start_periodic_logging(
-            std::time::Duration::from_secs(10),
-            limit.get(),
-        )
+    // Enforces the RSS ceiling on wall-clock time, independent of request
+    // traffic: memory can grow between requests (fragmentation, background
+    // YARA work). Skipped when throttling is disabled.
+    let _rss_logger = config.max_rss_bytes.map(|limit| {
+        cleave::memory_tracker::start_periodic_logging(Duration::from_secs(10), limit.get())
     });
 
-    let app = build_app(&config).await?;
+    let (app, state) = assemble(config)?;
+    let config = &state.config;
 
-    let listener = tokio::net::TcpListener::bind(config.bind()).await?;
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
     eprintln!(
         "Listening on http://{} (max size: {} MB, starting up) — Press Ctrl+C to stop",
-        config.bind(),
-        config.max_body_size() / 1024 / 1024,
+        config.bind,
+        config.max_body_size / 1024 / 1024,
     );
     // The startup line is the record of what this process actually is: an
     // operator reading the log after a restart should not have to reconstruct
@@ -1992,12 +1549,12 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         pid = std::process::id(),
-        bind = %config.bind(),
-        max_body_mb = config.max_body_size() / 1024 / 1024,
-        analysis_timeout_secs = config.analysis_timeout_secs(),
-        allow_cidrs = config.allow_cidrs().len(),
-        allowed_dirs = config.allowed_dirs().len(),
-        authenticated = config.auth_digest().is_some(),
+        bind = %config.bind,
+        max_body_mb = config.max_body_size / 1024 / 1024,
+        analysis_timeout_secs = config.analysis_timeout_secs,
+        allow_cidrs = config.allow_cidrs.len(),
+        allowed_dirs = config.allowed_dirs.len(),
+        authenticated = config.auth_digest.is_some(),
         "listening (resources loading in background)",
     );
 
@@ -2005,7 +1562,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // unconditionally — a loopback bind is not evidence of safety, because a
     // Cloudflare tunnel terminates on loopback and puts the whole internet on
     // the other side of it.
-    if config.auth_digest().is_none() {
+    if config.auth_digest.is_none() {
         tracing::warn!(
             "no --token-file: the API is unauthenticated; any peer that reaches the socket can submit work",
         );
@@ -2016,9 +1573,9 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // restriction stops protecting it. Leave --allowed-dirs empty unless the
     // host is genuinely local-only; with no allowed directory the route
     // rejects every request.
-    if !config.allowed_dirs().is_empty() {
+    if !config.allowed_dirs.is_empty() {
         tracing::warn!(
-            allowed_dirs = config.allowed_dirs().len(),
+            allowed_dirs = config.allowed_dirs.len(),
             "--allowed-dirs is set: /analyze-path can read those directories for any peer reaching loopback, including through a tunnel",
         );
     }
@@ -2026,41 +1583,32 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // Operator footgun: setting --allow-cidr while bound to loopback means
     // the CIDR list can never match (no remote peers can connect). Warn so
     // the operator notices before debugging "why is everyone getting 403?".
-    if !config.allow_cidrs().is_empty() && config.bind().ip().is_loopback() {
+    if !config.allow_cidrs.is_empty() && config.bind.ip().is_loopback() {
         tracing::warn!(
-            bind = %config.bind(),
+            bind = %config.bind,
             "--allow-cidr is set but bind address is loopback; remote clients cannot connect (use --bind 0.0.0.0:PORT)",
         );
     }
 
     // ConnectInfo<SocketAddr> is required by the ACL middleware so it can
     // see the peer IP. Tests inject ConnectInfo manually on each Request.
+    let stopping = Arc::clone(&state);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        // Background tasks stop now; open requests finish first.
+        stopping.shutdown.send_replace(true);
+    })
     .await?;
 
+    state.drain().await;
     tracing::info!("server shut down");
     Ok(())
 }
 
-/// Start the embedded idle worker: fill unused analysis capacity with queue
-/// work from hopper, and stand aside the moment a request arrives.
-///
-/// A scan server spends most of its life waiting. Meanwhile hopper holds a
-/// backlog and the fleet's dedicated workers grind through it, so the idle
-/// capacity here is pure waste — and, usefully, running the same queue work on
-/// every server produces a continuous like-for-like measurement of how fast
-/// each one actually is.
-///
-/// Interactive work always wins: [`RequestGuard`] raises the pause flag before
-/// a request starts and lowers it when the last one finishes, and the worker's
-/// prefetcher stops claiming while it is raised. Jobs already running are not
-/// abandoned — that work is real, and a claim that dies is redispatched by
-/// hopper anyway — so promptness comes from the slots held back for requests,
-/// not from killing work mid-flight.
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = signal::ctrl_c().await {
@@ -2086,13 +1634,12 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => tracing::info!("received SIGINT"),
-        _ = terminate => tracing::info!("received SIGTERM"),
+        () = ctrl_c => tracing::info!("received SIGINT"),
+        () = terminate => tracing::info!("received SIGTERM"),
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod size_bucket_tests {
     use super::{SIZE_BUCKET_NAMES, SIZE_BUCKETS, size_bucket};
 
@@ -2225,15 +1772,19 @@ mod job_bucket_tests {
 mod job_bucket_recent_tests {
     use super::JobBucket;
 
-    // `recent_json` is what ships on /_/stats, and beamline indexes it by these
+    fn recent(b: &JobBucket) -> serde_json::Value {
+        serde_json::to_value(b.recent()).expect("serializes")
+    }
+
+    // `recent` is what ships on /_/stats, and beamline indexes it by these
     // exact names. Asserting the shape here is what stops a rename from
     // silently demoting the router back to lifetime means — a failure that
     // looks like nothing at all from the outside.
     #[test]
-    fn recent_json_publishes_the_keys_beamline_reads() {
+    fn recent_publishes_the_keys_beamline_reads() {
         let b = JobBucket::default();
         b.record(9_000_000); // 9s
-        let v = b.recent_json();
+        let v = recent(&b);
         assert_eq!(v["samples"], 1);
         assert!(
             v["p80_ms"].is_number(),
@@ -2246,8 +1797,8 @@ mod job_bucket_recent_tests {
     }
 
     #[test]
-    fn recent_json_reports_an_untouched_bucket_as_empty_not_zero() {
-        let v = JobBucket::default().recent_json();
+    fn recent_reports_an_untouched_bucket_as_empty_not_zero() {
+        let v = recent(&JobBucket::default());
         assert_eq!(v["samples"], 0);
         assert!(
             v["p80_ms"].is_null(),
@@ -2264,117 +1815,34 @@ mod job_bucket_recent_tests {
             b.record(2_000_000);
         }
         assert_eq!(b.count.load(std::sync::atomic::Ordering::Relaxed), 5);
-        assert_eq!(b.recent_json()["samples"], 5);
+        assert_eq!(recent(&b)["samples"], 5);
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod whale_pool_tests {
-    /// Per-whale pools scale with the host: a quarter of the cores, floor
-    /// two, ceiling sixteen — the global pool keeps every core regardless.
-    #[test]
-    fn whale_pool_threads_scale_from_laptop_to_workstation() {
-        assert_eq!(super::whale_pool_threads(1), 2);
-        assert_eq!(super::whale_pool_threads(4), 2);
-        assert_eq!(super::whale_pool_threads(8), 2);
-        assert_eq!(super::whale_pool_threads(16), 4);
-        assert_eq!(super::whale_pool_threads(64), 16);
-        assert_eq!(super::whale_pool_threads(128), 16);
-        assert_eq!(super::whale_pool_threads(256), 16);
-    }
+mod tasks_tests {
+    use super::Tasks;
+    use std::sync::Arc;
 
-    /// Small-payload pools: an eighth of the cores, 2–8.
-    #[test]
-    fn small_pool_threads_scale_with_cores() {
-        assert_eq!(super::small_pool_threads(1), 2);
-        assert_eq!(super::small_pool_threads(4), 2);
-        assert_eq!(super::small_pool_threads(16), 2);
-        assert_eq!(super::small_pool_threads(32), 4);
-        assert_eq!(super::small_pool_threads(64), 8);
-        assert_eq!(super::small_pool_threads(256), 8);
-    }
+    /// Drain waits for every owned task, including one that finishes after
+    /// the drain began — the wakeup must not be lost between the count and
+    /// the wait.
+    #[tokio::test]
+    async fn drain_waits_for_owned_work() {
+        let tasks = Arc::new(Tasks::default());
+        tasks.drained().await;
 
-    /// Lane width follows the load: alone means the global pool, otherwise an
-    /// even share of the cores floored at the tier width.
-    #[test]
-    fn lane_threads_share_cores_by_load() {
-        assert_eq!(super::lane_threads(8, 64, 0), None);
-        assert_eq!(super::lane_threads(8, 64, 1), None);
-        assert_eq!(super::lane_threads(8, 64, 2), Some(32));
-        assert_eq!(super::lane_threads(8, 64, 4), Some(16));
-        assert_eq!(super::lane_threads(8, 64, 8), Some(8));
-        assert_eq!(
-            super::lane_threads(8, 64, 16),
-            Some(8),
-            "never below the floor"
-        );
-        assert_eq!(super::lane_threads(16, 64, 8), Some(16), "whale floor");
-        assert_eq!(super::lane_threads(2, 4, 2), Some(2));
-        assert_eq!(
-            super::lane_threads(16, 4, 2),
-            Some(16),
-            "floor above the cores stays the floor"
-        );
-    }
-
-    /// Big-whale slots: an eighth of the cores, 1–8, so slots × threads stays
-    /// near two whale threads per core.
-    #[test]
-    fn whale_slots_scale_with_cores() {
-        assert_eq!(super::whale_slots(1), 1);
-        assert_eq!(super::whale_slots(4), 1);
-        assert_eq!(super::whale_slots(8), 1);
-        assert_eq!(super::whale_slots(16), 2);
-        assert_eq!(super::whale_slots(64), 8);
-        assert_eq!(super::whale_slots(128), 8);
-        assert_eq!(super::whale_slots(256), 8);
-        for cores in [4, 16, 64, 128] {
-            assert!(
-                super::whale_slots(cores) * super::whale_pool_threads(cores) <= 2 * cores.max(4)
-            );
-        }
-    }
-
-    /// A full slot table refuses instead of waiting, and a dropped slot is
-    /// available again.
-    #[test]
-    fn whale_slot_refuses_when_full_and_frees_on_drop() {
-        let held = super::WhaleSlot::try_acquire(1).expect("first slot");
-        assert_eq!(super::WhaleSlot::in_use(), 1);
-        assert_eq!(
-            super::WhaleSlot::try_acquire(1).err(),
-            Some(super::WhaleSlotBusy { slots: 1 }),
-            "a full table refuses at once"
-        );
-        drop(held);
-        assert_eq!(super::WhaleSlot::in_use(), 0);
-        let again = super::WhaleSlot::try_acquire(1);
-        assert!(again.is_ok(), "the slot is free again after drop");
-        drop(again);
-        assert_eq!(super::WhaleSlot::in_use(), 0);
-    }
-}
-
-#[cfg(test)]
-mod max_rss_tests {
-    use crate::memory::{resolve_process_max_rss_bytes, resolve_worker_max_rss_gb};
-
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    /// A server and a worker read `--max-rss-gb` with the same vocabulary,
-    /// differing only in the unit they answer in. Asserted from the server's
-    /// side because `Startup::resolve` above is what feeds one of them, and a
-    /// divergence would show up as a container sized by the wrong rule.
-    #[test]
-    fn max_rss_semantics_match_for_disabled_and_explicit_values() {
-        assert_eq!(resolve_process_max_rss_bytes(-1), 0);
-        assert_eq!(resolve_worker_max_rss_gb(-1), 0);
-
-        assert_eq!(resolve_process_max_rss_bytes(3), 3 * GIB);
-        assert_eq!(resolve_worker_max_rss_gb(3), 3);
-
-        assert!(resolve_process_max_rss_bytes(0) > 0);
-        assert!(resolve_worker_max_rss_gb(0) > 0);
+        let (go, wait) = tokio::sync::oneshot::channel::<()>();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        tasks.spawn(async move {
+            let _ = wait.await;
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        assert_eq!(tasks.live(), 1);
+        let _ = go.send(());
+        tasks.drained().await;
+        assert!(done.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(tasks.live(), 0);
     }
 }

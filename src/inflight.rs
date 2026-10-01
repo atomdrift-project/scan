@@ -20,7 +20,7 @@ use std::time::Instant;
 ///
 /// [`run_job`]: crate::worker
 #[derive(Debug)]
-pub struct Entry {
+pub(crate) struct Entry {
     /// Monotonic per-process analysis id, matching the lifecycle log lines.
     pub analysis_id: u64,
     /// Shortened sha256, for cross-referencing the lifecycle logs.
@@ -50,7 +50,7 @@ fn registry() -> &'static Mutex<Vec<Arc<Entry>>> {
 /// dropped. A poisoned lock is tolerated: the entry simply lingers until the
 /// next successful lock prunes it (the census filters defensively too).
 #[derive(Debug)]
-pub struct Guard(u64);
+pub(crate) struct Guard(u64);
 
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -62,7 +62,7 @@ impl Drop for Guard {
 
 /// Record an analysis as in flight. The returned guard deregisters it on drop.
 #[must_use]
-pub fn register(
+pub(crate) fn register(
     analysis_id: u64,
     sha: Arc<str>,
     file: Arc<str>,
@@ -88,7 +88,7 @@ pub fn register(
 }
 
 /// Attach the OS thread id once the analysis lands on a blocking worker thread.
-pub fn set_thread_id(analysis_id: u64, thread_id: u64) {
+pub(crate) fn set_thread_id(analysis_id: u64, thread_id: u64) {
     if let Ok(reg) = registry().lock()
         && let Some(entry) = reg.iter().find(|e| e.analysis_id == analysis_id)
     {
@@ -99,7 +99,7 @@ pub fn set_thread_id(analysis_id: u64, thread_id: u64) {
 /// Snapshot the current in-flight set (cheap `Arc` clones), oldest first so the
 /// most-stuck analyses lead the census.
 #[must_use]
-pub fn snapshot() -> Vec<Arc<Entry>> {
+pub(crate) fn snapshot() -> Vec<Arc<Entry>> {
     let mut rows = registry().lock().map(|r| r.clone()).unwrap_or_default();
     rows.sort_by_key(|e| e.started);
     rows
@@ -112,7 +112,7 @@ pub fn snapshot() -> Vec<Arc<Entry>> {
 /// the caller falls back to the analysis phase. Other platforms resolve
 /// wait-channels in batch via [`wait_channels`].
 #[must_use]
-pub fn wait_channel(thread_id: u64) -> Option<String> {
+pub(crate) fn wait_channel(thread_id: u64) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         if thread_id == 0 {
@@ -147,10 +147,11 @@ pub fn wait_channel(thread_id: u64) -> Option<String> {
 ///
 /// Threads that are running (no wait channel) are simply absent from the map.
 #[must_use]
-pub fn wait_channels(thread_ids: &[u64]) -> std::collections::HashMap<u64, String> {
-    // `mut` is used on platforms whose arm populates the map (Linux) or replaces
-    // it (FreeBSD/illumos); macOS and others leave it empty.
-    #[allow(unused_mut)]
+pub(crate) fn wait_channels(thread_ids: &[u64]) -> std::collections::HashMap<u64, String> {
+    #[allow(
+        unused_mut,
+        reason = "Linux populates the map and FreeBSD/illumos replace it; elsewhere it stays empty"
+    )]
     let mut map = std::collections::HashMap::new();
     if thread_ids.is_empty() {
         return map;
@@ -238,9 +239,8 @@ fn ps_thread_channels(args: &[&str]) -> Option<std::collections::HashMap<u64, St
 /// Linux reads procfs directly (no fork); FreeBSD/illumos shell one `ps`. Empty
 /// on platforms with no per-thread wait channel (e.g. macOS).
 #[must_use]
-pub fn thread_wait_summary() -> std::collections::BTreeMap<String, usize> {
-    // `mut` is used on platforms whose arm populates the tally; macOS leaves it empty.
-    #[allow(unused_mut)]
+pub(crate) fn thread_wait_summary() -> std::collections::BTreeMap<String, usize> {
+    #[allow(unused_mut, reason = "only some platforms populate the tally")]
     let mut tally = std::collections::BTreeMap::new();
     #[cfg(target_os = "linux")]
     if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
@@ -285,7 +285,7 @@ fn normalize_channel(chan: &str) -> String {
 /// Render a [`thread_wait_summary`] tally as `chan=count` pairs, busiest first,
 /// for a single log field.
 #[must_use]
-pub fn format_wait_summary(tally: &std::collections::BTreeMap<String, usize>) -> String {
+pub(crate) fn format_wait_summary(tally: &std::collections::BTreeMap<String, usize>) -> String {
     let mut pairs: Vec<(&String, &usize)> = tally.iter().collect();
     pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
     pairs
@@ -301,12 +301,13 @@ pub fn format_wait_summary(tally: &std::collections::BTreeMap<String, usize>) ->
 /// distinguishes a worker grinding through heavy work (cores busy) from one
 /// wedged on locks, subprocesses, or I/O (cores ≈ idle while slots stay full).
 #[must_use]
-pub fn process_cpu_secs() -> f64 {
+pub(crate) fn process_cpu_secs() -> f64 {
     #[cfg(unix)]
     {
-        // SAFETY: getrusage into a zeroed rusage is the documented usage; we only
-        // read the two timeval fields it always populates.
+        // SAFETY: `rusage` is plain old data, so all-zero bytes are a valid value.
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: getrusage writes into the live, correctly typed `usage`; we
+        // read only the two timeval fields it always populates.
         if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
             return 0.0;
         }

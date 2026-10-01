@@ -19,8 +19,9 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use tokio::sync::watch;
 
 use crate::suspend::Idle;
 
@@ -41,19 +42,26 @@ const IDLE_OOM_SCORE_ADJ: i32 = 500;
 /// Requests in flight, counted so the worker is frozen for exactly as long as
 /// the server has something to do.
 ///
-/// One counter rather than the three signals it replaces (a pause flag, a
-/// quiet-period timestamp, and an active-request gauge). It is raised twice per
-/// request — once when the handler is entered, once when the analysis itself
-/// begins — and the overlap is the point: the handler covers the upload, which
-/// can be seconds of streaming before an analysis exists, and the analysis
-/// covers the work, which outlives the handler when the client hangs up.
-/// Neither alone spans the request.
+/// It is raised twice per request — once when the handler is entered, once
+/// when the analysis itself begins — and the overlap is the point: the handler
+/// covers the upload, which can be seconds of streaming before an analysis
+/// exists, and the analysis covers the work, which outlives the handler when
+/// the client hangs up. Neither alone spans the request.
+///
+/// A count under a lock rather than an atomic: the freeze or thaw a transition
+/// causes is made while the lock is held, so a 1→0 thaw and the 0→1 freeze
+/// racing it are applied in the order the count changed, and the worker never
+/// runs beside a request.
 #[derive(Debug, Default)]
 pub(super) struct Busy {
-    count: AtomicUsize,
+    count: Mutex<usize>,
 }
 
 impl Busy {
+    fn lock(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.count.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Mark the server busy until the returned token is dropped, freezing the
     /// worker on the transition into busy and thawing on the way out.
     ///
@@ -62,12 +70,15 @@ impl Busy {
     /// cannot freeze is degraded, not broken, and saying so once per failure is
     /// more useful than a loop.
     pub(super) fn enter(self: &Arc<Self>, worker: Option<&Arc<Worker>>) -> BusyToken {
-        if self.count.fetch_add(1, Ordering::AcqRel) == 0
+        let mut count = self.lock();
+        *count += 1;
+        if *count == 1
             && let Some(worker) = worker
             && let Err(e) = worker.freeze()
         {
             tracing::warn!(error = %e, "could not freeze the idle worker; it keeps running beside this request");
         }
+        drop(count);
         BusyToken {
             busy: Arc::clone(self),
             worker: worker.map(Arc::clone),
@@ -76,7 +87,7 @@ impl Busy {
 
     /// Whether the server is currently busy. Published on `/_/stats`.
     pub(super) fn is_busy(&self) -> bool {
-        self.count.load(Ordering::Acquire) > 0
+        *self.lock() > 0
     }
 }
 
@@ -89,7 +100,9 @@ pub(super) struct BusyToken {
 
 impl Drop for BusyToken {
     fn drop(&mut self) {
-        if self.busy.count.fetch_sub(1, Ordering::AcqRel) == 1
+        let mut count = self.busy.lock();
+        *count -= 1;
+        if *count == 0
             && let Some(worker) = &self.worker
             && let Err(e) = worker.thaw()
         {
@@ -209,34 +222,44 @@ pub(super) struct Worker {
 impl Worker {
     /// Whether a worker process is alive right now.
     pub(super) fn is_running(&self) -> bool {
-        self.current.read().is_ok_and(|g| g.is_some())
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
     }
 
     /// Suspend the worker, if one is running right now.
     fn freeze(&self) -> std::io::Result<()> {
-        match self.current.read() {
-            Ok(guard) => guard.as_ref().map_or(Ok(()), Idle::freeze),
-            // A poisoned lock means a supervisor panic, not a running worker.
-            Err(_) => Ok(()),
-        }
+        let current = self.current.read().unwrap_or_else(PoisonError::into_inner);
+        current.as_ref().map_or(Ok(()), Idle::freeze)
     }
 
     /// Resume the worker, if one is running right now.
     fn thaw(&self) -> std::io::Result<()> {
-        match self.current.read() {
-            Ok(guard) => guard.as_ref().map_or(Ok(()), Idle::thaw),
-            Err(_) => Ok(()),
-        }
+        let current = self.current.read().unwrap_or_else(PoisonError::into_inner);
+        current.as_ref().map_or(Ok(()), Idle::thaw)
     }
 
-    /// Replace the worker, and freeze the replacement if the server is busy.
-    ///
-    /// The order matters and is the whole of the correctness argument. The new
-    /// child is installed *before* the busy check, so a request arriving in
-    /// between either finds it (and freezes it on the 0→1 transition) or is
-    /// already counted (and the check below freezes it). A request *ending* in
-    /// between thaws a child that was never frozen, which costs nothing.
-    fn replace(&self, busy: &Busy) {
+    /// Start a worker if none is running, replacing one that exited. Blocking:
+    /// it reaps, kills and spawns processes, so it runs on a blocking thread,
+    /// and none of that happens under the lock the request path reads.
+    fn ensure_running(&self, busy: &Busy) {
+        let exited = {
+            let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
+            match current.as_mut().map(Idle::exited) {
+                Some(Ok(None)) => return,
+                Some(Ok(Some(status))) => {
+                    tracing::warn!(%status, worker = %self.name, "idle worker exited");
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "could not check on the idle worker");
+                    return;
+                }
+                // Nothing running: the first start, or a spawn that failed.
+                None => {}
+            }
+            current.take()
+        };
         // Retire the outgoing worker *before* starting its replacement. Both
         // live in the same control group, and the primitives that make this
         // design a guarantee act on membership rather than on a pid: the old
@@ -244,69 +267,55 @@ impl Worker {
         // first is simply killed along with it. Measured on galadriel
         // (2026-09-15): the supervisor restarted, logged the new pid, and the
         // new worker was dead before its first poll — then looped, forever.
-        if let Ok(mut guard) = self.current.write() {
-            *guard = None;
-        }
+        drop(exited);
+
         let traits_dir = cleave::traits_repo::override_dir();
         let spawned = worker_command(&self.hopper, &self.name, &self.cache, traits_dir.as_deref())
             .and_then(Idle::spawn);
         let started = match spawned {
             Ok(worker) => {
                 tracing::info!(pid = worker.pid(), worker = %self.name, "idle worker started");
-                Some(worker)
+                worker
             }
             Err(e) => {
                 tracing::error!(error = %e, worker = %self.name, "could not start the idle worker; retrying");
-                None
+                return;
             }
         };
-        let installed = started.is_some();
-        if let Ok(mut guard) = self.current.write() {
-            // Dropping the old `Idle` here kills and reaps it, which is what
-            // makes this safe to call on a worker that is merely wedged rather
-            // than exited.
-            *guard = started;
-        }
-        if installed
-            && busy.is_busy()
-            && let Err(e) = self.freeze()
-        {
+        // Installed under the busy lock, so no request can enter or leave
+        // between the freeze decision and the install.
+        let count = busy.lock();
+        let frozen = if *count > 0 { started.freeze() } else { Ok(()) };
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Some(started);
+        drop(count);
+        if let Err(e) = frozen {
             tracing::warn!(error = %e, "could not freeze a freshly started idle worker");
         }
     }
 
-    /// Watch the worker and replace it when it exits.
+    /// Keep a worker running until shutdown, checking on it every
+    /// [`RESTART_DELAY`].
     ///
     /// Polling rather than waiting on the child: the server has no SIGCHLD
     /// handler of its own to hang this off, and adding one would reach every
     /// subprocess the analysis path spawns.
-    fn supervise(self: Arc<Self>, busy: Arc<Busy>, shutdown: Arc<AtomicBool>) {
+    fn supervise(self: Arc<Self>, busy: Arc<Busy>, mut stop: watch::Receiver<bool>) {
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(RESTART_DELAY).await;
-                if shutdown.load(Ordering::Relaxed) {
+                let (worker, busy) = (Arc::clone(&self), Arc::clone(&busy));
+                if tokio::task::spawn_blocking(move || worker.ensure_running(&busy))
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        "idle worker supervisor panicked; the worker is no longer supervised"
+                    );
                     return;
                 }
-                let gone = match self.current.write() {
-                    Ok(mut guard) => match guard.as_mut() {
-                        Some(worker) => match worker.exited() {
-                            Ok(Some(status)) => {
-                                tracing::warn!(%status, worker = %self.name, "idle worker exited");
-                                true
-                            }
-                            Ok(None) => false,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "could not check on the idle worker");
-                                false
-                            }
-                        },
-                        // Nothing running: a previous spawn failed.
-                        None => true,
-                    },
-                    Err(_) => return,
-                };
-                if gone {
-                    self.replace(&busy);
+                tokio::select! {
+                    () = tokio::time::sleep(RESTART_DELAY) => {}
+                    // Shutdown raised, or the server state is gone.
+                    _ = stop.changed() => return,
                 }
             }
         });
@@ -318,12 +327,13 @@ impl Worker {
 /// Returns `None` for every deliberate reason not to run one, each named: the
 /// three that were previously silent cost an afternoon apiece to diagnose,
 /// because a worker that never started looks exactly like one with nothing to
-/// do.
+/// do. The worker itself starts on the supervisor's first pass, off the
+/// reactor.
 pub(super) fn start(
     hopper: Option<&str>,
     name: &str,
     busy: &Arc<Busy>,
-    shutdown: &Arc<AtomicBool>,
+    stop: watch::Receiver<bool>,
 ) -> Option<Arc<Worker>> {
     let Some(hopper) = hopper else {
         tracing::info!("idle worker disabled: no --hopper to claim work from");
@@ -352,9 +362,6 @@ pub(super) fn start(
         cache,
         current: std::sync::RwLock::new(None),
     });
-    // The first start goes through the same path as every restart, so a
-    // failure here is retried rather than being fatal and silent.
-    worker.replace(busy);
     tracing::info!(
         hopper = %worker.hopper,
         worker = %worker.name,
@@ -362,12 +369,11 @@ pub(super) fn start(
         "idle worker: filling spare capacity with hopper queue work, frozen \
          whenever a request is in flight",
     );
-    Arc::clone(&worker).supervise(Arc::clone(busy), Arc::clone(shutdown));
+    Arc::clone(&worker).supervise(Arc::clone(busy), stop);
     Some(worker)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

@@ -119,7 +119,6 @@ pub fn read_pool(reader: impl BufRead) -> Result<(KeySets, PoolStats)> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

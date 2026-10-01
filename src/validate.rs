@@ -8,8 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::{self, ClassifiedReport, ScanConfig};
-use crate::features::ExtractContext;
-use crate::model::{Classification, Model, Thresholds};
+use crate::model::{Classification, Decision, Model, Thresholds};
 
 const PROGRESS_EVERY: usize = 10;
 const SLOW_FIXTURE_THRESHOLD: Duration = Duration::from_secs(15);
@@ -22,18 +21,14 @@ const SLOW_FIXTURE_THRESHOLD: Duration = Duration::from_secs(15);
 /// running it here as a second uncached pass made this command too slow for a
 /// local deploy/pre-commit gate.
 pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
-    // Feature-layout validation is trait-independent: load the model and reject a
-    // structurally incompatible bundle deterministically, before any trait corpus
-    // is touched or any file is analyzed. The benign smoke pass below can't be relied
-    // on to exercise every offset-written family (the unsigned-bigram overflow
-    // only triggers on packed/unsigned samples), so anchor-failure must fail here.
+    // Model validation is trait-independent: load the model and every specialist
+    // and reject a structurally incompatible bundle deterministically, before any
+    // trait corpus is touched or any file is analyzed.
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     model
         .validate_all_routes()
         .context("validating specialist model routes")?;
     let thresholds = model.thresholds();
-    let ctx = ExtractContext::new(model.spec());
-    ctx.validate_layout().context("feature layout validation")?;
 
     // A model whose spec declares features this build's extractor cannot
     // produce is a hard failure in validate mode, not a warning: those slots
@@ -106,8 +101,10 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     // one mapper shared by all target analyses, and analysis caching enabled.
     // The cache key includes the traits revision, so current trait edits still
     // invalidate stale reports without forcing every pre-commit run to rescan
-    // the whole cleave fixture tree.
-    cleave::cache::set_skip_cache_override(Some(false));
+    // the whole cleave fixture tree. The cache override is put back when this
+    // returns; compact member retention is the mode every scan entry point
+    // sets for the process, so it stays.
+    let _cache = CacheOverride::force_enabled();
     cleave::set_compact_member_retention(true); // compact projection only
     let mut options = cleave::AnalysisOptions {
         disable_yara: true,
@@ -139,26 +136,15 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                 .and_then(|report| {
                     let analysis_elapsed = analysis_started.elapsed();
                     let classify_started = Instant::now();
+                    let label = path.display().to_string();
+                    // Validation consumes ML verdicts only: no LLM, renders,
+                    // manifest listing, or dependency uploads.
                     let classified = engine::classify_report(
-                        &path.display().to_string(),
                         report,
-                        &ctx,
-                        &model,
-                        None,
-                        None,
-                        &cleave::output::TinyOpts::tiny(),
-                        None, // validation corpus never calls the LLM
-                        &path,
-                        crate::fetch::FetchPolicy::default(),
-                        config.zip_passwords(),
-                        // Validation consumes ML verdicts only — no renders,
-                        // no manifest listing, no dependency uploads.
-                        engine::OutputNeeds::default(),
-                        None, // validation fixtures are local files, not fetched packages
-                        None, // local validation fixtures have no acquisition fetch record
-                        None, // validation consumes ML verdicts only; no bloom flag
-                        None,
-                        None, // no admission gate
+                        engine::ClassifyRequest {
+                            zip_passwords: config.zip_passwords(),
+                            ..engine::ClassifyRequest::new(&label, &path, &model)
+                        },
                     );
                     let classify_elapsed = classify_started.elapsed();
                     if analysis_elapsed > SLOW_FIXTURE_THRESHOLD
@@ -197,18 +183,12 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
         eprintln!("validate fixtures: {slow_count} fixture(s) exceeded 15s");
     }
 
-    let (passed, total, hostile_fps, suspicious_fps) = evaluate(results, thresholds)?;
-
-    // The corpus pass above sets this if any extraction saw feature-layout drift
-    // (total_features > cursor: feature_names slots no writer fills, extracting
-    // to zero). Fail before reporting ok — a drifted bundle must not deploy.
-    if ctx.had_layout_drift() {
-        anyhow::bail!(
-            "feature-layout drift: the spec declares more features than the extractor \
-             writes, so some feature_names slots extract to zero (see WARN above); \
-             resync features.rs layout constants with collimator before deploying"
-        );
-    }
+    let FixtureTally {
+        passed,
+        total,
+        hostile_fps,
+        suspicious_fps,
+    } = evaluate(results, thresholds)?;
 
     // Every target is a known-benign file (platform utilities + cleave's
     // does-nothing corpus). A HOSTILE grade on any of them is a hard false
@@ -287,20 +267,29 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// What the benign fixture pass found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FixtureTally {
+    /// Targets graded benign throughout.
+    passed: usize,
+    total: usize,
+    /// Targets in which something graded hostile: hard false positives.
+    hostile_fps: usize,
+    /// Targets whose worst grade was suspicious: tolerated.
+    suspicious_fps: usize,
+}
+
 fn evaluate(
     results: Vec<(PathBuf, Result<ClassifiedReport>)>,
     thresholds: Thresholds,
-) -> Result<(usize, usize, usize, usize)> {
-    let mut passed = 0usize;
-    let mut total = 0usize;
+) -> Result<FixtureTally> {
+    let mut tally = FixtureTally::default();
     let mut analysis_failed = 0usize;
-    let mut hostile_fps = 0usize;
-    let mut suspicious_fps = 0usize;
 
     for (path, result) in results {
-        total += 1;
+        tally.total += 1;
         let result = match result {
-            Ok(result) => result,
+            Ok(classified) => classified.result,
             Err(error) => {
                 analysis_failed += 1;
                 eprintln!("FAILED {}: analysis failed: {error:#}", path.display());
@@ -312,63 +301,96 @@ fn evaluate(
         // outcome: a benign fixture file is a HARD failure only if something in
         // it grades Hostile. A merely Suspicious top-grade is reported but
         // tolerated — the operator accepts suspicious on benign input.
-        let mut any_nonbenign = false;
-        let mut any_hostile = false;
-        if result.classification != Classification::Benign {
-            any_nonbenign = true;
-            any_hostile |= result.classification == Classification::Hostile;
-            eprintln!(
-                "WARN {}: grade={} level={} probability={} decision_threshold={} margin_logit={:+.3} ensemble_thresholds suspicious={} hostile={}",
-                path.display(),
-                result.classification,
-                format_level(result.level),
-                result.probability,
-                result.threshold,
-                logit_margin(result.probability, result.threshold),
-                thresholds.suspicious,
-                thresholds.hostile,
-            );
-            for finding in &result.top_findings {
-                eprintln!("  l{} {}  {}", finding.crit, finding.id, finding.desc);
+        let label = path.display().to_string();
+        let root = Decision {
+            class: result.classification,
+            probability: result.probability,
+            threshold: result.threshold,
+            level: result.level,
+        };
+        let embedded = result.embedded_files.values().map(|e| {
+            let decision = Decision {
+                class: e.classification,
+                probability: e.probability,
+                threshold: e.threshold,
+                level: e.level,
+            };
+            (
+                format!("{label}!!{}", e.path),
+                decision,
+                e.top_findings.as_slice(),
+            )
+        });
+        let mut worst = Classification::Benign;
+        for (label, decision, findings) in
+            std::iter::once((label.clone(), root, result.top_findings.as_slice())).chain(embedded)
+        {
+            if decision.class == Classification::Benign {
+                continue;
             }
-        }
-        for embedded in result.embedded_files.values() {
-            if embedded.classification != Classification::Benign {
-                any_nonbenign = true;
-                any_hostile |= embedded.classification == Classification::Hostile;
-                eprintln!(
-                    "WARN {}!!{}: grade={} level={} probability={} decision_threshold={} margin_logit={:+.3} ensemble_thresholds suspicious={} hostile={}",
-                    path.display(),
-                    embedded.path,
-                    embedded.classification,
-                    format_level(embedded.level),
-                    embedded.probability,
-                    embedded.threshold,
-                    logit_margin(embedded.probability, embedded.threshold),
-                    thresholds.suspicious,
-                    thresholds.hostile,
-                );
-                for finding in &embedded.top_findings {
-                    eprintln!("  l{} {}  {}", finding.crit, finding.id, finding.desc);
-                }
-            }
+            worst = worst.max(decision.class);
+            warn_nonbenign(&label, &decision, thresholds, findings);
         }
 
-        if any_hostile {
-            hostile_fps += 1;
-        } else if any_nonbenign {
-            suspicious_fps += 1;
-        } else {
-            passed += 1;
+        match worst {
+            Classification::Hostile => tally.hostile_fps += 1,
+            Classification::Benign => tally.passed += 1,
+            _ => tally.suspicious_fps += 1,
         }
     }
 
     if analysis_failed > 0 {
         anyhow::bail!(
-            "{analysis_failed} validation check(s) failed during analysis ({passed}/{total} targets benign, {hostile_fps} hostile FP, {suspicious_fps} suspicious)"
+            "{analysis_failed} validation check(s) failed during analysis ({}/{} targets benign, {} hostile FP, {} suspicious)",
+            tally.passed,
+            tally.total,
+            tally.hostile_fps,
+            tally.suspicious_fps,
         );
     }
-    Ok((passed, total, hostile_fps, suspicious_fps))
+    Ok(tally)
+}
+
+/// The WARN block for one non-benign grade on a benign fixture.
+fn warn_nonbenign(
+    label: &str,
+    decision: &Decision,
+    thresholds: Thresholds,
+    findings: &[engine::TopFinding],
+) {
+    eprintln!(
+        "WARN {label}: grade={} level={} probability={} decision_threshold={} margin_logit={:+.3} ensemble_thresholds suspicious={} hostile={}",
+        decision.class,
+        decision.level,
+        decision.probability,
+        decision.threshold,
+        logit_margin(decision.probability, decision.threshold),
+        thresholds.suspicious,
+        thresholds.hostile,
+    );
+    for finding in findings {
+        eprintln!("  l{} {}  {}", finding.crit, finding.id, finding.desc);
+    }
+}
+
+/// Forces cleave's analysis cache on for the life of the guard, then restores
+/// the setting that was in effect before.
+struct CacheOverride {
+    previous: bool,
+}
+
+impl CacheOverride {
+    fn force_enabled() -> Self {
+        let previous = cleave::cache::skip_cache();
+        cleave::cache::set_skip_cache_override(Some(false));
+        Self { previous }
+    }
+}
+
+impl Drop for CacheOverride {
+    fn drop(&mut self) {
+        cleave::cache::set_skip_cache_override(Some(self.previous));
+    }
 }
 
 /// Decision margin in log-odds: `logit(probability) - logit(threshold)`.
@@ -396,14 +418,6 @@ fn logit_margin(probability: f32, threshold: f32) -> f64 {
         (p / (1.0 - p)).ln()
     }
     logit(f64::from(probability)) - logit(f64::from(threshold))
-}
-
-fn format_level(level: Option<i32>) -> String {
-    match level {
-        Some(-1) => "clean".to_string(),
-        Some(n) => format!("L{n}"),
-        None => "manual".to_string(),
-    }
 }
 
 #[cfg(test)]

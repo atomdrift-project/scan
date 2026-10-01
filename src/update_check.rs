@@ -1,11 +1,11 @@
-//! Zero-telemetry update notifier.
+//! Release-update notifier.
 //!
 //! On first run and at most once every 24 hours, litmus fetches a small static
 //! TOML manifest (`litmus.toml`) and prints a one-line notice when a newer
-//! release exists. The fetch is a plain GET of a static file — no version,
-//! identity, or any other data is sent — so it leaks nothing even if the host
-//! logs requests. A fresh result is cached locally so subsequent runs print the
-//! notice without touching the network at all.
+//! release exists. The fetch is a plain GET of a static file; the only thing it
+//! says about this install is its User-Agent, `scan/<version>`. A fresh result
+//! is cached locally so subsequent runs print the notice without touching the
+//! network at all.
 //!
 //! The opt-out is honored everywhere: pass `--no-update-check` or set
 //! `SCAN_NO_UPDATE_CHECK` to disable the notice. The base URL is overridable
@@ -25,24 +25,14 @@ const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 /// never noticeably delay a command, and an offline host should fail fast.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Resolve the manifest base URL (overridable via `SCAN_UPDATE_URL`).
-fn base_url() -> String {
-    std::env::var("SCAN_UPDATE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned())
-}
-
-/// Build the URL for a named manifest. Apply-time fetches set the `?update=1`
-/// marker — a constant flag (no data embedded) distinguishing a fetch tied to
-/// an `update-rules` action from a passive notice check.
-fn manifest_url(name: &str, marker: bool) -> String {
-    let base = base_url();
+/// The URL of manifest `name` under `base`.
+fn manifest_url(base: &str, name: &str) -> String {
     let sep = if base.ends_with('/') { "" } else { "/" };
-    let query = if marker { "?update=1" } else { "" };
-    format!("{base}{sep}{name}{query}")
+    format!("{base}{sep}{name}")
 }
 
 /// Fetch and parse a manifest over HTTPS.
-fn fetch(name: &str, marker: bool) -> Result<Manifest> {
-    let url = manifest_url(name, marker);
+fn fetch(url: &str) -> Result<Manifest> {
     let client = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .connect_timeout(FETCH_TIMEOUT)
@@ -50,7 +40,7 @@ fn fetch(name: &str, marker: bool) -> Result<Manifest> {
         .build()
         .context("building update-check HTTP client")?;
     let text = client
-        .get(&url)
+        .get(url)
         .send()
         .with_context(|| format!("fetching {url}"))?
         .error_for_status()
@@ -140,55 +130,41 @@ pub fn maybe_notify(disabled_by_flag: bool) {
         return;
     }
 
-    match fetch("litmus.toml", false) {
-        Ok(manifest) => {
-            write_cache(&Cache {
-                checked_unix: now_unix(),
-                latest: manifest.latest.clone(),
-                url: manifest.url.clone(),
-            });
-            notify(&manifest.latest, manifest.url.as_deref(), installed);
-        }
+    let base = std::env::var("SCAN_UPDATE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+    let cache = match fetch(&manifest_url(&base, "litmus.toml")) {
+        Ok(manifest) => Cache {
+            checked_unix: now_unix(),
+            latest: manifest.latest,
+            url: manifest.url,
+        },
         Err(e) => {
             tracing::debug!(error = %format!("{e:#}"), "update check skipped");
             // Stamp the failed attempt so an unreachable manifest doesn't
             // trigger a network call on every run. Preserve any previously
             // known `latest` so a transient failure still shows the last notice.
-            let prev = cached.unwrap_or_default();
-            write_cache(&Cache {
+            Cache {
                 checked_unix: now_unix(),
-                latest: prev.latest.clone(),
-                url: prev.url.clone(),
-            });
-            notify(&prev.latest, prev.url.as_deref(), installed);
+                ..cached.unwrap_or_default()
+            }
         }
-    }
+    };
+    write_cache(&cache);
+    notify(&cache.latest, cache.url.as_deref(), installed);
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
     #[test]
-    fn manifest_url_joins_and_marks() {
-        // SAFETY: the test binary is single-threaded at this point.
-        unsafe { std::env::set_var("SCAN_UPDATE_URL", "https://example.test/u/") };
+    fn manifest_url_joins_with_or_without_a_trailing_slash() {
         assert_eq!(
-            manifest_url("litmus.toml", false),
+            manifest_url("https://example.test/u/", "litmus.toml"),
             "https://example.test/u/litmus.toml"
         );
         assert_eq!(
-            manifest_url("litmus.toml", true),
-            "https://example.test/u/litmus.toml?update=1"
-        );
-
-        // A base without a trailing slash still joins correctly.
-        unsafe { std::env::set_var("SCAN_UPDATE_URL", "https://example.test/u") };
-        assert_eq!(
-            manifest_url("cleave.toml", false),
+            manifest_url("https://example.test/u", "cleave.toml"),
             "https://example.test/u/cleave.toml"
         );
-        unsafe { std::env::remove_var("SCAN_UPDATE_URL") };
     }
 }

@@ -57,15 +57,15 @@ pub fn collector_sidecar(
     sha256: &str,
     size_bytes: u64,
 ) -> Option<Vec<u8>> {
-    let mut document = collector_document(artifact, sha256)?;
-    document["schema_version"] = serde_json::json!(SCHEMA_VERSION);
-    document["artifact"] = serde_json::json!({
-        "filename": filename,
-        "sha256": sha256,
-        "size_bytes": size_bytes,
-    });
-    trim_registry_raw(&mut document);
-    serde_json::to_vec(&document).ok()
+    let document = collector_document(artifact, sha256)?;
+    let artifact = ArtifactRef {
+        filename,
+        sha256,
+        size_bytes,
+    };
+    rebind(document, artifact)
+        .map_err(|e| tracing::warn!(%sha256, error = %e, "collector sidecar could not be rebound"))
+        .ok()
 }
 
 /// The package coordinate a collector recorded for these exact bytes.
@@ -77,7 +77,7 @@ pub fn collector_sidecar(
 /// to say which package the verdict is about.
 ///
 /// Canonicalized through fletch so a malformed or hostile `purl` string cannot
-/// reach the display, and `None` whenever [`collector_document`] declines.
+/// reach the display, and `None` whenever `collector_document` declines.
 #[must_use]
 pub fn collector_purl(artifact: &Path, sha256: &str) -> Option<String> {
     let document = collector_document(artifact, sha256)?;
@@ -140,7 +140,6 @@ fn collector_document(artifact: &Path, sha256: &str) -> Option<serde_json::Value
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod collector_sidecar_tests {
     use super::collector_sidecar;
 
@@ -299,165 +298,187 @@ mod collector_sidecar_tests {
 /// the collector did not record, are taken from `supplied`.
 #[must_use]
 pub fn with_registry_from(collected: &[u8], supplied: &[u8]) -> Vec<u8> {
-    let parsed: Option<(serde_json::Value, serde_json::Value)> = serde_json::from_slice(collected)
-        .ok()
-        .zip(serde_json::from_slice(supplied).ok());
-    let Some((mut merged, mut supplied)) = parsed else {
+    use serde_json::{Map, Value};
+    let (Ok(mut merged), Ok(mut supplied)) = (
+        serde_json::from_slice::<Map<String, Value>>(collected),
+        serde_json::from_slice::<Map<String, Value>>(supplied),
+    ) else {
         return collected.to_vec();
     };
     // The map was named explicitly, so its registry block wins outright — that
     // is the whole point of passing one. A package slot is different: the
     // collector recorded the coordinate it actually fetched, so the map only
     // fills that in when the capture record left it out.
-    let registry = supplied["registry"].take();
-    if !registry.is_null() {
-        merged["registry"] = registry;
+    if let Some(registry) = supplied.remove("registry").filter(|r| !r.is_null()) {
+        merged.insert("registry".into(), registry);
     }
-    let package = supplied["package"].take();
-    if !package.is_null() && merged.get("package").is_none_or(serde_json::Value::is_null) {
-        merged["package"] = package;
+    if let Some(package) = supplied.remove("package").filter(|p| !p.is_null())
+        && merged.get("package").is_none_or(Value::is_null)
+    {
+        merged.insert("package".into(), package);
     }
     serde_json::to_vec(&merged).unwrap_or_else(|_| collected.to_vec())
 }
 
-/// Build a hopper provenance sidecar JSON for an artifact about to be uploaded/// Build a hopper provenance sidecar JSON for an artifact about to be uploaded
-/// to `/api/upload`. Mirrors hopper's `Sidecar` Go struct field-for-field so the
-/// upload validator accepts it: `schema_version`, `artifact`, `fetch`, and —
-/// when the artifact is a fetched package — `package` + `registry{record}`.
+/// The facts every sidecar states about the bytes it travels with: which bytes,
+/// who pushed them, and where they came from. `purl` is the package's
+/// canonical PURL, `None` for a scanned root file or a plain-URL fetch.
 ///
-/// `purl` is the package's canonical PURL (empty for the scanned root file or a
-/// plain-URL fetch); `registry` is the normalized record scan derived for a
-/// fetched dependency (`None` for the root file). `sources` are the raw provider
-/// documents the registry lookup read (`(url, bytes)`), archived under
-/// `registry.raw` as the re-parsing backup — the same shape forager stores: a
-/// JSON body inline, anything else base64 in `body_b64`.
-#[must_use]
-#[allow(clippy::too_many_arguments)] // a flat sidecar record; a params struct would only indirect it
-pub fn build_sidecar(
-    filename: &str,
-    sha256: &str,
-    size_bytes: u64,
-    collector: &str,
-    now_rfc3339: &str,
-    url: &str,
-    purl: &str,
-    registry: Option<&Registry>,
-    sources: &[fletch::fetch::RecordedSource],
-) -> Vec<u8> {
-    let mut sidecar = serde_json::json!({
-        "schema_version": SCHEMA_VERSION,
-        "artifact": { "filename": filename, "sha256": sha256, "size_bytes": size_bytes },
-        // category "submitted": a scan push is a discovered-by-us artifact, not a
-        // labeled feed sample. hopper records it but derives the real label from
-        // analysis, never from this claim.
-        "fetch": { "collector": collector, "category": "submitted", "at": now_rfc3339, "url": url },
-    });
-    // A fetched dependency always carries its PURL, so hopper can project the
-    // version-less form into the queryable purl_base column — independent of
-    // whether the registry lookup resolved. Identity fields are filled from the
-    // record when present.
-    if !purl.is_empty() {
-        let mut package = serde_json::json!({ "purl": purl });
-        if let Some(reg) = registry {
-            package["ecosystem"] = serde_json::json!(reg.ecosystem);
-            package["name"] = serde_json::json!(reg.name);
-            package["version"] = serde_json::json!(reg.version);
-        }
-        sidecar["package"] = package;
-    }
-    if let Some(reg) = registry {
-        // Drop an over-cap raw archive rather than ship an oversized part that
-        // hopper cannot parse; see [`MAX_RAW_BYTES`]. The normalized `record`
-        // is small and bounded, so the record scan reasons over is unaffected.
-        let raw = raw_sources(sources);
-        let over_cap = serde_json::to_vec(&raw).map_or(0, |b| b.len()) > MAX_RAW_BYTES;
-        sidecar["registry"] = serde_json::json!({
-            "source_id": reg.ecosystem,
-            "ecosystem": reg.ecosystem,
-            "format": "fletch.registry",
-            "url": url,
-            "at": now_rfc3339,
-            "status": if over_cap { "partial" } else { "complete" },
-            "record": reg,
-        });
-        if !over_cap {
-            sidecar["registry"]["raw"] = raw;
-        }
-    }
-    serde_json::to_vec(&sidecar).unwrap_or_default()
+/// Builds the hopper `Sidecar` (`schema_version`, `artifact`, `fetch`, and —
+/// for a fetched package — `package` + `registry`) field-for-field, so the
+/// upload validator accepts it.
+#[derive(Debug, Clone, Copy)]
+pub struct Upload<'a> {
+    /// Filename hopper stores and sniffs the type from.
+    pub filename: &'a str,
+    /// SHA-256 of the bytes.
+    pub sha256: &'a str,
+    /// Size of the bytes.
+    pub size_bytes: u64,
+    /// The collector name (`scan+<worker>`).
+    pub collector: &'a str,
+    /// When the bytes were collected, RFC 3339.
+    pub at: &'a str,
+    /// The URL the bytes came from, empty when there is none.
+    pub url: &'a str,
+    /// The package the bytes were fetched as.
+    pub purl: Option<&'a str>,
 }
 
-/// Produce an uploadable hopper sidecar while preserving provenance supplied by
-/// a worker or `--registry-map`.
-///
-/// A complete hopper sidecar is reused as-is semantically. Bare fletch envelopes
-/// and legacy records are wrapped in a current sidecar; their raw provider data,
-/// when present, is copied into `registry.raw` without schema-specific parsing.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-pub fn build_sidecar_from_provenance(
-    filename: &str,
-    sha256: &str,
-    size_bytes: u64,
-    collector: &str,
-    now_rfc3339: &str,
-    url: &str,
-    purl: &str,
-    provenance: &RegistryProvenance,
-) -> Vec<u8> {
-    if serde_json::from_slice::<CompleteSidecarProbe>(provenance.document()).is_ok() {
-        let mut document = provenance.document_value().unwrap_or_default();
-        // The provenance wrapper is historical; the artifact binding is a
-        // present-tense integrity claim and must match the bytes being uploaded.
-        // Rebind it even for a complete sidecar so a stale/mistyped map entry
-        // cannot make hopper reject otherwise valid bytes.
-        document["schema_version"] = serde_json::json!(SCHEMA_VERSION);
-        document["artifact"] = serde_json::json!({
-            "filename": filename,
-            "sha256": sha256,
-            "size_bytes": size_bytes,
-        });
-        trim_registry_raw(&mut document);
-        return serde_json::to_vec(&document).unwrap_or_default();
+impl Upload<'_> {
+    /// A new sidecar. `registry` is the normalized record scan derived for a
+    /// fetched dependency (`None` for the root file); `sources` are the raw
+    /// provider documents its lookup read, archived under `registry.raw` as the
+    /// re-parsing backup — the shape forager stores: a JSON body inline,
+    /// anything else base64 in `body_b64`.
+    ///
+    /// # Errors
+    /// Returns serde's error if the document cannot be serialized.
+    pub fn sidecar(
+        &self,
+        registry: Option<&Registry>,
+        sources: &[fletch::fetch::RecordedSource],
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        // Measured once and embedded verbatim; an over-cap archive is dropped
+        // rather than shipped in a part hopper cannot parse ([`MAX_RAW_BYTES`]).
+        // The normalized `record` is small and bounded, so it always rides.
+        let raw = match registry {
+            Some(_) => Some(serde_json::to_string(&encoded_sources(sources))?)
+                .filter(|raw| raw.len() <= MAX_RAW_BYTES)
+                .map(serde_json::value::RawValue::from_string)
+                .transpose()?,
+            None => None,
+        };
+        serde_json::to_vec(&Sidecar {
+            schema_version: SCHEMA_VERSION,
+            artifact: self.artifact(),
+            // A fetched dependency always carries its PURL, so hopper can
+            // project the version-less form into the queryable purl_base
+            // column — whether or not the registry lookup resolved.
+            package: self.purl.map(|purl| Package {
+                ecosystem: registry.map(|r| r.ecosystem.as_str()),
+                name: registry.map(|r| r.name.as_str()),
+                version: registry.map(|r| r.version.as_str()),
+                purl,
+            }),
+            fetch: self.fetch(),
+            registry: registry.map(|record| self.registry(record, raw.as_deref())),
+        })
     }
 
-    let record = &provenance.record;
-    // RawValue points directly into the compact document. Its length is a safe
-    // cap check (possibly conservative only when an external producer included
-    // whitespace) and it serializes verbatim, avoiding a Value tree entirely.
-    let raw =
-        registry_raw_json(provenance.document()).filter(|raw| raw.get().len() <= MAX_RAW_BYTES);
-    let sidecar = WrappedSidecar {
-        schema_version: SCHEMA_VERSION,
-        artifact: WrappedArtifact {
-            filename,
-            sha256,
-            size_bytes,
-        },
-        package: (!purl.is_empty()).then_some(WrappedPackage {
-            ecosystem: &record.ecosystem,
-            name: &record.name,
-            version: &record.version,
-            purl,
-        }),
-        fetch: WrappedFetch {
-            collector,
+    /// A sidecar that preserves provenance supplied by a worker, a
+    /// `--registry-map`, or a live lookup.
+    ///
+    /// A complete hopper sidecar is reused as-is, rebound to these bytes. Bare
+    /// fletch envelopes and legacy records are wrapped in a current sidecar;
+    /// their raw provider data, when present, is copied into `registry.raw`
+    /// without schema-specific parsing.
+    ///
+    /// # Errors
+    /// Returns serde's error if the document cannot be parsed or serialized.
+    pub fn sidecar_from_provenance(
+        &self,
+        provenance: &RegistryProvenance,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        if serde_json::from_slice::<CompleteSidecarProbe>(provenance.document()).is_ok() {
+            return rebind(
+                serde_json::from_slice(provenance.document())?,
+                self.artifact(),
+            );
+        }
+        let record = &provenance.record;
+        // RawValue points directly into the compact document. Its length is a
+        // safe cap check (conservative only when an external producer included
+        // whitespace) and it serializes verbatim, with no Value tree.
+        let raw =
+            registry_raw_json(provenance.document()).filter(|raw| raw.get().len() <= MAX_RAW_BYTES);
+        serde_json::to_vec(&Sidecar {
+            schema_version: SCHEMA_VERSION,
+            artifact: self.artifact(),
+            package: self.purl.map(|purl| Package {
+                ecosystem: Some(&record.ecosystem),
+                name: Some(&record.name),
+                version: Some(&record.version),
+                purl,
+            }),
+            fetch: self.fetch(),
+            registry: Some(self.registry(record, raw)),
+        })
+    }
+
+    const fn artifact(&self) -> ArtifactRef<'_> {
+        ArtifactRef {
+            filename: self.filename,
+            sha256: self.sha256,
+            size_bytes: self.size_bytes,
+        }
+    }
+
+    const fn fetch(&self) -> FetchRef<'_> {
+        FetchRef {
+            collector: self.collector,
+            // A scan push is a discovered-by-us artifact, not a labeled feed
+            // sample: hopper records it but derives the real label from
+            // analysis, never from this claim.
             category: "submitted",
-            at: now_rfc3339,
-            url,
-        },
-        registry: WrappedRegistry {
+            at: self.at,
+            url: self.url,
+        }
+    }
+
+    fn registry<'r>(
+        &'r self,
+        record: &'r Registry,
+        raw: Option<&'r serde_json::value::RawValue>,
+    ) -> RegistryBlock<'r> {
+        RegistryBlock {
             source_id: &record.ecosystem,
             ecosystem: &record.ecosystem,
             format: "fletch.registry",
-            url,
-            at: now_rfc3339,
+            url: self.url,
+            at: self.at,
             status: if raw.is_some() { "complete" } else { "partial" },
             record,
             raw,
-        },
+        }
+    }
+}
+
+/// Rebind an existing sidecar document to the bytes being uploaded. Its
+/// provenance is historical; the artifact binding is a present-tense integrity
+/// claim and must match what is uploaded, or hopper rejects otherwise valid
+/// bytes. An over-cap raw archive is trimmed on the way out.
+fn rebind(
+    mut document: serde_json::Value,
+    artifact: ArtifactRef<'_>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let Some(object) = document.as_object_mut() else {
+        return Err(serde::de::Error::custom("a sidecar must be a JSON object"));
     };
-    serde_json::to_vec(&sidecar).unwrap_or_default()
+    object.insert("schema_version".into(), SCHEMA_VERSION.into());
+    object.insert("artifact".into(), serde_json::to_value(artifact)?);
+    trim_registry_raw(&mut document);
+    serde_json::to_vec(&document)
 }
 
 #[derive(Deserialize)]
@@ -472,33 +493,39 @@ struct CompleteSidecarProbe {
     _registry: serde::de::IgnoredAny,
 }
 
+/// hopper's `Sidecar`, as this crate writes it.
 #[derive(serde::Serialize)]
-struct WrappedSidecar<'a> {
+struct Sidecar<'a> {
     schema_version: &'static str,
-    artifact: WrappedArtifact<'a>,
+    artifact: ArtifactRef<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    package: Option<WrappedPackage<'a>>,
-    fetch: WrappedFetch<'a>,
-    registry: WrappedRegistry<'a>,
+    package: Option<Package<'a>>,
+    fetch: FetchRef<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registry: Option<RegistryBlock<'a>>,
 }
 
 #[derive(serde::Serialize)]
-struct WrappedArtifact<'a> {
+struct ArtifactRef<'a> {
     filename: &'a str,
     sha256: &'a str,
     size_bytes: u64,
 }
 
+/// Identity fields are filled from the registry record when one resolved.
 #[derive(serde::Serialize)]
-struct WrappedPackage<'a> {
-    ecosystem: &'a str,
-    name: &'a str,
-    version: &'a str,
+struct Package<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ecosystem: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
     purl: &'a str,
 }
 
 #[derive(serde::Serialize)]
-struct WrappedFetch<'a> {
+struct FetchRef<'a> {
     collector: &'a str,
     category: &'static str,
     at: &'a str,
@@ -506,7 +533,7 @@ struct WrappedFetch<'a> {
 }
 
 #[derive(serde::Serialize)]
-struct WrappedRegistry<'a> {
+struct RegistryBlock<'a> {
     source_id: &'a str,
     ecosystem: &'a str,
     format: &'static str,
@@ -555,33 +582,6 @@ fn take_registry_raw(document: &mut serde_json::Value) -> Option<serde_json::Val
     document
         .remove("raw")
         .or_else(|| document.remove("sources"))
-}
-
-/// Encode raw provider documents for the sidecar's `registry.raw`: each as
-/// `{url, status, content_type?, body|body_b64}` — a JSON body inline (the
-/// package-registry case), anything else base64. Matches the `sources` shape
-/// `fletch registry` emits and forager stores, so a future re-parse handles both
-/// producers uniformly.
-fn raw_sources(sources: &[fletch::fetch::RecordedSource]) -> serde_json::Value {
-    use base64::Engine as _;
-    let entries: Vec<serde_json::Value> = sources
-        .iter()
-        .map(|s| {
-            let mut entry = match serde_json::from_slice::<serde_json::Value>(&s.bytes) {
-                Ok(body) => serde_json::json!({ "url": s.url, "body": body }),
-                Err(_) => serde_json::json!({
-                    "url": s.url,
-                    "body_b64": base64::engine::general_purpose::STANDARD.encode(&s.bytes),
-                }),
-            };
-            entry["status"] = serde_json::json!(s.status);
-            if let Some(ct) = &s.content_type {
-                entry["content_type"] = serde_json::json!(ct);
-            }
-            entry
-        })
-        .collect();
-    serde_json::Value::Array(entries)
 }
 
 /// Lossless registry provenance at scan's input boundary.
@@ -638,11 +638,17 @@ impl RegistryProvenance {
             sources: Vec<EncodedSource<'a>>,
         }
 
+        // Every field serializes infallibly; should that ever change, the
+        // document stays empty — unparseable, so no consumer mistakes it for
+        // provenance — and the failure is said here.
         let document = serde_json::to_vec(&LiveDocument {
             record: &record,
             sources: encoded_sources(sources),
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::error!(package = %record.name, error = %e, "registry provenance could not be serialized");
+            Vec::new()
+        });
         Self {
             record,
             document: bytes::Bytes::from(document),
@@ -717,6 +723,15 @@ enum EncodedSource<'a> {
         content_type: Option<&'a str>,
         body_b64: String,
     },
+    /// A document fletch recorded without its bytes — past a source limit,
+    /// which scan never sets — so only what identifies it.
+    Unkept {
+        url: &'a str,
+        status: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_type: Option<&'a str>,
+        size: u64,
+    },
 }
 
 /// Borrow valid JSON bodies directly from fletch's source buffers so building a
@@ -727,22 +742,32 @@ fn encoded_sources(sources: &[fletch::fetch::RecordedSource]) -> Vec<EncodedSour
 
     sources
         .iter()
-        .map(
-            |source| match serde_json::from_slice::<&serde_json::value::RawValue>(&source.bytes) {
+        .map(|source| {
+            let (url, status) = (source.url.as_str(), source.status);
+            let content_type = source.content_type.as_deref();
+            let Some(bytes) = source.bytes.as_deref() else {
+                return EncodedSource::Unkept {
+                    url,
+                    status,
+                    content_type,
+                    size: source.size,
+                };
+            };
+            match serde_json::from_slice::<&serde_json::value::RawValue>(bytes) {
                 Ok(body) => EncodedSource::Json {
-                    url: &source.url,
-                    status: source.status,
-                    content_type: source.content_type.as_deref(),
+                    url,
+                    status,
+                    content_type,
                     body,
                 },
                 Err(_) => EncodedSource::Binary {
-                    url: &source.url,
-                    status: source.status,
-                    content_type: source.content_type.as_deref(),
-                    body_b64: base64::engine::general_purpose::STANDARD.encode(&source.bytes),
+                    url,
+                    status,
+                    content_type,
+                    body_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
                 },
-            },
-        )
+            }
+        })
         .collect()
 }
 
@@ -842,7 +867,6 @@ pub fn registry_map(json: &[u8]) -> Result<HashMap<String, RegistryProvenance>, 
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{registry_map, registry_provenance};
 
@@ -897,16 +921,17 @@ mod tests {
             r#"{{"record":{RECORD},"sources":[{{"url":"https://registry.example/left-pad","status":200,"body":{{"provider_only":42}}}}]}}"#
         );
         let provenance = registry_provenance(json.as_bytes()).expect("provenance present");
-        let sidecar = super::build_sidecar_from_provenance(
-            "left-pad.tgz",
-            &"a".repeat(64),
-            123,
-            "scan+test",
-            "2026-07-30T00:00:00Z",
-            "",
-            "",
-            &provenance,
-        );
+        let sidecar = super::Upload {
+            filename: "left-pad.tgz",
+            sha256: &"a".repeat(64),
+            size_bytes: 123,
+            collector: "scan+test",
+            at: "2026-07-30T00:00:00Z",
+            url: "",
+            purl: None,
+        }
+        .sidecar_from_provenance(&provenance)
+        .unwrap();
         let sidecar: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
         assert_eq!(sidecar["registry"]["raw"][0]["body"]["provider_only"], 42);
         assert_eq!(sidecar["registry"]["record"]["name"], "left-pad");
@@ -915,6 +940,7 @@ mod tests {
 
     #[test]
     fn wrapping_bare_provenance_applies_hopper_raw_cap() {
+        let large = format!(r#"{{"blob":"{}"}}"#, "x".repeat(super::MAX_RAW_BYTES)).into_bytes();
         let provenance = super::RegistryProvenance::from_record_sources(
             fletch::Registry {
                 ecosystem: "npm".to_string(),
@@ -926,19 +952,21 @@ mod tests {
                 url: "https://registry.example/large".to_string(),
                 status: 200,
                 content_type: Some("application/json".to_string()),
-                bytes: format!(r#"{{"blob":"{}"}}"#, "x".repeat(super::MAX_RAW_BYTES)).into_bytes(),
+                size: large.len() as u64,
+                bytes: Some(large),
             }],
         );
-        let sidecar = super::build_sidecar_from_provenance(
-            "large.tgz",
-            &"a".repeat(64),
-            123,
-            "scan+test",
-            "2026-07-30T00:00:00Z",
-            "https://registry.example/large.tgz",
-            "pkg:npm/large@1",
-            &provenance,
-        );
+        let sidecar = super::Upload {
+            filename: "large.tgz",
+            sha256: &"a".repeat(64),
+            size_bytes: 123,
+            collector: "scan+test",
+            at: "2026-07-30T00:00:00Z",
+            url: "https://registry.example/large.tgz",
+            purl: Some("pkg:npm/large@1"),
+        }
+        .sidecar_from_provenance(&provenance)
+        .unwrap();
         let sidecar: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
         assert_eq!(sidecar["registry"]["status"], "partial");
         assert!(sidecar["registry"].get("raw").is_none());
@@ -951,16 +979,17 @@ mod tests {
             r#"{{"schema_version":"1.0","artifact":{{"sha256":"ab"}},"fetch":{{"collector":"forager","category":"malware","at":"2026-07-30T00:00:00Z","url":"https://example.test"}},"future":{{"kept":true}},"registry":{{"record":{RECORD},"raw":{{"provider_only":42}}}}}}"#
         );
         let provenance = registry_provenance(json.as_bytes()).expect("provenance present");
-        let sidecar = super::build_sidecar_from_provenance(
-            "ignored.tgz",
-            "ignored",
-            0,
-            "scan+test",
-            "2026-07-30T00:00:00Z",
-            "",
-            "",
-            &provenance,
-        );
+        let sidecar = super::Upload {
+            filename: "ignored.tgz",
+            sha256: "ignored",
+            size_bytes: 0,
+            collector: "scan+test",
+            at: "2026-07-30T00:00:00Z",
+            url: "",
+            purl: None,
+        }
+        .sidecar_from_provenance(&provenance)
+        .unwrap();
         let sidecar: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
         assert_eq!(sidecar["future"]["kept"], true);
         assert_eq!(sidecar["registry"]["raw"]["provider_only"], 42);
@@ -1042,26 +1071,28 @@ mod tests {
                 url: "https://registry.npmjs.org/left-pad".to_string(),
                 status: 200,
                 content_type: Some("application/json".to_string()),
-                bytes: br#"{"name":"left-pad"}"#.to_vec(),
+                size: 19,
+                bytes: Some(br#"{"name":"left-pad"}"#.to_vec()),
             },
             fletch::fetch::RecordedSource {
                 url: "https://chromewebstore.example/detail".to_string(),
                 status: 200,
                 content_type: Some("text/html".to_string()),
-                bytes: b"<html>not json</html>".to_vec(),
+                size: 21,
+                bytes: Some(b"<html>not json</html>".to_vec()),
             },
         ];
-        let json = super::build_sidecar(
-            "left-pad-1.3.0.tgz",
-            &"a".repeat(64),
-            1234,
-            "scan+host",
-            "2026-06-25T00:00:00Z",
-            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-            "pkg:npm/left-pad@1.3.0",
-            Some(&reg),
-            &sources,
-        );
+        let json = super::Upload {
+            filename: "left-pad-1.3.0.tgz",
+            sha256: &"a".repeat(64),
+            size_bytes: 1234,
+            collector: "scan+host",
+            at: "2026-06-25T00:00:00Z",
+            url: "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+            purl: Some("pkg:npm/left-pad@1.3.0"),
+        }
+        .sidecar(Some(&reg), &sources)
+        .unwrap();
 
         // What scan writes, scan (and a worker) reads back as the same record.
         let rec = registry_record(&json).expect("registry record present");
@@ -1110,19 +1141,20 @@ mod tests {
             url: "https://registry.npmjs.org/socket".to_string(),
             status: 200,
             content_type: Some("application/json".to_string()),
-            bytes: huge.into_bytes(),
+            size: huge.len() as u64,
+            bytes: Some(huge.into_bytes()),
         }];
-        let json = super::build_sidecar(
-            "socket-1.1.137.tgz",
-            &"a".repeat(64),
-            5083868,
-            "scan+galadriel",
-            "2026-07-03T16:34:16Z",
-            "https://registry.npmjs.org/socket/-/socket-1.1.137.tgz",
-            "pkg:npm/socket@1.1.137",
-            Some(&reg),
-            &sources,
-        );
+        let json = super::Upload {
+            filename: "socket-1.1.137.tgz",
+            sha256: &"a".repeat(64),
+            size_bytes: 5083868,
+            collector: "scan+galadriel",
+            at: "2026-07-03T16:34:16Z",
+            url: "https://registry.npmjs.org/socket/-/socket-1.1.137.tgz",
+            purl: Some("pkg:npm/socket@1.1.137"),
+        }
+        .sidecar(Some(&reg), &sources)
+        .unwrap();
 
         assert!(
             json.len() < super::MAX_RAW_BYTES,
@@ -1141,36 +1173,74 @@ mod tests {
     fn build_sidecar_dep_carries_purl_even_without_a_registry_record() {
         // A fetched dependency whose registry lookup didn't resolve still uploads
         // with its PURL, so hopper can populate purl_base.
-        let json = super::build_sidecar(
-            "assertion-error-2.0.1.tgz",
-            &"d".repeat(64),
-            500,
-            "scan+host",
-            "2026-06-25T00:00:00Z",
-            "https://registry.npmjs.org/assertion-error/-/assertion-error-2.0.1.tgz",
-            "pkg:npm/assertion-error@2.0.1",
-            None,
-            &[],
-        );
+        let json = super::Upload {
+            filename: "assertion-error-2.0.1.tgz",
+            sha256: &"d".repeat(64),
+            size_bytes: 500,
+            collector: "scan+host",
+            at: "2026-06-25T00:00:00Z",
+            url: "https://registry.npmjs.org/assertion-error/-/assertion-error-2.0.1.tgz",
+            purl: Some("pkg:npm/assertion-error@2.0.1"),
+        }
+        .sidecar(None, &[])
+        .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["package"]["purl"], "pkg:npm/assertion-error@2.0.1");
         // No record resolved, so no registry slot — but the PURL still rode along.
         assert!(v.get("registry").is_none());
     }
 
+    /// A document that is not a sidecar is an error to the caller, never an
+    /// empty or half-built upload.
+    #[test]
+    fn rebinding_something_other_than_a_sidecar_is_an_error() {
+        let artifact = super::ArtifactRef {
+            filename: "a.tgz",
+            sha256: "cafe",
+            size_bytes: 1,
+        };
+        assert!(super::rebind(serde_json::json!(["not", "a", "sidecar"]), artifact).is_err());
+    }
+
+    /// An upload names its package only when it has one; a PURL without a
+    /// resolved record still rides, alone.
+    #[test]
+    fn an_upload_names_its_package_only_when_it_has_one() {
+        let sha = "a".repeat(64);
+        let upload = super::Upload {
+            filename: "x.tgz",
+            sha256: &sha,
+            size_bytes: 1,
+            collector: "scan+test",
+            at: "2026-01-01T00:00:00Z",
+            url: "",
+            purl: None,
+        };
+        let plain: serde_json::Value =
+            serde_json::from_slice(&upload.sidecar(None, &[]).unwrap()).unwrap();
+        assert!(plain.get("package").is_none() && plain.get("registry").is_none());
+        let named = super::Upload {
+            purl: Some("pkg:npm/x@1"),
+            ..upload
+        };
+        let named: serde_json::Value =
+            serde_json::from_slice(&named.sidecar(None, &[]).unwrap()).unwrap();
+        assert_eq!(named["package"], serde_json::json!({"purl": "pkg:npm/x@1"}));
+    }
+
     #[test]
     fn build_sidecar_without_registry_omits_package_and_registry() {
-        let json = super::build_sidecar(
-            "mal.bin",
-            &"b".repeat(64),
-            10,
-            "scan+host",
-            "2026-06-25T00:00:00Z",
-            "",
-            "",
-            None,
-            &[],
-        );
+        let json = super::Upload {
+            filename: "mal.bin",
+            sha256: &"b".repeat(64),
+            size_bytes: 10,
+            collector: "scan+host",
+            at: "2026-06-25T00:00:00Z",
+            url: "",
+            purl: None,
+        }
+        .sidecar(None, &[])
+        .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["artifact"]["filename"], "mal.bin");
         assert!(

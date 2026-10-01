@@ -5,19 +5,21 @@
 //! one sample's result POST hangs forever; the other samples must still
 //! complete and post within a bound.
 //!
-//! **Requires `SCAN_MODELS_DIR`** (same convention as `server_analyze.rs`).
+//! **Requires `SCAN_MODELS_DIR`**, so it is ignored by default:
+//! `SCAN_MODELS_DIR=... cargo test --test worker_post_hang -- --ignored`.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+mod worker_support;
+
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use scan::worker::{WorkerConfig, run};
+use scan::worker::{DispatchOrder, run};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -237,17 +239,25 @@ fn from_hex(b: u8) -> Option<u8> {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sibling_jobs_complete_while_one_result_post_hangs() {
-    let Ok(models_dir) = std::env::var("SCAN_MODELS_DIR") else {
-        eprintln!(
-            "skipping: SCAN_MODELS_DIR not set (same convention as \
-             server_analyze.rs integration tests)"
-        );
-        return;
-    };
-    let models_dir = PathBuf::from(models_dir);
+#[test]
+#[ignore = "needs a model bundle in SCAN_MODELS_DIR; run with --ignored"]
+fn sibling_jobs_complete_while_one_result_post_hangs() {
+    // Keep YARA cold-cache off this hang's critical path.
+    // SAFETY: set_var needs no other thread touching the environment. This is
+    // the binary's only test and the runtime is built below, so the only other
+    // thread is libtest's main thread, blocked waiting for this one.
+    unsafe {
+        std::env::set_var("CLEAVE_SKIP_YARA_CACHE", "1");
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(sibling_jobs_complete());
+}
 
+async fn sibling_jobs_complete() {
     let data = tempfile::tempdir().expect("temp data dir");
     let hang = write_sample(
         data.path(),
@@ -301,36 +311,15 @@ async fn sibling_jobs_complete_while_one_result_post_hangs() {
         }
     });
 
-    let config = WorkerConfig {
-        no_update: true,
-        // Standalone worker under test; no host server to defer to.
-        hopper_url: format!("http://{addr}"),
-        name: "post-hang-regression".into(),
-        workers: NonZeroUsize::new(2).expect("2 workers"),
-        poll_secs: 1,
-        max_rss_gb: 0,
-        model_dir: models_dir,
-        thresholds: None,
-        data_dir: Some(data.path().to_path_buf()),
-        slow_rule_ms: 4000,
-        max_jobs: None,
-        // Do not exit_if_empty: the hanging post never finishes, so drain
-        // Do not
-        // would wait forever. The test aborts the worker after siblings post.
-        exit_if_empty: false,
-        level: None,
-        nice: 0,
-        interpret: None,
-        fetch: scan::fetch::FetchPolicy::default(),
-        zip_passwords: scan::ArchivePasswords::default(),
-    };
-
-    // Keep YARA cold-cache / SJF off this hang's critical path.
-    // SAFETY: single-threaded test setup before the worker task starts.
-    unsafe {
-        std::env::set_var("CLEAVE_SKIP_YARA_CACHE", "1");
-        std::env::set_var("SCAN_SJF", "0");
-    }
+    // Never exit_if_empty: the hanging post never finishes, so a drain would
+    // wait forever. The test aborts the worker after the siblings post.
+    let mut config = worker_support::worker_config(
+        "post-hang-regression",
+        format!("http://{addr}"),
+        Some(data.path().to_path_buf()),
+    );
+    // FIFO, so the hanging sample (queued first) is dispatched first.
+    config.tuning.dispatch_order = DispatchOrder::Fifo;
 
     let worker = tokio::spawn(run(config));
 

@@ -6,38 +6,13 @@
 //! restarted server is still loading. If these ever start failing on readiness,
 //! the routes have picked up a dependency they should not have.
 
+mod common;
+
 use anyhow::{Context, Result};
-use axum::Router;
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use scan::server::{ServerConfig, build_app};
-use std::net::SocketAddr;
+use common::{app, encoded_purl, loopback};
 use tower::ServiceExt;
-
-/// Inject a peer address, as `into_make_service_with_connect_info` does in
-/// production. Without it the ACL fails closed and every request 403s.
-fn loopback<B>(mut req: Request<B>) -> Request<B> {
-    req.extensions_mut()
-        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
-    req
-}
-
-async fn app() -> Result<Router> {
-    let config = ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        1024 * 1024,
-        0,
-        std::env::temp_dir(),
-        None,
-        4000,
-        vec![],
-        None,
-        2,
-        vec![],
-    )?;
-    build_app(&config).await
-}
 
 /// Status and parsed JSON body of one GET.
 async fn get(uri: &str) -> Result<(StatusCode, serde_json::Value, Option<String>)> {
@@ -60,16 +35,6 @@ async fn get(uri: &str) -> Result<(StatusCode, serde_json::Value, Option<String>
 /// test that wants "not stored" has to pick a key that cannot be stored — using
 /// a real package name makes the result depend on what else has run here.
 const UNKNOWN: &str = "pkg:npm/scan-lookup-fixture-never-analyzed@0.0.0";
-
-/// Percent-encode a PURL for the query string.
-fn encoded_purl(purl: &str) -> String {
-    purl.chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '.' | '_' | '~' => c.to_string(),
-            other => format!("%{:02X}", other as u32),
-        })
-        .collect()
-}
 
 /// Nothing stored is `404 unknown sample` — not an empty 200, and not a 500.
 /// The bloom decision rides along, so one round trip answers both "do we have

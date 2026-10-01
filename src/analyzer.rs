@@ -4,8 +4,8 @@
 //!
 //! This is the recommended entry point for embedding litmus in other
 //! processes (proxies, daemons, fuzz harnesses). The lower-level
-//! [`Model`], [`ExtractContext`], [`ShapImportance`], and [`ScanConfig`]
-//! types remain available for callers
+//! [`Model`], [`ShapImportance`], and [`ScanConfig`] types remain available
+//! for callers
 //! that need finer control or want to share components across multiple
 //! analyzers.
 //!
@@ -25,9 +25,8 @@ use anyhow::Result;
 
 use crate::engine::{self, ScanResult, ScanSummary};
 use crate::explain::ShapImportance;
-use crate::features::ExtractContext;
 use crate::model::{Model, Thresholds};
-use crate::{DisplayFilter, OutputFormat, ScanConfig};
+use crate::{OutputFormat, ScanConfig};
 
 /// Bundled analyzer holding everything needed to classify a payload.
 ///
@@ -38,7 +37,6 @@ use crate::{DisplayFilter, OutputFormat, ScanConfig};
 pub struct Analyzer {
     model_dir: PathBuf,
     model: Model,
-    ctx: ExtractContext,
     shap: Option<ShapImportance>,
     config: ScanConfig,
 }
@@ -53,9 +51,9 @@ impl Analyzer {
     /// call is idempotent; future re-invocations short-circuit.
     ///
     /// # Errors
-    /// Propagates `Model::load` failures (missing or malformed `model.json`
-    /// / `feature_spec.json`). SHAP is optional — missing `shap.json` is
-    /// not an error.
+    /// Propagates `Model::load` failures (missing or malformed model
+    /// artifacts). SHAP is optional — a missing `shap_importance.json` is
+    /// not an error, but a corrupt or stale one is.
     pub fn load(model_dir: impl Into<PathBuf>) -> Result<Self> {
         let model_dir = model_dir.into();
         // Library callers deploy at the default severity level so the verdict
@@ -63,27 +61,18 @@ impl Analyzer {
         // level-independent (the lowest-firing-level sweep), so consumers wanting
         // a different cutoff reinterpret `level` rather than reloading the model.
         let model = Model::load(&model_dir, None, Some(crate::model::DEFAULT_SEVERITY_LEVEL))?;
-        let ctx = ExtractContext::new(model.spec());
-        let shap = ShapImportance::load(&model_dir).ok();
+        let shap = ShapImportance::load(&model_dir)?;
         // Library callers always get the full cleave report attached to the
         // ScanResult (`OutputFormat::Json`); humans calling the CLI go
         // through `engine::run` directly, which builds its own config.
-        let config = ScanConfig::new(
-            model_dir.clone(),
-            OutputFormat::Json,
-            None,
-            DisplayFilter::alerts_only(),
-            4_000,
-            false,
-        )?
-        .with_level(Some(crate::model::DEFAULT_SEVERITY_LEVEL));
+        let config = ScanConfig::new(model_dir.clone(), OutputFormat::Json, None)?
+            .with_level(Some(crate::model::DEFAULT_SEVERITY_LEVEL));
         // Warm cleave's globals from this (non-rayon) thread so the first
         // analysis cannot race into a deadlock against rayon workers.
         crate::engine::prefetch_cleave_resources();
         Ok(Self {
             model_dir,
             model,
-            ctx,
             shap,
             config,
         })
@@ -111,9 +100,8 @@ impl Analyzer {
     }
 
     /// Attach the FPR severity level (0..=10000) that produced the resolved
-    /// thresholds. Folded into the JSON envelope's `ml.lvl` field (alongside the
-    /// `-1` benign sentinel). Pass `None` to indicate manual thresholds with no
-    /// level metadata.
+    /// thresholds. Pass `None` to indicate manual thresholds with no level
+    /// metadata.
     #[must_use]
     pub fn with_level(mut self, level: Option<u16>) -> Self {
         self.config = self.config.with_level(level);
@@ -146,7 +134,6 @@ impl Analyzer {
             data,
             filename,
             &self.model,
-            &self.ctx,
             self.shap.as_ref(),
             &self.config,
         )
@@ -170,7 +157,6 @@ impl Analyzer {
             read_path,
             filename,
             &self.model,
-            &self.ctx,
             self.shap.as_ref(),
             &self.config,
         )
@@ -190,20 +176,17 @@ impl Analyzer {
         thresholds: Option<Thresholds>,
         slow_rule_ms: u64,
     ) -> Result<ScanConfig> {
-        Ok(ScanConfig::new(
-            self.model_dir.clone(),
-            self.config.format(),
-            thresholds,
-            self.config.filter(),
-            slow_rule_ms,
-            self.config.extra(),
-        )?
-        .with_level(self.config.level()))
+        Ok(
+            ScanConfig::new(self.model_dir.clone(), self.config.format(), thresholds)?
+                .with_filter(self.config.filter())
+                .with_slow_rule_ms(slow_rule_ms)
+                .with_extra(self.config.extra())
+                .with_level(self.config.level()),
+        )
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

@@ -41,6 +41,8 @@
 //! request, an over-broad one blinds the scanner to a real second stage. When a
 //! candidate is arguable, leave it out.
 
+use reqwest::Url;
+
 /// Hosts under an allowlisted domain that *do* serve third-party uploads.
 ///
 /// Checked before [`PUBLISHER`], so listing a parent domain there stays safe.
@@ -1033,21 +1035,45 @@ const PUBLISHER: &[&str] = &[
     "localhost",
 ];
 
-/// The host of a URL — scheme, path, query, and any `userinfo@` stripped. The
-/// port is kept, so this reads as a human would write the authority.
+/// A parsed URL's host, typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UrlHost<'a> {
+    /// An IP literal, either family.
+    Ip(std::net::IpAddr),
+    /// A DNS name, lowercased by the parser, root dot as written.
+    Domain(&'a str),
+}
+
+/// The host of `url`, as the WHATWG parser — and so the fetcher — resolved it.
 ///
-/// Used both to label a redirect in the fetch log and to test a reference
-/// against the allowlist. Only the authority survives, so a signed CDN URL's SAS
-/// token or JWT never reaches a terminal or a log line.
-pub(crate) fn host_of(url: &str) -> &str {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host)
+/// Read from `host_str`, whose spelling is the parser's own: an IPv4 host is
+/// always a canonical dotted quad and an IPv6 host always bracketed, so the
+/// form says which it is.
+pub(crate) fn url_host(url: &Url) -> Option<UrlHost<'_>> {
+    let host = url.host_str()?;
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6
+            .parse()
+            .ok()
+            .map(|ip| UrlHost::Ip(std::net::IpAddr::V6(ip)));
+    }
+    Some(match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => UrlHost::Ip(std::net::IpAddr::V4(ip)),
+        Err(_) => UrlHost::Domain(host),
+    })
+}
+
+/// `host[:port]` of a URL: never its userinfo, path, query, or fragment, and
+/// the port only when it is not the scheme's default.
+///
+/// Used to label a redirect in the fetch log. Only the authority survives, so a
+/// signed CDN URL's SAS token or JWT never reaches a terminal or a log line.
+pub(crate) fn authority(url: &Url) -> String {
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_owned(),
+        (None, _) => String::new(),
+    }
 }
 
 /// Whether `url` points at a host whose publisher is the only party that can
@@ -1055,19 +1081,21 @@ pub(crate) fn host_of(url: &str) -> &str {
 ///
 /// A `true` means the URL is boilerplate (a license link, a CRL endpoint, a
 /// vendor doc page) and fetching it cannot produce a sample.
-pub(crate) fn publisher_controlled(url: &str) -> bool {
-    let host = normalize(host_of(url));
-    if THIRD_PARTY.iter().any(|domain| under(&host, domain)) {
+pub(crate) fn publisher_controlled(url: &Url) -> bool {
+    let Some(host) = domain(url) else {
+        return false;
+    };
+    if THIRD_PARTY.iter().any(|domain| under(host, domain)) {
         return false;
     }
-    PUBLISHER.iter().any(|domain| under(&host, domain))
+    PUBLISHER.iter().any(|domain| under(host, domain))
 }
 
-/// Whether an exact URL was observed in /bin and should be suppressed only
-/// when it is discovered in another file.
-pub(crate) fn discovery_exception(url: &str) -> bool {
-    let host = normalize(host_of(url));
-    DISCOVERY_DOMAINS.iter().any(|domain| under(&host, domain)) || DISCOVERY_URLS.contains(&url)
+/// Whether a URL — `raw` as discovered, `url` as parsed — was observed in /bin
+/// and should be suppressed only when it is discovered in another file.
+pub(crate) fn discovery_exception(raw: &str, url: &Url) -> bool {
+    domain(url).is_some_and(|host| DISCOVERY_DOMAINS.iter().any(|domain| under(host, domain)))
+        || DISCOVERY_URLS.contains(&raw)
 }
 
 /// Whether `host` *is* `domain` or sits beneath it, compared on label
@@ -1078,39 +1106,80 @@ fn under(host: &str, domain: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
 }
 
-/// Lowercase a host and drop the two spellings that don't change which server it
-/// names: a `:port` suffix and the trailing root dot. `WWW.Apple.COM.:443` and
-/// `www.apple.com` are the same host, and both must match `apple.com`.
-///
-/// A bracketed IPv6 literal keeps its brackets and colons — no allowlist entry
-/// is an IP, so it simply never matches.
-fn normalize(host: &str) -> String {
-    let host = match host.rsplit_once(':') {
-        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
-        _ => host,
-    };
-    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+/// The DNS name a URL points at, without the root dot that does not change
+/// which server it names: `www.apple.com.` and `www.apple.com` both match
+/// `apple.com`. The parser has already lowercased it and set the port apart.
+/// An IP literal is no domain — no allowlist entry is an IP — so it never
+/// matches.
+fn domain(url: &Url) -> Option<&str> {
+    match url_host(url)? {
+        UrlHost::Domain(host) => Some(host.strip_suffix('.').unwrap_or(host)),
+        UrlHost::Ip(_) => None,
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    fn parse(url: &str) -> Url {
+        Url::parse(url).unwrap()
+    }
+
+    fn controlled(url: &str) -> bool {
+        publisher_controlled(&parse(url))
+    }
+
+    fn exception(url: &str) -> bool {
+        discovery_exception(url, &parse(url))
+    }
+
     #[test]
-    fn host_of_strips_scheme_path_query_and_userinfo() {
-        assert_eq!(host_of("https://example.com/a/b?c=d#e"), "example.com");
+    fn authority_strips_scheme_path_query_and_userinfo() {
+        let of = |url: &str| authority(&parse(url));
+        assert_eq!(of("https://example.com/a/b?c=d#e"), "example.com");
         assert_eq!(
-            host_of("https://release-assets.githubusercontent.com/x/y?sig=abc&jwt=xyz"),
+            of("https://release-assets.githubusercontent.com/x/y?sig=abc&jwt=xyz"),
             "release-assets.githubusercontent.com"
         );
-        assert_eq!(host_of("https://example.com"), "example.com");
-        assert_eq!(
-            host_of("http://user:pass@host.test:8080/x"),
-            "host.test:8080"
+        assert_eq!(of("https://example.com"), "example.com");
+        assert_eq!(of("http://user:pass@host.test:8080/x"), "host.test:8080");
+        assert_eq!(of("https://host.test:443/x"), "host.test", "default port");
+        assert_eq!(of("http://[2001:db8::1]:8080/x"), "[2001:db8::1]:8080");
+    }
+
+    /// The host is the one the fetcher would connect to. WHATWG ends a special
+    /// URL's authority at a backslash, so `evil.test\@apple.com` is a request
+    /// to evil.test — and must not be waved through as apple boilerplate.
+    #[test]
+    fn the_host_is_the_one_the_fetcher_connects_to() {
+        let url = parse("https://evil.test\\@apple.com/");
+        assert_eq!(url_host(&url), Some(UrlHost::Domain("evil.test")));
+        assert!(!publisher_controlled(&url));
+        assert!(!controlled("https://apple.com@evil.test/stage2"));
+        assert!(
+            controlled("https://evil.test@apple.com/x"),
+            "userinfo is not the host"
         );
-        assert_eq!(host_of("bareword"), "bareword");
+    }
+
+    #[test]
+    fn ip_literals_are_typed_and_never_allowlisted() {
+        assert_eq!(
+            url_host(&parse("http://[::1]/x")),
+            Some(UrlHost::Ip("::1".parse().unwrap()))
+        );
+        assert_eq!(
+            url_host(&parse("http://8.8.8.8/x")),
+            Some(UrlHost::Ip("8.8.8.8".parse().unwrap()))
+        );
+        // The parser canonicalizes IPv4 spellings before we see them.
+        assert_eq!(
+            url_host(&parse("http://0x7f.1/x")),
+            Some(UrlHost::Ip("127.0.0.1".parse().unwrap()))
+        );
+        assert!(!controlled("http://[2620:149::1]/apple"));
     }
 
     #[test]
@@ -1127,73 +1196,63 @@ mod tests {
             "https://ocsp.apple.com/ocsp03-appleaica",
             "https://translationproject.org/team/",
         ] {
-            assert!(publisher_controlled(url), "not filtered: {url}");
+            assert!(controlled(url), "not filtered: {url}");
         }
     }
 
     #[test]
     fn discovery_exceptions_do_not_open_a_whole_host() {
-        assert!(discovery_exception(
-            "https://github.com/clap-rs/clap/issues"
-        ));
-        assert!(discovery_exception(
+        assert!(exception("https://github.com/clap-rs/clap/issues"));
+        assert!(exception(
             "https://codeberg.org/smxi/inxi^or^https://smxi.org/"
         ));
-        assert!(discovery_exception("https://www.mirbsd.org/mksh.htm"));
-        assert!(discovery_exception("https://keys.gnupg.net/"));
-        assert!(discovery_exception("https://www.kornshell.com/"));
-        assert!(discovery_exception("https://www.spinics.net/lists/foo"));
-        assert!(discovery_exception(
-            "http://eel.is/c++draft/container.reqmts"
-        ));
-        assert!(discovery_exception(
+        assert!(exception("https://www.mirbsd.org/mksh.htm"));
+        assert!(exception("https://keys.gnupg.net/"));
+        assert!(exception("https://www.kornshell.com/"));
+        assert!(exception("https://www.spinics.net/lists/foo"));
+        assert!(exception("http://eel.is/c++draft/container.reqmts"));
+        assert!(exception(
             "http://www.topologi.com/resources/iso-pre-pro.xsl"
         ));
-        assert!(discovery_exception(
+        assert!(exception(
             "http://schemas.datacontract.org/2004/07/Microsoft.VisualStudio.TestPlatform.Extensions.HtmlLogger.ObjectModel"
         ));
-        assert!(!discovery_exception(
-            "https://github.com/clap-rs/clap/issues/999999"
-        ));
-        assert!(!discovery_exception("https://github.com/attacker/repo"));
+        assert!(!exception("https://github.com/clap-rs/clap/issues/999999"));
+        assert!(!exception("https://github.com/attacker/repo"));
     }
 
     #[test]
     fn subdomains_match_and_lookalikes_do_not() {
-        assert!(publisher_controlled("https://crl.apple.com/x.crl"));
-        assert!(publisher_controlled("https://apple.com/x"));
+        assert!(controlled("https://crl.apple.com/x.crl"));
+        assert!(controlled("https://apple.com/x"));
         // A label-boundary match, so neither a prefixed registration nor a
         // suffixed one gets in.
-        assert!(!publisher_controlled("https://evilapple.com/stage2"));
-        assert!(!publisher_controlled(
-            "https://apple.com.attacker.test/stage2"
-        ));
-        assert!(!publisher_controlled("https://notw3.org/x"));
+        assert!(!controlled("https://evilapple.com/stage2"));
+        assert!(!controlled("https://apple.com.attacker.test/stage2"));
+        assert!(!controlled("https://notw3.org/x"));
     }
 
     #[test]
     fn normalizes_case_port_and_root_dot() {
-        assert!(publisher_controlled("https://WWW.Apple.COM/x"));
-        assert!(publisher_controlled("https://www.apple.com.:443/x"));
-        assert!(publisher_controlled(
-            "http://python.org:80/ftp/python/README"
-        ));
+        assert!(controlled("https://WWW.Apple.COM/x"));
+        assert!(controlled("https://www.apple.com.:443/x"));
+        assert!(controlled("http://python.org:80/ftp/python/README"));
     }
 
     #[test]
     fn third_party_subdomains_override_their_parent() {
         // The parent is allowlisted...
-        assert!(publisher_controlled("https://archlinux.org/packages/"));
-        assert!(publisher_controlled("https://go.dev/dl/"));
-        assert!(publisher_controlled("https://www.mozilla.org/MPL/2.0/"));
+        assert!(controlled("https://archlinux.org/packages/"));
+        assert!(controlled("https://go.dev/dl/"));
+        assert!(controlled("https://www.mozilla.org/MPL/2.0/"));
         // ...but the subdomain anyone can publish under is not.
-        assert!(!publisher_controlled(
+        assert!(!controlled(
             "https://aur.archlinux.org/cgit/aur.git/snapshot/pkg.tar.gz"
         ));
-        assert!(!publisher_controlled(
+        assert!(!controlled(
             "https://proxy.golang.org/example.com/m/@v/v1.0.0.zip"
         ));
-        assert!(!publisher_controlled(
+        assert!(!controlled(
             "https://addons.mozilla.org/firefox/downloads/file/1/x.xpi"
         ));
     }
@@ -1222,7 +1281,7 @@ mod tests {
             "https://qianfan.baidubce.com/v2/models",
             "https://hunyuan.tencentcloudapi.com/",
         ] {
-            assert!(publisher_controlled(url), "not filtered: {url}");
+            assert!(controlled(url), "not filtered: {url}");
         }
     }
 
@@ -1247,7 +1306,7 @@ mod tests {
             "https://stackoverflow.com/questions/1/example",
             "https://sourceware.org/pub/example/stage2.tar.gz",
         ] {
-            assert!(!publisher_controlled(url), "wrongly filtered: {url}");
+            assert!(!controlled(url), "wrongly filtered: {url}");
         }
     }
 
@@ -1288,7 +1347,7 @@ mod tests {
             "https://f-droid.org/repo/x.apk",
             "https://community.chocolatey.org/api/v2/package/x",
         ] {
-            assert!(!publisher_controlled(url), "wrongly filtered: {url}");
+            assert!(!controlled(url), "wrongly filtered: {url}");
         }
     }
 

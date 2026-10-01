@@ -16,9 +16,9 @@ missing_docs = "warn"
 noop_method_call = "warn"
 
 [workspace.lints.clippy]
-all = { level = "deny", priority = -1 }
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "deny", priority = -1 }
+# Groups first (lowest priority), so the narrower settings below override
+# them: everything denies except style/complexity/perf, which warn.
+all = { level = "deny", priority = -2 }
 style = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
@@ -42,6 +42,7 @@ cast_sign_loss = "warn"
 wildcard_imports = "warn"
 string_slice = "warn"
 dbg_macro = "deny"
+undocumented_unsafe_blocks = "deny"
 large_futures = "warn"
 map_err_ignore = "warn"
 significant_drop_in_scrutinee = "warn"
@@ -49,7 +50,7 @@ significant_drop_tightening = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "2.12.0-beta.2"
+version = "2.12.0-beta.3"
 default-run = "atomscan"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable. Drives the
@@ -59,6 +60,8 @@ authors = ["The Atomdrift Project"]
 description = "ML-powered malware classification using cleave static analysis"
 license = "Apache-2.0"
 repository = "https://github.com/atomdrift-project/scan"
+# Git dependencies make a crates.io publish impossible anyway; say so.
+publish = false
 
 [dependencies]
 # The atomdrift crates below carry no `rev`/`tag`/`branch`: each tracks its
@@ -94,12 +97,6 @@ proclist = { git = "https://github.com/atomdrift-project/proclist.git" }
 # `ps` subcommand can tune rizin for low-latency live-process scanning:
 # native-arch-only, a tighter timeout, and a size gate on giant binaries.
 filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
-# Direct handle on stng (already in the graph via cleave/filefacts/fletch) so the
-# long-lived worker/server modes can reclaim stng's string/r2 caches in-process —
-# cleave only prunes them on directory scans, not the per-payload analysis a
-# daemon runs. Uses stng's own cache-root helpers, so a relocated
-# STNG_STRING_CACHE_DIR is still swept correctly.
-stng = { git = "https://github.com/atomdrift-project/stng.git" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -241,10 +238,8 @@ default = ["cleave-breadcrumbs"]
 # Analyze with: jeprof --text ./out/scan.heap out/heap/jeprof.*.heap
 jemalloc-prof = ["tikv-jemallocator/profiling"]
 
-# Emit per-member rayon-thread breadcrumbs in the SIGUSR1/wedge dump. Requires a
-# cleave build that exposes `cleave::breadcrumb` (the diagnostics PR); off by
-# default so the released-cleave build is unaffected. Enable with a matching
-# cleave via `[patch]` or a version bump.
+# Emit per-member rayon-thread breadcrumbs in the wedge dump. On by default
+# (see `default` above); needs a cleave that exposes `cleave::breadcrumb`.
 cleave-breadcrumbs = []
 
 # Isolate: Windows CRT heap instead of mimalloc (detection A/B).
@@ -340,12 +335,10 @@ name = "atomscan"
 path = "src/main.rs"
 
 # Mock hopper for self-contained worker benchmarks (see `make worker-benchmark`).
-# test = false: no #[test] lives here, and without this every `cargo test`
-# links a full debug harness binary (~200 MB, ~30 s) for nothing.
+# Self-contained (does not link the `scan` lib), so its test harness is small.
 [[bin]]
 name = "scan-bench-hopper"
 path = "src/bin/bench_hopper.rs"
-test = false
 
 # Bloom filter producer: builds known-good/known-bad filters from a labelled
 # pool export and writes a publishable bundle (see `make publish-bloom`).
@@ -377,16 +370,3 @@ tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", bran
 
 [patch."https://github.com/tstromberg/dmgwiz.git"]
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
-
-# TEMP (2026-09-05, uncommitted): local stng with the XOR prefilter, pending push + rev bump.
-
-# TEMP (2026-09-05, uncommitted): local cleave with AnalysisOptions::dedicated_pool, pending push + rev bump.
-
-# TEMP (2026-09-05, uncommitted): local fletch with Go proxy case recovery, pending push + rev bump.
-
-# TEMP (2026-09-06, uncommitted): local cleave with printable tiny windows, pending push + rev bump.
-
-# TEMP (2026-09-19, perf-cyclotron): local cleave worktree for the cyclotron wall-clock work.
-
-# TEMP (2026-09-19, perf-cyclotron): local filefacts carrying the targeted Go
-# pclntab analysis script (`aa; aac; aalg` in place of `aaa`), pending push.

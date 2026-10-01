@@ -22,19 +22,20 @@
 //! degrades every lookup to "unknown" rather than to an error.
 
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::Level;
+
 /// Findings kept per verdict. The wire view serves the worst few; the rest are
 /// headroom so the projection can widen without re-analyzing everything.
-pub const MAX_STORED_HITS: usize = 10;
+pub(crate) const MAX_STORED_HITS: usize = 10;
 
 /// Criticality floor for a stored finding: 3 notable, 4 suspicious, 5 hostile.
 /// Anything below is baseline noise that no consumer gates on.
-pub const MIN_HIT_CRIT: u8 = 3;
+pub(crate) const MIN_HIT_CRIT: u8 = 3;
 
 /// Verdicts memoized in process, ahead of the on-disk read.
 const MEMO_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
@@ -42,12 +43,9 @@ const MEMO_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
     None => NonZeroUsize::MIN,
 };
 
-/// Distinguishes concurrent temp files so two writers never collide.
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// One finding, flattened to what a consumer gates on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Hit {
+pub(crate) struct Hit {
     /// Stable trait identifier (`objectives/execution/shell/bash`).
     pub id: String,
     /// Criticality ordinal: 3 notable, 4 suspicious, 5 hostile.
@@ -79,9 +77,8 @@ pub(crate) struct Verdict {
     /// Content digest of the artifact this verdict is about.
     pub sha256: String,
     /// `ml.lvl`: the tightest false-positive budget per 100M benigns at which
-    /// this artifact grades hostile. `-1` never fires; `None` is
-    /// manual-threshold mode. Callers gate on this.
-    pub lvl: Option<i32>,
+    /// this artifact grades hostile. Callers gate on this.
+    pub lvl: Level,
     /// Scan build that produced the verdict.
     pub eng: String,
     /// RFC 3339 timestamp of the analysis.
@@ -101,12 +98,14 @@ impl Verdict {
     /// Project a finished scan into the stored answer. `purl` is the locator
     /// the artifact was requested by, when the request named one.
     pub(crate) fn from_scan(result: &crate::engine::ScanResult, purl: Option<&str>) -> Self {
-        let why = result
-            .interpretation
-            .as_ref()
-            .map(|llm| llm.interpretation.trim())
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
+        let why = match &result.interpretation {
+            Some(crate::interpret::Interpretation::Graded(graded))
+                if !graded.interpretation.trim().is_empty() =>
+            {
+                Some(graded.interpretation.trim().to_owned())
+            }
+            _ => None,
+        };
         Self {
             sha256: result.sha256.clone(),
             lvl: result.level,
@@ -123,11 +122,7 @@ impl Verdict {
     }
 }
 
-/// The worst findings across every file in the report, most critical first.
-///
-/// Mirrors what a consumer would pick out of `raw` itself, so a served verdict
-/// and a freshly rendered envelope agree on which findings matter.
-/// The worst findings in a report, most critical first.
+/// The worst findings across every file in a report, most critical first.
 ///
 /// One selection rule, shared by everything that reports findings, so two
 /// consumers never disagree about which ones matter. Notable and above
@@ -135,7 +130,7 @@ impl Verdict {
 /// [`MAX_STORED_HITS`]. `purl` names the package a finding belongs to when
 /// the artifact was fetched by coordinate.
 #[must_use]
-pub fn collect_hits(report: &cleave::types::CompactReport, purl: Option<&str>) -> Vec<Hit> {
+pub(crate) fn collect_hits(report: &cleave::types::CompactReport, purl: Option<&str>) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for file in &report.files {
@@ -194,7 +189,7 @@ pub(crate) struct View<'a> {
     pub sha: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub purl: Option<&'a str>,
-    pub lvl: Option<i32>,
+    pub lvl: Level,
     pub eng: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<&'a str>,
@@ -249,9 +244,16 @@ pub(crate) const CORPUS_TRAIT_ID: &str = "intel/corpus/known-bad";
 /// to let it stand in for an analysis. Stamping a build here would make a filter
 /// hit read as a scan we never ran, which is the one thing this must not do.
 pub(crate) struct BloomClaim {
-    /// The level this claim justifies on its own.
-    pub lvl: i32,
-    /// Criticality of the synthesized finding: 5 hostile, 4 suspicious.
+    /// The level this claim justifies on its own: [`Level::Clean`] for a skip.
+    pub lvl: Level,
+    /// The synthesized finding naming why; `None` for a skip, which is an
+    /// answer even though it names no evidence.
+    pub finding: Option<BloomFinding>,
+}
+
+/// The finding a filter hit is reported as.
+pub(crate) struct BloomFinding {
+    /// Criticality: 5 hostile, 4 suspicious.
     pub crit: u8,
     /// Which taxonomy made the claim.
     pub id: &'static str,
@@ -262,43 +264,48 @@ pub(crate) struct BloomClaim {
 /// What a bloom decision alone justifies saying, or `None` when it justifies
 /// nothing.
 ///
-/// `Skip` maps to a benign claim carrying no finding: the filters say we looked
-/// at this and found nothing, which is an answer even though it names no
-/// evidence. `Unknown` maps to `None` — no filter had an opinion, so there is
-/// nothing to report and the caller's own policy decides.
+/// `Skip` maps to a clean claim with no finding: the filters say we looked at
+/// this and found nothing. `Unknown` maps to `None` — no filter had an
+/// opinion, so there is nothing to report and the caller's own policy decides.
 ///
 /// One definition, read by both the native lookup route and the `/v1` decision,
 /// so the two cannot drift into answering the same filter hit differently.
-pub(crate) fn bloom_claim(decision: crate::bloom_repo::Decision) -> Option<Option<BloomClaim>> {
+pub(crate) fn bloom_claim(decision: crate::bloom_repo::Decision) -> Option<BloomClaim> {
     use crate::bloom_repo::Decision;
-    let default_level = i32::from(crate::model::DEFAULT_SEVERITY_LEVEL);
-    Some(Some(match decision {
-        // Nothing was claimed: benign, and no finding to name.
-        Decision::Skip => return Some(None),
+    let convicted = |lvl, crit, id, desc| BloomClaim {
+        lvl,
+        finding: Some(BloomFinding { crit, id, desc }),
+    };
+    let default_level = Level::At(crate::model::DEFAULT_SEVERITY_LEVEL);
+    Some(match decision {
+        Decision::Skip => BloomClaim {
+            lvl: Level::Clean,
+            finding: None,
+        },
         // Conflicted is a bless standing beside a conviction. Worst wins, so it
         // answers as the conviction — but says so, because the disagreement is
         // the operator's problem to see.
-        Decision::KnownBad | Decision::Conflicted => BloomClaim {
-            lvl: default_level,
-            crit: 5,
-            id: CORPUS_TRAIT_ID,
-            desc: "Catalogued as malicious by a previous analysis in our corpus.",
-        },
-        Decision::SightedHostile => BloomClaim {
-            lvl: default_level,
-            crit: 5,
-            id: FEED_TRAIT_ID,
-            desc: "Cited as malicious by corroborated threat intelligence.",
-        },
-        Decision::SightedSuspicious => BloomClaim {
-            lvl: SIGHTED_SUSPICIOUS_LEVEL,
-            crit: 4,
-            id: FEED_TRAIT_ID,
-            desc: "Cited as malicious by one unadjudicated threat intelligence source.",
-        },
+        Decision::KnownBad | Decision::Conflicted => convicted(
+            default_level,
+            5,
+            CORPUS_TRAIT_ID,
+            "Catalogued as malicious by a previous analysis in our corpus.",
+        ),
+        Decision::SightedHostile => convicted(
+            default_level,
+            5,
+            FEED_TRAIT_ID,
+            "Cited as malicious by corroborated threat intelligence.",
+        ),
+        Decision::SightedSuspicious => convicted(
+            Level::At(SIGHTED_SUSPICIOUS_LEVEL),
+            4,
+            FEED_TRAIT_ID,
+            "Cited as malicious by one unadjudicated threat intelligence source.",
+        ),
         // No filter had an opinion.
         Decision::Unknown => return None,
-    }))
+    })
 }
 
 /// The native-route projection of [`bloom_claim`]. `hits` is scratch the caller
@@ -311,8 +318,8 @@ pub(crate) fn bloom_derived_view<'a>(
     hits: &'a mut Vec<Hit>,
 ) -> Option<View<'a>> {
     let claim = bloom_claim(decision)?;
-    let lvl = claim.as_ref().map_or(BENIGN_LEVEL, |c| c.lvl);
-    if let Some(c) = claim {
+    let lvl = claim.lvl;
+    if let Some(c) = claim.finding {
         hits.push(Hit {
             id: c.id.to_owned(),
             crit: c.crit,
@@ -326,7 +333,7 @@ pub(crate) fn bloom_derived_view<'a>(
     Some(View {
         sha: sha256,
         purl,
-        lvl: Some(lvl),
+        lvl,
         eng: "",
         why: None,
         hits: &hits[..],
@@ -334,13 +341,10 @@ pub(crate) fn bloom_derived_view<'a>(
     })
 }
 
-/// The level meaning "fires at no budget at all" — a benign answer.
-pub(crate) const BENIGN_LEVEL: i32 = -1;
-
 /// The level a lone, unadjudicated outside citation justifies — hopper's
 /// `Floor(Weak)`. Above the default budget deliberately, so it does not convict
 /// by itself. Mirrors hopper's corroboration.go; keep the pair in sync.
-const SIGHTED_SUSPICIOUS_LEVEL: i32 = 100;
+const SIGHTED_SUSPICIOUS_LEVEL: u16 = 100;
 
 impl Verdict {
     /// Project the stored verdict onto the wire, worst findings first.
@@ -412,41 +416,54 @@ pub(crate) fn index_base() -> Option<PathBuf> {
 /// which case every lookup answers "unknown".
 pub(crate) fn global() -> Option<&'static Index> {
     static GLOBAL: OnceLock<Option<Index>> = OnceLock::new();
-    GLOBAL.get_or_init(Index::open).as_ref()
+    GLOBAL
+        .get_or_init(|| {
+            if std::env::var("SCAN_ANALYSIS_CACHE").is_ok_and(|v| v == "0" || v == "false") {
+                return None;
+            }
+            let base = index_base()?;
+            let version = crate::analysis_cache::ruleset_version();
+            crate::analysis_cache::prune_stale_versions(&base, &version);
+            Index::open(base.join(version))
+        })
+        .as_ref()
 }
 
 impl Index {
-    /// Open (creating on first use) the index for the active ruleset version.
-    /// Every failure degrades to `None` — "we know nothing" — never an error.
-    fn open() -> Option<Self> {
-        if std::env::var("SCAN_ANALYSIS_CACHE").is_ok_and(|v| v == "0" || v == "false") {
+    /// Open (creating on first use) the index in `dir`. A failure degrades to
+    /// `None` — "we know nothing" — and is said once, here.
+    fn open(dir: PathBuf) -> Option<Self> {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "verdict index unavailable; lookups answer unknown");
             return None;
         }
-        let base = index_base()?;
-        let version = crate::analysis_cache::ruleset_version();
-        crate::analysis_cache::prune_stale_versions(&base, &version);
-        let dir = base.join(version);
-        std::fs::create_dir_all(&dir).ok()?;
         Some(Self {
             dir,
             memo: Mutex::new(lru::LruCache::new(MEMO_CAPACITY)),
         })
     }
 
+    /// The memo, even after a panicking holder: an LRU of finished answers has
+    /// no invariant a panic can break, and giving up on it would disable the
+    /// memo for the life of the process.
+    fn memo(&self) -> MutexGuard<'_, lru::LruCache<String, Option<Verdict>>> {
+        self.memo.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The verdict for a content digest, or `None` when we hold none.
     pub(crate) fn get_sha(&self, sha256: &str) -> Option<Verdict> {
         let sha = normalize_sha(sha256)?;
-        if let Ok(mut memo) = self.memo.lock()
-            && let Some(hit) = memo.get(&sha)
-        {
+        if let Some(hit) = self.memo().get(&sha) {
             return hit.clone();
         }
-        let found = std::fs::read(self.verdict_path(&sha))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Verdict>(&bytes).ok());
-        if let Ok(mut memo) = self.memo.lock() {
-            memo.put(sha, found.clone());
-        }
+        // A missing entry is the ordinary miss; an unreadable one is a miss
+        // too, but worth a line.
+        let found = std::fs::read(self.verdict_path(&sha)).ok().and_then(|bytes| {
+            serde_json::from_slice::<Verdict>(&bytes)
+                .map_err(|e| tracing::debug!(sha256 = %sha, error = %e, "unreadable verdict index entry"))
+                .ok()
+        });
+        self.memo().put(sha, found.clone());
         found
     }
 
@@ -486,16 +503,17 @@ impl Index {
         let Ok(json) = serde_json::to_vec(verdict) else {
             return;
         };
-        if !self.write_atomic(&self.verdict_path(&sha), &json) {
+        if let Err(e) = self.write_atomic(&self.verdict_path(&sha), &json) {
+            tracing::debug!(sha256 = %sha, error = %e, "verdict index write failed");
             return;
         }
-        if let Ok(mut memo) = self.memo.lock() {
-            memo.put(sha.clone(), Some(verdict.clone()));
-        }
+        self.memo().put(sha.clone(), Some(verdict.clone()));
         // The alias is written after the verdict it points at, so a PURL never
         // resolves to a sha whose record is not yet readable.
-        if let Some(key) = verdict.purl.as_deref().and_then(purl_key) {
-            self.write_atomic(&self.alias_path(&key), sha.as_bytes());
+        if let Some(key) = verdict.purl.as_deref().and_then(purl_key)
+            && let Err(e) = self.write_atomic(&self.alias_path(&key), sha.as_bytes())
+        {
+            tracing::debug!(sha256 = %sha, error = %e, "verdict index alias write failed");
         }
     }
 
@@ -510,19 +528,16 @@ impl Index {
         self.dir.join(format!("{key}.purl"))
     }
 
-    /// Write via a unique temp path and rename, so a reader never sees a
-    /// half-written entry and concurrent writers do not collide.
-    fn write_atomic(&self, path: &std::path::Path, bytes: &[u8]) -> bool {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.dir.join(format!("w{seq}.tmp"));
-        if std::fs::write(&tmp, bytes).is_err() {
-            return false;
-        }
-        if std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return false;
-        }
-        true
+    /// Write via a uniquely named temp file and rename, so a reader never sees
+    /// a half-written entry and concurrent writers — in this process or another
+    /// sharing the cache directory — never collide. A failed write removes its
+    /// temp file.
+    fn write_atomic(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
+        tmp.write_all(bytes)?;
+        tmp.persist(path)?;
+        Ok(())
     }
 }
 
@@ -543,7 +558,6 @@ fn purl_key(purl: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::bloom_repo::Decision;
@@ -584,7 +598,7 @@ mod tests {
         let mut hits = Vec::new();
         let view = bloom_derived_view(Decision::Skip, "skip", "abc", None, &mut hits)
             .expect("a bless is answerable");
-        assert_eq!(view.lvl, Some(BENIGN_LEVEL));
+        assert_eq!(view.lvl, Level::Clean);
         assert!(view.hits.is_empty(), "a bless names no evidence");
         assert_eq!(view.eng, "", "still not a measurement of ours");
     }
@@ -593,12 +607,13 @@ mod tests {
     /// tighter than the evidence a filter can carry.
     #[test]
     fn derived_levels_are_the_loosest_of_their_band() {
-        let default_level = i32::from(crate::model::DEFAULT_SEVERITY_LEVEL);
+        let default_level = crate::model::DEFAULT_SEVERITY_LEVEL;
         let level = |d: Decision| {
             let mut hits = Vec::new();
-            bloom_derived_view(d, d.as_str(), "abc", None, &mut hits)
-                .and_then(|v| v.lvl)
-                .expect("a level")
+            match bloom_derived_view(d, d.as_str(), "abc", None, &mut hits).map(|v| v.lvl) {
+                Some(Level::At(n)) => n,
+                other => panic!("{d:?}: expected a level, got {other:?}"),
+            }
         };
         assert_eq!(level(Decision::SightedHostile), default_level);
         assert_eq!(level(Decision::KnownBad), default_level);
@@ -630,7 +645,7 @@ mod tests {
     fn verdict(sha: &str) -> Verdict {
         Verdict {
             sha256: sha.to_string(),
-            lvl: Some(-1),
+            lvl: Level::Clean,
             eng: "test".to_string(),
             at: "2026-08-20T00:00:00Z".to_string(),
             purl: None,
@@ -639,32 +654,51 @@ mod tests {
         }
     }
 
-    fn temp_index() -> Index {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("scan-lookup-test-{}-{seq}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create index dir");
-        Index {
-            dir,
-            memo: Mutex::new(lru::LruCache::new(MEMO_CAPACITY)),
+    /// The index outlives builds: entries written while `lvl` was an
+    /// `Option<i32>` still read, and write back byte for byte.
+    #[test]
+    fn stored_levels_keep_their_bytes() {
+        for (json, lvl) in [
+            (
+                r#"{"sha256":"ab","lvl":-1,"eng":"2.11.0","at":"2026-08-20T00:00:00Z"}"#,
+                Level::Clean,
+            ),
+            (
+                r#"{"sha256":"ab","lvl":25,"eng":"2.11.0","at":"2026-08-20T00:00:00Z"}"#,
+                Level::At(25),
+            ),
+            (
+                r#"{"sha256":"ab","lvl":null,"eng":"2.11.0","at":"2026-08-20T00:00:00Z"}"#,
+                Level::Manual,
+            ),
+        ] {
+            let v: Verdict = serde_json::from_str(json).expect("an old entry reads");
+            assert_eq!(v.lvl, lvl);
+            assert_eq!(serde_json::to_string(&v).expect("serialize"), json);
         }
+    }
+
+    /// An index in a fresh directory, kept alive by the returned guard.
+    fn temp_index() -> (tempfile::TempDir, Index) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index = Index::open(dir.path().join("v")).expect("open index");
+        (dir, index)
     }
 
     #[test]
     fn round_trips_by_sha() {
-        let idx = temp_index();
+        let (_dir, idx) = temp_index();
         let sha = "a".repeat(64);
         assert!(idx.get_sha(&sha).is_none(), "empty index is a miss");
         idx.put(&verdict(&sha));
-        assert_eq!(idx.get_sha(&sha).expect("stored").lvl, Some(-1));
+        assert_eq!(idx.get_sha(&sha).expect("stored").lvl, Level::Clean);
         // Uppercase and surrounding whitespace name the same artifact.
         assert!(idx.get_sha(&format!(" {} ", sha.to_uppercase())).is_some());
-        std::fs::remove_dir_all(&idx.dir).ok();
     }
 
     #[test]
     fn resolves_purl_through_alias() {
-        let idx = temp_index();
+        let (_dir, idx) = temp_index();
         let sha = "b".repeat(64);
         let mut v = verdict(&sha);
         v.purl = Some("pkg:npm/left-pad@1.3.0".to_string());
@@ -675,12 +709,11 @@ mod tests {
         // case variations resolve to the same artifact.
         assert!(idx.get_purl("PKG:NPM/left-pad@1.3.0").is_some());
         assert!(idx.get_purl("pkg:npm/right-pad@1.3.0").is_none());
-        std::fs::remove_dir_all(&idx.dir).ok();
     }
 
     #[test]
     fn the_first_verdict_for_an_artifact_stands() {
-        let idx = temp_index();
+        let (_dir, idx) = temp_index();
         let sha = "c".repeat(64);
         let mut rich = verdict(&sha);
         rich.why = Some("Postinstall launches a reverse shell.".to_string());
@@ -704,12 +737,11 @@ mod tests {
         assert_eq!(kept.hits.len(), 1, "findings are not overwritten");
         assert!(kept.why.is_some(), "interpretation is not overwritten");
         assert_eq!(kept.purl.as_deref(), Some("pkg:npm/evil@1.0.0"));
-        std::fs::remove_dir_all(&idx.dir).ok();
     }
 
     #[test]
     fn an_explicit_refresh_replaces_the_local_verdict() {
-        let idx = temp_index();
+        let (_dir, idx) = temp_index();
         let sha = "d".repeat(64);
         idx.put(&verdict(&sha));
         let mut refreshed = verdict(&sha);
@@ -719,7 +751,6 @@ mod tests {
             idx.get_sha(&sha).and_then(|v| v.why),
             Some("updated".to_string())
         );
-        std::fs::remove_dir_all(&idx.dir).ok();
     }
 
     /// A match reports the exact byte its note recorded, and the line that
@@ -776,15 +807,52 @@ mod tests {
         assert_eq!(locate(&file, &finding), (Some(2048), None));
     }
 
+    /// A panic while the memo was held must not switch the memo off for the
+    /// life of the process: the verdict keeps coming from memory.
+    #[test]
+    fn a_poisoned_memo_keeps_serving() {
+        let (_dir, idx) = temp_index();
+        let sha = "e".repeat(64);
+        idx.put(&verdict(&sha));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = idx.memo.lock();
+            panic!("poison the memo");
+        }));
+        assert!(poisoned.is_err() && idx.memo.is_poisoned());
+        std::fs::remove_file(idx.verdict_path(&sha)).expect("remove the stored copy");
+        assert!(idx.get_sha(&sha).is_some(), "served from the memo");
+    }
+
+    /// Writes land whole and leave nothing behind: no temp file outlives the
+    /// rename that publishes it.
+    #[test]
+    fn writes_leave_only_entries_behind() {
+        let (_dir, idx) = temp_index();
+        let mut v = verdict(&"f".repeat(64));
+        v.purl = Some("pkg:npm/left-pad@1.3.0".to_string());
+        idx.put(&v);
+        let mut names: Vec<String> = std::fs::read_dir(&idx.dir)
+            .expect("read index dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names
+                .iter()
+                .any(|n| n == &format!("{}.json", "f".repeat(64)))
+        );
+        assert!(names.iter().any(|n| n.ends_with(".purl")), "{names:?}");
+    }
+
     #[test]
     fn rejects_keys_that_are_not_digests() {
-        let idx = temp_index();
+        let (_dir, idx) = temp_index();
         assert!(idx.get_sha("not-a-sha").is_none());
         assert!(idx.get_sha(&"g".repeat(64)).is_none(), "not hex");
         // A verdict with a malformed digest is dropped rather than written to
         // an attacker-chosen path.
         idx.put(&verdict("../../etc/passwd"));
         assert!(!idx.dir.join("../../etc/passwd.json").exists());
-        std::fs::remove_dir_all(&idx.dir).ok();
     }
 }

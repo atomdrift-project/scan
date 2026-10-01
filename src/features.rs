@@ -1,38 +1,73 @@
-//! Feature extraction from cleave v3 AnalysisReport JSON.
+//! Feature extraction from cleave's compact report.
 //!
 //! Mirrors the feature extraction in collimator/src/collimator/features.py (v16)
 //! exactly, using the same feature_spec.json vocabulary to produce identical
 //! feature vectors.
 //!
-//! Feature assignment uses `FeatureWriter` which maps feature names to indices
-//! via the spec's `feature_names` list. Features not in the spec (disabled groups)
-//! are silently skipped — no errors, no wasted space.
+//! Feature assignment uses `FeatureWriter`, which maps feature names to the
+//! slots of the spec's `feature_names` list. A name the spec does not carry
+//! (a disabled group, or a vocabulary token the model never saw) writes
+//! nothing — that is how pruned and partial specs "just work".
 
 // All feature vectors use f32 to match the model's input dtype. The f64→f32
 // narrowing throughout this file is intentional and safe: feature values are
 // counts, ratios, or scores that fit well within f32 range.
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "feature values are narrowed to the model's f32 input dtype"
+)]
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::LazyLock;
 
-/// Name-based feature assignment. Wraps a feature vec + name→index lookup.
-/// Features not in the spec (disabled groups, unknown names) are silently
-/// skipped — this is how disabled feature groups "just work" without special
-/// handling.
+/// Name-based feature assignment: one route's feature vector plus the spec's
+/// name → slot lookup.
 struct FeatureWriter<'a> {
     vec: &'a mut [f32],
     lookup: &'a HashMap<String, usize>,
 }
 
 impl FeatureWriter<'_> {
-    /// Set a feature by name. No-op if the feature isn't in the spec.
+    /// Set a fixed-name feature. The spec may have pruned it (then this is a
+    /// no-op), but the name must be one the extractor declares in
+    /// [`FIXED_FEATURE_NAMES`]: a misspelled name would otherwise never fire
+    /// and never fail.
     #[inline]
     fn set(&mut self, name: &str, value: f32) {
+        debug_assert!(
+            FIXED_FEATURE_NAMES.contains(name),
+            "feature {name:?} is not declared in the extractor's layout"
+        );
+        self.set_token(name, value);
+    }
+
+    /// Set a vocabulary-driven feature (`elements:`, `kv:`, n-grams, …). Most
+    /// candidate tokens are not in the model's vocabulary, so a miss is the
+    /// normal case.
+    #[inline]
+    fn set_token(&mut self, name: &str, value: f32) {
         if let Some(&idx) = self.lookup.get(name) {
             self.vec[idx] = value;
+        }
+    }
+
+    /// [`Self::set_token`] for `<prefix><token>`, built in the reusable `key`.
+    fn set_prefixed(&mut self, key: &mut String, prefix: &str, token: &str, value: f32) {
+        key.clear();
+        key.push_str(prefix);
+        key.push_str(token);
+        self.set_token(key, value);
+    }
+
+    /// Set a feature whose slot was resolved when the context was built.
+    #[inline]
+    fn set_slot(&mut self, slot: usize, value: f32) {
+        if let Some(cell) = self.vec.get_mut(slot) {
+            *cell = value;
         }
     }
 }
@@ -59,8 +94,12 @@ pub const EXPECTED_MODEL_ABI_VERSION: u32 = EXPECTED_SPEC_VERSION;
 /// Minimum finding confidence for inclusion (matches collimator MIN_CONFIDENCE).
 const MIN_CONFIDENCE: f64 = 0.65;
 
-/// Number of riskiest files to summarize for top-k aggregate features.
-const TOP_K_RISK_FILES: usize = 1;
+/// Criticality ordinals as a compact report carries them
+/// ([`cleave::Criticality::rank`]).
+const CRIT_BASELINE: u32 = 2;
+const CRIT_NOTABLE: u32 = 3;
+const CRIT_SUSPICIOUS: u32 = 4;
+const CRIT_HOSTILE: u32 = 5;
 
 /// Key metrics extracted from the report's `metrics` object.
 /// Each entry is (group, field, use_log1p).
@@ -310,6 +349,11 @@ impl FeatureSpec {
     }
 
     /// Apply z-score standardization using training statistics.
+    ///
+    /// Mirrors collimator's `standardize`: a feature whose training stats are
+    /// exactly `(mean 0, std 1)` was constant during training, and collimator
+    /// zeroes it rather than pass through a raw value the model never saw. A
+    /// zero std is zeroed too, instead of dividing by it.
     pub fn standardize(&self, features: &mut [f32]) {
         if !self.standardized {
             return;
@@ -462,32 +506,60 @@ impl FeatureSpec {
 
     /// The full feature-name list this extractor emits for the spec's
     /// vocabularies — the canonical layout that `feature_names` is checked
-    /// against. The 22 vocab fields are threaded through once, here.
+    /// against. The fixed-name families come from the same tables that
+    /// [`FeatureWriter::set`] checks its names against.
     fn expected_feature_names(&self) -> Vec<String> {
-        build_expected_feature_names(
-            &self.presence_vocab,
-            &self.filetype_vocab,
-            &self.element_vocab,
-            &self.bigram_vocab,
-            &self.ghost_vocab,
-            &self.skeleton_vocab,
-            &self.rare_element_vocab,
-            &self.trigram_vocab,
-            &self.metric_vocab,
-            &self.crit_unigram_vocab,
-            &self.crit_bigram_vocab,
-            &self.crit_trigram_vocab,
-            &self.attack_bigram_vocab,
-            &self.attack_trigram_vocab,
-            &self.mbc_bigram_vocab,
-            &self.mbc_trigram_vocab,
-            &self.tiered_bigram_vocab,
-            &self.tiered_trigram_vocab,
-            &self.kv_vocab,
-            &self.symbol_vocab,
-            &self.symbol_bigram_vocab,
-            &self.symbol_trigram_vocab,
-        )
+        fn vocab(names: &mut Vec<String>, prefix: &str, vocab: &[String]) {
+            names.extend(vocab.iter().map(|v| format!("{prefix}{v}")));
+        }
+        fn fixed(names: &mut Vec<String>, fixed: &[&str]) {
+            names.extend(fixed.iter().map(|n| (*n).to_string()));
+        }
+        let mut names = Vec::with_capacity(self.total_features.max(1024));
+        vocab(&mut names, "present:", &self.presence_vocab);
+        vocab(&mut names, "maxcrit:", &self.presence_vocab);
+        fixed(&mut names, AGG_FEATURES);
+        vocab(&mut names, "crit:", &self.crit_unigram_vocab);
+        vocab(&mut names, "critbi:", &self.crit_bigram_vocab);
+        vocab(&mut names, "crittri:", &self.crit_trigram_vocab);
+        vocab(&mut names, "atkbi:", &self.attack_bigram_vocab);
+        vocab(&mut names, "atktri:", &self.attack_trigram_vocab);
+        vocab(&mut names, "mbcbi:", &self.mbc_bigram_vocab);
+        vocab(&mut names, "mbctri:", &self.mbc_trigram_vocab);
+        fixed(&mut names, EXT_FEATURES);
+        names.extend(metric_base_feature_names());
+        vocab(&mut names, "metrics:", &self.metric_vocab);
+        vocab(&mut names, "filetype:", &self.filetype_vocab);
+        names.extend(FORMAT_FEATURE_NAMES.iter().flatten().cloned());
+        fixed(&mut names, FORMAT_SUMMARY_FEATURES);
+        fixed(&mut names, STRUCT_FEATURES);
+        vocab(&mut names, "elements:", &self.element_vocab);
+        fixed(&mut names, FORMULA_FEATURES);
+        fixed(&mut names, SCORE_FEATURES);
+        names.extend(
+            self.filetype_vocab
+                .iter()
+                .map(|ft| format!("inter:{ft}*score")),
+        );
+        vocab(&mut names, "bigrams:", &self.bigram_vocab);
+        vocab(&mut names, "tierbi:", &self.tiered_bigram_vocab);
+        vocab(&mut names, "tiertri:", &self.tiered_trigram_vocab);
+        vocab(&mut names, "ghost:", &self.ghost_vocab);
+        vocab(&mut names, "skeleton:", &self.skeleton_vocab);
+        vocab(&mut names, "rare:", &self.rare_element_vocab);
+        fixed(&mut names, STRUCT_EXTENSION_FEATURES);
+        vocab(&mut names, "trigram:", &self.trigram_vocab);
+        names.extend(GAP_FEATURE_NAMES.iter().cloned());
+        vocab(&mut names, "unsigned_bigram:", &self.bigram_vocab);
+        names.extend(INTENT_GAP_FEATURE_NAMES.iter().cloned());
+        names.extend(MISSING_FEATURE_NAMES.iter().cloned());
+        fixed(&mut names, TAIL_FEATURES);
+        fixed(&mut names, TEXTENC_FEATURES);
+        vocab(&mut names, "kv:", &self.kv_vocab);
+        vocab(&mut names, "symbol:", &self.symbol_vocab);
+        vocab(&mut names, "symbol_bi:", &self.symbol_bigram_vocab);
+        vocab(&mut names, "symbol_tri:", &self.symbol_trigram_vocab);
+        names
     }
 }
 
@@ -576,411 +648,306 @@ const EXPECTED_GHOSTS: &[(&str, &[&str])] = &[
     ),
 ];
 
-#[allow(clippy::too_many_arguments)]
-fn build_expected_feature_names(
-    presence_vocab: &[String],
-    filetype_vocab: &[String],
-    element_vocab: &[String],
-    bigram_vocab: &[String],
-    ghost_vocab: &[String],
-    skeleton_vocab: &[String],
-    rare_element_vocab: &[String],
-    trigram_vocab: &[String],
-    metric_vocab: &[String],
-    crit_unigram_vocab: &[String],
-    crit_bigram_vocab: &[String],
-    crit_trigram_vocab: &[String],
-    attack_bigram_vocab: &[String],
-    attack_trigram_vocab: &[String],
-    mbc_bigram_vocab: &[String],
-    mbc_trigram_vocab: &[String],
-    tiered_bigram_vocab: &[String],
-    tiered_trigram_vocab: &[String],
-    kv_vocab: &[String],
-    symbol_vocab: &[String],
-    symbol_bigram_vocab: &[String],
-    symbol_trigram_vocab: &[String],
-) -> Vec<String> {
-    let mut feature_names = Vec::with_capacity(20000); // overestimate to avoid reallocs
+/// Group 3: report-level aggregates.
+const AGG_FEATURES: &[&str] = &[
+    "agg:max_crit",
+    "agg:category_breadth",
+    "agg:path_breadth_any",
+    "agg:total_active_paths",
+    "agg:suspicious_concentration",
+    "agg:hostile_concentration",
+    "agg:escalation_rate",
+    "agg:notable_only_fraction",
+    "agg:notable_findings_log",
+    "agg:suspicious_findings_log",
+    "agg:hostile_findings_log",
+    "agg:notable_finding_ratio",
+    "agg:suspicious_finding_ratio",
+    "agg:hostile_finding_ratio",
+    "agg:unique_suspicious_ids_log",
+    "agg:unique_hostile_ids_log",
+    // The `top1` block summarizes the single riskiest file; see
+    // `topk_file_risk_features_from_summaries`.
+    "agg:top1_file_suspicious_ratio_sum",
+    "agg:top1_file_hostile_ratio_sum",
+    "agg:top1_file_suspicious_findings_log",
+    "agg:top1_file_hostile_findings_log",
+    "agg:suspicious_category_breadth",
+    "agg:hostile_category_breadth",
+    "agg:suspicious_category_density",
+    "agg:hostile_category_density",
+    "agg:suspicious_findings_per_kb",
+    "agg:hostile_findings_per_kb",
+    "agg:suspicious_categories_per_kb",
+    "agg:hostile_categories_per_kb",
+    "agg:top1_file_suspicious_density_sum",
+    "agg:top1_file_hostile_density_sum",
+    "agg:top1_file_suspicious_category_breadth_sum",
+    "agg:top1_file_hostile_category_breadth_sum",
+    // Size-invariant crit-tier severity fractions (collimator's
+    // include_severity_fractions group).
+    "agg:crit3_finding_fraction",
+    "agg:crit4_finding_fraction",
+    "agg:hostile_finding_fraction",
+    "agg:severe_to_mundane_ratio",
+    "agg:crit4_present",
+    "agg:hostile_escalation_rate",
+    "agg:hostile_share_of_suspicious",
+    "agg:suspicious_finding_escalation_rate",
+    "agg:hostile_finding_escalation_rate",
+    "agg:hostile_share_of_suspicious_findings",
+    "agg:hostile_weighted_density",
+    "agg:top1_file_hostile_weighted_density_sum",
+    "agg:suspicious_id_repeat_ratio",
+    "agg:hostile_id_repeat_ratio",
+    "agg:suspicious_category_repeat_ratio",
+    "agg:hostile_category_repeat_ratio",
+    "agg:file_hostile_fraction",
+    "agg:file_suspicious_fraction",
+    "agg:file_notable_fraction",
+    "agg:file_hostile_count_log",
+    "agg:file_suspicious_count_log",
+    "agg:file_notable_count_log",
+    "agg:hostile_depth_weight",
+    "agg:suspicious_2level_breadth",
+    "agg:hostile_2level_breadth",
+    "agg:objectives_breadth",
+    // From here to `static_signed_file_fraction`, collimator computes these
+    // and litmus does not: they are declared so a spec carrying them is not
+    // reported as degraded, and extract as zero.
+    "agg:kill_chain_span",
+    "agg:objective_micro_ratio",
+    "agg:avg_finding_depth",
+    "agg:objective_hostile_density",
+    "agg:static_file_bytes_log",
+    "agg:static_import_count_log",
+    "agg:static_export_count_log",
+    "agg:static_dependency_count_log",
+    "agg:static_string_count_log",
+    "agg:static_wide_string_ratio",
+    "agg:static_max_string_length_log",
+    "agg:static_string_entropy_max",
+    "agg:static_text_lines_log",
+    "agg:static_function_count_log",
+    "agg:static_code_bytes_log",
+    "agg:static_code_to_data_ratio_max",
+    "agg:static_wx_units_log",
+    "agg:static_writable_unit_ratio",
+    "agg:static_executable_unit_ratio",
+    "agg:static_nonstandard_unit_names_log",
+    "agg:static_largest_unit_ratio_max",
+    "agg:static_resource_ratio_max",
+    "agg:static_signed_file_fraction",
+    "agg:attack_technique_count",
+    "agg:attack_tactic_count",
+    "agg:mbc_behavior_count",
+    "agg:has_attack_and_objective",
+    // ATT&CK / MBC co-occurrence aggregates (log1p of unordered combinations
+    // among distinct technique / behavior codes seen in raw_findings).
+    "agg:attack_bigram_count",
+    "agg:attack_trigram_count",
+    "agg:mbc_bigram_count",
+    // Objective path co-occurrence aggregates (log1p of unordered combinations
+    // among distinct `objectives/*` and `well-known/*` paths seen in
+    // sample_paths). Trigram is bounded with a per-pair cap of 20 inner
+    // elements to avoid O(n^3) explosion on samples with many objectives.
+    "agg:objective_bigram_count",
+    "agg:objective_trigram_count",
+];
 
-    // Group 1: present
-    for path in presence_vocab {
-        feature_names.push(format!("present:{path}"));
-    }
+/// Group 4: external-signal summary.
+const EXT_FEATURES: &[&str] = &[
+    "ext:third_party_max_crit",
+    "ext:third_party_count",
+    "ext:well_known_max_crit",
+    "ext:well_known_hostile_count",
+    "ext:well_known_suspicious_count",
+    "ext:has_yara_match",
+];
 
-    // Group 2: maxcrit
-    for path in presence_vocab {
-        feature_names.push(format!("maxcrit:{path}"));
-    }
+/// Group 6b: portable format-group hints, after the per-group block.
+const FORMAT_SUMMARY_FEATURES: &[&str] = &[
+    "format:group_count_log",
+    "format:mixed_script_binary",
+    "format:mixed_archive_script",
+    "format:mixed_archive_binary",
+    "format:unknown_file_fraction",
+];
 
-    // Group 3: agg (50 features in v16)
-    feature_names.extend([
-        "agg:max_crit".to_string(),
-        "agg:category_breadth".to_string(),
-        "agg:path_breadth_any".to_string(),
-        "agg:total_active_paths".to_string(),
-        "agg:suspicious_concentration".to_string(),
-        "agg:hostile_concentration".to_string(),
-        "agg:escalation_rate".to_string(),
-        "agg:notable_only_fraction".to_string(),
-        "agg:notable_findings_log".to_string(),
-        "agg:suspicious_findings_log".to_string(),
-        "agg:hostile_findings_log".to_string(),
-        "agg:notable_finding_ratio".to_string(),
-        "agg:suspicious_finding_ratio".to_string(),
-        "agg:hostile_finding_ratio".to_string(),
-        "agg:unique_suspicious_ids_log".to_string(),
-        "agg:unique_hostile_ids_log".to_string(),
-        format!("agg:top{TOP_K_RISK_FILES}_file_suspicious_ratio_sum"),
-        format!("agg:top{TOP_K_RISK_FILES}_file_hostile_ratio_sum"),
-        format!("agg:top{TOP_K_RISK_FILES}_file_suspicious_findings_log"),
-        format!("agg:top{TOP_K_RISK_FILES}_file_hostile_findings_log"),
-        "agg:suspicious_category_breadth".to_string(),
-        "agg:hostile_category_breadth".to_string(),
-        "agg:suspicious_category_density".to_string(),
-        "agg:hostile_category_density".to_string(),
-        "agg:suspicious_findings_per_kb".to_string(),
-        "agg:hostile_findings_per_kb".to_string(),
-        "agg:suspicious_categories_per_kb".to_string(),
-        "agg:hostile_categories_per_kb".to_string(),
-        format!("agg:top{TOP_K_RISK_FILES}_file_suspicious_density_sum"),
-        format!("agg:top{TOP_K_RISK_FILES}_file_hostile_density_sum"),
-        format!("agg:top{TOP_K_RISK_FILES}_file_suspicious_category_breadth_sum"),
-        format!("agg:top{TOP_K_RISK_FILES}_file_hostile_category_breadth_sum"),
-        // Size-invariant crit-tier severity fractions (collimator's
-        // include_severity_fractions group). Only land if the spec carries the
-        // slots; written unconditionally here since litmus produces a superset.
-        "agg:crit3_finding_fraction".to_string(),
-        "agg:crit4_finding_fraction".to_string(),
-        "agg:hostile_finding_fraction".to_string(),
-        "agg:severe_to_mundane_ratio".to_string(),
-        "agg:crit4_present".to_string(),
-        "agg:hostile_escalation_rate".to_string(),
-        "agg:hostile_share_of_suspicious".to_string(),
-        "agg:suspicious_finding_escalation_rate".to_string(),
-        "agg:hostile_finding_escalation_rate".to_string(),
-        "agg:hostile_share_of_suspicious_findings".to_string(),
-        "agg:hostile_weighted_density".to_string(),
-        format!("agg:top{TOP_K_RISK_FILES}_file_hostile_weighted_density_sum"),
-        "agg:suspicious_id_repeat_ratio".to_string(),
-        "agg:hostile_id_repeat_ratio".to_string(),
-        "agg:suspicious_category_repeat_ratio".to_string(),
-        "agg:hostile_category_repeat_ratio".to_string(),
-        "agg:file_hostile_fraction".to_string(),
-        "agg:file_suspicious_fraction".to_string(),
-        "agg:file_notable_fraction".to_string(),
-        "agg:file_hostile_count_log".to_string(),
-        "agg:file_suspicious_count_log".to_string(),
-        "agg:file_notable_count_log".to_string(),
-        "agg:hostile_depth_weight".to_string(),
-        "agg:suspicious_2level_breadth".to_string(),
-        "agg:hostile_2level_breadth".to_string(),
-        "agg:objectives_breadth".to_string(),
-        "agg:kill_chain_span".to_string(),
-        "agg:objective_micro_ratio".to_string(),
-        "agg:avg_finding_depth".to_string(),
-        "agg:objective_hostile_density".to_string(),
-        "agg:static_file_bytes_log".to_string(),
-        "agg:static_import_count_log".to_string(),
-        "agg:static_export_count_log".to_string(),
-        "agg:static_dependency_count_log".to_string(),
-        "agg:static_string_count_log".to_string(),
-        "agg:static_wide_string_ratio".to_string(),
-        "agg:static_max_string_length_log".to_string(),
-        "agg:static_string_entropy_max".to_string(),
-        "agg:static_text_lines_log".to_string(),
-        "agg:static_function_count_log".to_string(),
-        "agg:static_code_bytes_log".to_string(),
-        "agg:static_code_to_data_ratio_max".to_string(),
-        "agg:static_wx_units_log".to_string(),
-        "agg:static_writable_unit_ratio".to_string(),
-        "agg:static_executable_unit_ratio".to_string(),
-        "agg:static_nonstandard_unit_names_log".to_string(),
-        "agg:static_largest_unit_ratio_max".to_string(),
-        "agg:static_resource_ratio_max".to_string(),
-        "agg:static_signed_file_fraction".to_string(),
-        "agg:attack_technique_count".to_string(),
-        "agg:attack_tactic_count".to_string(),
-        "agg:mbc_behavior_count".to_string(),
-        "agg:has_attack_and_objective".to_string(),
-        // ATT&CK / MBC co-occurrence aggregates (log1p of unordered combinations
-        // among distinct technique / behavior codes seen in raw_findings).
-        "agg:attack_bigram_count".to_string(),
-        "agg:attack_trigram_count".to_string(),
-        "agg:mbc_bigram_count".to_string(),
-        // Objective path co-occurrence aggregates (log1p of unordered combinations
-        // among distinct `objectives/*` and `well-known/*` paths seen in
-        // sample_paths). Trigram is bounded with a per-pair cap of 20 inner
-        // elements to avoid O(n^3) explosion on samples with many objectives.
-        "agg:objective_bigram_count".to_string(),
-        "agg:objective_trigram_count".to_string(),
-    ]);
+/// Group 7: structure.
+const STRUCT_FEATURES: &[&str] = &[
+    "struct:tiny_executable",
+    "struct:no_imports",
+    "struct:zero_findings",
+    "struct:finding_count_log",
+    "struct:file_count_log",
+    "struct:inner_file_count_log",
+    "struct:stealth_potential",
+    "struct:suspicious_file_fraction",
+    "struct:hostile_file_fraction",
+    "struct:suspicious_file_count_log",
+    "struct:hostile_file_count_log",
+];
 
-    // Crit-category n-grams (vocab-driven)
-    for cu in crit_unigram_vocab {
-        feature_names.push(format!("crit:{cu}"));
-    }
-    for cb in crit_bigram_vocab {
-        feature_names.push(format!("critbi:{cb}"));
-    }
-    for ct in crit_trigram_vocab {
-        feature_names.push(format!("crittri:{ct}"));
-    }
+/// Group 9: formula.
+const FORMULA_FEATURES: &[&str] = &[
+    "formula:skeleton_len",
+    "formula:unique_elements",
+    "formula:complexity_ratio",
+];
 
-    // ATT&CK/MBC code n-grams (vocab-driven)
-    for ab in attack_bigram_vocab {
-        feature_names.push(format!("atkbi:{ab}"));
-    }
-    for at in attack_trigram_vocab {
-        feature_names.push(format!("atktri:{at}"));
-    }
-    for mb in mbc_bigram_vocab {
-        feature_names.push(format!("mbcbi:{mb}"));
-    }
-    for mt in mbc_trigram_vocab {
-        feature_names.push(format!("mbctri:{mt}"));
-    }
+/// Group 10: score (the `inter:` family follows it).
+const SCORE_FEATURES: &[&str] = &["score:hopper_score", "score:density"];
 
-    // Group 4: ext (6)
-    feature_names.extend([
-        "ext:third_party_max_crit".to_string(),
-        "ext:third_party_count".to_string(),
-        "ext:well_known_max_crit".to_string(),
-        "ext:well_known_hostile_count".to_string(),
-        "ext:well_known_suspicious_count".to_string(),
-        "ext:has_yara_match".to_string(),
-    ]);
+/// Group 15: structural extensions.
+const STRUCT_EXTENSION_FEATURES: &[&str] = &[
+    "struct:packaged_capability",
+    "struct:mtime_range_hours",
+    "struct:mtime_std_dev_hours",
+    "struct:max_nesting_depth_log",
+    "struct:inner_file_ratio",
+    "struct:entropy_std_dev",
+    "struct:entropy_max_diff",
+    "struct:air_gap_signal",
+    "struct:anachronistic_injection",
+    "struct:code_entropy_spike",
+    "struct:foreign_binary_signal",
+    "struct:extension_mismatch_signal",
+    "struct:hostile_finding_density",
+];
 
-    // Group 5: metrics (16 base + dynamic extended vocab)
-    for &(group, field_name, _) in KEY_METRICS {
-        feature_names.push(format!("metrics:{group}_{field_name}"));
-    }
-    for mk in metric_vocab {
-        feature_names.push(format!("metrics:{mk}"));
-    }
+/// Features only some route specs carry (e.g. filetypes/makefile): suspicious
+/// co-occurrence counts, cross-metric ratios, and the silent-packer signal.
+const TAIL_FEATURES: &[&str] = &[
+    "agg:suspicious_bigram_count",
+    "agg:suspicious_trigram_count",
+    "metrics:derived_string_per_function",
+    "metrics:derived_imports_per_dependency",
+    "metrics:derived_wide_string_ratio",
+    "struct:silent_packer_signal",
+];
 
-    // Group 6: filetype
-    for filetype in filetype_vocab {
-        feature_names.push(format!("filetype:{filetype}"));
-    }
+/// Group 24: textenc — collimator's `_apply_text_encoding_features` ratios
+/// over a file's strings. The compact report carries no strings, so these
+/// always extract as zero; they are declared so a spec carrying them is not
+/// reported as degraded.
+const TEXTENC_FEATURES: &[&str] = &[
+    "textenc:string_count_log",
+    "textenc:avg_len_log",
+    "textenc:max_len_log",
+    "textenc:base64ish_ratio",
+    "textenc:hexish_ratio",
+    "textenc:urlish_ratio",
+    "textenc:pathish_ratio",
+    "textenc:unicode_escape_ratio",
+    "textenc:wide_ratio",
+    "textenc:high_entropy_ratio",
+    "textenc:long_token_ratio",
+    "textenc:short_junk_ratio",
+];
 
-    // Group 6b: Portable format-group hints derived only from cleave file types.
-    for &(group, _) in FORMAT_GROUPS {
-        feature_names.push(format!("format:{group}"));
-        feature_names.push(format!("format:{group}_file_fraction"));
-        feature_names.push(format!("format:{group}_inner_fraction"));
-        feature_names.push(format!("format:{group}_suspicious_fraction"));
-        feature_names.push(format!("format:{group}_hostile_fraction"));
-    }
-    feature_names.extend([
-        "format:group_count_log".to_string(),
-        "format:mixed_script_binary".to_string(),
-        "format:mixed_archive_script".to_string(),
-        "format:mixed_archive_binary".to_string(),
-        "format:unknown_file_fraction".to_string(),
-    ]);
-
-    // Group 7: struct base 7 + extensions
-    feature_names.extend([
-        "struct:tiny_executable".to_string(),
-        "struct:no_imports".to_string(),
-        "struct:zero_findings".to_string(),
-        "struct:finding_count_log".to_string(),
-        "struct:file_count_log".to_string(),
-        "struct:inner_file_count_log".to_string(),
-        "struct:stealth_potential".to_string(),
-        "struct:suspicious_file_fraction".to_string(),
-        "struct:hostile_file_fraction".to_string(),
-        "struct:suspicious_file_count_log".to_string(),
-        "struct:hostile_file_count_log".to_string(),
-    ]);
-
-    // Group 8: elements
-    for el in element_vocab {
-        feature_names.push(format!("elements:{el}"));
-    }
-
-    // Group 9: formula
-    feature_names.extend([
-        "formula:skeleton_len".to_string(),
-        "formula:unique_elements".to_string(),
-        "formula:complexity_ratio".to_string(),
-    ]);
-
-    // Group 10: score + inter
-    feature_names.extend([
-        "score:hopper_score".to_string(),
-        "score:density".to_string(),
-    ]);
-    for ft in filetype_vocab {
-        feature_names.push(format!("inter:{ft}*score"));
-    }
-
-    // Group 11: bigrams
-    for bi in bigram_vocab {
-        feature_names.push(format!("bigrams:{bi}"));
-    }
-
-    // Group 11b: report-level severity-prefixed trait bigrams
-    for bi in tiered_bigram_vocab {
-        feature_names.push(format!("tierbi:{bi}"));
-    }
-
-    // Group 11c: report-level severity-prefixed trait trigrams
-    for tri in tiered_trigram_vocab {
-        feature_names.push(format!("tiertri:{tri}"));
-    }
-
-    // Group 12: ghost
-    for gh in ghost_vocab {
-        feature_names.push(format!("ghost:{gh}"));
-    }
-
-    // Group 13: skeleton
-    for skel in skeleton_vocab {
-        feature_names.push(format!("skeleton:{skel}"));
-    }
-
-    // Group 14: rare elements
-    for el in rare_element_vocab {
-        feature_names.push(format!("rare:{el}"));
-    }
-
-    // Group 15: structural extensions
-    feature_names.push("struct:packaged_capability".to_string());
-    feature_names.extend([
-        "struct:mtime_range_hours".to_string(),
-        "struct:mtime_std_dev_hours".to_string(),
-        "struct:max_nesting_depth_log".to_string(),
-        "struct:inner_file_ratio".to_string(),
-        "struct:entropy_std_dev".to_string(),
-        "struct:entropy_max_diff".to_string(),
-    ]);
-    feature_names.push("struct:air_gap_signal".to_string());
-    feature_names.push("struct:anachronistic_injection".to_string());
-    feature_names.push("struct:code_entropy_spike".to_string());
-    feature_names.push("struct:foreign_binary_signal".to_string());
-    feature_names.push("struct:extension_mismatch_signal".to_string());
-    feature_names.push("struct:hostile_finding_density".to_string());
-
-    // Group 16: trigrams
-    for tri in trigram_vocab {
-        feature_names.push(format!("trigram:{tri}"));
-    }
-
-    // Group 19: logic gaps
-    for cat in LOGIC_GAP_CATEGORIES {
-        feature_names.push(format!("gap:{cat}"));
-    }
-
-    // Group 20: unsigned bigrams
-    for bi in bigram_vocab {
-        feature_names.push(format!("unsigned_bigram:{bi}"));
-    }
-
-    // Group 22: intent gaps
-    for cat in INTENT_GAP_CATEGORIES {
-        feature_names.push(format!("intent_gap:{cat}"));
-    }
-
-    // Group 23: negative space
-    for &(ftype, traits) in EXPECTED_GHOSTS {
-        for trait_path in traits {
-            feature_names.push(format!("missing:{ftype}*{trait_path}"));
-        }
-    }
-
-    // Additional aggregate-level co-occurrence counts. Only present in some
-    // route specs (e.g. filetypes/makefile) — registered here so they don't
-    // surface as "unknown to this extractor".
-    feature_names.push("agg:suspicious_bigram_count".to_string());
-    feature_names.push("agg:suspicious_trigram_count".to_string());
-
-    // Cross-metric derived ratios. Computed from binary metric fields in
-    // write_derived_metric_features.
-    feature_names.push("metrics:derived_string_per_function".to_string());
-    feature_names.push("metrics:derived_imports_per_dependency".to_string());
-    feature_names.push("metrics:derived_wide_string_ratio".to_string());
-
-    // Optional silent-packer-signal struct feature.
-    feature_names.push("struct:silent_packer_signal".to_string());
-
-    // Group 24: textenc — 12 fixed ratios over file_strings.
-    for name in TEXTENC_FEATURE_NAMES {
-        feature_names.push(format!("textenc:{name}"));
-    }
-
-    // Group 25: kv vocab — sparse one-hot tokens from cleave metrics+values.
-    for kv in kv_vocab {
-        feature_names.push(format!("kv:{kv}"));
-    }
-
-    // Group 26: symbol vocab — normalized imports/exports/functions.
-    for sym in symbol_vocab {
-        feature_names.push(format!("symbol:{sym}"));
-    }
-    for sb in symbol_bigram_vocab {
-        feature_names.push(format!("symbol_bi:{sb}"));
-    }
-    for st in symbol_trigram_vocab {
-        feature_names.push(format!("symbol_tri:{st}"));
-    }
-
-    feature_names
+/// Group 5: `metrics:<group>_<field>` for every [`KEY_METRICS`] entry.
+fn metric_base_feature_names() -> impl Iterator<Item = String> {
+    KEY_METRICS
+        .iter()
+        .map(|&(group, field, _)| format!("metrics:{group}_{field}"))
 }
 
-/// Fixed textenc feature names; matches collimator's `_apply_text_encoding_features`.
-const TEXTENC_FEATURE_NAMES: &[&str] = &[
-    "string_count_log",
-    "avg_len_log",
-    "max_len_log",
-    "base64ish_ratio",
-    "hexish_ratio",
-    "urlish_ratio",
-    "pathish_ratio",
-    "unicode_escape_ratio",
-    "wide_ratio",
-    "high_entropy_ratio",
-    "long_token_ratio",
-    "short_junk_ratio",
-];
+/// Group 6b: `format:<group>` and its four fractions, per [`FORMAT_GROUPS`] entry.
+static FORMAT_FEATURE_NAMES: LazyLock<Vec<[String; 5]>> = LazyLock::new(|| {
+    FORMAT_GROUPS
+        .iter()
+        .map(|&(group, _)| {
+            [
+                format!("format:{group}"),
+                format!("format:{group}_file_fraction"),
+                format!("format:{group}_inner_fraction"),
+                format!("format:{group}_suspicious_fraction"),
+                format!("format:{group}_hostile_fraction"),
+            ]
+        })
+        .collect()
+});
+
+/// Group 19: `gap:<category>`, per [`LOGIC_GAP_CATEGORIES`] entry.
+static GAP_FEATURE_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    LOGIC_GAP_CATEGORIES
+        .iter()
+        .map(|cat| format!("gap:{cat}"))
+        .collect()
+});
+
+/// Group 22: `intent_gap:<category>`, per [`INTENT_GAP_CATEGORIES`] entry.
+static INTENT_GAP_FEATURE_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    INTENT_GAP_CATEGORIES
+        .iter()
+        .map(|cat| format!("intent_gap:{cat}"))
+        .collect()
+});
+
+/// Group 23: `missing:<type>*<trait>`, in [`EXPECTED_GHOSTS`] order.
+static MISSING_FEATURE_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    EXPECTED_GHOSTS
+        .iter()
+        .flat_map(|&(ftype, traits)| traits.iter().map(move |t| format!("missing:{ftype}*{t}")))
+        .collect()
+});
+
+/// Every fixed-name feature: the layout minus its vocabulary-driven families.
+/// The single list [`FeatureWriter::set`] checks names against.
+static FIXED_FEATURE_NAMES: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    [
+        AGG_FEATURES,
+        EXT_FEATURES,
+        FORMAT_SUMMARY_FEATURES,
+        STRUCT_FEATURES,
+        FORMULA_FEATURES,
+        SCORE_FEATURES,
+        STRUCT_EXTENSION_FEATURES,
+        TAIL_FEATURES,
+        TEXTENC_FEATURES,
+    ]
+    .concat()
+    .into_iter()
+    .map(str::to_string)
+    .chain(metric_base_feature_names())
+    .chain(FORMAT_FEATURE_NAMES.iter().flatten().cloned())
+    .chain(GAP_FEATURE_NAMES.iter().cloned())
+    .chain(INTENT_GAP_FEATURE_NAMES.iter().cloned())
+    .chain(MISSING_FEATURE_NAMES.iter().cloned())
+    .collect()
+});
+
+/// One `metrics:` feature resolved to its slot: the value at
+/// `metrics[group][field]`, optionally `ln(|v| + 1)`-scaled.
+#[derive(Debug)]
+struct MetricSlot {
+    slot: usize,
+    group: String,
+    field: String,
+    log: bool,
+}
 
 /// Pre-built lookup tables for fast repeated extraction against a spec.
 #[derive(Debug)]
 pub struct ExtractContext {
     presence_lookup: HashMap<String, usize>,
-    n_presence: usize,
-    n_ft: usize,
-    n_format: usize,
-    n_element: usize,
-    n_bigram: usize,
-    n_ghost: usize,
-    n_skeleton: usize,
-    n_rare: usize,
-    n_trigram: usize,
-    n_ext_metrics: usize,
-    metric_vocab: Vec<String>,
-    n_crit_unigram: usize,
-    n_crit_bigram: usize,
-    n_crit_trigram: usize,
-    n_atk_bigram: usize,
-    n_atk_trigram: usize,
-    n_mbc_bigram: usize,
-    n_mbc_trigram: usize,
-    n_tiered_bigram: usize,
-    n_tiered_trigram: usize,
-    n_kv: usize,
-    n_symbol: usize,
-    n_symbol_bi: usize,
-    n_symbol_tri: usize,
-    n_textenc: usize,
-    n_derived_metrics: usize,
-    n_silent_packer: usize,
-    n_extra_agg: usize,
-    /// Global feature name → index lookup for vocab-based features.
+    /// Global feature name → index lookup for name-written features.
     absolute_lookup: HashMap<String, usize>,
-    ghost_vocab: Vec<String>,
+    /// Group 5: the base [`KEY_METRICS`] then the spec's extended metric
+    /// vocab, each resolved to its slot (absent ones dropped).
+    metric_slots: Vec<MetricSlot>,
+    /// Group 12: `ghost:` vocab paths that have a slot in this spec.
+    ghost_slots: Vec<(String, usize)>,
     total_features: usize,
+    /// Optional families this spec carries; their inputs are only gathered
+    /// (and their writers only run) when a route needs them.
+    kv: bool,
+    /// Any of the `symbol:`, `symbol_bi:` and `symbol_tri:` families.
+    symbols: bool,
+    symbol_bigrams: bool,
+    symbol_trigrams: bool,
+    suspicious_ngram_counts: bool,
 
     // Optimized bigram/trigram lookups
     path_to_id: HashMap<String, u32>,
@@ -999,15 +966,6 @@ pub struct ExtractContext {
     bigram_slots: Vec<Option<usize>>,
     trigram_slots: Vec<Option<usize>>,
     unsigned_bigram_slots: Vec<Option<usize>>,
-
-    /// Set during extraction if the spec declares MORE features than the
-    /// extractor's layout fills — i.e. `total_features > cursor`, meaning some
-    /// `feature_names` slots are reached by no family writer and extract to a
-    /// silent zero (real collimator↔features.rs drift). An allowlist makes the
-    /// spec a SUBSET of the full layout (`total_features < cursor`), which is
-    /// expected and never sets this. Surfaced by [`Self::had_layout_drift`] so
-    /// `validate` fails a drifted bundle rather than shipping zeroed features.
-    layout_drift: std::sync::atomic::AtomicBool,
 }
 
 impl ExtractContext {
@@ -1055,8 +1013,6 @@ impl ExtractContext {
             }
         }
 
-        // Global feature name -> index. Built before `Self` so the anchored
-        // family bases below can be derived from it.
         let absolute_lookup: HashMap<String, usize> = spec
             .feature_names
             .iter()
@@ -1078,8 +1034,6 @@ impl ExtractContext {
         //     so writes never land on the wrong feature. No 1:1 contiguous block
         //     is required, so litmus accepts pruned/reordered bundles instead of
         //     rejecting them.
-        // The cursor below still walks the FULL layout for the `total_features`
-        // drift check (see end of extract); these maps drive the actual writes.
         let family_slots = |prefix: &str, vocab: &[String]| -> Vec<Option<usize>> {
             vocab
                 .iter()
@@ -1092,78 +1046,28 @@ impl ExtractContext {
         let trigram_slots = family_slots("trigram:", &spec.trigram_vocab);
         let unsigned_bigram_slots = family_slots("unsigned_bigram:", &spec.bigram_vocab);
 
+        let has_prefix = |prefix: &str| spec.feature_names.iter().any(|n| n.starts_with(prefix));
+        let has_name = |name: &str| absolute_lookup.contains_key(name);
+
         Self {
-            presence_lookup,
-            n_presence: spec.presence_vocab.len(),
-            n_ft: spec.filetype_vocab.len(),
-            n_format: spec
-                .feature_names
+            metric_slots: metric_slots(&absolute_lookup, &spec.metric_vocab),
+            ghost_slots: spec
+                .ghost_vocab
                 .iter()
-                .filter(|name| name.starts_with("format:"))
-                .count(),
-            n_element: spec.element_vocab.len(),
-            n_bigram: spec.bigram_vocab.len(),
-            n_ghost: spec.ghost_vocab.len(),
-            n_skeleton: spec.skeleton_vocab.len(),
-            n_rare: spec.rare_element_vocab.len(),
-            n_trigram: spec.trigram_vocab.len(),
-            n_ext_metrics: spec.metric_vocab.len(),
-            metric_vocab: spec.metric_vocab.clone(),
-            n_crit_unigram: spec.crit_unigram_vocab.len(),
-            n_crit_bigram: spec.crit_bigram_vocab.len(),
-            n_crit_trigram: spec.crit_trigram_vocab.len(),
-            n_atk_bigram: spec.attack_bigram_vocab.len(),
-            n_atk_trigram: spec.attack_trigram_vocab.len(),
-            n_mbc_bigram: spec.mbc_bigram_vocab.len(),
-            n_mbc_trigram: spec.mbc_trigram_vocab.len(),
-            n_tiered_bigram: spec.tiered_bigram_vocab.len(),
-            n_tiered_trigram: spec.tiered_trigram_vocab.len(),
-            n_kv: spec
-                .feature_names
-                .iter()
-                .filter(|n| n.starts_with("kv:"))
-                .count(),
-            n_symbol: spec
-                .feature_names
-                .iter()
-                .filter(|n| n.starts_with("symbol:"))
-                .count(),
-            n_symbol_bi: spec
-                .feature_names
-                .iter()
-                .filter(|n| n.starts_with("symbol_bi:"))
-                .count(),
-            n_symbol_tri: spec
-                .feature_names
-                .iter()
-                .filter(|n| n.starts_with("symbol_tri:"))
-                .count(),
-            n_textenc: spec
-                .feature_names
-                .iter()
-                .filter(|n| n.starts_with("textenc:"))
-                .count(),
-            n_derived_metrics: spec
-                .feature_names
-                .iter()
-                .filter(|n| n.starts_with("metrics:derived_"))
-                .count(),
-            n_silent_packer: spec
-                .feature_names
-                .iter()
-                .filter(|n| n.as_str() == "struct:silent_packer_signal")
-                .count(),
-            n_extra_agg: spec
-                .feature_names
-                .iter()
-                .filter(|n| {
-                    n.as_str() == "agg:suspicious_bigram_count"
-                        || n.as_str() == "agg:suspicious_trigram_count"
+                .filter_map(|path| {
+                    let slot = *absolute_lookup.get(&format!("ghost:{path}"))?;
+                    Some((path.clone(), slot))
                 })
-                .count(),
-            absolute_lookup,
-            ghost_vocab: spec.ghost_vocab.clone(),
+                .collect(),
             total_features: spec.total_features,
+            kv: has_prefix("kv:"),
+            symbols: has_prefix("symbol:") || has_prefix("symbol_bi:") || has_prefix("symbol_tri:"),
+            symbol_bigrams: has_prefix("symbol_bi:"),
+            symbol_trigrams: has_prefix("symbol_tri:"),
+            suspicious_ngram_counts: has_name("agg:suspicious_bigram_count")
+                || has_name("agg:suspicious_trigram_count"),
+            presence_lookup,
+            absolute_lookup,
             path_to_id,
             bigram_id_lookup,
             trigram_id_lookup,
@@ -1172,48 +1076,21 @@ impl ExtractContext {
             bigram_slots,
             trigram_slots,
             unsigned_bigram_slots,
-            layout_drift: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    /// Structural model-layout check, run at load time (corpus-independent).
-    ///
-    /// The offset-written families are now resolved per-member by name into
-    /// `*_slots` (see `new()`), so a partial / out-of-order / pruned family can
-    /// no longer misalign writes — each present member goes to its true slot and
-    /// missing members are skipped. There is therefore nothing to reject here for
-    /// those families; litmus accepts any layout the spec presents. Whole-bundle
-    /// drift (the spec declaring more features than any writer fills) is caught
-    /// separately by [`Self::had_layout_drift`] after the benign fixture pass.
-    pub fn validate_layout(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// Whether any extraction so far has observed feature-layout drift, i.e.
-    /// `total_features > cursor` (feature_names declares slots no writer fills,
-    /// so they extract to zero). False for a healthy or allowlist-pruned bundle.
-    /// Only meaningful after at least one extraction has run; `validate` checks
-    /// it after the benign fixture pass so a drifted bundle fails to deploy.
-    #[must_use]
-    pub fn had_layout_drift(&self) -> bool {
-        self.layout_drift.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Extract this route's feature vector from a cleave compact report.
     #[must_use]
     pub fn extract(&self, report: &cleave::types::CompactReport) -> Vec<f32> {
         let parsed = ParsedReport::from_compact_report(report, self.raw_needs(), None);
-        let mut vec = vec![0.0f32; self.total_features];
-        self.write_features(&parsed, &mut vec);
-        vec
+        self.extract_from_parsed(&parsed)
     }
 
     /// This route's active raw-subtree needs (which optional families it emits).
-    pub(crate) fn raw_needs(&self) -> RawNeeds {
+    pub(crate) const fn raw_needs(&self) -> RawNeeds {
         RawNeeds {
-            kv: self.n_kv > 0,
-            textenc: self.n_textenc > 0,
-            symbol: self.n_symbol > 0 || self.n_symbol_bi > 0 || self.n_symbol_tri > 0,
+            kv: self.kv,
+            symbol: self.symbols,
         }
     }
 
@@ -1226,518 +1103,193 @@ impl ExtractContext {
 
     /// Emit this route's features into `vec` from an already-parsed report.
     /// The parse is route-independent (see [`ParsedReport`]); only the writes
-    /// below depend on this context's vocab/slots.
+    /// below depend on this context's vocab/slots. Families are written in
+    /// layout order.
     fn write_features(&self, parsed: &ParsedReport, vec: &mut [f32]) {
-        use std::fmt::Write;
         let summaries = parsed.summaries.as_slice();
         let combined = &parsed.combined;
-        let merged_metrics = &parsed.merged_metrics;
-        let formula_str = parsed.formula_str.as_str();
-        let elements_str = parsed.elements_str.as_str();
-        let sample_score = parsed.sample_score;
-        let mut offsets = FeatureCursor::default();
+        let w = &mut FeatureWriter {
+            vec,
+            lookup: &self.absolute_lookup,
+        };
 
+        self.write_path_features(combined, parsed.sample_score, w); // G1, G2
+        write_aggregate_features(parsed, w); // G3
+        write_crit_ngrams(&parsed.crit_tokens, w);
+        write_ngrams(w, &parsed.attack_codes, "atkbi:", "atktri:", "ATT&CK");
+        write_ngrams(w, &parsed.mbc_codes, "mbcbi:", "mbctri:", "MBC");
+        write_external_summary_features(combined, w); // G4
+        self.write_metric_features(&parsed.merged_metrics, w); // G5
+        // G6 (filetype one-hots) is blindfolded since v16.
+        write_format_hint_features(summaries, w); // G6b
+        write_structural_features(w, summaries, combined.filtered_finding_count); // G7
+        self.write_formula_features(parsed, w); // G8–G10, G12–G14
+        self.write_bigram_features(summaries, w, &self.bigram_slots); // G11
+        write_tiered_bigram_features(&parsed.tiered_tokens, w); // G11b
+        write_tiered_trigram_features(&parsed.tiered_tokens, w); // G11c
+        write_structural_extensions(summaries, combined, w); // G15
+        self.write_trigram_features(summaries, w); // G16
+        write_logic_gap_features(combined, summaries, w); // G19
+        // G20: signature synergy — the bigram block again, for unsigned samples.
+        if combined.sample_paths.contains_key("metadata/unsigned") {
+            self.write_bigram_features(summaries, w, &self.unsigned_bigram_slots);
+        }
+        write_intent_gap_features(combined, w); // G22
+        write_negative_space_features(combined, summaries, w); // G23
+
+        // Families only some route specs carry. G24 (textenc) has no input in
+        // the compact report and always extracts as zero.
+        if self.suspicious_ngram_counts {
+            write_suspicious_ngram_counts(combined, w);
+        }
+        write_derived_metric_features(&parsed.merged_metrics, w);
+        write_silent_packer_signal(summaries, combined.filtered_finding_count, w);
+        if self.kv {
+            for s in summaries {
+                for token in &s.kv_tokens {
+                    w.set_token(token, 1.0);
+                }
+            }
+        }
+        if self.symbols {
+            write_symbol_features(summaries, w, self.symbol_bigrams, self.symbol_trigrams);
+        }
+    }
+
+    /// G1 presence and G2 max-criticality, per sample path, weighted by the
+    /// sample's risk score and the path's best confidence.
+    fn write_path_features(
+        &self,
+        summary: &FindingSummary,
+        sample_score: i64,
+        w: &mut FeatureWriter<'_>,
+    ) {
         let score_weight: f64 = if sample_score > 0 {
             (sample_score as f64).ln_1p()
         } else {
             1.0
         };
-
-        // G1: Presence. Cursor advanced only to feed the layout-drift check at
-        // the end; the write itself is anchored to the spec (see `new()`).
-        offsets.take(self.n_presence);
-        self.write_presence_features_v16(combined, vec, &self.present_slots, score_weight);
-
-        // G2: Max crit
-        offsets.take(self.n_presence);
-        self.write_max_crit_features_v16(combined, vec, &self.maxcrit_slots, score_weight);
-
-        // G3: Aggregates
-        let n_crit = self.n_crit_unigram + self.n_crit_bigram + self.n_crit_trigram;
-        let n_code_ngrams =
-            self.n_atk_bigram + self.n_atk_trigram + self.n_mbc_bigram + self.n_mbc_trigram;
-        offsets.take(57 + n_crit + n_code_ngrams);
-        write_aggregate_features(
-            combined,
-            summaries,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-        );
-
-        // Crit-category n-grams
-        {
-            let crit_categories: HashSet<&str> = [
-                "objectives",
-                "well-known",
-                "supply-chain",
-                "anti-analysis",
-                "anti-static",
-                "command-and-control",
-                "evasion",
-                "execution",
-                "exfiltration",
-            ]
-            .into_iter()
-            .collect();
-            let mut pmc: HashMap<String, u32> = HashMap::new();
-            for (path, &mo) in &combined.sample_paths {
-                if mo < 3 {
-                    continue;
-                }
-                let parts: Vec<&str> = path.split('/').collect();
-                if !crit_categories.contains(parts[0]) {
-                    continue;
-                }
-                let key = if parts.len() >= 2 {
-                    format!("{}/{}", parts[0], parts[1])
-                } else {
-                    parts[0].to_string()
-                };
-                let e = pmc.entry(key).or_insert(0);
-                *e = (*e).max(mo);
-            }
-            let mut tokens: Vec<String> = pmc
-                .iter()
-                .map(|(k, &c)| format!("{}:{k}", tier_prefix(c)))
-                .collect();
-            tokens.sort();
-            let lookup = &self.absolute_lookup;
-            let mut key = String::new();
-            for t in &tokens {
-                key.clear();
-                let _ = write!(key, "crit:{t}");
-                if let Some(&i) = lookup.get(key.as_str()) {
-                    vec[i] = 1.0;
-                }
-            }
-
-            // Safety: trigrams are O(N^3), bigrams O(N^2). Cap N to avoid complexity bombs on bloated reports.
-            if tokens.len() <= 512 {
-                for (i, t1) in tokens.iter().enumerate() {
-                    for t2 in &tokens[i + 1..] {
-                        key.clear();
-                        let _ = write!(key, "critbi:{t1} + {t2}");
-                        if let Some(&idx) = lookup.get(key.as_str()) {
-                            vec[idx] = 1.0;
-                        }
-                    }
-                    if tokens.len() <= 128 {
-                        for j in i + 1..tokens.len() {
-                            for t3 in &tokens[j + 1..] {
-                                key.clear();
-                                let _ = write!(key, "crittri:{t1} + {} + {t3}", tokens[j]);
-                                if let Some(&idx) = lookup.get(key.as_str()) {
-                                    vec[idx] = 1.0;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    tokens = tokens.len(),
-                    "too many unique crit tokens; skipping n-gram generation"
-                );
-            }
-        }
-
-        // ATT&CK/MBC code n-grams
-        {
-            let mut attacks: HashSet<String> = HashSet::new();
-            let mut mbcs: HashSet<String> = HashSet::new();
-            for s in summaries {
-                for f in &s.raw_findings {
-                    if let Some(a) = &f.atk {
-                        attacks.insert(a.clone());
-                    }
-                    if let Some(m) = &f.mbc {
-                        mbcs.insert(m.clone());
-                    }
-                }
-            }
-            let lookup = &self.absolute_lookup;
-            let mut key = String::new();
-            let mut sa: Vec<_> = attacks.iter().collect();
-            sa.sort();
-            if sa.len() <= 512 {
-                for (i, a1) in sa.iter().enumerate() {
-                    for (j, a2) in sa[i + 1..].iter().enumerate() {
-                        key.clear();
-                        let _ = write!(key, "atkbi:{a1} + {a2}");
-                        if let Some(&idx) = lookup.get(key.as_str()) {
-                            vec[idx] = 1.0;
-                        }
-                        if sa.len() <= 128 {
-                            for a3 in &sa[i + 1 + j + 1..] {
-                                key.clear();
-                                let _ = write!(key, "atktri:{a1} + {a2} + {a3}");
-                                if let Some(&idx) = lookup.get(key.as_str()) {
-                                    vec[idx] = 1.0;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    tokens = sa.len(),
-                    "too many unique ATT&CK tokens; skipping n-gram generation"
-                );
-            }
-
-            let mut sm: Vec<_> = mbcs.iter().collect();
-            sm.sort();
-            if sm.len() <= 512 {
-                for (i, m1) in sm.iter().enumerate() {
-                    for (j, m2) in sm[i + 1..].iter().enumerate() {
-                        key.clear();
-                        let _ = write!(key, "mbcbi:{m1} + {m2}");
-                        if let Some(&idx) = lookup.get(key.as_str()) {
-                            vec[idx] = 1.0;
-                        }
-                        if sm.len() <= 128 {
-                            for m3 in &sm[i + 1 + j + 1..] {
-                                key.clear();
-                                let _ = write!(key, "mbctri:{m1} + {m2} + {m3}");
-                                if let Some(&idx) = lookup.get(key.as_str()) {
-                                    vec[idx] = 1.0;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    tokens = sm.len(),
-                    "too many unique MBC tokens; skipping n-gram generation"
-                );
-            }
-        }
-
-        // G4: External (name-based)
-        offsets.take(6); // reserve space for offset tracking compatibility
-        write_external_summary_features(
-            combined,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-        );
-
-        // G5: Metrics (base + extended vocab)
-        offsets.take(KEY_METRICS.len() + self.n_ext_metrics);
-        write_metric_features(
-            merged_metrics,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-            &self.metric_vocab,
-        );
-
-        // G6: Filetype (blindfolded in v16)
-        let _file_type_offset = offsets.take(self.n_ft);
-
-        // G6b: Format hints
-        offsets.take(self.n_format);
-        write_format_hint_features(
-            summaries,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-        );
-
-        // G7: Structural
-        offsets.take(11);
-        write_structural_features(
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-            summaries,
-            combined.filtered_finding_count,
-        );
-
-        // G8: Elements
-        offsets.take(self.n_element);
-        {
-            let w = &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            };
-            if !elements_str.is_empty() {
-                for el in elements_str.split(',') {
-                    let el = el.trim();
-                    w.set(&format!("elements:{el}"), 1.0);
-                }
-            }
-
-            // G9: Formula
-            let skeleton_str: String = formula_str.chars().filter(|c| c.is_alphabetic()).collect();
-            let unique_skel_chars: HashSet<char> = skeleton_str.chars().collect();
-            w.set("formula:skeleton_len", skeleton_str.chars().count() as f32);
-            w.set("formula:unique_elements", unique_skel_chars.len() as f32);
-            if combined.filtered_finding_count > 0 {
-                w.set(
-                    "formula:complexity_ratio",
-                    formula_str.chars().count() as f32 / combined.filtered_finding_count as f32,
-                );
-            }
-
-            // G10: Score
-            let total_size_bytes: f64 = summaries.iter().map(|s| s.size_bytes).sum();
-            w.set("score:hopper_score", sample_score as f32);
-            w.set(
-                "score:density",
-                if total_size_bytes > 0.0 {
-                    sample_score as f32 / (total_size_bytes as f32).ln_1p()
-                } else {
-                    0.0
-                },
-            );
-            for s in summaries {
-                w.set(&format!("inter:{}*score", s.file_type), sample_score as f32);
-            }
-
-            // G12: Ghost
-            for ghost_path in &self.ghost_vocab {
-                let missing = match combined.sample_paths.get(ghost_path) {
-                    Some(&max_ord) => max_ord < 2,
-                    None => true,
-                };
-                if missing {
-                    w.set(&format!("ghost:{ghost_path}"), 1.0);
-                }
-            }
-
-            // G13: Skeleton
-            if !skeleton_str.is_empty() {
-                w.set(&format!("skeleton:{skeleton_str}"), 1.0);
-            }
-
-            // G14: Rare Elements
-            if !elements_str.is_empty() {
-                let weight: f32 = if combined.finding_confidences.is_empty() {
-                    1.0
-                } else {
-                    let sum: f64 = combined.finding_confidences.iter().sum();
-                    (sum / combined.finding_confidences.len() as f64) as f32
-                };
-                for el in elements_str.split(',') {
-                    let el = el.trim();
-                    w.set(&format!("rare:{el}"), weight);
-                }
-            }
-        }
-        offsets.take(3); // formula
-        offsets.take(2 + self.n_ft); // score
-
-        // G11: Bigrams (optimized — resolved per-member via the slot map)
-        offsets.take(self.n_bigram);
-        self.write_bigram_features_optimized(summaries, vec, &self.bigram_slots);
-
-        // G11b/G11c: Tiered report-level notable+ n-grams. Both share one token set.
-        let tiered_tokens = tiered_path_tokens(combined);
-        offsets.take(self.n_tiered_bigram);
-        write_tiered_bigram_features(
-            &tiered_tokens,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-        );
-        offsets.take(self.n_tiered_trigram);
-        write_tiered_trigram_features(
-            &tiered_tokens,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-        );
-
-        offsets.take(self.n_ghost); // ghost (now name-based above)
-        offsets.take(self.n_skeleton); // skeleton (now name-based above)
-        offsets.take(self.n_rare); // rare (now name-based above)
-
-        // G15: Structural Extensions
-        offsets.take(13);
-        write_structural_extensions(
-            summaries,
-            combined,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-        );
-
-        // G16: Trigrams (optimized)
-        offsets.take(self.n_trigram);
-        self.write_trigram_features_optimized(summaries, vec, &self.trigram_slots);
-
-        // G19: Logic Gaps
-        offsets.take(LOGIC_GAP_CATEGORIES.len());
-        write_logic_gap_features(
-            combined,
-            summaries,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-        );
-
-        // G20: Signature Synergy (unsigned-bigram block; same bigram ids, own slots)
-        offsets.take(self.n_bigram);
-        if combined.sample_paths.contains_key("metadata/unsigned") {
-            self.write_bigram_features_optimized(summaries, vec, &self.unsigned_bigram_slots);
-        }
-
-        // G22: Intent Gaps
-        offsets.take(INTENT_GAP_CATEGORIES.len());
-        write_intent_gap_features(
-            combined,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-        );
-
-        // G23: Negative Space
-        let missing_count: usize = EXPECTED_GHOSTS.iter().map(|(_, t)| t.len()).sum();
-        offsets.take(missing_count);
-        write_negative_space_features(
-            combined,
-            summaries,
-            &mut FeatureWriter {
-                vec,
-                lookup: &self.absolute_lookup,
-            },
-        );
-
-        // G24+: extras gated by per-route spec contents.
-        // Sparse one-hot families that resolve through absolute_lookup; the
-        // cursor bookkeeping below tracks how many of these slots actually
-        // exist in this spec so the final offset matches total_features.
-        let mut tail_writer = FeatureWriter {
-            vec,
-            lookup: &self.absolute_lookup,
-        };
-
-        if self.n_extra_agg > 0 {
-            offsets.take(self.n_extra_agg);
-            write_suspicious_ngram_counts(combined, &mut tail_writer);
-        }
-        if self.n_derived_metrics > 0 {
-            offsets.take(self.n_derived_metrics);
-            write_derived_metric_features(merged_metrics, &mut tail_writer);
-        }
-        if self.n_silent_packer > 0 {
-            offsets.take(self.n_silent_packer);
-            write_silent_packer_signal(
-                summaries,
-                combined.filtered_finding_count,
-                &mut tail_writer,
-            );
-        }
-        if self.n_textenc > 0 {
-            offsets.take(self.n_textenc);
-            write_textenc_features(summaries, &mut tail_writer);
-        }
-        if self.n_kv > 0 {
-            offsets.take(self.n_kv);
-            for s in summaries {
-                write_kv_features(s, &mut tail_writer);
-            }
-        }
-        if self.n_symbol > 0 || self.n_symbol_bi > 0 || self.n_symbol_tri > 0 {
-            offsets.take(self.n_symbol + self.n_symbol_bi + self.n_symbol_tri);
-            write_symbol_features(
-                summaries,
-                &mut tail_writer,
-                self.n_symbol_bi > 0,
-                self.n_symbol_tri > 0,
-            );
-        }
-
-        // The hand-maintained cursor sums the FULL layout (every family at its
-        // spec vocab length plus the fixed blocks). Writes are anchored to the
-        // spec's `feature_names`, so the cursor is not load-bearing for
-        // correctness — but it still detects layout drift, with a direction that
-        // matters:
-        //
-        //   * `total_features < cursor` — the spec is a SUBSET of the full
-        //     layout. This is exactly what an allowlist (COLLIMATOR_ALLOWED_
-        //     FEATURES_FILE) produces: feature_names is pruned while litmus walks
-        //     the full layout. Healthy and common; must NOT warn (it would fire
-        //     on every pruned bundle and block deploys that gate on warnings).
-        //
-        //   * `total_features > cursor` — feature_names declares MORE slots than
-        //     any family writer fills, so the surplus slots extract to a silent
-        //     zero. This is real drift: features.rs layout constants have fallen
-        //     behind collimator (a new fixed family it doesn't know to write).
-        //     Flag it so `validate` fails the bundle; never panic mid-analysis.
-        if self.total_features > offsets.offset {
-            self.layout_drift
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            static DRIFT_WARNED: std::sync::Once = std::sync::Once::new();
-            DRIFT_WARNED.call_once(|| {
-                tracing::warn!(
-                    cursor = offsets.offset,
-                    total_features = self.total_features,
-                    "feature-layout declares more features than the extractor \
-                     writes; the surplus feature_names slots are unreachable and \
-                     extract to zero — features.rs layout constants have drifted \
-                     behind collimator and must be resynced",
-                );
-            });
-        }
-    }
-
-    fn write_presence_features_v16(
-        &self,
-        summary: &FindingSummary,
-        vec: &mut [f32],
-        slots: &[Option<usize>],
-        score_weight: f64,
-    ) {
         for (path, &max_ord) in &summary.sample_paths {
-            if max_ord >= 2
+            if max_ord >= CRIT_BASELINE
                 && let Some(&idx) = self.presence_lookup.get(path.as_str())
-                && let Some(&Some(slot)) = slots.get(idx)
+                && let Some(&Some(slot)) = self.present_slots.get(idx)
             {
                 let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0);
-                if let Some(cell) = vec.get_mut(slot) {
-                    *cell = (score_weight * conf) as f32;
-                }
+                w.set_slot(slot, (score_weight * conf) as f32);
             }
         }
-    }
-
-    fn write_max_crit_features_v16(
-        &self,
-        summary: &FindingSummary,
-        vec: &mut [f32],
-        slots: &[Option<usize>],
-        score_weight: f64,
-    ) {
         for (path, &max_ord) in &summary.sample_paths {
             if let Some(&idx) = self.presence_lookup.get(path.as_str())
-                && let Some(&Some(slot)) = slots.get(idx)
+                && let Some(&Some(slot)) = self.maxcrit_slots.get(idx)
             {
                 let conf = summary.path_confidences.get(path).copied().unwrap_or(1.0);
-                if let Some(cell) = vec.get_mut(slot) {
-                    *cell = (f64::from(max_ord) * score_weight * conf) as f32;
-                }
+                w.set_slot(slot, (f64::from(max_ord) * score_weight * conf) as f32);
             }
         }
     }
 
-    fn write_bigram_features_optimized(
+    /// G5: the base [`KEY_METRICS`] then the spec's extended metric vocab.
+    fn write_metric_features(&self, metrics: &MetricMap, w: &mut FeatureWriter<'_>) {
+        for m in &self.metric_slots {
+            let value = metrics
+                .get(&m.group)
+                .and_then(|g| g.get(&m.field))
+                .copied()
+                .unwrap_or(0.0) as f32;
+            w.set_slot(
+                m.slot,
+                if m.log {
+                    (value.abs() + 1.0).ln()
+                } else {
+                    value
+                },
+            );
+        }
+    }
+
+    /// G8 elements, G9 formula, G10 score, G12 ghost, G13 skeleton and G14
+    /// rare elements: the families read off the primary file's formula and
+    /// risk score.
+    fn write_formula_features(&self, parsed: &ParsedReport, w: &mut FeatureWriter<'_>) {
+        let combined = &parsed.combined;
+        let formula_str = parsed.formula_str.as_str();
+        let elements_str = parsed.elements_str.as_str();
+        let sample_score = parsed.sample_score;
+        let mut key = String::new();
+
+        // G8: Elements
+        if !elements_str.is_empty() {
+            for el in elements_str.split(',') {
+                w.set_prefixed(&mut key, "elements:", el.trim(), 1.0);
+            }
+        }
+
+        // G9: Formula
+        let skeleton_str: String = formula_str.chars().filter(|c| c.is_alphabetic()).collect();
+        let unique_skel_chars: HashSet<char> = skeleton_str.chars().collect();
+        w.set("formula:skeleton_len", skeleton_str.chars().count() as f32);
+        w.set("formula:unique_elements", unique_skel_chars.len() as f32);
+        if combined.filtered_finding_count > 0 {
+            w.set(
+                "formula:complexity_ratio",
+                formula_str.chars().count() as f32 / combined.filtered_finding_count as f32,
+            );
+        }
+
+        // G10: Score
+        let total_size_bytes: f64 = parsed.summaries.iter().map(|s| s.size_bytes).sum();
+        w.set("score:hopper_score", sample_score as f32);
+        w.set(
+            "score:density",
+            if total_size_bytes > 0.0 {
+                sample_score as f32 / (total_size_bytes as f32).ln_1p()
+            } else {
+                0.0
+            },
+        );
+        for s in &parsed.summaries {
+            key.clear();
+            let _ = write!(key, "inter:{}*score", s.file_type);
+            w.set_token(&key, sample_score as f32);
+        }
+
+        // G12: Ghost — an expected path the sample never reached at baseline.
+        for (ghost_path, slot) in &self.ghost_slots {
+            let missing = combined
+                .sample_paths
+                .get(ghost_path)
+                .is_none_or(|&max_ord| max_ord < CRIT_BASELINE);
+            if missing {
+                w.set_slot(*slot, 1.0);
+            }
+        }
+
+        // G13: Skeleton
+        if !skeleton_str.is_empty() {
+            w.set_prefixed(&mut key, "skeleton:", &skeleton_str, 1.0);
+        }
+
+        // G14: Rare Elements, weighted by the mean finding confidence.
+        if !elements_str.is_empty() {
+            let weight: f32 = if combined.finding_confidences.is_empty() {
+                1.0
+            } else {
+                let sum: f64 = combined.finding_confidences.iter().sum();
+                (sum / combined.finding_confidences.len() as f64) as f32
+            };
+            for el in elements_str.split(',') {
+                w.set_prefixed(&mut key, "rare:", el.trim(), weight);
+            }
+        }
+    }
+
+    /// Path-pair features: a vocab bigram is set when both of its 3-level
+    /// paths fired in the same file. `slots` picks the family (`bigrams:` or
+    /// `unsigned_bigram:`), which share one vocab.
+    fn write_bigram_features(
         &self,
         summaries: &[FileSummary],
-        vec: &mut [f32],
+        w: &mut FeatureWriter<'_>,
         slots: &[Option<usize>],
     ) {
         for s in summaries {
@@ -1755,21 +1307,16 @@ impl ExtractContext {
                     let key = (ids[i].min(ids[j]), ids[i].max(ids[j]));
                     if let Some(&idx) = self.bigram_id_lookup.get(&key)
                         && let Some(&Some(slot)) = slots.get(idx)
-                        && let Some(cell) = vec.get_mut(slot)
                     {
-                        *cell = 1.0;
+                        w.set_slot(slot, 1.0);
                     }
                 }
             }
         }
     }
 
-    fn write_trigram_features_optimized(
-        &self,
-        summaries: &[FileSummary],
-        vec: &mut [f32],
-        slots: &[Option<usize>],
-    ) {
+    /// Path-triple features, as [`Self::write_bigram_features`].
+    fn write_trigram_features(&self, summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
         for s in summaries {
             let ids: Vec<u32> = s
                 .unique_3level_paths
@@ -1789,10 +1336,9 @@ impl ExtractContext {
                         if let Some(&idx) = self
                             .trigram_id_lookup
                             .get(&(sorted[0], sorted[1], sorted[2]))
-                            && let Some(&Some(slot)) = slots.get(idx)
-                            && let Some(cell) = vec.get_mut(slot)
+                            && let Some(&Some(slot)) = self.trigram_slots.get(idx)
                         {
-                            *cell = 1.0;
+                            w.set_slot(slot, 1.0);
                         }
                     }
                 }
@@ -1801,17 +1347,47 @@ impl ExtractContext {
     }
 }
 
-#[derive(Debug, Default)]
-struct FeatureCursor {
-    offset: usize,
-}
-
-impl FeatureCursor {
-    fn take(&mut self, width: usize) -> usize {
-        let start = self.offset;
-        self.offset += width;
-        start
-    }
+/// Resolve the `metrics:` family to slots: every [`KEY_METRICS`] entry, then
+/// each extended-vocab key (`<group>_<field>`) that is not a base metric.
+/// Extended keys are log-scaled when the field names a count or size.
+fn metric_slots(lookup: &HashMap<String, usize>, metric_vocab: &[String]) -> Vec<MetricSlot> {
+    let base = KEY_METRICS.iter().map(|&(group, field, log)| {
+        (
+            format!("metrics:{group}_{field}"),
+            group.to_string(),
+            field.to_string(),
+            log,
+        )
+    });
+    let base_keys: HashSet<String> = KEY_METRICS
+        .iter()
+        .map(|&(group, field, _)| format!("{group}_{field}"))
+        .collect();
+    let extended = metric_vocab.iter().filter_map(|key| {
+        let (group, field) = key.split_once('_')?;
+        if base_keys.contains(key.as_str()) {
+            return None;
+        }
+        let log = ["count", "size", "total", "bytes", "length"]
+            .iter()
+            .any(|word| field.contains(word));
+        Some((
+            format!("metrics:{key}"),
+            group.to_string(),
+            field.to_string(),
+            log,
+        ))
+    });
+    base.chain(extended)
+        .filter_map(|(name, group, field, log)| {
+            Some(MetricSlot {
+                slot: *lookup.get(&name)?,
+                group,
+                field,
+                log,
+            })
+        })
+        .collect()
 }
 
 /// The finding fields retained for cross-file aggregation: ID dedup and
@@ -1827,72 +1403,56 @@ struct RawFinding {
 }
 
 /// Pre-calculated data for a single file entry in a report.
+///
+/// The compact schema carries no parent links, mtimes, flat values or
+/// strings, so the features collimator derives from those (nesting depth,
+/// inner-file fractions, mtime spreads, `textenc:`) are constants here; the
+/// writers say which.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct FileSummary {
     path: String,
-    parent: String,
     file_type: String,
     size_bytes: f64,
-    mtime: Option<f64>,
     overall_entropy: f64,
     metrics: HashMap<String, HashMap<String, f64>>,
-    /// Full raw cleave metrics JSON (preserves strings, lists, dicts that
-    /// the numeric `metrics` map drops). Used by kv: token extraction.
-    raw_metrics: serde_json::Value,
-    /// Flat structural values from `fact.val` / `ff.v` or `k` (kv: source for v.* paths).
-    raw_values: serde_json::Value,
-    /// String tuples from `fact.str` / `ff.s` or `ss` (textenc source).
-    raw_strings: Vec<serde_json::Value>,
     findings: FindingSummary,
     risk: FileRiskStats,
     unique_3level_paths: Vec<String>,
+    /// Import tokens (`name` and `lib!name`) for the logic-gap features.
     imports: HashSet<String>,
-    /// Cleave imports array (preserves [lib, name, ...] tuples for symbol port).
-    raw_imports: Vec<serde_json::Value>,
-    /// Cleave exports (`fact.exp` / `ff.x`) — list of export entries; one source for `symbol:`.
-    raw_exports: Vec<serde_json::Value>,
-    /// Cleave function names (`fact.fn` / `ff.fn`) — second source for `symbol:`.
-    raw_functions: Vec<serde_json::Value>,
-    /// Filefacts call targets (`fact.tgt` / `ff.ct`) — dotted call paths
-    /// (`Symbol::Call.target`). Sourced from cleave's v5 compact AST
-    /// emission; flows into `symbol:` when the spec's symbol_vocab
-    /// contains the token.
-    raw_call_targets: Vec<serde_json::Value>,
-    /// Filefacts member chains (`fact.mbr` / `ff.mc`) — dotted access chains
-    /// (`Symbol::Member.path`). Same flow as call targets.
-    raw_member_chains: Vec<serde_json::Value>,
+    /// Full `kv:` feature names from the metrics block. Empty unless a route
+    /// reads the `kv:` family.
+    kv_tokens: Vec<String>,
+    /// Normalized import/export/function/AST symbols, sorted and unique.
+    /// Empty unless a route reads the `symbol:` family.
+    symbols: Vec<String>,
     /// Findings reduced to the fields used for cross-file aggregation.
     raw_findings: Vec<RawFinding>,
-    /// Whether the "is" key exists in the cleave JSON (even if empty).
-    has_imports_key: bool,
 }
 
-/// Which optional feature families are active for this route, so [`FileSummary::new`]
-/// only clones the raw JSON subtrees those families actually read.
-#[derive(Clone, Copy, Default)]
+/// Which optional feature families are active for this route, so
+/// [`FileSummary::from_compact`] only gathers the inputs they read.
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RawNeeds {
     kv: bool,
-    textenc: bool,
     symbol: bool,
 }
 
 impl RawNeeds {
-    /// All optional raw subtrees needed by any specialist feature family.
+    /// All optional inputs any specialist feature family may read.
     pub(crate) const fn all() -> Self {
         Self {
             kv: true,
-            textenc: true,
             symbol: true,
         }
     }
 
     /// The needs of any of two consumers — used to parse a report once for the
-    /// general pass and every route, cloning a subtree if *any* of them reads it.
+    /// general pass and every route, gathering an input if *any* of them reads it.
     /// `RawNeeds::default()` (no families) is the identity for folding these.
-    pub(crate) fn union(self, other: Self) -> Self {
+    pub(crate) const fn union(self, other: Self) -> Self {
         Self {
             kv: self.kv || other.kv,
-            textenc: self.textenc || other.textenc,
             symbol: self.symbol || other.symbol,
         }
     }
@@ -1901,10 +1461,11 @@ impl RawNeeds {
 /// A report parsed into the route-independent summaries the feature writers read.
 ///
 /// Building this is the expensive part of extraction (per-file `FileSummary`
-/// construction, cross-file finding/metric aggregation). It depends only on the
-/// report and the union of active families, never on a specific route's vocab —
-/// so the general pass and every ML route share one `ParsedReport` instead of
-/// each re-summarizing the same report.
+/// construction, cross-file finding/metric aggregation, token sets). It depends
+/// only on the report and the union of active families, never on a specific
+/// route's vocab — so the general pass and every ML route share one
+/// `ParsedReport` instead of each re-summarizing the same report.
+#[derive(Debug)]
 pub(crate) struct ParsedReport {
     summaries: Vec<FileSummary>,
     combined: FindingSummary,
@@ -1912,6 +1473,13 @@ pub(crate) struct ParsedReport {
     formula_str: String,
     elements_str: String,
     sample_score: i64,
+    /// Sorted `tier:category[/sub]` tokens for the `crit:` n-grams.
+    crit_tokens: Vec<String>,
+    /// Sorted `tier:path` tokens for the `tierbi:`/`tiertri:` families.
+    tiered_tokens: Vec<String>,
+    /// Distinct ATT&CK technique and MBC behavior codes, sorted.
+    attack_codes: Vec<String>,
+    mbc_codes: Vec<String>,
 }
 
 impl ParsedReport {
@@ -1924,7 +1492,7 @@ impl ParsedReport {
     pub(crate) fn from_compact_report(
         report: &cleave::types::CompactReport,
         needs: RawNeeds,
-        keep: Option<&std::collections::HashSet<String>>,
+        keep: Option<&HashSet<String>>,
     ) -> Self {
         let files: Vec<&cleave::types::CompactFile> = match keep {
             Some(shas) => report
@@ -1962,27 +1530,40 @@ impl ParsedReport {
         } else {
             file_summaries
         };
-        let canonical = files.iter().copied().find(|f| f.depth == 0).map_or_else(
-            || (String::new(), String::new(), 0),
-            |f| {
-                let formula = f.formula.clone().unwrap_or_default();
-                let elements: String = formula
-                    .chars()
-                    .filter(|c| !('\u{2080}'..='\u{2089}').contains(c))
-                    .collect();
-                (formula, elements, f.risk)
-            },
-        );
-        Self::from_summaries(summaries, canonical)
-    }
+        let (formula_str, elements_str, sample_score) =
+            files.iter().copied().find(|f| f.depth == 0).map_or_else(
+                || (String::new(), String::new(), 0),
+                |f| {
+                    let formula = f.formula.clone().unwrap_or_default();
+                    let elements: String = formula
+                        .chars()
+                        .filter(|c| !('\u{2080}'..='\u{2089}').contains(c))
+                        .collect();
+                    (formula, elements, f.risk)
+                },
+            );
 
-    /// Assemble from per-file summaries plus the primary file's canonical
-    /// fields. The aggregate half of the featurizer, shared by the JSON and
-    /// typed entry points so only the per-file read differs between them.
-    fn from_summaries(summaries: Vec<FileSummary>, canonical: (String, String, i64)) -> Self {
         let combined = summarize_report_summaries(&summaries);
         let merged_metrics = merge_metric_summaries(&summaries);
-        let (formula_str, elements_str, sample_score) = canonical;
+        let crit_tokens = crit_category_tokens(&combined);
+        let tiered_tokens = tiered_path_tokens(&combined);
+        let mut attack_codes: HashSet<&str> = HashSet::new();
+        let mut mbc_codes: HashSet<&str> = HashSet::new();
+        for finding in summaries.iter().flat_map(|s| &s.raw_findings) {
+            if let Some(a) = &finding.atk {
+                attack_codes.insert(a);
+            }
+            if let Some(m) = &finding.mbc {
+                mbc_codes.insert(m);
+            }
+        }
+        let sorted = |codes: HashSet<&str>| {
+            let mut codes: Vec<String> = codes.into_iter().map(str::to_string).collect();
+            codes.sort();
+            codes
+        };
+        let attack_codes = sorted(attack_codes);
+        let mbc_codes = sorted(mbc_codes);
         Self {
             summaries,
             combined,
@@ -1990,22 +1571,16 @@ impl ParsedReport {
             formula_str,
             elements_str,
             sample_score,
+            crit_tokens,
+            tiered_tokens,
+            attack_codes,
+            mbc_codes,
         }
     }
 }
 
 impl FileSummary {
-    /// Build a summary from the **typed** compact report instead of a
-    /// `serde_json::Value` tree — the read that lets `classify_report` skip
-    /// materializing a multi-GB DOM (MEMORY_EXPERIMENTS.md, N2).
-    ///
-    /// This must reproduce [`FileSummary::new`] exactly for a current-schema
-    /// report, including where that reader finds nothing: the compact schema
-    /// carries no `p`, `mt`, `val`/`k` or `str`/`ss` equivalents, so `parent`,
-    /// `mtime`, `raw_values` and `raw_strings` are empty on both paths, and
-    /// `has_imports_key` (which probes only the retired `fact`/`ff`/`is` keys)
-    /// is false on both. `typed_and_dom_readers_agree` pins that equality —
-    /// a divergence here would move ML output silently rather than fail.
+    /// Summarize one compact file entry.
     fn from_compact(file: &cleave::types::CompactFile, needs: RawNeeds) -> Self {
         let finding_views: Vec<FindingView<'_>> = file
             .findings
@@ -2033,7 +1608,7 @@ impl FileSummary {
 
         let mut unique_3level_paths: Vec<String> = finding_views
             .iter()
-            .filter(|f| f.conf >= MIN_CONFIDENCE && f.crit >= 3)
+            .filter(|f| f.conf >= MIN_CONFIDENCE && f.crit >= CRIT_NOTABLE)
             .map(|f| f.id.split("::").next().unwrap_or(f.id).to_string())
             .collect::<HashSet<_>>()
             .into_iter()
@@ -2053,8 +1628,6 @@ impl FileSummary {
             .copied()
             .unwrap_or(0.0);
 
-        // Same tokens the JSON reader derives from the `[library, name]`
-        // tuples, built without going through JSON.
         let imports: HashSet<String> = file
             .facts
             .imports
@@ -2074,60 +1647,29 @@ impl FileSummary {
             })
             .collect();
 
-        let raw_metrics = if needs.kv {
-            metrics_value.cloned().unwrap_or(serde_json::Value::Null)
-        } else {
-            serde_json::Value::Null
-        };
-
-        // The symbol family still reads these as JSON; convert only the
-        // subtrees whose feature family is active on this route.
-        let (raw_imports, raw_exports, raw_functions, raw_call_targets, raw_member_chains) =
-            if needs.symbol {
-                (
-                    to_value_vec(&file.facts.imports),
-                    to_value_vec(&file.facts.exports),
-                    to_value_vec(&file.facts.functions),
-                    to_value_vec(&file.facts.targets),
-                    to_value_vec(&file.facts.members),
-                )
-            } else {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            };
-
         Self {
             path: file.path.clone(),
-            // No `p` / `mt` / `val` / `str` equivalents in the compact schema.
-            parent: String::new(),
             file_type: file.file_type.clone(),
             size_bytes,
-            mtime: None,
             overall_entropy,
             metrics,
-            raw_metrics,
-            raw_values: serde_json::Value::Null,
-            raw_strings: Vec::new(),
             findings,
             risk,
             unique_3level_paths,
             imports,
-            raw_imports,
-            raw_exports,
-            raw_functions,
-            raw_call_targets,
-            raw_member_chains,
+            kv_tokens: if needs.kv {
+                kv_tokens(metrics_value)
+            } else {
+                Vec::new()
+            },
+            symbols: if needs.symbol {
+                file_symbols(&file.facts)
+            } else {
+                Vec::new()
+            },
             raw_findings,
-            has_imports_key: false,
         }
     }
-}
-
-/// Serialize a typed facts list into the JSON shape the symbol features read.
-fn to_value_vec<T: serde::Serialize>(items: &[T]) -> Vec<serde_json::Value> {
-    items
-        .iter()
-        .filter_map(|i| serde_json::to_value(i).ok())
-        .collect()
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -2153,8 +1695,7 @@ struct FindingSummary {
 }
 
 /// Flatten a metrics object into `{group: {field: number}}`, keeping numbers
-/// and booleans (`true` → 1.0) and dropping strings/nulls. Shared by both
-/// report readers so the numeric view of metrics cannot differ between them.
+/// and booleans (`true` → 1.0) and dropping strings/nulls.
 fn numeric_metrics(source: Option<&serde_json::Value>) -> HashMap<String, HashMap<String, f64>> {
     source
         .and_then(|v| v.as_object())
@@ -2180,7 +1721,7 @@ fn numeric_metrics(source: Option<&serde_json::Value>) -> HashMap<String, HashMa
 
 /// The tokens a `(library, name)` import pair contributes: the bare name and
 /// the `lib!name` form, each subject to collimator's per-token `len >= 2`
-/// gate. Shared by the JSON and typed readers so they cannot disagree.
+/// gate.
 fn import_tokens_from_parts(lib: &str, name: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(2);
     if name.len() >= 2 {
@@ -2200,23 +1741,19 @@ fn import_tokens_from_parts(lib: &str, name: &str) -> Vec<String> {
 }
 
 /// The whole of a finding that scoring reads: its id, confidence and
-/// criticality ordinal. Both report representations project into this before
-/// summarizing, so the DOM reader and the typed reader cannot drift into
-/// scoring the same report differently — a divergence that would move ML
-/// output silently rather than fail. See MEMORY_EXPERIMENTS.md (N2).
+/// criticality ordinal.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct FindingView<'a> {
-    pub(crate) id: &'a str,
-    pub(crate) conf: f64,
-    pub(crate) crit: u32,
+struct FindingView<'a> {
+    id: &'a str,
+    conf: f64,
+    crit: u32,
 }
 
 impl<'a> FindingView<'a> {
     /// Project a typed compact finding. `criticality` is already the same
-    /// 0-5 ordinal the wire `crit` field carries, and `conf` is now always
-    /// written, so both read straight through — no reader-side default to
-    /// disagree about.
-    pub(crate) fn from_compact(finding: &'a cleave::types::CompactTrait) -> Self {
+    /// 0-5 ordinal the wire `crit` field carries, and `conf` is always
+    /// written, so both read straight through.
+    fn from_compact(finding: &'a cleave::types::CompactTrait) -> Self {
         Self {
             id: &finding.id,
             conf: f64::from(finding.confidence),
@@ -2245,15 +1782,15 @@ fn summarize_findings(findings: &[FindingView<'_>]) -> FindingSummary {
         summary.finding_confidences.push(conf);
         let crit_ord = finding.crit;
 
-        if crit_ord >= 3 {
+        if crit_ord >= CRIT_NOTABLE {
             summary.notable_finding_count += 1;
             notable_ids.insert(fid);
         }
-        if crit_ord >= 4 {
+        if crit_ord >= CRIT_SUSPICIOUS {
             summary.suspicious_finding_count += 1;
             suspicious_ids.insert(fid);
         }
-        if crit_ord >= 5 {
+        if crit_ord >= CRIT_HOSTILE {
             summary.hostile_finding_count += 1;
             hostile_ids.insert(fid);
         }
@@ -2269,9 +1806,9 @@ fn summarize_findings(findings: &[FindingView<'_>]) -> FindingSummary {
             }
             "well-known" => {
                 summary.well_known_max_crit = summary.well_known_max_crit.max(crit_ord);
-                if crit_ord >= 5 {
+                if crit_ord >= CRIT_HOSTILE {
                     summary.well_known_hostile += 1;
-                } else if crit_ord >= 4 {
+                } else if crit_ord >= CRIT_SUSPICIOUS {
                     summary.well_known_suspicious += 1;
                 }
             }
@@ -2302,20 +1839,27 @@ fn summarize_findings(findings: &[FindingView<'_>]) -> FindingSummary {
     summary.unique_notable_ids = notable_ids.len();
     summary.unique_suspicious_ids = suspicious_ids.len();
     summary.unique_hostile_ids = hostile_ids.len();
+    (
+        summary.suspicious_category_breadth,
+        summary.hostile_category_breadth,
+    ) = category_breadth(&summary.sample_paths);
+    summary
+}
 
+/// Distinct top-level categories reached at suspicious and at hostile
+/// criticality.
+fn category_breadth(sample_paths: &HashMap<String, u32>) -> (usize, usize) {
     let mut susp_cats: HashSet<&str> = HashSet::new();
     let mut host_cats: HashSet<&str> = HashSet::new();
-    for (path, &max_ord) in &summary.sample_paths {
-        if max_ord >= 4 {
+    for (path, &max_ord) in sample_paths {
+        if max_ord >= CRIT_SUSPICIOUS {
             susp_cats.insert(path.split('/').next().unwrap_or(""));
         }
-        if max_ord >= 5 {
+        if max_ord >= CRIT_HOSTILE {
             host_cats.insert(path.split('/').next().unwrap_or(""));
         }
     }
-    summary.suspicious_category_breadth = susp_cats.len();
-    summary.hostile_category_breadth = host_cats.len();
-    summary
+    (susp_cats.len(), host_cats.len())
 }
 
 fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
@@ -2376,13 +1920,13 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
                 continue;
             }
             let crit = finding.crit;
-            if crit >= 3 {
+            if crit >= CRIT_NOTABLE {
                 notable_ids.insert(fid);
             }
-            if crit >= 4 {
+            if crit >= CRIT_SUSPICIOUS {
                 suspicious_ids.insert(fid);
             }
-            if crit >= 5 {
+            if crit >= CRIT_HOSTILE {
                 hostile_ids.insert(fid);
             }
         }
@@ -2391,19 +1935,10 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
     combined.unique_notable_ids = notable_ids.len();
     combined.unique_suspicious_ids = suspicious_ids.len();
     combined.unique_hostile_ids = hostile_ids.len();
-
-    let mut susp_cats: HashSet<&str> = HashSet::new();
-    let mut host_cats: HashSet<&str> = HashSet::new();
-    for (path, &max_ord) in &combined.sample_paths {
-        if max_ord >= 4 {
-            susp_cats.insert(path.split('/').next().unwrap_or(""));
-        }
-        if max_ord >= 5 {
-            host_cats.insert(path.split('/').next().unwrap_or(""));
-        }
-    }
-    combined.suspicious_category_breadth = susp_cats.len();
-    combined.hostile_category_breadth = host_cats.len();
+    (
+        combined.suspicious_category_breadth,
+        combined.hostile_category_breadth,
+    ) = category_breadth(&combined.sample_paths);
     combined
 }
 
@@ -2420,69 +1955,157 @@ struct FileRiskStats {
     max_crit: u32,
 }
 
-fn write_aggregate_features(
+/// G3: report-level aggregates.
+fn write_aggregate_features(parsed: &ParsedReport, w: &mut FeatureWriter<'_>) {
+    let summary = &parsed.combined;
+    let summaries = parsed.summaries.as_slice();
+    let breadth = PathBreadth::new(summary);
+    write_breadth_features(summary, &breadth, w);
+    write_finding_volume_features(summary, summaries, w);
+    write_top_file_features(summaries, w);
+    write_file_tier_features(summaries, w);
+    write_code_features(summary, &parsed.attack_codes, &parsed.mbc_codes, w);
+}
+
+/// How widely the sample's findings spread over the trait taxonomy, counted
+/// over distinct sample paths at each criticality tier.
+struct PathBreadth {
+    max_crit: u32,
+    /// Top-level categories reached at baseline or above.
+    categories: usize,
+    /// Paths at depth >= 2 reached at baseline or above.
+    any: u32,
+    /// Paths at depth >= 2 reached at notable or above, and the split of
+    /// those by their highest tier.
+    notable: u32,
+    suspicious: u32,
+    hostile: u32,
+    notable_only: u32,
+}
+
+impl PathBreadth {
+    fn new(summary: &FindingSummary) -> Self {
+        let mut breadth = Self {
+            max_crit: 0,
+            categories: 0,
+            any: 0,
+            notable: 0,
+            suspicious: 0,
+            hostile: 0,
+            notable_only: 0,
+        };
+        let mut categories: HashSet<&str> = HashSet::new();
+        for (path, &max_ord) in &summary.sample_paths {
+            let path_depth = path.chars().filter(|&c| c == '/').count();
+            if max_ord >= CRIT_BASELINE {
+                categories.insert(path.split('/').next().unwrap_or(""));
+                if path_depth >= 2 {
+                    breadth.any += 1;
+                }
+            }
+            if path_depth < 2 || max_ord < CRIT_NOTABLE {
+                continue;
+            }
+            breadth.notable += 1;
+            breadth.max_crit = breadth.max_crit.max(max_ord);
+            if max_ord >= CRIT_SUSPICIOUS {
+                breadth.suspicious += 1;
+            }
+            if max_ord >= CRIT_HOSTILE {
+                breadth.hostile += 1;
+            } else if max_ord == CRIT_NOTABLE {
+                breadth.notable_only += 1;
+            }
+        }
+        breadth.categories = categories.len();
+        breadth
+    }
+}
+
+/// Breadth over the taxonomy: categories, active paths, and how far their
+/// criticality escalates.
+fn write_breadth_features(
+    summary: &FindingSummary,
+    breadth: &PathBreadth,
+    w: &mut FeatureWriter<'_>,
+) {
+    w.set("agg:max_crit", breadth.max_crit as f32);
+    w.set("agg:category_breadth", breadth.categories as f32);
+    w.set("agg:path_breadth_any", (breadth.any as f32).ln_1p());
+    w.set("agg:total_active_paths", (breadth.notable as f32).ln_1p());
+    w.set(
+        "agg:suspicious_concentration",
+        breadth.suspicious as f32 / breadth.any.max(1) as f32,
+    );
+    w.set(
+        "agg:hostile_concentration",
+        breadth.hostile as f32 / breadth.any.max(1) as f32,
+    );
+    w.set(
+        "agg:escalation_rate",
+        breadth.suspicious as f32 / breadth.notable.max(1) as f32,
+    );
+    w.set(
+        "agg:notable_only_fraction",
+        breadth.notable_only as f32 / breadth.notable.max(1) as f32,
+    );
+    w.set(
+        "agg:hostile_escalation_rate",
+        breadth.hostile as f32 / breadth.notable.max(1) as f32,
+    );
+    w.set(
+        "agg:hostile_share_of_suspicious",
+        breadth.hostile as f32 / breadth.suspicious.max(1) as f32,
+    );
+    let category_denom = breadth.categories.max(1) as f32;
+    w.set(
+        "agg:suspicious_category_density",
+        summary.suspicious_category_breadth as f32 / category_denom,
+    );
+    w.set(
+        "agg:hostile_category_density",
+        summary.hostile_category_breadth as f32 / category_denom,
+    );
+
+    // 2-level breadth features.
+    let mut suspicious_2level: HashSet<String> = HashSet::new();
+    let mut hostile_2level: HashSet<String> = HashSet::new();
+    let mut objectives_2level: HashSet<String> = HashSet::new();
+    for (path, &max_ord) in &summary.sample_paths {
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() >= 2 {
+            let two_level = format!("{}/{}", parts[0], parts[1]);
+            if max_ord >= CRIT_SUSPICIOUS {
+                suspicious_2level.insert(two_level.clone());
+            }
+            if max_ord >= CRIT_HOSTILE {
+                hostile_2level.insert(two_level.clone());
+            }
+            if parts[0] == "objectives" && max_ord >= CRIT_BASELINE {
+                objectives_2level.insert(two_level);
+            }
+        }
+    }
+    w.set(
+        "agg:suspicious_2level_breadth",
+        suspicious_2level.len() as f32,
+    );
+    w.set("agg:hostile_2level_breadth", hostile_2level.len() as f32);
+    w.set("agg:objectives_breadth", objectives_2level.len() as f32);
+}
+
+/// Finding counts at each tier: as logs, per KB, as shares of each other,
+/// and how often the same id or category repeats.
+fn write_finding_volume_features(
     summary: &FindingSummary,
     summaries: &[FileSummary],
     w: &mut FeatureWriter<'_>,
 ) {
-    let mut max_crit = 0u32;
-    let mut categories: HashSet<&str> = HashSet::new();
-    let mut path_breadth_any = 0u32;
-    let mut total_active = 0u32;
-    let mut breadth_notable = 0u32;
-    let mut breadth_suspicious = 0u32;
-    let mut breadth_hostile = 0u32;
-    let mut breadth_notable_only = 0u32;
-
-    for (path, &max_ord) in &summary.sample_paths {
-        let path_depth = path.chars().filter(|&c| c == '/').count();
-        if max_ord >= 2 {
-            categories.insert(path.split('/').next().unwrap_or(""));
-            if path_depth >= 2 {
-                path_breadth_any += 1;
-            }
-        }
-        if path_depth < 2 || max_ord < 3 {
-            continue;
-        }
-        total_active += 1;
-        breadth_notable += 1;
-        max_crit = max_crit.max(max_ord);
-        if max_ord >= 4 {
-            breadth_suspicious += 1;
-        }
-        if max_ord >= 5 {
-            breadth_hostile += 1;
-        } else if max_ord == 3 {
-            breadth_notable_only += 1;
-        }
-    }
-
     let total_size_bytes: f64 = summaries.iter().map(|s| s.size_bytes).sum();
     let total_kb_raw = (total_size_bytes / 1024.0) as f32;
     let total_kb_p1 = total_kb_raw.max(0.1);
     let total_kb_1 = total_kb_raw.max(1.0);
 
-    w.set("agg:max_crit", max_crit as f32);
-    w.set("agg:category_breadth", categories.len() as f32);
-    w.set("agg:path_breadth_any", (path_breadth_any as f32).ln_1p());
-    w.set("agg:total_active_paths", (total_active as f32).ln_1p());
-    w.set(
-        "agg:suspicious_concentration",
-        breadth_suspicious as f32 / path_breadth_any.max(1) as f32,
-    );
-    w.set(
-        "agg:hostile_concentration",
-        breadth_hostile as f32 / path_breadth_any.max(1) as f32,
-    );
-    w.set(
-        "agg:escalation_rate",
-        breadth_suspicious as f32 / breadth_notable.max(1) as f32,
-    );
-    w.set(
-        "agg:notable_only_fraction",
-        breadth_notable_only as f32 / breadth_notable.max(1) as f32,
-    );
     w.set(
         "agg:notable_findings_log",
         (summary.notable_finding_count as f32).ln_1p(),
@@ -2519,8 +2142,7 @@ fn write_aggregate_features(
 
     // Size-invariant crit-tier severity fractions — mirror of collimator's
     // include_severity_fractions block (count of crit>=N findings as a share of
-    // ALL findings, not per-KB). `w.set` no-ops when the spec lacks the slot, so
-    // these only materialize when the model was trained with the feature group.
+    // ALL findings, not per-KB).
     let total_findings = summary.filtered_finding_count.max(1) as f32;
     let mundane = summary
         .filtered_finding_count
@@ -2544,20 +2166,9 @@ fn write_aggregate_features(
     );
     w.set(
         "agg:crit4_present",
-        if summary.suspicious_finding_count > 0 {
-            1.0
-        } else {
-            0.0
-        },
+        f32::from(summary.suspicious_finding_count > 0),
     );
 
-    let topk = topk_file_risk_features_from_summaries(summaries);
-    w.set("agg:top1_file_suspicious_ratio_sum", topk[0]);
-    w.set("agg:top1_file_hostile_ratio_sum", topk[1]);
-    w.set("agg:top1_file_suspicious_findings_log", topk[2]);
-    w.set("agg:top1_file_hostile_findings_log", topk[3]);
-
-    let category_denom = categories.len().max(1) as f32;
     w.set(
         "agg:suspicious_category_breadth",
         summary.suspicious_category_breadth as f32,
@@ -2565,14 +2176,6 @@ fn write_aggregate_features(
     w.set(
         "agg:hostile_category_breadth",
         summary.hostile_category_breadth as f32,
-    );
-    w.set(
-        "agg:suspicious_category_density",
-        summary.suspicious_category_breadth as f32 / category_denom,
-    );
-    w.set(
-        "agg:hostile_category_density",
-        summary.hostile_category_breadth as f32 / category_denom,
     );
     w.set(
         "agg:suspicious_findings_per_kb",
@@ -2590,19 +2193,7 @@ fn write_aggregate_features(
         "agg:hostile_categories_per_kb",
         summary.hostile_category_breadth as f32 / total_kb_1,
     );
-    w.set("agg:top1_file_suspicious_density_sum", topk[4]);
-    w.set("agg:top1_file_hostile_density_sum", topk[5]);
-    w.set("agg:top1_file_suspicious_category_breadth_sum", topk[6]);
-    w.set("agg:top1_file_hostile_category_breadth_sum", topk[7]);
 
-    w.set(
-        "agg:hostile_escalation_rate",
-        breadth_hostile as f32 / breadth_notable.max(1) as f32,
-    );
-    w.set(
-        "agg:hostile_share_of_suspicious",
-        breadth_hostile as f32 / breadth_suspicious.max(1) as f32,
-    );
     w.set(
         "agg:suspicious_finding_escalation_rate",
         summary.suspicious_finding_count as f32 / summary.notable_finding_count.max(1) as f32,
@@ -2623,28 +2214,6 @@ fn write_aggregate_features(
         host_density_global + 0.25 * susp_density_global,
     );
 
-    // TOP_K_RISK_FILES == 1, so the "top-k weighted sum" is the single max; min_by
-    // over the same descending comparator picks the same first-maximum file a stable
-    // sort + take(1) would. Raising the constant would need a partial sort here.
-    let top_weighted = summaries
-        .iter()
-        .map(|s| &s.risk)
-        .min_by(|a, b| {
-            let ka = (
-                a.hostile_density + 0.25 * a.suspicious_density,
-                a.hostile_density,
-                a.suspicious_density,
-            );
-            let kb = (
-                b.hostile_density + 0.25 * b.suspicious_density,
-                b.hostile_density,
-                b.suspicious_density,
-            );
-            kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map_or(0.0, |s| s.hostile_density + 0.25 * s.suspicious_density);
-    w.set("agg:top1_file_hostile_weighted_density_sum", top_weighted);
-
     w.set(
         "agg:suspicious_id_repeat_ratio",
         1.0 - (summary.unique_suspicious_ids as f32
@@ -2664,11 +2233,58 @@ fn write_aggregate_features(
         1.0 - (summary.hostile_category_breadth as f32
             / summary.hostile_finding_count.max(1) as f32),
     );
+}
 
+/// The `top1` block: the single riskiest file by each ordering.
+fn write_top_file_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
+    let topk = topk_file_risk_features_from_summaries(summaries);
+    w.set("agg:top1_file_suspicious_ratio_sum", topk[0]);
+    w.set("agg:top1_file_hostile_ratio_sum", topk[1]);
+    w.set("agg:top1_file_suspicious_findings_log", topk[2]);
+    w.set("agg:top1_file_hostile_findings_log", topk[3]);
+    w.set("agg:top1_file_suspicious_density_sum", topk[4]);
+    w.set("agg:top1_file_hostile_density_sum", topk[5]);
+    w.set("agg:top1_file_suspicious_category_breadth_sum", topk[6]);
+    w.set("agg:top1_file_hostile_category_breadth_sum", topk[7]);
+
+    // The "top-k weighted sum" is the single max; min_by over the same
+    // descending comparator picks the same first-maximum file a stable
+    // sort + take(1) would.
+    let top_weighted = summaries
+        .iter()
+        .map(|s| &s.risk)
+        .min_by(|a, b| {
+            let ka = (
+                a.hostile_density + 0.25 * a.suspicious_density,
+                a.hostile_density,
+                a.suspicious_density,
+            );
+            let kb = (
+                b.hostile_density + 0.25 * b.suspicious_density,
+                b.hostile_density,
+                b.suspicious_density,
+            );
+            kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or(0.0, |s| s.hostile_density + 0.25 * s.suspicious_density);
+    w.set("agg:top1_file_hostile_weighted_density_sum", top_weighted);
+}
+
+/// How many files sit in each criticality tier.
+fn write_file_tier_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
     let n_files = summaries.len().max(1) as f32;
-    let hostile_files = summaries.iter().filter(|s| s.risk.max_crit >= 5).count() as f32;
-    let suspicious_files = summaries.iter().filter(|s| s.risk.max_crit == 4).count() as f32;
-    let notable_files = summaries.iter().filter(|s| s.risk.max_crit == 3).count() as f32;
+    let hostile_files = summaries
+        .iter()
+        .filter(|s| s.risk.max_crit >= CRIT_HOSTILE)
+        .count() as f32;
+    let suspicious_files = summaries
+        .iter()
+        .filter(|s| s.risk.max_crit == CRIT_SUSPICIOUS)
+        .count() as f32;
+    let notable_files = summaries
+        .iter()
+        .filter(|s| s.risk.max_crit == CRIT_NOTABLE)
+        .count() as f32;
     w.set("agg:file_hostile_fraction", hostile_files / n_files);
     w.set("agg:file_suspicious_fraction", suspicious_files / n_files);
     w.set("agg:file_notable_fraction", notable_files / n_files);
@@ -2676,46 +2292,15 @@ fn write_aggregate_features(
     w.set("agg:file_suspicious_count_log", suspicious_files.ln_1p());
     w.set("agg:file_notable_count_log", notable_files.ln_1p());
     w.set("agg:hostile_depth_weight", 0.0);
+}
 
-    // 2-level breadth features.
-    let mut suspicious_2level: HashSet<String> = HashSet::new();
-    let mut hostile_2level: HashSet<String> = HashSet::new();
-    let mut objectives_2level: HashSet<String> = HashSet::new();
-    for (path, &max_ord) in &summary.sample_paths {
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() >= 2 {
-            let two_level = format!("{}/{}", parts[0], parts[1]);
-            if max_ord >= 4 {
-                suspicious_2level.insert(two_level.clone());
-            }
-            if max_ord >= 5 {
-                hostile_2level.insert(two_level.clone());
-            }
-            if parts[0] == "objectives" && max_ord >= 2 {
-                objectives_2level.insert(two_level);
-            }
-        }
-    }
-    w.set(
-        "agg:suspicious_2level_breadth",
-        suspicious_2level.len() as f32,
-    );
-    w.set("agg:hostile_2level_breadth", hostile_2level.len() as f32);
-    w.set("agg:objectives_breadth", objectives_2level.len() as f32);
-
-    // ATT&CK / MBC features from `atk`/`mbc` fields in findings.
-    let mut attack_techniques: HashSet<String> = HashSet::new();
-    let mut mbc_behaviors: HashSet<String> = HashSet::new();
-    for s in summaries {
-        for finding in &s.raw_findings {
-            if let Some(a) = &finding.atk {
-                attack_techniques.insert(a.clone());
-            }
-            if let Some(m) = &finding.mbc {
-                mbc_behaviors.insert(m.clone());
-            }
-        }
-    }
+/// ATT&CK / MBC code counts and the objective-path co-occurrence counts.
+fn write_code_features(
+    summary: &FindingSummary,
+    attack_techniques: &[String],
+    mbc_behaviors: &[String],
+    w: &mut FeatureWriter<'_>,
+) {
     w.set("agg:attack_technique_count", attack_techniques.len() as f32);
     // An ATT&CK technique ID is ASCII ("T1059.001"), but `atk` is whatever the
     // finding carried and nothing validates it, so a multi-byte codepoint can
@@ -2752,11 +2337,7 @@ fn write_aggregate_features(
         .any(|p| p.starts_with("objectives/"));
     w.set(
         "agg:has_attack_and_objective",
-        if !attack_techniques.is_empty() && has_objectives {
-            1.0
-        } else {
-            0.0
-        },
+        f32::from(!attack_techniques.is_empty() && has_objectives),
     );
 
     // Objective-path co-occurrence aggregates.  Mirrors collimator's
@@ -2765,14 +2346,11 @@ fn write_aggregate_features(
     // `objectives/*` and `well-known/*` sample paths.  The trigram inner loop
     // is capped at 20 per (i, j) pair to bound work on samples with many
     // objective paths — the same cap collimator uses, so the values match.
-    let mut obj_paths: Vec<&str> = summary
+    let n_obj = summary
         .sample_paths
         .keys()
         .filter(|p| p.starts_with("objectives/") || p.starts_with("well-known/"))
-        .map(String::as_str)
-        .collect();
-    obj_paths.sort_unstable();
-    let n_obj = obj_paths.len();
+        .count();
     let n_obj_bi = (n_obj * n_obj.saturating_sub(1)) / 2;
     let mut n_obj_tri: usize = 0;
     for i in 0..n_obj {
@@ -2787,8 +2365,8 @@ fn write_aggregate_features(
 
 fn tier_prefix(crit: u32) -> &'static str {
     match crit {
-        5 => "h",
-        4 => "s",
+        CRIT_HOSTILE => "h",
+        CRIT_SUSPICIOUS => "s",
         _ => "n",
     }
 }
@@ -2800,12 +2378,53 @@ fn truncate_path_depth(path: &str, depth: usize) -> String {
     path.split('/').take(depth).collect::<Vec<_>>().join("/")
 }
 
+/// Categories whose notable-or-above paths feed the `crit:` n-grams.
+const CRIT_CATEGORIES: &[&str] = &[
+    "objectives",
+    "well-known",
+    "supply-chain",
+    "anti-analysis",
+    "anti-static",
+    "command-and-control",
+    "evasion",
+    "execution",
+    "exfiltration",
+];
+
+/// Sorted `tier:category[/sub]` tokens: each notable-or-above sample path in
+/// a [`CRIT_CATEGORIES`] category, cut to two levels, at its highest tier.
+fn crit_category_tokens(summary: &FindingSummary) -> Vec<String> {
+    let mut max_crit: HashMap<String, u32> = HashMap::new();
+    for (path, &mo) in &summary.sample_paths {
+        if mo < CRIT_NOTABLE {
+            continue;
+        }
+        let parts: Vec<&str> = path.split('/').collect();
+        if !CRIT_CATEGORIES.contains(&parts[0]) {
+            continue;
+        }
+        let key = if parts.len() >= 2 {
+            format!("{}/{}", parts[0], parts[1])
+        } else {
+            parts[0].to_string()
+        };
+        let e = max_crit.entry(key).or_insert(0);
+        *e = (*e).max(mo);
+    }
+    let mut tokens: Vec<String> = max_crit
+        .iter()
+        .map(|(k, &c)| format!("{}:{k}", tier_prefix(c)))
+        .collect();
+    tokens.sort();
+    tokens
+}
+
 /// Sorted `tier:path` tokens (crit-3+ findings, paths truncated to depth 3),
 /// shared by the tiered bigram and trigram feature builders.
 fn tiered_path_tokens(summary: &FindingSummary) -> Vec<String> {
     let mut token_max_crit: HashMap<String, u32> = HashMap::new();
     for (path, &max_ord) in &summary.sample_paths {
-        if max_ord < 3 {
+        if max_ord < CRIT_NOTABLE {
             continue;
         }
         let key = truncate_path_depth(path, 3);
@@ -2821,6 +2440,45 @@ fn tiered_path_tokens(summary: &FindingSummary) -> Vec<String> {
     tokens
 }
 
+/// `crit:` unigrams over the category tokens, then their n-grams.
+fn write_crit_ngrams(tokens: &[String], w: &mut FeatureWriter<'_>) {
+    let mut key = String::new();
+    for t in tokens {
+        key.clear();
+        let _ = write!(key, "crit:{t}");
+        w.set_token(&key, 1.0);
+    }
+    write_ngrams(w, tokens, "critbi:", "crittri:", "crit");
+}
+
+/// Set the pair (`<bi>a + b`) and triple (`<tri>a + b + c`) tokens over
+/// sorted, distinct `tokens`. Pairs are O(n²) and triples O(n³), so a
+/// bloated report skips both past 512 tokens and triples past 128.
+fn write_ngrams(w: &mut FeatureWriter<'_>, tokens: &[String], bi: &str, tri: &str, what: &str) {
+    if tokens.len() > 512 {
+        tracing::warn!(
+            tokens = tokens.len(),
+            "too many unique {what} tokens; skipping n-gram generation"
+        );
+        return;
+    }
+    let mut key = String::new();
+    for (i, t1) in tokens.iter().enumerate() {
+        for (j, t2) in tokens.iter().enumerate().skip(i + 1) {
+            key.clear();
+            let _ = write!(key, "{bi}{t1} + {t2}");
+            w.set_token(&key, 1.0);
+            if tokens.len() <= 128 {
+                for t3 in &tokens[j + 1..] {
+                    key.clear();
+                    let _ = write!(key, "{tri}{t1} + {t2} + {t3}");
+                    w.set_token(&key, 1.0);
+                }
+            }
+        }
+    }
+}
+
 fn write_tiered_bigram_features(tokens: &[String], w: &mut FeatureWriter<'_>) {
     if tokens.len() > 512 {
         tracing::warn!(
@@ -2829,13 +2487,12 @@ fn write_tiered_bigram_features(tokens: &[String], w: &mut FeatureWriter<'_>) {
         );
         return;
     }
-    use std::fmt::Write;
     let mut key = String::new();
     for (i, t1) in tokens.iter().enumerate() {
         for t2 in &tokens[i + 1..] {
             key.clear();
             let _ = write!(key, "tierbi:{t1} + {t2}");
-            w.set(&key, 1.0);
+            w.set_token(&key, 1.0);
         }
     }
 }
@@ -2848,7 +2505,6 @@ fn write_tiered_trigram_features(tokens: &[String], w: &mut FeatureWriter<'_>) {
         );
         return;
     }
-    use std::fmt::Write;
     let mut key = String::new();
     for (i, t1) in tokens.iter().enumerate() {
         for j in i + 1..tokens.len() {
@@ -2856,18 +2512,17 @@ fn write_tiered_trigram_features(tokens: &[String], w: &mut FeatureWriter<'_>) {
             for t3 in &tokens[j + 1..] {
                 key.clear();
                 let _ = write!(key, "tiertri:{t1} + {t2} + {t3}");
-                w.set(&key, 1.0);
+                w.set_token(&key, 1.0);
             }
         }
     }
 }
 
+/// The `top1` block's eight values: the single highest-risk file by each
+/// ordering. min_by with the descending comparators below returns the same
+/// first-maximum file a stable sort + take(1) would; summing over more than
+/// one file would need a partial sort.
 fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8] {
-    // The block sums over the single highest-risk file by each ordering. min_by with
-    // the descending comparators below returns the same first-maximum file a stable
-    // sort + take(1) would; raising TOP_K_RISK_FILES would require a partial sort.
-    const _: () = assert!(TOP_K_RISK_FILES == 1);
-
     let top_susp = summaries.iter().map(|s| &s.risk).min_by(|a, b| {
         (
             b.suspicious_ratio,
@@ -2926,13 +2581,9 @@ fn format_groups_for_type(file_type: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// G6b: portable format-group hints derived only from cleave file types.
 fn write_format_hint_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
     let total_files = summaries.len().max(1) as f32;
-    let inner_files = summaries
-        .iter()
-        .filter(|s| !s.parent.is_empty())
-        .count()
-        .max(1) as f32;
     let mut known_files = 0usize;
     let mut present_groups = HashSet::new();
 
@@ -2942,22 +2593,15 @@ fn write_format_hint_features(summaries: &[FileSummary], w: &mut FeatureWriter<'
         .map(|s| format_groups_for_type(&s.file_type))
         .collect();
 
-    for &(group, _) in FORMAT_GROUPS {
+    for (&(group, _), names) in FORMAT_GROUPS.iter().zip(FORMAT_FEATURE_NAMES.iter()) {
         let mut group_count = 0usize;
-        let mut inner_count = 0usize;
         let mut suspicious_count = 0usize;
         let mut hostile_count = 0usize;
 
         for (s, groups) in summaries.iter().zip(&file_groups) {
-            if groups.is_empty() {
-                continue;
-            }
             if groups.contains(&group) {
                 group_count += 1;
                 present_groups.insert(group);
-                if !s.parent.is_empty() {
-                    inner_count += 1;
-                }
                 if s.findings.suspicious_finding_count > 0 {
                     suspicious_count += 1;
                 }
@@ -2969,23 +2613,19 @@ fn write_format_hint_features(summaries: &[FileSummary], w: &mut FeatureWriter<'
 
         known_files += group_count;
         let group_denom = group_count.max(1) as f32;
-        w.set(&format!("format:{group}"), f32::from(group_count > 0));
-        w.set(
-            &format!("format:{group}_file_fraction"),
-            group_count as f32 / total_files,
-        );
-        w.set(
-            &format!("format:{group}_inner_fraction"),
-            inner_count as f32 / inner_files,
-        );
-        w.set(
-            &format!("format:{group}_suspicious_fraction"),
-            suspicious_count as f32 / group_denom,
-        );
-        w.set(
-            &format!("format:{group}_hostile_fraction"),
-            hostile_count as f32 / group_denom,
-        );
+        let [
+            present,
+            file_fraction,
+            inner_fraction,
+            suspicious_fraction,
+            hostile_fraction,
+        ] = names;
+        w.set(present, f32::from(group_count > 0));
+        w.set(file_fraction, group_count as f32 / total_files);
+        // No compact file has a parent link, so no file is "inner".
+        w.set(inner_fraction, 0.0);
+        w.set(suspicious_fraction, suspicious_count as f32 / group_denom);
+        w.set(hostile_fraction, hostile_count as f32 / group_denom);
     }
 
     w.set(
@@ -3012,6 +2652,10 @@ fn write_format_hint_features(summaries: &[FileSummary], w: &mut FeatureWriter<'
     );
 }
 
+/// G15: structural extensions. Compact files carry neither parent links nor
+/// mtimes, so the nesting and inner-file features are constant zero, the
+/// mtime-spread and anachronism features are never set, and every hostile
+/// file counts as one with no parent.
 fn write_structural_extensions(
     summaries: &[FileSummary],
     combined: &FindingSummary,
@@ -3020,35 +2664,18 @@ fn write_structural_extensions(
     let binary_like = ["pe", "elf", "macho"];
     let source_types = ["javascript", "python", "typescript", "ruby", "php"];
     let text_exts = ["txt", "md", "json", "png", "jpg"];
+    let code_types = ["javascript", "python", "pe", "elf", "macho"];
 
-    let mut mtimes = Vec::new();
-    let mut hostile_mtimes = Vec::new();
     let mut entropies = Vec::new();
     let mut code_entropies = Vec::new();
     let mut max_entropy = 0.0_f64;
     let mut hostile_files = 0;
-    let mut hostile_files_with_parent = 0;
-    let mut inner_file_count = 0;
-    let mut total_loc = 0;
+    let mut total_loc: u64 = 0;
     let mut extension_mismatches = 0;
     let mut has_source_files = false;
     let mut has_foreign_binaries = false;
 
-    let mut depths = HashMap::new();
     for s in summaries {
-        if s.parent.is_empty() {
-            depths.insert(&s.path, 0);
-        } else {
-            let pd = depths.get(&s.parent).copied().unwrap_or(0);
-            depths.insert(&s.path, pd + 1);
-        }
-    }
-    let max_nesting_depth = depths.values().copied().max().unwrap_or(0);
-
-    for s in summaries {
-        if !s.parent.is_empty() {
-            inner_file_count += 1;
-        }
         if source_types.contains(&s.file_type.as_str()) {
             has_source_files = true;
         }
@@ -3062,7 +2689,9 @@ fn write_structural_extensions(
             .and_then(|t| t.get("total_lines"))
             .copied()
             .unwrap_or(0.0);
-        total_loc += lines as u64;
+        #[expect(clippy::cast_sign_loss, reason = "a line count is never negative")]
+        let lines = lines as u64;
+        total_loc += lines;
 
         if !s.path.is_empty()
             && s.path.contains('.')
@@ -3073,9 +2702,6 @@ fn write_structural_extensions(
             extension_mismatches += 1;
         }
 
-        if let Some(t) = s.mtime {
-            mtimes.push(t);
-        }
         if s.overall_entropy > 0.0 {
             entropies.push(s.overall_entropy);
         }
@@ -3083,15 +2709,8 @@ fn write_structural_extensions(
 
         if s.findings.hostile_finding_count > 0 {
             hostile_files += 1;
-            if let Some(t) = s.mtime {
-                hostile_mtimes.push(t);
-            }
-            if !s.parent.is_empty() {
-                hostile_files_with_parent += 1;
-            }
         }
 
-        let code_types = ["javascript", "python", "pe", "elf", "macho"];
         if s.overall_entropy > 0.0 && code_types.contains(&s.file_type.as_str()) {
             code_entropies.push(s.overall_entropy);
         }
@@ -3101,51 +2720,17 @@ fn write_structural_extensions(
         "struct:packaged_capability",
         (combined.sample_paths.len() as f64 * max_entropy) as f32,
     );
-    if mtimes.len() > 1 {
-        let mn = mtimes.iter().cloned().fold(f64::INFINITY, f64::min);
-        let mx = mtimes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        w.set("struct:mtime_range_hours", ((mx - mn) / 3600.0) as f32);
-        let mean = mtimes.iter().sum::<f64>() / mtimes.len() as f64;
-        let var = mtimes.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / mtimes.len() as f64;
-        w.set("struct:mtime_std_dev_hours", (var.sqrt() / 3600.0) as f32);
-    }
-    w.set(
-        "struct:max_nesting_depth_log",
-        (max_nesting_depth as f32).ln_1p(),
-    );
-    w.set(
-        "struct:inner_file_ratio",
-        inner_file_count as f32 / summaries.len().max(1) as f32,
-    );
+    w.set("struct:max_nesting_depth_log", 0.0);
+    w.set("struct:inner_file_ratio", 0.0);
     if entropies.len() > 1 {
         let mean = entropies.iter().sum::<f64>() / entropies.len() as f64;
         let var =
             entropies.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / entropies.len() as f64;
         w.set("struct:entropy_std_dev", var.sqrt() as f32);
-        let mx = entropies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mx = entropies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         w.set("struct:entropy_max_diff", (mx - mean) as f32);
     }
-    w.set(
-        "struct:air_gap_signal",
-        f32::from(hostile_files > 0 && hostile_files_with_parent == 0),
-    );
-    if !mtimes.is_empty() && !hostile_mtimes.is_empty() {
-        let mut sorted = mtimes.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = if sorted.len() % 2 == 1 {
-            sorted[sorted.len() / 2]
-        } else {
-            (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
-        };
-        let max_delta = hostile_mtimes
-            .iter()
-            .map(|t| (t - median).abs())
-            .fold(0.0, f64::max);
-        w.set(
-            "struct:anachronistic_injection",
-            (max_delta / 3600.0) as f32,
-        );
-    }
+    w.set("struct:air_gap_signal", f32::from(hostile_files > 0));
     if !code_entropies.is_empty() {
         let avg_ent = if entropies.is_empty() {
             0.0
@@ -3154,7 +2739,7 @@ fn write_structural_extensions(
         };
         let max_code_ent = code_entropies
             .iter()
-            .cloned()
+            .copied()
             .fold(f64::NEG_INFINITY, f64::max);
         w.set("struct:code_entropy_spike", (max_code_ent - avg_ent) as f32);
     }
@@ -3174,6 +2759,7 @@ fn write_structural_extensions(
     }
 }
 
+/// G19: a capability imported but never exercised (no notable behavior).
 fn write_logic_gap_features(
     summary: &FindingSummary,
     summaries: &[FileSummary],
@@ -3219,21 +2805,22 @@ fn write_logic_gap_features(
         }
     }
 
-    for target_cat in LOGIC_GAP_CATEGORIES {
+    for (target_cat, name) in LOGIC_GAP_CATEGORIES.iter().zip(GAP_FEATURE_NAMES.iter()) {
         if let Some((_, imports_set, traits_set)) =
             logic_gaps.iter().find(|(c, _, _)| c == target_cat)
         {
             let has_import = imports_set.iter().any(|imp| all_imports.contains(*imp));
             let has_behavior = summary.sample_paths.iter().any(|(path, &max_ord)| {
-                max_ord >= 3 && traits_set.iter().any(|t| path.starts_with(t))
+                max_ord >= CRIT_NOTABLE && traits_set.iter().any(|t| path.starts_with(t))
             });
             if has_import && !has_behavior {
-                w.set(&format!("gap:{target_cat}"), 1.0);
+                w.set(name, 1.0);
             }
         }
     }
 }
 
+/// G22: a risky behavior with no documentation explaining it.
 fn write_intent_gap_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
     let intent_signal = summary
         .sample_paths
@@ -3254,22 +2841,25 @@ fn write_intent_gap_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>
         ),
         ("crypto", &["objectives/crypto", "micro-behaviors/crypto"]),
     ];
-    for target_cat in INTENT_GAP_CATEGORIES {
+    for (target_cat, name) in INTENT_GAP_CATEGORIES
+        .iter()
+        .zip(INTENT_GAP_FEATURE_NAMES.iter())
+    {
         let traits = risky
             .iter()
             .find(|(c, _)| c == target_cat)
             .map(|(_, t)| *t)
             .unwrap_or(&[]);
-        let has_behavior = summary
-            .sample_paths
-            .iter()
-            .any(|(path, &max_ord)| max_ord >= 4 && traits.iter().any(|t| path.starts_with(t)));
+        let has_behavior = summary.sample_paths.iter().any(|(path, &max_ord)| {
+            max_ord >= CRIT_SUSPICIOUS && traits.iter().any(|t| path.starts_with(t))
+        });
         if has_behavior && !intent_signal {
-            w.set(&format!("intent_gap:{target_cat}"), 1.0);
+            w.set(name, 1.0);
         }
     }
 }
 
+/// G23: negative space — a file type present without a trait it should have.
 fn write_negative_space_features(
     summary: &FindingSummary,
     summaries: &[FileSummary],
@@ -3281,11 +2871,12 @@ fn write_negative_space_features(
             present_types.insert(s.file_type.as_str());
         }
     }
-    for &(ftype, traits) in EXPECTED_GHOSTS {
-        for trait_path in traits {
-            if present_types.contains(ftype) && !summary.sample_paths.contains_key(*trait_path) {
-                w.set(&format!("missing:{ftype}*{trait_path}"), 1.0);
-            }
+    let expected = EXPECTED_GHOSTS
+        .iter()
+        .flat_map(|&(ftype, traits)| traits.iter().map(move |t| (ftype, *t)));
+    for ((ftype, trait_path), name) in expected.zip(MISSING_FEATURE_NAMES.iter()) {
+        if present_types.contains(ftype) && !summary.sample_paths.contains_key(trait_path) {
+            w.set(name, 1.0);
         }
     }
 }
@@ -3330,53 +2921,7 @@ fn merge_metric_summaries(summaries: &[FileSummary]) -> MetricMap {
     merged
 }
 
-/// The `{group}_{field}` keys of [`KEY_METRICS`], computed once. The extended
-/// vocab is filtered against these so a base metric is never emitted twice.
-static BASE_METRIC_KEYS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(|| {
-    KEY_METRICS
-        .iter()
-        .map(|&(g, f, _)| format!("{g}_{f}"))
-        .collect()
-});
-
-fn write_metric_features(metrics: &MetricMap, w: &mut FeatureWriter<'_>, metric_vocab: &[String]) {
-    // Base KEY_METRICS with explicit log transforms.
-    for &(group, field_name, use_log) in KEY_METRICS {
-        let value = metrics
-            .get(group)
-            .and_then(|g| g.get(field_name))
-            .copied()
-            .unwrap_or(0.0) as f32;
-        let val = if use_log {
-            (value.abs() + 1.0).ln()
-        } else {
-            value
-        };
-        w.set(&format!("metrics:{group}_{field_name}"), val);
-    }
-
-    // Extended metrics from dynamic vocab — skip keys already in KEY_METRICS.
-    for mk in metric_vocab {
-        let parts: Vec<&str> = mk.splitn(2, '_').collect();
-        if parts.len() == 2 && !BASE_METRIC_KEYS.contains(mk.as_str()) {
-            let value = metrics
-                .get(parts[0])
-                .and_then(|g| g.get(parts[1]))
-                .copied()
-                .unwrap_or(0.0) as f32;
-            let use_log = ["count", "size", "total", "bytes", "length"]
-                .iter()
-                .any(|word| parts[1].contains(word));
-            let val = if use_log {
-                (value.abs() + 1.0).ln()
-            } else {
-                value
-            };
-            w.set(&format!("metrics:{mk}"), val);
-        }
-    }
-}
-
+/// G7: structure.
 fn write_structural_features(
     w: &mut FeatureWriter<'_>,
     summaries: &[FileSummary],
@@ -3384,8 +2929,6 @@ fn write_structural_features(
 ) {
     let binary_like = ["pe", "elf", "macho"];
     let mut any_tiny_binary = false;
-    let mut import_candidates = 0;
-    let mut importless_candidates = 0;
     let mut max_entropy = 0.0_f64;
     let mut suspicious_files = 0;
     let mut hostile_files = 0;
@@ -3393,12 +2936,6 @@ fn write_structural_features(
     for s in summaries {
         if binary_like.contains(&s.file_type.as_str()) && s.size_bytes < 20_000.0 {
             any_tiny_binary = true;
-        }
-        if s.has_imports_key {
-            import_candidates += 1;
-            if s.imports.is_empty() {
-                importless_candidates += 1;
-            }
         }
         max_entropy = max_entropy.max(s.overall_entropy);
         if s.findings.suspicious_finding_count > 0 {
@@ -3410,10 +2947,9 @@ fn write_structural_features(
     }
 
     w.set("struct:tiny_executable", f32::from(any_tiny_binary));
-    w.set(
-        "struct:no_imports",
-        f32::from(import_candidates > 0 && importless_candidates == import_candidates),
-    );
+    // Collimator sets this when every file with an imports key imports
+    // nothing; the compact schema has no such key, so it is always 0.
+    w.set("struct:no_imports", 0.0);
     w.set(
         "struct:zero_findings",
         f32::from(filtered_finding_count == 0),
@@ -3496,9 +3032,10 @@ struct FindingPaths<'a> {
 
 impl<'a> Iterator for FindingPaths<'a> {
     type Item = &'a str;
-    // slash_ends and third_end are byte offsets of ASCII '/' characters, which are
-    // always single-byte UTF-8 codepoints — so these slices are valid UTF-8 boundaries.
-    #[allow(clippy::string_slice)]
+    #[expect(
+        clippy::string_slice,
+        reason = "the offsets are of ASCII '/' bytes, so always char boundaries"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         let result = match self.step {
             0 => Some(if self.n_slashes >= 1 {
@@ -3556,237 +3093,78 @@ fn normalize_vocab_token(value: &str, max_len: usize) -> String {
     out
 }
 
-/// Shannon entropy over characters. Matches `_char_entropy`.
-fn char_entropy(value: &str) -> f64 {
-    if value.is_empty() {
-        return 0.0;
+/// The `kv:` tokens of a metrics block. Mirrors collimator's
+/// `_metric_kv_tokens` with shape mode off (its runtime default): a boolean
+/// becomes `kv:<group>.<field>=true|false`, a string
+/// `kv:<group>.<field>=<normalized value>`; numbers, lists and nested
+/// objects only contribute in shape mode, so they emit nothing. Models
+/// trained with shape tokens see those slots as zeros (graceful degradation).
+fn kv_tokens(metrics: Option<&serde_json::Value>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let Some(groups) = metrics.and_then(serde_json::Value::as_object) else {
+        return tokens;
+    };
+    for (group, fields) in groups {
+        let Some(fields) = fields.as_object() else {
+            continue;
+        };
+        for (key, value) in fields {
+            match value {
+                serde_json::Value::Bool(b) => tokens.push(format!("kv:{group}.{key}={b}")),
+                serde_json::Value::String(s) => {
+                    let val = normalize_vocab_token(s, 80);
+                    if !val.is_empty() {
+                        tokens.push(format!("kv:{group}.{key}={val}"));
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    let mut counts: HashMap<char, u32> = HashMap::new();
-    let mut n = 0u32;
-    for ch in value.chars() {
-        *counts.entry(ch).or_insert(0) += 1;
-        n += 1;
-    }
-    let n_f = f64::from(n);
-    counts
-        .values()
-        .map(|&c| {
-            let p = f64::from(c) / n_f;
-            -p * p.log2()
-        })
-        .sum()
+    tokens
 }
 
-/// `_looks_base64ish` — char-class heuristic.
-///
-/// Note: Python's `str.isalnum()` is Unicode-aware (e.g. accented letters,
-/// Cyrillic), so we use `is_alphanumeric()` not `is_ascii_alphanumeric()`.
-/// Using the ASCII-only variant under-counts on non-Latin strings and
-/// produces values smaller than Python's by a few thousandths.
-fn looks_base64ish(value: &str) -> bool {
-    let len = value.chars().count();
-    if len < 16 {
-        return false;
-    }
-    let approved = value
-        .chars()
-        .filter(|c| c.is_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-'))
-        .count();
-    let has_b64_punct = value.chars().any(|c| matches!(c, '+' | '/' | '='));
-    (approved as f64) / (len.max(1) as f64) > 0.92 && has_b64_punct
-}
-
-/// `_looks_hexish` — fraction of hex digits after whitespace strip.
-fn looks_hexish(value: &str) -> bool {
-    let compact: String = value
-        .trim()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    let len = compact.chars().count();
-    if len < 16 {
-        return false;
-    }
-    let hex = compact.chars().filter(char::is_ascii_hexdigit).count();
-    (hex as f64) / (len as f64) > 0.95
-}
-
-/// Extract one string entry: `(value, is_wide)`. Matches `_string_values`.
-/// A cleave string row looks like `[offset, ..., "value"]` or
-/// `[offset, "wide", "value"]`; we pull the last element as value and check
-/// any non-first / non-last element for a wide-encoding marker.
-fn extract_string_entry(item: &serde_json::Value) -> Option<(String, bool)> {
-    let arr = item.as_array()?;
-    if arr.len() < 2 {
-        return None;
-    }
-    let value = arr.last()?.as_str()?.to_string();
-    if value.is_empty() {
-        return None;
-    }
-    let is_wide = arr[1..arr.len().saturating_sub(1)].iter().any(|part| {
-        part.as_str()
-            .map(|s| {
-                matches!(
-                    s.to_lowercase().as_str(),
-                    "wide" | "u16" | "utf16le" | "utf-16le"
-                )
-            })
-            .unwrap_or(false)
-    });
-    Some((value, is_wide))
-}
-
-/// Collect normalized import + export + function symbols for a file.
-/// Mirrors `_file_symbols` in collimator: imports may be `[lib, name]`
-/// tuples (we record both the bare name and the `lib!name` form), dicts
-/// with `n`/`name`/`symbol`, or plain strings. Exports (`ff.x`) and
-/// function names (`ff.fn`) contribute their first tuple element.
-fn collect_file_symbols(summary: &FileSummary) -> HashSet<String> {
+/// A file's normalized symbols, sorted and unique. Mirrors `_file_symbols`
+/// in collimator: an import contributes its bare name and its `lib!name`
+/// form (or whichever half it has); exports, function names, AST call
+/// targets and member chains contribute their name. Tokens shorter than two
+/// characters are dropped.
+fn file_symbols(facts: &cleave::types::CompactFacts) -> Vec<String> {
     let mut out = HashSet::new();
-    let insert_if_long = |out: &mut HashSet<String>, token: String| {
+    let mut insert = |raw: &str| {
+        let token = normalize_vocab_token(raw, 96);
         if token.chars().count() >= 2 {
             out.insert(token);
         }
     };
-
-    for raw in &summary.raw_imports {
-        let mut composite: Option<String> = None;
-        if let Some(arr) = raw.as_array() {
-            let lib = arr.first().and_then(|v| v.as_str()).unwrap_or("");
-            let name = arr.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let name_sym = normalize_vocab_token(name, 96);
-            if !name_sym.is_empty() {
-                insert_if_long(&mut out, name_sym);
-            }
-            composite = match (lib.is_empty(), name.is_empty()) {
-                (false, false) => Some(format!("{lib}!{name}")),
-                (true, false) => Some(name.to_string()),
-                (false, true) => Some(lib.to_string()),
-                _ => None,
-            };
-        }
-        let raw_str = if let Some(s) = composite {
-            s
-        } else if let Some(s) = raw.as_str() {
-            s.to_string()
-        } else if let Some(obj) = raw.as_object() {
-            obj.get("n")
-                .or_else(|| obj.get("name"))
-                .or_else(|| obj.get("symbol"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        } else {
-            String::new()
-        };
-        let sym = normalize_vocab_token(&raw_str, 96);
-        if !sym.is_empty() {
-            insert_if_long(&mut out, sym);
+    for imp in &facts.imports {
+        let (lib, name) = (imp.library.as_str(), imp.name.as_str());
+        insert(name);
+        match (lib.is_empty(), name.is_empty()) {
+            (false, false) => insert(&format!("{lib}!{name}")),
+            (true, false) => insert(name),
+            (false, true) => insert(lib),
+            (true, true) => {}
         }
     }
-
-    for raw in summary
-        .raw_exports
+    for name in facts
+        .exports
         .iter()
-        .chain(summary.raw_functions.iter())
+        .map(|e| e.name.as_str())
+        .chain(facts.functions.iter().map(|f| f.name.as_str()))
+        .chain(facts.targets.iter().map(String::as_str))
+        .chain(facts.members.iter().map(String::as_str))
     {
-        let candidate = if let Some(arr) = raw.as_array() {
-            arr.first()
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        } else if let Some(s) = raw.as_str() {
-            s.to_string()
-        } else {
-            String::new()
-        };
-        let sym = normalize_vocab_token(&candidate, 96);
-        if !sym.is_empty() {
-            insert_if_long(&mut out, sym);
-        }
+        insert(name);
     }
-
-    // Filefacts AST symbol kinds: Call (ff.ct) and Member (ff.mc).
-    // Older cleave reports don't carry these keys; the iterator is then
-    // empty and the loop is a no-op.
-    for raw in summary
-        .raw_call_targets
-        .iter()
-        .chain(summary.raw_member_chains.iter())
-    {
-        let candidate = raw.as_str().unwrap_or("");
-        let sym = normalize_vocab_token(candidate, 96);
-        if !sym.is_empty() {
-            insert_if_long(&mut out, sym);
-        }
-    }
-
-    out
+    let mut symbols: Vec<String> = out.into_iter().collect();
+    symbols.sort();
+    symbols
 }
 
 /// Per-file caps from collimator (`_SYMBOL_BIGRAM_CAP`/`_SYMBOL_TRIGRAM_CAP`).
 const SYMBOL_BIGRAM_CAP: usize = 64;
 const SYMBOL_TRIGRAM_CAP: usize = 24;
-
-/// Emit sparse kv:* tokens for one file. Mirrors `_metric_kv_tokens`.
-///
-/// `include_shape` and `split_string_values` are gated by collimator's
-/// `FeatureConfig.include_kv_shape_features` / `include_kv_value_split`
-/// env knobs; runtime models keep both off by default, so we set them
-/// to `false`. Models that need shape/split features were trained with
-/// extra vocab entries that won't appear here — they extract as zeros
-/// (acceptable graceful degradation; matches existing policy).
-fn write_kv_features(summary: &FileSummary, w: &mut FeatureWriter<'_>) {
-    if let Some(obj) = summary.raw_metrics.as_object() {
-        for (group, fields) in obj {
-            let Some(field_map) = fields.as_object() else {
-                continue;
-            };
-            for (key, value) in field_map {
-                let base = format!("{group}.{key}");
-                emit_kv_value_tokens(&base, value, w);
-            }
-        }
-    }
-    if let Some(obj) = summary.raw_values.as_object() {
-        for (path, value) in obj {
-            let base = format!("v.{path}");
-            emit_kv_value_tokens(&base, value, w);
-        }
-    }
-}
-
-fn emit_kv_value_tokens(base: &str, value: &serde_json::Value, w: &mut FeatureWriter<'_>) {
-    // bool: emit "<base>=true|false". Numeric values are never directly
-    // tokenized — only their bucket form is, which is gated by shape mode
-    // (off by default), so we skip them entirely here.
-    match value {
-        serde_json::Value::Bool(b) => {
-            w.set(
-                &format!("kv:{base}={}", if *b { "true" } else { "false" }),
-                1.0,
-            );
-        }
-        serde_json::Value::String(s) => {
-            let val = normalize_vocab_token(s, 80);
-            if !val.is_empty() {
-                w.set(&format!("kv:{base}={val}"), 1.0);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            // Python emits `<base>:item=<value>` for the first 32 items when
-            // shape mode is on. Shape mode is off in production, so skip.
-            // We still descend into nested objects below for the dict case.
-            let _ = items;
-        }
-        serde_json::Value::Object(map) => {
-            // Same: nested-dict tokens are shape-mode only.
-            let _ = map;
-        }
-        _ => {}
-    }
-}
 
 /// Emit symbol:*, symbol_bi:*, symbol_tri:* for a set of summaries.
 fn write_symbol_features(
@@ -3795,27 +3173,21 @@ fn write_symbol_features(
     emit_bigrams: bool,
     emit_trigrams: bool,
 ) {
-    use std::fmt::Write;
     let mut key = String::new();
     for s in summaries {
-        let symbols = collect_file_symbols(s);
-        for sym in &symbols {
+        let sorted = s.symbols.as_slice();
+        for sym in sorted {
             key.clear();
             let _ = write!(key, "symbol:{sym}");
-            w.set(&key, 1.0);
+            w.set_token(&key, 1.0);
         }
-        if !emit_bigrams && !emit_trigrams {
-            continue;
-        }
-        let mut sorted: Vec<&String> = symbols.iter().collect();
-        sorted.sort();
         if emit_bigrams {
             let cap = sorted.len().min(SYMBOL_BIGRAM_CAP);
             for i in 0..cap {
                 for j in (i + 1)..cap {
                     key.clear();
                     let _ = write!(key, "symbol_bi:{}||{}", sorted[i], sorted[j]);
-                    w.set(&key, 1.0);
+                    w.set_token(&key, 1.0);
                 }
             }
         }
@@ -3830,117 +3202,12 @@ fn write_symbol_features(
                             "symbol_tri:{}||{}||{}",
                             sorted[i], sorted[j], sorted[k]
                         );
-                        w.set(&key, 1.0);
+                        w.set_token(&key, 1.0);
                     }
                 }
             }
         }
     }
-}
-
-/// Emit textenc:* — 12 fixed ratios over concatenated strings across files.
-/// Mirrors `_apply_text_encoding_features`.
-fn write_textenc_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
-    let mut strings: Vec<(String, bool)> = Vec::new();
-    for s in summaries {
-        for item in &s.raw_strings {
-            if let Some(entry) = extract_string_entry(item) {
-                strings.push(entry);
-            }
-        }
-    }
-    let n = strings.len();
-    if n == 0 {
-        return;
-    }
-
-    let mut sum_len: usize = 0;
-    let mut max_len: usize = 0;
-    let mut base64ish = 0u32;
-    let mut hexish = 0u32;
-    let mut urlish = 0u32;
-    let mut pathish = 0u32;
-    let mut unicode_escape = 0u32;
-    let mut wide_n = 0u32;
-    let mut high_entropy = 0u32;
-    let mut long_token = 0u32;
-    let mut short_junk = 0u32;
-
-    for (value, is_wide) in &strings {
-        let len = value.chars().count();
-        sum_len += len;
-        max_len = max_len.max(len);
-        let lower = value.to_lowercase();
-
-        if looks_base64ish(value) {
-            base64ish += 1;
-        }
-        if looks_hexish(value) {
-            hexish += 1;
-        }
-        if lower.contains("http://")
-            || lower.contains("https://")
-            || lower.contains("://")
-            || lower.contains("%2f")
-        {
-            urlish += 1;
-        }
-        if value.contains('/')
-            || value.contains('\\')
-            || lower.starts_with("c:")
-            || lower.starts_with("./")
-            || lower.starts_with("../")
-        {
-            pathish += 1;
-        }
-        if value.contains("\\x") || value.contains("\\u") || lower.contains("%u") {
-            unicode_escape += 1;
-        }
-        if *is_wide {
-            wide_n += 1;
-        }
-        if len >= 24 && char_entropy(value) >= 4.0 {
-            high_entropy += 1;
-        }
-        if len >= 80 {
-            long_token += 1;
-        }
-        if (4..=8).contains(&len) && char_entropy(value) >= 2.4 {
-            short_junk += 1;
-        }
-    }
-
-    let n_f = n as f64;
-    let denom = n_f.max(1.0);
-    let log1p = |x: f64| x.ln_1p();
-
-    w.set("textenc:string_count_log", log1p(n_f) as f32);
-    w.set("textenc:avg_len_log", log1p(sum_len as f64 / denom) as f32);
-    w.set("textenc:max_len_log", log1p(max_len as f64) as f32);
-    w.set(
-        "textenc:base64ish_ratio",
-        (f64::from(base64ish) / denom) as f32,
-    );
-    w.set("textenc:hexish_ratio", (f64::from(hexish) / denom) as f32);
-    w.set("textenc:urlish_ratio", (f64::from(urlish) / denom) as f32);
-    w.set("textenc:pathish_ratio", (f64::from(pathish) / denom) as f32);
-    w.set(
-        "textenc:unicode_escape_ratio",
-        (f64::from(unicode_escape) / denom) as f32,
-    );
-    w.set("textenc:wide_ratio", (f64::from(wide_n) / denom) as f32);
-    w.set(
-        "textenc:high_entropy_ratio",
-        (f64::from(high_entropy) / denom) as f32,
-    );
-    w.set(
-        "textenc:long_token_ratio",
-        (f64::from(long_token) / denom) as f32,
-    );
-    w.set(
-        "textenc:short_junk_ratio",
-        (f64::from(short_junk) / denom) as f32,
-    );
 }
 
 /// Cross-metric derived ratios. Mirrors collimator `_BATCH1_RATIOS`.
@@ -4147,7 +3414,6 @@ mod import_token_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -4163,33 +3429,16 @@ mod tests {
     /// with "end byte index 4 is not a char boundary".
     #[test]
     fn attack_tactic_prefix_tolerates_non_ascii_technique_id() {
-        let hostile = FileSummary {
-            raw_findings: vec![
-                RawFinding {
-                    // T(0) ü(1..3) ─(3..6) — byte 4 lands inside the box char.
-                    id: "hostile".to_string(),
-                    conf: 1.0,
-                    crit: 1,
-                    atk: Some("T\u{fc}\u{2500}x".to_string()),
-                    mbc: None,
-                },
-                RawFinding {
-                    id: "ordinary".to_string(),
-                    conf: 1.0,
-                    crit: 1,
-                    atk: Some("T1059.001".to_string()),
-                    mbc: None,
-                },
-            ],
-            ..FileSummary::default()
-        };
+        // T(0) ü(1..3) ─(3..6) — byte 4 lands inside the box char.
+        let codes = ["T\u{fc}\u{2500}x".to_string(), "T1059.001".to_string()];
         let lookup: HashMap<String, usize> = [("agg:attack_tactic_count".to_string(), 0)]
             .into_iter()
             .collect();
         let mut vec = vec![0.0f32; 1];
-        write_aggregate_features(
+        write_code_features(
             &FindingSummary::default(),
-            std::slice::from_ref(&hostile),
+            &codes,
+            &[],
             &mut FeatureWriter {
                 vec: &mut vec,
                 lookup: &lookup,
@@ -4200,6 +3449,30 @@ mod tests {
             vec[0], 1.0,
             "expected only the ASCII technique to yield a tactic prefix"
         );
+    }
+
+    /// The ordinals the writers compare against are cleave's criticality ranks.
+    #[test]
+    fn criticality_ordinals_match_cleave_ranks() {
+        use cleave::Criticality;
+        assert_eq!(u32::from(Criticality::Baseline.rank()), CRIT_BASELINE);
+        assert_eq!(u32::from(Criticality::Notable.rank()), CRIT_NOTABLE);
+        assert_eq!(u32::from(Criticality::Suspicious.rank()), CRIT_SUSPICIOUS);
+        assert_eq!(u32::from(Criticality::Hostile.rank()), CRIT_HOSTILE);
+    }
+
+    /// `kv:` tokens come from boolean and string metrics only, as in
+    /// collimator with shape mode off.
+    #[test]
+    fn kv_tokens_cover_booleans_and_strings_only() {
+        let metrics = serde_json::json!({
+            "pe": {"signed": true, "subsystem": "  windows   gui ", "sections": 4},
+            "text": "not a group",
+        });
+        let mut tokens = kv_tokens(Some(&metrics));
+        tokens.sort();
+        assert_eq!(tokens, ["kv:pe.signed=true", "kv:pe.subsystem=windows gui"]);
+        assert!(kv_tokens(None).is_empty());
     }
 
     #[test]
@@ -4227,12 +3500,12 @@ mod tests {
         assert_eq!(paths("standalone"), vec!["standalone"]);
     }
 
-    /// `collect_file_symbols` reads imports/exports/functions PLUS the
+    /// `file_symbols` reads imports/exports/functions PLUS the
     /// filefacts AST symbol kinds (`tgt` = call targets, `mbr` = member
     /// chains). Tokens shorter than 2 chars are dropped to match collimator's
     /// `_file_symbols` threshold.
     #[test]
-    fn collect_file_symbols_picks_up_targets_and_members() {
+    fn file_symbols_picks_up_targets_and_members() {
         let file: cleave::types::CompactFile = serde_json::from_value(serde_json::json!({
             "id": 0,
             "path": "lib.rs",
@@ -4248,15 +3521,15 @@ mod tests {
             }
         }))
         .expect("fixture is a valid compact file");
-        let summary = FileSummary::from_compact(
-            &file,
-            RawNeeds {
-                kv: true,
-                textenc: true,
-                symbol: true,
-            },
+        let syms = file_symbols(&file.facts);
+        assert!(
+            syms.is_sorted(),
+            "symbols are sorted for the n-gram writers"
         );
-        let syms = collect_file_symbols(&summary);
+        assert_eq!(
+            FileSummary::from_compact(&file, RawNeeds::all()).symbols,
+            syms
+        );
 
         for expected in [
             "open",                 // import
@@ -4269,12 +3542,12 @@ mod tests {
             "process.env.PATH",     // member chain
         ] {
             assert!(
-                syms.contains(expected),
+                syms.iter().any(|s| s == expected),
                 "expected {expected:?} in symbol set, got {syms:?}"
             );
         }
         assert!(
-            !syms.contains("a") && !syms.contains("x"),
+            syms.iter().all(|s| s != "a" && s != "x"),
             "1-char symbols should be filtered out"
         );
     }
@@ -4425,7 +3698,6 @@ mod tests {
         );
         let ctx = ExtractContext::new(&spec);
         assert_eq!(ctx.bigram_slots, vec![Some(1), Some(0)]);
-        assert!(ctx.validate_layout().is_ok());
     }
 
     #[test]
@@ -4449,7 +3721,6 @@ mod tests {
         let ctx = ExtractContext::new(&spec);
         assert_eq!(ctx.present_slots, vec![Some(0), Some(1)]);
         assert_eq!(ctx.maxcrit_slots, vec![None, Some(2)]);
-        assert!(ctx.validate_layout().is_ok());
     }
 
     #[test]
@@ -4466,24 +3737,5 @@ mod tests {
         );
         let ctx = ExtractContext::new(&spec);
         assert_eq!(ctx.bigram_slots, vec![None]);
-        assert!(ctx.validate_layout().is_ok());
-    }
-
-    #[test]
-    fn validate_layout_accepts_anchored_spec() {
-        // Both bigram families present: a healthy bundle.
-        let spec = anchor_spec(
-            vec![],
-            vec!["a + b".to_string()],
-            vec![],
-            vec![
-                "bigrams:a + b".to_string(),
-                "unsigned_bigram:a + b".to_string(),
-            ],
-        );
-        let ctx = ExtractContext::new(&spec);
-        assert_eq!(ctx.bigram_slots, vec![Some(0)]);
-        assert_eq!(ctx.unsigned_bigram_slots, vec![Some(1)]);
-        assert!(ctx.validate_layout().is_ok());
     }
 }

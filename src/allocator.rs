@@ -46,10 +46,11 @@ pub fn trim() {
     // blocks while the pool is busy. That is why callers gate on an idle worker;
     // on a genuinely wedged rayon thread (which the summary ticker detects and
     // reports separately) this parks one blocking thread rather than spinning.
-    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
     // SAFETY: `mi_collect` takes no pointers and is safe to call from any
-    // thread at any time; it is `unsafe` only by virtue of being an `extern "C"`
-    // declaration.
+    // thread at any time; it is `unsafe` only by virtue of being an
+    // `extern "C"` declaration.
+    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+    // SAFETY: as above.
     unsafe { libmimalloc_sys::mi_collect(true) };
 }
 
@@ -57,7 +58,7 @@ pub fn trim() {
 /// unix jemalloc's `background_thread` already does this on its own schedule,
 /// and on a `crt-heap` build there is no knob to reach for.
 #[cfg(not(all(windows, not(feature = "crt-heap"))))]
-pub fn trim() {}
+pub(crate) fn trim() {}
 
 #[cfg(test)]
 mod tests {

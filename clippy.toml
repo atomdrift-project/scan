@@ -1,0 +1,5 @@
+# A test asserts by unwrapping, expecting and panicking; that is what a
+# failing test is. Production code still denies all three (Cargo.toml).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

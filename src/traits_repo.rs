@@ -1,41 +1,51 @@
 //! Thin wrapper over cleave's R2-backed trait updater.
 //!
-//! cleave traits are distributed as signed `.tar.zst` bundles from the update
-//! bucket (`cleave::rule_update`); this module resolves the install dir and
-//! delegates, so `scan update-rules` fetches traits the same way `cleave
-//! update-rules` does. No git.
+//! cleave traits are distributed as `.tar.zst` bundles from the update bucket
+//! (`cleave::rule_update`), verified by sha256 against the bucket's own
+//! manifest; that guards against corruption, not a compromised bucket (they
+//! are not signed). This module resolves the install dir and delegates, so
+//! `scan update-rules` fetches traits the same way `cleave update-rules` does.
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Make cleave use an already-installed traits directory instead of attempting
-/// to fetch during resource initialization.
+/// Pin cleave to the installed traits tree unless the caller chose one.
 ///
-/// This protects first-run litmus startup: cleave sees no explicit traits dir
-/// and would otherwise try to install into its default data directory during a
-/// scan. Point it at an existing tree if one is present.
+/// With no explicit directory, cleave prefers a `traits/` in the working
+/// directory over the installed tree, so scanning inside an untrusted checkout
+/// would let that checkout supply (or hollow out) the rules. `CLEAVE_TRAITS_DIR`
+/// still selects a development tree. With nothing installed and no `traits/`
+/// here, cleave is left to bootstrap-install into the data directory.
 pub fn prepare_runtime_env() {
-    if cleave::traits_repo::override_dir().is_some() {
+    let env_set = std::env::var_os("CLEAVE_TRAITS_DIR").is_some_and(|v| !v.is_empty());
+    if env_set || cleave::traits_repo::override_dir().is_some() {
         return;
     }
-    if let Some(value) = std::env::var_os("CLEAVE_TRAITS_DIR")
-        && !value.is_empty()
-    {
-        return;
-    }
-    let default = dirs::data_dir()
+    // cleave's own default (`traits_repo::default_traits_dir`, private there).
+    let installed = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
+        .join("atomdrift")
         .join("cleave")
         .join("traits");
-    if let Some(path) = [PathBuf::from("traits"), default].into_iter().find(|path| {
-        path.is_dir()
-            && (path.join("objectives").is_dir()
-                || path.join("micro-behaviors").is_dir()
-                || path.join("metadata").is_dir())
-    }) {
-        tracing::debug!(path = %path.display(), "using existing cleave traits directory");
-        cleave::traits_repo::set_override_dir(Some(path));
+    let local = looks_like_traits(Path::new("traits"));
+    if !local && !looks_like_traits(&installed) {
+        return;
     }
+    if local {
+        tracing::debug!(
+            path = %installed.display(),
+            "ignoring traits/ in the working directory; set CLEAVE_TRAITS_DIR to use it"
+        );
+    }
+    cleave::traits_repo::set_override_dir(Some(installed));
+}
+
+/// The test cleave applies to a candidate traits directory.
+fn looks_like_traits(path: &Path) -> bool {
+    path.is_dir()
+        && (path.join("objectives").is_dir()
+            || path.join("micro-behaviors").is_dir()
+            || path.join("metadata").is_dir())
 }
 
 /// Install or refresh cleave traits from the R2 bundle, the same path

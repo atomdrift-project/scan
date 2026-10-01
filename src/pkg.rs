@@ -104,9 +104,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
             && let Some((name, bytes)) = crate::fetch::registry_document(reg)
         {
             if progress {
-                eprintln!(
-                    "\n  \x1b[38;2;230;180;80m\u{26a0}\x1b[0m  \x1b[38;2;160;160;160mversion unpublished — scanning registry metadata only\x1b[0m"
-                );
+                warn_metadata_only("version unpublished");
             }
             return crate::engine::run_bytes(
                 &name,
@@ -132,11 +130,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
         Ok((bytes, name, rec)) => {
             // Display under the resolved URL when there is one (a PURL resolves to
             // its download URL); fall back to the locator itself.
-            let label = if rec.resolved_url.is_empty() {
-                rec.locator.clone()
-            } else {
-                rec.resolved_url.clone()
-            };
+            let label = crate::fetch::fetch_target(&rec).to_owned();
             crate::engine::run_bytes(
                 &label,
                 &name,
@@ -156,9 +150,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
         Err(e) => match registry.as_ref().and_then(crate::fetch::registry_document) {
             Some((name, bytes)) => {
                 if progress {
-                    eprintln!(
-                        "\n  \x1b[38;2;230;180;80m\u{26a0}\x1b[0m  \x1b[38;2;160;160;160martifact unavailable — scanning registry metadata only\x1b[0m"
-                    );
+                    warn_metadata_only("artifact unavailable");
                 }
                 crate::engine::run_bytes(
                     &name,
@@ -173,4 +165,18 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
             None => Err(e),
         },
     }
+}
+
+/// Tell the operator the scan fell back to the registry's record because there
+/// are no bytes to scan, and why.
+fn warn_metadata_only(why: &str) {
+    use crate::output::{Rgb, fg};
+    eprintln!(
+        "\n  {}  {}",
+        fg(Rgb(230, 180, 80), "\u{26a0}"),
+        fg(
+            Rgb(160, 160, 160),
+            &format!("{why} — scanning registry metadata only")
+        )
+    );
 }

@@ -14,34 +14,12 @@
 //!
 //! The corpus is a stub standing in for hopper, so the test covers the real
 //! chain — index miss, then corpus — rather than a seam invented for it.
-//!
-//! # Why most of these are `#[ignore]`
-//!
-//! Every case that needs a corpus is blocked, and not by anything in this file.
-//! `build_app` constructs hopper's background uploader when `--hopper` is set,
-//! and `Uploader::new` builds a *blocking* reqwest client (upload.rs). Tokio
-//! refuses that from inside a runtime — "Cannot drop a runtime in a context
-//! where blocking is not allowed" — so any test that builds the app with a
-//! corpus panics before it can assert anything. `flavor = "multi_thread"`,
-//! `block_in_place`, and arming `corpus_precheck` off-runtime first were all
-//! tried; none of them help, because the client is built fresh on every call
-//! rather than once behind a `OnceLock`.
-//!
-//! This predates the precheck: nothing here touches upload.rs or server/mod.rs.
-//! It is also why the repository has no integration test covering any
-//! hopper-dependent server behaviour at all.
-//!
-//! Unresolved: a probe reproducing the server binary's exact startup — a
-//! `new_multi_thread().enable_all()` runtime, then `block_on(build_app)` with
-//! `--hopper` set — panics the same way, yet the deployed server runs with
-//! `--hopper` and serves. Those two facts have not been reconciled. Moving the
-//! uploader's client construction off the async path would unblock these tests
-//! and settle the question.
+
+mod common;
 
 use anyhow::Result;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use scan::server::{ServerConfig, build_app};
 use sha2::{Digest, Sha256};
@@ -111,62 +89,21 @@ async fn stub_corpus(holds: Holds) -> Result<(String, Arc<Asked>)> {
     Ok((base, asked))
 }
 
-/// Build the corpus precheck's HTTP client on a thread with no runtime.
-///
-/// `corpus_precheck` keeps a blocking reqwest client behind a `OnceLock`, and
-/// reqwest will not construct one from inside a tokio runtime. Whoever touches
-/// it first decides that context — and in a `#[tokio::test]` that would be
-/// `build_app`, which runs in one. Arming it here from a plain thread leaves the
-/// later call a lookup rather than an initialization. A harness concern only:
-/// the server binary reaches the same code from its own startup path.
-fn arm_corpus_precheck(base: &str) {
-    let base = base.to_owned();
-    let joined = std::thread::spawn(move || {
-        // Constructed and dropped off-runtime, which is the whole point.
-        drop(scan::upload::Uploader::new(
-            &base,
-            "precheck-arming".to_owned(),
-        ));
-    })
-    .join();
-    assert!(joined.is_ok(), "arming thread panicked");
-}
-
 async fn app_with_corpus(base: Option<&str>) -> Result<Router> {
-    if let Some(base) = base {
-        arm_corpus_precheck(base);
-    }
-    let config = ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        1024 * 1024,
-        0,
-        std::env::temp_dir(),
-        None,
-        4000,
-        vec![],
-        None,
-        2,
-        vec![],
-    )?
-    .with_hopper(base.map(str::to_owned));
-    let app = build_app(&config).await?;
-    // Naming a corpus also starts hopper's background uploader, which owns a
-    // blocking reqwest client. Dropping that client from inside a tokio runtime
-    // panics ("Cannot drop a runtime in a context where blocking is not
-    // allowed"), so one handle is deliberately kept alive for the life of the
-    // test binary instead of being torn down. A teardown artifact of running the
-    // server in-process, not behaviour under test — and a test binary is short.
-    std::mem::forget(app.clone());
-    Ok(app)
+    let config = ServerConfig {
+        hopper: base.map(str::to_owned),
+        ..common::unready_config()
+    };
+    build_app(&config).await
 }
 
 async fn analyze(app: Router, uri: &str, body: &str) -> Result<(StatusCode, serde_json::Value)> {
-    let mut req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .body(Body::from(body.to_owned()))?;
-    req.extensions_mut()
-        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+    let req = common::loopback(
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(Body::from(body.to_owned()))?,
+    );
     let res = app.oneshot(req).await?;
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), 256 * 1024).await?;
@@ -180,7 +117,6 @@ async fn analyze(app: Router, uri: &str, body: &str) -> Result<(StatusCode, serd
 /// The whole point: a verdict the corpus already holds is answered without
 /// spending an analysis slot.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: build_app with --hopper builds a blocking reqwest client, which panics under any tokio runtime. Pre-existing; see the module comment."]
 async fn a_held_verdict_answers_without_analyzing() -> Result<()> {
     let (base, asked) = stub_corpus(Holds::Verdict).await?;
     let app = app_with_corpus(Some(&base)).await?;
@@ -227,7 +163,6 @@ async fn a_held_verdict_answers_without_analyzing() -> Result<()> {
 /// configured one. Under the old rule this analyzed instead, and answered
 /// non-200 against the empty model directory.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: build_app with --hopper builds a blocking reqwest client, which panics under any tokio runtime. Pre-existing; see the module comment."]
 async fn a_policy_the_operator_did_not_configure_still_reads_the_corpus() -> Result<()> {
     let (base, asked) = stub_corpus(Holds::Verdict).await?;
     let app = app_with_corpus(Some(&base)).await?;
@@ -258,7 +193,6 @@ async fn a_policy_the_operator_did_not_configure_still_reads_the_corpus() -> Res
 /// An upload is asked about by the digest of the bytes in hand — the identity —
 /// so re-sending an artifact the fleet has already seen costs nothing either.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: build_app with --hopper builds a blocking reqwest client, which panics under any tokio runtime. Pre-existing; see the module comment."]
 async fn an_upload_is_answered_from_a_verdict_held_for_its_digest() -> Result<()> {
     let (base, asked) = stub_corpus(Holds::Verdict).await?;
     let app = app_with_corpus(Some(&base)).await?;
@@ -296,7 +230,6 @@ async fn an_upload_is_answered_from_a_verdict_held_for_its_digest() -> Result<()
 /// index path was already safe (`pick_verdict` accepts a PURL's verdict only
 /// when it describes the same bytes); the corpus path had no such guard.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: build_app with --hopper builds a blocking reqwest client, which panics under any tokio runtime. Pre-existing; see the module comment."]
 async fn an_uploads_purl_never_reaches_the_resolver() -> Result<()> {
     let (base, asked) = stub_corpus(Holds::Verdict).await?;
     let app = app_with_corpus(Some(&base)).await?;
@@ -330,7 +263,6 @@ async fn an_uploads_purl_never_reaches_the_resolver() -> Result<()> {
 /// `unknown` is not a verdict. Answering with it would tell a caller nobody has
 /// analyzed the artifact — which is precisely what they asked us to change.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: build_app with --hopper builds a blocking reqwest client, which panics under any tokio runtime. Pre-existing; see the module comment."]
 async fn nothing_held_still_analyzes() -> Result<()> {
     let (base, asked) = stub_corpus(Holds::Nothing).await?;
     let app = app_with_corpus(Some(&base)).await?;
@@ -353,7 +285,6 @@ async fn nothing_held_still_analyzes() -> Result<()> {
 /// answer would make an outage look like a refusal to work — the failure this
 /// keeps `unavailable` distinct from `unknown` to avoid.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: build_app with --hopper builds a blocking reqwest client, which panics under any tokio runtime. Pre-existing; see the module comment."]
 async fn an_unreachable_corpus_still_analyzes() -> Result<()> {
     // Port 1 on loopback: nothing listens, and connection is refused promptly.
     let app = app_with_corpus(Some("http://127.0.0.1:1")).await?;
@@ -384,7 +315,6 @@ async fn no_corpus_configured_still_analyzes() -> Result<()> {
 /// upgrade, say. It has to beat a verdict the corpus is holding, or it is not a
 /// force at all.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "blocked: build_app with --hopper builds a blocking reqwest client, which panics under any tokio runtime. Pre-existing; see the module comment."]
 async fn force_analyzes_even_when_a_verdict_is_held() -> Result<()> {
     let (base, asked) = stub_corpus(Holds::Verdict).await?;
     let app = app_with_corpus(Some(&base)).await?;

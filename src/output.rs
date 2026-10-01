@@ -2,12 +2,12 @@
 //! Supports both dark and light terminal backgrounds via auto-detection.
 
 use std::io::IsTerminal;
-use std::sync::{LazyLock, RwLock};
+use std::sync::OnceLock;
 use unicode_width::UnicodeWidthStr;
 
 use crate::OutputFormat;
 use crate::engine::{ScanResult, ScanSummary, level_confidence};
-use crate::model::{Classification, RouteScore};
+use crate::model::{Classification, Level, RouteScore};
 
 const BLOCK: &str = "\u{2588}";
 const TERMINAL_MARKER_WIDTH: usize = 3;
@@ -29,7 +29,7 @@ fn terminal_marker_prefix_with_width(indent: usize, marker: &str, marker_width: 
 
 /// RGB color tuple.
 #[derive(Debug, Clone, Copy)]
-struct Rgb(u8, u8, u8);
+pub(crate) struct Rgb(pub(crate) u8, pub(crate) u8, pub(crate) u8);
 
 /// Terminal background theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,61 +114,45 @@ impl Palette {
     }
 }
 
-/// Process-global theme selection. Starts unset, then caches either an explicit
-/// override or the first successful auto-detection result.
-static THEME: LazyLock<RwLock<Option<Theme>>> = LazyLock::new(|| RwLock::new(None));
+/// Process-global theme, chosen once at startup — by [`set_theme`] from a CLI
+/// flag, or by [`detect_theme`] — before any output. Dark until then.
+static THEME: OnceLock<Theme> = OnceLock::new();
 
-/// Detect the terminal theme, with env var override.
+/// Detect the terminal theme, with env var override, and keep it for the
+/// rest of the process (unless [`set_theme`] already chose one).
 ///
 /// Priority: `SCAN_THEME` env var > terminal query > default (dark).
 pub fn detect_theme() -> Theme {
-    if let Ok(theme) = THEME.read()
-        && let Some(theme) = *theme
-    {
-        return theme;
-    }
-
-    let detected = if let Ok(val) = std::env::var("SCAN_THEME") {
-        match val.to_ascii_lowercase().as_str() {
-            "light" | "white" => Theme::Light,
-            _ => Theme::Dark,
+    *THEME.get_or_init(|| {
+        if let Ok(val) = std::env::var("SCAN_THEME") {
+            match val.to_ascii_lowercase().as_str() {
+                "light" | "white" => Theme::Light,
+                _ => Theme::Dark,
+            }
+        } else if
+        // Terminal queries must only be attempted on a real TTY. Without one,
+        // the read blocks indefinitely or the kernel sends SIGTTIN.
+        !std::io::stderr().is_terminal() {
+            Theme::Dark
+        } else {
+            match terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default())
+            {
+                Ok(terminal_colorsaurus::ColorScheme::Light) => Theme::Light,
+                Ok(terminal_colorsaurus::ColorScheme::Dark) | Err(_) => Theme::Dark,
+            }
         }
-    } else if
-    // Terminal queries must only be attempted on a real TTY. Without one,
-    // the read blocks indefinitely or the kernel sends SIGTTIN.
-    !std::io::stderr().is_terminal() {
-        Theme::Dark
-    } else {
-        match terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default()) {
-            Ok(scheme) => match scheme {
-                terminal_colorsaurus::ColorScheme::Dark => Theme::Dark,
-                terminal_colorsaurus::ColorScheme::Light => Theme::Light,
-            },
-            Err(_) => Theme::Dark,
-        }
-    };
-
-    if let Ok(mut theme) = THEME.write() {
-        *theme = Some(detected);
-    }
-
-    detected
+    })
 }
 
-/// Override the theme (called from CLI flags before any output).
+/// Choose the theme (called from CLI flags before any output). The first
+/// choice stands for the life of the process.
 pub fn set_theme(theme: Theme) {
-    if let Ok(mut current) = THEME.write() {
-        *current = Some(theme);
-    }
+    let _ = THEME.set(theme);
 }
 
-/// The active theme, defaulting to dark when unset or the lock is poisoned.
+/// The active theme, dark when none was chosen.
 fn current_theme() -> Theme {
-    THEME
-        .read()
-        .ok()
-        .and_then(|theme| *theme)
-        .unwrap_or(Theme::Dark)
+    THEME.get().copied().unwrap_or(Theme::Dark)
 }
 
 fn palette() -> &'static Palette {
@@ -181,20 +165,36 @@ fn palette() -> &'static Palette {
     }
 }
 
-/// Set truecolor foreground on text.
-fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
-    format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
+/// Whether output may carry ANSI color: stdout is a terminal and `NO_COLOR`
+/// is unset, as the `colored` crate decides it.
+pub(crate) fn color_enabled() -> bool {
+    colored::control::SHOULD_COLORIZE.should_colorize()
 }
 
-/// Set truecolor foreground + bold on text.
-fn fg_bold(Rgb(r, g, b): Rgb, text: &str) -> String {
-    format!("\x1b[1;38;2;{r};{g};{b}m{text}\x1b[0m")
+/// `text` in truecolor foreground, or plain when color is off.
+pub(crate) fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// `text` in truecolor foreground + bold, or plain when color is off.
+pub(crate) fn fg_bold(Rgb(r, g, b): Rgb, text: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[1;38;2;{r};{g};{b}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
 }
 
 /// Linear interpolation between two RGB colors.
-// The .clamp(0.0, 255.0) bounds the value before the u8 cast; sign-loss is
-// impossible because clamp ensures non-negative output.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to 0..=255 before the cast"
+)]
 fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let ch = |x: u8, y: u8| -> u8 {
         (x as f32 + (y as f32 - x as f32) * t)
@@ -285,7 +285,7 @@ fn display_probability(raw: f32, threshold: f32) -> f32 {
 /// Level-derived confidence for DISPLAY, or `None` when the level carries no
 /// confidence worth showing.
 ///
-/// [`level_confidence`] maps a negative level — "cleared no calibrated level
+/// [`level_confidence`] maps [`Level::Clean`] — "cleared no calibrated level
 /// at all" — onto `Some(0)`. That is a defensible wire value, but rendering it
 /// prints ` BENIGN    0% `, which reads as *maximum* confidence in benign. The
 /// model never said that. It said the sample cleared no calibrated level,
@@ -299,9 +299,9 @@ fn display_probability(raw: f32, threshold: f32) -> f32 {
 ///
 /// Display-only by construction: the JSON `conf` field keeps calling
 /// [`level_confidence`], so the machine-readable shape is unchanged.
-fn display_confidence(level: Option<i32>) -> Option<u8> {
+fn display_confidence(level: Level) -> Option<u8> {
     match level {
-        Some(n) if n < 0 => None,
+        Level::Clean => None,
         other => level_confidence(other),
     }
 }
@@ -325,7 +325,7 @@ fn colored_conf_or_pct(
     probability: f32,
     classification: &Classification,
     threshold: f32,
-    level: Option<i32>,
+    level: Level,
 ) -> String {
     match display_confidence(level) {
         Some(conf) => {
@@ -350,6 +350,25 @@ fn class_color(classification: &Classification) -> Rgb {
     }
 }
 
+/// The verdict word stamped on cards and badges.
+const fn verdict_word(classification: &Classification) -> &'static str {
+    match classification {
+        Classification::Hostile => "HOSTILE",
+        Classification::Suspicious => "SUSPECT",
+        Classification::Benign => "BENIGN",
+    }
+}
+
+/// The card's marker rail — `marker` in its fixed-width column — when color
+/// is on; `plain` (grep-able text, no glyph alignment) when it is off.
+fn rail(indent: usize, marker: &str, plain: &str) -> String {
+    if color_enabled() {
+        terminal_marker_prefix(indent, marker)
+    } else {
+        plain.to_string()
+    }
+}
+
 /// Classification label colored to match the band.
 fn colored_label(classification: &Classification, p: &Palette) -> String {
     match classification {
@@ -371,7 +390,7 @@ pub(crate) fn terminal_badge(
     classification: &Classification,
     probability: f32,
     threshold: f32,
-    level: Option<i32>,
+    level: Level,
 ) -> (String, usize) {
     // ` ` + 7-char word + ` ` + 4-char percentage + ` `.
     const BADGE_WIDTH: usize = 14;
@@ -384,12 +403,8 @@ pub(crate) fn terminal_badge(
         },
         |conf| format!("{conf}%"),
     );
-    let word = match classification {
-        Classification::Hostile => "HOSTILE",
-        Classification::Suspicious => "SUSPECT",
-        Classification::Benign => "BENIGN",
-    };
-    if !colored::control::SHOULD_COLORIZE.should_colorize() {
+    let word = verdict_word(classification);
+    if !color_enabled() {
         let stamp = format!("{word}[{pct}]");
         let width = stamp.chars().count();
         return (stamp, width);
@@ -418,16 +433,13 @@ pub(crate) fn terminal_trailer(reasons: &[crate::explain::Reason]) -> Option<Str
         .map(|r| r.description.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    if colored::control::SHOULD_COLORIZE.should_colorize() {
-        let p = palette();
-        Some(format!(
-            "{}{}",
-            terminal_marker_prefix_with_width(1, &fg(p.dim, "\u{00b7}"), 1),
-            fg(p.reason, &body)
-        ))
+    let p = palette();
+    let lead = if color_enabled() {
+        terminal_marker_prefix_with_width(1, &fg(p.dim, "\u{00b7}"), 1)
     } else {
-        Some(format!("\u{00b7} {body}"))
-    }
+        "\u{00b7} ".to_string()
+    };
+    Some(format!("{lead}{}", fg(p.reason, &body)))
 }
 
 /// The LLM interpretation as its own headline-grade line, sitting directly
@@ -440,27 +452,19 @@ pub(crate) fn terminal_interpretation(
     indent: usize,
 ) -> Option<String> {
     let llm = interpretation?;
-    let pad = " ".repeat(indent);
-    let color = colored::control::SHOULD_COLORIZE.should_colorize();
-    if llm.error.is_some() {
-        return Some(if color {
-            format!(
-                "{}{}",
-                terminal_marker_prefix(indent, "\u{2728}"),
-                fg(palette().very_dim, "interpretation unavailable")
-            )
-        } else {
-            format!("{pad}\u{2728} interpretation unavailable")
-        });
-    }
-    Some(if color {
-        format!(
-            "{}{}",
-            terminal_marker_prefix(indent, "\u{2728}"),
-            fg_bold(palette().path_name, &llm.interpretation)
-        )
-    } else {
-        format!("{pad}\u{2728} {}", llm.interpretation)
+    let lead = rail(
+        indent,
+        "\u{2728}",
+        &format!("{}\u{2728} ", " ".repeat(indent)),
+    );
+    let p = palette();
+    Some(match llm {
+        crate::interpret::Interpretation::Failed(_) => {
+            format!("{lead}{}", fg(p.very_dim, "interpretation unavailable"))
+        }
+        crate::interpret::Interpretation::Graded(graded) => {
+            format!("{lead}{}", fg_bold(p.path_name, &graded.interpretation))
+        }
     })
 }
 
@@ -471,15 +475,11 @@ pub(crate) fn terminal_identity_line(identity: &str) -> Option<String> {
     if identity.is_empty() {
         return None;
     }
-    Some(if colored::control::SHOULD_COLORIZE.should_colorize() {
-        format!(
-            "{}{}",
-            terminal_marker_prefix(1, "\u{1faaA}"), // 🪪
-            fg(palette().header_path, identity)
-        )
-    } else {
-        format!("   {identity}")
-    })
+    Some(format!(
+        "{}{}",
+        rail(1, "\u{1faaA}", "   "), // 🪪
+        fg(palette().header_path, identity)
+    ))
 }
 
 /// The registry's account of the package, beneath its identity. Carries the
@@ -491,15 +491,11 @@ pub(crate) fn terminal_registry_line(summary: &str) -> Option<String> {
     if summary.is_empty() {
         return None;
     }
-    Some(if colored::control::SHOULD_COLORIZE.should_colorize() {
-        format!(
-            "{}{}",
-            terminal_marker_prefix(1, "\u{24d8}"), // ⓘ
-            fg(palette().dim, summary)
-        )
-    } else {
-        format!("   {summary}")
-    })
+    Some(format!(
+        "{}{}",
+        rail(1, "\u{24d8}", "   "), // ⓘ
+        fg(palette().dim, summary)
+    ))
 }
 
 /// One finding in the artifact-level terminal summary.
@@ -549,7 +545,7 @@ fn severity_dots(criticality: cleave::Criticality) -> (String, usize) {
         _ => "·",
     };
     let width = UnicodeWidthStr::width(dots);
-    if !colored::control::SHOULD_COLORIZE.should_colorize() {
+    if !color_enabled() {
         return (dots.to_string(), width);
     }
     let rendered = match criticality {
@@ -589,7 +585,6 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
     };
     let location_gap = usize::from(location_width > 0) * 2;
     let description_width = available.saturating_sub(location_width + location_gap);
-    let color = colored::control::SHOULD_COLORIZE.should_colorize();
     let p = palette();
 
     traits
@@ -608,11 +603,7 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
             );
             let location_padding = " "
                 .repeat(location_width.saturating_sub(UnicodeWidthStr::width(location.as_str())));
-            let location = if color {
-                fg(p.dim, &location)
-            } else {
-                location
-            };
+            let location = fg(p.dim, &location);
             format!("{prefix}{description}{padding}  {location_padding}{location}")
         })
         .collect::<Vec<_>>()
@@ -629,7 +620,8 @@ pub(crate) fn terminal_hash_line(sha256: &str, bloom: Option<BloomMark>) -> Opti
     if sha256.is_empty() {
         return None;
     }
-    if !colored::control::SHOULD_COLORIZE.should_colorize() {
+    if !color_enabled() {
+        // Plain output keeps the grep-able text marker instead of the glyph.
         let mark = bloom.map_or_else(String::new, BloomMark::marker);
         return Some(format!("{sha256}{mark}"));
     }
@@ -670,7 +662,7 @@ pub(crate) fn terminal_rule(
     classification: &Classification,
     probability: f32,
     threshold: f32,
-    level: Option<i32>,
+    level: Level,
     width: usize,
 ) -> String {
     let (stamp, stamp_w) = terminal_badge(classification, probability, threshold, level);
@@ -703,17 +695,13 @@ pub(crate) fn terminal_artifact_line(
     if !size.is_empty() {
         meta.push_str(&format!(" \u{00b7} {size}"));
     }
-    if colored::control::SHOULD_COLORIZE.should_colorize() {
-        let p = palette();
-        format!(
-            "{}{} {}",
-            terminal_marker_prefix(1, glyph),
-            fg_bold(p.path_name, label),
-            fg(p.dim, &format!("\u{00b7} {meta}")),
-        )
-    } else {
-        format!("{label} \u{00b7} {meta}")
-    }
+    let p = palette();
+    format!(
+        "{}{} {}",
+        rail(1, glyph, ""),
+        fg_bold(p.path_name, label),
+        fg(p.dim, &format!("\u{00b7} {meta}")),
+    )
 }
 
 /// Render one fetched artifact as a branch beneath the file that referenced it.
@@ -726,14 +714,6 @@ pub(crate) fn terminal_reference_branch(
     body: &str,
     last: bool,
 ) -> String {
-    let status = verdict.map(|(classification, probability)| {
-        let word = match classification {
-            Classification::Hostile => "HOSTILE",
-            Classification::Suspicious => "SUSPECT",
-            Classification::Benign => "BENIGN",
-        };
-        (word, format!("{:.0}%", probability * 100.0))
-    });
     let relationship = format!("{subject} from {source}");
     let fork = if last {
         "\u{2514}\u{2500}"
@@ -742,83 +722,54 @@ pub(crate) fn terminal_reference_branch(
     };
     let stem = if last { "  " } else { "\u{2502} " };
     let indent = "   ";
-    let mut out = String::new();
-    if colored::control::SHOULD_COLORIZE.should_colorize() {
-        let p = palette();
+    let p = palette();
+    let status = match verdict {
+        Some((classification, probability)) => format!(
+            "{} {}",
+            fg_bold(class_color(classification), verdict_word(classification)),
+            fg(p.dim, &format!("{:.0}%", probability * 100.0)),
+        ),
+        None => fg_bold(p.warning, "NOT EVALUATED"),
+    };
+    let mut out = format!(
+        "{indent}{} {} {} {status}\n",
+        fg(p.very_dim, fork),
+        fg_bold(p.path_name, &relationship),
+        fg(p.very_dim, "\u{00b7}"),
+    );
+    let stem = fg(p.very_dim, stem);
+    for line in body.lines() {
         out.push_str(indent);
-        out.push_str(&fg(p.very_dim, fork));
-        out.push(' ');
-        out.push_str(&fg_bold(p.path_name, &relationship));
-        out.push(' ');
-        out.push_str(&fg(p.very_dim, "·"));
-        out.push(' ');
-        if let (Some((classification, _)), Some((word, pct))) = (verdict, status.as_ref()) {
-            out.push_str(&fg_bold(class_color(classification), word));
-            out.push(' ');
-            out.push_str(&fg(p.dim, pct));
-        } else {
-            out.push_str(&fg_bold(p.warning, "NOT EVALUATED"));
-        }
+        out.push_str(&stem);
+        out.push_str(line);
         out.push('\n');
-        for line in body.lines() {
-            out.push_str(indent);
-            out.push_str(&fg(p.very_dim, stem));
-            out.push_str(line);
-            out.push('\n');
-        }
-    } else {
-        let status = status.map_or_else(
-            || "NOT EVALUATED".to_string(),
-            |(word, pct)| format!("{word} {pct}"),
-        );
-        out.push_str(&format!(
-            "{indent}{fork} {relationship} \u{00b7} {status}\n"
-        ));
-        for line in body.lines() {
-            out.push_str(indent);
-            out.push_str(stem);
-            out.push_str(line);
-            out.push('\n');
-        }
     }
     out
 }
 
 /// Non-graded counterpart for a fetched/registry branch.
 pub(crate) fn terminal_reference_status_heading(status: &str, subject: &str) -> String {
-    if colored::control::SHOULD_COLORIZE.should_colorize() {
-        let p = palette();
-        format!(
-            "  ↳ {} {} {}",
-            fg_bold(p.warning, status),
-            fg(p.very_dim, "·"),
-            fg(p.dim, subject),
-        )
-    } else {
-        format!("  ↳ {status} · {subject}")
-    }
+    let p = palette();
+    format!(
+        "  ↳ {} {} {}",
+        fg_bold(p.warning, status),
+        fg(p.very_dim, "·"),
+        fg(p.dim, subject),
+    )
 }
 
 /// The fetched locator as a secondary identity line in the nested branch.
 pub(crate) fn terminal_reference_locator(locator: &str) -> String {
-    if colored::control::SHOULD_COLORIZE.should_colorize() {
-        format!("    {}", fg_bold(palette().path_name, locator))
-    } else {
-        format!("    {locator}")
-    }
+    format!("    {}", fg_bold(palette().path_name, locator))
 }
 
 /// Locator row used inside a compact fetched-reference branch.
 pub(crate) fn terminal_reference_locator_row(locator: &str) -> String {
-    if colored::control::SHOULD_COLORIZE.should_colorize() {
-        format!(
-            "{}{}",
-            terminal_marker_prefix(1, "\u{1f517}"), // 🔗
-            fg_bold(palette().path_name, locator)
-        )
-    } else {
-        format!(" \u{1f517}  {locator}")
-    }
+    format!(
+        "{}{}",
+        terminal_marker_prefix(1, "\u{1f517}"), // 🔗
+        fg_bold(palette().path_name, locator)
+    )
 }
 
 /// Hash/type/size row used inside a compact fetched-reference branch.
@@ -828,23 +779,15 @@ pub(crate) fn terminal_reference_hash_row(sha256: &str, file_type: &str, size: u
     if !size.is_empty() {
         meta.push_str(&format!(" \u{00b7} {size}"));
     }
-    let hash = if colored::control::SHOULD_COLORIZE.should_colorize() {
-        format!(
-            "{}{}",
-            terminal_marker_prefix(1, "\u{1f9ec}"), // 🧬
-            fg(palette().very_dim, sha256)
-        )
-    } else {
-        format!(" \u{1f9ec}  {sha256}")
-    };
+    let hash = format!(
+        "{}{}",
+        terminal_marker_prefix(1, "\u{1f9ec}"), // 🧬
+        fg(palette().very_dim, sha256)
+    );
     if meta.is_empty() {
         return hash;
     }
-    if colored::control::SHOULD_COLORIZE.should_colorize() {
-        format!("{hash}  {}", fg(palette().dim, &format!("\u{00b7} {meta}")))
-    } else {
-        format!("{hash}  \u{00b7} {meta}")
-    }
+    format!("{hash}  {}", fg(palette().dim, &format!("\u{00b7} {meta}")))
 }
 
 /// Frame one independently-scanned package nested inside an archive as a
@@ -864,18 +807,16 @@ pub(crate) fn terminal_card(
     // hostile archive shares the same confidence band, so eight identical `92%`
     // stamps read as a stuck gauge. The one calibrated number lives on the
     // archive banner; the cards rank by severity (worst first) and by class.
-    let word = match classification {
-        Classification::Hostile => "HOSTILE",
-        Classification::Suspicious => "SUSPECT",
-        Classification::Benign => "BENIGN",
-    };
+    let word = verdict_word(classification);
     let mut meta = file_type.to_uppercase();
     let size = human_size(size);
     if !size.is_empty() {
         meta.push_str(&format!(" \u{00b7} {size}"));
     }
     let mut out = String::new();
-    if colored::control::SHOULD_COLORIZE.should_colorize() {
+    // Plain (piped) output drops the frame and indents instead, so every line
+    // stays grep-able.
+    if color_enabled() {
         let p = palette();
         let accent = class_color(classification);
         let Rgb(r, g, b) = accent;
@@ -922,11 +863,6 @@ pub(crate) fn terminal_embedded_branch(
     body: &str,
     last: bool,
 ) -> String {
-    let word = match classification {
-        Classification::Hostile => "HOSTILE",
-        Classification::Suspicious => "SUSPECT",
-        Classification::Benign => "BENIGN",
-    };
     let mut meta = file_type.to_uppercase();
     let size = human_size(size);
     if !size.is_empty() {
@@ -940,34 +876,20 @@ pub(crate) fn terminal_embedded_branch(
     }; // └─ / ├─
     let stem = if last { "  " } else { "\u{2502} " }; //    / │
     let indent = "   ";
-    let mut out = String::new();
-    if colored::control::SHOULD_COLORIZE.should_colorize() {
-        let p = palette();
-        let accent = class_color(classification);
+    let p = palette();
+    let mut out = format!(
+        "{indent}{} {} {}{}\n",
+        fg(p.very_dim, fork),
+        fg_bold(p.path_name, name),
+        fg(p.dim, &format!("\u{00b7} {meta} \u{00b7} ")),
+        fg_bold(class_color(classification), verdict_word(classification)),
+    );
+    let stem = fg(p.very_dim, stem);
+    for line in body.lines() {
         out.push_str(indent);
-        out.push_str(&fg(p.very_dim, fork));
-        out.push(' ');
-        out.push_str(&fg_bold(p.path_name, name));
-        out.push(' ');
-        out.push_str(&fg(p.dim, &format!("\u{00b7} {meta} \u{00b7} ")));
-        out.push_str(&fg_bold(accent, word));
+        out.push_str(&stem);
+        out.push_str(line);
         out.push('\n');
-        for line in body.lines() {
-            out.push_str(indent);
-            out.push_str(&fg(p.very_dim, stem));
-            out.push_str(line);
-            out.push('\n');
-        }
-    } else {
-        out.push_str(&format!(
-            "{indent}{fork} {name} \u{00b7} {meta} \u{00b7} {word}\n"
-        ));
-        for line in body.lines() {
-            out.push_str(indent);
-            out.push_str(stem);
-            out.push_str(line);
-            out.push('\n');
-        }
     }
     out
 }
@@ -1021,7 +943,10 @@ pub fn print_ps_result(
     );
 
     if let Some(llm) = &result.interpretation {
-        eprint!("   {}", crate::engine::format_llm_line(llm, true));
+        eprint!(
+            "   {}",
+            crate::engine::format_llm_line(llm, color_enabled())
+        );
     }
     print_detail_lines(result, p);
     print_reasons(result, p);
@@ -1058,9 +983,12 @@ fn print_detail_lines(result: &ScanResult, p: &Palette) {
                     .or_else(|| base.strip_prefix("well-known/"))
                     .or_else(|| base.strip_prefix("metadata/"))
                     .unwrap_or(base);
+                let crit = |c: cleave::Criticality| u32::from(c.rank());
                 match f.crit {
-                    5 => fg(p.hostile_finding, name),
-                    4 => fg(p.suspicious_finding, name),
+                    c if c == crit(cleave::Criticality::Hostile) => fg(p.hostile_finding, name),
+                    c if c == crit(cleave::Criticality::Suspicious) => {
+                        fg(p.suspicious_finding, name)
+                    }
                     _ => name.to_string(),
                 }
             })
@@ -1100,12 +1028,6 @@ pub(crate) fn format_route_scores(scores: &[RouteScore]) -> String {
         .join(" ")
 }
 
-/// Render a matched operating-point level for display: `L0`, `L50`, or `—`
-/// when the file fired at no calibrated level (benign past the loosest row).
-pub(crate) fn format_level(level: Option<i32>) -> String {
-    level.map_or_else(|| "\u{2014}".to_string(), |n| format!("L{n}"))
-}
-
 /// Print the matched level, raw route scores, and SHAP feature values
 /// (hidden --extra mode). Leads with the level — the operating point a file
 /// maps to is the actionable signal; the calibrated probability is not shown
@@ -1114,7 +1036,7 @@ fn print_extra(result: &ScanResult, p: &Palette) {
     eprintln!(
         "          {} {}",
         fg(p.dim, "level:"),
-        fg(p.dim, &format_level(result.level)),
+        fg(p.dim, &result.level.to_string()),
     );
     if !result.model_scores.is_empty() {
         eprintln!(
@@ -1135,10 +1057,7 @@ fn print_extra(result: &ScanResult, p: &Palette) {
             "          {} {} {} {} {}",
             fg(p.dim, "embedded:"),
             fg(p.dim, &ef.path),
-            fg(
-                p.dim,
-                &format!("[{} {}]", ef.file_type, format_level(ef.level)),
-            ),
+            fg(p.dim, &format!("[{} {}]", ef.file_type, ef.level)),
             fg(p.dim, &format_route_scores(&ef.model_scores)),
             fg(p.very_dim, "(raw scores)"),
         );
@@ -1272,11 +1191,7 @@ impl BloomMark {
     /// then the glyph and label colored by trust. Plain when color is disabled.
     fn marker(self) -> String {
         let body = format!("{} {}", self.glyph(), self.tiny_str());
-        if colored::control::SHOULD_COLORIZE.should_colorize() {
-            format!("  {}", fg(self.color(), &body))
-        } else {
-            format!("  {body}")
-        }
+        format!("  {}", fg(self.color(), &body))
     }
 
     /// The machine token for the `--format tiny` verdict line.
@@ -1344,7 +1259,7 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
 pub fn print_summary(summary: &ScanSummary) {
     let p = palette();
     let flagged = summary.hostile > 0 || summary.suspicious > 0;
-    let color = colored::control::SHOULD_COLORIZE.should_colorize();
+    let color = color_enabled();
     let bloom = crate::bloom_repo::counts();
 
     if flagged && color {
@@ -1601,7 +1516,7 @@ fn now_unix() -> i64 {
 
 /// Format an upstream Unix timestamp as a UTC `YYYY-MM-DD` date.
 fn fmt_date(epoch: i64) -> String {
-    let (y, m, d) = civil_from_days(epoch.div_euclid(86_400));
+    let (y, m, d) = crate::civil::from_days(epoch.div_euclid(86_400));
     format!("{y:04}-{m:02}-{d:02}")
 }
 
@@ -1631,45 +1546,18 @@ fn freshness_color(secs: i64) -> Rgb {
     }
 }
 
-/// Convert days since the Unix epoch to `(year, month, day)` in the proleptic
-/// Gregorian calendar (UTC). Howard Hinnant's `civil_from_days`.
-// Casts are bounded by the algorithm: `d` ∈ [1,31] and `m` ∈ [1,12].
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    (y + i64::from(m <= 2), m, d)
-}
-
 /// Parse a `YYYY-MM-DD` date as a UTC-midnight Unix timestamp (seconds).
-/// Returns `None` for any malformed field. Inverse of `civil_from_days`
-/// (Howard Hinnant's `days_from_civil`).
+/// Returns `None` for any malformed field.
 #[must_use]
 pub fn parse_ymd(s: &str) -> Option<i64> {
     let mut parts = s.splitn(3, '-');
     let y: i64 = parts.next()?.trim().parse().ok()?;
-    let m: i64 = parts.next()?.trim().parse().ok()?;
-    let d: i64 = parts.next()?.trim().parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    let y = y - i64::from(m <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    Some((era * 146_097 + doe - 719_468) * 86_400)
+    let m: u32 = parts.next()?.trim().parse().ok()?;
+    let d: u32 = parts.next()?.trim().parse().ok()?;
+    Some(crate::civil::to_days(y, m, d)? * 86_400)
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1717,7 +1605,7 @@ mod tests {
         // An absent hash renders nothing.
         assert!(terminal_hash_line("", Some(BloomMark::KnownBad)).is_none());
         // The badge itself carries no bloom glyph.
-        let (badge, _) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Some(0));
+        let (badge, _) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Level::At(0));
         assert!(!badge.contains(BloomMark::KnownBad.glyph()));
     }
 
@@ -1809,6 +1697,58 @@ mod tests {
         assert!(!rendered.contains('\u{2570}'));
     }
 
+    /// Piped output: each renderer's plain form, byte for byte, and no
+    /// escape anywhere.
+    #[test]
+    fn plain_renderers_emit_grep_able_text() {
+        // See `terminal_trait_grid_is_three_rows_and_keeps_location_tail`.
+        colored::control::set_override(false);
+        let lines = [
+            terminal_artifact_line("pkg.tgz", "npm", 2048, true),
+            terminal_identity_line("lodash 4.17.21").unwrap(),
+            terminal_registry_line("published 3d ago").unwrap(),
+            terminal_reference_status_heading("NOT FETCHED", "left-pad"),
+            terminal_reference_locator_row("https://example.com/x"),
+            terminal_reference_hash_row("ab12", "pe", 0),
+            terminal_trailer(&[crate::explain::Reason {
+                feature: "agg:max_crit".to_string(),
+                importance: 1.0,
+                value: 5.0,
+                description: "aggregate: max crit".to_string(),
+            }])
+            .unwrap(),
+            terminal_reference_branch(
+                Some((&Classification::Hostile, 0.97)),
+                "dependency",
+                "package.json",
+                "body",
+                true,
+            ),
+        ];
+        assert_eq!(
+            lines,
+            [
+                "pkg.tgz \u{00b7} NPM \u{00b7} 2.0KB",
+                "   lodash 4.17.21",
+                "   published 3d ago",
+                "  ↳ NOT FETCHED · left-pad",
+                " \u{1f517}  https://example.com/x",
+                " \u{1f9ec}  ab12  \u{00b7} PE",
+                "\u{00b7} aggregate: max crit",
+                "   \u{2514}\u{2500} dependency from package.json \u{00b7} HOSTILE 97%\n     body\n",
+            ]
+        );
+        assert!(lines.iter().all(|l| !l.contains('\x1b')));
+    }
+
+    #[test]
+    fn a_level_names_both_levelless_states() {
+        assert_eq!(Level::At(0).to_string(), "L0");
+        assert_eq!(Level::At(250).to_string(), "L250");
+        assert_eq!(Level::Clean.to_string(), "clean");
+        assert_eq!(Level::Manual.to_string(), "manual");
+    }
+
     #[test]
     fn commas_group_by_threes() {
         assert_eq!(with_commas(0), "0");
@@ -1871,17 +1811,16 @@ mod tests {
     fn display_confidence_is_absent_for_unflagged_levels() {
         // Every level that is actually on the grid keeps its confidence: 0 is
         // the tightest and most certain, higher levels are looser and less so.
-        assert_eq!(display_confidence(Some(0)), Some(100));
-        assert_eq!(display_confidence(Some(5)), Some(95));
+        assert_eq!(display_confidence(Level::At(0)), Some(100));
+        assert_eq!(display_confidence(Level::At(5)), Some(95));
         // No level marker at all → no level-derived confidence. Unchanged.
-        assert_eq!(display_confidence(None), None);
-        // A negative level means the sample cleared no calibrated level. The
+        assert_eq!(display_confidence(Level::Manual), None);
+        // A clean level means the sample cleared no calibrated level. The
         // wire value stays 0 (consumers of the JSON `conf` field see no change)
         // but the display must not reuse it: 0% renders as certainty, and the
         // model expressed absence.
-        assert_eq!(level_confidence(Some(-1)), Some(0));
-        assert_eq!(display_confidence(Some(-1)), None);
-        assert_eq!(display_confidence(Some(-7)), None);
+        assert_eq!(level_confidence(Level::Clean), Some(0));
+        assert_eq!(display_confidence(Level::Clean), None);
     }
 
     #[test]
@@ -1894,7 +1833,7 @@ mod tests {
         //
         // Asserted with `contains` so the test holds in both the plain and the
         // colored badge form.
-        let (unflagged, _) = terminal_badge(&Classification::Benign, 0.998, 0.999, Some(-1));
+        let (unflagged, _) = terminal_badge(&Classification::Benign, 0.998, 0.999, Level::Clean);
         assert!(
             unflagged.contains("BENIGN") && unflagged.contains("50%"),
             "unflagged badge should show the threshold-relative percentage, got {unflagged:?}"
@@ -1902,7 +1841,7 @@ mod tests {
 
         // A level that IS on the grid still reports its calibrated confidence,
         // so the fix does not disturb the flagged path.
-        let (flagged, _) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Some(0));
+        let (flagged, _) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Level::At(0));
         assert!(
             flagged.contains("HOSTILE") && flagged.contains("100%"),
             "flagged badge should keep the level-derived confidence, got {flagged:?}"

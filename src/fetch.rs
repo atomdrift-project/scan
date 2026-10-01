@@ -34,19 +34,23 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
-    BlobCache, Fetch, FetchBudget, FetchError, FetchRecord, Fetched, HttpFetch, Outcome, fetch_ref,
-    fetch_references_with,
+    BlobCache, Fetch, FetchBudget, FetchError, FetchRecord, Fetched, HttpFetch, Method, Outcome,
+    RecordedSource, Request, Served, fetch_ref, fetch_references_with,
 };
 use fletch::{RefKind, RefLocator, Reference, Registry, find};
+use reqwest::Url;
 
 use crate::analysis_cache::AnalysisCache;
+use crate::corpus_precheck::{Precheck, Standing, Verdict};
 use crate::deptree::{DepState, DepTree};
-use crate::hosts;
+use crate::hosts::{self, UrlHost};
+use crate::output::{Rgb, fg};
+use crate::provenance::RegistryProvenance;
 
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
@@ -140,31 +144,178 @@ pub const DEFAULT_MAX_TOTAL_FETCHES: usize = 1000;
 /// (`--fetch-max-total-size`). Lifted in long-lived server modes.
 pub const DEFAULT_MAX_TOTAL_SIZE: u64 = 10 * GIB;
 
-/// Set the process-wide per-fetch byte ceiling (re-exported from [`fletch`] so
-/// the binary configures it through `scan::fetch`). See
-/// [`fletch::fetch::set_max_fetch_bytes`].
-pub use fletch::fetch::set_max_fetch_bytes;
+/// What the process's fetch client and blob cache are built with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settings {
+    /// Ceiling on one fetched response, in bytes (`--fetch-max-size`); a larger
+    /// one is abandoned.
+    pub max_fetch_bytes: u64,
+    /// Replaces both mutable registry-metadata TTLs (`--registry-ttl`). `None`
+    /// keeps fletch's tiered defaults; the immutable tier (a released version's
+    /// file list) is never re-checked regardless.
+    pub registry_ttl: Option<Duration>,
+}
 
-/// Override the process-wide mutable registry-metadata TTLs (re-exported from
-/// [`fletch`]). `None` keeps the tiered defaults (4h for a pinned version's
-/// packument, 1h for a `latest` lookup); a value collapses both to that
-/// lifetime. The immutable tier (a released version's file list) is never
-/// re-checked regardless. See [`fletch::fetch::set_registry_ttl`].
-pub use fletch::fetch::set_registry_ttl;
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            max_fetch_bytes: DEFAULT_MAX_FETCH_SIZE,
+            registry_ttl: None,
+        }
+    }
+}
 
-/// Per-execution fetch budget — a running total shared by every [`orchestrate`]
-/// call in the process. Scans run concurrently, so it's atomic. Set once at
-/// startup via [`set_total_budget`] for one-shot runs; left at the unlimited
-/// default in long-lived server modes, where each job is bounded by the per-file
-/// caps instead. Each per-file [`FetchBudget`] is clamped to what remains here.
-static TOTAL_FETCH_COUNT: AtomicUsize = AtomicUsize::new(usize::MAX);
-static TOTAL_FETCH_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
+static SETTINGS: OnceLock<Settings> = OnceLock::new();
+
+/// Fix the [`Settings`] for the process. Call once at startup, before any
+/// fetch: the client and cache are built on first use and keep what they were
+/// built with, so a later call is ignored.
+pub fn configure(settings: Settings) {
+    let _ = SETTINGS.set(settings);
+}
+
+fn settings() -> Settings {
+    SETTINGS.get().copied().unwrap_or_default()
+}
+
+/// fletch's blob cache under the configured [`Settings`]. Everything that reads
+/// fetched bytes back opens it here, so it can read whatever a fetch admitted.
+///
+/// # Errors
+/// When there is no OS cache directory.
+pub(crate) fn open_blob_cache() -> std::io::Result<BlobCache> {
+    let settings = settings();
+    Ok(BlobCache::open()?
+        .with_max_bytes(settings.max_fetch_bytes)
+        .with_registry_ttl(settings.registry_ttl))
+}
+
+/// A fetch allowance: live fetches and bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Allowance {
+    fetches: usize,
+    bytes: u64,
+}
+
+/// The per-execution fetch budget (`--fetch-max-total-*`), shared by every
+/// fetch phase in the process. Concurrent scans draw on it, so a fetch reserves
+/// its allowance before touching the network and refunds what it did not use:
+/// two scans can never both spend the last of it. Left unlimited in long-lived
+/// server modes, where each job is bounded by its own per-root budget instead.
+#[derive(Debug)]
+struct TotalBudget {
+    fetches: AtomicUsize,
+    bytes: AtomicU64,
+}
+
+static TOTAL_BUDGET: TotalBudget = TotalBudget::new(usize::MAX, u64::MAX);
+
+impl TotalBudget {
+    const fn new(fetches: usize, bytes: u64) -> Self {
+        Self {
+            fetches: AtomicUsize::new(fetches),
+            bytes: AtomicU64::new(bytes),
+        }
+    }
+
+    /// Take up to `want` of each, as much as is left. The grant is the
+    /// caller's to spend, and to [`Self::settle`] when done.
+    fn reserve(&self, want: Allowance) -> Allowance {
+        let fetches = self
+            .fetches
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                Some(left - left.min(want.fetches))
+            })
+            .unwrap_or_else(|left| left);
+        let bytes = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                Some(left - left.min(want.bytes))
+            })
+            .unwrap_or_else(|left| left);
+        Allowance {
+            fetches: fetches.min(want.fetches),
+            bytes: bytes.min(want.bytes),
+        }
+    }
+
+    /// Settle a grant against what was spent: the unused part goes back, and
+    /// any overshoot is taken too — fletch's byte cap is best-effort, stopping
+    /// only after the fetch that crossed it. The count cap is exact.
+    fn settle(&self, granted: Allowance, spent: Allowance) {
+        let _ = self
+            .fetches
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                Some(left.saturating_add(granted.fetches.saturating_sub(spent.fetches)))
+            });
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                Some(if spent.bytes <= granted.bytes {
+                    left.saturating_add(granted.bytes - spent.bytes)
+                } else {
+                    left.saturating_sub(spent.bytes - granted.bytes)
+                })
+            });
+    }
+}
 
 /// Set the process-wide per-execution fetch ceiling (`--fetch-max-total-*`).
 /// Called once at startup for one-shot scans; server modes leave it unlimited.
 pub fn set_total_budget(max_fetches: usize, max_bytes: u64) {
-    TOTAL_FETCH_COUNT.store(max_fetches, Ordering::Relaxed);
-    TOTAL_FETCH_BYTES.store(max_bytes, Ordering::Relaxed);
+    TOTAL_BUDGET.fetches.store(max_fetches, Ordering::Relaxed);
+    TOTAL_BUDGET.bytes.store(max_bytes, Ordering::Relaxed);
+}
+
+/// What one scanned artifact may still fetch, across all of its hops and
+/// declaring files: `--fetch-max-file-fetches` live dependency/package
+/// fetches, `--fetch-max-urls` live URL fetches, and `--fetch-max-file-size`
+/// bytes. Cache hits are free and uncounted, so a warm re-run is never
+/// throttled; references past a cap become `BudgetExceeded`, never silently
+/// dropped.
+#[derive(Debug, Clone, Copy)]
+struct RootBudget {
+    deps: usize,
+    urls: usize,
+    bytes: u64,
+}
+
+/// The two fetch classes, each with its own count cap: declared dependencies
+/// and command-mentioned packages, and opportunistic raw URLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchClass {
+    Deps,
+    Urls,
+}
+
+impl RootBudget {
+    const fn new(policy: &FetchPolicy) -> Self {
+        Self {
+            deps: policy.max_file_fetches,
+            urls: policy.max_url_fetches,
+            bytes: policy.max_file_bytes,
+        }
+    }
+
+    /// What one fetch of `class` may ask the total budget for.
+    const fn want(&self, class: FetchClass) -> Allowance {
+        Allowance {
+            fetches: match class {
+                FetchClass::Deps => self.deps,
+                FetchClass::Urls => self.urls,
+            },
+            bytes: self.bytes,
+        }
+    }
+
+    fn spend(&mut self, class: FetchClass, spent: Allowance) {
+        let fetches = match class {
+            FetchClass::Deps => &mut self.deps,
+            FetchClass::Urls => &mut self.urls,
+        };
+        *fetches = fetches.saturating_sub(spent.fetches);
+        self.bytes = self.bytes.saturating_sub(spent.bytes);
+    }
 }
 
 /// Dependency payloads whose analysis has finished, process-wide, whatever the
@@ -178,18 +329,6 @@ static PAYLOADS_ANALYZED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// How many dependency payloads have finished analysis in this process.
 pub fn payloads_analyzed_total() -> u64 {
     PAYLOADS_ANALYZED_TOTAL.load(Ordering::Relaxed)
-}
-
-/// Charge the per-execution budget for one file's live fetches, saturating at
-/// zero so a charge never wraps. Cache hits and budget-skipped edges cost
-/// nothing (the caller filters them out before charging).
-fn charge_total_budget(fetches: usize, bytes: u64) {
-    let _ = TOTAL_FETCH_COUNT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-        Some(n.saturating_sub(fetches))
-    });
-    let _ = TOTAL_FETCH_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-        Some(n.saturating_sub(bytes))
-    });
 }
 
 /// Describe the count budget that can clip one fetch class. The per-file cap
@@ -209,15 +348,22 @@ fn fetch_count_budget_notice(
     }
 }
 
-/// Count the live network work represented by a batch. Cache hits and
-/// budget-clipped edges are intentionally free of both process-wide budgets.
-fn live_fetch_usage(records: &[FetchRecord]) -> (usize, u64) {
+/// The live network work in a batch. Cache hits and budget-clipped edges are
+/// free of every budget.
+fn live_fetch_usage(records: &[FetchRecord]) -> Allowance {
     records
         .iter()
         .filter(|record| fletch::fetch::counts_against_budget(record))
-        .fold((0, 0), |(fetches, bytes), record| {
-            (fetches + 1, bytes.saturating_add(record.size.unwrap_or(0)))
-        })
+        .fold(
+            Allowance {
+                fetches: 0,
+                bytes: 0,
+            },
+            |spent, record| Allowance {
+                fetches: spent.fetches + 1,
+                bytes: spent.bytes.saturating_add(record.size.unwrap_or(0)),
+            },
+        )
 }
 
 /// Parse a byte size with an optional 1024-based unit suffix — `K`, `M`, `G`, or
@@ -632,11 +778,13 @@ fn off_host_platform(r: &Reference, host: (&str, &str)) -> bool {
     let RefLocator::Purl(purl) = &r.locator else {
         return false;
     };
-    // Package name = the PURL body without its trailing `@version`; split into
-    // lowercase alphanumeric segments (`cli-darwin-arm64` → [cli, darwin, arm64],
-    // `%40biomejs` → [40, biomejs]).
-    let name = purl.rsplit_once('@').map_or(purl.as_str(), |(n, _)| n);
-    let mut segs: Vec<String> = name
+    let Some(coordinate) = Coordinate::of(purl) else {
+        return false;
+    };
+    // The package path in lowercase alphanumeric segments
+    // (`%40biomejs/cli-darwin-arm64` → [40, biomejs, cli, darwin, arm64]).
+    let mut segs: Vec<String> = coordinate
+        .path
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|s| !s.is_empty())
         .map(str::to_ascii_lowercase)
@@ -666,6 +814,41 @@ fn off_host_platform(r: &Reference, host: (&str, &str)) -> bool {
     false
 }
 
+/// A PURL's coordinate, split once the way every reader in this module needs
+/// it: `pkg:<type>/<path>[@<version>]`, qualifiers and subpath dropped. The
+/// version follows the last `@` that is not part of the path — a scope's `@` is
+/// `%40`-encoded or opens a segment, so it never reads as one. A borrowed view;
+/// canonicalization is fletch's job ([`fletch::purl::normalize`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Coordinate<'a> {
+    /// `pkg:<type>/<path>`: the package, whatever its version.
+    key: &'a str,
+    /// The package type (`npm`, `golang`, …).
+    typ: &'a str,
+    /// The package path after the type, still percent-encoded.
+    path: &'a str,
+    version: Option<&'a str>,
+}
+
+impl<'a> Coordinate<'a> {
+    fn of(purl: &'a str) -> Option<Self> {
+        let body = purl.strip_prefix("pkg:")?;
+        let body = body.split(['?', '#']).next().unwrap_or(body);
+        let (typ, rest) = body.split_once('/')?;
+        let (path, version) = match rest.rsplit_once('@') {
+            Some((path, version)) if !version.contains('/') => (path, Some(version)),
+            _ => (rest, None),
+        };
+        let key = purl.get(.."pkg:".len() + typ.len() + 1 + path.len())?;
+        Some(Self {
+            key,
+            typ,
+            path,
+            version,
+        })
+    }
+}
+
 /// The root sample's imperative hunt re-reads it from disk and re-parses it.
 /// Skip that for large roots — the win is scripts/manifests/Dockerfiles, which
 /// are small; a multi-megabyte binary root has no imperative install commands to
@@ -685,8 +868,11 @@ struct Resources {
 fn shared_resources() -> Option<&'static Resources> {
     static RESOURCES: OnceLock<Option<Resources>> = OnceLock::new();
     RESOURCES
-        .get_or_init(|| match (HttpFetch::new(), BlobCache::open()) {
-            (Ok(net), Ok(cache)) => Some(Resources { net, cache }),
+        .get_or_init(|| match (HttpFetch::new(), open_blob_cache()) {
+            (Ok(net), Ok(cache)) => Some(Resources {
+                net: net.with_max_bytes(settings().max_fetch_bytes),
+                cache,
+            }),
             (Err(e), _) => {
                 tracing::warn!("fetch disabled: http client unavailable: {e:#}");
                 None
@@ -760,12 +946,6 @@ const API_URL_PATH_COMPONENTS: &[&str] = &[
     "token",
 ];
 
-/// Whether a discovered URL looks enough like a dropper download to spend a
-/// network request on it.
-///
-/// This is deliberately a shape check, not a content or reputation check:
-/// direct scans still fetch exactly what the operator names, and a URL with a
-/// plausible payload basename remains eligible even when its host is unknown.
 /// Whether a path component reads as a version rather than a filename: every
 /// dot-separated segment is digits, with at least one dot and an optional
 /// leading `v` (`0.40.0`, `v2.1`, `10.0.1`). A bare `v1` or a plain number has
@@ -788,22 +968,17 @@ fn is_version_shaped(component: &str) -> bool {
 
 /// Whether a discovered URL has a real network host. URL extraction also sees
 /// relative paths, malformed authority strings, and single-label local names
-/// such as `wpad`; none can identify a public download host. IP literals are
-/// valid, while DNS names must have at least two labels.
-fn valid_discovered_url_host(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
+/// such as `wpad`; none can identify a public download host. Public IP literals
+/// of either family are valid, while DNS names must have at least two labels.
+fn valid_discovered_url_host(url: &Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
         return false;
     }
-    let Some(host) = parsed.host_str() else {
-        return false;
+    let host = match hosts::url_host(url) {
+        Some(UrlHost::Ip(ip)) => return public_ip(ip),
+        Some(UrlHost::Domain(host)) => host,
+        None => return false,
     };
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return public_ip(ip);
-    }
-
     let host = host.strip_suffix('.').unwrap_or(host);
     host.len() <= 253
         && host.contains('.')
@@ -850,8 +1025,10 @@ fn has_unexpanded_url_placeholder(url: &str) -> bool {
 /// that describe the scanner's host, a lab network, or documentation rather
 /// than an external payload service.
 fn public_ip(ip: std::net::IpAddr) -> bool {
+    // Only an IPv4-*mapped* address is an IPv4 host in disguise; the
+    // deprecated IPv4-compatible form would turn `::1` into `0.0.0.1`.
     if let std::net::IpAddr::V6(ipv6) = ip
-        && let Some(ipv4) = ipv6.to_ipv4()
+        && let Some(ipv4) = ipv6.to_ipv4_mapped()
     {
         return public_ip(std::net::IpAddr::V4(ipv4));
     }
@@ -886,24 +1063,17 @@ fn public_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn looks_like_dropper_download_url(url: &str) -> bool {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return false;
-    };
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return false;
-    }
-
-    // Stop at the first path/query/fragment delimiter. A URL with no path is
-    // a site or API root, not a downloadable file.
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    if authority_end == 0 {
+/// Whether a discovered URL looks enough like a dropper download to spend a
+/// network request on it.
+///
+/// This is deliberately a shape check, not a content or reputation check:
+/// direct scans still fetch exactly what the operator names, and a URL with a
+/// plausible payload basename remains eligible even when its host is unknown.
+fn looks_like_dropper_download_url(url: &Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
         return false;
     }
-    let Some(path_and_suffix) = rest.get(authority_end..) else {
-        return false;
-    };
-    let path = path_and_suffix.split(['?', '#']).next().unwrap_or_default();
+    let path = url.path();
     // A path ending in `/` names a directory, not a file: whatever a server
     // returns for it is an index or a landing page, never the download itself.
     // `https://pypi.org/project/diffusers/0.40.0/` was being fetched as a
@@ -948,7 +1118,9 @@ fn looks_like_dropper_download_url(url: &str) -> bool {
         return false;
     }
     let explicit_download_path = components.iter().any(|component| {
-        DOWNLOAD_URL_PATH_COMPONENTS.contains(&component.to_ascii_lowercase().as_str())
+        DOWNLOAD_URL_PATH_COMPONENTS
+            .iter()
+            .any(|route| component.eq_ignore_ascii_case(route))
     });
     let extensionless_download = !has_dot && explicit_download_path && components.len() >= 2;
 
@@ -964,12 +1136,14 @@ fn looks_like_dropper_download_url(url: &str) -> bool {
     // `/releases/download/...`, `/raw/...`, and Telegram-style `/file/...`
     // eligible while dropping `/api/v1/models`, `/graphql`, and similar
     // service calls (which already fail the basename test in most cases).
-    let api_host = hosts::host_of(url)
-        .split('.')
-        .next()
+    let api_host = url
+        .host_str()
+        .and_then(|host| host.split('.').next())
         .is_some_and(|label| label.eq_ignore_ascii_case("api"));
     let api_path = components.iter().any(|component| {
-        API_URL_PATH_COMPONENTS.contains(&component.to_ascii_lowercase().as_str())
+        API_URL_PATH_COMPONENTS
+            .iter()
+            .any(|route| component.eq_ignore_ascii_case(route))
     });
     !(api_host || api_path) || explicit_download_path
 }
@@ -1110,7 +1284,7 @@ fn client_user_agent(reference: &Reference) -> Option<&'static str> {
     if reference.kind != RefKind::UrlFetch {
         return None;
     }
-    if reference.source == REDIRECT_DESTINATION_SOURCE {
+    if is_redirect_destination(reference) {
         return Some(CURL_USER_AGENT);
     }
     reference.evidence.split_whitespace().find_map(|word| {
@@ -1129,36 +1303,25 @@ fn client_user_agent(reference: &Reference) -> Option<&'static str> {
 }
 
 /// A fetch backend that requests each URL with the User-Agent of the client
-/// that names it (see [`client_user_agent`]), keyed by locator. Every other
-/// request passes through unchanged.
+/// that names it (see [`client_user_agent`]), keyed by locator. Only a plain
+/// GET is dressed so; every other request — one carrying headers of its own,
+/// one asking for any status, a POST — passes through unchanged.
 struct AsClient<'a> {
     net: &'a HttpFetch,
     agents: HashMap<String, &'static str>,
 }
 
 impl Fetch for AsClient<'_> {
-    fn get(&self, url: &str) -> Result<Fetched, FetchError> {
-        match self.agents.get(url) {
-            Some(agent) => self.net.get_with(url, &[("User-Agent", agent)]),
-            None => self.net.get(url),
+    fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+        let plain =
+            request.method == Method::Get && request.headers.is_empty() && !request.any_status;
+        match self.agents.get(request.url) {
+            Some(&agent) if plain => self.net.send(&Request {
+                headers: &[("User-Agent", agent)],
+                ..*request
+            }),
+            _ => self.net.send(request),
         }
-    }
-
-    fn get_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.net.get_with(url, headers)
-    }
-
-    fn get_any_status(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.net.get_any_status(url, headers)
-    }
-
-    fn post(
-        &self,
-        url: &str,
-        body: &[u8],
-        headers: &[(&str, &str)],
-    ) -> Result<Fetched, FetchError> {
-        self.net.post(url, body, headers)
     }
 
     fn allows_oci(&self) -> bool {
@@ -1167,8 +1330,15 @@ impl Fetch for AsClient<'_> {
 }
 
 /// [`Reference::source`] for a URL that a fetched redirect page names as its
-/// destination (see [`redirect_destinations`]).
+/// destination (see [`redirect_destinations`]). A tag in a text field, because
+/// next-hop references are fletch's type and ride the analysis cache as such;
+/// [`is_redirect_destination`] is the one place that reads it.
 const REDIRECT_DESTINATION_SOURCE: &str = "redirect-destination";
+
+/// Whether a fetched redirect page named this reference as its destination.
+fn is_redirect_destination(r: &Reference) -> bool {
+    r.source == REDIRECT_DESTINATION_SOURCE
+}
 
 /// Redirect pages larger than this are real sites, not an interstitial.
 const REDIRECT_PAGE_MAX_BYTES: usize = 1024 * 1024;
@@ -1378,6 +1548,147 @@ pub(crate) struct FetchOutcome {
     pub(crate) adopted: HashMap<String, crate::corpus_precheck::Verdict>,
 }
 
+/// References to fetch, grouped by the sha256 of the file that declared them.
+type Group = (String, Vec<Reference>);
+
+/// Payloads a batch gathers before analyzing: enough to keep every core busy
+/// across many small groups without holding a whole hop's analyzed reports in
+/// memory.
+const BATCH_PAYLOAD_TARGET: usize = 256;
+
+/// Process-wide fetch knobs, read from the environment once.
+#[derive(Debug, Clone, Copy)]
+struct Knobs {
+    /// `SCAN_FETCH_ONLY=1`: stop after the first group's network phase, before
+    /// any analysis. A benchmark hatch: fetch tuning — depth, kind selection,
+    /// age gating, concurrency — is about what we retrieve, and re-analyzing
+    /// every payload to measure that turns a sub-minute experiment into a long
+    /// one.
+    fetch_only: bool,
+    /// `SCAN_PAYLOAD_FANOUT`: whether payload analyses fan out across the pool.
+    fanout: Fanout,
+}
+
+/// Whether a batch may fan its payload analyses across the Rayon pool.
+///
+/// Each fetched payload is a full cleave analysis, and cleave bounds how many
+/// analyses fan out at once on the assumption that the throttled ones make
+/// serial progress on their own blocking threads (see
+/// [`cleave::pool_has_headroom`]). Dispatching them from `par_iter` breaks
+/// that: a throttled payload analysis occupies a Rayon worker instead of
+/// freeing one, and the dispatcher sits blocked-and-stealing on top. Measured
+/// on a wedged worker 2026-09-04, that left every pool thread carrying 15-29
+/// nested blocked joins with frames from unrelated analyses interleaved — one
+/// runaway leaf then pinned the whole pool rather than one thread.
+///
+/// So fan out only when the pool has headroom — a lone analysis, or a scan
+/// draining its queue, which are exactly the cases where fanning out is what
+/// keeps the pool busy. Under saturation the payloads run inline on the
+/// blocking thread that owns this batch, which is both the shape cleave's
+/// throttle expects and no loss of machine utilization: the sibling analyses
+/// already have every core. `SCAN_PAYLOAD_FANOUT=always` restores the
+/// unconditional fan-out, `never` forces inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fanout {
+    WhenIdle,
+    Always,
+    Never,
+}
+
+impl Fanout {
+    fn allowed(self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::WhenIdle => cleave::pool_has_headroom(),
+        }
+    }
+}
+
+fn knobs() -> &'static Knobs {
+    static KNOBS: OnceLock<Knobs> = OnceLock::new();
+    KNOBS.get_or_init(|| Knobs {
+        fetch_only: std::env::var("SCAN_FETCH_ONLY").as_deref() == Ok("1"),
+        fanout: match std::env::var("SCAN_PAYLOAD_FANOUT").as_deref() {
+            Ok("always") => Fanout::Always,
+            Ok("never") => Fanout::Never,
+            _ => Fanout::WhenIdle,
+        },
+    })
+}
+
+/// The wall-clock ceiling on one artifact's fetch phase (`--fetch-timeout`).
+///
+/// The count and byte budgets bound how much a scan pulls, not how long pulling
+/// takes: a wide tree of slow or rate-limited registries keeps every count
+/// budget's room while holding the scan open indefinitely. Checked at group
+/// boundaries — a group already fetching finishes, so no download is torn
+/// mid-transfer and no partially-analyzed payload reaches the report — and once
+/// passed it stays passed, so no later hop restarts the sweep.
+#[derive(Debug)]
+struct Deadline {
+    /// `None` for no cap: a zero duration, or one no `Instant` can hold.
+    at: Option<Instant>,
+    limit: Duration,
+    passed: bool,
+}
+
+impl Deadline {
+    fn new(limit: Duration) -> Self {
+        Self {
+            at: (!limit.is_zero())
+                .then(|| Instant::now().checked_add(limit))
+                .flatten(),
+            limit,
+            passed: false,
+        }
+    }
+
+    /// Whether the cap has passed, said once when it first does.
+    fn passed(&mut self) -> bool {
+        if !self.passed && self.at.is_some_and(|at| Instant::now() >= at) {
+            self.passed = true;
+            tracing::warn!(
+                timeout_secs = self.limit.as_secs(),
+                "fetch time cap reached (--fetch-timeout); remaining references not followed"
+            );
+        }
+        self.passed
+    }
+}
+
+/// One group's references after selection and the age gate: the ones to
+/// fetch, and the registry records materialized for its dependencies.
+struct GroupPlan {
+    source_sha: String,
+    selected: Vec<Reference>,
+    registries: Vec<Gated>,
+}
+
+/// One group after the network phase.
+struct GroupFetch {
+    source_sha: String,
+    registries: Vec<Gated>,
+    landed: Vec<Landed>,
+}
+
+/// One group's analyses, aligned with its [`GroupFetch`]: a sub-report per
+/// registry record and an [`Analyzed`] per landed reference, `None` where
+/// there was nothing to graft.
+struct GroupAnalysis {
+    registries: Vec<Option<AnalysisReport>>,
+    payloads: Vec<Option<Analyzed>>,
+}
+
+/// One selected reference after the network phase: the edge recorded for it,
+/// and what the corpus already lets us skip — [`Standing::Analyze`] for
+/// anything that went to the network.
+struct Landed {
+    reference: Reference,
+    record: FetchRecord,
+    standing: Standing,
+}
+
 /// Discover, fetch, and graft, following references up to `policy.depth` hops.
 /// Mutates `report.files` in place with one node per fetched payload (and any
 /// extracted members) and returns the fetch edge log plus the standalone report
@@ -1404,829 +1715,956 @@ pub(crate) fn orchestrate(
     let Some(res) = shared_resources() else {
         return FetchOutcome::default();
     };
-
-    // Analyze fetched payloads with the same bloom short-circuit the top-level
-    // scan uses, so a trusted binary shipped inside a dependency isn't needlessly
-    // re-disassembled; and memoize the whole analysis by content sha, so a warm
-    // re-run reuses it rather than repeating a minutes-long pass.
-    cleave::set_compact_member_retention(true); // compact projection only
-    let mut opts = AnalysisOptions {
-        skip_predicate: dep_skip_predicate(),
-        ..AnalysisOptions::default()
-    };
-    crate::engine::add_zip_passwords(&mut opts, zip_passwords);
-    // Opened lazily on the first payload actually analyzed. Opening it derives
-    // the ruleset-version namespace, which calls `cleave::version_info` — and that
-    // spins up the YARA engine just to count rules. A scan that fetches nothing
-    // (every reference age-gated or none present, the common `pkg:` case) must
-    // not pay that: `None` here means "not yet opened".
-    let mut acache: Option<Option<AnalysisCache>> = None;
-    let mut records = Vec::new();
-    // Verdicts adopted from hopper's corpus instead of being computed here,
-    // keyed by content sha. The caller turns each into this dependency's
-    // evaluation, exactly as if it had been analyzed locally.
-    let mut adopted: HashMap<String, crate::corpus_precheck::Verdict> = HashMap::new();
-    // (declaring file sha) -> (registry records materialized, of which security-held)
-    let mut registry_outcomes: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-    // Standalone reports for each fetched dependency, captured before the payload
-    // is grafted into the merged report. Uploaded to hopper as their own samples.
-    let mut dependencies: Vec<FetchedDependency> = Vec::new();
-    let mut dependency_registries: Vec<DependencyRegistry> = Vec::new();
-    // Two budget tiers. Per scanned file: each file's references get a fresh
-    // ceiling (`--fetch-max-file-fetches` live fetches, `--fetch-max-file-size`
-    // bytes), so one file can't starve the rest. Per execution: a process-wide
-    // running total (`--fetch-max-total-*`, lifted in server modes) shared across
-    // every file scanned, so a crafted corpus can't multiply the per-file cap
-    // into a fetch storm. Each per-file budget below is clamped to what the total
-    // budget still allows, and every live fetch is charged against it. Cache hits
-    // are free and uncounted (a warm re-run is never throttled); refs past a cap
-    // become `BudgetExceeded`, never silently dropped.
-    // Loop guard: a locator is fetched at most once per run, so a chain that
-    // points back at an earlier stage can't cycle.
-    let mut seen: HashSet<String> = HashSet::new();
-
-    // Where the fetch phase's progress goes: the live in-place dependency tree on
-    // an interactive single-artifact scan, the streamed log above any active
-    // scan bar otherwise, or nothing for machine output. Created once and shared
-    // across every hop, so transitive dependencies join the same view.
-    let reporter = Reporter::new(progress);
-
     // Hop 0's work-list: declared references from every file in the report plus
     // fletch's imperative discovery over the root sample's bytes. Each later hop
     // works from the references found *inside* the previous hop's payloads.
-    let mut worklist = collect_references(
-        report,
-        root_path,
-        if policy.ci {
-            CiRefs::Include
-        } else {
-            CiRefs::Skip
-        },
-    );
-    // Image URLs whose declaring file shows a stego loader: exempt from the
-    // page-asset extension filter below. Hop 0 only — later hops hunt payload
-    // bytes before any analysis, so there are no findings to vouch for one.
-    let carriers = image_carrier_urls(report, &worklist);
-    // Phantom-dependency signal: a package imperatively installed or loaded
-    // somewhere in this artifact but absent from its manifest's declared deps —
-    // a covertly-installed companion or a dependency-confusion target. Computed
-    // across the whole work-list so a member's `require("x")` is diffed against
-    // the root manifest's declarations.
-    let all_refs: Vec<Reference> = worklist
-        .iter()
-        .flat_map(|(_, refs)| refs.iter().cloned())
-        .collect();
-    // Surfaced at debug, not warn: this is only meaningful when a manifest is
-    // present to diff against. Scanning loose files (no manifest) flags every
-    // imperative import as "undeclared", so emitting it by default is noise.
-    // `--verbose` (scan=debug) still exposes it for investigation.
-    for u in find::undeclared_packages(&all_refs) {
-        tracing::debug!(
-            package = %locator_key(u),
-            source = %u.source,
-            "undeclared dependency: imperatively acquired but not declared in manifest"
-        );
-    }
-    // One wall-clock reading for the whole run, so every dependency's age is
-    // judged against the same instant.
-    let now = unix_now();
-    // The host platform, for filtering off-host native-binary dependencies.
-    // Sampled once — it can't change mid-run.
-    let host = host_platform();
-
-    // Wall-clock ceiling for this artifact's whole fetch phase
-    // (`--fetch-timeout`). The count and byte budgets bound how much a scan
-    // pulls, not how long pulling takes, and the two are not the same
-    // ceiling: a wide tree of slow or rate-limited registries keeps every
-    // count budget's room while holding the scan open indefinitely. Checked at
-    // group boundaries — a group already fetching finishes, so no download is
-    // torn mid-transfer and no partially-analyzed payload reaches the report —
-    // and once tripped it stays tripped, so no later hop restarts the sweep.
-    // A zero duration, or one no `Instant` can hold, means no cap.
-    let deadline = if policy.max_duration.is_zero() {
-        None
+    let ci = if policy.ci {
+        CiRefs::Include
     } else {
-        Instant::now().checked_add(policy.max_duration)
+        CiRefs::Skip
     };
-    let timed_out = std::cell::Cell::new(false);
-    let out_of_time = || {
-        if timed_out.get() {
-            return true;
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            timed_out.set(true);
-            tracing::warn!(
-                timeout_secs = policy.max_duration.as_secs(),
-                "fetch time cap reached (--fetch-timeout); remaining references not followed"
-            );
-            return true;
-        }
-        false
-    };
-    // Newest-version gate: only the most recent version of a package in the
-    // dependency tree is fetched and analyzed. Deep ungated trees pin dozens
-    // of releases of the same packages (syn ×27, libc ×21 on the mx crate
-    // benchmark — 48% of its tree was older duplicates); analyzing every
-    // pinned release repeats near-identical work without detection value the
-    // newest release doesn't provide. Versionless references are exempt (they
-    // already resolve to the latest release), and the kept version is monotone
-    // across hops: once a release is scanned, an older sibling discovered in a
-    // later hop never resurrects the package.
-    let mut newest_seen: HashMap<String, String> = HashMap::new();
-    // Coordinates (`pkg:eco/name`) for which a version-pinned reference exists
-    // anywhere in the tree. A manifest range (`"puppeteer": "^10.4.0"`) reaches
-    // us version-stripped as a bare `pkg:npm/puppeteer` and would resolve to
-    // `dist-tags/latest` — a version the project never installs. When the
-    // co-located lockfile also pins the coordinate (`pkg:npm/puppeteer@10.4.2`),
-    // that pin is ground truth and must win, so the bare sibling is dropped
-    // below. Monotone across hops, mirroring `newest_seen`.
-    let mut pinned_coords: HashSet<String> = HashSet::new();
-    // source content-sha → the declaring manifest's path (relative to the root
-    // artifact), so each dependency row can name the file it came from. Built
-    // once from the report's own files; a source discovered only inside a fetched
-    // payload (a deeper hop) simply isn't found and stays unnamed.
-    let source_manifests: HashMap<String, String> = report
-        .files
-        .iter()
-        .map(|f| (f.sha256.clone(), manifest_relpath(&f.path)))
-        .collect();
-    // A redirect page is not a stage. A shortener's safety or preview page
-    // stands where an HTTP 3xx would, naming the payload instead of being it,
-    // so a payload reached through one credits its group a hop and the chain
-    // behind the redirect keeps its full `policy.depth`. Keyed by the payload
-    // content sha that `merge_payload` groups next-hop references under.
-    let mut redirect_credit: HashMap<String, u8> = HashMap::new();
-    for hop in 0..policy.depth.saturating_add(MAX_REDIRECT_HOPS) {
-        worklist.retain(|(sha, _)| {
-            hop < policy
-                .depth
-                .saturating_add(redirect_credit.get(sha).copied().unwrap_or(0))
-        });
-        if worklist.is_empty() || out_of_time() {
-            break;
-        }
-        // Build-host code runs before the package's runtime entry point.
-        // Stable ordering preserves deterministic ties and existing budgets.
-        for (_, refs) in &mut worklist {
-            refs.sort_by_key(dependency_execution_priority);
-        }
-        worklist.sort_by_key(|(_, refs)| {
-            refs.iter()
-                .map(dependency_execution_priority)
-                .min()
-                .unwrap_or(3)
-        });
-        // Pre-scan the whole hop so the winner is hop-wide, not
-        // first-group-wins: every fetchable versioned reference bids, and the
-        // running cross-hop maximum only rises.
-        for (_, refs) in &worklist {
-            for r in refs {
-                if !policy.wants_at(r.kind, hop) {
-                    continue;
-                }
-                let locator = locator_key(r);
-                let Some((key, version)) = versioned_purl(&locator) else {
-                    continue;
-                };
-                // This coordinate is pinned somewhere; its bare sibling loses.
-                pinned_coords.insert(key.to_string());
-                match newest_seen.get(key) {
-                    Some(best)
-                        if lenient_version_cmp(version, best) != std::cmp::Ordering::Greater => {}
-                    _ => {
-                        newest_seen.insert(key.to_string(), version.to_string());
-                    }
-                }
-            }
-        }
-        let dropped_old_versions = std::cell::Cell::new(0usize);
-        let mut next = Vec::new();
-        // The declaring-file groups in a hop are independent until their serial
-        // merge, but a deep tree yields many small groups — one per previous-hop
-        // payload — and analyzing one group at a time strands most of a large
-        // machine on the tail. Groups are therefore processed in batches:
-        // selection, gating, and fetching stay serial in group order (`seen`
-        // dedup and budget charges keep their exact order), registry-record and
-        // payload analysis fan out across the whole batch, and merging replays
-        // serially in group order — report ids, and therefore output, are
-        // identical to the one-group-at-a-time code this replaces.
-        struct GroupWork {
-            source_sha: String,
-            selected: Vec<Reference>,
-            registries: Vec<GatedDep>,
-            fetched: Vec<FetchRecord>,
-            /// Verdicts the batch PURL negotiation adopted, keyed by the content
-            /// sha of the dependency they describe. These skipped the fetch
-            /// entirely, so nothing downstream can re-derive them: the merge
-            /// pass pairs them back onto their records here.
-            corpus: HashMap<String, crate::corpus_precheck::Verdict>,
-        }
-        // Caps the payloads held un-merged at once: enough to keep every core
-        // busy across many small groups without holding a whole hop's analyzed
-        // reports in memory.
-        const BATCH_PAYLOAD_TARGET: usize = 256;
-        // A registry record is canonical JSON we serialized ourselves; its
-        // signal is entirely `registry.*` value facts and no YARA rule targets
-        // it. Disabling YARA here removed ~1400s of system time per scan — the
-        // engine's per-analysis setup, paid hundreds of times. Built once per
-        // hop: cloning `AnalysisOptions` per record cost more user time than
-        // the YARA saving returned.
+    let worklist = collect_references(report, root_path, ci);
+    let mut session = FetchSession::new(
+        report,
+        &worklist,
+        policy,
+        res,
+        Reporter::new(progress),
+        capture_deps,
+        zip_passwords,
+    );
+    session.run(report, worklist);
+    session.finish(report)
+}
+
+/// One fetch phase: everything `orchestrate` carries from hop to hop.
+struct FetchSession {
+    policy: FetchPolicy,
+    res: &'static Resources,
+    knobs: &'static Knobs,
+    /// hopper's corpus, when this process has one to ask.
+    precheck: Option<Arc<Precheck>>,
+    /// How fetched payloads are analyzed: with the same bloom short-circuit
+    /// the top-level scan uses, so a trusted binary shipped inside a dependency
+    /// isn't needlessly re-disassembled.
+    opts: AnalysisOptions,
+    /// A registry record is canonical JSON we serialized ourselves; its signal
+    /// is entirely `registry.*` value facts and no YARA rule targets it.
+    /// Disabling YARA here removed ~1400s of system time per scan — the
+    /// engine's per-analysis setup, paid hundreds of times. Built once:
+    /// cloning `AnalysisOptions` per record cost more user time than the YARA
+    /// saving returned.
+    registry_opts: AnalysisOptions,
+    /// Opened on the first payload actually analyzed. Opening it derives the
+    /// ruleset-version namespace, which calls `cleave::version_info` — and that
+    /// spins up the YARA engine just to count rules. A scan that analyzes
+    /// nothing (every reference age-gated or none present, the common `pkg:`
+    /// case) must not pay that.
+    acache: OnceLock<Option<AnalysisCache>>,
+    /// Where the fetch phase's progress goes: the live in-place dependency tree
+    /// on an interactive single-artifact scan, the streamed log above any active
+    /// scan bar otherwise, or nothing for machine output. Shared across every
+    /// hop, so transitive dependencies join the same view.
+    reporter: Reporter,
+    capture_deps: bool,
+    /// One wall-clock reading for the whole run, so every dependency's age is
+    /// judged against the same instant.
+    now: u64,
+    /// The host platform, for filtering off-host native-binary dependencies.
+    host: (&'static str, &'static str),
+    deadline: Deadline,
+    budget: RootBudget,
+    /// Loop guard: a locator is fetched at most once per run, so a chain that
+    /// points back at an earlier stage can't cycle.
+    seen: HashSet<String>,
+    /// Newest-version gate: only the most recent version of a package in the
+    /// dependency tree is fetched and analyzed. Deep ungated trees pin dozens
+    /// of releases of the same packages (syn ×27, libc ×21 on the mx crate
+    /// benchmark — 48% of its tree was older duplicates); analyzing every
+    /// pinned release repeats near-identical work without detection value the
+    /// newest release doesn't provide. Versionless references are exempt (they
+    /// already resolve to the latest release), and the kept version is monotone
+    /// across hops: once a release is scanned, an older sibling discovered in a
+    /// later hop never resurrects the package.
+    newest: HashMap<String, String>,
+    /// Coordinates (`pkg:eco/name`) for which a version-pinned reference exists
+    /// anywhere in the tree. A manifest range (`"puppeteer": "^10.4.0"`) reaches
+    /// us version-stripped as a bare `pkg:npm/puppeteer` and would resolve to
+    /// `dist-tags/latest` — a version the project never installs. When the
+    /// co-located lockfile also pins the coordinate (`pkg:npm/puppeteer@10.4.2`),
+    /// that pin is ground truth and must win, so the bare sibling is dropped.
+    /// Monotone across hops, mirroring `newest`.
+    pinned: HashSet<String>,
+    /// A redirect page is not a stage. A shortener's safety or preview page
+    /// stands where an HTTP 3xx would, naming the payload instead of being it,
+    /// so a payload reached through one credits its group a hop and the chain
+    /// behind the redirect keeps its full `policy.depth`. Keyed by the payload
+    /// content sha that `merge_payload` groups next-hop references under.
+    redirect_credit: HashMap<String, u8>,
+    /// Image URLs whose declaring file shows a stego loader: exempt from the
+    /// page-asset extension filter. Hop 0 only — later hops hunt payload bytes
+    /// before any analysis, so there are no findings to vouch for one.
+    carriers: HashSet<String>,
+    /// source content-sha → the declaring manifest's path (relative to the root
+    /// artifact), so each dependency row can name the file it came from. A
+    /// source discovered only inside a fetched payload (a deeper hop) simply
+    /// isn't found and stays unnamed.
+    manifests: HashMap<String, String>,
+    graft: Graft,
+    out: FetchOutcome,
+    /// (declaring file sha) -> (registry records materialized, of which security-held)
+    registry_outcomes: BTreeMap<String, (u64, u64)>,
+    /// Set when `SCAN_FETCH_ONLY` has stopped the run.
+    stopped: bool,
+}
+
+impl FetchSession {
+    fn new(
+        report: &AnalysisReport,
+        worklist: &[Group],
+        policy: FetchPolicy,
+        res: &'static Resources,
+        reporter: Reporter,
+        capture_deps: bool,
+        zip_passwords: &[String],
+    ) -> Self {
         cleave::set_compact_member_retention(true); // compact projection only
-        let registry_opts = AnalysisOptions {
-            disable_yara: true,
-            ..opts.clone()
+        let mut opts = AnalysisOptions {
+            skip_predicate: dep_skip_predicate(),
+            ..AnalysisOptions::default()
         };
-        let mut groups = std::mem::take(&mut worklist).into_iter().peekable();
-        while groups.peek().is_some() {
-            if out_of_time() {
+        crate::engine::add_zip_passwords(&mut opts, zip_passwords);
+        // Phantom-dependency signal: a package imperatively installed or loaded
+        // somewhere in this artifact but absent from its manifest's declared
+        // deps — a covertly-installed companion or a dependency-confusion
+        // target. Computed across the whole work-list so a member's
+        // `require("x")` is diffed against the root manifest's declarations.
+        // Surfaced at debug, not warn: this is only meaningful when a manifest
+        // is present to diff against. Scanning loose files (no manifest) flags
+        // every imperative import as "undeclared", so emitting it by default is
+        // noise. `--verbose` (scan=debug) still exposes it for investigation.
+        let all_refs: Vec<Reference> = worklist
+            .iter()
+            .flat_map(|(_, refs)| refs.iter().cloned())
+            .collect();
+        for u in find::undeclared_packages(&all_refs) {
+            tracing::debug!(
+                package = %locator(u),
+                source = %u.source,
+                "undeclared dependency: imperatively acquired but not declared in manifest"
+            );
+        }
+        Self {
+            policy,
+            res,
+            knobs: knobs(),
+            precheck: crate::corpus_precheck::armed(),
+            registry_opts: AnalysisOptions {
+                disable_yara: true,
+                ..opts.clone()
+            },
+            opts,
+            acache: OnceLock::new(),
+            reporter,
+            capture_deps,
+            now: unix_now(),
+            host: host_platform(),
+            deadline: Deadline::new(policy.max_duration),
+            budget: RootBudget::new(&policy),
+            seen: HashSet::new(),
+            newest: HashMap::new(),
+            pinned: HashSet::new(),
+            redirect_credit: HashMap::new(),
+            carriers: image_carrier_urls(report, worklist),
+            manifests: report
+                .files
+                .iter()
+                .map(|f| (f.sha256.clone(), manifest_relpath(&f.path)))
+                .collect(),
+            graft: Graft::new(report),
+            out: FetchOutcome::default(),
+            registry_outcomes: BTreeMap::new(),
+            stopped: false,
+        }
+    }
+
+    /// Walk the hops: each works from the references found inside the
+    /// previous hop's payloads.
+    fn run(&mut self, report: &mut AnalysisReport, mut worklist: Vec<Group>) {
+        for hop in 0..self.policy.depth.saturating_add(MAX_REDIRECT_HOPS) {
+            worklist.retain(|(sha, _)| {
+                hop < self
+                    .policy
+                    .depth
+                    .saturating_add(self.redirect_credit.get(sha).copied().unwrap_or(0))
+            });
+            if worklist.is_empty() || self.deadline.passed() {
                 break;
             }
-            let mut batch: Vec<GroupWork> = Vec::new();
-            let mut batch_payloads = 0usize;
-            while batch_payloads < BATCH_PAYLOAD_TARGET {
-                // Re-checked per group, not per batch: one batch gathers up to
-                // `BATCH_PAYLOAD_TARGET` payloads, and stopping only at the
-                // batch edge would overrun the cap by that whole fetch set.
-                // Whatever this batch already fetched still gets analyzed below.
-                if out_of_time() {
+            // Build-host code runs before the package's runtime entry point.
+            // Stable ordering preserves deterministic ties and existing budgets.
+            for (_, refs) in &mut worklist {
+                refs.sort_by_key(dependency_execution_priority);
+            }
+            worklist.sort_by_key(|(_, refs)| {
+                refs.iter()
+                    .map(dependency_execution_priority)
+                    .min()
+                    .unwrap_or(3)
+            });
+            self.bid_versions(&worklist, hop);
+            worklist = self.hop(report, worklist, hop);
+            if self.stopped {
+                break;
+            }
+        }
+    }
+
+    /// Pre-scan a whole hop so the newest version is hop-wide, not
+    /// first-group-wins: every fetchable versioned reference bids, and the
+    /// running cross-hop maximum only rises.
+    fn bid_versions(&mut self, worklist: &[Group], hop: u8) {
+        for r in worklist.iter().flat_map(|(_, refs)| refs) {
+            if !self.policy.wants_at(r.kind, hop) {
+                continue;
+            }
+            let Some((key, version)) = versioned_purl(locator(r)) else {
+                continue;
+            };
+            // This coordinate is pinned somewhere; its bare sibling loses.
+            self.pinned.insert(key.to_string());
+            let newer = self.newest.get(key).is_none_or(|best| {
+                lenient_version_cmp(version, best) == std::cmp::Ordering::Greater
+            });
+            if newer {
+                self.newest.insert(key.to_string(), version.to_string());
+            }
+        }
+    }
+
+    /// One hop, in batches. The declaring-file groups of a hop are independent
+    /// until their serial merge, but a deep tree yields many small groups — one
+    /// per previous-hop payload — and analyzing one group at a time strands most
+    /// of a large machine on the tail. So selection, gating, and fetching stay
+    /// serial in group order (`seen` dedup and budget charges keep their exact
+    /// order), registry-record and payload analysis fan out across the whole
+    /// batch, and merging replays serially in group order — report ids, and
+    /// therefore output, do not depend on batching.
+    fn hop(&mut self, report: &mut AnalysisReport, worklist: Vec<Group>, hop: u8) -> Vec<Group> {
+        // Fetch-only stops after the first group that fetches anything, so it
+        // plans one such group at a time.
+        let target = if self.knobs.fetch_only {
+            1
+        } else {
+            BATCH_PAYLOAD_TARGET
+        };
+        let mut groups = worklist.into_iter();
+        let mut next = Vec::new();
+        let mut dropped_old_versions = 0usize;
+        let mut exhausted = false;
+        while !exhausted && !self.deadline.passed() {
+            let mut plans = Vec::new();
+            let mut planned = 0usize;
+            while planned < target {
+                // Re-checked per group, not per batch: stopping only at the
+                // batch edge would overrun the cap by a whole batch's fetches.
+                if self.deadline.passed() {
                     break;
                 }
                 let Some((source_sha, refs)) = groups.next() else {
+                    exhausted = true;
                     break;
                 };
-                // Keep only the kinds this policy selected — by RefKind, so a
-                // command-mentioned package (`packages`) is distinct from a declared
-                // dependency (`deps`) even though both are PURLs — and that haven't
-                // been fetched yet this run.
-                let selected: Vec<Reference> = refs
-                    .into_iter()
-                    .filter(|r| {
-                        let wanted = policy.wants_at(r.kind, hop);
-                        if !wanted && policy.wants(r.kind) {
-                            tracing::debug!(
-                                package = %locator_key(r),
-                                hop = hop + 1,
-                                "transitive dependency; registry lookup and fetch both skipped"
-                            );
-                        }
-                        wanted
-                    })
-                    // Drop publisher-controlled URLs, obvious site/API
-                    // endpoints, and the exact documentation/update URLs
-                    // observed in stock /bin binaries. They cost a round trip
-                    // each and are unlikely to yield a dropper payload.
-                    // Applied per hop so a payload's own boilerplate is
-                    // filtered too, and only to *discovered* references:
-                    // `scan url <url>` fetches whatever the operator names
-                    // (see `crate::hosts`).
-                    .filter(|r| {
-                        let RefLocator::Url(url) = &r.locator else {
-                            return true;
-                        };
-                        if !valid_discovered_url_host(url) {
-                            tracing::debug!(
-                                url = %url,
-                                source = %r.source,
-                                "invalid or local URL host; fetch skipped"
-                            );
-                            return false;
-                        }
-                        if has_unexpanded_url_placeholder(url) {
-                            tracing::debug!(
-                                url = %url,
-                                source = %r.source,
-                                "unexpanded URL template; fetch skipped"
-                            );
-                            return false;
-                        }
-                        let boilerplate = hosts::publisher_controlled(url)
-                            || hosts::discovery_exception(url);
-                        if boilerplate {
-                            tracing::debug!(
-                                url = %url,
-                                source = %r.source,
-                                "known boilerplate URL; fetch skipped"
-                            );
-                            return false;
-                        }
-                        if r.kind == RefKind::UrlFetch
-                            && !looks_like_dropper_download_url(url)
-                            && !is_eval_pipeline_url(r)
-                            && !is_download_to_file_url(r)
-                            && r.source != REDIRECT_DESTINATION_SOURCE
-                            && !carriers.contains(url)
-                        {
-                            tracing::debug!(
-                                url = %url,
-                                source = %r.source,
-                                "URL does not look like a dropper download or eval pipeline; fetch skipped"
-                            );
-                            return false;
-                        }
-                        true
-                    })
-                    // Drop native-binary dependencies built for another platform
-                    // before they're ever fetched — the host variant is scanned, its
-                    // linux/windows siblings never run here. Off unless the policy
-                    // asks for it (`--fetch-all-platforms` audits every platform).
-                    .filter(|r| {
-                        let off_host = policy.host_platform_only && off_host_platform(r, host);
-                        if off_host {
-                            tracing::debug!(
-                                package = %locator_key(r),
-                                host_os = host.0,
-                                host_arch = host.1,
-                                "dependency pinned to another platform; skipped (--fetch-all-platforms to include)"
-                            );
-                        }
-                        !off_host
-                    })
-                    // Older-version duplicates are skipped entirely — no
-                    // registry-record materialization, no fetch (operator
-                    // policy 2, 2026-07-30). Never silent: each skip logs at
-                    // debug, the hop logs one count at info.
-                    .filter(|r| {
-                        let locator = locator_key(r);
-                        let Some((key, version)) = versioned_purl(&locator) else {
-                            return true;
-                        };
-                        let newest = !matches!(
-                            newest_seen.get(key),
-                            Some(best) if lenient_version_cmp(version, best)
-                                == std::cmp::Ordering::Less
-                        );
-                        if !newest {
-                            dropped_old_versions.set(dropped_old_versions.get() + 1);
-                            tracing::debug!(
-                                package = %locator,
-                                newest = %newest_seen[key],
-                                "older version of an already-kept package; skipped (newest-version policy)"
-                            );
-                        }
-                        newest
-                    })
-                    // A lockfile pin supersedes the manifest's versionless
-                    // sibling: drop a bare `pkg:eco/name` when the same
-                    // coordinate is pinned elsewhere in the tree, so the exact
-                    // installed version is scanned instead of `dist-tags/latest`.
-                    .filter(|r| {
-                        if superseded_by_pin(r, &pinned_coords) {
-                            tracing::debug!(
-                                package = %locator_key(r),
-                                "versionless dependency superseded by a lockfile-pinned sibling; skipped"
-                            );
-                            return false;
-                        }
-                        true
-                    })
-                    .filter(|r| seen.insert(locator_key(r)))
-                    .collect();
+                let selected = self.select(refs, hop, &mut dropped_old_versions);
                 if selected.is_empty() {
                     continue;
                 }
-                // Look up each declared dependency's registry metadata first. Every
-                // resolved record is materialized as a `*.registry.json` node so its
-                // facts are trait-matched, and releases older than the age ceiling
-                // are dropped before the expensive fetch+scan of their bytes. Skips
-                // are reported, never silent.
-                let (selected, registries) = age_gate(selected, &policy, res, now);
-                // Reveal the kept (to-fetch) set as pending, so the tree shows the
-                // dependencies it will actually scan up front. Aged-out deps are
-                // deliberately never announced — for a large npm graph they are the
-                // overwhelming majority and only a registry-metadata lookup runs on
-                // them, so listing them would bury the handful of live scans.
-                reporter.announce(
-                    &selected,
-                    source_manifests.get(&source_sha).map_or("", String::as_str),
-                );
-                if selected.is_empty() {
-                    // Nothing to fetch; the group still merges its registry
-                    // records below.
-                    batch.push(GroupWork {
-                        source_sha,
-                        selected,
-                        registries,
-                        fetched: Vec::new(),
-                        corpus: HashMap::new(),
-                    });
-                    continue;
-                }
-                // URL fetches have a deliberately smaller independent fan-out cap
-                // than declared dependencies and command-mentioned packages. Split
-                // the groups so fletch's per-call count budget can enforce both
-                // ceilings without making one category consume the other's slots.
-                let (url_selected, dep_selected): (Vec<Reference>, Vec<Reference>) = selected
-                    .iter()
-                    .cloned()
-                    .partition(|r| r.kind == RefKind::UrlFetch);
-
-                let dep_budget_notice = fetch_count_budget_notice(
-                    "--fetch-max-file-fetches",
-                    policy.max_file_fetches,
-                    TOTAL_FETCH_COUNT.load(Ordering::Relaxed),
-                );
-
-                // Mark the to-fetch set in flight, then fetch. The callback fires as
-                // each download lands (from a pool worker, so it's `Sync`), flipping
-                // that row to "analyzing" the moment its bytes arrive rather than when
-                // the whole concurrent batch returns — keyed on the original
-                // reference, since a versionless locator may be refined during fetch.
-                reporter.fetching(&selected);
-                let on_fetched = |r: &Reference, rec: &FetchRecord| reporter.landed(r, rec);
-                let mut file_bytes_remaining = policy.max_file_bytes;
-
-                // Dependencies/packages get the larger cap. Charge this group before
-                // starting URLs so the process-wide budget is also respected between
-                // the two independent fletch calls.
-                let dep_budget = FetchBudget {
-                    max_count: policy
-                        .max_file_fetches
-                        .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
-                    max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
-                };
-                // Pre-fetch PURL negotiation: hopper may hold a standing
-                // verdict (same rules as the per-sha corpus precheck) for a
-                // registry dependency whose content sha we would otherwise
-                // only learn by downloading it. One batched lookup up front
-                // skips the download, the analysis, and the re-upload for
-                // every such PURL; the answer's sha still records the fetch
-                // edge. Anything unanswered fetches exactly as before.
-                let purl_candidates: Vec<String> = dep_selected
-                    .iter()
-                    .filter(|r| {
-                        matches!(r.locator, RefLocator::Purl(_)) && r.content_sha256.is_none()
-                    })
-                    .map(|r| locator_str(&r.locator))
-                    .collect();
-                let corpus_hits = crate::corpus_precheck::precheck_purls(&purl_candidates);
-                let dep_to_fetch: Vec<Reference> = dep_selected
-                    .iter()
-                    .filter(|r| !corpus_hits.contains_key(&locator_str(&r.locator)))
-                    .cloned()
-                    .collect();
-                // Keyed by content sha for the merge pass, which sees records
-                // rather than locators.
-                let group_corpus: HashMap<String, crate::corpus_precheck::Verdict> = corpus_hits
-                    .values()
-                    .filter_map(|hit| hit.verdict.clone().map(|v| (hit.sha.clone(), v)))
-                    .collect();
-                let dep_fetched_real = fetch_references_with(
-                    &dep_to_fetch,
-                    &source_sha,
-                    false,
-                    &res.net,
-                    &res.cache,
-                    dep_budget,
-                    &on_fetched,
-                );
-                // Reassemble in dep_selected order: downstream zips records
-                // against the selected refs positionally.
-                let mut real_iter = dep_fetched_real.into_iter();
-                let dep_fetched: Vec<FetchRecord> = dep_selected
-                    .iter()
-                    .filter_map(|r| match corpus_hits.get(&locator_str(&r.locator)) {
-                        Some(hit) => Some(corpus_hit_record(r, &source_sha, &hit.sha)),
-                        // fletch emits one record per reference it selects as a
-                        // fetch target; anything it declines has no record and
-                        // drops out here, exactly as in the regrouping below.
-                        None => real_iter.next(),
-                    })
-                    .collect();
-                if !corpus_hits.is_empty() {
-                    tracing::info!(
-                        skipped = corpus_hits.len(),
-                        asked = purl_candidates.len(),
-                        "purl precheck: hopper verdicts stand; skipped fetch+analysis+upload"
-                    );
-                }
-                let (dep_spent, dep_bytes) = live_fetch_usage(&dep_fetched);
-                charge_total_budget(dep_spent, dep_bytes);
-                file_bytes_remaining = file_bytes_remaining.saturating_sub(dep_bytes);
-
-                // Opportunistic raw URLs get their own, smaller cap. A URL that is
-                // expressed as a declared dependency or command-mentioned package
-                // was kept in `dep_selected` and therefore follows the 100 cap.
-                let url_budget = FetchBudget {
-                    max_count: policy
-                        .max_url_fetches
-                        .min(TOTAL_FETCH_COUNT.load(Ordering::Relaxed)),
-                    max_bytes: file_bytes_remaining.min(TOTAL_FETCH_BYTES.load(Ordering::Relaxed)),
-                };
-                let url_budget_notice = fetch_count_budget_notice(
-                    "--fetch-max-urls",
-                    policy.max_url_fetches,
-                    TOTAL_FETCH_COUNT.load(Ordering::Relaxed),
-                );
-                let url_net = AsClient {
-                    net: &res.net,
-                    agents: url_selected
-                        .iter()
-                        .filter_map(|r| Some((locator_key(r), client_user_agent(r)?)))
-                        .collect(),
-                };
-                let url_fetched = fetch_references_with(
-                    &url_selected,
-                    &source_sha,
-                    true,
-                    &url_net,
-                    &res.cache,
-                    url_budget,
-                    &on_fetched,
-                );
-                let (url_spent, url_bytes) = live_fetch_usage(&url_fetched);
-                charge_total_budget(url_spent, url_bytes);
-
-                // Reassemble in the original declaration order. Each fletch call
-                // preserves order within its category, and the two iterators restore
-                // the order expected by the analysis/grafting pass below.
-                let mut dep_iter = dep_fetched.into_iter();
-                let mut url_iter = url_fetched.into_iter();
-                let mut fetched = Vec::with_capacity(selected.len());
-                for r in &selected {
-                    if r.kind == RefKind::UrlFetch {
-                        if let Some(record) = url_iter.next() {
-                            fetched.push(record);
-                        }
-                    } else if let Some(record) = dep_iter.next() {
-                        fetched.push(record);
-                    }
-                }
-                debug_assert_eq!(
-                    fetched.len(),
-                    selected.len(),
-                    "grouped fetch results must align with selected refs"
-                );
-
-                // Authoritative pass over every returned edge: settle each row (the
-                // tree finalizes any budget-clipped edge the live callback never saw;
-                // re-settling a callback-landed row is idempotent) and print the
-                // streamed line. `selected` and `fetched` align one-to-one and in
-                // order — every selected reference is a fetch target, so fletch emits
-                // exactly one record per reference in declaration order.
-                for (r, rec) in selected.iter().zip(&fetched) {
-                    reporter.landed(r, rec);
-                    let budget_notice = if r.kind == RefKind::UrlFetch {
-                        &url_budget_notice
-                    } else {
-                        &dep_budget_notice
-                    };
-                    reporter.report(rec, Some(budget_notice));
-                }
-
-                // Benchmark escape hatch: stop after the network phase, before the
-                // (far more expensive) analysis of what was pulled. Fetch tuning —
-                // depth, kind selection, age gating, concurrency — is about what we
-                // retrieve, and re-analyzing every payload to measure that turns a
-                // sub-minute experiment into a long one. Reports what was fetched so
-                // a run is still comparable, then exits non-analyzing. Earlier
-                // groups in this batch contribute their edges too; their registry
-                // nodes — exactly the analysis this mode skips — do not merge.
-                if std::env::var("SCAN_FETCH_ONLY").as_deref() == Ok("1") {
-                    let bytes: u64 = fetched.iter().filter_map(|r| r.size).sum();
-                    tracing::info!(
-                        refs_selected = selected.len(),
-                        payloads_fetched = fetched.iter().filter(|r| r.size.is_some()).count(),
-                        fetched_bytes = bytes,
-                        "SCAN_FETCH_ONLY: stopping before payload analysis"
-                    );
-                    println!(
-                        "fetch-only: selected={} fetched={} bytes={}",
-                        selected.len(),
-                        fetched.iter().filter(|r| r.size.is_some()).count(),
-                        bytes
-                    );
-                    for g in batch {
-                        records.extend(g.fetched);
-                    }
-                    records.extend(fetched);
-                    reporter.finish(&records);
-                    return FetchOutcome {
-                        records,
-                        dependencies,
-                        registries: dependency_registries,
-                        adopted,
-                    };
-                }
-                batch_payloads += fetched.iter().filter(|r| delivered_bytes(r)).count();
-                batch.push(GroupWork {
-                    source_sha,
-                    selected,
-                    registries,
-                    fetched,
-                    corpus: group_corpus,
-                });
+                let plan = self.plan(source_sha, selected);
+                planned += plan.selected.len();
+                plans.push(plan);
             }
-
-            // Analyze the batch. Registry records and fetched payloads are both
-            // report-independent (`registry_node` and `analyze_payload` are pure
-            // with respect to the report), so they fan out together across every
-            // group in the batch. Each `registry_node` is an independent cleave
-            // analysis of one small JSON document at ~23 ms; a payload is a full
-            // cleave pass. The callback settles each payload row from
-            // "analyzing" to its final glyph as its scan finishes.
-            let acache_ref = acache
-                .get_or_insert_with(crate::analysis_cache::AnalysisCache::open)
-                .as_ref();
-            // Per-group results, aligned with `batch`.
-            type BatchRegistrySubs = Vec<Vec<Option<AnalysisReport>>>;
-            type BatchAnalyzed = Vec<Vec<Option<Analyzed>>>;
-            // Both halves dispatch full cleave analyses, so they fan out only
-            // while the pool has headroom (see `payload_fanout_allowed`).
-            // Saturated, the batch runs inline on this blocking thread — the
-            // shape cleave's own nesting throttle is written for.
-            let registries_of = |g: &GroupWork| -> Vec<Option<AnalysisReport>> {
-                g.registries
-                    .iter()
-                    .map(|(_, provenance, _)| registry_node(&provenance.record, &registry_opts))
-                    .collect()
-            };
-            let payloads_of = |g: &GroupWork| -> Vec<Option<Analyzed>> {
-                let on_analyzed = |i: usize| {
-                    if let (Some(r), Some(rec)) = (g.selected.get(i), g.fetched.get(i)) {
-                        reporter.analyzed(r, rec);
-                    }
-                };
-                analyze_payloads(&g.fetched, &res.cache, &opts, acache_ref, &on_analyzed)
-            };
-            let (registry_subs, analyzed): (BatchRegistrySubs, BatchAnalyzed) =
-                if payload_fanout_allowed() {
-                    use rayon::prelude::*;
-                    rayon::join(
-                        || batch.par_iter().map(&registries_of).collect(),
-                        || batch.par_iter().map(&payloads_of).collect(),
-                    )
-                } else {
-                    (
-                        batch.iter().map(&registries_of).collect(),
-                        batch.iter().map(&payloads_of).collect(),
-                    )
-                };
-
-            // Merge serially — groups in order, registry records before payloads
-            // within a group, both in materialization order — because
-            // `merge_registry`/`merge_payload` assign report ids from a running
-            // max; parallelizing the merge would make ids (and therefore output)
-            // depend on completion order.
-            for (g, (subs, payloads)) in batch
+            if plans.is_empty() {
+                continue;
+            }
+            let corpus = self.precheck_purls(&plans);
+            let batch: Vec<GroupFetch> = plans
                 .into_iter()
-                .zip(registry_subs.into_iter().zip(analyzed))
-            {
-                // Registry findings keyed by locator, captured as each record is
-                // merged so the package pass below can pair an artifact with
-                // its own registry metadata (see `apply_package_composites`).
-                let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
-                for ((r, provenance, skip), sub) in g.registries.iter().zip(subs) {
-                    let reg = &provenance.record;
-                    if let Some(sub) = sub {
-                        let findings = sub_findings(&sub);
-                        // Every registry record we materialized for this file is a
-                        // reference whose outcome the declarer should carry. Tallied
-                        // here rather than from `g.fetched` because the two travel
-                        // separately: a dependency resolved without a live download
-                        // still yields a registry document, so attributing only from
-                        // fetch records left the commonest case with no outcome at
-                        // all.
-                        let tally = registry_outcomes
-                            .entry(g.source_sha.clone())
-                            .or_insert((0u64, 0u64));
-                        tally.0 += 1;
-                        if findings
-                            .iter()
-                            .any(|f| f.id.contains("registry-security-hold-record"))
-                        {
-                            tally.1 += 1;
-                        }
-                        // A skipped dependency has no artifact upload and only
-                        // appears in provenance output when its registry node is
-                        // notable. Drop its raw provider document immediately when
-                        // neither condition applies; lockfiles can contain hundreds
-                        // of ordinary aged-out records.
-                        let retain_provenance = skip.is_none()
-                            || findings
-                                .iter()
-                                .any(|finding| finding.crit >= cleave::Criticality::Notable);
-                        registry_findings
-                            .entry(locator_key(r))
-                            .or_default()
-                            .extend(findings);
-                        if let Some(file_id) = merge_registry(report, &g.source_sha, sub)
-                            && retain_provenance
-                        {
-                            let artifact_skip = skip.map(|reason| match reason {
-                                SkipReason::Removed => "version removed",
-                                SkipReason::AgedOut => "older than fetch age limit",
-                                SkipReason::KnownGood => "known-good coordinate",
-                            });
-                            dependency_registries.push(DependencyRegistry {
-                                locator: locator_key(r),
-                                provenance: provenance.clone(),
-                                file_id,
-                                artifact_skip,
-                            });
-                        }
-                    }
-                    // The record is materialized either way; only the artifact fetch
-                    // is skipped. `None` = kept for fetch+scan.
-                    let Some(reason) = skip else {
-                        continue;
-                    };
-                    let common = tracing::field::display(locator_key(r));
-                    if *reason == SkipReason::KnownGood {
-                        crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
-                    }
-                    let log_reason = match reason {
-                        SkipReason::Removed => "version removed from registry",
-                        SkipReason::AgedOut => "older than --max-dep-age",
-                        SkipReason::KnownGood => "known-good (bloom, resolved version)",
-                    };
-                    // Age-outs are the common, expected case; they stay at debug so
-                    // `--verbose` can still see them, while removals and known-good
-                    // skips — the interesting decisions — are surfaced at info.
-                    match reason {
-                        SkipReason::AgedOut => tracing::debug!(
-                            package = %common,
-                            ecosystem = %reg.ecosystem,
-                            version = %reg.version,
-                            age_days = reg.age_days.unwrap_or(0),
-                            downloads = reg.downloads_recent.or(reg.downloads_total),
-                            reason = log_reason,
-                            "registry record materialized; artifact fetch skipped"
-                        ),
-                        SkipReason::Removed | SkipReason::KnownGood => tracing::info!(
-                            package = %common,
-                            ecosystem = %reg.ecosystem,
-                            version = %reg.version,
-                            age_days = reg.age_days.unwrap_or(0),
-                            downloads = reg.downloads_recent.or(reg.downloads_total),
-                            reason = log_reason,
-                            "registry record materialized; artifact fetch skipped"
-                        ),
-                    }
-                    // Settle the skipped row. The tree shows every reason (so no row
-                    // is left hanging as pending); the stream keeps flooding-averse
-                    // behaviour, printing only the surfaced removals/known-good skips.
-                    reporter.skipped(r, reg, now, *reason);
-                }
-                for (selected_ref, (rec, payload)) in
-                    g.selected.iter().zip(g.fetched.iter().zip(payloads))
-                {
-                    if let Some(mut payload) = payload {
-                        let credit = redirect_credit.get(&g.source_sha).copied().unwrap_or(0)
-                            + u8::from(selected_ref.source == REDIRECT_DESTINATION_SOURCE);
-                        if credit > 0 {
-                            redirect_credit
-                                .insert(payload.content_sha.clone(), credit.min(MAX_REDIRECT_HOPS));
-                        }
-                        // Run registry-aware package composites on the dependency's
-                        // standalone report before either consumer takes it. This
-                        // lets the dependency grader see the same finding that the
-                        // merged parent's embedded-file pass sees, so a suspicious
-                        // or hostile dependency can be pinned back to its declaring
-                        // manifest. Running this after `merge_payload` left the
-                        // standalone capture blind to registry/package composites.
-                        prepare_dependency_report(
-                            &mut payload,
-                            registry_findings_for_reference(&registry_findings, selected_ref),
-                            &opts,
-                        );
-                        // Capture the dependency's standalone report before merge_payload
-                        // consumes the sub-report into the merged tree — only when a
-                        // consumer (hopper upload, dependency appendix) will read it.
-                        if capture_deps && let Some(dep) = capture_dependency(rec, &payload) {
-                            dependencies.push(dep);
-                        }
-                        // The verdict this dependency arrives with, from either
-                        // negotiation: the per-sha precheck puts it on the
-                        // payload, the batch PURL answer in the group's map.
-                        let verdict = payload.corpus.clone().or_else(|| {
-                            rec.content_sha256
-                                .as_deref()
-                                .and_then(|sha| g.corpus.get(sha).cloned())
-                        });
-                        if let (Some(v), Some(sha)) = (&verdict, rec.content_sha256.as_deref()) {
-                            adopted.insert(sha.to_string(), v.clone());
-                        }
-                        next.extend(merge_payload(report, rec, payload, verdict.as_ref()));
-                    }
-                }
-                records.extend(g.fetched);
+                .map(|plan| self.fetch_group(plan, &corpus))
+                .collect();
+            if self.knobs.fetch_only && batch.iter().any(|g| !g.landed.is_empty()) {
+                self.stop_after_fetch(batch);
+                return Vec::new();
+            }
+            let analyzed = self.analyze_batch(&batch);
+            for (group, analysis) in batch.into_iter().zip(analyzed) {
+                self.merge_group(report, group, analysis, &mut next);
             }
         }
-        if dropped_old_versions.get() > 0 {
+        if dropped_old_versions > 0 {
             tracing::info!(
-                skipped = dropped_old_versions.get(),
+                skipped = dropped_old_versions,
                 "older package versions skipped this hop (newest-version policy)"
             );
         }
-        worklist = next;
+        next
     }
-    reporter.finish(&records);
-    attribute_reference_outcomes(report, &records, &registry_outcomes);
-    FetchOutcome {
-        records,
-        dependencies,
-        registries: dependency_registries,
-        adopted,
+
+    /// Keep only the references this hop follows and this run has not yet
+    /// seen. Selection is by [`RefKind`], so a command-mentioned package
+    /// (`packages`) is distinct from a declared dependency (`deps`) even though
+    /// both are PURLs.
+    fn select(&mut self, refs: Vec<Reference>, hop: u8, dropped_old: &mut usize) -> Vec<Reference> {
+        let mut selected = Vec::new();
+        for r in refs {
+            if self.wanted(&r, hop)
+                && self.fetchable(&r)
+                && !self.off_host(&r)
+                && self.newest_version(&r, dropped_old)
+                && !self.superseded(&r)
+                && self.seen.insert(locator(&r).to_owned())
+            {
+                selected.push(r);
+            }
+        }
+        selected
+    }
+
+    fn wanted(&self, r: &Reference, hop: u8) -> bool {
+        let wanted = self.policy.wants_at(r.kind, hop);
+        if !wanted && self.policy.wants(r.kind) {
+            tracing::debug!(
+                package = %locator(r),
+                hop = hop + 1,
+                "transitive dependency; registry lookup and fetch both skipped"
+            );
+        }
+        wanted
+    }
+
+    /// Whether a reference can be fetched at all, and — for a discovered URL —
+    /// whether it is worth a round trip. Publisher-controlled URLs, obvious
+    /// site/API endpoints, and the exact documentation/update URLs observed in
+    /// stock /bin binaries cost a round trip each and are unlikely to yield a
+    /// dropper payload. Applied per hop so a payload's own boilerplate is
+    /// filtered too, and only to *discovered* references: `scan url <url>`
+    /// fetches whatever the operator names (see `crate::hosts`).
+    fn fetchable(&self, r: &Reference) -> bool {
+        let raw = match &r.locator {
+            RefLocator::Purl(_) => return true,
+            // Resolved against the artifact's own files, never fetched.
+            RefLocator::Path(path) => {
+                tracing::debug!(path = %path, source = %r.source, "intra-artifact path; not a fetch");
+                return false;
+            }
+            RefLocator::Url(raw) => raw,
+        };
+        let skip = |why: &str| {
+            tracing::debug!(url = %raw, source = %r.source, "{why}; fetch skipped");
+            false
+        };
+        let Ok(url) = Url::parse(raw) else {
+            return skip("invalid or local URL host");
+        };
+        if !valid_discovered_url_host(&url) {
+            return skip("invalid or local URL host");
+        }
+        if has_unexpanded_url_placeholder(raw) {
+            return skip("unexpanded URL template");
+        }
+        if hosts::publisher_controlled(&url) || hosts::discovery_exception(raw, &url) {
+            return skip("known boilerplate URL");
+        }
+        if r.kind == RefKind::UrlFetch
+            && !looks_like_dropper_download_url(&url)
+            && !is_eval_pipeline_url(r)
+            && !is_download_to_file_url(r)
+            && !is_redirect_destination(r)
+            && !self.carriers.contains(raw)
+        {
+            return skip("URL does not look like a dropper download or eval pipeline");
+        }
+        true
+    }
+
+    /// Native-binary dependencies built for another platform are dropped before
+    /// they're ever fetched — the host variant is scanned, its linux/windows
+    /// siblings never run here. Off unless the policy asks for it
+    /// (`--fetch-all-platforms` audits every platform).
+    fn off_host(&self, r: &Reference) -> bool {
+        let off_host = self.policy.host_platform_only && off_host_platform(r, self.host);
+        if off_host {
+            tracing::debug!(
+                package = %locator(r),
+                host_os = self.host.0,
+                host_arch = self.host.1,
+                "dependency pinned to another platform; skipped (--fetch-all-platforms to include)"
+            );
+        }
+        off_host
+    }
+
+    /// Older-version duplicates are skipped entirely — no registry-record
+    /// materialization, no fetch (operator policy 2, 2026-07-30). Never silent:
+    /// each skip logs at debug, the hop logs one count at info.
+    fn newest_version(&self, r: &Reference, dropped_old: &mut usize) -> bool {
+        let Some((key, version)) = versioned_purl(locator(r)) else {
+            return true;
+        };
+        match self.newest.get(key) {
+            Some(newest) if lenient_version_cmp(version, newest) == std::cmp::Ordering::Less => {
+                *dropped_old += 1;
+                tracing::debug!(
+                    package = %locator(r),
+                    newest = %newest,
+                    "older version of an already-kept package; skipped (newest-version policy)"
+                );
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// A lockfile pin supersedes the manifest's versionless sibling: a bare
+    /// `pkg:eco/name` is dropped when the same coordinate is pinned elsewhere
+    /// in the tree, so the exact installed version is scanned instead of
+    /// `dist-tags/latest`.
+    fn superseded(&self, r: &Reference) -> bool {
+        let superseded = superseded_by_pin(r, &self.pinned);
+        if superseded {
+            tracing::debug!(
+                package = %locator(r),
+                "versionless dependency superseded by a lockfile-pinned sibling; skipped"
+            );
+        }
+        superseded
+    }
+
+    /// Look up each declared dependency's registry metadata first. Every
+    /// resolved record is materialized as a `*.registry.json` node so its facts
+    /// are trait-matched, and releases older than the age ceiling are dropped
+    /// before the expensive fetch+scan of their bytes. Skips are reported, never
+    /// silent.
+    fn plan(&mut self, source_sha: String, selected: Vec<Reference>) -> GroupPlan {
+        let (selected, registries) = age_gate(selected, &self.policy, self.res, self.now);
+        // Reveal the kept (to-fetch) set as pending, so the tree shows the
+        // dependencies it will actually scan up front. Aged-out deps are
+        // deliberately never announced — for a large npm graph they are the
+        // overwhelming majority and only a registry-metadata lookup runs on
+        // them, so listing them would bury the handful of live scans.
+        self.reporter.announce(
+            &selected,
+            self.manifests.get(&source_sha).map_or("", String::as_str),
+        );
+        GroupPlan {
+            source_sha,
+            selected,
+            registries,
+        }
+    }
+
+    /// Pre-fetch PURL negotiation for a whole batch: hopper may hold a standing
+    /// verdict (same rules as the per-sha corpus precheck) for a registry
+    /// dependency whose content sha we would otherwise only learn by
+    /// downloading it. One batched lookup up front skips the download, the
+    /// analysis, and the re-upload for every such PURL; the answer's sha still
+    /// records the fetch edge. Anything unanswered fetches exactly as before.
+    fn precheck_purls(
+        &self,
+        plans: &[GroupPlan],
+    ) -> HashMap<String, crate::corpus_precheck::PurlHit> {
+        let Some(precheck) = &self.precheck else {
+            return HashMap::new();
+        };
+        let candidates: Vec<String> = plans
+            .iter()
+            .flat_map(|plan| &plan.selected)
+            .filter(|r| {
+                r.kind != RefKind::UrlFetch
+                    && matches!(r.locator, RefLocator::Purl(_))
+                    && r.content_sha256.is_none()
+            })
+            .map(|r| locator(r).to_owned())
+            .collect();
+        if candidates.is_empty() {
+            return HashMap::new();
+        }
+        let hits = precheck.purls(&candidates);
+        if !hits.is_empty() {
+            tracing::info!(
+                skipped = hits.len(),
+                asked = candidates.len(),
+                "purl precheck: hopper verdicts stand; skipped fetch+analysis+upload"
+            );
+        }
+        hits
+    }
+
+    /// Fetch one group's selected references: dependencies and
+    /// command-mentioned packages under one cap, opportunistic URLs under their
+    /// own smaller one, and none at all for a dependency the corpus answered.
+    fn fetch_group(
+        &mut self,
+        plan: GroupPlan,
+        corpus: &HashMap<String, crate::corpus_precheck::PurlHit>,
+    ) -> GroupFetch {
+        let GroupPlan {
+            source_sha,
+            selected,
+            registries,
+        } = plan;
+        if selected.is_empty() {
+            // Nothing to fetch; the group still merges its registry records.
+            return GroupFetch {
+                source_sha,
+                registries,
+                landed: Vec::new(),
+            };
+        }
+        let mut slots: Vec<Option<(FetchRecord, Standing)>> = vec![None; selected.len()];
+        let mut deps = Vec::new();
+        let mut urls = Vec::new();
+        for (i, r) in selected.iter().enumerate() {
+            if r.kind == RefKind::UrlFetch {
+                urls.push(keyed(r, i));
+            } else if let Some(hit) = corpus.get(locator(r)) {
+                slots[i] = Some((
+                    corpus_hit_record(r, &source_sha, &hit.sha),
+                    hit.standing.clone(),
+                ));
+            } else {
+                deps.push(keyed(r, i));
+            }
+        }
+        // Mark the to-fetch set in flight, then fetch. Dependencies go first
+        // and are charged before URLs start, so both budgets hold between the
+        // two fletch calls.
+        self.reporter.fetching(&selected);
+        let (dep_records, dep_notice) = self.fetch_class(FetchClass::Deps, &deps, &source_sha);
+        let (url_records, url_notice) = self.fetch_class(FetchClass::Urls, &urls, &source_sha);
+        pair_records(
+            &selected,
+            dep_records.into_iter().chain(url_records),
+            &mut slots,
+        );
+        let landed: Vec<Landed> = selected
+            .into_iter()
+            .zip(slots)
+            .filter_map(|(reference, slot)| {
+                slot.map(|(record, standing)| Landed {
+                    reference,
+                    record,
+                    standing,
+                })
+            })
+            .collect();
+        // Authoritative pass over every returned edge: settle each row (the tree
+        // finalizes any budget-clipped edge the live callback never saw;
+        // re-settling a callback-landed row is idempotent) and print the
+        // streamed line.
+        for l in &landed {
+            self.reporter.landed(&l.reference, &l.record);
+            let notice = if l.reference.kind == RefKind::UrlFetch {
+                &url_notice
+            } else {
+                &dep_notice
+            };
+            self.reporter.report(&l.record, notice);
+        }
+        GroupFetch {
+            source_sha,
+            registries,
+            landed,
+        }
+    }
+
+    /// Fetch one class's references under this root's budget and the
+    /// process-wide one: reserve from the total first, refund what went
+    /// unspent. Returns the records and the notice a budget-clipped edge shows.
+    fn fetch_class(
+        &mut self,
+        class: FetchClass,
+        refs: &[Reference],
+        source_sha: &str,
+    ) -> (Vec<FetchRecord>, String) {
+        if refs.is_empty() {
+            return (Vec::new(), String::new());
+        }
+        let (flag, limit) = match class {
+            FetchClass::Deps => ("--fetch-max-file-fetches", self.policy.max_file_fetches),
+            FetchClass::Urls => ("--fetch-max-urls", self.policy.max_url_fetches),
+        };
+        let want = self.budget.want(class);
+        let grant = TOTAL_BUDGET.reserve(want);
+        let total_limited = if grant.fetches < want.fetches {
+            grant.fetches
+        } else {
+            usize::MAX
+        };
+        let notice = fetch_count_budget_notice(flag, limit, total_limited);
+        // The callback fires as each download lands (from a pool worker, so
+        // it's `Sync`), flipping that row to "analyzing" the moment its bytes
+        // arrive rather than when the whole concurrent batch returns.
+        let reporter = &self.reporter;
+        let on_fetched = |r: &Reference, rec: &FetchRecord| reporter.landed(r, rec);
+        let budget = FetchBudget {
+            max_count: grant.fetches,
+            max_bytes: grant.bytes,
+        };
+        let records = match class {
+            FetchClass::Deps => fetch_references_with(
+                refs,
+                source_sha,
+                false,
+                &self.res.net,
+                &self.res.cache,
+                budget,
+                &on_fetched,
+            ),
+            FetchClass::Urls => {
+                let net = AsClient {
+                    net: &self.res.net,
+                    agents: refs
+                        .iter()
+                        .filter_map(|r| Some((locator(r).to_owned(), client_user_agent(r)?)))
+                        .collect(),
+                };
+                fetch_references_with(
+                    refs,
+                    source_sha,
+                    true,
+                    &net,
+                    &self.res.cache,
+                    budget,
+                    &on_fetched,
+                )
+            }
+        };
+        let spent = live_fetch_usage(&records);
+        TOTAL_BUDGET.settle(grant, spent);
+        self.budget.spend(class, spent);
+        (records, notice)
+    }
+
+    /// Analyze a batch. Registry records and fetched payloads are both
+    /// report-independent, so they fan out together across every group in the
+    /// batch — when the pool has headroom (see [`Fanout`]); saturated, the batch
+    /// runs inline on this blocking thread, the shape cleave's own nesting
+    /// throttle is written for. Each `registry_node` is an independent cleave
+    /// analysis of one small JSON document at ~23 ms; a payload is a full
+    /// cleave pass. Results align with `batch`.
+    fn analyze_batch(&self, batch: &[GroupFetch]) -> Vec<GroupAnalysis> {
+        let analyzes_bytes = batch
+            .iter()
+            .flat_map(|g| &g.landed)
+            .any(|l| matches!(l.standing, Standing::Analyze) && delivered_bytes(&l.record));
+        let payloads = Payloads {
+            cache: &self.res.cache,
+            opts: &self.opts,
+            acache: if analyzes_bytes {
+                self.acache.get_or_init(AnalysisCache::open).as_ref()
+            } else {
+                None
+            },
+            precheck: self.precheck.as_deref(),
+        };
+        let fanout = self.knobs.fanout;
+        let registries_of = |g: &GroupFetch| -> Vec<Option<AnalysisReport>> {
+            g.registries
+                .iter()
+                .map(|gated| registry_node(&gated.record, &self.registry_opts))
+                .collect()
+        };
+        let payloads_of = |g: &GroupFetch| -> Vec<Option<Analyzed>> {
+            // Settles each payload row from "analyzing" to its final glyph as
+            // its scan finishes.
+            let on_analyzed = |i: usize| {
+                if let Some(l) = g.landed.get(i) {
+                    self.reporter.analyzed(&l.reference, &l.record);
+                }
+            };
+            payloads.analyze_all(&g.landed, fanout, &on_analyzed)
+        };
+        let (subs, payloads): (Vec<_>, Vec<_>) = if fanout.allowed() {
+            use rayon::prelude::*;
+            rayon::join(
+                || batch.par_iter().map(&registries_of).collect(),
+                || batch.par_iter().map(&payloads_of).collect(),
+            )
+        } else {
+            (
+                batch.iter().map(&registries_of).collect(),
+                batch.iter().map(&payloads_of).collect(),
+            )
+        };
+        subs.into_iter()
+            .zip(payloads)
+            .map(|(registries, payloads)| GroupAnalysis {
+                registries,
+                payloads,
+            })
+            .collect()
+    }
+
+    /// Merge one group — registry records before payloads, both in
+    /// materialization order — because the graft assigns report ids from a
+    /// running counter; merging in completion order would make ids (and
+    /// therefore output) depend on timing.
+    fn merge_group(
+        &mut self,
+        report: &mut AnalysisReport,
+        group: GroupFetch,
+        analysis: GroupAnalysis,
+        next: &mut Vec<Group>,
+    ) {
+        let GroupFetch {
+            source_sha,
+            registries,
+            landed,
+        } = group;
+        let GroupAnalysis {
+            registries: subs,
+            payloads,
+        } = analysis;
+        // Registry findings keyed by locator, captured as each record is merged
+        // so the package pass below can pair an artifact with its own registry
+        // metadata (see `apply_package_composites`).
+        let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
+        for (gated, sub) in registries.into_iter().zip(subs) {
+            self.merge_registry_record(report, &source_sha, gated, sub, &mut registry_findings);
+        }
+        for (l, payload) in landed.iter().zip(payloads) {
+            if let Some(payload) = payload {
+                self.merge_landed(report, &source_sha, l, payload, &registry_findings, next);
+            }
+        }
+        self.out
+            .records
+            .extend(landed.into_iter().map(|l| l.record));
+    }
+
+    /// Graft one materialized registry record under its declaring file, keep
+    /// its provenance when anything downstream will read it, and report its
+    /// skip.
+    fn merge_registry_record(
+        &mut self,
+        report: &mut AnalysisReport,
+        source_sha: &str,
+        gated: Gated,
+        sub: Option<AnalysisReport>,
+        registry_findings: &mut HashMap<String, Vec<Finding>>,
+    ) {
+        let Gated {
+            reference,
+            record,
+            sources,
+            skip,
+        } = gated;
+        if let Some(sub) = sub {
+            let findings = sub_findings(&sub);
+            // Every registry record we materialized for this file is a
+            // reference whose outcome the declarer should carry. Tallied here
+            // rather than from the fetch records because the two travel
+            // separately: a dependency resolved without a live download still
+            // yields a registry document.
+            let tally = self
+                .registry_outcomes
+                .entry(source_sha.to_owned())
+                .or_insert((0, 0));
+            tally.0 += 1;
+            if findings
+                .iter()
+                .any(|f| f.id.contains(TRAIT_SECURITY_HOLD_RECORD))
+            {
+                tally.1 += 1;
+            }
+            // A skipped dependency has no artifact upload and only appears in
+            // provenance output when its registry node is notable. Drop its raw
+            // provider document when neither applies; lockfiles can contain
+            // hundreds of ordinary aged-out records.
+            let retain_provenance = skip.is_none()
+                || findings
+                    .iter()
+                    .any(|finding| finding.crit >= cleave::Criticality::Notable);
+            registry_findings
+                .entry(locator(&reference).to_owned())
+                .or_default()
+                .extend(findings);
+            if let Some(file_id) = merge_registry(report, &mut self.graft, source_sha, sub)
+                && retain_provenance
+            {
+                // A memo hit kept only the record; its provider documents are
+                // recovered from fletch's bounded blob cache now that they are
+                // needed, and only now.
+                let sources = sources.unwrap_or_else(|| {
+                    fletch::registry_with_sources(
+                        &reference.locator,
+                        &self.res.net,
+                        &self.res.cache,
+                    )
+                    .1
+                });
+                self.out.registries.push(DependencyRegistry {
+                    locator: locator(&reference).to_owned(),
+                    provenance: RegistryProvenance::from_record_sources(record.clone(), &sources),
+                    file_id,
+                    artifact_skip: skip.map(SkipReason::artifact_note),
+                });
+            }
+        }
+        // The record is materialized either way; only the artifact fetch is
+        // skipped. `None` = kept for fetch+scan.
+        let Some(reason) = skip else {
+            return;
+        };
+        if reason == SkipReason::KnownGood {
+            crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
+        }
+        let package = tracing::field::display(locator(&reference));
+        // Age-outs are the common, expected case; they stay at debug so
+        // `--verbose` can still see them, while removals and known-good skips —
+        // the interesting decisions — are surfaced at info.
+        match reason {
+            SkipReason::AgedOut => tracing::debug!(
+                package = %package,
+                ecosystem = %record.ecosystem,
+                version = %record.version,
+                age_days = record.age_days.unwrap_or(0),
+                downloads = record.downloads_recent.or(record.downloads_total),
+                reason = reason.log_reason(),
+                "registry record materialized; artifact fetch skipped"
+            ),
+            SkipReason::Removed | SkipReason::KnownGood => tracing::info!(
+                package = %package,
+                ecosystem = %record.ecosystem,
+                version = %record.version,
+                age_days = record.age_days.unwrap_or(0),
+                downloads = record.downloads_recent.or(record.downloads_total),
+                reason = reason.log_reason(),
+                "registry record materialized; artifact fetch skipped"
+            ),
+        }
+        // Settle the skipped row. The tree shows every reason (so no row is left
+        // hanging as pending); the stream keeps flooding-averse behaviour,
+        // printing only the surfaced removals/known-good skips.
+        self.reporter.skipped(&reference, &record, self.now, reason);
+    }
+
+    /// Fold one analyzed payload into the run: its redirect credit, its
+    /// standalone capture, an adopted verdict, and its subtree in the report.
+    fn merge_landed(
+        &mut self,
+        report: &mut AnalysisReport,
+        source_sha: &str,
+        l: &Landed,
+        mut payload: Analyzed,
+        registry_findings: &HashMap<String, Vec<Finding>>,
+        next: &mut Vec<Group>,
+    ) {
+        let credit = self
+            .redirect_credit
+            .get(source_sha)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(u8::from(is_redirect_destination(&l.reference)));
+        if credit > 0 {
+            self.redirect_credit
+                .insert(payload.content_sha.clone(), credit.min(MAX_REDIRECT_HOPS));
+        }
+        // Run registry-aware package composites on the dependency's standalone
+        // report before either consumer takes it. This lets the dependency
+        // grader see the same finding that the merged parent's embedded-file
+        // pass sees, so a suspicious or hostile dependency can be pinned back to
+        // its declaring manifest.
+        prepare_dependency_report(
+            &mut payload,
+            registry_findings_for_reference(registry_findings, &l.reference),
+            &self.opts,
+        );
+        // Capture the dependency's standalone report before merge_payload
+        // consumes the sub-report into the merged tree — only when a consumer
+        // (hopper upload, dependency appendix) will read it.
+        if self.capture_deps
+            && let Some(dep) = capture_dependency(&l.record, &payload)
+        {
+            self.out.dependencies.push(dep);
+        }
+        // A verdict the corpus handed us — from the batch PURL negotiation or
+        // the per-sha precheck — is this dependency's evaluation, exactly as if
+        // it had been analyzed here.
+        if let Some(verdict) = &payload.corpus {
+            self.out
+                .adopted
+                .insert(payload.content_sha.clone(), verdict.clone());
+        }
+        next.extend(merge_payload(report, &mut self.graft, &l.record, payload));
+    }
+
+    /// `SCAN_FETCH_ONLY`: keep the edges of what was fetched, say how much, and
+    /// end the run here. Registry nodes — exactly the analysis this mode skips —
+    /// do not merge.
+    fn stop_after_fetch(&mut self, batch: Vec<GroupFetch>) {
+        let records: Vec<FetchRecord> = batch
+            .into_iter()
+            .flat_map(|g| g.landed)
+            .map(|l| l.record)
+            .collect();
+        let fetched = records.iter().filter(|r| r.size.is_some()).count();
+        let bytes: u64 = records.iter().filter_map(|r| r.size).sum();
+        tracing::info!(
+            refs_selected = records.len(),
+            payloads_fetched = fetched,
+            fetched_bytes = bytes,
+            "SCAN_FETCH_ONLY: stopping before payload analysis"
+        );
+        // stderr, so a JSON report on stdout stays parseable.
+        eprintln!(
+            "fetch-only: selected={} fetched={fetched} bytes={bytes}",
+            records.len()
+        );
+        self.out.records.extend(records);
+        self.stopped = true;
+    }
+
+    /// Close out the phase: settle the progress view and record, on each file
+    /// that declared references, what became of them.
+    fn finish(self, report: &mut AnalysisReport) -> FetchOutcome {
+        self.reporter.finish(&self.out.records);
+        attribute_reference_outcomes(report, &self.out.records, &self.registry_outcomes);
+        self.out
+    }
+}
+
+/// A copy of `r` whose offset is `index`. fletch drops references it will not
+/// fetch and may refine a locator (a versionless PURL becomes the release it
+/// resolved to), so neither a record's position nor its locator joins it back
+/// to its reference; the offset fletch stamps on every record from its
+/// reference does. See [`pair_records`].
+fn keyed(r: &Reference, index: usize) -> Reference {
+    Reference {
+        offset: index as u64,
+        ..r.clone()
+    }
+}
+
+/// Put each record fletch returned in the slot of the reference it was fetched
+/// for — the one whose index [`keyed`] stamped as its offset — and restore the
+/// reference's real offset on the record.
+fn pair_records(
+    selected: &[Reference],
+    records: impl IntoIterator<Item = FetchRecord>,
+    slots: &mut [Option<(FetchRecord, Standing)>],
+) {
+    for mut record in records {
+        let index = record
+            .source_offset
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|&i| i < selected.len());
+        let Some(i) = index else {
+            tracing::error!(locator = %record.locator, "fetch record names no selected reference; dropped");
+            continue;
+        };
+        record.source_offset = Some(selected[i].offset);
+        slots[i] = Some((record, Standing::Analyze));
     }
 }
 
@@ -2255,21 +2693,21 @@ fn attribute_reference_outcomes(
     registry_outcomes: &BTreeMap<String, (u64, u64)>,
 ) {
     #[derive(Default)]
-    struct Tally {
+    struct Tally<'a> {
         declared: u64,
-        unresolved: Vec<String>,
+        unresolved: Vec<&'a str>,
     }
 
     let mut touched: Vec<String> = Vec::new();
-    let mut by_source: BTreeMap<&str, Tally> = BTreeMap::new();
+    let mut by_source: BTreeMap<&str, Tally<'_>> = BTreeMap::new();
     for rec in records {
-        if rec.source_sha256.is_empty() {
+        let Some(source) = rec.source_sha256.as_deref() else {
             continue;
-        }
-        let tally = by_source.entry(rec.source_sha256.as_str()).or_default();
+        };
+        let tally = by_source.entry(source).or_default();
         tally.declared += 1;
-        if matches!(rec.outcome, Outcome::Unresolved) {
-            tally.unresolved.push(rec.locator.clone());
+        if matches!(rec.outcome, Outcome::Unresolved(_)) {
+            tally.unresolved.push(rec.locator.as_str());
         }
     }
 
@@ -2307,7 +2745,9 @@ fn attribute_reference_outcomes(
         let extension_unresolved = fetched.map_or(0, |t| {
             t.unresolved
                 .iter()
-                .filter(|l| l.starts_with("pkg:vscode/") || l.starts_with("pkg:openvsx/"))
+                .filter(|l| {
+                    Coordinate::of(l).is_some_and(|c| matches!(c.typ, "vscode" | "openvsx"))
+                })
                 .count()
         });
         metrics.insert(
@@ -2391,7 +2831,7 @@ impl Reporter {
     fn announce(&self, refs: &[Reference], source: &str) {
         if let Self::Tree { tree, .. } = self {
             for r in refs {
-                tree.add(&locator_key(r), &dep_display_name(r), source);
+                tree.add(locator(r), &dep_display_name(r), source);
             }
         }
     }
@@ -2415,7 +2855,7 @@ impl Reporter {
             }
             Self::Tree { tree, .. } => {
                 for r in refs {
-                    tree.set(&locator_key(r), DepState::Fetching);
+                    tree.set(locator(r), DepState::Fetching);
                 }
             }
             Self::Off => {}
@@ -2430,9 +2870,9 @@ impl Reporter {
     fn landed(&self, r: &Reference, rec: &FetchRecord) {
         if let Self::Tree { tree, .. } = self {
             if matches!(rec.outcome, Outcome::BudgetExceeded) || !terminal_fetch_row_visible(rec) {
-                tree.set(&locator_key(r), DepState::Hidden);
+                tree.set(locator(r), DepState::Hidden);
             } else {
-                tree.set(&locator_key(r), landed_state(rec));
+                tree.set(locator(r), landed_state(rec));
             }
         }
     }
@@ -2443,7 +2883,7 @@ impl Reporter {
     ///
     /// Successful rows are intentionally omitted; failures, skips, and pin
     /// mismatches remain visible because they need attention.
-    fn report(&self, rec: &FetchRecord, budget_notice: Option<&str>) {
+    fn report(&self, rec: &FetchRecord, budget_notice: &str) {
         if matches!(rec.outcome, Outcome::BudgetExceeded) {
             match self {
                 Self::Off => {}
@@ -2453,8 +2893,7 @@ impl Reporter {
                 } => {
                     if !emitted.swap(true, Ordering::Relaxed) {
                         tracing::debug!(
-                            message = budget_notice
-                                .unwrap_or("Skipping remaining fetches, hit fetch budget"),
+                            message = budget_notice,
                             "fetch budget exceeded; remaining references skipped"
                         );
                     }
@@ -2463,12 +2902,10 @@ impl Reporter {
                     budget_notice: stored,
                     ..
                 } => {
-                    let mut guard = stored
+                    stored
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if guard.is_none() {
-                        *guard = budget_notice.map(str::to_owned);
-                    }
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get_or_insert_with(|| budget_notice.to_owned());
                 }
             }
             return;
@@ -2477,9 +2914,9 @@ impl Reporter {
             match &rec.outcome {
                 Outcome::Failed(why) => tracing::debug!(
                     locator = %rec.locator,
-                    url = %rec.resolved_url,
-                    status = ?failure_status(rec),
-                    why,
+                    url = rec.resolved_url.as_deref(),
+                    status = ?rec.status,
+                    why = %why,
                     "fetch: artifact absent from its registry"
                 ),
                 Outcome::Skipped if rec.content_sha256.is_some() => tracing::debug!(
@@ -2515,22 +2952,17 @@ impl Reporter {
         let Self::Stream { printed, .. } = self else {
             return true;
         };
-        let target = if rec.resolved_url.is_empty() {
-            rec.locator.as_str()
-        } else {
-            rec.resolved_url.as_str()
-        };
         printed
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(format!("{:?}\x1f{target}", rec.outcome))
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(format!("{:?}\x1f{}", rec.outcome, fetch_target(rec)))
     }
 
     /// A payload finished analysis: settle its row to the final fetch glyph
     /// (tree only).
     fn analyzed(&self, r: &Reference, rec: &FetchRecord) {
         if let Self::Tree { tree, .. } = self {
-            tree.set(&locator_key(r), done_state(rec));
+            tree.set(locator(r), done_state(rec));
         }
     }
 
@@ -2553,7 +2985,7 @@ impl Reporter {
             // rewritten in place.
             Self::Stream { .. } if matches!(reason, SkipReason::KnownGood) => {
                 tracing::debug!(
-                    locator = %locator_key(r),
+                    locator = %locator(r),
                     age_days = reg.age_secs(now).unwrap_or(0) / 86_400,
                     "fetch: known-good dependency skipped"
                 );
@@ -2562,8 +2994,8 @@ impl Reporter {
                 crate::engine::print_above_bar(|| report_skip(r, reg, now, reason))
             }
             Self::Tree { tree, .. } => {
-                tree.add(&locator_key(r), &dep_display_name(r), "");
-                tree.set(&locator_key(r), skip_state(reg, now, reason));
+                tree.add(locator(r), &dep_display_name(r), "");
+                tree.set(locator(r), skip_state(reg, now, reason));
             }
         }
     }
@@ -2590,7 +3022,7 @@ impl Reporter {
                 tree.finish(&summary_line(records));
                 let message = budget_notice
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .take();
                 if let Some(message) = message {
                     eprintln!("    {message}");
@@ -2600,10 +3032,16 @@ impl Reporter {
     }
 }
 
-/// A compact, human display name for a reference: `name version` for a PURL
-/// (scope preserved, e.g. `@biomejs/cli-darwin-arm64 2.5.0`), or the URL with
-/// its scheme trimmed. This is what the tree shows in place of the full registry
-/// URL the streamed log prints.
+/// The fetch log's palette, matching the scan progress bar's truecolor one.
+const LIVE: Rgb = Rgb(100, 180, 255);
+const CACHED: Rgb = Rgb(120, 200, 140);
+const CAUTION: Rgb = Rgb(230, 180, 80);
+const FAILED: Rgb = Rgb(255, 90, 90);
+const GOOD: Rgb = Rgb(80, 200, 80);
+const MUTED: Rgb = Rgb(120, 120, 120);
+const DETAIL: Rgb = Rgb(130, 130, 130);
+const LABEL: Rgb = Rgb(160, 160, 160);
+
 /// The source manifest's path as the dep tree shows it, led by the scanned
 /// artifact so a nested manifest reads plainly as a file *inside* it:
 /// `demo.zip!!vexium-1.0.tgz!!package/package.json` →
@@ -2621,6 +3059,10 @@ fn manifest_relpath(path: &str) -> String {
     }
 }
 
+/// A compact, human display name for a reference: `name version` for a PURL
+/// (scope preserved, e.g. `@biomejs/cli-darwin-arm64 2.5.0`), or the URL with
+/// its scheme trimmed. This is what the tree shows in place of the full registry
+/// URL the streamed log prints.
 fn dep_display_name(r: &Reference) -> String {
     match &r.locator {
         RefLocator::Purl(p) => purl_display(p),
@@ -2636,22 +3078,13 @@ fn dep_display_name(r: &Reference) -> String {
 /// `@scope/pkg 1.2.3`; a versionless coordinate shows just the name. Falls back
 /// to the raw PURL for anything that doesn't parse.
 fn purl_display(purl: &str) -> String {
-    let body = purl.strip_prefix("pkg:").unwrap_or(purl);
-    let Some((_ecosystem, rest)) = body.split_once('/') else {
+    let Some(coordinate) = Coordinate::of(purl) else {
         return purl.to_string();
     };
-    // The version follows the last '@'; a scope's '@' is `%40`-encoded, so a
-    // literal '@' only ever separates the version. Qualifiers are dropped from
-    // both halves: spec order puts them after the version, and the non-spec
-    // ordering older exports emitted glues them onto the name.
-    let (name, version) = rest.rsplit_once('@').unwrap_or((rest, ""));
-    let name = name.split(['?', '#']).next().unwrap_or(name);
-    let name = name.replace("%40", "@");
-    let version = version.split(['?', '#']).next().unwrap_or(version);
-    if version.is_empty() {
-        name
-    } else {
-        format!("{name} {version}")
+    let name = coordinate.path.replace("%40", "@");
+    match coordinate.version.filter(|v| !v.is_empty()) {
+        Some(version) => format!("{name} {version}"),
+        None => name,
     }
 }
 
@@ -2664,6 +3097,12 @@ fn delivered_bytes(rec: &FetchRecord) -> bool {
         rec.outcome,
         Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin
     )
+}
+
+/// What a fetch is shown and filed under: the URL it resolved to, or the bare
+/// locator when it never resolved to one.
+pub(crate) fn fetch_target(rec: &FetchRecord) -> &str {
+    rec.resolved_url.as_deref().unwrap_or(&rec.locator)
 }
 
 /// The tree state for a fetch the moment it lands: "analyzing" when bytes are in
@@ -2684,11 +3123,13 @@ fn done_state(rec: &FetchRecord) -> DepState {
     if !terminal_fetch_row_visible(rec) {
         return DepState::Hidden;
     }
-    let (glyph, _label, r, g, b, detail) = fetch_row(rec);
+    let row = fetch_row(rec);
     DepState::Done {
-        glyph,
-        color: (r, g, b),
-        detail: detail.unwrap_or_else(|| rec.size.map_or(String::new(), human_bytes)),
+        glyph: row.glyph,
+        color: row.color,
+        detail: row
+            .detail
+            .unwrap_or_else(|| rec.size.map_or(String::new(), human_bytes)),
     }
 }
 
@@ -2697,79 +3138,15 @@ fn done_state(rec: &FetchRecord) -> DepState {
 fn skip_state(reg: &Registry, now: u64, reason: SkipReason) -> DepState {
     let age_days = reg.age_secs(now).unwrap_or(0) / 86_400;
     let (glyph, color, detail) = match reason {
-        SkipReason::KnownGood => ('\u{2713}', (80, 200, 80), "known-good".to_string()),
-        SkipReason::Removed => ('\u{00b7}', (120, 120, 120), "removed".to_string()),
-        SkipReason::AgedOut => ('\u{00b7}', (120, 120, 120), format!("{age_days}d old")),
+        SkipReason::KnownGood => ('\u{2713}', GOOD, "known-good".to_string()),
+        SkipReason::Removed => ('\u{00b7}', MUTED, "removed".to_string()),
+        SkipReason::AgedOut => ('\u{00b7}', MUTED, format!("{age_days}d old")),
     };
     DepState::Done {
         glyph,
         color,
         detail,
     }
-}
-
-/// Capture a fetched payload's standalone report for upload as its own hopper
-/// sample. The report is the pristine one cleave produced for the dependency's
-/// own bytes (container at depth 0, correct member structure) — so it needs no
-/// rerooting, unlike reconstructing a subtree out of the merged parent report.
-/// Compacted from a borrow: no clone of the report, and no strip pass (the raw is
-/// never fed to a model here, and a single dependency never nears the body
-/// limit). Returns `None` when there is nothing to upload.
-/// The record a corpus-satisfied dependency gets instead of a download: no
-/// bytes, no budget charge, hopper's sha as `content_sha256` so the fetch
-/// edge (`source → content`) is still recorded. `Outcome::Skipped` with a
-/// content sha never occurs naturally (a real skip never learned one), and
-/// [`analyze_payload`] keys on exactly that pair to produce the same
-/// "verdict stands in hopper" result as the per-sha precheck — without the
-/// second lookup roundtrip.
-/// The string a [`RefLocator`] is keyed by everywhere a record carries it.
-fn locator_str(locator: &RefLocator) -> String {
-    match locator {
-        RefLocator::Purl(p) | RefLocator::Url(p) | RefLocator::Path(p) => p.clone(),
-    }
-}
-
-fn corpus_hit_record(r: &Reference, source_sha: &str, sha: &str) -> FetchRecord {
-    FetchRecord {
-        source_sha256: source_sha.to_string(),
-        source_offset: Some(r.offset),
-        kind: r.kind,
-        locator: locator_str(&r.locator),
-        resolved_url: String::new(),
-        final_url: None,
-        redirects: Vec::new(),
-        status: None,
-        headers: Vec::new(),
-        fetched_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
-        content_sha256: Some(sha.to_string()),
-        size: None,
-        cached: true,
-        stale: false,
-        pin_verified: None,
-        outcome: Outcome::Skipped,
-    }
-}
-
-fn capture_dependency(rec: &FetchRecord, analyzed: &Analyzed) -> Option<FetchedDependency> {
-    let sub = analyzed.sub.as_ref()?;
-    if analyzed.content_sha.is_empty() {
-        return None;
-    }
-    let compact = cleave::types::compact::compact_from_files(&sub.files);
-    let raw = serde_json::to_string(&compact).ok()?;
-    let url = rec
-        .final_url
-        .clone()
-        .unwrap_or_else(|| rec.resolved_url.clone());
-    Some(FetchedDependency {
-        locator: rec.locator.clone(),
-        url,
-        content_sha: analyzed.content_sha.clone(),
-        size: rec.size.unwrap_or(0),
-        raw,
-    })
 }
 
 /// The artifact could not be retrieved: the registry refused it, the locator
@@ -2796,13 +3173,13 @@ pub struct Unretrievable {
 
 impl std::fmt::Display for Unretrievable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The wording predates the type and is what the logs and the `scan`
-        // CLI have always shown for this failure. Kept verbatim.
-        write!(
-            f,
-            "fetch retrieved nothing for {}: {:?}",
-            self.target, self.outcome
-        )
+        let why = match &self.outcome {
+            Outcome::Failed(error) => failure_detail(error),
+            Outcome::Unresolved(reason) => format!("unresolved ({reason:?})"),
+            Outcome::BudgetExceeded => "fetch budget exhausted".to_string(),
+            other => format!("{other:?}"),
+        };
+        write!(f, "fetch retrieved nothing for {}: {why}", self.target)
     }
 }
 
@@ -2837,19 +3214,12 @@ pub fn fetch_one(
     };
     let rec = fetch_ref(&reference, &res.net, &res.cache);
     if progress {
-        eprintln!(
-            "\n  \x1b[38;2;100;180;255m\u{2b07}\x1b[0m  \x1b[38;2;160;160;160mfetching\x1b[0m"
-        );
+        eprintln!("\n  {}  {}", fg(LIVE, "\u{2b07}"), fg(LABEL, "fetching"));
         report_fetch(&rec);
     }
     if !delivered_bytes(&rec) {
-        let target = if rec.resolved_url.is_empty() {
-            rec.locator.as_str()
-        } else {
-            rec.resolved_url.as_str()
-        };
         return Err(Unretrievable {
-            target: target.to_string(),
+            target: fetch_target(&rec).to_string(),
             outcome: rec.outcome.clone(),
         }
         .into());
@@ -2909,7 +3279,8 @@ pub(crate) fn graft_root_registry(report: &mut AnalysisReport, reg: &Registry) {
     // the registry node's findings — the two halves of the package pass.
     let artifact = sub_findings(report);
     let registry = sub_findings(&sub);
-    let _ = merge_registry(report, &root_sha, sub);
+    let mut graft = Graft::new(report);
+    merge_registry(report, &mut graft, &root_sha, sub);
     apply_package_composites(report, &root_sha, &artifact, &registry, &opts);
 }
 
@@ -2962,50 +3333,51 @@ pub fn report_registry(reg: &Registry, progress: bool) {
     if !progress {
         return;
     }
-    let parts = registry_summary(reg);
     eprintln!(
-        "\n  \x1b[38;2;180;160;255m\u{24d8}\x1b[0m  \x1b[38;2;160;160;160mregistry\x1b[0m \x1b[2m{}\x1b[0m",
-        reg.ecosystem
+        "\n  {}  {} {}",
+        fg(Rgb(180, 160, 255), "\u{24d8}"),
+        fg(LABEL, "registry"),
+        fg(MUTED, &reg.ecosystem)
     );
+    let parts = registry_summary(reg);
     if !parts.is_empty() {
-        eprintln!(
-            "    \x1b[38;2;130;130;130m{}\x1b[0m",
-            parts.join("  \u{00b7}  ")
-        );
+        eprintln!("    {}", fg(DETAIL, &parts.join("  \u{00b7}  ")));
     }
 }
 
 /// Render one fetched reference to stderr, distinguishing a live network fetch
 /// from a cache hit and naming the actual URL that was (or would be) retrieved.
 /// Only the interactive terminal path passes `progress`; JSON/server callers
-/// stay silent. Colors mirror the scan progress bar's truecolor palette.
+/// stay silent.
 fn report_fetch(rec: &FetchRecord) {
     if !terminal_fetch_row_visible(rec) {
         return;
     }
-    let (glyph, label, r, g, b, detail) = fetch_row(rec);
-
-    // The actual URL fetched; fall back to the bare locator (PURL) when the
-    // reference never resolved to one.
-    let url = if rec.resolved_url.is_empty() {
-        rec.locator.as_str()
-    } else {
-        rec.resolved_url.as_str()
-    };
+    let row = fetch_row(rec);
     // A redirect lands the payload elsewhere — name the host, dimmed. Only the
     // host: a release-asset redirect carries a time-limited SAS token and JWT in
     // its query, which are noise on the line and a credential better kept out of
     // terminals and logs.
-    let redirect = match &rec.final_url {
-        Some(f) if f != &rec.resolved_url => {
-            format!("  \x1b[2m\u{2192} {}\x1b[0m", hosts::host_of(f))
-        }
-        _ => String::new(),
-    };
-    let column = detail.unwrap_or_else(|| rec.size.map_or(String::new(), human_bytes));
-
+    let redirect = rec
+        .final_url
+        .as_deref()
+        .filter(|f| Some(*f) != rec.resolved_url.as_deref())
+        .and_then(|f| Url::parse(f).ok())
+        .map(|f| {
+            format!(
+                "  {}",
+                fg(MUTED, &format!("\u{2192} {}", hosts::authority(&f)))
+            )
+        })
+        .unwrap_or_default();
+    let column = row
+        .detail
+        .unwrap_or_else(|| rec.size.map_or(String::new(), human_bytes));
     eprintln!(
-        "    \x1b[38;2;{r};{g};{b}m{glyph} {label:<6}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {url}{redirect}"
+        "    {} {}  {}{redirect}",
+        fg(row.color, &format!("{} {:<6}", row.glyph, row.label)),
+        fg(DETAIL, &format!("{column:>10}")),
+        fetch_target(rec)
     );
 }
 
@@ -3016,12 +3388,11 @@ fn report_fetch(rec: &FetchRecord) {
 /// scanned. Retain their [`FetchRecord`]s for machine output and diagnostics,
 /// but keep the default human view quiet.
 ///
-///
 /// A corpus hit (see [`corpus_hit_record`]) is quiet for the same reason: the
 /// fleet already judged those bytes, so there is nothing here to look at.
 fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
     match rec.outcome {
-        Outcome::Unresolved | Outcome::Skipped => false,
+        Outcome::Unresolved(_) | Outcome::Skipped => false,
         Outcome::Failed(_) => !artifact_absent(rec),
         _ => true,
     }
@@ -3036,95 +3407,71 @@ fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
 /// timeout, `5xx`, a `403` that may be an authenticated mirror) is a fetch that
 /// *should* have worked, and stays visible.
 fn artifact_absent(rec: &FetchRecord) -> bool {
-    matches!(failure_status(rec), Some(404 | 410))
+    matches!(rec.status, Some(404 | 410))
 }
 
-/// The HTTP status behind a failure. Fletch records the code when the fetch
-/// reached the network; a record that predates that (a cached one, an older
-/// fletch) carries it only in the error text it built from the same code —
-/// `http status 404`.
-fn failure_status(rec: &FetchRecord) -> Option<u16> {
-    if let Some(status) = rec.status {
-        return Some(status);
+/// How one fetch outcome reads in the terminal: a glyph and short label in one
+/// colour, and the detail that replaces the size column when the fetch
+/// delivered no bytes.
+struct FetchRow {
+    glyph: char,
+    label: &'static str,
+    color: Rgb,
+    detail: Option<String>,
+}
+
+impl FetchRow {
+    const fn new(glyph: char, label: &'static str, color: Rgb) -> Self {
+        Self {
+            glyph,
+            label,
+            color,
+            detail: None,
+        }
     }
-    let Outcome::Failed(why) = &rec.outcome else {
-        return None;
-    };
-    why.strip_prefix("http status ")?.trim().parse().ok()
+
+    fn detail(mut self, detail: String) -> Self {
+        self.detail = Some(detail);
+        self
+    }
 }
 
-/// One `report_fetch` display row: `(glyph, label, r, g, b, detail)`, where
-/// `detail` replaces the size column when set.
-type FetchRow = (char, &'static str, u8, u8, u8, Option<String>);
-
-/// The display row for a fetch outcome — glyph, label, truecolor, and the
-/// optional detail that replaces the size column when a fetch delivered no
-/// bytes. Shared by the streamed log ([`report_fetch`]) and the live tree, so a
-/// dependency reads the same either way: a *fetched* dep the local bloom filters
-/// vouch for (or flag) is relabeled `known` instead of `live`/`cache` (green ✓
-/// known-good, red ✗ known-bad); `skip`/`fail` rows are left as-is.
+/// The display row for a fetch outcome. Shared by the streamed log
+/// ([`report_fetch`]) and the live tree, so a dependency reads the same either
+/// way: a *fetched* dep the local bloom filters vouch for (or flag) is relabeled
+/// `known` instead of `live`/`cache`; `skip`/`fail` rows are left as-is.
 fn fetch_row(rec: &FetchRecord) -> FetchRow {
     match &rec.outcome {
-        Outcome::PinMismatch => (
-            '\u{2716}',
-            "pin!",
-            255,
-            90,
-            90,
-            Some("hash mismatch".to_string()),
-        ),
-        Outcome::UnverifiablePin => (
-            '\u{25cb}',
-            "pin?",
-            230,
-            180,
-            80,
-            Some("pin unverifiable".to_string()),
-        ),
-        Outcome::Ok if rec.stale => ('\u{25cf}', "stale", 230, 180, 80, None),
-        Outcome::Ok => {
-            if let Some(verdict) = bloom_fetch_verdict(rec) {
-                verdict
-            } else if rec.cached {
-                ('\u{25cf}', "cache", 120, 200, 140, None)
-            } else {
-                ('\u{2b07}', "live", 100, 180, 255, None)
-            }
+        Outcome::PinMismatch => {
+            FetchRow::new('\u{2716}', "pin!", FAILED).detail("hash mismatch".to_string())
         }
-        Outcome::BudgetExceeded => (
-            '\u{25cb}',
-            "budget",
-            230,
-            180,
-            80,
-            Some("over fetch budget".to_string()),
-        ),
-        Outcome::Unresolved => (
-            '\u{00b7}',
-            "skip",
-            120,
-            120,
-            120,
-            Some("unresolved".to_string()),
-        ),
+        Outcome::UnverifiablePin => {
+            FetchRow::new('\u{25cb}', "pin?", CAUTION).detail("pin unverifiable".to_string())
+        }
+        Outcome::Ok if rec.served == Some(Served::StaleCache) => {
+            FetchRow::new('\u{25cf}', "stale", CAUTION)
+        }
+        Outcome::Ok => bloom_fetch_verdict(rec).unwrap_or_else(|| {
+            if rec.cached() {
+                FetchRow::new('\u{25cf}', "cache", CACHED)
+            } else {
+                FetchRow::new('\u{2b07}', "live", LIVE)
+            }
+        }),
+        Outcome::BudgetExceeded => {
+            FetchRow::new('\u{25cb}', "budget", CAUTION).detail("over fetch budget".to_string())
+        }
+        Outcome::Unresolved(_) => {
+            FetchRow::new('\u{00b7}', "skip", MUTED).detail("unresolved".to_string())
+        }
         // Never rendered — every `Skipped` is hidden (see
         // `terminal_fetch_row_visible`) — but the match must still name it.
-        Outcome::Skipped => (
-            '\u{00b7}',
-            "skip",
-            120,
-            120,
-            120,
-            Some("not a target".to_string()),
-        ),
-        Outcome::Failed(why) => (
-            '\u{2716}',
-            "fail",
-            255,
-            90,
-            90,
-            Some(failure_detail(rec, why)),
-        ),
+        Outcome::Skipped => {
+            FetchRow::new('\u{00b7}', "skip", MUTED).detail("not a target".to_string())
+        }
+        Outcome::Failed(why) => {
+            FetchRow::new('\u{2716}', "fail", FAILED).detail(failure_detail(why))
+        }
     }
 }
 
@@ -3156,30 +3503,27 @@ fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
         return None;
     }
 
-    match lookup.decide_any(purl, digest.as_ref()) {
-        Decision::Conflicted => Some(('\u{1f3f4}', "known", 230, 180, 80, None)), // 🏴
-        Decision::KnownBad => Some(('\u{1f6a9}', "known", 235, 120, 120, None)),  // 🚩
-        Decision::SightedHostile | Decision::SightedSuspicious => {
-            Some(('\u{1f441}', "known", 235, 170, 120, None)) // 👁
-        }
-        Decision::Skip => Some(('\u{2713}', "known", 80, 200, 80, None)),
-        Decision::Unknown => None,
-    }
+    let (glyph, color) = match lookup.decide_any(purl, digest.as_ref()) {
+        Decision::Conflicted => ('\u{1f3f4}', CAUTION), // 🏴
+        Decision::KnownBad => ('\u{1f6a9}', Rgb(235, 120, 120)), // 🚩
+        Decision::SightedHostile | Decision::SightedSuspicious => ('\u{1f441}', Rgb(235, 170, 120)), // 👁
+        Decision::Skip => ('\u{2713}', GOOD),
+        Decision::Unknown => return None,
+    };
+    Some(FetchRow::new(glyph, "known", color))
 }
 
-/// The compact failure note for a failed fetch — the HTTP status when one was
-/// seen (the common, informative case), else the transport reason trimmed.
-fn failure_detail(rec: &FetchRecord, why: &str) -> String {
-    failure_status(rec).map_or_else(
-        || {
-            why.split(['\n', ':'])
-                .next()
-                .unwrap_or(why)
-                .trim()
-                .to_string()
-        },
-        |s| format!("HTTP {s}"),
-    )
+/// The compact failure note for a failed fetch — the HTTP status when the
+/// server answered with one (the common, informative case), else the kind of
+/// failure without its detail, which runs long.
+fn failure_detail(why: &FetchError) -> String {
+    match why {
+        FetchError::Status(status) => format!("HTTP {status}"),
+        FetchError::Refused(_) => "refused".to_string(),
+        FetchError::Transport(_) => "transport".to_string(),
+        FetchError::Internal(_) => "internal error".to_string(),
+        FetchError::TooLarge | FetchError::Timeout => why.to_string(),
+    }
 }
 
 /// Why a dependency's artifact fetch was skipped. The registry record is
@@ -3199,6 +3543,26 @@ enum SkipReason {
     /// [`age_gate`] cannot match; pinned coordinates are filtered before the
     /// lookup instead.
     KnownGood,
+}
+
+impl SkipReason {
+    /// Why the artifact is absent, as provenance output states it.
+    const fn artifact_note(self) -> &'static str {
+        match self {
+            Self::Removed => "version removed",
+            Self::AgedOut => "older than fetch age limit",
+            Self::KnownGood => "known-good coordinate",
+        }
+    }
+
+    /// The reason a skip log line gives.
+    const fn log_reason(self) -> &'static str {
+        match self {
+            Self::Removed => "version removed from registry",
+            Self::AgedOut => "older than --max-dep-age",
+            Self::KnownGood => "known-good (bloom, resolved version)",
+        }
+    }
 }
 
 /// Whether a dependency version has been withdrawn from its registry — an npm
@@ -3266,41 +3630,27 @@ pub(crate) fn must_rescan(reg: &Registry, now: u64) -> bool {
 /// registry lookup rather than being guessed at, so this can only ever save
 /// work, never invent an age.
 fn go_pseudo_version_published(purl: &str) -> Option<u64> {
-    let (_, tail) = purl.strip_prefix("pkg:golang/")?.split_once('@')?;
+    let coordinate = Coordinate::of(purl).filter(|c| c.typ == "golang")?;
     // Split on both separators: the bare form joins the stamp with dashes
     // (`v0.0.0-<stamp>-<hash>`), while the post-release form reaches it through
     // a dotted pre-release segment (`v1.2.3-0.<stamp>-<hash>`). The version's own
     // numeric fields are far too short to be mistaken for a 14-digit stamp, and
     // a Go commit hash is 12 hex chars.
-    let stamp = tail
+    let stamp = coordinate
+        .version?
         .split(['-', '.'])
         .find(|f| f.len() == 14 && f.bytes().all(|b| b.is_ascii_digit()))?;
     let n = |a: usize, b: usize| stamp.get(a..b)?.parse::<u32>().ok();
-    let (y, mo, d) = (n(0, 4)?, n(4, 6)?, n(6, 8)?);
-    let (h, mi, s) = (n(8, 10)?, n(10, 12)?, n(12, 14)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
-        return None;
-    }
-    // Days from the civil epoch — Howard Hinnant's `days_from_civil`, which is
-    // exact for the proleptic Gregorian calendar and needs no date crate.
-    let y = i64::from(y) - i64::from(mo <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = i64::from(mo) + if mo > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days * 86_400 + i64::from(h) * 3_600 + i64::from(mi) * 60 + i64::from(s)).ok()
+    utc_epoch(
+        n(0, 4)?,
+        n(4, 6)?,
+        n(6, 8)?,
+        n(8, 10)?,
+        n(10, 12)?,
+        n(12, 14)?,
+    )
 }
 
-/// Whether a reference is a known-good package coordinate per the loaded bloom
-/// filters. Purl-keyed, so it vouches for the coordinate, not the exact bytes.
-///
-/// Used by [`age_gate`] as a pre-lookup filter: a vouched coordinate skips both
-/// the registry round-trip and the artifact fetch. That means the yank check
-/// [`must_rescan`] performs is *not* applied there — it needs a registry record
-/// this path deliberately never fetches. The trade is intentional: a vouched
-/// coordinate is not worth a network round-trip to re-confirm.
 /// The reference's coordinate with the registry's resolved version attached, or
 /// `None` when it isn't a PURL or nothing resolved.
 ///
@@ -3313,8 +3663,7 @@ fn go_pseudo_version_published(purl: &str) -> Option<u64> {
 ///
 /// The version is appended to the declared locator rather than rebuilt from
 /// `reg.ecosystem`, so the PURL type and namespace stay exactly as the reference
-/// resolver produced them. A scoped npm name percent-encodes its `@`
-/// (`pkg:npm/%40scope/name`), so a bare `@` in the body can only be a version.
+/// resolver produced them.
 fn resolved_purl(r: &Reference, reg: &Registry) -> Option<String> {
     let RefLocator::Purl(purl) = &r.locator else {
         return None;
@@ -3322,8 +3671,7 @@ fn resolved_purl(r: &Reference, reg: &Registry) -> Option<String> {
     if reg.version.is_empty() {
         return None;
     }
-    let body = purl.strip_prefix("pkg:")?;
-    if body.contains('@') {
+    if Coordinate::of(purl)?.version.is_some() {
         return Some(purl.clone());
     }
     Some(format!("{purl}@{}", reg.version))
@@ -3340,6 +3688,14 @@ fn bloom_known_good_resolved(r: &Reference, reg: &Registry) -> bool {
     })
 }
 
+/// Whether a reference is a known-good package coordinate per the loaded bloom
+/// filters. Purl-keyed, so it vouches for the coordinate, not the exact bytes.
+///
+/// Used by [`age_gate`] as a pre-lookup filter: a vouched coordinate skips both
+/// the registry round-trip and the artifact fetch. That means the yank check
+/// [`must_rescan`] performs is *not* applied there — it needs a registry record
+/// this path deliberately never fetches. The trade is intentional: a vouched
+/// coordinate is not worth a network round-trip to re-confirm.
 fn bloom_known_good_purl(r: &Reference) -> bool {
     let RefLocator::Purl(purl) = &r.locator else {
         return false;
@@ -3366,39 +3722,36 @@ fn dep_skip_predicate() -> Option<cleave::SkipPredicate> {
     )))
 }
 
-/// One dependency's age-gate outcome: its normalized record plus the raw
-/// provider snapshot it came from, paired with why its byte fetch was skipped —
-/// `None` when the dependency is kept for a full fetch+scan.
-type GatedDep = (
-    Reference,
-    crate::provenance::RegistryProvenance,
-    Option<SkipReason>,
-);
-type RegistryLookup = (Registry, Vec<fletch::fetch::RecordedSource>);
-type IndexedRegistryLookup = (usize, Option<RegistryLookup>);
+/// A dependency whose registry record resolved. The record is materialized
+/// whether or not its bytes are fetched; `skip` says why they were not.
+struct Gated {
+    reference: Reference,
+    record: Registry,
+    /// The provider documents a fresh lookup read. `None` after a memo hit,
+    /// whose documents stay in fletch's blob cache until a kept record needs
+    /// them.
+    sources: Option<Vec<RecordedSource>>,
+    skip: Option<SkipReason>,
+}
 
-/// Look up each declared dependency's registry metadata, stamp its relative
-/// age, and decide which to fetch. A dependency older than the policy's age
-/// ceiling — or one whose coordinate is known-good and whose trust isn't stale —
-/// is dropped before the expensive fetch+scan of its bytes; one whose age is
-/// unknown or under the ceiling is kept — fail open, so a registry hiccup or an
-/// unsupported ecosystem never silently hides a dependency from the scan. URLs
-/// and command-mentioned packages aren't gated: their risk isn't a function of a
-/// registry release date. Returns the refs to fetch plus, for *every* dependency
-/// that resolved a registry record, its [`GatedDep`] — the record is materialized
-/// whether or not its bytes are fetched, and the reason drives the skip report.
-/// Split a locator into `(package key, version)` when it carries an explicit
-/// version. The key is everything before the last `@`, so npm scoped names
-/// (`pkg:npm/@scope/name@1.2.3`) keep their leading `@`. A candidate version
+/// One registry lookup's result, as [`Gated`] carries it.
+struct Lookup {
+    record: Registry,
+    sources: Option<Vec<RecordedSource>>,
+}
+
+/// Split a locator into `(package key, version)` when it is a PURL carrying an
+/// explicit version. The key keeps npm scoped names whole
+/// (`pkg:npm/@scope/name@1.2.3` → `pkg:npm/@scope/name`). A candidate version
 /// must start with an ASCII digit — git refs, tags, and a scoped name with no
 /// version at all (`pkg:npm/@scope/name`) are not versions and exempt the
 /// reference from the newest-version gate.
 fn versioned_purl(locator: &str) -> Option<(&str, &str)> {
-    let (key, version) = locator.rsplit_once('@')?;
-    if key.is_empty() || !version.starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    Some((key, version))
+    let coordinate = Coordinate::of(locator)?;
+    let version = coordinate
+        .version
+        .filter(|v| v.starts_with(|c: char| c.is_ascii_digit()))?;
+    Some((coordinate.key, version))
 }
 
 /// True when `r` is a bare (versionless) PURL whose coordinate is pinned by a
@@ -3474,28 +3827,44 @@ fn lenient_version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     ca.len().cmp(&cb.len())
 }
 
+/// Look up each declared dependency's registry metadata, stamp its relative
+/// age, and decide which to fetch. A dependency older than the policy's age
+/// ceiling — or one whose coordinate is known-good and whose trust isn't stale —
+/// is dropped before the expensive fetch+scan of its bytes; one whose age is
+/// unknown or under the ceiling is kept — fail open, so a registry hiccup or an
+/// unsupported ecosystem never silently hides a dependency from the scan. URLs
+/// and command-mentioned packages aren't gated: their risk isn't a function of a
+/// registry release date. Returns the refs to fetch plus, for *every* dependency
+/// that resolved a registry record, its [`Gated`] — the record is materialized
+/// whether or not its bytes are fetched, and the reason drives the skip report.
 fn age_gate(
     selected: Vec<Reference>,
     policy: &FetchPolicy,
     res: &Resources,
     now: u64,
-) -> (Vec<Reference>, Vec<GatedDep>) {
+) -> (Vec<Reference>, Vec<Gated>) {
     // Never age-gate a manifest range using today's unrelated latest release.
     // Unresolvable references bypass registry gating and retain the normal
-    // unresolved fetch outcome, making incomplete coverage visible.
+    // unresolved fetch outcome, making incomplete coverage visible. Resolution
+    // may ask a registry, so the references resolve concurrently, in order.
+    let resolved: Vec<(Reference, Option<Reference>)> = {
+        use rayon::prelude::*;
+        selected
+            .into_par_iter()
+            .map(|r| {
+                let exact = fletch::fetch::resolve_declared_reference(&r, &res.net, &res.cache);
+                (r, exact)
+            })
+            .collect()
+    };
     let mut unresolved = Vec::new();
-    let selected: Vec<Reference> = selected
-        .into_iter()
-        .filter_map(
-            |r| match fletch::fetch::resolve_declared_reference(&r, &res.net, &res.cache) {
-                Some(exact) => Some(exact),
-                None => {
-                    unresolved.push(r);
-                    None
-                }
-            },
-        )
-        .collect();
+    let mut selected = Vec::with_capacity(resolved.len());
+    for (r, exact) in resolved {
+        match exact {
+            Some(exact) => selected.push(exact),
+            None => unresolved.push(r),
+        }
+    }
     // `None` ceiling (the `--max-dep-age 0` opt-out) gates nothing, but registry
     // records are still looked up and materialized.
     let max_age =
@@ -3531,14 +3900,14 @@ fn age_gate(
         });
     for r in &self_dated {
         tracing::debug!(
-            package = %locator_key(r),
+            package = %locator(r),
             "go pseudo-version dates itself past --max-dep-age; registry lookup skipped"
         );
     }
     for r in &vouched {
         crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
         tracing::debug!(
-            package = %locator_key(r),
+            package = %locator(r),
             "known-good coordinate (bloom); registry lookup and fetch both skipped"
         );
     }
@@ -3554,22 +3923,27 @@ fn age_gate(
             // so skip the doomed fetch too. In every skip case the materialized
             // record's signals still surface. (Known-good coordinates never get
             // here — they were filtered out above, before the lookup.)
-            Some(provenance) => {
-                let reg = &provenance.record;
-                let reason = if reg.version_removed == Some(true) {
+            Some(Lookup { record, sources }) => {
+                let skip = if record.version_removed == Some(true) {
                     Some(SkipReason::Removed)
-                } else if max_age.is_some_and(|max| reg.age_secs(now).is_some_and(|age| age >= max))
+                } else if max_age
+                    .is_some_and(|max| record.age_secs(now).is_some_and(|age| age >= max))
                 {
                     Some(SkipReason::AgedOut)
-                } else if bloom_known_good_resolved(&r, reg) && !must_rescan(reg, now) {
+                } else if bloom_known_good_resolved(&r, &record) && !must_rescan(&record, now) {
                     Some(SkipReason::KnownGood)
                 } else {
                     None
                 };
-                if reason.is_none() {
+                if skip.is_none() {
                     keep.push(r.clone());
                 }
-                registries.push((r, provenance, reason));
+                registries.push(Gated {
+                    reference: r,
+                    record,
+                    sources,
+                    skip,
+                });
             }
             // A non-dependency, or a dependency whose record didn't resolve —
             // fetch it (fail open).
@@ -3607,20 +3981,17 @@ const REGISTRY_MEMO_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUs
 /// Release-cadence window `Registry::with_age` looks back over (48 h).
 const RELEASE_CADENCE_WINDOW_SECS: u64 = 172_800;
 
-/// Look up each declared dependency's registry record and raw provider snapshot,
-/// returning one slot per input ref in `selected` order. A non-dependency ref,
-/// or one whose record can't be resolved, yields `None`.
+/// Look up each declared dependency's registry record, returning one slot per
+/// input ref in `selected` order. A non-dependency ref, or one whose record
+/// can't be resolved, yields `None`.
 ///
 /// Fresh misses use `registry_with_sources` once, so the normalized record and
 /// provenance come from one lookup. The process memo deliberately retains only
-/// the small record; memo hits recover raw bytes from fletch's blob cache rather
-/// than pinning every packument in a long-lived daemon's heap.
-fn lookup_registries(
-    selected: &[Reference],
-    res: &Resources,
-    now: u64,
-) -> Vec<Option<crate::provenance::RegistryProvenance>> {
-    let mut records: Vec<Option<Registry>> = selected.iter().map(|_| None).collect();
+/// the small record; a memo hit leaves the provider documents in fletch's blob
+/// cache, read again only for a record that is kept (see [`Gated::sources`])
+/// rather than pinned in a long-lived daemon's heap or re-read for every hit.
+fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<Option<Lookup>> {
+    let mut found: Vec<Option<Lookup>> = selected.iter().map(|_| None).collect();
 
     // Split dependency refs into memo hits — served from memory, no disk or
     // network — and misses that still need a lookup.
@@ -3631,10 +4002,18 @@ fn lookup_registries(
         let memo = registry_memo()
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        for i in (0..selected.len()).filter(|&i| selected[i].kind == RefKind::Dependency) {
-            match memo.peek(&locator_key(&selected[i])) {
+        for (i, r) in selected.iter().enumerate() {
+            if r.kind != RefKind::Dependency {
+                continue;
+            }
+            match memo.peek(locator(r)) {
                 // Stored un-aged; stamp the age signals from this scan's clock.
-                Some(hit) => records[i] = hit.clone().map(|reg| reg.with_age(now)),
+                Some(hit) => {
+                    found[i] = hit.clone().map(|record| Lookup {
+                        record: record.with_age(now),
+                        sources: None,
+                    });
+                }
                 None => misses.push(i),
             }
         }
@@ -3656,7 +4035,7 @@ fn lookup_registries(
     // all are blob-cache hits that parse JSON and map an ecosystem, i.e. CPU. A
     // separate experiment raising the old constant 8 -> 64 made the scan *slower*
     // (40s vs 33s) for exactly that reason.
-    let collected: Vec<IndexedRegistryLookup> = {
+    let fresh: Vec<(usize, Option<Lookup>)> = {
         use rayon::prelude::*;
         misses
             .par_iter()
@@ -3664,36 +4043,37 @@ fn lookup_registries(
                 // The raw, un-aged record (or `None` for an unresolved or
                 // unsupported package) — both worth memoizing so the lookup isn't
                 // re-attempted for every file that names it.
-                (i, {
-                    let (record, sources) =
-                        fletch::registry_with_sources(&selected[i].locator, &res.net, &res.cache);
-                    record.map(|record| (record, sources))
-                })
+                let (record, sources) =
+                    fletch::registry_with_sources(&selected[i].locator, &res.net, &res.cache);
+                let lookup = record.map(|record| Lookup {
+                    record,
+                    sources: Some(sources),
+                });
+                (i, lookup)
             })
             .collect()
     };
 
-    // Stamp the aged copy for this scan into each result slot, keeping the raw
-    // record to memoize.
-    let mut writes: Vec<(String, Option<Registry>)> = Vec::with_capacity(misses.len());
-    let mut fresh_sources = HashMap::with_capacity(collected.len());
-    for (i, lookup) in collected {
-        match lookup {
-            Some((record, sources)) => {
-                records[i] = Some(record.clone().with_age(now));
-                fresh_sources.insert(i, sources);
-                // Keep only the release times `with_age` can still count from
-                // any later clock: a release older than the cadence window at
-                // memo time can never fall inside it again. Bounds the one
-                // unbounded field a memoized record carries.
-                let mut record = record;
-                record
-                    .release_times
-                    .retain(|&t| now.saturating_sub(t) <= RELEASE_CADENCE_WINDOW_SECS);
-                writes.push((locator_key(&selected[i]), Some(record)));
-            }
-            None => writes.push((locator_key(&selected[i]), None)),
-        }
+    let mut writes: Vec<(String, Option<Registry>)> = Vec::with_capacity(fresh.len());
+    for (i, lookup) in fresh {
+        let key = locator(&selected[i]).to_owned();
+        let Some(Lookup { record, sources }) = lookup else {
+            writes.push((key, None));
+            continue;
+        };
+        // Keep only the release times `with_age` can still count from any later
+        // clock: a release older than the cadence window at memo time can never
+        // fall inside it again. Bounds the one unbounded field a memoized record
+        // carries.
+        let mut memoized = record.clone();
+        memoized
+            .release_times
+            .retain(|&t| now.saturating_sub(t) <= RELEASE_CADENCE_WINDOW_SECS);
+        writes.push((key, Some(memoized)));
+        found[i] = Some(Lookup {
+            record: record.with_age(now),
+            sources,
+        });
     }
     // One short critical section: nothing but the batch insert runs under the lock.
     {
@@ -3704,24 +4084,7 @@ fn lookup_registries(
             memo.put(key, value);
         }
     }
-
-    records
-        .into_iter()
-        .enumerate()
-        .map(|(i, record)| {
-            let record = record?;
-            let sources = fresh_sources.remove(&i).unwrap_or_else(|| {
-                // Memo hit: the provider documents remain in fletch's bounded
-                // blob cache, not in the unbounded process memo.
-                let (_, sources) =
-                    fletch::registry_with_sources(&selected[i].locator, &res.net, &res.cache);
-                sources
-            });
-            Some(crate::provenance::RegistryProvenance::from_record_sources(
-                record, &sources,
-            ))
-        })
-        .collect()
+    found
 }
 
 /// Serialize a registry record to its `*.registry.json` document and analyze it
@@ -3740,39 +4103,6 @@ fn registry_node(reg: &Registry, opts: &AnalysisOptions) -> Option<AnalysisRepor
             None
         }
     }
-}
-
-/// Graft a materialized registry sub-report under the file that declared the
-/// dependency (its sha256), mirroring [`merge_payload`]'s id/depth re-basing.
-/// The node carries only facts — a registry document references nothing to
-/// fetch — so no next-hop work-list is produced.
-fn merge_registry(
-    report: &mut AnalysisReport,
-    parent_sha: &str,
-    sub: AnalysisReport,
-) -> Option<u32> {
-    let (parent_id, parent_depth) = report
-        .files
-        .iter()
-        .find(|f| f.sha256 == parent_sha)
-        .map_or((0, 0), |f| (f.id, f.depth));
-    let id_base = report.files.iter().map(|f| f.id).max().map_or(0, |m| m + 1);
-    let mut root_id = None;
-    for mut file in sub.files {
-        // The registry document itself (the sub-report's root) is a sidecar:
-        // metadata about its parent package, analyzed from its own canonical
-        // JSON bytes so its findings feed ML, but not standalone content.
-        if file.parent_id.is_none() {
-            file.rel = cleave::types::Rel::Registry;
-            file.role = cleave::types::Role::Sidecar;
-            root_id = Some(file.id + id_base);
-        }
-        file.id += id_base;
-        file.parent_id = Some(file.parent_id.map_or(parent_id, |p| p + id_base));
-        file.depth += parent_depth + 1;
-        report.files.push(file);
-    }
-    root_id
 }
 
 /// The synthetic filename for a registry document: `<name>@<version>.registry
@@ -3809,24 +4139,18 @@ fn report_skip(r: &Reference, reg: &Registry, now: u64, reason: SkipReason) {
         .downloads_recent
         .or(reg.downloads_total)
         .map(|d| format!("{d} dl"))
-        .or_else(|| reg.rating_count.map(|v| format!("{v} votes")))
-        .unwrap_or_default();
-    let column = format!("{age_days}d old");
-    let detail = if signal.is_empty() {
-        String::new()
-    } else {
-        format!("  \x1b[2m{signal}\x1b[0m")
-    };
-    // (glyph, label, r, g, b) — green ✓ for a trusted known-good skip, muted for
-    // an unpublished/removed version.
-    let (glyph, label, cr, cg, cb) = match reason {
-        SkipReason::KnownGood => ('\u{2713}', "known-good", 80, 200, 80),
-        SkipReason::Removed => ('\u{00b7}', "removed", 120, 120, 120),
-        SkipReason::AgedOut => ('\u{00b7}', "skip", 120, 120, 120),
+        .or_else(|| reg.rating_count.map(|v| format!("{v} votes")));
+    let detail = signal.map_or_else(String::new, |signal| format!("  {}", fg(MUTED, &signal)));
+    let (glyph, label, color) = match reason {
+        SkipReason::KnownGood => ('\u{2713}', "known-good", GOOD),
+        SkipReason::Removed => ('\u{00b7}', "removed", MUTED),
+        SkipReason::AgedOut => ('\u{00b7}', "skip", MUTED),
     };
     eprintln!(
-        "    \x1b[38;2;{cr};{cg};{cb}m{glyph} {label:<10}\x1b[0m \x1b[38;2;130;130;130m{column:>10}\x1b[0m  {}{detail}",
-        locator_key(r)
+        "    {} {}  {}{detail}",
+        fg(color, &format!("{glyph} {label:<10}")),
+        fg(DETAIL, &format!("{:>10}", format!("{age_days}d old"))),
+        locator(r)
     );
 }
 
@@ -3834,8 +4158,27 @@ fn report_skip(r: &Reference, reg: &Registry, now: u64, reason: SkipReason) {
 pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Unix seconds for a UTC civil time, or `None` for a field out of range or a
+/// time before 1970.
+pub(crate) fn utc_epoch(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<u64> {
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let days = crate::civil::to_days(i64::from(year), month, day)?;
+    u64::try_from(
+        days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second),
+    )
+    .ok()
 }
 
 /// Tally the run's fetches into a one-line summary mirroring the progress bar's
@@ -3850,12 +4193,12 @@ fn summary_line(records: &[FetchRecord]) -> String {
     for rec in records {
         bytes += rec.size.unwrap_or(0);
         match &rec.outcome {
-            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin if rec.cached => {
+            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin if rec.cached() => {
                 cached += 1;
             }
             Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin => live += 1,
             Outcome::Failed(_) => failed += 1,
-            Outcome::BudgetExceeded | Outcome::Unresolved | Outcome::Skipped => {}
+            Outcome::BudgetExceeded | Outcome::Unresolved(_) | Outcome::Skipped => {}
         }
     }
     // Only the counts that actually happened, so a warm run reads
@@ -3873,15 +4216,15 @@ fn summary_line(records: &[FetchRecord]) -> String {
     }
     parts.push(human_bytes(bytes));
     format!(
-        "  \x1b[38;2;80;220;80m\u{2713}\x1b[0m  \x1b[38;2;160;160;160m{}\x1b[0m",
-        parts.join("  \u{b7}  ")
+        "  {}  {}",
+        fg(Rgb(80, 220, 80), "\u{2713}"),
+        fg(LABEL, &parts.join("  \u{b7}  "))
     )
 }
 
 /// Bytes in a compact human-readable form (`45.2 KB`), for the fetch log.
 fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    #[allow(clippy::cast_precision_loss)] // display only; magnitude, not exact bytes
     let mut value = n as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -3899,8 +4242,8 @@ fn human_bytes(n: u64) -> String {
 /// — a GitHub Actions workflow or composite `action.yml`. Its `uses:` actions
 /// and `run:` fetches are third-party code, but they run on the CI runner, so a
 /// routine dependency fetch skips them; `--fetch=all`/`--fetch=ci` opts in.
-fn is_ci_context(file_type: &str) -> bool {
-    file_type == "github_actions"
+fn is_ci_context(file: &cleave::types::FileAnalysis) -> bool {
+    file.file_type == filefacts::FileType::GithubActions.label()
 }
 
 /// Whether [`collect_references`] follows references that only ever execute in
@@ -3924,6 +4267,15 @@ fn collect_references(
     // with the sample. Keep hunting absent imports, but resolve local packages
     // first from the package.json members already present in this report.
     let local_npm = LocalNpmPackages::from_report(report);
+    // Built once: a lockfile is looked up by path, and a declaring file's
+    // nodes by sha, once per file — a scan apiece would be quadratic in the
+    // size of an archive.
+    let mut by_path: HashMap<&str, &cleave::types::FileAnalysis> = HashMap::new();
+    let mut by_sha: HashMap<&str, Vec<&cleave::types::FileAnalysis>> = HashMap::new();
+    for file in &report.files {
+        by_path.entry(file.path.as_str()).or_insert(file);
+        by_sha.entry(file.sha256.as_str()).or_default().push(file);
+    }
     let mut local_imports_skipped = 0usize;
     let mut vendored_imports_skipped = 0usize;
     let mut groups: Vec<(String, Vec<Reference>)> = Vec::new();
@@ -3933,7 +4285,7 @@ fn collect_references(
         // unless CI auditing was requested (`--fetch=all`, `--fetch=ci`). The
         // root of a single-file workflow scan is a member here like any other,
         // so this one gate covers it too.
-        if ci == CiRefs::Skip && is_ci_context(&file.file_type) {
+        if ci == CiRefs::Skip && is_ci_context(file) {
             continue;
         }
         let Some(view) = &file.filefacts else {
@@ -3956,10 +4308,8 @@ fn collect_references(
             };
             if let Some(lock_name) = lock_name {
                 let lock_path = format!("{directory}/{lock_name}");
-                if let Some(lock) = report
-                    .files
-                    .iter()
-                    .find(|f| f.path == lock_path)
+                if let Some(lock) = by_path
+                    .get(lock_path.as_str())
                     .and_then(|f| f.filefacts.as_ref())
                 {
                     refs = refs
@@ -4032,7 +4382,7 @@ fn collect_references(
     // gate — a workflow's raw text re-discovers the `uses:` actions just
     // skipped.
     if let Some(root) = report.files.first()
-        && (ci == CiRefs::Include || !is_ci_context(&root.file_type))
+        && (ci == CiRefs::Include || !is_ci_context(root))
         && root.size <= ROOT_HUNT_MAX_BYTES
         && let Ok(bytes) = std::fs::read(root_path)
     {
@@ -4054,26 +4404,24 @@ fn collect_references(
     hunt_download_members(report, root_path, ci, &mut groups);
     // Filefacts owns Go's module/workspace semantics. Include raw root hunts
     // in the inputs so they cannot reintroduce an unreconciled declaration.
+    let mut group_refs: HashMap<&str, &[Reference]> = HashMap::new();
+    for (sha, refs) in &groups {
+        group_refs.entry(sha.as_str()).or_insert(refs.as_slice());
+    }
     let go_members: Vec<_> = report
         .files
         .iter()
-        .map(|file| {
-            let references = groups
-                .iter()
-                .find(|(sha, _)| sha == &file.sha256)
-                .map_or(&[][..], |(_, refs)| refs.as_slice());
-            filefacts::ReferenceMember {
-                path: &file.path,
-                references,
-            }
+        .map(|file| filefacts::ReferenceMember {
+            path: &file.path,
+            references: group_refs.get(file.sha256.as_str()).copied().unwrap_or(&[]),
         })
         .collect();
     let go_context = filefacts::go_dependency_context(&go_members);
     for (sha, refs) in &mut groups {
-        let contexts: Vec<_> = report
-            .files
-            .iter()
-            .filter(|f| &f.sha256 == sha)
+        let contexts: Vec<_> = by_sha
+            .get(sha.as_str())
+            .into_iter()
+            .flatten()
             .filter_map(|f| go_context.get(&f.path))
             .collect();
         if !contexts.is_empty() {
@@ -4098,17 +4446,28 @@ fn collect_references(
 /// storm; the members past the cap keep their declared references.
 const MEMBER_HUNT_MAX: usize = 16;
 
+/// cleave trait ids this module reads. cleave owns the taxonomy; naming every
+/// id here keeps the module's dependence on it in one place.
+const TRAIT_DROPPER: &str = "objectives/command-and-control/dropper/";
+const TRAIT_DROPPER_EXECUTION: &str = "objectives/command-and-control/dropper/execution/";
+const TRAIT_STEGO_LOADER: &str = "objectives/command-and-control/dropper/execution/stego-loader";
+const TRAIT_STEGANOGRAPHY: &str = "objectives/anti-static/obfuscation/steganography/";
+const TRAIT_SHELL_PIPELINE: &str = "micro-behaviors/process/create/shell/pipeline";
+const TRAIT_PROCESS_CREATE: &str = "micro-behaviors/process/create/";
+const TRAIT_IMAGE_FILE_URL: &str = "micro-behaviors/communications/http/url/path::image-file-url";
+const TRAIT_SECURITY_HOLD_RECORD: &str = "registry-security-hold-record";
+
 /// Trait-id namespaces whose findings show that a file downloads something in
 /// order to run it: dropper objectives, a pipeline into a shell, and a process
 /// spawn of `curl`/`wget`. Ordered most- to least-specific; the first match
 /// names the reason a member was hunted.
 fn download_intent(findings: &[Finding]) -> Option<&str> {
     let rank = |id: &str| {
-        if id.starts_with("objectives/command-and-control/dropper/") {
+        if id.starts_with(TRAIT_DROPPER) {
             Some(0)
-        } else if id.starts_with("micro-behaviors/process/create/shell/pipeline") {
+        } else if id.starts_with(TRAIT_SHELL_PIPELINE) {
             Some(1)
-        } else if id.starts_with("micro-behaviors/process/create/")
+        } else if id.starts_with(TRAIT_PROCESS_CREATE)
             && (id.contains("curl") || id.contains("wget"))
         {
             Some(2)
@@ -4129,9 +4488,8 @@ fn download_intent(findings: &[Finding]) -> Option<&str> {
 /// dedicated recognizer — never reached the work list: only the root's bytes
 /// are re-read. The member's own findings are the gate, so an ordinary source
 /// tree costs nothing; a flagged member is re-extracted from the root archive
-/// and hunted like a root. Its references keep their recognizer as `source`,
-/// suffixed with the trait that justified the hunt, so every later fetch or
-/// skip decision in the log names why the reference was considered at all.
+/// and hunted like a root. Its references keep their recognizer as `source`;
+/// the trait that justified the hunt is logged with it.
 fn hunt_download_members(
     report: &AnalysisReport,
     root_path: &Path,
@@ -4144,7 +4502,7 @@ fn hunt_download_members(
     let prefix = format!("{}!!", root.path);
     let mut hunted_members = 0usize;
     for file in members {
-        if ci == CiRefs::Skip && is_ci_context(&file.file_type) {
+        if ci == CiRefs::Skip && is_ci_context(file) {
             continue;
         }
         let Some(trigger) = download_intent(&file.findings) else {
@@ -4196,10 +4554,7 @@ fn hunt_download_members(
                 continue;
             }
         };
-        let mut hunted = find::references_in_bytes(&bytes, member);
-        for reference in &mut hunted {
-            reference.source = format!("{} via {trigger}", reference.source);
-        }
+        let hunted = find::references_in_bytes(&bytes, member);
         tracing::info!(
             member,
             trigger,
@@ -4221,19 +4576,11 @@ const IMAGE_CARRIER_EXTENSIONS: &[&str] = &["avif", "bmp", "gif", "jpeg", "jpg",
 fn image_carrier_evidence(findings: &[Finding]) -> Option<&str> {
     let ids = || findings.iter().map(|f| f.id.as_str());
     ids()
-        .find(|id| {
-            id.starts_with("objectives/command-and-control/dropper/execution/stego-loader")
-                || id.starts_with("objectives/anti-static/obfuscation/steganography/")
-        })
+        .find(|id| id.starts_with(TRAIT_STEGO_LOADER) || id.starts_with(TRAIT_STEGANOGRAPHY))
         .or_else(|| {
-            let image_url = ids()
-                .any(|id| id == "micro-behaviors/communications/http/url/path::image-file-url");
-            image_url
-                .then(|| {
-                    ids().find(|id| {
-                        id.starts_with("objectives/command-and-control/dropper/execution/")
-                    })
-                })
+            ids()
+                .any(|id| id == TRAIT_IMAGE_FILE_URL)
+                .then(|| ids().find(|id| id.starts_with(TRAIT_DROPPER_EXECUTION)))
                 .flatten()
         })
 }
@@ -4247,14 +4594,17 @@ fn image_carrier_urls(
     report: &AnalysisReport,
     groups: &[(String, Vec<Reference>)],
 ) -> HashSet<String> {
+    let mut evidence_by_sha: HashMap<&str, (&cleave::types::FileAnalysis, &str)> = HashMap::new();
+    for file in &report.files {
+        if let Some(evidence) = image_carrier_evidence(&file.findings) {
+            evidence_by_sha
+                .entry(file.sha256.as_str())
+                .or_insert((file, evidence));
+        }
+    }
     let mut carriers = HashSet::new();
     for (sha, refs) in groups {
-        let Some((file, evidence)) = report
-            .files
-            .iter()
-            .filter(|f| &f.sha256 == sha)
-            .find_map(|f| image_carrier_evidence(&f.findings).map(|e| (f, e)))
-        else {
+        let Some(&(file, evidence)) = evidence_by_sha.get(sha.as_str()) else {
             continue;
         };
         for reference in refs {
@@ -4290,7 +4640,7 @@ fn has_image_extension(url: &str) -> bool {
 /// collected artifact: hopper's `*.forage.json` collection sidecar, or the
 /// normalized `*.registry.json` a fetch materializes.
 fn is_provenance_document(file_type: &str, name: &str) -> bool {
-    file_type == "registry"
+    file_type == filefacts::FileType::Registry.label()
         || name
             .rsplit_once(".forage.")
             .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("json"))
@@ -4409,12 +4759,10 @@ fn npm_import_name(reference: &Reference) -> Option<String> {
     let RefLocator::Purl(purl) = &reference.locator else {
         return None;
     };
-    let coordinate = purl.strip_prefix("pkg:npm/")?.split('?').next()?;
-    let encoded_name = coordinate
-        .rsplit_once('@')
-        .map_or(coordinate, |(name, _)| name);
+    let coordinate = Coordinate::of(purl).filter(|c| c.typ == "npm")?;
     Some(
-        encoded_name
+        coordinate
+            .path
             .replace("%40", "@")
             .replace("%2F", "/")
             .replace("%2f", "/"),
@@ -4434,7 +4782,7 @@ fn merge_into_root(
     let Some((_, group)) = groups.iter_mut().find(|(sha, _)| sha == root_sha) else {
         return; // unreachable: just ensured the group exists
     };
-    let mut seen: HashSet<String> = group.iter().map(locator_key).collect();
+    let mut seen: HashSet<String> = group.iter().map(|r| locator(r).to_owned()).collect();
     for r in hunted {
         if r.kind == RefKind::Undefined {
             if !group.contains(&r) {
@@ -4442,17 +4790,17 @@ fn merge_into_root(
             }
             continue;
         }
-        if seen.insert(locator_key(&r)) {
+        if seen.insert(locator(&r).to_owned()) {
             group.push(r);
         }
     }
 }
 
-/// A reference's locator as a stable string for dedup and cross-record pairing
-/// (it matches `FetchRecord::locator`, the original filefacts locator).
-fn locator_key(r: &Reference) -> String {
+/// A reference's locator as written — the key dedup, rows, memos, and
+/// registry findings pair on.
+fn locator(r: &Reference) -> &str {
     match &r.locator {
-        RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
+        RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s,
     }
 }
 
@@ -4466,217 +4814,340 @@ fn sub_findings(sub: &AnalysisReport) -> Vec<Finding> {
         .collect()
 }
 
-/// Whether this batch may fan its payload analyses across the Rayon pool.
-///
-/// Each fetched payload is a full cleave analysis, and cleave bounds how many
-/// analyses fan out at once on the assumption that the throttled ones make
-/// serial progress on their own blocking threads (see
-/// [`cleave::pool_has_headroom`]). Dispatching them from `par_iter` breaks
-/// that: a throttled payload analysis occupies a Rayon worker instead of
-/// freeing one, and the dispatcher sits blocked-and-stealing on top. Measured
-/// on a wedged worker 2026-09-04, that left every pool thread carrying 15-29
-/// nested blocked joins with frames from unrelated analyses interleaved — one
-/// runaway leaf then pinned the whole pool rather than one thread.
-///
-/// So fan out only when the pool has headroom — a lone analysis, or a scan
-/// draining its queue, which are exactly the cases where fanning out is what
-/// keeps the pool busy. Under saturation the payloads run inline on the
-/// blocking thread that owns this batch, which is both the shape cleave's
-/// throttle expects and no loss of machine utilization: the sibling analyses
-/// already have every core.
-///
-/// `SCAN_PAYLOAD_FANOUT` overrides: `always` restores the unconditional
-/// fan-out, `never` forces inline.
-fn payload_fanout_allowed() -> bool {
-    match std::env::var("SCAN_PAYLOAD_FANOUT").ok().as_deref() {
-        Some("always") => true,
-        Some("never") => false,
-        _ => cleave::pool_has_headroom(),
-    }
-}
-
 /// The product of analyzing one fetched payload: the finalized sub-report to
 /// graft (absent if the payload couldn't be analyzed) and the next-hop
 /// references found in its own bytes. Produced off the report so the expensive
 /// analysis can run concurrently; [`merge_payload`] folds it in serially.
 struct Analyzed {
-    sub: Option<AnalysisReport>,
     content_sha: String,
-    next_from_bytes: Vec<(String, Vec<Reference>)>,
+    sub: Option<AnalysisReport>,
+    next_from_bytes: Vec<Group>,
     /// The corpus verdict adopted in place of analyzing these bytes — set only
     /// when hopper's stored verdict came from the analyzer this build is
-    /// running (see [`crate::corpus_precheck::Standing`]). `None` for an
-    /// ordinary analysis and for a rule-2 benign skip, which carries no
-    /// reportable finding.
-    corpus: Option<crate::corpus_precheck::Verdict>,
+    /// running (see [`Standing`]).
+    corpus: Option<Verdict>,
 }
 
-/// Analyze the bytes of fetched payloads on cleave's shared rayon pool, one slot
-/// per input record in order (`None` where there was nothing to analyze).
-///
-/// The payloads fan out as rayon tasks, so the whole pool works the batch: a
-/// dependency carrying a large native binary — a minutes-long, single-threaded
-/// disassembly that no amount of threads can split — runs *alongside* its
-/// siblings instead of being metered a couple at a time on a private pair of OS
-/// threads. Nesting is safe and is the point: each payload's own analysis is
-/// itself rayon-parallel, and a task that blocks awaiting its children steals
-/// and runs other pending work, so the machine stays saturated rather than
-/// idling behind one slow binary. Called from a plain thread the caller simply
-/// blocks on the pool; called from a worker it nests — either way `on_analyzed`
-/// fires as each payload settles, and the indexed collect preserves input order.
-///
-/// Concurrency is bounded by the pool width (work-stealing runs ~one payload per
-/// worker at a time), so at most that many payloads' bytes are resident at once
-/// — the batch size itself never dictates peak memory.
-fn analyze_payloads(
-    fetched: &[FetchRecord],
-    cache: &BlobCache,
-    opts: &AnalysisOptions,
-    acache: Option<&AnalysisCache>,
-    on_analyzed: &(dyn Fn(usize) + Sync),
-) -> Vec<Option<Analyzed>> {
-    let one = |(i, rec): (usize, &FetchRecord)| {
-        let a = analyze_payload(rec, cache, opts, acache);
-        PAYLOADS_ANALYZED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        on_analyzed(i);
-        a
-    };
-    if payload_fanout_allowed() {
-        use rayon::prelude::*;
-        fetched.par_iter().enumerate().map(one).collect()
-    } else {
-        fetched.iter().enumerate().map(one).collect()
-    }
+/// Everything analyzing a fetched payload reads: the blob cache its bytes sit
+/// in, the analysis options, the warm analysis cache, and hopper's corpus.
+struct Payloads<'a> {
+    cache: &'a BlobCache,
+    opts: &'a AnalysisOptions,
+    acache: Option<&'a AnalysisCache>,
+    precheck: Option<&'a Precheck>,
 }
 
-/// Analyze a fetched payload's bytes (the expensive, report-independent half of
-/// grafting): hunt its own bytes for next-hop references and run cleave over it.
-/// Returns `None` when there is nothing to analyze (a skipped/unresolved/failed
-/// fetch, or bytes that vanished from cache). Pure with respect to the report,
-/// so it is safe to run concurrently; [`merge_payload`] does the report mutation.
-fn analyze_payload(
-    rec: &FetchRecord,
-    cache: &BlobCache,
-    opts: &AnalysisOptions,
-    acache: Option<&AnalysisCache>,
-) -> Option<Analyzed> {
-    // Scan whatever bytes we hold: a clean fetch, a pin mismatch, or a pin we
-    // could not verify (the pin outcomes are exactly the cases worth analyzing).
-    // Skipped/unresolved/failed have no bytes.
-    if !delivered_bytes(rec) {
-        return None;
-    }
-    // Corpus-satisfied PURL (see `corpus_hit_record`): the verdict already
-    // stands in hopper; produce the same skip the per-sha precheck would,
-    // without re-asking.
-    if matches!(rec.outcome, Outcome::Skipped) {
-        // The verdict for this one rides the batch's PURL answer, which the
-        // merge pass pairs back on by content sha (`GroupWork::corpus`).
-        return rec.content_sha256.clone().map(|content_sha| Analyzed {
-            sub: None,
-            content_sha,
-            next_from_bytes: Vec::new(),
-            corpus: None,
-        });
-    }
-
-    let content_sha = rec.content_sha256.clone().unwrap_or_default();
-
-    // Warm-cache hit: reuse the prior analysis of these exact bytes, skipping the
-    // re-analysis (a minutes-long disassembly for a big native binary). Keyed by
-    // content sha under a ruleset-version namespace, so an entry is only ever one
-    // the current detector produced — a rules/engine change misses and re-scans.
-    if let Some(ac) = acache
-        && !content_sha.is_empty()
-        && let Some(hit) = ac.get(&content_sha)
-    {
-        tracing::debug!(
-            locator = %rec.locator,
-            content_sha = %content_sha,
-            "analysis cache hit; reusing prior result"
-        );
-        return Some(Analyzed {
-            sub: hit.sub,
-            content_sha,
-            next_from_bytes: hit.next,
-            corpus: None,
-        });
+impl Payloads<'_> {
+    /// Analyze every landed payload of a group, one slot per input in order
+    /// (`None` where there was nothing to analyze).
+    ///
+    /// The payloads fan out as rayon tasks, so the whole pool works the batch: a
+    /// dependency carrying a large native binary — a minutes-long,
+    /// single-threaded disassembly that no amount of threads can split — runs
+    /// *alongside* its siblings instead of being metered a couple at a time.
+    /// Nesting is safe and is the point: each payload's own analysis is itself
+    /// rayon-parallel, and a task that blocks awaiting its children steals and
+    /// runs other pending work. Either way `on_analyzed` fires as each payload
+    /// settles, and the indexed collect preserves input order.
+    ///
+    /// Concurrency is bounded by the pool width (work-stealing runs ~one payload
+    /// per worker at a time), so at most that many payloads' bytes are resident
+    /// at once — the batch size itself never dictates peak memory.
+    fn analyze_all(
+        &self,
+        landed: &[Landed],
+        fanout: Fanout,
+        on_analyzed: &(dyn Fn(usize) + Sync),
+    ) -> Vec<Option<Analyzed>> {
+        let one = |(i, l): (usize, &Landed)| {
+            let analyzed = self.analyze(l);
+            PAYLOADS_ANALYZED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            on_analyzed(i);
+            analyzed
+        };
+        if fanout.allowed() {
+            use rayon::prelude::*;
+            landed.par_iter().enumerate().map(one).collect()
+        } else {
+            landed.iter().enumerate().map(one).collect()
+        }
     }
 
-    // Fleet-shared skip: the corpus already holds a benign verdict for these
-    // exact bytes, analyzed within the freshness window. The local cache above
-    // is better when it hits (it returns the full sub-report to graft); this
-    // covers the fleet-wide case it cannot — another worker analyzed the same
-    // dependency, or a release just invalidated every local cache at once. A
-    // skipped payload merges like a benign analysis that found nothing: no
-    // sub-report to graft, no next-hop references, and — because it never
-    // enters the envelope — no member fan-out or renewal on hopper's side.
-    if !content_sha.is_empty() {
-        let standing = crate::corpus_precheck::corpus_standing(&content_sha);
-        if standing.skips_analysis() {
-            let corpus = match standing {
-                // Same analyzer: its verdict is the one this scan would have
-                // computed, so it is carried through as this dependency's
-                // result rather than dropped on the floor.
-                crate::corpus_precheck::Standing::Adopt(v) => Some(v),
-                _ => None,
-            };
+    /// Analyze a fetched payload's bytes (the expensive, report-independent half
+    /// of grafting): hunt its own bytes for next-hop references and run cleave
+    /// over it. `None` when there is nothing to merge: no bytes in hand, a
+    /// benign verdict that stands in the corpus, or bytes gone from the cache.
+    /// Pure with respect to the report, so it is safe to run concurrently;
+    /// [`merge_payload`] does the report mutation.
+    fn analyze(&self, landed: &Landed) -> Option<Analyzed> {
+        let rec = &landed.record;
+        match &landed.standing {
+            // The batch PURL negotiation answered before any download: the
+            // corpus's verdict is this dependency's, under the sha it named.
+            Standing::Adopt(verdict) => {
+                return Some(Analyzed {
+                    content_sha: rec.content_sha256.clone()?,
+                    sub: None,
+                    next_from_bytes: Vec::new(),
+                    corpus: Some(verdict.clone()),
+                });
+            }
+            Standing::SkipBenign => return None,
+            Standing::Analyze => {}
+        }
+        // Scan whatever bytes we hold: a clean fetch, a pin mismatch, or a pin
+        // we could not verify (the pin outcomes are exactly the cases worth
+        // analyzing). Skipped/unresolved/failed have no bytes — and fletch
+        // always states the digest of bytes it delivered.
+        if !delivered_bytes(rec) {
+            return None;
+        }
+        let content_sha = rec.content_sha256.clone()?;
+
+        // Warm-cache hit: reuse the prior analysis of these exact bytes,
+        // skipping the re-analysis (a minutes-long disassembly for a big native
+        // binary). Keyed by content sha under a ruleset-version namespace, so an
+        // entry is only ever one the current detector produced — a
+        // rules/engine change misses and re-scans.
+        if let Some(hit) = self.acache.and_then(|ac| ac.get(&content_sha)) {
             tracing::debug!(
                 locator = %rec.locator,
                 content_sha = %content_sha,
-                adopted = corpus.is_some(),
-                "corpus precheck: verdict stands in hopper; skipping re-analysis"
+                "analysis cache hit; reusing prior result"
             );
             return Some(Analyzed {
-                sub: None,
                 content_sha,
-                next_from_bytes: Vec::new(),
-                corpus,
+                sub: hit.sub,
+                next_from_bytes: hit.next,
+                corpus: None,
             });
         }
-    }
 
-    let bytes = cache.load(&rec.locator)?;
-    let name = payload_name(rec);
-
-    // Next-hop references discovered in the payload's own bytes — the full hunt,
-    // so a stage-2 script's `curl | bash` (or an encoded URL) is followed.
-    let mut next_from_bytes = Vec::new();
-    let mut payload_refs = find::references_in_bytes(&bytes, &name);
-    mark_redirect_destinations(&bytes, &mut payload_refs);
-    if !content_sha.is_empty() && !payload_refs.is_empty() {
-        next_from_bytes.push((content_sha.clone(), payload_refs));
-    }
-
-    let sub = match cleave::analyze_bytes_owned(bytes, &name, opts) {
-        Ok(mut sub) => {
-            // finalize() collapses the sub-analysis into its files[]; without it
-            // the payload's data stays in top-level fields and files[] is empty.
-            sub.finalize();
-            Some(sub)
+        // Fleet-shared skip: the corpus already holds a verdict for these exact
+        // bytes that spares the analysis. The local cache above is better when
+        // it hits (it returns the full sub-report to graft); this covers the
+        // fleet-wide case it cannot — another worker analyzed the same
+        // dependency, or a release just invalidated every local cache at once.
+        match self.precheck.map_or(Standing::Analyze, |precheck| {
+            precheck.standing(&content_sha)
+        }) {
+            Standing::Analyze => {}
+            standing => {
+                tracing::debug!(
+                    locator = %rec.locator,
+                    content_sha = %content_sha,
+                    adopted = matches!(standing, Standing::Adopt(_)),
+                    "corpus precheck: verdict stands in hopper; skipping re-analysis"
+                );
+                // Same analyzer: its verdict is the one this scan would have
+                // computed, so it is carried through as this dependency's
+                // result. A benign skip carries nothing to report.
+                let Standing::Adopt(verdict) = standing else {
+                    return None;
+                };
+                return Some(Analyzed {
+                    content_sha,
+                    sub: None,
+                    next_from_bytes: Vec::new(),
+                    corpus: Some(verdict),
+                });
+            }
         }
-        Err(e) => {
-            tracing::warn!("analysis of fetched {} failed: {e:#}", rec.locator);
-            None
+
+        let Some(bytes) = self.cache.load(&rec.locator) else {
+            tracing::debug!(locator = %rec.locator, "fetched bytes gone from the blob cache; not analyzed");
+            return None;
+        };
+        let name = payload_name(rec);
+
+        // Next-hop references discovered in the payload's own bytes — the full
+        // hunt, so a stage-2 script's `curl | bash` (or an encoded URL) is
+        // followed.
+        let mut next_from_bytes = Vec::new();
+        let mut payload_refs = find::references_in_bytes(&bytes, &name);
+        mark_redirect_destinations(&bytes, &mut payload_refs);
+        if !payload_refs.is_empty() {
+            next_from_bytes.push((content_sha.clone(), payload_refs));
         }
-    };
 
-    // Memoize for the next run's warm hit (best-effort; borrowed, so no clone of
-    // the report). Only cache a definite result — an analysis error might be a
-    // transient (a cache-evicted byte, an OOM), so leave it to re-run.
-    if let Some(ac) = acache
-        && !content_sha.is_empty()
-        && sub.is_some()
-    {
-        ac.put(&content_sha, &sub, &next_from_bytes);
+        let sub = match cleave::analyze_bytes_owned(bytes, &name, self.opts) {
+            Ok(mut sub) => {
+                // finalize() collapses the sub-analysis into its files[]; without
+                // it the payload's data stays in top-level fields and files[] is
+                // empty.
+                sub.finalize();
+                Some(sub)
+            }
+            Err(e) => {
+                tracing::warn!("analysis of fetched {} failed: {e:#}", rec.locator);
+                None
+            }
+        };
+
+        // Memoize for the next run's warm hit (best-effort; borrowed, so no
+        // clone of the report). Only cache a definite result — an analysis
+        // error might be a transient (a cache-evicted byte, an OOM), so leave it
+        // to re-run.
+        if let Some(ac) = self.acache
+            && sub.is_some()
+        {
+            ac.put(&content_sha, &sub, &next_from_bytes);
+        }
+
+        Some(Analyzed {
+            content_sha,
+            sub,
+            next_from_bytes,
+            corpus: None,
+        })
     }
+}
 
-    Some(Analyzed {
-        sub,
-        corpus: None,
-        content_sha,
-        next_from_bytes,
+/// The record a corpus-satisfied dependency gets instead of a download: no
+/// bytes, no budget charge, hopper's sha as `content_sha256` so the fetch edge
+/// (`source → content`) is still recorded. Served from a cache — the corpus —
+/// rather than the network. Its verdict travels beside it, in
+/// [`Landed::standing`].
+fn corpus_hit_record(r: &Reference, source_sha: &str, sha: &str) -> FetchRecord {
+    FetchRecord {
+        source_sha256: (!source_sha.is_empty()).then(|| source_sha.to_owned()),
+        source_offset: Some(r.offset),
+        kind: r.kind,
+        locator: locator(r).to_owned(),
+        resolved_url: None,
+        final_url: None,
+        redirects: Vec::new(),
+        status: None,
+        headers: Vec::new(),
+        fetched_at: Some(unix_now()),
+        content_sha256: Some(sha.to_string()),
+        size: None,
+        served: Some(Served::Cache),
+        pin_verified: None,
+        outcome: Outcome::Skipped,
+    }
+}
+
+/// Capture a fetched payload's standalone report for upload as its own hopper
+/// sample. The report is the pristine one cleave produced for the dependency's
+/// own bytes (container at depth 0, correct member structure) — so it needs no
+/// rerooting, unlike reconstructing a subtree out of the merged parent report.
+/// Compacted from a borrow: no clone of the report, and no strip pass (the raw is
+/// never fed to a model here, and a single dependency never nears the body
+/// limit). Returns `None` when there is nothing to upload.
+fn capture_dependency(rec: &FetchRecord, analyzed: &Analyzed) -> Option<FetchedDependency> {
+    let sub = analyzed.sub.as_ref()?;
+    let compact = cleave::types::compact::compact_from_files(&sub.files);
+    let raw = serde_json::to_string(&compact)
+        .map_err(|e| tracing::warn!(locator = %rec.locator, error = %e, "dependency report could not be serialized for upload"))
+        .ok()?;
+    let url = fetched_url(rec).unwrap_or_default().to_owned();
+    Some(FetchedDependency {
+        locator: rec.locator.clone(),
+        url,
+        content_sha: analyzed.content_sha.clone(),
+        size: rec.size.unwrap_or(0),
+        raw,
     })
+}
+
+/// Where grafted nodes attach: the next free file id, and the first node of
+/// each content sha — the one a scan of `report.files` would find — as
+/// `(id, depth)`. Built once per fetch phase and kept current as nodes are
+/// appended, so each graft costs a lookup rather than two passes over a report
+/// that grows with every payload.
+#[derive(Debug, Default)]
+struct Graft {
+    next_id: u32,
+    first: HashMap<String, (u32, u32)>,
+}
+
+impl Graft {
+    fn new(report: &AnalysisReport) -> Self {
+        let mut graft = Self::default();
+        for file in &report.files {
+            graft.note(file);
+        }
+        graft
+    }
+
+    fn note(&mut self, file: &cleave::types::FileAnalysis) {
+        self.next_id = self.next_id.max(file.id.saturating_add(1));
+        self.first
+            .entry(file.sha256.clone())
+            .or_insert((file.id, file.depth));
+    }
+
+    /// The `(id, depth)` of the file `sha` names, falling back to the root.
+    fn parent(&self, sha: Option<&str>) -> (u32, u32) {
+        sha.and_then(|sha| self.first.get(sha))
+            .copied()
+            .unwrap_or((0, 0))
+    }
+
+    /// Append one node, keeping the index current.
+    fn push(&mut self, report: &mut AnalysisReport, file: cleave::types::FileAnalysis) {
+        self.note(&file);
+        report.files.push(file);
+    }
+}
+
+/// Graft a materialized registry sub-report under the file that declared the
+/// dependency (its sha256), mirroring [`merge_payload`]'s id/depth re-basing.
+/// The node carries only facts — a registry document references nothing to
+/// fetch — so no next-hop work-list is produced. Returns the registry node's id.
+fn merge_registry(
+    report: &mut AnalysisReport,
+    graft: &mut Graft,
+    parent_sha: &str,
+    sub: AnalysisReport,
+) -> Option<u32> {
+    let (parent_id, parent_depth) = graft.parent(Some(parent_sha));
+    let id_base = graft.next_id;
+    let mut root_id = None;
+    for mut file in sub.files {
+        // The registry document itself (the sub-report's root) is a sidecar:
+        // metadata about its parent package, analyzed from its own canonical
+        // JSON bytes so its findings feed ML, but not standalone content.
+        if file.parent_id.is_none() {
+            file.rel = cleave::types::Rel::Registry;
+            file.role = cleave::types::Role::Sidecar;
+            root_id = Some(file.id + id_base);
+        }
+        file.id += id_base;
+        file.parent_id = Some(file.parent_id.map_or(parent_id, |p| p + id_base));
+        file.depth += parent_depth + 1;
+        graft.push(report, file);
+    }
+    root_id
+}
+
+/// Give a dependency whose verdict came from the corpus the same node a fetched
+/// payload gets from [`merge_payload`]: attached to the file that declared it,
+/// named by its locator, marked [`Rel::Fetched`](cleave::types::Rel::Fetched)
+/// and carrying the URL it came from. It has no members and no traits of its
+/// own — nothing was analyzed here — so it is the identity a verdict hangs on,
+/// not an analysis result.
+fn append_adopted_node(
+    report: &mut AnalysisReport,
+    graft: &mut Graft,
+    rec: &FetchRecord,
+    content_sha: &str,
+) {
+    let (parent_id, parent_depth) = graft.parent(rec.source_sha256.as_deref());
+    let via = fetch_target(rec);
+    let node = cleave::types::FileAnalysis {
+        id: graft.next_id,
+        parent_id: Some(parent_id),
+        depth: parent_depth + 1,
+        path: rec.locator.clone(),
+        sha256: content_sha.to_string(),
+        size: rec.size.unwrap_or(0),
+        rel: cleave::types::Rel::Fetched,
+        via: (!via.is_empty()).then(|| via.to_owned()),
+        ..cleave::types::FileAnalysis::default()
+    };
+    graft.push(report, node);
 }
 
 /// Fold an [`Analyzed`] payload into the report: append its file nodes nested
@@ -4685,44 +5156,12 @@ fn analyze_payload(
 /// content_sha256`) is the authoritative link; ids and depth are renumbered so
 /// the grafted nodes are a well-formed subtree that never collides with the main
 /// report's. Must run serially — it reads and extends `report.files`.
-/// Give a dependency whose verdict came from the corpus the same node a fetched
-/// payload gets from [`merge_payload`]: attached to the file that declared it,
-/// named by its locator, marked [`Rel::Fetched`] and carrying the URL it came
-/// from. It has no members and no traits of its own — nothing was analyzed here
-/// — so it is the identity a verdict hangs on, not an analysis result.
-fn append_adopted_node(report: &mut AnalysisReport, rec: &FetchRecord, content_sha: &str) {
-    let (parent_id, parent_depth) = report
-        .files
-        .iter()
-        .find(|f| f.sha256 == rec.source_sha256)
-        .map_or((0, 0), |f| (f.id, f.depth));
-    let id = report.files.iter().map(|f| f.id).max().map_or(0, |m| m + 1);
-    let via = if rec.resolved_url.is_empty() {
-        rec.locator.clone()
-    } else {
-        rec.final_url
-            .clone()
-            .unwrap_or_else(|| rec.resolved_url.clone())
-    };
-    report.files.push(cleave::types::FileAnalysis {
-        id,
-        parent_id: Some(parent_id),
-        depth: parent_depth + 1,
-        path: rec.locator.clone(),
-        sha256: content_sha.to_string(),
-        size: rec.size.unwrap_or(0),
-        rel: cleave::types::Rel::Fetched,
-        via: (!via.is_empty()).then_some(via),
-        ..cleave::types::FileAnalysis::default()
-    });
-}
-
 fn merge_payload(
     report: &mut AnalysisReport,
+    graft: &mut Graft,
     rec: &FetchRecord,
     analyzed: Analyzed,
-    adopted: Option<&crate::corpus_precheck::Verdict>,
-) -> Vec<(String, Vec<Reference>)> {
+) -> Vec<Group> {
     let mut next = analyzed.next_from_bytes;
     let Some(sub) = analyzed.sub else {
         // Nothing was analyzed, but the corpus handed us this dependency's
@@ -4731,28 +5170,21 @@ fn merge_payload(
         // `ml.files` can carry its grade, and the backref pass can find it by
         // content sha. Without a node an adopted verdict would be invisible —
         // the hole this whole path exists to close.
-        if adopted.is_some() && !analyzed.content_sha.is_empty() {
-            append_adopted_node(report, rec, &analyzed.content_sha);
+        if analyzed.corpus.is_some() {
+            append_adopted_node(report, graft, rec, &analyzed.content_sha);
         }
         return next;
     };
 
     // Attach under the file that declared the reference (its sha256 is the
     // edge's source endpoint); fall back to the root file.
-    let (parent_id, parent_depth) = report
-        .files
-        .iter()
-        .find(|f| f.sha256 == rec.source_sha256)
-        .map_or((0, 0), |f| (f.id, f.depth));
-    let id_base = report.files.iter().map(|f| f.id).max().map_or(0, |m| m + 1);
+    let (parent_id, parent_depth) = graft.parent(rec.source_sha256.as_deref());
+    let id_base = graft.next_id;
     // The resolved download URL (falling back to the bare locator/PURL) this
     // subtree came from, recorded on the graft root as `via`.
-    let via_str = if rec.resolved_url.is_empty() {
-        rec.locator.as_str()
-    } else {
-        rec.resolved_url.as_str()
-    };
-    let via = (!via_str.is_empty()).then(|| via_str.to_string());
+    let via = Some(fetch_target(rec))
+        .filter(|via| !via.is_empty())
+        .map(str::to_owned);
     // Name the subtree for what it is. cleave named these from payload_name — the
     // URL's basename, which it needs for extension type detection but which says
     // nothing about origin. In the merged report that left a fetched dependency
@@ -4794,7 +5226,7 @@ fn merge_payload(
             file.rel = cleave::types::Rel::Fetched;
             file.via = via.clone();
         }
-        report.files.push(file);
+        graft.push(report, file);
     }
 
     // If the payload was an archive, its members' facts (declared deps, npm
@@ -4866,7 +5298,7 @@ fn registry_findings_for_reference<'a>(
     findings: &'a HashMap<String, Vec<Finding>>,
     reference: &Reference,
 ) -> Option<&'a [Finding]> {
-    findings.get(&locator_key(reference)).map(Vec::as_slice)
+    findings.get(locator(reference)).map(Vec::as_slice)
 }
 
 /// Injectable core of [`prepare_dependency_report`]. Keeping the mutation in a
@@ -4889,12 +5321,17 @@ fn prepare_dependency_report_with(
     graft(sub, &artifact_sha, &artifact, registry, opts);
 }
 
+/// The URL a fetch's bytes came from: where the redirects ended, else where
+/// the locator resolved. `None` when it never reached one.
+pub(crate) fn fetched_url(rec: &FetchRecord) -> Option<&str> {
+    rec.final_url.as_deref().or(rec.resolved_url.as_deref())
+}
+
 /// A filename for a fetched payload: the final URL's basename, else the
 /// content hash. Drives cleave's extension-based type detection.
 fn payload_name(rec: &FetchRecord) -> String {
-    let url = rec.final_url.as_deref().unwrap_or(&rec.resolved_url);
-    url.rsplit('/')
-        .next()
+    fetched_url(rec)
+        .and_then(|url| url.rsplit('/').next())
         .and_then(|s| s.split(['?', '#']).next())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -4903,10 +5340,17 @@ fn payload_name(rec: &FetchRecord) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use fletch::RefKind;
+
+    fn dropper(url: &str) -> bool {
+        Url::parse(url).is_ok_and(|u| looks_like_dropper_download_url(&u))
+    }
+
+    fn valid_host(url: &str) -> bool {
+        Url::parse(url).is_ok_and(|u| valid_discovered_url_host(&u))
+    }
 
     #[test]
     fn manifest_relpath_leads_with_the_scanned_artifact() {
@@ -4984,20 +5428,19 @@ mod tests {
 
     fn fetched_record() -> FetchRecord {
         FetchRecord {
-            source_sha256: "s".repeat(64),
+            source_sha256: Some("s".repeat(64)),
             source_offset: Some(17),
             kind: RefKind::Dependency,
             locator: "pkg:npm/held@0.0.1-security".to_string(),
-            resolved_url: "https://registry.test/held-0.0.1-security.tgz".to_string(),
+            resolved_url: Some("https://registry.test/held-0.0.1-security.tgz".to_string()),
             final_url: None,
             redirects: Vec::new(),
             status: Some(200),
             headers: Vec::new(),
-            fetched_at: 0,
+            fetched_at: None,
             content_sha256: Some("d".repeat(64)),
             size: Some(399),
-            cached: true,
-            stale: false,
+            served: Some(Served::Cache),
             pin_verified: None,
             outcome: Outcome::Ok,
         }
@@ -5066,7 +5509,8 @@ mod tests {
             }]
         }))
         .expect("parent report");
-        merge_payload(&mut parent, &rec, payload, None);
+        let mut graft = Graft::new(&parent);
+        merge_payload(&mut parent, &mut graft, &rec, payload);
         let fetched = parent
             .files
             .iter()
@@ -5121,11 +5565,11 @@ mod tests {
         };
         let fetched = fetched_record();
         assert_eq!(fetched.locator, "pkg:npm/held@0.0.1-security");
-        assert_ne!(locator_key(&declared), fetched.locator);
+        assert_ne!(locator(&declared), fetched.locator);
 
         let mut by_declared_locator = HashMap::new();
         by_declared_locator.insert(
-            locator_key(&declared),
+            locator(&declared).to_owned(),
             vec![test_finding(
                 "metadata/registry::registry-security-hold-record",
                 cleave::Criticality::Suspicious,
@@ -5146,28 +5590,27 @@ mod tests {
 
     #[test]
     fn summary_line_omits_zero_counts() {
-        let record = |outcome: Outcome, cached: bool, size: Option<u64>| FetchRecord {
-            source_sha256: String::new(),
+        let record = |outcome: Outcome, served: Served, size: Option<u64>| FetchRecord {
+            source_sha256: None,
             source_offset: None,
             kind: RefKind::Dependency,
             locator: "pkg:npm/x".to_string(),
-            resolved_url: String::new(),
+            resolved_url: None,
             final_url: None,
             redirects: Vec::new(),
             status: None,
             headers: Vec::new(),
-            fetched_at: 0,
+            fetched_at: None,
             content_sha256: None,
             size,
-            cached,
-            stale: false,
+            served: Some(served),
             pin_verified: None,
             outcome,
         };
         // Two cache hits, nothing live: the `0 live` is dropped, bytes stay.
         let warm = vec![
-            record(Outcome::Ok, true, Some(512)),
-            record(Outcome::Ok, true, Some(512)),
+            record(Outcome::Ok, Served::Cache, Some(512)),
+            record(Outcome::Ok, Served::Cache, Some(512)),
         ];
         let line = summary_line(&warm);
         assert!(line.contains("2 cached"), "{line}");
@@ -5177,8 +5620,8 @@ mod tests {
         );
         // A mixed run keeps both non-zero counts.
         let mixed = vec![
-            record(Outcome::Ok, false, Some(0)),
-            record(Outcome::Ok, true, Some(0)),
+            record(Outcome::Ok, Served::Network, Some(0)),
+            record(Outcome::Ok, Served::Cache, Some(0)),
         ];
         let line = summary_line(&mixed);
         assert!(line.contains("1 live"), "{line}");
@@ -5188,13 +5631,13 @@ mod tests {
     #[test]
     fn unresolved_fetches_stay_out_of_the_terminal_view() {
         let mut rec = fetched_record();
-        rec.outcome = Outcome::Unresolved;
+        rec.outcome = Outcome::Unresolved(fletch::fetch::Unresolved::NoRelease);
 
         assert!(!terminal_fetch_row_visible(&rec));
         assert!(matches!(landed_state(&rec), DepState::Hidden));
         assert!(matches!(done_state(&rec), DepState::Hidden));
 
-        rec.outcome = Outcome::Failed("transport".to_string());
+        rec.outcome = Outcome::Failed(FetchError::Transport("connection reset".to_string()));
         assert!(terminal_fetch_row_visible(&rec));
         assert!(matches!(done_state(&rec), DepState::Done { .. }));
     }
@@ -5222,7 +5665,7 @@ mod tests {
     #[test]
     fn absent_artifacts_stay_out_of_the_terminal_view() {
         let mut rec = fetched_record();
-        rec.outcome = Outcome::Failed("http status 404".to_string());
+        rec.outcome = Outcome::Failed(FetchError::Status(404));
         rec.status = Some(404);
         assert!(!terminal_fetch_row_visible(&rec));
         assert!(matches!(done_state(&rec), DepState::Hidden));
@@ -5230,11 +5673,12 @@ mod tests {
         rec.status = Some(503);
         assert!(terminal_fetch_row_visible(&rec));
 
-        // The same 404 as an older record spells it: in the message only.
+        // Only the typed status says the artifact is absent; error text is
+        // never parsed for one.
         rec.status = None;
-        assert!(!terminal_fetch_row_visible(&rec));
+        assert!(terminal_fetch_row_visible(&rec));
 
-        rec.outcome = Outcome::Failed("connection reset".to_string());
+        rec.outcome = Outcome::Failed(FetchError::Transport("connection reset".to_string()));
         assert!(terminal_fetch_row_visible(&rec), "transport failure");
     }
 
@@ -5256,22 +5700,23 @@ mod tests {
         };
         let mut rec = fetched_record();
         rec.locator = "pkg:npm/zaboodle@1.49".to_string();
-        rec.source_sha256 = "s".repeat(64);
+        rec.source_sha256 = Some("s".repeat(64));
         rec.outcome = Outcome::Skipped;
-        let analyzed = || Analyzed {
-            sub: None,
-            content_sha: "d".repeat(64),
-            next_from_bytes: Vec::new(),
-            corpus: None,
-        };
         let verdict = crate::corpus_precheck::Verdict {
-            fires_at: 2,
+            fires_at: crate::model::Level::At(2),
             reason: None,
             findings: Vec::new(),
         };
+        let analyzed = |corpus: Option<Verdict>| Analyzed {
+            sub: None,
+            content_sha: "d".repeat(64),
+            next_from_bytes: Vec::new(),
+            corpus,
+        };
 
         let mut adopted = parent();
-        merge_payload(&mut adopted, &rec, analyzed(), Some(&verdict));
+        let mut graft = Graft::new(&adopted);
+        merge_payload(&mut adopted, &mut graft, &rec, analyzed(Some(verdict)));
         let node = adopted
             .files
             .iter()
@@ -5289,7 +5734,8 @@ mod tests {
         // Nothing adopted (a rule-2 benign skip, or an ordinary empty payload)
         // adds nothing: there is no verdict for a node to carry.
         let mut bare = parent();
-        merge_payload(&mut bare, &rec, analyzed(), None);
+        let mut graft = Graft::new(&bare);
+        merge_payload(&mut bare, &mut graft, &rec, analyzed(None));
         assert_eq!(bare.files.len(), 1);
     }
 
@@ -5313,8 +5759,7 @@ mod tests {
 
         // And read as its own row, distinct from a verified fetch and from the
         // harder `pin!` mismatch.
-        let (_, label, ..) = fetch_row(&rec);
-        assert_eq!(label, "pin?");
+        assert_eq!(fetch_row(&rec).label, "pin?");
     }
 
     /// One dependency named by forty manifests fails identically forty times.
@@ -5331,7 +5776,7 @@ mod tests {
         };
 
         let mut rec = fetched_record();
-        rec.outcome = Outcome::Failed("http status 404".to_string());
+        rec.outcome = Outcome::Failed(FetchError::Status(404));
         assert!(stream.claim_row(&rec), "the first row must print");
         assert!(!stream.claim_row(&rec), "a repeat of it must not");
 
@@ -5342,13 +5787,13 @@ mod tests {
 
         // So is the same outcome over a different target.
         let mut other_target = rec.clone();
-        other_target.resolved_url = "https://registry.test/other-1.0.0.tgz".to_string();
+        other_target.resolved_url = Some("https://registry.test/other-1.0.0.tgz".to_string());
         assert!(stream.claim_row(&other_target));
 
         // A record that never resolved is keyed by its locator instead, so two
         // unresolved locators do not collapse into one row.
         let mut bare = rec.clone();
-        bare.resolved_url = String::new();
+        bare.resolved_url = None;
         assert!(stream.claim_row(&bare));
         assert!(!stream.claim_row(&bare));
 
@@ -5610,10 +6055,7 @@ mod tests {
             "https://example.test/archive/payload.tar.gz?sig=abc",
             "https://example.test/payload.js",
         ] {
-            assert!(
-                looks_like_dropper_download_url(url),
-                "download-shaped URL was rejected: {url}"
-            );
+            assert!(dropper(url), "download-shaped URL was rejected: {url}");
         }
 
         for url in [
@@ -5642,10 +6084,7 @@ mod tests {
             "https://example.test/lib/1.2.3/",
             "https://example.test/pkg/2.0.0",
         ] {
-            assert!(
-                !looks_like_dropper_download_url(url),
-                "site/API-shaped URL was kept: {url}"
-            );
+            assert!(!dropper(url), "site/API-shaped URL was kept: {url}");
         }
     }
 
@@ -5653,9 +6092,7 @@ mod tests {
     fn eval_pipeline_urls_are_followed_even_without_a_filename() {
         let mut reference = url_ref("https://cdn.jsdelivr.net/gh/example/stage-opaque");
         reference.evidence = "irm cdn.jsdelivr.net/gh/example/stage-opaque | iex".to_string();
-        assert!(!looks_like_dropper_download_url(
-            "https://cdn.jsdelivr.net/gh/example/stage-opaque"
-        ));
+        assert!(!dropper("https://cdn.jsdelivr.net/gh/example/stage-opaque"));
         assert!(is_eval_pipeline_url(&reference));
 
         reference.evidence = "curl jsonkeeper.com/abc123 | iex".to_string();
@@ -5681,7 +6118,7 @@ mod tests {
     #[test]
     fn download_to_file_urls_are_followed_even_from_an_api_route() {
         let url = "https://example.vercel.app/api/settings/bootstrap";
-        assert!(!looks_like_dropper_download_url(url));
+        assert!(!dropper(url));
         let mut reference = url_ref(url);
         for evidence in [
             r#"wget -q -O "$DIR/boot.sh" "https://example.vercel.app/api/settings/bootstrap""#,
@@ -5780,7 +6217,7 @@ mod tests {
         mark_redirect_destinations(page, &mut refs);
         let sources: Vec<(String, &str)> = refs
             .iter()
-            .map(|r| (locator_key(r), r.source.as_str()))
+            .map(|r| (locator(r).to_owned(), r.source.as_str()))
             .collect();
         assert_eq!(
             sources,
@@ -5801,10 +6238,7 @@ mod tests {
     #[test]
     fn discovered_urls_need_a_domain_or_ip_host() {
         for url in ["https://example.com/stage.sh", "http://8.8.8.8/payload.bin"] {
-            assert!(
-                valid_discovered_url_host(url),
-                "valid host was rejected: {url}"
-            );
+            assert!(valid_host(url), "valid host was rejected: {url}");
         }
         for url in [
             "http://wpad/wpad.dat",
@@ -5823,7 +6257,7 @@ mod tests {
             "relative/payload.bin",
         ] {
             assert!(
-                !valid_discovered_url_host(url),
+                !valid_host(url),
                 "invalid or local host was accepted: {url}"
             );
         }
@@ -5892,11 +6326,11 @@ mod tests {
             "https://example.test/bucket/files",
         ] {
             assert!(
-                !looks_like_dropper_download_url(url),
+                !dropper(url),
                 "listing endpoint accepted as a download: {url}"
             );
         }
-        assert!(looks_like_dropper_download_url(
+        assert!(dropper(
             "https://github.com/atomdrift-project/scan/releases/download/v2.8.0/atomscan"
         ));
     }
@@ -5931,10 +6365,7 @@ mod tests {
             "https://example.test/releases/v1.2.3/payload.bin",
             "https://proxy.golang.org/github.com/o/r/@v/v0.0.0-20260823143148-1fb3b878e2fb.zip",
         ] {
-            assert!(
-                looks_like_dropper_download_url(url),
-                "versioned artifact was rejected: {url}"
-            );
+            assert!(dropper(url), "versioned artifact was rejected: {url}");
         }
     }
 
@@ -6442,7 +6873,7 @@ mod tests {
             .iter()
             .flat_map(|(_, refs)| refs)
             .filter(|r| r.kind == RefKind::Dependency)
-            .map(locator_key)
+            .map(|r| locator(r).to_owned())
             .collect();
         assert_eq!(
             selected,
@@ -6524,7 +6955,7 @@ mod tests {
             .iter()
             .flat_map(|(sha, refs)| {
                 refs.iter()
-                    .map(move |r| (sha.as_str(), locator_key(r), r.source.as_str()))
+                    .map(move |r| (sha.as_str(), locator(r).to_owned(), r.source.as_str()))
             })
             .collect();
         assert_eq!(
@@ -6536,8 +6967,8 @@ mod tests {
         assert_eq!(*sha, "bb".repeat(32));
         assert_eq!(locator, "https://stage.test/bashlinux.sh");
         assert!(
-            source.ends_with(&format!(" via {trigger}")),
-            "reference names the trait that justified the hunt: {source}"
+            !source.contains(trigger),
+            "the recognizer's own source is kept, never rewritten: {source}"
         );
     }
 
@@ -6622,9 +7053,7 @@ mod tests {
             ])
         );
         // Carrier or not, an ordinary image URL still fails the download shape.
-        assert!(!looks_like_dropper_download_url(
-            "https://img.shields.io/crates/v/tool.png"
-        ));
+        assert!(!dropper("https://img.shields.io/crates/v/tool.png"));
     }
 
     #[test]
@@ -6658,7 +7087,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         let (gsha, refs) = &groups[0];
         assert_eq!(gsha, &sha);
-        let locs: Vec<String> = refs.iter().map(locator_key).collect();
+        let locs: Vec<String> = refs.iter().map(|r| locator(r).to_owned()).collect();
         assert!(
             locs.iter().any(|l| l == "pkg:npm/declared-dep@1.0.0"),
             "declared dep retained: {locs:?}"
@@ -6701,7 +7130,7 @@ mod tests {
         let all: Vec<Reference> = groups.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
         let undeclared: Vec<String> = find::undeclared_packages(&all)
             .iter()
-            .map(|r| locator_key(r))
+            .map(|r| locator(r).to_owned())
             .collect();
         assert!(
             undeclared.contains(&"pkg:npm/db-dx-connector".to_string()),
@@ -6740,7 +7169,7 @@ mod tests {
             collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         let locs: Vec<String> = groups
             .iter()
-            .flat_map(|(_, refs)| refs.iter().map(locator_key))
+            .flat_map(|(_, refs)| refs.iter().map(|r| locator(r).to_owned()))
             .collect();
         assert_eq!(
             locs,
@@ -6770,7 +7199,7 @@ mod tests {
             collect_references(&report, std::path::Path::new("/nonexistent"), CiRefs::Skip);
         let locs: Vec<String> = groups
             .iter()
-            .flat_map(|(_, refs)| refs.iter().map(locator_key))
+            .flat_map(|(_, refs)| refs.iter().map(|r| locator(r).to_owned()))
             .collect();
         assert_eq!(locs, vec!["pkg:npm/express"]);
     }
@@ -6838,20 +7267,19 @@ mod tests {
             .expect("sub report")
         };
         let rec_for = |locator: &str, url: &str| FetchRecord {
-            source_sha256: String::new(),
+            source_sha256: None,
             source_offset: None,
             kind: RefKind::Dependency,
             locator: locator.to_string(),
-            resolved_url: url.to_string(),
+            resolved_url: Some(url.to_string()),
             final_url: None,
             redirects: Vec::new(),
             status: None,
             headers: Vec::new(),
-            fetched_at: 0,
+            fetched_at: None,
             content_sha256: Some("d".repeat(64)),
             size: None,
-            cached: false,
-            stale: false,
+            served: Some(Served::Network),
             pin_verified: None,
             outcome: Outcome::Ok,
         };
@@ -6859,6 +7287,7 @@ mod tests {
         let mut report: AnalysisReport =
             serde_json::from_value(serde_json::json!({"version": "3", "files": []}))
                 .expect("root report");
+        let mut graft = Graft::new(&report);
 
         // Two dependencies whose URLs share a basename — the collision case.
         for (locator, url) in [
@@ -6867,6 +7296,7 @@ mod tests {
         ] {
             merge_payload(
                 &mut report,
+                &mut graft,
                 &rec_for(locator, url),
                 Analyzed {
                     sub: Some(sub_report("index.js")),
@@ -6874,7 +7304,6 @@ mod tests {
                     next_from_bytes: Vec::new(),
                     corpus: None,
                 },
-                None,
             );
         }
 
@@ -6897,32 +7326,31 @@ mod tests {
     #[test]
     fn payload_name_prefers_url_basename_then_falls_back_to_hash() {
         let mut rec = FetchRecord {
-            source_sha256: String::new(),
+            source_sha256: None,
             source_offset: None,
             kind: RefKind::Dependency,
             locator: "pkg:npm/x".to_string(),
-            resolved_url: "https://reg.test/x/-/x-1.0.0.tgz".to_string(),
+            resolved_url: Some("https://reg.test/x/-/x-1.0.0.tgz".to_string()),
             final_url: None,
             redirects: Vec::new(),
             status: None,
             headers: Vec::new(),
-            fetched_at: 0,
+            fetched_at: None,
             content_sha256: Some("abc123".to_string()),
             size: None,
-            cached: false,
-            stale: false,
+            served: Some(Served::Network),
             pin_verified: None,
             outcome: Outcome::Ok,
         };
         assert_eq!(payload_name(&rec), "x-1.0.0.tgz");
 
         // Query string is stripped.
-        rec.resolved_url = "https://reg.test/dl?file=stage2.sh".to_string();
+        rec.resolved_url = Some("https://reg.test/dl?file=stage2.sh".to_string());
         // basename before '?' is "dl" (path component), so query strip applies to it.
         assert_eq!(payload_name(&rec), "dl");
 
         // No usable basename → content hash.
-        rec.resolved_url = "https://reg.test/".to_string();
+        rec.resolved_url = Some("https://reg.test/".to_string());
         assert_eq!(payload_name(&rec), "abc123");
     }
 
@@ -6950,5 +7378,327 @@ mod tests {
         assert_eq!(parse_bytes("256M"), Ok(DEFAULT_MAX_FETCH_SIZE));
         assert_eq!(parse_bytes("2G"), Ok(DEFAULT_MAX_FILE_SIZE));
         assert_eq!(parse_bytes("10G"), Ok(DEFAULT_MAX_TOTAL_SIZE));
+    }
+
+    fn report_of(files: &serde_json::Value) -> AnalysisReport {
+        serde_json::from_value(serde_json::json!({"version": "3", "files": files}))
+            .expect("report deserializes")
+    }
+
+    /// The batch PURL negotiation's answer is its own case: nothing was
+    /// downloaded, yet an adopted verdict becomes a payload to merge, gets its
+    /// node, and carries its verdict. It used to be dropped as "no bytes", so
+    /// the verdict never left the group that negotiated it.
+    #[test]
+    fn a_corpus_answer_reaches_the_report_without_a_download() {
+        let sha = "e".repeat(64);
+        let source = "s".repeat(64);
+        let landed = |standing: Standing| {
+            let reference = purl_ref("pkg:npm/zaboodle@1.49");
+            Landed {
+                record: corpus_hit_record(&reference, &source, &sha),
+                reference,
+                standing,
+            }
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path().to_path_buf());
+        let opts = AnalysisOptions::default();
+        let payloads = Payloads {
+            cache: &cache,
+            opts: &opts,
+            acache: None,
+            precheck: None,
+        };
+
+        let adopted = landed(Standing::Adopt(Verdict {
+            fires_at: crate::model::Level::At(2),
+            reason: Some("steals tokens".to_string()),
+            findings: Vec::new(),
+        }));
+        let analyzed = payloads
+            .analyze(&adopted)
+            .expect("an adopted verdict is a payload to merge");
+        assert_eq!(analyzed.content_sha, sha);
+        assert!(analyzed.sub.is_none(), "nothing was downloaded or analyzed");
+        assert_eq!(
+            analyzed.corpus.as_ref().map(|v| v.fires_at),
+            Some(crate::model::Level::At(2))
+        );
+
+        let mut report = report_of(&serde_json::json!([{
+            "id": 0, "path": "package.json", "depth": 0,
+            "file_type": "package_json", "sha256": source, "size": 100u64
+        }]));
+        let mut graft = Graft::new(&report);
+        let next = merge_payload(&mut report, &mut graft, &adopted.record, analyzed);
+        assert!(next.is_empty());
+        let node = report
+            .files
+            .iter()
+            .find(|f| f.sha256 == sha)
+            .expect("the adopted dependency has a node");
+        assert_eq!(node.path, "pkg:npm/zaboodle@1.49");
+        assert_eq!(node.rel, cleave::types::Rel::Fetched);
+        assert_eq!(node.parent_id, Some(0));
+
+        // A benign answer from another analyzer carries nothing to report.
+        assert!(payloads.analyze(&landed(Standing::SkipBenign)).is_none());
+    }
+
+    /// fletch returns records only for the references it fetches and may
+    /// refine a locator on the way; the index stamped going in still pairs
+    /// every record with its own reference. Pairing by position moved every
+    /// record after a skipped reference onto the wrong one.
+    #[test]
+    fn records_pair_with_their_references_by_key() {
+        let mut path = purl_ref("unused");
+        path.locator = RefLocator::Path("./lib/index.js".to_string());
+        let mut b = purl_ref("pkg:npm/b");
+        b.offset = 99;
+        let selected = vec![purl_ref("pkg:npm/a"), path, b];
+        // As fletch answers: nothing for the path, `b` refined to a release.
+        let record = |i: usize, locator: &str| FetchRecord {
+            source_offset: Some(keyed(&selected[i], i).offset),
+            locator: locator.to_string(),
+            ..fetched_record()
+        };
+        let records = vec![record(0, "pkg:npm/a@1.0.0"), record(2, "pkg:npm/b@2.0.0")];
+        let mut slots = vec![None; selected.len()];
+        pair_records(&selected, records, &mut slots);
+        assert_eq!(
+            slots[0].as_ref().map(|(r, _)| r.locator.as_str()),
+            Some("pkg:npm/a@1.0.0")
+        );
+        assert!(slots[1].is_none(), "the path was never fetched");
+        let (record_b, standing) = slots[2].as_ref().expect("b keeps its own slot");
+        assert_eq!(record_b.locator, "pkg:npm/b@2.0.0");
+        assert_eq!(
+            record_b.source_offset,
+            Some(99),
+            "the real offset is restored"
+        );
+        assert!(matches!(standing, Standing::Analyze));
+    }
+
+    /// Concurrent fetch phases reserve before the network, so together they
+    /// can never spend more than the process-wide budget.
+    #[test]
+    fn the_total_budget_is_reserved_not_overshot() {
+        let total = TotalBudget::new(10, 1_000);
+        let want = Allowance {
+            fetches: 4,
+            bytes: 400,
+        };
+        let granted: Vec<Allowance> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| total.reserve(want)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+        assert_eq!(granted.iter().map(|g| g.fetches).sum::<usize>(), 10);
+        assert_eq!(granted.iter().map(|g| g.bytes).sum::<u64>(), 1_000);
+    }
+
+    /// What a fetch did not spend goes back; bytes past its grant — fletch
+    /// stops only after the fetch that crossed the cap — come out of what is
+    /// left.
+    #[test]
+    fn a_grant_is_settled_against_what_was_spent() {
+        let total = TotalBudget::new(10, 1_000);
+        let all = Allowance {
+            fetches: usize::MAX,
+            bytes: u64::MAX,
+        };
+        let grant = total.reserve(Allowance {
+            fetches: 4,
+            bytes: 400,
+        });
+        total.settle(
+            grant,
+            Allowance {
+                fetches: 1,
+                bytes: 100,
+            },
+        );
+        assert_eq!(
+            total.reserve(all),
+            Allowance {
+                fetches: 9,
+                bytes: 900
+            }
+        );
+        let total = TotalBudget::new(5, 100);
+        let grant = total.reserve(Allowance {
+            fetches: 1,
+            bytes: 10,
+        });
+        total.settle(
+            grant,
+            Allowance {
+                fetches: 1,
+                bytes: 30,
+            },
+        );
+        assert_eq!(
+            total.reserve(all),
+            Allowance {
+                fetches: 4,
+                bytes: 70
+            }
+        );
+    }
+
+    /// One root's budget spans all its hops and declaring files: what an
+    /// earlier group spent is gone for the next, per class for the counts and
+    /// shared for the bytes.
+    #[test]
+    fn a_roots_budget_carries_across_groups() {
+        let mut budget = RootBudget::new(&FetchPolicy {
+            max_file_fetches: 10,
+            max_url_fetches: 2,
+            max_file_bytes: 100,
+            ..FetchPolicy::default()
+        });
+        budget.spend(
+            FetchClass::Deps,
+            Allowance {
+                fetches: 7,
+                bytes: 60,
+            },
+        );
+        assert_eq!(
+            budget.want(FetchClass::Deps),
+            Allowance {
+                fetches: 3,
+                bytes: 40
+            }
+        );
+        assert_eq!(
+            budget.want(FetchClass::Urls),
+            Allowance {
+                fetches: 2,
+                bytes: 40
+            }
+        );
+        budget.spend(
+            FetchClass::Urls,
+            Allowance {
+                fetches: 5,
+                bytes: 90,
+            },
+        );
+        assert_eq!(
+            budget.want(FetchClass::Urls),
+            Allowance {
+                fetches: 0,
+                bytes: 0
+            }
+        );
+    }
+
+    /// IPv6 literals are judged by address, not refused for their brackets,
+    /// and only a *mapped* IPv4 address is read as IPv4.
+    #[test]
+    fn ipv6_literals_are_judged_by_address() {
+        assert!(valid_host("http://[2606:4700:4700::1111]/payload.bin"));
+        assert!(
+            valid_host("http://[::ffff:8.8.8.8]/payload.bin"),
+            "mapped public v4"
+        );
+        assert!(
+            !valid_host("http://[::ffff:10.0.0.1]/payload.bin"),
+            "mapped private v4"
+        );
+        assert!(
+            !valid_host("http://[2001:db8::1]/payload.bin"),
+            "documentation range"
+        );
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(!public_ip(ip("::1")), "loopback, never the IPv4 0.0.0.1");
+        assert!(!public_ip(ip("::")));
+        assert!(public_ip(ip("::8.8.8.8")), "IPv4-compatible is plain IPv6");
+    }
+
+    #[test]
+    fn a_purl_coordinate_splits_once() {
+        let c = Coordinate::of("pkg:npm/%40scope/name@1.2.3?arch=x64#sub").unwrap();
+        assert_eq!(
+            (c.key, c.typ, c.path, c.version),
+            (
+                "pkg:npm/%40scope/name",
+                "npm",
+                "%40scope/name",
+                Some("1.2.3")
+            )
+        );
+        // A literal scope `@` opens a segment; it is never a version.
+        assert_eq!(Coordinate::of("pkg:npm/@scope/name").unwrap().version, None);
+        assert_eq!(
+            Coordinate::of("pkg:npm/@scope/name@2.0.0").unwrap().key,
+            "pkg:npm/@scope/name"
+        );
+        // Qualifiers are not part of the version.
+        assert_eq!(
+            Coordinate::of("pkg:cargo/serde@1.0.219?checksum=abc")
+                .unwrap()
+                .version,
+            Some("1.0.219")
+        );
+        assert!(Coordinate::of("https://example.test/x@1.zip").is_none());
+        assert!(Coordinate::of("pkg:npm").is_none());
+        // Every reader shares the one split.
+        assert_eq!(versioned_purl("https://example.test/x@1.zip"), None);
+        assert_eq!(
+            purl_display("pkg:npm/%40scope/pkg@1.2.3"),
+            "@scope/pkg 1.2.3"
+        );
+        assert_eq!(purl_display("pkg:npm/%40scope/pkg"), "@scope/pkg");
+        assert_eq!(
+            npm_import_name(&purl_ref("pkg:npm/%40scope/tool")).as_deref(),
+            Some("@scope/tool")
+        );
+        assert_eq!(npm_import_name(&purl_ref("pkg:pypi/requests")), None);
+    }
+
+    /// The graft index is what a scan of the report would find: ids continue
+    /// past the highest, and a parent is the first node with the declaring sha.
+    #[test]
+    fn the_graft_index_matches_a_scan_of_the_report() {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let mut report = report_of(&serde_json::json!([
+            {"id": 0, "path": "root", "depth": 0, "file_type": "tar", "sha256": a, "size": 1u64},
+            {"id": 5, "parent_id": 0, "path": "root!!m", "depth": 1, "file_type": "json", "sha256": b, "size": 1u64},
+            {"id": 2, "parent_id": 5, "path": "root!!m!!n", "depth": 3, "file_type": "json", "sha256": a, "size": 1u64},
+        ]));
+        let mut graft = Graft::new(&report);
+        assert_eq!(graft.next_id, 6);
+        assert_eq!(
+            graft.parent(Some(&a)),
+            (0, 0),
+            "the first node with the sha"
+        );
+        assert_eq!(graft.parent(Some(&b)), (5, 1));
+        assert_eq!(
+            graft.parent(Some("unknown")),
+            (0, 0),
+            "falls back to the root"
+        );
+        assert_eq!(graft.parent(None), (0, 0), "as does no declarer at all");
+
+        let sub = report_of(&serde_json::json!([
+            {"id": 0, "path": "x@1.registry.json", "depth": 0, "file_type": "registry", "sha256": "c".repeat(64), "size": 1u64},
+            {"id": 1, "parent_id": 0, "path": "x@1.registry.json!!y", "depth": 1, "file_type": "json", "sha256": "d".repeat(64), "size": 1u64},
+        ]));
+        assert_eq!(merge_registry(&mut report, &mut graft, &b, sub), Some(6));
+        let grafted: Vec<(u32, Option<u32>, u32)> = report.files[3..]
+            .iter()
+            .map(|f| (f.id, f.parent_id, f.depth))
+            .collect();
+        assert_eq!(grafted, [(6, Some(5), 2), (7, Some(6), 3)]);
+        assert_eq!(graft.next_id, 8);
     }
 }

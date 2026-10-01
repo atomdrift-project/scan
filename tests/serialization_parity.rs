@@ -22,8 +22,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use scan::engine::{EmbeddedFile, FindingCounts, ScanResult};
-use scan::interpret::Interpretation;
-use scan::model::{Classification, RouteScore, SkippedRoute};
+use scan::interpret::{Graded, Interpretation, LlmGrade};
+use scan::model::{Classification, Level, RouteScore, SkippedRoute};
 
 /// Serialize a `ScanResult` through all three envelope builders and assert the
 /// resulting JSON is byte-for-byte identical. `to_writer`/`to_vec` share
@@ -66,13 +66,13 @@ fn full_result_serializes_identically() {
             class: Classification::Hostile,
             probability: 0.873_21,
             threshold: 0.5,
-            level: Some(50),
+            level: Level::At(50),
         },
         floor: None,
         classification: Classification::Hostile,
         probability: 0.873_21,
         threshold: 0.5,
-        level: Some(50),
+        level: Level::At(50),
         version: "model-abc123".to_string(),
         analyzed_at: "2026-06-17T15:01:22Z".to_string(),
         cleave: Some(
@@ -107,7 +107,7 @@ fn full_result_serializes_identically() {
                 classification: Classification::Suspicious,
                 probability: 0.42,
                 threshold: 0.5,
-                level: Some(100),
+                level: Level::At(100),
                 model_scores: vec![],
                 skipped_models: vec![],
                 formula: String::new(),
@@ -125,22 +125,21 @@ fn full_result_serializes_identically() {
             reason: "type not applicable",
         }],
         rendered_context: "1  import base64".to_string(),
-        interpretation: Some(Interpretation {
-            grade: None,
+        interpretation: Some(Interpretation::Graded(Graded {
+            grade: LlmGrade::Hostile,
             outcome: Classification::Hostile,
-            corroborated: true,
             blended: 0.873_21,
             interpretation: "imports base64 and writes to sys.modules".to_string(),
             model: "claude-test".to_string(),
-            error: None,
             analyzer_directed: true,
-            cached: false,
             before: scan::interpret::MlVerdict {
                 class: Classification::Suspicious,
                 prob: 0.612,
-                lvl: Some(85),
+                lvl: Level::At(85),
             },
-        }),
+            corroborated: true,
+            cached: false,
+        })),
         pending_llm: None,
         analysis_cached: false,
         interpret_ms: 0,
@@ -164,13 +163,13 @@ fn minimal_result_serializes_identically() {
             class: Classification::Benign,
             probability: 0.01,
             threshold: 0.5,
-            level: Some(-1),
+            level: Level::Clean,
         },
         floor: None,
         classification: Classification::Benign,
         probability: 0.01,
         threshold: 0.5,
-        level: Some(-1),
+        level: Level::Clean,
         version: "model-abc123".to_string(),
         analyzed_at: "2026-06-17T15:01:22Z".to_string(),
         cleave: None,
